@@ -335,6 +335,11 @@ jobs:
     with:
       base64-subjects: ${{ needs.hashes.outputs.subjects }}
       upload-assets: false
+      # Provenance and the keyless signatures land in the public Rekor
+      # transparency log, which records the repository name; this
+      # acknowledgment is required while the repository is still private and
+      # is a no-op once it is public.
+      private-repository: true
       provenance-name: stellar-agent-${{ needs.preflight.outputs.version }}.intoto.jsonl
 
   publish:
