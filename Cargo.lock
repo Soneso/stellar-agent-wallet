@@ -4943,6 +4943,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "hex",
+ "openssl",
  "p256",
  "proptest",
  "rand_core 0.6.4",

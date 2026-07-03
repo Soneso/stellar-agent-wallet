@@ -138,6 +138,10 @@ tracing = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 webauthn-rs-core = { workspace = true }
+# Not imported by this crate directly: present only to turn on the vendored
+# feature of the OpenSSL that webauthn-rs-core links transitively, so release
+# builds compile OpenSSL from source on every target.
+openssl = { workspace = true }
 base64 = { workspace = true }
 serde_json = { workspace = true }
 # p256: secp256r1 for DER → compact + low-S transform in webauthn/sig_normalize.rs.
@@ -181,3 +185,6 @@ stellar-agent-webauthn-bridge = { workspace = true }
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["openssl"]

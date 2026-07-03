@@ -148,6 +148,27 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cargo install cross --version 0.2.5 --locked
 
+      # stellar-baselib links libsodium; on MSVC its build script fetches the
+      # prebuilt archive from download.libsodium.org over plain HTTP with no
+      # retry, which is flaky from Windows runners. Pre-fetching the same
+      # archive over HTTPS with retries into SODIUM_DIST_DIR makes the build
+      # script consume the local copy instead; it still verifies the
+      # archive's minisign signature against its pinned upstream key, so
+      # integrity does not rest on this download step.
+      - name: Prefetch libsodium dist (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIST_DIR="$RUNNER_TEMP/sodium-dist"
+          mkdir -p "$DIST_DIR"
+          BASE="https://download.libsodium.org/libsodium/releases"
+          for f in libsodium-1.0.22-stable-msvc.zip libsodium-1.0.22-stable-msvc.zip.minisig; do
+            curl --fail --silent --show-error --location --retry 5 --retry-all-errors \
+              --output "$DIST_DIR/$f" "$BASE/$f"
+          done
+          echo "SODIUM_DIST_DIR=$DIST_DIR" >> "$GITHUB_ENV"
+
       - name: Build binaries
         # CROSS_IMAGE pins the cross Docker image by digest (an index
         # manifest covering both amd64 and arm64 host variants; Docker
