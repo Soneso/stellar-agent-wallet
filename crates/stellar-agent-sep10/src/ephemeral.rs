@@ -339,14 +339,14 @@ pub fn signing_key_from_seed(seed: &zeroize::Zeroizing<[u8; 32]>) -> SigningKey 
 /// Signs a challenge `envelope_xdr` with `signing_key` and returns the
 /// re-encoded base64 XDR.
 ///
-/// Thin `pub` wrapper over [`sign_challenge_with_key`] for use in integration
+/// Thin `pub` wrapper over the crate-private `sign_challenge_with_key` for use in integration
 /// test binaries that cannot access `pub(crate)` items.
 ///
 /// Only available under `--features test-helpers`.
 ///
 /// # Errors
 ///
-/// Same as [`sign_challenge_with_key`].
+/// Same as the wrapped crate-private `sign_challenge_with_key`.
 ///
 /// # Panics
 ///

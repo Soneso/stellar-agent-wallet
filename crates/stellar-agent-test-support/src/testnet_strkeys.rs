@@ -110,7 +110,7 @@ pub fn base32_encode_35(input: &[u8; 35]) -> String {
 ///
 /// Returns a 56-character RFC 4648 base32 string — the canonical Stellar
 /// strkey wire form. Used in place of committing literal strkeys, and delegates
-/// CRC-16/XMODEM to [`crate::secret_patterns::crc16_xmodem`] so the oracle and
+/// CRC-16/XMODEM to the crate-private `secret_patterns::crc16_xmodem` so the oracle and
 /// the synthesiser share one implementation.
 #[must_use]
 pub fn strkey_from_seed(version_byte: u8, seed: &[u8; 32]) -> String {

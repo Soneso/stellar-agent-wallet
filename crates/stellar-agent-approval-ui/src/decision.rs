@@ -10,7 +10,7 @@
 //! # Concurrency model
 //!
 //! The server never holds a resident
-//! [`PendingApprovalStore`](stellar_agent_core::approval::PendingApprovalStore).
+//! [`PendingApprovalStore`].
 //! Every call here opens the store via [`open_with_retry`], performs the one
 //! action, and lets the store drop — releasing the advisory file lock — before
 //! returning. Lock contention that survives the bounded retry surfaces as

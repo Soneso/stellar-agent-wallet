@@ -34,7 +34,6 @@ use stellar_agent_core::approval::{
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, open_with_retry,
 };
 use stellar_agent_core::envelope_decode::decode_authoritative_args;
-use stellar_agent_core::profile::schema::default_approval_dir;
 use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_network::{
     BASE_RESERVE_STROOPS, BalanceView, ClassicOpBuilder, StellarRpcClient, fetch_account,
@@ -198,8 +197,9 @@ impl WalletServer {
         simulated_seq_num: i64,
         profile_name: &str,
     ) -> Result<PendingApproval, String> {
-        let approvals_dir =
-            default_approval_dir().map_err(|e| format!("approval dir resolution failed: {e}"))?;
+        let approvals_dir = self
+            .resolve_approval_dir()
+            .map_err(|e| format!("approval dir resolution failed: {e}"))?;
         std::fs::create_dir_all(&approvals_dir)
             .map_err(|e| format!("approval dir create_all failed: {e}"))?;
         let store_path = approvals_dir.join(format!("{profile_name}.toml"));
@@ -870,7 +870,7 @@ impl WalletServer {
                 // cannot be replayed. Failure does not abort the response —
                 // the transaction is already on-chain.
                 if let Some(ref approval_nonce_str) = args.approval_nonce
-                    && let Ok(approvals_dir) = default_approval_dir()
+                    && let Ok(approvals_dir) = self.resolve_approval_dir()
                 {
                     let profile_name = self.profile_name_for_approval();
                     let store_path = approvals_dir.join(format!("{profile_name}.toml"));

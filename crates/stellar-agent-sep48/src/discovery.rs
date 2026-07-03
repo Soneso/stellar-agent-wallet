@@ -28,7 +28,7 @@
 //!
 //! # WASM fetch path
 //!
-//! The WASM bytes are fetched via [`crate::spec::fetch_wasm_bytes`].
+//! The WASM bytes are fetched via the crate-private `spec::fetch_wasm_bytes`.
 //! NOTE: The in-process SPEC_CACHE stores parsed `Vec<ScSpecEntry>` (not raw
 //! WASM bytes), so `discover_claimed_seps` fetches the WASM independently of
 //! the SEP-48 spec path. The two caches are separate: SPEC_CACHE covers the

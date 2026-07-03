@@ -29,13 +29,13 @@ use zeroize::Zeroizing;
 
 const BASE_FEE: u32 = 100;
 
-/// Number of attempts for the [`retry_rpc!`] macro.
+/// Number of attempts for the `retry_rpc!` macro.
 ///
 /// Exposed so acceptance tests can reference the same constant when building
 /// log messages or assertions.
 pub const RETRY_RPC_ATTEMPTS: u32 = 3;
 
-/// Backoff duration in milliseconds between [`retry_rpc!`] attempts.
+/// Backoff duration in milliseconds between `retry_rpc!` attempts.
 ///
 /// Exposed so acceptance tests can reference the same constant when building
 /// log messages or assertions.

@@ -785,6 +785,19 @@ impl WalletServer {
             .unwrap_or("default")
             .to_owned()
     }
+
+    /// Resolves the pending-approval store directory, honoring the test-only
+    /// override so integration tests never write into the operator's real
+    /// approval directory.
+    pub(crate) fn resolve_approval_dir(
+        &self,
+    ) -> Result<std::path::PathBuf, stellar_agent_core::profile::schema::StateDirError> {
+        #[cfg(any(test, feature = "test-helpers"))]
+        if let Some(ref override_dir) = self.approval_dir_override {
+            return Ok(override_dir.clone());
+        }
+        stellar_agent_core::profile::schema::default_approval_dir()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

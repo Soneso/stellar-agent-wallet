@@ -27,7 +27,7 @@
 //! `SPEC_CACHE` stores the parsed `Vec<ScSpecEntry>` keyed on the contract
 //! C-strkey — it is SEP-48 spec-path only. The SEP-47 discovery path
 //! ([`crate::discovery`]) fetches WASM bytes independently via
-//! [`fetch_wasm_bytes`]; it does NOT share this cache (which stores parsed
+//! `fetch_wasm_bytes`; it does NOT share this cache (which stores parsed
 //! spec entries, not raw WASM bytes). Upstream contract specs are treated as
 //! trusted: the typed preview is a non-authoritative display and does not
 //! validate spec semantics beyond the bounded XDR parse.
