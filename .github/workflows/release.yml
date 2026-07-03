@@ -155,6 +155,24 @@ jobs:
       # script consume the local copy instead; it still verifies the
       # archive's minisign signature against its pinned upstream key, so
       # integrity does not rest on this download step.
+      # The vendored OpenSSL build runs OpenSSL's perl-based Configure, which
+      # needs a Windows-native Perl with its full module set; the MSYS perl
+      # that Git for Windows puts on PATH lacks it. openssl-src honors
+      # OPENSSL_SRC_PERL, so point it at Strawberry Perl (preinstalled on the
+      # runner image; installed on the spot if a future image drops it).
+      - name: Provide a native Perl for the vendored OpenSSL build (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'C:\Strawberry\perl\bin\perl.exe')) {
+            choco install strawberryperl --no-progress -y
+          }
+          if (-not (Test-Path 'C:\Strawberry\perl\bin\perl.exe')) {
+            Write-Error 'Strawberry Perl unavailable'
+            exit 1
+          }
+          Add-Content $env:GITHUB_ENV "OPENSSL_SRC_PERL=C:\Strawberry\perl\bin\perl.exe"
+
       - name: Prefetch libsodium dist (Windows)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: bash
