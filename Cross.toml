@@ -1,0 +1,16 @@
+# Configuration for `cross`, used by the release workflow's
+# aarch64-unknown-linux-gnu leg.
+
+[target.aarch64-unknown-linux-gnu]
+# Digest-pinned: GHCR tags are mutable, so pinning by tag alone would let a
+# push to the cross-rs registry silently change the image this build
+# compiles inside. Re-resolve with `docker buildx imagetools inspect` when
+# bumping the cross version.
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu@sha256:7f8308a8734d9fcd2ebbe9a3e4bdea74af293f0799d80c3cc341e340cda49a4c"
+# hidapi (via stellar-ledger) links libudev, which the stock image does not
+# carry for the target architecture; install the arm64 package into a
+# derived image before building.
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update && apt-get install --assume-yes libudev-dev:$CROSS_DEB_ARCH",
+]

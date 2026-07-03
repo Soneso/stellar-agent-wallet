@@ -147,11 +147,18 @@ jobs:
       # The instrumented build plus every compiled test binary is large; reclaim
       # space the build does not need.
       - name: Free disk space
+        # The instrumented workspace build plus the vendored OpenSSL source
+        # build need more headroom than the plain test job.
         run: |
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /opt/hostedtoolcache
+          sudo rm -rf /usr/lib/jvm
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/local/lib/node_modules
           sudo docker image prune --all --force >/dev/null 2>&1 || true
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
         with:

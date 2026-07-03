@@ -163,24 +163,16 @@ jobs:
           DIST_DIR="$RUNNER_TEMP/sodium-dist"
           mkdir -p "$DIST_DIR"
           BASE="https://download.libsodium.org/libsodium/releases"
-          for f in libsodium-1.0.22-stable-msvc.zip libsodium-1.0.22-stable-msvc.zip.minisig; do
+          for f in libsodium-1.0.22-stable-msvc.zip libsodium-1.0.22-stable-msvc.zip.minisig \
+                   LATEST.tar.gz LATEST.tar.gz.minisig; do
             curl --fail --silent --show-error --location --retry 5 --retry-all-errors \
               --output "$DIST_DIR/$f" "$BASE/$f"
           done
           echo "SODIUM_DIST_DIR=$DIST_DIR" >> "$GITHUB_ENV"
 
       - name: Build binaries
-        # CROSS_IMAGE pins the cross Docker image by digest (an index
-        # manifest covering both amd64 and arm64 host variants; Docker
-        # resolves to the runner's own architecture at pull time). GHCR tags
-        # are mutable, so pinning by tag alone would let a push to the
-        # cross-rs registry silently change the image this build compiles
-        # inside. Digest confirmed current against the ghcr.io/cross-rs
-        # 0.2.5 tag at the time this workflow was authored; re-resolve with
-        # `docker buildx imagetools inspect` when the cross version pin above
-        # changes.
-        env:
-          CROSS_IMAGE: ghcr.io/cross-rs/aarch64-unknown-linux-gnu@sha256:7f8308a8734d9fcd2ebbe9a3e4bdea74af293f0799d80c3cc341e340cda49a4c
+        # The aarch64 leg's image pin and its libudev pre-build hook live in
+        # Cross.toml.
         shell: bash
         run: |
           set -euo pipefail
