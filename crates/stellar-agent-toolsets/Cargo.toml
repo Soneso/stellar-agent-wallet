@@ -1,0 +1,43 @@
+[package]
+name = "stellar-agent-toolsets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Signed-toolset (TOOLSET.md) format parsing and capability-manifest validation."
+
+[dependencies]
+thiserror = { workspace = true }
+
+# Serialisation for CapabilitySet persistence.
+serde = { workspace = true }
+
+# validate_toolset_tool_args accepts &serde_json::Value for the
+# pre-canonicalisation argument walk.
+serde_json = { workspace = true }
+
+# YAML frontmatter parser.
+#
+# yaml-rust2 is used because its event-based API surfaces alias / duplicate-key
+# / nesting-depth issues before any tree is materialised, which is required to
+# parse UNTRUSTED toolset files safely.  serde-derive paths expand aliases during
+# deserialisation, silently collapse duplicate keys, and give no hook to bound
+# nesting depth pre-materialisation.
+#
+# Exact-pinned `=0.11.0` because this is a supply-chain-sensitive parse path on
+# untrusted input; `default-features = false` drops the unused `encoding`
+# feature (UTF-8 is pre-validated before the YAML parser sees the bytes).
+yaml-rust2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+# Exposes parse_capability_value_pub for use in sibling-crate tests.
+# Must NOT be enabled in production builds.
+test-helpers = []
+
+[lints]
+workspace = true

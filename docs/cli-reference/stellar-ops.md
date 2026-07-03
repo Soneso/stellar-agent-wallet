@@ -1,0 +1,385 @@
+# CLI reference: accounts and core Stellar operations
+
+This page documents the everyday Stellar operations exposed by the `stellar-agent` CLI: creating and funding accounts, deploying a smart-account contract, sending payments, reading balances, managing trustlines, funding via Friendbot, reading fee statistics, and managing the counterparty resolution cache.
+
+The binary is `stellar-agent`. It is also discoverable as a `stellar-cli` plugin, so when `stellar` is installed the same command runs as `stellar agent <command> ...`. The examples here use the direct form.
+
+Conventions shared by every command — profile resolution, the `--output` format, the JSON envelope and exit codes, the signer-source group, and the mainnet-write refusal — are defined once in the [CLI reference index](index.md). This page references that index for the shared flags and documents only what is specific to each command.
+
+For the concepts referenced below (profiles, the policy engine, the approval spine, the audit log), see [concepts](../concepts.md). For SEP-29 memo enforcement and the counterparty `stellar.toml` resolution, see [protocols](../protocols.md).
+
+## Shared flags
+
+Several flags recur across the commands on this page with the same meaning. Their full description lives in the [global conventions](index.md#global-conventions) section of the index:
+
+- `--profile <NAME>` — selects the [profile](../concepts.md). On the commands here it defaults to `"default"` (`accounts deploy-c` and `fees stats` instead default to no profile); none of these commands consult `STELLAR_AGENT_PROFILE`. Each command's table states its own default.
+- `--network <NETWORK>` — `testnet` (default) or `mainnet`, case-insensitive. Write and signing commands structurally refuse `mainnet`; see [Mainnet-write refusal](index.md#mainnet-write-refusal).
+- `--rpc-url <URL>` — the Soroban RPC endpoint. Default `https://soroban-testnet.stellar.org` where applicable.
+- `--output <FORMAT>` — `json` (default) or `table`.
+- `--timeout-seconds <SECONDS>` — bounds submission. Default `60`.
+- Signer source — `--secret-env <VAR>` / `--deployer-secret-env <VAR>` (an env-var name, never the secret) or `--sign-with-ledger`, with `--account-index <INDEX>` for the Ledger derivation path (default `0`).
+- `--fee <STROOPS|auto[:pNN]>` — the classic per-operation fee. An integer sets an explicit stroop value; `auto` selects the p95 percentile from `getFeeStats`; `auto:pNN` selects an explicit percentile (`p50`, `p75`, `p95`, `p99`). When absent, the profile default (100 stroops) applies. For Soroban operations the resource fee is set by simulation and is additional to this base.
+
+Every command prints one JSON envelope on stdout by default and exits `0` on success, `1` on any error.
+
+## `stellar-agent accounts`
+
+Account-management group. Subcommands: `create`, `deploy-c`.
+
+### `stellar-agent accounts create [NEW_G_STRKEY] [flags]`
+
+Creates a new Stellar account in one of two mutually exclusive modes: a sponsored `CreateAccount` operation, or Friendbot funding.
+
+- **Signing.** Sponsored mode signs the `CreateAccount` operation with the sponsor's key. Friendbot mode performs no signing and touches no key.
+- **Network.** `--network` accepts only `testnet`; `mainnet` is structurally refused before any RPC, HTTP, or key access. Sponsored mode returns `network.mainnet_write_forbidden`; Friendbot mode returns `network.friendbot_mainnet_forbidden`. Friendbot funding is testnet-only.
+- **Account identity.** Provide the new account's G-strkey as the positional argument, or pass `--generate` to mint a fresh ed25519 keypair in-process. Exactly one is required.
+- **Secret-key discipline.** `--generate` returns the new S-strkey in the JSON envelope's `data.secret_key` field. It is never emitted in `--output table` and never logged. Capture it from the JSON output and store it securely; for example, redirect with a restrictive umask: `umask 077 && stellar-agent accounts create --generate ... > secret.json`.
+
+Argument groups (enforced by the parser):
+
+- Mode (required, exactly one): `--sponsor` xor `--fund-with-friendbot`.
+- Account (required, exactly one): positional `<NEW_G_STRKEY>` xor `--generate`.
+- Signer (sponsored mode): `--secret-env` xor `--sign-with-ledger`.
+
+| Flag / arg | Meaning | Required | Default |
+|---|---|---|---|
+| `<NEW_G_STRKEY>` (positional) | G-strkey of the account to create | one of the account group | — |
+| `--generate` | Generate a fresh ed25519 keypair in-process; returns the G- and S-strkey in JSON | one of the account group | `false` |
+| `--sponsor <G_STRKEY>` | Sponsor/source account for the `CreateAccount` op | one of the mode group | — |
+| `--starting-balance <AMOUNT>` | Starting balance with explicit units, e.g. `"5 XLM"` (bare numbers rejected) | sponsored mode | — |
+| `--secret-env <VAR>` | Env-var name holding the sponsor S-strkey | signer group (sponsored) | — |
+| `--sign-with-ledger` | Sign with a connected Ledger | signer group (sponsored) | `false` |
+| `--account-index <INDEX>` | Ledger BIP-32 account index | optional | `0` |
+| `--fund-with-friendbot` | Fund the account via Friendbot (testnet only) | one of the mode group | `false` |
+| `--friendbot-url <URL>` | Friendbot endpoint URL (Friendbot mode) | optional | `https://friendbot.stellar.org` |
+| `--network <NETWORK>` | Target network; only `testnet` accepted | optional | `testnet` |
+| `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee (sponsored mode) | optional | profile default (100) |
+| `--timeout-seconds <SECONDS>` | Submission timeout (sponsored mode) | optional | `60` |
+| `--rpc-url <URL>` | Soroban RPC endpoint (sponsored mode) | optional | `https://soroban-testnet.stellar.org` |
+| `--output <FORMAT>` | `json` or `table` | optional | `json` |
+
+The sponsor's public key must match the public key derived from the signer; a mismatch fails before submission.
+
+Example — generate a new keypair and create it under a sponsor:
+
+```bash
+export SPONSOR_SK="S..."   # sponsor account secret key
+stellar-agent accounts create \
+  --generate \
+  --sponsor GABC...WXYZ \
+  --secret-env SPONSOR_SK \
+  --starting-balance "5 XLM"
+```
+
+### `stellar-agent accounts deploy-c [flags]`
+
+Deploys a new OpenZeppelin smart-account (C-account) contract instance on Soroban via `CreateContractV2`. The initial signer is installed through the contract's `__constructor`.
+
+- **Signing.** Signs the transaction's source-account credentials with the deployer key. The exception is `--dry-run`, which derives the resulting C-strkey deterministically with no signing and no RPC traffic.
+- **Network.** `--network` accepts only `testnet`; `mainnet` is structurally refused (`network.mainnet_write_forbidden`) before any RPC or key access, with a passphrase-layer refusal at submit as defence in depth.
+- **Salt.** The salt determines the deployed C-strkey. By default a fresh random 32-byte salt is generated. Pass `--salt-hex` to re-derive a known address (for example, recovery or interop verification); the same deployer plus the same salt always recovers the same C-strkey.
+- **Audit.** Pass `--profile` to route deployment entries to that profile's audit-log writer. When omitted, the handler emits no `deploy-c` audit entries.
+
+Argument groups (enforced by the parser):
+
+- Deployer (required, exactly one): `--deployer-secret-env` xor `--sign-with-ledger`.
+- Salt (at most one): `--salt-hex` xor `--salt-random`; defaults to random when neither is given.
+
+| Flag | Meaning | Required | Default |
+|---|---|---|---|
+| `--initial-signer <G_STRKEY>` | Initial signer installed via `__constructor` | yes | — |
+| `--deployer-secret-env <VAR>` | Env-var name holding the deployer S-strkey | one of the deployer group | — |
+| `--sign-with-ledger` | Use a Ledger as the deployer | one of the deployer group | `false` |
+| `--account-index <INDEX>` | Ledger BIP-44 account index | optional | `0` |
+| `--salt-hex <HEX64>` | 32-byte salt as 64-char lowercase hex (re-deploy at a known C-strkey) | one of the salt group | — |
+| `--salt-random` | Generate a fresh random 32-byte salt | one of the salt group | random when `--salt-hex` absent |
+| `--profile <NAME>` | Profile whose audit writer receives deploy entries | optional | none |
+| `--network <NETWORK>` | Target network; only `testnet` accepted | optional | `testnet` |
+| `--rpc-url <URL>` | Soroban RPC endpoint | optional | `https://soroban-testnet.stellar.org` |
+| `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee; see [Shared flags](#shared-flags) | optional | profile default (100) |
+| `--timeout-seconds <SECONDS>` | Submission timeout | optional | `60` |
+| `--output <FORMAT>` | `json` or `table` | optional | `json` |
+| `--dry-run` | Derive the C-strkey only; no signing, no RPC | optional | `false` |
+
+The deployer account must be funded; it pays the deployment fee.
+
+Example — deploy with a random salt, signing from an env-var secret:
+
+```bash
+export DEPLOYER_SK="S..."   # deployer account secret key
+stellar-agent accounts deploy-c \
+  --initial-signer GABC...WXYZ \
+  --deployer-secret-env DEPLOYER_SK \
+  --salt-random
+```
+
+## `stellar-agent pay <DESTINATION> <AMOUNT> [ASSET] [flags]`
+
+Sends a payment from a source account to a destination, enforcing SEP-29 memo-required before signing (see [protocols](../protocols.md)).
+
+- **Signing.** By default the command builds, signs, and submits atomically. Three staged flags split the pipeline: `--build-only` emits the unsigned envelope XDR and exits (no signing); `--sign-only <XDR>` signs a prebuilt envelope and emits signed XDR; `--submit-only <XDR>` submits a pre-signed envelope. The stage flags are mutually exclusive.
+- **Network.** `--network` accepts only `testnet`; `mainnet` returns `network.mainnet_write_forbidden` before any RPC call, with a submit-layer URL rejection as defence in depth.
+- **Relayer.** `--use-oz-relayer` is not implemented in this build. Passing it emits an AGPL-3.0 disclosure to stderr and declines the operation rather than submitting.
+
+Argument groups (enforced by the parser):
+
+- Stage (at most one): `--build-only` / `--sign-only` / `--submit-only`.
+- Memo (at most one): `--memo-text` / `--memo-id` / `--memo-hash` / `--memo-return`.
+- Signer (at most one): `--secret-env` xor `--sign-with-ledger`.
+
+| Flag / arg | Meaning | Required | Default |
+|---|---|---|---|
+| `<DESTINATION>` (positional) | Destination account G-strkey | yes | — |
+| `<AMOUNT>` (positional) | Amount with explicit units, e.g. `"10 XLM"`, `"10.5 USDC"` (raw stroop strings rejected) | yes | — |
+| `[ASSET]` (positional) | `native`, `XLM`, or `CODE:ISSUER_GSTRKEY` | optional | `native` |
+| `--source <G_STRKEY>` | Source account; required for signing | conditional | — |
+| `--memo-text <STRING>` | Memo text (UTF-8, up to 28 bytes) | one of the memo group | — |
+| `--memo-id <U64>` | Memo ID (u64 decimal) | one of the memo group | — |
+| `--memo-hash <64_HEX>` | Memo hash (64 hex chars / 32 bytes) | one of the memo group | — |
+| `--memo-return <64_HEX>` | Memo return hash (64 hex chars / 32 bytes) | one of the memo group | — |
+| `--secret-env <VAR>` | Env-var name holding the source S-strkey | signer group | — |
+| `--sign-with-ledger` | Sign with a connected Ledger | signer group | `false` |
+| `--account-index <INDEX>` | Ledger BIP-32 account index | optional | `0` |
+| `--build-only` | Emit the unsigned envelope XDR and exit | stage group | `false` |
+| `--sign-only <BASE64_XDR>` | Sign the given XDR, emit signed XDR | stage group | — |
+| `--submit-only <BASE64_XDR>` | Submit the given signed XDR | stage group | — |
+| `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee | optional | profile default (100) |
+| `--network <NETWORK>` | Target network; only `testnet` accepted | optional | `testnet` |
+| `--timeout-seconds <SECONDS>` | Submission timeout | optional | `60` |
+| `--rpc-url <URL>` | Soroban RPC endpoint | optional | `https://soroban-testnet.stellar.org` |
+| `--output <FORMAT>` | `json` or `table` | optional | `json` |
+| `--use-oz-relayer` | Opt into the OZ Relayer path (not implemented; declines) | optional | `false` |
+
+Example — send 10 XLM with a text memo:
+
+```bash
+export WALLET_SK="S..."   # source account secret key
+stellar-agent pay GDEST...WXYZ "10 XLM" \
+  --source GSRC...WXYZ \
+  --secret-env WALLET_SK \
+  --memo-text "invoice-42"
+```
+
+## `stellar-agent claim <BALANCE_ID> [flags]`
+
+Claims a classic claimable balance by its ID, after an RPC-backed pre-flight:
+the entry is fetched via `getLedgerEntries`, a typed preview is rendered
+(asset, amount, claimants, clawback flag, predicate verdict with the
+claimability window), and the command refuses before signing unless the source
+account is a claimant (`claim.not_claimant`), the claimant's predicate is
+currently satisfied (`claim.predicate_not_satisfied`), and — for a non-native
+asset — an authorized trustline with enough limit headroom exists
+(`claim.trustline_missing` / `claim.trustline_not_authorized` /
+`claim.trustline_limit`).
+
+- **Balance ID forms.** The canonical 72-hex form (eight-`0` V0 prefix plus the
+  64-hex hash), the bare 64-hex hash, or the `B...` strkey. Any non-V0
+  discriminant is rejected (`claim.invalid_balance_id`).
+- **Listing is out of scope.** Stellar RPC cannot enumerate claimable balances
+  by claimant; the ID arrives out-of-band (from the sender, an anchor
+  response, or the creating transaction's result).
+- **Signing.** Same staged pipeline as `pay`: atomic by default;
+  `--build-only` / `--sign-only <XDR>` / `--submit-only <XDR>` split it.
+- **Network.** `--network` accepts only `testnet`; `mainnet` returns
+  `network.mainnet_write_forbidden` before any RPC call.
+- **Timing.** The predicate is evaluated against the local clock; on-chain
+  validation uses the apply-ledger close time, so a claim previewed near a
+  time-bound boundary can still fail on submit.
+
+| Flag / arg | Meaning | Required | Default |
+|---|---|---|---|
+| `<BALANCE_ID>` (positional) | Claimable balance ID (72-hex, 64-hex, or `B...` strkey) | yes | — |
+| `--source <G_STRKEY>` | Claiming account; must be a claimant | yes | — |
+| `--secret-env <VAR>` | Env-var name holding the source S-strkey | signer group | — |
+| `--sign-with-ledger` | Sign with a connected Ledger | signer group | `false` |
+| `--account-index <INDEX>` | Ledger BIP-32 account index | optional | `0` |
+| `--build-only` | Emit the unsigned envelope XDR and exit | stage group | `false` |
+| `--sign-only <BASE64_XDR>` | Sign the given XDR, emit signed XDR | stage group | — |
+| `--submit-only <BASE64_XDR>` | Submit the given signed XDR | stage group | — |
+| `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee | optional | profile default (100) |
+| `--network <NETWORK>` | Target network; only `testnet` accepted | optional | `testnet` |
+| `--timeout-seconds <SECONDS>` | Submission timeout | optional | `60` |
+| `--rpc-url <URL>` | Soroban RPC endpoint | optional | `https://soroban-testnet.stellar.org` |
+| `--output <FORMAT>` | `json` or `table` | optional | `json` |
+
+Example — claim a balance received from a payment sender:
+
+```bash
+export WALLET_SK="S..."   # claiming account secret key
+stellar-agent claim BAAD...R4TU \
+  --source GABC...WXYZ \
+  --secret-env WALLET_SK
+```
+
+## `stellar-agent balances [flags]`
+
+Reads the native XLM balance and trustlines for an account via the Stellar RPC `getLedgerEntries`.
+
+- **Signing.** Read-only; no signing or key access.
+- **Network.** No mainnet gate; the command queries whatever `--rpc-url` points at.
+- **Account.** `--account` is required in practice. When omitted the command exits `1` (the active-profile fallback is not wired).
+- **Trustlines.** Pass `--asset CODE:ISSUER` to query specific trustlines; repeat the flag for multiple assets. Assets the account does not trust are silently omitted from the output.
+
+| Flag | Meaning | Required | Default |
+|---|---|---|---|
+| `--account <G_STRKEY>` | Account to query | required in practice | — |
+| `--asset <CODE:ISSUER>` | Trustline asset to query; repeatable | optional | none |
+| `--rpc-url <URL>` | Stellar RPC endpoint | optional | `https://soroban-testnet.stellar.org` |
+| `--output <FORMAT>` | `json` or `table` | optional | `json` |
+
+Example — read XLM plus a USDC trustline:
+
+```bash
+stellar-agent balances \
+  --account GABC...WXYZ \
+  --asset USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN
+```
+
+## `stellar-agent trustline [flags]`
+
+Creates or removes a classic trustline (`ChangeTrust`) behind an ordered trust gate: operator policy evaluation, denomination resolution (USDT hard-refusal plus a known-lookalike denylist and pinned-issuer checks), a live issuer-flag fetch that fail-closes on error, a clawback gate, and a typed preview, before the envelope is built, signed, and submitted.
+
+- **Signing.** Signs via the profile's keyring signer; builds, signs, submits, and waits atomically. There is no staged pipeline.
+- **Network.** Derived from the loaded profile (`rpc_url`, `network_passphrase`, `chain_id`). `--chain-id` overrides the CAIP-2 value. There is no `--network` flag and no built-in mainnet refusal here; the network is governed by the profile configuration.
+- **USDT is hard-refused.** The denomination resolver rejects USDT outright; the command cannot create a USDT trustline.
+- **Limit.** `--limit-stroops 0` removes the trustline. When absent the Stellar default (`i64::MAX`, unlimited) applies.
+- **Asset grammar.** A bare code such as `USDC` resolves through the pin table; `CODE:ISSUER` names an explicit issuer; a 56-char `C...` SAC address is deferred and returns a typed error.
+
+| Flag | Meaning | Required | Default |
+|---|---|---|---|
+| `--from <G_STRKEY>` | Account that will hold the trustline | yes | — |
+| `--asset <ASSET>` | `USDC` (bare, pin table), `CODE:ISSUER`, or a `C...` SAC address (deferred) | yes | — |
+| `--limit-stroops <I64>` | Explicit trustline limit; `0` removes the trustline | optional | unlimited (`i64::MAX`) |
+| `--profile <NAME>` | Profile to load | optional | `default` |
+| `--chain-id <CAIP2>` | CAIP-2 chain id, e.g. `stellar:testnet` | optional | profile value |
+| `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee | optional | profile `classic_fee_per_op_stroops` |
+
+Example — establish a USDC trustline:
+
+```bash
+stellar-agent trustline \
+  --from GABC...WXYZ \
+  --asset USDC \
+  --profile default
+```
+
+## `stellar-agent friendbot [flags]`
+
+Funds a testnet or futurenet account via the Stellar Friendbot HTTP endpoint.
+
+- **Signing.** No local signing or key access; Friendbot funds the account.
+- **Network.** `--network` accepts `testnet`, `futurenet`, or `mainnet` at the parser, but `mainnet` is structurally refused at dispatch with `network.friendbot_mainnet_forbidden` before any HTTP call. The endpoint URL is validated against an allow-list (`friendbot.stellar.org`, `friendbot-futurenet.stellar.org`) unless `--friendbot-url-unchecked` is set.
+
+| Flag | Meaning | Required | Default |
+|---|---|---|---|
+| `--account <G_STRKEY>` | Account to fund | yes | — |
+| `--network <NETWORK>` | `testnet`, `futurenet`, or `mainnet` (mainnet refused at dispatch) | optional | `testnet` |
+| `--friendbot-url <URL>` | Override the Friendbot endpoint URL; when omitted, resolves at runtime to the SDF testnet URL (`https://friendbot.stellar.org`) regardless of `--network`, so `futurenet` needs an explicit override | optional | `https://friendbot.stellar.org` (testnet) |
+| `--friendbot-url-unchecked` | Bypass the URL allow-list (development/test escape hatch) | optional | `false` |
+| `--output <FORMAT>` | `json` or `table` | optional | `json` |
+
+Example — fund a testnet account:
+
+```bash
+stellar-agent friendbot --account GABC...WXYZ --network testnet
+```
+
+## `stellar-agent fees`
+
+Fee-statistics group. Subcommand: `stats`.
+
+### `stellar-agent fees stats [flags]`
+
+Fetches Stellar RPC fee statistics, the helper behind classic fee selection.
+
+- **Signing.** Read-only; no signing or key access.
+- **Network.** No mainnet gate. The RPC endpoint resolves in order: `--rpc-url`, then the profile's `rpc_url` (via `--profile`), then the testnet default. When `--rpc-url` is given it is validated against the allow-list.
+
+| Flag | Meaning | Required | Default |
+|---|---|---|---|
+| `--profile <NAME>` | Profile whose RPC URL to use | optional | none (falls back to testnet default) |
+| `--rpc-url <URL>` | Allow-listed RPC endpoint override | optional | `https://soroban-testnet.stellar.org` |
+| `--output <FORMAT>` | `json` or `table` | optional | `json` |
+
+Example — print fee stats as a table:
+
+```bash
+stellar-agent fees stats --output table
+```
+
+## `stellar-agent counterparty`
+
+Manages the per-profile cache of `stellar.toml` bindings that backs the counterparty allowlist policy (see [concepts](../concepts.md) and [protocols](../protocols.md)). None of these subcommands sign a Stellar transaction.
+
+Cache files live under the OS-conventional local data directory for the profile, for example `~/Library/Application Support/Soneso.stellar-agent/counterparty/<profile>/` on macOS, `~/.local/share/stellar-agent/counterparty/<profile>/` (or `$XDG_DATA_HOME/stellar-agent/counterparty/<profile>/`) on Linux, and `%LOCALAPPDATA%\Soneso\stellar-agent\data\counterparty\<profile>\` on Windows. Each binding is HMAC-protected with the per-profile cache key; entries that fail verification are skipped on read.
+
+Subcommands: `list`, `refresh`, `evict`, `warm-up`, `rotate-hmac-key`.
+
+### `stellar-agent counterparty list [flags]`
+
+Lists the cached bindings for a profile — home domain plus fetched and expiry timestamps. Entries whose HMAC fails verification are silently skipped. Read-only (local cache read).
+
+| Flag | Meaning | Required | Default |
+|---|---|---|---|
+| `--profile <NAME>` | Profile whose cache to list | optional | `default` |
+| `--json` | Emit the canonical JSON envelope (JSON is the only shape; the flag is a no-op for scripting compatibility) | optional | `false` |
+
+```bash
+stellar-agent counterparty list --profile default
+```
+
+### `stellar-agent counterparty refresh <HOME_DOMAIN> [flags]`
+
+Force-fetches `https://<home-domain>/.well-known/stellar.toml`, HMAC-protects the body, and writes it to the cache atomically. Performs a network fetch and a keyring write; signs no transaction. The home domain must be strict ASCII, 1 to 32 characters; IDN and homoglyph domains are rejected to prevent counterparty-binding spoofing.
+
+| Flag / arg | Meaning | Required | Default |
+|---|---|---|---|
+| `<HOME_DOMAIN>` (positional) | Domain to refresh (strict ASCII, 1-32 chars) | yes | — |
+| `--profile <NAME>` | Profile whose cache to update | optional | `default` |
+
+```bash
+stellar-agent counterparty refresh circle.com --profile default
+```
+
+### `stellar-agent counterparty evict <HOME_DOMAIN> [flags]`
+
+Deletes a single cached binding, leaving other domains untouched. Exits `0` even when the cache file was already absent. Performs a local file removal; signs no transaction.
+
+| Flag / arg | Meaning | Required | Default |
+|---|---|---|---|
+| `<HOME_DOMAIN>` (positional) | Domain whose cache file to remove | yes | — |
+| `--profile <NAME>` | Profile whose cache to update | optional | `default` |
+
+```bash
+stellar-agent counterparty evict circle.com --profile alice
+```
+
+### `stellar-agent counterparty warm-up [flags]`
+
+Refreshes every `HOME_DOMAIN` entry currently configured in the profile's policy counterparty allowlist and prints a per-domain summary. Exits `1` if any refresh fails. Performs network fetches and HMAC writes; signs no transaction.
+
+| Flag | Meaning | Required | Default |
+|---|---|---|---|
+| `--profile <NAME>` | Profile whose allowlist to refresh | optional | `default` |
+
+```bash
+stellar-agent counterparty warm-up --profile default
+```
+
+### `stellar-agent counterparty rotate-hmac-key [flags]`
+
+Rotates the per-profile counterparty cache HMAC key. After rotation, existing cache files fail verification and must be refreshed. Rotates a keyring secret; signs no transaction.
+
+| Flag | Meaning | Required | Default |
+|---|---|---|---|
+| `--profile <NAME>` | Profile whose cache HMAC key to rotate | optional | `default` |
+
+```bash
+stellar-agent counterparty rotate-hmac-key --profile default
+```
+
+## Related pages
+
+- [CLI reference index](index.md)
+- [Concepts](../concepts.md)
+- [Protocols](../protocols.md)

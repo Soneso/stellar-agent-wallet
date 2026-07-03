@@ -1,0 +1,62 @@
+[package]
+name = "stellar-agent-x402-identity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "SEP-10 counterparty-identity pre-payment gate for x402 Exact Stellar payments (payer side)."
+publish = false
+
+[lib]
+name = "stellar_agent_x402_identity"
+
+[dependencies]
+# SEP-10 ephemeral key flow — auth_with_ephemeral_key entry point.
+# Provides Sep10Client, Sep10Session, Sep10Error.
+stellar-agent-sep10 = { workspace = true }
+
+# stellar.toml fetch + MinimalSep1 parser — home-domain → WEB_AUTH_ENDPOINT +
+# SIGNING_KEY resolution.  Provides fetch_stellar_toml, parse_minimal_sep1.
+stellar-agent-network = { workspace = true }
+
+# Typed error derives.
+thiserror = { workspace = true }
+
+# Structured logging facade.
+tracing = { workspace = true }
+
+# URL parsing for the SSRF same-domain bind host extraction.
+url = { workspace = true }
+
+# HTTP client — the `reqwest::Client` type for the test seam's optional
+# client parameter. In production the toml fetch goes through
+# `fetch_stellar_toml`, which builds its own no-redirect / HTTPS-only client.
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tokio      = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock   = { workspace = true }
+serde_json = { workspace = true }
+# SEP-10 test helpers: generate_ephemeral_seed + signing_key_from_seed.
+# Required for constructing wire-correct SEP-10 challenges in the offline gate tests.
+stellar-agent-sep10 = { workspace = true, features = ["test-helpers"] }
+ed25519-dalek  = { workspace = true }
+rand_core      = { workspace = true }
+stellar-xdr    = { workspace = true }
+stellar-strkey = { workspace = true }
+stellar-agent-network = { workspace = true }
+sha2   = { workspace = true }
+base64 = { workspace = true }
+reqwest = { workspace = true }
+
+[features]
+# Exposes test-helper constructors for adversarial integration tests across crate
+# boundaries.  Never enable in production binaries. Propagates to the SEP-10
+# test-helper client constructor the gate test seam needs.
+test-helpers = ["stellar-agent-sep10/test-helpers"]
+# Gated testnet acceptance tests.  Implies test-helpers.
+testnet-acceptance = ["test-helpers"]
+
+[lints]
+workspace = true

@@ -1,0 +1,24 @@
+{
+  "test_kind": "evaluate",
+  "name": "missing_cache_fail_closed",
+  "category": "home_domain_resolved",
+  "description": "home_domain_resolved criterion: identity has home_domain='anchor.example.com' but mock_resolved_domains is absent (cache not wired) → CriterionEvaluationFailed (fail-closed).",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "args": {
+    "destination": "GASGYUZWEIPQJPT6BX367DXWXPHWSGNVJDYCH4EH5BTT43WQPJXVY3WJ",
+    "amount": "10 XLM",
+    "asset": "native"
+  },
+  "profile_name": "default",
+  "mock_home_domain": "anchor.example.com",
+  "expected": {
+    "kind": "Error",
+    "error_contains": "CriterionEvaluationFailed"
+  }
+}

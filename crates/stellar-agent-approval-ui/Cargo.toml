@@ -1,0 +1,80 @@
+[package]
+name = "stellar-agent-approval-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Localhost approval-inbox web UI for the Stellar agent wallet: a loopback HTTP server that surfaces the pending-approval queue for browser approve/reject."
+publish = false
+
+[lib]
+name = "stellar_agent_approval_ui"
+
+[dependencies]
+# HTTP framework for the loopback approval-inbox listener.
+axum = { workspace = true }
+
+# Middleware composition for the layered defence stack.
+tower = { workspace = true }
+
+# HTTP-specific middleware: RequestBodyLimitLayer + TraceLayer.
+tower-http = { workspace = true }
+
+# Async runtime — net + rt-multi-thread + macros required by axum::serve;
+# sync (mpsc/oneshot/Mutex) + time (interval) drive the watcher and shutdown;
+# io-util (AsyncReadExt/AsyncWriteExt) drives the raw-socket request in the
+# start_serve end-to-end test (no HTTP client dependency needed for one test).
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "sync", "time", "io-util"] }
+
+# PendingApprovalStore, the attest path, and the redacted view types.
+stellar-agent-core = { workspace = true }
+
+# record_first_invoke_grant for the ToolsetFirstInvokeGate approval branch.
+stellar-agent-toolsets-runtime = { workspace = true }
+
+# Constant-time comparison for the bootstrap token, session id, and CSRF value.
+subtle = { workspace = true }
+
+# OS CSPRNG for the bootstrap token, session id, and per-session CSRF key.
+rand_core = { workspace = true }
+
+# Hex encoding for the tokens emitted in URLs / cookies / CSRF headers.
+hex = { workspace = true }
+
+# HMAC-SHA256 CSRF derivation over the approval nonce.
+hmac = { workspace = true }
+sha2 = { workspace = true }
+
+# JSON response bodies and the pending.json shape. The redacted view types are
+# serialised through their own `Serialize` impls in `stellar-agent-core`; this
+# crate only needs the `serde_json` value/serialiser surface.
+serde_json = { workspace = true }
+
+# Structured logging facade for library code.
+tracing = { workspace = true }
+
+# Typed error derives.
+thiserror = { workspace = true }
+
+# request_id generation for the ApprovalRejected audit event.
+uuid = { workspace = true }
+
+[dev-dependencies]
+# Temporary directories for store/keyring test isolation.
+tempfile = { workspace = true }
+
+# Process-global keyring-store serialisation across tests in one binary.
+serial_test = { workspace = true }
+
+# In-memory mock keyring store for the attest-key tests.
+stellar-agent-test-support = { workspace = true }
+
+# Seed the attestation key into the mock keyring in decision tests.
+keyring-core = { workspace = true }
+
+# Decode/verify the surfaced attestation blob in decision tests.
+base64 = { workspace = true }
+
+[lints]
+workspace = true

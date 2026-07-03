@@ -1,0 +1,24 @@
+{
+  "test_kind": "evaluate",
+  "name": "resolved_domain_allow",
+  "category": "home_domain_resolved",
+  "description": "home_domain_resolved criterion: identity has home_domain='circle.com', cache contains 'circle.com' → Allow.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "args": {
+    "destination": "GASGYUZWEIPQJPT6BX367DXWXPHWSGNVJDYCH4EH5BTT43WQPJXVY3WJ",
+    "amount": "10 XLM",
+    "asset": "native"
+  },
+  "profile_name": "default",
+  "mock_home_domain": "circle.com",
+  "mock_resolved_domains": ["circle.com", "anchor.example.com"],
+  "expected": {
+    "kind": "Allow"
+  }
+}

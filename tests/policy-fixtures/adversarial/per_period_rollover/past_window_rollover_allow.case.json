@@ -1,0 +1,25 @@
+{
+  "test_kind": "evaluate",
+  "name": "past_window_rollover_allow",
+  "category": "per_period_rollover",
+  "description": "Window = 1d, max = 5000 XLM. Prior spend of 49_000 XLM from 25 hours ago is outside the 1d window and evicted. New tx of 200 XLM is within cap. Expect Allow (window rolled over).",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "args": {
+    "amount": "200 XLM",
+    "asset": "native",
+    "destination": "GASGYUZWEIPQJPT6BX367DXWXPHWSGNVJDYCH4EH5BTT43WQPJXVY3WJ"
+  },
+  "profile_name": "default",
+  "state_seed": [
+    { "offset_secs_ago": 90000, "amount_stroops": 490000000000 }
+  ],
+  "expected": {
+    "kind": "Allow"
+  }
+}

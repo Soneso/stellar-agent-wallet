@@ -1,0 +1,23 @@
+{
+  "test_kind": "evaluate",
+  "name": "both_pass_allow",
+  "category": "combinator_and_or",
+  "description": "Rule has per_tx_cap (1000 XLM) and per_period_cap (5000 XLM/day). No prior spend. tx = 500 XLM: under both caps. Both criteria pass. Expect Allow.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "args": {
+    "amount": "500 XLM",
+    "asset": "native",
+    "destination": "GASGYUZWEIPQJPT6BX367DXWXPHWSGNVJDYCH4EH5BTT43WQPJXVY3WJ"
+  },
+  "profile_name": "default",
+  "state_seed": [],
+  "expected": {
+    "kind": "Allow"
+  }
+}

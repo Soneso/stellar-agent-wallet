@@ -1,0 +1,173 @@
+[package]
+name = "stellar-agent-network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Stellar RPC network client, account query, transaction assembly, and hardware-signing adapter for the Stellar agent wallet."
+
+[lib]
+name = "stellar_agent_network"
+
+[features]
+# Enables `validate_friendbot_url_allowing_loopback` for cross-crate integration
+# tests that need to point a wiremock server at 127.0.0.1. Never enable this
+# feature in production or release builds — the loopback escape is intentionally
+# absent from the production allow-list.
+test-loopback = []
+
+# Exposes `keyring::PANIC_AFTER_LOAD` and `keyring::DROP_COUNTER` for integration
+# tests that exercise the panic-injection path inside
+# `sign_payload_verifying_pubkey`. These `pub` statics are gated on this feature
+# and never included in non-test builds. Enable only in `[dev-dependencies]` or
+# via `cargo test --features test-hooks`.
+test-hooks = []
+
+# Exposes test-only public helpers (e.g. `cache::read_cache_entry`,
+# `NoopCounterpartyResolver`) gated behind this feature so they do not appear in
+# production builds. Enable only in dev-dependencies or
+# `cargo test --features test-helpers`.
+test-helpers = []
+
+# Gate end-to-end testnet acceptance tests for the fee-bump path.
+# Run with: cargo test -p stellar-agent-network --features testnet-acceptance
+testnet-acceptance = ["test-helpers"]
+
+[dependencies]
+stellar-agent-core = { workspace = true }
+stellar-agent-xdr-limits = { workspace = true }
+stellar-rpc-client = { workspace = true }
+stellar-baselib = { workspace = true }
+stellar-xdr = { workspace = true }
+stellar-strkey = { workspace = true }
+secrecy = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+stellar-ledger = { workspace = true }
+zeroize = { workspace = true }
+async-trait = { workspace = true }
+ed25519-dalek = { workspace = true }
+# SHA-256 for the SEP-23 signing payload (TransactionSignaturePayload hash).
+sha2 = { workspace = true }
+# URL parsing for friendbot endpoint validation.
+url = { workspace = true }
+# Cross-platform keyring access; platform backends are conditional deps below
+# that initialise the default store at startup via `init_platform_keyring_store`.
+keyring-core = { workspace = true }
+# HMAC-SHA-256 for counterparty-cache integrity.
+hmac = { workspace = true }
+# Constant-time comparison for HMAC tag verification (timing side-channel defence).
+subtle = { workspace = true }
+# Atomic temp-file writes for the cache write path (temp + rename).
+tempfile = { workspace = true }
+# Base64 for the HMAC key stored in the keyring.
+base64 = { workspace = true }
+# Format-preserving TOML editor for SEP-1 parsing.
+toml_edit = { workspace = true }
+# OS CSPRNG for HMAC key generation during lazy-mint.
+rand_core = { workspace = true }
+
+# macOS Keychain backend (Security.framework legacy keychain).
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { workspace = true, features = ["keychain"] }
+
+# Linux Secret Service backend (GNOME Keyring / KWallet via D-Bus).
+# `crypto-rust` avoids a native openssl dep; `vendored` avoids a system dbus dep.
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus-secret-service-keyring-store = { workspace = true, features = ["crypto-rust", "vendored"] }
+
+# Windows Credential Manager backend.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = { workspace = true }
+
+[dev-dependencies]
+stellar-agent-test-support = { workspace = true, features = ["wiremock-helpers", "test-helpers"] }
+wiremock = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "test-util"] }
+# jsonrpsee-core builds Error::JsonRpc fixtures in retry.rs unit tests. The pin
+# must match the version stellar-rpc-client resolves (jsonrpsee 0.26) so the two
+# resolve to one crate instance and the `From` impl on `stellar_rpc_client::Error`
+# applies; otherwise two distinct `ClientError` types exist in the binary.
+jsonrpsee-core = "=0.26.0"
+# CaptureWriter-backed subscriber in redaction_audit.rs.
+tracing-subscriber = { workspace = true }
+# ledger-apdu provides the APDUAnswer / APDUCommand types used in hardware
+# signing tests. Pinned to the version stellar-ledger resolves (via
+# ledger-transport 0.10) so the types are one instance, not two.
+ledger-apdu = "=0.10.0"
+# Keyring integration tests share a process-global default store; #[serial]
+# serialises them so parallel runs do not race on the global state.
+serial_test = { workspace = true }
+
+[[test]]
+name = "counterparty_cache_integration"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "counterparty_concurrent_first_fetch"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "counterparty_fetch_integration"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "counterparty_fetch_extended_integration"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "fee_bump_testnet"
+required-features = ["testnet-acceptance"]
+
+[[test]]
+name = "idempotent_submit_integration"
+
+[[test]]
+name = "idempotent_submit_block_b_integration"
+
+[[test]]
+name = "idempotent_submit_receipt_reconcile"
+
+[[test]]
+name = "retry_backoff_integration"
+
+[[test]]
+name = "fee_bump_idempotent_integration"
+
+[[test]]
+name = "fee_bump_idempotent_testnet"
+required-features = ["testnet-acceptance"]
+
+[[test]]
+name = "sep29_cross_rpc_integration"
+
+[[test]]
+name = "account_client_coverage"
+
+[[test]]
+name = "cache_coverage"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "builder_cache_account_topup"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "builder_cache_account_topup2"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "builder_cache_account_topup3"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "submit_result_mapping"
+
+[lints]
+workspace = true

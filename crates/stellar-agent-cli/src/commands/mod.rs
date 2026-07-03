@@ -1,0 +1,29 @@
+//! CLI subcommand dispatch module.
+//!
+//! Each subcommand lives in its own submodule. The `Commands` enum is the
+//! `clap` top-level subcommand union dispatched from `main.rs`.
+
+pub mod accounts;
+pub mod approve;
+pub mod audit;
+pub mod balances;
+pub mod counterparty;
+pub mod credentials;
+pub mod fees;
+pub mod friendbot;
+pub(crate) mod policy_engine;
+// Blend lending adapter — lend verb.
+pub mod lend;
+pub mod pay;
+pub mod pool;
+pub mod profile;
+pub mod toolsets;
+pub mod wallet;
+// DeFindex vault adapter — vault verb.
+pub mod vault;
+// Soroswap DEX swap adapter — trade verb.
+pub mod trade;
+// Stablecoin substrate — trustline verb.
+pub mod trustline;
+// Claimable-balance substrate — claim verb.
+pub mod claim;

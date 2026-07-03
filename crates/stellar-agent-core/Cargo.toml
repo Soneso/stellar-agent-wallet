@@ -1,0 +1,69 @@
+[package]
+name = "stellar-agent-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Core library for the Stellar agent wallet: signing, policy engine, smart accounts, and a hash-chained audit log. Embeddable; the primary public API of the workspace."
+
+[lib]
+name = "stellar_agent_core"
+
+[dependencies]
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-log = { workspace = true }
+stellar-strkey = { workspace = true }
+bip39 = { workspace = true }
+stellar-xdr = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+figment = { workspace = true }
+toml = { workspace = true }
+tempfile = { workspace = true }
+url = { workspace = true }
+directories = { workspace = true }
+hmac = { workspace = true }
+subtle = { workspace = true }
+# "alloc" is required for `Zeroizing<String>` / `Zeroizing<Vec<u8>>`, used by
+# the attestation-key load path (`approval::attest::load_attestation_key`).
+zeroize = { workspace = true, features = ["alloc"] }
+base64 = { workspace = true }
+rand_core = { workspace = true }
+inventory = { workspace = true }
+schemars = { workspace = true }
+toml_edit = { workspace = true }
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }
+region = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+proptest = { workspace = true, optional = true }
+stellar-agent-test-support = { workspace = true, optional = true }
+stellar-agent-xdr-limits = { workspace = true }
+# Reads the attestation-key entry from whichever platform backend the host
+# process (CLI, MCP server) has already registered as the default keyring
+# store via `stellar_agent_network::keyring::init_platform_keyring_store`.
+# Core itself never registers a platform backend.
+keyring-core = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+stellar-agent-windows-identity = { workspace = true }
+
+[features]
+# Exposes proptest strategy generators to downstream integration-test crates,
+# which do not receive cfg(test) and so cannot reach test-only items.
+test-helpers = ["dep:proptest", "dep:stellar-agent-test-support"]
+
+[dev-dependencies]
+proptest = { workspace = true }
+stellar-agent-test-support = { workspace = true }
+serial_test = { workspace = true }
+rand_core = { workspace = true }
+
+[lints]
+workspace = true

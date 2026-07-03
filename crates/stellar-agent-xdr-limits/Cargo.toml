@@ -1,0 +1,19 @@
+[package]
+name = "stellar-agent-xdr-limits"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Recursion-depth and length bounds for decoding untrusted XDR in the Stellar agent wallet."
+publish = false
+
+[lib]
+name = "stellar_agent_xdr_limits"
+path = "src/lib.rs"
+
+[dependencies]
+stellar-xdr = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,27 @@
+{
+  "test_kind": "evaluate",
+  "name": "boundary_23h59m_deny",
+  "category": "per_period_rollover",
+  "description": "Window = 1d, max = 5000 XLM. Prior spend of 4900 XLM from exactly 23h59m ago (still within 1d window). New tx of 200 XLM would exceed cap. Expect PerPeriodCapExceeded.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "args": {
+    "amount": "200 XLM",
+    "asset": "native",
+    "destination": "GASGYUZWEIPQJPT6BX367DXWXPHWSGNVJDYCH4EH5BTT43WQPJXVY3WJ"
+  },
+  "profile_name": "default",
+  "state_seed": [
+    { "offset_secs_ago": 86340, "amount_stroops": 49000000000 }
+  ],
+  "expected": {
+    "kind": "Deny",
+    "deny_reason": "per_period_cap_exceeded",
+    "wire_code": "policy.deny.per_period_cap_exceeded"
+  }
+}

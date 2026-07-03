@@ -1,0 +1,10 @@
+{
+  "test_kind": "load_failure",
+  "name": "signed_with_stale_key_rejected",
+  "category": "mutation_stale_key",
+  "description": "Policy signed with key A; load_signed_policy called with key B's pubkey (owner key was rotated). Signature verification fails. Expect OwnerSignatureInvalid.",
+  "load_signing_strategy": "stale_key",
+  "expected_load_ok": false,
+  "expected_load_error": "owner_signature_invalid",
+  "expected_load_wire_code": "policy.owner_signature_invalid"
+}

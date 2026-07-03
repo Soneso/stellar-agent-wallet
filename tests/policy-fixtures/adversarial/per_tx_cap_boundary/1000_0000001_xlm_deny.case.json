@@ -1,0 +1,24 @@
+{
+  "test_kind": "evaluate",
+  "name": "1000_0000001_xlm_deny",
+  "category": "per_tx_cap_boundary",
+  "description": "Per-tx cap = 1000 XLM. One stroop over cap (10_000_000_001 stroops = 1000.0000001 XLM). Expect PerTxCapExceeded.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "args": {
+    "amount": "1000.0000001 XLM",
+    "asset": "native",
+    "destination": "GASGYUZWEIPQJPT6BX367DXWXPHWSGNVJDYCH4EH5BTT43WQPJXVY3WJ"
+  },
+  "profile_name": "default",
+  "expected": {
+    "kind": "Deny",
+    "deny_reason": "per_tx_cap_exceeded",
+    "wire_code": "policy.deny.per_tx_cap_exceeded"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "test_kind": "evaluate",
+  "name": "unresolved_domain_deny",
+  "category": "home_domain_resolved",
+  "description": "home_domain_resolved criterion: identity has home_domain='new-anchor.example', cache does NOT contain it → Deny(HomeDomainNotResolved).",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "args": {
+    "destination": "GASGYUZWEIPQJPT6BX367DXWXPHWSGNVJDYCH4EH5BTT43WQPJXVY3WJ",
+    "amount": "10 XLM",
+    "asset": "native"
+  },
+  "profile_name": "default",
+  "mock_home_domain": "new-anchor.example",
+  "mock_resolved_domains": ["circle.com"],
+  "expected": {
+    "kind": "Deny",
+    "deny_reason": "home_domain_not_resolved",
+    "wire_code": "policy.deny.home_domain_not_resolved"
+  }
+}

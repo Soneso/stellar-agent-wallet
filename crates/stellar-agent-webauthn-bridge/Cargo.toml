@@ -1,0 +1,76 @@
+[package]
+name = "stellar-agent-webauthn-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Localhost HTTP listener that ferries WebAuthn ceremony bytes from the operator's browser into the wallet-owned approval spine."
+publish = false
+
+[lib]
+name = "stellar_agent_webauthn_bridge"
+
+[dependencies]
+# HTTP framework for the localhost bridge listener.
+# default-features = false; only tokio + http1 + json are enabled.
+axum = { workspace = true }
+
+# Middleware composition for the bridge's layered defence stack.
+tower = { workspace = true }
+
+# HTTP-specific middleware: TraceLayer + RequestBodyLimitLayer.
+tower-http = { workspace = true }
+
+# Async runtime — net + rt-multi-thread + macros required by axum::serve.
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "sync", "time"] }
+
+# Constant-time comparison for CSRF token validation.
+subtle = { workspace = true }
+
+# OS CSPRNG for CSRF token generation.
+rand_core = { workspace = true }
+
+# Hex encoding for CSRF tokens (URL emission as 64 lowercase hex chars).
+hex = { workspace = true }
+
+# Serialisation for POST handler request/response bodies.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Structured logging facade for library code.
+tracing = { workspace = true }
+
+# Typed error derives.
+thiserror = { workspace = true }
+
+# PendingApprovalStore + approval types consumed by the POST handlers.
+stellar-agent-core = { workspace = true }
+
+# DER-to-compact signature normalisation + assertion pre-verification primitives.
+stellar-agent-smart-account = { workspace = true }
+
+# Base64 decode/encode for WebAuthn credential ID and public key fields.
+base64 = { workspace = true }
+
+# SHA-256 for the RP-ID hash passed to pre_verify_assertion.
+sha2 = { workspace = true }
+
+[dev-dependencies]
+# HTTP client for integration tests (healthz, callbacks).
+reqwest = { workspace = true, features = ["json"] }
+
+# Temporary directories for test isolation.
+tempfile = { workspace = true }
+
+# Hex encoding for CSRF token construction in integration tests.
+hex = { workspace = true }
+
+# JSON assertions in integration tests.
+serde_json = { workspace = true }
+
+# P-256 signing fixtures for approval POST pre-verification integration tests.
+p256 = { workspace = true }
+
+[lints]
+workspace = true

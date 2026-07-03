@@ -1,0 +1,5 @@
+error: fn carries more than one #[mcp_tool_item(...)] attribute; expected at most one (each tool fn must have a single registration annotation)
+  --> tests/compile_fail/double_mcp_tool_item.rs:19:8
+   |
+19 |     fn stellar_pay(&self) {}
+   |        ^^^^^^^^^^^

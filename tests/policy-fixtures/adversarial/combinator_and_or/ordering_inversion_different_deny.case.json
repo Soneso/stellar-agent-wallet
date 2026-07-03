@@ -1,0 +1,27 @@
+{
+  "test_kind": "evaluate",
+  "name": "ordering_inversion_different_deny",
+  "category": "combinator_and_or",
+  "description": "Rule has per_tx_cap first (1000 XLM), then per_period_cap (5000 XLM/day). Prior spend = 4900 XLM. tx = 1500 XLM: exceeds both per_tx_cap AND would exceed per_period_cap. per_tx_cap is evaluated first and fires. Expect PerTxCapExceeded (not PerPeriodCapExceeded), demonstrating ordering determines which reason surfaces.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "args": {
+    "amount": "1500 XLM",
+    "asset": "native",
+    "destination": "GASGYUZWEIPQJPT6BX367DXWXPHWSGNVJDYCH4EH5BTT43WQPJXVY3WJ"
+  },
+  "profile_name": "default",
+  "state_seed": [
+    { "offset_secs_ago": 3600, "amount_stroops": 49000000000 }
+  ],
+  "expected": {
+    "kind": "Deny",
+    "deny_reason": "per_tx_cap_exceeded",
+    "wire_code": "policy.deny.per_tx_cap_exceeded"
+  }
+}

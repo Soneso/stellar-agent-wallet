@@ -1,0 +1,53 @@
+[package]
+name = "stellar-agent-toolsets-install"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Toolset install/uninstall with cryptographic provenance (SHA-256 + ed25519 publisher signatures) for the Stellar agent wallet."
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+ed25519-dalek = { workspace = true }
+stellar-strkey = { workspace = true }
+hex = { workspace = true }
+tempfile = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+stellar-agent-toolsets = { workspace = true }
+stellar-agent-core = { workspace = true }
+# Gzip decompression (pure-Rust miniz_oxide backend; never enable zlib/zlib-ng C backends).
+flate2 = { workspace = true }
+# Tar entry iteration (entry-by-entry; NEVER Archive::unpack).
+tar = { workspace = true }
+# SemVer parse + precedence ordering for version downgrade check.
+semver = { workspace = true }
+
+[dev-dependencies]
+stellar-agent-test-support = { workspace = true }
+tempfile = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand_core = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+stellar-strkey = { workspace = true }
+# For building adversarial tarballs programmatically in tests.
+flate2 = { workspace = true }
+tar = { workspace = true }
+# For parse_capability_value_pub in pin tests.
+stellar-agent-toolsets = { workspace = true, features = ["test-helpers"] }
+
+[features]
+# Exposes `ToolsetPinRecord::build_for_test` for sibling-crate tests.
+# Must NOT be enabled in production builds.
+# `read_pin` is part of the always-public API and is unaffected by this feature.
+test-helpers = []
+
+[lints]
+workspace = true

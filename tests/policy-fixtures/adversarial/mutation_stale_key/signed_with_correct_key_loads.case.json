@@ -1,0 +1,8 @@
+{
+  "test_kind": "load_failure",
+  "name": "signed_with_correct_key_loads",
+  "category": "mutation_stale_key",
+  "description": "Policy signed with key A; load_signed_policy called with key A's pubkey. Signature is valid. Expect Ok (positive sanity test).",
+  "load_signing_strategy": "correct_key",
+  "expected_load_ok": true
+}

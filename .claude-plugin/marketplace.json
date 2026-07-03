@@ -1,0 +1,23 @@
+{
+  "name": "soneso-stellar-agent-wallet",
+  "owner": {
+    "name": "Soneso"
+  },
+  "metadata": {
+    "description": "Agent skill for the Stellar Agent Wallet"
+  },
+  "plugins": [
+    {
+      "name": "stellar-agent-wallet",
+      "source": "./skills",
+      "description": "Teaches AI agents how to operate the Stellar Agent Wallet through its stellar-agent CLI and stellar-agent-mcp server. Covers profiles and key custody, payments and accounts, the policy engine and operator-approval flow, smart-account governance, DeFi, SEP protocols, and x402 agent payments.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Soneso"
+      },
+      "homepage": "https://github.com/Soneso/stellar-agent-wallet",
+      "license": "Apache-2.0",
+      "keywords": ["stellar", "blockchain", "wallet", "ai-agent", "mcp", "cli", "agent-skill"]
+    }
+  ]
+}

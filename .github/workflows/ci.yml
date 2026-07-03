@@ -1,0 +1,176 @@
+name: CI
+
+# Offline gate suite for the workspace. Every push and pull request to main runs
+# format, lint, the offline test tier, unused-dependency detection, and the
+# license/advisory check. The live testnet-acceptance tests are intentionally
+# out of scope here: they hit real RPC and Friendbot and run from a separate,
+# deliberately paced workflow.
+
+on:
+  push:
+    branches: [main]
+    # A commit that touches only documentation cannot affect any gate below.
+    paths-ignore:
+      - '**/*.md'
+      - 'LICENSE'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'LICENSE'
+
+# Supersede in-flight runs for the same ref so rapid pushes do not queue stale
+# work.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# These jobs only read the checked-out source; deny the token every other scope.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
+        with:
+          toolchain: stable
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
+        with:
+          toolchain: stable
+          components: clippy
+      # stellar-ledger pulls hidapi, which links libudev on Linux for HID device
+      # enumeration. The runner ships pkg-config but not the libudev headers.
+      - name: Install libudev (Linux hidapi)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # --all-features compile-checks the entire graph, including the code behind
+      # the testnet-acceptance features, without executing any test. The
+      # workspace lints declared in the root Cargo.toml deny warnings; -D
+      # warnings turns any remaining warning into a failure.
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: test (offline)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Dropping test-profile debuginfo roughly halves target/ size and link time,
+    # keeping the build closure within the runner's free disk.
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # The smart-account dependency closure (Arkworks, wasmi, soroban-env-host)
+      # plus every compiled test binary is large; reclaim space the build does
+      # not need.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
+        with:
+          toolchain: stable
+      - name: Install libudev (Linux hidapi)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # Offline tier only. The enabled features expose the test-only helpers and
+      # fixtures the integration suites depend on; none of them pulls the live
+      # testnet client helpers. The testnet-acceptance / testnet-integration
+      # features stay off and the heavy submit flows are #[ignore]d, so no test
+      # reaches the network. --all-features is deliberately avoided here: it
+      # would enable the live tiers and attempt real RPC and Friendbot access.
+      - run: cargo test --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry
+
+  machete:
+    name: unused-deps
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # cargo machete shells out to cargo metadata, so declare the toolchain
+      # explicitly rather than relying on the runner image default.
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@9bcaee1dcae34154180f412e2fa69355a7cda9f6 # v2.82.6
+        with:
+          tool: cargo-machete@0.9.2
+      - run: cargo machete
+
+  deny:
+    name: licenses-advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # cargo deny check resolves the dependency graph via cargo metadata, so
+      # declare the toolchain explicitly rather than relying on the runner image
+      # default.
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@9bcaee1dcae34154180f412e2fa69355a7cda9f6 # v2.82.6
+        with:
+          tool: cargo-deny@0.19.9
+      # The advisories check fetches the RustSec advisory database over the
+      # network at run time, so its result can change between runs of the same
+      # commit when an upstream advisory is published. The license, ban, and
+      # source checks are deterministic from the committed Cargo.lock and
+      # deny.toml.
+      - run: cargo deny check
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # The instrumented build plus every compiled test binary is large; reclaim
+      # space the build does not need.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+      - name: Install libudev (Linux hidapi)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # Coverage builds are instrumented and differ from the other jobs; keep
+          # them in a separate cache so they do not evict the plain-build caches.
+          prefix-key: coverage
+      - uses: taiki-e/install-action@9bcaee1dcae34154180f412e2fa69355a7cda9f6 # v2.82.6
+        with:
+          tool: cargo-llvm-cov@0.8.7
+      # Offline tier only, matching the `test` job's feature set. --all-features
+      # is deliberately avoided so no live RPC / Friendbot test runs; coverage of
+      # the remaining live-network lines is out of scope for this offline gate.
+      - name: Measure offline line coverage
+        run: cargo llvm-cov --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov.json
+      - name: Enforce per-crate line-coverage floors
+        run: python3 .github/scripts/check-coverage.py cov.json

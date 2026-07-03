@@ -1,0 +1,58 @@
+# cargo-deny configuration.
+
+[advisories]
+# Fail on crates with an active security advisory or that have been yanked.
+yanked = "deny"
+# Unmaintained-class advisories (informational, not security vulnerabilities) on
+# deep transitive build-time proc-macro crates pulled by the OpenZeppelin Stellar
+# contract crates (stellar-accounts / stellar-governance) through
+# soroban-sdk -> soroban-env-host -> arkworks. There is no fixed release and no
+# way to drop them without abandoning the on-chain ABI types the smart-account
+# encoding is verified against.
+ignore = [
+    "RUSTSEC-2024-0388", # derivative: unmaintained
+    "RUSTSEC-2024-0436", # paste: unmaintained
+]
+
+[licenses]
+# Only permissive licenses are accepted.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Zlib",
+    # ISC: ring (TLS crypto provider via reqwest rustls-tls).
+    "ISC",
+    # CDLA-Permissive-2.0: Mozilla CA root bundle (webpki-roots) used by the
+    # rustls-tls webpki-roots default; a permissive data licence for the cert set.
+    "CDLA-Permissive-2.0",
+    # BSD-2-Clause: arrayref (transitive via blake3); fully permissive.
+    "BSD-2-Clause",
+    # MPL-2.0: option-ext (transitive via directories); file-level weak copyleft
+    # that applies only to its own sources, which we use unmodified.
+    "MPL-2.0",
+    # Apache-2.0 WITH LLVM-exception: wasmparser + wasm-encoder (transitives of
+    # soroban-spec-tools). The LLVM exception adds a linking exception to the
+    # standard Apache-2.0, making it more permissive, not less.
+    "Apache-2.0 WITH LLVM-exception",
+]
+confidence-threshold = 0.9
+
+# `nacl` is LGPL-3.0-or-later. It is a wasm32-only transitive dependency of
+# stellar-baselib and is never compiled into the native (macOS/Linux/Windows)
+# binaries this project builds, so the copyleft terms do not reach the shipped
+# artifacts. The allowance is scoped narrowly to this one crate rather than
+# permitting LGPL workspace-wide.
+[[licenses.exceptions]]
+name = "nacl"
+allow = ["LGPL-3.0-or-later"]
+
+[bans]
+# Surface, but do not fail on, multiple versions of the same crate.
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -1,0 +1,23 @@
+{
+  "test_kind": "evaluate",
+  "name": "in_window_under_cap_allow",
+  "category": "per_period_rollover",
+  "description": "Window = 1d, max = 5000 XLM. No prior spend in store. Single tx of 100 XLM is under cap. Expect Allow.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "args": {
+    "amount": "100 XLM",
+    "asset": "native",
+    "destination": "GASGYUZWEIPQJPT6BX367DXWXPHWSGNVJDYCH4EH5BTT43WQPJXVY3WJ"
+  },
+  "profile_name": "default",
+  "state_seed": [],
+  "expected": {
+    "kind": "Allow"
+  }
+}

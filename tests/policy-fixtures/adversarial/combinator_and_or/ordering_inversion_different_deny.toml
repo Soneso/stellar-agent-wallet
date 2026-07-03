@@ -1,0 +1,10 @@
+version = 1
+scope = "profile:*"
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "*" }
+criteria = [
+    { kind = "per_tx_cap", asset = "native", max_stroops = 10_000_000_000 },
+    { kind = "per_period_cap", asset = "native", window = "1d", max_stroops = 50_000_000_000 },
+]
+decision = "allow"

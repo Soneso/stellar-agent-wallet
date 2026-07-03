@@ -1,0 +1,156 @@
+[package]
+name = "stellar-agent-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "CLI binary for the Stellar agent wallet. Integrates with stellar-cli via the external-binary plugin convention (discovered as `stellar agent`)."
+publish = false
+
+[[bin]]
+name = "stellar-agent"
+path = "src/main.rs"
+
+# `cargo binstall stellar-agent-cli` support. The CLI and MCP binaries share a
+# single release archive; `{ bin }` resolves to `stellar-agent` here via the
+# `[[bin]]` declaration above. `cargo binstall` users get TLS-only trust; the
+# manual-install flow provides the full signature/provenance verification (see
+# the README "Verifying a release" section).
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/stellar-agent-{ version }-{ target }.tar.xz"
+pkg-fmt = "txz"
+bin-dir = "stellar-agent-{ version }-{ target }/{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.'cfg(target_os = "windows")']
+pkg-url = "{ repo }/releases/download/v{ version }/stellar-agent-{ version }-{ target }.zip"
+pkg-fmt = "zip"
+
+[dependencies]
+stellar-agent-core = { workspace = true }
+stellar-agent-network = { workspace = true }
+# Blend lending adapter — `lend` subcommand.
+stellar-agent-blend = { workspace = true }
+# DeFindex vault adapter — `vault` subcommand.
+stellar-agent-defindex = { workspace = true }
+# Soroswap DEX swap adapter — `trade` subcommand.
+stellar-agent-dex = { workspace = true }
+stellar-agent-defi = { workspace = true }
+# Stablecoin substrate — `trustline` subcommand.
+stellar-agent-stablecoin = { workspace = true }
+# Claimable-balance substrate — `claim` subcommand.
+stellar-agent-claimable = { workspace = true }
+# Channel-account pool subcommands (pool init / list / status).
+stellar-agent-pool = { workspace = true }
+# SEP-5 HD-path derivation for pool channel keypairs.
+stellar-agent-derive = { workspace = true }
+# Toolset install/uninstall with cryptographic provenance.
+stellar-agent-toolsets-install = { workspace = true }
+# Capability-to-tool matrix + enforcement for toolsets.
+stellar-agent-toolsets-runtime = { workspace = true }
+# Smart-account deployment + deterministic address derivation.
+stellar-agent-smart-account = { workspace = true, features = ["deploy-cli"] }
+# Nonce-key rotation subcommand.
+stellar-agent-nonce = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "sync"] }
+tracing = { workspace = true }
+# Localhost approval-inbox web UI for `approve serve`.
+stellar-agent-approval-ui = { workspace = true }
+# Secret-key parsing from --secret-env (pay.rs).
+stellar-strkey = { workspace = true }
+# XDR envelope signing — TransactionEnvelope, SEP-23 payload (pay.rs).
+stellar-xdr = { workspace = true }
+# SHA-256 of the SEP-23 signing payload (pay.rs).
+sha2 = { workspace = true }
+# Zeroizing<[u8; 32]> when constructing SoftwareSigningKey (pay.rs).
+zeroize = { workspace = true }
+# Structured Serialize/Deserialize on PayResult (pay.rs).
+serde = { workspace = true }
+# In-process keypair generation for --generate (accounts/create.rs).
+ed25519-dalek = { workspace = true }
+# OsRng in SigningKey::generate (accounts/create.rs).
+rand_core = { workspace = true }
+# Entry::new / set_password / get_password (key_ops.rs).
+keyring-core = { workspace = true }
+# OS-conventional cache-dir resolution (counterparty/{list,refresh}.rs).
+directories = { workspace = true }
+# Read-only HOME_DOMAIN allowlist extraction from owner-signed policy TOML
+# (counterparty/warm_up.rs).
+toml_edit = { workspace = true }
+# request_id generation in error envelopes (counterparty/{list,refresh}.rs).
+uuid = { workspace = true }
+# URL-safe encoding of generated keys (key_ops.rs).
+base64 = { workspace = true }
+# hex decode for --signer-key-data (wallet signers --signer-external path).
+hex = { workspace = true }
+# Browser launch for the passkey-registration handoff (credentials/add_passkey.rs).
+webbrowser = { workspace = true }
+# WebAuthn bridge for the passkey-registration ceremony.
+stellar-agent-webauthn-bridge = { workspace = true }
+# JSON output for credentials subcommand envelopes.
+serde_json = { workspace = true }
+# URL host extraction for the timelock degraded-defence INFO log (logs host
+# only at INFO; full URL at DEBUG).
+url = { workspace = true }
+
+[dev-dependencies]
+# Build signed toolset .tar.gz fixtures in the install tests.
+flate2 = { workspace = true }
+tar = { workspace = true }
+# Construct CreateClaimableBalance transactions directly in the claim
+# testnet-acceptance test; production code has no balance-creation path
+# (only ClaimClaimableBalance, via ClassicOpBuilder), so the test builds the
+# fixture with stellar-baselib.
+stellar-baselib = { workspace = true }
+# Friendbot HTTP funding in the claim testnet-acceptance test.
+reqwest = { workspace = true }
+# #[tokio::test] async runtime for the claim testnet-acceptance test (the
+# production [dependencies] entry only enables rt-multi-thread).
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# parse_capability_value_pub + CapabilitySet in tests.
+stellar-agent-toolsets = { workspace = true, features = ["test-helpers"] }
+# build_attestation_preimage in the install tests.
+stellar-agent-toolsets-install = { workspace = true }
+# test-helpers enables the STELLAR_AGENT_HOME override on default_passkeys_dir()
+# in test builds.
+stellar-agent-core = { workspace = true, features = ["test-helpers"] }
+# test-helpers enables VerifierAllowlistEntry::new_for_test in advisory tests;
+# the production [dependencies] entry uses deploy-cli only.
+stellar-agent-smart-account = { workspace = true, features = ["deploy-cli", "test-helpers"] }
+# Deterministic mocked RPC responses in pay.rs / accounts/create.rs tests.
+wiremock = { workspace = true }
+# wiremock::Respond impls in command-module unit tests.
+async-trait = { workspace = true }
+# profile/show.rs + profile/migrate.rs tests.
+tempfile = { workspace = true }
+# process-global keyring store serialisation (key_ops.rs tests).
+serial_test = { workspace = true }
+# keyring_mock::install for the mock store setup (key_ops.rs tests).
+stellar-agent-test-support = { workspace = true }
+# request_id generation in audit/verify.rs tests.
+uuid = { workspace = true }
+# Assert on structured tracing events captured via CaptureWriter.
+tracing-subscriber = { workspace = true }
+# Construct a real SaError::NetworksTomlParse (carries toml::de::Error) for the
+# $HOME-path-redaction regression test (wallet/common.rs).
+toml = { workspace = true }
+# Parse Rust source via AST and walk the advisory module's `use` graph in
+# tests/advisory_no_network_deps.rs (the `visit` feature provides syn::visit::Visit).
+syn = { workspace = true, features = ["visit"] }
+
+[features]
+# Exposes test-only helpers (e.g. run_startup_advisory_with_allowlist) under a
+# feature gate. Enabled in the [dev-dependencies] of consumers that need the
+# injection API.
+test-helpers = []
+# Gate end-to-end testnet acceptance tests that require a live Friendbot + RPC.
+# These tests are NOT run under default `cargo test`; invoke with:
+#   cargo test -p stellar-agent-cli --features testnet-acceptance \
+#     --test claim_testnet_acceptance
+# This feature is CI/dev-only and MUST NOT be enabled in any release-artefact
+# feature set.
+testnet-acceptance = []
+
+[lints]
+workspace = true

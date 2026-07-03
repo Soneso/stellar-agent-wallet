@@ -1,0 +1,42 @@
+[package]
+name = "stellar-agent-x402"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Rust-native x402 Exact Stellar payment scheme (payer side)"
+
+[features]
+# Exposes constructors used by integration tests across crate boundaries.
+# Never enable in production binaries.
+test-helpers = []
+# Gated testnet acceptance tests.  Implies test-helpers.
+testnet-acceptance = ["test-helpers"]
+
+[dependencies]
+stellar-xdr = { workspace = true }
+stellar-strkey = { workspace = true }
+stellar-rpc-client = { workspace = true }
+stellar-baselib = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+stellar-agent-core = { workspace = true }
+stellar-agent-network = { workspace = true }
+stellar-agent-sep43 = { workspace = true }
+
+[dev-dependencies]
+stellar-agent-test-support = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+rand_core = { workspace = true }
+ed25519-dalek = { workspace = true }
+serial_test = { workspace = true }
+reqwest = { workspace = true }
+zeroize = { workspace = true }
+
+[lints]
+workspace = true

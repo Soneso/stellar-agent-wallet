@@ -1,0 +1,24 @@
+{
+  "test_kind": "evaluate",
+  "name": "no_home_domain_allow",
+  "category": "home_domain_resolved",
+  "description": "home_domain_resolved criterion: identity view present but home_domain is None (empty string = absent) → criterion passes through as Allow (nothing to resolve).",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "args": {
+    "destination": "GASGYUZWEIPQJPT6BX367DXWXPHWSGNVJDYCH4EH5BTT43WQPJXVY3WJ",
+    "amount": "10 XLM",
+    "asset": "native"
+  },
+  "profile_name": "default",
+  "mock_home_domain": "",
+  "mock_resolved_domains": [],
+  "expected": {
+    "kind": "Allow"
+  }
+}

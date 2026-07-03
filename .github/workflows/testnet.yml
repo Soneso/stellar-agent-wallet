@@ -1,0 +1,87 @@
+name: Testnet acceptance
+
+# The live on-chain leg: every testnet-acceptance / testnet-integration suite,
+# serialized, against the public Stellar testnet (RPC + Friendbot, ephemeral
+# Friendbot-funded keypairs — no secrets). This deliberately does NOT run per
+# push: a full leg takes hours of live round-trips and hammering Friendbot on
+# every commit would rate-limit itself into flakiness. It runs on manual
+# dispatch (pre-release validation, or after changing any *_testnet_acceptance
+# test) and on a weekly schedule (drift detection: testnet protocol upgrades,
+# RPC behaviour changes, third-party contract redeployments).
+
+on:
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: >-
+          Only run suites whose "<crate>/<test target>" contains this
+          substring (empty runs the full leg)
+        required: false
+        default: ''
+  schedule:
+    # Weekly, Monday 05:00 UTC.
+    - cron: '0 5 * * 1'
+
+# Never run two legs at once: they would compete for Friendbot funding and
+# trip its rate limits. Queued rather than cancelled so a dispatched run is
+# never silently dropped.
+concurrency:
+  group: testnet-acceptance
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  acceptance:
+    name: testnet acceptance (serialized)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    # Setting the repository variable TESTNET_SCHEDULE to "off" disables the
+    # weekly run without a commit; manual dispatch always runs.
+    if: github.event_name != 'schedule' || vars.TESTNET_SCHEDULE != 'off'
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # The smart-account dependency closure plus every compiled test binary is
+      # large; reclaim space the build does not need.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
+        with:
+          toolchain: stable
+      # stellar-ledger pulls hidapi, which links libudev on Linux for HID device
+      # enumeration. The runner ships pkg-config but not the libudev headers.
+      - name: Install libudev (Linux hidapi)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      # The WebAuthn suite launches a headless Chromium for the CDP
+      # virtual-authenticator ceremony (with --no-sandbox, so no userns
+      # provisioning is needed on the runner). Explicit major-version tag (not
+      # "stable") so the binary is deterministic across runs. Re-pin trigger:
+      # Chromium stable major-version bump. Current pin: Chrome 150 (stable as
+      # of 2026-07-02).
+      - name: Setup Chromium (WebAuthn suite)
+        uses: browser-actions/setup-chrome@2e1d749697dd1612b833dba4a722266286fbefcd # v2.1.2
+        with:
+          chrome-version: 150
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # The testnet feature set builds a different dependency graph from
+          # the offline jobs; keep it in its own cache.
+          prefix-key: testnet
+      # Serialization, inter-suite pacing, one-retry-with-cooldown, and the
+      # zero-tests-executed guard all live in the driver script so the same
+      # entrypoint runs locally and in CI.
+      - name: Run testnet acceptance suites
+        env:
+          FILTER: ${{ inputs.filter }}
+        run: .github/scripts/run-testnet-acceptance.sh

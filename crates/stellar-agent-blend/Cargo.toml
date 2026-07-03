@@ -1,0 +1,38 @@
+[package]
+name = "stellar-agent-blend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Blend lending adapter for the Stellar agent wallet — ABI binding, typed preview, health-factor guard, and Reflector oracle-staleness guard"
+
+[features]
+# Exposes test helper constructors for cross-crate tests.
+# Never enable in production binaries.
+test-helpers = ["stellar-agent-defi/test-helpers"]
+# Gated testnet acceptance tests. Implies test-helpers.
+testnet-acceptance = ["test-helpers", "stellar-agent-test-support/testnet-helpers"]
+
+[dependencies]
+stellar-agent-core    = { workspace = true }
+stellar-agent-defi    = { workspace = true }
+stellar-agent-network = { workspace = true }
+stellar-agent-smart-account = { workspace = true }
+stellar-agent-xdr-limits = { workspace = true }
+stellar-xdr           = { workspace = true }
+stellar-strkey        = { workspace = true }
+thiserror             = { workspace = true }
+serde                 = { workspace = true }
+tracing               = { workspace = true }
+async-trait           = { workspace = true }
+
+[dev-dependencies]
+stellar-agent-test-support  = { workspace = true, features = ["test-helpers"] }
+tokio                       = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+serde_json                  = { workspace = true }
+zeroize                     = { workspace = true }
+
+[lints]
+workspace = true

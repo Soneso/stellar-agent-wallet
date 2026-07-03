@@ -1,0 +1,183 @@
+[package]
+name = "stellar-agent-smart-account"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Smart-account orchestration layer for the Stellar agent wallet (OZ stellar-accounts v0.7.1 consumer)."
+publish = false
+
+[lib]
+name = "stellar_agent_smart_account"
+path = "src/lib.rs"
+
+# soroban-sdk is a dev-dependency with testutils always on for the auth_digest_parity
+# gate. The testutils machinery is only needed in tests/auth_digest_parity.rs; it is
+# not needed in any production path.
+
+[features]
+default = []
+# Gate end-to-end testnet acceptance tests that require live Friendbot + RPC.
+# These tests are NOT run under default `cargo test`; invoke with:
+#   cargo test --features testnet-integration
+#
+# Enables test-helpers: the testnet acceptance tests consume the gated
+# inspection helpers, so the documented single-feature invocation must compile
+# on its own.
+testnet-integration = ["test-helpers"]
+# Expose test-only inspection helpers as pub items for adversarial fixture tests.
+# Never enabled in production builds.
+test-helpers = []
+# Gates embedded deploy-time WASM bytes for binaries that upload vendored
+# verifier / policy contracts at runtime.
+deploy-cli = []
+
+# Tests that consume gated test-helpers (interop deployer helpers):
+[[test]]
+name = "audit_log_emission"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "deploy_c_via_cli_returns_strkey_and_seed"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "deterministic_address_derivation"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "recover_strkey_from_seed_and_deployer"
+required-features = ["test-helpers"]
+
+# testnet acceptance tests: each requires the testnet-integration feature.
+[[test]]
+name = "deploy_c_testnet_acceptance"
+required-features = ["testnet-integration"]
+
+[[test]]
+name = "wallet_caps_testnet_acceptance"
+required-features = ["testnet-integration"]
+
+[[test]]
+name = "wallet_multicall_testnet_acceptance"
+required-features = ["testnet-integration"]
+
+[[test]]
+name = "wallet_policy_mutators_testnet_acceptance"
+required-features = ["testnet-integration"]
+
+[[test]]
+name = "wallet_rules_pinning_testnet_acceptance"
+required-features = ["testnet-integration"]
+
+[[test]]
+name = "wallet_rules_testnet_acceptance"
+required-features = ["testnet-integration"]
+
+[[test]]
+name = "wallet_sa_list_rules_testnet_acceptance"
+required-features = ["testnet-integration"]
+
+[[test]]
+name = "wallet_sa_migrate_verifier_testnet_acceptance"
+required-features = ["testnet-integration"]
+
+[[test]]
+name = "wallet_session_rule_expiry_testnet_acceptance"
+required-features = ["testnet-integration"]
+
+[[test]]
+name = "wallet_session_rule_horizon_testnet_acceptance"
+required-features = ["testnet-integration"]
+
+[[test]]
+name = "wallet_signers_testnet_acceptance"
+required-features = ["testnet-integration"]
+
+[[test]]
+name = "wallet_sim_audit_testnet_acceptance"
+required-features = ["testnet-integration"]
+
+[[test]]
+name = "wallet_smart_account_timelock_testnet_acceptance"
+required-features = ["testnet-integration"]
+
+[[test]]
+name = "quorum_authorization_info_testnet_acceptance"
+required-features = ["testnet-integration"]
+
+[[test]]
+name = "wallet_rules_webauthn_testnet_acceptance"
+required-features = ["testnet-integration"]
+
+[dependencies]
+bon = { workspace = true }
+stellar-accounts = { workspace = true }
+# serde: Serialize on SaError for JSON envelope shape consumed by CLI mapper
+# and MCP envelopes.
+serde = { workspace = true }
+thiserror = { workspace = true }
+# stellar-rpc-client replaces soroban-client for tx-prep and submit-poll for
+# Soroban. Uses stellar-xdr 27 types throughout.
+stellar-rpc-client = { workspace = true }
+# stellar-baselib provides Account, TransactionBuilder, Transaction with the
+# same conceptual API as soroban-client but against stellar-xdr 27.
+stellar-baselib = { workspace = true }
+stellar-xdr = { workspace = true }
+stellar-strkey = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand_core = { workspace = true }
+zeroize = { workspace = true }
+stellar-agent-core = { workspace = true }
+stellar-agent-network = { workspace = true }
+stellar-agent-xdr-limits = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+webauthn-rs-core = { workspace = true }
+base64 = { workspace = true }
+serde_json = { workspace = true }
+# p256: secp256r1 for DER → compact + low-S transform in webauthn/sig_normalize.rs.
+p256 = { workspace = true }
+toml = { workspace = true }
+tempfile = { workspace = true }
+directories = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+# stellar-governance: OZ timelock module (Timelock trait + TimelockError).
+stellar-governance = { workspace = true }
+
+[build-dependencies]
+sha2 = { workspace = true }
+
+[dev-dependencies]
+static_assertions = { workspace = true }
+stellar-agent-test-support = { workspace = true, features = ["verifier-registry", "wiremock-helpers", "test-helpers"] }
+tracing-subscriber = { workspace = true }
+stellar-agent-core = { workspace = true }
+# soroban-sdk with testutils for the auth_digest_parity byte-parity gate.
+soroban-sdk = { workspace = true, features = ["testutils"] }
+sha2 = { workspace = true }
+wiremock = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand_core = { workspace = true }
+# reqwest: Friendbot HTTP calls in testnet acceptance tests.
+reqwest = { workspace = true }
+tempfile = { workspace = true }
+proptest = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+serial_test = { workspace = true }
+url = { workspace = true }
+# chromiumoxide: CDP virtual-authenticator client for the WebAuthn ceremony in
+# wallet_rules_webauthn_testnet_acceptance.rs (testnet-integration only).
+chromiumoxide = { workspace = true }
+# futures: StreamExt for the chromiumoxide CDP event handler.
+futures = { workspace = true }
+# stellar-agent-webauthn-bridge: the bridge listener driven by the WebAuthn
+# acceptance test.
+stellar-agent-webauthn-bridge = { workspace = true }
+
+[lints]
+workspace = true

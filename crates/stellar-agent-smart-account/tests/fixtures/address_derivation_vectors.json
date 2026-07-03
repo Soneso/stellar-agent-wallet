@@ -1,0 +1,45 @@
+{
+  "note": "Deterministic smart-account address derivation test vectors. The salt is SHA256(credentialId); derive_smart_account_address takes the pre-computed salt. Expected C-strkeys are cross-checked against the 112-byte XDR preimage byte-layout.",
+  "vectors": [
+    {
+      "deployer_pubkey": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+      "salt_hex": "5dfbabeedf318bf33c0927c43d7630f51b82f351740301354fa3d7fc51f0132e",
+      "network_passphrase": "Test SDF Network ; September 2015",
+      "expected_smart_account": "CA3C7DNPRNBS5ESLAPUJ3MK5DXN5PHHPJOETLLRCK2Z5NE7CDHMK6GO4",
+      "source": "short credentialId, testnet; salt=SHA256([0x01..0x10])",
+      "credential_id_note": "credentialId = ByteArray(16) { (it + 1).toByte() } = 0102030405060708090a0b0c0d0e0f10 (16 bytes); salt = SHA256(credentialId)"
+    },
+    {
+      "deployer_pubkey": "GA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVSGZ",
+      "salt_hex": "cbfee57093b600520fa472bb2cd32dd58482380623792f8dcc0dcb82984b9555",
+      "network_passphrase": "Test SDF Network ; September 2015",
+      "expected_smart_account": "CDQ6LFJRREBEBZMQNNUHO3KBMTHSWVNPOBQNV4PUWJJRRJLYXSXZOB5P",
+      "source": "medium credentialId, testnet; salt=SHA256(ByteArray(32){(it*3+7).toByte()})",
+      "credential_id_note": "credentialId = ByteArray(32) { (it * 3 + 7).toByte() } (32 bytes); salt = SHA256(credentialId)"
+    },
+    {
+      "deployer_pubkey": "GAAH4OT36RRCCAGKARGPN2HLHT2NOBVFHO4GUHA6CF7UKQ4MMV24WQ4N",
+      "salt_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "network_passphrase": "Test SDF Network ; September 2015",
+      "expected_smart_account": "CCIVP3H6YJXZVL4ZMRXOET6EH3K6JZHZ2AT6PP7XJCJNDFBE7SYV6BTE",
+      "source": "local derivation using the well-known interop deployer (GAAH4OT36...) + zero-salt",
+      "credential_id_note": "well-known interop deployer (SHA256('openzeppelin-smart-account-kit')); zero salt for deterministic interop test vector"
+    },
+    {
+      "deployer_pubkey": "GDUKMGUGDZQK6YHYA5Z6AY2G4XDSZPSZ3SW5UN3ARVMO6QSRDWP5YLEX",
+      "salt_hex": "e5ce84a8261da67ce9a85ecd086a0ed27e6efe0c1c25cab02cf25aa9d572fd5f",
+      "network_passphrase": "Test SDF Network ; September 2015",
+      "expected_smart_account": "CBJZWSGF66ATQNCVVQNGOSNAXUHX2TKB6NCL74K6NESUM23Y7KCJL657",
+      "source": "long credentialId, testnet; salt=SHA256(ByteArray(128){(it*17+42).toByte()})",
+      "credential_id_note": "credentialId = ByteArray(128) { (it * 17 + 42).toByte() } (128 bytes, typical WebAuthn credential ID size); salt = SHA256(credentialId)"
+    },
+    {
+      "deployer_pubkey": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+      "salt_hex": "5dfbabeedf318bf33c0927c43d7630f51b82f351740301354fa3d7fc51f0132e",
+      "network_passphrase": "Public Global Stellar Network ; September 2015",
+      "expected_smart_account": "CBFNAE3DHSNSUKUJ7FNSN3BQUVEIR24SOWPEAJWO3WJW3UAFAPKPQEPZ",
+      "source": "same credentialId as vector 1 but mainnet passphrase",
+      "credential_id_note": "Same credentialId as vector 1 ([0x01..0x10]); mainnet passphrase produces a distinct C-strkey (network isolation)"
+    }
+  ]
+}

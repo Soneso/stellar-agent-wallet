@@ -1,0 +1,40 @@
+[package]
+name = "stellar-agent-mcp-macros"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+description = "Proc-macro crate exporting #[mcp_tool_router] and #[mcp_tool_item] for the Stellar agent wallet MCP registry."
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]
+# AST parsing — full feature set required for ImplItemFn / ItemImpl parsing.
+syn = { workspace = true }
+
+# Token quoting in proc-macro expansions.
+quote = { workspace = true }
+
+# Provides the `TokenStream` type used in `expand_mcp_tool_router`'s signature
+# and codegen (independent of the `proc_macro` runtime API), bridged to
+# `proc_macro::TokenStream` at the attribute entry point.
+proc-macro2 = { workspace = true }
+
+# Attribute parsing via darling::FromMeta.
+darling = { workspace = true }
+
+# NOTE: `inventory` is NOT a dep of this crate.
+# The macro emits tokens that reference `::inventory::submit!` by path; the
+# consumer crate (stellar-agent-mcp) must declare `inventory` as its own dep.
+# Proc-macro crates cannot carry runtime deps for use in emitted code.  The
+# `inventory` crate is declared at [workspace.dependencies] and consumed by
+# stellar-agent-mcp directly.
+
+[dev-dependencies]
+trybuild = { workspace = true }
+
+[lints]
+workspace = true

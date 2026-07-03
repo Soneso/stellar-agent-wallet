@@ -1,0 +1,2 @@
+cf4469953efcb5617a870ae3f022b3ad48aee8c06012ccdafcabc73058f123a0  simplewebauthn-browser-13.3.0.min.js
+f3c60d2fa0045b421d05c24031497ece8879c8115d8c95f76b0d4d108f19a5b7  simplewebauthn-browser-13.3.0.src.js

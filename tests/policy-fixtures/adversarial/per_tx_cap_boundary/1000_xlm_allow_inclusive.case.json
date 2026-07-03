@@ -1,0 +1,22 @@
+{
+  "test_kind": "evaluate",
+  "name": "1000_xlm_allow_inclusive",
+  "category": "per_tx_cap_boundary",
+  "description": "Per-tx cap = 1000 XLM (10_000_000_000 stroops). Exactly 1000 XLM = 10_000_000_000 stroops is at the cap boundary. Boundary is inclusive (allowed).",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "args": {
+    "amount": "1000 XLM",
+    "asset": "native",
+    "destination": "GASGYUZWEIPQJPT6BX367DXWXPHWSGNVJDYCH4EH5BTT43WQPJXVY3WJ"
+  },
+  "profile_name": "default",
+  "expected": {
+    "kind": "Allow"
+  }
+}

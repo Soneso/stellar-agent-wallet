@@ -1,0 +1,69 @@
+[package]
+name = "stellar-agent-test-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Test harness: log-capture, secret-leakage assertions, and Stellar test fixtures."
+
+[lib]
+name = "stellar_agent_test_support"
+
+[dependencies]
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+regex-lite = { workspace = true }
+memchr = { workspace = true }
+async-trait = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+stellar-strkey = { workspace = true, optional = true }
+stellar-xdr = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["net"], optional = true }
+wiremock = { workspace = true, optional = true }
+ed25519-dalek = { workspace = true, optional = true }
+rand_core = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+stellar-baselib = { workspace = true, optional = true }
+stellar-rpc-client = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
+
+# In-memory mock keyring store; full rationale in `src/keyring_mock.rs`.
+keyring-core = { workspace = true }
+
+[dev-dependencies]
+# Serialises tests that touch process-global state (the keyring default store
+# and the tracing subscriber).
+serial_test = { workspace = true }
+# Drives the wiremock responder self-test over HTTP (rustls/ring; no OpenSSL).
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[features]
+test-helpers = [
+    "dep:async-trait",
+    "dep:serde_json",
+    "dep:stellar-strkey",
+    "dep:stellar-xdr",
+    "dep:tokio",
+    "dep:wiremock",
+    "wiremock-helpers",
+]
+testnet-helpers = [
+    "dep:ed25519-dalek",
+    "dep:rand_core",
+    "dep:reqwest",
+    "dep:stellar-baselib",
+    "dep:stellar-rpc-client",
+    "dep:stellar-strkey",
+    "dep:stellar-xdr",
+    "dep:tokio",
+    "dep:zeroize",
+]
+verifier-registry = ["dep:tempfile"]
+wiremock-helpers = ["dep:async-trait", "dep:serde_json", "dep:wiremock"]
+
+[lints]
+workspace = true

@@ -1,0 +1,10 @@
+{
+  "test_kind": "load_failure",
+  "name": "truncated_signature_rejected",
+  "category": "mutation_stale_key",
+  "description": "Policy signed with correct key; the hex-encoded signature is truncated by 4 characters before writing (producing a 124-char hex instead of 128-char). Signature decode fails. Expect OwnerSignatureInvalid.",
+  "load_signing_strategy": "truncated",
+  "expected_load_ok": false,
+  "expected_load_error": "owner_signature_invalid",
+  "expected_load_wire_code": "policy.owner_signature_invalid"
+}

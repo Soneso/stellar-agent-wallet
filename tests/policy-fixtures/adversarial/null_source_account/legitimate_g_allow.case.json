@@ -1,0 +1,22 @@
+{
+  "test_kind": "evaluate",
+  "name": "legitimate_g_allow",
+  "category": "null_source_account",
+  "description": "G_ACCOUNT allowlist = ['GA5Z...']. Destination = 'GA5Z...' (on allowlist). Expect Allow (positive control for null_source_account category).",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "args": {
+    "destination": "GASGYUZWEIPQJPT6BX367DXWXPHWSGNVJDYCH4EH5BTT43WQPJXVY3WJ",
+    "amount": "10 XLM",
+    "asset": "native"
+  },
+  "profile_name": "default",
+  "expected": {
+    "kind": "Allow"
+  }
+}

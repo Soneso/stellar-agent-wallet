@@ -1,0 +1,9 @@
+version = 1
+scope = "profile:*"
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "*" }
+criteria = [
+    { kind = "home_domain_resolved" },
+]
+decision = "allow"

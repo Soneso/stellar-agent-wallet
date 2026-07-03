@@ -1,0 +1,39 @@
+[package]
+name = "stellar-agent-sep45"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "SEP-45 Web Authentication for Contract Accounts: challenge validation, ephemeral-key signing, and JWT session handling."
+
+[dependencies]
+stellar-xdr = { workspace = true }
+# XDR decode limits: depth + length bounds for untrusted authorization entries.
+stellar-agent-xdr-limits = { workspace = true }
+stellar-strkey = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand_core = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serial_test = { workspace = true }
+wiremock = { workspace = true }
+
+[features]
+# End-to-end round-trip tests against a mock SEP-45 server. Implies test-helpers.
+testnet-integration = ["test-helpers"]
+# Exposes ephemeral key-generation helpers to integration-test binaries, which
+# do not receive cfg(test) and so cannot reach test-only inherent functions.
+test-helpers = []
+
+[lints]
+workspace = true

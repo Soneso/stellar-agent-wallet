@@ -1,0 +1,37 @@
+[package]
+name = "stellar-agent-stablecoin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Stablecoin substrate for the Stellar agent wallet — issuer-account pins, denomination resolver, USDT refusal, clawback disclosure, trustline preview"
+
+[features]
+# Exposes test-helper constructors for cross-crate tests.
+# Never enable in production binaries.
+test-helpers = []
+# Gated testnet acceptance tests. Implies test-helpers.
+testnet-acceptance = ["test-helpers", "stellar-agent-test-support/testnet-helpers"]
+
+[dependencies]
+stellar-agent-core    = { workspace = true }
+stellar-agent-network = { workspace = true }
+stellar-strkey        = { workspace = true }
+thiserror             = { workspace = true }
+serde                 = { workspace = true }
+tracing               = { workspace = true }
+
+[dev-dependencies]
+serde_json                 = { workspace = true }
+stellar-agent-test-support = { workspace = true, features = ["test-helpers"] }
+ed25519-dalek              = { workspace = true }
+rand_core                  = { workspace = true }
+reqwest                    = { workspace = true }
+tempfile                   = { workspace = true }
+tokio                      = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+zeroize                    = { workspace = true }
+
+[lints]
+workspace = true

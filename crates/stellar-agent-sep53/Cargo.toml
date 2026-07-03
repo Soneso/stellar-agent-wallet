@@ -1,0 +1,39 @@
+[package]
+name = "stellar-agent-sep53"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "SEP-53 prefixed-message sign/verify primitive for the Stellar agent wallet."
+
+[lib]
+name = "stellar_agent_sep53"
+
+[dependencies]
+# SHA-256 for the SEP-53 prefixed-message preimage.
+sha2 = { workspace = true }
+# Stellar strkey encode/decode for G-key validation and the signer public key.
+stellar-strkey = { workspace = true }
+# Ed25519 VerifyingKey + Signature for message verification.
+ed25519-dalek = { workspace = true }
+# Typed error derives.
+thiserror = { workspace = true }
+# The signing primitive: SEP-53 builds the prefix + message preimage, SHA-256
+# digests it, then calls Signer::sign_tx_payload on the digest.
+stellar-agent-network = { workspace = true }
+
+[features]
+# Exposes test-helper constructors to integration tests that cannot use
+# cfg(test) directly.
+test-helpers = []
+
+[dev-dependencies]
+stellar-agent-test-support = { workspace = true, features = ["test-helpers"] }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+# base64 for decoding spec test-vector signatures in unit tests.
+base64 = { workspace = true }
+
+[lints]
+workspace = true

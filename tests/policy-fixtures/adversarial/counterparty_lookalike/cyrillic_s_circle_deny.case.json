@@ -1,0 +1,25 @@
+{
+  "test_kind": "evaluate",
+  "name": "cyrillic_s_circle_deny",
+  "category": "counterparty_lookalike",
+  "description": "HOME_DOMAIN allowlist = ['circle.com']. Resolved domain = '\\u0441ircle.com' (Cyrillic 'с' U+0441 substituting ASCII 'c'). Non-ASCII bytes trigger strict-ASCII enforcement; value is redacted. Expect CounterpartyDenied.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "args": {
+    "destination": "GASGYUZWEIPQJPT6BX367DXWXPHWSGNVJDYCH4EH5BTT43WQPJXVY3WJ",
+    "amount": "10 XLM",
+    "asset": "native"
+  },
+  "profile_name": "default",
+  "mock_home_domain": "сircle.com",
+  "expected": {
+    "kind": "Deny",
+    "deny_reason": "counterparty_denied",
+    "wire_code": "policy.deny.counterparty_denied"
+  }
+}

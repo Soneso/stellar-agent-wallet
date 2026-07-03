@@ -1,0 +1,32 @@
+[package]
+name = "stellar-agent-claimable"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Claimable-balance domain logic for the Stellar agent wallet — balance-id normalization, predicate evaluation, entry/trustline fetch, and claim preview"
+
+[features]
+# Exposes test-helper constructors for cross-crate tests.
+# Never enable in production binaries.
+test-helpers = []
+
+[dependencies]
+stellar-agent-core       = { workspace = true }
+stellar-agent-network    = { workspace = true }
+stellar-agent-xdr-limits = { workspace = true }
+stellar-xdr              = { workspace = true }
+stellar-strkey           = { workspace = true }
+thiserror                = { workspace = true }
+serde                    = { workspace = true }
+
+[dev-dependencies]
+serde_json                 = { workspace = true }
+stellar-agent-test-support = { workspace = true, features = ["wiremock-helpers", "test-helpers"] }
+wiremock                    = { workspace = true }
+tokio                       = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

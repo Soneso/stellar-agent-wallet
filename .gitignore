@@ -1,0 +1,40 @@
+# Rust build artefacts
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Claude Code local working directory (agent worktrees, session state)
+.claude/
+
+# Editor and OS
+.DS_Store
+**/.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+\#*\#
+
+# Environment
+.env
+.env.local
+*.env
+
+# Misc
+.cache/
+
+# cargo-expand output artifact
+rust_out
+
+# Soroban SDK testutils ledger-state snapshots (generated at test time, not
+# part of the committed source).
+**/test_snapshots/
+
+# rustdoc output redirected to the workspace root via the -o flag
+/doc/
+
+# cargo-llvm-cov coverage export written to the workspace root by the CI
+# coverage gate (and by local coverage runs).
+/cov.json
+/lcov.info

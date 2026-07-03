@@ -1,0 +1,51 @@
+[package]
+name = "stellar-agent-sep7"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "SEP-7 web+stellar URI inbound parsing and anti-phishing signature verification for the Stellar agent wallet."
+
+[lib]
+name = "stellar_agent_sep7"
+
+[dependencies]
+# Typed error derives.
+thiserror = { workspace = true }
+# Stellar strkey encode/decode for G-key validation.
+stellar-strkey = { workspace = true }
+# Stellar XDR decode to validate the `xdr` param is a well-formed envelope.
+stellar-xdr = { workspace = true }
+# XDR decode limits: depth + length bounds for the untrusted `xdr` URI param.
+stellar-agent-xdr-limits = { workspace = true }
+# Base64url + standard base64 for the `xdr` and `signature` params.
+base64 = { workspace = true }
+# Structured logging.
+tracing = { workspace = true }
+# JSON output for the preview.
+serde_json = { workspace = true }
+# SEP-1 stellar.toml fetch for fresh URI_REQUEST_SIGNING_KEY resolution
+# (anti-phishing freshness requirement); reuses the counterparty fetch primitive.
+stellar-agent-network = { workspace = true }
+# Ed25519 signature verification for origin_domain signature checks.
+ed25519-dalek = { workspace = true }
+# URL validation for the callback SSRF surface.
+url = { workspace = true }
+
+[features]
+# Exposes test-helper constructors to integration tests.
+test-helpers = []
+# Gated live testnet acceptance tests against a real anchor.
+testnet-acceptance = []
+
+[dev-dependencies]
+stellar-agent-test-support = { workspace = true, features = ["test-helpers"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# OS CSPRNG for generating ed25519 test keys in the adversarial suite.
+rand_core = { workspace = true }
+
+[[test]]
+name = "sep7_testnet_acceptance"
+required-features = ["testnet-acceptance"]

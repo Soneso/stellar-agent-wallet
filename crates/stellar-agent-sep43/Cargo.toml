@@ -1,0 +1,59 @@
+[package]
+name = "stellar-agent-sep43"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "SEP-43 v1.2.1 Wallet Protocol: five-method ModuleInterface dispatch (signTransaction, signAuthEntry, signMessage, getNetwork, getAddress) for the Stellar agent wallet."
+publish = false
+
+[lib]
+name = "stellar_agent_sep43"
+
+[dependencies]
+# Canonical Stellar XDR encode/decode — TransactionEnvelope + SorobanAuthorizationEntry
+# parsing for signTransaction + signAuthEntry methods.
+stellar-xdr = { workspace = true }
+
+# Canonical Stellar strkey encode/decode — G/C/M-key validation and
+# public-key-to-G-strkey encoding for signer_address fields.
+stellar-strkey = { workspace = true }
+
+# Base64 encode/decode for the signAuthEntry preimage input and the base64
+# signature outputs of signAuthEntry and signMessage.
+base64 = { workspace = true }
+
+# JSON construction for to_sep43_response().
+serde_json = { workspace = true }
+
+# Typed error derives for the Sep43Error enum.
+thiserror = { workspace = true }
+
+# Async trait object support for ModuleAdapter async methods.
+async-trait = { workspace = true }
+
+# SHA-256 for the SEP-53 signMessage digest.
+sha2 = { workspace = true }
+
+# Profile types: network passphrase, mcp_signer_default, chain_id.
+stellar-agent-core = { workspace = true }
+
+# XDR decode limits for untrusted preimage input.
+stellar-agent-xdr-limits = { workspace = true }
+
+# Signer trait: sign_tx_payload + sign_soroban_address_auth_payload.
+stellar-agent-network = { workspace = true }
+
+# SEP-53 message-signing scheme — shared PREFIX and MAX_MESSAGE_BYTES constants
+# so signMessage produces interoperable signatures.
+stellar-agent-sep53 = { workspace = true }
+
+[dev-dependencies]
+stellar-agent-test-support = { workspace = true, features = ["test-helpers"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# Independent ed25519 verification of produced signatures in tests.
+ed25519-dalek = { workspace = true }
+
+[lints]
+workspace = true

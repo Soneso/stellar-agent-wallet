@@ -1,0 +1,29 @@
+[package]
+name = "stellar-agent-derive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "SEP-5 / BIP-44 HD-path ed25519 key derivation for Stellar."
+
+[dependencies]
+hmac = { workspace = true }
+sha2 = { workspace = true }
+ed25519-dalek = { workspace = true }
+bip39 = { workspace = true }
+stellar-strkey = { workspace = true }
+zeroize = { workspace = true }
+secrecy = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Encode/decode hex for the BIP-39 seed and intermediate-key assertions.
+hex = { workspace = true }
+# Re-derive the m/44'/148' intermediate key in the test helper.
+hmac = { workspace = true }
+sha2 = { workspace = true }
+
+[lints]
+workspace = true

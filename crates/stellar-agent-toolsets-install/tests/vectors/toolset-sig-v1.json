@@ -1,0 +1,16 @@
+{
+  "description": "Test vector for stellar-agent-toolset-sig:v1 preimage + ed25519 signature.",
+  "version_note": "Canonical layout source for the publisher preimage.",
+  "domain_tag_hex": "73 74 65 6c 6c 61 72 2d 61 67 65 6e 74 2d 74 6f 6f 6c 73 65 74 2d 73 69 67 3a 76 31",
+  "domain_tag_ascii": "stellar-agent-toolset-sig:v1",
+  "package": "test-toolset",
+  "version": "1.0.0",
+  "shasum": "ba7816bf8f01cfea414140de5dae2ec73b00361bbef0469224bca68a674e5262",
+  "preimage_note": "DOMAIN_TAG || u32_be(len('test-toolset')) || 'test-toolset' || u32_be(len('1.0.0')) || '1.0.0' || u32_be(64) || shasum_hex",
+  "preimage_hex": "73 74 65 6c 6c 61 72 2d 61 67 65 6e 74 2d 74 6f 6f 6c 73 65 74 2d 73 69 67 3a 76 31 00 00 00 0c 74 65 73 74 2d 74 6f 6f 6c 73 65 74 00 00 00 05 31 2e 30 2e 30 00 00 00 40 62 61 37 38 31 36 62 66 38 66 30 31 63 66 65 61 34 31 34 31 34 30 64 65 35 64 61 65 32 65 63 37 33 62 30 30 33 36 31 62 62 65 66 30 34 36 39 32 32 34 62 63 61 36 38 61 36 37 34 65 35 32 36 32",
+  "key_type": "ed25519 ephemeral test key derived from fixed TEST_SEED in tests/signature_vector.rs (NEVER a mainnet key)",
+  "test_seed_note": "TEST_SEED = 0x01..0x20 (32 bytes); see tests/signature_vector.rs",
+  "public_key_hex": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+  "signature_hex": "49386d482ca76418ed69242a761011fc2ea1b1b10071b8f19083ee7455ae27eb4b18458a0ce2b5baa89f312b89012e9008b0381af32ecf543c23eefdf348a107",
+  "test_note": "The public_key_hex and signature_hex are committed constants that lock the signature. Tests in tests/signature_vector.rs assert that test-time signatures EQUAL these constants, locking the preimage layout and ed25519 determinism. The preimage bytes are the authoritative byte-layout source for the publisher preimage."
+}

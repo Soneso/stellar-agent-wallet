@@ -1,0 +1,5 @@
+error: fn carries #[mcp_tool_item(...)] but is missing rmcp's #[tool(...)]; a registry entry must correspond to an actual MCP tool
+  --> tests/compile_fail/orphan_mcp_tool_item.rs:13:8
+   |
+13 |     fn stellar_pay(&self) {}
+   |        ^^^^^^^^^^^

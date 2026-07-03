@@ -1,0 +1,7 @@
+version = 1
+scope = "profile:other-profile"
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "*" }
+criteria = []
+decision = "allow"

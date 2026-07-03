@@ -1,0 +1,23 @@
+{
+  "test_kind": "evaluate",
+  "name": "case_insensitive_match_allow",
+  "category": "counterparty_lookalike",
+  "description": "HOME_DOMAIN allowlist = ['circle.com']. On-chain AccountEntry.home_domain = 'Circle.com' (mixed case). ASCII-lowercase normalisation (RFC 4343, Security-MAJOR-6) converts it to 'circle.com' before comparison. Expect Allow.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "args": {
+    "destination": "GASGYUZWEIPQJPT6BX367DXWXPHWSGNVJDYCH4EH5BTT43WQPJXVY3WJ",
+    "amount": "10 XLM",
+    "asset": "native"
+  },
+  "profile_name": "default",
+  "mock_home_domain": "Circle.com",
+  "expected": {
+    "kind": "Allow"
+  }
+}

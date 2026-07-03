@@ -1,0 +1,60 @@
+[package]
+name = "stellar-agent-anchor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "SEP-24 interactive hand-off and SEP-6 discovery-only anchor client. Calls GET /info only for SEP-6; returns the interactive URL for SEP-24 without opening or following it."
+publish = false
+
+[lib]
+name = "stellar_agent_anchor"
+path = "src/lib.rs"
+
+[[test]]
+name = "anchor_adversarial"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "anchor_http_tests"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "anchor_testnet_acceptance"
+required-features = ["testnet-acceptance"]
+
+[dependencies]
+thiserror         = { workspace = true }
+serde             = { workspace = true }
+serde_json        = { workspace = true }
+tracing           = { workspace = true }
+url               = { workspace = true }
+reqwest           = { workspace = true }
+stellar-agent-network = { workspace = true }
+
+# stellar-agent-sep10 and stellar-agent-sep45 are intentionally absent.
+# The library receives the JWT as a `&str`; it does not depend on Sep10Session
+# or Sep45Session types.  The caller extracts the JWT and passes the raw string
+# to start_sep24_interactive / get_sep6_info, keeping the dep-closure minimal.
+
+[dev-dependencies]
+tokio               = { workspace = true, features = ["rt-multi-thread", "macros"] }
+stellar-agent-sep10 = { workspace = true }
+stellar-agent-network = { workspace = true }
+serde_json          = { workspace = true }
+serde               = { workspace = true }
+reqwest             = { workspace = true }
+url                 = { workspace = true }
+wiremock            = { workspace = true }
+
+[features]
+# Expose test-only helpers (test fixtures, etc.).
+test-helpers = []
+# Gate end-to-end testnet acceptance tests against testanchor.stellar.org.
+# These tests are NOT run under default `cargo test`; invoke with:
+#   cargo test -p stellar-agent-anchor --features testnet-acceptance
+testnet-acceptance = ["test-helpers"]
+
+[lints]
+workspace = true

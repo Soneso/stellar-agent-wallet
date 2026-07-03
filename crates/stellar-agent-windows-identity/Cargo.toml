@@ -1,0 +1,26 @@
+[package]
+name = "stellar-agent-windows-identity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Windows account-SID lookup used to bind approval attestations to the current OS user. Safe wrapper isolating the Win32 FFI from the unsafe-free core crate."
+
+[lib]
+name = "stellar_agent_windows_identity"
+
+[dependencies]
+thiserror = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true

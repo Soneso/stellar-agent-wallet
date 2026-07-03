@@ -1,0 +1,5 @@
+error: fn carries #[tool(...)] but is missing #[mcp_tool_item(...)]; each rmcp tool fn must declare wallet registry metadata
+ --> tests/compile_fail/missing_mcp_tool_item.rs:8:8
+  |
+8 |     fn stellar_pay(&self) {}
+  |        ^^^^^^^^^^^

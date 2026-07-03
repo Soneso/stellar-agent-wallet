@@ -1,0 +1,27 @@
+{
+  "test_kind": "evaluate",
+  "name": "in_window_over_cap_deny",
+  "category": "per_period_rollover",
+  "description": "Window = 1d, max = 5000 XLM (50_000_000_000 stroops). Prior spend in store = 4_900 XLM (49_000_000_000 stroops), within window. New tx = 200 XLM (2_000_000_000 stroops) would push total to 5100 XLM. Expect PerPeriodCapExceeded.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "args": {
+    "amount": "200 XLM",
+    "asset": "native",
+    "destination": "GASGYUZWEIPQJPT6BX367DXWXPHWSGNVJDYCH4EH5BTT43WQPJXVY3WJ"
+  },
+  "profile_name": "default",
+  "state_seed": [
+    { "offset_secs_ago": 3600, "amount_stroops": 49000000000 }
+  ],
+  "expected": {
+    "kind": "Deny",
+    "deny_reason": "per_period_cap_exceeded",
+    "wire_code": "policy.deny.per_period_cap_exceeded"
+  }
+}

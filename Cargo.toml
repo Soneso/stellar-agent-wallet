@@ -1,0 +1,156 @@
+[workspace]
+resolver = "2"
+members = ["crates/stellar-agent-derive", "crates/stellar-agent-toolsets", "crates/stellar-agent-sep10", "crates/stellar-agent-sep45", "crates/stellar-agent-test-support", "crates/stellar-agent-windows-identity", "crates/stellar-agent-core", "crates/stellar-agent-network", "crates/stellar-agent-sep53", "crates/stellar-agent-nonce", "crates/stellar-agent-sep7", "crates/stellar-agent-sep43", "crates/stellar-agent-stablecoin", "crates/stellar-agent-pool", "crates/stellar-agent-xdr-limits", "crates/stellar-agent-sep48", "crates/stellar-agent-defi", "crates/stellar-agent-anchor", "crates/stellar-agent-toolsets-install", "crates/stellar-agent-mcp-macros", "crates/stellar-agent-toolsets-runtime", "crates/stellar-agent-smart-account", "crates/stellar-agent-webauthn-bridge", "crates/stellar-agent-approval-ui", "crates/stellar-agent-blend", "crates/stellar-agent-dex", "crates/stellar-agent-defindex", "crates/stellar-agent-x402", "crates/stellar-agent-x402-identity", "crates/stellar-agent-mcp", "crates/stellar-agent-cli", "crates/stellar-agent-claimable"]
+
+[workspace.package]
+version = "0.1.0-alpha.1"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/Soneso/stellar-agent-wallet"
+authors = ["Soneso"]
+
+# Shared dependency pins live here; each is added when a crate first needs
+# it, so the workspace only carries dependencies it actually uses.
+[workspace.dependencies]
+bip39 = { version = "2.2.2", default-features = false, features = ["std"] }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["zeroize", "rand_core"] }
+hex = { version = "=0.4.3", default-features = false, features = ["std"] }
+hmac = { version = "=0.13.0", default-features = false, features = ["zeroize"] }
+secrecy = { version = "0.10.3", default-features = false }
+sha2 = { version = "0.11.0", features = ["zeroize"] }
+stellar-strkey = { version = "0.0.18", default-features = false }
+serde = { version = "1", default-features = false, features = ["std"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+tempfile = "=3.27.0"
+thiserror = "2.0.18"
+yaml-rust2 = { version = "=0.11.0", default-features = false }
+zeroize = { version = "=1.9.0", default-features = false }
+stellar-xdr = { version = "27.0.0", features = ["base64"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+base64 = { version = "=0.22.1", default-features = false, features = ["std"] }
+rand_core = { version = "=0.6.4", default-features = false, features = ["getrandom"] }
+tokio = { version = "1.52", default-features = false, features = ["macros", "rt-multi-thread"] }
+serial_test = { version = "3.5.0", default-features = false }
+wiremock = "0.6.5"
+tracing = { version = "0.1.44", default-features = false, features = ["std", "attributes", "release_max_level_info"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "env-filter", "fmt", "json", "registry", "ansi"] }
+regex-lite = "0.1.9"
+memchr = "2.8.2"
+keyring-core = { version = "=1.0.0", default-features = false }
+async-trait = "=0.1.89"
+windows-sys = { version = "=0.61.2", default-features = false }
+tracing-log = "0.2.0"
+uuid = { version = "1.23.3", default-features = false, features = ["std", "v4"] }
+figment = { version = "=0.10.19", features = ["toml", "env"] }
+toml = { version = "=1.1.2", default-features = false, features = ["display", "parse", "serde"] }
+url = { version = "=2.5.8", default-features = false, features = ["serde"] }
+directories = "=6.0.0"
+subtle = { version = "=2.6.1", default-features = false }
+inventory = "=0.3.24"
+schemars = { version = "=1.2.1", default-features = false, features = ["std"] }
+toml_edit = { version = "0.25.12", default-features = true }
+blake3 = { version = "1.8.5", default-features = false, features = ["std", "pure"] }
+region = "=3.0.2"
+proptest = "1.11.0"
+stellar-agent-test-support = { path = "crates/stellar-agent-test-support" }
+stellar-agent-windows-identity = { path = "crates/stellar-agent-windows-identity" }
+stellar-agent-core = { path = "crates/stellar-agent-core" }
+stellar-agent-network = { path = "crates/stellar-agent-network" }
+stellar-agent-derive = { path = "crates/stellar-agent-derive" }
+stellar-agent-toolsets = { path = "crates/stellar-agent-toolsets" }
+stellar-agent-toolsets-install = { path = "crates/stellar-agent-toolsets-install" }
+stellar-agent-toolsets-runtime = { path = "crates/stellar-agent-toolsets-runtime" }
+stellar-agent-nonce = { path = "crates/stellar-agent-nonce" }
+stellar-agent-sep10 = { path = "crates/stellar-agent-sep10" }
+stellar-agent-sep53 = { path = "crates/stellar-agent-sep53" }
+stellar-agent-sep43 = { path = "crates/stellar-agent-sep43" }
+stellar-agent-xdr-limits = { path = "crates/stellar-agent-xdr-limits" }
+soroban-spec-tools = { version = "=27.0.0", default-features = false }
+wasmparser = { version = "=0.116.1", default-features = false }
+stellar-rpc-client = "=27.0.0"
+stellar-baselib = "=0.5.8"
+stellar-ledger = { version = "=27.0.0", default-features = false }
+apple-native-keyring-store = { version = "=1.0.0", default-features = false }
+dbus-secret-service-keyring-store = { version = "=1.0.0", default-features = false }
+windows-native-keyring-store = { version = "=1.1.0", default-features = false }
+# Toolset-package extraction.
+flate2 = { version = "=1.1.9", default-features = true }
+tar = { version = "=0.4.46", default-features = false }
+semver = { version = "=1.0.28", default-features = false, features = ["std"] }
+# Proc-macro support (stellar-agent-mcp-macros).
+syn = { version = "=2.0.118", features = ["full"] }
+quote = { version = "=1.0.46" }
+proc-macro2 = { version = "=1.0.106" }
+darling = { version = "=0.23.0" }
+trybuild = { version = "=1.0.117" }
+# stellar-agent-smart-account deps.
+bon = "=3.9.3"
+stellar-accounts = "=0.7.1"
+stellar-governance = "=0.7.1"
+webauthn-rs-core = "=0.5.5"
+p256 = { version = "=0.13.2", features = ["ecdsa"] }
+soroban-sdk = { version = "=25.3.0", default-features = false }
+static_assertions = "=1.1.0"
+stellar-agent-smart-account = { path = "crates/stellar-agent-smart-account" }
+# stellar-agent-webauthn-bridge deps.
+axum = { version = "=0.8.9", default-features = false, features = ["tokio", "http1", "json"] }
+tower = { version = "=0.5.3", default-features = false, features = ["util"] }
+tower-http = { version = "=0.7.0", default-features = false, features = ["limit", "trace"] }
+stellar-agent-webauthn-bridge = { path = "crates/stellar-agent-webauthn-bridge" }
+stellar-agent-approval-ui = { path = "crates/stellar-agent-approval-ui" }
+stellar-agent-blend = { path = "crates/stellar-agent-blend" }
+stellar-agent-defi = { path = "crates/stellar-agent-defi" }
+stellar-agent-dex = { path = "crates/stellar-agent-dex" }
+stellar-agent-defindex = { path = "crates/stellar-agent-defindex" }
+stellar-agent-x402 = { path = "crates/stellar-agent-x402" }
+stellar-agent-x402-identity = { path = "crates/stellar-agent-x402-identity" }
+# chromiumoxide: CDP virtual-authenticator client driving the headless-Chrome
+# WebAuthn ceremony in the smart-account testnet acceptance test (dev-only).
+chromiumoxide = { version = "=0.9.1", default-features = false }
+# futures: StreamExt for chromiumoxide's CDP event handler.
+futures = { version = "=0.3.32", default-features = false, features = ["std"] }
+# MCP stdio server binary (stellar-agent-mcp) deps.
+# rmcp: MCP server framework. The default IntoTransport adapter is not used;
+# the transport is constructed explicitly with a bounded JsonRpcMessageCodec
+# (1 MiB max line) at the transport construction site.
+rmcp = { version = "=1.8.0", default-features = false, features = ["server", "macros", "transport-io", "schemars"] }
+# tokio-util: codec framing for the bounded-line transport (FramedRead / FramedWrite).
+tokio-util = { version = "=0.7.18", default-features = false, features = ["codec"] }
+# libc: raw prctl(2) on Linux for process isolation; #[cfg(target_os = "linux")]
+# only, a zero-dep no-op on macOS/Windows.
+libc = { version = "=0.2.186", default-features = false }
+stellar-agent-stablecoin = { path = "crates/stellar-agent-stablecoin" }
+stellar-agent-sep48 = { path = "crates/stellar-agent-sep48" }
+stellar-agent-sep7 = { path = "crates/stellar-agent-sep7" }
+stellar-agent-anchor = { path = "crates/stellar-agent-anchor" }
+stellar-agent-mcp-macros = { path = "crates/stellar-agent-mcp-macros" }
+stellar-agent-mcp = { path = "crates/stellar-agent-mcp" }
+# CLI binary (stellar-agent) deps.
+clap = { version = "=4.6.1", default-features = false, features = ["std", "derive", "help", "usage"] }
+# webbrowser: launches the system browser for the passkey-registration handoff.
+webbrowser = { version = "=1.2.1", default-features = false }
+stellar-agent-pool = { path = "crates/stellar-agent-pool" }
+stellar-agent-cli = { path = "crates/stellar-agent-cli" }
+stellar-agent-claimable = { path = "crates/stellar-agent-claimable" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "deny"
+
+[workspace.lints.clippy]
+# Core lint groups.
+all = { level = "deny", priority = -1 }
+
+# Selected pedantic lints.
+missing_errors_doc = "deny"
+missing_panics_doc = "deny"
+needless_pass_by_value = "deny"
+
+# Restriction lints enabled individually; the rest of the restriction group
+# stays off.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+dbg_macro = "deny"

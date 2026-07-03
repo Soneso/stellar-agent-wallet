@@ -1,0 +1,27 @@
+{
+  "test_kind": "evaluate",
+  "name": "per_period_fails_first",
+  "category": "combinator_and_or",
+  "description": "Rule has per_period_cap listed first (5000 XLM/day), then per_tx_cap (1000 XLM). Prior spend of 4900 XLM in window. tx = 200 XLM: within per_tx_cap but would push period total to 5100 XLM. per_period is listed first so it fires first. Expect PerPeriodCapExceeded.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "args": {
+    "amount": "200 XLM",
+    "asset": "native",
+    "destination": "GASGYUZWEIPQJPT6BX367DXWXPHWSGNVJDYCH4EH5BTT43WQPJXVY3WJ"
+  },
+  "profile_name": "default",
+  "state_seed": [
+    { "offset_secs_ago": 3600, "amount_stroops": 49000000000 }
+  ],
+  "expected": {
+    "kind": "Deny",
+    "deny_reason": "per_period_cap_exceeded",
+    "wire_code": "policy.deny.per_period_cap_exceeded"
+  }
+}

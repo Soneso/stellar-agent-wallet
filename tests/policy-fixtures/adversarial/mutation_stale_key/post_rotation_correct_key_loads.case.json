@@ -1,0 +1,8 @@
+{
+  "test_kind": "load_failure",
+  "name": "post_rotation_correct_key_loads",
+  "category": "mutation_stale_key",
+  "description": "Policy signed after owner-key rotation; load_signed_policy is called with the rotated public key. Signature is valid and must load.",
+  "load_signing_strategy": "post_rotation_correct_key",
+  "expected_load_ok": true
+}

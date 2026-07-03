@@ -1,0 +1,41 @@
+[package]
+name = "stellar-agent-sep48"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "SEP-48 contract-interface typed-preview + SEP-47 Contract Interface Discovery for the Stellar agent wallet"
+
+[features]
+# Exposes test-only constructors used by cross-crate tests. Never enable in
+# production binaries.
+test-helpers = []
+# Gated testnet acceptance tests. Implies test-helpers.
+testnet-acceptance = ["test-helpers"]
+
+[dependencies]
+soroban-spec-tools    = { workspace = true }
+stellar-xdr           = { workspace = true }
+stellar-strkey        = { workspace = true }
+wasmparser            = { workspace = true }
+serde                 = { workspace = true }
+serde_json            = { workspace = true }
+thiserror             = { workspace = true }
+stellar-agent-network = { workspace = true }
+stellar-agent-xdr-limits = { workspace = true }
+tracing               = { workspace = true }
+
+[dev-dependencies]
+stellar-agent-test-support = { workspace = true, features = ["wiremock-helpers"] }
+tokio              = { workspace = true, features = ["rt-multi-thread", "macros"] }
+serial_test        = { workspace = true }
+soroban-spec-tools = { workspace = true }
+stellar-xdr        = { workspace = true }
+serde_json         = { workspace = true }
+wiremock           = { workspace = true }
+sha2               = { workspace = true }
+
+[lints]
+workspace = true

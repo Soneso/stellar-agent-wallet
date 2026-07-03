@@ -1,0 +1,24 @@
+{
+  "test_kind": "evaluate",
+  "name": "null_g_account_deny",
+  "category": "null_source_account",
+  "description": "G_ACCOUNT allowlist contains one legitimate address. Destination = null G-account GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF (all-zeros public key). It is a valid G-strkey but not on the allowlist. Expect CounterpartyDenied.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "args": {
+    "destination": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    "amount": "10 XLM",
+    "asset": "native"
+  },
+  "profile_name": "default",
+  "expected": {
+    "kind": "Deny",
+    "deny_reason": "counterparty_denied",
+    "wire_code": "policy.deny.counterparty_denied"
+  }
+}

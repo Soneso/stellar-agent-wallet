@@ -1,0 +1,576 @@
+# CLI reference
+
+`stellar-agent` is a self-custodial Stellar wallet for AI agents. It builds, signs, and submits transactions on testnet under a policy engine, an operator-approval spine, and a tamper-evident hash-chained audit log. This file documents the full command surface for an agent driving the CLI. For the MCP tool surface, see `./mcp-tools.md` (ships alongside this file).
+
+## Invocation and global model
+
+The binary is `stellar-agent` on `PATH`. When `stellar` is installed it is also reachable as a plugin: `stellar agent <command> ...`. Examples below use the direct form.
+
+There are no flags on the top-level command. Network, profile, RPC URLs, and signer source are declared per subcommand. Run `stellar-agent --help` for the live subcommand list and `stellar-agent <command> --help` for a group's flags.
+
+### Output envelope and exit codes
+
+Every command prints one JSON object on stdout. Exit code `0` means success; exit code `1` means any error. The standard envelope is:
+
+```json
+{"ok": true, "data": { ... }, "request_id": "..."}
+{"ok": false, "error": {"code": "...", "message": "..."}, "request_id": "..."}
+```
+
+Exceptions: the `credentials` and `toolsets` groups print a flat object using a `status` field (for example `{"status":"ok", ...}` or `{"status":"error","error":"..."}`) rather than the `{ok, data|error, request_id}` shape.
+
+### Value formats
+
+- Amounts are decimal strings with an explicit unit, e.g. `"10 XLM"`, `"10.5 USDC"`, `"5 XLM"`. Bare numbers and raw stroop strings are rejected on user-facing amount flags. (The DeFi venue flags `lend`/`vault`/`trade` are the exception: they take raw integer base-unit amounts — `i128` / `--amount`, `--shares`, etc. — with no unit.)
+- Assets are `native`, `XLM`, or `CODE:ISSUER_GSTRKEY` (e.g. `USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN`). Contract addresses are C-strkeys; classic accounts are G-strkeys; secret keys are S-strkeys.
+- `--fee <STROOPS|auto[:pNN]>`: an integer sets explicit stroops; `auto` selects the p95 percentile from `getFeeStats`; `auto:pNN` selects an explicit percentile (`p50`, `p75`, `p95`, `p99`). Absent uses the profile default (100 stroops). Soroban resource fees are added by simulation. (`wallet multicall` accepts only an integer `--fee`; `auto` is rejected there.)
+
+### Shared flags
+
+These recur with the same meaning across groups:
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--profile <NAME>` | Selects the per-environment TOML profile (binds CAIP-2 chain, RPC, keyring entry references, thresholds, policy engine). Holds no secrets. | resolves `--profile` → `STELLAR_AGENT_PROFILE` → `"default"` |
+| `--network <NETWORK>` | `testnet` (default) or `mainnet`, case-insensitive | `testnet` |
+| `--rpc-url <URL>` | Primary Soroban RPC endpoint (allow-list validated) | `https://soroban-testnet.stellar.org` |
+| `--secondary-rpc-url <URL>` | Second RPC for two-RPC cross-checks (WASM-hash divergence) | per command |
+| `--timeout-seconds <SECONDS>` | Bounds submission and simulation | `60` |
+| `--output <FORMAT>` | `json` (default) or `table`; not accepted on every command | `json` |
+
+### Signer source
+
+Signing commands take a mutually exclusive signer-source group (exactly one):
+
+- The secret-env flag — the **name of an environment variable** holding the source-account S-strkey. Set the variable to your secret; pass the variable name, never the secret. Spelled `--secret-env` on `pay` / `accounts create`, `--deployer-secret-env` on `accounts deploy-c` / `wallet sa deploy-webauthn-verifier`, `--signer-secret-env` on the `wallet` commands.
+- `--sign-with-ledger` — sign with a connected Ledger hardware device.
+- `--account-index <INDEX>` — BIP-44 account index for the Ledger derivation path. Default `0`.
+
+```bash
+export WALLET_SK="S..."   # source-account secret key
+stellar-agent pay GDEST...WXYZ "10 XLM" --source GSRC...WXYZ --secret-env WALLET_SK
+```
+
+### Mainnet-write refusal
+
+This is a testnet-first alpha. `mainnet` is accepted for read-only commands but every write or signing command structurally refuses `mainnet` before any RPC call and before any signing key is touched. The refusal surfaces as `network.mainnet_write_forbidden` (the `friendbot` command and `accounts create --fund-with-friendbot` use `network.friendbot_mainnet_forbidden`). Exception: `wallet sa migrate-verifier` permits a mainnet submit when `--confirm-mainnet-migrate` is supplied.
+
+---
+
+## accounts
+
+Account-management group. Subcommands: `create`, `deploy-c`.
+
+### `accounts create [NEW_G_STRKEY] [flags]`
+
+Creates a new account in one of two mutually exclusive modes: sponsored `CreateAccount`, or Friendbot funding. Sponsored mode signs with the sponsor key; Friendbot mode signs nothing. Only `testnet` is accepted.
+
+Argument groups (parser-enforced): mode (exactly one) `--sponsor` xor `--fund-with-friendbot`; account (exactly one) positional `<NEW_G_STRKEY>` xor `--generate`; signer (sponsored) `--secret-env` xor `--sign-with-ledger`.
+
+| Flag / arg | Meaning | Default |
+|---|---|---|
+| `<NEW_G_STRKEY>` (positional) | G-strkey of the account to create | — |
+| `--generate` | Mint a fresh ed25519 keypair in-process; returns G- and S-strkey in JSON (`data.secret_key`, never in `table`, never logged) | `false` |
+| `--sponsor <G_STRKEY>` | Sponsor/source for `CreateAccount` | — |
+| `--starting-balance <AMOUNT>` | Starting balance with units, e.g. `"5 XLM"` (sponsored mode) | — |
+| `--secret-env <VAR>` | Env-var name holding sponsor S-strkey | — |
+| `--sign-with-ledger` / `--account-index <INDEX>` | Ledger signer / BIP index | `false` / `0` |
+| `--fund-with-friendbot` | Fund via Friendbot (testnet only) | `false` |
+| `--friendbot-url <URL>` | Friendbot endpoint (Friendbot mode) | `https://friendbot.stellar.org` |
+| `--network` / `--fee` / `--timeout-seconds` / `--rpc-url` / `--output` | shared (sponsored mode) | as above |
+
+The sponsor public key must match the public key derived from the signer.
+
+```bash
+export SPONSOR_SK="S..."
+stellar-agent accounts create --generate --sponsor GABC...WXYZ \
+  --secret-env SPONSOR_SK --starting-balance "5 XLM"
+```
+
+### `accounts deploy-c [flags]`
+
+Deploys a new OpenZeppelin smart-account (C-account) contract via `CreateContractV2`; the initial signer is installed through the contract `__constructor`. Signs source-account credentials with the deployer key (except `--dry-run`, which derives the C-strkey deterministically with no signing or RPC). Only `testnet` accepted.
+
+Argument groups: deployer (exactly one) `--deployer-secret-env` xor `--sign-with-ledger`; salt (at most one) `--salt-hex` xor `--salt-random` (random when neither given).
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--initial-signer <G_STRKEY>` (required) | Initial signer installed via `__constructor` | — |
+| `--deployer-secret-env <VAR>` | Env-var name holding deployer S-strkey | — |
+| `--sign-with-ledger` / `--account-index <INDEX>` | Ledger deployer / BIP-44 index | `false` / `0` |
+| `--salt-hex <HEX64>` | 32-byte salt as 64-char lowercase hex (re-deploy a known C-strkey) | — |
+| `--salt-random` | Fresh random 32-byte salt | random default |
+| `--profile <NAME>` | Profile whose audit writer receives deploy entries | none |
+| `--network` / `--rpc-url` / `--fee` / `--timeout-seconds` / `--output` | shared | as above |
+| `--dry-run` | Derive C-strkey only; no signing, no RPC | `false` |
+
+```bash
+export DEPLOYER_SK="S..."
+stellar-agent accounts deploy-c --initial-signer GABC...WXYZ \
+  --deployer-secret-env DEPLOYER_SK --salt-random
+```
+
+---
+
+## pay
+
+`pay <DESTINATION> <AMOUNT> [ASSET] [flags]` — sends a classic payment, enforcing SEP-29 memo-required before signing. By default builds, signs, and submits atomically. Only `testnet` accepted. `--use-oz-relayer` is not implemented and declines.
+
+Staged pipeline (mutually exclusive): `--build-only` emits unsigned envelope XDR and exits; `--sign-only <XDR>` signs a prebuilt envelope and emits signed XDR; `--submit-only <XDR>` submits a pre-signed envelope.
+
+| Flag / arg | Meaning | Default |
+|---|---|---|
+| `<DESTINATION>` (positional) | Destination G-strkey | — |
+| `<AMOUNT>` (positional) | Amount with units, e.g. `"10 XLM"` | — |
+| `[ASSET]` (positional) | `native`, `XLM`, or `CODE:ISSUER` | `native` |
+| `--source <G_STRKEY>` | Source account; required for signing | — |
+| `--memo-text <STRING>` | Memo text (UTF-8, up to 28 bytes) | — |
+| `--memo-id <U64>` | Memo ID (u64 decimal) | — |
+| `--memo-hash <64_HEX>` / `--memo-return <64_HEX>` | Memo hash / return hash (32 bytes) | — |
+| `--secret-env <VAR>` | Env-var name holding source S-strkey | — |
+| `--sign-with-ledger` / `--account-index <INDEX>` | Ledger signer / BIP index | `false` / `0` |
+| `--build-only` / `--sign-only <XDR>` / `--submit-only <XDR>` | Stage selection (at most one) | — |
+| `--fee` / `--network` / `--timeout-seconds` / `--rpc-url` / `--output` | shared | as above |
+
+Memo flags are a mutually exclusive group (at most one). 
+
+```bash
+export WALLET_SK="S..."
+stellar-agent pay GDEST...WXYZ "10 XLM" --source GSRC...WXYZ \
+  --secret-env WALLET_SK --memo-text "invoice-42"
+```
+
+---
+
+## balances
+
+`balances [flags]` — reads native XLM balance and trustlines via RPC `getLedgerEntries`. Read-only; no mainnet gate. `--account` is required in practice (omitting it exits `1`).
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--account <G_STRKEY>` (required) | Account to query | — |
+| `--asset <CODE:ISSUER>` | Trustline asset; repeatable (untrusted assets omitted) | none |
+| `--rpc-url` / `--output` | shared | as above |
+
+```bash
+stellar-agent balances --account GABC...WXYZ \
+  --asset USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN
+```
+
+---
+
+## trustline
+
+`trustline [flags]` — creates or removes a classic trustline (`ChangeTrust`) behind an ordered trust gate (operator policy, denomination resolution with USDT hard-refusal plus a known-lookalike denylist and pinned-issuer checks, live issuer-flag fetch that fail-closes, clawback gate, typed preview). Builds, signs, submits, waits atomically — no staged pipeline. Network derives from the profile; there is no `--network` flag. USDT cannot be trusted.
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--from <G_STRKEY>` (required) | Account that will hold the trustline | — |
+| `--asset <ASSET>` (required) | `USDC` (bare, pin table), `CODE:ISSUER`, or a `C...` SAC address (deferred, typed error) | — |
+| `--limit-stroops <I64>` | Explicit limit; `0` removes the trustline | unlimited (`i64::MAX`) |
+| `--profile <NAME>` | Profile to load | `default` |
+| `--chain-id <CAIP2>` | CAIP-2 chain id, e.g. `stellar:testnet` | profile value |
+| `--fee` | shared | profile `classic_fee_per_op_stroops` |
+
+```bash
+stellar-agent trustline --from GABC...WXYZ --asset USDC --profile default
+```
+
+---
+
+## friendbot
+
+`friendbot [flags]` — funds a testnet or futurenet account via the Friendbot HTTP endpoint. No local signing. `--network` accepts `testnet`/`futurenet`/`mainnet` at the parser but `mainnet` is refused at dispatch (`network.friendbot_mainnet_forbidden`). The endpoint is allow-list validated (`friendbot.stellar.org`, `friendbot-futurenet.stellar.org`) unless `--friendbot-url-unchecked`.
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--account <G_STRKEY>` (required) | Account to fund | — |
+| `--network <NETWORK>` | `testnet`/`futurenet`/`mainnet` (mainnet refused) | `testnet` |
+| `--friendbot-url <URL>` | Endpoint override; otherwise resolves to the SDF testnet URL regardless of `--network`, so `futurenet` needs an explicit override | `https://friendbot.stellar.org` |
+| `--friendbot-url-unchecked` | Bypass URL allow-list (dev/test escape hatch) | `false` |
+| `--output` | shared | `json` |
+
+```bash
+stellar-agent friendbot --account GABC...WXYZ --network testnet
+```
+
+---
+
+## fees
+
+Fee-statistics group. Subcommand: `stats`.
+
+### `fees stats [flags]`
+
+Fetches RPC fee statistics for classic fee selection. Read-only; no mainnet gate. RPC resolves `--rpc-url` → profile `rpc_url` → testnet default.
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--profile <NAME>` | Profile whose RPC URL to use | none |
+| `--rpc-url <URL>` | Allow-listed RPC override | `https://soroban-testnet.stellar.org` |
+| `--output` | shared | `json` |
+
+```bash
+stellar-agent fees stats --output table
+```
+
+---
+
+## counterparty
+
+Manages the per-profile cache of `stellar.toml` bindings backing the counterparty allowlist policy. None of these sign a transaction; entries are HMAC-protected and skipped on read if verification fails. Subcommands: `list`, `refresh`, `evict`, `warm-up`, `rotate-hmac-key`.
+
+| Subcommand | Form | Notes |
+|---|---|---|
+| `list` | `counterparty list [--profile NAME] [--json]` | Lists cached bindings (home domain, fetched/expiry timestamps). `--json` is a no-op; JSON is the only shape. Read-only. |
+| `refresh` | `counterparty refresh <HOME_DOMAIN> [--profile NAME]` | Force-fetches `https://<domain>/.well-known/stellar.toml`, HMAC-protects, writes atomically. Domain must be strict ASCII, 1–32 chars (IDN/homoglyph rejected). |
+| `evict` | `counterparty evict <HOME_DOMAIN> [--profile NAME]` | Deletes one cached binding; exits `0` even if already absent. |
+| `warm-up` | `counterparty warm-up [--profile NAME]` | Refreshes every domain in the profile's policy allowlist; exits `1` if any fails. |
+| `rotate-hmac-key` | `counterparty rotate-hmac-key [--profile NAME]` | Rotates the per-profile cache HMAC key; existing files then fail verification and need refresh. |
+
+`--profile` defaults to `default` for this group.
+
+```bash
+stellar-agent counterparty refresh circle.com --profile default
+```
+
+---
+
+## wallet
+
+Smart-account governance over an on-chain OpenZeppelin smart-account: context rules, signer sets and thresholds, policy contracts, supporting infrastructure (verifier registry, multicall router registry, upgrade timelock), and multicall submission. All write verbs sign through the smart-account auth-entry digest path. Most on-chain signing verbs structurally refuse `mainnet`.
+
+Signer source for write verbs: exactly one of `--signer-secret-env <VAR>` or `--sign-with-ledger`, plus `--account-index <INDEX>` (default `0`).
+
+### `wallet rules` — context-rule lifecycle
+
+Each rule has a `rule_id` (u32), a name (OZ cap 20 bytes), an optional expiry ledger, a signer set (OZ cap 15), and up to 5 policy contracts. `--auth-rule-id <U32>` names the authorizing rule (repeatable on create/add-policy/remove-policy; default `[0]`, the bootstrap rule); where optional it defaults to `--rule-id`.
+
+| Verb | Purpose | Key flags (plus `--account <C_STRKEY>` required everywhere, signer source on write verbs) |
+|---|---|---|
+| `create` | Install a new rule (`add_context_rule`); returns minted `rule_id` | `--name <STRING>` (required); `--signer-delegated <G_STRKEY>` (repeatable); `--signer-webauthn <CRED_NAME>` (repeatable); `--accept-no-delegated-fallback`; `--accept-mutable-verifier`; `--accept-unknown-verifier`; `--auth-rule-id <U32>`; `--valid-until <LEDGER\|none>` (default `none`). At least one signer required. |
+| `get` | Read one rule (`get_context_rule`); read-only, `mainnet` ok | `--rule-id <U32>` (required); `--source-account <G_STRKEY>` (required, simulation only, not debited/signed) |
+| `set-name` | Rename a rule (`update_context_rule_name`) | `--rule-id <U32>`; `--name <STRING>`; `--auth-rule-id` (optional) |
+| `set-valid-until` | Change expiry (`update_context_rule_valid_until`) | `--rule-id <U32>`; `--valid-until <LEDGER\|none>` (required) |
+| `delete` | Remove a rule (`remove_context_rule`) | `--rule-id <U32>`; `--auth-rule-id` (optional) |
+| `verify-pins` | Verify pinned verifier/policy WASM hashes vs on-chain (drift); read-only, `mainnet` ok; exit `1` on `drift` | `--rule-id <U32>`. Each `*_pin_status` is `match`/`drift`/`unavailable`/`no_pin`/`no_contracts`. |
+| `add-policy` | Add a policy (`add_policy`); cap 5; returns `policy_id` | `--rule-id <U32>`; `--policy-address <C_STRKEY>`; `--install-param <SCVAL_BASE64>` (standard base64 XDR `ScVal`, raw passthrough); `--auth-rule-id` |
+| `remove-policy` | Remove a policy by id (`remove_policy`) | `--rule-id <U32>`; `--policy-id <U32>`; `--auth-rule-id` |
+| `list` | Enumerate active rules by on-chain scan; read-only, `mainnet` ok; alias of `wallet sa list-rules` | see `wallet sa list-rules` |
+
+```bash
+stellar-agent wallet rules create --account CABC...WXYZ --name agent-ops \
+  --signer-delegated GABC...WXYZ --signer-secret-env WALLET_SK
+```
+
+### `wallet signers` — signer-set lifecycle
+
+All verbs take `--account <C_STRKEY>` and `--rule-id <U32>` (both required), the signer source, and shared network flags. None accept `--output`. All refuse `mainnet`, including `list`/`refresh` (which require a signer source to assemble the read envelope and write audit rows).
+
+| Verb | Purpose | Extra flags |
+|---|---|---|
+| `list` | Read on-chain signer set; baselines `SaSignerSetBaselined` if no prior baseline. Reports `signer_count`, `threshold`, `signer_ids`, `signer_kinds` | — |
+| `refresh` | Unconditionally re-anchor the signer-set baseline | — |
+| `add` | Add one signer (`add_signer`); cap 15; returns `new_signer_id` | exactly one of `--signer-delegated <G_STRKEY>` (alias `--new-signer`) / `--signer-external <C_STRKEY>` (requires `--signer-key-data <HEX>`) / `--signer-webauthn <CRED_NAME>` |
+| `remove` | Remove a signer (`remove_signer`); refuses if it would drop count below threshold | `--signer-id <U32>` (required) |
+| `set-threshold` | Change threshold via threshold-policy `set_threshold` | `--new-threshold <U32>` (required); no `--auth-rule-id` override |
+
+```bash
+stellar-agent wallet signers set-threshold --account CABC...WXYZ \
+  --rule-id 0 --new-threshold 2 --signer-secret-env WALLET_SK
+```
+
+### `wallet multicall`
+
+Submits an atomic multicall bundle (1–50 invocations) through the registered router. Signs and submits. Router resolved from the local registry (`~/.config/stellar-agent/networks.toml`); `mainnet` requires a mainnet-registered router. Requires a signer source and `--secondary-rpc-url` (flag or `profile.secondary_rpc_url`, else a typed error).
+
+| Flag | Meaning |
+|---|---|
+| `--smart-account <C_STRKEY>` (required) | Smart-account executing the bundle |
+| `--rule-id <U32>` (required) | Authorizing context rule |
+| `--invocation <TARGET:FN:JSON_ARGS>` (required, repeatable, 1–50) | `<target C-strkey>:<fn>:<json array of XDR-encoded args>` |
+| `--secondary-rpc-url <URL>` | Cross-verification RPC (required) |
+| `--fee <STROOPS>` | Integer only; `auto` rejected | 
+
+```bash
+stellar-agent wallet multicall --smart-account CABC...WXYZ --rule-id 0 \
+  --invocation 'CTOK...WXYZ:transfer:["GABC...WXYZ","GWXY...WXYZ","1000000"]' \
+  --secondary-rpc-url https://rpc2.example --signer-secret-env WALLET_SK
+```
+
+### `wallet sa` — smart-account infrastructure
+
+| Verb | Purpose | Key flags |
+|---|---|---|
+| `deploy-webauthn-verifier` | Deploy OZ WebAuthn-verifier WASM, record in registry; idempotent (`status:"already_deployed"`); testnet only | `--deployer-secret-env <VAR>` xor `--sign-with-ledger`; `--account-index`; `--network`; `--rpc-url`; `--fee`; `--timeout-seconds`; `--output`; `--dry-run` (`status:"dry_run"`) |
+| `migrate-verifier` | Move all `External` signers from one verifier to another across rules; dry-run renders plan; mainnet submit needs `--confirm-mainnet-migrate` | `--account <C_STRKEY>`; `--from <HASH_HEX>` (64-char SHA-256 of source WASM); `--to <C_STRKEY>`; `--dry-run`; `--confirm-mainnet-migrate`; signer source (submit) |
+| `list-verifiers` | Enumerate compile-time verifier allowlist + audit-status taxonomy; read-only, no network | `--output` |
+| `list-rules` | Enumerate active rules by scanning `[0, max_scan_id)`; read-only, `mainnet` ok; backs `wallet rules list` | `--account <C_STRKEY>`; `--source-account <G_STRKEY>` (sim source); `--rpc-url`; `--secondary-rpc-url`; `--network`; `--profile`; `--max-scan-id <1..=10000>` (else profile, else 50); `--timeout-seconds`; `--output` (table deferred) |
+| `register-multicall` | Register router address + WASM hash in local registry; idempotent; refuses if `--wasm-sha256` ≠ compiled-in hash | `--network`; `--address <C_STRKEY>`; `--wasm-sha256 <HEX>` (64-char lowercase); `--profile` |
+| `unregister-multicall` | Remove router registry entry | `--network`; `--force` (corruption recovery, needs TTY `[y/N]` or `--yes-i-have-verified-the-prior-values`); `--profile` |
+
+```bash
+stellar-agent wallet sa deploy-webauthn-verifier --deployer-secret-env DEPLOYER_SK
+```
+
+### `wallet sa timelock` — OpenZeppelin upgrade timelock
+
+Schedule, cancel, execute, and list pending operations. All share `--timelock <C_STRKEY>` (required), `--rpc-url`, `--secondary-rpc-url` (defaults to `--rpc-url`), `--network`, `--profile`; write verbs add the signer source. Write verbs refuse `mainnet`; `list-pending` is read-only and accepts `mainnet`.
+
+| Verb | Purpose | Extra flags |
+|---|---|---|
+| `schedule` | Schedule (PROPOSER role); returns `salt` (64-char hex) and `operation_id_full_hex` — record `salt`, required by `execute`/`cancel`, not recomputable | `--target <C_STRKEY>`; `--function <NAME>`; `--delay-ledgers <N>` |
+| `cancel` | Cancel pending op (CANCELLER role); cross-confirms event | `--operation-id <HEX>` (64-char from schedule) |
+| `execute` | Execute a ready op (EXECUTOR role / open mode); dual-RPC ready-check fails closed | `--target <C_STRKEY>`; `--function <NAME>`; `--operation-id <HEX>`; `--salt <HEX>` (must match schedule) |
+| `list-pending` | List pending ops via audit log + dual-RPC `get_operation_state`; read-only | (shared only) |
+
+```bash
+stellar-agent wallet sa timelock schedule --timelock CTLCK...WXYZ \
+  --target CTGT...WXYZ --function upgrade --delay-ledgers 100 \
+  --signer-secret-env PROPOSER_SK
+# Save the "salt" field from the JSON output.
+```
+
+---
+
+## DeFi: lend, vault, trade
+
+`lend`, `vault deposit`, `vault withdraw`, and `trade` are signing commands. Before signing each loads the profile, pins the target contract by WASM hash (two-RPC cross-check when `--secondary-rpc-url` is set), evaluates the operator policy engine, then signs and submits. A `Deny` decision refuses `policy.deny.<code>`; a `RequireApproval` decision refuses `policy.approval_required` (use the MCP server for two-phase approval — the CLI has no interactive approval path for these verbs); an unbuildable engine refuses `policy.engine_unavailable` (fail-closed). These commands do not accept `--output`; they always emit JSON. No command-level mainnet refusal — constrained by per-network contract pins. DeFi amounts are raw integer base units (no decimal/unit string).
+
+### `lend` (Blend)
+
+Supply/borrow/repay/withdraw against a Blend pool. Trust gate: verify pool WASM hash, require oracle in Reflector allowlist (else `blend.oracle_not_allowlisted`), check oracle staleness (else `oracle.staleness_exceeded`). Liquidation is not exposed.
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--profile <NAME>` | Profile | `default` |
+| `--pool <C-strkey>` (required) | Blend pool address | — |
+| `--from <C-strkey>` (required) | Wallet smart-account submitting | — |
+| `--op <OP>` (required) | `supply`, `withdraw`, `supply-collateral`, `withdraw-collateral`, `borrow`, `repay` | — |
+| `--asset <C-strkey>` (required) | Asset contract address | — |
+| `--amount <i128>` (required) | Amount in base unit (integer) | — |
+| `--override-oracle-staleness` | Bypass staleness block | `false` |
+| `--max-staleness-secs <SECS>` | Max accepted staleness; `0` forces a block | `600` |
+| `--secondary-rpc-url <URL>` | Two-RPC WASM-hash cross-check | none |
+
+```bash
+stellar-agent lend --pool CABC...WXYZ --from CABC...WXYZ \
+  --op supply --asset CABC...WXYZ --amount 500000000 --profile default
+```
+
+### `vault deposit` / `vault withdraw` (DeFindex)
+
+Deposit/withdraw via a DeFindex vault. Five-step trust gate (verify WASM hash; read upgradable flag; read role addresses and management mode; read on-chain assets and validate amount-vector length against pinned asset count, else `vault.asset_count_mismatch`; evaluate upgradable in light of mode). An `upgradable:true` vault is refused (`vault.upgradable_refused`) unless `--override-upgradable` (emits `vault.upgradable_override`). The min-amount vectors are required — omitting is a structural pre-sign refusal; `0` per asset means no slippage protection on that asset (opt-in).
+
+`deposit` flags: `--vault <C-strkey>` (required), `--from <C-strkey>` (required), `--amounts-desired <i128>...` (required, per asset in order), `--amounts-min <i128>...` (required, same length), `--invest` (auto-invest after deposit), `--override-upgradable`, `--secondary-rpc-url`, `--profile`.
+
+`withdraw` flags: `--vault <C-strkey>` (required), `--from <C-strkey>` (required), `--shares <i128>` (required, shares to redeem), `--min-amounts-out <i128>...` (required), `--override-upgradable`, `--secondary-rpc-url`, `--profile`.
+
+```bash
+stellar-agent vault deposit --vault CABC...WXYZ --from CABC...WXYZ \
+  --amounts-desired 1000000000 --amounts-min 900000000 --profile default
+```
+
+### `trade` (Soroswap)
+
+Swap tokens via the Soroswap router (`swap_exact_tokens_for_tokens`). Router resolved per-network; an unpinned network refuses `dex.unrecognised_network`. Trust gate: venue allowlist, two-RPC router WASM-hash pin, on-chain `router_get_amounts_out` slippage re-check before signing. There is no separate `quote` subcommand — price discovery happens inside `trade` at signing time. `--amount-out-min` is an absolute output floor in base units, not a percentage.
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--profile <NAME>` | Profile | `default` |
+| `--from <C-strkey>` (required) | Wallet smart-account | — |
+| `--amount-in <i128>` (required) | Exact input amount in base units | — |
+| `--amount-out-min <i128>` (required) | Absolute minimum output floor | — |
+| `--path <ASSET>` (required, repeatable) | One path element; first = input, last = output (≥2 total). Each is a C-strkey, `native`, or `CODE:ISSUER` | — |
+| `--deadline <UNIX_SECS>` | Swap deadline | `now + 300s` |
+| `--secondary-rpc-url <URL>` | Two-RPC router WASM-hash cross-check | none |
+
+```bash
+stellar-agent trade --from CABC...WXYZ --amount-in 10000000 \
+  --amount-out-min 9800000 --path CABC...WXYZ --path CDEF...WXYZ --profile default
+```
+
+---
+
+## pool
+
+The channel pool is a set of channel accounts derived from a single pool master seed at `m/44'/148'/<index>'`, used to submit transactions concurrently (not a DeFi venue). The master seed lives only in the OS keyring; channel private keys are re-derived on demand. Subcommands: `init`, `list`, `status`. All accept `--profile` (default `default`) and `--output` (`json` default or `table`).
+
+| Verb | Purpose | Extra flags |
+|---|---|---|
+| `init` | Fund `N` channels via one CAP-33 sponsored-reserve sandwich; signing. Master seed written to keyring only after confirmation. Refuses if a master exists (message `pool.already_initialised:`, fail-closed on ambiguous probe) unless `--force` (which orphans prior channels). | `--size <N>` (required, `1..=19`); `--force` |
+| `list` | List channels (BIP-44 index, public G-strkey, live sequence). Read-only; requires an initialised pool (else `internal.unexpected_state` with `pool.not_initialised:`). | — |
+| `status` | Report `initialised`, `pool_size`, `free`, `in_flight`. Read-only, no network (reads persisted `PoolConfig`). `in_flight:0` is not "safe to flood" — it reflects a stateless process. | — |
+
+Pool refusals surface as `error.code` `internal.unexpected_state` with the specific reason (e.g. `pool.size_out_of_range:`, `pool.already_initialised:`) in `error.message`.
+
+```bash
+stellar-agent pool init --size 5 --profile default
+```
+
+---
+
+## profile
+
+Lists, shows, and migrates profiles, and rotates the keyring-backed keys a profile names. A profile is a per-environment TOML config (schema version 2) holding no secrets. The subcommands that take a profile name take it as a positional `<NAME>`, not a `--profile` flag, and have no confirmation flag. All operate on local state — no network, no mainnet gate. Uses the `{ok, data, request_id}` envelope.
+
+| Verb | Form | Notes |
+|---|---|---|
+| `list` | `profile list` | Read-only. Returns known profile names sorted as a JSON array. No flags. |
+| `show <NAME>` | `profile show default` | Read-only. Resolved config; keyring refs appear as opaque `{service, account}`, secrets never read. Exits `1` with `ProfileNotFound` or an unsupported-version error. |
+| `migrate <NAME>` | `profile migrate default` | State-changing (atomic temp+rename). No-op if already current (`status:"no_op"`); else `status:"migrated"` with `from_version`/`to_version`/`path`. |
+
+### Key-rotation subcommands
+
+Each generates a fresh 32-byte CSPRNG secret, atomically replaces one named keyring entry, and is not reversible. Each takes the profile as positional `<NAME>` and returns `profile` + `rotated`; some add `key_kind`.
+
+| Subcommand | Keyring entry | Effect |
+|---|---|---|
+| `rotate-owner-key` | policy-file owner ed25519 (`policy_owner_key_id`) | Policy files signed by the old key are rejected on next load; re-sign all policy files. `key_kind:"ed25519_seed"`. |
+| `rotate-attestation-key` | approval-spine attestation HMAC (`attestation_key_id`) | Invalidates all pending approvals; the simulate-and-approve round trip must be re-run. `key_kind:"hmac_32_bytes"`. |
+| `rotate-audit-key` | audit-log chain-root HMAC (`audit_log_hash_chain_key_id`) | New log files use the new chain-root key; open files keep their key. `key_kind:"hmac_32_bytes"`. |
+| `rotate-nonce-key` | HMAC nonce key (`mcp_nonce_key_alias`) | Invalidates outstanding nonces. Returns only `profile` + `rotated`. |
+| `rotate-counterparty-key` | `stellar.toml` cache-integrity HMAC (`counterparty_cache_key_id`) | Invalidates every cached counterparty binding (re-fetched on next check). Adds `key_kind:"hmac_32_bytes"` and `cache_invalidated:true`. |
+
+```bash
+stellar-agent profile rotate-attestation-key default
+```
+
+---
+
+## credentials
+
+WebAuthn passkey lifecycle for a profile. The registry holds only public metadata (credential name, redacted credential ID, RP-ID, transports, registration timestamp); the private key never leaves the authenticator. `credential_id` is redacted to first-five-last-five base64url. These print a flat status/result object, not the `{ok, data, request_id}` envelope.
+
+Two common flags: `--profile <NAME>` (resolves `--profile` → `STELLAR_AGENT_PROFILE` → `"default"`), `--rp-id <DOMAIN>` (default `localhost`; set the deployment domain for a self-hosted deployment; IP literals rejected; changing it after registration breaks existing passkeys).
+
+| Verb | Form | Notes |
+|---|---|---|
+| `add-passkey <NAME>` | `credentials add-passkey laptop-key --rp-id wallet.example.com` | State-changing; opens the browser to the bridge registration URL and polls. `<NAME>`: 1–64 printable ASCII, no `/ \ :`. Extra flags: `--timeout-seconds` (default `300`), `--accept-rp-id-binding-risk`. First registration prompts `[y/N]` with an RP-ID binding warning unless the flag is set. Status: `registered`/`timeout`/`user_canceled`/`entry_missing`/`error`. |
+| `list` | `credentials list` | Read-only. Lists registered passkeys for the profile+RP-ID. |
+| `show <NAME>` | `credentials show laptop-key` | Read-only. Metadata incl. transports. Exits `1` when not found. |
+| `delete <NAME>` | `credentials delete laptop-key --yes` | State-changing; prompts `[y/N]` (skip with `--yes`/`-y`). Does not remove the on-chain signer. Declining exits `1` (status `canceled`). |
+
+---
+
+## approve
+
+The operator-side half of the approval spine. When a signing-adjacent action needs out-of-band approval, the agent surface records a pending approval and returns an approval nonce; the wallet owner runs `approve --id <NONCE>` in a separate trusted context to inspect a wallet-controlled summary and consent. The summary is rendered from stored fields, not from anything the agent supplied. Approval is bound to the local user (recorded process uid must match at approve time). Uses the `{ok, data, request_id}` envelope.
+
+### `approve --id <NONCE>`
+
+State-changing (records an HMAC attestation, or for a toolset first-invoke gate mints a toolset grant and consumes the entry).
+
+| Flag | Meaning |
+|---|---|
+| `--id <NONCE>` (required in this form) | Approval nonce from the agent surface's simulate response |
+| `--profile <NAME>` | Profile whose attestation key + pending-approval store to use (resolves `--profile` → env → `default`) |
+| `--yes` | Non-interactive auto-approve; the summary is still printed |
+
+Interactively prompts `Approve? [y/N]:`; anything other than `y`/`yes` denies. Exits `1` when the nonce is unknown, expired, already attested, created by a different local user, denied, or on I/O error. For payment-style approvals the response returns `approval_attestation` (the HMAC blob the agent must pass as the `approval_attestation` argument to the matching `*_commit` tool); omitted for kinds whose gate reads recorded consent directly (toolset first-invoke grants, trustline clawback opt-ins).
+
+```bash
+stellar-agent approve --id ABCxyzNonce
+```
+
+```json
+{"ok":true,"data":{"approval_nonce":"ABCxyzNonce","attested":true,"process_uid":"501","expires_at_unix_ms":1717000000000,"approval_attestation":"q83vEjRWeJq83v..."},"request_id":"..."}
+```
+
+### `approve gc`
+
+State-changing. Evicts every expired entry from the pending-approval store and reports the count (`evicted_count`). When `gc` is present, `--id` is ignored. Evicting zero is a success. `--profile <NAME>` selects the store.
+
+```bash
+stellar-agent approve gc --profile default
+```
+
+---
+
+## audit
+
+Verifies the per-profile audit log, an append-only hash-chained JSONL record of every tool invocation and lifecycle event. Argument values are never logged; only argument key names. The chain links each entry to the SHA-256 of the prior entry's canonical body. Uses the `{ok, data, request_id}` envelope.
+
+### `audit verify <LOG_PATH>`
+
+Read-only. Walks the log at `<LOG_PATH>`, following rotation manifests, and verifies the hash chain end to end. With `--profile`, also loads that profile's audit chain-root HMAC key and verifies the chain-root sidecars; without it, only the hash chain is checked and `hmac_verified` is `false`.
+
+| Flag / arg | Meaning |
+|---|---|
+| `<LOG_PATH>` (positional, required) | Path to the audit log file. Default location by OS: Linux `~/.local/state/stellar-agent/audit/<profile>.jsonl`; macOS `~/Library/Application Support/stellar-agent/audit/<profile>.jsonl`; Windows `%LOCALAPPDATA%\stellar-agent\audit\<profile>.jsonl` |
+| `--profile <NAME>` | Profile whose chain-root HMAC key verifies sidecars |
+| `--output <FORMAT>` | `json` is the default and only stable format |
+
+On Unix, refuses to verify a log whose parent directory is owned by a different user. Exits `0` when the chain is intact, `1` on any integrity violation (broken chain, rotation gap, HMAC mismatch, missing sidecar, unparseable line), path-contract failure, or I/O error.
+
+```bash
+stellar-agent audit verify ~/.local/state/stellar-agent/audit/default.jsonl --profile default
+```
+
+```json
+{"ok":true,"data":{"entries_verified":42,"files_walked":2,"hmac_verified":true,"per_file":[],"warnings":[],"audit_writer_degraded":false},"request_id":"..."}
+```
+
+### Governance loop
+
+1. The agent surface evaluates an action against the policy engine; an action needing consent records a pending approval and returns its nonce instead of executing.
+2. The wallet owner runs `approve --id <NONCE>`, reads the wallet-controlled summary, and consents; an HMAC attestation (or toolset grant) is written, bound to the nonce, the executed envelope's hash, and the local user.
+3. The agent surface verifies the attestation and executes; every invocation is appended to the hash-chained log.
+4. The operator periodically runs `audit verify --profile <NAME>` to confirm the chain (and chain-root HMAC sidecars) are intact.
+
+---
+
+## toolsets
+
+Install, list, run, and uninstall agent toolsets with cryptographic provenance verification. These print a flat object with a `status` field, not the `{ok, data, request_id}` envelope. JSON by default. All four accept `--toolsets-dir <PATH>` to override the OS-conventional toolsets root. The binary subcommand is `toolsets` (plural).
+
+### `toolsets install <PKG@VERSION> [flags]`
+
+Installs a toolset from a signed local `.tar.gz`. The publisher key must be in the configured publisher trust set. Toolsets that declare a key-touching capability (e.g. `sign-payment`) additionally require a valid auditor attestation unless `--override-attestation`.
+
+| Flag / arg | Meaning |
+|---|---|
+| `<PKG@VERSION>` (positional, required) | `<name>@<version>`, e.g. `my-toolset@1.0.0` |
+| `--file <PATH>` (required) | Path to the `.tar.gz` package |
+| `--shasum <HEX>` (required) | Expected SHA-256 of the package (64 lowercase hex) |
+| `--signature <HEX>` (required) | Publisher ed25519 signature over the canonical preimage (128 hex = 64 bytes) |
+| `--publisher <G-STRKEY>` (required) | Publisher ed25519 public key as a Stellar G-strkey |
+| `--trust-set <PATH>` | Publisher trust-set file (default `<toolsets_dir>/trust.txt`) |
+| `--attestation-file <PATH>` | JSON `ToolsetAttestation` from the auditor tool; required for key-touching toolsets unless overridden |
+| `--auditor-trust-set <PATH>` | Auditor trust-set file (default `<toolsets_dir>/auditor-trust.txt`); distinct from the publisher set; an absent/empty set fails closed for key-touching toolsets |
+| `--override-attestation` | Bypass the attestation gate for a key-touching toolset (the only sanctioned bypass); installs with the key-touching capability inert; reports `"attestation":"overridden"` |
+| `--force` | Reinstall even if already installed |
+| `--allow-downgrade` | Allow installing an older version over a newer one (only with `--force`) |
+| `--toolsets-dir <PATH>` | Override toolsets root |
+
+Output reports `status`, `package`, `version`, and `attestation` (`"attested"` / `"overridden"` / `"not-required"` — the actual gate decision, not an inference from flags). Refusals include attestation-required and auditor-untrusted (no partial install).
+
+```bash
+stellar-agent toolsets install my-toolset@1.0.0 --file ./my-toolset-1.0.0.tar.gz \
+  --shasum <sha256hex> --signature <128hex> --publisher GPUB...WXYZ
+```
+
+### `toolsets list [--toolsets-dir PATH]`
+
+Read-only. The canonical scriptable enumeration of installed toolsets and their capability-derived action lists (not parsed from `--help`). Reports `status` and `toolsets`.
+
+### `toolsets run <TOOLSET-NAME> <ACTION> [--toolsets-dir PATH]`
+
+Runs the four-part capability enforcement check for an installed toolset action and reports the resolved trusted tool name. It does **not** execute the routed tool — use the MCP surface tool `stellar_toolset_invoke` for execution.
+
+- `<TOOLSET-NAME>` (positional, required) — installed toolset package name.
+- `<ACTION>` (positional, required) — must be an exact registry tool name the toolset's capabilities grant, e.g. `stellar_balances`.
+
+On success, exit `0` and `status:"resolved"` with `toolset`, `action`, `routed_to`, and a `note` clarifying that enforcement passed but the tool was not run. On failure, exit `1`, `status:"error"`, with a `code`: `toolset.not_installed`, `toolset.unknown_action`, `toolset.capability_not_declared`, `toolset.tool_not_allowed`, `toolset.io_error`, or `toolset.error`. The toolset gate is additive: the routed tool's operator policy and chain gates still apply at execution time.
+
+```bash
+stellar-agent toolsets run balance-reporter stellar_balances
+```
+
+### `toolsets uninstall <PACKAGE> [--toolsets-dir PATH]`
+
+Removes the toolset directory and pin record; refuses if not installed. `<PACKAGE>` (positional, required) is the package name (`[a-z0-9-]`). Reports `status` and `package`.
+
+```bash
+stellar-agent toolsets uninstall my-toolset
+```

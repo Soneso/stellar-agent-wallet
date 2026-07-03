@@ -1,0 +1,10 @@
+{
+  "test_kind": "load_failure",
+  "name": "cross_profile_replay_rejected",
+  "category": "mutation_stale_key",
+  "description": "Policy signature is valid for the owner key, but the document is scoped to another profile and must not load for the default profile.",
+  "load_signing_strategy": "cross_profile_replay",
+  "expected_load_ok": false,
+  "expected_load_error": "policy_file_parse_failed",
+  "expected_load_wire_code": "policy.policy_file_parse_failed"
+}
