@@ -263,7 +263,7 @@ pub struct MulticallInnerResult {
 /// # Example
 ///
 /// ```sh
-/// STELLAR_AGENT_NETWORKS_TOML=/tmp/my-networks.toml wallet sa register-multicall ...
+/// STELLAR_AGENT_NETWORKS_TOML=/tmp/my-networks.toml smart-account register-multicall ...
 /// ```
 pub const STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV: &str = "STELLAR_AGENT_NETWORKS_TOML";
 
@@ -288,7 +288,7 @@ pub const STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV: &str = "STELLAR_AGENT_NETWO
 /// and accumulates `RegistryLoadWarning` values in `partial_load_warnings` (capped
 /// at 32 entries; per-warning text capped at 256 bytes). The whole load never fails
 /// due to a single corrupted entry; operators can recover via
-/// `wallet sa unregister-multicall --force`.
+/// `smart-account unregister-multicall --force`.
 ///
 /// # Thread safety
 ///
@@ -607,7 +607,7 @@ impl MulticallRegistry {
     /// Forcibly removes the entry identified by `network_safename` (TOML key),
     /// bypassing strkey/hex validation.
     ///
-    /// This is the corruption-recovery path for `wallet sa unregister-multicall
+    /// This is the corruption-recovery path for `smart-account unregister-multicall
     /// --force`. It locates entries by `network_safename` (the TOML section key)
     /// rather than `network_passphrase`, and returns the raw string values before
     /// validation for forensic audit emission.

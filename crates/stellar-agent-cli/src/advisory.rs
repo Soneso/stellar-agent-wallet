@@ -194,7 +194,7 @@ fn advisory_impl(audit_log_path: &Path, allowlist: &[VerifierAllowlistEntry]) ->
             //     ("revoked verifier" would be misleading for a Retired entry).
             eprintln!(
                 "[advisory] rule {} references {} verifier {}; \
-                 run 'stellar-agent wallet sa migrate-verifier' to remediate",
+                 run 'stellar-agent smart-account migrate-verifier' to remediate",
                 rule_id, advisory_kind, hash_first8,
             );
 
@@ -354,7 +354,7 @@ mod tests {
         pinned_hashes: Vec<String>,
     ) {
         let mut entry = AuditEntry::new_tool_invocation(NewToolInvocation::new(
-            "wallet.rules.create",
+            "smart-account.rules.create",
             Option::<String>::None,
             vec![],
             PolicyDecision::Allow,
@@ -408,7 +408,7 @@ mod tests {
             let mut w = writer.lock().unwrap();
             // Write a ToolInvocation row only — no SaContextRuleCreated.
             let entry = AuditEntry::new_tool_invocation(NewToolInvocation::new(
-                "wallet.rules.list",
+                "smart-account.rules.list",
                 Option::<String>::None,
                 vec![],
                 PolicyDecision::Allow,

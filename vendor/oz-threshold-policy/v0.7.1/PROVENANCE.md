@@ -65,7 +65,7 @@
   is the deployable WebAuthn-verifier contract.
   `vendor/oz-smart-account-multisig/v0.7.1/multisig_account_example.wasm` is the
   deployable smart-account contract.  This threshold-policy artefact is the fourth
-  vendored OZ WASM; it is deployed via `wallet sa deploy-threshold-policy`.
+  vendored OZ WASM; it is deployed via `smart-account deploy-threshold-policy`.
 - **Integrity gate (CI side):** CI re-hashes the in-repo WASM against the SHA-256 in this
   `PROVENANCE.md` at every run (iterates `vendor/*/v*/PROVENANCE.md` with per-file
   expected-SHA extraction).  This catches uncoordinated mutation of the WASM.  The defence

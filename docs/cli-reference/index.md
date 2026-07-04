@@ -4,7 +4,7 @@
 
 This page covers the conventions shared by every command: how the profile and network are resolved, the signer-source flags, the JSON output envelope and exit codes, and the mainnet-write refusal. Each command group is documented on its own page, linked from the [command index](#command-index) below.
 
-For the concepts referenced here (profiles, the policy engine, the approval spine, the audit log, context rules), see [concepts](../concepts.md).
+For the concepts referenced here (profiles, the policy engine, the approval spine, the audit log, context rules), see [concepts](../concepts.md). For which commands need only a classic keyring key versus a deployed smart-account contract, see [the two account models](../concepts.md#two-account-models).
 
 ## Invocation
 
@@ -53,9 +53,9 @@ A few commands derive their network from the loaded profile rather than from a `
 
 - `--rpc-url <URL>` — the primary Soroban RPC endpoint. On most commands the default is `https://soroban-testnet.stellar.org`. URLs are validated against an allow-list on the commands that resolve them.
 - `--secondary-rpc-url <URL>` — a second RPC endpoint for two-RPC cross-checks (for example, divergence detection on WASM-hash pins). Optional; its absence resolves per command:
-  - On `lend`, `vault`, `trade`, and `wallet rules` the dual-RPC cross-check is disabled and verification proceeds against the primary endpoint only.
-  - On the `wallet sa timelock` commands it falls back to the primary `--rpc-url` and warns that the divergence defence is then off.
-  - `wallet multicall` requires it (set on the flag or as `secondary_rpc_url` in the profile) and errors when it is absent.
+  - On `lend`, `vault`, `trade`, and `smart-account rules` the dual-RPC cross-check is disabled and verification proceeds against the primary endpoint only.
+  - On the `smart-account timelock` commands it falls back to the primary `--rpc-url` and warns that the divergence defence is then off.
+  - `smart-account multicall` requires it (set on the flag or as `secondary_rpc_url` in the profile) and errors when it is absent.
 
 ### Timeout
 
@@ -69,7 +69,7 @@ A few commands derive their network from the loaded profile rather than from a `
 
 Signing commands take a mutually exclusive signer-source group. Exactly one source is selected:
 
-- The secret-env flag — the name of an environment variable holding the source account S-strkey. Set the variable to your secret; pass the variable name, never the secret itself. This flag is spelled `--secret-env` on `pay` and `accounts create`, `--deployer-secret-env` on `accounts deploy-c`, and `--signer-secret-env` on the `wallet` commands; the per-group pages give the exact spelling.
+- The secret-env flag — the name of an environment variable holding the source account S-strkey. Set the variable to your secret; pass the variable name, never the secret itself. This flag is spelled `--secret-env` on `pay` and `accounts create`, `--deployer-secret-env` on `accounts deploy-c`, and `--signer-secret-env` on the `smart-account` commands; the per-group pages give the exact spelling.
 - `--sign-with-ledger` — sign with a connected Ledger hardware device.
 - `--account-index <INDEX>` — the BIP-44 account index for the Ledger derivation path. Default `0`.
 
@@ -104,7 +104,7 @@ Before dispatching any command, the CLI runs a local-only startup advisory: it s
 
 | Command group | Purpose | Page |
 |---|---|---|
-| `wallet` | Smart-account orchestration: context rules, signers, threshold, multicall, verifier and timelock infrastructure. | [wallet](wallet.md) |
+| `smart-account` (alias `sa`) | Smart-account administration: context rules, signers, threshold, multicall, verifier and timelock infrastructure. | [smart-account](smart-account.md) |
 | `accounts` | Create a Stellar account (sponsored `CreateAccount` or Friendbot) and deploy an OpenZeppelin smart-account contract. | [stellar-ops](stellar-ops.md) |
 | `pay` | Send a classic payment with SEP-29 memo enforcement; supports staged build/sign/submit. | [stellar-ops](stellar-ops.md) |
 | `claim` | Claim a claimable balance by ID behind claimant, predicate, and trustline pre-flight guards; supports staged build/sign/submit. | [stellar-ops](stellar-ops.md) |
@@ -125,7 +125,7 @@ Before dispatching any command, the CLI runs a local-only startup advisory: it s
 
 ## Related pages
 
-- [Wallet smart-account commands](wallet.md)
+- [Smart-account commands](smart-account.md)
 - [Core Stellar operations](stellar-ops.md)
 - [DeFi and channel-account pool commands](defi-and-pool.md)
 - [Profiles, credentials, approval, and audit](profile-and-governance.md)

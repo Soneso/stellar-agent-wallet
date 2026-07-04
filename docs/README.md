@@ -13,7 +13,7 @@ shipping a `stellar-agent` CLI and a `stellar-agent-mcp` MCP server.
 - [Concepts](concepts.md) — the security and governance model: profiles, key
   custody, the policy engine, the approval spine, and the audit log.
 - [CLI reference](cli-reference/index.md) — the `stellar-agent` command surface.
-  - [Wallet (smart-account governance)](cli-reference/wallet.md)
+  - [Smart-account governance](cli-reference/smart-account.md)
   - [Accounts and core Stellar operations](cli-reference/stellar-ops.md)
   - [DeFi and the channel pool](cli-reference/defi-and-pool.md)
   - [Profiles, credentials, approvals, and audit](cli-reference/profile-and-governance.md)

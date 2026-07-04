@@ -10,7 +10,7 @@
 # WASM artefact provenance note:
 # This WASM is the DEPLOYABLE multisig-threshold-policy-example contract for
 # on-chain upload via UploadContractWasm. The wallet deploys it as a one-shot
-# per-network bootstrap via `wallet sa deploy-threshold-policy`. The deployed
+# per-network bootstrap via `smart-account deploy-threshold-policy`. The deployed
 # contract is invoked by the smart-account's __check_auth to validate the
 # threshold requirement for context-rule-bound operations (atomic signer and
 # threshold updates).

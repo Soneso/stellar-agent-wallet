@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Renamed the `wallet` CLI command group to `smart-account` (with `sa` as a
+  shorter alias), and flattened the former nested `sa` admin subgroup so its
+  verbs (`deploy-webauthn-verifier`, `migrate-verifier`, `list-verifiers`,
+  `list-rules`, `register-multicall`, `unregister-multicall`, `timelock`) are now
+  direct children of `smart-account` alongside `rules`, `signers`, and
+  `multicall`. This is a breaking change to the CLI command surface.
+
 ## [0.1.0-alpha.1] - 2026-07-03
 
 First public alpha of the Stellar Agent Wallet: a Stellar wallet for AI agents.

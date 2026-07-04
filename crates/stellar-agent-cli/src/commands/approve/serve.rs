@@ -39,7 +39,7 @@ use stellar_agent_core::profile::loader;
 use stellar_agent_core::profile::schema::default_approval_dir;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 
-use crate::commands::wallet::common::open_audit_writer;
+use crate::commands::smart_account::common::open_audit_writer;
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
 

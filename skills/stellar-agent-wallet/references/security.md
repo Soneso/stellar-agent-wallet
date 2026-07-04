@@ -134,7 +134,7 @@ explicitly so the mainnet gate stays in place until the operator stands up a V1
 owner key.
 
 The narrow exceptions are explicit, consent-gated mainnet operations, e.g.
-`wallet sa migrate-verifier` which requires `--confirm-mainnet-migrate`. Friendbot
+`smart-account migrate-verifier` which requires `--confirm-mainnet-migrate`. Friendbot
 funding is scoped to `testnet` and `futurenet` and refuses `mainnet` with
 `network.friendbot_mainnet_forbidden`.
 

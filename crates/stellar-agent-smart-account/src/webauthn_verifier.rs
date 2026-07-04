@@ -42,9 +42,9 @@
 //! # Deployment model
 //!
 //! The verifier is deployed once per network and the contract-id is recorded
-//! in wallet-local config.  Subsequent `wallet rules create --signer-webauthn`
+//! in wallet-local config.  Subsequent `smart-account rules create --signer-webauthn`
 //! invocations populate `ContextRuleSignerInput::External::verifier` from this
-//! config via `wallet sa deploy-webauthn-verifier`.
+//! config via `smart-account deploy-webauthn-verifier`.
 //!
 //! # Supply-chain integrity
 //!
@@ -101,7 +101,7 @@ pub const WEBAUTHN_VERIFIER_WASM_SHA256: &str =
 /// The vendored `multisig_webauthn_verifier_example.wasm` binary, embedded at
 /// compile time.
 ///
-/// Embedded so the deploy CLI (`wallet sa deploy-webauthn-verifier`) can
+/// Embedded so the deploy CLI (`smart-account deploy-webauthn-verifier`) can
 /// upload the WASM via `UploadContractWasm` without re-fetching from disk at
 /// runtime; the bytes are passed by reference to the deployment substrate.
 /// Also ensures the SHA-256 check in

@@ -1752,7 +1752,7 @@ impl AuditEntry {
 
     /// Constructs a `SaMulticallRegistered` audit entry.
     ///
-    /// Emitted by `wallet sa register-multicall` on success, after the registry
+    /// Emitted by `smart-account register-multicall` on success, after the registry
     /// entry is written to disk.
     ///
     /// # Redaction
@@ -1793,7 +1793,7 @@ impl AuditEntry {
 
     /// Constructs a `SaMulticallRegistrationRefused` audit entry.
     ///
-    /// Emitted by `wallet sa register-multicall` when registration is refused due
+    /// Emitted by `smart-account register-multicall` when registration is refused due
     /// to a WASM SHA-256 mismatch (either at the CLI handler level or at
     /// `MulticallRegistry::register`).
     ///
@@ -1839,7 +1839,7 @@ impl AuditEntry {
 
     /// Constructs a `SaMulticallUnregistered` audit entry.
     ///
-    /// Emitted by `wallet sa unregister-multicall` (normal path, not `--force`)
+    /// Emitted by `smart-account unregister-multicall` (normal path, not `--force`)
     /// on success, after the registry entry is removed from disk.
     ///
     /// # Redaction
@@ -1879,7 +1879,7 @@ impl AuditEntry {
 
     /// Constructs a `SaMulticallUnregisteredForce` audit entry.
     ///
-    /// Emitted by `wallet sa unregister-multicall --force` BEFORE any file mutation.
+    /// Emitted by `smart-account unregister-multicall --force` BEFORE any file mutation.
     /// Raw field values from the TOML file are included without validation; each is
     /// truncated to 64 characters.
     ///

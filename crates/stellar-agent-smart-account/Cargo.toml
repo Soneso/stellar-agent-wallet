@@ -56,51 +56,51 @@ name = "deploy_c_testnet_acceptance"
 required-features = ["testnet-integration"]
 
 [[test]]
-name = "wallet_caps_testnet_acceptance"
+name = "smart_account_caps_testnet_acceptance"
 required-features = ["testnet-integration"]
 
 [[test]]
-name = "wallet_multicall_testnet_acceptance"
+name = "smart_account_multicall_testnet_acceptance"
 required-features = ["testnet-integration"]
 
 [[test]]
-name = "wallet_policy_mutators_testnet_acceptance"
+name = "smart_account_policy_mutators_testnet_acceptance"
 required-features = ["testnet-integration"]
 
 [[test]]
-name = "wallet_rules_pinning_testnet_acceptance"
+name = "smart_account_rules_pinning_testnet_acceptance"
 required-features = ["testnet-integration"]
 
 [[test]]
-name = "wallet_rules_testnet_acceptance"
+name = "smart_account_rules_testnet_acceptance"
 required-features = ["testnet-integration"]
 
 [[test]]
-name = "wallet_sa_list_rules_testnet_acceptance"
+name = "smart_account_list_rules_testnet_acceptance"
 required-features = ["testnet-integration"]
 
 [[test]]
-name = "wallet_sa_migrate_verifier_testnet_acceptance"
+name = "smart_account_migrate_verifier_testnet_acceptance"
 required-features = ["testnet-integration"]
 
 [[test]]
-name = "wallet_session_rule_expiry_testnet_acceptance"
+name = "smart_account_session_rule_expiry_testnet_acceptance"
 required-features = ["testnet-integration"]
 
 [[test]]
-name = "wallet_session_rule_horizon_testnet_acceptance"
+name = "smart_account_session_rule_horizon_testnet_acceptance"
 required-features = ["testnet-integration"]
 
 [[test]]
-name = "wallet_signers_testnet_acceptance"
+name = "smart_account_signers_testnet_acceptance"
 required-features = ["testnet-integration"]
 
 [[test]]
-name = "wallet_sim_audit_testnet_acceptance"
+name = "smart_account_sim_audit_testnet_acceptance"
 required-features = ["testnet-integration"]
 
 [[test]]
-name = "wallet_smart_account_timelock_testnet_acceptance"
+name = "smart_account_timelock_testnet_acceptance"
 required-features = ["testnet-integration"]
 
 [[test]]
@@ -108,7 +108,7 @@ name = "quorum_authorization_info_testnet_acceptance"
 required-features = ["testnet-integration"]
 
 [[test]]
-name = "wallet_rules_webauthn_testnet_acceptance"
+name = "smart_account_rules_webauthn_testnet_acceptance"
 required-features = ["testnet-integration"]
 
 [dependencies]
@@ -175,7 +175,7 @@ uuid = { workspace = true, features = ["v4"] }
 serial_test = { workspace = true }
 url = { workspace = true }
 # chromiumoxide: CDP virtual-authenticator client for the WebAuthn ceremony in
-# wallet_rules_webauthn_testnet_acceptance.rs (testnet-integration only).
+# smart_account_rules_webauthn_testnet_acceptance.rs (testnet-integration only).
 chromiumoxide = { workspace = true }
 # futures: StreamExt for the chromiumoxide CDP event handler.
 futures = { workspace = true }

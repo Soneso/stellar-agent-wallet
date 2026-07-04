@@ -29,6 +29,10 @@ reads secret keys from a named environment variable, not from the command line.
 - No prerequisites if you install a prebuilt binary.
 - A Rust stable toolchain only if you build from source. The repository pins the
   channel via `rust-toolchain.toml` (`channel = "stable"`).
+- Before running commands, note that some need only a classic keyring key while
+  others require a deployed smart-account contract. See
+  [the two account models](concepts.md#two-account-models) for the split and a
+  prerequisite map.
 
 ## Install
 

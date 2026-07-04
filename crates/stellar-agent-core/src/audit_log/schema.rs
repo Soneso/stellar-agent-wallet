@@ -1043,7 +1043,7 @@ pub enum EventKind {
     },
 
     /// Verifier wasm hash on a context rule was migrated from one hash to
-    /// another via `wallet sa migrate-verifier`.
+    /// another via `smart-account migrate-verifier`.
     ///
     /// Emitted per affected rule after on-chain submission of the migration
     /// transaction. The per-rule emission allows operator triage to enumerate
@@ -1155,7 +1155,7 @@ pub enum EventKind {
         advised_status: VerifierAdvisoryKind,
     },
 
-    /// A policy was added to a context rule via `wallet rules add-policy`.
+    /// A policy was added to a context rule via `smart-account rules add-policy`.
     ///
     /// Emitted by `ContextRuleManager::add_policy` after a successful on-chain
     /// `add_policy(context_rule_id, policy, install_param) -> u32` invocation.
@@ -1192,7 +1192,7 @@ pub enum EventKind {
         smart_account_redacted: RedactedStrkey,
     },
 
-    /// A policy was removed from a context rule via `wallet rules remove-policy`.
+    /// A policy was removed from a context rule via `smart-account rules remove-policy`.
     ///
     /// Emitted by `ContextRuleManager::remove_policy` after a successful
     /// on-chain `remove_policy(context_rule_id, policy_id)` invocation.
@@ -1329,7 +1329,7 @@ pub enum EventKind {
 
     /// A multicall router was successfully registered in the local registry.
     ///
-    /// Emitted by `wallet sa register-multicall` on success, after
+    /// Emitted by `smart-account register-multicall` on success, after
     /// `MulticallRegistry::register` writes the entry to disk.
     ///
     /// # Field redaction
@@ -1352,7 +1352,7 @@ pub enum EventKind {
 
     /// A multicall router registration was refused due to a WASM SHA-256 mismatch.
     ///
-    /// Emitted by `wallet sa register-multicall` when the supplied `--wasm-sha256`
+    /// Emitted by `smart-account register-multicall` when the supplied `--wasm-sha256`
     /// does not equal `MULTICALL_WASM_SHA256`, or when an existing entry has a
     /// different SHA (re-register drift guard).
     ///
@@ -1382,7 +1382,7 @@ pub enum EventKind {
 
     /// A multicall router was successfully unregistered from the local registry.
     ///
-    /// Emitted by `wallet sa unregister-multicall` (normal path, not `--force`)
+    /// Emitted by `smart-account unregister-multicall` (normal path, not `--force`)
     /// on success, after `MulticallRegistry::unregister` removes the entry.
     ///
     /// # Field redaction
@@ -1404,7 +1404,7 @@ pub enum EventKind {
     },
 
     /// A multicall router was forcibly removed from the local registry via
-    /// `wallet sa unregister-multicall --force`.
+    /// `smart-account unregister-multicall --force`.
     ///
     /// This is the corruption-recovery path. The raw string values from the TOML
     /// file are included without validation — they may be invalid strkeys or hex

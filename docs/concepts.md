@@ -13,6 +13,29 @@ An AI agent calls wallet tools on its own initiative. The model does not assume 
 
 Two structural rules apply across all surfaces in this alpha. The default network is `stellar:testnet`. Every write or signing command structurally refuses `stellar:mainnet` (wire code `network.mainnet_write_forbidden`) before any RPC call or signing, while `stellar:mainnet` remains accepted for read-only commands.
 
+## Two account models
+
+The wallet operates against two different kinds of Stellar account, and each command belongs to one of them. Knowing which model a command uses tells you what you must have in place before it can run.
+
+**Classic account operations** work with a keyring-held ed25519 key on its own. There is no contract to deploy: the source account is a standard Stellar account and the signing key is the account's secret. These commands are `pay`, `balances`, `trustline`, `claim`, and `pool`. The read-only helpers `friendbot` (testnet funding) and `fees` (network fee stats) sit in the same bucket, as does `accounts create`, which creates a plain classic account. If you hold a funded classic key, you can run any of these directly.
+
+**Smart-account operations** center on a deployed OpenZeppelin smart-account contract. The contract holds the context rules, signer sets, thresholds, and policy attachments; the keyring key signs as a delegated signer rather than as the account itself. The commands that operate against an existing contract — `trade`, `lend`, the `vault` write verbs, and `smart-account rules`, `signers`, `list-rules`, `migrate-verifier`, `timelock`, plus `multicall` (which names its target via `--smart-account`) — cannot run until that contract address exists. Four verbs in the `smart-account` group (alias `sa`) need no deployed contract: `list-verifiers` reads the compile-time verifier allowlist, `register-multicall` and `unregister-multicall` edit the local per-network router registry, and `deploy-webauthn-verifier` deploys a new verifier contract from a classic deployer key.
+
+**Bootstrapping** bridges the two. `accounts deploy-c` is itself a classic operation — the deployer signs the deployment with a keyring key — but its *output* is a new smart-account contract address. That address is the prerequisite the second bucket needs. So the usual path is: fund a classic key (`friendbot` on testnet), deploy the contract (`accounts deploy-c`), then install rules and signers (`smart-account rules`, `smart-account signers`) before the agent can trade, lend, or run vault writes through it.
+
+A handful of commands need neither model directly. `profile`, `credentials`, `approve`, `audit`, `toolsets`, and `counterparty` operate at the profile and operator layer — they configure the wallet, manage the approval spine and audit trail, or resolve counterparty metadata, independent of any single account.
+
+### Prerequisite map
+
+| Command group | Account model | What you need first |
+|---|---|---|
+| `pay`, `balances`, `trustline`, `claim`, `pool`, `friendbot`, `fees` | Classic | A funded classic keyring key (`friendbot` funds one on testnet). |
+| `accounts create` | Classic | A keyring key to hold the new account's secret. |
+| `accounts deploy-c` | Classic (bridge) | A funded classic deployer key; the command's output is the smart-account contract address. |
+| `smart-account` (alias `sa`) | Smart-account | For `rules`, `signers`, `list-rules`, `migrate-verifier`, `timelock`, `multicall`: a deployed OZ smart-account contract address (from `accounts deploy-c`), plus at least one signer or context rule installed for write verbs. `list-verifiers`, `register-multicall`, `unregister-multicall`, and `deploy-webauthn-verifier` need no deployed contract. |
+| `trade`, `lend`, `vault` (writes) | Smart-account | A smart-account contract address with a context rule authorizing the operation. |
+| `profile`, `credentials`, `approve`, `audit`, `toolsets`, `counterparty` | Neither | An initialized profile; these operate at the profile/operator layer. |
+
 ## Key custody and the unlock window
 
 Secrets are never stored in configuration. A Profile is a per-environment TOML file (schema version 2) that binds a CAIP-2 chain id, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. It holds no secret material; each `*_key_id` field is a Keyring entry reference (a `service` + `account` pair) that names a platform-keyring secret. The signer seed, the nonce key, and every HMAC key live in the platform keyring (macOS Keychain, Linux Secret Service, Windows Credential Manager). The profile TOML is therefore safe to back up. The profile's `Debug` output additionally redacts `rpc_url` and `secondary_rpc_url`, since those may embed RPC credentials.

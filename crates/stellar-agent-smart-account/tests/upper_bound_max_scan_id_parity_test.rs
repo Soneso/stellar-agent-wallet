@@ -7,7 +7,7 @@
 //! `stellar-agent-core`).
 //!
 //! This test asserts that the two values stay in sync. If they drift, the
-//! migration-planner / `wallet sa list-rules` would silently reject values
+//! migration-planner / `smart-account list-rules` would silently reject values
 //! the manager would accept (or vice versa), creating a max-scan-id
 //! enforcement gap.
 

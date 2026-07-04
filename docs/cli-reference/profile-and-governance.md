@@ -88,7 +88,7 @@ Each rotation exits `1` with `ProfileNotFound` if the profile does not exist, or
 
 ## `credentials`
 
-The `credentials` group manages the WebAuthn passkey lifecycle for a profile. Passkeys are stored in a per-profile registry that holds only public metadata: credential name, a redacted credential ID, RP-ID, transports, and a registration timestamp. The private key never leaves the authenticator. Registered passkeys can be installed as WebAuthn signers on a context rule (see the `wallet` commands).
+The `credentials` group manages the WebAuthn passkey lifecycle for a profile. Passkeys are stored in a per-profile registry that holds only public metadata: credential name, a redacted credential ID, RP-ID, transports, and a registration timestamp. The private key never leaves the authenticator. Registered passkeys can be installed as WebAuthn signers on a context rule (see the `smart-account` commands).
 
 Two flags are common to every subcommand:
 

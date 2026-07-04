@@ -51,7 +51,7 @@ Keep the following properties of the current alpha in mind when assessing impact
   `stellar:testnet` and `stellar:mainnet`, but nearly all write and signing commands
   structurally refuse `stellar:mainnet` (wire code `network.mainnet_write_forbidden`)
   before any RPC call or signing takes place. The narrow exceptions are explicit,
-  consent-gated mainnet operations (for example `wallet sa migrate-verifier`, which
+  consent-gated mainnet operations (for example `smart-account migrate-verifier`, which
   requires `--confirm-mainnet-migrate`). Friendbot funding is scoped to `testnet` and
   `futurenet` and structurally refuses `mainnet`
   (`network.friendbot_mainnet_forbidden`).

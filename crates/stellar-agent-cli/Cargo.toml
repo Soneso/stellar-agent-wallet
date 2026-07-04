@@ -84,7 +84,7 @@ toml_edit = { workspace = true }
 uuid = { workspace = true }
 # URL-safe encoding of generated keys (key_ops.rs).
 base64 = { workspace = true }
-# hex decode for --signer-key-data (wallet signers --signer-external path).
+# hex decode for --signer-key-data (smart-account signers --signer-external path).
 hex = { workspace = true }
 # Browser launch for the passkey-registration handoff (credentials/add_passkey.rs).
 webbrowser = { workspace = true }

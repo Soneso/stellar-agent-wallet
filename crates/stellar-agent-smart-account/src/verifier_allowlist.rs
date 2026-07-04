@@ -17,7 +17,7 @@
 //! [`VerifierAuditStatus`] serialises with `#[serde(rename_all = "snake_case",
 //! tag = "kind")]` so the `kind` discriminator appears as `"audited"`,
 //! `"unaudited"`, `"revoked"`, or `"retired"`. This is the canonical wire format
-//! consumed by `wallet sa list-verifiers --output json`.
+//! consumed by `smart-account list-verifiers --output json`.
 //!
 //! # 24-month retention
 //!
@@ -41,7 +41,7 @@ use serde::Serialize;
 ///
 /// `Revoked` and `Retired` entries both trigger the startup advisory emitted by
 /// `run_startup_advisory`. The advisory is informational and non-fatal;
-/// operators should run `wallet sa migrate-verifier` to remediate.
+/// operators should run `smart-account migrate-verifier` to remediate.
 ///
 /// # Serialise-only posture
 ///
@@ -49,7 +49,7 @@ use serde::Serialize;
 /// a compile-time type whose string fields are `&'static str`; serde's
 /// `Deserialize` derive cannot satisfy the `'static` bound for borrowed strings
 /// when driven from a `'de` lifetime. Since entries are only serialised for
-/// `wallet sa list-verifiers` output and never deserialised from external JSON,
+/// `smart-account list-verifiers` output and never deserialised from external JSON,
 /// `Serialize`-only is the correct posture — matching the `SaError` pattern in
 /// this crate. If a future input path requires deserialization, introduce a
 /// parallel owned type. `Serialize`-only (no `Deserialize`) is a defence-in-depth
@@ -101,7 +101,7 @@ pub enum VerifierAuditStatus {
 
     /// `Revoked` + 24-month retention elapsed. Still recognised by the startup-
     /// advisory check (operator advisory continues to fire), but the long-form
-    /// audit-status text is dropped from `wallet sa list-verifiers --json`
+    /// audit-status text is dropped from `smart-account list-verifiers --json`
     /// after the 24-month rotation cadence.
     ///
     /// # Wire format
@@ -141,7 +141,7 @@ impl fmt::Display for VerifierAuditStatus {
 /// compile-time constant (`VERIFIER_ALLOWLIST`) whose inner
 /// `VerifierAuditStatus` fields are `&'static str`. Serde's `Deserialize`
 /// derive cannot satisfy the `'static` bound when driven from a `'de`
-/// lifetime. Since entries are only serialised for `wallet sa list-verifiers`
+/// lifetime. Since entries are only serialised for `smart-account list-verifiers`
 /// output and never deserialised from external JSON, `Serialize`-only matches
 /// the `SaError` pattern in this crate. Introduce a parallel owned type if a
 /// future input path requires deserialization. `Serialize`-only (no
@@ -186,7 +186,7 @@ impl VerifierAllowlistEntry {
 ///
 /// Compile-time constant; no central server is consulted. Updates ship via
 /// wallet patch releases; revoked entries fire startup advisories until
-/// operators migrate via `wallet sa migrate-verifier`.
+/// operators migrate via `smart-account migrate-verifier`.
 ///
 /// # Current entries
 ///

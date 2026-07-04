@@ -54,7 +54,7 @@ use super::{
 ///
 /// Carries first-8-hex projections of the pinned wasm hashes recorded at
 /// rule-install time, plus the install-time override flags so
-/// `wallet rules verify-pins` output can convey whether the pin was established
+/// `smart-account rules verify-pins` output can convey whether the pin was established
 /// under an opt-in override.
 ///
 /// # Backward-compatibility
@@ -1705,7 +1705,7 @@ mod tests {
 
     fn write_event(writer: &mut AuditWriter, kind: EventKind) {
         let mut entry = AuditEntry::new_tool_invocation(NewToolInvocation::new(
-            "wallet.signers.list",
+            "smart-account.signers.list",
             Option::<String>::None,
             vec![],
             PolicyDecision::Allow,

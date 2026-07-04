@@ -209,7 +209,7 @@ pub enum ProfileLoadError {
     /// safety cap (`UPPER_BOUND_MAX_SCAN_ID = 10_000`).
     ///
     /// A value beyond the cap would allow an attacker who can edit the profile
-    /// TOML to DoS the wallet's `wallet sa list-rules` / `migrate-verifier`
+    /// TOML to DoS the wallet's `smart-account list-rules` / `migrate-verifier`
     /// path by triggering up to ~4.3B simulate calls (u32::MAX iterations).
     ///
     /// # Fix

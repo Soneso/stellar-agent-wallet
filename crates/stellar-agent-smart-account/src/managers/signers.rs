@@ -641,7 +641,7 @@ impl SignersManager {
     /// emits a `SaSignerSetBaselined` audit row if and only if no prior
     /// baseline / state-change row exists for this `(rule_id, smart_account)`.
     ///
-    /// This is the human-path bootstrap: calling `wallet signers list` for the
+    /// This is the human-path bootstrap: calling `smart-account signers list` for the
     /// first time establishes the audit-log baseline so subsequent signing
     /// attempts can use it.
     ///
@@ -1215,7 +1215,7 @@ impl SignersManager {
     /// 1. Validates `threshold' >= 1 && signer_count' >= threshold'`.
     ///    Returns [`SaError::ThresholdUnreachable`] with a `safe_ordering_hint`
     ///    if the invariant would be violated.  To lower the threshold first, run
-    ///    `wallet signers set-threshold` and then retry the removal.
+    ///    `smart-account signers set-threshold` and then retry the removal.
     /// 2. Constructs and submits a single `InvokeHostFunctionOp` transaction.
     /// 3. Emits `SaSignerRemoved` audit row.
     ///
@@ -2575,17 +2575,17 @@ fn compute_post_op_invariant(
         let hint = match &requested_op {
             ThresholdAffectingOp::RemoveSigner { signer_id } => {
                 format!(
-                    "run 'wallet signers set-threshold --rule-id {rule_id} \
+                    "run 'smart-account signers set-threshold --rule-id {rule_id} \
                      --threshold {safe_threshold}' first, \
-                     then retry 'wallet signers remove --rule-id {rule_id} \
+                     then retry 'smart-account signers remove --rule-id {rule_id} \
                      --signer {signer_id}'"
                 )
             }
             ThresholdAffectingOp::AddSigner { .. } => {
                 format!(
-                    "add the signer first ('wallet signers add --rule-id {rule_id} ...'), \
+                    "add the signer first ('smart-account signers add --rule-id {rule_id} ...'), \
                      then adjust the threshold with \
-                     'wallet signers set-threshold --rule-id {rule_id} \
+                     'smart-account signers set-threshold --rule-id {rule_id} \
                      --threshold {safe_threshold}'"
                 )
             }

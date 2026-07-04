@@ -19,7 +19,7 @@
 #   PACE            seconds to sleep between suites (default 30)
 #   RETRY_COOLDOWN  seconds to sleep before the single retry (default 60)
 #
-# The WebAuthn suite (wallet_rules_webauthn_testnet_acceptance) and the
+# The WebAuthn suite (smart_account_rules_webauthn_testnet_acceptance) and the
 # remote-approval browser suite (remote_approval_browser_testnet_acceptance)
 # each launch a headless Chromium and need chromium/google-chrome on PATH or
 # the CHROME env var pointing at the executable.
@@ -69,19 +69,19 @@ SUITES=(
   "stellar-agent-cli testnet-acceptance claim_testnet_acceptance"
   "stellar-agent-smart-account testnet-integration deploy_c_testnet_acceptance"
   "stellar-agent-smart-account testnet-integration quorum_authorization_info_testnet_acceptance"
-  "stellar-agent-smart-account testnet-integration wallet_caps_testnet_acceptance"
-  "stellar-agent-smart-account testnet-integration wallet_signers_testnet_acceptance"
-  "stellar-agent-smart-account testnet-integration wallet_rules_testnet_acceptance"
-  "stellar-agent-smart-account testnet-integration wallet_rules_pinning_testnet_acceptance"
-  "stellar-agent-smart-account testnet-integration wallet_sa_list_rules_testnet_acceptance"
-  "stellar-agent-smart-account testnet-integration wallet_policy_mutators_testnet_acceptance"
-  "stellar-agent-smart-account testnet-integration wallet_session_rule_expiry_testnet_acceptance"
-  "stellar-agent-smart-account testnet-integration wallet_session_rule_horizon_testnet_acceptance"
-  "stellar-agent-smart-account testnet-integration wallet_sim_audit_testnet_acceptance"
-  "stellar-agent-smart-account testnet-integration wallet_sa_migrate_verifier_testnet_acceptance"
-  "stellar-agent-smart-account testnet-integration wallet_multicall_testnet_acceptance"
-  "stellar-agent-smart-account testnet-integration wallet_smart_account_timelock_testnet_acceptance"
-  "stellar-agent-smart-account testnet-integration wallet_rules_webauthn_testnet_acceptance"
+  "stellar-agent-smart-account testnet-integration smart_account_caps_testnet_acceptance"
+  "stellar-agent-smart-account testnet-integration smart_account_signers_testnet_acceptance"
+  "stellar-agent-smart-account testnet-integration smart_account_rules_testnet_acceptance"
+  "stellar-agent-smart-account testnet-integration smart_account_rules_pinning_testnet_acceptance"
+  "stellar-agent-smart-account testnet-integration smart_account_list_rules_testnet_acceptance"
+  "stellar-agent-smart-account testnet-integration smart_account_policy_mutators_testnet_acceptance"
+  "stellar-agent-smart-account testnet-integration smart_account_session_rule_expiry_testnet_acceptance"
+  "stellar-agent-smart-account testnet-integration smart_account_session_rule_horizon_testnet_acceptance"
+  "stellar-agent-smart-account testnet-integration smart_account_sim_audit_testnet_acceptance"
+  "stellar-agent-smart-account testnet-integration smart_account_migrate_verifier_testnet_acceptance"
+  "stellar-agent-smart-account testnet-integration smart_account_multicall_testnet_acceptance"
+  "stellar-agent-smart-account testnet-integration smart_account_timelock_testnet_acceptance"
+  "stellar-agent-smart-account testnet-integration smart_account_rules_webauthn_testnet_acceptance"
   "stellar-agent-approval-remote testnet-acceptance remote_approval_browser_testnet_acceptance"
 )
 

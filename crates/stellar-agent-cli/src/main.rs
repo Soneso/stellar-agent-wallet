@@ -225,21 +225,34 @@ enum Commands {
     /// No MCP tool or capability registration at install time.
     Toolsets(commands::toolsets::ToolsetsArgs),
 
-    /// Wallet-side smart-account orchestration.
+    /// Smart-account administration (alias `sa`).
     ///
-    /// Provides:
-    /// - `wallet rules create` — install a new context rule via OZ
-    ///   `add_context_rule`.
-    /// - `wallet rules get <id>` — read a single rule by id (read-only).
-    /// - `wallet rules set-name <id> <name>` — rename via OZ
-    ///   `update_context_rule_name`.
-    /// - `wallet rules set-valid-until <id> <ledger | none>` — change expiry
-    ///   via OZ `update_context_rule_valid_until` (`none` = permanent).
-    /// - `wallet rules delete <id>` — remove via OZ `remove_context_rule`.
+    /// Operates against a deployed OpenZeppelin smart-account contract:
+    /// context-rule and signer-set lifecycle, multicall-router bundle
+    /// submission, verifier deployment/migration, and upgrade-timelock
+    /// operations.
+    ///
+    /// Verbs:
+    /// - `smart-account rules <create | get | set-name | set-valid-until |
+    ///   delete | add-policy | remove-policy | list>` — context-rule lifecycle.
+    /// - `smart-account signers <list | refresh | add | remove |
+    ///   set-threshold>` — signer-set lifecycle.
+    /// - `smart-account multicall` — submit a batched invocation bundle.
+    /// - `smart-account deploy-webauthn-verifier` — deploy the OZ
+    ///   WebAuthn-verifier WASM and record its address.
+    /// - `smart-account migrate-verifier` — plan/execute External-signer
+    ///   verifier migration.
+    /// - `smart-account list-verifiers` — enumerate the verifier allowlist.
+    /// - `smart-account list-rules` — alias for `smart-account rules list`.
+    /// - `smart-account register-multicall` / `unregister-multicall` — manage
+    ///   the local multicall-router registry.
+    /// - `smart-account timelock <schedule | cancel | execute | list-pending>`
+    ///   — OZ upgrade-timelock operations.
     ///
     /// All write subcommands invoke `Signer::sign_auth_digest` exclusively
     /// and structurally refuse mainnet.
-    Wallet(commands::wallet::WalletArgs),
+    #[command(visible_alias = "sa")]
+    SmartAccount(commands::smart_account::SmartAccountArgs),
 }
 
 #[tokio::main]
@@ -297,7 +310,7 @@ async fn main() {
         Commands::Pool(args) => commands::pool::run(&args).await,
         Commands::Profile(args) => commands::profile::run(&args).await,
         Commands::Toolsets(args) => commands::toolsets::run(&args).await,
-        Commands::Wallet(args) => commands::wallet::run(&args).await,
+        Commands::SmartAccount(args) => commands::smart_account::run(&args).await,
     };
 
     std::process::exit(exit_code);

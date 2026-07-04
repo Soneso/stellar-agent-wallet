@@ -5,7 +5,7 @@
 //! (`stellar_agent_core::approval::operator_credentials`) that authenticates
 //! an operator for the remote-approval HTTP surface
 //! (`stellar-agent-approval-remote`). This is a DIFFERENT trust role from a
-//! smart-account signer passkey (`stellar-agent wallet sa add-passkey`):
+//! smart-account signer passkey (`stellar-agent credentials add-passkey`):
 //! enrolling here only ever grants the ability to consent to pending
 //! wallet-controlled approvals, never on-chain signing authority.
 //!

@@ -412,8 +412,8 @@ pub struct InstallRuleOutput {
 /// Output of [`ContextRuleManager::verify_rule_wasm_pins`].
 ///
 /// Carries per-address pin status and first-8-hex hash projections for
-/// the `wallet rules verify-pins` JSON envelope. See also the CLI envelope type
-/// `stellar_agent_cli::commands::wallet::rules::VerifyPinsResult`, which adds
+/// the `smart-account rules verify-pins` JSON envelope. See also the CLI envelope type
+/// `stellar_agent_cli::commands::smart_account::rules::VerifyPinsResult`, which adds
 /// chain metadata and CLI-facing field names.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
@@ -2069,7 +2069,7 @@ impl ContextRuleManager {
     ///
     /// Runs the same two-RPC re-fetch used by `sign_with_passkey_rule` at
     /// signing time, but as a stand-alone read-only call initiated by the
-    /// operator via `wallet rules verify-pins`.
+    /// operator via `smart-account rules verify-pins`.
     ///
     /// # Flow
     ///
@@ -2623,7 +2623,7 @@ pub const DEFAULT_MAX_SCAN_ID: u32 = 50;
 /// `smart_account_max_context_rule_scan_id`.
 ///
 /// A value of `u32::MAX` in a profile TOML would cause up to ~4.3B
-/// `simulate_transaction` calls on any `wallet sa list-rules` or
+/// `simulate_transaction` calls on any `smart-account list-rules` or
 /// `migrate-verifier` invocation, a practical DoS for any process that can
 /// edit the profile file. Capping at 10,000 limits the worst-case scan to
 /// 10,000 simulate calls — roughly 10,000 × RTT overhead — which is
@@ -2809,7 +2809,7 @@ pub struct ActiveContextRuleEnumeration {
     /// rules, this is `last_probed_id + 1`.  For a scan that exhausts
     /// `max_scan_id` without error this is `max_scan_id`.
     ///
-    /// Exposed in the `wallet sa list-rules` JSON envelope as
+    /// Exposed in the `smart-account list-rules` JSON envelope as
     /// `scanned_id_range.end`.
     pub scanned_id_range_end: u32,
     /// Rule IDs that appear in the local audit log as installed
@@ -3609,7 +3609,7 @@ fn parse_context_rule_summary(scval: ScVal, rule_id: u32) -> Result<ContextRuleS
 /// Decodes the `signer_ids` length from an OZ `ContextRule` [`ScVal::Map`],
 /// returning the number of signers currently attached to the rule.
 ///
-/// This is the pre-simulate cap check helper used by `wallet signers add` to
+/// This is the pre-simulate cap check helper used by `smart-account signers add` to
 /// refuse a 16th-signer attempt fail-CLOSED before the simulate/submit cycle
 /// reaches the contract.
 ///

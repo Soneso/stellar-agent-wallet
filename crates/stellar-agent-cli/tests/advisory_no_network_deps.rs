@@ -32,7 +32,7 @@
 //!
 //! `cargo tree -e normal -p stellar-agent-cli` shows the full CLI dep
 //! closure, which INCLUDES `reqwest` / `hyper` / `mio` because OTHER
-//! subcommands (`wallet deploy`, `wallet rules`, etc.) legitimately need
+//! subcommands (`accounts deploy-c`, `smart-account rules`, etc.) legitimately need
 //! networking. A crate-level dep scan can't isolate the advisory call-path.
 //! This fixture's per-file AST walk provides the necessary path-level
 //! granularity.

@@ -156,8 +156,8 @@ pub enum SaError {
         requested_op: ThresholdAffectingOp,
         /// Human-readable safe ordering hint for the two-command sequence.
         ///
-        /// Example: `"run 'wallet signers set-threshold --rule-id 1 --threshold 2' \
-        /// first, then retry 'wallet signers remove --rule-id 1 --signer 3'"`
+        /// Example: `"run 'smart-account signers set-threshold --rule-id 1 --threshold 2' \
+        /// first, then retry 'smart-account signers remove --rule-id 1 --signer 3'"`
         safe_ordering_hint: String,
         /// Redacted smart-account contract address (first-5-last-5 C-strkey).
         smart_account_redacted: RedactedStrkey,
@@ -513,7 +513,7 @@ pub enum SaError {
         "signer-set diverged on rule {rule_id} \
          (sa={smart_account_redacted}, req={request_id}): \
          expected {expected}, observed {observed} \
-         [use 'wallet signers list --rule-id {rule_id}' and check the audit log for details]"
+         [use 'smart-account signers list --rule-id {rule_id}' and check the audit log for details]"
     )]
     #[serde(rename = "sa.signer_set_diverged")]
     SignerSetDiverged {
@@ -682,7 +682,7 @@ pub enum SaError {
     /// DIFFERENT `wasm_sha256`.  Refuses to overwrite silently.
     ///
     /// Operator action: re-vendor the WASM (update `vendor/oz-webauthn-verifier/v0.7.1/`),
-    /// update `WEBAUTHN_VERIFIER_WASM_SHA256`, and re-run `wallet sa deploy-webauthn-verifier`
+    /// update `WEBAUTHN_VERIFIER_WASM_SHA256`, and re-run `smart-account deploy-webauthn-verifier`
     /// so the registry entry and the pinned SHA-256 stay in sync.
     ///
     /// `network` is the Stellar network passphrase (not secret).
@@ -843,7 +843,7 @@ pub enum SaError {
     ///
     /// Fired by `SignersManager::identify_threshold_policy` when the rule has
     /// `policies.len() == 0`.  The operator must install a threshold policy via
-    /// `wallet sa deploy-threshold-policy` and attach it to the rule before
+    /// `smart-account deploy-threshold-policy` and attach it to the rule before
     /// signer-threshold atomic updates can proceed.
     ///
     /// `smart_account_redacted` MUST be pre-redacted (first-5-last-5 C-strkey)
@@ -864,8 +864,8 @@ pub enum SaError {
     /// Fired when a signing attempt against a context rule finds no
     /// `SaSignerSetBaselined`, `SaSignerAdded`, `SaSignerRemoved`, or
     /// `SaThresholdChanged` audit row for this `(rule_id, smart_account)` pair.
-    /// The operator must run `wallet signers list --rule-id <N>` or
-    /// `wallet signers refresh --rule-id <N>` to create the baseline before
+    /// The operator must run `smart-account signers list --rule-id <N>` or
+    /// `smart-account signers refresh --rule-id <N>` to create the baseline before
     /// signing can proceed.
     ///
     /// Wire code: `sa.signer_set_missing_baseline`.
@@ -1104,7 +1104,7 @@ pub enum SaError {
     /// validation when the wasm hash is in `VERIFIER_ALLOWLIST` with
     /// `VerifierAuditStatus::Revoked { revoked_at, reason }`. Unconditional
     /// refusal — no opt-in flag overrides a Revoked entry. The operator response
-    /// is `wallet sa migrate-verifier` to a non-revoked hash, NOT bypass.
+    /// is `smart-account migrate-verifier` to a non-revoked hash, NOT bypass.
     ///
     /// # Forensic spine
     ///
@@ -1171,7 +1171,7 @@ pub enum SaError {
         request_id: String,
     },
 
-    /// `wallet sa migrate-verifier` failed at a named phase.
+    /// `smart-account migrate-verifier` failed at a named phase.
     ///
     /// Fired by the migration planner and the submission path. The `phase` is a
     /// closed-set `&'static str` discriminator naming the failure stage.
@@ -1352,11 +1352,11 @@ pub enum SaError {
     ///
     /// # Fix
     ///
-    /// Run `wallet sa register-multicall --network-passphrase <passphrase>
+    /// Run `smart-account register-multicall --network-passphrase <passphrase>
     /// --address <C-strkey>` to register the router address.
     #[error(
         "no multicall router registered for network '{network_safename}'; \
-         run 'wallet sa register-multicall' to register the router address"
+         run 'smart-account register-multicall' to register the router address"
     )]
     #[serde(rename = "sa.multicall_registry_entry_not_found")]
     MulticallRegistryEntryNotFound {
@@ -2053,7 +2053,7 @@ mod tests {
                     current_signer_count: 3,
                     current_threshold: 3,
                     requested_op: ThresholdAffectingOp::RemoveSigner { signer_id: 2 },
-                    safe_ordering_hint: "run 'wallet signers set-threshold --rule-id 1 \
+                    safe_ordering_hint: "run 'smart-account signers set-threshold --rule-id 1 \
                         --threshold 2' first, then retry remove"
                         .to_owned(),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),

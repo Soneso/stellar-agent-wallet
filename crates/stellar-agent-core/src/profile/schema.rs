@@ -611,7 +611,7 @@ pub struct Profile {
     /// [`crate::profile::loader::ProfileLoadError::InvalidScanIdBound`].
     /// This caps a profile-write threat vector where an attacker who can edit
     /// the profile TOML sets the field to `u32::MAX` and triggers up to ~4.3B
-    /// simulate calls on any `wallet sa list-rules` / `migrate-verifier`
+    /// simulate calls on any `smart-account list-rules` / `migrate-verifier`
     /// invocation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub smart_account_max_context_rule_scan_id: Option<u32>,

@@ -166,8 +166,9 @@ payments. See `references/cli-reference.md` and `references/mcp-tools.md`.
 
 The wallet manages OpenZeppelin smart accounts: context rules, ed25519 and
 WebAuthn passkey signers, quorum thresholds, verifier/policy WASM-hash pinning,
-multicall, and an upgrade timelock. These run under the CLI `wallet sa` command
-group and submit through the smart account. See `references/smart-accounts.md`.
+multicall, and an upgrade timelock. These run under the CLI `smart-account`
+(alias `sa`) command group and submit through the smart account. See
+`references/smart-accounts.md`.
 
 ## 6. DeFi
 

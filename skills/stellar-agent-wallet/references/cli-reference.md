@@ -23,7 +23,7 @@ Exceptions: the `credentials` and `toolsets` groups print a flat object using a 
 
 - Amounts are decimal strings with an explicit unit, e.g. `"10 XLM"`, `"10.5 USDC"`, `"5 XLM"`. Bare numbers and raw stroop strings are rejected on user-facing amount flags. (The DeFi venue flags `lend`/`vault`/`trade` are the exception: they take raw integer base-unit amounts — `i128` / `--amount`, `--shares`, etc. — with no unit.)
 - Assets are `native`, `XLM`, or `CODE:ISSUER_GSTRKEY` (e.g. `USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN`). Contract addresses are C-strkeys; classic accounts are G-strkeys; secret keys are S-strkeys.
-- `--fee <STROOPS|auto[:pNN]>`: an integer sets explicit stroops; `auto` selects the p95 percentile from `getFeeStats`; `auto:pNN` selects an explicit percentile (`p50`, `p75`, `p95`, `p99`). Absent uses the profile default (100 stroops). Soroban resource fees are added by simulation. (`wallet multicall` accepts only an integer `--fee`; `auto` is rejected there.)
+- `--fee <STROOPS|auto[:pNN]>`: an integer sets explicit stroops; `auto` selects the p95 percentile from `getFeeStats`; `auto:pNN` selects an explicit percentile (`p50`, `p75`, `p95`, `p99`). Absent uses the profile default (100 stroops). Soroban resource fees are added by simulation. (`smart-account multicall` accepts only an integer `--fee`; `auto` is rejected there.)
 
 ### Shared flags
 
@@ -42,7 +42,7 @@ These recur with the same meaning across groups:
 
 Signing commands take a mutually exclusive signer-source group (exactly one):
 
-- The secret-env flag — the **name of an environment variable** holding the source-account S-strkey. Set the variable to your secret; pass the variable name, never the secret. Spelled `--secret-env` on `pay` / `accounts create`, `--deployer-secret-env` on `accounts deploy-c` / `wallet sa deploy-webauthn-verifier`, `--signer-secret-env` on the `wallet` commands.
+- The secret-env flag — the **name of an environment variable** holding the source-account S-strkey. Set the variable to your secret; pass the variable name, never the secret. Spelled `--secret-env` on `pay` / `accounts create`, `--deployer-secret-env` on `accounts deploy-c` / `smart-account deploy-webauthn-verifier`, `--signer-secret-env` on the `smart-account` commands.
 - `--sign-with-ledger` — sign with a connected Ledger hardware device.
 - `--account-index <INDEX>` — BIP-44 account index for the Ledger derivation path. Default `0`.
 
@@ -53,7 +53,7 @@ stellar-agent pay GDEST...WXYZ "10 XLM" --source GSRC...WXYZ --secret-env WALLET
 
 ### Mainnet-write refusal
 
-This is a testnet-first alpha. `mainnet` is accepted for read-only commands but every write or signing command structurally refuses `mainnet` before any RPC call and before any signing key is touched. The refusal surfaces as `network.mainnet_write_forbidden` (the `friendbot` command and `accounts create --fund-with-friendbot` use `network.friendbot_mainnet_forbidden`). Exception: `wallet sa migrate-verifier` permits a mainnet submit when `--confirm-mainnet-migrate` is supplied.
+This is a testnet-first alpha. `mainnet` is accepted for read-only commands but every write or signing command structurally refuses `mainnet` before any RPC call and before any signing key is touched. The refusal surfaces as `network.mainnet_write_forbidden` (the `friendbot` command and `accounts create --fund-with-friendbot` use `network.friendbot_mainnet_forbidden`). Exception: `smart-account migrate-verifier` permits a mainnet submit when `--confirm-mainnet-migrate` is supplied.
 
 ---
 
@@ -260,13 +260,13 @@ stellar-agent counterparty refresh circle.com --profile default
 
 ---
 
-## wallet
+## smart-account
 
-Smart-account governance over an on-chain OpenZeppelin smart-account: context rules, signer sets and thresholds, policy contracts, supporting infrastructure (verifier registry, multicall router registry, upgrade timelock), and multicall submission. All write verbs sign through the smart-account auth-entry digest path. Most on-chain signing verbs structurally refuse `mainnet`.
+Invoke as `stellar-agent smart-account <verb>` or via the shorter `sa` alias. Administration of an on-chain OpenZeppelin smart-account: context rules, signer sets and thresholds, policy contracts, supporting infrastructure (verifier registry, multicall router registry, upgrade timelock), and multicall submission. All write verbs sign through the smart-account auth-entry digest path. Most on-chain signing verbs structurally refuse `mainnet`.
 
 Signer source for write verbs: exactly one of `--signer-secret-env <VAR>` or `--sign-with-ledger`, plus `--account-index <INDEX>` (default `0`).
 
-### `wallet rules` — context-rule lifecycle
+### `smart-account rules` — context-rule lifecycle
 
 Each rule has a `rule_id` (u32), a name (OZ cap 20 bytes), an optional expiry ledger, a signer set (OZ cap 15), and up to 5 policy contracts. `--auth-rule-id <U32>` names the authorizing rule (repeatable on create/add-policy/remove-policy; default `[0]`, the bootstrap rule); where optional it defaults to `--rule-id`.
 
@@ -280,14 +280,14 @@ Each rule has a `rule_id` (u32), a name (OZ cap 20 bytes), an optional expiry le
 | `verify-pins` | Verify pinned verifier/policy WASM hashes vs on-chain (drift); read-only, `mainnet` ok; exit `1` on `drift` | `--rule-id <U32>`. Each `*_pin_status` is `match`/`drift`/`unavailable`/`no_pin`/`no_contracts`. |
 | `add-policy` | Add a policy (`add_policy`); cap 5; returns `policy_id` | `--rule-id <U32>`; `--policy-address <C_STRKEY>`; `--install-param <SCVAL_BASE64>` (standard base64 XDR `ScVal`, raw passthrough); `--auth-rule-id` |
 | `remove-policy` | Remove a policy by id (`remove_policy`) | `--rule-id <U32>`; `--policy-id <U32>`; `--auth-rule-id` |
-| `list` | Enumerate active rules by on-chain scan; read-only, `mainnet` ok; alias of `wallet sa list-rules` | see `wallet sa list-rules` |
+| `list` | Enumerate active rules by on-chain scan; read-only, `mainnet` ok; alias of `smart-account list-rules` | see `smart-account list-rules` |
 
 ```bash
-stellar-agent wallet rules create --account CABC...WXYZ --name agent-ops \
+stellar-agent smart-account rules create --account CABC...WXYZ --name agent-ops \
   --signer-delegated GABC...WXYZ --signer-secret-env WALLET_SK
 ```
 
-### `wallet signers` — signer-set lifecycle
+### `smart-account signers` — signer-set lifecycle
 
 All verbs take `--account <C_STRKEY>` and `--rule-id <U32>` (both required), the signer source, and shared network flags. None accept `--output`. All refuse `mainnet`, including `list`/`refresh` (which require a signer source to assemble the read envelope and write audit rows).
 
@@ -300,11 +300,11 @@ All verbs take `--account <C_STRKEY>` and `--rule-id <U32>` (both required), the
 | `set-threshold` | Change threshold via threshold-policy `set_threshold` | `--new-threshold <U32>` (required); no `--auth-rule-id` override |
 
 ```bash
-stellar-agent wallet signers set-threshold --account CABC...WXYZ \
+stellar-agent smart-account signers set-threshold --account CABC...WXYZ \
   --rule-id 0 --new-threshold 2 --signer-secret-env WALLET_SK
 ```
 
-### `wallet multicall`
+### `smart-account multicall`
 
 Submits an atomic multicall bundle (1–50 invocations) through the registered router. Signs and submits. Router resolved from the local registry (`~/.config/stellar-agent/networks.toml`); `mainnet` requires a mainnet-registered router. Requires a signer source and `--secondary-rpc-url` (flag or `profile.secondary_rpc_url`, else a typed error).
 
@@ -317,27 +317,27 @@ Submits an atomic multicall bundle (1–50 invocations) through the registered r
 | `--fee <STROOPS>` | Integer only; `auto` rejected | 
 
 ```bash
-stellar-agent wallet multicall --smart-account CABC...WXYZ --rule-id 0 \
+stellar-agent smart-account multicall --smart-account CABC...WXYZ --rule-id 0 \
   --invocation 'CTOK...WXYZ:transfer:["GABC...WXYZ","GWXY...WXYZ","1000000"]' \
   --secondary-rpc-url https://rpc2.example --signer-secret-env WALLET_SK
 ```
 
-### `wallet sa` — smart-account infrastructure
+### Infrastructure and timelock verbs
 
 | Verb | Purpose | Key flags |
 |---|---|---|
 | `deploy-webauthn-verifier` | Deploy OZ WebAuthn-verifier WASM, record in registry; idempotent (`status:"already_deployed"`); testnet only | `--deployer-secret-env <VAR>` xor `--sign-with-ledger`; `--account-index`; `--network`; `--rpc-url`; `--fee`; `--timeout-seconds`; `--output`; `--dry-run` (`status:"dry_run"`) |
 | `migrate-verifier` | Move all `External` signers from one verifier to another across rules; dry-run renders plan; mainnet submit needs `--confirm-mainnet-migrate` | `--account <C_STRKEY>`; `--from <HASH_HEX>` (64-char SHA-256 of source WASM); `--to <C_STRKEY>`; `--dry-run`; `--confirm-mainnet-migrate`; signer source (submit) |
 | `list-verifiers` | Enumerate compile-time verifier allowlist + audit-status taxonomy; read-only, no network | `--output` |
-| `list-rules` | Enumerate active rules by scanning `[0, max_scan_id)`; read-only, `mainnet` ok; backs `wallet rules list` | `--account <C_STRKEY>`; `--source-account <G_STRKEY>` (sim source); `--rpc-url`; `--secondary-rpc-url`; `--network`; `--profile`; `--max-scan-id <1..=10000>` (else profile, else 50); `--timeout-seconds`; `--output` (table deferred) |
+| `list-rules` | Enumerate active rules by scanning `[0, max_scan_id)`; read-only, `mainnet` ok; backs `smart-account rules list` | `--account <C_STRKEY>`; `--source-account <G_STRKEY>` (sim source); `--rpc-url`; `--secondary-rpc-url`; `--network`; `--profile`; `--max-scan-id <1..=10000>` (else profile, else 50); `--timeout-seconds`; `--output` (table deferred) |
 | `register-multicall` | Register router address + WASM hash in local registry; idempotent; refuses if `--wasm-sha256` ≠ compiled-in hash | `--network`; `--address <C_STRKEY>`; `--wasm-sha256 <HEX>` (64-char lowercase); `--profile` |
 | `unregister-multicall` | Remove router registry entry | `--network`; `--force` (corruption recovery, needs TTY `[y/N]` or `--yes-i-have-verified-the-prior-values`); `--profile` |
 
 ```bash
-stellar-agent wallet sa deploy-webauthn-verifier --deployer-secret-env DEPLOYER_SK
+stellar-agent smart-account deploy-webauthn-verifier --deployer-secret-env DEPLOYER_SK
 ```
 
-### `wallet sa timelock` — OpenZeppelin upgrade timelock
+### `smart-account timelock` — OpenZeppelin upgrade timelock
 
 Schedule, cancel, execute, and list pending operations. All share `--timelock <C_STRKEY>` (required), `--rpc-url`, `--secondary-rpc-url` (defaults to `--rpc-url`), `--network`, `--profile`; write verbs add the signer source. Write verbs refuse `mainnet`; `list-pending` is read-only and accepts `mainnet`.
 
@@ -349,7 +349,7 @@ Schedule, cancel, execute, and list pending operations. All share `--timelock <C
 | `list-pending` | List pending ops via audit log + dual-RPC `get_operation_state`; read-only | (shared only) |
 
 ```bash
-stellar-agent wallet sa timelock schedule --timelock CTLCK...WXYZ \
+stellar-agent smart-account timelock schedule --timelock CTLCK...WXYZ \
   --target CTGT...WXYZ --function upgrade --delay-ledgers 100 \
   --signer-secret-env PROPOSER_SK
 # Save the "salt" field from the JSON output.

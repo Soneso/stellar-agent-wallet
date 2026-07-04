@@ -17,8 +17,8 @@ pub mod lend;
 pub mod pay;
 pub mod pool;
 pub mod profile;
+pub mod smart_account;
 pub mod toolsets;
-pub mod wallet;
 // DeFindex vault adapter — vault verb.
 pub mod vault;
 // Soroswap DEX swap adapter — trade verb.

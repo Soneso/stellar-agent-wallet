@@ -43,7 +43,7 @@
 /// The vendored `multisig_webauthn_verifier_example.wasm` binary, embedded at
 /// compile time.
 ///
-/// Embedded so the deploy CLI (`wallet sa deploy-webauthn-verifier`) can upload
+/// Embedded so the deploy CLI (`smart-account deploy-webauthn-verifier`) can upload
 /// the WASM via `UploadContractWasm` without re-fetching from disk at runtime,
 /// and so the SHA-256 check in
 /// `tests::vendored_wasm_hash_matches_allowlist_entry` can verify the

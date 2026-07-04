@@ -20,7 +20,7 @@
 - **sha256(timelock_controller_example.wasm):**
   `36299255cf77678a59d7fdfe9823d803be2bdddb9cc375be3130daed265295eb`
 - **Size:** 28357 bytes.
-- **Usage:** Uploaded to testnet in `wallet_smart_account_timelock_testnet_acceptance.rs`
+- **Usage:** Uploaded to testnet in `smart_account_timelock_testnet_acceptance.rs`
   via `HostFunction::UploadContractWasm` + `HostFunction::CreateContractV2`.
   The contract is instantiated inline per test (not a one-time singleton).
 - **Constructor:** `__constructor(min_delay: u32, proposers: Vec<Address>,

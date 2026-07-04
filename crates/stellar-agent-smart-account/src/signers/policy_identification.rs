@@ -75,7 +75,7 @@ pub const THRESHOLD_POLICY_WASM_HASHES: &[[u8; 32]] = &[
 /// The vendored `multisig_threshold_policy_example.wasm` binary, embedded at
 /// compile time.
 ///
-/// Embedded so the deploy CLI (`wallet sa deploy-threshold-policy`) can upload
+/// Embedded so the deploy CLI (`smart-account deploy-threshold-policy`) can upload
 /// the WASM via `UploadContractWasm` without re-fetching from disk at runtime.
 /// Also ensures the SHA-256 check in
 /// `tests::vendored_wasm_hash_matches_allowlist_entry` can verify the

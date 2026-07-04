@@ -59,7 +59,7 @@ fn threshold_unreachable_safe_ordering_hint_is_always_non_empty() {
     for op in &ops {
         let hint = match op {
             ThresholdAffectingOp::RemoveSigner { .. } => {
-                "run 'wallet signers set-threshold --rule-id 1 --new-threshold 1' first"
+                "run 'smart-account signers set-threshold --rule-id 1 --new-threshold 1' first"
             }
             ThresholdAffectingOp::SetThreshold { .. } => {
                 "new_threshold > signer_count; add signers first"

@@ -134,7 +134,7 @@ fn write_temp_toml(content: &str) -> (tempfile::NamedTempFile, std::path::PathBu
 /// T-10a: `smart_account_max_context_rule_scan_id = 4294967295` (u32::MAX) is
 /// rejected at profile-load time with `ProfileLoadError::InvalidScanIdBound`.
 ///
-/// u32::MAX would cause ~4.3B simulate calls per `wallet sa list-rules` invocation.
+/// u32::MAX would cause ~4.3B simulate calls per `smart-account list-rules` invocation.
 /// The bounds check prevents this at profile-load, never reaching the manager layer.
 #[test]
 fn t10a_u32_max_scan_id_rejected() {

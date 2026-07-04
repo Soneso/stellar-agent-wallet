@@ -281,7 +281,7 @@ pub enum PinVerifyError {
 ///
 /// This enum is **not consumed by any sign-time gate**; it is only for
 /// operator-facing reporting (analogous to the `VerifyPinsResult` produced by
-/// `stellar-agent-smart-account`'s rule-pin verifier for the `wallet rules
+/// `stellar-agent-smart-account`'s rule-pin verifier for the `smart-account rules
 /// verify-pins` command).
 ///
 /// All fields carry first-8 hex hashes and first-5-last-5 contract addresses;
@@ -447,7 +447,7 @@ pub fn verify_pin_for_sign(
 /// This function does NOT gate signing.  It is the report-only counterpart to
 /// [`verify_pin_for_sign`], analogous to `stellar-agent-smart-account`'s
 /// rule-pin verifier which produces a verification result for the
-/// `wallet rules verify-pins` command.
+/// `smart-account rules verify-pins` command.
 ///
 /// The result is intentionally separate from `verify_pin_for_sign` to make it
 /// structurally impossible for a caller to accidentally route a report-only call
