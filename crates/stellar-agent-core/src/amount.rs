@@ -1441,6 +1441,22 @@ mod tests {
         }
     }
 
+    /// Pins the exact decimal string at the `i64` extremes so no caller can
+    /// regress `as_xlm_decimal_string` back to lossy `f64` division, which
+    /// loses precision well below this magnitude (an `f64` mantissa carries
+    /// only ~15-17 significant decimal digits; these stroop counts need 19).
+    #[test]
+    fn as_xlm_decimal_string_exact_at_i64_extremes() {
+        assert_eq!(
+            StellarAmount::from_stroops(i64::MAX).as_xlm_decimal_string(),
+            "922337203685.4775807"
+        );
+        assert_eq!(
+            StellarAmount::from_stroops(i64::MIN).as_xlm_decimal_string(),
+            "-922337203685.4775808"
+        );
+    }
+
     #[test]
     fn as_xlm_decimal_string_matches_display_without_unit() {
         for stroops in &[

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/stellar-agent-derive", "crates/stellar-agent-toolsets", "crates/stellar-agent-sep10", "crates/stellar-agent-sep45", "crates/stellar-agent-test-support", "crates/stellar-agent-windows-identity", "crates/stellar-agent-core", "crates/stellar-agent-network", "crates/stellar-agent-sep53", "crates/stellar-agent-nonce", "crates/stellar-agent-sep7", "crates/stellar-agent-sep43", "crates/stellar-agent-stablecoin", "crates/stellar-agent-pool", "crates/stellar-agent-xdr-limits", "crates/stellar-agent-sep48", "crates/stellar-agent-defi", "crates/stellar-agent-anchor", "crates/stellar-agent-toolsets-install", "crates/stellar-agent-mcp-macros", "crates/stellar-agent-toolsets-runtime", "crates/stellar-agent-smart-account", "crates/stellar-agent-webauthn-bridge", "crates/stellar-agent-approval-ui", "crates/stellar-agent-blend", "crates/stellar-agent-dex", "crates/stellar-agent-defindex", "crates/stellar-agent-x402", "crates/stellar-agent-x402-identity", "crates/stellar-agent-mcp", "crates/stellar-agent-cli", "crates/stellar-agent-claimable"]
+members = ["crates/stellar-agent-derive", "crates/stellar-agent-toolsets", "crates/stellar-agent-sep10", "crates/stellar-agent-sep45", "crates/stellar-agent-test-support", "crates/stellar-agent-windows-identity", "crates/stellar-agent-core", "crates/stellar-agent-network", "crates/stellar-agent-sep53", "crates/stellar-agent-nonce", "crates/stellar-agent-sep7", "crates/stellar-agent-sep43", "crates/stellar-agent-stablecoin", "crates/stellar-agent-pool", "crates/stellar-agent-xdr-limits", "crates/stellar-agent-sep48", "crates/stellar-agent-defi", "crates/stellar-agent-anchor", "crates/stellar-agent-toolsets-install", "crates/stellar-agent-mcp-macros", "crates/stellar-agent-toolsets-runtime", "crates/stellar-agent-smart-account", "crates/stellar-agent-webauthn-bridge", "crates/stellar-agent-approval-ui", "crates/stellar-agent-loopback-http", "crates/stellar-agent-blend", "crates/stellar-agent-dex", "crates/stellar-agent-defindex", "crates/stellar-agent-x402", "crates/stellar-agent-x402-identity", "crates/stellar-agent-mcp", "crates/stellar-agent-cli", "crates/stellar-agent-claimable"]
 
 [workspace.package]
 version = "0.1.0-alpha.1"
@@ -102,6 +102,7 @@ tower = { version = "=0.5.3", default-features = false, features = ["util"] }
 tower-http = { version = "=0.7.0", default-features = false, features = ["limit", "trace"] }
 stellar-agent-webauthn-bridge = { path = "crates/stellar-agent-webauthn-bridge" }
 stellar-agent-approval-ui = { path = "crates/stellar-agent-approval-ui" }
+stellar-agent-loopback-http = { path = "crates/stellar-agent-loopback-http" }
 stellar-agent-blend = { path = "crates/stellar-agent-blend" }
 stellar-agent-defi = { path = "crates/stellar-agent-defi" }
 stellar-agent-dex = { path = "crates/stellar-agent-dex" }

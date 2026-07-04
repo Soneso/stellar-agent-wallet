@@ -26,6 +26,7 @@ wiremock = { workspace = true, optional = true }
 ed25519-dalek = { workspace = true, optional = true }
 rand_core = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 stellar-baselib = { workspace = true, optional = true }
 stellar-rpc-client = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
@@ -55,6 +56,7 @@ testnet-helpers = [
     "dep:ed25519-dalek",
     "dep:rand_core",
     "dep:reqwest",
+    "dep:sha2",
     "dep:stellar-baselib",
     "dep:stellar-rpc-client",
     "dep:stellar-strkey",

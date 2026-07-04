@@ -1,0 +1,33 @@
+[package]
+name = "stellar-agent-loopback-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared tower/axum defence-in-depth middleware for the Stellar agent wallet's loopback-only HTTP listeners (Host allowlist, Origin allowlist, hardened security headers)."
+publish = false
+
+[lib]
+name = "stellar_agent_loopback_http"
+
+[dependencies]
+# HTTP framework types (Request/Response/StatusCode/header) the middleware
+# operates on; no server or router surface is exposed from this crate.
+axum = { workspace = true }
+
+# Layer/Service traits the middleware implements.
+tower = { workspace = true }
+
+# JSON rejection bodies (`{"error": "..."}`).
+serde_json = { workspace = true }
+
+# Diagnostic log line on a loopback-named Host at the wrong port.
+tracing = { workspace = true }
+
+[dev-dependencies]
+# oneshot() driver + Router test harness for the middleware unit tests.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -28,6 +28,72 @@ use crate::signing::divergence::{
     EnvelopeContext, SimulationContext, detect_simulation_divergence,
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Classic (Ed25519) source-account auth signature ScVal
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One `TryFrom` step of [`build_classic_signature_scval`], pre-formatted as
+/// `"encode <step>: {e:?}"` so callers can prepend their own call-site prefix
+/// without losing the step detail.
+pub(crate) struct ClassicSigScValStep(String);
+
+impl std::fmt::Display for ClassicSigScValStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Builds the standard single-Ed25519 Stellar source-account auth signature
+/// ScVal: `ScVal::Vec([ScVal::Map([{public_key: Bytes<32>, signature: Bytes<64>}])])`.
+///
+/// Cross-reference: js-stellar-base auth.js:171-184 (canonical encoding for
+/// `SorobanCredentials::Address` whose address is a Stellar account).
+///
+/// Shared by [`build_and_sign_delegated_g_key_entry`] and
+/// `timelock_submit`'s per-signer re-signing loop — both attach a classic
+/// G-key signature to a `SorobanCredentials::Address` entry.
+///
+/// # Errors
+///
+/// Every step's `TryFrom` conversion is unreachable in practice — `pubkey`
+/// and `signature_bytes` are always fixed-size (32 and 64 bytes) and the
+/// symbol literals are short ASCII, none of which can exceed their target
+/// XDR types' length limits — but the typed [`ClassicSigScValStep`] error
+/// keeps each call site's existing error text exact.
+pub(crate) fn build_classic_signature_scval(
+    pubkey: &[u8; 32],
+    signature_bytes: &[u8],
+) -> Result<ScVal, ClassicSigScValStep> {
+    let public_key_sym = ScSymbol::try_from("public_key")
+        .map_err(|e| ClassicSigScValStep(format!("encode public_key Symbol: {e:?}")))?;
+    let signature_sym = ScSymbol::try_from("signature")
+        .map_err(|e| ClassicSigScValStep(format!("encode signature Symbol: {e:?}")))?;
+    let pubkey_bytesm: BytesM = pubkey
+        .to_vec()
+        .try_into()
+        .map_err(|e| ClassicSigScValStep(format!("encode pubkey BytesM: {e:?}")))?;
+    let sig_bytesm: BytesM = signature_bytes
+        .to_vec()
+        .try_into()
+        .map_err(|e| ClassicSigScValStep(format!("encode signature BytesM: {e:?}")))?;
+    let inner_map_entries: VecM<ScMapEntry> = vec![
+        ScMapEntry {
+            key: ScVal::Symbol(public_key_sym),
+            val: ScVal::Bytes(ScBytes(pubkey_bytesm)),
+        },
+        ScMapEntry {
+            key: ScVal::Symbol(signature_sym),
+            val: ScVal::Bytes(ScBytes(sig_bytesm)),
+        },
+    ]
+    .try_into()
+    .map_err(|e| ClassicSigScValStep(format!("encode inner ScMap: {e:?}")))?;
+    let outer_vec: VecM<ScVal> = vec![ScVal::Map(Some(ScMap(inner_map_entries)))]
+        .try_into()
+        .map_err(|e| ClassicSigScValStep(format!("encode outer ScVec: {e:?}")))?;
+    Ok(ScVal::Vec(Some(ScVec(outer_vec))))
+}
+
 /// Simulation metadata required to build the smart-account auth digest.
 ///
 /// Uses Soroban authorization preimage fields matching the OZ `__check_auth`
@@ -631,8 +697,8 @@ pub(crate) async fn build_and_sign_delegated_g_key_entry(
 ) -> Result<SorobanAuthorizationEntry, SaError> {
     use stellar_xdr::{
         AccountId, BytesM, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization, PublicKey,
-        ScBytes, ScMap, ScMapEntry, SorobanAddressCredentials, SorobanAuthorizedFunction,
-        SorobanAuthorizedInvocation, SorobanCredentials, Uint256, WriteXdr,
+        ScBytes, SorobanAddressCredentials, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
+        SorobanCredentials, Uint256, WriteXdr,
     };
 
     let auth_payload_err = |reason: String| SaError::AuthEntryConstructionFailed {
@@ -726,39 +792,8 @@ pub(crate) async fn build_and_sign_delegated_g_key_entry(
     // ScVal::Vec([ScVal::Map([{public_key: BytesN<32>, signature: BytesN<64>}])])
     // Cross-reference: js-stellar-base auth.js:171-184 (canonical encoding
     // for SorobanCredentials::Address whose address is a Stellar account).
-    let public_key_sym = ScSymbol::try_from("public_key").map_err(|e| {
-        auth_payload_err(format!("delegated entry: encode public_key Symbol: {e:?}"))
-    })?;
-    let signature_sym = ScSymbol::try_from("signature").map_err(|e| {
-        auth_payload_err(format!("delegated entry: encode signature Symbol: {e:?}"))
-    })?;
-
-    let pubkey_bytesm: BytesM =
-        pubkey.0.to_vec().try_into().map_err(|e| {
-            auth_payload_err(format!("delegated entry: encode pubkey BytesM: {e:?}"))
-        })?;
-    let sig_bytesm: BytesM = signature_bytes.to_vec().try_into().map_err(|e| {
-        auth_payload_err(format!("delegated entry: encode signature BytesM: {e:?}"))
-    })?;
-
-    let inner_map_entries: VecM<ScMapEntry> = vec![
-        ScMapEntry {
-            key: ScVal::Symbol(public_key_sym),
-            val: ScVal::Bytes(ScBytes(pubkey_bytesm)),
-        },
-        ScMapEntry {
-            key: ScVal::Symbol(signature_sym),
-            val: ScVal::Bytes(ScBytes(sig_bytesm)),
-        },
-    ]
-    .try_into()
-    .map_err(|e| auth_payload_err(format!("delegated entry: encode inner ScMap: {e:?}")))?;
-    let inner_map = ScVal::Map(Some(ScMap(inner_map_entries)));
-
-    let outer_vec: VecM<ScVal> = vec![inner_map]
-        .try_into()
-        .map_err(|e| auth_payload_err(format!("delegated entry: encode outer ScVec: {e:?}")))?;
-    let signature_scval = ScVal::Vec(Some(ScVec(outer_vec)));
+    let signature_scval = build_classic_signature_scval(&pubkey.0, &signature_bytes)
+        .map_err(|e| auth_payload_err(format!("delegated entry: {e}")))?;
 
     Ok(SorobanAuthorizationEntry {
         credentials: SorobanCredentials::Address(SorobanAddressCredentials {

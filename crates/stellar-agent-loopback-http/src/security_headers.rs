@@ -1,8 +1,8 @@
 //! Security response headers middleware.
 //!
-//! Injects hardened HTTP response headers on every response from the bridge,
-//! regardless of status code (200, 4xx, 5xx, or upstream-produced errors all
-//! receive the headers).
+//! Injects hardened HTTP response headers on every response from the
+//! listener, regardless of status code (200, 4xx, 5xx, or upstream-produced
+//! errors all receive the headers).
 //!
 //! # Headers injected
 //!
@@ -17,16 +17,18 @@
 //! # CSP policy
 //!
 //! The `Content-Security-Policy` value is the most security-critical header.
-//! It restricts executable content to `'self'` (the bridge origin) only:
+//! It restricts executable content to `'self'` (the listener's own origin)
+//! only:
 //!
 //! - `default-src 'none'` — deny-by-default for all resource types.
-//! - `script-src 'self'` — only `/static/webauthn.js` may execute.
+//! - `script-src 'self'` — only the listener's own same-origin script may
+//!   execute.
 //! - `style-src 'self' 'unsafe-inline'` — inline `<style>` blocks permitted
 //!   for the minimal UI (no external stylesheet dependencies).
-//! - `connect-src 'self'` — only same-origin XHR/fetch (POST to bridge).
+//! - `connect-src 'self'` — only same-origin XHR/fetch.
 //! - `img-src 'self'` — only same-origin images.
 //! - `base-uri 'none'` — `<base>` tag attacks disabled.
-//! - `form-action 'none'` — `<form>` submissions disabled (bridge uses XHR).
+//! - `form-action 'none'` — `<form>` submissions disabled (callers use XHR).
 //! - `frame-ancestors 'none'` — supersedes `X-Frame-Options: DENY` per
 //!   CSP3 §6.3.1 in modern browsers; pairs with the XFO header for legacy
 //!   fallback (clickjacking defence in depth).
@@ -51,7 +53,8 @@ use tower::{Layer, Service};
 // CSP constant
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Content Security Policy for all bridge-served pages.
+/// Content Security Policy for all pages served by a loopback listener using
+/// this middleware.
 ///
 /// Hardening properties:
 /// - No `'unsafe-eval'`, no remote origins, no wildcard.
@@ -82,7 +85,7 @@ pub(crate) const CSP_VALUE: &str = "default-src 'none'; \
 /// # Examples
 ///
 /// ```no_run
-/// use stellar_agent_webauthn_bridge::middleware::security_headers::SecurityHeadersLayer;
+/// use stellar_agent_loopback_http::security_headers::SecurityHeadersLayer;
 ///
 /// let _layer = SecurityHeadersLayer::new();
 /// ```
@@ -149,7 +152,7 @@ where
 /// Inject the five hardened security response headers into `headers`.
 ///
 /// Existing values for these headers are overwritten to prevent a handler
-/// from accidentally weakening the policy.  All header values are `'static`
+/// from accidentally weakening the policy. All header values are `'static`
 /// ASCII strings, so construction via `HeaderValue::from_static` is infallible.
 fn inject_security_headers(headers: &mut axum::http::HeaderMap) {
     headers.insert(
@@ -264,6 +267,13 @@ mod tests {
             .to_str()
             .unwrap();
         assert_eq!(val, CSP_VALUE, "CSP must match the exact constant");
+    }
+
+    #[tokio::test]
+    async fn csp_has_no_unsafe_inline_scripts() {
+        assert!(CSP_VALUE.contains("script-src 'self'"));
+        assert!(!CSP_VALUE.contains("script-src 'self' 'unsafe-inline'"));
+        assert!(!CSP_VALUE.contains("unsafe-eval"));
     }
 
     #[tokio::test]

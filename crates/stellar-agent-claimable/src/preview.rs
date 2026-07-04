@@ -17,6 +17,7 @@
 //! malformed-input condition, not an informational state to display.
 
 use serde::{Deserialize, Serialize};
+use stellar_agent_core::amount::StellarAmount;
 use stellar_xdr::{Asset, ClaimableBalanceEntry, ClaimableBalanceEntryExt, Claimant};
 
 use crate::entry::TrustlineState;
@@ -129,7 +130,7 @@ impl ClaimPreview {
         });
 
         let (asset_code, asset_issuer) = asset_code_issuer(&entry.asset);
-        let amount_display = format_stroops(entry.amount);
+        let amount_display = StellarAmount::from_stroops(entry.amount).as_xlm_decimal_string();
 
         let mut claimants = Vec::with_capacity(entry.claimants.len());
         let mut matched_predicate: Option<&stellar_xdr::ClaimPredicate> = None;
@@ -311,17 +312,6 @@ fn trim_asset_code(bytes: &[u8]) -> String {
         .unwrap_or_default()
         .trim_end_matches('\0')
         .to_owned()
-}
-
-/// Formats `stroops` as a fixed-point decimal string at the Stellar
-/// protocol's 7-decimal-place unit (applies uniformly to native and
-/// non-native assets — the wire type is the same `i64` unit for both).
-fn format_stroops(stroops: i64) -> String {
-    let negative = stroops < 0;
-    let magnitude = stroops.unsigned_abs();
-    let whole = magnitude / 10_000_000;
-    let frac = magnitude % 10_000_000;
-    format!("{}{whole}.{frac:07}", if negative { "-" } else { "" })
 }
 
 #[cfg(test)]
@@ -690,20 +680,29 @@ mod tests {
         assert!(check_trustline(&state, Some("USDC"), Some(ISSUER_G), 100).is_ok());
     }
 
-    // ─── format_stroops ──────────────────────────────────────────────────
+    // ─── amount_display (StellarAmount::as_xlm_decimal_string) ────────────
 
     #[test]
-    fn format_stroops_zero() {
-        assert_eq!(format_stroops(0), "0.0000000");
+    fn amount_display_zero() {
+        assert_eq!(
+            StellarAmount::from_stroops(0).as_xlm_decimal_string(),
+            "0.0000000"
+        );
     }
 
     #[test]
-    fn format_stroops_one_unit() {
-        assert_eq!(format_stroops(10_000_000), "1.0000000");
+    fn amount_display_one_unit() {
+        assert_eq!(
+            StellarAmount::from_stroops(10_000_000).as_xlm_decimal_string(),
+            "1.0000000"
+        );
     }
 
     #[test]
-    fn format_stroops_fractional() {
-        assert_eq!(format_stroops(1_500_000), "0.1500000");
+    fn amount_display_fractional() {
+        assert_eq!(
+            StellarAmount::from_stroops(1_500_000).as_xlm_decimal_string(),
+            "0.1500000"
+        );
     }
 }

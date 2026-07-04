@@ -15,8 +15,10 @@ name = "stellar_agent_approval_ui"
 # HTTP framework for the loopback approval-inbox listener.
 axum = { workspace = true }
 
-# Middleware composition for the layered defence stack.
-tower = { workspace = true }
+# Shared Host/Origin allowlist + security-headers middleware, also used by
+# stellar-agent-webauthn-bridge.
+stellar-agent-loopback-http = { workspace = true }
+
 
 # HTTP-specific middleware: RequestBodyLimitLayer + TraceLayer.
 tower-http = { workspace = true }
@@ -61,6 +63,8 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# ServiceExt::oneshot for in-process router tests.
+tower = { workspace = true }
 # Temporary directories for store/keyring test isolation.
 tempfile = { workspace = true }
 

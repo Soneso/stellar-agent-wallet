@@ -35,7 +35,6 @@ pub use stellar_agent_core::BASE_RESERVE_STROOPS;
 use stellar_agent_core::amount::StellarAmount;
 use stellar_agent_core::error::{NetworkError, ProtocolError, ValidationError, WalletError};
 pub(crate) use stellar_agent_core::observability::redact_strkey_first5_last5 as redact_account_id;
-use stellar_agent_core::{STELLAR_DECIMALS, STROOPS_PER_XLM};
 use stellar_rpc_client::Error as RpcError;
 use stellar_xdr::{
     AccountEntry, AccountId, LedgerEntryData, LedgerKey, LedgerKeyAccount, LedgerKeyData,
@@ -392,9 +391,9 @@ impl BalanceView {
     /// - [`WalletError::Validation`] wrapping a [`ValidationError`] variant if
     ///   `self.balance` cannot be parsed as a 7-decimal XLM string.  In practice
     ///   this should never happen for values returned by [`fetch_account`] (they
-    ///   are produced by `format_stroops`, which always emits a valid 7-decimal
-    ///   string), but the fallible path is preserved for defensive handling of
-    ///   externally-supplied `BalanceView` instances.
+    ///   are produced by `StellarAmount::as_xlm_decimal_string`, which always
+    ///   emits a valid 7-decimal string), but the fallible path is preserved
+    ///   for defensive handling of externally-supplied `BalanceView` instances.
     /// - [`WalletError::Validation`] wrapping [`ValidationError::AmountOutOfRange`]
     ///   if the parsed stroop value is negative.  Defence-in-depth: on-chain
     ///   balances are always ≥ 0; a negative result indicates a malformed RPC
@@ -421,7 +420,7 @@ impl BalanceView {
     /// ```
     pub fn balance_stroops(&self) -> Result<i64, WalletError> {
         // Format as "NNN.NNNNNNN XLM" so parse_with_unit can accept it.
-        // The balance string from format_stroops is already 7-decimal but lacks
+        // self.balance is already 7-decimal (as_xlm_decimal_string) but lacks
         // the unit suffix.
         let with_unit = format!("{} XLM", self.balance);
         let stroops = StellarAmount::parse_with_unit(&with_unit)
@@ -800,10 +799,11 @@ fn project_trustline_entry(tl: &stellar_xdr::TrustLineEntry) -> Result<BalanceVi
 
     Ok(BalanceView {
         asset: asset_view,
-        balance: format_stroops(tl.balance),
-        limit: Some(format_stroops(tl.limit)),
-        buying_liabilities: format_stroops(buying_liabilities),
-        selling_liabilities: format_stroops(selling_liabilities),
+        balance: StellarAmount::from_stroops(tl.balance).as_xlm_decimal_string(),
+        limit: Some(StellarAmount::from_stroops(tl.limit).as_xlm_decimal_string()),
+        buying_liabilities: StellarAmount::from_stroops(buying_liabilities).as_xlm_decimal_string(),
+        selling_liabilities: StellarAmount::from_stroops(selling_liabilities)
+            .as_xlm_decimal_string(),
     })
 }
 
@@ -907,7 +907,7 @@ fn project_account_entry(
     entry: &AccountEntry,
 ) -> Result<AccountView, WalletError> {
     // Native XLM balance from the account entry.
-    let native_balance = format_stroops(entry.balance);
+    let native_balance = StellarAmount::from_stroops(entry.balance).as_xlm_decimal_string();
 
     // Liabilities live in AccountEntryExt > V1.
     let (buying_liabilities, selling_liabilities) = extract_liabilities(entry);
@@ -916,8 +916,9 @@ fn project_account_entry(
         asset: AssetView::native(),
         balance: native_balance,
         limit: None,
-        buying_liabilities: format_stroops(buying_liabilities),
-        selling_liabilities: format_stroops(selling_liabilities),
+        buying_liabilities: StellarAmount::from_stroops(buying_liabilities).as_xlm_decimal_string(),
+        selling_liabilities: StellarAmount::from_stroops(selling_liabilities)
+            .as_xlm_decimal_string(),
     }];
 
     // Thresholds: bytes [0]=master, [1]=low, [2]=med, [3]=high.
@@ -1039,23 +1040,6 @@ fn project_home_domain(bytes: &[u8]) -> Option<String> {
     }
     let domain = std::str::from_utf8(bytes).ok()?;
     is_valid_ldh_home_domain(domain).then(|| domain.to_owned())
-}
-
-/// Formats a stroop integer as a 7-decimal decimal string.
-///
-/// e.g. `10_000_000` → `"1.0000000"`, `0` → `"0.0000000"`.
-///
-/// Uses the same formatting logic as `stellar_agent_core::StellarAmount::Display`.
-fn format_stroops(stroops: i64) -> String {
-    // Use integer arithmetic to avoid floating-point imprecision.
-    let abs = stroops.unsigned_abs();
-    let whole = abs / (STROOPS_PER_XLM as u64);
-    let frac = abs % (STROOPS_PER_XLM as u64);
-    let sign = if stroops < 0 { "-" } else { "" };
-    format!(
-        "{sign}{whole}.{frac:0>width$}",
-        width = STELLAR_DECIMALS as usize
-    )
 }
 
 /// Fetches the value of an account data entry (account `manageData`) by key.
@@ -1190,6 +1174,8 @@ fn map_rpc_error_generic(e: &RpcError, url: &str) -> WalletError {
     reason = "test-only; assertions via unwrap/expect are idiomatic in unit tests"
 )]
 mod tests {
+    use stellar_agent_core::STROOPS_PER_XLM;
+
     use super::*;
 
     // ─── balance_stroops unit tests ───────────────────────────────────────────
@@ -1253,22 +1239,34 @@ mod tests {
 
     #[test]
     fn format_stroops_zero() {
-        assert_eq!(format_stroops(0), "0.0000000");
+        assert_eq!(
+            StellarAmount::from_stroops(0).as_xlm_decimal_string(),
+            "0.0000000"
+        );
     }
 
     #[test]
     fn format_stroops_one_xlm() {
-        assert_eq!(format_stroops(STROOPS_PER_XLM), "1.0000000");
+        assert_eq!(
+            StellarAmount::from_stroops(STROOPS_PER_XLM).as_xlm_decimal_string(),
+            "1.0000000"
+        );
     }
 
     #[test]
     fn format_stroops_fractional() {
-        assert_eq!(format_stroops(100), "0.0000100");
+        assert_eq!(
+            StellarAmount::from_stroops(100).as_xlm_decimal_string(),
+            "0.0000100"
+        );
     }
 
     #[test]
     fn format_stroops_large() {
-        assert_eq!(format_stroops(1_000_000_000_000_i64), "100000.0000000");
+        assert_eq!(
+            StellarAmount::from_stroops(1_000_000_000_000_i64).as_xlm_decimal_string(),
+            "100000.0000000"
+        );
     }
 
     #[test]

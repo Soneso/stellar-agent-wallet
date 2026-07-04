@@ -129,36 +129,13 @@ pub fn parse_memo_fields(
 /// - [`WalletError::Validation`] if the input length is not 64 or contains
 ///   non-hex characters.
 pub(crate) fn decode_32_hex_bytes(hex_str: &str, memo_type: &str) -> Result<[u8; 32], WalletError> {
-    if hex_str.len() != 64 || !hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(WalletError::Validation(ValidationError::MemoInvalidType {
+    // Redaction invariant: this field MUST NOT contain raw key/seed/signature
+    // bytes; the mapped error never echoes attacker-supplied memo bytes.
+    stellar_agent_core::hex::decode_hex32(hex_str).map_err(|_| {
+        WalletError::Validation(ValidationError::MemoInvalidType {
             memo_type: format!("{memo_type} (must be exactly 64 hex characters)"),
-        }));
-    }
-
-    let mut bytes = [0u8; 32];
-    for (i, chunk) in hex_str.as_bytes().chunks(2).enumerate() {
-        let hi = hex_nibble(chunk[0])?;
-        let lo = hex_nibble(chunk[1])?;
-        bytes[i] = (hi << 4) | lo;
-    }
-    Ok(bytes)
-}
-
-fn hex_nibble(b: u8) -> Result<u8, WalletError> {
-    match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => {
-            // Redaction invariant: this field MUST NOT contain raw key/seed/signature
-            // bytes; do not echo attacker-supplied memo bytes into the error
-            // envelope — the raw byte value of an invalid hex character could
-            // be an encoding of sensitive input.
-            Err(WalletError::Validation(ValidationError::MemoInvalidType {
-                memo_type: "invalid hex character (non-hex byte present)".to_owned(),
-            }))
-        }
-    }
+        })
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

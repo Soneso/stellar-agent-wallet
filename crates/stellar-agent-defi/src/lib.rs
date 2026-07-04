@@ -21,6 +21,10 @@
 //!    is structurally unrepresentable: the submit hand-off requires a witness value
 //!    constructible only from a `GateOutcome::Allow`.
 //!
+//! 4. **Shared `ScVal` encoders** (`scval`) — the contract-address and `i128`
+//!    encoding primitives common to every protocol crate's own `InvokeContractArgs`
+//!    builder.
+//!
 //! # Primary consumers
 //!
 //! - `stellar-agent-blend`, `stellar-agent-defindex`,
@@ -70,6 +74,7 @@ pub mod network;
 pub mod oracle_staleness;
 pub mod pins;
 pub mod reflector;
+pub mod scval;
 pub mod simulate;
 
 // Re-export the most-used oracle-staleness surface at crate root so consumers

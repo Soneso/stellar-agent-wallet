@@ -63,6 +63,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use clap::Args;
 use serde::Serialize;
 
+use stellar_agent_core::amount::StellarAmount;
 use stellar_agent_core::approval::{
     ApprovalKind, ApproverIdentity, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, PendingApproval,
     Surface, load_and_validate_entry, load_attestation_key, open_with_retry,
@@ -382,8 +383,8 @@ fn render_summary(entry: &PendingApproval) {
                 .unwrap_or_else(|| "  Memo:              (none)".to_owned());
             let amount_xlm = if summary_asset == "XLM" {
                 format!(
-                    "{:.7} XLM ({} stroops)",
-                    *summary_amount_stroops as f64 / 10_000_000.0,
+                    "{} XLM ({} stroops)",
+                    StellarAmount::from_stroops(*summary_amount_stroops).as_xlm_decimal_string(),
                     summary_amount_stroops
                 )
             } else {
@@ -437,8 +438,8 @@ fn render_summary(entry: &PendingApproval) {
             };
             let amount_max_xlm = if asset == "XLM" {
                 format!(
-                    "{:.7} XLM ({amount_max_stroops} stroops)",
-                    *amount_max_stroops as f64 / 10_000_000.0,
+                    "{} XLM ({amount_max_stroops} stroops)",
+                    StellarAmount::from_stroops(*amount_max_stroops).as_xlm_decimal_string(),
                 )
             } else {
                 format!("{amount_max_stroops} stroops")
@@ -488,8 +489,8 @@ fn render_summary(entry: &PendingApproval) {
             // PaymentSimulated's summary_to.
             let amount = if summary_asset == "XLM" {
                 format!(
-                    "{:.7} XLM ({} stroops)",
-                    *summary_amount_stroops as f64 / 10_000_000.0,
+                    "{} XLM ({} stroops)",
+                    StellarAmount::from_stroops(*summary_amount_stroops).as_xlm_decimal_string(),
                     summary_amount_stroops
                 )
             } else {

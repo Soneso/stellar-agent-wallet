@@ -1,13 +1,18 @@
 //! Origin-header validation middleware (cross-origin POST hardening).
 //!
-//! State-changing HTTP methods (POST, PUT,
-//! PATCH, DELETE) must carry an `Origin:` header whose value is exactly
-//! `http://127.0.0.1:<port>` or `http://localhost:<port>`. Requests missing the
-//! `Origin:` header on those methods are rejected with `403 Forbidden`.
+//! State-changing HTTP methods (POST, PUT, PATCH, DELETE) must carry an
+//! `Origin:` header whose value is exactly `http://127.0.0.1:<port>` or
+//! `http://localhost:<port>`. Requests missing or mismatching that header on
+//! those methods are rejected with `403 Forbidden` and a JSON body
+//! `{"error":"origin_header_rejected"}`.
 //!
 //! `GET` and `HEAD` requests are allowed through unconditionally — browsers do
 //! not reliably send `Origin` on same-origin GET requests, and these methods
 //! cause no state change.
+//!
+//! `[::1]` is intentionally NOT accepted here: wallet-emitted URLs use
+//! `127.0.0.1`/`localhost`, so the browser's `Origin` for a page loaded from
+//! the bootstrap URL is always one of those two.
 //!
 //! # RFC 9110 §7.2 case-insensitivity
 //!
@@ -17,8 +22,8 @@
 //!
 //! # DNS rebinding
 //!
-//! Unlike the `Host:` header check, the `Origin:` header is set by
-//! the browser and cannot be forged by a DNS-rebinding attack: the browser's
+//! Unlike the `Host:` header check, the `Origin:` header is set by the
+//! browser and cannot be forged by a DNS-rebinding attack: the browser's
 //! Origin-reflection rules constrain the value to the page's actual origin.
 //! A page from `attacker.example` whose DNS is rebounded to `127.0.0.1` still
 //! sends `Origin: http://attacker.example:<port>`, which fails this check.
@@ -47,7 +52,7 @@ use tower::{Layer, Service};
 /// Tower `Layer` that enforces the `Origin`-header allowlist on
 /// state-changing HTTP methods.
 ///
-/// Constructed with the bridge's actual bound [`SocketAddr`]; the service
+/// Constructed with the listener's actual bound [`SocketAddr`]; the service
 /// accepts only `Origin: http://127.0.0.1:<port>` and
 /// `Origin: http://localhost:<port>` on POST/PUT/PATCH/DELETE.
 ///
@@ -57,7 +62,7 @@ use tower::{Layer, Service};
 ///
 /// ```no_run
 /// use std::net::SocketAddr;
-/// use stellar_agent_webauthn_bridge::middleware::origin_header::OriginHeaderAllowlistLayer;
+/// use stellar_agent_loopback_http::origin_header::OriginHeaderAllowlistLayer;
 ///
 /// let bound: SocketAddr = "127.0.0.1:8443".parse().unwrap();
 /// let _layer = OriginHeaderAllowlistLayer::new(bound);
@@ -160,7 +165,7 @@ where
 ///
 /// Rejects:
 /// - Missing header.
-/// - `https://` scheme (wrong scheme for the bridge's HTTP-only listener).
+/// - `https://` scheme (wrong scheme for the HTTP-only listener).
 /// - Wrong port.
 /// - Foreign origin (e.g. `http://attacker.example:<port>`).
 /// - DNS-rebind subdomain (e.g. `http://rebound.attacker.example:<port>`).
@@ -312,6 +317,28 @@ mod tests {
     async fn rejects_post_without_origin() {
         let status = do_post(test_router(8080), None).await;
         assert_eq!(status, 403, "POST without Origin should be rejected");
+    }
+
+    /// An `Origin` header that is not valid UTF-8 fails `HeaderValue::to_str`
+    /// and is rejected, never panics.
+    #[tokio::test]
+    async fn rejects_non_utf8_origin_header() {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let router = Router::new()
+            .route("/post", axum::routing::post(|| async { "ok" }))
+            .layer(OriginHeaderAllowlistLayer::new(bound));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/post")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(
+                header::ORIGIN,
+                axum::http::HeaderValue::from_bytes(&[0x80, 0x81, 0x82]).unwrap(),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 403);
     }
 
     #[tokio::test]

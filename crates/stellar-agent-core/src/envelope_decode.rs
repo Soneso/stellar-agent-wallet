@@ -33,8 +33,6 @@
 
 use thiserror::Error;
 
-use crate::amount::STROOPS_PER_XLM;
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Error type
 // ─────────────────────────────────────────────────────────────────────────────
@@ -139,7 +137,9 @@ pub enum EnvelopeDecodeError {
 /// Converts an `i64` stroop amount to a human-readable decimal string with
 /// exactly 7 decimal places (e.g. `10_000_000` → `"1.0000000"`).
 ///
-/// Uses integer arithmetic; no floating-point involved.
+/// Delegates to [`crate::amount::StellarAmount::as_xlm_decimal_string`]; kept
+/// as a free function in this module since callers reach for it alongside
+/// [`decode_authoritative_args`] without needing the full [`StellarAmount`](crate::amount::StellarAmount) type.
 ///
 /// # Examples
 ///
@@ -153,15 +153,7 @@ pub enum EnvelopeDecodeError {
 /// ```
 #[must_use]
 pub fn stroops_to_human(stroops: i64) -> String {
-    // Work in absolute value to simplify integer division; prepend sign.
-    let (sign, abs) = if stroops < 0 {
-        ("-", stroops.unsigned_abs())
-    } else {
-        ("", stroops.unsigned_abs())
-    };
-    let whole = abs / (STROOPS_PER_XLM as u64);
-    let frac = abs % (STROOPS_PER_XLM as u64);
-    format!("{sign}{whole}.{frac:07}")
+    crate::amount::StellarAmount::from_stroops(stroops).as_xlm_decimal_string()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

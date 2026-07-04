@@ -15,13 +15,18 @@ use std::{error::Error, fmt, future::Future, time::Duration};
 
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore as _};
+use sha2::{Digest as _, Sha256};
 use stellar_baselib::{
     account::{Account as BaselibAccount, AccountBehavior},
-    transaction::TransactionBehavior,
+    asset::{Asset as BaselibAsset, AssetBehavior},
+    claimant::{Claimant, ClaimantBehavior},
+    operation::Operation as BaselibOperation,
+    transaction::{Transaction, TransactionBehavior},
     transaction_builder::{TransactionBuilder, TransactionBuilderBehavior},
     xdr::{
-        HostFunction, InvokeContractArgs, InvokeHostFunctionOp, Limits, Operation, OperationBody,
-        SorobanAuthorizationEntry, SorobanCredentials, VecM, WriteXdr,
+        AccountId, ClaimPredicate, HashIdPreimage, HashIdPreimageOperationId, HostFunction,
+        InvokeContractArgs, InvokeHostFunctionOp, Limits, Operation, OperationBody, PublicKey,
+        SequenceNumber, SorobanAuthorizationEntry, SorobanCredentials, Uint256, VecM, WriteXdr,
     },
 };
 use stellar_rpc_client::Client;
@@ -455,6 +460,104 @@ where
     eprintln!("{log_prefix} SAC funding confirmed on-chain");
 
     Ok(result)
+}
+
+/// Builds, signs, and submits a `CreateClaimableBalance` transaction for the
+/// native asset with a single claimant, then derives the created balance's
+/// canonical 72-hex id per CAP-23 (`HashIdPreimage::OpId`).
+///
+/// Production code has no balance-creation path (`ClassicOpBuilder` only
+/// builds `ClaimClaimableBalance` — creating balances is not a wallet verb),
+/// so the envelope here is built directly with `stellar-baselib`.
+///
+/// Callers inject `fetch_sequence`, `sign_envelope`, and `submit_signed_xdr`
+/// rather than this module depending directly on `stellar-agent-network` —
+/// the same dependency-injection style [`fund_sac_balance`] uses, avoiding a
+/// dependency edge back onto a crate that already depends on
+/// `stellar-agent-test-support` in its own tests.
+///
+/// # Errors
+///
+/// Returns an error when the sequence fetch, envelope construction, signing,
+/// or submission fails.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "acceptance helper keeps test-specific network hooks explicit at call sites"
+)]
+pub async fn create_claimable_balance<F, FFut, S, SFut, Sub, SubFut>(
+    creator_g: &str,
+    creator_seed: &Zeroizing<[u8; 32]>,
+    claimant_g: &str,
+    amount_stroops: i64,
+    predicate: Option<ClaimPredicate>,
+    network_passphrase: &str,
+    fee_per_op_stroops: u32,
+    fetch_sequence: F,
+    sign_envelope: S,
+    submit_signed_xdr: Sub,
+) -> TestnetHelperResult<String>
+where
+    F: Fn(&str) -> FFut,
+    FFut: Future<Output = TestnetHelperResult<i64>>,
+    S: FnOnce(String, Zeroizing<[u8; 32]>, &str) -> SFut,
+    SFut: Future<Output = TestnetHelperResult<String>>,
+    Sub: FnOnce(String) -> SubFut,
+    SubFut: Future<Output = TestnetHelperResult<()>>,
+{
+    let creator_sequence = fetch_sequence(creator_g).await?;
+
+    let seq_str = creator_sequence.to_string();
+    let mut account = BaselibAccount::new(creator_g, &seq_str)
+        .map_err(|e| TestnetHelperError::new(e.to_string()))?;
+    let mut tx_builder = TransactionBuilder::new(&mut account, network_passphrase, None);
+    tx_builder.fee(fee_per_op_stroops);
+
+    let claimant = Claimant::new(Some(claimant_g), predicate)
+        .map_err(|e| TestnetHelperError::new(e.to_string()))?;
+    let op = BaselibOperation::new()
+        .create_claimable_balance(&BaselibAsset::native(), amount_stroops, vec![claimant])
+        .map_err(|e| TestnetHelperError::new(format!("{e:?}")))?;
+    tx_builder.add_operation(op);
+
+    let tx: Transaction = tx_builder.build();
+    let envelope = tx
+        .to_envelope()
+        .map_err(|e| TestnetHelperError::new(e.to_string()))?;
+    let unsigned_b64 = envelope
+        .to_xdr_base64(Limits::none())
+        .map_err(|e| TestnetHelperError::new(e.to_string()))?;
+
+    let creator_seed_owned = Zeroizing::new(**creator_seed);
+    let signed_b64 = sign_envelope(unsigned_b64, creator_seed_owned, network_passphrase).await?;
+
+    submit_signed_xdr(signed_b64).await?;
+
+    // CAP-23 balance-id derivation: SHA-256 of the HashIdPreimage::OpId
+    // preimage built from the creator's account id, the tx's seq_num (the
+    // fetched sequence + 1 — `TransactionBuilder::build` increments the
+    // in-memory `Account` before rendering XDR), and the operation index
+    // (0 — a single-operation transaction).
+    let creator_pubkey = stellar_strkey::ed25519::PublicKey::from_string(creator_g)
+        .map_err(|e| TestnetHelperError::new(e.to_string()))?
+        .0;
+    let creator_account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(creator_pubkey)));
+    let tx_seq_num = creator_sequence.saturating_add(1);
+    let preimage = HashIdPreimage::OpId(HashIdPreimageOperationId {
+        source_account: creator_account_id,
+        seq_num: SequenceNumber(tx_seq_num),
+        op_num: 0,
+    });
+    let preimage_xdr = preimage
+        .to_xdr(Limits::none())
+        .map_err(|e| TestnetHelperError::new(e.to_string()))?;
+    let balance_hash: [u8; 32] = Sha256::digest(&preimage_xdr).into();
+    Ok(format!(
+        "00000000{}",
+        balance_hash
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    ))
 }
 
 async fn fund_with_friendbot(

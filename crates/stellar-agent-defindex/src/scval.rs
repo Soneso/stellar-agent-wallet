@@ -33,8 +33,8 @@
 //! Encoding: `ScAddress::Contract(ContractId(Hash([32 bytes])))`
 //! via `stellar_strkey::Contract::from_string`.
 
-use stellar_strkey::Contract;
-use stellar_xdr::{ContractId, Hash, Int128Parts, ScAddress, ScVal, ScVec, VecM};
+use stellar_agent_defi::scval::{contract_strkey_to_sc_address, encode_i128};
+use stellar_xdr::{ScVal, ScVec, VecM};
 use thiserror::Error;
 
 use crate::abi::{VaultDepositArgs, VaultWithdrawArgs};
@@ -121,23 +121,11 @@ pub fn encode_vault_withdraw_args(args: &VaultWithdrawArgs) -> Result<Vec<ScVal>
 /// Returns [`VaultScValError::InvalidAddress`] if `strkey` is not a valid
 /// `C`-prefixed contract strkey.
 pub fn encode_c_strkey_address(strkey: &str) -> Result<ScVal, VaultScValError> {
-    let contract = Contract::from_string(strkey).map_err(|e| VaultScValError::InvalidAddress {
-        reason: format!("{e}"),
-    })?;
-    let sc_addr = ScAddress::Contract(ContractId(Hash(contract.0)));
+    let sc_addr =
+        contract_strkey_to_sc_address(strkey).map_err(|e| VaultScValError::InvalidAddress {
+            reason: format!("{e}"),
+        })?;
     Ok(ScVal::Address(sc_addr))
-}
-
-/// Encodes a single `i128` value as `ScVal::I128(Int128Parts { hi, lo })`.
-///
-/// Encoding per stellar-xdr `types.rs`: `lo = v as u64`, `hi = (v >> 64) as i64`.
-fn encode_i128(v: i128) -> ScVal {
-    ScVal::I128(Int128Parts {
-        #[allow(clippy::cast_possible_truncation)]
-        lo: v as u64,
-        #[allow(clippy::cast_possible_truncation)]
-        hi: (v >> 64) as i64,
-    })
 }
 
 /// Encodes a `Vec<i128>` as `ScVal::Vec([ScVal::I128(...), ...])`.

@@ -21,7 +21,10 @@
 //!
 //! # Defence stack
 //!
-//! The middleware layers, listed outermost first:
+//! Layers 1-3 are the shared `stellar-agent-loopback-http` middleware also
+//! applied by `stellar-agent-approval-ui`; the two loopback listeners share
+//! one implementation of the Host/Origin/security-header defences. The
+//! middleware layers, listed outermost first:
 //!
 //! 1. **`HostHeaderAllowlistLayer`** — DNS-rebinding defence; rejects any
 //!    `Host:` header that is not `127.0.0.1:<port>`, `localhost:<port>`, or
@@ -69,6 +72,8 @@
 //! - `stellar-agent-smart-account` — provides the off-chain WebAuthn
 //!   verification pipeline consumed after the bridge POST handler delivers
 //!   [`stellar_agent_core::approval::AssertionInput`] to the manager.
+//! - `stellar-agent-loopback-http` — provides the Host/Origin allowlist and
+//!   security-headers middleware re-exported below.
 //!
 //! # HTTP framework choice
 //!
@@ -90,7 +95,6 @@ use tracing::instrument;
 
 pub mod csrf;
 pub mod error;
-pub mod middleware;
 pub(crate) mod templates;
 // `wire` carries the @simplewebauthn/browser 13.x JSON shapes. All struct
 // fields are credential / signature / attestation material; the module
@@ -110,9 +114,9 @@ pub(crate) mod web;
 // Re-export public API surface.
 pub use csrf::{CsrfToken, CsrfTokenParseError};
 pub use error::{BridgeShutdownError, BridgeStartError};
-pub use middleware::host_header::HostHeaderAllowlistLayer;
-pub use middleware::origin_header::OriginHeaderAllowlistLayer;
-pub use middleware::security_headers::SecurityHeadersLayer;
+pub use stellar_agent_loopback_http::host_header::HostHeaderAllowlistLayer;
+pub use stellar_agent_loopback_http::origin_header::OriginHeaderAllowlistLayer;
+pub use stellar_agent_loopback_http::security_headers::SecurityHeadersLayer;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants

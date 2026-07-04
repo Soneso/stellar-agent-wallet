@@ -16,8 +16,10 @@ name = "stellar_agent_webauthn_bridge"
 # default-features = false; only tokio + http1 + json are enabled.
 axum = { workspace = true }
 
-# Middleware composition for the bridge's layered defence stack.
-tower = { workspace = true }
+# Shared Host/Origin allowlist + security-headers middleware, also used by
+# stellar-agent-approval-ui.
+stellar-agent-loopback-http = { workspace = true }
+
 
 # HTTP-specific middleware: TraceLayer + RequestBodyLimitLayer.
 tower-http = { workspace = true }

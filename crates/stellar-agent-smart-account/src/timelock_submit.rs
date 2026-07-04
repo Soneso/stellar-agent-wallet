@@ -61,10 +61,10 @@ use stellar_baselib::transaction::TransactionBehavior;
 use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilderBehavior};
 use stellar_rpc_client::Client;
 use stellar_xdr::{
-    AccountId, BytesM, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization, HostFunction,
+    AccountId, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization, HostFunction,
     InvokeHostFunctionOp, Limits, Operation, OperationBody, PublicKey as XdrPublicKey, ScAddress,
-    ScBytes, ScMap, ScMapEntry, ScSymbol, ScVal, ScVec, SorobanAddressCredentials,
-    SorobanAuthorizationEntry, SorobanCredentials, Uint256, VecM, WriteXdr,
+    ScVal, SorobanAddressCredentials, SorobanAuthorizationEntry, SorobanCredentials, Uint256, VecM,
+    WriteXdr,
 };
 
 use crate::SaError;
@@ -385,57 +385,9 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
 
         // Build the single-Ed25519 standard Stellar signature ScVal:
         // `ScVal::Vec([ScVal::Map([{public_key: Bytes<32>, signature: Bytes<64>}])])`
-        let public_key_sym = ScSymbol::try_from("public_key").map_err(|e| {
-            auth_err(
-                "auth_payload",
-                format!("{}: encode public_key Symbol: {e:?}", args.op_label),
-            )
-        })?;
-        let signature_sym = ScSymbol::try_from("signature").map_err(|e| {
-            auth_err(
-                "auth_payload",
-                format!("{}: encode signature Symbol: {e:?}", args.op_label),
-            )
-        })?;
-        let pubkey_bytesm: BytesM = pubkey.0.to_vec().try_into().map_err(|e| {
-            auth_err(
-                "auth_payload",
-                format!("{}: encode pubkey BytesM: {e:?}", args.op_label),
-            )
-        })?;
-        let sig_bytesm: BytesM = signature_bytes.to_vec().try_into().map_err(|e| {
-            auth_err(
-                "auth_payload",
-                format!("{}: encode signature BytesM: {e:?}", args.op_label),
-            )
-        })?;
-        let inner_map_entries: VecM<ScMapEntry> = vec![
-            ScMapEntry {
-                key: ScVal::Symbol(public_key_sym),
-                val: ScVal::Bytes(ScBytes(pubkey_bytesm)),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(signature_sym),
-                val: ScVal::Bytes(ScBytes(sig_bytesm)),
-            },
-        ]
-        .try_into()
-        .map_err(|e| {
-            auth_err(
-                "auth_payload",
-                format!("{}: encode inner ScMap: {e:?}", args.op_label),
-            )
-        })?;
-        let signature_scval = ScVal::Vec(Some(ScVec(
-            vec![ScVal::Map(Some(ScMap(inner_map_entries)))]
-                .try_into()
-                .map_err(|e| {
-                    auth_err(
-                        "auth_payload",
-                        format!("{}: encode outer ScVec: {e:?}", args.op_label),
-                    )
-                })?,
-        )));
+        let signature_scval =
+            crate::managers::auth_entry::build_classic_signature_scval(&pubkey.0, &signature_bytes)
+                .map_err(|e| auth_err("auth_payload", format!("{}: {e}", args.op_label)))?;
 
         signed_entries.push(SorobanAuthorizationEntry {
             credentials: SorobanCredentials::Address(SorobanAddressCredentials {
@@ -655,7 +607,7 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
 mod tests {
     #![allow(clippy::unwrap_used, reason = "test-only")]
 
-    use stellar_xdr::{ContractId, Hash, InvokeContractArgs, ScAddress, ScSymbol};
+    use stellar_xdr::{BytesM, ContractId, Hash, InvokeContractArgs, ScAddress, ScSymbol};
 
     use super::*;
 

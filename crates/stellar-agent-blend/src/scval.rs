@@ -29,9 +29,8 @@
 //! Cited from `blend-contracts pool/src/pool/actions.rs` (`request_type: u32`)
 //! and `blend-contracts-v2 pool/src/pool/actions.rs` (same).
 
-use stellar_xdr::{
-    ContractId, Hash, Int128Parts, ScAddress, ScMap, ScMapEntry, ScSymbol, ScVal, StringM,
-};
+use stellar_agent_defi::scval::contract_strkey_to_sc_address;
+use stellar_xdr::{Int128Parts, ScAddress, ScMap, ScMapEntry, ScSymbol, ScVal, StringM};
 
 use crate::abi::{BlendAbiError, BlendRequest};
 
@@ -154,12 +153,9 @@ pub fn encode_blend_request(request: &BlendRequest) -> Result<ScVal, BlendScValE
 /// Returns [`BlendScValError::InvalidAddress`] when `address` is not a valid
 /// Stellar C-strkey.
 pub fn c_strkey_to_sc_address(address: &str) -> Result<ScAddress, BlendScValError> {
-    let contract = stellar_strkey::Contract::from_string(address).map_err(|e| {
-        BlendScValError::InvalidAddress {
-            reason: e.to_string(),
-        }
-    })?;
-    Ok(ScAddress::Contract(ContractId(Hash(contract.0))))
+    contract_strkey_to_sc_address(address).map_err(|e| BlendScValError::InvalidAddress {
+        reason: e.to_string(),
+    })
 }
 
 /// Encodes a `Vec<BlendRequest>` as `ScVal::Vec` for the `submit` `requests`
@@ -218,6 +214,8 @@ mod tests {
         clippy::panic,
         reason = "test-only fixture construction"
     )]
+
+    use stellar_xdr::{ContractId, Hash};
 
     use super::*;
     use crate::abi::{BlendRequest, RequestType};

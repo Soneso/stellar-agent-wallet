@@ -22,7 +22,8 @@
 //!   recomputed and constant-time-compared server-side.
 //! - **Layered defence stack.** Host allowlist, security headers + CSP
 //!   (`script-src 'self'`), Origin allowlist on state-changing methods, and a
-//!   16 KiB body cap, mirroring the WebAuthn bridge.
+//!   16 KiB body cap — the same `stellar-agent-loopback-http` layers the
+//!   WebAuthn bridge applies.
 //! - **No resident store.** Every watcher tick and every handler action opens
 //!   the store via [`stellar_agent_core::approval::open_with_retry`], performs
 //!   one action, and drops it — releasing the advisory file lock — before
@@ -49,7 +50,6 @@ use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 
 pub mod decision;
 pub mod error;
-pub mod middleware;
 
 mod auth;
 mod routes;
@@ -62,9 +62,9 @@ mod tests;
 
 pub use decision::{Decision, DecisionContext, Outcome, REJECT_TOMBSTONE_TTL_MS, apply_decision};
 pub use error::{ServeShutdownError, ServeStartError};
-pub use middleware::host_header::HostHeaderAllowlistLayer;
-pub use middleware::origin_header::OriginHeaderAllowlistLayer;
-pub use middleware::security_headers::SecurityHeadersLayer;
+pub use stellar_agent_loopback_http::host_header::HostHeaderAllowlistLayer;
+pub use stellar_agent_loopback_http::origin_header::OriginHeaderAllowlistLayer;
+pub use stellar_agent_loopback_http::security_headers::SecurityHeadersLayer;
 
 use auth::{AuthState, OpaqueToken};
 

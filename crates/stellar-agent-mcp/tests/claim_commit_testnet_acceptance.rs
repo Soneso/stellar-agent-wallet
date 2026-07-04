@@ -53,13 +53,13 @@
     reason = "test-only; panics and unwraps are acceptable in testnet acceptance tests"
 )]
 
+use std::error::Error;
 use std::time::Duration;
 
 use base64::Engine as _;
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use serial_test::serial;
-use sha2::{Digest as _, Sha256};
 use stellar_agent_claimable::entry::fetch_claimable_balance_entry;
 use stellar_agent_claimable::id::BalanceId;
 use stellar_agent_core::approval::{
@@ -76,19 +76,11 @@ use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_mcp::server::{StellarClaimArgs, StellarClaimCommitArgs, WalletServer};
 use stellar_agent_network::signing::SoftwareSigningKey;
 use stellar_agent_network::signing::envelope_signing::attach_signature;
-use stellar_agent_network::submit::{SubmissionResult, SubmissionSignerKind};
+use stellar_agent_network::submit::SubmissionSignerKind;
 use stellar_agent_network::{StellarRpcClient, fetch_account, submit_transaction_and_wait};
 use stellar_agent_test_support::keyring_mock;
-use stellar_baselib::account::{Account, AccountBehavior};
-use stellar_baselib::asset::{Asset as BaselibAsset, AssetBehavior};
-use stellar_baselib::claimant::{Claimant, ClaimantBehavior};
-use stellar_baselib::operation::Operation as BaselibOperation;
-use stellar_baselib::transaction::{Transaction, TransactionBehavior};
-use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilderBehavior};
-use stellar_xdr::{
-    AccountId, ClaimPredicate, HashIdPreimage, HashIdPreimageOperationId, Limits, PublicKey,
-    SequenceNumber, Uint256, WriteXdr as _,
-};
+use stellar_agent_test_support::testnet_helpers::create_claimable_balance;
+use stellar_xdr::ClaimPredicate;
 use zeroize::Zeroizing;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -228,85 +220,45 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>, attestation_key: 
         .expect("set attestation key");
 }
 
-/// Builds, signs, and submits a `CreateClaimableBalance` transaction for the
-/// native asset with a single claimant, then derives the created balance's
-/// canonical 72-hex id per CAP-23 (`HashIdPreimage::OpId`).
+/// Fetches `account_id`'s current sequence number over `client`.
 ///
-/// Production code has no balance-creation path (`ClassicOpBuilder` only
-/// builds `ClaimClaimableBalance`, by design — creating balances is not a
-/// wallet verb), so the envelope here is built directly with `stellar-baselib`,
-/// mirroring `ClassicOpBuilder::build_baselib_envelope_b64`'s internal pattern.
-async fn create_claimable_balance(
+/// Takes an owned `account_id` (rather than `&str`) so the closure at the
+/// call site produces a future with no lifetime tied to the per-call
+/// argument — required for the `Fn(&str) -> FFut` trait bound in
+/// [`create_claimable_balance`]'s dependency-injected `fetch_sequence`.
+async fn fetch_testnet_sequence(
     client: &StellarRpcClient,
-    creator_g: &str,
-    creator_seed: &Zeroizing<[u8; 32]>,
-    claimant_g: &str,
-    amount_stroops: i64,
-    predicate: Option<ClaimPredicate>,
-) -> String {
-    let creator_account_view = fetch_account(client, creator_g, &[])
-        .await
-        .expect("creator account fetch");
-    let creator_sequence = creator_account_view.sequence_number;
+    account_id: String,
+) -> Result<i64, Box<dyn Error + Send + Sync>> {
+    Ok(fetch_account(client, &account_id, &[])
+        .await?
+        .sequence_number)
+}
 
-    let seq_str = creator_sequence.to_string();
-    let mut account = Account::new(creator_g, &seq_str).expect("baselib Account::new");
-    let mut tx_builder = TransactionBuilder::new(&mut account, TESTNET_PASSPHRASE, None);
-    tx_builder.fee(CREATE_FEE_STROOPS_PER_OP);
+/// Signs `unsigned_b64` with a fresh [`SoftwareSigningKey`] built from `seed`.
+async fn sign_testnet_envelope(
+    unsigned_b64: String,
+    seed: Zeroizing<[u8; 32]>,
+    network_passphrase: String,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let signer = SoftwareSigningKey::new_from_bytes(*seed);
+    Ok(attach_signature(&unsigned_b64, &signer, &network_passphrase).await?)
+}
 
-    let claimant = Claimant::new(Some(claimant_g), predicate).expect("Claimant::new");
-    let op = BaselibOperation::new()
-        .create_claimable_balance(&BaselibAsset::native(), amount_stroops, vec![claimant])
-        .expect("create_claimable_balance op construction");
-    tx_builder.add_operation(op);
-
-    let tx: Transaction = tx_builder.build();
-    let envelope = tx.to_envelope().expect("baselib to_envelope");
-    let unsigned_b64 = envelope
-        .to_xdr_base64(Limits::none())
-        .expect("unsigned envelope XDR encode");
-
-    let creator_signer = SoftwareSigningKey::new_from_bytes(**creator_seed);
-    let signed_b64 = attach_signature(&unsigned_b64, &creator_signer, TESTNET_PASSPHRASE)
-        .await
-        .expect("creator envelope signing");
-
-    let _submission: SubmissionResult = submit_transaction_and_wait(
+/// Submits `signed_b64` over `client` and waits for ledger confirmation.
+async fn submit_testnet_signed_xdr(
+    client: &StellarRpcClient,
+    signed_b64: String,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    submit_transaction_and_wait(
         client,
         &signed_b64,
         Duration::from_secs(60),
         TESTNET_PASSPHRASE,
         Some(SubmissionSignerKind::Software),
     )
-    .await
-    .expect("CreateClaimableBalance submit-and-confirm");
-
-    // CAP-23 balance-id derivation: SHA-256 of the HashIdPreimage::OpId
-    // preimage built from the creator's account id, the tx's seq_num (the
-    // fetched sequence + 1 — `TransactionBuilder::build` increments the
-    // in-memory `Account` before rendering XDR), and the operation index
-    // (0 — a single-operation transaction).
-    let creator_pubkey = stellar_strkey::ed25519::PublicKey::from_string(creator_g)
-        .expect("creator g-strkey parses")
-        .0;
-    let creator_account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(creator_pubkey)));
-    let tx_seq_num = creator_sequence.saturating_add(1);
-    let preimage = HashIdPreimage::OpId(HashIdPreimageOperationId {
-        source_account: creator_account_id,
-        seq_num: SequenceNumber(tx_seq_num),
-        op_num: 0,
-    });
-    let preimage_xdr = preimage
-        .to_xdr(Limits::none())
-        .expect("HashIdPreimage XDR encode");
-    let balance_hash: [u8; 32] = Sha256::digest(&preimage_xdr).into();
-    format!(
-        "00000000{}",
-        balance_hash
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    )
+    .await?;
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -330,14 +282,21 @@ async fn t1_claim_two_phase_happy_path() {
     let client = StellarRpcClient::new(TESTNET_RPC_URL).expect("RPC client");
 
     let balance_id_hex72 = create_claimable_balance(
-        &client,
         &creator_g,
         &creator_seed,
         &claimant_g,
         CLAIM_AMOUNT_STROOPS,
         None, // Unconditional predicate.
+        TESTNET_PASSPHRASE,
+        CREATE_FEE_STROOPS_PER_OP,
+        |account_id| fetch_testnet_sequence(&client, account_id.to_owned()),
+        |unsigned_b64, seed, network_passphrase| {
+            sign_testnet_envelope(unsigned_b64, seed, network_passphrase.to_owned())
+        },
+        |signed_b64| submit_testnet_signed_xdr(&client, signed_b64),
     )
-    .await;
+    .await
+    .expect("create_claimable_balance");
     let balance_id = BalanceId::parse(&balance_id_hex72).expect("balance id parses");
     wait_until_balance_queryable(&client, &balance_id).await;
 
@@ -505,7 +464,6 @@ async fn t2_predicate_expired_refused() {
     let client = StellarRpcClient::new(TESTNET_RPC_URL).expect("RPC client");
 
     let balance_id_hex72 = create_claimable_balance(
-        &client,
         &creator_g,
         &creator_seed,
         &claimant_g,
@@ -513,8 +471,16 @@ async fn t2_predicate_expired_refused() {
         Some(ClaimPredicate::BeforeAbsoluteTime(
             PAST_ABSOLUTE_TIME_UNIX_SECS,
         )),
+        TESTNET_PASSPHRASE,
+        CREATE_FEE_STROOPS_PER_OP,
+        |account_id| fetch_testnet_sequence(&client, account_id.to_owned()),
+        |unsigned_b64, seed, network_passphrase| {
+            sign_testnet_envelope(unsigned_b64, seed, network_passphrase.to_owned())
+        },
+        |signed_b64| submit_testnet_signed_xdr(&client, signed_b64),
     )
-    .await;
+    .await
+    .expect("create_claimable_balance");
     let balance_id = BalanceId::parse(&balance_id_hex72).expect("balance id parses");
     wait_until_balance_queryable(&client, &balance_id).await;
 

@@ -45,7 +45,8 @@
 //! An absolute `amount_out_min` is required in the encoded call. Path addresses
 //! must be canonicalised before encoding.
 
-use stellar_xdr::{ContractId, Hash, Int128Parts, ScAddress, ScVal, ScVec, VecM};
+use stellar_agent_defi::scval::{contract_strkey_to_sc_address, encode_i128};
+use stellar_xdr::{ScVal, ScVec, VecM};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DexScValError
@@ -192,14 +193,6 @@ fn encode_path_as_stellar_scval(path: &[String]) -> Result<ScVal, DexScValError>
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Encodes `i128` as `stellar_xdr::ScVal::I128`.
-fn encode_i128(v: i128) -> ScVal {
-    ScVal::I128(Int128Parts {
-        hi: (v >> 64) as i64,
-        lo: v as u64,
-    })
-}
-
 /// Encodes `u64` as `stellar_xdr::ScVal::U64`.
 fn encode_u64(v: u64) -> ScVal {
     ScVal::U64(v)
@@ -207,12 +200,10 @@ fn encode_u64(v: u64) -> ScVal {
 
 /// Encodes a C-strkey as `stellar_xdr::ScVal::Address(Contract(...))`.
 fn stellar_c_strkey_to_sc_val(address: &str) -> Result<ScVal, DexScValError> {
-    let contract = stellar_strkey::Contract::from_string(address).map_err(|e| {
-        DexScValError::InvalidPathAddress {
+    let sc_addr =
+        contract_strkey_to_sc_address(address).map_err(|e| DexScValError::InvalidPathAddress {
             reason: e.to_string(),
-        }
-    })?;
-    let sc_addr = ScAddress::Contract(ContractId(Hash(contract.0)));
+        })?;
     Ok(ScVal::Address(sc_addr))
 }
 

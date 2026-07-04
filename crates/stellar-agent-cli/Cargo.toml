@@ -150,7 +150,7 @@ test-helpers = []
 #     --test claim_testnet_acceptance
 # This feature is CI/dev-only and MUST NOT be enabled in any release-artefact
 # feature set.
-testnet-acceptance = []
+testnet-acceptance = ["stellar-agent-test-support/testnet-helpers"]
 
 [lints]
 workspace = true
