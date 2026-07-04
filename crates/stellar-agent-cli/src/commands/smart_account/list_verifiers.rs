@@ -10,6 +10,13 @@
 //! {
 //!   "entries": [
 //!     {
+//!       "wasm_hash_first8": "9427e3dd",
+//!       "wasm_hash_full": "9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7",
+//!       "audit_status": "audited",
+//!       "auditor": "OpenZeppelin",
+//!       "audited_at": "2026-07-04"
+//!     },
+//!     {
 //!       "wasm_hash_first8": "67800690",
 //!       "wasm_hash_full": "678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a",
 //!       "audit_status": "audited",
@@ -17,9 +24,13 @@
 //!       "audited_at": "2025-11-01"
 //!     }
 //!   ],
-//!   "entry_count": 1
+//!   "entry_count": 2
 //! }
 //! ```
+//!
+//! Index 0 is the canonical OZ WebAuthn-verifier v0.7.2 (the hash new deployments
+//! use); index 1 is the legacy v0.7.1, still recognised for verifiers already
+//! deployed on-chain.
 //!
 //! `Revoked` entries carry `revoked_at` + `reason`.
 //! `Retired` entries carry `revoked_at` + `retired_at`; the long-form reason is
@@ -306,24 +317,37 @@ mod tests {
     }
 
     #[test]
-    fn list_verifiers_result_oz_v071_entry_is_audited() {
+    fn list_verifiers_result_oz_canonical_and_legacy_entries_are_audited() {
         let result = ListVerifiersResult::from_allowlist();
         assert!(
-            !result.entries.is_empty(),
-            "VERIFIER_ALLOWLIST must have at least one entry"
+            result.entries.len() >= 2,
+            "VERIFIER_ALLOWLIST must have the canonical v0.7.2 and legacy v0.7.1 entries"
         );
+
+        // Index 0: canonical OZ WebAuthn verifier v0.7.2.
         let oz = &result.entries[0];
         assert_eq!(oz.audit_status, "audited");
-        assert_eq!(oz.wasm_hash_first8, "67800690");
+        assert_eq!(oz.wasm_hash_first8, "9427e3dd");
         assert_eq!(
             oz.wasm_hash_full,
-            "678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a"
+            "9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7"
         );
         assert_eq!(oz.auditor.as_deref(), Some("OpenZeppelin"));
-        assert!(oz.audited_at.is_some());
+        assert_eq!(oz.audited_at.as_deref(), Some("2026-07-04"));
         assert!(oz.revoked_at.is_none());
         assert!(oz.reason.is_none());
         assert!(oz.retired_at.is_none());
+
+        // Index 1: legacy OZ WebAuthn verifier v0.7.1 (still recognised).
+        let legacy = &result.entries[1];
+        assert_eq!(legacy.audit_status, "audited");
+        assert_eq!(legacy.wasm_hash_first8, "67800690");
+        assert_eq!(
+            legacy.wasm_hash_full,
+            "678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a"
+        );
+        assert_eq!(legacy.auditor.as_deref(), Some("OpenZeppelin"));
+        assert_eq!(legacy.audited_at.as_deref(), Some("2025-11-01"));
     }
 
     #[test]
@@ -352,12 +376,12 @@ mod tests {
     fn list_verifiers_entry_audited_wire_format() {
         // Validates the audited-variant JSON envelope wire shape.
         let entry = ListVerifiersEntry {
-            wasm_hash_first8: "67800690".to_owned(),
-            wasm_hash_full: "678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a"
+            wasm_hash_first8: "9427e3dd".to_owned(),
+            wasm_hash_full: "9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7"
                 .to_owned(),
             audit_status: "audited".to_owned(),
             auditor: Some("OpenZeppelin".to_owned()),
-            audited_at: Some("2025-11-01".to_owned()),
+            audited_at: Some("2026-07-04".to_owned()),
             revoked_at: None,
             reason: None,
             retired_at: None,
@@ -365,7 +389,7 @@ mod tests {
         let json = serde_json::to_string(&entry).expect("serialise");
         assert!(json.contains(r#""audit_status":"audited""#), "json={json}");
         assert!(json.contains(r#""auditor":"OpenZeppelin""#), "json={json}");
-        assert!(json.contains(r#""audited_at":"2025-11-01""#), "json={json}");
+        assert!(json.contains(r#""audited_at":"2026-07-04""#), "json={json}");
         // revoked_at / reason / retired_at must be absent (skip_serializing_if).
         assert!(
             !json.contains("revoked_at"),

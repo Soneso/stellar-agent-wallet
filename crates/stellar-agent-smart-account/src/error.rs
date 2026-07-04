@@ -33,7 +33,7 @@ use stellar_agent_core::observability::RedactedStrkey;
 /// # Wire format
 ///
 /// `Display` renders as `"Admin"` or `"Owner"` (PascalCase — matches OZ
-/// stellar-contracts canonical naming at SHA `3f81125`).
+/// stellar-contracts canonical naming at SHA `a9c4216`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum AdminOrOwnerKey {
@@ -536,7 +536,7 @@ pub enum SaError {
     /// Per-rule `MAX_SIGNERS=15` / `MAX_POLICIES=5` caps hit.
     ///
     /// `kind` is one of `"signers"` or `"policies"`.
-    /// Constants are defined on-chain in OZ `stellar-contracts` v0.7.1 (SHA `3f81125`).
+    /// Constants are defined on-chain in OZ `stellar-contracts` v0.7.2 (SHA `a9c4216`).
     #[error("context-rule caps exceeded: kind={kind} cur={cur} max={max}")]
     #[serde(rename = "sa.context_rule_caps_exceeded")]
     ContextRuleCapsExceeded {
@@ -567,7 +567,7 @@ pub enum SaError {
     /// overridable via `session_rule_max_horizon_ledgers` in the profile,
     /// up to `UPPER_BOUND_HORIZON_LEDGERS = 10_000`).
     ///
-    /// The OZ on-chain contract (SHA `3f81125`)
+    /// The OZ on-chain contract (SHA `a9c4216`)
     /// only rejects `valid_until < current_ledger`; the horizon cap is
     /// a wallet-side discipline. The surfaced
     /// [`stellar_agent_core::error::WalletError`] carries this via
@@ -681,7 +681,7 @@ pub enum SaError {
     /// The verifier registry already contains an entry for the given network with a
     /// DIFFERENT `wasm_sha256`.  Refuses to overwrite silently.
     ///
-    /// Operator action: re-vendor the WASM (update `vendor/oz-webauthn-verifier/v0.7.1/`),
+    /// Operator action: re-vendor the WASM (update `vendor/oz-webauthn-verifier/v0.7.2/`),
     /// update `WEBAUTHN_VERIFIER_WASM_SHA256`, and re-run `smart-account deploy-webauthn-verifier`
     /// so the registry entry and the pinned SHA-256 stay in sync.
     ///
@@ -1437,7 +1437,7 @@ pub enum SaError {
     /// Retained for routing-table compatibility (`rules.rs::sa_error_to_invocation_result`
     /// maps this variant to `PreSubmissionRefused`). The cancel path no longer emits this
     /// variant — OZ error code 4006 (`OperationNotScheduled`) is unreachable from the
-    /// canonical `cancel_operation` path (OZ storage.rs SHA `3f81125`); all cancel
+    /// canonical `cancel_operation` path (OZ storage.rs SHA `a9c4216`); all cancel
     /// failures route through `TimelockCancelFailed` with `InvalidOperationState` (4002).
     ///
     /// Wire-code is `sa.timelock_operation_not_found`.

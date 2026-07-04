@@ -54,7 +54,8 @@ use super::rpc_mock_helpers::{
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// OZ WebAuthn verifier v0.7.1 wasm hash — the only `VERIFIER_ALLOWLIST` entry.
+/// OZ WebAuthn verifier v0.7.1 wasm hash — the legacy `VERIFIER_ALLOWLIST[1]`
+/// entry (one of two Audited OZ entries; still recognised).
 ///
 /// `vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md` SHA-256 anchor.
 /// OZ source SHA: `3f81125bed3114cc93f5fca6d13240082050269a` (tag v0.7.1).

@@ -131,8 +131,8 @@ fn char_to_nibble(b: u8) -> Option<u8> {
 /// ```
 /// use stellar_agent_core::hex::redact_hex_first8_last8;
 ///
-/// let h = "06186e938a0ba1585a5d8a6d2ec802f3d184aaf9ec298d8c8aece50ca56cb239";
-/// assert_eq!(redact_hex_first8_last8(h), "06186e93...a56cb239");
+/// let h = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+/// assert_eq!(redact_hex_first8_last8(h), "00112233...ccddeeff");
 /// assert_eq!(redact_hex_first8_last8("short"), "<short>");
 /// ```
 #[must_use]
@@ -296,9 +296,9 @@ mod tests {
 
     #[test]
     fn redact_64_char_sha256_hash() {
-        let h = "06186e938a0ba1585a5d8a6d2ec802f3d184aaf9ec298d8c8aece50ca56cb239";
+        let h = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
         let result = redact_hex_first8_last8(h);
-        assert_eq!(result, "06186e93...a56cb239");
+        assert_eq!(result, "00112233...ccddeeff");
     }
 
     #[test]

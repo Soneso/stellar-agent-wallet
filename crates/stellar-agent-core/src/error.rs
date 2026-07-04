@@ -386,7 +386,7 @@ impl WalletError {
 /// without parsing the human-readable message.
 ///
 /// Distinguishes the two OZ per-rule hard limits: `MAX_SIGNERS = 15` and
-/// `MAX_POLICIES = 5` (OpenZeppelin Stellar contracts v0.7.1,
+/// `MAX_POLICIES = 5` (OpenZeppelin Stellar contracts v0.7.2,
 /// `smart_account/mod.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -610,7 +610,7 @@ pub enum ValidationError {
     /// The CLI orchestration layer refuses cap-exceeding operations
     /// fail-closed, before the simulate/submit cycle reaches the contract.
     /// The on-chain panic discriminants `TooManySigners = 3010` and
-    /// `TooManyPolicies = 3011` (OpenZeppelin Stellar contracts v0.7.1,
+    /// `TooManyPolicies = 3011` (OpenZeppelin Stellar contracts v0.7.2,
     /// `smart_account/mod.rs`)
     /// remain the authoritative last-line defence if the CLI check is
     /// bypassed (e.g. concurrent on-chain mutation between fetch and submit).
@@ -629,7 +629,7 @@ pub enum ValidationError {
     )]
     ContextRuleCapsExceeded {
         /// Which cap was exceeded — signer (`MAX_SIGNERS = 15`) or policy
-        /// (`MAX_POLICIES = 5`). OpenZeppelin Stellar contracts v0.7.1,
+        /// (`MAX_POLICIES = 5`). OpenZeppelin Stellar contracts v0.7.2,
         /// `smart_account/mod.rs`.
         kind: CapKind,
         /// The count the operation would produce (current count + 1).
@@ -786,7 +786,7 @@ pub enum ValidationError {
     ///
     /// `name_len` is the byte length of the supplied name. `max` is the
     /// OZ canonical cap (`MAX_NAME_SIZE = 20` bytes, OpenZeppelin Stellar
-    /// contracts v0.7.1, `smart_account/mod.rs`).
+    /// contracts v0.7.2, `smart_account/mod.rs`).
     ///
     /// The on-chain enforcement (`SmartAccountError::NameTooLong = 3015`,
     /// `smart_account/mod.rs`) is the authoritative last-line defence.

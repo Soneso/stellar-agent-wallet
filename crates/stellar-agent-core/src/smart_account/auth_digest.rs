@@ -31,7 +31,7 @@ use tracing::debug;
 /// The signing payload is bound to the context rules by computing
 /// `sha256(signature_payload || context_rule_ids_xdr)`.  This closes the
 /// rule-ID downgrade attack (by a malicious transaction sponsor), matching
-/// the on-chain computation in OpenZeppelin `stellar-accounts` v0.7.1
+/// the on-chain computation in OpenZeppelin `stellar-accounts` v0.7.2
 /// in `smart_account/storage.rs`.
 ///
 /// # Examples
@@ -87,7 +87,7 @@ impl fmt::Display for AuthDigest {
 /// of context-rule IDs.
 ///
 /// Returns `sha256(signature_payload || context_rule_ids_xdr)`, matching the
-/// OZ v0.7.1 on-chain computation.  Closes the rule-ID downgrade attack.
+/// OZ v0.7.2 on-chain computation.  Closes the rule-ID downgrade attack.
 ///
 /// This is the preimage that off-chain signers MUST sign when authorising a
 /// smart-account transaction governed by one or more context rules.  Signing
@@ -123,7 +123,7 @@ impl fmt::Display for AuthDigest {
 ///   will compute a digest that passes [`compute_auth_digest`] but fails
 ///   on-chain verification, which is the silent-failure footgun this
 ///   primitive exists to prevent.  Layout verified against OpenZeppelin
-///   `stellar-contracts` v0.7.1 (`smart_account/storage.rs`).
+///   `stellar-contracts` v0.7.2 (`smart_account/storage.rs`).
 ///
 /// # Examples
 ///

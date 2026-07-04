@@ -1,6 +1,6 @@
 //! Context-rule manager for the OZ smart-account context-rule lifecycle.
 //!
-//! Wraps the OZ `stellar-accounts` v0.7.1 context-rule entrypoints with a
+//! Wraps the OZ `stellar-accounts` v0.7.2 context-rule entrypoints with a
 //! typed off-chain orchestrator. Ships the metadata-only lifecycle:
 //! `install_rule`, `update_name`, `update_valid_until`, `delete_rule`, plus
 //! the read-side `get_rule` and `get_rules_count`. The per-rule signer-set +
@@ -332,7 +332,7 @@ pub(crate) struct HorizonCheck {
 ///
 /// # Canonical citation
 ///
-/// OZ `storage.rs:280-285` (SHA `3f81125`):
+/// OZ `storage.rs:280-285` (SHA `a9c4216`):
 /// ```text
 /// if let Some(valid_until) = context_rule.valid_until {
 ///     if valid_until < e.ledger().sequence() {
@@ -341,7 +341,7 @@ pub(crate) struct HorizonCheck {
 /// }
 /// ```
 /// The wallet's pre-submission check mirrors this strict-`<` logic.
-/// `UnvalidatedContext = 3002` per `mod.rs:542` SHA `3f81125`.
+/// `UnvalidatedContext = 3002` per `mod.rs:542` SHA `a9c4216`.
 pub(crate) struct ExpiryCheck {
     /// Context-rule ID whose expiry to verify.
     ///
@@ -1331,7 +1331,7 @@ impl ContextRuleManager {
     /// # Reference cross-check
     ///
     /// - **OZ canonical:** `packages/accounts/src/smart_account/mod.rs:440` +
-    ///   `storage.rs:1110–1143` SHA `3f81125` —
+    ///   `storage.rs:1110–1143` SHA `a9c4216` —
     ///   `fn add_policy(e, context_rule_id: u32, policy: Address, install_param: Val) -> u32`.
     ///
     /// # Arguments
@@ -1520,18 +1520,18 @@ impl ContextRuleManager {
                 None, // no horizon check for policy install
                 // Expiry check at signing-path entry.
                 // Refuses with `SaError::RuleExpired` when `valid_until <
-                // latest_ledger` (OZ `storage.rs:280-285` SHA `3f81125`).
+                // latest_ledger` (OZ `storage.rs:280-285` SHA `a9c4216`).
                 Some(ExpiryCheck { rule_id }),
             )
             .await?;
 
         // OZ `add_policy` returns `u32` (the assigned policy_id) per
-        // `mod.rs:440` + `storage.rs:1143` SHA `3f81125`.
+        // `mod.rs:440` + `storage.rs:1143` SHA `a9c4216`.
         match result.return_val {
             ScVal::U32(policy_id) => Ok((policy_id, result.tx_hash)),
             other => Err(auth_payload_err(format!(
                 "add_policy return value is not ScVal::U32 (got {other:?}); \
-                 expected u32 policy_id per OZ mod.rs:440 SHA 3f81125"
+                 expected u32 policy_id per OZ mod.rs:440 SHA a9c4216"
             ))),
         }
     }
@@ -1541,7 +1541,7 @@ impl ContextRuleManager {
     /// # Reference cross-check
     ///
     /// - **OZ canonical:** `packages/accounts/src/smart_account/mod.rs:473` +
-    ///   `storage.rs:1175–1230` SHA `3f81125` —
+    ///   `storage.rs:1175–1230` SHA `a9c4216` —
     ///   `fn remove_policy(e, context_rule_id: u32, policy_id: u32)`.
     ///
     /// # Arguments
@@ -1750,8 +1750,8 @@ impl ContextRuleManager {
                     || redacted_reason.contains("Error(Contract, #3000)")) =>
             {
                 // OZ `SmartAccountError::ContextRuleNotFound` has discriminant
-                // 3000 (OpenZeppelin stellar-contracts v0.7.1,
-                // `packages/accounts/src/smart_account/mod.rs:540`, SHA `3f81125`).
+                // 3000 (OpenZeppelin stellar-contracts v0.7.2,
+                // `packages/accounts/src/smart_account/mod.rs:540`, SHA `a9c4216`).
                 // Soroban-RPC's simulate response surfaces contract panics as
                 // `Error(Contract, #<code>)` with the numeric discriminant —
                 // the symbolic enum name is NOT serialised over the wire.
@@ -1820,7 +1820,7 @@ impl ContextRuleManager {
     ///
     /// # Reference cross-check
     ///
-    /// OZ `storage.rs:280-285` (SHA `3f81125`):
+    /// OZ `storage.rs:280-285` (SHA `a9c4216`):
     /// ```text
     /// if let Some(valid_until) = context_rule.valid_until {
     ///     if valid_until < e.ledger().sequence() {
@@ -1829,7 +1829,7 @@ impl ContextRuleManager {
     /// }
     /// ```
     /// The wallet's check mirrors this strict-`<` logic.
-    /// `UnvalidatedContext = 3002` per `mod.rs:542` SHA `3f81125`.
+    /// `UnvalidatedContext = 3002` per `mod.rs:542` SHA `a9c4216`.
     ///
     /// # Errors
     ///
@@ -2499,7 +2499,7 @@ pub struct ContextRuleDefinition {
 
 /// Wallet-side off-chain mirror of the OZ `Signer` enum
 /// (`packages/accounts/src/smart_account/storage.rs:96-102`,
-/// SHA `3f81125`). Carries off-chain XDR types so callers don't need a
+/// SHA `a9c4216`). Carries off-chain XDR types so callers don't need a
 /// soroban-sdk host `Env` to construct values.
 ///
 /// Encoded to the on-chain wire shape by `encode_signer`:
@@ -2672,47 +2672,47 @@ pub const UPPER_BOUND_HORIZON_LEDGERS: u32 = 10_000;
 /// Maximum number of signers per context rule, mirroring the OZ on-chain
 /// canonical constant.
 ///
-/// OZ source: `packages/accounts/src/smart_account/mod.rs:526` SHA `3f81125`
+/// OZ source: `packages/accounts/src/smart_account/mod.rs:526` SHA `a9c4216`
 /// (`pub const MAX_SIGNERS: u32 = 15`).
 ///
 /// The CLI orchestration layer uses this constant to refuse cap-exceeding
 /// operations fail-CLOSED before the simulate/submit cycle reaches the
 /// contract. The on-chain enforcement remains the authoritative last-line
 /// defence via the `TooManySigners` panic discriminant `3010`
-/// (`mod.rs:558`, SHA `3f81125`).
+/// (`mod.rs:558`, SHA `a9c4216`).
 ///
 /// **Cross-crate parity test:**
 /// `crates/stellar-agent-smart-account/tests/oz_caps_parity_test.rs` asserts
-/// this constant equals `15` against the OZ canonical pinned at SHA `3f81125`.
+/// this constant equals `15` against the OZ canonical pinned at SHA `a9c4216`.
 /// If either side drifts, the parity test fails CI at the next pin-advancement.
 pub const OZ_MAX_SIGNERS: u32 = 15;
 
 /// Maximum number of policies per context rule, mirroring the OZ on-chain
 /// canonical constant.
 ///
-/// OZ source: `packages/accounts/src/smart_account/mod.rs:524` SHA `3f81125`
+/// OZ source: `packages/accounts/src/smart_account/mod.rs:524` SHA `a9c4216`
 /// (`pub const MAX_POLICIES: u32 = 5`).
 ///
 /// The CLI orchestration layer uses this constant to refuse cap-exceeding
 /// `add-policy` operations fail-CLOSED before simulate. The on-chain
 /// enforcement remains the authoritative last-line defence via the
-/// `TooManyPolicies` panic discriminant `3011` (`mod.rs:560`, SHA `3f81125`).
+/// `TooManyPolicies` panic discriminant `3011` (`mod.rs:560`, SHA `a9c4216`).
 ///
 /// **Cross-crate parity test:**
 /// `crates/stellar-agent-smart-account/tests/oz_caps_parity_test.rs` asserts
-/// this constant equals `5` against the OZ canonical pinned at SHA `3f81125`.
+/// this constant equals `5` against the OZ canonical pinned at SHA `a9c4216`.
 pub const OZ_MAX_POLICIES: u32 = 5;
 
 /// Maximum byte length of a context-rule name, mirroring the OZ on-chain
 /// canonical constant.
 ///
-/// OZ source: `packages/accounts/src/smart_account/mod.rs:528` SHA `3f81125`
+/// OZ source: `packages/accounts/src/smart_account/mod.rs:528` SHA `a9c4216`
 /// (`pub const MAX_NAME_SIZE: u32 = 20`).
 ///
 /// The CLI orchestration layer uses this constant to refuse oversized names
 /// fail-CLOSED before the simulate/submit cycle. The on-chain enforcement
 /// remains the authoritative last-line defence via the `NameTooLong` panic
-/// discriminant `3015` (`mod.rs:569`, SHA `3f81125`).
+/// discriminant `3015` (`mod.rs:569`, SHA `a9c4216`).
 ///
 /// Canonical off-chain implementations validate `name.is_empty()` but do
 /// not enforce a byte cap client-side; this wallet adds the pre-flight cap
@@ -2722,7 +2722,7 @@ pub const OZ_MAX_NAME_SIZE: usize = 20;
 /// Maximum byte length of an `External` signer `pubkey_data` payload.
 ///
 /// Mirrors OZ `stellar-contracts` `packages/accounts/src/smart_account/mod.rs:530`
-/// (`pub const MAX_EXTERNAL_KEY_SIZE: u32 = 256`) SHA `3f81125`. A `pubkey_data`
+/// (`pub const MAX_EXTERNAL_KEY_SIZE: u32 = 256`) SHA `a9c4216`. A `pubkey_data`
 /// exceeding this cap would be rejected on-chain by the `CheckAuth` error `3012`
 /// (`ExternalKeyTooLong`); this client-side check surfaces a typed error before
 /// the RPC round-trip.
@@ -2744,20 +2744,20 @@ pub struct ContextRuleSummary {
     /// On-chain rule ID (`NextId`-allocated monotonically, never reused).
     pub rule_id: u32,
     /// Operator-visible rule name (OZ `name` field,
-    /// `storage.rs:157`, SHA `3f81125`).
+    /// `storage.rs:157`, SHA `a9c4216`).
     pub name: String,
     /// Closed-set context-type label (`"default"`, `"call_contract"`,
     /// `"create_contract"`). Derived from the on-chain `ContextRuleType`
-    /// discriminant (OZ `storage.rs:152-174`, SHA `3f81125`).
+    /// discriminant (OZ `storage.rs:152-174`, SHA `a9c4216`).
     pub context_type_label: &'static str,
     /// Number of signers attached to the rule (OZ `signers` field,
-    /// `storage.rs:162-164`, SHA `3f81125`).
+    /// `storage.rs:162-164`, SHA `a9c4216`).
     pub signer_count: u32,
     /// Number of policies attached to the rule (OZ `policies` field,
-    /// `storage.rs:168-170`, SHA `3f81125`).
+    /// `storage.rs:168-170`, SHA `a9c4216`).
     pub policy_count: u32,
     /// Optional ledger sequence at which the rule expires. `None` means
-    /// permanent (OZ `valid_until` field, `storage.rs:159`, SHA `3f81125`).
+    /// permanent (OZ `valid_until` field, `storage.rs:159`, SHA `a9c4216`).
     pub valid_until: Option<u32>,
 }
 
@@ -2774,7 +2774,7 @@ pub struct ActiveContextRuleEnumeration {
     /// On-chain `get_context_rules_count` value at the start of the scan.
     ///
     /// Authoritative active-rule count per the OZ contract
-    /// (`storage.rs:212-213`, SHA `3f81125` — decremented at delete).
+    /// (`storage.rs:212-213`, SHA `a9c4216` — decremented at delete).
     /// Distinct from `rules.len()` which is the count this enumeration
     /// successfully decoded.  When `active_count_on_chain` exceeds
     /// `rules.len() as u32 + rules_skipped + gaps_seen` the scan
@@ -2980,8 +2980,8 @@ pub(crate) fn validate_latest_ledger(latest_ledger: u32) -> Result<(), SaError> 
 
 /// Builds the `Vec<ScVal>` arg list for OZ `add_context_rule`.
 ///
-/// Argument order per OpenZeppelin stellar-contracts v0.7.1,
-/// `packages/accounts/src/smart_account/mod.rs:238-248` (SHA `3f81125`):
+/// Argument order per OpenZeppelin stellar-contracts v0.7.2,
+/// `packages/accounts/src/smart_account/mod.rs:238-248` (SHA `a9c4216`):
 /// `(context_type, name, valid_until, signers, policies)`.
 fn build_add_context_rule_args(def: &ContextRuleDefinition) -> Result<Vec<ScVal>, SaError> {
     let auth_payload_err = |reason: String| SaError::AuthEntryConstructionFailed {
@@ -3025,7 +3025,7 @@ fn build_add_context_rule_args(def: &ContextRuleDefinition) -> Result<Vec<ScVal>
     // Duplicate-key detection: the Soroban host rejects maps with duplicate
     // keys at simulate time (`scval_validations.rs:69` uses strict `<`).
     // Duplicate addresses also trigger `DuplicatePolicy` on-chain
-    // (`storage.rs:1119-1121`, SHA `3f81125`).  Both layers enforce uniqueness;
+    // (`storage.rs:1119-1121`, SHA `a9c4216`).  Both layers enforce uniqueness;
     // the sort here does not merge duplicates — a duplicate will produce
     // adjacent equal keys, which the host rejects with `Error::Invalid`.
     let mut policy_entries: Vec<ScMapEntry> = Vec::with_capacity(def.policies.len());
@@ -3130,8 +3130,8 @@ fn encode_context_type(ct: &ContextRuleType) -> Result<ScVal, SaError> {
 /// - `External { verifier, pubkey_data }` →
 ///   `ScVal::Vec([Symbol("External"), Address(verifier), Bytes(pubkey_data)])`
 ///
-/// Cross-reference: OpenZeppelin stellar-contracts v0.7.1,
-/// `packages/accounts/src/smart_account/storage.rs:96-102` (SHA `3f81125`);
+/// Cross-reference: OpenZeppelin stellar-contracts v0.7.2,
+/// `packages/accounts/src/smart_account/storage.rs:96-102` (SHA `a9c4216`);
 /// the soroban-sdk `#[contracttype]` macro serialises enum variants as a
 /// leading `Symbol("VariantName")` followed by the variant's payload elements
 /// as siblings in the same `ScVec`.
@@ -3160,7 +3160,7 @@ fn encode_signer(s: &ContextRuleSignerInput) -> Result<ScVal, SaError> {
         } => {
             // Pre-flight cap check before the RPC round-trip.
             // OZ `MAX_EXTERNAL_KEY_SIZE = 256` enforced on-chain at
-            // `packages/accounts/src/smart_account/mod.rs:530`, SHA `3f81125`.
+            // `packages/accounts/src/smart_account/mod.rs:530`, SHA `a9c4216`.
             if pubkey_data.len() > OZ_MAX_EXTERNAL_KEY_SIZE {
                 return Err(SaError::AuthEntryConstructionFailed {
                     stage: "auth_payload",
@@ -3241,17 +3241,17 @@ pub(crate) fn chain_id_fingerprint(chain_id: &str) -> String {
 
 /// Maps an OZ `SmartAccountError` discriminant to its symbolic name.
 ///
-/// Cross-reference: OpenZeppelin stellar-contracts v0.7.1,
-/// `packages/accounts/src/smart_account/mod.rs:535-572` (SHA `3f81125`) —
+/// Cross-reference: OpenZeppelin stellar-contracts v0.7.2,
+/// `packages/accounts/src/smart_account/mod.rs:535-572` (SHA `a9c4216`) —
 /// `pub enum SmartAccountError` carries discriminants 3000, 3002-3016 (3001 is
-/// SKIPPED in OZ v0.7.1; not all discriminants are contiguous). Returning
+/// SKIPPED in OZ v0.7.2; not all discriminants are contiguous). Returning
 /// `None` for unknown / skipped codes preserves forward compatibility
 /// with future OZ releases that add new variants and prevents falsely
 /// annotating an unknown discriminant with a stale name.
 fn oz_smart_account_error_name(code: u32) -> Option<&'static str> {
     match code {
         3000 => Some("ContextRuleNotFound"),
-        // 3001 is SKIPPED in OZ v0.7.1 (no variant assigned).
+        // 3001 is SKIPPED in OZ v0.7.2 (no variant assigned).
         3002 => Some("UnvalidatedContext"),
         3003 => Some("ExternalVerificationFailed"),
         3004 => Some("NoSignersAndPolicies"),
@@ -3275,8 +3275,8 @@ fn oz_smart_account_error_name(code: u32) -> Option<&'static str> {
 ///
 /// # Reference cross-check
 ///
-/// Canonical source: OpenZeppelin stellar-contracts v0.7.1 (`stellar-governance`),
-/// `packages/governance/src/timelock/mod.rs:325-339` (SHA `3f81125`).
+/// Canonical source: OpenZeppelin stellar-contracts v0.7.2 (`stellar-governance`),
+/// `packages/governance/src/timelock/mod.rs:325-339` (SHA `a9c4216`).
 ///
 /// ```text
 /// TimelockError::OperationAlreadyScheduled  = 4000
@@ -3314,9 +3314,9 @@ fn oz_timelock_error_name(code: u32) -> Option<&'static str> {
 ///
 /// Covers two OZ error ranges:
 /// - `SmartAccountError` 3000-3016
-///   (`packages/accounts/src/smart_account/mod.rs`, SHA `3f81125`)
+///   (`packages/accounts/src/smart_account/mod.rs`, SHA `a9c4216`)
 /// - `TimelockError` 4000-4006
-///   (`packages/governance/src/timelock/mod.rs:325-339`, SHA `3f81125`)
+///   (`packages/governance/src/timelock/mod.rs:325-339`, SHA `a9c4216`)
 ///
 /// Returns the message unchanged when no OZ error code is detected, or
 /// when the code is outside both discriminant ranges.
@@ -3468,7 +3468,7 @@ fn parse_context_rule_id_from_return(scval: &ScVal) -> Result<u32, SaError> {
 ///   raw ABI directly, without any Map or Vec wrapping). The existing wallet
 ///   encoder at `rules.rs:encode_option_u32` already uses this canonical shape.
 ///
-/// Byte-layout canonical citation: OZ `storage.rs:152-174` (SHA `3f81125`) for
+/// Byte-layout canonical citation: OZ `storage.rs:152-174` (SHA `a9c4216`) for
 /// the `ContextRule` struct field layout; `soroban-env-common/src/option.rs:3-16`
 /// for the `Option<u32>` host-ABI encoding.
 ///
@@ -3615,7 +3615,7 @@ fn parse_context_rule_summary(scval: ScVal, rule_id: u32) -> Result<ContextRuleS
 ///
 /// The `ContextRule` ScVal layout is defined by `#[contracttype]` on the OZ
 /// `ContextRule` struct at
-/// `packages/accounts/src/smart_account/storage.rs:152-174` SHA `3f81125`.
+/// `packages/accounts/src/smart_account/storage.rs:152-174` SHA `a9c4216`.
 /// Relevant fields for this helper:
 ///
 /// ```text
@@ -3688,9 +3688,9 @@ pub fn decode_signer_count_from_scval(scval: &ScVal) -> Result<u32, SaError> {
 /// policies) and returns its length.  Both `signer_ids` and `policy_ids` are
 /// maintained in lockstep with their corresponding data vectors by
 /// `add_policy` / `remove_policy` (per OZ `storage.rs:1123` + `:1181`, SHA
-/// `3f81125`).
+/// `a9c4216`).
 ///
-/// The `ContextRule` storage layout (OZ `storage.rs:152-174`, SHA `3f81125`):
+/// The `ContextRule` storage layout (OZ `storage.rs:152-174`, SHA `a9c4216`):
 ///
 /// ```text
 /// ContextRuleEntry {
@@ -3760,7 +3760,7 @@ pub fn decode_policy_count_from_scval(scval: &ScVal) -> Result<u32, SaError> {
 /// - `None`  → `Val::VOID` → `ScVal::Void`
 /// - `Some(t)` → `t.try_into_val(env)` → for `u32`: `ScVal::U32(n)`
 ///
-/// OZ `storage.rs:159` (SHA `3f81125`): `valid_until: Option<u32>` field in
+/// OZ `storage.rs:159` (SHA `a9c4216`): `valid_until: Option<u32>` field in
 /// `ContextRule` struct.
 ///
 /// # Errors
@@ -4081,7 +4081,7 @@ fn sa_error_to_invocation_result(
         // distinguishes pre-submission refusals, on-chain rejections, and the
         // post-submit event-confirmation-missing case.
         //
-        // The OZ stellar-contracts v0.7.1 contract has no off-chain
+        // The OZ stellar-contracts v0.7.2 contract has no off-chain
         // InvocationResult taxonomy — on-chain TimelockError codes are
         // classified wallet-side. No off-chain SDK exposes a timelock-handler
         // surface, so this taxonomy is wallet-specific with no reference analogue.
@@ -4264,7 +4264,7 @@ mod tests {
     /// Pins the OZ on-chain cap constants against upstream drift.
     ///
     /// Canonical source: `packages/accounts/src/smart_account/mod.rs:524-530`
-    /// SHA `3f81125` (`MAX_POLICIES = 5`, `MAX_SIGNERS = 15`,
+    /// SHA `a9c4216` (`MAX_POLICIES = 5`, `MAX_SIGNERS = 15`,
     /// `MAX_NAME_SIZE = 20`, `MAX_EXTERNAL_KEY_SIZE = 256`).
     /// If OZ changes these caps, this test fails and forces a deliberate re-pin.
     #[test]
@@ -4416,8 +4416,8 @@ mod tests {
 
     /// Pins the OZ `Signer::Delegated(Address)` `#[contracttype]` wire
     /// shape: `ScVal::Vec([Symbol("Delegated"), Address(addr)])`. Matches OZ
-    /// canonical at OpenZeppelin stellar-contracts v0.7.1,
-    /// `packages/accounts/src/smart_account/storage.rs:96-102` (SHA `3f81125`).
+    /// canonical at OpenZeppelin stellar-contracts v0.7.2,
+    /// `packages/accounts/src/smart_account/storage.rs:96-102` (SHA `a9c4216`).
     #[test]
     fn encode_signer_delegated_round_trip() {
         let address = ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
@@ -4475,7 +4475,7 @@ mod tests {
 
     /// Exactly OZ_MAX_EXTERNAL_KEY_SIZE bytes is accepted.
     ///
-    /// Canonical source: `packages/accounts/src/smart_account/mod.rs:530`, SHA `3f81125`.
+    /// Canonical source: `packages/accounts/src/smart_account/mod.rs:530`, SHA `a9c4216`.
     #[test]
     fn encode_signer_external_at_max_key_size_is_accepted() {
         let verifier = ScAddress::Contract(ContractId(stellar_xdr::Hash([0x01_u8; 32])));
@@ -4489,7 +4489,7 @@ mod tests {
 
     /// One byte over OZ_MAX_EXTERNAL_KEY_SIZE is rejected.
     ///
-    /// Canonical source: `packages/accounts/src/smart_account/mod.rs:530`, SHA `3f81125`.
+    /// Canonical source: `packages/accounts/src/smart_account/mod.rs:530`, SHA `a9c4216`.
     #[test]
     fn encode_signer_external_over_max_key_size_is_rejected() {
         let verifier = ScAddress::Contract(ContractId(stellar_xdr::Hash([0x02_u8; 32])));
@@ -4538,12 +4538,12 @@ mod tests {
     }
 
     /// Pins the OZ `SmartAccountError` enum discriminant table at OpenZeppelin
-    /// stellar-contracts v0.7.1, `packages/accounts/src/smart_account/mod.rs:535-572`
-    /// (SHA `3f81125`). Drift on a reference SHA bump surfaces here as a test
+    /// stellar-contracts v0.7.2, `packages/accounts/src/smart_account/mod.rs:535-572`
+    /// (SHA `a9c4216`). Drift on a reference SHA bump surfaces here as a test
     /// failure rather than a silent annotation gap. Note: OZ's enum is
     /// non-contiguous — discriminant 3001 is SKIPPED.
     #[test]
-    fn oz_smart_account_error_name_matches_v0_7_1_discriminants() {
+    fn oz_smart_account_error_name_matches_oz_wire_discriminants() {
         assert_eq!(
             oz_smart_account_error_name(3000),
             Some("ContextRuleNotFound")
@@ -4551,7 +4551,7 @@ mod tests {
         assert_eq!(
             oz_smart_account_error_name(3001),
             None,
-            "OZ v0.7.1 SKIPS 3001"
+            "OZ v0.7.2 SKIPS 3001"
         );
         assert_eq!(
             oz_smart_account_error_name(3002),
@@ -4586,7 +4586,7 @@ mod tests {
         assert_eq!(
             oz_smart_account_error_name(3017),
             None,
-            "outside OZ v0.7.1 range"
+            "outside OZ v0.7.2 range"
         );
         assert_eq!(oz_smart_account_error_name(0), None);
         assert_eq!(oz_smart_account_error_name(u32::MAX), None);
@@ -4617,7 +4617,7 @@ mod tests {
     fn augment_with_oz_error_name_does_not_annotate_skipped_3001() {
         let msg = "Error(Contract, #3001) skipped-discriminant";
         let augmented = augment_with_oz_error_name(msg);
-        assert_eq!(augmented, msg, "OZ v0.7.1 skips 3001; must not annotate");
+        assert_eq!(augmented, msg, "OZ v0.7.2 skips 3001; must not annotate");
     }
 
     // ── OZ caps panic discriminant mapping ────────────────────────────────────
@@ -4632,7 +4632,7 @@ mod tests {
     /// `Error(Contract, #3010)` is augmented with `[OZ:TooManySigners]`.
     ///
     /// OZ discriminant: `TooManySigners = 3010`
-    /// (`packages/accounts/src/smart_account/mod.rs:558`, SHA `3f81125`).
+    /// (`packages/accounts/src/smart_account/mod.rs:558`, SHA `a9c4216`).
     ///
     /// `augment_with_oz_error_name` MUST be called before surfacing simulate
     /// errors at all cap-check bypass sites so that operators see the symbolic
@@ -4671,7 +4671,7 @@ mod tests {
     /// `Error(Contract, #3011)` is augmented with `[OZ:TooManyPolicies]`.
     ///
     /// OZ discriminant: `TooManyPolicies = 3011`
-    /// (`packages/accounts/src/smart_account/mod.rs:560`, SHA `3f81125`).
+    /// (`packages/accounts/src/smart_account/mod.rs:560`, SHA `a9c4216`).
     #[test]
     fn t10_error_contract_3011_augmented_with_too_many_policies() {
         let raw = "simulate returned: Error(Contract, #3011)";
@@ -4700,14 +4700,14 @@ mod tests {
 
     // ── oz_timelock_error_name: discriminant table pin ────────────────────────
     //
-    // Canonical source: OpenZeppelin stellar-contracts v0.7.1 (`stellar-governance`),
-    // `packages/governance/src/timelock/mod.rs:325-339` (SHA `3f81125`).
+    // Canonical source: OpenZeppelin stellar-contracts v0.7.2 (`stellar-governance`),
+    // `packages/governance/src/timelock/mod.rs:325-339` (SHA `a9c4216`).
 
     /// Pins the full `TimelockError` discriminant table at mod.rs:325-339,
-    /// SHA `3f81125`. Drift on a reference SHA bump surfaces here before
+    /// SHA `a9c4216`. Drift on a reference SHA bump surfaces here before
     /// reaching operator-facing error messages.
     #[test]
-    fn oz_timelock_error_name_matches_v0_7_1_discriminants() {
+    fn oz_timelock_error_name_matches_oz_wire_discriminants() {
         assert_eq!(
             oz_timelock_error_name(4000),
             Some("OperationAlreadyScheduled")
@@ -4721,7 +4721,7 @@ mod tests {
         assert_eq!(
             oz_timelock_error_name(4007),
             None,
-            "outside OZ v0.7.1 range"
+            "outside OZ v0.7.2 range"
         );
         assert_eq!(
             oz_timelock_error_name(3000),
@@ -4733,7 +4733,7 @@ mod tests {
 
     /// `augment_with_oz_error_name` annotates `Error(Contract, #4004)` with
     /// `[OZ:Unauthorized]` (most common timelock failure — proposer or canceller
-    /// without the corresponding role; OZ `mod.rs:325-339` SHA `3f81125`).
+    /// without the corresponding role; OZ `mod.rs:325-339` SHA `a9c4216`).
     #[test]
     fn augment_with_oz_error_name_annotates_timelock_unauthorized() {
         let msg = "simulation returned: Error(Contract, #4004) something";
@@ -4749,7 +4749,7 @@ mod tests {
     }
 
     /// `augment_with_oz_error_name` annotates `Error(Contract, #4002)` with
-    /// `[OZ:InvalidOperationState]` (cancel failure mode; mod.rs:325-339 SHA `3f81125`).
+    /// `[OZ:InvalidOperationState]` (cancel failure mode; mod.rs:325-339 SHA `a9c4216`).
     #[test]
     fn augment_with_oz_error_name_annotates_timelock_invalid_state() {
         let raw = "Error(Contract, #4002)";
@@ -4761,7 +4761,7 @@ mod tests {
     }
 
     /// `augment_with_oz_error_name` annotates `Error(Contract, #4000)` with
-    /// `[OZ:OperationAlreadyScheduled]` (duplicate-schedule failure; mod.rs:325-339 SHA `3f81125`).
+    /// `[OZ:OperationAlreadyScheduled]` (duplicate-schedule failure; mod.rs:325-339 SHA `a9c4216`).
     #[test]
     fn augment_with_oz_error_name_annotates_timelock_already_scheduled() {
         let raw = "Error(Contract, #4000)";
@@ -4776,7 +4776,7 @@ mod tests {
 
     /// Happy path: `ScVal::Map` with `signer_ids: Vec([U32(0), U32(1)])` → 2.
     ///
-    /// Layout per OZ `storage.rs:152-174` SHA `3f81125`:
+    /// Layout per OZ `storage.rs:152-174` SHA `a9c4216`:
     /// `signer_ids: Vec<u32>` is a `ScVal::Vec(Some(ScVec([...])))` under the
     /// `"signer_ids"` Symbol key.
     #[test]
@@ -5344,7 +5344,7 @@ mod tests {
     /// supports only the Default context type; the other variants are explicitly
     /// refused with a clear error message.
     ///
-    /// Canonical source: OZ `storage.rs:152-174` SHA `3f81125` defines the
+    /// Canonical source: OZ `storage.rs:152-174` SHA `a9c4216` defines the
     /// three `ContextRuleType` variants; the wallet's off-chain XDR encoder
     /// only covers `Default`.
     #[test]
@@ -5750,7 +5750,7 @@ mod tests {
     /// supplied in a non-sorted order, the encoder must sort them before
     /// constructing the `ScMap`.
     ///
-    /// Canonical source: OZ `mod.rs:238-248` SHA `3f81125` — the fifth arg to
+    /// Canonical source: OZ `mod.rs:238-248` SHA `a9c4216` — the fifth arg to
     /// `add_context_rule` is `Map<Address, Val>` (policies map).
     ///
     /// We verify that the encoded policies ScVal is a `ScVal::Map(Some(...))`.
@@ -5799,7 +5799,7 @@ mod tests {
     /// = `ScVal::U32(n)` per the `Option<u32>` host ABI.
     ///
     /// Canonical source: `soroban-env-common/src/option.rs:3-16`; arg position
-    /// per OZ `mod.rs:238-248` SHA `3f81125`.
+    /// per OZ `mod.rs:238-248` SHA `a9c4216`.
     #[test]
     fn build_add_context_rule_args_encodes_valid_until_some() {
         let def = ContextRuleDefinition::new(
@@ -5897,11 +5897,11 @@ mod tests {
     //
     // `parse_context_rule_summary` is a pure decoder that maps an on-chain
     // `ContextRule` ScVal::Map to a `ContextRuleSummary`. The OZ storage layout
-    // (SHA `3f81125`, `storage.rs:152-174`) defines the field set.
+    // (SHA `a9c4216`, `storage.rs:152-174`) defines the field set.
 
     /// Helper: build a full synthetic `ContextRule` ScVal::Map.
     ///
-    /// Layout per OZ `storage.rs:152-174` SHA `3f81125`. Fields are sorted
+    /// Layout per OZ `storage.rs:152-174` SHA `a9c4216`. Fields are sorted
     /// alphabetically as required by the `#[contracttype]` derived ScVal
     /// encoding.
     ///
@@ -6014,7 +6014,7 @@ mod tests {
     /// `parse_context_rule_summary` decodes a CallContract context type label.
     ///
     /// The parser maps `Symbol("CallContract")` at vec[0] to `"call_contract"`.
-    /// Canonical source: OZ `storage.rs:152-174` SHA `3f81125`; the `ContextRuleType`
+    /// Canonical source: OZ `storage.rs:152-174` SHA `a9c4216`; the `ContextRuleType`
     /// enum has a `CallContract(Address)` variant.
     #[test]
     fn parse_context_rule_summary_call_contract_context_type_label() {
@@ -6094,7 +6094,7 @@ mod tests {
     /// `context_type` field contains an unknown variant symbol.
     ///
     /// The closed set of on-chain variants is `Default`, `CallContract`,
-    /// `CreateContract` (OZ `storage.rs:152-174` SHA `3f81125`). Any other
+    /// `CreateContract` (OZ `storage.rs:152-174` SHA `a9c4216`). Any other
     /// symbol must be rejected.
     #[test]
     fn parse_context_rule_summary_unknown_context_type_returns_error() {
@@ -6524,13 +6524,13 @@ mod tests {
     //
     // Mirror of the four `decode_signer_count_from_scval` tests above.  Reads
     // the `policy_ids` field from a synthetic `ScVal::Map` (OZ `storage.rs:
-    // 152-174` SHA `3f81125`).
+    // 152-174` SHA `a9c4216`).
 
     /// `policy_ids` with two entries → count=2.
     ///
     /// Layout: `ScVal::Map([{ key: Symbol("policy_ids"), val: Vec([U32(0), U32(1)]) }])`.
     ///
-    /// OZ storage layout: `policy_ids: Vec<u32>` at `storage.rs:171` SHA `3f81125`.
+    /// OZ storage layout: `policy_ids: Vec<u32>` at `storage.rs:171` SHA `a9c4216`.
     #[test]
     fn decode_policy_count_happy_path_two_policies() {
         let map = ScVal::Map(Some(ScMap(
@@ -6595,7 +6595,7 @@ mod tests {
     /// Builds a synthetic `ContextRule` ScVal with the given `valid_until` value
     /// for use in expiry detection unit tests.
     ///
-    /// Layout per OZ `storage.rs:152-174` SHA `3f81125`: the ScVal is a
+    /// Layout per OZ `storage.rs:152-174` SHA `a9c4216`: the ScVal is a
     /// `ScVal::Map` with Symbol keys sorted lexicographically.  Only the
     /// `valid_until` field is populated; other fields are omitted (the
     /// `extract_valid_until_from_rule_scval` helper only reads `valid_until`).
@@ -6607,7 +6607,7 @@ mod tests {
     ///
     /// `soroban-env-common/src/option.rs:3-16`:
     ///   `None → ScVal::Void`, `Some(n) → ScVal::U32(n)`.
-    /// OZ `storage.rs:159` SHA `3f81125`: `valid_until: Option<u32>`.
+    /// OZ `storage.rs:159` SHA `a9c4216`: `valid_until: Option<u32>`.
     fn synthetic_rule_scval_with_valid_until(valid_until: Option<u32>) -> ScVal {
         let valid_until_scval = match valid_until {
             Some(n) => ScVal::U32(n),
@@ -6633,9 +6633,9 @@ mod tests {
     ///
     /// # Canonical citation
     ///
-    /// OZ `storage.rs:280-285` SHA `3f81125`:
+    /// OZ `storage.rs:280-285` SHA `a9c4216`:
     /// `if valid_until < e.ledger().sequence() { panic_with_error!(e, UnvalidatedContext) }`.
-    /// `UnvalidatedContext = 3002` per `mod.rs:542` SHA `3f81125`.
+    /// `UnvalidatedContext = 3002` per `mod.rs:542` SHA `a9c4216`.
     #[test]
     fn t4_add_signer_against_expired_rule_returns_rule_expired() {
         let rule_id: u32 = 7;
@@ -6739,7 +6739,7 @@ mod tests {
     /// against a near-expired rule — the expiry check is NOT wired into
     /// `update_valid_until_inner`, so this path PASSES.
     ///
-    /// OZ `storage.rs:286-287` SHA `3f81125` rejects `valid_until <
+    /// OZ `storage.rs:286-287` SHA `a9c4216` rejects `valid_until <
     /// current_ledger` with `PastValidUntil = 3005`.  Setting to exactly
     /// `current_ledger` is the canonical revocation pattern: the rule expires
     /// at the NEXT ledger (strict-`<` validate-time check).
@@ -7493,14 +7493,14 @@ mod tests {
 
     /// `oz_smart_account_error_name` returns the correct symbolic name for all
     /// OZ `SmartAccountError` discriminants in the 3012-3016 range not yet
-    /// exercised by the existing `oz_smart_account_error_name_matches_v0_7_1_discriminants`
+    /// exercised by the existing `oz_smart_account_error_name_matches_oz_wire_discriminants`
     /// test.
     ///
     /// The existing test at line 4573 covers 3000, 3002-3011. This test pins the
     /// remaining codes 3012-3016 independently.
     ///
     /// Canonical source: `packages/accounts/src/smart_account/mod.rs:535-572`
-    /// SHA `3f81125` (OZ v0.7.1).
+    /// SHA `a9c4216` (OZ v0.7.2).
     #[test]
     fn oz_smart_account_error_name_upper_discriminants_3012_to_3016() {
         let cases = [

@@ -1,6 +1,6 @@
 //! Timelock testnet acceptance tests.
 //!
-//! Deploys an OZ v0.7.1 `TimelockController` contract on testnet and exercises
+//! Deploys an OZ v0.7.2 `TimelockController` contract on testnet and exercises
 //! the full schedule → cancel + schedule → execute lifecycle.
 //!
 //! This file ships in the SAME COMMIT as the `timelock.rs` production substance,
@@ -31,7 +31,7 @@
 //!
 //! # OZ timelock contract
 //!
-//! Uses the vendored `vendor/oz-timelock-controller/v0.7.1/timelock_controller_example.wasm`
+//! Uses the vendored `vendor/oz-timelock-controller/v0.7.2/timelock_controller_example.wasm`
 //! (the OpenZeppelin `timelock-controller-example` package).
 //! Constructor: `__constructor(min_delay: u32, proposers: Vec<Address>,
 //! executors: Vec<Address>, admin: Option<Address>)`.
@@ -185,7 +185,7 @@ fn read_audit_entries(path: &PathBuf) -> Vec<AuditEntry> {
     entries
 }
 
-/// Deploys the OZ timelock-controller v0.7.1 WASM to testnet and returns the
+/// Deploys the OZ timelock-controller v0.7.2 WASM to testnet and returns the
 /// contract C-strkey.
 ///
 /// Delegates to

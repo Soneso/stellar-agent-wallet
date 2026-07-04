@@ -217,7 +217,7 @@ async fn deploy_threshold_policy_wasm(
 ) -> String {
     let wasm_hash_bytes: [u8; 32] = Sha256::digest(THRESHOLD_POLICY_WASM).into();
 
-    let salt_input = format!("oz-threshold-policy-v0.7.1-{TESTNET_PASSPHRASE}");
+    let salt_input = format!("oz-threshold-policy-v0.7.2-{TESTNET_PASSPHRASE}");
     let salt: [u8; 32] = Sha256::digest(salt_input.as_bytes()).into();
 
     let policy_strkey = derive_smart_account_address(deployer_g, &salt, TESTNET_PASSPHRASE)

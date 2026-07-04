@@ -6,7 +6,7 @@
 //! [`stellar_agent_smart_account::managers::rules::OZ_MAX_SIGNERS`] and
 //! [`stellar_agent_smart_account::managers::rules::OZ_MAX_POLICIES`] are
 //! mirrors of the OZ on-chain canonical values at
-//! `packages/accounts/src/smart_account/mod.rs:524-526` SHA `3f81125`:
+//! `packages/accounts/src/smart_account/mod.rs:524-526` SHA `a9c4216`:
 //!
 //! ```text
 //! pub const MAX_POLICIES: u32 = 5;
@@ -32,17 +32,17 @@ use stellar_agent_smart_account::managers::rules::{OZ_MAX_POLICIES, OZ_MAX_SIGNE
 
 /// Asserts that `OZ_MAX_SIGNERS` matches the OZ canonical value.
 ///
-/// OZ source: `packages/accounts/src/smart_account/mod.rs:526` SHA `3f81125`
+/// OZ source: `packages/accounts/src/smart_account/mod.rs:526` SHA `a9c4216`
 /// (`pub const MAX_SIGNERS: u32 = 15`).
 ///
 /// On-chain enforcement: `SmartAccountError::TooManySigners = 3010`
-/// (`mod.rs:558`, SHA `3f81125`).
+/// (`mod.rs:558`, SHA `a9c4216`).
 #[test]
 fn oz_max_signers_parity_with_canonical() {
     assert_eq!(
         OZ_MAX_SIGNERS, 15,
         "OZ_MAX_SIGNERS parity violation: wallet constant is {} but OZ canonical \
-         (packages/accounts/src/smart_account/mod.rs:526 SHA 3f81125) is 15. \
+         (packages/accounts/src/smart_account/mod.rs:526 SHA a9c4216) is 15. \
          Update OZ_MAX_SIGNERS in managers/rules.rs to match the canonical, \
          then re-verify the CLI cap check sites.",
         OZ_MAX_SIGNERS,
@@ -51,17 +51,17 @@ fn oz_max_signers_parity_with_canonical() {
 
 /// Asserts that `OZ_MAX_POLICIES` matches the OZ canonical value.
 ///
-/// OZ source: `packages/accounts/src/smart_account/mod.rs:524` SHA `3f81125`
+/// OZ source: `packages/accounts/src/smart_account/mod.rs:524` SHA `a9c4216`
 /// (`pub const MAX_POLICIES: u32 = 5`).
 ///
 /// On-chain enforcement: `SmartAccountError::TooManyPolicies = 3011`
-/// (`mod.rs:560`, SHA `3f81125`).
+/// (`mod.rs:560`, SHA `a9c4216`).
 #[test]
 fn oz_max_policies_parity_with_canonical() {
     assert_eq!(
         OZ_MAX_POLICIES, 5,
         "OZ_MAX_POLICIES parity violation: wallet constant is {} but OZ canonical \
-         (packages/accounts/src/smart_account/mod.rs:524 SHA 3f81125) is 5. \
+         (packages/accounts/src/smart_account/mod.rs:524 SHA a9c4216) is 5. \
          Update OZ_MAX_POLICIES in managers/rules.rs to match the canonical, \
          then re-verify the CLI cap check sites.",
         OZ_MAX_POLICIES,

@@ -1,7 +1,7 @@
 //! Upgrade timelock surface (configurable on-chain execution delay).
 //!
-//! Production wrapper for the OZ `stellar-governance v0.7.1` `Timelock`
-//! contract surface (`packages/governance/src/timelock/`, SHA `3f81125`).
+//! Production wrapper for the OZ `stellar-governance v0.7.2` `Timelock`
+//! contract surface (`packages/governance/src/timelock/`, SHA `a9c4216`).
 //!
 //! # What this module does
 //!
@@ -44,7 +44,7 @@
 //! `hash_operation` ABI are sourced from
 //! `packages/governance/src/timelock/mod.rs` and
 //! `packages/governance/src/timelock/storage.rs` in the
-//! `stellar-governance v0.7.1` contract source.
+//! `stellar-governance v0.7.2` contract source.
 //!
 //! All timelock logic in this module is wallet-only with no off-chain reference
 //! counterpart. The OpenZeppelin on-chain contract is the single authority for
@@ -66,8 +66,8 @@ use stellar_xdr::{
     AccountId, BytesM, ContractEventBody, ContractEventV0, Hash, HostFunction, InvokeContractArgs,
     InvokeHostFunctionOp, Operation, OperationBody, ScAddress, ScSymbol, ScVal, ScVec, VecM,
 };
-// Use the upstream typed error enum from stellar-governance v0.7.1
-// (packages/governance/src/timelock/mod.rs:325-340, SHA 3f81125) instead of
+// Use the upstream typed error enum from stellar-governance v0.7.2
+// (packages/governance/src/timelock/mod.rs:325-340, SHA a9c4216) instead of
 // hand-rolled u32 constants. TimelockError is #[repr(u32)] so `as u32` is safe and
 // produces the same wire codes as the on-chain contract.
 use stellar_governance::timelock::TimelockError as OzTimelockError;
@@ -84,8 +84,8 @@ use crate::managers::rules::{
 
 // ── OZ Timelock error codes ───────────────────────────────────────────────────
 // Referenced as `OzTimelockError::Variant as u32`.
-// Enum: stellar-governance v0.7.1, packages/governance/src/timelock/mod.rs:325-340,
-// SHA 3f81125. All codes are #[repr(u32)] with fixed values that match the on-chain
+// Enum: stellar-governance v0.7.2, packages/governance/src/timelock/mod.rs:325-340,
+// SHA a9c4216. All codes are #[repr(u32)] with fixed values that match the on-chain
 // contract ABI.
 //
 // OzTimelockError::OperationAlreadyScheduled  = 4000
@@ -97,7 +97,7 @@ use crate::managers::rules::{
 // OzTimelockError::OperationNotScheduled      = 4006
 
 // ── State sentinel values (storage.rs:UNSET_LEDGER / DONE_LEDGER) ────────────
-// packages/governance/src/timelock/mod.rs:352-357 (SHA 3f81125)
+// packages/governance/src/timelock/mod.rs:352-357 (SHA a9c4216)
 const UNSET_LEDGER: u32 = 0;
 const DONE_LEDGER: u32 = 1;
 
@@ -107,8 +107,8 @@ const DONE_LEDGER: u32 = 1;
 ///
 /// Corresponds to the `BytesN<32>` returned by `Timelock::schedule` / computed
 /// by `Timelock::hash_operation` on the OZ contract
-/// (`packages/governance/src/timelock/storage.rs:403`, SHA `3f81125`).
-/// The hash is produced on-chain by `hash_operation` (storage.rs:403, SHA `3f81125`).
+/// (`packages/governance/src/timelock/storage.rs:403`, SHA `a9c4216`).
+/// The hash is produced on-chain by `hash_operation` (storage.rs:403, SHA `a9c4216`).
 ///
 /// # Redaction
 ///
@@ -400,7 +400,7 @@ fn classify_schedule_error(sim_error: &str) -> TimelockScheduleFailureReason {
 /// # Canonical failure mode
 ///
 /// `Timelock::cancel` delegates to `cancel_operation` in
-/// `packages/governance/src/timelock/storage.rs:376-378` (SHA `3f81125`),
+/// `packages/governance/src/timelock/storage.rs:376-378` (SHA `a9c4216`),
 /// which panics with `TimelockError::InvalidOperationState` (code 4002) when
 /// the operation is not in the `Pending` state. An unscheduled operation has
 /// `ready_ledger == UNSET_LEDGER (0)` and `is_operation_pending` returns `false`
@@ -409,7 +409,7 @@ fn classify_schedule_error(sim_error: &str) -> TimelockScheduleFailureReason {
 fn classify_cancel_error(sim_error: &str) -> TimelockCancelFailureReason {
     // Use OzTimelockError typed enum values for comparison.
     // Code 4006 branch is absent — unreachable from canonical OZ
-    // cancel_operation (storage.rs:376-378, SHA 3f81125).
+    // cancel_operation (storage.rs:376-378, SHA a9c4216).
     match extract_oz_error_code(sim_error) {
         Some(c) if c == OzTimelockError::Unauthorized as u32 => {
             TimelockCancelFailureReason::Unauthorized
@@ -549,7 +549,7 @@ pub(crate) async fn query_operation_state_cross_rpc(
 
 /// Converts the raw `ready_ledger` storage value to a `TimelockOperationStateView`.
 ///
-/// Per OZ `packages/governance/src/timelock/storage.rs:116-126` (SHA `3f81125`):
+/// Per OZ `packages/governance/src/timelock/storage.rs:116-126` (SHA `a9c4216`):
 /// - `ready_ledger == UNSET_LEDGER (0)` → `Unset`.
 /// - `ready_ledger == DONE_LEDGER (1)` → `Done`.
 /// - `ready_ledger > current_ledger` → `Waiting`.
@@ -620,7 +620,7 @@ async fn query_operation_ready_ledger(
     // Build a dummy simulate transaction targeting `get_operation_ledger`.
     // This is a read-only view function on the OZ timelock contract.
     // Timelock::get_operation_ledger(e, operation_id: BytesN<32>) -> u32
-    // OZ mod.rs:116 (SHA 3f81125).
+    // OZ mod.rs:116 (SHA a9c4216).
     //
     // We cannot use the stellar-governance crate's types directly here because
     // that crate provides a soroban-sdk `contracttrait` which requires a host
@@ -649,7 +649,7 @@ async fn query_operation_ready_ledger(
         .map_err(|e| format!("timelock address parse failed: {e:?}"))?;
 
     // The OZ Timelock trait method is `get_operation_ledger`
-    // (`packages/governance/src/timelock/mod.rs:116`, SHA `3f81125`).
+    // (`packages/governance/src/timelock/mod.rs:116`, SHA `a9c4216`).
     // Soroban Symbols permit up to 32 chars; `get_operation_ledger` is 21 chars
     // and fits. Any abbreviated name triggers "function not found" at simulate-time,
     // silently breaking the ready-window pre-check and list_pending cross-RPC query.
@@ -998,11 +998,11 @@ enum CrossConfirmError {
 /// 2. The first topic (`ScVal::Symbol`) equals the OZ snake_case event name
 ///    (`"operation_scheduled"` / `"operation_cancelled"` / `"operation_executed"`).
 ///    This is the topic emitted by the `#[contractevent]` macro for the struct
-///    name converted to snake_case (OZ mod.rs:382-392 / 433-442 / 479-481, SHA 3f81125;
+///    name converted to snake_case (OZ mod.rs:382-392 / 433-442 / 479-481, SHA a9c4216;
 ///    macro derive in rs-soroban-sdk soroban-sdk-macros/src/derive_event.rs:105).
 /// 3. The second topic (`ScVal::Bytes`) contains the expected 32-byte operation_id.
 ///
-/// # Event format (OZ timelock-controller v0.7.1, SHA 3f81125)
+/// # Event format (OZ timelock-controller v0.7.2, SHA a9c4216)
 ///
 /// | event_kind | topic[0] | topic[1] | topic[2] |
 /// |---|---|---|---|
@@ -1010,7 +1010,7 @@ enum CrossConfirmError {
 /// | `OperationCancelled` | `Symbol("operation_cancelled")` | `Bytes(id)` | — |
 /// | `OperationExecuted` | `Symbol("operation_executed")` | `Bytes(id)` | `Address(target)` |
 ///
-/// Reference: OZ `packages/governance/src/timelock/mod.rs:157,221,279` (SHA 3f81125).
+/// Reference: OZ `packages/governance/src/timelock/mod.rs:157,221,279` (SHA a9c4216).
 ///
 /// # Cross-RPC divergence digest
 ///
@@ -1358,9 +1358,9 @@ fn to_snake_case(pascal: &str) -> String {
 
 // ── Soroban function name constants ──────────────────────────────────────────
 // OZ timelock-controller function names from examples/timelock-controller/src/contract.rs
-// (SHA 3f81125): schedule = "schedule", cancel = "cancel", execute = "execute".
+// (SHA a9c4216): schedule = "schedule", cancel = "cancel", execute = "execute".
 // The OZ `contracttrait` macro expands these as the on-chain function names.
-// OZ contract.rs:272-315 (SHA 3f81125).
+// OZ contract.rs:272-315 (SHA a9c4216).
 const FN_SCHEDULE: &str = "schedule";
 const FN_CANCEL: &str = "cancel";
 const FN_EXECUTE: &str = "execute";
@@ -1423,7 +1423,7 @@ pub async fn schedule_upgrade(
     let salt_bytes = derive_schedule_salt_impl(request_id, timestamp_nanos);
 
     // Build the `schedule` InvokeHostFunction call.
-    // OZ TimelockController::schedule signature (contract.rs:272-285, SHA 3f81125):
+    // OZ TimelockController::schedule signature (contract.rs:272-285, SHA a9c4216):
     //   fn schedule(e, target: Address, function: Symbol, args: Vec<Val>,
     //               predecessor: BytesN<32>, salt: BytesN<32>, delay: u32, proposer: Address)
     //   -> BytesN<32>
@@ -1571,7 +1571,7 @@ pub async fn schedule_upgrade(
     // the OZ TimelockController does not expose — all three production submit
     // calls were failing at `build_authorization_entry` (empty rule_ids rejected
     // with `SaError::RuleIdMismatch`). Use the direct G-key auth path instead.
-    // OZ mod.rs:180-181 (SHA 3f81125): `proposer.require_auth()`.
+    // OZ mod.rs:180-181 (SHA a9c4216): `proposer.require_auth()`.
     let result = crate::timelock_submit::submit_timelock_invoke_with_g_key_auth(
         crate::timelock_submit::TimelockSubmitArgs {
             host_function,
@@ -1684,7 +1684,7 @@ pub async fn schedule_upgrade(
 /// Wraps `Timelock::cancel(operation_id, canceller)`. The canceller must hold
 /// `CANCELLER_ROLE` on the timelock contract. In the default OZ timelock-controller
 /// configuration, proposers are automatically granted the canceller role at
-/// initialisation time (contract.rs:255-258, SHA `3f81125`).
+/// initialisation time (contract.rs:255-258, SHA `a9c4216`).
 ///
 /// # Event cross-confirmation
 ///
@@ -1698,7 +1698,7 @@ pub async fn schedule_upgrade(
 ///   submission failure; typed `failure_reason` from the OZ error code.
 ///   The canonical cancel failure mode is `InvalidOperationState` (OZ code
 ///   4002), fired by `cancel_operation` (`packages/governance/src/timelock/
-///   storage.rs:378`, SHA `3f81125`) when the operation is not in `Pending`
+///   storage.rs:378`, SHA `a9c4216`) when the operation is not in `Pending`
 ///   state — including when it was never scheduled. Code 4006
 ///   (`OperationNotScheduled`) is not reachable from the canonical cancel
 ///   path.
@@ -1771,7 +1771,7 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
         })?);
 
     // OZ TimelockController::cancel(e, operation_id: BytesN<32>, canceller: Address)
-    // contract.rs:307-309, SHA 3f81125.
+    // contract.rs:307-309, SHA a9c4216.
     let invoke_args: Vec<ScVal> = vec![
         ScVal::Bytes(op_id_scbytes),
         ScVal::Address(canceller_sc_address),
@@ -1802,7 +1802,7 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
 
     // The OZ TimelockController is NOT a smart-account; `cancel` calls
     // `canceller.require_auth()` on the G-key Address argument.
-    // OZ mod.rs:292 (SHA 3f81125): `canceller.require_auth()`.
+    // OZ mod.rs:292 (SHA a9c4216): `canceller.require_auth()`.
     let result = crate::timelock_submit::submit_timelock_invoke_with_g_key_auth(
         crate::timelock_submit::TimelockSubmitArgs {
             host_function,
@@ -1820,7 +1820,7 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
         // OZ `cancel_operation` fires `InvalidOperationState` (4002) for any
         // non-pending op (including never-scheduled ones). Code 4006
         // (`OperationNotScheduled`) is unreachable from the canonical OZ
-        // storage.rs:376-378 (SHA 3f81125); all cancel failures route through
+        // storage.rs:376-378 (SHA a9c4216); all cancel failures route through
         // `classify_cancel_error` which extracts the OZ code internally.
         SaError::TimelockCancelFailed {
             failure_reason: classified,
@@ -2039,7 +2039,7 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
     }
 
     // Derive operation_id by simulating `hash_operation(target, function, args,
-    // predecessor, salt)` on the OZ Timelock contract (mod.rs:98-108, SHA 3f81125)
+    // predecessor, salt)` on the OZ Timelock contract (mod.rs:98-108, SHA a9c4216)
     // instead of an off-chain Keccak-256 re-implementation. Both primary and
     // secondary RPCs simulate; hashes must match (divergence is a security failure).
     let operation_id = simulate_hash_operation(
@@ -2159,7 +2159,7 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
     }
 
     // Build the `execute` call.
-    // OZ TimelockController::execute signature (contract.rs:286-304, SHA 3f81125):
+    // OZ TimelockController::execute signature (contract.rs:286-304, SHA a9c4216):
     //   fn execute(e, target: Address, function: Symbol, args: Vec<Val>,
     //              predecessor: BytesN<32>, salt: BytesN<32>, executor: Option<Address>)
     //   -> Val
@@ -2220,7 +2220,7 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
 
     // executor: Option<Address> — for open-execution, pass ScVal::Vec(None) (Soroban None).
     // The OZ timelock-controller allows open execution when no executors are configured
-    // (contract.rs:295-296, SHA 3f81125). We use open-execution as the default.
+    // (contract.rs:295-296, SHA a9c4216). We use open-execution as the default.
     // Expose executor: Option<&str> in the public API for closed-execution mode.
     let executor_scval = ScVal::Void; // Soroban `None` for Option<Address>
 
@@ -2261,7 +2261,7 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
     // The OZ TimelockController is NOT a smart-account; `execute` calls
     // `executor.require_auth()` on the G-key Address argument (only when an
     // explicit executor is supplied; open execution passes None).
-    // OZ mod.rs:244-245 (SHA 3f81125): `if let Some(ref exec) = executor { exec.require_auth() }`.
+    // OZ mod.rs:244-245 (SHA a9c4216): `if let Some(ref exec) = executor { exec.require_auth() }`.
     let result = crate::timelock_submit::submit_timelock_invoke_with_g_key_auth(
         crate::timelock_submit::TimelockSubmitArgs {
             host_function,
@@ -2473,7 +2473,7 @@ fn decode_hex32(hex: &str) -> Option<[u8; 32]> {
 /// against BOTH primary and secondary RPCs concurrently.
 ///
 /// Calls `Timelock::hash_operation(e, target, function, args, predecessor, salt) -> BytesN<32>`
-/// (`packages/governance/src/timelock/mod.rs:98-108`, SHA `3f81125`) rather than
+/// (`packages/governance/src/timelock/mod.rs:98-108`, SHA `a9c4216`) rather than
 /// an off-chain Keccak-256 re-implementation — the result is authoritative.
 ///
 /// Both RPCs MUST return the identical 32-byte hash. A mismatch yields
@@ -2562,7 +2562,7 @@ async fn simulate_hash_operation(
 
     // OZ hash_operation(e, target: Address, function: Symbol, args: Vec<Val>,
     //                   predecessor: BytesN<32>, salt: BytesN<32>) -> BytesN<32>
-    // mod.rs:98-108 (SHA 3f81125). Argument order mirrors the trait signature exactly.
+    // mod.rs:98-108 (SHA a9c4216). Argument order mirrors the trait signature exactly.
     let invoke_args: Vec<ScVal> = vec![
         ScVal::Address(target_sc_address),
         ScVal::Symbol(fn_sym),
@@ -2961,7 +2961,7 @@ mod tests {
     #[test]
     fn classify_cancel_error_not_scheduled_falls_through_to_other() {
         // OZ code 4006 (`OperationNotScheduled`) is unreachable from the canonical
-        // cancel path (storage.rs:376-378, SHA 3f81125); code 4006 falls through
+        // cancel path (storage.rs:376-378, SHA a9c4216); code 4006 falls through
         // to `Other`.
         let reason = classify_cancel_error("Error(Contract, #4006)");
         assert_eq!(reason, TimelockCancelFailureReason::Other);

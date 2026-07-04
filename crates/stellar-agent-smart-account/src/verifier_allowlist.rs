@@ -22,7 +22,7 @@
 //! # 24-month retention
 //!
 //! `Revoked` entries persist for 24 months minimum, then rotate to `Retired`.
-//! See `vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md` for the retention policy.
+//! See `vendor/oz-webauthn-verifier/v0.7.2/PROVENANCE.md` for the retention policy.
 
 use std::fmt;
 
@@ -190,17 +190,26 @@ impl VerifierAllowlistEntry {
 ///
 /// # Current entries
 ///
-/// A single entry: OZ `multisig-webauthn-verifier-example` v0.7.1.
-/// - SHA-256: `678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a`
-/// - OZ source SHA: `3f81125bed3114cc93f5fca6d13240082050269a` (tag `v0.7.1`)
-/// - PROVENANCE: `vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md`
-/// - Audit status: `Audited { auditor: "OpenZeppelin", audited_at: "2025-11-01" }`
-///   — PROVISIONAL (not externally verified; pending independent audit).
+/// Two production entries. Index 0 is the hash new verifier deployments upload
+/// (`sha2::Sha256::digest(VERIFIER_WASM_FIXTURE)`); index 1 is the legacy hash,
+/// still recognised for verifier contracts already deployed on-chain.
 ///
-/// The `audited_at` date is PROVISIONAL (not externally verified; pending
-/// independent audit) for the OZ internal review of the v0.7.1
-/// `multisig-webauthn-verifier-example` artefact. When a formal external audit
-/// date is confirmed, update this date and the PROVENANCE.md.
+/// - Index 0: OZ `multisig-webauthn-verifier-example` v0.7.2.
+///   - SHA-256: `9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7`
+///   - OZ source SHA: `a9c42169000638da937577f592ebf61a7a3c94ca` (tag `v0.7.2`)
+///   - PROVENANCE: `vendor/oz-webauthn-verifier/v0.7.2/PROVENANCE.md`
+///   - Audit status: `Audited { auditor: "OpenZeppelin", audited_at: "2026-07-04" }`
+///     — PROVISIONAL (OZ internal v0.7.2 artefact review date; not externally verified).
+/// - Index 1: OZ `multisig-webauthn-verifier-example` v0.7.1 (legacy, still recognised).
+///   - SHA-256: `678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a`
+///   - OZ source SHA: `3f81125bed3114cc93f5fca6d13240082050269a` (tag `v0.7.1`)
+///   - PROVENANCE: `vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md`
+///   - Audit status: `Audited { auditor: "OpenZeppelin", audited_at: "2025-11-01" }`
+///     — PROVISIONAL (not externally verified; pending independent audit).
+///
+/// The ABI is unchanged between v0.7.1 and v0.7.2; the v0.7.2 bytes differ only
+/// because of the soroban-sdk 26.1.0 bump. When a formal external audit date is
+/// confirmed, update the corresponding `audited_at` date and PROVENANCE.md.
 ///
 /// # 24-month retention
 ///
@@ -208,31 +217,55 @@ impl VerifierAllowlistEntry {
 ///
 /// # Extension
 ///
-/// Append a new entry when a new audited verifier deployment is created.
-/// Each addition requires an operator-authorised PR with an updated
-/// `vendor/oz-webauthn-verifier/` artefact and PROVENANCE.md.
+/// Append a new entry when a new audited verifier deployment is created, and keep
+/// index 0 as the hash the deploy CLI currently uploads
+/// (`Sha256::digest(VERIFIER_WASM_FIXTURE)`). Each addition requires an
+/// operator-authorised PR with an updated `vendor/oz-webauthn-verifier/` artefact
+/// and PROVENANCE.md.
 pub const VERIFIER_ALLOWLIST: &[VerifierAllowlistEntry] = &[
-    // OZ multisig-webauthn-verifier-example v0.7.1 (canonical reference verifier).
+    // Index 0: OZ multisig-webauthn-verifier-example v0.7.2 (canonical deploy verifier).
+    //
+    // Wasm hash: 9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7
+    // (SHA-256 verified at vendor/oz-webauthn-verifier/v0.7.2/PROVENANCE.md).
+    //
+    // OZ source SHA: a9c42169000638da937577f592ebf61a7a3c94ca (tag v0.7.2).
+    // OZ source file: examples/multisig-smart-account/webauthn-verifier/src/contract.rs
+    //
+    // Build: stellar contract build --package multisig-webauthn-verifier-example
+    //        stellar-cli 25.2.0, rustc 1.96.0 stable, wasm32v1-none target.
+    //
+    // audited_at: PROVISIONAL "2026-07-04" (not externally verified; pending
+    // independent audit) — represents the OZ internal v0.7.2 artefact review date.
+    // Update when a formal external audit date is confirmed.
+    VerifierAllowlistEntry {
+        wasm_hash: [
+            // SHA-256: 9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7
+            // Canonical per vendor/oz-webauthn-verifier/v0.7.2/PROVENANCE.md.
+            // Canonical hash is pinned in 3 sites; all must agree. See
+            // verifier_identification.rs supply-chain test + verifier_allowlist.rs
+            // anchor test + this const definition.
+            0x94, 0x27, 0xe3, 0xdd, 0x71, 0xfb, 0x29, 0x11, 0x5c, 0x6f, 0x0e, 0xfd, 0xf2, 0xf7,
+            0x03, 0xb3, 0x2f, 0xec, 0x56, 0x6b, 0x15, 0x14, 0x21, 0xf9, 0x91, 0xc3, 0xb4, 0xe2,
+            0x48, 0xeb, 0xb1, 0xf7,
+        ],
+        audit_status: VerifierAuditStatus::Audited {
+            auditor: "OpenZeppelin",
+            audited_at: "2026-07-04",
+        },
+    },
+    // Index 1: OZ multisig-webauthn-verifier-example v0.7.1 (legacy, still recognised).
     //
     // Wasm hash: 678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a
     // (SHA-256 verified at vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md).
     //
     // OZ source SHA: 3f81125bed3114cc93f5fca6d13240082050269a (tag v0.7.1).
-    // OZ source file: examples/multisig-smart-account/webauthn-verifier/src/contract.rs
-    //
-    // Build: stellar contract build --package multisig-webauthn-verifier-example
-    //        stellar-cli 25.2.0, rustc 1.94.0 stable, wasm32v1-none target.
+    // Still recognised for verifier contracts already deployed on-chain from the
+    // v0.7.1 bytes; no longer deployed for new verifiers.
     //
     // audited_at: PROVISIONAL "2025-11-01" (not externally verified; pending
     // independent audit) — represents the OZ internal v0.7.1 artefact review date.
-    // Update when a formal external audit date is confirmed.
     VerifierAllowlistEntry {
         wasm_hash: [
-            // SHA-256: 678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a
-            // Canonical per vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md.
-            // Canonical hash is pinned in 3 sites; all must agree. See
-            // verifier_identification.rs supply-chain test + verifier_allowlist.rs
-            // anchor test + this const definition.
             0x67, 0x80, 0x06, 0x90, 0x9b, 0x50, 0xc6, 0xc3, 0x65, 0xc0, 0x33, 0xf1, 0x37, 0x19,
             0x7e, 0x91, 0x0d, 0x83, 0x96, 0xa2, 0xc6, 0x8e, 0x92, 0x81, 0x32, 0x7a, 0x2e, 0xd7,
             0xdb, 0xf4, 0xb2, 0x7a,
@@ -294,22 +327,52 @@ mod tests {
             oz.audit_status,
             VerifierAuditStatus::Audited { .. }
         ));
-        // Hard-coded canonical hash per vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md.
-        // OZ source SHA: 3f81125bed3114cc93f5fca6d13240082050269a (tag v0.7.1).
-        // SHA-256: 678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a
+        // Hard-coded canonical hash per vendor/oz-webauthn-verifier/v0.7.2/PROVENANCE.md.
+        // OZ source SHA: a9c42169000638da937577f592ebf61a7a3c94ca (tag v0.7.2).
+        // SHA-256: 9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7
         //
         // Hard-coded byte array assertion: any future wasm_hash change is caught
-        // here and must match vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md.
+        // here and must match vendor/oz-webauthn-verifier/v0.7.2/PROVENANCE.md.
         let canonical: [u8; 32] = [
+            0x94, 0x27, 0xe3, 0xdd, 0x71, 0xfb, 0x29, 0x11, 0x5c, 0x6f, 0x0e, 0xfd, 0xf2, 0xf7,
+            0x03, 0xb3, 0x2f, 0xec, 0x56, 0x6b, 0x15, 0x14, 0x21, 0xf9, 0x91, 0xc3, 0xb4, 0xe2,
+            0x48, 0xeb, 0xb1, 0xf7,
+        ];
+        assert_eq!(
+            oz.wasm_hash, canonical,
+            "VERIFIER_ALLOWLIST[0].wasm_hash does not match the canonical OZ v0.7.2 hash; \
+             update verifier_allowlist.rs to match PROVENANCE.md \
+             (vendor/oz-webauthn-verifier/v0.7.2/PROVENANCE.md)."
+        );
+    }
+
+    #[test]
+    fn verifier_allowlist_retains_legacy_v0_7_1_verifier() {
+        // Guards the index-reorder: index 0 is the current v0.7.2 deploy hash and
+        // index 1 must remain the v0.7.1 hash so verifier contracts already
+        // deployed on-chain keep passing identification. A silent loss of the
+        // legacy entry fails here.
+        assert!(
+            VERIFIER_ALLOWLIST.len() >= 2,
+            "VERIFIER_ALLOWLIST must retain the legacy v0.7.1 verifier at index 1"
+        );
+        let legacy = &VERIFIER_ALLOWLIST[1];
+        assert!(matches!(
+            legacy.audit_status,
+            VerifierAuditStatus::Audited { .. }
+        ));
+        // Hard-coded canonical v0.7.1 hash per vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md.
+        // SHA-256: 678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a
+        let legacy_v0_7_1: [u8; 32] = [
             0x67, 0x80, 0x06, 0x90, 0x9b, 0x50, 0xc6, 0xc3, 0x65, 0xc0, 0x33, 0xf1, 0x37, 0x19,
             0x7e, 0x91, 0x0d, 0x83, 0x96, 0xa2, 0xc6, 0x8e, 0x92, 0x81, 0x32, 0x7a, 0x2e, 0xd7,
             0xdb, 0xf4, 0xb2, 0x7a,
         ];
         assert_eq!(
-            oz.wasm_hash, canonical,
-            "VERIFIER_ALLOWLIST[0].wasm_hash does not match the canonical OZ v0.7.1 hash; \
-             update verifier_allowlist.rs to match PROVENANCE.md \
-             (vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md)."
+            legacy.wasm_hash, legacy_v0_7_1,
+            "VERIFIER_ALLOWLIST[1].wasm_hash must remain the OZ v0.7.1 legacy hash \
+             (vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md); verifier contracts \
+             already deployed on-chain rely on it staying recognised."
         );
     }
 

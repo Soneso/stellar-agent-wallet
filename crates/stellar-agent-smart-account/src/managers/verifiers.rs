@@ -7,17 +7,17 @@
 //!
 //! # Architectural note — instance storage
 //!
-//! OpenZeppelin `stellar-contracts` v0.7.1 stores admin / owner roles in
+//! OpenZeppelin `stellar-contracts` v0.7.2 stores admin / owner roles in
 //! **instance storage** (`e.storage().instance().set/get`), which Soroban
 //! embeds as the `storage: Option<ScMap>` field of the
 //! `ScContractInstance` value inside the contract's `LedgerKeyContractInstance`
 //! ledger entry.
 //!
 //! Canonical sources:
-//! - `packages/access/src/ownable/storage.rs:13-16` (SHA `3f81125`) —
+//! - `packages/access/src/ownable/storage.rs:13-16` (SHA `a9c4216`) —
 //!   `OwnableStorageKey::{ Owner, PendingOwner }`, stored via
 //!   `e.storage().instance().get/set`.
-//! - `packages/access/src/access_control/storage.rs:20-29` (SHA `3f81125`) —
+//! - `packages/access/src/access_control/storage.rs:20-29` (SHA `a9c4216`) —
 //!   `AccessControlStorageKey::Admin`, stored via `e.storage().instance().get/set`.
 //! - `soroban-sdk`, `storage.rs` testutils (`Storage::instance` read-back path) —
 //!   confirms that instance storage is embedded in `ScContractInstance.storage`
@@ -52,7 +52,7 @@
 //!
 //! # OZ Admin / Owner survey result
 //!
-//! Surveyed OZ `stellar-contracts` v0.7.1 (SHA `3f81125`):
+//! Surveyed OZ `stellar-contracts` v0.7.2 (SHA `a9c4216`):
 //!
 //! | Contract path | Storage key enum | Variant | On-wire `ScVal` map key |
 //! |---|---|---|---|
@@ -65,10 +65,10 @@
 //! **Smart-account-adjacent contracts in `packages/accounts/`:**
 //! - `threshold-policy` (example at `examples/multisig-smart-account/`): no
 //!   admin / owner key. Uses only `SimpleThresholdStorageKey::AccountContext(sa, rule_id)`.
-//!   Confirmed at `examples/multisig-smart-account/threshold-policy/src/contract.rs` (SHA `3f81125`).
+//!   Confirmed at `examples/multisig-smart-account/threshold-policy/src/contract.rs` (SHA `a9c4216`).
 //! - `packages/accounts/src/smart_account/`: no top-level admin / owner key.
 //!   Uses `SmartAccountStorageKey` variants (`Count`, `NextId`, `SignerData(u32)`, etc.) —
-//!   confirmed at `packages/accounts/src/smart_account/storage.rs:27-94` (SHA `3f81125`).
+//!   confirmed at `packages/accounts/src/smart_account/storage.rs:27-94` (SHA `a9c4216`).
 //!
 //! **Conclusion:** canonical OZ convention is Pascal-case: `"Admin"` and `"Owner"`.
 //! No `"admin"`, `"owner"`, `"Upgrader"`, `"Governance"`, or `"Pauser"` variants
@@ -1134,10 +1134,10 @@ async fn identify_policy_wasm_hash(
         .await
 }
 
-// ── Admin / Owner key names surveyed from OZ v0.7.1 ──────────────────────────
+// ── Admin / Owner key names surveyed from OZ v0.7.2 ──────────────────────────
 
 /// Closed-set of admin-equivalent instance-storage key names surveyed from OZ
-/// `stellar-contracts` v0.7.1 (SHA `3f81125`).
+/// `stellar-contracts` v0.7.2 (SHA `a9c4216`).
 ///
 /// Survey result per `packages/access/src/ownable/storage.rs:14` and
 /// `packages/access/src/access_control/storage.rs:27` — Pascal-case on the wire.
@@ -1156,10 +1156,10 @@ const ADMIN_KEY_NAMES: &[AdminOrOwnerKey] = &[AdminOrOwnerKey::Admin, AdminOrOwn
 ///
 /// # OZ instance storage
 ///
-/// OZ `stellar-contracts` v0.7.1 embeds admin keys in `ScContractInstance.storage`
+/// OZ `stellar-contracts` v0.7.2 embeds admin keys in `ScContractInstance.storage`
 /// (instance storage), not as separate `LedgerKey::ContractData` entries.
 /// Confirmed at `packages/access/src/ownable/storage.rs:27,50` and
-/// `packages/access/src/access_control/storage.rs:57,156` (SHA `3f81125`).
+/// `packages/access/src/access_control/storage.rs:57,156` (SHA `a9c4216`).
 ///
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1174,7 +1174,7 @@ pub enum MutabilityStatus {
     Mutable {
         /// Instance-storage key name (`Admin` or `Owner`).
         ///
-        /// Closed-set per OZ v0.7.1 survey (see module-level doc).
+        /// Closed-set per OZ v0.7.2 survey (see module-level doc).
         admin_or_owner_key: AdminOrOwnerKey,
         /// First-5-last-5 redacted strkey of the admin / owner holder.
         ///
@@ -1206,7 +1206,7 @@ pub enum MutabilityStatus {
 /// `ScVal::Symbol("Owner")` keys with non-zero `ScVal::Address` values.
 ///
 /// Survey source: `packages/access/src/ownable/storage.rs:14` and
-/// `packages/access/src/access_control/storage.rs:27` (SHA `3f81125` tag v0.7.1).
+/// `packages/access/src/access_control/storage.rs:27` (SHA `a9c4216` tag v0.7.2).
 ///
 /// # Return value
 ///

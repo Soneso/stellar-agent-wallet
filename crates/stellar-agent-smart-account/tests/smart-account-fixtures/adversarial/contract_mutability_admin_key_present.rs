@@ -18,7 +18,7 @@
 //! then wrapped in `ScVal::Vec` by `TryFrom<Enum> for ScVal` (same file).
 //! Keys are stored in instance storage (`e.storage().instance()`),
 //! which embeds in `ScContractInstance.storage: Option<ScMap>`.
-//! Source: `packages/access/src/access_control/storage.rs:20-29` (OZ SHA `3f81125`).
+//! Source: `packages/access/src/access_control/storage.rs:20-29` (OZ SHA `a9c4216`).
 //!
 //! # Property verified
 //!

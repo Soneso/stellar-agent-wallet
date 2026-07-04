@@ -2,7 +2,7 @@
 //!
 //! # What this crate does
 //!
-//! Wraps the OpenZeppelin `stellar-accounts` v0.7.1 on-chain contract surface
+//! Wraps the OpenZeppelin `stellar-accounts` v0.7.2 on-chain contract surface
 //! into typed off-chain primitives the wallet uses for: smart-account deployment,
 //! context-rule install + auth-digest binding, WebAuthn passkey signer, atomic
 //! signer-threshold updates, wasm-hash pinning, verifier migration,

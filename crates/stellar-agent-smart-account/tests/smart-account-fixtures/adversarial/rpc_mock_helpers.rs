@@ -48,11 +48,13 @@ use wiremock::{Request, Respond, ResponseTemplate};
 
 /// The OZ threshold-policy WASM hash from the compile-time allowlist.
 ///
-/// Value: `43c48790b83fbe283e139f881aa091198c4df554022aa10c12d9ca484edf0702`
-/// (OZ multisig-threshold-policy-example v0.7.1, SHA `3f81125`).
+/// Value: `4c14f402df29675d4155283698c436ee588aacb39adc313845010a565c07567d`
+/// (OZ multisig-threshold-policy-example v0.7.2, SHA `a9c4216`) —
+/// `THRESHOLD_POLICY_WASM_HASHES[0]`, the canonical deploy hash. The legacy
+/// v0.7.1 hash is `THRESHOLD_POLICY_WASM_HASHES[1]`; both are allowlisted.
 pub const KNOWN_WASM_HASH: [u8; 32] = [
-    0x43, 0xc4, 0x87, 0x90, 0xb8, 0x3f, 0xbe, 0x28, 0x3e, 0x13, 0x9f, 0x88, 0x1a, 0xa0, 0x91, 0x19,
-    0x8c, 0x4d, 0xf5, 0x54, 0x02, 0x2a, 0xa1, 0x0c, 0x12, 0xd9, 0xca, 0x48, 0x4e, 0xdf, 0x07, 0x02,
+    0x4c, 0x14, 0xf4, 0x02, 0xdf, 0x29, 0x67, 0x5d, 0x41, 0x55, 0x28, 0x36, 0x98, 0xc4, 0x36, 0xee,
+    0x58, 0x8a, 0xac, 0xb3, 0x9a, 0xdc, 0x31, 0x38, 0x45, 0x01, 0x0a, 0x56, 0x5c, 0x07, 0x56, 0x7d,
 ];
 
 /// Unknown wasm hash — not in the allowlist.
@@ -197,7 +199,7 @@ pub fn contract_instance_entry_xdr(contract: &ScAddress, wasm_hash: [u8; 32]) ->
 ///
 /// # Byte-layout citation
 ///
-/// `stellar-accounts-0.7.1/src/smart_account/storage.rs:153-174` (SHA `3f81125`):
+/// `stellar-accounts-0.7.2/src/smart_account/storage.rs:153-174` (SHA `a9c4216`):
 /// `ContextRule` 8-field `#[contracttype]` struct; soroban-sdk-macros
 /// `derive_type_struct` produces `ScVal::Map` sorted by `ScVal::Symbol` key.
 pub fn build_context_rule_scval_xdr(
@@ -208,7 +210,7 @@ pub fn build_context_rule_scval_xdr(
     // Build signer ScVals: Delegated(Address) for each Ed25519 signer.
     // OZ Signer contracttype: `Delegated(Address)` →
     //   `ScVal::Vec([Symbol("Delegated"), Address(account_addr)])`
-    // storage.rs:96-102 (SHA `3f81125`).
+    // storage.rs:96-102 (SHA `a9c4216`).
     let signer_scvals: Vec<ScVal> = signers
         .signer_pubkeys
         .iter()
@@ -256,7 +258,7 @@ pub fn build_context_rule_scval_xdr(
 
     // context_type: `Default` variant = ScVal::Vec([Symbol("Default")]).
     // OZ contracttype enum encoding: leading Symbol("VariantName") + payload.
-    // storage.rs:96 (SHA 3f81125).
+    // storage.rs:96 (SHA a9c4216).
     let context_type_vec: VecM<ScVal> = vec![sym(b"Default")]
         .try_into()
         .expect("context_type Vec fits");
@@ -342,7 +344,7 @@ pub fn build_context_rule_scval_xdr(
 ///
 /// # Byte-layout citation
 ///
-/// `stellar-accounts-0.7.1/src/smart_account/storage.rs:153-174` (SHA `3f81125`);
+/// `stellar-accounts-0.7.2/src/smart_account/storage.rs:153-174` (SHA `a9c4216`);
 /// `soroban-env-common/src/option.rs:3-16`.
 pub fn build_context_rule_scval_xdr_with_valid_until(
     rule_id: u32,
@@ -471,7 +473,7 @@ pub fn build_context_rule_scval_xdr_with_valid_until(
 /// # Byte-layout citation
 ///
 /// `Signer::External(Address, Bytes)` at
-/// `stellar-accounts-0.7.1/src/smart_account/storage.rs:96-102` (SHA `3f81125`):
+/// `stellar-accounts-0.7.2/src/smart_account/storage.rs:96-102` (SHA `a9c4216`):
 /// `External(Address, Bytes)` → `ScVal::Vec([Symbol("External"), Address(...), Bytes(...)])`.
 pub fn build_context_rule_external_signers_xdr(
     rule_id: u32,

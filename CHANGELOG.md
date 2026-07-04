@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `list-rules`, `register-multicall`, `unregister-multicall`, `timelock`) are now
   direct children of `smart-account` alongside `rules`, `signers`, and
   `multicall`. This is a breaking change to the CLI command surface.
+- Bumped the vendored OpenZeppelin `stellar-accounts` and `stellar-governance`
+  dependencies from `0.7.1` to `0.7.2` (a `soroban_sdk` 26.1.0 fix upstream, no
+  entrypoint or ABI changes) and rebuilt all five vendored OZ WASM artifacts at
+  the new tag. New smart-account, threshold-policy, timelock-controller, and
+  WebAuthn-verifier deployments now use the `0.7.2` artifacts. Verifier and
+  threshold-policy contracts already deployed from the `0.7.1` artifacts remain
+  recognized and valid; nothing on-chain is redeployed.
 
 ## [0.1.0-alpha.1] - 2026-07-03
 

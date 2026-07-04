@@ -1,7 +1,7 @@
 //! Signer-set manager — atomic add/remove/set-threshold for OZ context rules.
 //!
 //! Implements `SignersManager`, the off-chain orchestrator for atomic
-//! signer-threshold updates against OpenZeppelin `stellar-accounts` v0.7.1
+//! signer-threshold updates against OpenZeppelin `stellar-accounts` v0.7.2
 //! context-rule signer sets.  Every mutating method enforces:
 //!
 //! 1. **Threshold invariant pre-flight**: refuses operations that would produce
@@ -92,10 +92,10 @@ pub(crate) struct NotInAllowlistContext {
     pub(crate) request_id: String,
 }
 
-// ── On-chain constants (OZ stellar-contracts v0.7.1) ────────────
+// ── On-chain constants (OZ stellar-contracts v0.7.2) ────────────
 
 /// Maximum number of signers per context rule, per the OpenZeppelin
-/// stellar-accounts v0.7.1 smart-account contract.
+/// stellar-accounts v0.7.2 smart-account contract.
 const MAX_SIGNERS: u32 = 15;
 
 // ── Per-rule async mutex registry ────────────────────────────────────────────
@@ -1974,7 +1974,7 @@ impl SignersManager {
     ///
     /// The threshold policy exposes
     /// `get_threshold(e, context_rule_id: u32, smart_account: Address) -> u32`
-    /// per the OpenZeppelin stellar-accounts v0.7.1 contract.
+    /// per the OpenZeppelin stellar-accounts v0.7.2 contract.
     async fn fetch_threshold(
         &self,
         rpc_client: &StellarRpcClient,
@@ -2905,7 +2905,7 @@ fn pubkeys_first8(pks: &[SignerPubkey]) -> Vec<String> {
 /// Builds an OZ `Signer::Delegated(Address)` ScVal from a delegated signer
 /// G-strkey.
 ///
-/// OZ `Signer` contracttype byte-layout (stellar-accounts v0.7.1):
+/// OZ `Signer` contracttype byte-layout (stellar-accounts v0.7.2):
 /// `Delegated(Address)` is encoded as
 /// `ScVal::Vec([ScVal::Symbol("Delegated"), ScVal::Address(account)])`.
 ///
@@ -2932,7 +2932,7 @@ pub fn build_delegated_signer_scval(g_strkey: &str) -> Result<ScVal, SaError> {
 /// Builds an OZ `Signer::External(Address, Bytes)` ScVal from a verifier
 /// C-strkey and raw `key_data` bytes.
 ///
-/// OZ `Signer` contracttype byte-layout (stellar-accounts v0.7.1):
+/// OZ `Signer` contracttype byte-layout (stellar-accounts v0.7.2):
 /// `External(Address, Bytes)` is encoded as
 /// `ScVal::Vec([ScVal::Symbol("External"), ScVal::Address(verifier), ScVal::Bytes(key_data)])`.
 ///
@@ -3159,7 +3159,7 @@ impl OnChainContextRule {
     ///
     /// # Byte-layout
     ///
-    /// The OZ stellar-accounts v0.7.1 `ContextRule` is an 8-field
+    /// The OZ stellar-accounts v0.7.2 `ContextRule` is an 8-field
     /// `#[contracttype]` struct. The `#[contracttype]` derive
     /// (soroban-sdk-macros `derive_type_struct`) produces `ScVal::Map(ScMap([sorted entries]))`.
     /// Field ordering by `ScVal::Symbol` lexicographic key:
@@ -3292,7 +3292,7 @@ fn decode_context_rule_scval(val: ScVal) -> Result<OnChainContextRule, SaError> 
 /// to [`SignerPubkey`] (truncating `key_data` to 16 bytes for audit-log
 /// display) or assert byte-exact equality against the original key blob.
 ///
-/// Decoded from the OZ stellar-accounts v0.7.1 `Signer` contracttype.
+/// Decoded from the OZ stellar-accounts v0.7.2 `Signer` contracttype.
 ///
 /// This type is always compiled.  It is accessible outside the crate only via
 /// the `#[cfg(any(test, feature = "test-helpers"))]`-gated re-export in
@@ -3337,7 +3337,7 @@ pub enum DecodedOnChainSigner {
 /// A future OZ change to the `Signer` enum encoding requires updating only
 /// this function — production and test paths pick up the change automatically.
 ///
-/// The OZ stellar-accounts v0.7.1 `Signer` contracttype encodes as:
+/// The OZ stellar-accounts v0.7.2 `Signer` contracttype encodes as:
 /// - `Delegated(Address)` → `ScVal::Vec([Symbol("Delegated"), Address(pubkey_addr)])`
 /// - `External(Address, Bytes)` → `ScVal::Vec([Symbol("External"), Address(verifier), Bytes(key_data)])`
 ///

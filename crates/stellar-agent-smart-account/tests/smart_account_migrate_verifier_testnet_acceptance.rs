@@ -103,12 +103,16 @@ const CHAIN_ID: &str = "stellar:testnet";
 const TIMEOUT_SECS: u64 = 90;
 const FEE_STROOPS: u32 = 1_000_000;
 
-/// OpenZeppelin WebAuthn verifier v0.7.1 wasm hash — the only `VERIFIER_ALLOWLIST` entry.
+/// OpenZeppelin WebAuthn verifier v0.7.2 wasm hash — the canonical
+/// `VERIFIER_ALLOWLIST[0]` entry, i.e. the on-chain wasm hash that
+/// `deploy_webauthn_verifier` now produces. Used as the migration `from_hash`
+/// so the planner matches rules whose External signer references a verifier
+/// deployed by these tests (which upload the v0.7.2 bytes).
 ///
-/// SHA-256 verified at `vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md`.
+/// SHA-256 verified at `vendor/oz-webauthn-verifier/v0.7.2/PROVENANCE.md`.
 const OZ_WEBAUTHN_VERIFIER_HASH: [u8; 32] = [
-    0x67, 0x80, 0x06, 0x90, 0x9b, 0x50, 0xc6, 0xc3, 0x65, 0xc0, 0x33, 0xf1, 0x37, 0x19, 0x7e, 0x91,
-    0x0d, 0x83, 0x96, 0xa2, 0xc6, 0x8e, 0x92, 0x81, 0x32, 0x7a, 0x2e, 0xd7, 0xdb, 0xf4, 0xb2, 0x7a,
+    0x94, 0x27, 0xe3, 0xdd, 0x71, 0xfb, 0x29, 0x11, 0x5c, 0x6f, 0x0e, 0xfd, 0xf2, 0xf7, 0x03, 0xb3,
+    0x2f, 0xec, 0x56, 0x6b, 0x15, 0x14, 0x21, 0xf9, 0x91, 0xc3, 0xb4, 0xe2, 0x48, 0xeb, 0xb1, 0xf7,
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -209,7 +213,7 @@ fn encode_simple_threshold_params(threshold: u32) -> ScVal {
 /// # Construction notes
 ///
 /// - `CreateContractV2` with `ContractIdPreimageFromAddress`.
-/// - Deterministic salt: `SHA256("oz-threshold-policy-v0.7.1-" || network_passphrase)` —
+/// - Deterministic salt: `SHA256("oz-threshold-policy-v0.7.2-" || network_passphrase)` —
 ///   pins the salt to the WASM version and network, matching the same convention used in
 ///   `deploy_webauthn_verifier_body`.
 /// - No `__constructor` args for the threshold-policy contract: only `enforce`,
@@ -221,8 +225,8 @@ async fn deploy_threshold_policy_wasm(
     // Compute wasm SHA-256 for LedgerKey construction and idempotency check.
     let wasm_hash_bytes: [u8; 32] = Sha256::digest(THRESHOLD_POLICY_WASM).into();
 
-    // Deterministic salt: SHA256("oz-threshold-policy-v0.7.1-" || network_passphrase).
-    let salt_input = format!("oz-threshold-policy-v0.7.1-{TESTNET_PASSPHRASE}");
+    // Deterministic salt: SHA256("oz-threshold-policy-v0.7.2-" || network_passphrase).
+    let salt_input = format!("oz-threshold-policy-v0.7.2-{TESTNET_PASSPHRASE}");
     let salt: [u8; 32] = Sha256::digest(salt_input.as_bytes()).into();
 
     // Derive the expected contract address (pure; no network).
@@ -751,7 +755,8 @@ async fn fetch_rule_decoded(smart_account_addr: &ScAddress, rule_id: u32) -> Dec
 ///
 /// # Pre-flight gates exercised
 ///
-/// 1. Destination hash in `VERIFIER_ALLOWLIST` → passes (OZ v0.7.1 Audited entry).
+/// 1. Destination hash in `VERIFIER_ALLOWLIST` → passes (freshly deployed OZ v0.7.2
+///    Audited entry, `VERIFIER_ALLOWLIST[0]`).
 /// 2. Destination audit status `Audited` → passes.
 /// 3. Destination contract immutable → passes (OZ vendored WASM has no Admin key).
 ///
@@ -1287,8 +1292,8 @@ async fn d2_migrate_verifier_dry_run_identifies_one_external_signer() {
 ///
 /// Migration steps:
 /// 1. Deploy fresh smart account with bootstrap signer S1.
-/// 2. Deploy verifier-A (OZ WebAuthn v0.7.1, first deployer).
-/// 3. Deploy verifier-B (OZ WebAuthn v0.7.1, second deployer — different address).
+/// 2. Deploy verifier-A (OZ WebAuthn v0.7.2, first deployer).
+/// 3. Deploy verifier-B (OZ WebAuthn v0.7.2, second deployer — different address).
 /// 4. Deploy threshold-policy WASM (required so `refresh_signer_baseline` routes
 ///    through `identify_threshold_policy`).
 /// 5. Install a context rule with one External signer pointing to verifier-A.

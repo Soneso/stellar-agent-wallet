@@ -8,7 +8,7 @@
 //!
 //! - `pin_and_install_with_canonical_oz_threshold_policy_no_drift` —
 //!   Install a rule whose `policies` list references the deployed canonical OZ
-//!   v0.7.1 threshold-policy contract (wasm hash in `THRESHOLD_POLICY_WASM_HASHES`
+//!   v0.7.2 threshold-policy contract (wasm hash in `THRESHOLD_POLICY_WASM_HASHES`
 //!   allowlist). Expects `install_rule` to succeed, and the resulting
 //!   `SaContextRuleCreated` audit row to carry a non-empty
 //!   `pinned_policy_wasm_hashes_first8` and `mutable_override = false`.
@@ -53,7 +53,7 @@
 //!   `SaVerifierHashDrift` / `SaPolicyHashDrift` rows emitted for that `request_id`.
 //!
 //! - `install_rule_refuses_mutable_verifier_without_override` —
-//!   Deploy the OZ v0.7.1 timelock-controller contract (has `AccessControlStorageKey::Admin`
+//!   Deploy the OZ v0.7.2 timelock-controller contract (has `AccessControlStorageKey::Admin`
 //!   in instance storage via its constructor; wasm hash NOT in `VERIFIER_ALLOWLIST`).
 //!   Pass `accept_unknown_verifier = true` (bypasses allowlist check, emits
 //!   `SaUnknownContractOverride`) AND `accept_mutable_verifier = false` (default).
@@ -303,14 +303,14 @@ async fn deploy_fresh_smart_account(signer_g: &str) -> String {
 /// test runs reuse the same contract address rather than re-deploying.
 /// Returns the deployed C-strkey.
 ///
-/// Salt derivation: `SHA256("oz-threshold-policy-v0.7.1-" || TESTNET_PASSPHRASE)`.
+/// Salt derivation: `SHA256("oz-threshold-policy-v0.7.2-" || TESTNET_PASSPHRASE)`.
 async fn deploy_threshold_policy_wasm(
     deployer_g: &str,
     signer: &(dyn Signer + Send + Sync),
 ) -> String {
     let wasm_hash_bytes: [u8; 32] = Sha256::digest(THRESHOLD_POLICY_WASM).into();
 
-    let salt_input = format!("oz-threshold-policy-v0.7.1-{TESTNET_PASSPHRASE}");
+    let salt_input = format!("oz-threshold-policy-v0.7.2-{TESTNET_PASSPHRASE}");
     let salt: [u8; 32] = Sha256::digest(salt_input.as_bytes()).into();
 
     let policy_strkey = derive_smart_account_address(deployer_g, &salt, TESTNET_PASSPHRASE)
@@ -518,7 +518,7 @@ fn encode_simple_threshold_params(threshold: u32) -> ScVal {
 // ── Canonical OZ threshold-policy pin succeeds ───────────────────────────────
 
 /// Install a context rule whose `policies` list references the
-/// canonical OZ v0.7.1 threshold-policy WASM (hash in
+/// canonical OZ v0.7.2 threshold-policy WASM (hash in
 /// `THRESHOLD_POLICY_WASM_HASHES`) with the pin-check `SignersManager` active.
 ///
 /// The rule installation must:
@@ -1544,7 +1544,7 @@ async fn p5_drift_check_infra_failure_routes_to_drift_check_unavailable_not_drif
 
 // ── Shared helper: deploy timelock controller as mutable fixture ──────────────
 
-/// Deploys the OZ v0.7.1 timelock-controller to testnet and returns its C-strkey.
+/// Deploys the OZ v0.7.2 timelock-controller to testnet and returns its C-strkey.
 ///
 /// The timelock controller's `__constructor` calls `set_admin(e, &admin_addr)`,
 /// which stores `AccessControlStorageKey::Admin` (serialised `"Admin"` symbol key)
@@ -1612,7 +1612,7 @@ async fn deploy_mutable_contract_for_verifier_test(
 ///
 /// # Setup
 ///
-/// The verifier is a freshly-deployed OZ v0.7.1 timelock-controller whose
+/// The verifier is a freshly-deployed OZ v0.7.2 timelock-controller whose
 /// `__constructor` sets `AccessControlStorageKey::Admin` in instance storage.
 /// The timelock-controller WASM hash is NOT in `VERIFIER_ALLOWLIST`, so
 /// `accept_unknown_verifier = true` is needed to bypass the allowlist check

@@ -29,8 +29,8 @@
 //! # RP-ID-hash check (step 3)
 //!
 //! The on-chain OZ verifier **omits** RP-ID-hash validation — per the on-chain
-//! docstring in OpenZeppelin stellar-contracts v0.7.1,
-//! `packages/accounts/src/verifiers/webauthn.rs:9-15` (SHA `3f81125`):
+//! docstring in OpenZeppelin stellar-contracts v0.7.2,
+//! `packages/accounts/src/verifiers/webauthn.rs:9-15` (SHA `a9c4216`):
 //! > "RP ID hash validation: Verification of `rpIdHash` in authenticatorData
 //! > against expected RP ID hash is omitted."
 //!
@@ -47,7 +47,7 @@
 //!
 //! # On-chain authority
 //!
-//! - OZ `stellar-contracts` v0.7.1 SHA `3f81125`:
+//! - OZ `stellar-contracts` v0.7.2 SHA `a9c4216`:
 //!   `packages/accounts/src/verifiers/webauthn.rs`
 //!   (the canonical on-chain authority — the wallet's pre-verifier mirrors
 //!   the on-chain `webauthn::verify` 7-step pipeline byte-for-byte).
@@ -78,7 +78,7 @@ use crate::error::WebAuthnInvalidReason;
 /// Implements the 7-step pipeline:
 ///
 /// 1. `clientDataJSON.type == "webauthn.get"` (W3C step 11;
-///    on-chain OZ `webauthn.rs:121-126`, SHA `3f81125`).
+///    on-chain OZ `webauthn.rs:121-126`, SHA `a9c4216`).
 /// 2. `clientDataJSON.challenge == base64url(challenge[0..32])` (W3C step 12;
 ///    on-chain OZ `webauthn.rs:151-163`).
 /// 3. `authenticator_data[0..32] == rp_id_hash` (wallet-only defence-in-depth;
@@ -414,7 +414,7 @@ mod tests {
 
     // ── Fixture constants ─────────────────────────────────────────────────
     //
-    // Source: OZ `stellar-contracts` v0.7.1 SHA `3f81125`
+    // Source: OZ `stellar-contracts` v0.7.2 SHA `a9c4216`
     // `examples/multisig-smart-account/webauthn-verifier/src/test.rs:64-93`
     // (the `verify_success` test).
     //

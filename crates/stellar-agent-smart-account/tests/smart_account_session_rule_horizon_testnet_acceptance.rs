@@ -30,11 +30,11 @@
 //!
 //! # Reference cross-check
 //!
-//! - OZ `packages/accounts/src/smart_account/storage.rs:649-652` SHA `3f81125`:
+//! - OZ `packages/accounts/src/smart_account/storage.rs:649-652` SHA `a9c4216`:
 //!   `PastValidUntil = 3005` — OZ rejects `valid_until < current_ledger` on-chain
 //!   but imposes no upper-horizon cap. The wallet-side cap is an off-chain
 //!   discipline enforced before submission.
-//! - OZ `packages/accounts/src/smart_account/storage.rs:786-787` SHA `3f81125`:
+//! - OZ `packages/accounts/src/smart_account/storage.rs:786-787` SHA `a9c4216`:
 //!   Same error path for `update_context_rule_valid_until`.
 //!
 //!

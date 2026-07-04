@@ -3,12 +3,12 @@
 //!
 //! # OZ Criteria Encoding Research Finding
 //!
-//! OZ stellar-contracts v0.7.1 at SHA `3f81125bed3114cc93f5fca6d13240082050269a`
+//! OZ stellar-contracts v0.7.2 at SHA `a9c42169000638da937577f592ebf61a7a3c94ca`
 //! does NOT ship a `PerTxCapCriterion` type or any per-transaction value-cap
 //! criterion in any policy contract.
 //!
 //! The nearest on-chain value-capping primitive is `SpendingLimitData`
-//! (`packages/accounts/src/policies/spending_limit.rs:97-108`, SHA `3f81125`),
+//! (`packages/accounts/src/policies/spending_limit.rs:97-108`, SHA `a9c4216`),
 //! which implements a **rolling-window cumulative spending limit** — NOT a
 //! per-transaction cap. Its `spending_limit: i128` field represents the maximum
 //! cumulative spend over a `period_ledgers`-wide rolling window, not the maximum
@@ -21,17 +21,17 @@
 //! NOT recognised by this extractor.
 //!
 //! The `ContextRule` struct (`packages/accounts/src/smart_account/storage.rs:155-174`,
-//! SHA `3f81125`) carries no `criteria` field; policy parameters are stored in the
+//! SHA `a9c4216`) carries no `criteria` field; policy parameters are stored in the
 //! policy contract's own persistent ledger entries, not in the rule struct itself.
 //!
 //! # Schema-anticipation Pattern
 //!
-//! Since OZ v0.7.1 does not ship a per-transaction value-cap criterion, this
+//! Since OZ v0.7.2 does not ship a per-transaction value-cap criterion, this
 //! extractor adopts a **schema-anticipation** pattern. It recognises two
 //! forward-compat key byte-patterns (`b"value_threshold"` and `b"max_stroops"`)
 //! that a future OZ `PerTxCapCriterion`-equivalent might use.
 //!
-//! Because neither key exists in any OZ v0.7.1 contract, the extractor currently
+//! Because neither key exists in any OZ v0.7.2 contract, the extractor currently
 //! returns `Undetermined` for all real on-chain policy storage, which correctly
 //! triggers the fail-CLOSED enforce-default path: operators with unknown policy
 //! shapes use `--accept-single-verifier` to opt out.
@@ -52,14 +52,14 @@ use stellar_xdr::{Int128Parts, ScMap, ScSymbol, ScVal};
 /// Schema-anticipation forward-compat key for a hypothetical OZ
 /// `PerTxCapCriterion`-style value-threshold field.
 ///
-/// Not present in any OZ v0.7.1 contract (SHA `3f81125`).
+/// Not present in any OZ v0.7.2 contract (SHA `a9c4216`).
 /// Not yet supported: schema-anticipation for canonical OZ PerTxCap encoding.
 const KEY_VALUE_THRESHOLD: &[u8] = b"value_threshold";
 
 /// Schema-anticipation forward-compat key for a hypothetical OZ
 /// `PerTxCapCriterion`-style max-stroops field.
 ///
-/// Not present in any OZ v0.7.1 contract (SHA `3f81125`).
+/// Not present in any OZ v0.7.2 contract (SHA `a9c4216`).
 /// Not yet supported: schema-anticipation for canonical OZ PerTxCap encoding.
 const KEY_MAX_STROOPS: &[u8] = b"max_stroops";
 
@@ -96,7 +96,7 @@ const KEY_MAX_STROOPS: &[u8] = b"max_stroops";
 ///
 /// Forward-compat OZ per-tx-cap criterion values would likely be `i128`
 /// on-chain (consistent with OZ `SpendingLimitData.spending_limit: i128` at
-/// `packages/accounts/src/policies/spending_limit.rs:91`, SHA `3f81125`).
+/// `packages/accounts/src/policies/spending_limit.rs:91`, SHA `a9c4216`).
 /// Values that exceed [`i64::MAX`] (≈ 9.2 × 10¹⁸ stroops — far above any
 /// meaningful per-transaction cap) cannot fit in the `Stroops` variant and
 /// are classified as `Undetermined` (overflow → fail-CLOSED). The `i64` type
@@ -126,21 +126,21 @@ pub(crate) enum ValueThresholdResult {
 ///
 /// # Canonical criteria encoding
 ///
-/// OZ stellar-contracts v0.7.1 (SHA `3f81125`) does not ship a per-transaction
+/// OZ stellar-contracts v0.7.2 (SHA `a9c4216`) does not ship a per-transaction
 /// value-cap criterion type. The extractor uses a schema-anticipation pattern
 /// and recognises two forward-compat keys (`b"value_threshold"`,
 /// `b"max_stroops"`) that a future OZ per-tx-cap policy might emit.
 /// Not yet supported: schema-anticipation for canonical OZ PerTxCap encoding.
 ///
 /// The OZ `SpendingLimitData.spending_limit` key
-/// (`packages/accounts/src/policies/spending_limit.rs:101`, SHA `3f81125`) is
+/// (`packages/accounts/src/policies/spending_limit.rs:101`, SHA `a9c4216`) is
 /// intentionally NOT recognised: that field is a rolling-window cumulative cap,
 /// not a per-transaction limit. Using it as a per-tx proxy would fire the
 /// diversification gate on low-value transactions and produce misleading
 /// `observed_value_threshold_stroops` in audit rows.
 ///
-/// Because no OZ v0.7.1 contract emits the recognised keys, this extractor
-/// returns `Undetermined` for all real on-chain policy storage in v0.7.1.
+/// Because no OZ v0.7.2 contract emits the recognised keys, this extractor
+/// returns `Undetermined` for all real on-chain policy storage in v0.7.2.
 /// That correctly routes operators to the `--accept-single-verifier` opt-out.
 ///
 /// # Fail-CLOSED contract
@@ -201,13 +201,13 @@ fn extract_from_scmap(map: &ScMap) -> ValueThresholdResult {
 /// the recognised per-transaction value-cap field names.
 ///
 /// Recognised names (schema-anticipation forward-compat; not present in any
-/// OZ v0.7.1 contract at SHA `3f81125`):
+/// OZ v0.7.2 contract at SHA `a9c4216`):
 /// - `b"value_threshold"` — anticipated per-tx-cap field name.
 /// - `b"max_stroops"` — anticipated per-tx-cap field name.
 ///
 /// Intentionally NOT recognised:
 /// - `b"spending_limit"` — OZ `SpendingLimitData` rolling-window cumulative
-///   limit (`spending_limit.rs:101`, SHA `3f81125`); semantically distinct
+///   limit (`spending_limit.rs:101`, SHA `a9c4216`); semantically distinct
 ///   from a per-transaction cap; see module-level rustdoc.
 #[allow(
     dead_code,
@@ -298,7 +298,7 @@ mod tests {
     ///
     /// `spending_limit` is a rolling-window cumulative limit, not a
     /// per-transaction cap (OZ `packages/accounts/src/policies/spending_limit.rs:101`,
-    /// SHA `3f81125`). Recognising it would make the trigger over-eager and
+    /// SHA `a9c4216`). Recognising it would make the trigger over-eager and
     /// produce misleading audit rows. It belongs to the fail-CLOSED
     /// unrecognised-key set.
     #[test]
@@ -443,7 +443,7 @@ mod tests {
     /// `b"value_threshold"` and `b"max_stroops"` are recognised when paired
     /// with a valid `ScVal::I128` value.
     ///
-    /// Neither key exists in any OZ v0.7.1 contract (SHA `3f81125`).
+    /// Neither key exists in any OZ v0.7.2 contract (SHA `a9c4216`).
     /// Not yet supported: schema-anticipation for canonical OZ PerTxCap encoding.
     #[test]
     fn extract_value_threshold_recognises_schema_anticipation_keys() {

@@ -14,7 +14,7 @@
 //!   WASM; no `__constructor` args; records result in
 //!   `VerifierRegistry` (`~/.config/stellar-agent/networks.toml`).
 //! - [`mod@deploy_timelock_controller`] — deploy path for the OZ
-//!   `timelock-controller-example` v0.7.1 WASM; takes
+//!   `timelock-controller-example` v0.7.2 WASM; takes
 //!   `__constructor` args (min_delay, proposers, executors, admin).
 //! - re-exports: `derive_smart_account_address`, `deploy_smart_account`,
 //!   `DeploymentResult`, `DeploymentArgs`, `DeployerKeypair`,

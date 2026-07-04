@@ -7,7 +7,7 @@
 //! # Key types
 //!
 //! - [`rule_id::ContextRuleId`] — `u32` per-context rule identifier,
-//!   mirroring the OZ v0.7.1 on-chain representation
+//!   mirroring the OZ v0.7.2 on-chain representation
 //!   (`AuthPayload::context_rule_ids: Vec<u32>`).
 //! - [`auth_digest::AuthDigest`] — 32-byte SHA-256 auth digest.
 //!
@@ -22,7 +22,7 @@
 //!
 //! Together these types and functions implement the off-chain signing layer
 //! that matches the on-chain computation in
-//! OpenZeppelin `stellar-contracts` v0.7.1 (`smart_account/storage.rs`).
+//! OpenZeppelin `stellar-contracts` v0.7.2 (`smart_account/storage.rs`).
 //! The byte layout produced by
 //! [`rule_id::encode_context_rule_ids`] is verified against the OZ on-chain
 //! call site.

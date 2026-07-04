@@ -2,13 +2,13 @@
 //!
 //! Asserts that `stellar_agent_core::smart_account::auth_digest::compute_auth_digest`
 //! produces the same 32-byte SHA-256 digest as the on-chain OZ `stellar-accounts`
-//! v0.7.1 `do_check_auth` recompute, exercised here via `soroban_sdk::Vec::to_xdr`.
+//! v0.7.2 `do_check_auth` recompute, exercised here via `soroban_sdk::Vec::to_xdr`.
 //!
 //! # Why this is not a tautology
 //!
 //! The wallet substrate (`encode_context_rule_ids`) uses `stellar-xdr 27`
-//! to encode `ScVal::Vec(...)`. The on-chain canonical uses `soroban-sdk 25.3.0`'s
-//! `Vec::to_xdr` (which pulls `stellar-xdr 25.0.0` — the two crates coexist in
+//! to encode `ScVal::Vec(...)`. The on-chain canonical uses `soroban-sdk 26.1.0`'s
+//! `Vec::to_xdr` (which pulls `stellar-xdr 26.0.1` — the two crates coexist in
 //! the same binary via Cargo's semver deduplication). Both SHOULD produce the same bytes because
 //! `Vec<u32>` ScVal serialisation is stable across this version boundary;
 //! this test asserts it empirically.
@@ -60,7 +60,7 @@ fn auth_digest_parity_with_onchain_canonical() {
     let wallet_digest = compute_auth_digest(&signature_payload, &rule_ids_xdr);
 
     // ── On-chain canonical computation ────────────────────────────────────────
-    // Use soroban-sdk 25.3.0's Vec::to_xdr — this is the EXACT method the
+    // Use soroban-sdk 26.1.0's Vec::to_xdr — this is the EXACT method the
     // on-chain contract calls at storage.rs:494
     // (`signatures.context_rule_ids.clone().to_xdr(e)`).
     // The native Env exercises the same serialisation path without requiring
@@ -73,7 +73,7 @@ fn auth_digest_parity_with_onchain_canonical() {
     onchain_xdr_soroban.copy_into_slice(&mut onchain_xdr_bytes);
 
     // Replicate the on-chain sha256(signature_payload || context_rule_ids.to_xdr(e))
-    // from storage.rs:492-495 (OZ stellar-contracts v0.7.1 SHA 3f81125).
+    // from storage.rs:492-495 (OZ stellar-contracts v0.7.2 SHA a9c4216).
     let mut hasher = Sha256::new();
     hasher.update(&signature_payload);
     hasher.update(&onchain_xdr_bytes);
@@ -90,7 +90,7 @@ fn auth_digest_parity_with_onchain_canonical() {
          wallet:   {}\n\
          onchain:  {}\n\
          This indicates an XDR serialisation drift between stellar-xdr 27 \
-         (wallet substrate) and soroban-sdk 25.x Vec::to_xdr (on-chain canonical).",
+         (wallet substrate) and soroban-sdk 26.x Vec::to_xdr (on-chain canonical).",
         wallet_digest
             .as_bytes()
             .iter()

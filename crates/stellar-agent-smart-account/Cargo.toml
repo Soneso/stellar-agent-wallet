@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Smart-account orchestration layer for the Stellar agent wallet (OZ stellar-accounts v0.7.1 consumer)."
+description = "Smart-account orchestration layer for the Stellar agent wallet (OZ stellar-accounts v0.7.2 consumer)."
 publish = false
 
 [lib]

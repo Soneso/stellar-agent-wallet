@@ -55,7 +55,7 @@ use crate::deployment::address::derive_interop_deployer_seed;
 
 /// The deployable OZ smart-account multisig contract WASM.
 ///
-/// Embedded at compile time from `vendor/oz-smart-account-multisig/v0.7.1/multisig_account_example.wasm`.
+/// Embedded at compile time from `vendor/oz-smart-account-multisig/v0.7.2/multisig_account_example.wasm`.
 /// SHA-256 verified by `build.rs` at compile time and at `cargo test` by
 /// `tests::multisig_account_wasm_sha256_matches_provenance`.
 ///
@@ -63,14 +63,17 @@ use crate::deployment::address::derive_interop_deployer_seed;
 ///
 /// The embedded contract exposes
 /// `pub fn __constructor(e: &Env, signers: Vec<Signer>, policies: Map<Address, Val>)`.
+///
+/// New smart-account deployments use these v0.7.2 bytes. Accounts already deployed
+/// on-chain from the v0.7.1 bytes remain valid and recognised (the ABI is unchanged).
 pub const MULTISIG_ACCOUNT_WASM: &[u8] = include_bytes!(
-    "../../../../vendor/oz-smart-account-multisig/v0.7.1/multisig_account_example.wasm"
+    "../../../../vendor/oz-smart-account-multisig/v0.7.2/multisig_account_example.wasm"
 );
 
 /// SHA-256 of [`MULTISIG_ACCOUNT_WASM`], pinned at build time.
 ///
 /// Pinned here, in `build.rs`, and in
-/// `vendor/oz-smart-account-multisig/v0.7.1/PROVENANCE.md`. The compile-time
+/// `vendor/oz-smart-account-multisig/v0.7.2/PROVENANCE.md`. The compile-time
 /// integrity gate is `build.rs`; the `multisig_account_wasm_sha256_matches_provenance`
 /// test in `deployment/deploy.rs::tests` and a `debug_assert!` at the entry of
 /// `deploy_smart_account()` remain as defense in depth.
@@ -82,7 +85,7 @@ pub const MULTISIG_ACCOUNT_WASM: &[u8] = include_bytes!(
 /// both would produce a diff detectable by reviewer attention to the binary WASM diff and
 /// the adjacent const change.
 pub const MULTISIG_ACCOUNT_WASM_SHA256: &str =
-    "06186e938a0ba1585a5d8a6d2ec802f3d184aaf9ec298d8c8aece50ca56cb239";
+    "5bc710da20f401665f0b48ceb008c4cd313c933dbb4aeb7b54d2aacd5646e286";
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -1352,7 +1355,9 @@ mod tests {
 
         let result = verify_post_deploy_wasm_hash(
             &synthetic,
-            "5603378c6039b5ccd4038d04a261d5f08467d5f68046e863b40ca85e4d779322",
+            // Synthetic non-matching expected hash; the value is irrelevant because
+            // decode fails before any hash comparison.
+            "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
             "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
         );
 
@@ -1407,8 +1412,9 @@ mod tests {
 
         let result = verify_post_deploy_wasm_hash(
             &synthetic,
-            // A different expected hash (MULTISIG_ACCOUNT_WASM_SHA256 starts with "0618...").
-            "5603378c6039b5ccd4038d04a261d5f08467d5f68046e863b40ca85e4d779322",
+            // A synthetic expected hash that differs from the observed all-zeros hash
+            // (and from MULTISIG_ACCOUNT_WASM_SHA256, which starts with "5bc7...").
+            "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
             test_c_strkey,
         );
 
@@ -1436,9 +1442,9 @@ mod tests {
             redacted_reason.contains("00000000"),
             "redacted_reason should carry observed first-8 hex: {redacted_reason}"
         );
-        // first-8 hex of the expected hash (5603378c...)
+        // first-8 hex of the expected hash (12345678...)
         assert!(
-            redacted_reason.contains("5603378c"),
+            redacted_reason.contains("12345678"),
             "redacted_reason should carry expected first-8 hex: {redacted_reason}"
         );
     }

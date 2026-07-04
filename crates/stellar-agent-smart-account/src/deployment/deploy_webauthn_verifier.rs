@@ -18,14 +18,14 @@
 //!    `CreateContractV2(args: [])` (the verifier has no `__constructor`; no constructor
 //!    args required; confirmed from
 //!    OZ `examples/multisig-smart-account/webauthn-verifier/src/contract.rs:51-90`
-//!    (SHA `3f81125`), which exports only `verify`, `canonicalize_key`, and
+//!    (SHA `a9c4216`), which exports only `verify`, `canonicalize_key`, and
 //!    `batch_canonicalize_key`).
 //! 4. **Record**: invoke [`VerifierRegistry::record_webauthn_verifier`] + persist.
 //! 5. **Audit-log**: emit `SaRawInvocation` with `operation: "deploy_webauthn_verifier"`.
 //!
 //! # Deterministic salt
 //!
-//! Salt = `SHA256("oz-webauthn-verifier-v0.7.1-" || network_passphrase)`.
+//! Salt = `SHA256("oz-webauthn-verifier-v0.7.2-" || network_passphrase)`.
 //! Using the WASM version string + passphrase as a salt domain means the same
 //! deployer + WASM version will always produce the same contract address for a given
 //! network.  A future WASM version bump changes the domain and thus the address.
@@ -38,7 +38,7 @@
 //! # Reference cross-check
 //!
 //! - OZ `examples/multisig-smart-account/webauthn-verifier/src/contract.rs:51-90`
-//!   (SHA `3f81125`) — the contract whose WASM this deploys; no `__constructor`.
+//!   (SHA `a9c4216`) — the contract whose WASM this deploys; no `__constructor`.
 //! - `deployment/deploy.rs` — reuses `submit_transaction_and_wait`,
 //!   `verify_post_deploy_wasm_hash`, `to_hex`, `decode_hex32`, `redact_wasm_hash`,
 //!   fee + RPC helpers; mirrors the two-tx split pattern.
@@ -84,7 +84,7 @@ use crate::webauthn_verifier::{WEBAUTHN_VERIFIER_WASM, WEBAUTHN_VERIFIER_WASM_SH
 /// future verifier bump produces a different address even on the same
 /// network with the same deployer.  Pinned to a single `const` so a version
 /// bump touches one site.
-const VERIFIER_SALT_DOMAIN_PREFIX: &str = "oz-webauthn-verifier-v0.7.1-";
+const VERIFIER_SALT_DOMAIN_PREFIX: &str = "oz-webauthn-verifier-v0.7.2-";
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -229,7 +229,7 @@ async fn deploy_webauthn_verifier_body(
         debug_assert_eq!(
             observed, WEBAUTHN_VERIFIER_WASM_SHA256,
             "WEBAUTHN_VERIFIER_WASM bytes do not match the compile-time pin; \
-             re-run vendor/oz-webauthn-verifier/v0.7.1/build.sh"
+             re-run vendor/oz-webauthn-verifier/v0.7.2/build.sh"
         );
     }
     {
@@ -524,7 +524,7 @@ async fn deploy_webauthn_verifier_body(
     // The OZ WebAuthn verifier has NO `__constructor` — it exports only `verify`,
     // `canonicalize_key`, `batch_canonicalize_key`.  Constructor args must be empty.
     // Cross-check: OZ `examples/multisig-smart-account/webauthn-verifier/src/contract.rs:51-90`
-    // (SHA `3f81125`) — no `__constructor` function in the contract impl.
+    // (SHA `a9c4216`) — no `__constructor` function in the contract impl.
     let deployer_pk =
         stellar_strkey::ed25519::PublicKey::from_string(&deployer_pubkey).map_err(|_| {
             SaError::DeploymentFailed {

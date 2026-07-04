@@ -222,11 +222,11 @@ fn encode_threshold_params(threshold: u32) -> ScVal {
     ScVal::Map(Some(ScMap(map)))
 }
 
-/// Deploys the OZ v0.7.1 threshold-policy WASM to testnet and returns the
+/// Deploys the OZ v0.7.2 threshold-policy WASM to testnet and returns the
 /// resulting contract C-strkey.
 ///
 /// The deployed contract address is deterministic:
-/// `sha256("oz-threshold-policy-v0.7.1-{salt_suffix}")` combined with the
+/// `sha256("oz-threshold-policy-v0.7.2-{salt_suffix}")` combined with the
 /// deployer's G-strkey. Callers MUST pass distinct `salt_suffix` values when
 /// they need distinct contract addresses, because:
 ///
@@ -250,7 +250,7 @@ async fn deploy_threshold_policy_with_salt(
 ) -> String {
     let wasm_hash_bytes: [u8; 32] = Sha256::digest(THRESHOLD_POLICY_WASM).into();
 
-    let salt_input = format!("oz-threshold-policy-v0.7.1-{salt_suffix}");
+    let salt_input = format!("oz-threshold-policy-v0.7.2-{salt_suffix}");
     let salt: [u8; 32] = Sha256::digest(salt_input.as_bytes()).into();
 
     let policy_strkey = derive_smart_account_address(deployer_g, &salt, TESTNET_PASSPHRASE)

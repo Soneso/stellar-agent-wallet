@@ -1,11 +1,11 @@
 //! Smart-account manager surfaces: signers, rules, policies, credentials, verifiers.
 //!
-//! Each sub-module wraps the corresponding OZ `stellar-accounts` v0.7.1 on-chain
+//! Each sub-module wraps the corresponding OZ `stellar-accounts` v0.7.2 on-chain
 //! surface with typed off-chain orchestration primitives.
 //!
 //! # Reference cross-check
 //!
-//! Consulted at SHA `3f81125`:
+//! Consulted at SHA `a9c4216`:
 //! - `packages/accounts/src/smart_account/mod.rs:495-515` (`ExecutionEntryPoint`
 //!   trait — the entry point for smart-account call dispatch).
 //! - `packages/accounts/src/policies/simple_threshold.rs:99-101`

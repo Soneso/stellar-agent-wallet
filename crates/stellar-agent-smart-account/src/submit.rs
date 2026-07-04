@@ -531,7 +531,7 @@ pub async fn submit_signed_invoke(
     // ── Step 3 continued: Option<*Check> dispatch ─────────────────────────────
     //
     // Horizon check: fires AFTER simulate (latestLedger known) BEFORE signing.
-    // OZ storage.rs:649-652 (install) and :786-787 (update), SHA `3f81125`,
+    // OZ storage.rs:649-652 (install) and :786-787 (update), SHA `a9c4216`,
     // reject only `valid_until < current_ledger` (PastValidUntil = 3005).
     // The wallet-side horizon cap is an operator-configurable safety discipline.
     if let Some(HorizonCheck {
@@ -552,8 +552,8 @@ pub async fn submit_signed_invoke(
     }
 
     // Expiry check: fires AFTER simulate (latestLedger known) BEFORE signing.
-    // OZ storage.rs:280-285 (SHA `3f81125`): strict-< check on valid_until.
-    // UnvalidatedContext = 3002 per OZ mod.rs:542 SHA `3f81125`.
+    // OZ storage.rs:280-285 (SHA `a9c4216`): strict-< check on valid_until.
+    // UnvalidatedContext = 3002 per OZ mod.rs:542 SHA `a9c4216`.
     if let Some(ExpiryCheck { rule_id }) = args.expiry_check {
         let latest_ledger = sim_response.latest_ledger;
         check_rule_not_expired_standalone(

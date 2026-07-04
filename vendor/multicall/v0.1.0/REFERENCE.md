@@ -21,8 +21,9 @@
      vendor/multicall/v0.1.0/multicall.wasm
   ```
   Run from the workspace root `stellar-agent-wallet/`.
-- **soroban-sdk version:** `=25.3.0` (workspace pin per `Cargo.toml`
-  `[workspace.dependencies]`; paired with OZ `stellar-accounts = "=0.7.1"`).
+- **soroban-sdk version:** `=25.3.0` (the workspace pin at this artifact's
+  build time, then paired with OZ `stellar-accounts = "=0.7.1"`; the artifact
+  has not been rebuilt since).
 - **sha256(multicall.wasm):**
   `267e94a092df01fa02ad4edf8320a98bd65e4d4d6575254ac9521cb65727f3d4`
 - **Size:** 11825 bytes.

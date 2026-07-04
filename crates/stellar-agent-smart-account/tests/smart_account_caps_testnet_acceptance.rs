@@ -25,11 +25,11 @@
 //!
 //! # Reference cross-check
 //!
-//! - OZ `packages/accounts/src/smart_account/mod.rs:526` SHA `3f81125`:
+//! - OZ `packages/accounts/src/smart_account/mod.rs:526` SHA `a9c4216`:
 //!   `pub const MAX_SIGNERS: u32 = 15`.
-//! - OZ `packages/accounts/src/smart_account/mod.rs:558` SHA `3f81125`:
+//! - OZ `packages/accounts/src/smart_account/mod.rs:558` SHA `a9c4216`:
 //!   `TooManySigners = 3010` (on-chain fallback panic if CLI check bypassed).
-//! - OZ `packages/accounts/src/smart_account/storage.rs:155-174` SHA `3f81125`:
+//! - OZ `packages/accounts/src/smart_account/storage.rs:155-174` SHA `a9c4216`:
 //!   `ContextRule` struct + `signer_ids: Vec<u32>` field layout decoded by
 //!   `decode_signer_count_from_scval`.
 //!
@@ -238,10 +238,10 @@ fn release_binary() -> std::path::PathBuf {
 ///
 /// # Reference cross-check
 ///
-/// - OZ `storage.rs:155-174` SHA `3f81125`: `ContextRule.signer_ids: Vec<u32>`
+/// - OZ `storage.rs:155-174` SHA `a9c4216`: `ContextRule.signer_ids: Vec<u32>`
 ///   is the field decoded by `decode_signer_count_from_scval`.
-/// - OZ `mod.rs:526` SHA `3f81125`: `MAX_SIGNERS = 15`.
-/// - OZ `mod.rs:558` SHA `3f81125`: `TooManySigners = 3010` (on-chain fallback).
+/// - OZ `mod.rs:526` SHA `a9c4216`: `MAX_SIGNERS = 15`.
+/// - OZ `mod.rs:558` SHA `a9c4216`: `TooManySigners = 3010` (on-chain fallback).
 ///
 /// # Implements
 ///
@@ -444,7 +444,7 @@ async fn h1_16th_signer_refused() {
 ///
 /// `#[contracttype]` struct encoding: `ScVal::Map(ScMap([("threshold", U32(N))]))`.
 /// Per OZ `packages/accounts/src/policies/simple_threshold.rs:96-102` SHA
-/// `3f81125` — `SimpleThresholdAccountParams { threshold: u32 }`.
+/// `a9c4216` — `SimpleThresholdAccountParams { threshold: u32 }`.
 fn encode_threshold_params_h2(threshold: u32) -> ScVal {
     let entry = ScMapEntry {
         key: ScVal::Symbol(ScSymbol::try_from("threshold").expect("'threshold' fits ScSymbol")),
@@ -454,11 +454,11 @@ fn encode_threshold_params_h2(threshold: u32) -> ScVal {
     ScVal::Map(Some(ScMap(map)))
 }
 
-/// Deploys the OZ v0.7.1 threshold-policy WASM to testnet and returns the
+/// Deploys the OZ v0.7.2 threshold-policy WASM to testnet and returns the
 /// resulting contract C-strkey.
 ///
 /// The deployed contract address is deterministic: it is derived from
-/// `sha256("oz-threshold-policy-v0.7.1-{salt_suffix}")` and the deployer's
+/// `sha256("oz-threshold-policy-v0.7.2-{salt_suffix}")` and the deployer's
 /// G-strkey. Distinct `salt_suffix` values produce distinct contract addresses
 /// even when the same deployer and the same WASM are used, which is required
 /// for the 5-policy rule (5 distinct policy contracts) where the on-chain
@@ -475,14 +475,14 @@ fn encode_threshold_params_h2(threshold: u32) -> ScVal {
 ///
 /// # Reference cross-check
 ///
-/// - OZ `storage.rs:632-638` SHA `3f81125`: `add_context_rule` takes
+/// - OZ `storage.rs:632-638` SHA `a9c4216`: `add_context_rule` takes
 ///   `policies: &Map<Address, Val>` — a Soroban Map, whose keys are unique
 ///   by construction. The wallet's off-chain `ScVal::Map` encoding for the
 ///   policies argument therefore MUST NOT contain duplicate `Address` keys.
 /// - `rs-stellar-xdr/src/curr/scval_validations.rs:58-75`: the Soroban host
 ///   validates every `ScVal::Map` for strict ascending key order; duplicate
 ///   keys fail with `Error::Invalid` at the simulate phase.
-/// - OZ `storage.rs:1119-1121` SHA `3f81125`: `add_policy` also rejects
+/// - OZ `storage.rs:1119-1121` SHA `a9c4216`: `add_policy` also rejects
 ///   duplicate addresses via `DuplicatePolicy` panic, making a second
 ///   `add_policy(same_addr)` call on any rule impossible.
 async fn deploy_threshold_policy_with_salt(
@@ -492,7 +492,7 @@ async fn deploy_threshold_policy_with_salt(
 ) -> String {
     let wasm_hash_bytes: [u8; 32] = Sha256::digest(THRESHOLD_POLICY_WASM).into();
 
-    let salt_input = format!("oz-threshold-policy-v0.7.1-{salt_suffix}");
+    let salt_input = format!("oz-threshold-policy-v0.7.2-{salt_suffix}");
     let salt: [u8; 32] = Sha256::digest(salt_input.as_bytes()).into();
 
     let policy_strkey = derive_smart_account_address(deployer_g, &salt, TESTNET_PASSPHRASE)
@@ -687,7 +687,7 @@ async fn deploy_threshold_policy_with_salt(
 /// Each contract is deployed with salt suffix `"h2-salt-N"` (N = 1..=5), producing
 /// 5 distinct contract addresses from the same WASM.  This is required because
 /// the `policies` argument to OZ `add_context_rule` is typed
-/// `Map<Address, Val>` (OZ `storage.rs:632-638` SHA `3f81125`), whose keys
+/// `Map<Address, Val>` (OZ `storage.rs:632-638` SHA `a9c4216`), whose keys
 /// must be unique. The wallet's off-chain encoding as `ScVal::Map` is validated
 /// by the Soroban host for strict ascending key order with no duplicates
 /// (`scval_validations.rs:58-75`); passing 5 entries with the same `Address`
@@ -730,7 +730,7 @@ async fn deploy_five_distinct_threshold_policies_h2(
 /// # Why 5 DISTINCT policy contracts are required
 ///
 /// The `policies` argument to OZ `add_context_rule` is typed
-/// `Map<Address, Val>` (OZ `storage.rs:632-638` SHA `3f81125`). The wallet
+/// `Map<Address, Val>` (OZ `storage.rs:632-638` SHA `a9c4216`). The wallet
 /// encodes this off-chain as `ScVal::Map` (rules.rs `build_add_context_rule_args`).
 /// The Soroban host validates every `ScVal::Map` for strict ascending key order
 /// with no duplicate keys (rs-stellar-xdr `scval_validations.rs`, `validate_scmap`).
@@ -753,14 +753,14 @@ async fn deploy_five_distinct_threshold_policies_h2(
 ///
 /// # Reference cross-check
 ///
-/// - OZ `mod.rs:524` SHA `3f81125`: `pub const MAX_POLICIES: u32 = 5`.
-/// - OZ `mod.rs:560` SHA `3f81125`: `TooManyPolicies = 3011` (on-chain fallback).
-/// - OZ `storage.rs:171` SHA `3f81125`: `ContextRuleEntry.policy_ids: Vec<u32>`.
-/// - OZ `storage.rs:632-638` SHA `3f81125`: `add_context_rule` takes
+/// - OZ `mod.rs:524` SHA `a9c4216`: `pub const MAX_POLICIES: u32 = 5`.
+/// - OZ `mod.rs:560` SHA `a9c4216`: `TooManyPolicies = 3011` (on-chain fallback).
+/// - OZ `storage.rs:171` SHA `a9c4216`: `ContextRuleEntry.policy_ids: Vec<u32>`.
+/// - OZ `storage.rs:632-638` SHA `a9c4216`: `add_context_rule` takes
 ///   `policies: &Map<Address, Val>` — Soroban Map with unique Address keys.
 /// - `scval_validations.rs:58-75`: Soroban host rejects `ScVal::Map` with
 ///   duplicate keys.
-/// - OZ `storage.rs:1119-1121` SHA `3f81125`: `add_policy` panics with
+/// - OZ `storage.rs:1119-1121` SHA `a9c4216`: `add_policy` panics with
 ///   `DuplicatePolicy` when the same address is already registered in the rule.
 ///
 /// # Implements
@@ -823,7 +823,7 @@ async fn h2_6th_policy_refused() {
     // Using distinct addresses satisfies the Soroban ScVal::Map uniqueness
     // constraint (scval_validations.rs:58-75) and the on-chain Map<Address, Val>
     // semantics of the `policies` argument to `add_context_rule`
-    // (OZ storage.rs:632-638 SHA `3f81125`).
+    // (OZ storage.rs:632-638 SHA `a9c4216`).
     let threshold_params = encode_threshold_params_h2(1);
     let policies: Vec<ContextRulePolicy> = policy_strkeys
         .iter()

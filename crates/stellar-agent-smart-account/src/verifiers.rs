@@ -32,7 +32,7 @@
 //! # ~/.config/stellar-agent/networks.toml
 //! [networks."Test SDF Network ; September 2015"]
 //! webauthn_verifier_address = "CABC...XYZ"
-//! webauthn_verifier_wasm_sha256 = "678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a"
+//! webauthn_verifier_wasm_sha256 = "9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7"
 //! webauthn_verifier_deployed_at_unix_ms = 1747000000000
 //!
 //! [networks."Public Global Stellar Network ; September 2015"]
@@ -74,7 +74,7 @@ pub const STELLAR_AGENT_NETWORKS_TOML_ENV: &str = "STELLAR_AGENT_NETWORKS_TOML";
 ///     .record_webauthn_verifier(
 ///         "Test SDF Network ; September 2015",
 ///         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
-///         "678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a".to_owned(),
+///         "9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7".to_owned(),
 ///     )
 ///     .expect("record");
 /// assert_eq!(outcome, RecordOutcome::Recorded);
@@ -343,7 +343,7 @@ impl VerifierRegistry {
     /// # let path = dir.path().join("networks.toml");
     /// let mut reg = VerifierRegistry::open_at(path).expect("open");
     /// let addr = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned();
-    /// let sha = "678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a".to_owned();
+    /// let sha = "9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7".to_owned();
     /// let outcome1 = reg.record_webauthn_verifier("Test SDF Network ; September 2015", addr.clone(), sha.clone()).expect("record");
     /// let outcome2 = reg.record_webauthn_verifier("Test SDF Network ; September 2015", addr, sha).expect("idempotent");
     /// assert_eq!(outcome1, RecordOutcome::Recorded);
@@ -407,7 +407,7 @@ impl VerifierRegistry {
     /// reg.record_webauthn_verifier(
     ///     "Test SDF Network ; September 2015",
     ///     "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
-    ///     "678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a".to_owned(),
+    ///     "9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7".to_owned(),
     /// ).expect("record");
     /// reg.persist().expect("persist");
     /// assert!(path.exists());
@@ -625,7 +625,7 @@ mod tests {
     }
 
     fn fake_sha256() -> String {
-        "678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a".to_owned()
+        "9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7".to_owned()
     }
 
     fn alt_sha256() -> String {

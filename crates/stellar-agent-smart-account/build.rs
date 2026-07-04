@@ -18,29 +18,38 @@ struct WasmPin {
 const WASM_PINS: &[WasmPin] = &[
     WasmPin {
         label: "stellar_accounts.wasm",
-        path: "../../vendor/oz-stellar-accounts/v0.7.1/stellar_accounts.wasm",
-        expected_sha256: "5603378c6039b5ccd4038d04a261d5f08467d5f68046e863b40ca85e4d779322",
+        path: "../../vendor/oz-stellar-accounts/v0.7.2/stellar_accounts.wasm",
+        expected_sha256: "b0ac8ad7156957757de89ea3dc00ed4d7d0148d273c12af52dfaa15252240c83",
     },
     WasmPin {
         label: "multisig_account_example.wasm",
-        path: "../../vendor/oz-smart-account-multisig/v0.7.1/multisig_account_example.wasm",
-        expected_sha256: "06186e938a0ba1585a5d8a6d2ec802f3d184aaf9ec298d8c8aece50ca56cb239",
+        path: "../../vendor/oz-smart-account-multisig/v0.7.2/multisig_account_example.wasm",
+        expected_sha256: "5bc710da20f401665f0b48ceb008c4cd313c933dbb4aeb7b54d2aacd5646e286",
     },
     WasmPin {
         label: "multisig_webauthn_verifier_example.wasm",
-        path: "../../vendor/oz-webauthn-verifier/v0.7.1/multisig_webauthn_verifier_example.wasm",
-        expected_sha256: "678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a",
+        path: "../../vendor/oz-webauthn-verifier/v0.7.2/multisig_webauthn_verifier_example.wasm",
+        expected_sha256: "9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7",
     },
     WasmPin {
         label: "multicall.wasm",
         path: "../../vendor/multicall/v0.1.0/multicall.wasm",
         expected_sha256: "267e94a092df01fa02ad4edf8320a98bd65e4d4d6575254ac9521cb65727f3d4",
     },
-    // OZ timelock-controller-example v0.7.1 WASM.
+    // OZ timelock-controller-example v0.7.2 WASM.
     WasmPin {
         label: "timelock_controller_example.wasm",
-        path: "../../vendor/oz-timelock-controller/v0.7.1/timelock_controller_example.wasm",
-        expected_sha256: "36299255cf77678a59d7fdfe9823d803be2bdddb9cc375be3130daed265295eb",
+        path: "../../vendor/oz-timelock-controller/v0.7.2/timelock_controller_example.wasm",
+        expected_sha256: "ef360d61a44648176f0aae923b9884c6ac5e5a9229af5eb8ab120e81cc4cc1f4",
+    },
+    // OZ multisig-threshold-policy-example v0.7.2 WASM. This is the deploy-time
+    // artefact embedded by policy_identification.rs::THRESHOLD_POLICY_WASM
+    // (THRESHOLD_POLICY_WASM_HASHES[0]); every deploy-time artefact carries a
+    // compile-time pin here.
+    WasmPin {
+        label: "multisig_threshold_policy_example.wasm",
+        path: "../../vendor/oz-threshold-policy/v0.7.2/multisig_threshold_policy_example.wasm",
+        expected_sha256: "4c14f402df29675d4155283698c436ee588aacb39adc313845010a565c07567d",
     },
 ];
 

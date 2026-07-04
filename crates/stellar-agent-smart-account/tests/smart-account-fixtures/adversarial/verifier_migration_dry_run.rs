@@ -58,7 +58,8 @@ use super::rpc_mock_helpers::{
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// OZ WebAuthn verifier v0.7.1 wasm hash — the only `VERIFIER_ALLOWLIST` entry.
+/// OZ WebAuthn verifier v0.7.1 wasm hash — the legacy `VERIFIER_ALLOWLIST[1]`
+/// entry (one of two Audited OZ entries; still recognised).
 ///
 /// `vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md` SHA-256 anchor.
 /// OZ source SHA: `3f81125bed3114cc93f5fca6d13240082050269a` (tag v0.7.1).
@@ -454,9 +455,9 @@ async fn empty_plan_via_planner() {
 ///
 /// OZ reference:
 /// - `remove_signer` at `packages/accounts/src/smart_account/mod.rs:405-408`
-///   (SHA `3f81125`).
+///   (SHA `a9c4216`).
 /// - `add_signer` at `packages/accounts/src/smart_account/mod.rs:374-377`
-///   (SHA `3f81125`).
+///   (SHA `a9c4216`).
 ///
 /// # Implements
 ///

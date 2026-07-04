@@ -20,7 +20,7 @@
 //! # Implementation notes
 //!
 //! Criteria fetch passes `ScVal::Void` for all rules because OZ
-//! `stellar-contracts` v0.7.1 (SHA `3f81125`) carries no `PerTxCapCriterion`
+//! `stellar-contracts` v0.7.2 (SHA `a9c4216`) carries no `PerTxCapCriterion`
 //! type. `ScVal::Void` maps to `Required` through `Undetermined` (fail-CLOSED).
 //! `observed_value_threshold_stroops =
 //! DiversificationCheck::SENTINEL_OBSERVED_VALUE_THRESHOLD_STROOPS` is the
@@ -287,7 +287,7 @@ mod tests {
     /// An `Undetermined` criteria result (malformed, absent, or unrecognised
     /// criteria ScVal) is treated as above-threshold. The trigger fires on all
     /// single-verifier rules with unrecognised criteria shapes, including every
-    /// real OZ v0.7.1 policy contract (which carries no `PerTxCapCriterion`).
+    /// real OZ v0.7.2 policy contract (which carries no `PerTxCapCriterion`).
     #[test]
     fn diversification_required_when_undetermined_threshold_fail_closed() {
         let pinned = pinned_one("aabbccdd");
@@ -315,7 +315,7 @@ mod tests {
     ///
     /// An absent `PinnedHashesRecord` (empty `pinned_verifier_first8`) is
     /// treated as single-verifier. Combined with Undetermined criteria (OZ
-    /// v0.7.1 default) this triggers the Required variant with an empty
+    /// v0.7.2 default) this triggers the Required variant with an empty
     /// `verifier_hash_first8` field.
     #[test]
     fn diversification_required_when_no_pinned_hashes_fail_closed() {

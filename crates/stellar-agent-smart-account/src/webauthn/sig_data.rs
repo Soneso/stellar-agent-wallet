@@ -9,7 +9,7 @@
 //!
 //! # Wire shape (canonical source)
 //!
-//! OpenZeppelin stellar-contracts v0.7.1
+//! OpenZeppelin stellar-contracts v0.7.2
 //! declares the on-chain contracttype. The `soroban-sdk-macros` derive path
 //! (`derive_struct.rs`, `derive_type_struct`) sorts struct fields
 //! **alphabetically by field name** before emitting the ScVal::Map entries.
@@ -45,7 +45,7 @@ use crate::SaError;
 ///
 /// # Canonical source
 ///
-/// OpenZeppelin stellar-contracts v0.7.1
+/// OpenZeppelin stellar-contracts v0.7.2
 /// (`#[contracttype]` declaration). The on-chain `from_xdr` deserialiser
 /// expects the three named fields keyed by `authenticator_data` /
 /// `client_data` / `signature`.
@@ -65,7 +65,7 @@ use crate::SaError;
 /// `webauthn_sigdata_inner_encoding_parity_with_onchain_canonical` at
 /// `tests/wallet_install_arg_parity.rs` exercises this against a fixed
 /// fixture cross-encoded through the soroban-sdk-side `WebAuthnSigData`
-/// type imported from the OZ `stellar-accounts` v0.7.1 crate.
+/// type imported from the OZ `stellar-accounts` v0.7.2 crate.
 ///
 /// # Errors
 ///

@@ -18,7 +18,7 @@
 //!
 //! # Reference
 //!
-//! OZ `stellar-governance v0.7.1` `Timelock` trait.
+//! OZ `stellar-governance v0.7.2` `Timelock` trait.
 
 pub mod cancel;
 pub mod execute;

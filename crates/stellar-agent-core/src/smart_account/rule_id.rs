@@ -6,7 +6,7 @@
 //! to prevent rule-ID downgrade attacks.
 //!
 //! This type mirrors the on-chain representation in OpenZeppelin
-//! `stellar-accounts` v0.7.1, where `AuthPayload::context_rule_ids` is
+//! `stellar-accounts` v0.7.2, where `AuthPayload::context_rule_ids` is
 //! `Vec<u32>` (see `smart_account/storage.rs`).
 //!
 //! # XDR encoding
@@ -54,7 +54,7 @@ pub enum ParseContextRuleIdError {
 /// any realistic slice length, so this variant is effectively
 /// unreachable for callers in practice. Realistic smart-account
 /// rule-ID lists (a handful of entries per the OpenZeppelin
-/// `stellar-accounts` v0.7.1 model) never approach the bound.
+/// `stellar-accounts` v0.7.2 model) never approach the bound.
 ///
 /// # Examples
 ///
@@ -78,7 +78,7 @@ pub enum EncodeContextRuleIdsError {
 /// A `u32` per-context rule identifier for an OpenZeppelin smart-account
 /// context rule.
 ///
-/// Each context rule on an OpenZeppelin `stellar-accounts` v0.7.1 C-account
+/// Each context rule on an OpenZeppelin `stellar-accounts` v0.7.2 C-account
 /// is selected by a `u32` identifier carried in
 /// `AuthPayload::context_rule_ids`.  The
 /// [`super::auth_digest::compute_auth_digest`] primitive binds the
@@ -104,7 +104,7 @@ pub enum EncodeContextRuleIdsError {
 /// # `#[non_exhaustive]` exemption
 ///
 /// This is a newtype over `u32`, mirroring the on-chain `AuthPayload::context_rule_ids`
-/// element type in OZ `stellar-accounts` v0.7.1.  The width is fixed by the
+/// element type in OZ `stellar-accounts` v0.7.2.  The width is fixed by the
 /// on-chain protocol.  The single field is private; external callers use
 /// [`ContextRuleId::new`] or `FromStr`.  `#[non_exhaustive]` on a newtype
 /// with a private field adds no forward-compat guarantee and is omitted.
@@ -200,14 +200,14 @@ impl FromStr for ContextRuleId {
 }
 
 /// Encodes a slice of [`ContextRuleId`] to the XDR byte layout the on-chain
-/// OpenZeppelin `stellar-accounts` v0.7.1 contract consumes at
+/// OpenZeppelin `stellar-accounts` v0.7.2 contract consumes at
 /// `__check_auth` time.
 ///
 /// Produces exactly the bytes required as the `context_rule_ids_xdr` argument
 /// to [`super::auth_digest::compute_auth_digest`].  The byte layout is
 /// `ScVal::Vec(Some(ScVec([ScVal::U32(id0), ScVal::U32(id1), ...])))` in
 /// Stellar XDR, matching the on-chain computation at
-/// `smart_account/storage.rs` of OpenZeppelin `stellar-contracts` v0.7.1,
+/// `smart_account/storage.rs` of OpenZeppelin `stellar-contracts` v0.7.2,
 /// which
 /// calls `signatures.context_rule_ids.clone().to_xdr(e)` on its host
 /// `Vec<u32>`.
@@ -430,7 +430,7 @@ mod tests {
     // encode_context_rule_ids — byte-layout known-answer tests
     //
     // KAT ground truth verified via the `stellar-xdr` MCP `encode` tool and
-    // cross-checked against OpenZeppelin `stellar-contracts` v0.7.1
+    // cross-checked against OpenZeppelin `stellar-contracts` v0.7.2
     // (`smart_account/storage.rs`).
     // -------------------------------------------------------------------------
 

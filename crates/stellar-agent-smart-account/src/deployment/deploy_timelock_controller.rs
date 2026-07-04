@@ -1,4 +1,4 @@
-//! OZ `timelock-controller-example` v0.7.1 contract deployment.
+//! OZ `timelock-controller-example` v0.7.2 contract deployment.
 //!
 //! Deploys the vendored OZ `timelock_controller_example.wasm`
 //! to a Stellar network. Unlike the WebAuthn-verifier deploy, the timelock controller
@@ -9,7 +9,7 @@
 //!
 //! 1. **Runtime SHA gate**: re-verify `sha256(TIMELOCK_CONTROLLER_WASM) ==
 //!    TIMELOCK_CONTROLLER_WASM_SHA256` before any submission.
-//! 2. **Salt derivation**: `SHA256("oz-timelock-controller-v0.7.1-" || network_passphrase
+//! 2. **Salt derivation**: `SHA256("oz-timelock-controller-v0.7.2-" || network_passphrase
 //!    || first_proposer_strkey_or_empty)`. Including the first proposer in the domain
 //!    separates deployments per-role-set on the same network and deployer.
 //! 3. **Idempotency check**: attempt `getLedgerEntries` on the derived contract address.
@@ -23,9 +23,9 @@
 //!    admin: Option<Address>)`.
 //! 6. **Return** the derived C-strkey.
 //!
-//! # Constructor args (OZ timelock-controller v0.7.1)
+//! # Constructor args (OZ timelock-controller v0.7.2)
 //!
-//! Per `examples/timelock-controller/src/contract.rs:242-265` (SHA `3f81125`):
+//! Per `examples/timelock-controller/src/contract.rs:242-265` (SHA `a9c4216`):
 //! - `min_delay: u32` — minimum ledger delay before ops can execute.
 //! - `proposers: Vec<Address>` — accounts granted PROPOSER + CANCELLER roles.
 //! - `executors: Vec<Address>` — accounts granted EXECUTOR role; empty = open execution.
@@ -68,25 +68,33 @@ use crate::managers::rules::parse_c_strkey_to_smart_account;
 
 // ── Embedded WASM ─────────────────────────────────────────────────────────────
 
-/// Vendored OZ `timelock-controller-example` v0.7.1 WASM.
+/// Vendored OZ `timelock-controller-example` v0.7.2 WASM.
 ///
-/// Built from SHA `3f81125` via `vendor/oz-timelock-controller/v0.7.1/build.sh`.
+/// Built from SHA `a9c4216` via `vendor/oz-timelock-controller/v0.7.2/build.sh`.
+/// New timelock deployments use these v0.7.2 bytes; the ABI is unchanged from
+/// v0.7.1.
 pub const TIMELOCK_CONTROLLER_WASM: &[u8] = include_bytes!(
-    "../../../../vendor/oz-timelock-controller/v0.7.1/timelock_controller_example.wasm"
+    "../../../../vendor/oz-timelock-controller/v0.7.2/timelock_controller_example.wasm"
 );
 
 /// SHA-256 of [`TIMELOCK_CONTROLLER_WASM`], 64-char lowercase hex.
 ///
-/// Matches `36299255cf77678a59d7fdfe9823d803be2bdddb9cc375be3130daed265295eb`.
+/// Matches `ef360d61a44648176f0aae923b9884c6ac5e5a9229af5eb8ab120e81cc4cc1f4`.
 /// The `build.rs` gate in this crate asserts this at compile time.
 pub const TIMELOCK_CONTROLLER_WASM_SHA256: &str =
-    "36299255cf77678a59d7fdfe9823d803be2bdddb9cc375be3130daed265295eb";
+    "ef360d61a44648176f0aae923b9884c6ac5e5a9229af5eb8ab120e81cc4cc1f4";
 
 /// Salt domain-separator prefix for the deterministic deploy salt.
 ///
 /// Salt = `SHA256(TIMELOCK_SALT_DOMAIN_PREFIX || network_passphrase || first_proposer_or_empty)`.
 /// Including the first proposer separates deployments per role-set on the same network.
-const TIMELOCK_SALT_DOMAIN_PREFIX: &str = "oz-timelock-controller-v0.7.1-";
+///
+/// The version suffix pins the salt to the vendored OZ WASM version, so a version bump
+/// derives a different address even for the same network + deployer + role-set. This
+/// keeps a new v0.7.2 deployment from colliding on-chain with a v0.7.1 timelock the same
+/// deployer already deployed at the v0.7.1-domain address, and leaves that v0.7.1
+/// timelock valid on-chain. Bumping the vendored WASM version bumps this literal.
+const TIMELOCK_SALT_DOMAIN_PREFIX: &str = "oz-timelock-controller-v0.7.2-";
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -148,7 +156,7 @@ pub struct TimelockControllerDeployResult {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Deploys the vendored OZ `timelock-controller-example` v0.7.1 contract.
+/// Deploys the vendored OZ `timelock-controller-example` v0.7.2 contract.
 ///
 /// See the module-level documentation for the full deploy flow.
 ///
@@ -209,7 +217,7 @@ async fn deploy_timelock_controller_body(
 
     // ── Step 3: Deterministic salt ────────────────────────────────────────────
     //
-    // Salt = SHA256("oz-timelock-controller-v0.7.1-" || network_passphrase ||
+    // Salt = SHA256("oz-timelock-controller-v0.7.2-" || network_passphrase ||
     //               first_proposer_or_empty).
     // Including the first proposer separates deployments per role-set on the same
     // network + deployer.
@@ -458,7 +466,7 @@ async fn deploy_timelock_controller_body(
     //
     // OZ __constructor(e, min_delay: u32, proposers: Vec<Address>,
     //                  executors: Vec<Address>, admin: Option<Address>)
-    // examples/timelock-controller/src/contract.rs:242-265 (SHA 3f81125).
+    // examples/timelock-controller/src/contract.rs:242-265 (SHA a9c4216).
 
     // proposers: Vec<Address> → ScVal::Vec(Some(ScVec([ScVal::Address(...)...])))
     let proposers_scvals: Result<Vec<ScVal>, SaError> = args

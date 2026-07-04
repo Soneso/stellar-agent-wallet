@@ -119,7 +119,7 @@ pub struct AuthorizationSimulation {
 /// placeholder signature. The signing step consumes this state, calls
 /// `Signer::sign_auth_digest`, and only then assembles the final credentials.
 ///
-/// Stores the digest bytes that must be signed for OZ v0.7.1 `__check_auth`.
+/// Stores the digest bytes that must be signed for OZ v0.7.2 `__check_auth`.
 /// Preserves the Soroban-side root invocation and address-credential fields
 /// needed to complete the auth entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -284,7 +284,7 @@ fn root_contract_invocation(
     args: Vec<ScVal>,
     sub_invocations: VecM<SorobanAuthorizedInvocation>,
 ) -> Result<SorobanAuthorizedInvocation, SaError> {
-    // Manual InvokeContractArgs construction. The OZ `stellar-accounts` v0.7.1
+    // Manual InvokeContractArgs construction. The OZ `stellar-accounts` v0.7.2
     // surface exposes context-rule operations through contract trait/client
     // methods, not as standalone argument helper types — re-using a generated
     // helper would tie us to a particular client harness. Constructing the

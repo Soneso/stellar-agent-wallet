@@ -108,7 +108,7 @@ Verifier contracts are governed by a compile-time allowlist; no central server i
 | `revoked` | Disclosed-vulnerable (`revoked_at` + `reason`) | Blocked unless overridden | Fires on every CLI invocation until migrated |
 | `retired` | `revoked` past 24-month retention (`revoked_at` + `retired_at`; reason dropped) | Blocked unless overridden | Still fires |
 
-`smart-account list-verifiers` enumerates the allowlist with this taxonomy (read-only, no network, only flag is `--output`). The single canonical entry is the OZ `multisig-webauthn-verifier-example` v0.7.1, WASM SHA-256 `678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a`, status `audited`.
+`smart-account list-verifiers` enumerates the allowlist with this taxonomy (read-only, no network, only flag is `--output`). It has two `audited` OZ `multisig-webauthn-verifier-example` entries: the canonical v0.7.2 (WASM SHA-256 `9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7`), which new deployments use, and the legacy v0.7.1 (WASM SHA-256 `678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a`), still recognised for verifier contracts already deployed on-chain. The two versions share an identical ABI.
 
 Override flags on `smart-account rules create`:
 

@@ -10,10 +10,12 @@
 //! This is the canonical allowlist source.
 //! Use `VERIFIER_ALLOWLIST[i].wasm_hash` to access the raw hash bytes.
 //!
-//! The allowlist currently contains a single entry: the OZ
-//! `multisig-webauthn-verifier-example` v0.7.1 canonical hash built from
+//! The allowlist's canonical entry (index 0) is the OZ
+//! `multisig-webauthn-verifier-example` v0.7.2 hash built from
 //! OpenZeppelin `stellar-contracts` at SHA
-//! `3f81125bed3114cc93f5fca6d13240082050269a` (tag `v0.7.1`).
+//! `a9c42169000638da937577f592ebf61a7a3c94ca` (tag `v0.7.2`) — the hash new
+//! verifier deployments upload. Index 1 is the v0.7.1 hash, still recognised for
+//! verifier contracts already deployed on-chain (the ABI is unchanged).
 //!
 //! # Supply-chain integrity
 //!
@@ -22,9 +24,11 @@
 //! fires on every `cargo test` invocation, providing a supply-chain integrity
 //! gate.  The SHA-256 value is pinned
 //! in TWO places (the `VERIFIER_ALLOWLIST` const in `verifier_allowlist.rs` +
-//! `vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md`).  A substitution attack
+//! `vendor/oz-webauthn-verifier/v0.7.2/PROVENANCE.md`).  A substitution attack
 //! must update both the WASM bytes and the PROVENANCE.md to defeat the gate;
 //! the secondary defence is the per-PR CI vendored-wasm-provenance gate.
+//!
+//! Note the pinned PROVENANCE path below is the v0.7.2 artefact.
 //!
 //! # Verifier identification
 //!
@@ -52,9 +56,9 @@
 /// # Provenance
 ///
 /// Built from OpenZeppelin `stellar-contracts` at SHA
-/// `3f81125bed3114cc93f5fca6d13240082050269a` (tag `v0.7.1`) via
+/// `a9c42169000638da937577f592ebf61a7a3c94ca` (tag `v0.7.2`) via
 /// `stellar contract build --package multisig-webauthn-verifier-example`
-/// (stellar-cli 25.2.0, rustc 1.94.0 stable, wasm32v1-none target).
+/// (stellar-cli 25.2.0, rustc 1.96.0 stable, wasm32v1-none target).
 ///
 /// Supply-chain integrity: `sha2::Sha256::digest(VERIFIER_WASM_FIXTURE)`
 /// must equal `crate::VERIFIER_ALLOWLIST[0].wasm_hash` — verified by
@@ -63,10 +67,10 @@
 // Path is relative to THIS FILE (`src/signers/verifier_identification.rs`),
 // per Rust `include_bytes!` semantics — NOT the crate root or workspace root.
 // Resolves to `<repo-root>/vendor/oz-webauthn-verifier/
-// v0.7.1/multisig_webauthn_verifier_example.wasm`.
+// v0.7.2/multisig_webauthn_verifier_example.wasm`.
 #[cfg(any(test, feature = "deploy-cli"))]
 pub const VERIFIER_WASM_FIXTURE: &[u8] = include_bytes!(
-    "../../../../vendor/oz-webauthn-verifier/v0.7.1/multisig_webauthn_verifier_example.wasm"
+    "../../../../vendor/oz-webauthn-verifier/v0.7.2/multisig_webauthn_verifier_example.wasm"
 );
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -87,39 +91,39 @@ mod tests {
     /// `cargo test` invocation.
     ///
     /// A WASM blob substitution will fail this test AND fail the
-    /// `vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md` cross-reference (the
+    /// `vendor/oz-webauthn-verifier/v0.7.2/PROVENANCE.md` cross-reference (the
     /// SHA-256 is pinned in both places, verified at CI time by the
     /// vendored-wasm-provenance CI gate).
     ///
     /// # Hard-coded OZ canonical hash
     ///
-    /// The expected digest is the OZ multisig-webauthn-verifier-example v0.7.1
-    /// wasm hash verbatim from `vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md`:
-    /// `678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a`
-    /// (OZ source SHA `3f81125bed3114cc93f5fca6d13240082050269a`, tag v0.7.1).
+    /// The expected digest is the OZ multisig-webauthn-verifier-example v0.7.2
+    /// wasm hash verbatim from `vendor/oz-webauthn-verifier/v0.7.2/PROVENANCE.md`:
+    /// `9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7`
+    /// (OZ source SHA `a9c42169000638da937577f592ebf61a7a3c94ca`, tag v0.7.2).
     /// Asserted against BOTH the computed digest AND `VERIFIER_ALLOWLIST[0].wasm_hash`
     /// so a mismatch in either direction is caught.
     #[test]
     fn vendored_wasm_hash_matches_allowlist_entry() {
-        // Hard-coded canonical hash per vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md.
-        // OZ source SHA: 3f81125bed3114cc93f5fca6d13240082050269a (tag v0.7.1).
+        // Hard-coded canonical hash per vendor/oz-webauthn-verifier/v0.7.2/PROVENANCE.md.
+        // OZ source SHA: a9c42169000638da937577f592ebf61a7a3c94ca (tag v0.7.2).
         let canonical: [u8; 32] = [
-            0x67, 0x80, 0x06, 0x90, 0x9b, 0x50, 0xc6, 0xc3, 0x65, 0xc0, 0x33, 0xf1, 0x37, 0x19,
-            0x7e, 0x91, 0x0d, 0x83, 0x96, 0xa2, 0xc6, 0x8e, 0x92, 0x81, 0x32, 0x7a, 0x2e, 0xd7,
-            0xdb, 0xf4, 0xb2, 0x7a,
+            0x94, 0x27, 0xe3, 0xdd, 0x71, 0xfb, 0x29, 0x11, 0x5c, 0x6f, 0x0e, 0xfd, 0xf2, 0xf7,
+            0x03, 0xb3, 0x2f, 0xec, 0x56, 0x6b, 0x15, 0x14, 0x21, 0xf9, 0x91, 0xc3, 0xb4, 0xe2,
+            0x48, 0xeb, 0xb1, 0xf7,
         ];
         let digest: [u8; 32] = Sha256::digest(VERIFIER_WASM_FIXTURE).into();
         assert_eq!(
             digest, canonical,
             "vendored multisig_webauthn_verifier_example.wasm sha256 mismatch against \
              PROVENANCE.md canonical: if the WASM was intentionally updated, regenerate via \
-             vendor/oz-webauthn-verifier/v0.7.1/build.sh and update VERIFIER_ALLOWLIST[0].wasm_hash \
+             vendor/oz-webauthn-verifier/v0.7.2/build.sh and update VERIFIER_ALLOWLIST[0].wasm_hash \
              and PROVENANCE.md."
         );
-        // Cross-check: VERIFIER_ALLOWLIST[0].wasm_hash must equal the canonical hash.
+        // Cross-check: VERIFIER_ALLOWLIST[0].wasm_hash must equal the canonical v0.7.2 hash.
         assert_eq!(
             VERIFIER_ALLOWLIST[0].wasm_hash, canonical,
-            "VERIFIER_ALLOWLIST[0].wasm_hash does not match the canonical OZ v0.7.1 hash; \
+            "VERIFIER_ALLOWLIST[0].wasm_hash does not match the canonical OZ v0.7.2 hash; \
              update verifier_allowlist.rs to match PROVENANCE.md."
         );
     }

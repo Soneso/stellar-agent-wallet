@@ -2,24 +2,24 @@
 //!
 //! # Architecture
 //!
-//! OZ `stellar-contracts` v0.7.1 has no dedicated "replace verifier" entrypoint.
+//! OZ `stellar-contracts` v0.7.2 has no dedicated "replace verifier" entrypoint.
 //! A verifier migration for an `External(old_verifier_addr, key_data)` signer
 //! is a two-step pair at the OZ level:
 //!
 //! 1. `remove_signer(rule_id, signer_id)` — removes the `External` signer with
 //!    the old verifier address.
 //!    OZ reference: `packages/accounts/src/smart_account/mod.rs:405-408`
-//!    (SHA `3f81125`).
+//!    (SHA `a9c4216`).
 //!
 //! 2. `add_signer(rule_id, Signer::External(new_verifier_addr, key_data))` — adds a
 //!    new `External` signer with the new verifier address, preserving the same
 //!    key data (public key bytes).
 //!    OZ reference: `packages/accounts/src/smart_account/mod.rs:374-377`
-//!    (SHA `3f81125`).
+//!    (SHA `a9c4216`).
 //!
 //! Each step is one `InvokeHostFunctionOp` per Soroban transaction (CAP-46
 //! invariant: exactly one `InvokeHostFunctionOp` per Soroban tx, confirmed at
-//! `packages/accounts/src/smart_account/mod.rs:511-513` SHA `3f81125`).
+//! `packages/accounts/src/smart_account/mod.rs:511-513` SHA `a9c4216`).
 //! A rule with `k` affected external signers requires `2k` transactions.
 //!
 //! The read-only planner builds a [`MigrationPlan`] for `--dry-run` inspection.
@@ -50,36 +50,36 @@
 //! The dry-run envelope surfaces this hazard as a `warnings` field so the
 //! operator can assess it before authorising execution. See [`MigrationPlan::warnings`].
 //!
-//! # Entrypoint names (OZ stellar-contracts v0.7.1 SHA `3f81125`)
+//! # Entrypoint names (OZ stellar-contracts v0.7.2 SHA `a9c4216`)
 //!
 //! | Step | OZ entrypoint | File:line |
 //! |------|--------------|-----------|
 //! | Remove old External signer | `remove_signer(context_rule_id, signer_id)` | `mod.rs:405-408` |
 //! | Add new External signer | `add_signer(context_rule_id, signer)` | `mod.rs:374-377` |
 //!
-//! There is no `update_verifier`, `replace_signer`, or `set_context_rule` entrypoint in OZ v0.7.1.
+//! There is no `update_verifier`, `replace_signer`, or `set_context_rule` entrypoint in OZ v0.7.2.
 //! Migration is implemented as a remove+add pair per affected External signer per context rule.
 //!
 //! # Reference cross-check
 //!
-//! - OZ `packages/accounts/src/smart_account/mod.rs:374-408` (SHA `3f81125`) —
+//! - OZ `packages/accounts/src/smart_account/mod.rs:374-408` (SHA `a9c4216`) —
 //!   `add_signer` / `remove_signer` entrypoints.
-//! - OZ `packages/accounts/src/smart_account/storage.rs:96-102` (SHA `3f81125`) —
+//! - OZ `packages/accounts/src/smart_account/storage.rs:96-102` (SHA `a9c4216`) —
 //!   `Signer::External(Address, Bytes)` contracttype shape.
-//! - OZ `packages/accounts/src/smart_account/mod.rs:511-513` (SHA `3f81125`) —
+//! - OZ `packages/accounts/src/smart_account/mod.rs:511-513` (SHA `a9c4216`) —
 //!   `ExecutionEntryPoint::execute` single-target call; CAP-46 single-op invariant.
 //!
 //! # Why remove+add pairs (not a single atomic replace)
 //!
-//! There is no atomic "replace verifier" primitive in OZ v0.7.1. A single-tx
+//! There is no atomic "replace verifier" primitive in OZ v0.7.2. A single-tx
 //! bundle is not possible for two independent reasons:
 //!
 //! 1. **CAP-46 invariant** — Stellar restricts every Soroban transaction to
 //!    exactly one `InvokeHostFunctionOp` (confirmed at OZ
-//!    `packages/accounts/src/smart_account/mod.rs:511-513` SHA `3f81125`). A
+//!    `packages/accounts/src/smart_account/mod.rs:511-513` SHA `a9c4216`). A
 //!    single transaction cannot bundle a `remove_signer` + `add_signer` pair.
 //!
-//! 2. **OZ v0.7.1 surface absence** — OZ `stellar-contracts` v0.7.1 has no
+//! 2. **OZ v0.7.2 surface absence** — OZ `stellar-contracts` v0.7.2 has no
 //!    `update_verifier`, `replace_signer`, or `set_context_rule` entrypoint.
 //!    Migration is necessarily a remove+add pair per affected External signer.
 //!
@@ -109,7 +109,7 @@ use stellar_agent_network::Signer;
 
 /// One per-signer migration step within a rule migration.
 ///
-/// OZ `stellar-contracts` v0.7.1 has no atomic "replace verifier" primitive:
+/// OZ `stellar-contracts` v0.7.2 has no atomic "replace verifier" primitive:
 /// migration is a `remove_signer` + `add_signer` pair per affected External signer.
 /// This struct captures both HostFunctions so they can be submitted sequentially.
 ///
@@ -121,9 +121,9 @@ use stellar_agent_network::Signer;
 /// # OZ entrypoints
 ///
 /// - `remove_host_function`: `remove_signer(context_rule_id, signer_id)` at
-///   `packages/accounts/src/smart_account/mod.rs:405-408` (SHA `3f81125`).
+///   `packages/accounts/src/smart_account/mod.rs:405-408` (SHA `a9c4216`).
 /// - `add_host_function`: `add_signer(context_rule_id, signer)` at
-///   `packages/accounts/src/smart_account/mod.rs:374-377` (SHA `3f81125`).
+///   `packages/accounts/src/smart_account/mod.rs:374-377` (SHA `a9c4216`).
 ///
 #[non_exhaustive]
 #[derive(Clone, Debug)]
@@ -135,13 +135,13 @@ pub struct SignerMigrationStep {
     /// Pre-formed `HostFunction::InvokeContract` for the `remove_signer` call.
     ///
     /// Invokes `remove_signer(rule_id, signer_id)` on the smart-account contract.
-    /// OZ: `packages/accounts/src/smart_account/mod.rs:405-408` (SHA `3f81125`).
+    /// OZ: `packages/accounts/src/smart_account/mod.rs:405-408` (SHA `a9c4216`).
     pub remove_host_function: HostFunction,
     /// Pre-formed `HostFunction::InvokeContract` for the `add_signer` call.
     ///
     /// Invokes `add_signer(rule_id, Signer::External(new_verifier_addr, key_data))`
     /// on the smart-account contract. OZ:
-    /// `packages/accounts/src/smart_account/mod.rs:374-377` (SHA `3f81125`).
+    /// `packages/accounts/src/smart_account/mod.rs:374-377` (SHA `a9c4216`).
     pub add_host_function: HostFunction,
 }
 
@@ -288,7 +288,7 @@ struct ExternalSignerData {
     /// Full key bytes from the on-chain `Signer::External(Address, Bytes)`.
     ///
     /// Byte-layout citation: `Signer::External(Address, Bytes)` at
-    /// `packages/accounts/src/smart_account/storage.rs:96-102` (SHA `3f81125`).
+    /// `packages/accounts/src/smart_account/storage.rs:96-102` (SHA `a9c4216`).
     key_data_full: Vec<u8>,
 }
 
@@ -1260,7 +1260,7 @@ impl<'a> MigrationPlanner<'a> {
                 }
 
                 // Build `remove_signer(rule_id, signer_id)` HostFunction.
-                // OZ: `packages/accounts/src/smart_account/mod.rs:405-408` (SHA `3f81125`).
+                // OZ: `packages/accounts/src/smart_account/mod.rs:405-408` (SHA `a9c4216`).
                 let remove_host_function = build_invoke_host_function(
                     smart_account,
                     "remove_signer",
@@ -1278,7 +1278,7 @@ impl<'a> MigrationPlanner<'a> {
                 // Build `add_signer(rule_id, Signer::External(new_verifier, key_data))`.
                 // OZ `Signer::External(Address, Bytes)` ScVal:
                 // `ScVal::Vec([Symbol("External"), Address(new_verifier_addr), Bytes(key_data)])`
-                // `packages/accounts/src/smart_account/storage.rs:96-102` (SHA `3f81125`).
+                // `packages/accounts/src/smart_account/storage.rs:96-102` (SHA `a9c4216`).
                 let new_signer_scval =
                     build_external_signer_scval(to_verifier_addr, &ext.key_data_full).map_err(
                         |detail| SaError::VerifierMigrationFailed {
@@ -1291,7 +1291,7 @@ impl<'a> MigrationPlanner<'a> {
                         },
                     )?;
 
-                // OZ: `packages/accounts/src/smart_account/mod.rs:374-377` (SHA `3f81125`).
+                // OZ: `packages/accounts/src/smart_account/mod.rs:374-377` (SHA `a9c4216`).
                 let add_host_function = build_invoke_host_function(
                     smart_account,
                     "add_signer",
@@ -1388,8 +1388,8 @@ impl<'a> MigrationPlanner<'a> {
 /// # Byte-layout citation
 ///
 /// `ContextRule` struct fields at `packages/accounts/src/smart_account/storage.rs:155-174`
-/// (SHA `3f81125`). `Signer::External(Address, Bytes)` ScVal encoding:
-/// `packages/accounts/src/smart_account/storage.rs:96-102` (SHA `3f81125`).
+/// (SHA `a9c4216`). `Signer::External(Address, Bytes)` ScVal encoding:
+/// `packages/accounts/src/smart_account/storage.rs:96-102` (SHA `a9c4216`).
 fn decode_external_signers_from_context_rule(
     val: ScVal,
     rule_id: u32,
@@ -1441,7 +1441,7 @@ fn decode_external_signers_from_context_rule(
 
     // Match signer_ids to signer ScVals by index position (parallel slice).
     // OZ parallel `signer_ids` / `signers` array alignment:
-    // `packages/accounts/src/smart_account/storage.rs:155-174` (SHA `3f81125`).
+    // `packages/accounts/src/smart_account/storage.rs:155-174` (SHA `a9c4216`).
     let result: Vec<ExternalSignerData> = signer_ids
         .into_iter()
         .zip(signers_scvals)
@@ -1460,7 +1460,7 @@ fn decode_external_signers_from_context_rule(
 ///
 /// `Signer::External(Address, Bytes)` ScVal:
 /// `ScVal::Vec([Symbol("External"), Address(verifier_addr), Bytes(key_data)])`
-/// `packages/accounts/src/smart_account/storage.rs:96-102` (SHA `3f81125`).
+/// `packages/accounts/src/smart_account/storage.rs:96-102` (SHA `a9c4216`).
 fn decode_external_signer_scval(signer_id: u32, val: ScVal) -> Option<ExternalSignerData> {
     let items = match val {
         ScVal::Vec(Some(v)) => v,
@@ -1531,7 +1531,7 @@ fn build_invoke_host_function(
 ///
 /// `Signer::External(Address, Bytes)` ScVal encoding:
 /// `ScVal::Vec([Symbol("External"), Address(verifier_addr), Bytes(key_data)])`
-/// `packages/accounts/src/smart_account/storage.rs:96-102` (SHA `3f81125`).
+/// `packages/accounts/src/smart_account/storage.rs:96-102` (SHA `a9c4216`).
 fn build_external_signer_scval(
     verifier_addr: &ScAddress,
     key_data: &[u8],
@@ -1702,7 +1702,7 @@ mod tests {
     /// # Byte-layout citation
     ///
     /// `Signer::External(Address, Bytes)` ScVal encoding:
-    /// `packages/accounts/src/smart_account/storage.rs:96-102` (SHA `3f81125`).
+    /// `packages/accounts/src/smart_account/storage.rs:96-102` (SHA `a9c4216`).
     #[test]
     fn build_external_signer_scval_shape() {
         let addr = ScAddress::Contract(ContractId(Hash([0x42u8; 32])));
@@ -2058,7 +2058,7 @@ mod tests {
 
     /// `decode_external_signer_scval` returns `None` for an unknown tag string.
     ///
-    /// OZ `Signer` only has `"External"` and `"Delegated"` variants (SHA `3f81125`).
+    /// OZ `Signer` only has `"External"` and `"Delegated"` variants (SHA `a9c4216`).
     /// Any other tag (e.g., a future extension) must be silently skipped by the
     /// migration planner, which only affects `External` signers.
     #[test]
@@ -2176,7 +2176,7 @@ mod tests {
     /// # Byte-layout citation
     ///
     /// OZ parallel `signer_ids` / `signers` alignment:
-    /// `packages/accounts/src/smart_account/storage.rs:155-174` (SHA `3f81125`).
+    /// `packages/accounts/src/smart_account/storage.rs:155-174` (SHA `a9c4216`).
     #[test]
     fn decode_external_signers_filters_delegated_and_returns_external() {
         use stellar_xdr::{ScMap, ScMapEntry};
