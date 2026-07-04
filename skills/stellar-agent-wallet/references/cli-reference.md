@@ -178,6 +178,30 @@ stellar-agent trustline --from GABC...WXYZ --asset USDC --profile default
 
 ---
 
+## claim
+
+`claim <BALANCE_ID> [flags]` — claims a Stellar `ClaimClaimableBalance` operation for a balance the agent already holds the id of. Enforces the claim guards (claimant membership, predicate satisfaction, non-native trustline state, native-XLM fee affordability) before signing. Only `testnet` accepted. Same three-stage pipeline as `pay`: `--build-only` emits unsigned envelope XDR and exits; `--sign-only <XDR>` signs a prebuilt envelope; `--submit-only <XDR>` submits a pre-signed envelope; the default runs all three atomically.
+
+| Flag / arg | Meaning | Default |
+|---|---|---|
+| `<BALANCE_ID>` (positional) | A `B...` strkey, canonical 72-hex id, or bare 64-hex hash | — |
+| `--source <G_STRKEY>` (required) | Claiming account; also the transaction source | — |
+| `--fee <STROOPS\|auto[:pNN]>` | Classic fee selector | profile default |
+| `--secret-env <VAR>` | Env-var name holding source S-strkey | — |
+| `--sign-with-ledger` / `--account-index <INDEX>` | Ledger signer / BIP index | `false` / `0` |
+| `--build-only` / `--sign-only <XDR>` / `--submit-only <XDR>` | Stage selection (at most one) | — |
+| `--network` | Only `testnet` accepted | `testnet` |
+| `--timeout-seconds` / `--rpc-url` / `--output` | shared | as above |
+
+The build stage prints a typed preview (balance id, asset, amount, claimants, `is_claimant`, predicate verdict) to stdout before the guards run, so the operator sees the balance disclosure even when a guard subsequently refuses.
+
+```bash
+export WALLET_SK="S..."
+stellar-agent claim BAAD...WXYZ --source GSRC...WXYZ --secret-env WALLET_SK
+```
+
+---
+
 ## friendbot
 
 `friendbot [flags]` — funds a testnet or futurenet account via the Friendbot HTTP endpoint. No local signing. `--network` accepts `testnet`/`futurenet`/`mainnet` at the parser but `mainnet` is refused at dispatch (`network.friendbot_mainnet_forbidden`). The endpoint is allow-list validated (`friendbot.stellar.org`, `friendbot-futurenet.stellar.org`) unless `--friendbot-url-unchecked`.
@@ -483,6 +507,75 @@ State-changing. Evicts every expired entry from the pending-approval store and r
 
 ```bash
 stellar-agent approve gc --profile default
+```
+
+### `approve list`
+
+Read-only. Enumerates pending approvals from the profile's store: opens it, renders a redacted snapshot, and exits. No keyring access, no network calls.
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--profile <NAME>` | Profile whose store to read | `default` |
+| `--output <FORMAT>` | `json` (default) or `table` | `json` |
+| `--include-expired` | Include already-expired entries instead of omitting them | `false` |
+
+`data.expired_count` always reports the number of expired entries regardless of `--include-expired`, so the operator can tell whether `approve gc` is due even when expired entries are hidden.
+
+```bash
+stellar-agent approve list --profile default --output table
+```
+
+### `approve serve`
+
+Binds a loopback-only HTTP server with a local web UI for the pending-approval queue, so the operator can review and approve/reject entries in a browser instead of running `approve --id <NONCE>` per entry. Runs until Ctrl-C.
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--profile <NAME>` | Profile whose store and attestation key to use | `default` |
+| `--port <PORT>` | TCP port to bind on `127.0.0.1`; `0` picks an OS-assigned port | `0` |
+| `--no-open` | Print the bootstrap URL instead of opening a browser | `false` |
+| `--notify <on\|off>` | Best-effort OS toast notification when the queue grows | `on` |
+| `--bell` | Emit a terminal bell alongside each queue-growth notice | `false` |
+| `--include-expired` | Load the inbox with expired entries shown by default | `false` |
+
+On start the server mints a single-use bootstrap token and prints a `http://127.0.0.1:<port>/bootstrap/<token>` URL; opening it exchanges the token for a session cookie and redirects to the inbox. Must run as the same OS user as the wallet's MCP server process — the attestation binds that user's id.
+
+```bash
+stellar-agent approve serve --profile default --port 7823
+```
+
+### `approve serve --remote`
+
+Binds a TLS-protected, passkey-authenticated remote-approval surface instead of the loopback inbox, for approving from a device other than the wallet host. Refuses to start unless BOTH the profile has a `[remote_approval]` block with `enabled = true` AND `--confirm-remote-exposure` is also passed — the profile block alone is never sufficient consent. `--port` / `--no-open` / `--notify` / `--bell` / `--include-expired` are ignored in this mode.
+
+| Flag | Meaning |
+|---|---|
+| `--remote` | Bind the remote surface instead of the loopback inbox |
+| `--confirm-remote-exposure` | Required explicit consent, separate from the profile's `enabled` flag |
+
+Every approve or reject on this surface requires a fresh WebAuthn passkey assertion bound to the exact pending entry, in addition to the session login. See `docs/remote-approval.md` in the wallet repository for the full setup guide (the `[remote_approval]` profile block, DNS/hosts-file requirements for `rp_id`, and the login/approve walkthrough).
+
+```bash
+stellar-agent approve serve --remote --confirm-remote-exposure --profile default
+```
+
+### `approve operator enroll`
+
+Enrolls a WebAuthn passkey credential for the remote-approval surface. Runs entirely locally — it never touches the network. Enrollment alone does not authorize the credential; its id must also be added to the profile's `[remote_approval] allowed_credentials` list.
+
+| Flag | Meaning |
+|---|---|
+| `--profile <NAME>` | Profile whose operator-credential store to write |
+| `--credential-id <B64URL>` (required) | Base64url WebAuthn credential id (16-64 raw bytes) |
+| `--public-key <B64URL>` (required) | Base64url-encoded 65-byte uncompressed SEC1 P-256 public key (`0x04 \|\| X \|\| Y`) |
+| `--rp-id <HOSTNAME>` (required) | Must match the profile's `[remote_approval] rp_id` exactly |
+| `--label <LABEL>` (required) | Operator-chosen name for the credential (e.g. `"laptop"`) |
+
+The credential id and public key normally come from the remote-approval listener's own `GET /enroll` helper page, which displays a ready-to-run copy of this command.
+
+```bash
+stellar-agent approve operator enroll --credential-id <B64URL> \
+  --public-key <B64URL> --rp-id wallet.example.internal --label laptop
 ```
 
 ---

@@ -270,6 +270,35 @@ There is no OS-notification push for remote operators; the open inbox page
 updates itself and the serve terminal prints a count line when new approvals
 arrive.
 
+### `approve serve --remote`
+
+```bash
+stellar-agent approve serve --remote --confirm-remote-exposure --profile default
+```
+
+Binds a TLS-protected, passkey-authenticated listener beyond loopback instead
+of the local inbox above — for approving from a device other than the wallet
+host, without an SSH tunnel. Requires the profile's `[remote_approval]` block
+with `enabled = true` AND `--confirm-remote-exposure` as a separate, explicit
+consent flag; either alone refuses to start. See
+[Remote approval](../remote-approval.md) for the full setup, trust model, and
+walkthrough.
+
+### `approve operator enroll`
+
+```bash
+stellar-agent approve operator enroll \
+  --credential-id <B64URL> --public-key <B64URL> --rp-id <HOSTNAME> --label laptop
+```
+
+Validates and writes a WebAuthn credential id and SEC1 public key to the
+profile's dedicated operator-approval credential store, for use with
+`approve serve --remote`. Runs entirely locally — it never touches the
+network — and does not by itself authorize the credential; add its id to the
+profile's `[remote_approval] allowed_credentials` list separately. See
+[Remote approval](../remote-approval.md) for where the credential id and
+public key come from.
+
 ## `audit`
 
 The `audit` group verifies the per-profile audit log, an append-only, hash-chained JSONL record of every tool invocation and lifecycle event. Argument values are never logged; only argument key names are recorded. The chain links each entry to the SHA-256 of the prior entry's canonical body, so any external modification breaks verification.

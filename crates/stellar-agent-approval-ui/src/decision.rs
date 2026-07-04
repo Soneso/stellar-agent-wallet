@@ -38,9 +38,31 @@ use stellar_agent_core::timefmt;
 /// enough to be swept by the normal expiry/gc path.
 pub const REJECT_TOMBSTONE_TTL_MS: u64 = 3_600_000;
 
-/// Origin string recorded in the `ApprovalAttested` / `ApprovalRejected` audit
-/// events for actions driven by the approval-inbox server.
-const SERVE_ORIGIN: &str = "serve";
+/// The authenticated identity behind a decision, supplied by the HTTP layer
+/// that already performed authentication.
+///
+/// [`apply_decision`] is authentication-agnostic per the module docs; this
+/// type is the narrow seam a caller uses to say WHO is deciding, without
+/// `apply_decision` itself knowing how that identity was established.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum RequestIdentity {
+    /// The loopback approval-inbox server: derive
+    /// `ApproverIdentity::OsUid(process_uid_for_attestation())` internally,
+    /// exactly as before this type existed. Byte-identical to the
+    /// pre-remote-approval behaviour; the allowlist is never consulted.
+    Local,
+    /// A passkey-authenticated identity from the remote-approval HTTP
+    /// surface, already verified by the caller (see
+    /// `ApproverIdentity::from_verified_passkey_assertion`), plus the
+    /// profile's operator-approval credential allowlist to check it against.
+    Remote {
+        /// The verified `PasskeyCredential` identity.
+        identity: ApproverIdentity,
+        /// The profile's `RemoteApprovalConfig::allowed_credentials`.
+        allowed_credentials: Vec<String>,
+    },
+}
 
 /// A single operator decision on one pending approval.
 #[derive(Debug, Clone)]
@@ -141,21 +163,88 @@ pub enum Outcome {
     WrongKind,
 }
 
-/// Apply one operator [`Decision`] against the profile's approval store.
+/// Apply one operator [`Decision`] against the profile's approval store, on
+/// behalf of `requester`.
 ///
 /// This is synchronous file/keyring I/O plus at most one audit write — no
 /// network — matching the CLI `approve` command's in-async-fn synchronous
 /// house style. All authentication and CSRF checks happen at the HTTP boundary
-/// before this is called.
+/// before this is called; `requester` says WHO is deciding, not whether they
+/// were authenticated.
 ///
 /// # Panics
 ///
 /// Never panics.
 #[must_use]
-pub fn apply_decision(ctx: &DecisionContext, decision: Decision) -> Outcome {
+pub fn apply_decision(
+    ctx: &DecisionContext,
+    decision: Decision,
+    requester: &RequestIdentity,
+) -> Outcome {
     match decision {
-        Decision::Approve { nonce } => apply_approve(ctx, &nonce),
-        Decision::Reject { nonce } => apply_reject(ctx, &nonce),
+        Decision::Approve { nonce } => apply_approve(ctx, &nonce, requester),
+        Decision::Reject { nonce } => apply_reject(ctx, &nonce, requester),
+    }
+}
+
+/// Resolves `requester` into the `ApproverIdentity` and allowlist to gate
+/// with, plus the `Surface` and optional redacted-audit credential id to
+/// attribute the action to.
+///
+/// For [`RequestIdentity::Local`] this derives
+/// `ApproverIdentity::OsUid(process_uid_for_attestation())`, exactly as
+/// `apply_approve` / `apply_reject` did before remote approval existed.
+///
+/// # Errors
+///
+/// Returns `Err(Outcome::Unavailable)` if process-UID derivation fails for
+/// `RequestIdentity::Local`.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err variant is the ready-to-return Outcome for a derivation failure"
+)]
+fn resolve_requester(
+    requester: &RequestIdentity,
+) -> Result<(ApproverIdentity, Vec<String>, Surface, Option<String>), Outcome> {
+    match requester {
+        RequestIdentity::Local => {
+            let uid = process_uid_for_attestation().map_err(|e| {
+                tracing::warn!(error = %e, "decision: process uid derivation failed");
+                Outcome::Unavailable
+            })?;
+            Ok((
+                ApproverIdentity::OsUid(uid),
+                Vec::new(),
+                Surface::Serve,
+                None,
+            ))
+        }
+        RequestIdentity::Remote {
+            identity,
+            allowed_credentials,
+        } => {
+            let credential_id = match identity {
+                ApproverIdentity::PasskeyCredential {
+                    credential_id_b64url,
+                    ..
+                } => credential_id_b64url.clone(),
+                // `ApproverIdentity` is `#[non_exhaustive]` and defined in a
+                // different crate, so this match needs a wildcard arm. A
+                // caller passing an `OsUid` (or a future variant) inside
+                // `RequestIdentity::Remote` is a caller error, not a security
+                // gap: `is_authorized_for_entry` still fails closed against a
+                // passkey-only allowlist regardless of what this placeholder
+                // string is; there is simply no operator credential id to
+                // attribute in that case.
+                _ => "non-passkey-identity".to_owned(),
+            };
+            Ok((
+                identity.clone(),
+                allowed_credentials.clone(),
+                Surface::ServeRemote,
+                Some(credential_id),
+            ))
+        }
     }
 }
 
@@ -194,22 +283,19 @@ fn approval_detail_code_is(err: &WalletError, code: &str) -> bool {
     err.to_string().contains(&format!("{code}: "))
 }
 
-fn apply_approve(ctx: &DecisionContext, nonce: &str) -> Outcome {
+fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity) -> Outcome {
     let store = match open_store(ctx, "approve") {
         Ok(s) => s,
         Err(outcome) => return outcome,
     };
 
-    let uid = match process_uid_for_attestation() {
-        Ok(u) => u,
-        Err(e) => {
-            tracing::warn!(error = %e, "approve: process uid derivation failed");
-            return Outcome::Unavailable;
-        }
-    };
-    let identity = ApproverIdentity::OsUid(uid);
+    let (identity, allowed_credentials, surface, operator_credential_id) =
+        match resolve_requester(requester) {
+            Ok(resolved) => resolved,
+            Err(outcome) => return outcome,
+        };
 
-    let entry = match load_and_validate_entry(&store, nonce, &identity) {
+    let entry = match load_and_validate_entry(&store, nonce, &identity, &allowed_credentials) {
         Ok(e) => e,
         Err(e) => {
             if approval_detail_code_is(&e, "approval.user_mismatch") {
@@ -267,8 +353,9 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str) -> Outcome {
         &mut store,
         &entry,
         &key,
-        Surface::Serve,
+        surface,
         audit_ref,
+        operator_credential_id.as_deref(),
         |req, grant_key| {
             stellar_agent_toolsets_runtime::record_first_invoke_grant(
                 profile_name,
@@ -313,7 +400,7 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str) -> Outcome {
     }
 }
 
-fn apply_reject(ctx: &DecisionContext, nonce: &str) -> Outcome {
+fn apply_reject(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity) -> Outcome {
     let mut store = match open_store(ctx, "reject") {
         Ok(s) => s,
         Err(outcome) => return outcome,
@@ -321,7 +408,7 @@ fn apply_reject(ctx: &DecisionContext, nonce: &str) -> Outcome {
 
     // Idempotency + capture-before-mutate: read what we need, then mutate.
     // The full entry is cloned (not just its fields) because the
-    // ApproverIdentity check below needs `process_uid`.
+    // ApproverIdentity check below needs `process_uid` and `approval_nonce`.
     let entry = store.get(nonce).cloned();
     let (already_resolved, resolved_attestation, original_kind_name) = match &entry {
         None => (true, None, None),
@@ -340,25 +427,28 @@ fn apply_reject(ctx: &DecisionContext, nonce: &str) -> Outcome {
 
     // Same ApproverIdentity gate `apply_approve` enforces via
     // `load_and_validate_entry`: without it, a caller reachable over HTTP but
-    // running as a different OS user than the one that parked this entry
-    // could inject a terminal "no" the operator never gave — reject is not
-    // exempt from the cross-user binding just because it carries no
-    // attestation.
-    let uid = match process_uid_for_attestation() {
-        Ok(u) => u,
-        Err(e) => {
-            tracing::warn!(error = %e, "reject: process uid derivation failed");
-            return Outcome::Unavailable;
-        }
-    };
-    let identity = ApproverIdentity::OsUid(uid);
+    // not authorized for this entry could inject a terminal "no" the
+    // operator never gave — reject is not exempt from the identity binding
+    // just because it carries no attestation. Threaded symmetrically with
+    // `apply_approve` via `is_authorized_for_entry`, so a `RequestIdentity::Remote`
+    // reject is gated by the same allowlist + entry-binding checks as an
+    // approve.
+    let (identity, allowed_credentials, surface, operator_credential_id) =
+        match resolve_requester(requester) {
+            Ok(resolved) => resolved,
+            Err(outcome) => return outcome,
+        };
     // `entry` is `Some` here: `already_resolved` is `true` for every arm
     // above where it is `None`.
     let Some(entry) = entry else {
         tracing::warn!("reject: entry unexpectedly absent after not-already-resolved check");
         return Outcome::Unavailable;
     };
-    if !identity.matches_entry_process_uid(&entry.process_uid) {
+    if !identity.is_authorized_for_entry(
+        &entry.process_uid,
+        &entry.approval_nonce,
+        &allowed_credentials,
+    ) {
         return Outcome::UserMismatch;
     }
 
@@ -386,12 +476,20 @@ fn apply_reject(ctx: &DecisionContext, nonce: &str) -> Outcome {
     // an audit hiccup must never undo it.
     let kind_name = original_kind_name.unwrap_or_else(|| "unknown".to_owned());
     if let Ok(mut writer) = ctx.audit_writer.lock() {
-        let audit_entry = AuditEntry::new_approval_rejected(
-            kind_name,
-            nonce,
-            SERVE_ORIGIN,
-            uuid::Uuid::new_v4().to_string(),
-        );
+        let audit_entry = match &operator_credential_id {
+            Some(cred_id) => AuditEntry::new_approval_rejected_remote(
+                kind_name,
+                nonce,
+                cred_id,
+                uuid::Uuid::new_v4().to_string(),
+            ),
+            None => AuditEntry::new_approval_rejected(
+                kind_name,
+                nonce,
+                surface.as_str(),
+                uuid::Uuid::new_v4().to_string(),
+            ),
+        };
         if let Err(e) = writer.write_entry(audit_entry) {
             tracing::warn!(error = %e, "reject: audit write failed; rejection already persisted");
         }
@@ -527,6 +625,7 @@ mod tests {
             Decision::Approve {
                 nonce: nonce.clone(),
             },
+            &RequestIdentity::Local,
         );
         let attestation = match outcome {
             Outcome::Attested { attestation, .. } => attestation.expect("payment surfaces a blob"),
@@ -571,7 +670,11 @@ mod tests {
         )
         .unwrap();
         let nonce = insert(&fx.ctx, entry);
-        let outcome = apply_decision(&fx.ctx, Decision::Approve { nonce });
+        let outcome = apply_decision(
+            &fx.ctx,
+            Decision::Approve { nonce },
+            &RequestIdentity::Local,
+        );
         assert!(matches!(
             outcome,
             Outcome::Attested {
@@ -603,6 +706,7 @@ mod tests {
             Decision::Approve {
                 nonce: nonce.clone(),
             },
+            &RequestIdentity::Local,
         );
         assert!(matches!(
             outcome,
@@ -629,7 +733,11 @@ mod tests {
         )
         .unwrap();
         let nonce = insert(&fx.ctx, entry);
-        let outcome = apply_decision(&fx.ctx, Decision::Approve { nonce });
+        let outcome = apply_decision(
+            &fx.ctx,
+            Decision::Approve { nonce },
+            &RequestIdentity::Local,
+        );
         assert!(matches!(
             outcome,
             Outcome::Attested {
@@ -656,7 +764,11 @@ mod tests {
         )
         .unwrap();
         let nonce = insert(&fx.ctx, entry);
-        let outcome = apply_decision(&fx.ctx, Decision::Approve { nonce });
+        let outcome = apply_decision(
+            &fx.ctx,
+            Decision::Approve { nonce },
+            &RequestIdentity::Local,
+        );
         assert_eq!(outcome, Outcome::WrongKind);
     }
 
@@ -668,7 +780,11 @@ mod tests {
         let entry = payment_entry(1);
         let nonce = insert(&fx.ctx, entry);
         std::thread::sleep(std::time::Duration::from_millis(5));
-        let outcome = apply_decision(&fx.ctx, Decision::Approve { nonce });
+        let outcome = apply_decision(
+            &fx.ctx,
+            Decision::Approve { nonce },
+            &RequestIdentity::Local,
+        );
         assert_eq!(outcome, Outcome::Expired);
     }
 
@@ -684,6 +800,7 @@ mod tests {
             Decision::Approve {
                 nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             },
+            &RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::NotFound);
     }
@@ -699,6 +816,7 @@ mod tests {
             Decision::Approve {
                 nonce: nonce.clone(),
             },
+            &RequestIdentity::Local,
         );
         let first_blob = match first {
             Outcome::Attested {
@@ -707,7 +825,11 @@ mod tests {
             } => b,
             other => panic!("expected Attested, got {other:?}"),
         };
-        let second = apply_decision(&fx.ctx, Decision::Approve { nonce });
+        let second = apply_decision(
+            &fx.ctx,
+            Decision::Approve { nonce },
+            &RequestIdentity::Local,
+        );
         match second {
             Outcome::AlreadyResolved {
                 attestation: Some(b),
@@ -727,6 +849,7 @@ mod tests {
             Decision::Reject {
                 nonce: nonce.clone(),
             },
+            &RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Rejected);
 
@@ -736,7 +859,7 @@ mod tests {
         drop(store);
 
         // Second reject is idempotent.
-        let again = apply_decision(&fx.ctx, Decision::Reject { nonce });
+        let again = apply_decision(&fx.ctx, Decision::Reject { nonce }, &RequestIdentity::Local);
         assert_eq!(again, Outcome::AlreadyResolved { attestation: None });
     }
 
@@ -751,11 +874,16 @@ mod tests {
                 &fx.ctx,
                 Decision::Reject {
                     nonce: nonce.clone()
-                }
+                },
+                &RequestIdentity::Local
             ),
             Outcome::Rejected
         );
-        let outcome = apply_decision(&fx.ctx, Decision::Approve { nonce });
+        let outcome = apply_decision(
+            &fx.ctx,
+            Decision::Approve { nonce },
+            &RequestIdentity::Local,
+        );
         assert_eq!(outcome, Outcome::AlreadyResolved { attestation: None });
     }
 
@@ -770,6 +898,7 @@ mod tests {
             Decision::Reject {
                 nonce: "BBBBBBBBBBBBBBBBBBBBBB".to_owned(),
             },
+            &RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::AlreadyResolved { attestation: None });
     }
@@ -785,6 +914,7 @@ mod tests {
             Decision::Approve {
                 nonce: nonce.clone(),
             },
+            &RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::UserMismatch);
 
@@ -805,6 +935,7 @@ mod tests {
             Decision::Reject {
                 nonce: nonce.clone(),
             },
+            &RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::UserMismatch);
 
@@ -833,6 +964,7 @@ mod tests {
             Decision::Approve {
                 nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             },
+            &RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Unavailable);
     }
@@ -848,6 +980,7 @@ mod tests {
             Decision::Reject {
                 nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             },
+            &RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Unavailable);
     }

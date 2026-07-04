@@ -216,6 +216,56 @@ Commit: `chain_id`, `from`, plus the binding triple (`nonce`,
 `approval_attestation` pair. The authoritative asset/issuer/limit are re-derived
 from `envelope_xdr`, not from caller-supplied args.
 
+## Claimable balances
+
+| Tool | Purpose | Gating |
+| --- | --- | --- |
+| `stellar_claim` | Fetch the on-chain claimable-balance entry, render a typed preview, enforce the claim guards (claimant, predicate, trustline, fee affordability), build the `ClaimClaimableBalance` envelope, mint a single-use nonce. | No signing; no submission. Mints the nonce the commit step consumes. |
+| `stellar_claim_commit` | Re-derive the authoritative args from the envelope, re-fetch and re-check the entry, verify the nonce, rebuild and byte-compare the envelope, sign from the keyring, submit. | Signs and submits. Two-phase; approval spine. |
+
+### stellar_claim (simulate) arguments
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `chain_id` | string | yes | CAIP-2; must match profile. |
+| `balance_id` | string | yes | A `B...` strkey, a canonical 72-hex id, or a bare 64-hex hash. |
+| `source_account` | string | no | G-strkey of the claiming account. Defaults to the profile's default MCP signer account when omitted. |
+
+Returns `{ envelope_xdr, nonce, expires_at_unix_ms, preview }`. `preview`
+carries the balance id (both hex72 and strkey forms), asset code/issuer
+(absent for native XLM), `amount_stroops`, `amount_display`, the entry's
+claimants, whether `source_account` is a claimant, and the matched predicate
+verdict. When the policy requires approval, the response includes an
+`approval` block with `approval_nonce` and `expires_at_unix_ms`.
+
+Claim guards enforced before the nonce is minted, in order: claimant
+membership (`claim.not_claimant`), predicate satisfaction
+(`claim.predicate_not_satisfied`), non-native trustline state
+(`claim.trustline_missing` / `claim.trustline_not_authorized` /
+`claim.trustline_limit`), and native-XLM fee affordability
+(`ledger.insufficient_balance` — claiming credits the account, so only the fee
+is checked, never the claimed amount).
+
+### stellar_claim_commit arguments
+
+Repeats the simulate arguments (`chain_id`, `balance_id`, `source_account` —
+same values as simulate) plus the binding triple and the optional approval
+pair:
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `nonce` | string | yes | Base64-url-no-pad nonce from `stellar_claim`. |
+| `expires_at_unix_ms` | integer (u64) | yes | Unix milliseconds at which the nonce expires. |
+| `envelope_xdr` | string | yes | Base64 envelope from `stellar_claim`; byte-compared against a fresh rebuild. |
+| `approval_nonce` | string | when approval required | Wallet-issued approval nonce from the simulate-step `approval` block. |
+| `approval_attestation` | string | when approval required | HMAC-SHA256 attestation minted by the operator at approve time. |
+
+`stellar_claim_commit` re-fetches the claimable-balance entry and re-runs the
+claimant and predicate guards against fresh on-chain state (the trustline and
+account checks are not re-run at commit time — a between-phase trustline
+change fails cleanly on submission instead). A rebuilt envelope that does not
+byte-match the presented `envelope_xdr` returns `simulation.divergence`.
+
 ## Fees
 
 | Tool | Purpose | Gating |

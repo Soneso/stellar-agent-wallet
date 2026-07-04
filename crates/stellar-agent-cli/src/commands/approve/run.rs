@@ -219,7 +219,9 @@ pub async fn run(args: RunArgs) -> i32 {
     };
 
     let identity = ApproverIdentity::OsUid(our_uid.clone());
-    let entry = match load_and_validate_entry(&store, &nonce, &identity) {
+    // The CLI only ever constructs an `OsUid` identity, so the allowlist is
+    // never consulted; pass an empty slice.
+    let entry = match load_and_validate_entry(&store, &nonce, &identity, &[]) {
         Ok(entry) => entry,
         Err(e) => {
             render::render_json(&Envelope::<()>::err(&e));
@@ -286,6 +288,7 @@ pub async fn run(args: RunArgs) -> i32 {
         &key_bytes,
         Surface::Cli,
         audit_writer_ref,
+        None,
         |req, key| {
             stellar_agent_toolsets_runtime::record_first_invoke_grant(
                 &profile_name,
@@ -891,6 +894,7 @@ mod tests {
             &key,
             Surface::Cli,
             None,
+            None,
             |_req, _key| Err("must not be called for PaymentSimulated".to_owned()),
         )
         .unwrap();
@@ -959,7 +963,7 @@ mod tests {
             .unwrap();
 
         let validated =
-            load_and_validate_entry(&store, &nonce, &ApproverIdentity::OsUid(uid)).unwrap();
+            load_and_validate_entry(&store, &nonce, &ApproverIdentity::OsUid(uid), &[]).unwrap();
         assert_eq!(validated.approval_nonce, nonce);
     }
 
@@ -979,6 +983,7 @@ mod tests {
             &store,
             &nonce,
             &ApproverIdentity::OsUid("different-uid".to_owned()),
+            &[],
         )
         .unwrap_err();
         assert!(

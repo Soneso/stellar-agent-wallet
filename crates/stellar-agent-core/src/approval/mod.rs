@@ -59,6 +59,7 @@ pub mod assertion_input;
 pub mod attest;
 pub mod attestation;
 pub mod error;
+pub mod operator_credentials;
 pub mod registration_input;
 pub mod retry;
 pub mod store;
@@ -77,6 +78,10 @@ pub use attestation::{
     verify_attestation, verify_toolset_gate_attestation,
 };
 pub use error::ApprovalError;
+pub use operator_credentials::{
+    OperatorApprovalCredential, OperatorApprovalCredentialStore,
+    default_operator_approval_credentials_path,
+};
 pub use registration_input::RegistrationInput;
 pub use retry::{DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, open_with_retry};
 pub use store::{
@@ -87,5 +92,5 @@ pub use toolset_grant::{
     TOOLSET_GRANT_DEFAULT_TTL_MS, ToolsetGrant, ToolsetGrantStore, build_attested_grant,
     default_toolset_grants_path,
 };
-pub use user_id::{ApproverIdentity, process_uid_for_attestation};
+pub use user_id::{ApproverIdentity, VerifiedPasskeyAssertion, process_uid_for_attestation};
 pub use view::{ApprovalSummaryView, PendingApprovalView};

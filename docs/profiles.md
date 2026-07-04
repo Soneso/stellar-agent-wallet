@@ -138,6 +138,18 @@ which the 32-byte signing seed is resident in pinned, zeroize-on-drop memory.
 |-------|------|----------|---------|-------------|
 | `engine` | string | yes (in v2) | — | `"noop"` or `"v1"`. `noop`: testnet allow-all; mainnet read-only allowed; mainnet destructive operations refused with `policy.engine_required`. `v1`: signature-verified typed-criteria engine, first-match default-deny. Newly minted profiles default to `v1`; a profile migrated from v1 is set to `noop` explicitly. |
 
+### `[remote_approval]` block
+
+Optional; absent by default. Enables `approve serve --remote` — see
+[Remote approval](remote-approval.md) for the full setup walkthrough.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `enabled` | bool | no | `false` | Must be `true`, together with the CLI's `--confirm-remote-exposure` flag, for `--remote` to take effect. The profile block alone does not start remote mode. |
+| `bind` | string | yes (if block present) | — | Socket address to bind, e.g. `"0.0.0.0:8443"`. Must parse as a valid address; validated fail-closed before any TLS provisioning or bind attempt. |
+| `rp_id` | string | yes (if block present) | — | The WebAuthn Relying Party ID — a DNS hostname that resolves to this host from the approving device. Must NOT be an IP literal (WebAuthn Level 2 §5.1.2 forbids IP-literal Relying Party IDs); rejected fail-closed if it is one. |
+| `allowed_credentials` | array of strings | no | `[]` | Base64url WebAuthn credential IDs authorized to approve or reject. A credential enrolled via `approve operator enroll` but absent from this list is refused identically to an unknown credential. |
+
 ## Secret discipline
 
 No profile field holds a secret. The signer seed, nonce key, and every HMAC and

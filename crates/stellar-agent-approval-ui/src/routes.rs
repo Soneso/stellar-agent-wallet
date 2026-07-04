@@ -34,7 +34,7 @@ use crate::ServeState;
 use crate::auth::{
     CSRF_HEADER_NAME, SESSION_COOKIE_NAME, SessionState, session_cookie_value, verify_csrf,
 };
-use crate::decision::{Decision, Outcome, apply_decision};
+use crate::decision::{Decision, Outcome, RequestIdentity, apply_decision};
 use crate::templates::{render_detail_page, render_inbox_page, render_not_found_page};
 use crate::web;
 
@@ -350,7 +350,11 @@ async fn approve_post(
     if let Err(resp) = require_csrf(&session, &headers, &nonce) {
         return resp;
     }
-    let outcome = apply_decision(&state.ctx, Decision::Approve { nonce });
+    let outcome = apply_decision(
+        &state.ctx,
+        Decision::Approve { nonce },
+        &RequestIdentity::Local,
+    );
     outcome_to_response(outcome)
 }
 
@@ -367,7 +371,11 @@ async fn reject_post(
     if let Err(resp) = require_csrf(&session, &headers, &nonce) {
         return resp;
     }
-    let outcome = apply_decision(&state.ctx, Decision::Reject { nonce });
+    let outcome = apply_decision(
+        &state.ctx,
+        Decision::Reject { nonce },
+        &RequestIdentity::Local,
+    );
     outcome_to_response(outcome)
 }
 

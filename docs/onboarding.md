@@ -73,7 +73,10 @@ Two guardrail features frame all of it:
 - **The approval inbox** is where held actions wait for you. Run it as a
   terminal command (`stellar-agent approve list`) or as a small local web
   page (`stellar-agent approve serve`) that updates live, notifies you when
-  something arrives, and shows exactly what the agent wants to do.
+  something arrives, and shows exactly what the agent wants to do. If the
+  agent runs on a different machine, [remote approval](remote-approval.md)
+  lets you review and approve from another device over TLS with a passkey,
+  no SSH tunnel required.
 
 ## What it costs you to trust it
 

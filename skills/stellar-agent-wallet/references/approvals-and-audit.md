@@ -143,8 +143,11 @@ of pending entries:
   hard cap on pending entries (expired entries pruned first) and a default entry
   TTL of 24 hours.
 
-Entry kinds: `PaymentSimulated`, `SignWithPasskey`, `RegisterPasskey`,
-`ToolsetFirstInvokeGate`, `TrustlineClawbackOptIn`.
+Entry kinds: `PaymentSimulated`, `ClaimSimulated`, `SignWithPasskey`,
+`RegisterPasskey`, `ToolsetFirstInvokeGate`, `TrustlineClawbackOptIn`. A
+seventh kind, `Rejected`, is not a fresh entry an agent's build/simulate step
+creates — it is the short-TTL tombstone the store writes in place of an entry
+after the operator rejects it.
 
 ### What `approve` does
 
@@ -163,7 +166,7 @@ Per kind:
 
 | Kind | What `approve` records |
 |---|---|
-| `PaymentSimulated` | Computes the HMAC attestation over the envelope SHA-256 and persists it; returns `approval_attestation`. |
+| `PaymentSimulated` / `ClaimSimulated` | Computes the HMAC attestation over the envelope SHA-256 and persists it; returns `approval_attestation`. Both kinds share the same attestation path. |
 | `TrustlineClawbackOptIn` | Computes a domain-separated HMAC over `(network, code, issuer)` and stores it; the trustline gate recomputes and verifies it. No `approval_attestation` returned. |
 | `ToolsetFirstInvokeGate` | Builds and persists a time-boxed toolset grant, then consumes (removes) the pending entry. Does not set an attestation blob on the entry. No `approval_attestation` returned. |
 
@@ -234,6 +237,42 @@ stellar-agent approve gc --profile default
 ```json
 {"ok":true,"data":{"profile":"default","evicted_count":3},"request_id":"..."}
 ```
+
+## Operator approval surfaces
+
+The agent's job is the same regardless of how the operator consents: present
+the `approval_nonce` from the simulate/build response, wait for the operator
+to produce an `approval_attestation`, then call the matching `*_commit` tool
+with it. Three surfaces exist for the operator side of that handshake:
+
+- **CLI, one at a time** — `stellar-agent approve --id <NONCE>` (above), or
+  `stellar-agent approve list` to enumerate every pending entry first
+  (read-only; `--include-expired` also shows expired ones).
+- **Loopback web inbox** — `stellar-agent approve serve` binds a local HTTP
+  server and opens a browser to the pending-approval queue, so the operator
+  clicks Approve/Reject per entry instead of running `approve --id` per nonce.
+- **Remote approval** — `stellar-agent approve serve --remote
+  --confirm-remote-exposure` binds a TLS-protected listener reachable from a
+  device other than the wallet host, authenticated by a registered WebAuthn
+  passkey, for when the agent runs on a headless machine. Every approve or
+  reject additionally requires a fresh passkey assertion bound to the exact
+  entry.
+
+None of this changes what the agent does or what an attestation proves — see
+"The attestation" above. Setup for remote approval (the profile's
+`[remote_approval]` block, enrolling a passkey via `approve operator enroll`,
+the trust model, DNS requirements) is out of scope here; see
+`docs/remote-approval.md` in the wallet repository for the full operator
+guide.
+
+A remote approve or reject is recorded in the audit log under
+`ApprovalAttestedRemote` / `ApprovalRejectedRemote` event kinds rather than
+the loopback `ApprovalAttested` / `ApprovalRejected` ones — the distinguishing
+detail when reading the audit log directly. Both remote kinds also carry
+`operator_credential_id_redacted`, a stable, non-reversible pseudonym for
+which passkey credential consented (the first 8 hex characters of
+`SHA-256(credential_id_b64url)`); nothing else about the attestation or its
+binding differs from a local approval.
 
 ## First-invoke gate vs. per-action payment approval
 

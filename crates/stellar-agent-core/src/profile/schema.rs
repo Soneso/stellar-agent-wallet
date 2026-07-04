@@ -685,6 +685,18 @@ pub struct Profile {
     /// `pool_master_key_id`; no secrets are stored in this struct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_config: Option<PoolConfig>,
+
+    /// Remote-approval HTTP surface configuration.
+    ///
+    /// `None` (the default) means remote approval is off: `approve serve`
+    /// stays bound to loopback regardless of any other flag. Configuring
+    /// this block is necessary but not sufficient to expose the surface
+    /// beyond loopback — `approve serve --remote` additionally requires an
+    /// explicit process-level consent flag at start time, matching the
+    /// `--confirm-*` pattern used for other risky-write exceptions. A
+    /// profile alone cannot silently turn on network exposure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_approval: Option<RemoteApprovalConfig>,
 }
 
 /// A single channel record within the channel-account pool.
@@ -773,6 +785,90 @@ impl PoolConfig {
     }
 }
 
+/// Configuration for the network-exposed remote-approval HTTP surface.
+///
+/// Stored as `[remote_approval]` in the profile TOML via
+/// `Profile.remote_approval: Option<RemoteApprovalConfig>`. Absent by
+/// default: remote approval is off unless the operator explicitly writes
+/// this block.
+///
+/// ```toml
+/// [remote_approval]
+/// enabled = true
+/// bind = "0.0.0.0:8443"
+/// rp_id = "wallet.internal"
+/// allowed_credentials = ["<credential_id_b64url>"]
+/// ```
+///
+/// # Security
+///
+/// This block only carries configuration; on its own it does not expose
+/// anything to the network. `approve serve --remote` additionally requires
+/// an explicit process-level consent flag before binding beyond loopback.
+///
+/// `allowed_credentials` is the authorization allowlist
+/// `crate::approval::user_id::ApproverIdentity::is_authorized_for_entry`
+/// consults for a `PasskeyCredential` identity: an assertion for a
+/// credential ID absent from this list is refused by the in-core gate
+/// regardless of what the HTTP layer verified.
+///
+/// `rp_id` MUST be a DNS hostname, never an IP literal — WebAuthn Level 2
+/// §5.1.2 forbids IP-literal Relying Party IDs.
+///
+/// # Debug redaction
+///
+/// `Debug` is hand-implemented to redact each entry of `allowed_credentials`
+/// to first-5-last-5 form (the same discipline used for credential IDs
+/// elsewhere in the wallet); `bind` and `rp_id` are not secret and are shown
+/// verbatim.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RemoteApprovalConfig {
+    /// Enables the remote-approval HTTP surface when `true`.
+    ///
+    /// `approve serve --remote` refuses to bind beyond loopback unless this
+    /// is `true` AND the operator passes the process's explicit consent
+    /// flag. Defaults to `false` when omitted, so a `[remote_approval]`
+    /// block written without this key is off by default rather than
+    /// silently enabled.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Socket address the remote-approval listener binds to (e.g.
+    /// `"0.0.0.0:8443"`).
+    pub bind: String,
+
+    /// WebAuthn Relying Party ID: a DNS hostname, never an IP literal.
+    ///
+    /// The operator must give the wallet host a resolvable name from the
+    /// approving device and reach it as `https://<rp_id>:<port>`.
+    pub rp_id: String,
+
+    /// Base64url WebAuthn credential IDs authorized to consent to pending
+    /// approvals over the remote surface.
+    ///
+    /// Defaults to an empty list when omitted — fail-closed: no credential
+    /// is authorized until the operator explicitly lists one.
+    #[serde(default)]
+    pub allowed_credentials: Vec<String>,
+}
+
+impl std::fmt::Debug for RemoteApprovalConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_credentials: Vec<String> = self
+            .allowed_credentials
+            .iter()
+            .map(|c| crate::redact_first5_last5(c))
+            .collect();
+        f.debug_struct("RemoteApprovalConfig")
+            .field("enabled", &self.enabled)
+            .field("bind", &self.bind)
+            .field("rp_id", &self.rp_id)
+            .field("allowed_credentials", &redacted_credentials)
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for Profile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // `rpc_url` and `secondary_rpc_url` are redacted because they may
@@ -820,6 +916,7 @@ impl std::fmt::Debug for Profile {
             )
             .field("pool_master_key_id", &self.pool_master_key_id)
             .field("pool_config", &self.pool_config)
+            .field("remote_approval", &self.remote_approval)
             .finish()
     }
 }
@@ -1269,6 +1366,9 @@ impl ProfileBuilder {
             // Pool not yet initialised in newly-built profiles.
             pool_master_key_id: None,
             pool_config: None,
+            // Remote approval is off by default; the operator opts in by
+            // writing a `[remote_approval]` block to the profile TOML.
+            remote_approval: None,
         }
     }
 }
@@ -1563,6 +1663,54 @@ pub fn default_toolsets_dir() -> Result<PathBuf, StateDirError> {
     let dirs =
         directories::ProjectDirs::from("", "Soneso", "stellar-agent").ok_or(StateDirError)?;
     Ok(dirs.data_local_dir().join("toolsets"))
+}
+
+/// Returns the OS-conventional operator-approval credential registry
+/// directory.
+///
+/// Per-profile operator-approval credential registries are stored as
+/// `<dir>/<profile_name>.toml`. This is a distinct directory from
+/// [`default_passkeys_dir`]: the two registries hold credentials for
+/// different trust roles (smart-account transaction signing vs. consenting
+/// to a pending wallet-controlled approval from a remote device) and must
+/// never be conflated by sharing storage.
+///
+/// - Linux: `~/.local/share/stellar-agent/operator-approval-credentials/`
+///   (`$XDG_DATA_HOME/stellar-agent/operator-approval-credentials/` when
+///   `$XDG_DATA_HOME` is set)
+/// - macOS: `~/Library/Application Support/stellar-agent/operator-approval-credentials/`
+/// - Windows: `%LOCALAPPDATA%\stellar-agent\operator-approval-credentials\`
+///
+/// Tests may set `STELLAR_AGENT_HOME` to redirect this directory to
+/// `$STELLAR_AGENT_HOME/operator-approval-credentials`. The env-var read is
+/// gated behind `#[cfg(any(test, feature = "test-helpers"))]` so production
+/// release builds never honour it, closing the env-injection
+/// credential-store-swap attack surface.
+///
+/// # Errors
+///
+/// Returns [`StateDirError`] when the platform directories library cannot
+/// determine the user's data-local directory.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::profile::schema::default_operator_approval_credentials_dir;
+///
+/// // Returns Ok on any platform where home-dir resolution succeeds.
+/// if let Ok(dir) = default_operator_approval_credentials_dir() {
+///     assert!(dir.ends_with("operator-approval-credentials"));
+/// }
+/// ```
+pub fn default_operator_approval_credentials_dir() -> Result<PathBuf, StateDirError> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    if let Some(home) = std::env::var_os("STELLAR_AGENT_HOME") {
+        return Ok(PathBuf::from(home).join("operator-approval-credentials"));
+    }
+
+    let dirs =
+        directories::ProjectDirs::from("", "Soneso", "stellar-agent").ok_or(StateDirError)?;
+    Ok(dirs.data_local_dir().join("operator-approval-credentials"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2071,6 +2219,26 @@ mod tests {
         );
     }
 
+    /// `default_operator_approval_credentials_dir` returns a path ending with
+    /// the `operator-approval-credentials` component, distinct from
+    /// `default_passkeys_dir`.
+    #[test]
+    fn default_operator_approval_credentials_dir_ends_with_expected_component() {
+        let dir = default_operator_approval_credentials_dir()
+            .expect("default_operator_approval_credentials_dir must succeed on CI");
+        assert!(
+            dir.ends_with("operator-approval-credentials"),
+            "must end with 'operator-approval-credentials' component: {dir:?}"
+        );
+
+        let passkeys_dir = default_passkeys_dir().expect("default_passkeys_dir must succeed on CI");
+        assert_ne!(
+            dir, passkeys_dir,
+            "operator-approval credential dir must be distinct from the smart-account \
+             passkeys dir"
+        );
+    }
+
     // ── KeyringEntryRef helpers ───────────────────────────────────────────────
 
     #[test]
@@ -2404,6 +2572,75 @@ mod tests {
         assert!(
             p.pool_config.is_none(),
             "pool_config must be None in a newly built profile"
+        );
+    }
+
+    // ── remote_approval is None by default, and round-trips when set ─────────
+
+    #[test]
+    fn remote_approval_none_in_new_profile() {
+        let p = make_testnet_profile();
+        assert!(
+            p.remote_approval.is_none(),
+            "remote_approval must be None in a newly built profile"
+        );
+        let toml_str = toml::to_string(&p).unwrap();
+        assert!(
+            !toml_str.contains("remote_approval"),
+            "absent remote_approval must be omitted from serialised TOML: {toml_str}"
+        );
+    }
+
+    #[test]
+    fn remote_approval_serde_round_trip_when_set() {
+        let mut p = make_testnet_profile();
+        p.remote_approval = Some(RemoteApprovalConfig {
+            enabled: true,
+            bind: "0.0.0.0:8443".to_owned(),
+            rp_id: "wallet.internal".to_owned(),
+            allowed_credentials: vec!["AABBCCDDEEFFGGHHIIJJKK".to_owned()],
+        });
+        let toml_str = toml::to_string(&p).unwrap();
+        let restored: Profile = toml::from_str(&toml_str).unwrap();
+        let cfg = restored
+            .remote_approval
+            .expect("remote_approval must round-trip");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.bind, "0.0.0.0:8443");
+        assert_eq!(cfg.rp_id, "wallet.internal");
+        assert_eq!(cfg.allowed_credentials, vec!["AABBCCDDEEFFGGHHIIJJKK"]);
+    }
+
+    #[test]
+    fn remote_approval_enabled_defaults_to_false_when_omitted() {
+        let toml_str = "bind = \"0.0.0.0:8443\"\nrp_id = \"wallet.internal\"\n";
+        let cfg: RemoteApprovalConfig = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.enabled, "enabled must default to false when omitted");
+        assert!(
+            cfg.allowed_credentials.is_empty(),
+            "allowed_credentials must default to empty when omitted"
+        );
+    }
+
+    /// `Debug` output for `RemoteApprovalConfig` must redact allowlisted
+    /// credential IDs, matching the redaction discipline used for credential
+    /// IDs elsewhere in the wallet.
+    #[test]
+    fn remote_approval_config_debug_redacts_credential_ids() {
+        let cfg = RemoteApprovalConfig {
+            enabled: true,
+            bind: "0.0.0.0:8443".to_owned(),
+            rp_id: "wallet.internal".to_owned(),
+            allowed_credentials: vec!["AABBCCDDEEFFGGHHIIJJKK".to_owned()],
+        };
+        let debug_str = format!("{cfg:?}");
+        assert!(
+            !debug_str.contains("AABBCCDDEEFFGGHHIIJJKK"),
+            "full credential ID must not appear in Debug output: {debug_str}"
+        );
+        assert!(
+            debug_str.contains("wallet.internal"),
+            "rp_id is not secret and should appear verbatim: {debug_str}"
         );
     }
 

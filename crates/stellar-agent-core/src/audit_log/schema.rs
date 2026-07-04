@@ -1742,6 +1742,74 @@ pub enum EventKind {
         /// Which origin rejected the entry: `"cli"` or `"serve"`.
         origin: String,
     },
+
+    /// A pending approval was attested (approved) by an operator
+    /// authenticated over the remote-approval HTTP surface via a WebAuthn
+    /// passkey assertion, rather than the OS process boundary.
+    ///
+    /// `ApprovalAttested` carries an `origin` string but no attribution of
+    /// which credential consented; a remote approval MUST additionally
+    /// record which operator credential attested, which is a new field on a
+    /// hash-chained event that forbids adding fields to an existing variant
+    /// after it has shipped. This variant exists instead of widening
+    /// `ApprovalAttested` for that reason — see `EventKind`'s module-level
+    /// additivity rule.
+    ///
+    /// # Field redaction
+    ///
+    /// `nonce_prefix` and `envelope_sha256_hex` follow the same redaction
+    /// discipline as `ApprovalAttested`. `operator_credential_id_redacted`
+    /// is a stable, non-reversible per-operator pseudonym: the first 8 hex
+    /// characters of `SHA-256(credential_id_b64url)`. It is deterministic —
+    /// the same operator credential always produces the same tag across
+    /// rows, so the audit trail can distinguish operators and correlate
+    /// their actions over time — but it is one-way: the tag cannot be
+    /// inverted back to the credential ID. It is linkable, not anonymous.
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; existing wildcard-match arms in
+    /// `audit verify` continue to compile.
+    ApprovalAttestedRemote {
+        /// `ApprovalKind::kind_name()` of the attested entry.
+        approval_kind: String,
+        /// MCP tool this approval gates (e.g. `"stellar_pay_commit"`).
+        gated_tool: String,
+        /// Hex-encoded SHA-256 of the envelope XDR bytes, for
+        /// `PaymentSimulated` and `ClaimSimulated` entries.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        envelope_sha256_hex: Option<String>,
+        /// First 8 characters of the approval nonce.
+        nonce_prefix: String,
+        /// First 8 hex characters of `SHA-256(credential_id_b64url)` of the
+        /// operator credential that attested — a stable, non-reversible
+        /// per-operator pseudonym, never the raw credential ID.
+        operator_credential_id_redacted: String,
+    },
+
+    /// A pending approval was rejected by an operator authenticated over the
+    /// remote-approval HTTP surface via a WebAuthn passkey assertion.
+    ///
+    /// Additive schema: the field set mirrors `ApprovalAttestedRemote` minus
+    /// the attestation-specific fields, defined up front alongside it
+    /// because the hash-chained log forbids adding fields to an existing
+    /// variant later.
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; existing wildcard-match arms in
+    /// `audit verify` continue to compile.
+    ApprovalRejectedRemote {
+        /// `ApprovalKind::kind_name()` of the rejected entry.
+        approval_kind: String,
+        /// First 8 characters of the approval nonce.
+        nonce_prefix: String,
+        /// First 8 hex characters of `SHA-256(credential_id_b64url)` of the
+        /// operator credential that rejected — see
+        /// [`Self::ApprovalAttestedRemote`] for the pseudonym's stability
+        /// and non-reversibility properties.
+        operator_credential_id_redacted: String,
+    },
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -2985,6 +3053,147 @@ mod tests {
             "AAAAAAAAAAAAAAAAAAAAAA",
             "cli",
             "00000000-0000-0000-0000-0000000000a2",
+        );
+        let s = serde_json::to_string(&rejected).unwrap();
+        assert_eq!(
+            s.matches("\"request_id\"").count(),
+            1,
+            "exactly one request_id key must appear: {s}"
+        );
+        let back: AuditEntry = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.request_id, rejected.request_id);
+    }
+
+    /// Asserts `ApprovalAttestedRemote` serialises with the correct wire
+    /// discriminant and all required fields, and round-trips cleanly.
+    #[test]
+    fn event_kind_approval_attested_remote_round_trip() {
+        let ev = EventKind::ApprovalAttestedRemote {
+            approval_kind: "PaymentSimulated".to_owned(),
+            gated_tool: "stellar_pay_commit".to_owned(),
+            envelope_sha256_hex: Some("a".repeat(64)),
+            nonce_prefix: "AAAAAAAA".to_owned(),
+            operator_credential_id_redacted: "deadbeef".to_owned(),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: EventKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(ev, back, "ApprovalAttestedRemote must round-trip cleanly");
+        assert!(
+            s.contains("\"approval_attested_remote\""),
+            "wire discriminant must be 'approval_attested_remote': {s}"
+        );
+        assert!(s.contains("\"approval_kind\""), "approval_kind field: {s}");
+        assert!(s.contains("\"gated_tool\""), "gated_tool field: {s}");
+        assert!(
+            s.contains("\"envelope_sha256_hex\""),
+            "envelope_sha256_hex field: {s}"
+        );
+        assert!(s.contains("\"nonce_prefix\""), "nonce_prefix field: {s}");
+        assert!(
+            s.contains("\"operator_credential_id_redacted\""),
+            "operator_credential_id_redacted field: {s}"
+        );
+    }
+
+    /// `envelope_sha256_hex` is sparse on `ApprovalAttestedRemote` for the
+    /// same reason as on `ApprovalAttested`: absent for kinds with no signed
+    /// envelope.
+    #[test]
+    fn event_kind_approval_attested_remote_omits_absent_envelope_hash() {
+        let ev = EventKind::ApprovalAttestedRemote {
+            approval_kind: "ToolsetFirstInvokeGate".to_owned(),
+            gated_tool: "toolset:my-toolset:sign-payment".to_owned(),
+            envelope_sha256_hex: None,
+            nonce_prefix: "AAAAAAAA".to_owned(),
+            operator_credential_id_redacted: "deadbeef".to_owned(),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: EventKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(ev, back);
+        assert!(
+            !s.contains("envelope_sha256_hex"),
+            "absent envelope_sha256_hex must be skipped, not null: {s}"
+        );
+    }
+
+    /// `ApprovalAttestedRemote` with missing required fields MUST fail to
+    /// deserialise.
+    #[test]
+    fn event_kind_approval_attested_remote_missing_fields_fail() {
+        let json = r#"{"kind":"approval_attested_remote"}"#;
+        let result: Result<EventKind, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "missing-field deserialisation must fail for ApprovalAttestedRemote"
+        );
+    }
+
+    /// Asserts `ApprovalRejectedRemote` serialises with the correct wire
+    /// discriminant and all required fields, and round-trips cleanly.
+    #[test]
+    fn event_kind_approval_rejected_remote_round_trip() {
+        let ev = EventKind::ApprovalRejectedRemote {
+            approval_kind: "PaymentSimulated".to_owned(),
+            nonce_prefix: "BBBBBBBB".to_owned(),
+            operator_credential_id_redacted: "cafebabe".to_owned(),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: EventKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(ev, back, "ApprovalRejectedRemote must round-trip cleanly");
+        assert!(
+            s.contains("\"approval_rejected_remote\""),
+            "wire discriminant must be 'approval_rejected_remote': {s}"
+        );
+        assert!(s.contains("\"approval_kind\""), "approval_kind field: {s}");
+        assert!(s.contains("\"nonce_prefix\""), "nonce_prefix field: {s}");
+        assert!(
+            s.contains("\"operator_credential_id_redacted\""),
+            "operator_credential_id_redacted field: {s}"
+        );
+    }
+
+    /// `ApprovalRejectedRemote` with missing required fields MUST fail to
+    /// deserialise.
+    #[test]
+    fn event_kind_approval_rejected_remote_missing_fields_fail() {
+        let json = r#"{"kind":"approval_rejected_remote"}"#;
+        let result: Result<EventKind, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "missing-field deserialisation must fail for ApprovalRejectedRemote"
+        );
+    }
+
+    /// Neither new remote variant's fields collide with the flattened outer
+    /// `AuditEntry::request_id` — a full `AuditEntry` round-trip must produce
+    /// exactly one `request_id` key and deserialise back cleanly (the
+    /// serde-flatten collision class documented on `SaContextRuleNameUpdated`).
+    #[test]
+    fn approval_attested_remote_and_rejected_remote_do_not_collide_with_outer_request_id() {
+        use crate::audit_log::entry::AuditEntry;
+
+        let attested = AuditEntry::new_approval_attested_remote(
+            "PaymentSimulated",
+            "stellar_pay_commit",
+            Some("a".repeat(64)),
+            "AAAAAAAAAAAAAAAAAAAAAA",
+            "enrolled-operator-cred-id",
+            "00000000-0000-0000-0000-0000000000b1",
+        );
+        let s = serde_json::to_string(&attested).unwrap();
+        assert_eq!(
+            s.matches("\"request_id\"").count(),
+            1,
+            "exactly one request_id key must appear: {s}"
+        );
+        let back: AuditEntry = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.request_id, attested.request_id);
+
+        let rejected = AuditEntry::new_approval_rejected_remote(
+            "PaymentSimulated",
+            "AAAAAAAAAAAAAAAAAAAAAA",
+            "enrolled-operator-cred-id",
+            "00000000-0000-0000-0000-0000000000b2",
         );
         let s = serde_json::to_string(&rejected).unwrap();
         assert_eq!(

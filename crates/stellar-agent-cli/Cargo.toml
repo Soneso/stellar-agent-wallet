@@ -57,6 +57,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "signal", "sync"] }
 tracing = { workspace = true }
 # Localhost approval-inbox web UI for `approve serve`.
 stellar-agent-approval-ui = { workspace = true }
+# TLS-protected, passkey-authenticated remote approval for `approve serve --remote`.
+stellar-agent-approval-remote = { workspace = true }
 # Secret-key parsing from --secret-env (pay.rs).
 stellar-strkey = { workspace = true }
 # XDR envelope signing — TransactionEnvelope, SEP-23 payload (pay.rs).

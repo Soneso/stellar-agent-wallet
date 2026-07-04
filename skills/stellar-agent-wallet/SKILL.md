@@ -1,6 +1,6 @@
 ---
 name: stellar-agent-wallet
-description: Operate the Stellar Agent Wallet — a self-custodial Stellar wallet built for AI agents — through its stellar-agent CLI and stellar-agent-mcp MCP server. Use when an agent needs to read Stellar account state, send XLM or asset payments, create accounts, manage trustlines, run OpenZeppelin smart-account governance, lend/trade/deposit on DeFi, or handle SEP and x402 flows, all under a local policy engine, an operator-approval gate, and a tamper-evident audit log. Covers the two-phase build-then-commit signing pattern, the simulate-approve-commit handshake, chain_id and the JSON result envelope, and the mainnet write gate. Reach for it when the user mentions the stellar-agent wallet, an AI-agent wallet on Stellar, MCP-driven Stellar payments, or autonomous-agent key custody.
+description: Operate the Stellar Agent Wallet — a self-custodial Stellar wallet built for AI agents — through its stellar-agent CLI and stellar-agent-mcp MCP server. Use when an agent needs to read Stellar account state, send XLM or asset payments, create accounts, manage trustlines, claim claimable balances, run OpenZeppelin smart-account governance, lend/trade/deposit on DeFi, or handle SEP and x402 flows, all under a local policy engine, an operator-approval gate (satisfiable via the CLI, a local web inbox, or a TLS-protected remote-approval surface), and a tamper-evident audit log. Covers the two-phase build-then-commit signing pattern, the simulate-approve-commit handshake, chain_id and the JSON result envelope, and the mainnet write gate. Reach for it when the user mentions the stellar-agent wallet, an AI-agent wallet on Stellar, MCP-driven Stellar payments, or autonomous-agent key custody.
 license: Apache-2.0
 compatibility: Requires the stellar-agent CLI and stellar-agent-mcp server (v0.1.0-alpha.1 public alpha, built from source). Targets Stellar testnet (default) and mainnet.
 metadata:
@@ -138,9 +138,13 @@ If the policy engine returns `RequireApproval` (a V1 policy rule, the high-value
 cross-check, or any toolset-routed payment), the build call returns an `approval`
 block with an `approval_nonce` and the commit is held. The handshake:
 
-1. The operator runs `stellar-agent approve --id <approval_nonce>` in a trusted
-   context, reviews the wallet-rendered summary, and consents.
-2. That command returns an `approval_attestation` — an HMAC blob bound to that
+1. The operator consents out-of-band — `stellar-agent approve --id
+   <approval_nonce>` at a terminal, `approve list` / `approve serve` (a local
+   web inbox), or `approve serve --remote` (a TLS-protected, passkey-authenticated
+   inbox for a device other than the wallet host) — and reviews the
+   wallet-rendered summary before consenting. See
+   `references/approvals-and-audit.md` for all three surfaces.
+2. That step returns an `approval_attestation` — an HMAC blob bound to that
    exact envelope. The operator relays it to you.
 3. Re-invoke `stellar_pay_commit` with `approval_nonce` and `approval_attestation`
    added. The wallet verifies the attestation, then signs and submits.
@@ -153,8 +157,10 @@ transient error to retry blindly.
 
 `stellar_create_account` / `stellar_create_account_commit` fund and create a new
 account; `stellar_trustline` / `stellar_trustline_commit` add or change a
-trustline. Both follow the same two-phase build-then-commit pattern as payments.
-See `references/cli-reference.md` and `references/mcp-tools.md`.
+trustline. `stellar_claim` / `stellar_claim_commit` claim a Stellar claimable
+balance the agent already holds the id of, behind claimant/predicate/trustline
+guards. All three pairs follow the same two-phase build-then-commit pattern as
+payments. See `references/cli-reference.md` and `references/mcp-tools.md`.
 
 ## 5. Smart-account governance
 

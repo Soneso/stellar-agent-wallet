@@ -25,6 +25,7 @@ import sys
 # Minimum line-coverage percent per crate for the offline suite.
 FLOORS = {
     "stellar-agent-anchor": 93,
+    "stellar-agent-approval-remote": 83,
     "stellar-agent-approval-ui": 93,
     "stellar-agent-blend": 76,
     "stellar-agent-claimable": 94,

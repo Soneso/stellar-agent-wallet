@@ -2392,6 +2392,88 @@ impl AuditEntry {
         }
     }
 
+    /// Constructs an `ApprovalAttestedRemote` audit entry.
+    ///
+    /// Emitted after a remote-approval-surface attestation (or recorded
+    /// consent) is durably persisted, from an operator identity
+    /// authenticated by a WebAuthn passkey assertion rather than the OS
+    /// process boundary. `approval_nonce` is truncated internally to its
+    /// first 8 characters, and `operator_credential_id_b64url` is hashed
+    /// internally into its redacted pseudonym — callers MUST pass the full
+    /// nonce and the full credential ID, not pre-truncated or pre-hashed
+    /// values.
+    #[must_use]
+    pub fn new_approval_attested_remote(
+        approval_kind: impl Into<String>,
+        gated_tool: impl Into<String>,
+        envelope_sha256_hex: Option<String>,
+        approval_nonce: &str,
+        operator_credential_id_b64url: &str,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "approval.attested".to_owned(),
+            chain_id: None,
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::ApprovalAttestedRemote {
+                approval_kind: approval_kind.into(),
+                gated_tool: gated_tool.into(),
+                envelope_sha256_hex,
+                nonce_prefix: nonce_prefix8(approval_nonce),
+                operator_credential_id_redacted: pseudonymize_credential_id(
+                    operator_credential_id_b64url,
+                ),
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
+    /// Constructs an `ApprovalRejectedRemote` audit entry.
+    ///
+    /// Emitted after a pending approval is rejected by an operator
+    /// authenticated over the remote-approval HTTP surface.
+    /// `approval_nonce` is truncated internally to its first 8 characters,
+    /// and `operator_credential_id_b64url` is hashed internally into its
+    /// redacted pseudonym — callers MUST pass the full nonce and the full
+    /// credential ID.
+    #[must_use]
+    pub fn new_approval_rejected_remote(
+        approval_kind: impl Into<String>,
+        approval_nonce: &str,
+        operator_credential_id_b64url: &str,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "approval.rejected".to_owned(),
+            chain_id: None,
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::ApprovalRejectedRemote {
+                approval_kind: approval_kind.into(),
+                nonce_prefix: nonce_prefix8(approval_nonce),
+                operator_credential_id_redacted: pseudonymize_credential_id(
+                    operator_credential_id_b64url,
+                ),
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
     /// Returns the canonical JSON bytes used as the hash-input body.
     ///
     /// The `previous_entry_hash` field is set to `""` (empty string) in the
@@ -2618,6 +2700,24 @@ fn nonce_prefix8(nonce: &str) -> String {
     nonce
         .get(..8)
         .map_or_else(|| nonce.to_owned(), ToOwned::to_owned)
+}
+
+/// Derives a stable, non-reversible per-operator pseudonym for a
+/// remote-approval operator credential ID: the first 8 hex characters of
+/// `SHA-256(credential_id_b64url)`.
+///
+/// Deterministic — the same credential ID always produces the same tag, so
+/// audit rows from the same operator correlate — but one-way: the tag cannot
+/// be inverted back to the credential ID. Distinct from
+/// [`redact_credential_id_b64url`], which preserves a partial view of the
+/// original string (first-5-last-5) rather than a hash; the audit-log
+/// attribution field intentionally uses the non-reversible form because it
+/// is persisted indefinitely in a hash-chained log that operators may share
+/// for forensic review.
+fn pseudonymize_credential_id(credential_id_b64url: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(credential_id_b64url.as_bytes());
+    digest[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -3342,6 +3442,90 @@ mod tests {
         let id = "ABCD"; // 4 chars — below minimum
         let redacted = redact_credential_id_b64url(id);
         assert_eq!(redacted, "ABCD");
+    }
+
+    /// `pseudonymize_credential_id` produces a deterministic 8-hex-character
+    /// tag and never leaks the raw credential ID substring into its output.
+    #[test]
+    fn pseudonymize_credential_id_is_deterministic_and_redacted() {
+        let id = "enrolled-operator-cred-id";
+        let tag1 = pseudonymize_credential_id(id);
+        let tag2 = pseudonymize_credential_id(id);
+        assert_eq!(tag1, tag2, "same credential ID must produce the same tag");
+        assert_eq!(tag1.len(), 8, "tag must be exactly 8 hex characters");
+        assert!(
+            tag1.chars().all(|c| c.is_ascii_hexdigit()),
+            "tag must be lowercase hex: {tag1}"
+        );
+        assert!(
+            !tag1.contains(id),
+            "raw credential ID must not appear in its pseudonym"
+        );
+    }
+
+    /// Distinct credential IDs produce distinct tags (no trivial collision
+    /// for adjacent test-fixture-shaped inputs).
+    #[test]
+    fn pseudonymize_credential_id_differs_across_distinct_ids() {
+        let tag_a = pseudonymize_credential_id("operator-credential-a");
+        let tag_b = pseudonymize_credential_id("operator-credential-b");
+        assert_ne!(tag_a, tag_b, "distinct credential IDs must not collide");
+    }
+
+    /// `new_approval_attested_remote` hashes the credential ID into the
+    /// redacted pseudonym rather than storing it verbatim, and truncates the
+    /// nonce exactly as `new_approval_attested` does.
+    #[test]
+    fn new_approval_attested_remote_hashes_credential_id() {
+        let entry = AuditEntry::new_approval_attested_remote(
+            "PaymentSimulated",
+            "stellar_pay_commit",
+            Some("a".repeat(64)),
+            "AAAAAAAAAAAAAAAAAAAAAA",
+            "enrolled-operator-cred-id",
+            "req-remote-attest-001",
+        );
+        assert_eq!(entry.tool, "approval.attested");
+        let EventKind::ApprovalAttestedRemote {
+            nonce_prefix,
+            operator_credential_id_redacted,
+            ..
+        } = &entry.event_kind
+        else {
+            panic!("expected ApprovalAttestedRemote");
+        };
+        assert_eq!(nonce_prefix, "AAAAAAAA");
+        assert_eq!(
+            *operator_credential_id_redacted,
+            pseudonymize_credential_id("enrolled-operator-cred-id")
+        );
+        assert!(!operator_credential_id_redacted.contains("enrolled-operator-cred-id"));
+    }
+
+    /// `new_approval_rejected_remote` mirrors the same hashing and
+    /// truncation discipline.
+    #[test]
+    fn new_approval_rejected_remote_hashes_credential_id() {
+        let entry = AuditEntry::new_approval_rejected_remote(
+            "PaymentSimulated",
+            "BBBBBBBBBBBBBBBBBBBBBB",
+            "enrolled-operator-cred-id",
+            "req-remote-reject-001",
+        );
+        assert_eq!(entry.tool, "approval.rejected");
+        let EventKind::ApprovalRejectedRemote {
+            nonce_prefix,
+            operator_credential_id_redacted,
+            ..
+        } = &entry.event_kind
+        else {
+            panic!("expected ApprovalRejectedRemote");
+        };
+        assert_eq!(nonce_prefix, "BBBBBBBB");
+        assert_eq!(
+            *operator_credential_id_redacted,
+            pseudonymize_credential_id("enrolled-operator-cred-id")
+        );
     }
 
     /// `new_passkey_registered` with `timeout` status round-trips through

@@ -457,6 +457,7 @@ pub fn load_from_path(
         secondary_rpc_url: partial.secondary_rpc_url,
         pool_master_key_id: partial.pool_master_key_id,
         pool_config: partial.pool_config,
+        remote_approval: partial.remote_approval,
     };
 
     // ── Step 5: validate rpc_url.
@@ -768,6 +769,7 @@ pub fn load_with_overlay_from_dir(
         secondary_rpc_url: partial.secondary_rpc_url,
         pool_master_key_id: partial.pool_master_key_id,
         pool_config: partial.pool_config,
+        remote_approval: partial.remote_approval,
     };
 
     profile
@@ -923,6 +925,10 @@ struct PartialProfile {
     /// `None` when the pool has not been initialised.
     #[serde(default)]
     pool_config: Option<super::schema::PoolConfig>,
+    /// Remote-approval HTTP surface configuration. Absent from profiles
+    /// predating remote approval; defaults to `None` (off).
+    #[serde(default)]
+    remote_approval: Option<super::schema::RemoteApprovalConfig>,
 }
 
 fn require_policy_section(

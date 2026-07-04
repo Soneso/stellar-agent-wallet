@@ -1,0 +1,100 @@
+[package]
+name = "stellar-agent-approval-remote"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "TLS-protected, passkey-authenticated remote approval HTTP surface for the Stellar agent wallet: lets an operator approve or reject pending agent actions from a device other than the wallet host."
+publish = false
+
+[lib]
+name = "stellar_agent_approval_remote"
+
+[dependencies]
+stellar-agent-core = { workspace = true }
+stellar-agent-approval-ui = { workspace = true }
+stellar-agent-smart-account = { workspace = true }
+stellar-agent-loopback-http = { workspace = true }
+
+axum = { workspace = true }
+axum-server = { workspace = true, features = ["tls-rustls-no-provider"] }
+# Pinned to the ring crypto provider explicitly: rustls / tokio-rustls default
+# to aws-lc-rs, which would pull a second, unvetted crypto backend into the
+# graph alongside the ring/rustls stack reqwest's rustls-tls feature already
+# brings in (root Cargo.toml). `axum-server` itself disables default features
+# on both, so this crate's own feature selection is the only source of a
+# crypto provider for the shared dependency.
+rustls = { workspace = true, features = ["ring", "std", "tls12"] }
+tokio-rustls = { workspace = true, features = ["ring", "tls12"] }
+rustls-pki-types = { workspace = true, features = ["std"] }
+rcgen = { workspace = true, features = ["ring", "pem"] }
+
+tower = { workspace = true }
+tower-http = { workspace = true }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+subtle = { workspace = true }
+rand_core = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+directories = { workspace = true }
+tempfile = { workspace = true }
+p256 = { workspace = true, optional = true }
+
+[features]
+# Exposes the software-authenticator test helper (p256 keypair signing
+# authenticatorData || SHA-256(clientDataJSON)) to produce valid and
+# adversarial WebAuthn assertions in tests, without a real platform
+# authenticator. Never compiled into a production binary.
+test-helpers = ["dep:p256"]
+# Gate end-to-end testnet acceptance tests that require a live Friendbot +
+# RPC, a headless Chromium, and TLS-terminated loopback HTTP. NOT run under
+# default `cargo test`; invoke with:
+#   cargo test -p stellar-agent-approval-remote --features testnet-acceptance \
+#     --test remote_approval_browser_testnet_acceptance -- --ignored
+# CI/dev-only; MUST NOT be enabled in any release-artefact feature set.
+testnet-acceptance = ["test-helpers", "stellar-agent-mcp/test-helpers"]
+
+[dev-dependencies]
+stellar-agent-test-support = { workspace = true }
+serial_test = { workspace = true }
+keyring-core = { workspace = true }
+# Testnet-acceptance-only: WalletServer (simulate/commit spine), the network
+# client, a headless-Chromium CDP client for the shipped browser frontend, and
+# the WebAuthn-ceremony-adjacent signing/encoding helpers the acceptance test
+# needs to seed a virtual authenticator with a known keypair.
+stellar-agent-mcp = { workspace = true }
+stellar-agent-network = { workspace = true }
+chromiumoxide = { workspace = true }
+futures = { workspace = true }
+url = { workspace = true }
+ed25519-dalek = { workspace = true }
+stellar-strkey = { workspace = true }
+reqwest = { workspace = true }
+uuid = { workspace = true }
+zeroize = { workspace = true }
+rmcp = { workspace = true }
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-machete]
+# `rustls` / `tokio-rustls` / `rustls-pki-types` are never imported directly
+# by name in this crate's source — they exist solely to pin the `ring`
+# crypto-provider feature onto the shared `rustls` dependency edge that
+# `axum-server` (with `tls-rustls-no-provider`) also pulls in. Removing them
+# would silently let the shared dependency default back to `aws-lc-rs`,
+# reintroducing the second crypto backend `deny.toml` forbids. See the
+# comment above the `rustls` dependency declaration.
+ignored = ["rustls", "tokio-rustls", "rustls-pki-types"]

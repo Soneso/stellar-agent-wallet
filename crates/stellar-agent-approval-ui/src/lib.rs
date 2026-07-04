@@ -60,7 +60,9 @@ mod web;
 #[cfg(test)]
 mod tests;
 
-pub use decision::{Decision, DecisionContext, Outcome, REJECT_TOMBSTONE_TTL_MS, apply_decision};
+pub use decision::{
+    Decision, DecisionContext, Outcome, REJECT_TOMBSTONE_TTL_MS, RequestIdentity, apply_decision,
+};
 pub use error::{ServeShutdownError, ServeStartError};
 pub use stellar_agent_loopback_http::host_header::HostHeaderAllowlistLayer;
 pub use stellar_agent_loopback_http::origin_header::OriginHeaderAllowlistLayer;

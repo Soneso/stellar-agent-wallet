@@ -693,7 +693,10 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
                 // No rotation-handoff tracking needed; the hash-chain is
                 // maintained by the surrounding hash check.
             }
-            EventKind::ApprovalAttested { .. } | EventKind::ApprovalRejected { .. } => {
+            EventKind::ApprovalAttested { .. }
+            | EventKind::ApprovalRejected { .. }
+            | EventKind::ApprovalAttestedRemote { .. }
+            | EventKind::ApprovalRejectedRemote { .. } => {
                 // Approval lifecycle events. No rotation-handoff tracking
                 // needed; the hash-chain is maintained by the surrounding
                 // hash check.
@@ -1222,6 +1225,8 @@ mod tests {
             EventKind::SubmissionAuthMismatch { .. } => "submission_auth_mismatch",
             EventKind::ApprovalAttested { .. } => "approval_attested",
             EventKind::ApprovalRejected { .. } => "approval_rejected",
+            EventKind::ApprovalAttestedRemote { .. } => "approval_attested_remote",
+            EventKind::ApprovalRejectedRemote { .. } => "approval_rejected_remote",
         }
     }
 
@@ -1532,6 +1537,18 @@ mod tests {
                 nonce_prefix: "BBBBBBBB".to_owned(),
                 origin: "cli".to_owned(),
             },
+            EventKind::ApprovalAttestedRemote {
+                approval_kind: "PaymentSimulated".to_owned(),
+                gated_tool: "stellar_pay_commit".to_owned(),
+                envelope_sha256_hex: Some("a".repeat(64)),
+                nonce_prefix: "CCCCCCCC".to_owned(),
+                operator_credential_id_redacted: "deadbeef".to_owned(),
+            },
+            EventKind::ApprovalRejectedRemote {
+                approval_kind: "PaymentSimulated".to_owned(),
+                nonce_prefix: "DDDDDDDD".to_owned(),
+                operator_credential_id_redacted: "cafebabe".to_owned(),
+            },
         ]
     }
 
@@ -1760,6 +1777,8 @@ mod tests {
                 "sa_context_rule_valid_until_updated",
                 "approval_attested",
                 "approval_rejected",
+                "approval_attested_remote",
+                "approval_rejected_remote",
             ]
         );
     }

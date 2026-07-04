@@ -87,6 +87,25 @@ pub struct ServeArgs {
     /// Load the inbox with expired entries shown by default.
     #[arg(long = "include-expired")]
     pub include_expired: bool,
+
+    /// Bind the network-exposed, TLS-protected remote-approval surface
+    /// instead of the loopback approval-inbox server.
+    ///
+    /// Refuses to start unless the profile has a `[remote_approval]` block
+    /// with `enabled = true` AND `--confirm-remote-exposure` is also passed.
+    /// `--port` / `--no-open` / `--notify` / `--bell` / `--include-expired`
+    /// are ignored in this mode (the remote surface has its own bind address
+    /// from the profile config and no browser auto-launch).
+    #[arg(long = "remote")]
+    pub remote: bool,
+
+    /// Explicit consent to expose the approve/reject surface beyond
+    /// loopback. Required (together with the profile's `[remote_approval]`
+    /// block) for `--remote` to take effect; matches the `--confirm-*`
+    /// consent-flag pattern used for other risky-write exceptions elsewhere
+    /// in this CLI.
+    #[arg(long = "confirm-remote-exposure")]
+    pub confirm_remote_exposure: bool,
 }
 
 /// Runs `stellar-agent approve serve`.
@@ -157,6 +176,16 @@ pub async fn run(args: ServeArgs) -> i32 {
         None,
     );
 
+    if args.remote {
+        return run_remote(
+            &args,
+            &profile_name,
+            profile.remote_approval.as_ref(),
+            context,
+        )
+        .await;
+    }
+
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), args.port);
     let notify_enabled = matches!(args.notify, NotifyMode::On);
@@ -200,6 +229,142 @@ pub async fn run(args: ServeArgs) -> i32 {
         tracing::debug!(error = %e, "approve serve: shutdown did not complete cleanly");
     }
     0
+}
+
+/// Runs `stellar-agent approve serve --remote`.
+///
+/// Refuses to start (exit `1`) unless BOTH the profile carries a
+/// `[remote_approval]` block with `enabled = true` AND
+/// `--confirm-remote-exposure` was passed — the profile block alone can
+/// never silently turn on network exposure. Validates `bind` and `rp_id`
+/// fail-closed before touching TLS or the network: `rp_id` must be a DNS
+/// hostname, never an IP literal; `bind` must parse as a `SocketAddr`.
+///
+/// # Panics
+///
+/// Never panics.
+async fn run_remote(
+    args: &ServeArgs,
+    profile_name: &str,
+    remote_config: Option<&stellar_agent_core::profile::schema::RemoteApprovalConfig>,
+    context: DecisionContext,
+) -> i32 {
+    let Some(remote_config) = remote_config.filter(|c| c.enabled) else {
+        let err = WalletError::Internal(InternalError::UnexpectedState {
+            detail: "approve.remote_not_configured: profile has no enabled [remote_approval] \
+                     block; add one before passing --remote"
+                .to_owned(),
+        });
+        render_json(&Envelope::<()>::err(&err));
+        return 1;
+    };
+
+    if !args.confirm_remote_exposure {
+        let err = WalletError::Internal(InternalError::UnexpectedState {
+            detail: "approve.remote_exposure_not_confirmed: --remote requires \
+                     --confirm-remote-exposure as an explicit, separate consent flag"
+                .to_owned(),
+        });
+        render_json(&Envelope::<()>::err(&err));
+        return 1;
+    }
+
+    let bind_addr = match stellar_agent_approval_remote::validate_remote_config(
+        &remote_config.bind,
+        &remote_config.rp_id,
+    ) {
+        Ok(addr) => addr,
+        Err(e) => {
+            let err = WalletError::Internal(InternalError::UnexpectedState {
+                detail: format!("approve.remote_config_invalid: {e}"),
+            });
+            render_json(&Envelope::<()>::err(&err));
+            return 1;
+        }
+    };
+
+    let tls = match stellar_agent_approval_remote::provision_or_load(
+        profile_name,
+        &remote_config.rp_id,
+    ) {
+        Ok(tls) => tls,
+        Err(e) => {
+            let err = WalletError::Internal(InternalError::UnexpectedState {
+                detail: format!("approve.remote_tls_provision_failed: {e}"),
+            });
+            render_json(&Envelope::<()>::err(&err));
+            return 1;
+        }
+    };
+
+    let operator_credentials_path =
+        match stellar_agent_core::approval::default_operator_approval_credentials_path(profile_name)
+        {
+            Ok(p) => p,
+            Err(e) => {
+                let err = WalletError::Internal(InternalError::UnexpectedState {
+                    detail: format!("approve.remote_operator_store_unavailable: {e}"),
+                });
+                render_json(&Envelope::<()>::err(&err));
+                return 1;
+            }
+        };
+
+    let fingerprint = tls.fingerprint_sha256_hex.clone();
+    let config = stellar_agent_approval_remote::RemoteServeConfig::new(
+        bind_addr,
+        remote_config.rp_id.clone(),
+        remote_config.allowed_credentials.clone(),
+        context,
+        operator_credentials_path,
+        tls,
+    );
+
+    let handle = match stellar_agent_approval_remote::start_remote_serve(config).await {
+        Ok(h) => h,
+        Err(e) => {
+            let err = WalletError::Internal(InternalError::UnexpectedState {
+                detail: format!("approve.remote_serve_start_failed: {e}"),
+            });
+            render_json(&Envelope::<()>::err(&err));
+            return 1;
+        }
+    };
+
+    print_remote_startup(
+        &remote_config.rp_id,
+        handle.local_addr().port(),
+        &fingerprint,
+    );
+
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        tracing::debug!(error = %e, "approve serve --remote: ctrl-c wait failed; shutting down");
+    }
+
+    if let Err(e) = handle.shutdown().await {
+        tracing::debug!(error = %e, "approve serve --remote: shutdown did not complete cleanly");
+    }
+    0
+}
+
+/// Prints the remote-approval startup banner: the HTTPS URL and the
+/// certificate fingerprint for out-of-band verification on the approving
+/// device.
+fn print_remote_startup(rp_id: &str, port: u16, fingerprint_sha256_hex: &str) {
+    #[allow(
+        clippy::print_stdout,
+        reason = "CLI binary intentional user output — remote-approval startup"
+    )]
+    {
+        println!("Remote approval inbox: https://{rp_id}:{port}/");
+        println!(
+            "Certificate SHA-256 fingerprint (verify out-of-band before trusting): {fingerprint_sha256_hex}"
+        );
+        println!(
+            "\"{rp_id}\" must resolve to this host from the approving device (internal DNS or a \
+             hosts-file entry) — WebAuthn requires a DNS Relying Party ID, never an IP address."
+        );
+    }
 }
 
 /// Maps a [`ServeStartError`] to a wallet error for the JSON envelope.
@@ -297,6 +462,8 @@ mod tests {
             "off",
             "--bell",
             "--include-expired",
+            "--remote",
+            "--confirm-remote-exposure",
         ])
         .expect("flags parse");
         assert_eq!(w.args.profile.as_deref(), Some("myprofile"));
@@ -305,6 +472,8 @@ mod tests {
         assert_eq!(w.args.notify, NotifyMode::Off);
         assert!(w.args.bell);
         assert!(w.args.include_expired);
+        assert!(w.args.remote);
+        assert!(w.args.confirm_remote_exposure);
     }
 
     #[test]
@@ -316,6 +485,11 @@ mod tests {
         assert_eq!(w.args.notify, NotifyMode::On);
         assert!(!w.args.bell);
         assert!(!w.args.include_expired);
+        assert!(
+            !w.args.remote,
+            "--remote must default to false (loopback default)"
+        );
+        assert!(!w.args.confirm_remote_exposure);
     }
 
     /// `serve::run` with an explicit already-bound port must fail cleanly with
@@ -334,6 +508,26 @@ mod tests {
             notify: NotifyMode::Off,
             bell: false,
             include_expired: false,
+            remote: false,
+            confirm_remote_exposure: false,
+        };
+        let code = run(args).await;
+        assert_eq!(code, 1);
+    }
+
+    /// `--remote` without a `[remote_approval]` profile block must exit `1`
+    /// cleanly (fail-closed) rather than attempting to bind or provision TLS.
+    #[tokio::test]
+    async fn run_remote_without_profile_block_exits_1_without_panic() {
+        let args = ServeArgs {
+            profile: Some("__stellar_agent_serve_test_absent_profile_remote".to_owned()),
+            port: 0,
+            no_open: true,
+            notify: NotifyMode::Off,
+            bell: false,
+            include_expired: false,
+            remote: true,
+            confirm_remote_exposure: true,
         };
         let code = run(args).await;
         assert_eq!(code, 1);

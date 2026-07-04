@@ -7221,9 +7221,13 @@ amount_max_stroops = 1000000
             debug.contains("Some(<set>)"),
             "attestation_blob_b64 must appear as 'Some(<set>)' in Debug: {debug}"
         );
-        // The raw base64 value of [0x42u8; 32] must not appear.
+        // The stored value is the URL_SAFE_NO_PAD encoding of the attestation
+        // bytes; the FULL encoded string must be absent from Debug output. An
+        // exact 43-character match cannot collide with the entry's other
+        // base64url fields (nonce, envelope) in the same Debug string.
+        let encoded = URL_SAFE_NO_PAD.encode([0x42u8; 32]);
         assert!(
-            !debug.contains("Qg"),
+            !debug.contains(&encoded),
             "raw base64 attestation bytes must not appear in Debug: {debug}"
         );
     }

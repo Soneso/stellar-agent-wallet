@@ -175,6 +175,8 @@ behind the same policy engine, approval spine, and audit log as the CLI. See
   running agent toolsets, with runnable [examples](examples/toolsets/).
 - [docs/profiles.md](docs/profiles.md) — profile schema and keyring entry
   references.
+- [docs/remote-approval.md](docs/remote-approval.md) — approving pending actions
+  from another device over TLS with a passkey, without SSH.
 - [docs/maintainers/](docs/maintainers/) — maintainer and review documentation.
 
 ## Agent skill
@@ -207,3 +209,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+---
+
+"Stellar" is a trademark of the Stellar Development Foundation.
+This is an independent project, not affiliated with, sponsored or endorsed by the Stellar Development Foundation.

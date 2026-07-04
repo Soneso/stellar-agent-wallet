@@ -45,6 +45,7 @@
 mod common;
 pub mod gc;
 pub mod list;
+pub mod operator;
 pub mod run;
 pub mod serve;
 
@@ -97,7 +98,12 @@ pub enum ApproveSubcommand {
     ///
     /// Binds a loopback HTTP server so the operator can review and
     /// approve/reject pending approvals in a browser. Runs until Ctrl-C.
+    /// Pass `--remote` to bind the TLS-protected, passkey-authenticated
+    /// remote-approval surface instead.
     Serve(serve::ServeArgs),
+
+    /// Manage operator-approval credentials for the remote-approval surface.
+    Operator(operator::OperatorArgs),
 }
 
 /// Runs the `approve` subcommand group.
@@ -120,6 +126,7 @@ pub async fn dispatch(args: ApproveArgs) -> i32 {
         Some(ApproveSubcommand::Gc(gc_args)) => gc::run(gc_args).await,
         Some(ApproveSubcommand::List(list_args)) => list::run(list_args).await,
         Some(ApproveSubcommand::Serve(serve_args)) => serve::run(serve_args).await,
+        Some(ApproveSubcommand::Operator(operator_args)) => operator::dispatch(operator_args).await,
         None => run::run(args.run).await,
     }
 }

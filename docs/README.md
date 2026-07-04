@@ -26,6 +26,8 @@ shipping a `stellar-agent` CLI and a `stellar-agent-mcp` MCP server.
   capability-restricting toolsets.
 - [Profile configuration](profiles.md) — the profile TOML reference and the
   key-rotation runbook.
+- [Remote approval](remote-approval.md) — approving or rejecting pending
+  actions from another device over TLS with a passkey, without SSH.
 
 The downloadable [agent knowledge skill](../skills/) (`skills/`) teaches an AI
 agent how to operate the wallet without cloning the repository; it is distinct
@@ -41,3 +43,8 @@ from the capability-restriction toolsets feature above.
   detail behind the model.
 - [Review checklist](maintainers/review-checklist.md) — the production-readiness
   gate every change passes.
+
+---
+
+"Stellar" is a trademark of the Stellar Development Foundation.
+This is an independent project, not affiliated with, sponsored or endorsed by the Stellar Development Foundation.

@@ -165,6 +165,43 @@ pub enum ApprovalError {
         /// The hard cap enforced by the store.
         max: usize,
     },
+
+    /// An operator-approval credential enrollment named a `credential_id_b64url`
+    /// already present in the store.
+    ///
+    /// `enroll` refuses silent overwrite: replacing an already-enrolled
+    /// operator's public key without an explicit prior removal could let a
+    /// compromised enrollment path substitute an attacker-controlled key
+    /// under a credential ID the operator still recognises.
+    #[error("operator-approval credential already enrolled: {credential_id_redacted}")]
+    DuplicateCredentialId {
+        /// Redacted credential ID (first-5-last-5 characters, or the full
+        /// value if length ≤ 10).
+        credential_id_redacted: String,
+    },
+
+    /// A WebAuthn sign-counter update presented a counter that did not
+    /// advance past the stored counter, for a credential where both are
+    /// non-zero.
+    ///
+    /// Per WebAuthn Level 2, a non-advancing counter across two verified
+    /// assertions from the same credential is a cloned-authenticator signal:
+    /// the presented value is refused and the stored counter is left
+    /// unchanged.  A presented or stored counter of `0` means the
+    /// authenticator does not report counters and is exempt from this check.
+    #[error(
+        "sign counter did not advance for {credential_id_redacted}: presented {presented}, \
+         stored {stored} (possible cloned authenticator)"
+    )]
+    SignCounterRegression {
+        /// Redacted credential ID (first-5-last-5 characters, or the full
+        /// value if length ≤ 10).
+        credential_id_redacted: String,
+        /// The counter value presented by the verified assertion.
+        presented: u32,
+        /// The counter value previously stored for this credential.
+        stored: u32,
+    },
 }
 
 impl ApprovalError {
@@ -201,6 +238,28 @@ impl ApprovalError {
     /// Constructs an [`ApprovalError::PendingStoreFull`] with the cap value.
     pub(crate) fn pending_store_full(max: usize) -> Self {
         Self::PendingStoreFull { max }
+    }
+
+    /// Constructs a [`ApprovalError::DuplicateCredentialId`] with the
+    /// credential ID redacted.
+    pub(crate) fn duplicate_credential_id(credential_id_b64url: &str) -> Self {
+        Self::DuplicateCredentialId {
+            credential_id_redacted: redact_nonce(credential_id_b64url),
+        }
+    }
+
+    /// Constructs a [`ApprovalError::SignCounterRegression`] with the
+    /// credential ID redacted.
+    pub(crate) fn sign_counter_regression(
+        credential_id_b64url: &str,
+        presented: u32,
+        stored: u32,
+    ) -> Self {
+        Self::SignCounterRegression {
+            credential_id_redacted: redact_nonce(credential_id_b64url),
+            presented,
+            stored,
+        }
     }
 }
 
@@ -344,6 +403,32 @@ mod tests {
         assert!(
             !msg.contains("secret") && !msg.contains("attestation_blob"),
             "display must not leak secret material: {msg}"
+        );
+    }
+
+    #[test]
+    fn duplicate_credential_id_error_redacts() {
+        let err = ApprovalError::duplicate_credential_id("enrolled-operator-credential-id");
+        match err {
+            ApprovalError::DuplicateCredentialId {
+                credential_id_redacted,
+            } => {
+                assert!(credential_id_redacted.contains("..."));
+                assert!(!credential_id_redacted.contains("enrolled-operator-credential-id"));
+            }
+            _ => panic!("expected DuplicateCredentialId"),
+        }
+    }
+
+    #[test]
+    fn sign_counter_regression_display_contains_values_not_full_id() {
+        let err = ApprovalError::sign_counter_regression("enrolled-operator-credential-id", 3, 5);
+        let msg = err.to_string();
+        assert!(msg.contains('3'), "presented value must appear: {msg}");
+        assert!(msg.contains('5'), "stored value must appear: {msg}");
+        assert!(
+            !msg.contains("enrolled-operator-credential-id"),
+            "full credential ID must not appear: {msg}"
         );
     }
 }

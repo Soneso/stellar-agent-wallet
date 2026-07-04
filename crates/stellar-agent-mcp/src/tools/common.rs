@@ -2261,6 +2261,7 @@ mod tests {
             &attestation_key,
             Surface::Cli,
             None,
+            None,
             |_req, _key| Err("must not be called for PaymentSimulated".to_owned()),
         )
         .unwrap()

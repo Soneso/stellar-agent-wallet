@@ -51,17 +51,24 @@ use super::user_id::ApproverIdentity;
 pub enum Surface {
     /// The `stellar-agent approve --id <nonce>` CLI command.
     Cli,
-    /// A resident, server-driven approve surface.
+    /// A resident, server-driven approve surface bound to loopback.
     Serve,
+    /// A resident, server-driven approve surface reachable from beyond
+    /// loopback, authenticated by a passkey-authenticated
+    /// [`super::user_id::ApproverIdentity::PasskeyCredential`] identity
+    /// rather than the OS process boundary.
+    ServeRemote,
 }
 
 impl Surface {
-    /// Returns the wire string for this surface (`"cli"` or `"serve"`).
+    /// Returns the wire string for this surface (`"cli"`, `"serve"`, or
+    /// `"serve-remote"`).
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Cli => "cli",
             Self::Serve => "serve",
+            Self::ServeRemote => "serve-remote",
         }
     }
 }
@@ -106,11 +113,22 @@ pub struct ToolsetGrantRequest<'a> {
 /// already-attested state, and the caller's identity binding.
 ///
 /// `identity` is an [`ApproverIdentity`] rather than a raw `process_uid: &str`
-/// so a future remote-approval mode can bind a different identity kind
-/// without changing this signature. For the current [`ApproverIdentity::OsUid`]
-/// variant, [`ApproverIdentity::matches_entry_process_uid`] compares against
-/// the stored entry's `process_uid` exactly as the pre-abstraction
-/// `process_uid: &str` parameter was — byte-identical wire behaviour.
+/// so a remote-approval mode can bind a different identity kind without
+/// changing this signature. For [`ApproverIdentity::OsUid`],
+/// [`ApproverIdentity::is_authorized_for_entry`] compares against the stored
+/// entry's `process_uid` exactly as the pre-abstraction `process_uid: &str`
+/// parameter was — byte-identical wire behaviour, and `allowed_credentials`
+/// is not consulted. For [`ApproverIdentity::PasskeyCredential`], the check
+/// instead requires the identity's credential ID to be non-empty and present
+/// in `allowed_credentials` — the profile's operator-approval allowlist —
+/// AND the identity's verified-assertion witness to be bound to this exact
+/// entry's nonce, regardless of the entry's stored `process_uid`. The
+/// nonce-binding check is what prevents a witness verified for one pending
+/// entry's per-action challenge from ever authorizing a different entry.
+/// Passing an empty `allowed_credentials` slice is the correct call for any
+/// surface that only ever constructs `OsUid` identities (the CLI and the
+/// loopback serve surface today): the slice is simply never read on that
+/// path.
 ///
 /// # Errors
 ///
@@ -118,11 +136,13 @@ pub struct ToolsetGrantRequest<'a> {
 /// `approval.*` detail prefix) when: the nonce is unknown
 /// (`approval.not_found`); the entry has expired (`approval.expired`); the
 /// entry is already attested (`approval.already_attested`); or the
-/// caller's identity does not match the entry's (`approval.user_mismatch`).
+/// caller's identity is not authorized against the entry
+/// (`approval.user_mismatch`).
 pub fn load_and_validate_entry(
     store: &PendingApprovalStore,
     nonce: &str,
     identity: &ApproverIdentity,
+    allowed_credentials: &[String],
 ) -> Result<PendingApproval, WalletError> {
     let entry = store.get(nonce).cloned().ok_or_else(|| {
         // Distinguishable UX error: indistinguishability is required for the
@@ -146,10 +166,15 @@ pub fn load_and_validate_entry(
         }));
     }
 
-    if !identity.matches_entry_process_uid(&entry.process_uid) {
+    if !identity.is_authorized_for_entry(
+        &entry.process_uid,
+        &entry.approval_nonce,
+        allowed_credentials,
+    ) {
         return Err(WalletError::Internal(InternalError::UnexpectedState {
             detail: "approval.user_mismatch: this pending approval was created by a different \
-                     local user (process_uid mismatch); a different user cannot attest it"
+                     local user (process_uid mismatch), or the presented passkey credential is \
+                     not authorized for this profile; this caller cannot attest it"
                 .to_owned(),
         }));
     }
@@ -273,11 +298,15 @@ pub fn load_attestation_key(
 /// recorded consent from the store directly and take no attestation
 /// argument.
 ///
-/// On success, emits an `ApprovalAttested` audit event through `audit` (if
-/// supplied) after the persist step. Audit emission is non-fatal: a failure
-/// to write the event is logged (`tracing::warn!`) and does not affect the
-/// return value — a failed attestation write must never be reported as a
-/// successful attest, but a failed *audit* write must never undo one.
+/// On success, emits an audit event through `audit` (if supplied) after the
+/// persist step: `ApprovalAttested` when `operator_credential_id_b64url` is
+/// `None` (the loopback CLI and serve surfaces), or `ApprovalAttestedRemote`
+/// — carrying the operator's redacted credential pseudonym — when it is
+/// `Some` (the remote-approval surface). Audit emission is non-fatal: a
+/// failure to write the event is logged (`tracing::warn!`) and does not
+/// affect the return value — a failed attestation write must never be
+/// reported as a successful attest, but a failed *audit* write must never
+/// undo one.
 ///
 /// # Errors
 ///
@@ -292,6 +321,7 @@ pub fn attest_and_persist(
     key_bytes: &[u8],
     surface: Surface,
     mut audit: Option<&mut AuditWriter>,
+    operator_credential_id_b64url: Option<&str>,
     persist_toolset_grant: impl FnOnce(&ToolsetGrantRequest<'_>, &[u8; 32]) -> Result<(), String>,
 ) -> Result<Option<String>, WalletError> {
     let key_arr: [u8; 32] = key_bytes.try_into().map_err(|_| {
@@ -327,6 +357,7 @@ pub fn attest_and_persist(
                 Some(envelope_sha256_hex.clone()),
                 &entry.approval_nonce,
                 surface,
+                operator_credential_id_b64url,
             );
             Some(blob_b64)
         }
@@ -353,6 +384,7 @@ pub fn attest_and_persist(
                 Some(envelope_sha256_hex.clone()),
                 &entry.approval_nonce,
                 surface,
+                operator_credential_id_b64url,
             );
             Some(blob_b64)
         }
@@ -419,6 +451,7 @@ pub fn attest_and_persist(
                 None,
                 &entry.approval_nonce,
                 surface,
+                operator_credential_id_b64url,
             );
 
             // The first-invoke gate reads the persisted grant from the grant
@@ -478,6 +511,7 @@ pub fn attest_and_persist(
                 None,
                 &entry.approval_nonce,
                 surface,
+                operator_credential_id_b64url,
             );
 
             // The trustline clawback opt-in gate recomputes the digest and
@@ -546,18 +580,29 @@ fn emit_attested_audit(
     envelope_sha256_hex: Option<String>,
     approval_nonce: &str,
     surface: Surface,
+    operator_credential_id_b64url: Option<&str>,
 ) {
     let Some(writer) = audit.as_deref_mut() else {
         return;
     };
-    let entry = AuditEntry::new_approval_attested(
-        approval_kind,
-        gated_tool,
-        envelope_sha256_hex,
-        approval_nonce,
-        surface.as_str(),
-        uuid::Uuid::new_v4().to_string(),
-    );
+    let entry = match operator_credential_id_b64url {
+        Some(cred_id) => AuditEntry::new_approval_attested_remote(
+            approval_kind,
+            gated_tool,
+            envelope_sha256_hex,
+            approval_nonce,
+            cred_id,
+            uuid::Uuid::new_v4().to_string(),
+        ),
+        None => AuditEntry::new_approval_attested(
+            approval_kind,
+            gated_tool,
+            envelope_sha256_hex,
+            approval_nonce,
+            surface.as_str(),
+            uuid::Uuid::new_v4().to_string(),
+        ),
+    };
     if let Err(e) = writer.write_entry(entry) {
         tracing::warn!(
             error = %e,
@@ -646,7 +691,7 @@ mod tests {
             .unwrap();
 
         let validated =
-            load_and_validate_entry(&store, &nonce, &ApproverIdentity::OsUid(uid)).unwrap();
+            load_and_validate_entry(&store, &nonce, &ApproverIdentity::OsUid(uid), &[]).unwrap();
         assert_eq!(validated.approval_nonce, nonce);
     }
 
@@ -666,9 +711,101 @@ mod tests {
             &store,
             &nonce,
             &ApproverIdentity::OsUid("different-uid".to_owned()),
+            &[],
         )
         .unwrap_err();
         assert!(err.to_string().contains("approval.user_mismatch"));
+    }
+
+    /// GATE-IS-REAL: a `PasskeyCredential` identity reaching
+    /// `load_and_validate_entry` — the single production gate every approve
+    /// surface funnels through — is refused when its credential ID is not in
+    /// `allowed_credentials`, even though the entry itself is otherwise valid
+    /// (unexpired, unattested) and the identity carries a verified-assertion
+    /// witness. This pins the fix for the fail-open risk of an always-true
+    /// gate arm: a future regression that stops threading the allowlist (or
+    /// reintroduces an unconditional pass) fails this test.
+    #[test]
+    #[serial_test::serial]
+    fn load_and_validate_entry_refuses_non_allowlisted_passkey_credential() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
+        let entry = make_entry(DEFAULT_TTL_MS);
+        let nonce = entry.approval_nonce.clone();
+        store
+            .insert(entry, timefmt::now_unix_ms().expect("clock"))
+            .unwrap();
+
+        let identity = ApproverIdentity::from_verified_passkey_assertion(
+            "attacker-controlled-cred-id",
+            crate::approval::user_id::VerifiedPasskeyAssertion::new_for_test(&nonce),
+        );
+        let allowed = vec!["enrolled-operator-cred-id".to_owned()];
+        let err = load_and_validate_entry(&store, &nonce, &identity, &allowed).unwrap_err();
+        assert!(
+            err.to_string().contains("approval.user_mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// GATE-IS-REAL, positive case: the same gate authorizes a
+    /// `PasskeyCredential` identity whose credential ID IS present in
+    /// `allowed_credentials`, proving the check is a genuine membership test
+    /// rather than always refusing (which would make the earlier test
+    /// vacuous).
+    #[test]
+    #[serial_test::serial]
+    fn load_and_validate_entry_accepts_allowlisted_passkey_credential() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
+        let entry = make_entry(DEFAULT_TTL_MS);
+        let nonce = entry.approval_nonce.clone();
+        store
+            .insert(entry, timefmt::now_unix_ms().expect("clock"))
+            .unwrap();
+
+        let identity = ApproverIdentity::from_verified_passkey_assertion(
+            "enrolled-operator-cred-id",
+            crate::approval::user_id::VerifiedPasskeyAssertion::new_for_test(&nonce),
+        );
+        let allowed = vec!["enrolled-operator-cred-id".to_owned()];
+        let validated = load_and_validate_entry(&store, &nonce, &identity, &allowed).unwrap();
+        assert_eq!(validated.approval_nonce, nonce);
+    }
+
+    /// ENTRY-BINDING at the `load_and_validate_entry` layer: an allowlisted
+    /// `PasskeyCredential` identity whose witness is bound to a DIFFERENT
+    /// nonce than the entry being loaded is refused, even though the
+    /// credential itself is allowlisted. Proves cross-entry replay is
+    /// impossible through the production gate, not just through the
+    /// `ApproverIdentity` unit tests in `user_id.rs`.
+    #[test]
+    #[serial_test::serial]
+    fn load_and_validate_entry_refuses_witness_bound_to_different_entry() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
+        let entry = make_entry(DEFAULT_TTL_MS);
+        let nonce = entry.approval_nonce.clone();
+        store
+            .insert(entry, timefmt::now_unix_ms().expect("clock"))
+            .unwrap();
+
+        let identity = ApproverIdentity::from_verified_passkey_assertion(
+            "enrolled-operator-cred-id",
+            // Bound to a different (well-formed but unrelated) nonce, not `nonce`.
+            crate::approval::user_id::VerifiedPasskeyAssertion::new_for_test(
+                "ZZZZZZZZZZZZZZZZZZZZZZ",
+            ),
+        );
+        let allowed = vec!["enrolled-operator-cred-id".to_owned()];
+        let err = load_and_validate_entry(&store, &nonce, &identity, &allowed).unwrap_err();
+        assert!(
+            err.to_string().contains("approval.user_mismatch"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -704,6 +841,7 @@ mod tests {
             &entry,
             &raw_key,
             Surface::Cli,
+            None,
             None,
             |_req, _key| Err("must not be called for PaymentSimulated".to_owned()),
         )
@@ -746,6 +884,7 @@ mod tests {
             &raw_key,
             Surface::Cli,
             None,
+            None,
             |_req, _key| Err("must not be called".to_owned()),
         )
         .unwrap_err();
@@ -785,6 +924,7 @@ mod tests {
             &entry,
             &raw_key,
             Surface::Cli,
+            None,
             None,
             |req, _key| {
                 assert_eq!(req.toolset_name, "my-toolset");
@@ -832,6 +972,7 @@ mod tests {
             &entry,
             &raw_key,
             Surface::Cli,
+            None,
             None,
             |_req, _key| Err("grant store unavailable".to_owned()),
         )
