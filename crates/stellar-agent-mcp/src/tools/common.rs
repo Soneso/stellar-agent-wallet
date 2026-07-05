@@ -2184,6 +2184,101 @@ mod tests {
         );
     }
 
+    // ── verify_attestation_gate's `other =>` arm rejects RuleProposalSimulated ──
+    //
+    // GH issue #8: `RuleProposalSimulated`
+    // has its OWN dedicated gate (`PendingApprovalStore::verify_rule_proposal_gate`,
+    // wired inside `stellar_rule_create_commit`); the shared pay/claim
+    // `verify_attestation_gate` (this fn) MUST NOT accept it — defense in
+    // depth in both directions. A `RuleProposalSimulated` entry reaching step
+    // 6 (`match &entry.kind { PaymentSimulated | ClaimSimulated => .., other =>
+    // refuse }`) must fall into the `other` arm and refuse
+    // indistinguishably, exactly like any other wrong-kind entry.
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(keyring)]
+    async fn verify_attestation_gate_rejects_rule_proposal_simulated_entry() {
+        use base64::Engine as _;
+        use stellar_agent_core::approval::rule_proposal::{
+            ContextRuleProposalSnapshot, RuleProposalContextType, RuleProposalSigner,
+        };
+        use stellar_agent_core::approval::{
+            DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, process_uid_for_attestation,
+        };
+
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let profile = Profile::builder_testnet(
+            "rule-gate-svc",
+            "rule-gate-acct",
+            "rule-gate-n-svc",
+            "rule-gate-n-acct",
+        )
+        .with_noop_engine()
+        .build();
+        let mut server =
+            crate::server::WalletServer::new(profile).expect("WalletServer::new must not fail");
+        let approvals_dir = tempfile::tempdir().unwrap();
+        server.set_approval_dir_for_test(approvals_dir.path().to_path_buf());
+
+        let store_path = approvals_dir
+            .path()
+            .join(format!("{}.toml", server.profile_name_for_approval()));
+        let mut store = PendingApprovalStore::open(store_path).unwrap();
+
+        let definition = ContextRuleProposalSnapshot::new(
+            RuleProposalContextType::Default,
+            "spend-daily".to_owned(),
+            None,
+            vec![RuleProposalSigner::delegated(
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                true,
+            )],
+            vec![],
+            vec![0],
+            false,
+            false,
+        );
+        let entry = PendingApproval::new_rule_proposal_pending(
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+            "Test SDF Network ; September 2015".to_owned(),
+            "stellar:testnet".to_owned(),
+            definition,
+            [0x11_u8; 32],
+            "CallContract rule \"spend-daily\"".to_owned(),
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let approval_nonce = entry.approval_nonce.clone();
+        let now_ms = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        store.insert(entry, now_ms).unwrap();
+        drop(store);
+
+        let dispatch_outcome =
+            DispatchOutcome::RequireApproval(ApprovalRequest::new(approval_nonce.clone(), 120));
+        let attestation_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0_u8; 32]);
+
+        let result = verify_attestation_gate(
+            &server,
+            &dispatch_outcome,
+            "AAAA",
+            Some(&approval_nonce),
+            Some(&attestation_b64),
+            "stellar_pay_commit",
+        )
+        .await;
+
+        let err = result.expect_err(
+            "verify_attestation_gate must refuse a RuleProposalSimulated entry, not accept it",
+        );
+        assert!(
+            err.message.contains("policy.approval_required"),
+            "RuleProposalSimulated must be refused with the same indistinguishable \
+             approval-required wire code as any other wrong-kind entry, got: {}",
+            err.message
+        );
+    }
+
     // ── Cross-check: a core-minted attestation verifies through this gate ─────
     //
     // `stellar_agent_core::approval::attest_and_persist` is the same function

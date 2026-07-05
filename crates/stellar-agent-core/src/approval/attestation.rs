@@ -306,6 +306,116 @@ pub fn compute_trustline_clawback_opt_in_digest(
     out
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// RuleProposalSimulated digest
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Domain-separation tag for the `RuleProposalSimulated` attestation digest
+/// (Package D, GH issue #8).
+///
+/// ANY change to the preimage layout REQUIRES a tag-version bump so old
+/// proposals fail closed rather than cross-validating against a new layout.
+///
+/// Current version: `v1`.
+pub const RULE_PROPOSAL_DOMAIN_TAG: &[u8] = b"stellar-agent-rule-proposal-v1";
+
+/// Computes the 32-byte SHA-256 digest binding an agent-proposed
+/// `add_context_rule` installation to its EXACT resolved arguments.
+///
+/// # Domain-separated length-prefixed preimage
+///
+/// ```text
+/// SHA-256(
+///   RULE_PROPOSAL_DOMAIN_TAG
+///   || u32_be(len(invoke_contract_args_xdr)) || invoke_contract_args_xdr
+///   || u32_be(len(smart_account_xdr))        || smart_account_xdr
+///   || u32_be(len(auth_rule_ids_xdr))         || auth_rule_ids_xdr
+///   || flags_byte
+/// )
+/// ```
+///
+/// Length prefixes on every variable-length field prevent boundary-collision
+/// attacks (same discipline as every other digest in this module). The
+/// fixed-width `flags_byte` needs no length prefix.
+///
+/// # Why XDR, not serde
+///
+/// `serde`/JSON/TOML serialization of the resolved rule definition is not
+/// ordering-stable across crate versions (field order, map key order, and
+/// numeric representation are all serde-implementation details). XDR is the
+/// wire format the Soroban host itself consumes to execute
+/// `add_context_rule`, and is stable by protocol definition — hashing the
+/// SAME XDR bytes the invocation will submit is the only representation
+/// guaranteed to bind EXACTLY what gets installed.
+///
+/// # Domain separation
+///
+/// The domain tag, plus hashing a distinct XDR type
+/// (`InvokeContractArgs` for `add_context_rule`), makes this digest space
+/// disjoint from `envelope_sha256` (`PaymentSimulated` / `ClaimSimulated`,
+/// which hash a full transaction envelope) and from
+/// [`compute_toolset_gate_digest`] / [`compute_trustline_clawback_opt_in_digest`]
+/// (different domain tags) — an attestation minted for one kind can never
+/// verify as another, even though every kind shares the same keyring HMAC key.
+///
+/// # Caller-side construction
+///
+/// `stellar-agent-core` cannot depend on `stellar-agent-smart-account` (the
+/// latter depends on the former), so this function accepts pre-encoded XDR
+/// byte buffers rather than typed `InvokeContractArgs` / `ScAddress` values.
+/// `stellar-agent-smart-account::managers::rules::compute_context_rule_proposal_sha256`
+/// builds `invoke_contract_args_xdr` from `build_add_context_rule_args`
+/// wrapped in the OZ `add_context_rule` `InvokeContractArgs` (the SAME
+/// builder `install_rule_inner` calls), `smart_account_xdr` from XDR-encoding
+/// the smart-account contract's `ScAddress`, and `auth_rule_ids_xdr` via
+/// [`super::super::smart_account::rule_id::encode_context_rule_ids`] — the
+/// SAME encoder already used for the on-chain signing auth-digest preimage.
+/// `flags_byte` packs `accept_mutable_verifier` (bit 0) and
+/// `accept_unknown_verifier` (bit 1); all other bits are reserved and MUST
+/// be zero.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::approval::attestation::compute_rule_proposal_digest;
+///
+/// let digest = compute_rule_proposal_digest(b"invoke-args-xdr", b"sa-xdr", b"ids-xdr", 0);
+/// assert_eq!(digest.len(), 32);
+/// ```
+#[must_use]
+pub fn compute_rule_proposal_digest(
+    invoke_contract_args_xdr: &[u8],
+    smart_account_xdr: &[u8],
+    auth_rule_ids_xdr: &[u8],
+    flags_byte: u8,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+
+    // Domain-separation tag (fixed-length; no length prefix needed).
+    hasher.update(RULE_PROPOSAL_DOMAIN_TAG);
+
+    // Length-prefixed variable-length fields.
+    let args_len = u32::try_from(invoke_contract_args_xdr.len()).unwrap_or(u32::MAX);
+    hasher.update(args_len.to_be_bytes());
+    hasher.update(invoke_contract_args_xdr);
+
+    let sa_len = u32::try_from(smart_account_xdr.len()).unwrap_or(u32::MAX);
+    hasher.update(sa_len.to_be_bytes());
+    hasher.update(smart_account_xdr);
+
+    let ids_len = u32::try_from(auth_rule_ids_xdr.len()).unwrap_or(u32::MAX);
+    hasher.update(ids_len.to_be_bytes());
+    hasher.update(auth_rule_ids_xdr);
+
+    // Fixed-width flags byte (no length prefix needed).
+    hasher.update([flags_byte]);
+
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
 /// Computes the HMAC-SHA256 attestation blob.
 ///
 /// # Input domain
@@ -763,5 +873,100 @@ mod tests {
             ),
             "tampered amount_max_stroops must fail verification"
         );
+    }
+
+    // ── RuleProposalSimulated digest KAT ─────────────────────────────────────
+    //
+    // Known-answer test vector for `compute_rule_proposal_digest`. Any
+    // accidental change to the preimage layout is detected immediately.
+    // Reference Python:
+    //
+    // ```python
+    // import hashlib, struct
+    // DOMAIN_TAG = b"stellar-agent-rule-proposal-v1"
+    // args_xdr = b"fake-invoke-contract-args-xdr"
+    // sa_xdr = b"fake-smart-account-xdr"
+    // ids_xdr = b"fake-auth-rule-ids-xdr"
+    // flags = 0
+    //
+    // msg = (
+    //     DOMAIN_TAG
+    //     + struct.pack(">I", len(args_xdr)) + args_xdr
+    //     + struct.pack(">I", len(sa_xdr)) + sa_xdr
+    //     + struct.pack(">I", len(ids_xdr)) + ids_xdr
+    //     + bytes([flags])
+    // )
+    // print(hashlib.sha256(msg).hexdigest())
+    // ```
+
+    #[test]
+    fn compute_rule_proposal_digest_known_answer() {
+        const ARGS: &[u8] = b"fake-invoke-contract-args-xdr";
+        const SA: &[u8] = b"fake-smart-account-xdr";
+        const IDS: &[u8] = b"fake-auth-rule-ids-xdr";
+
+        let result = compute_rule_proposal_digest(ARGS, SA, IDS, 0);
+
+        let mut hasher = Sha256::new();
+        hasher.update(RULE_PROPOSAL_DOMAIN_TAG);
+        for field in [ARGS, SA, IDS] {
+            let len = u32::try_from(field.len()).unwrap().to_be_bytes();
+            hasher.update(len);
+            hasher.update(field);
+        }
+        hasher.update([0u8]);
+        let mut expected = [0u8; 32];
+        expected.copy_from_slice(&hasher.finalize());
+
+        assert_eq!(
+            result, expected,
+            "KAT: compute_rule_proposal_digest output mismatch — domain tag or \
+             preimage layout changed; bump RULE_PROPOSAL_DOMAIN_TAG version"
+        );
+        assert_ne!(
+            result, [0u8; 32],
+            "KAT: rule proposal digest must not be all-zero"
+        );
+    }
+
+    #[test]
+    fn rule_proposal_digest_no_boundary_collision_across_fields() {
+        // args="ab" sa="cd" must differ from args="a" sa="bcd" (length prefixes).
+        let d1 = compute_rule_proposal_digest(b"ab", b"cd", b"ids", 0);
+        let d2 = compute_rule_proposal_digest(b"a", b"bcd", b"ids", 0);
+        assert_ne!(
+            d1, d2,
+            "boundary collision detected across invoke_contract_args_xdr/smart_account_xdr"
+        );
+    }
+
+    #[test]
+    fn rule_proposal_digest_flags_byte_changes_digest() {
+        let d0 = compute_rule_proposal_digest(b"args", b"sa", b"ids", 0);
+        let d1 = compute_rule_proposal_digest(b"args", b"sa", b"ids", 1);
+        let d2 = compute_rule_proposal_digest(b"args", b"sa", b"ids", 2);
+        let d3 = compute_rule_proposal_digest(b"args", b"sa", b"ids", 3);
+        assert_ne!(d0, d1);
+        assert_ne!(d0, d2);
+        assert_ne!(d0, d3);
+        assert_ne!(d1, d2);
+    }
+
+    #[test]
+    fn rule_proposal_digest_is_deterministic() {
+        let a = compute_rule_proposal_digest(b"args", b"sa", b"ids", 3);
+        let b = compute_rule_proposal_digest(b"args", b"sa", b"ids", 3);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn rule_proposal_digest_differs_from_toolset_gate_digest() {
+        // Same conceptual inputs must land in disjoint digest spaces because
+        // of the differing domain tags — a rule-proposal attestation can
+        // never verify as a toolset-gate attestation.
+        const DEST_G: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let rule_digest = compute_rule_proposal_digest(b"x", b"y", b"z", 0);
+        let toolset_digest = compute_toolset_gate_digest("x", "y", DEST_G, "XLM", 0, 1_000_000);
+        assert_ne!(rule_digest, toolset_digest);
     }
 }

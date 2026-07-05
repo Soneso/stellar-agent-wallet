@@ -266,6 +266,11 @@ fn render_summary_line(view: &PendingApprovalView) -> String {
             issuer_redacted,
             ..
         } => format!("clawback opt-in for {code}:{issuer_redacted}"),
+        ApprovalSummaryView::RuleProposal {
+            smart_account_redacted,
+            summary_line,
+            ..
+        } => format!("{summary_line} on {smart_account_redacted}"),
         ApprovalSummaryView::Rejected { original_kind_name } => {
             format!("rejected ({original_kind_name})")
         }

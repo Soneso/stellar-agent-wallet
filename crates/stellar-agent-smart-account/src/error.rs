@@ -1774,6 +1774,7 @@ pub(crate) const ALL_AUTH_ENTRY_STAGES: &[&str] = &[
     "quorum_external_contract_guard",
     "quorum_signatures",
     "ed25519_rule_signer_quorum_guard",
+    "rule_proposal_digest",
 ];
 
 /// Pre-signing simulation-divergence attribution sub-code.
@@ -3977,12 +3978,12 @@ mod tests {
             stray_literals.join("\n")
         );
 
-        // Also assert that ALL_AUTH_ENTRY_STAGES has the expected 8 entries
+        // Also assert that ALL_AUTH_ENTRY_STAGES has the expected 9 entries
         // so a silent truncation of the const is caught.
         assert_eq!(
             ALL_AUTH_ENTRY_STAGES.len(),
-            8,
-            "ALL_AUTH_ENTRY_STAGES must contain exactly 8 entries"
+            9,
+            "ALL_AUTH_ENTRY_STAGES must contain exactly 9 entries"
         );
     }
 

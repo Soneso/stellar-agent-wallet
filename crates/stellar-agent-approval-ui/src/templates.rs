@@ -12,7 +12,11 @@
 //! redacted addresses) are HTML-escaped via [`html_escape`]; the data-island
 //! JSON is escaped via [`json_data_island`].
 
-use stellar_agent_core::approval::{ApprovalSummaryView, PendingApprovalView};
+use stellar_agent_core::amount::StellarAmount;
+use stellar_agent_core::approval::{
+    ApprovalSummaryView, ContextRuleProposalSnapshot, PendingApprovalView, RuleProposalContextType,
+    RuleProposalSignerKind, try_decode_spending_limit_params,
+};
 
 /// Serialise `value` to JSON safe to embed inside a
 /// `<script type="application/json">` element.
@@ -48,6 +52,7 @@ pub(crate) fn kind_is_approvable(summary: &ApprovalSummaryView) -> bool {
             | ApprovalSummaryView::Claim { .. }
             | ApprovalSummaryView::ToolsetFirstInvokeGate { .. }
             | ApprovalSummaryView::TrustlineClawbackOptIn { .. }
+            | ApprovalSummaryView::RuleProposal { .. }
     )
 }
 
@@ -129,6 +134,15 @@ pub(crate) fn render_detail_page(
 ) -> String {
     let approvable = kind_is_approvable(&view.summary) && !view.expired && !view.attested;
     let summary_html = render_summary_html(&view.summary);
+    // The full rule definition (context callout, signer table, policy table,
+    // override warnings) is not dt/dd-shaped, so it renders as its own block
+    // AFTER the `<dl>` closes rather than inside `summary_html`.
+    let rule_proposal_extra_html = match &view.summary {
+        ApprovalSummaryView::RuleProposal { definition, .. } => {
+            render_rule_proposal_definition_html(definition)
+        }
+        _ => String::new(),
+    };
 
     let status_line = if view.attested {
         "<strong>Status:</strong> already resolved (consent recorded)".to_owned()
@@ -202,6 +216,7 @@ pub(crate) fn render_detail_page(
     <dt>Expires at (unix ms)</dt><dd>{expires}</dd>
 {summary_html}
   </dl>
+  {rule_proposal_extra_html}
   {attested_block}
   {actions}
   <div id="result" class="muted"></div>
@@ -215,6 +230,7 @@ pub(crate) fn render_detail_page(
         created = view.created_at_unix_ms,
         expires = view.expires_at_unix_ms,
         summary_html = summary_html,
+        rule_proposal_extra_html = rule_proposal_extra_html,
         attested_block = attested_block,
         actions = actions,
         data_island = data_island,
@@ -322,6 +338,23 @@ fn render_summary_html(summary: &ApprovalSummaryView) -> String {
             s.push_str(&row("Issuer", issuer_redacted));
             s
         }
+        ApprovalSummaryView::RuleProposal {
+            smart_account_redacted,
+            chain_id,
+            proposal_sha256_hex,
+            ..
+        } => {
+            // The full rule definition (context, signers, policies, warnings)
+            // is NOT dt/dd-shaped (it needs tables and callout paragraphs), so
+            // it is rendered separately by `render_rule_proposal_extra_html`
+            // and inserted by the caller AFTER this `<dl>` closes, keeping
+            // the HTML validly nested.
+            let mut s = String::new();
+            s.push_str(&row("Smart account", smart_account_redacted));
+            s.push_str(&row("Chain ID", chain_id));
+            s.push_str(&row("Proposal digest", proposal_sha256_hex));
+            s
+        }
         ApprovalSummaryView::Rejected { original_kind_name } => {
             row("Rejected kind", original_kind_name)
         }
@@ -329,6 +362,159 @@ fn render_summary_html(summary: &ApprovalSummaryView) -> String {
         // a minimal placeholder rather than failing to build.
         _ => "    <dt>Summary</dt><dd>(unrecognised kind)</dd>\n".to_owned(),
     }
+}
+
+/// Renders the full resolved rule definition of a `RuleProposalSimulated`
+/// entry: context type (with a prominent account-wide-authority callout for
+/// `Default`), name, expiry, a signer table (kind, verifier/address, the
+/// FULL pubkey hex — not a prefix, so it is meaningfully verifiable against
+/// `proposal_sha256` — and a PROPOSER tag), a policy table (typed params
+/// where recognized, else the raw base64 XDR params string), `auth_rule_ids`,
+/// and the two override warning lines when set.
+///
+/// Every snapshot-derived string is passed through `html_escape`. No
+/// inline `<script>` or event-handler attribute is produced — this fn emits
+/// static markup only, consistent with the page's `script-src 'self'` CSP.
+///
+/// `pub` (re-exported at the crate root) so `stellar-agent-approval-remote`
+/// renders the identical markup for the SAME entry kind on the remote
+/// approval surface, rather than duplicating this rendering logic.
+#[must_use]
+pub fn render_rule_proposal_definition_html(definition: &ContextRuleProposalSnapshot) -> String {
+    let mut s = String::new();
+
+    match &definition.context_type {
+        RuleProposalContextType::Default => {
+            s.push_str(
+                "  <p class=\"warning\"><strong>WARNING:</strong> Default context grants \
+                 ACCOUNT-WIDE AUTHORITY — this rule authorizes ANY contract invocation, \
+                 not a scoped subset.</p>\n",
+            );
+        }
+        RuleProposalContextType::CallContract { contract } => {
+            s.push_str(&format!(
+                "  <p>Context: CallContract {}</p>\n",
+                html_escape(contract)
+            ));
+        }
+        RuleProposalContextType::CreateContract { wasm_hash_hex } => {
+            s.push_str(&format!(
+                "  <p>Context: CreateContract (wasm hash) {}</p>\n",
+                html_escape(wasm_hash_hex)
+            ));
+        }
+        // RuleProposalContextType is #[non_exhaustive]; a future variant
+        // renders with a minimal fallback rather than aborting the page.
+        other => {
+            s.push_str(&format!(
+                "  <p>Context: (unrecognized: {})</p>\n",
+                html_escape(&format!("{other:?}"))
+            ));
+        }
+    }
+
+    s.push_str(&format!(
+        "  <p>Rule name: {}</p>\n",
+        html_escape(&definition.name)
+    ));
+    let expiry = match definition.valid_until {
+        Some(ledger) => format!("expires at ledger {ledger}"),
+        None => "permanent (no expiry)".to_owned(),
+    };
+    s.push_str(&format!("  <p>Expiry: {}</p>\n", html_escape(&expiry)));
+
+    s.push_str("  <h3>Signers</h3>\n  <table>\n");
+    s.push_str(
+        "    <tr><th>#</th><th>Kind</th><th>Address / verifier</th><th>Pubkey (hex)</th><th></th></tr>\n",
+    );
+    for (idx, signer) in definition.signers.iter().enumerate() {
+        let (kind_label, address_cell, pubkey_cell) = match signer.kind {
+            RuleProposalSignerKind::Delegated => (
+                "Delegated",
+                signer.address.as_deref().unwrap_or("<missing>").to_owned(),
+                "—".to_owned(),
+            ),
+            RuleProposalSignerKind::External => (
+                "External",
+                signer.verifier.as_deref().unwrap_or("<missing>").to_owned(),
+                // WYSIWYS: the FULL pubkey is rendered — not a prefix — so
+                // the operator can meaningfully verify it against the
+                // signer bytes bound into `proposal_sha256`. A truncated
+                // prefix cannot be verified against the digest.
+                signer
+                    .pubkey_data
+                    .as_deref()
+                    .map(|bytes| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>())
+                    .unwrap_or_else(|| "<none>".to_owned()),
+            ),
+        };
+        let proposer_tag = if signer.is_proposer {
+            "<strong>PROPOSER</strong>"
+        } else {
+            ""
+        };
+        s.push_str(&format!(
+            "    <tr><td>{idx}</td><td>{}</td><td>{}</td><td>{}</td><td>{proposer_tag}</td></tr>\n",
+            html_escape(kind_label),
+            html_escape(&address_cell),
+            html_escape(&pubkey_cell),
+        ));
+    }
+    s.push_str("  </table>\n");
+
+    if definition.policies.is_empty() {
+        s.push_str("  <p>Policies: (none)</p>\n");
+    } else {
+        s.push_str("  <h3>Policies</h3>\n  <table>\n");
+        s.push_str("    <tr><th>#</th><th>Policy contract</th><th>Params</th></tr>\n");
+        for (idx, policy) in definition.policies.iter().enumerate() {
+            let detail = match try_decode_spending_limit_params(&policy.params_xdr_b64) {
+                Some(decoded) => match i64::try_from(decoded.limit_stroops) {
+                    Ok(stroops_i64) => format!(
+                        "spending-limit: {} XLM ({} stroops) / {} ledgers",
+                        StellarAmount::from_stroops(stroops_i64).as_xlm_decimal_string(),
+                        decoded.limit_stroops,
+                        decoded.period_ledgers
+                    ),
+                    Err(_) => format!(
+                        "spending-limit: {} stroops / {} ledgers",
+                        decoded.limit_stroops, decoded.period_ledgers
+                    ),
+                },
+                // WYSIWYS: an unrecognized policy still must show what the
+                // operator is actually attesting to, not just its byte
+                // count. The base64 XDR string is size-bounded (OZ policy
+                // install params) so truncation is not a concern here.
+                None => format!("(raw XDR params) {}", policy.params_xdr_b64),
+            };
+            s.push_str(&format!(
+                "    <tr><td>{idx}</td><td>{}</td><td>{}</td></tr>\n",
+                html_escape(&policy.policy_address),
+                html_escape(&detail),
+            ));
+        }
+        s.push_str("  </table>\n");
+    }
+
+    s.push_str(&format!(
+        "  <p>Auth rule IDs: {}</p>\n",
+        html_escape(&format!("{:?}", definition.auth_rule_ids))
+    ));
+
+    if definition.accept_mutable_verifier {
+        s.push_str(
+            "  <p class=\"warning\"><strong>WARNING:</strong> accept_mutable_verifier is \
+             set — a mutable verifier/policy contract will NOT block install.</p>\n",
+        );
+    }
+    if definition.accept_unknown_verifier {
+        s.push_str(
+            "  <p class=\"warning\"><strong>WARNING:</strong> accept_unknown_verifier is \
+             set — an unrecognized verifier/policy wasm hash will NOT block install.</p>\n",
+        );
+    }
+
+    s
 }
 
 #[cfg(test)]
@@ -514,6 +700,76 @@ mod tests {
         store.snapshot(NOW_MS).into_iter().next().unwrap()
     }
 
+    /// Builds a `RuleProposalSimulated` view with a `Default` context (the
+    /// account-wide-authority callout case), one `Delegated` proposer
+    /// signer, one `External` (WebAuthn-shaped) non-proposer signer, one
+    /// recognized spending-limit policy, and both override flags set — this
+    /// single fixture exercises every renderer branch at once.
+    fn rule_proposal_view(dir: &TempDir) -> PendingApprovalView {
+        use base64::Engine as _;
+        use stellar_agent_core::approval::{
+            ContextRuleProposalSnapshot, RuleProposalContextType, RuleProposalPolicy,
+            RuleProposalSigner,
+        };
+        use stellar_xdr::{Int128Parts, ScMap, ScMapEntry, ScSymbol, ScVal, WriteXdr};
+
+        let entries: Vec<ScMapEntry> = vec![
+            ScMapEntry {
+                key: ScVal::Symbol(ScSymbol::try_from("period_ledgers").unwrap()),
+                val: ScVal::U32(17_280),
+            },
+            ScMapEntry {
+                key: ScVal::Symbol(ScSymbol::try_from("spending_limit").unwrap()),
+                val: ScVal::I128(Int128Parts {
+                    hi: 0,
+                    lo: 10_000_000,
+                }),
+            },
+        ];
+        let scval = ScVal::Map(Some(ScMap(entries.try_into().unwrap())));
+        let bytes = scval.to_xdr(stellar_xdr::Limits::none()).unwrap();
+        let params_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+
+        let definition = ContextRuleProposalSnapshot::new(
+            RuleProposalContextType::Default,
+            "spend-daily".to_owned(),
+            None,
+            vec![
+                RuleProposalSigner::delegated(
+                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                    true,
+                ),
+                RuleProposalSigner::external(
+                    "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                    vec![0xABu8; 65],
+                    false,
+                ),
+            ],
+            vec![RuleProposalPolicy::new(
+                "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_owned(),
+                params_b64,
+            )],
+            vec![0],
+            true,
+            true,
+        );
+
+        let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
+        let entry = PendingApproval::new_rule_proposal_pending(
+            "CDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD".to_owned(),
+            "Test SDF Network ; September 2015".to_owned(),
+            "stellar:testnet".to_owned(),
+            definition,
+            [0x11u8; 32],
+            "Default rule \"spend-daily\"".to_owned(),
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        store.insert(entry, NOW_MS).unwrap();
+        store.snapshot(NOW_MS).into_iter().next().unwrap()
+    }
+
     fn rejected_view(dir: &TempDir) -> PendingApprovalView {
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
         let entry = PendingApproval::new_payment_pending(
@@ -583,6 +839,190 @@ mod tests {
         let html = render_summary_html(&rejected_view(&dir).summary);
         assert!(html.contains("Rejected kind"));
         assert!(html.contains("PaymentSimulated"));
+    }
+
+    #[test]
+    fn render_summary_html_covers_rule_proposal() {
+        let dir = TempDir::new().unwrap();
+        let html = render_summary_html(&rule_proposal_view(&dir).summary);
+        assert!(html.contains("Smart account"));
+        assert!(html.contains("Proposal digest"));
+    }
+
+    #[test]
+    fn kind_is_approvable_true_for_rule_proposal() {
+        let dir = TempDir::new().unwrap();
+        assert!(kind_is_approvable(&rule_proposal_view(&dir).summary));
+    }
+
+    #[test]
+    fn render_rule_proposal_definition_html_shows_account_wide_authority_callout() {
+        let dir = TempDir::new().unwrap();
+        let view = rule_proposal_view(&dir);
+        let ApprovalSummaryView::RuleProposal { definition, .. } = &view.summary else {
+            panic!("expected RuleProposal summary");
+        };
+        let html = render_rule_proposal_definition_html(definition);
+        assert!(
+            html.contains("ACCOUNT-WIDE AUTHORITY"),
+            "Default context must render the callout: {html}"
+        );
+    }
+
+    #[test]
+    fn render_rule_proposal_definition_html_tags_proposer_and_shows_full_pubkey() {
+        let dir = TempDir::new().unwrap();
+        let view = rule_proposal_view(&dir);
+        let ApprovalSummaryView::RuleProposal { definition, .. } = &view.summary else {
+            panic!("expected RuleProposal summary");
+        };
+        let html = render_rule_proposal_definition_html(definition);
+        assert!(
+            html.contains("<strong>PROPOSER</strong>"),
+            "the delegated proposer signer must be tagged: {html}"
+        );
+        // WYSIWYS: the fixture's external signer pubkey is 65 bytes of
+        // 0xAB — the FULL hex encoding (130 chars), not a truncated prefix,
+        // must appear so the rendered value is verifiable against the
+        // digest bound into proposal_sha256.
+        let full_pubkey_hex = "ab".repeat(65);
+        assert!(
+            html.contains(&full_pubkey_hex),
+            "external signer's FULL pubkey must render as hex, not a prefix: {html}"
+        );
+    }
+
+    #[test]
+    fn render_rule_proposal_definition_html_renders_typed_spending_limit() {
+        let dir = TempDir::new().unwrap();
+        let view = rule_proposal_view(&dir);
+        let ApprovalSummaryView::RuleProposal { definition, .. } = &view.summary else {
+            panic!("expected RuleProposal summary");
+        };
+        let html = render_rule_proposal_definition_html(definition);
+        assert!(html.contains("spending-limit:"));
+        assert!(html.contains("10000000 stroops"));
+        assert!(html.contains("17280 ledgers"));
+    }
+
+    #[test]
+    fn render_rule_proposal_definition_html_falls_back_to_raw_for_unrecognized_policy_params() {
+        use base64::Engine as _;
+        use stellar_agent_core::approval::{
+            ContextRuleProposalSnapshot, RuleProposalContextType, RuleProposalPolicy,
+            RuleProposalSigner,
+        };
+        let raw_params =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not a spending limit");
+        let definition = ContextRuleProposalSnapshot::new(
+            RuleProposalContextType::CallContract {
+                contract: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            },
+            "spend-daily".to_owned(),
+            None,
+            vec![RuleProposalSigner::delegated(
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                true,
+            )],
+            vec![RuleProposalPolicy::new(
+                "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_owned(),
+                raw_params.clone(),
+            )],
+            vec![0],
+            false,
+            false,
+        );
+        let html = render_rule_proposal_definition_html(&definition);
+        assert!(!html.contains("spending-limit:"));
+        // WYSIWYS: the fallback must show the ACTUAL params content, not
+        // merely a byte count — a count is not verifiable against what
+        // gets bound into proposal_sha256.
+        assert!(
+            html.contains(&raw_params),
+            "raw fallback must render the actual base64 XDR string, not just a byte count: {html}"
+        );
+    }
+
+    #[test]
+    fn render_rule_proposal_definition_html_same_policy_address_different_params_render_differently()
+     {
+        use base64::Engine as _;
+        use stellar_agent_core::approval::{
+            ContextRuleProposalSnapshot, RuleProposalContextType, RuleProposalPolicy,
+            RuleProposalSigner,
+        };
+        let params_a =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"unrecognized params A");
+        let params_b =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"unrecognized params B");
+        let build = |params: String| {
+            ContextRuleProposalSnapshot::new(
+                RuleProposalContextType::CallContract {
+                    contract: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                },
+                "spend-daily".to_owned(),
+                None,
+                vec![RuleProposalSigner::delegated(
+                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                    true,
+                )],
+                // Same policy_address in both — only params_xdr_b64 differs.
+                vec![RuleProposalPolicy::new(
+                    "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_owned(),
+                    params,
+                )],
+                vec![0],
+                false,
+                false,
+            )
+        };
+        let html_a = render_rule_proposal_definition_html(&build(params_a));
+        let html_b = render_rule_proposal_definition_html(&build(params_b));
+        assert_ne!(
+            html_a, html_b,
+            "two proposals sharing a policy_address but with different params_xdr_b64 must \
+             render differently, proving CONTENT (not just address) is displayed"
+        );
+    }
+
+    #[test]
+    fn render_rule_proposal_definition_html_shows_both_override_warnings() {
+        let dir = TempDir::new().unwrap();
+        let view = rule_proposal_view(&dir);
+        let ApprovalSummaryView::RuleProposal { definition, .. } = &view.summary else {
+            panic!("expected RuleProposal summary");
+        };
+        let html = render_rule_proposal_definition_html(definition);
+        assert!(html.contains("accept_mutable_verifier is"));
+        assert!(html.contains("accept_unknown_verifier is"));
+    }
+
+    #[test]
+    fn render_rule_proposal_definition_html_escapes_malicious_rule_name() {
+        use stellar_agent_core::approval::{
+            ContextRuleProposalSnapshot, RuleProposalContextType, RuleProposalSigner,
+        };
+        let definition = ContextRuleProposalSnapshot::new(
+            RuleProposalContextType::CallContract {
+                contract: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            },
+            "</script><script>alert(1)</script>".to_owned(),
+            None,
+            vec![RuleProposalSigner::delegated(
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                false,
+            )],
+            vec![],
+            vec![0],
+            false,
+            false,
+        );
+        let html = render_rule_proposal_definition_html(&definition);
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "rule name must be HTML-escaped, not passed through raw: {html}"
+        );
+        assert!(html.contains("&lt;script&gt;"));
     }
 
     /// The detail page's "informational kind" actions branch (no interactive

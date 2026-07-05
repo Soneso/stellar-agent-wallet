@@ -62,6 +62,7 @@ pub mod error;
 pub mod operator_credentials;
 pub mod registration_input;
 pub mod retry;
+pub mod rule_proposal;
 pub mod store;
 pub mod toolset_grant;
 pub mod user_id;
@@ -73,9 +74,10 @@ pub use attest::{
     load_attestation_key,
 };
 pub use attestation::{
-    TOOLSET_GATE_DOMAIN_TAG, TRUSTLINE_CLAWBACK_OPT_IN_DOMAIN_TAG, compute_attestation,
-    compute_toolset_gate_digest, compute_trustline_clawback_opt_in_digest, envelope_sha256,
-    verify_attestation, verify_toolset_gate_attestation,
+    RULE_PROPOSAL_DOMAIN_TAG, TOOLSET_GATE_DOMAIN_TAG, TRUSTLINE_CLAWBACK_OPT_IN_DOMAIN_TAG,
+    compute_attestation, compute_rule_proposal_digest, compute_toolset_gate_digest,
+    compute_trustline_clawback_opt_in_digest, envelope_sha256, verify_attestation,
+    verify_toolset_gate_attestation,
 };
 pub use error::ApprovalError;
 pub use operator_credentials::{
@@ -84,9 +86,14 @@ pub use operator_credentials::{
 };
 pub use registration_input::RegistrationInput;
 pub use retry::{DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, open_with_retry};
+pub use rule_proposal::{
+    CONTEXT_RULE_PROPOSAL_SNAPSHOT_VERSION, ContextRuleProposalSnapshot,
+    DecodedSpendingLimitParams, RuleProposalContextType, RuleProposalPolicy, RuleProposalSigner,
+    RuleProposalSignerKind, try_decode_spending_limit_params,
+};
 pub use store::{
     ApprovalKind, DEFAULT_TTL_MS, EXPECTED_NONCE_LEN, PendingApproval, PendingApprovalStore,
-    generate_csrf_token,
+    RuleProposalGateError, generate_csrf_token,
 };
 pub use toolset_grant::{
     TOOLSET_GRANT_DEFAULT_TTL_MS, ToolsetGrant, ToolsetGrantStore, build_attested_grant,

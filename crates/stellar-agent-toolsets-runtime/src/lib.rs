@@ -1772,6 +1772,159 @@ mod tests {
         }
     }
 
+    // ── SignRuleCreate gated resolver (Package D, GH issue #8) ────────────────
+    //
+    // `resolve_toolset_sign_payment_gated` is reused as-is for `sign-rule-create`
+    // (it is generic over the GATED matrix / Capability, despite its name): the
+    // "destination/asset/amount" triple is repurposed as the bucket-matching
+    // dimension for rule-create grants — `authoritative_destination` carries the
+    // smart-account C-strkey (the correct re-prompt dimension: a DIFFERENT
+    // smart account should re-trigger first-invoke consent, exactly like a
+    // different payment destination does), `authoritative_asset` is a fixed
+    // sentinel (`"context-rule"`, not a real asset), and
+    // `authoritative_amount_stroops` is a fixed positive dummy (`1`) since the
+    // amount dimension carries no independent meaning here. The per-proposal
+    // `RuleProposalSimulated` attestation (verified inside
+    // `stellar_rule_create_commit`) remains the REAL, unconditional per-action
+    // security boundary — this first-invoke gate is only the one-time
+    // "this toolset may attempt rule-create for this smart account" consent.
+
+    use crate::matrix::{SIGN_RULE_CREATE_AMOUNT_SENTINEL, SIGN_RULE_CREATE_ASSET_SENTINEL};
+
+    fn write_sign_rule_create_pin(toolsets_root: &std::path::Path, pkg: &str) {
+        std::fs::create_dir_all(toolsets_root.join(pkg)).unwrap();
+        let caps = stellar_agent_toolsets::parse_capability_value_pub("sign-rule-create").unwrap();
+        let pin = stellar_agent_toolsets_install::ToolsetPinRecord::build_for_test(
+            pkg,
+            "1.0.0",
+            "d".repeat(64),
+            "GABC1234567890123456789012345678901234567890123456",
+            "2026-06-12T00:00:00Z",
+            caps,
+            vec![],
+            None,
+        );
+        write_pin_json(toolsets_root, pkg, &pin);
+    }
+
+    #[test]
+    #[cfg(feature = "test-helpers")]
+    fn gated_resolver_sign_rule_create_no_grant_queues_first_invoke_gate() {
+        let toolsets_dir = tempfile::TempDir::new().unwrap();
+        let approval_dir = tempfile::TempDir::new().unwrap();
+        let grant_dir = tempfile::TempDir::new().unwrap();
+
+        write_sign_rule_create_pin(toolsets_dir.path(), "rule-toolset");
+
+        let params = GatedInvokeParams {
+            toolset_name: "rule-toolset",
+            action: "stellar_rule_create_commit",
+            toolsets_root: toolsets_dir.path(),
+            profile_name: "test",
+            authoritative_destination: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            authoritative_asset: SIGN_RULE_CREATE_ASSET_SENTINEL,
+            authoritative_amount_stroops: SIGN_RULE_CREATE_AMOUNT_SENTINEL,
+            now_unix_ms: 1_000_000,
+            process_uid: "uid-test",
+            approval_dir_override: Some(approval_dir.path().to_path_buf()),
+            grant_store_path_override: Some(grant_dir.path().join("grants.json")),
+        };
+
+        let outcome = resolve_toolset_sign_payment_gated(&params).unwrap();
+        match outcome {
+            GatedResolveOutcome::FirstInvokeApprovalRequired {
+                approval_nonce,
+                toolset_name,
+                capability,
+            } => {
+                assert!(
+                    !approval_nonce.is_empty(),
+                    "approval_nonce must be non-empty"
+                );
+                assert_eq!(toolset_name, "rule-toolset");
+                assert_eq!(capability, "sign-rule-create");
+            }
+            GatedResolveOutcome::Resolved { .. } => {
+                panic!("expected FirstInvokeApprovalRequired, got Resolved");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "test-helpers")]
+    fn gated_resolver_sign_rule_create_with_matching_grant_returns_resolved() {
+        use stellar_agent_core::approval::process_uid_for_attestation;
+
+        let toolsets_dir = tempfile::TempDir::new().unwrap();
+        let approval_dir = tempfile::TempDir::new().unwrap();
+        let grant_dir = tempfile::TempDir::new().unwrap();
+        let grant_path = grant_dir.path().join("grants.json");
+
+        write_sign_rule_create_pin(toolsets_dir.path(), "rule-toolset");
+
+        let now_unix_ms: u64 = 1_000_000;
+        let smart_account = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        let attestation_key = [0u8; 32];
+        let uid = process_uid_for_attestation().unwrap();
+
+        record_first_invoke_grant(
+            "test",
+            "rule-toolset",
+            "sign-rule-create",
+            smart_account,
+            SIGN_RULE_CREATE_ASSET_SENTINEL,
+            0,
+            SIGN_RULE_CREATE_AMOUNT_SENTINEL,
+            &uid,
+            now_unix_ms,
+            &attestation_key,
+            Some(grant_path.clone()),
+        )
+        .unwrap();
+
+        let params = GatedInvokeParams {
+            toolset_name: "rule-toolset",
+            action: "stellar_rule_create_commit",
+            toolsets_root: toolsets_dir.path(),
+            profile_name: "test",
+            authoritative_destination: smart_account,
+            authoritative_asset: SIGN_RULE_CREATE_ASSET_SENTINEL,
+            authoritative_amount_stroops: SIGN_RULE_CREATE_AMOUNT_SENTINEL,
+            now_unix_ms,
+            process_uid: &uid,
+            approval_dir_override: Some(approval_dir.path().to_path_buf()),
+            grant_store_path_override: Some(grant_path),
+        };
+
+        let outcome = resolve_toolset_sign_payment_gated(&params).unwrap();
+        match outcome {
+            GatedResolveOutcome::Resolved { tool_name } => {
+                assert_eq!(tool_name, "stellar_rule_create_commit");
+            }
+            GatedResolveOutcome::FirstInvokeApprovalRequired { .. } => {
+                panic!("expected Resolved, got FirstInvokeApprovalRequired");
+            }
+        }
+    }
+
+    /// Negative: a toolset granting ONLY `propose-transaction` (ungated) can
+    /// invoke `stellar_rule_create` (the propose step) but NOT
+    /// `stellar_rule_create_commit` (gated; requires `sign-rule-create`) via
+    /// the ungated path.
+    #[test]
+    fn propose_transaction_grants_stellar_rule_create_but_not_commit() {
+        let caps =
+            stellar_agent_toolsets::parse_capability_value_pub("propose-transaction").unwrap();
+        let tool = check_toolset_action("stellar_rule_create", &caps, &[]).unwrap();
+        assert_eq!(tool, "stellar_rule_create");
+
+        let err = check_toolset_action("stellar_rule_create_commit", &caps, &[]).unwrap_err();
+        assert!(matches!(
+            err,
+            ToolsetRuntimeError::UnknownToolsetAction { .. }
+        ));
+    }
+
     // ── Gated resolver: zero amount rejected EVEN WITH a matching grant ───────
     // Regression guard: the positivity check must run BEFORE the grant lookup,
     // so a grant covering the [0, N] bucket cannot resolve a zero-stroop invoke

@@ -318,6 +318,60 @@ entries fall out of the rolling window), but an intervening spend shrinks
 it — the numbers are a point-in-time estimate, not a guarantee for a future
 submission, which can still fail `SpendingLimitExceeded`.
 
+## Agent-proposed context rules
+
+| Tool | Purpose | Gating |
+| --- | --- | --- |
+| `stellar_rule_create` | Testnet-only. Resolve and simulate an `add_context_rule` installation you are proposing — signers, policies, context, name, expiry, `auth_rule_ids` — and park it as a pending approval. | No signing; no submission. Always mints an `approval_nonce`. |
+| `stellar_rule_create_commit` | Testnet-only. Verify the operator's attestation over the resolved definition and install the rule. | Signs and submits. Two-phase verb; approval spine. ALWAYS requires operator attestation, regardless of any policy verdict. |
+
+You never hold rule-write authority: `stellar_rule_create` only resolves and
+simulates; `stellar_rule_create_commit` installs only after the operator has
+attested to the EXACT definition you proposed, reviewed on one of the
+operator's approval surfaces (CLI, loopback inbox, or remote inbox), which
+render the full rule — every signer, every policy, the context, and a
+prominent callout if you proposed `Default` (account-wide authority).
+Unlike the payment/claim commit tools, a policy engine `Allow` verdict can
+never let `stellar_rule_create_commit` skip the operator attestation step —
+this pair only operates on testnet.
+
+### stellar_rule_create arguments
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `chain_id` | string | yes | |
+| `smart_account` | string | yes | Smart-account contract C-strkey. |
+| `context` | string | no | `"default"` (default), `"call-contract:<C-strkey>"`, or `"create-contract:<64-hex-wasm-hash>"`. |
+| `name` | string | yes | 1–20 bytes (OZ cap). |
+| `valid_until` | integer (u32) | no | Ledger sequence at which the rule expires; omit for permanent. |
+| `signers` | array | yes | At least one entry (OZ cap 15). Each is `{"kind": "delegated", "address": <G-or-C-strkey>}`, `{"kind": "external", "verifier": <C-strkey>, "pubkey_data_hex": <hex>}`, or `{"kind": "webauthn", "credential_name": <name>}` (resolved from the passkey store at propose time). |
+| `policies` | array | no | Up to 5. Each is `{"kind": "raw", "policy_address": <C-strkey>, "install_param_xdr_b64": <base64>}` or `{"kind": "spending_limit", "limit_stroops": <decimal string>, "period_ledgers": <u32>, "policy_address": <C-strkey, optional>}`. |
+| `auth_rule_ids` | array of integer | no | Defaults to `[0]` (the bootstrap rule). |
+| `accept_mutable_verifier` | bool | no | Opt in to a mutable-admin verifier/policy contract. Rendered as a warning on every approval surface when set. |
+| `accept_unknown_verifier` | bool | no | Opt in to a verifier/policy wasm hash outside the compile-time allowlist. Rendered as a warning when set. |
+| `accept_no_delegated_fallback` | bool | no | Required `true` when every signer is `webauthn` and no `delegated` entry is present — otherwise the rule has no ed25519 fallback if the passkey device is lost. |
+
+Returns `{ approval_nonce, expires_at_unix_ms, requires_operator_approval,
+proposal_sha256_hex, summary: { context_type_label, name, signer_count,
+policy_count, auth_rule_ids, summary_line } }`. `approval_nonce` is always
+present — unlike `stellar_pay` / `stellar_claim`, there is no envelope
+fallback for the commit step, so the pending approval is the sole carrier of
+the resolved definition.
+
+### stellar_rule_create_commit arguments
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `chain_id` | string | yes | |
+| `approval_nonce` | string | yes | From `stellar_rule_create`'s response. REQUIRED (not optional, unlike the pay/claim commit pair). |
+| `approval_attestation` | string | when `requires_operator_approval` was `true` | HMAC-SHA256 attestation blob the operator's `approve` produced. |
+
+Returns `{ rule_id, tx_hash }` on success. Verifies the attestation through a
+DEDICATED gate (distinct from the payment/claim attestation gate) and
+recomputes the digest from the stored snapshot UNCONDITIONALLY before
+installing — a mismatch refuses with `simulation.divergence` regardless of
+the policy verdict.
+
 ## DeFi
 
 | Tool | Purpose | Gating |

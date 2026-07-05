@@ -42,6 +42,8 @@
         return "toolset '" + s.toolset_name + "' requests " + s.capability;
       case "trustline_clawback_opt_in":
         return "clawback opt-in for " + s.code;
+      case "rule_proposal":
+        return s.summary_line + " on " + s.smart_account_redacted;
       case "rejected":
         return "rejected (" + s.original_kind_name + ")";
       default:

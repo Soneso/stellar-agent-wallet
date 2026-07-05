@@ -180,12 +180,17 @@ fn require_csrf(session: &SessionState, headers: &HeaderMap, nonce: &str) -> Res
 /// for `entry`, per [`ApprovalKind`].
 ///
 /// `PaymentSimulated` / `ClaimSimulated` entries carry a real envelope
-/// SHA-256; other attestable kinds (`ToolsetFirstInvokeGate`,
-/// `TrustlineClawbackOptIn`) have no signed envelope, and use a fixed
-/// all-zero 32-byte placeholder — the challenge's binding for those kinds
-/// rests on `approval_nonce` (unique per entry) rather than an envelope
-/// digest, which is the same binding the HMAC attestation preimage itself
-/// uses for those kinds (`compute_attestation` with a domain-specific
+/// SHA-256. `RuleProposalSimulated` has no envelope but carries its own
+/// domain-separated `proposal_sha256` digest over the resolved rule
+/// definition — using it here (rather than falling back to the zero
+/// placeholder) binds the per-action challenge to the EXACT rule the
+/// operator reviewed, the same strengthening `envelope_sha256_hex` gives
+/// `PaymentSimulated` / `ClaimSimulated`. Other attestable kinds
+/// (`ToolsetFirstInvokeGate`, `TrustlineClawbackOptIn`) have no such digest,
+/// and use a fixed all-zero 32-byte placeholder — the challenge's binding for
+/// those kinds rests on `approval_nonce` (unique per entry) rather than a
+/// content digest, which is the same binding the HMAC attestation preimage
+/// itself uses for those kinds (`compute_attestation` with a domain-specific
 /// digest, not an envelope hash).
 fn entry_envelope_sha256(entry: &PendingApproval) -> [u8; 32] {
     match &entry.kind {
@@ -197,6 +202,9 @@ fn entry_envelope_sha256(entry: &PendingApproval) -> [u8; 32] {
             envelope_sha256_hex,
             ..
         } => decode_sha256_hex(envelope_sha256_hex).unwrap_or([0u8; 32]),
+        ApprovalKind::RuleProposalSimulated {
+            proposal_sha256, ..
+        } => *proposal_sha256,
         _ => [0u8; 32],
     }
 }
@@ -1954,6 +1962,121 @@ mod tests {
                 .unwrap();
             assert_csp_contract(resp).await;
         });
+    }
+
+    // ── entry_envelope_sha256: non-zero binding for every digest-carrying kind ─
+    //
+    // Package D, GH issue #8, Leg 3: `RuleProposalSimulated` must bind the
+    // per-action challenge to its `proposal_sha256`, exactly as
+    // `PaymentSimulated` / `ClaimSimulated` bind to their envelope digest.
+    // Regression guard: if the `RuleProposalSimulated` arm were ever removed
+    // or fell through to the wildcard, this test catches it immediately
+    // (the fallback zero placeholder is the WRONG behaviour for a kind that
+    // has a real content digest to bind to).
+
+    #[test]
+    fn entry_envelope_sha256_is_non_zero_for_every_digest_carrying_kind() {
+        let payment = stellar_agent_core::approval::PendingApproval::new_payment_pending(
+            "b64xdr".to_owned(),
+            b"fake-xdr-bytes",
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            2_500_000,
+            "XLM".to_owned(),
+            None,
+            100,
+            1_234_567,
+            "424242".to_owned(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        assert_ne!(
+            entry_envelope_sha256(&payment),
+            [0u8; 32],
+            "PaymentSimulated"
+        );
+
+        let claim = stellar_agent_core::approval::PendingApproval::new_claim_pending(
+            "b64xdr".to_owned(),
+            b"fake-xdr-bytes",
+            "a".repeat(72),
+            "B".to_owned() + &"A".repeat(57),
+            "XLM".to_owned(),
+            500,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            100,
+            1,
+            "424242".to_owned(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        assert_ne!(entry_envelope_sha256(&claim), [0u8; 32], "ClaimSimulated");
+
+        let definition = stellar_agent_core::approval::ContextRuleProposalSnapshot::new(
+            stellar_agent_core::approval::RuleProposalContextType::Default,
+            "spend-daily".to_owned(),
+            None,
+            vec![stellar_agent_core::approval::RuleProposalSigner::delegated(
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                true,
+            )],
+            vec![],
+            vec![0],
+            false,
+            false,
+        );
+        let rule_proposal =
+            stellar_agent_core::approval::PendingApproval::new_rule_proposal_pending(
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+                "Test SDF Network ; September 2015".to_owned(),
+                "stellar:testnet".to_owned(),
+                definition,
+                [0x11u8; 32],
+                "Default rule \"spend-daily\"".to_owned(),
+                "424242".to_owned(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap();
+        assert_eq!(
+            entry_envelope_sha256(&rule_proposal),
+            [0x11u8; 32],
+            "RuleProposalSimulated must bind to proposal_sha256, not the zero placeholder"
+        );
+
+        // Kinds with no content digest of their own correctly fall back to
+        // the zero placeholder — binding for these rests on approval_nonce
+        // alone, by design (see the fn's doc comment).
+        let toolset_gate =
+            stellar_agent_core::approval::PendingApproval::new_toolset_first_invoke_gate_pending(
+                "my-toolset".to_owned(),
+                "sign-payment".to_owned(),
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                "XLM".to_owned(),
+                0,
+                1_000_000,
+                "424242".to_owned(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap();
+        assert_eq!(
+            entry_envelope_sha256(&toolset_gate),
+            [0u8; 32],
+            "ToolsetFirstInvokeGate has no content digest; must use the placeholder"
+        );
+
+        let clawback =
+            stellar_agent_core::approval::PendingApproval::new_trustline_clawback_opt_in_pending(
+                "Test SDF Network ; September 2015".to_owned(),
+                "USDC".to_owned(),
+                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
+                "424242".to_owned(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap();
+        assert_eq!(
+            entry_envelope_sha256(&clawback),
+            [0u8; 32],
+            "TrustlineClawbackOptIn has no content digest; must use the placeholder"
+        );
     }
 
     /// Asserts `resp` carries the hardened CSP (`script-src 'self'`, no

@@ -77,3 +77,6 @@ pub(crate) mod trustline;
 pub(crate) mod claim;
 // Smart-account rules observability — stellar_rules_list / stellar_rules_get.
 pub(crate) mod rules;
+// Agent-proposed context rules — stellar_rule_create / stellar_rule_create_commit
+// (Package D, GH issue #8).
+pub(crate) mod rule_create;

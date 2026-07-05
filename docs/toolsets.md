@@ -63,6 +63,7 @@ The capability manifest is the space-separated value of
 | `observe-event` | Observe a ledger event. No tool is wired to this capability yet, so it grants nothing. |
 | `sign-payment` | Sign and submit a classic payment. Signing-adjacent and gated; inert until the first-invoke gate converts it to a runtime grant. |
 | `read-rules` | Read the agent's own context rules (spending-limit budgets, expiry, signer/policy counts). Separately grantable from `read-balance` — rule visibility and balance visibility are distinct concerns. |
+| `sign-rule-create` | Install an agent-proposed context rule on-chain. Signing-adjacent and gated; inert until the first-invoke gate converts it to a runtime grant. The per-proposal operator attestation (`RuleProposalSimulated`) fires unconditionally regardless of the grant. |
 
 The bare token `sign-transaction` is always refused with a format error. There is
 no flat "sign" capability — signing is never grantable as a plain manifest token.
@@ -104,19 +105,29 @@ The ungated matrix contains no signing, key-derivation, or policy-mutation tool.
 A toolset that declares every capability still cannot resolve a signing tool through
 the ungated path, because no such tool exists in the matrix to resolve to. The
 build-vs-commit split is load-bearing here: `propose-transaction` grants
-`stellar_pay` and `stellar_claim` (which build unsigned envelopes), never
-`stellar_pay_commit` or `stellar_claim_commit` (which sign and submit).
+`stellar_pay`, `stellar_claim`, and `stellar_rule_create` (which build an unsigned
+envelope or a simulated rule proposal only), never `stellar_pay_commit`,
+`stellar_claim_commit`, or `stellar_rule_create_commit` (which sign and submit).
 
-The **gated tier** is a separate table for the one signing-adjacent capability:
+The **gated tier** is a separate table for the signing-adjacent capabilities:
 
 | Capability | Tool | Admission |
 |---|---|---|
 | `sign-payment` | `stellar_pay_commit` | First-invoke gate plus unconditional per-action approval only |
+| `sign-rule-create` | `stellar_rule_create_commit` | First-invoke gate plus unconditional per-proposal `RuleProposalSimulated` attestation only |
+
+`sign-rule-create`'s first-invoke gate reuses the same payment-shaped
+`ToolsetFirstInvokeGate` grant mechanism, with the smart-account C-strkey as
+the bucket-matching dimension (a different smart account re-triggers
+first-invoke consent, exactly as a different payment destination does) and a
+fixed sentinel in place of the asset/amount fields, which carry no
+independent meaning for rule creation.
 
 A **signing denylist** names every signing, key, and policy-mutation tool by
-literal string, including `stellar_pay_commit`, the SEP-43 and SEP-53 signing
-tools, the `*_commit` tools, the x402 tools, and the toolset dispatcher's own tools
-`stellar_toolset_list` / `stellar_toolset_invoke` (the last two prevent a toolset from
+literal string, including `stellar_pay_commit`, `stellar_rule_create_commit`,
+the SEP-43 and SEP-53 signing tools, the `*_commit` tools, the x402 tools, and
+the toolset dispatcher's own tools `stellar_toolset_list` /
+`stellar_toolset_invoke` (the last two prevent a toolset from
 re-invoking the dispatcher to escalate). The denylist and the ungated matrix are
 disjoint by literal name, so the gated tool is unreachable from the ungated
 resolver.

@@ -171,6 +171,37 @@ How a `RequireApproval` verdict is satisfied depends on the tool shape:
   `RequireApproval` for one of these tools, the call is refused fail-closed with
   `policy.approval_required_unsupported`; the wallet never signs without a
   verified approval.
+- `stellar_rule_create` / `stellar_rule_create_commit` (Package D, GH issue
+  #8) is a two-phase pair with a DIFFERENT approval-block contract: unlike the
+  signing verbs above, there is no envelope fallback for the commit step to
+  fall back on, so `stellar_rule_create` persists the pending approval
+  UNCONDITIONALLY — the `approval_nonce` in its response is always present.
+  A `requires_operator_approval` field reports the PROPOSE-time policy
+  verdict, but this is informational only: `stellar_rule_create_commit`
+  ALWAYS requires operator attestation, unconditionally, regardless of this
+  field's value or of the policy engine's verdict at commit time. This is a
+  deliberate divergence from the signing verbs above (where an `Allow`
+  verdict on the commit tool does let the call proceed without an
+  attestation): a payment `Allow` spends within an operator-configured
+  budget, but a rule-create `Allow` would let the agent grant itself
+  permanent — potentially account-wide — authority, which this feature's
+  contract forbids. The agent NEVER holds rule-write authority at any point
+  in this flow: `stellar_rule_create` only simulates and resolves the
+  definition (no signing, no submission);
+  `stellar_rule_create_commit` verifies the operator's attestation over the
+  resolved definition through a DEDICATED gate
+  (`PendingApprovalStore::verify_rule_proposal_gate`, distinct from the
+  shared pay/claim attestation gate) and unconditionally recomputes the
+  digest from the stored snapshot before installing — a mismatch is
+  `simulation.divergence` regardless of the policy verdict. Every approval
+  surface (CLI `approve`, the loopback inbox, the remote inbox) renders the
+  FULL resolved rule — context, every signer, every policy, the override
+  flags — so operator consent binds to exactly what gets installed, not to a
+  name or a hash. Both tools structurally refuse `chain_id=stellar:mainnet`
+  (`network.mainnet_write_forbidden`), matching every other smart-account
+  write surface: `stellar_rule_create` refuses at propose time,
+  `stellar_rule_create_commit` refuses again at commit time as defense in
+  depth.
 
 Argument values are never written to the [audit log](./concepts.md); only key
 names and lifecycle metadata are recorded. Verify the chain with
@@ -178,7 +209,7 @@ names and lifecycle metadata are recorded. Verify the chain with
 
 ## Tool catalog
 
-The server registers 36 tools. For each tool below: the exact registered name,
+The server registers 38 tools. For each tool below: the exact registered name,
 its purpose, and whether it is read-only, signs without submitting, or signs and
 submits. Every tool except `stellar_x402_parse_receipt`, `stellar_toolset_list`,
 and `stellar_toolset_invoke` requires a `chain_id` argument carrying the CAIP-2
@@ -219,6 +250,8 @@ supplied.
 | --- | --- | --- |
 | `stellar_rules_list` | Enumerate active context rules on a smart account: `rule_id`, `name`, `context_type_label`, `valid_until`, `signer_count`, `policy_count`, plus `as_of_ledger`. Scans up to the same `max_scan_id` default as the CLI `smart-account rules list`. | Read-only. |
 | `stellar_rules_get` | Read one context rule's metadata plus its attached policies (`address`, `identified_kind`: `threshold`, `spending-limit`, or `unknown`), and, when exactly one policy identifies as `spending-limit`, the budget snapshot (`spending_limit`, `period_ledgers`, `in_window_spent`, `remaining_budget`, `as_of_ledger`). Identification failure or an absent policy degrades to the metadata-only shape rather than failing. | Read-only. |
+| `stellar_rule_create` | Testnet-only. Resolve and simulate an agent-proposed `add_context_rule` installation: signers (delegated, raw external, or WebAuthn passkey by credential name — resolved to bytes at propose time), policies (raw or typed spending-limit), context, name, expiry, and `auth_rule_ids`. Mints a domain-separated digest over the resolved arguments and parks the full definition as a pending approval. | No signing; no submission. Mints the pending-approval nonce the commit step consumes. |
+| `stellar_rule_create_commit` | Testnet-only. ALWAYS requires operator attestation, unconditionally — the policy engine's verdict for this call can never bypass it. Verify the operator's attestation over the resolved definition (a dedicated gate, distinct from the payment/claim attestation gate), recompute the digest from the stored snapshot, and install the rule. | Signs and submits. Two-phase verb; approval spine. |
 
 `in_window_spent` and `remaining_budget` are exact only as of `as_of_ledger`:
 forward ledger movement past that point only grows headroom (older spend

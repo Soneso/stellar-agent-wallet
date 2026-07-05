@@ -10,6 +10,7 @@
 
 use serde::Serialize;
 
+use super::rule_proposal::ContextRuleProposalSnapshot;
 use super::store::{ApprovalKind, PendingApproval, redact_g_strkey};
 
 /// Read-only, non-secret view of a single pending approval entry.
@@ -67,7 +68,7 @@ pub struct PendingApprovalView {
 /// Serialises as a JSON object tagged with a `"kind"` discriminator
 /// (`"payment"`, `"claim"`, `"sign_with_passkey"`, `"register_passkey"`,
 /// `"toolset_first_invoke_gate"`, `"trustline_clawback_opt_in"`,
-/// `"rejected"`), the same tagging convention as
+/// `"rule_proposal"`, `"rejected"`), the same tagging convention as
 /// `stellar_agent_stablecoin::preview::GateDecisionView`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -151,6 +152,32 @@ pub enum ApprovalSummaryView {
         issuer_redacted: String,
     },
 
+    /// [`ApprovalKind::RuleProposalSimulated`] summary fields (Package D, GH
+    /// issue #8).
+    ///
+    /// Carries the FULL resolved rule definition (`definition`) — not just a
+    /// flattened summary — because Leg 3's approval surfaces render every
+    /// operator-relevant field (context type, every signer with its
+    /// proposer tag, every policy, the override flags) so the operator
+    /// consents to exactly what will be installed. This is the same "shown
+    /// in full, non-secret" posture as `Payment` / `Claim`: every field here
+    /// is either public on-chain data or already redacted (`smart_account`
+    /// itself is never exposed — only its redaction).
+    RuleProposal {
+        /// First-5-last-5 redacted smart-account C-strkey.
+        smart_account_redacted: String,
+        /// Network passphrase the proposal was simulated against.
+        network_passphrase: String,
+        /// CAIP-2 chain ID.
+        chain_id: String,
+        /// The fully-resolved rule definition snapshot.
+        definition: ContextRuleProposalSnapshot,
+        /// Hex-encoded `proposal_sha256` digest.
+        proposal_sha256_hex: String,
+        /// Pre-computed, non-secret one-line summary.
+        summary_line: String,
+    },
+
     /// [`ApprovalKind::Rejected`] tombstone — carries no summary data, only
     /// the kind name of the entry that was rejected.
     Rejected {
@@ -165,7 +192,8 @@ impl PendingApprovalView {
         let attested = match &entry.kind {
             ApprovalKind::PaymentSimulated { .. }
             | ApprovalKind::ClaimSimulated { .. }
-            | ApprovalKind::TrustlineClawbackOptIn { .. } => entry.attestation_blob_b64.is_some(),
+            | ApprovalKind::TrustlineClawbackOptIn { .. }
+            | ApprovalKind::RuleProposalSimulated { .. } => entry.attestation_blob_b64.is_some(),
             ApprovalKind::SignWithPasskey { .. } => entry.passkey_assertion.is_some(),
             ApprovalKind::RegisterPasskey {
                 registration_input, ..
@@ -249,6 +277,22 @@ impl PendingApprovalView {
                 network: network.clone(),
                 code: code.clone(),
                 issuer_redacted: redact_g_strkey(issuer),
+            },
+            ApprovalKind::RuleProposalSimulated {
+                smart_account_redacted,
+                network_passphrase,
+                chain_id,
+                definition,
+                proposal_sha256,
+                summary_line,
+                ..
+            } => ApprovalSummaryView::RuleProposal {
+                smart_account_redacted: smart_account_redacted.clone(),
+                network_passphrase: network_passphrase.clone(),
+                chain_id: chain_id.clone(),
+                definition: definition.clone(),
+                proposal_sha256_hex: proposal_sha256.iter().map(|b| format!("{b:02x}")).collect(),
+                summary_line: summary_line.clone(),
             },
             ApprovalKind::Rejected { original_kind_name } => ApprovalSummaryView::Rejected {
                 original_kind_name: original_kind_name.clone(),
@@ -542,6 +586,58 @@ mod tests {
                 assert_eq!(original_kind_name, "PaymentSimulated");
             }
             other => panic!("expected Rejected summary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_renders_rule_proposal_simulated() {
+        use super::super::rule_proposal::{
+            ContextRuleProposalSnapshot, RuleProposalContextType, RuleProposalSigner,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let mut store = open_store(&dir);
+        let definition = ContextRuleProposalSnapshot::new(
+            RuleProposalContextType::Default,
+            "spend-daily".to_owned(),
+            None,
+            vec![RuleProposalSigner::delegated(
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                true,
+            )],
+            vec![],
+            vec![0],
+            false,
+            false,
+        );
+        let entry = PendingApproval::new_rule_proposal_pending(
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            TESTNET_PASSPHRASE.to_owned(),
+            "stellar:testnet".to_owned(),
+            definition,
+            [0x99u8; 32],
+            "CallContract rule \"spend-daily\"".to_owned(),
+            uid(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        store.insert(entry, TEST_NOW_MS).unwrap();
+
+        let views = store.snapshot(TEST_NOW_MS);
+        assert_eq!(views[0].kind_name, "RuleProposalSimulated");
+        assert!(!views[0].attested);
+        match &views[0].summary {
+            ApprovalSummaryView::RuleProposal {
+                smart_account_redacted,
+                definition,
+                proposal_sha256_hex,
+                ..
+            } => {
+                assert!(smart_account_redacted.contains("..."));
+                assert_eq!(definition.name, "spend-daily");
+                assert_eq!(proposal_sha256_hex.len(), 64);
+            }
+            other => panic!("expected RuleProposal summary, got {other:?}"),
         }
     }
 

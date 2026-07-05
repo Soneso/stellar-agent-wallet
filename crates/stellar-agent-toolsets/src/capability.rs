@@ -28,6 +28,14 @@ pub(crate) const SIGN_TRANSACTION_TOKEN: &str = "sign-transaction";
 /// it into a runtime grant.
 pub(crate) const SIGN_PAYMENT_TOKEN: &str = "sign-payment";
 
+/// The `sign-rule-create` capability token (Package D, GH issue #8).
+///
+/// Same inert-at-declaration posture as [`SIGN_PAYMENT_TOKEN`]: declaring it
+/// confers nothing until the first-invoke gate converts it into a runtime
+/// grant. Gates `stellar_rule_create_commit` — installing an agent-proposed
+/// context rule on-chain.
+pub(crate) const SIGN_RULE_CREATE_TOKEN: &str = "sign-rule-create";
+
 /// A wallet capability that a toolset may declare in its manifest.
 ///
 /// `#[non_exhaustive]` so that future releases can add capability kinds without
@@ -89,6 +97,27 @@ pub enum Capability {
     /// `read-balance`: rule visibility and balance visibility are distinct
     /// concerns, so a toolset must request each independently.
     ReadRules,
+
+    /// Install an agent-proposed context rule on-chain (signing-adjacent;
+    /// gated).
+    ///
+    /// Maps to the `sign-rule-create` token.
+    ///
+    /// # Inert at declaration
+    ///
+    /// Same posture as [`Capability::SignPayment`]: declaring `sign-rule-create`
+    /// confers NOTHING at parse or install time. This capability is INERT
+    /// until the wallet's first-invoke gate queues an out-of-band operator
+    /// approval and, after the operator approves, converts it into a
+    /// runtime grant.
+    ///
+    /// Even with a current grant, the per-proposal `RuleProposalSimulated`
+    /// attestation fires unconditionally for every toolset-routed
+    /// `stellar_rule_create_commit` call. `sign-rule-create` NEVER replaces
+    /// that per-action approval; it is an additive first-invoke consent
+    /// layered before it — same relationship `sign-payment` has to the
+    /// per-action `PaymentSimulated` approval.
+    SignRuleCreate,
 }
 
 impl Capability {
@@ -130,6 +159,7 @@ impl Capability {
             Self::ObserveEvent => false,
             Self::SignPayment => true,
             Self::ReadRules => false,
+            Self::SignRuleCreate => true,
         }
     }
 }
@@ -143,6 +173,7 @@ impl fmt::Display for Capability {
             Self::ObserveEvent => f.write_str("observe-event"),
             Self::SignPayment => f.write_str("sign-payment"),
             Self::ReadRules => f.write_str("read-rules"),
+            Self::SignRuleCreate => f.write_str("sign-rule-create"),
         }
     }
 }
@@ -387,6 +418,9 @@ fn match_capability_token(token: &str) -> Result<Capability, ToolsetFormatError>
         // The first-invoke gate is the sole admission control for this code path.
         SIGN_PAYMENT_TOKEN => Ok(Capability::SignPayment),
         "read-rules" => Ok(Capability::ReadRules),
+        // sign-rule-create is declarable but INERT at parse/install time.
+        // The first-invoke gate is the sole admission control for this code path.
+        SIGN_RULE_CREATE_TOKEN => Ok(Capability::SignRuleCreate),
         other => Err(ToolsetFormatError::UnknownCapability {
             token: other.to_owned(),
         }),
@@ -436,6 +470,20 @@ mod tests {
         let set = parse_capability_value("sign-payment").unwrap();
         assert!(set.contains(Capability::SignPayment));
         assert_eq!(set.len(), 1);
+    }
+
+    // ── sign-rule-create is declarable and parses to SignRuleCreate ──────────
+
+    #[test]
+    fn sign_rule_create_parses_to_sign_rule_create_capability() {
+        let set = parse_capability_value("sign-rule-create").unwrap();
+        assert!(set.contains(Capability::SignRuleCreate));
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn sign_rule_create_display_roundtrip() {
+        assert_eq!(Capability::SignRuleCreate.to_string(), "sign-rule-create");
     }
 
     #[test]
@@ -593,6 +641,16 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_sign_rule_create_is_ok() {
+        let json = r#"["sign-rule-create"]"#;
+        let set: CapabilitySet = serde_json::from_str(json).unwrap();
+        assert!(
+            set.contains(Capability::SignRuleCreate),
+            "sign-rule-create must deserialise to SignRuleCreate variant"
+        );
+    }
+
+    #[test]
     fn deserialize_unknown_token_silently_skipped() {
         // Unknown tokens (future capabilities) are silently skipped so old
         // binaries can load records written by new binaries.
@@ -668,6 +726,8 @@ mod tests {
         );
         assert_eq!(Capability::ObserveEvent.to_string(), "observe-event");
         assert_eq!(Capability::SignPayment.to_string(), "sign-payment");
+        assert_eq!(Capability::ReadRules.to_string(), "read-rules");
+        assert_eq!(Capability::SignRuleCreate.to_string(), "sign-rule-create");
     }
 
     // ── is_key_touching ───────────────────────────────────────────────────────
@@ -680,6 +740,14 @@ mod tests {
         assert!(
             Capability::SignPayment.is_key_touching(),
             "SignPayment must be key-touching (accesses signing key)"
+        );
+    }
+
+    #[test]
+    fn sign_rule_create_is_key_touching() {
+        assert!(
+            Capability::SignRuleCreate.is_key_touching(),
+            "SignRuleCreate must be key-touching (installs a rule via the signing key)"
         );
     }
 
@@ -713,6 +781,7 @@ mod tests {
             (Capability::ObserveEvent, false),
             (Capability::SignPayment, true),
             (Capability::ReadRules, false),
+            (Capability::SignRuleCreate, true),
         ];
         for (cap, expected) in table {
             assert_eq!(

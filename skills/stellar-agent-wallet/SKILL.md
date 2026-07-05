@@ -184,6 +184,12 @@ account's full authority. These run under the CLI `smart-account` (alias `sa`)
 command group and submit through the smart account. See
 `references/smart-accounts.md`.
 
+You can also PROPOSE a new rule yourself via `stellar_rule_create` /
+`stellar_rule_create_commit` instead of asking the operator to run the CLI —
+you resolve and simulate the definition, but the rule installs only after the
+operator attests to the exact definition you proposed. See
+`references/mcp-tools.md#agent-proposed-context-rules`.
+
 ## 6. DeFi
 
 `stellar_blend_lend` (supply/withdraw/borrow/repay), `stellar_dex_trade`

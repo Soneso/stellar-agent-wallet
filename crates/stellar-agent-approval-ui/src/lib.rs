@@ -67,6 +67,10 @@ pub use error::{ServeShutdownError, ServeStartError};
 pub use stellar_agent_loopback_http::host_header::HostHeaderAllowlistLayer;
 pub use stellar_agent_loopback_http::origin_header::OriginHeaderAllowlistLayer;
 pub use stellar_agent_loopback_http::security_headers::SecurityHeadersLayer;
+// Shared `RuleProposalSimulated` full-definition HTML renderer — reused
+// as-is by `stellar-agent-approval-remote` so both approval surfaces render
+// the identical markup for the same entry kind.
+pub use templates::render_rule_proposal_definition_html;
 
 use auth::{AuthState, OpaqueToken};
 

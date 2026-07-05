@@ -78,11 +78,17 @@ pub const READ_BALANCE_GRANTS: &[&str] = &["stellar_balances"];
 /// - `stellar_claim` — simulate/build an UNSIGNED `ClaimClaimableBalance`
 ///   envelope ONLY. `stellar_claim_commit` is EXPLICITLY excluded (that is the
 ///   sign+submit tool; it is denylist-only, unreachable via toolset routing).
+/// - `stellar_rule_create` — resolve/simulate an agent-proposed
+///   `add_context_rule` installation ONLY (mints a pending approval; installs
+///   nothing). `stellar_rule_create_commit` is EXPLICITLY excluded — that is
+///   the gated sign+submit tool, reachable only via `Capability::SignRuleCreate`'s
+///   gated tier.
 ///
-/// **Invariant**: `stellar_pay_commit` / `stellar_claim_commit` MUST NOT appear
-/// here. If either simulate tool ever gains an integrated sign step, remove it
-/// from this list immediately.
-pub const PROPOSE_TRANSACTION_GRANTS: &[&str] = &["stellar_pay", "stellar_claim"];
+/// **Invariant**: `stellar_pay_commit` / `stellar_claim_commit` /
+/// `stellar_rule_create_commit` MUST NOT appear here. If any propose tool
+/// ever gains an integrated sign step, remove it from this list immediately.
+pub const PROPOSE_TRANSACTION_GRANTS: &[&str] =
+    &["stellar_pay", "stellar_claim", "stellar_rule_create"];
 
 // ── SuggestDestination grant ──────────────────────────────────────────────────
 
@@ -130,6 +136,7 @@ pub const ALL_MATRIX_ENTRIES: &[(&str, Capability)] = &[
     // ProposeTransaction
     ("stellar_pay", Capability::ProposeTransaction),
     ("stellar_claim", Capability::ProposeTransaction),
+    ("stellar_rule_create", Capability::ProposeTransaction),
     // SuggestDestination
     ("stellar_sep47_discover", Capability::SuggestDestination),
     (
@@ -152,6 +159,7 @@ pub const ALL_MATRIX_TOOL_NAMES: &[&str] = &[
     "stellar_balances",
     "stellar_pay",
     "stellar_claim",
+    "stellar_rule_create",
     "stellar_sep47_discover",
     "stellar_sep48_preview_invocation",
     "stellar_sep7_parse_uri",
@@ -181,6 +189,36 @@ pub const ALL_MATRIX_TOOL_NAMES: &[&str] = &[
 /// permanently blocked.
 pub const SIGN_PAYMENT_GATED_TOOLS: &[&str] = &["stellar_pay_commit"];
 
+/// Sentinel `authoritative_asset` value for `resolve_toolset_sign_payment_gated`
+/// calls routing `sign-rule-create` (Package D, GH issue #8).
+///
+/// The `ToolsetFirstInvokeGate` / grant-matching machinery is payment-shaped
+/// (destination + asset + amount bucket); `sign-rule-create` repurposes
+/// `authoritative_destination` to carry the smart-account C-strkey (see
+/// [`SIGN_RULE_CREATE_GATED_TOOLS`]) but has no real "asset" concept, so this
+/// fixed, code:issuer-shaped sentinel is used instead of a real asset. The
+/// issuer half is `stellar_agent_core::constants::SIMULATE_SENTINEL_G` (the
+/// well-known all-zero-key sentinel used elsewhere in this codebase for
+/// simulate-only / non-real account references) — never a real trustline
+/// issuer.
+pub const SIGN_RULE_CREATE_ASSET_SENTINEL: &str =
+    "RULECREATE:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
+/// Sentinel `authoritative_amount_stroops` value for `sign-rule-create` gated
+/// calls. The amount dimension carries no independent meaning for rule
+/// creation; a fixed positive value keeps the (required-positive) bucket
+/// check satisfied and makes every `sign-rule-create` grant/invoke land in
+/// the SAME `[0, 1]` bucket, so re-prompting is driven entirely by
+/// `authoritative_destination` (the smart account), not by this value.
+pub const SIGN_RULE_CREATE_AMOUNT_SENTINEL: i64 = 1;
+
+/// The single gated-tier entry for `SignRuleCreate` (Package D, GH issue #8).
+///
+/// `stellar_rule_create_commit` routes through the first-invoke gate ONLY.
+/// It MUST remain in `SIGNING_DENYLIST` so the ungated `resolve_action` path
+/// is permanently blocked.
+pub const SIGN_RULE_CREATE_GATED_TOOLS: &[&str] = &["stellar_rule_create_commit"];
+
 /// All (capability, tool_name) pairs in the GATED matrix.
 ///
 /// This structure is iterated by the gated-tier invariant tests and by the
@@ -188,8 +226,10 @@ pub const SIGN_PAYMENT_GATED_TOOLS: &[&str] = &["stellar_pay_commit"];
 ///
 /// NEVER add a gated entry to `ALL_MATRIX_ENTRIES` — that would bypass the
 /// gate entirely.
-pub const GATED_MATRIX_ENTRIES: &[(Capability, &[&str])] =
-    &[(Capability::SignPayment, SIGN_PAYMENT_GATED_TOOLS)];
+pub const GATED_MATRIX_ENTRIES: &[(Capability, &[&str])] = &[
+    (Capability::SignPayment, SIGN_PAYMENT_GATED_TOOLS),
+    (Capability::SignRuleCreate, SIGN_RULE_CREATE_GATED_TOOLS),
+];
 
 /// Returns the gated grant set for a signing-adjacent capability.
 ///
@@ -209,6 +249,7 @@ pub const GATED_MATRIX_ENTRIES: &[(Capability, &[&str])] =
 pub fn gated_grants_for_capability(cap: Capability) -> Option<&'static [&'static str]> {
     match cap {
         Capability::SignPayment => Some(SIGN_PAYMENT_GATED_TOOLS),
+        Capability::SignRuleCreate => Some(SIGN_RULE_CREATE_GATED_TOOLS),
         _ => None,
     }
 }
@@ -245,6 +286,8 @@ pub const SIGNING_DENYLIST: &[&str] = &[
     "stellar_pay_commit",
     "stellar_create_account_commit",
     "stellar_claim_commit",
+    // Agent-proposed context-rule commit (sign+submit) tool
+    "stellar_rule_create_commit",
     // x402 tools (default-exclude: confirm at impl whether each reaches a signer)
     "stellar_x402_create_payment",
     "stellar_x402_parse_receipt",
@@ -282,6 +325,9 @@ pub fn grants_for_capability(cap: Capability) -> &'static [&'static str] {
         // The gated resolver is the sole admission path.
         Capability::SignPayment => &[],
         Capability::ReadRules => READ_RULES_GRANTS,
+        // SignRuleCreate is gated — ungated path always returns empty.
+        // The gated resolver is the sole admission path.
+        Capability::SignRuleCreate => &[],
         // New variants fail closed (empty grant).
         _ => &[],
     }
@@ -432,6 +478,13 @@ mod tests {
     }
 
     #[test]
+    fn resolve_stellar_rule_create() {
+        let (tool, cap) = resolve_action("stellar_rule_create").unwrap();
+        assert_eq!(tool, "stellar_rule_create");
+        assert_eq!(cap, Capability::ProposeTransaction);
+    }
+
+    #[test]
     fn resolve_suggest_destination_tools() {
         for tool in [
             "stellar_sep47_discover",
@@ -519,6 +572,17 @@ mod tests {
         assert!(
             grants.is_empty(),
             "SignPayment ungated grant must be empty (gated tier only)"
+        );
+    }
+
+    // ── grants_for_capability: SignRuleCreate returns empty from ungated path ─
+
+    #[test]
+    fn grants_for_sign_rule_create_ungated_is_empty() {
+        let grants = grants_for_capability(Capability::SignRuleCreate);
+        assert!(
+            grants.is_empty(),
+            "SignRuleCreate ungated grant must be empty (gated tier only)"
         );
     }
 
@@ -649,5 +713,47 @@ mod tests {
                 "capability {cap:?} must NOT have gated grants"
             );
         }
+    }
+
+    // ── SignRuleCreate gated-tier tests (Package D, GH issue #8) ──────────────
+    // Mirror the SignPayment tests above exactly.
+
+    #[test]
+    fn gated_grants_for_sign_rule_create() {
+        let grants = gated_grants_for_capability(Capability::SignRuleCreate);
+        assert!(grants.is_some(), "SignRuleCreate must have gated grants");
+        let grants = grants.unwrap();
+        assert!(grants.contains(&"stellar_rule_create_commit"));
+    }
+
+    #[test]
+    fn sign_rule_create_gated_tools_do_not_include_bare_sign_tools() {
+        let bare_sign_tools = [
+            "stellar_sep43_sign_transaction",
+            "stellar_sep43_sign_and_submit_transaction",
+            "stellar_sep43_sign_auth_entry",
+            "stellar_sep43_sign_message",
+            "stellar_sep53_sign_message",
+        ];
+        for bare in &bare_sign_tools {
+            assert!(
+                !SIGN_RULE_CREATE_GATED_TOOLS.contains(bare),
+                "SignRuleCreate gated tools must NOT include bare-sign tool '{bare}'"
+            );
+        }
+        assert!(
+            SIGN_RULE_CREATE_GATED_TOOLS.contains(&"stellar_rule_create_commit"),
+            "stellar_rule_create_commit must be in SIGN_RULE_CREATE_GATED_TOOLS"
+        );
+    }
+
+    #[test]
+    fn resolve_action_does_not_resolve_stellar_rule_create_commit() {
+        // The gated commit tool must NOT resolve via the ungated resolve_action
+        // path — already covered generically by
+        // `resolve_action_does_not_resolve_gated_tools` (which iterates
+        // `flattened_gated_tools()`), but pinned here explicitly for this
+        // specific tool name.
+        assert!(resolve_action("stellar_rule_create_commit").is_err());
     }
 }

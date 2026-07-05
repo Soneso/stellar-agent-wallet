@@ -14,6 +14,20 @@ side of the picture is unchanged in kind, only in degree: it signs with a key
 the wallet's context-rule machinery now recognizes as a first-class signer
 type.
 
+The walkthrough below has the operator author the rule directly via the CLI.
+An agent can also PROPOSE a rule for the operator to review and consent to,
+via the `stellar_rule_create` / `stellar_rule_create_commit` MCP tool pair
+(see [MCP: tool catalog](mcp.md#tool-catalog)) — the agent resolves and
+simulates the definition (signers, policies, context, expiry) but never
+installs it; installation only proceeds after the operator attests to the
+EXACT resolved definition on one of the three approval surfaces (CLI
+`approve`, the loopback inbox, the remote inbox), each of which renders the
+full rule — including a prominent callout when the proposed context is
+`Default` (account-wide authority) — before the operator can consent. This is
+the same "no new administrative capability without operator sign-off"
+posture as the CLI-authored path above; only the AUTHORING step moves from
+operator-typed flags to agent-resolved, operator-reviewed JSON.
+
 ## Recommended agent-signer doctrine
 
 A context-rule signer is either **Delegated** (a classic `G...` account) or

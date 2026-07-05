@@ -139,6 +139,9 @@ libc = { workspace = true }
 base64     = { workspace = true }
 keyring-core = { workspace = true }
 ed25519-dalek = { workspace = true }
+# Hex encode/decode for rule_create.rs (context wasm-hash grammar, raw
+# External signer pubkey_data).
+hex = { workspace = true }
 
 # SEP-7 origin_domain verification makes a fresh stellar.toml HTTPS GET via
 # reqwest; the Client is constructed in the stellar_sep7_parse_uri tool fn.

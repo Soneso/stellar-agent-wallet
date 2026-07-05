@@ -144,10 +144,10 @@ of pending entries:
   TTL of 24 hours.
 
 Entry kinds: `PaymentSimulated`, `ClaimSimulated`, `SignWithPasskey`,
-`RegisterPasskey`, `ToolsetFirstInvokeGate`, `TrustlineClawbackOptIn`. A
-seventh kind, `Rejected`, is not a fresh entry an agent's build/simulate step
-creates — it is the short-TTL tombstone the store writes in place of an entry
-after the operator rejects it.
+`RegisterPasskey`, `ToolsetFirstInvokeGate`, `TrustlineClawbackOptIn`,
+`RuleProposalSimulated`. An eighth kind, `Rejected`, is not a fresh entry an
+agent's build/simulate step creates — it is the short-TTL tombstone the
+store writes in place of an entry after the operator rejects it.
 
 ### What `approve` does
 
@@ -169,6 +169,7 @@ Per kind:
 | `PaymentSimulated` / `ClaimSimulated` | Computes the HMAC attestation over the envelope SHA-256 and persists it; returns `approval_attestation`. Both kinds share the same attestation path. |
 | `TrustlineClawbackOptIn` | Computes a domain-separated HMAC over `(network, code, issuer)` and stores it; the trustline gate recomputes and verifies it. No `approval_attestation` returned. |
 | `ToolsetFirstInvokeGate` | Builds and persists a time-boxed toolset grant, then consumes (removes) the pending entry. Does not set an attestation blob on the entry. No `approval_attestation` returned. |
+| `RuleProposalSimulated` | Computes the HMAC attestation over `proposal_sha256` (the domain-separated digest of the FULL resolved rule definition), not an envelope hash; persists it and returns `approval_attestation`. A DEDICATED gate verifies it at commit — the shared `PaymentSimulated`/`ClaimSimulated` gate rejects this kind outright. |
 
 ### The attestation
 

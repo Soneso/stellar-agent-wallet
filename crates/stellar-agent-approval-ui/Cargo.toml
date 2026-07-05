@@ -80,5 +80,9 @@ keyring-core = { workspace = true }
 # Decode/verify the surfaced attestation blob in decision tests.
 base64 = { workspace = true }
 
+# Build a spending-limit policy install-param ScVal fixture in the
+# RuleProposalSimulated renderer tests.
+stellar-xdr = { workspace = true }
+
 [lints]
 workspace = true

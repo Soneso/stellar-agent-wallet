@@ -106,7 +106,7 @@ The store is a per-profile TOML file holding a flat list of pending entries:
 - Writes are atomic (write-to-temp then rename, with a parent-directory fsync) and the file is created with owner-only permissions.
 - Nonces are validated on load; malformed nonces are rejected. The store has a hard cap on the number of pending entries (expired entries are pruned first) and a default entry TTL of 24 hours.
 
-Entries are kinded. The kinds are `PaymentSimulated`, `SignWithPasskey`, `RegisterPasskey`, `ToolsetFirstInvokeGate`, and `TrustlineClawbackOptIn`.
+Entries are kinded. The kinds are `PaymentSimulated`, `ClaimSimulated`, `SignWithPasskey`, `RegisterPasskey`, `ToolsetFirstInvokeGate`, `TrustlineClawbackOptIn`, and `RuleProposalSimulated`.
 
 ### What `approve` does
 
@@ -130,6 +130,10 @@ The MCP commit-path verifier recomputes the tag and compares it in constant time
 The attestation proves that **the keyring holder ran `approve`** — not that a human clicked "yes" in some agent-controlled UI. The agent's own UI is not a trust input; the wallet-controlled `approve` step is.
 
 What an attacker who can write to the store file can and cannot do: deleting a pending entry forces re-approval, which is a denial-of-service nuisance, not a bypass. The attacker cannot forge an attestation, because the HMAC key is in the keyring, not in the file. Rotating the attestation key invalidates all outstanding pending approvals.
+
+### Agent-proposed context rules
+
+`RuleProposalSimulated` (Package D, GH issue #8) is the one entry kind that does NOT use the shared attestation described above. `stellar_rule_create` resolves and parks the FULL rule definition — every signer as resolved bytes, every policy typed, context, expiry, and `auth_rule_ids` — and mints a domain-separated `proposal_sha256` digest over it, computed the same way regardless of policy outcome. `stellar_rule_create_commit` verifies the operator's attestation through a DEDICATED gate (`PendingApprovalStore::verify_rule_proposal_gate`) that binds `proposal_sha256` in place of `envelope_sha256`, then UNCONDITIONALLY recomputes the digest from the stored snapshot and refuses with `simulation.divergence` on any mismatch — a store-self-consistency check independent of whether the policy required approval at all. Every approval surface (CLI `approve`, the loopback inbox, the remote inbox) renders the entire resolved definition — including a prominent callout when the context is `Default` (account-wide authority) and a warning line for either override flag — so operator consent binds to exactly what will be installed.
 
 ## First-invoke gate vs. per-action payment approval
 

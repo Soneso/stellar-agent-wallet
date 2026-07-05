@@ -291,11 +291,11 @@ pub fn load_attestation_key(
 /// Computes and persists the operator's attestation (or recorded consent) for
 /// a pending approval, dispatching on [`ApprovalKind`].
 ///
-/// Returns `Some(base64url_blob)` for `PaymentSimulated` / `ClaimSimulated` —
-/// the attestation the agent surface must present as `approval_attestation`
-/// to the matching `*_commit` tool. Returns `None` for
-/// `ToolsetFirstInvokeGate` and `TrustlineClawbackOptIn`, whose gates read the
-/// recorded consent from the store directly and take no attestation
+/// Returns `Some(base64url_blob)` for `PaymentSimulated` / `ClaimSimulated` /
+/// `RuleProposalSimulated` — the attestation the agent surface must present
+/// as `approval_attestation` to the matching `*_commit` tool. Returns `None`
+/// for `ToolsetFirstInvokeGate` and `TrustlineClawbackOptIn`, whose gates
+/// read the recorded consent from the store directly and take no attestation
 /// argument.
 ///
 /// On success, emits an audit event through `audit` (if supplied) after the
@@ -313,7 +313,7 @@ pub fn load_attestation_key(
 /// Returns a [`WalletError`] on key-length mismatch, hash-decode failure, a
 /// store-level `NotFound` / `Expired` / `AlreadyAttested` race, a
 /// `persist_toolset_grant` failure, or when `entry.kind` is not one of the
-/// four attestable kinds (including `ApprovalKind::Rejected`, which can never
+/// five attestable kinds (including `ApprovalKind::Rejected`, which can never
 /// be attested).
 pub fn attest_and_persist(
     store: &mut PendingApprovalStore,
@@ -518,6 +518,62 @@ pub fn attest_and_persist(
             // verifies the stored blob; the agent presents no attestation here.
             None
         }
+        ApprovalKind::RuleProposalSimulated {
+            proposal_sha256, ..
+        } => {
+            // RuleProposalSimulated shares the digest-HMAC attestation path
+            // with PaymentSimulated/ClaimSimulated: the blob binds
+            // `proposal_sha256`, the nonce, and the process UID, and is
+            // surfaced to `stellar_rule_create_commit`.
+            let attestation_blob = compute_attestation(
+                &key_arr,
+                &entry.approval_nonce,
+                proposal_sha256,
+                &entry.process_uid,
+            );
+            store
+                .record_rule_proposal_attestation(&entry.approval_nonce, attestation_blob)
+                .map_err(|e| match e {
+                    ApprovalError::NotFound => {
+                        WalletError::Internal(InternalError::UnexpectedState {
+                            detail: "approval.not_found: entry disappeared between lookup \
+                                     and record"
+                                .to_owned(),
+                        })
+                    }
+                    ApprovalError::Expired => {
+                        WalletError::Internal(InternalError::UnexpectedState {
+                            detail: "approval.expired: entry expired between check and record"
+                                .to_owned(),
+                        })
+                    }
+                    ApprovalError::AlreadyAttested => {
+                        WalletError::Internal(InternalError::UnexpectedState {
+                            detail: "approval.already_attested: entry was attested by a \
+                                     concurrent process"
+                                .to_owned(),
+                        })
+                    }
+                    other => WalletError::Internal(InternalError::UnexpectedState {
+                        detail: format!("approval.record_failed: {other}"),
+                    }),
+                })?;
+            let blob_b64 = URL_SAFE_NO_PAD.encode(attestation_blob);
+            let proposal_sha256_hex = proposal_sha256
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            emit_attested_audit(
+                &mut audit,
+                "RuleProposalSimulated",
+                "stellar_rule_create_commit",
+                Some(proposal_sha256_hex),
+                &entry.approval_nonce,
+                surface,
+                operator_credential_id_b64url,
+            );
+            Some(blob_b64)
+        }
         ApprovalKind::Rejected { .. } => {
             return Err(WalletError::Internal(InternalError::UnexpectedState {
                 detail: "approval.rejected: this pending approval was rejected by the operator \
@@ -530,7 +586,7 @@ pub fn attest_and_persist(
                 detail: format!(
                     "approval.wrong_kind: attest_and_persist does not support {}, \
                      expected PaymentSimulated, ClaimSimulated, ToolsetFirstInvokeGate, \
-                     or TrustlineClawbackOptIn",
+                     TrustlineClawbackOptIn, or RuleProposalSimulated",
                     other.kind_name()
                 ),
             }));
@@ -981,6 +1037,122 @@ mod tests {
         assert!(
             store.get(&nonce).is_some(),
             "entry must survive a failed grant persist"
+        );
+    }
+
+    fn make_rule_proposal_entry(ttl_ms: u64) -> PendingApproval {
+        use crate::approval::rule_proposal::{
+            ContextRuleProposalSnapshot, RuleProposalContextType, RuleProposalSigner,
+        };
+
+        let definition = ContextRuleProposalSnapshot::new(
+            RuleProposalContextType::Default,
+            "spend-daily".to_owned(),
+            None,
+            vec![RuleProposalSigner::delegated(
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                true,
+            )],
+            vec![],
+            vec![0],
+            false,
+            false,
+        );
+        PendingApproval::new_rule_proposal_pending(
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "Test SDF Network ; September 2015".to_owned(),
+            "stellar:testnet".to_owned(),
+            definition,
+            [0x77u8; 32],
+            "CallContract rule \"spend-daily\"".to_owned(),
+            process_uid_for_attestation().expect("UID available on test host"),
+            ttl_ms,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn attest_and_persist_rule_proposal_records_hmac_and_surfaces_blob() {
+        keyring_mock::install().unwrap();
+        let svc = "stellar-agent-attestation-core-test-rule-proposal";
+        let raw_key = seed_key_32(svc, "default");
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let mut store = PendingApprovalStore::open(path).unwrap();
+        let entry = make_rule_proposal_entry(DEFAULT_TTL_MS);
+        let nonce = entry.approval_nonce.clone();
+        let process_uid = entry.process_uid.clone();
+
+        let proposal_sha256 = if let ApprovalKind::RuleProposalSimulated {
+            proposal_sha256, ..
+        } = &entry.kind
+        {
+            *proposal_sha256
+        } else {
+            unreachable!("make_rule_proposal_entry always produces RuleProposalSimulated")
+        };
+
+        store
+            .insert(entry.clone(), timefmt::now_unix_ms().expect("clock"))
+            .unwrap();
+
+        let surfaced = attest_and_persist(
+            &mut store,
+            &entry,
+            &raw_key,
+            Surface::Cli,
+            None,
+            None,
+            |_req, _key| Err("must not be called for RuleProposalSimulated".to_owned()),
+        )
+        .unwrap();
+        let surfaced_blob =
+            surfaced.expect("RuleProposalSimulated must surface its attestation blob");
+
+        let final_entry = store.get(&nonce).unwrap();
+        let blob_b64 = final_entry.attestation_blob_b64.as_ref().unwrap();
+        assert_eq!(surfaced_blob, *blob_b64);
+
+        let expected = compute_attestation(&raw_key, &nonce, &proposal_sha256, &process_uid);
+        let persisted_bytes: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(blob_b64)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(persisted_bytes, expected);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn attest_and_persist_rule_proposal_rejected_tombstone_fails_closed() {
+        keyring_mock::install().unwrap();
+        let svc = "stellar-agent-attestation-core-test-rule-proposal-rejected";
+        let raw_key = seed_key_32(svc, "default");
+
+        let dir = TempDir::new().unwrap();
+        let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
+        let entry = make_rule_proposal_entry(DEFAULT_TTL_MS);
+        let nonce = entry.approval_nonce.clone();
+        let now_ms = timefmt::now_unix_ms().expect("clock");
+        store.insert(entry, now_ms).unwrap();
+        store.reject(&nonce, now_ms, 60_000).unwrap();
+
+        let rejected_entry = store.get(&nonce).unwrap().clone();
+        let err = attest_and_persist(
+            &mut store,
+            &rejected_entry,
+            &raw_key,
+            Surface::Cli,
+            None,
+            None,
+            |_req, _key| Err("must not be called".to_owned()),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("approval.rejected"),
+            "unexpected error: {err}"
         );
     }
 }

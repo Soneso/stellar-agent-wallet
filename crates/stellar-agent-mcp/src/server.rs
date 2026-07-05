@@ -279,6 +279,11 @@ pub use crate::tools::fee_stats::StellarFeeStatsArgs;
 pub use crate::tools::friendbot::StellarFriendbotArgs;
 /// Re-exported for back-compat: argument types for `stellar_pay`.
 pub use crate::tools::pay::{StellarPayArgs, StellarPayCommitArgs};
+/// Re-exported for testnet acceptance tests: argument and signer/policy grammar
+/// types for `stellar_rule_create` / `stellar_rule_create_commit`.
+pub use crate::tools::rule_create::{
+    RuleCreatePolicyArg, RuleCreateSignerArg, StellarRuleCreateArgs, StellarRuleCreateCommitArgs,
+};
 /// Re-exported for testnet acceptance tests: argument types for
 /// `stellar_rules_list` / `stellar_rules_get`.
 pub use crate::tools::rules::{StellarRulesGetArgs, StellarRulesListArgs};
@@ -760,6 +765,8 @@ impl WalletServer {
         // Smart-account rules observability — read-only.
         router.merge(Self::rules_tool_router());
         router.merge(Self::rules_get_tool_router());
+        // Agent-proposed context rules (Package D, GH issue #8).
+        router.merge(Self::rule_create_tool_router());
         router
     }
 }
@@ -1007,7 +1014,20 @@ impl ServerHandler for WalletServer {
              one attached policy identifies as spending-limit — the budget \
              snapshot (spending_limit, period_ledgers, in_window_spent, \
              remaining_budget, as_of_ledger); in_window_spent/remaining_budget are \
-             exact only as of as_of_ledger, read_only=true). \
+             exact only as of as_of_ledger, read_only=true); \
+             stellar_rule_create (propose step, testnet-only: resolve signers \
+             (delegated, raw external, or webauthn passkey by credential name — \
+             resolved to bytes at propose time), policies (raw or typed \
+             spending-limit), context, name, expiry, and auth_rule_ids; simulate \
+             the add_context_rule installation, mint a domain-separated proposal \
+             digest, and park the full resolved definition as a pending \
+             approval, returns approval_nonce+expires_at_unix_ms+summary); \
+             stellar_rule_create_commit (commit step, testnet-only: ALWAYS \
+             requires operator attestation regardless of the policy verdict — \
+             the agent never holds rule-write authority; verify the operator's \
+             attestation over the resolved definition via a dedicated gate, \
+             recompute the digest from the stored snapshot, install the rule — \
+             destructive). \
              Resources: mcp-resource://usage.md (tool documentation), \
              mcp-resource://profiles/<name> (non-secret profile metadata), \
              mcp-resource://accounts/<G> (public account directory). \

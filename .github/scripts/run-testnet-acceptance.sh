@@ -19,10 +19,12 @@
 #   PACE            seconds to sleep between suites (default 30)
 #   RETRY_COOLDOWN  seconds to sleep before the single retry (default 60)
 #
-# The WebAuthn suite (smart_account_rules_webauthn_testnet_acceptance) and the
-# remote-approval browser suite (remote_approval_browser_testnet_acceptance)
-# each launch a headless Chromium and need chromium/google-chrome on PATH or
-# the CHROME env var pointing at the executable.
+# The WebAuthn suite (smart_account_rules_webauthn_testnet_acceptance), the
+# remote-approval browser suite (remote_approval_browser_testnet_acceptance),
+# and the rule-proposal remote browser suite
+# (rule_proposal_remote_browser_testnet_acceptance) each launch a headless
+# Chromium and need chromium/google-chrome on PATH or the CHROME env var
+# pointing at the executable.
 #
 # The multicall suite's happy-path test additionally wants
 # STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS and
@@ -85,6 +87,7 @@ SUITES=(
   "stellar-agent-smart-account testnet-integration smart_account_delegation_testnet_acceptance"
   "stellar-agent-smart-account testnet-integration smart_account_policy_observability_testnet_acceptance"
   "stellar-agent-approval-remote testnet-acceptance remote_approval_browser_testnet_acceptance"
+  "stellar-agent-approval-remote testnet-acceptance rule_proposal_remote_browser_testnet_acceptance"
 )
 
 # Runs one suite; prints the cargo output as it streams. Returns 0 on a real

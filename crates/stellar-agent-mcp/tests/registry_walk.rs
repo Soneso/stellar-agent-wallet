@@ -276,12 +276,12 @@ fn instructions_string_names_every_registered_tool() {
 /// The count assertion guards against a tool being accidentally added or dropped.
 /// When the tool set changes, update the expected count and the name list below.
 #[test]
-fn registry_contains_thirty_six_tools() {
+fn registry_contains_thirty_eight_tools() {
     let registry = collect_registry_names();
     assert_eq!(
         registry.len(),
-        36,
-        "registry must contain exactly 36 tools \
+        38,
+        "registry must contain exactly 38 tools \
          (stellar_balances + stellar_friendbot + stellar_create_account \
          + stellar_create_account_commit + stellar_pay + stellar_pay_commit \
          + stellar_fee_stats + stellar_sep43_get_address + stellar_sep43_get_network \
@@ -297,7 +297,8 @@ fn registry_contains_thirty_six_tools() {
          + stellar_dex_trade + stellar_dex_quote \
          + stellar_trustline + stellar_trustline_commit \
          + stellar_claim + stellar_claim_commit \
-         + stellar_rules_list + stellar_rules_get); \
+         + stellar_rules_list + stellar_rules_get \
+         + stellar_rule_create + stellar_rule_create_commit); \
          got: {registry:?}"
     );
     assert!(
@@ -1187,5 +1188,50 @@ fn stellar_rules_get_annotations_correct() {
     assert!(
         reg.chain_id_required,
         "stellar_rules_get: chain_id_required must be true"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Agent-proposed context rules tool annotation tests (Package D, GH issue #8)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Verifies `stellar_rule_create` annotations: not read-only (persists a
+/// pending approval), not destructive (does not install anything),
+/// chain_id required.
+#[test]
+fn stellar_rule_create_annotations_correct() {
+    let reg = find_registration("stellar_rule_create")
+        .expect("stellar_rule_create McpToolRegistration not found in inventory registry");
+    assert!(
+        !reg.destructive_hint,
+        "stellar_rule_create: destructive_hint must be false (simulate only, no install)"
+    );
+    assert!(
+        !reg.read_only_hint,
+        "stellar_rule_create: read_only_hint must be false (persists a pending-approval entry)"
+    );
+    assert!(
+        reg.chain_id_required,
+        "stellar_rule_create: chain_id_required must be true"
+    );
+}
+
+/// Verifies `stellar_rule_create_commit` annotations: not read-only, IS
+/// destructive (installs a rule on-chain), chain_id required.
+#[test]
+fn stellar_rule_create_commit_annotations_correct() {
+    let reg = find_registration("stellar_rule_create_commit")
+        .expect("stellar_rule_create_commit McpToolRegistration not found in inventory registry");
+    assert!(
+        reg.destructive_hint,
+        "stellar_rule_create_commit: destructive_hint must be true (installs on-chain)"
+    );
+    assert!(
+        !reg.read_only_hint,
+        "stellar_rule_create_commit: read_only_hint must be false (signs and submits)"
+    );
+    assert!(
+        reg.chain_id_required,
+        "stellar_rule_create_commit: chain_id_required must be true"
     );
 }

@@ -268,13 +268,23 @@ impl WalletServer {
 
         // ── Check if this is a gated action ───────────────────────────────────
         //
-        // The gated matrix maps SignPayment → stellar_pay_commit.  If the
-        // action is in the gated matrix, route through the GATED RESOLVER
-        // (a distinct entry point, NOT route_to_matrix_tool).
+        // The gated matrix maps SignPayment → stellar_pay_commit and
+        // SignRuleCreate → stellar_rule_create_commit.  If the action is in
+        // the gated matrix, route through the appropriate GATED RESOLVER (a
+        // distinct entry point, NOT route_to_matrix_tool) — the two
+        // capabilities need different authoritative-args extraction
+        // (payment decodes an envelope_xdr; rule-create looks up the
+        // smart_account from the pending RuleProposalSimulated entry), so a
+        // SEPARATE resolver method handles each.
         //
         // Gated actions are NOT in ALL_MATRIX_ENTRIES; resolve_toolset_and_check
         // would return UnknownToolsetAction for them.  We check the gated matrix
         // BEFORE the ungated resolver to give the correct error.
+        if matrix::SIGN_RULE_CREATE_GATED_TOOLS.contains(&action.as_str()) {
+            return self
+                .route_to_gated_resolver_rule_create(&toolset_name, &action, &args, &toolsets_root)
+                .await;
+        }
         if matrix::GATED_MATRIX_ENTRIES
             .iter()
             .any(|(_, tools)| tools.contains(&action.as_str()))
@@ -635,6 +645,209 @@ impl WalletServer {
         // The tool_name here is "stellar_pay_commit" (a &'static str constant).
         self.route_to_gated_tool(tool_name, tool_args_value).await
     }
+
+    /// Route a toolset-routed `sign-rule-create` action through the GATED
+    /// resolver (Package D, GH issue #8).
+    ///
+    /// Distinct entry point from [`Self::route_to_gated_resolver`] (the
+    /// `sign-payment` resolver): rule-create has no `envelope_xdr` to decode
+    /// the authoritative bucket-matching fields from — the pending
+    /// `RuleProposalSimulated` entry (looked up by the caller-supplied
+    /// `approval_nonce`, which `stellar_rule_create` always mints) is the
+    /// SOLE source of the authoritative smart-account.
+    ///
+    /// `resolve_toolset_sign_payment_gated` is reused as-is (it is generic
+    /// over the GATED matrix / `Capability`, despite its name) with the
+    /// smart-account C-strkey as `authoritative_destination` and the fixed
+    /// `matrix::SIGN_RULE_CREATE_ASSET_SENTINEL` /
+    /// `matrix::SIGN_RULE_CREATE_AMOUNT_SENTINEL` for the asset/amount
+    /// dimensions, which carry no independent meaning for rule creation —
+    /// see that module's doc comments for the full rationale.
+    ///
+    /// # Errors
+    ///
+    /// - `toolset.gated_missing_approval_nonce` — `args.approval_nonce`
+    ///   absent, not a string, or does not resolve to a pending
+    ///   `RuleProposalSimulated` entry.
+    /// - `toolset.first_invoke_approval_required` — gate fired, approval queued.
+    /// - All `stellar_rule_create_commit` errors (policy, attestation, chain, etc.).
+    pub(crate) async fn route_to_gated_resolver_rule_create(
+        &self,
+        toolset_name: &str,
+        action: &str,
+        toolset_args: &StellarToolsetInvokeArgs,
+        toolsets_root: &std::path::Path,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        use stellar_agent_core::approval::process_uid_for_attestation;
+        use stellar_agent_core::approval::store::ApprovalKind;
+        use stellar_agent_toolsets_runtime::ToolsetRuntimeError;
+
+        let tool_args_obj = match &toolset_args.args {
+            serde_json::Value::Object(m) => m,
+            _ => {
+                return Err(rmcp::ErrorData::invalid_params(
+                    "toolset.gated_missing_approval_nonce: sign-rule-create requires \
+                     args.approval_nonce (from stellar_rule_create propose output)",
+                    None,
+                ));
+            }
+        };
+        let approval_nonce = match tool_args_obj.get("approval_nonce").and_then(|v| v.as_str()) {
+            Some(s) => s.to_owned(),
+            None => {
+                return Err(rmcp::ErrorData::invalid_params(
+                    "toolset.gated_missing_approval_nonce: sign-rule-create requires \
+                     args.approval_nonce (from stellar_rule_create propose output)",
+                    None,
+                ));
+            }
+        };
+
+        // ── Look up the AUTHORITATIVE smart_account from the stored entry ────
+        // Never from toolset-supplied args — only the pending
+        // RuleProposalSimulated entry (identified by approval_nonce) is
+        // authoritative.
+        let approvals_dir = self.resolve_approval_dir().map_err(|e| {
+            rmcp::ErrorData::internal_error(format!("approval.dir_error: {e}"), None)
+        })?;
+        let store_path = approvals_dir.join(format!("{}.toml", self.profile_name_for_approval()));
+        let store = stellar_agent_core::approval::open_with_retry(
+            &store_path,
+            stellar_agent_core::approval::DEFAULT_RETRY_ATTEMPTS,
+            stellar_agent_core::approval::DEFAULT_RETRY_BACKOFF,
+        )
+        .map_err(|e| rmcp::ErrorData::internal_error(format!("approval.store_open: {e}"), None))?;
+
+        let entry = store.get(&approval_nonce).cloned().ok_or_else(|| {
+            rmcp::ErrorData::invalid_params(
+                "toolset.gated_missing_approval_nonce: approval_nonce does not resolve to a \
+                 pending RuleProposalSimulated entry; call stellar_rule_create first",
+                None,
+            )
+        })?;
+        let smart_account = match &entry.kind {
+            ApprovalKind::RuleProposalSimulated { smart_account, .. } => smart_account.clone(),
+            other => {
+                return Err(rmcp::ErrorData::invalid_params(
+                    format!(
+                        "toolset.gated_missing_approval_nonce: approval_nonce resolves to a \
+                         {} entry, not RuleProposalSimulated",
+                        other.kind_name()
+                    ),
+                    None,
+                ));
+            }
+        };
+
+        let profile_name = self.profile_name_for_approval();
+        let process_uid = process_uid_for_attestation().map_err(|e| {
+            rmcp::ErrorData::internal_error(format!("approval.uid_unavailable: {e}"), None)
+        })?;
+        let now_unix_ms = stellar_agent_core::timefmt::now_unix_ms()
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("clock_error: {e}"), None))?;
+
+        #[cfg(not(feature = "test-helpers"))]
+        let gated_params = GatedInvokeParams {
+            toolset_name,
+            action,
+            toolsets_root,
+            profile_name: &profile_name,
+            authoritative_destination: &smart_account,
+            authoritative_asset:
+                stellar_agent_toolsets_runtime::matrix::SIGN_RULE_CREATE_ASSET_SENTINEL,
+            authoritative_amount_stroops:
+                stellar_agent_toolsets_runtime::matrix::SIGN_RULE_CREATE_AMOUNT_SENTINEL,
+            now_unix_ms,
+            process_uid: &process_uid,
+        };
+        #[cfg(feature = "test-helpers")]
+        let gated_params = GatedInvokeParams {
+            toolset_name,
+            action,
+            toolsets_root,
+            profile_name: &profile_name,
+            authoritative_destination: &smart_account,
+            authoritative_asset:
+                stellar_agent_toolsets_runtime::matrix::SIGN_RULE_CREATE_ASSET_SENTINEL,
+            authoritative_amount_stroops:
+                stellar_agent_toolsets_runtime::matrix::SIGN_RULE_CREATE_AMOUNT_SENTINEL,
+            now_unix_ms,
+            process_uid: &process_uid,
+            approval_dir_override: self.approval_dir_override.clone(),
+            grant_store_path_override: self.grant_store_path_override.clone(),
+        };
+
+        match resolve_toolset_sign_payment_gated(&gated_params) {
+            Err(e) => {
+                let err = match e {
+                    ToolsetRuntimeError::ToolsetNotInstalled { .. }
+                    | ToolsetRuntimeError::UnknownToolsetAction { .. }
+                    | ToolsetRuntimeError::CapabilityNotDeclared { .. }
+                    | ToolsetRuntimeError::ToolNotAllowed { .. } => {
+                        rmcp::ErrorData::invalid_params(e.to_string(), None)
+                    }
+                    _ => rmcp::ErrorData::internal_error(
+                        format!("toolset.enforcement_error: {e}"),
+                        None,
+                    ),
+                };
+                Err(err)
+            }
+            Ok(GatedResolveOutcome::FirstInvokeApprovalRequired {
+                approval_nonce,
+                toolset_name: sn,
+                capability,
+            }) => {
+                let payload = serde_json::json!({
+                    "approval_nonce": &approval_nonce,
+                    "toolset_name": &sn,
+                    "capability": &capability,
+                    "message": format!(
+                        "toolset.first_invoke_approval_required: run \
+                         `stellar-agent approve --id {approval_nonce}` then re-invoke"
+                    )
+                });
+                Err(rmcp::ErrorData::invalid_params(
+                    format!(
+                        "toolset.first_invoke_approval_required: \
+                         approval_nonce={approval_nonce}"
+                    ),
+                    Some(payload),
+                ))
+            }
+            Ok(GatedResolveOutcome::Resolved { tool_name }) => {
+                self.route_to_gated_commit_rule_create(tool_name, toolset_args)
+                    .await
+            }
+        }
+    }
+
+    /// Routes to `stellar_rule_create_commit` with the per-proposal
+    /// `RuleProposalSimulated` approval FORCED ON UNCONDITIONALLY.
+    async fn route_to_gated_commit_rule_create(
+        &self,
+        tool_name: &'static str,
+        toolset_args: &StellarToolsetInvokeArgs,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let chain_id = toolset_args.chain_id.as_deref().unwrap_or("");
+        let mut tool_args = match &toolset_args.args {
+            serde_json::Value::Object(m) => m.clone(),
+            _ => serde_json::Map::new(),
+        };
+        if !chain_id.is_empty() {
+            tool_args.insert(
+                "chain_id".to_owned(),
+                serde_json::Value::String(chain_id.to_owned()),
+            );
+        }
+        let tool_args_value = serde_json::Value::Object(tool_args);
+
+        stellar_agent_toolsets::validate_toolset_tool_args(&tool_args_value).map_err(|e| {
+            rmcp::ErrorData::invalid_params(format!("toolset.args_validation: {e}"), None)
+        })?;
+
+        self.route_to_gated_tool(tool_name, tool_args_value).await
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -676,6 +889,21 @@ impl WalletServer {
                 // Route via invoke_stellar_pay_commit_toolset_gated which forces
                 // RequireApproval unconditionally.
                 self.invoke_stellar_pay_commit_toolset_gated(typed).await
+            }
+            "stellar_rule_create_commit" => {
+                let typed: super::rule_create::StellarRuleCreateCommitArgs =
+                    serde_json::from_value(args).map_err(|e| {
+                        rmcp::ErrorData::invalid_params(
+                            format!(
+                                "toolset.gated_args_deserialise: stellar_rule_create_commit: {e}"
+                            ),
+                            None,
+                        )
+                    })?;
+                // Route via invoke_stellar_rule_create_commit_toolset_gated
+                // which forces RequireApproval unconditionally.
+                self.invoke_stellar_rule_create_commit_toolset_gated(typed)
+                    .await
             }
             other => Err(rmcp::ErrorData::internal_error(
                 format!(
@@ -739,6 +967,16 @@ impl WalletServer {
                         )
                     })?;
                 self.invoke_stellar_claim(typed).await
+            }
+            "stellar_rule_create" => {
+                let typed: super::rule_create::StellarRuleCreateArgs = serde_json::from_value(args)
+                    .map_err(|e| {
+                        rmcp::ErrorData::invalid_params(
+                            format!("toolset.args_deserialise: stellar_rule_create: {e}"),
+                            None,
+                        )
+                    })?;
+                self.invoke_stellar_rule_create(typed).await
             }
             "stellar_sep47_discover" => {
                 let typed: super::sep47_discover::Sep47DiscoverArgs = serde_json::from_value(args)
@@ -855,6 +1093,7 @@ mod tests {
             "stellar_balances",
             "stellar_pay",
             "stellar_claim",
+            "stellar_rule_create",
             "stellar_sep47_discover",
             "stellar_sep48_preview_invocation",
             "stellar_sep7_parse_uri",

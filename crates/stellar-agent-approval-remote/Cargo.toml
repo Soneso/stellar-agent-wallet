@@ -76,6 +76,11 @@ keyring-core = { workspace = true }
 # needs to seed a virtual authenticator with a known keypair.
 stellar-agent-mcp = { workspace = true }
 stellar-agent-network = { workspace = true }
+# The rule-proposal acceptance suite registers a co-signer WebAuthn credential
+# via the local bridge (the rules_webauthn precedent) and exercises the
+# toolset-gated sign-rule-create first-invoke-grant path.
+stellar-agent-webauthn-bridge = { workspace = true }
+stellar-agent-toolsets-runtime = { workspace = true }
 chromiumoxide = { workspace = true }
 futures = { workspace = true }
 url = { workspace = true }

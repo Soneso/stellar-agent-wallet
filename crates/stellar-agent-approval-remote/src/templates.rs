@@ -59,6 +59,7 @@ fn kind_is_approvable(summary: &ApprovalSummaryView) -> bool {
             | ApprovalSummaryView::Claim { .. }
             | ApprovalSummaryView::ToolsetFirstInvokeGate { .. }
             | ApprovalSummaryView::TrustlineClawbackOptIn { .. }
+            | ApprovalSummaryView::RuleProposal { .. }
     )
 }
 
@@ -243,6 +244,15 @@ pub(crate) fn render_detail_page(
 ) -> String {
     let approvable = kind_is_approvable(&view.summary) && !view.expired && !view.attested;
     let summary_html = render_summary_html(&view.summary);
+    // The full rule definition (context callout, signer table, policy
+    // table, override warnings) is not dt/dd-shaped, so it renders as its
+    // own block AFTER the `<dl>` closes rather than inside `summary_html`.
+    let rule_proposal_extra_html = match &view.summary {
+        ApprovalSummaryView::RuleProposal { definition, .. } => {
+            stellar_agent_approval_ui::render_rule_proposal_definition_html(definition)
+        }
+        _ => String::new(),
+    };
 
     let status_line = if view.attested {
         "<strong>Status:</strong> already resolved (consent recorded)".to_owned()
@@ -312,6 +322,7 @@ pub(crate) fn render_detail_page(
     <dt>Expires at (unix ms)</dt><dd>{expires}</dd>
 {summary_html}
   </dl>
+  {rule_proposal_extra_html}
   {attested_block}
   {actions}
   <div id="result" class="muted"></div>
@@ -325,6 +336,7 @@ pub(crate) fn render_detail_page(
         created = view.created_at_unix_ms,
         expires = view.expires_at_unix_ms,
         summary_html = summary_html,
+        rule_proposal_extra_html = rule_proposal_extra_html,
         attested_block = attested_block,
         actions = actions,
         data_island = data_island,
@@ -430,6 +442,22 @@ fn render_summary_html(summary: &ApprovalSummaryView) -> String {
             s.push_str(&row("Network", network));
             s.push_str(&row("Asset code", code));
             s.push_str(&row("Issuer", issuer_redacted));
+            s
+        }
+        ApprovalSummaryView::RuleProposal {
+            smart_account_redacted,
+            chain_id,
+            proposal_sha256_hex,
+            ..
+        } => {
+            // The full rule definition (context callout, signer table,
+            // policy table, override warnings) is not dt/dd-shaped, so it
+            // renders as its own block AFTER this `<dl>` closes — see
+            // `render_detail_page`'s `rule_proposal_extra_html`.
+            let mut s = String::new();
+            s.push_str(&row("Smart account", smart_account_redacted));
+            s.push_str(&row("Chain ID", chain_id));
+            s.push_str(&row("Proposal digest", proposal_sha256_hex));
             s
         }
         ApprovalSummaryView::Rejected { original_kind_name } => {
