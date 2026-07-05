@@ -33,10 +33,10 @@ use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::{Signer, SoftwareSigningKey};
-use stellar_agent_smart_account::bindings::ContextRuleType;
 use stellar_agent_smart_account::deployment::{
     DeployerKeypair, DeploymentArgs, ResolvedFeePerOp, deploy_smart_account,
 };
+use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRuleSignerInput,
     parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
@@ -164,7 +164,7 @@ async fn sim_audit_happy_path_on_chain_submit() {
         .expect("signer G-strkey must parse to ScAddress");
     // Rule name must be ≤ 20 bytes (OZ MAX_NAME_SIZE).
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "audit-acceptance".to_owned(),
         None,
         vec![ContextRuleSignerInput::Delegated {

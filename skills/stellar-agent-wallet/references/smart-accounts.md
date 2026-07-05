@@ -12,7 +12,7 @@ This file is self-contained. For the MCP tool surface and result-envelope shape 
 
 ## Mainnet write refusal
 
-Most signing verbs that mutate context-rule, signer, or timelock state refuse `mainnet` structurally — before any RPC call or signing-key access — surfacing the wire code `network.mainnet_write_forbidden`. This covers: the `smart-account rules` write verbs, all `smart-account signers` verbs (including `list` and `refresh`, which emit audit rows), the timelock write verbs (`schedule`, `cancel`, `execute`), and `smart-account deploy-webauthn-verifier`.
+Most signing verbs that mutate context-rule, signer, or timelock state refuse `mainnet` structurally — before any RPC call or signing-key access — surfacing the wire code `network.mainnet_write_forbidden`. This covers: the `smart-account rules` write verbs, all `smart-account signers` verbs (including `list` and `refresh`, which emit audit rows), the timelock write verbs (`schedule`, `cancel`, `execute`), and the deploy verbs (`smart-account deploy-webauthn-verifier`, `smart-account deploy-ed25519-verifier`, `smart-account deploy-spending-limit-policy`).
 
 Exceptions:
 
@@ -43,13 +43,13 @@ A context rule has a `rule_id` (`u32`), a name (OZ cap: 20 bytes), an optional e
 
 | Verb | Purpose | Key flags | Notes |
 |------|---------|-----------|-------|
-| `create` | Install a rule (OZ `add_context_rule`); returns new `rule_id` | `--account` (req), `--name` (req), `--signer-delegated <G>` (repeatable), `--signer-webauthn <CRED>` (repeatable), `--accept-no-delegated-fallback`, `--accept-mutable-verifier`, `--accept-unknown-verifier`, `--auth-rule-id` (repeatable, default `[0]`), `--valid-until <LEDGER\|none>` (default `none`) | Testnet only. At least one `--signer-delegated` or `--signer-webauthn` required. |
+| `create` | Install a rule (OZ `add_context_rule`); returns new `rule_id` | `--account` (req), `--name` (req), `--context <SPEC>` (default `default`), `--signer-delegated <G>` (repeatable), `--signer-webauthn <CRED>` (repeatable), `--accept-no-delegated-fallback`, `--accept-mutable-verifier`, `--accept-unknown-verifier`, `--auth-rule-id` (repeatable, default `[0]`), `--valid-until <LEDGER\|none>` (default `none`) | Testnet only. At least one `--signer-delegated` or `--signer-webauthn` required. `--context` scopes the rule: `default` matches any invocation, `call-contract:<C>` scopes it to one contract, `create-contract:<64_HEX_WASM_HASH>` scopes it to deploying one wasm hash. Malformed specs refuse before any network call. |
 | `get` | Read one rule (OZ `get_context_rule`) | `--account` (req), `--rule-id` (req), `--source-account <G>` (req) | Read-only, mainnet OK. Source account is for simulation only, not debited. Envelope: `present: true\|false`. |
 | `set-name` | Rename (OZ `update_context_rule_name`) | `--account`, `--rule-id`, `--name` (all req), `--auth-rule-id` (opt, default `--rule-id`) | Testnet only. 20-byte name cap. |
 | `set-valid-until` | Change expiry (OZ `update_context_rule_valid_until`) | `--account`, `--rule-id`, `--valid-until <LEDGER\|none>` (all req), `--auth-rule-id` (opt) | Testnet only. `none` clears expiry (permanent rule). |
 | `delete` | Remove a rule (OZ `remove_context_rule`) | `--account`, `--rule-id` (req), `--auth-rule-id` (opt) | Testnet only. |
 | `verify-pins` | Drift-check pinned verifier/policy WASM hashes vs on-chain | `--account`, `--rule-id` (req) | Read-only, mainnet OK. Exit `1` if any pin status is `drift`. |
-| `add-policy` | Attach a policy (OZ `add_policy`); returns `policy_id` | `--account`, `--rule-id`, `--policy-address <C>`, `--install-param <SCVAL_BASE64>` (all req), `--auth-rule-id` (opt, repeatable) | Testnet only. Per-rule cap of 5 enforced via pre-fetch. `--install-param` is standard-base64 XDR `ScVal` (not base64url), passed through raw. |
+| `add-policy` | Attach a policy (OZ `add_policy`); returns `policy_id` | `--account`, `--rule-id` (req); `--kind <raw\|spending-limit>` (default `raw`); raw: `--policy-address <C>`, `--install-param <SCVAL_BASE64>` (req); spending-limit: `--limit <STROOPS>`, `--period <LEDGERS>` (req), `--policy <C>` (opt override); `--auth-rule-id` (opt, repeatable) | Testnet only. Per-rule cap of 5 enforced via pre-fetch. Raw `--install-param` is standard-base64 XDR `ScVal` (not base64url), passed through raw. `--kind spending-limit` resolves the deployed policy from the registry, builds the typed install param, and refuses client-side if `--limit <= 0`, `--period == 0`, or the rule's context type is not `call-contract`. |
 | `remove-policy` | Detach a policy (OZ `remove_policy`) | `--account`, `--rule-id`, `--policy-id <U32>` (all req), `--auth-rule-id` (opt, repeatable) | Testnet only. |
 | `list` | Enumerate active rules (on-chain scan) | same as `smart-account list-rules` | Read-only, mainnet OK. Alias of `smart-account list-rules`. |
 
@@ -75,7 +75,7 @@ The wallet maps to three OpenZeppelin signer kinds. `smart-account signers list`
 |-------------|-----------|-----------|
 | `ed25519` | `Signer::Delegated(Address)` — a G-strkey ed25519 keypair | `--signer-delegated <G>` (alias `--new-signer`) |
 | `webauthn` | WebAuthn passkey signer (verifier-backed) | `--signer-webauthn <CRED>`, resolved from the profile passkey registry; verifier address read from the verifier registry |
-| `external` | Custom external-verifier signer | `--signer-external <C>` with `--signer-key-data <HEX>` |
+| `external` | Custom external-verifier signer, or a first-class external Ed25519 signer | `--signer-external <C>` with `--signer-key-data <HEX>`, or `--signer-ed25519 <HEX_PUBKEY_64>` (typed; verifier resolves from the registry unless `--verifier <C>` overrides it). The recommended signer shape for an autonomous agent's own key: no funded classic account required, HSM/keyring-holdable, cheap rotation. |
 
 ## Signer-set and threshold lifecycle
 
@@ -85,7 +85,7 @@ All `smart-account signers` verbs take `--account <C>` and `--rule-id <U32>` (bo
 |------|---------|-------------|-------|
 | `list` | Read on-chain signer set; baseline if none exists | — | Testnet only. Writes a `SaSignerSetBaselined` audit row on first sight of a `(rule_id, account)` pair. Envelope: `signer_count`, `threshold`, `signer_ids`, `signer_kinds`. No on-chain tx. |
 | `refresh` | Re-anchor the baseline unconditionally | — | Testnet only. Audit-log write only; use after an intentional out-of-band signer change. |
-| `add` | Add a signer (OZ `add_signer`); returns `new_signer_id` | exactly one of `--signer-delegated <G>` (alias `--new-signer`) / `--signer-external <C>` / `--signer-webauthn <CRED>`; `--signer-key-data <HEX>` required with and only with `--signer-external` | Testnet only. Per-rule cap of 15 checked via pre-fetch. |
+| `add` | Add a signer (OZ `add_signer`); returns `new_signer_id` | exactly one of `--signer-delegated <G>` (alias `--new-signer`) / `--signer-ed25519 <HEX_PUBKEY_64>` (optional `--verifier <C>` override) / `--signer-external <C>` / `--signer-webauthn <CRED>`; `--signer-key-data <HEX>` required with and only with `--signer-external` | Testnet only. Per-rule cap of 15 checked via pre-fetch. `--signer-ed25519` fails closed if no verifier is registered and `--verifier` is omitted (deploy one via `smart-account deploy-ed25519-verifier`). |
 | `remove` | Remove a signer (OZ `remove_signer`) | `--signer-id <U32>` (req) | Testnet only. Refused if removing would drop `signer_count` below `threshold` — lower the threshold first. |
 | `set-threshold` | Change quorum threshold via the threshold-policy contract `set_threshold` | `--new-threshold <U32>` (req) | Testnet only. No `--auth-rule-id` override (the authorizing rule is `--rule-id`). The threshold-policy contract is found by WASM-hash allowlist lookup; zero or multiple matches refuse with `sa.threshold_policy_identification_failed`. |
 
@@ -129,6 +129,13 @@ Drift detection: `smart-account rules verify-pins` compares a rule's pinned veri
 
 ```bash
 stellar-agent smart-account deploy-webauthn-verifier --deployer-secret-env DEPLOYER_SK
+```
+
+`smart-account deploy-ed25519-verifier` and `smart-account deploy-spending-limit-policy` deploy the OZ Ed25519-verifier and spending-limit-policy WASMs respectively, with the same idempotency, signer modes, and flags as `deploy-webauthn-verifier` above. Both are per-network singletons — deploy once per network. The Ed25519 verifier backs `--signer-ed25519`; the spending-limit policy backs `rules add-policy --kind spending-limit`.
+
+```bash
+stellar-agent smart-account deploy-ed25519-verifier --deployer-secret-env DEPLOYER_SK
+stellar-agent smart-account deploy-spending-limit-policy --deployer-secret-env DEPLOYER_SK
 ```
 
 `smart-account migrate-verifier` builds and optionally executes a plan that moves all `external` signers from one verifier to another across every context rule. Dry-run is read-only and renders the plan as JSON; without `--dry-run` it signs and submits `remove_signer` / `add_signer` pairs. Mainnet dry-run allowed; mainnet submit additionally requires `--confirm-mainnet-migrate`. Pre-flight gates (fail-closed): destination verifier hash must be allowlisted, its audit status must be `audited` or `unaudited`, and the destination contract must be immutable.

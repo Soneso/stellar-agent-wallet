@@ -36,7 +36,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sha2::{Digest as _, Sha256};
-use stellar_accounts::smart_account::ContextRuleType;
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::health::AuditWriterHealthHandle;
 use stellar_agent_core::audit_log::writer::AuditWriter;
@@ -2469,6 +2468,43 @@ impl ContextRuleManager {
 // ContextRuleDefinition
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Wallet-side off-chain mirror of the OZ `ContextRuleType` enum
+/// (`packages/accounts/src/smart_account/storage.rs:140-150`, SHA `a9c4216`).
+///
+/// The OZ type wraps `soroban_sdk::Address` / `soroban_sdk::BytesN<32>`, both of
+/// which require a host `Env` to construct and are therefore unusable off-chain.
+/// `RuleContext` carries only off-chain XDR types ([`ScAddress`] + a raw 32-byte
+/// array) and is encoded to the on-chain `ContextRuleType` ScVal at install time
+/// via `encode_context_type`. This is the same layering pattern as
+/// [`ContextRuleSignerInput`] versus the OZ `Signer` type.
+///
+/// Encoded to the on-chain `#[contracttype]` wire shape by `encode_context_type`:
+/// - `Default` → `ScVal::Vec([Symbol("Default")])`
+/// - `CallContract { contract }` →
+///   `ScVal::Vec([Symbol("CallContract"), Address(contract)])`
+/// - `CreateContract { wasm_hash }` →
+///   `ScVal::Vec([Symbol("CreateContract"), Bytes(wasm_hash)])`
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RuleContext {
+    /// Default rule that can authorize any context (OZ `ContextRuleType::Default`,
+    /// `storage.rs:145`, SHA `a9c4216`).
+    Default,
+    /// Rule scoped to invocations of one specific contract (OZ
+    /// `ContextRuleType::CallContract(Address)`, `storage.rs:147`, SHA `a9c4216`).
+    CallContract {
+        /// Target contract address (`ScAddress::Contract`).
+        contract: ScAddress,
+    },
+    /// Rule scoped to creating a contract with one specific wasm hash (OZ
+    /// `ContextRuleType::CreateContract(BytesN<32>)`, `storage.rs:149`,
+    /// SHA `a9c4216`).
+    CreateContract {
+        /// 32-byte wasm hash the rule authorizes creation of.
+        wasm_hash: [u8; 32],
+    },
+}
+
 /// Definition of a context rule for [`ContextRuleManager::install_rule`].
 ///
 /// Mirrors the OZ `add_context_rule` argument set with wallet-side types.
@@ -2484,7 +2520,7 @@ impl ContextRuleManager {
 pub struct ContextRuleDefinition {
     /// Context-type variant the rule applies to (`Default`, `CallContract`,
     /// `CreateContract`).
-    pub context_type: ContextRuleType,
+    pub context_type: RuleContext,
     /// Operator-facing rule name (max OZ length enforced on-chain).
     pub name: String,
     /// Optional ledger sequence at which the rule expires. `None` means
@@ -2563,7 +2599,7 @@ impl ContextRuleDefinition {
     /// crates cannot use struct-expression syntax).
     #[must_use]
     pub fn new(
-        context_type: ContextRuleType,
+        context_type: RuleContext,
         name: String,
         valid_until: Option<u32>,
         signers: Vec<ContextRuleSignerInput>,
@@ -2578,14 +2614,14 @@ impl ContextRuleDefinition {
         }
     }
 
-    /// Stable label of the [`ContextRuleType`] variant for audit-log emission
+    /// Stable label of the [`RuleContext`] variant for audit-log emission
     /// (closed 3-value set: `"default"`, `"call_contract"`, `"create_contract"`).
     #[must_use]
     pub fn context_type_label(&self) -> &'static str {
         match self.context_type {
-            ContextRuleType::Default => "default",
-            ContextRuleType::CallContract(_) => "call_contract",
-            ContextRuleType::CreateContract(_) => "create_contract",
+            RuleContext::Default => "default",
+            RuleContext::CallContract { .. } => "call_contract",
+            RuleContext::CreateContract { .. } => "create_contract",
         }
     }
 
@@ -2989,7 +3025,8 @@ fn build_add_context_rule_args(def: &ContextRuleDefinition) -> Result<Vec<ScVal>
         redacted_reason: reason,
     };
 
-    // 1. context_type: ScVal-encode the ContextRuleType enum.
+    // 1. context_type: ScVal-encode the RuleContext into the on-chain
+    //    ContextRuleType wire shape.
     let context_type_scval = encode_context_type(&def.context_type)?;
 
     // 2. name: ScVal::String.
@@ -3085,41 +3122,204 @@ fn encode_option_u32(v: Option<u32>) -> Result<ScVal, SaError> {
     })
 }
 
-/// Encodes a `ContextRuleType` enum variant as the corresponding ScVal
-/// `#[contracttype]` shape.
-fn encode_context_type(ct: &ContextRuleType) -> Result<ScVal, SaError> {
+/// Encodes a [`RuleContext`] as the on-chain OZ `ContextRuleType` enum's
+/// `#[contracttype]` ScVal wire shape.
+///
+/// The soroban-sdk `#[contracttype]` macro serialises a data-carrying enum
+/// variant as a leading `Symbol("VariantName")` followed by the variant's
+/// payload elements as siblings in the same `ScVec`:
+///
+/// - `Default` → `ScVal::Vec([Symbol("Default")])`
+/// - `CallContract { contract }` →
+///   `ScVal::Vec([Symbol("CallContract"), Address(contract)])`
+/// - `CreateContract { wasm_hash }` →
+///   `ScVal::Vec([Symbol("CreateContract"), Bytes(wasm_hash)])`
+///
+/// Cross-reference: OpenZeppelin stellar-contracts v0.7.2,
+/// `packages/accounts/src/smart_account/storage.rs:140-150` (SHA `a9c4216`)
+/// defines `ContextRuleType { Default, CallContract(Address),
+/// CreateContract(BytesN<32>) }`. In the XDR ABI a soroban `Address` maps to
+/// `ScVal::Address` and a `BytesN<32>` maps to `ScVal::Bytes` (the 32-byte
+/// length is enforced by the host on conversion, not by a distinct ScVal
+/// variant).
+///
+/// # Errors
+///
+/// - [`SaError::AuthEntryConstructionFailed`] with `stage: "auth_payload"` if
+///   `Symbol`, `Bytes`, or `ScVec` construction fails (unreachable on
+///   well-formed inputs).
+fn encode_context_type(ct: &RuleContext) -> Result<ScVal, SaError> {
     let auth_payload_err = |reason: String| SaError::AuthEntryConstructionFailed {
         stage: "auth_payload",
         redacted_reason: reason,
     };
 
-    let (tag, payload) = match ct {
-        ContextRuleType::Default => ("Default", None),
-        ContextRuleType::CallContract(_) => {
-            return Err(auth_payload_err(
-                "ContextRuleType::CallContract requires soroban-sdk Address access; \
-                 only the Default context type is currently supported."
-                    .to_owned(),
-            ));
+    let elems: Vec<ScVal> = match ct {
+        RuleContext::Default => {
+            let tag = ScSymbol::try_from("Default")
+                .map_err(|e| auth_payload_err(format!("encode Default symbol: {e:?}")))?;
+            vec![ScVal::Symbol(tag)]
         }
-        ContextRuleType::CreateContract(_) => {
-            return Err(auth_payload_err(
-                "ContextRuleType::CreateContract requires soroban-sdk BytesN access; \
-                 only the Default context type is currently supported."
-                    .to_owned(),
-            ));
+        RuleContext::CallContract { contract } => {
+            let tag = ScSymbol::try_from("CallContract")
+                .map_err(|e| auth_payload_err(format!("encode CallContract symbol: {e:?}")))?;
+            vec![ScVal::Symbol(tag), ScVal::Address(contract.clone())]
+        }
+        RuleContext::CreateContract { wasm_hash } => {
+            let tag = ScSymbol::try_from("CreateContract")
+                .map_err(|e| auth_payload_err(format!("encode CreateContract symbol: {e:?}")))?;
+            let bytes: BytesM = wasm_hash
+                .to_vec()
+                .try_into()
+                .map_err(|e| auth_payload_err(format!("encode CreateContract Bytes: {e:?}")))?;
+            vec![ScVal::Symbol(tag), ScVal::Bytes(ScBytes(bytes))]
         }
     };
-    let tag_sym =
-        ScSymbol::try_from(tag).map_err(|e| auth_payload_err(format!("encode {tag}: {e:?}")))?;
-    let mut elems: Vec<ScVal> = vec![ScVal::Symbol(tag_sym)];
-    if let Some(p) = payload {
-        elems.push(p);
-    }
     let v: VecM<ScVal> = elems
         .try_into()
         .map_err(|e| auth_payload_err(format!("encode context-type ScVec: {e:?}")))?;
     Ok(ScVal::Vec(Some(ScVec(v))))
+}
+
+/// Decodes the on-chain `context_type` ScVal `Vec` into a [`RuleContext`] — the
+/// exact inverse of [`encode_context_type`].
+///
+/// Accepts the three OZ `ContextRuleType` `#[contracttype]` variant shapes
+/// (`packages/accounts/src/smart_account/storage.rs:143-149`, SHA `a9c4216`):
+///
+/// - `ScVal::Vec([Symbol("Default")])` → [`RuleContext::Default`]
+/// - `ScVal::Vec([Symbol("CallContract"), Address(contract)])` →
+///   [`RuleContext::CallContract`]
+/// - `ScVal::Vec([Symbol("CreateContract"), Bytes(wasm_hash)])` →
+///   [`RuleContext::CreateContract`] (`Bytes` must be exactly 32 bytes)
+///
+/// Fail-closed on any other shape (wrong element count, non-Symbol tag, unknown
+/// variant, wrong payload type, or a `CreateContract` `Bytes` payload whose
+/// length is not 32).
+///
+/// # Errors
+///
+/// - [`SaError::DeploymentFailed`] (`phase = "simulate"`) — the ScVal does not
+///   match one of the three canonical variant shapes.
+fn rule_context_from_context_type_scval(context_type: &ScVal) -> Result<RuleContext, SaError> {
+    let parse_err = |detail: String| SaError::DeploymentFailed {
+        phase: "simulate",
+        redacted_reason: format!("decode context_type: {detail}"),
+    };
+
+    let elems = match context_type {
+        ScVal::Vec(Some(ScVec(elems))) => elems,
+        other => {
+            return Err(parse_err(format!("expected ScVal::Vec, got {other:?}")));
+        }
+    };
+
+    let tag = match elems.first() {
+        Some(ScVal::Symbol(s)) => s.to_utf8_string_lossy(),
+        Some(other) => {
+            return Err(parse_err(format!("vec[0]: expected Symbol, got {other:?}")));
+        }
+        None => {
+            return Err(parse_err("context_type vec is empty".to_owned()));
+        }
+    };
+
+    match tag.as_ref() {
+        "Default" => {
+            if elems.len() != 1 {
+                return Err(parse_err(format!(
+                    "Default takes no payload; got {} elements",
+                    elems.len()
+                )));
+            }
+            Ok(RuleContext::Default)
+        }
+        "CallContract" => {
+            if elems.len() != 2 {
+                return Err(parse_err(format!(
+                    "CallContract takes one Address payload; got {} elements",
+                    elems.len()
+                )));
+            }
+            match &elems[1] {
+                ScVal::Address(addr) => Ok(RuleContext::CallContract {
+                    contract: addr.clone(),
+                }),
+                other => Err(parse_err(format!(
+                    "CallContract vec[1]: expected Address, got {other:?}"
+                ))),
+            }
+        }
+        "CreateContract" => {
+            if elems.len() != 2 {
+                return Err(parse_err(format!(
+                    "CreateContract takes one Bytes payload; got {} elements",
+                    elems.len()
+                )));
+            }
+            match &elems[1] {
+                ScVal::Bytes(ScBytes(b)) => {
+                    let wasm_hash: [u8; 32] = b.as_slice().try_into().map_err(|_| {
+                        parse_err(format!(
+                            "CreateContract wasm hash must be 32 bytes, got {}",
+                            b.len()
+                        ))
+                    })?;
+                    Ok(RuleContext::CreateContract { wasm_hash })
+                }
+                other => Err(parse_err(format!(
+                    "CreateContract vec[1]: expected Bytes, got {other:?}"
+                ))),
+            }
+        }
+        other => Err(parse_err(format!("unknown context_type variant '{other}'"))),
+    }
+}
+
+/// Decodes the `context_type` field of an OZ `ContextRule` [`ScVal::Map`] into a
+/// [`RuleContext`].
+///
+/// This is the read-side companion to the `encode_context_type` write-path
+/// encoder, reached from the full on-chain `ContextRule` map returned by
+/// `get_rule`.  The `ContextRule` ScVal layout is defined by `#[contracttype]` on
+/// the OZ `ContextRule` struct at
+/// `packages/accounts/src/smart_account/storage.rs:152-174` (SHA `a9c4216`); this
+/// helper extracts the `context_type` field and decodes it as the exact inverse
+/// of `encode_context_type` (variant shapes at `storage.rs:143-149`).
+///
+/// Used by the typed `smart-account rules add-policy --kind spending-limit`
+/// pre-flight to obtain the real [`RuleContext`] for
+/// [`crate::spending_limit_policy::ensure_call_contract_context_for_spending_limit`]
+/// without an extra RPC round-trip (the rule map is already fetched for the
+/// policy-cap check).
+///
+/// # Errors
+///
+/// - [`SaError::DeploymentFailed`] (`phase = "simulate"`) — the ScVal is not a
+///   `ScVal::Map`, the `context_type` field is missing, or the field does not
+///   decode to one of the three canonical variant shapes.
+pub fn decode_context_type_from_scval(rule_scval: &ScVal) -> Result<RuleContext, SaError> {
+    let parse_err = |detail: String| SaError::DeploymentFailed {
+        phase: "simulate",
+        redacted_reason: format!("decode_context_type_from_scval: {detail}"),
+    };
+
+    let entries = match rule_scval {
+        ScVal::Map(Some(ScMap(e))) => e.as_slice(),
+        other => {
+            return Err(parse_err(format!("expected ScVal::Map, got {other:?}")));
+        }
+    };
+
+    for entry in entries {
+        if let ScVal::Symbol(s) = &entry.key
+            && s.to_utf8_string_lossy() == "context_type"
+        {
+            return rule_context_from_context_type_scval(&entry.val);
+        }
+    }
+
+    Err(parse_err("missing 'context_type' field".to_owned()))
 }
 
 /// Encodes a [`ContextRuleSignerInput`] as the on-chain `Signer` enum's
@@ -3300,6 +3500,42 @@ fn oz_timelock_error_name(code: u32) -> Option<&'static str> {
     }
 }
 
+/// Maps an OZ `SpendingLimitError` numeric discriminant to its symbolic name.
+///
+/// # Reference cross-check
+///
+/// Canonical source: OpenZeppelin stellar-contracts v0.7.2 (`stellar-accounts`),
+/// `packages/accounts/src/policies/spending_limit.rs:120-140` (SHA
+/// `a9c42169000638da937577f592ebf61a7a3c94ca`).
+///
+/// ```text
+/// SpendingLimitError::SmartAccountNotInstalled = 3220
+/// SpendingLimitError::SpendingLimitExceeded    = 3221
+/// SpendingLimitError::InvalidLimitOrPeriod     = 3222
+/// SpendingLimitError::NotAllowed               = 3223
+/// SpendingLimitError::HistoryCapacityExceeded  = 3224
+/// SpendingLimitError::AlreadyInstalled         = 3225
+/// SpendingLimitError::LessThanZero             = 3226
+/// SpendingLimitError::OnlyCallContractAllowed  = 3227
+/// ```
+///
+/// The 3220-3227 range does not overlap the `SmartAccountError` (3000-3016) or
+/// `TimelockError` (4000-4006) ranges, so chaining this after the other two in
+/// [`augment_with_oz_error_name`] is unambiguous.
+fn oz_spending_limit_policy_error_name(code: u32) -> Option<&'static str> {
+    match code {
+        3220 => Some("SmartAccountNotInstalled"),
+        3221 => Some("SpendingLimitExceeded"),
+        3222 => Some("InvalidLimitOrPeriod"),
+        3223 => Some("NotAllowed"),
+        3224 => Some("HistoryCapacityExceeded"),
+        3225 => Some("AlreadyInstalled"),
+        3226 => Some("LessThanZero"),
+        3227 => Some("OnlyCallContractAllowed"),
+        _ => None,
+    }
+}
+
 /// Augments a simulator-returned error message with the symbolic OZ
 /// `SmartAccountError` or `TimelockError` name when the message contains an
 /// `Error(Contract, #<code>)` token whose `<code>` matches a known OZ
@@ -3312,14 +3548,16 @@ fn oz_timelock_error_name(code: u32) -> Option<&'static str> {
 /// the `get_rule` / `delete_rule` typed-mapping substring matchers can
 /// rely on the symbolic name alongside the numeric code.
 ///
-/// Covers two OZ error ranges:
+/// Covers three OZ error ranges:
 /// - `SmartAccountError` 3000-3016
 ///   (`packages/accounts/src/smart_account/mod.rs`, SHA `a9c4216`)
+/// - `SpendingLimitError` 3220-3227
+///   (`packages/accounts/src/policies/spending_limit.rs:120-140`, SHA `a9c4216`)
 /// - `TimelockError` 4000-4006
 ///   (`packages/governance/src/timelock/mod.rs:325-339`, SHA `a9c4216`)
 ///
 /// Returns the message unchanged when no OZ error code is detected, or
-/// when the code is outside both discriminant ranges.
+/// when the code is outside all three discriminant ranges.
 pub(crate) fn augment_with_oz_error_name(message: &str) -> String {
     // Find every `Error(Contract, #N)` token and append a single
     // `[OZ:<Name>]` annotation per known code. Repeated occurrences of
@@ -3330,7 +3568,9 @@ pub(crate) fn augment_with_oz_error_name(message: &str) -> String {
         if let Some(end) = after_hash.find(')')
             && let Ok(code) = after_hash[..end].parse::<u32>()
         {
-            let name = oz_smart_account_error_name(code).or_else(|| oz_timelock_error_name(code));
+            let name = oz_smart_account_error_name(code)
+                .or_else(|| oz_spending_limit_policy_error_name(code))
+                .or_else(|| oz_timelock_error_name(code));
             if let Some(name) = name {
                 return format!("{message} [OZ:{name}]");
             }
@@ -4027,6 +4267,11 @@ fn sa_error_to_invocation_result(
         // submission (SHA gate, TOML parse, config I/O, sha256-drift guard).
         | SaError::WebAuthnVerifierProvenanceMismatch { .. }
         | SaError::WebAuthnVerifierSha256Drift { .. }
+        | SaError::Ed25519VerifierProvenanceMismatch { .. }
+        | SaError::Ed25519VerifierSha256Drift { .. }
+        | SaError::SpendingLimitPolicyProvenanceMismatch { .. }
+        | SaError::SpendingLimitPolicySha256Drift { .. }
+        | SaError::SpendingLimitInstallRefused { .. }
         | SaError::NetworksTomlIo { .. }
         | SaError::NetworksTomlParse { .. }
         // Signer-threshold pre-submission refusal variants.
@@ -4348,7 +4593,7 @@ mod tests {
     #[test]
     fn context_rule_definition_default_label() {
         let def = ContextRuleDefinition {
-            context_type: ContextRuleType::Default,
+            context_type: RuleContext::Default,
             name: "default".to_owned(),
             valid_until: None,
             signers: vec![],
@@ -4367,7 +4612,7 @@ mod tests {
         )
         .unwrap();
         let def = ContextRuleDefinition::new(
-            ContextRuleType::Default,
+            RuleContext::Default,
             "mixed-signers".to_owned(),
             None,
             vec![
@@ -4403,7 +4648,7 @@ mod tests {
 
     #[test]
     fn build_default_context_type_scval_round_trip() {
-        let scval = encode_context_type(&ContextRuleType::Default).unwrap();
+        let scval = encode_context_type(&RuleContext::Default).unwrap();
         let ScVal::Vec(Some(ScVec(v))) = scval else {
             panic!("expected ScVal::Vec");
         };
@@ -5330,93 +5575,288 @@ mod tests {
         );
     }
 
-    // ── encode_context_type CallContract / CreateContract rejection ───────────
+    // ── encode_context_type CallContract / CreateContract wire shape ──────────
     //
-    // These branches are currently unsupported because they require soroban-sdk
-    // types not available off-chain. The manager returns a typed error so that
-    // callers receive a clear message instead of a runtime panic.
+    // The wallet encodes all three `RuleContext` variants off-chain to the OZ
+    // `ContextRuleType` `#[contracttype]` ScVal wire shape. There is no refusal
+    // path for `CallContract` / `CreateContract`.
 
-    /// `encode_context_type(ContextRuleType::CallContract(_))` returns
-    /// `AuthEntryConstructionFailed(auth_payload)`.
+    /// Pins the OZ `ContextRuleType::CallContract(Address)` `#[contracttype]`
+    /// wire shape: `ScVal::Vec([Symbol("CallContract"), Address(contract)])`.
     ///
-    /// CallContract / CreateContract require soroban-sdk Address / BytesN types
-    /// that are only constructable with a soroban host Env. The wallet currently
-    /// supports only the Default context type; the other variants are explicitly
-    /// refused with a clear error message.
-    ///
-    /// Canonical source: OZ `storage.rs:152-174` SHA `a9c4216` defines the
-    /// three `ContextRuleType` variants; the wallet's off-chain XDR encoder
-    /// only covers `Default`.
+    /// Canonical source: OpenZeppelin stellar-contracts v0.7.2,
+    /// `packages/accounts/src/smart_account/storage.rs:147` (SHA `a9c4216`) —
+    /// `CallContract(Address)`; a soroban `Address` maps to `ScVal::Address`.
     #[test]
-    fn encode_context_type_call_contract_returns_construction_error() {
-        use stellar_accounts::smart_account::ContextRuleType;
-        // The inner value for CallContract is a soroban Address; the encoder
-        // returns Err at the match arm before accessing the inner value, so
-        // the specific address is irrelevant — any valid Address is a suitable
-        // placeholder. soroban_sdk::Address does not implement Default; use
-        // the testutils generator instead.
-        let soroban_env = soroban_sdk::Env::default();
-        let placeholder_addr =
-            <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&soroban_env);
-        let ct = ContextRuleType::CallContract(placeholder_addr);
-        let err = encode_context_type(&ct).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                SaError::AuthEntryConstructionFailed {
-                    stage: "auth_payload",
-                    ..
-                }
-            ),
-            "CallContract must return AuthEntryConstructionFailed(auth_payload); got {err:?}"
+    fn encode_context_type_call_contract_round_trip() {
+        use stellar_xdr::ReadXdr as _;
+
+        // Canonical all-zeros contract C-strkey fixture.
+        let contract = parse_c_strkey_to_smart_account(
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        )
+        .unwrap();
+        let scval = encode_context_type(&RuleContext::CallContract {
+            contract: contract.clone(),
+        })
+        .unwrap();
+
+        // Field-by-field wire shape.
+        let ScVal::Vec(Some(ScVec(v))) = &scval else {
+            panic!("expected ScVal::Vec; got {scval:?}");
+        };
+        assert_eq!(v.len(), 2, "CallContract encodes as a 2-element Vec");
+        let ScVal::Symbol(s) = &v[0] else {
+            panic!("expected Symbol tag; got {:?}", v[0]);
+        };
+        assert_eq!(s.to_utf8_string_lossy(), "CallContract");
+        let ScVal::Address(a) = &v[1] else {
+            panic!("expected Address payload; got {:?}", v[1]);
+        };
+        assert_eq!(a, &contract);
+
+        // Full expected ScVal equality (every byte of the payload asserted).
+        let expected = ScVal::Vec(Some(ScVec(
+            vec![
+                ScVal::Symbol(ScSymbol::try_from("CallContract").unwrap()),
+                ScVal::Address(contract.clone()),
+            ]
+            .try_into()
+            .unwrap(),
+        )));
+        assert_eq!(
+            scval, expected,
+            "CallContract wire shape must be byte-exact"
         );
-        if let SaError::AuthEntryConstructionFailed {
-            redacted_reason, ..
-        } = err
-        {
-            assert!(
-                redacted_reason.contains("CallContract"),
-                "error message must mention CallContract; got: {redacted_reason}"
+
+        // Canonical XDR serialisation round-trips losslessly.
+        let bytes = scval.to_xdr(Limits::none()).unwrap();
+        let decoded = ScVal::from_xdr(&bytes, Limits::none()).unwrap();
+        assert_eq!(decoded, scval, "CallContract ScVal must XDR round-trip");
+    }
+
+    /// Pins the OZ `ContextRuleType::CreateContract(BytesN<32>)`
+    /// `#[contracttype]` wire shape:
+    /// `ScVal::Vec([Symbol("CreateContract"), Bytes(wasm_hash)])`.
+    ///
+    /// Canonical source: OpenZeppelin stellar-contracts v0.7.2,
+    /// `packages/accounts/src/smart_account/storage.rs:149` (SHA `a9c4216`) —
+    /// `CreateContract(BytesN<32>)`; a soroban `BytesN<32>` maps to
+    /// `ScVal::Bytes` (32-byte length host-enforced on conversion).
+    #[test]
+    fn encode_context_type_create_contract_round_trip() {
+        use stellar_xdr::ReadXdr as _;
+
+        let wasm_hash = [0xAB_u8; 32];
+        let scval = encode_context_type(&RuleContext::CreateContract { wasm_hash }).unwrap();
+
+        // Field-by-field wire shape.
+        let ScVal::Vec(Some(ScVec(v))) = &scval else {
+            panic!("expected ScVal::Vec; got {scval:?}");
+        };
+        assert_eq!(v.len(), 2, "CreateContract encodes as a 2-element Vec");
+        let ScVal::Symbol(s) = &v[0] else {
+            panic!("expected Symbol tag; got {:?}", v[0]);
+        };
+        assert_eq!(s.to_utf8_string_lossy(), "CreateContract");
+        let ScVal::Bytes(ScBytes(b)) = &v[1] else {
+            panic!("expected Bytes payload; got {:?}", v[1]);
+        };
+        assert_eq!(b.as_slice(), &wasm_hash[..], "wasm hash bytes must match");
+
+        // Full expected ScVal equality.
+        let expected = ScVal::Vec(Some(ScVec(
+            vec![
+                ScVal::Symbol(ScSymbol::try_from("CreateContract").unwrap()),
+                ScVal::Bytes(ScBytes(wasm_hash.to_vec().try_into().unwrap())),
+            ]
+            .try_into()
+            .unwrap(),
+        )));
+        assert_eq!(
+            scval, expected,
+            "CreateContract wire shape must be byte-exact"
+        );
+
+        // Canonical XDR serialisation round-trips losslessly.
+        let bytes = scval.to_xdr(Limits::none()).unwrap();
+        let decoded = ScVal::from_xdr(&bytes, Limits::none()).unwrap();
+        assert_eq!(decoded, scval, "CreateContract ScVal must XDR round-trip");
+    }
+
+    // ── RuleContext encode/decode round-trip tests ────────────────────────────
+
+    /// `rule_context_from_context_type_scval` is the exact inverse of
+    /// `encode_context_type` for all three variants: encode then decode returns
+    /// the original `RuleContext`.
+    #[test]
+    fn rule_context_encode_decode_round_trip_all_variants() {
+        let contract = parse_c_strkey_to_smart_account(
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        )
+        .unwrap();
+        let cases = [
+            RuleContext::Default,
+            RuleContext::CallContract {
+                contract: contract.clone(),
+            },
+            RuleContext::CreateContract {
+                wasm_hash: [0xCD_u8; 32],
+            },
+        ];
+        for original in cases {
+            let encoded = encode_context_type(&original).unwrap();
+            let decoded = rule_context_from_context_type_scval(&encoded).unwrap();
+            assert_eq!(
+                decoded, original,
+                "encode -> decode must return the original RuleContext"
             );
         }
     }
 
-    /// `encode_context_type(ContextRuleType::CreateContract(_))` returns
-    /// `AuthEntryConstructionFailed(auth_payload)`.
-    ///
-    /// Same rationale as `CallContract`; only the Default context type is
-    /// currently supported off-chain.
+    /// `decode_context_type_from_scval` extracts and decodes the `context_type`
+    /// field from a full `ContextRule` map.
     #[test]
-    fn encode_context_type_create_contract_returns_construction_error() {
-        use stellar_accounts::smart_account::ContextRuleType;
-        // soroban_sdk::BytesN<32> does not implement Default; use the
-        // testutils random generator.  The encoder returns Err at the match
-        // arm before accessing the inner value, so the specific bytes are
-        // irrelevant.
-        let soroban_env = soroban_sdk::Env::default();
-        let placeholder_bytes =
-            <soroban_sdk::BytesN<32> as soroban_sdk::testutils::BytesN<32>>::random(&soroban_env);
-        let ct = ContextRuleType::CreateContract(placeholder_bytes);
-        let err = encode_context_type(&ct).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                SaError::AuthEntryConstructionFailed {
-                    stage: "auth_payload",
-                    ..
-                }
-            ),
-            "CreateContract must return AuthEntryConstructionFailed(auth_payload); got {err:?}"
+    fn decode_context_type_from_full_rule_map() {
+        let contract = parse_c_strkey_to_smart_account(
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        )
+        .unwrap();
+        let expected = RuleContext::CallContract {
+            contract: contract.clone(),
+        };
+        let context_type_scval = encode_context_type(&expected).unwrap();
+
+        // Minimal ContextRule map carrying only the context_type field (the
+        // decoder ignores sibling fields).
+        let rule_map = ScVal::Map(Some(ScMap(
+            vec![ScMapEntry {
+                key: ScVal::Symbol(ScSymbol::try_from("context_type").unwrap()),
+                val: context_type_scval,
+            }]
+            .try_into()
+            .unwrap(),
+        )));
+
+        let decoded = decode_context_type_from_scval(&rule_map).unwrap();
+        assert_eq!(decoded, expected);
+    }
+
+    /// `decode_context_type_from_scval` fails closed when the map has no
+    /// `context_type` field.
+    #[test]
+    fn decode_context_type_missing_field_fails_closed() {
+        let rule_map = ScVal::Map(Some(ScMap(
+            vec![ScMapEntry {
+                key: ScVal::Symbol(ScSymbol::try_from("name").unwrap()),
+                val: ScVal::U32(1),
+            }]
+            .try_into()
+            .unwrap(),
+        )));
+        let err = decode_context_type_from_scval(&rule_map).expect_err("missing field must fail");
+        assert!(matches!(err, SaError::DeploymentFailed { .. }));
+    }
+
+    /// `rule_context_from_context_type_scval` fails closed on an unknown variant
+    /// tag.
+    #[test]
+    fn rule_context_decode_unknown_variant_fails_closed() {
+        let bogus = ScVal::Vec(Some(ScVec(
+            vec![ScVal::Symbol(ScSymbol::try_from("Bogus").unwrap())]
+                .try_into()
+                .unwrap(),
+        )));
+        let err = rule_context_from_context_type_scval(&bogus)
+            .expect_err("unknown variant must fail closed");
+        assert!(matches!(err, SaError::DeploymentFailed { .. }));
+    }
+
+    /// `rule_context_from_context_type_scval` fails closed when a
+    /// `CreateContract` Bytes payload is not exactly 32 bytes.
+    #[test]
+    fn rule_context_decode_create_contract_wrong_length_fails_closed() {
+        let short_bytes: ScBytes = ScBytes(vec![0u8; 16].try_into().unwrap());
+        let bogus = ScVal::Vec(Some(ScVec(
+            vec![
+                ScVal::Symbol(ScSymbol::try_from("CreateContract").unwrap()),
+                ScVal::Bytes(short_bytes),
+            ]
+            .try_into()
+            .unwrap(),
+        )));
+        let err = rule_context_from_context_type_scval(&bogus)
+            .expect_err("16-byte CreateContract payload must fail closed");
+        assert!(matches!(err, SaError::DeploymentFailed { .. }));
+    }
+
+    // ── OZ SpendingLimitError symbolic-name tests ─────────────────────────────
+
+    /// `oz_spending_limit_policy_error_name` maps the OZ `SpendingLimitError`
+    /// 3220-3227 discriminants to their symbolic names and returns `None`
+    /// outside the range.
+    #[test]
+    fn oz_spending_limit_policy_error_name_matches_oz_wire_discriminants() {
+        assert_eq!(
+            oz_spending_limit_policy_error_name(3220),
+            Some("SmartAccountNotInstalled")
         );
-        if let SaError::AuthEntryConstructionFailed {
-            redacted_reason, ..
-        } = err
-        {
-            assert!(
-                redacted_reason.contains("CreateContract"),
-                "error message must mention CreateContract; got: {redacted_reason}"
-            );
-        }
+        assert_eq!(
+            oz_spending_limit_policy_error_name(3221),
+            Some("SpendingLimitExceeded")
+        );
+        assert_eq!(
+            oz_spending_limit_policy_error_name(3222),
+            Some("InvalidLimitOrPeriod")
+        );
+        assert_eq!(
+            oz_spending_limit_policy_error_name(3223),
+            Some("NotAllowed")
+        );
+        assert_eq!(
+            oz_spending_limit_policy_error_name(3224),
+            Some("HistoryCapacityExceeded")
+        );
+        assert_eq!(
+            oz_spending_limit_policy_error_name(3225),
+            Some("AlreadyInstalled")
+        );
+        assert_eq!(
+            oz_spending_limit_policy_error_name(3226),
+            Some("LessThanZero")
+        );
+        assert_eq!(
+            oz_spending_limit_policy_error_name(3227),
+            Some("OnlyCallContractAllowed")
+        );
+        assert_eq!(oz_spending_limit_policy_error_name(3219), None);
+        assert_eq!(oz_spending_limit_policy_error_name(3228), None);
+    }
+
+    /// `augment_with_oz_error_name` attaches the `SpendingLimitExceeded` symbolic
+    /// name for discriminant 3221 (the over-budget failure the live acceptance
+    /// distinguishes from a wrong-reason failure).
+    #[test]
+    fn augment_with_oz_error_name_annotates_spending_limit_exceeded() {
+        let msg = "HostError: Error(Contract, #3221)";
+        let augmented = augment_with_oz_error_name(msg);
+        assert!(
+            augmented.contains("[OZ:SpendingLimitExceeded]"),
+            "3221 must be annotated SpendingLimitExceeded, got: {augmented}"
+        );
+    }
+
+    /// `augment_with_oz_error_name` attaches the `NotAllowed` symbolic name for
+    /// discriminant 3223 (the wrong-shape failure the live acceptance
+    /// distinguishes from an over-budget failure).
+    #[test]
+    fn augment_with_oz_error_name_annotates_spending_limit_not_allowed() {
+        let msg = "HostError: Error(Contract, #3223)";
+        let augmented = augment_with_oz_error_name(msg);
+        assert!(
+            augmented.contains("[OZ:NotAllowed]"),
+            "3223 must be annotated NotAllowed, got: {augmented}"
+        );
     }
 
     // ── scaddress_to_strkey round-trip tests ──────────────────────────────────
@@ -5761,7 +6201,7 @@ mod tests {
         let policy_b = ScAddress::Contract(ContractId(stellar_xdr::Hash([0x01_u8; 32])));
 
         let def = ContextRuleDefinition::new(
-            ContextRuleType::Default,
+            RuleContext::Default,
             "with-policies".to_owned(),
             None,
             vec![],
@@ -5803,7 +6243,7 @@ mod tests {
     #[test]
     fn build_add_context_rule_args_encodes_valid_until_some() {
         let def = ContextRuleDefinition::new(
-            ContextRuleType::Default,
+            RuleContext::Default,
             "session-rule".to_owned(),
             Some(60_000_100),
             vec![],
@@ -5825,7 +6265,7 @@ mod tests {
     #[test]
     fn build_add_context_rule_args_encodes_valid_until_none() {
         let def = ContextRuleDefinition::new(
-            ContextRuleType::Default,
+            RuleContext::Default,
             "permanent-rule".to_owned(),
             None,
             vec![],
@@ -5838,36 +6278,42 @@ mod tests {
         }
     }
 
-    /// `build_add_context_rule_args` returns `AuthEntryConstructionFailed` for
-    /// `CallContract` context type.
+    /// `build_add_context_rule_args` encodes a `CallContract` context type into
+    /// arg[0] as `ScVal::Vec([Symbol("CallContract"), Address(target)])`.
     ///
-    /// The `build_add_context_rule_args` function calls `encode_context_type`
-    /// first; a `CallContract` variant causes it to fail before encoding any
-    /// other fields.
+    /// There is no refusal path: `encode_context_type` handles all three
+    /// `RuleContext` variants off-chain. Arg position per OZ `mod.rs:238-248`
+    /// SHA `a9c4216` — the first `add_context_rule` arg is the context type.
     #[test]
-    fn build_add_context_rule_args_rejects_call_contract_context_type() {
-        // soroban_sdk::Address does not implement Default; use testutils.
-        let soroban_env = soroban_sdk::Env::default();
-        let placeholder_addr =
-            <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&soroban_env);
+    fn build_add_context_rule_args_encodes_call_contract_context_type() {
+        let target = parse_c_strkey_to_smart_account(
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        )
+        .unwrap();
         let def = ContextRuleDefinition::new(
-            ContextRuleType::CallContract(placeholder_addr),
+            RuleContext::CallContract {
+                contract: target.clone(),
+            },
             "call-contract-rule".to_owned(),
             None,
             vec![],
             vec![],
         );
-        let err = build_add_context_rule_args(&def).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                SaError::AuthEntryConstructionFailed {
-                    stage: "auth_payload",
-                    ..
-                }
-            ),
-            "CallContract context type must return AuthEntryConstructionFailed; got {err:?}"
-        );
+        let args = build_add_context_rule_args(&def)
+            .expect("CallContract context type must encode without error");
+        // arg[0] is the context type.
+        let ScVal::Vec(Some(ScVec(v))) = &args[0] else {
+            panic!("context type must encode to ScVal::Vec; got {:?}", args[0]);
+        };
+        assert_eq!(v.len(), 2, "CallContract context type is a 2-element Vec");
+        let ScVal::Symbol(s) = &v[0] else {
+            panic!("expected Symbol tag; got {:?}", v[0]);
+        };
+        assert_eq!(s.to_utf8_string_lossy(), "CallContract");
+        let ScVal::Address(a) = &v[1] else {
+            panic!("expected Address payload; got {:?}", v[1]);
+        };
+        assert_eq!(a, &target);
     }
 
     // ── parse_context_rule_id: id field not U32 ───────────────────────────────
@@ -6853,7 +7299,7 @@ mod tests {
     #[test]
     fn build_add_context_rule_args_accepts_multi_delegated_signers() {
         let def = ContextRuleDefinition::new(
-            ContextRuleType::Default,
+            RuleContext::Default,
             "two-delegated".to_owned(),
             None,
             vec![

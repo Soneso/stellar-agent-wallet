@@ -23,6 +23,12 @@
 //! - [`deploy_webauthn_verifier`] — `smart-account deploy-webauthn-verifier` —
 //!   deploy the vendored OZ WebAuthn-verifier WASM contract and record the
 //!   address in `~/.config/stellar-agent/networks.toml`.
+//! - [`deploy_ed25519_verifier`] — `smart-account deploy-ed25519-verifier` —
+//!   deploy the vendored OZ Ed25519-verifier WASM contract and record the
+//!   address in `~/.config/stellar-agent/networks.toml`.
+//! - [`deploy_spending_limit_policy`] — `smart-account deploy-spending-limit-policy`
+//!   — deploy the vendored OZ spending-limit-policy WASM contract (per-network
+//!   singleton) and record the address in `~/.config/stellar-agent/networks.toml`.
 //! - [`migrate_verifier`] — `smart-account migrate-verifier` — construct a
 //!   [`MigrationPlan`] for moving all `External` signers from one verifier to
 //!   another. Currently `--dry-run` only.
@@ -49,6 +55,8 @@
 //! [`VERIFIER_ALLOWLIST`]: stellar_agent_smart_account::verifier_allowlist::VERIFIER_ALLOWLIST
 
 pub mod common;
+pub mod deploy_ed25519_verifier;
+pub mod deploy_spending_limit_policy;
 pub mod deploy_webauthn_verifier;
 pub mod list_rules;
 pub mod list_verifiers;
@@ -132,9 +140,13 @@ pub enum SmartAccountSubcommand {
     /// - `smart-account signers refresh` — unconditionally writes a fresh
     ///   `SaSignerSetBaselined` row (re-anchor after intentional out-of-band
     ///   mutation).
-    /// - `smart-account signers add` — adds one delegated ed25519 signer to a context
-    ///   rule via OZ `add_signer`; emits `SaSignerAdded`. Refuses if adding
-    ///   would exceed internal counters (upstream guard).
+    /// - `smart-account signers add` — adds one signer to a context rule via OZ
+    ///   `add_signer`; emits `SaSignerAdded`. Accepts exactly one of
+    ///   `--signer-delegated` (G-key), `--signer-ed25519` (raw Ed25519 pubkey
+    ///   verified by the registered Ed25519 verifier; optional `--verifier`
+    ///   override), `--signer-webauthn` (passkey), or `--signer-external`
+    ///   (raw External escape hatch). Refuses if adding would exceed internal
+    ///   counters (upstream guard).
     /// - `smart-account signers remove` — removes one signer by `signer_id` via OZ
     ///   `remove_signer`; emits `SaSignerRemoved`. Refuses if removing would
     ///   drop `signer_count` below `threshold` (brick-prevention).
@@ -163,6 +175,48 @@ pub enum SmartAccountSubcommand {
     /// `status: "already_deployed"` is returned.
     #[command(name = "deploy-webauthn-verifier")]
     DeployWebAuthnVerifier(Box<deploy_webauthn_verifier::DeployWebAuthnVerifierArgs>),
+
+    /// Deploy the OZ Ed25519-verifier WASM contract and record the address in the
+    /// verifier registry (`~/.config/stellar-agent/networks.toml`).
+    ///
+    /// Supports two mutually-exclusive deployer-source modes:
+    ///
+    /// - `--deployer-secret-env <VAR>` — read deployer S-strkey from an env var.
+    /// - `--sign-with-ledger` — use a connected Ledger hardware wallet.
+    ///
+    /// Mainnet is structurally refused. Use `--dry-run` to derive the
+    /// deterministic verifier address without any network access.
+    ///
+    /// The verifier SHA-256 is re-verified at runtime before any submission.
+    /// The command is idempotent: if the registry already has an Ed25519-verifier
+    /// entry for the target network with the same WASM sha256, no RPC traffic is
+    /// issued and `status: "already_deployed"` is returned.
+    ///
+    /// Bootstraps first-class Ed25519 external signers
+    /// (`smart-account signers add --signer-ed25519`).
+    #[command(name = "deploy-ed25519-verifier")]
+    DeployEd25519Verifier(Box<deploy_ed25519_verifier::DeployEd25519VerifierArgs>),
+
+    /// Deploy the OZ spending-limit-policy WASM contract (per-network singleton)
+    /// and record the address in the verifier registry
+    /// (`~/.config/stellar-agent/networks.toml`).
+    ///
+    /// Supports two mutually-exclusive deployer-source modes:
+    ///
+    /// - `--deployer-secret-env <VAR>` — read deployer S-strkey from an env var.
+    /// - `--sign-with-ledger` — use a connected Ledger hardware wallet.
+    ///
+    /// Mainnet is structurally refused. Use `--dry-run` to derive the
+    /// deterministic policy address without any network access.
+    ///
+    /// The policy SHA-256 is re-verified at runtime before any submission.
+    /// The command is idempotent: if the registry already has a
+    /// spending-limit-policy entry for the target network with the same WASM
+    /// sha256, no RPC traffic is issued and `status: "already_deployed"` is
+    /// returned. The address is consumed by
+    /// `smart-account rules add-policy --kind spending-limit`.
+    #[command(name = "deploy-spending-limit-policy")]
+    DeploySpendingLimitPolicy(Box<deploy_spending_limit_policy::DeploySpendingLimitPolicyArgs>),
 
     /// Construct a migration plan for moving `External` signers from one verifier
     /// contract to another across all context rules on a smart account.
@@ -261,6 +315,12 @@ pub async fn run(args: &SmartAccountArgs) -> i32 {
         SmartAccountSubcommand::Signers(signers_args) => signers::run(signers_args).await,
         SmartAccountSubcommand::DeployWebAuthnVerifier(deploy_args) => {
             deploy_webauthn_verifier::run(deploy_args).await
+        }
+        SmartAccountSubcommand::DeployEd25519Verifier(deploy_args) => {
+            deploy_ed25519_verifier::run(deploy_args).await
+        }
+        SmartAccountSubcommand::DeploySpendingLimitPolicy(deploy_args) => {
+            deploy_spending_limit_policy::run(deploy_args).await
         }
         SmartAccountSubcommand::MigrateVerifier(migrate_args) => {
             migrate_verifier::run(migrate_args).await

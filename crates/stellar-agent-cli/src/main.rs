@@ -240,6 +240,11 @@ enum Commands {
     /// - `smart-account multicall` — submit a batched invocation bundle.
     /// - `smart-account deploy-webauthn-verifier` — deploy the OZ
     ///   WebAuthn-verifier WASM and record its address.
+    /// - `smart-account deploy-ed25519-verifier` — deploy the OZ
+    ///   Ed25519-verifier WASM and record its address.
+    /// - `smart-account deploy-spending-limit-policy` — deploy the OZ
+    ///   spending-limit-policy WASM (per-network singleton) and record its
+    ///   address.
     /// - `smart-account migrate-verifier` — plan/execute External-signer
     ///   verifier migration.
     /// - `smart-account list-verifiers` — enumerate the verifier allowlist.

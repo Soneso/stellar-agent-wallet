@@ -63,15 +63,20 @@ use stellar_agent_core::error::{NetworkError, ValidationError, WalletError};
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_core::profile::caip2::MAINNET_RPC_URL;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
+use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::credentials::CredentialsManager;
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRuleSignerInput,
-    InstallRuleOutput, OZ_MAX_NAME_SIZE, OZ_MAX_POLICIES, OZ_MAX_SIGNERS, PinStatus,
-    SmartAccountAddress, VerifyPinsResult as SaVerifyPinsResult, decode_policy_count_from_scval,
-    parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
+    InstallRuleOutput, OZ_MAX_NAME_SIZE, OZ_MAX_POLICIES, OZ_MAX_SIGNERS, PinStatus, RuleContext,
+    SmartAccountAddress, VerifyPinsResult as SaVerifyPinsResult, decode_context_type_from_scval,
+    decode_policy_count_from_scval, parse_c_strkey_to_smart_account,
+    parse_g_strkey_to_signer_address,
+};
+use stellar_agent_smart_account::spending_limit_policy::{
+    build_spending_limit_install_param, ensure_call_contract_context_for_spending_limit,
+    ensure_valid_spending_limit_params,
 };
 use stellar_agent_smart_account::verifiers::VerifierRegistry;
-use stellar_agent_smart_account::{bindings::ContextRuleType, error::SaError};
 use stellar_xdr::ReadXdr as _;
 use tracing::info;
 use uuid::Uuid;
@@ -491,6 +496,16 @@ pub struct CreateArgs {
     /// `none`) for a permanent rule.
     #[arg(long, value_name = "LEDGER", default_value = "none")]
     pub valid_until: String,
+
+    /// Context the rule authorizes. Accepted forms:
+    ///
+    /// - `default` (or omit the flag) — authorizes any context.
+    /// - `call-contract:<C-strkey>` — scopes the rule to invocations of one
+    ///   specific contract.
+    /// - `create-contract:<64-hex-wasm-hash>` — scopes the rule to creating a
+    ///   contract with one specific 32-byte wasm hash.
+    #[arg(long = "context", value_name = "SPEC", default_value = "default")]
+    pub context: String,
 }
 
 /// Result envelope for `smart-account rules create`.
@@ -801,6 +816,13 @@ async fn create_run(args: &CreateArgs) -> i32 {
         Err(e) => return emit_error(&e, args.common.output, &request_id),
     };
 
+    // Parse the context grammar before any network setup so a malformed
+    // `--context` fails closed with no RPC round-trip.
+    let context_type = match parse_rule_context(&args.context) {
+        Ok(c) => c,
+        Err(e) => return emit_error(&e, args.common.output, &request_id),
+    };
+
     // `create_run` builds its own context/manager here rather than going through
     // `prepare_write_context` because it has substantial pre-validation above.
     // The explicit `context_rule_manager()` call is required to wire the
@@ -815,7 +837,7 @@ async fn create_run(args: &CreateArgs) -> i32 {
     };
 
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        context_type,
         args.name.clone(),
         valid_until,
         signers,
@@ -1509,16 +1531,37 @@ async fn verify_pins_run(args: &VerifyPinsArgs) -> i32 {
 // `smart-account rules add-policy`
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Selects how `smart-account rules add-policy` builds the install parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PolicyKind {
+    /// Raw passthrough: the operator supplies `--policy-address` and a
+    /// base64-XDR `--install-param` verbatim.
+    Raw,
+    /// Typed spending-limit policy: the wallet resolves the deployed
+    /// spending-limit policy from the registry (or `--policy` override), builds
+    /// the `SpendingLimitAccountParams` install param from `--limit` + `--period`,
+    /// and refuses non-`CallContract` rules client-side.
+    SpendingLimit,
+}
+
 /// Arguments for `smart-account rules add-policy`.
 ///
-/// Adds a policy contract to an existing context rule.  The `--install-param`
-/// value is a base64-encoded XDR `ScVal` (standard base64, not base64url).
-/// The wallet passes the decoded `ScVal` through to the on-chain
-/// `add_policy(rule_id, policy, install_param)` call without further
-/// validation — raw passthrough.
+/// Adds a policy contract to an existing context rule.  Two mutually-exclusive
+/// modes selected by `--kind`:
+///
+/// - `--kind raw` (default) — the operator supplies `--policy-address` and a
+///   base64-encoded XDR `ScVal` `--install-param` (standard base64, not
+///   base64url).  The wallet passes the decoded `ScVal` through to the on-chain
+///   `add_policy(rule_id, policy, install_param)` call without further validation
+///   (raw passthrough).
+/// - `--kind spending-limit` — the wallet resolves the deployed OZ
+///   spending-limit policy from the [`VerifierRegistry`] (or `--policy`
+///   override), builds the `SpendingLimitAccountParams` install param from
+///   `--limit` + `--period`, and refuses non-`CallContract` rules client-side
+///   (OZ `install` rejects them with `OnlyCallContractAllowed`).
 ///
 /// The per-rule policy cap (`OZ_MAX_POLICIES = 5`) is enforced BEFORE the
-/// simulate cycle via a `get_context_rule` pre-fetch.
+/// simulate cycle via a `get_context_rule` pre-fetch (shared by both modes).
 ///
 /// # Mainnet write defence
 ///
@@ -1535,18 +1578,47 @@ pub struct AddPolicyArgs {
     #[arg(long, value_name = "U32", required = true)]
     pub rule_id: u32,
 
-    /// Policy contract C-strkey.
-    #[arg(long, value_name = "C_STRKEY", required = true)]
-    pub policy_address: String,
+    /// Install-parameter mode. Default: `raw`.
+    #[arg(long, value_enum, default_value_t = PolicyKind::Raw, value_name = "raw|spending-limit")]
+    pub kind: PolicyKind,
 
-    /// Base64-encoded XDR `ScVal` install parameter.
+    /// Policy contract C-strkey (raw mode).
     ///
-    /// The wallet decodes this from standard base64 (not base64url) and passes
-    /// the resulting `ScVal` to `add_policy` unvalidated (raw passthrough).
-    /// Use `stellar-xdr encode` or the MCP XDR tools to produce the correct
-    /// encoding for a given policy type.
-    #[arg(long, value_name = "SCVAL_BASE64", required = true)]
-    pub install_param: String,
+    /// Required with `--kind raw`. Ignored with `--kind spending-limit` (use
+    /// `--policy` for the typed override).
+    #[arg(long, value_name = "C_STRKEY")]
+    pub policy_address: Option<String>,
+
+    /// Base64-encoded XDR `ScVal` install parameter (raw mode).
+    ///
+    /// Required with `--kind raw`. The wallet decodes this from standard base64
+    /// (not base64url) and passes the resulting `ScVal` to `add_policy`
+    /// unvalidated (raw passthrough). Use `stellar-xdr encode` or the MCP XDR
+    /// tools to produce the correct encoding for a given policy type.
+    #[arg(long, value_name = "SCVAL_BASE64")]
+    pub install_param: Option<String>,
+
+    /// Spending-limit in stroops (`--kind spending-limit`).
+    ///
+    /// Required with `--kind spending-limit`. The `i128` amount the rolling
+    /// window admits before the policy panics `SpendingLimitExceeded`.
+    #[arg(long, value_name = "STROOPS")]
+    pub limit: Option<i128>,
+
+    /// Rolling-window length in ledgers (`--kind spending-limit`).
+    ///
+    /// Required with `--kind spending-limit`.
+    #[arg(long, value_name = "LEDGERS")]
+    pub period: Option<u32>,
+
+    /// Spending-limit policy contract C-strkey override (`--kind spending-limit`).
+    ///
+    /// When omitted, the policy address resolves from the [`VerifierRegistry`]
+    /// for the target network (deploy one via
+    /// `smart-account deploy-spending-limit-policy`). Only meaningful with
+    /// `--kind spending-limit`.
+    #[arg(long, value_name = "C_STRKEY")]
+    pub policy: Option<String>,
 
     /// Auth rule-id(s) whose signers authorise this operation. Default: the
     /// `--rule-id` value (the rule being modified is also the authorising rule).
@@ -1647,45 +1719,209 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
         Err(e) => return emit_error(&e, args.output, &request_id),
     };
 
-    // Parse the policy contract address.
-    let policy_sc_address = match parse_c_strkey_to_smart_account(&args.policy_address) {
-        Ok(addr) => addr,
-        Err(e) => {
-            return emit_error(
-                &WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!("--policy-address: {e}"),
-                }),
-                args.output,
-                &request_id,
-            );
-        }
-    };
+    // Validate the flag combination for the selected mode and resolve the policy
+    // address (display string) + install parameter accordingly. The typed
+    // spending-limit path additionally decodes the rule context below (after the
+    // rule fetch) and refuses non-CallContract rules before submit.
+    let (policy_display, policy_sc_address, install_param) = match args.kind {
+        PolicyKind::Raw => {
+            let policy_address = match &args.policy_address {
+                Some(a) => a.clone(),
+                None => {
+                    return emit_error(
+                        &WalletError::Validation(ValidationError::AddressInvalid {
+                            input: "--kind raw requires --policy-address".to_owned(),
+                        }),
+                        args.output,
+                        &request_id,
+                    );
+                }
+            };
+            let raw_install = match &args.install_param {
+                Some(p) => p,
+                None => {
+                    return emit_error(
+                        &WalletError::Validation(ValidationError::AddressInvalid {
+                            input: "--kind raw requires --install-param".to_owned(),
+                        }),
+                        args.output,
+                        &request_id,
+                    );
+                }
+            };
+            if args.limit.is_some() || args.period.is_some() || args.policy.is_some() {
+                return emit_error(
+                    &WalletError::Validation(ValidationError::AddressInvalid {
+                        input: "--limit / --period / --policy are only valid with \
+                                --kind spending-limit"
+                            .to_owned(),
+                    }),
+                    args.output,
+                    &request_id,
+                );
+            }
 
-    // Decode `--install-param` from standard base64 XDR to ScVal.
-    // Raw passthrough — the wallet does NOT validate the param against the
-    // target policy contract's expected shape.
-    //
-    // Use explicit depth + length limits (depth=500, len=10 MiB) instead of
-    // `Limits::none()` to bound XDR-bomb resource exhaustion on operator-supplied
-    // input. `stellar_xdr::Limits` does not implement `Default`; the values here
-    // are the established XDR-decoder default (10 MB / 500 depth).
-    let install_param = match stellar_xdr::ScVal::from_xdr_base64(
-        &args.install_param,
-        stellar_xdr::Limits {
-            depth: 500,
-            len: 10 * 1024 * 1024,
-        },
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            return emit_error(
-                &WalletError::Validation(ValidationError::XdrArgumentMalformed {
-                    arg: "install-param".to_owned(),
-                    reason: format!("{e}"),
-                }),
-                args.output,
-                &request_id,
-            );
+            let policy_sc_address = match parse_c_strkey_to_smart_account(&policy_address) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    return emit_error(
+                        &WalletError::Validation(ValidationError::AddressInvalid {
+                            input: format!("--policy-address: {e}"),
+                        }),
+                        args.output,
+                        &request_id,
+                    );
+                }
+            };
+
+            // Decode `--install-param` from standard base64 XDR to ScVal.
+            // Raw passthrough — the wallet does NOT validate the param against the
+            // target policy contract's expected shape.
+            //
+            // Use explicit depth + length limits (depth=500, len=10 MiB) instead
+            // of `Limits::none()` to bound XDR-bomb resource exhaustion on
+            // operator-supplied input. `stellar_xdr::Limits` does not implement
+            // `Default`; the values here are the established XDR-decoder default
+            // (10 MB / 500 depth).
+            let install_param = match stellar_xdr::ScVal::from_xdr_base64(
+                raw_install,
+                stellar_xdr::Limits {
+                    depth: 500,
+                    len: 10 * 1024 * 1024,
+                },
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    return emit_error(
+                        &WalletError::Validation(ValidationError::XdrArgumentMalformed {
+                            arg: "install-param".to_owned(),
+                            reason: format!("{e}"),
+                        }),
+                        args.output,
+                        &request_id,
+                    );
+                }
+            };
+
+            (policy_address, policy_sc_address, install_param)
+        }
+        PolicyKind::SpendingLimit => {
+            let limit = match args.limit {
+                Some(v) => v,
+                None => {
+                    return emit_error(
+                        &WalletError::Validation(ValidationError::AddressInvalid {
+                            input: "--kind spending-limit requires --limit".to_owned(),
+                        }),
+                        args.output,
+                        &request_id,
+                    );
+                }
+            };
+            let period = match args.period {
+                Some(v) => v,
+                None => {
+                    return emit_error(
+                        &WalletError::Validation(ValidationError::AddressInvalid {
+                            input: "--kind spending-limit requires --period".to_owned(),
+                        }),
+                        args.output,
+                        &request_id,
+                    );
+                }
+            };
+            if args.policy_address.is_some() || args.install_param.is_some() {
+                return emit_error(
+                    &WalletError::Validation(ValidationError::AddressInvalid {
+                        input: "--policy-address / --install-param are only valid with \
+                                --kind raw (use --policy for the typed override)"
+                            .to_owned(),
+                    }),
+                    args.output,
+                    &request_id,
+                );
+            }
+
+            // Value pre-flight: refuse a non-positive limit or a zero period before
+            // any registry lookup or network round-trip. Mirrors the OZ
+            // `InvalidLimitOrPeriod` install-time constraint client-side.
+            if let Err(e) = ensure_valid_spending_limit_params(limit, period) {
+                return emit_error(
+                    &WalletError::SmartAccount {
+                        wire_code: e.wire_code(),
+                        message: e.to_string(),
+                    },
+                    args.output,
+                    &request_id,
+                );
+            }
+
+            // Resolve the policy address: explicit `--policy` override, else the
+            // network's registered spending-limit policy. Fail closed if neither.
+            let policy_address = if let Some(explicit) = &args.policy {
+                explicit.clone()
+            } else {
+                let registry = match VerifierRegistry::open() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return emit_error(
+                            &WalletError::Validation(ValidationError::AddressInvalid {
+                                input: format!("could not open verifier registry: {e}"),
+                            }),
+                            args.output,
+                            &request_id,
+                        );
+                    }
+                };
+                let passphrase = args.network.passphrase();
+                match registry.spending_limit_policy_for(passphrase) {
+                    Some(entry) => entry.address.clone(),
+                    None => {
+                        return emit_error(
+                            &WalletError::Validation(ValidationError::AddressInvalid {
+                                input: format!(
+                                    "no spending-limit policy deployed for network \
+                                     '{passphrase}'; run: \
+                                     smart-account deploy-spending-limit-policy \
+                                     (or pass --policy)"
+                                ),
+                            }),
+                            args.output,
+                            &request_id,
+                        );
+                    }
+                }
+            };
+
+            let policy_sc_address = match parse_c_strkey_to_smart_account(&policy_address) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    return emit_error(
+                        &WalletError::Validation(ValidationError::AddressInvalid {
+                            input: format!("spending-limit policy address: {e}"),
+                        }),
+                        args.output,
+                        &request_id,
+                    );
+                }
+            };
+
+            // Build the typed SpendingLimitAccountParams install param.
+            let install_param = match build_spending_limit_install_param(limit, period) {
+                Ok(v) => v,
+                Err(e) => {
+                    return emit_error(
+                        &WalletError::SmartAccount {
+                            wire_code: e.wire_code(),
+                            message: e.to_string(),
+                        },
+                        args.output,
+                        &request_id,
+                    );
+                }
+            };
+
+            (policy_address, policy_sc_address, install_param)
         }
     };
 
@@ -1743,6 +1979,28 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
         Err(e) => return emit_error_sa(&e, args.output, &request_id),
     };
 
+    // Typed spending-limit pre-flight: decode the rule's real context type from
+    // the already-fetched rule map (no extra RPC round-trip) and refuse
+    // non-CallContract rules client-side before simulate/submit. OZ `install`
+    // rejects them with `OnlyCallContractAllowed`
+    // (spending_limit.rs:376-377, SHA a9c4216).
+    if args.kind == PolicyKind::SpendingLimit {
+        let rule_context = match decode_context_type_from_scval(&rule_scval) {
+            Ok(c) => c,
+            Err(e) => return emit_error_sa(&e, args.output, &request_id),
+        };
+        if let Err(e) = ensure_call_contract_context_for_spending_limit(&rule_context) {
+            return emit_error(
+                &WalletError::SmartAccount {
+                    wire_code: e.wire_code(),
+                    message: e.to_string(),
+                },
+                args.output,
+                &request_id,
+            );
+        }
+    }
+
     let policy_count = match decode_policy_count_from_scval(&rule_scval) {
         Ok(n) => n,
         Err(e) => return emit_error_sa(&e, args.output, &request_id),
@@ -1786,7 +2044,7 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 smart_account: args.account.clone(),
                 rule_id: args.rule_id,
                 policy_id,
-                policy_address: args.policy_address.clone(),
+                policy_address: policy_display.clone(),
             };
             emit_success(&result, args.output, &request_id, 0)
         }
@@ -2004,6 +2262,65 @@ fn parse_valid_until(s: &str) -> Result<Option<u32>, WalletError> {
     })
 }
 
+/// Accepted `--context` grammar, embedded verbatim in every parse error so the
+/// operator sees the exact valid forms.
+const CONTEXT_GRAMMAR: &str = "accepted --context forms: 'default' (or omit the flag), \
+     'call-contract:<C-strkey>', 'create-contract:<64-hex-wasm-hash>'";
+
+/// Parses the `--context` flag into a [`RuleContext`].
+///
+/// Fail-closed: any value that is not `default`, a well-formed
+/// `call-contract:<C-strkey>`, or a well-formed
+/// `create-contract:<64-hex-wasm-hash>` is rejected before any network call.
+/// The C-strkey and the 32-byte wasm hash are validated here at parse time.
+fn parse_rule_context(s: &str) -> Result<RuleContext, WalletError> {
+    let config_err = |reason: String| {
+        WalletError::Validation(ValidationError::ConfigInvalid {
+            component: "--context",
+            reason,
+        })
+    };
+
+    if s.eq_ignore_ascii_case("default") {
+        return Ok(RuleContext::Default);
+    }
+
+    if let Some(strkey) = s.strip_prefix("call-contract:") {
+        let contract = parse_c_strkey_to_smart_account(strkey).map_err(|_| {
+            config_err(format!(
+                "call-contract target is not a valid C-strkey; {CONTEXT_GRAMMAR}"
+            ))
+        })?;
+        return Ok(RuleContext::CallContract { contract });
+    }
+
+    if let Some(hex_hash) = s.strip_prefix("create-contract:") {
+        if hex_hash.len() != 64 {
+            return Err(config_err(format!(
+                "create-contract wasm hash must be 64 hex chars (32 bytes), got {}; \
+                 {CONTEXT_GRAMMAR}",
+                hex_hash.len()
+            )));
+        }
+        let bytes = hex::decode(hex_hash).map_err(|_| {
+            config_err(format!(
+                "create-contract wasm hash is not valid hex; {CONTEXT_GRAMMAR}"
+            ))
+        })?;
+        let wasm_hash: [u8; 32] = bytes.try_into().map_err(|_| {
+            // Unreachable: a 64-char hex string decodes to exactly 32 bytes.
+            config_err(format!(
+                "create-contract wasm hash did not decode to 32 bytes; {CONTEXT_GRAMMAR}"
+            ))
+        })?;
+        return Ok(RuleContext::CreateContract { wasm_hash });
+    }
+
+    Err(config_err(format!(
+        "unknown context '{s}'; {CONTEXT_GRAMMAR}"
+    )))
+}
+
 /// Builds a read-only [`ContextRuleManager`] (no signing, no divergence check).
 ///
 /// Used only by `smart-account rules get` which is a simulation-only read path.
@@ -2107,6 +2424,7 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
+        clippy::panic,
         reason = "test-only assertions"
     )]
 
@@ -2362,6 +2680,172 @@ mod tests {
             parsed.args.common.secondary_rpc_url.as_deref(),
             Some("https://secondary.example")
         );
+    }
+
+    // ── --context grammar matrix ─────────────────────────────────────────────
+
+    /// Extracts the `ConfigInvalid` reason string from a `--context` parse
+    /// failure, asserting the error is the expected variant and component.
+    fn context_error_reason(err: WalletError) -> String {
+        match err {
+            WalletError::Validation(ValidationError::ConfigInvalid { component, reason }) => {
+                assert_eq!(
+                    component, "--context",
+                    "context parse errors must carry component '--context'"
+                );
+                reason
+            }
+            other => panic!("expected ConfigInvalid for --context; got {other:?}"),
+        }
+    }
+
+    /// Both the literal `default` and an omitted flag (whose clap default is
+    /// `default`) resolve to `RuleContext::Default`, and the parse is
+    /// case-insensitive.
+    #[test]
+    fn parse_rule_context_default_variants() {
+        assert!(matches!(
+            parse_rule_context("default").unwrap(),
+            RuleContext::Default
+        ));
+        assert!(matches!(
+            parse_rule_context("DEFAULT").unwrap(),
+            RuleContext::Default
+        ));
+
+        // Flag absent: clap fills the `default` default_value.
+        let parsed = CreateArgsHarness::parse_from([
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--name",
+            "no-context-flag",
+            "--signer-delegated",
+            SIMULATE_SENTINEL_G,
+            "--signer-secret-env",
+            "__STELLAR_AGENT_RULES_TEST_DUMMY_VAR",
+        ]);
+        assert_eq!(
+            parsed.args.context, "default",
+            "omitted --context must default to 'default'"
+        );
+        assert!(matches!(
+            parse_rule_context(&parsed.args.context).unwrap(),
+            RuleContext::Default
+        ));
+    }
+
+    /// `call-contract:<C-strkey>` parses to `RuleContext::CallContract` carrying
+    /// the decoded contract address.
+    #[test]
+    fn parse_rule_context_call_contract_valid() {
+        let strkey = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        let expected = parse_c_strkey_to_smart_account(strkey).unwrap();
+        let ctx = parse_rule_context(&format!("call-contract:{strkey}")).unwrap();
+        match ctx {
+            RuleContext::CallContract { contract } => assert_eq!(contract, expected),
+            other => panic!("expected CallContract; got {other:?}"),
+        }
+    }
+
+    /// `create-contract:<64-hex>` parses to `RuleContext::CreateContract`
+    /// carrying the decoded 32-byte wasm hash.
+    #[test]
+    fn parse_rule_context_create_contract_valid() {
+        let hex_hash = "ab".repeat(32);
+        let ctx = parse_rule_context(&format!("create-contract:{hex_hash}")).unwrap();
+        match ctx {
+            RuleContext::CreateContract { wasm_hash } => assert_eq!(wasm_hash, [0xAB_u8; 32]),
+            other => panic!("expected CreateContract; got {other:?}"),
+        }
+    }
+
+    /// A malformed C-strkey in `call-contract:` fails closed with the accepted
+    /// grammar in the message.
+    #[test]
+    fn parse_rule_context_call_contract_malformed_strkey_fails_closed() {
+        let err = parse_rule_context("call-contract:not-a-strkey").unwrap_err();
+        let reason = context_error_reason(err);
+        assert!(
+            reason.contains("call-contract:") && reason.contains("create-contract:"),
+            "error must name the accepted grammar; got: {reason}"
+        );
+    }
+
+    /// A wrong-length hex in `create-contract:` (63 chars) fails closed.
+    #[test]
+    fn parse_rule_context_create_contract_wrong_length_fails_closed() {
+        let short = "a".repeat(63);
+        let err = parse_rule_context(&format!("create-contract:{short}")).unwrap_err();
+        let reason = context_error_reason(err);
+        assert!(
+            reason.contains("64 hex chars"),
+            "wrong-length hash error must name the 64-hex requirement; got: {reason}"
+        );
+        assert!(
+            reason.contains("create-contract:"),
+            "error must name the accepted grammar; got: {reason}"
+        );
+    }
+
+    /// A 64-char non-hex string in `create-contract:` fails closed.
+    #[test]
+    fn parse_rule_context_create_contract_non_hex_fails_closed() {
+        let non_hex = "z".repeat(64);
+        let err = parse_rule_context(&format!("create-contract:{non_hex}")).unwrap_err();
+        let reason = context_error_reason(err);
+        assert!(
+            reason.contains("not valid hex"),
+            "non-hex hash error must say so; got: {reason}"
+        );
+    }
+
+    /// An unknown context kind fails closed with the accepted grammar.
+    #[test]
+    fn parse_rule_context_unknown_kind_fails_closed() {
+        let err = parse_rule_context("frobnicate:whatever").unwrap_err();
+        let reason = context_error_reason(err);
+        assert!(
+            reason.contains("unknown context") && reason.contains("call-contract:"),
+            "unknown kind must name the accepted grammar; got: {reason}"
+        );
+    }
+
+    /// The empty string fails closed (it is neither `default` nor a prefixed
+    /// form).
+    #[test]
+    fn parse_rule_context_empty_string_fails_closed() {
+        let err = parse_rule_context("").unwrap_err();
+        let reason = context_error_reason(err);
+        assert!(
+            reason.contains("call-contract:") && reason.contains("create-contract:"),
+            "empty context must name the accepted grammar; got: {reason}"
+        );
+    }
+
+    /// `CreateArgs` accepts a well-formed `--context call-contract:<C-strkey>`
+    /// on the command line and threads it through to `parse_rule_context`.
+    #[test]
+    fn create_args_accepts_call_contract_context_flag() {
+        let strkey = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        let parsed = CreateArgsHarness::parse_from([
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--name",
+            "scoped-rule",
+            "--signer-delegated",
+            SIMULATE_SENTINEL_G,
+            "--context",
+            &format!("call-contract:{strkey}"),
+            "--signer-secret-env",
+            "__STELLAR_AGENT_RULES_TEST_DUMMY_VAR",
+        ]);
+        assert_eq!(parsed.args.context, format!("call-contract:{strkey}"));
+        assert!(matches!(
+            parse_rule_context(&parsed.args.context).unwrap(),
+            RuleContext::CallContract { .. }
+        ));
     }
 
     #[derive(Parser)]
@@ -2891,7 +3375,15 @@ mod tests {
         ]);
 
         assert_eq!(parsed.args.rule_id, 3);
-        assert_eq!(parsed.args.install_param, void_b64);
+        assert_eq!(parsed.args.kind, PolicyKind::Raw, "default kind is raw");
+        assert_eq!(
+            parsed.args.install_param.as_deref(),
+            Some(void_b64.as_str())
+        );
+        assert_eq!(
+            parsed.args.policy_address.as_deref(),
+            Some("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM")
+        );
         assert_eq!(
             parsed.args.network,
             TargetNetwork::Testnet,
@@ -3439,5 +3931,142 @@ mod tests {
             .is_err(),
             "two signer-source flags must be mutually exclusive"
         );
+    }
+
+    // ── add-policy --kind spending-limit pre-flight tests ─────────────────────
+
+    const ADD_POLICY_TEST_ACCOUNT: &str =
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+
+    fn add_policy_args(kind: PolicyKind) -> AddPolicyArgs {
+        AddPolicyArgs {
+            account: ADD_POLICY_TEST_ACCOUNT.to_owned(),
+            rule_id: 1,
+            kind,
+            policy_address: None,
+            install_param: None,
+            limit: None,
+            period: None,
+            policy: None,
+            auth_rule_id: vec![],
+            profile: None,
+            signer_source: SignerSourceFlags {
+                signer_secret_env: Some("__STELLAR_AGENT_RULES_ADD_POLICY_DUMMY".to_owned()),
+                sign_with_ledger: false,
+                account_index: Some(0),
+            },
+            network: TargetNetwork::Testnet,
+            rpc_url: TESTNET_RPC_URL.to_owned(),
+            secondary_rpc_url: None,
+            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            output: OutputFormat::Json,
+        }
+    }
+
+    /// `--kind raw` without `--policy-address` is refused before any network
+    /// call.
+    #[tokio::test]
+    async fn add_policy_raw_requires_policy_address() {
+        let mut args = add_policy_args(PolicyKind::Raw);
+        args.install_param = Some("AAAAAA==".to_owned());
+        let code = add_policy_run(&args).await;
+        assert_eq!(code, 1, "raw mode without --policy-address must be refused");
+    }
+
+    /// `--kind spending-limit` without `--limit` is refused before any network
+    /// call.
+    #[tokio::test]
+    async fn add_policy_spending_limit_requires_limit() {
+        let mut args = add_policy_args(PolicyKind::SpendingLimit);
+        args.period = Some(17_280);
+        let code = add_policy_run(&args).await;
+        assert_eq!(
+            code, 1,
+            "spending-limit mode without --limit must be refused"
+        );
+    }
+
+    /// `--kind spending-limit` combined with the raw-mode `--policy-address`
+    /// flag is refused (mode conflict) before any network call.
+    #[tokio::test]
+    async fn add_policy_spending_limit_rejects_raw_flags() {
+        let mut args = add_policy_args(PolicyKind::SpendingLimit);
+        args.limit = Some(10_000_000);
+        args.period = Some(17_280);
+        args.policy_address = Some(ADD_POLICY_TEST_ACCOUNT.to_owned());
+        let code = add_policy_run(&args).await;
+        assert_eq!(
+            code, 1,
+            "spending-limit mode must reject the raw --policy-address flag"
+        );
+    }
+
+    /// `--kind spending-limit` with no `--policy` override and no registered
+    /// policy for the network fails closed before any network call.
+    #[tokio::test]
+    #[serial]
+    async fn add_policy_spending_limit_missing_registry_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry_path = dir.path().join("networks.toml");
+
+        // SAFETY: serialised by #[serial]; no concurrent env access.
+        #[allow(unsafe_code, reason = "test-only env override; #[serial] serialises")]
+        unsafe {
+            std::env::set_var(
+                stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
+                &registry_path,
+            );
+        }
+
+        let mut args = add_policy_args(PolicyKind::SpendingLimit);
+        args.limit = Some(10_000_000);
+        args.period = Some(17_280);
+        let code = add_policy_run(&args).await;
+
+        // SAFETY: same as set; serialised by #[serial].
+        #[allow(unsafe_code, reason = "test-only env cleanup; #[serial] serialises")]
+        unsafe {
+            std::env::remove_var(
+                stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
+            );
+        }
+
+        assert_eq!(
+            code, 1,
+            "spending-limit mode must fail closed when no policy is registered"
+        );
+    }
+
+    /// `--kind spending-limit --limit 0` is refused before any registry lookup
+    /// or network call (OZ `InvalidLimitOrPeriod` pre-flight).
+    #[tokio::test]
+    async fn add_policy_spending_limit_rejects_zero_limit() {
+        let mut args = add_policy_args(PolicyKind::SpendingLimit);
+        args.limit = Some(0);
+        args.period = Some(17_280);
+        let code = add_policy_run(&args).await;
+        assert_eq!(code, 1, "limit == 0 must be refused");
+    }
+
+    /// `--kind spending-limit --limit -1` is refused before any registry
+    /// lookup or network call.
+    #[tokio::test]
+    async fn add_policy_spending_limit_rejects_negative_limit() {
+        let mut args = add_policy_args(PolicyKind::SpendingLimit);
+        args.limit = Some(-1);
+        args.period = Some(17_280);
+        let code = add_policy_run(&args).await;
+        assert_eq!(code, 1, "negative limit must be refused");
+    }
+
+    /// `--kind spending-limit --period 0` is refused before any registry
+    /// lookup or network call.
+    #[tokio::test]
+    async fn add_policy_spending_limit_rejects_zero_period() {
+        let mut args = add_policy_args(PolicyKind::SpendingLimit);
+        args.limit = Some(10_000_000);
+        args.period = Some(0);
+        let code = add_policy_run(&args).await;
+        assert_eq!(code, 1, "period == 0 must be refused");
     }
 }

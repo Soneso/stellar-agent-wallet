@@ -163,6 +163,7 @@ Some agent accounts are on-chain OpenZeppelin smart accounts rather than plain k
 - A **context rule** is identified by a `u32` rule id and governs which signers may authorize which actions.
 - An **AuthorizationInfo** declares groups of signers, each with an M-of-N threshold, combined across groups by an AND/OR combinator (the quorum). Quorum semantics are fail-closed: an empty signer set is an error, not a no-auth transaction.
 - The **auth digest** is `sha256(signature_payload || context_rule_ids_xdr)`. A smart-account signer signs this digest rather than the raw signature payload. Binding the rule ids into the signed value closes a downgrade attack in which a hostile transaction sponsor swaps in a weaker set of rules; the digest matches the on-chain check. The `context_rule_ids_xdr` portion must be produced by the canonical encoder, since a hand-assembled byte string yields a wrong digest that fails only on-chain at submission.
+- A rule's **context type** scopes which invocations it can authorize: `Default` matches any invocation; `CallContract` scopes it to one target contract; `CreateContract` scopes it to deploying one specific WASM hash. A `CallContract` rule combined with an external Ed25519 signer and a spending-limit policy is the bounded-agent-delegation shape — see [Agent delegation](agent-delegation.md).
 
 Passkey (WebAuthn) ceremonies use a browser handoff: registration and signing entries live in the approval spine, the assertion is pre-verified off-chain (including signature normalization) before being accepted, and the registration and assertion are recorded as audit events. The approval-spine and attestation mechanics these entries rely on are detailed in [Security internals](maintainers/security-internals.md).
 
@@ -181,5 +182,7 @@ Passkey (WebAuthn) ceremonies use a browser handoff: registration and signing en
 | Audit log | A per-profile append-only hash-chained JSONL record of every tool invocation and lifecycle event; argument values are never logged. Verified with `audit verify`. |
 | Context rule | An on-chain OpenZeppelin smart-account authorization rule, identified by a `u32` rule id; governs which signers may authorize which actions. |
 | Auth digest | `sha256(signature_payload || context_rule_ids_xdr)`; the value a smart-account signer signs, binding the rule ids to close a downgrade attack. |
+| External Ed25519 signer | A context-rule signer authenticated by a raw ed25519 key through a deployed verifier contract, rather than by a funded classic account. The recommended signer shape for an autonomous agent's own key — see [Agent delegation](agent-delegation.md). |
+| Spending-limit policy | A context-rule policy enforcing a rolling-window cap on SEP-41 `transfer` amount, evaluated during authorization on a `CallContract`-scoped rule. |
 | First-invoke gate | A one-time gate on a toolset's first use of a signing-adjacent capability; once approved, a time-boxed grant suppresses only that re-prompt. |
 | Per-action payment approval | The payment approval that fires unconditionally on every toolset-routed payment and binds the actual executed envelope. |

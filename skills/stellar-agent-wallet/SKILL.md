@@ -164,10 +164,15 @@ payments. See `references/cli-reference.md` and `references/mcp-tools.md`.
 
 ## 5. Smart-account governance
 
-The wallet manages OpenZeppelin smart accounts: context rules, ed25519 and
-WebAuthn passkey signers, quorum thresholds, verifier/policy WASM-hash pinning,
-multicall, and an upgrade timelock. These run under the CLI `smart-account`
-(alias `sa`) command group and submit through the smart account. See
+The wallet manages OpenZeppelin smart accounts: context rules, ed25519
+(delegated and first-class external) and WebAuthn passkey signers, quorum
+thresholds, verifier/policy WASM-hash pinning, multicall, and an upgrade
+timelock. A context rule scoped to one contract (`--context call-contract:<C>`)
+combined with a fresh external Ed25519 signer and a spending-limit policy is
+the bounded-agent-delegation shape: an operator can hand an autonomous agent
+its own key, capped to one contract and a spending limit, without exposing the
+account's full authority. These run under the CLI `smart-account` (alias `sa`)
+command group and submit through the smart account. See
 `references/smart-accounts.md`.
 
 ## 6. DeFi

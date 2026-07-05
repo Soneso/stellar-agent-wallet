@@ -2,7 +2,7 @@
 
 The `smart-account` command group (also available under the shorter alias `sa`) governs an on-chain OpenZeppelin smart-account: its context rules, its signer sets and thresholds, the policy contracts attached to each rule, and the supporting infrastructure (verifier registry, multicall router registry, upgrade timelock). It also submits multicall bundles through the registered router.
 
-Most on-chain signing verbs that mutate context-rule, signer, or timelock state structurally refuse `mainnet` before any RPC call or signing key access, surfacing the wire code `network.mainnet_write_forbidden`: the `smart-account rules` write verbs, all `smart-account signers` verbs (including `list` and `refresh`, which emit audit rows), the timelock write verbs (`schedule`, `cancel`, `execute`), and `smart-account deploy-webauthn-verifier`. The exceptions:
+Most on-chain signing verbs that mutate context-rule, signer, or timelock state structurally refuse `mainnet` before any RPC call or signing key access, surfacing the wire code `network.mainnet_write_forbidden`: the `smart-account rules` write verbs, all `smart-account signers` verbs (including `list` and `refresh`, which emit audit rows), the timelock write verbs (`schedule`, `cancel`, `execute`), and the deploy verbs (`smart-account deploy-webauthn-verifier`, `smart-account deploy-ed25519-verifier`, `smart-account deploy-spending-limit-policy`). The exceptions:
 
 - `smart-account migrate-verifier` allows a mainnet dry-run and permits a mainnet submit only when `--confirm-mainnet-migrate` is supplied; it never returns `network.mainnet_write_forbidden`.
 - `smart-account multicall` accepts `mainnet` at the flag level but requires a multicall router registered for mainnet.
@@ -37,6 +37,7 @@ Flags:
 
 - `--account <C_STRKEY>` (required) — smart-account contract address.
 - `--name <STRING>` (required) — rule name; refused as `validation.rule_name_too_long` over 20 bytes.
+- `--context <SPEC>` — the rule's context type. `default` (also the default when the flag is omitted) authorizes any invocation; `call-contract:<C_STRKEY>` scopes the rule to invocations of one target contract; `create-contract:<64_HEX_WASM_HASH>` scopes it to creating a contract with that wasm hash. A malformed spec is refused before any network call, naming the accepted grammar. See [Agent delegation](../agent-delegation.md) for the `call-contract` shape used to scope an autonomous agent to one token contract.
 - `--signer-delegated <G_STRKEY>` — a delegated ed25519 signer. Repeatable.
 - `--signer-webauthn <CREDENTIAL_NAME>` — a passkey signer, resolved from the profile's passkey registry (see [`credentials add-passkey`](profile-and-governance.md)). Repeatable. The verifier contract address is read from the verifier registry, which is populated by `smart-account deploy-webauthn-verifier`.
 - `--accept-no-delegated-fallback` — acknowledge a passkey-only rule (no ed25519 fallback). Required when only `--signer-webauthn` signers are given; without it the command refuses with `validation.passkey_only_rule_no_delegated_fallback` after printing a stderr warning.
@@ -156,12 +157,20 @@ stellar-agent smart-account rules verify-pins \
 
 Adds a policy contract to a rule (OZ `add_policy`). The per-rule policy cap (5) is checked before simulation via a `get_context_rule` pre-fetch. Signs and submits. Testnet only. Returns the assigned `policy_id`.
 
+`--kind <raw|spending-limit>` (default `raw`) selects the install-parameter mode:
+
+- `--kind raw` (default) — the caller supplies `--policy-address` and a hand-encoded `--install-param`. Works with any policy contract.
+- `--kind spending-limit` — the wallet resolves the deployed OZ spending-limit policy from the [`VerifierRegistry`](../agent-delegation.md) (or an explicit `--policy` override) and builds the typed `SpendingLimitAccountParams` install parameter internally. Refused client-side before any network call when `--limit <= 0` or `--period == 0` (mirroring the on-chain `InvalidLimitOrPeriod` constraint), and when the target rule's context type is not `call-contract` (mirroring `OnlyCallContractAllowed`) — see [Agent delegation](../agent-delegation.md).
+
 Flags:
 
 - `--account <C_STRKEY>` (required).
 - `--rule-id <U32>` (required) — rule to add the policy to.
-- `--policy-address <C_STRKEY>` (required) — policy contract address.
-- `--install-param <SCVAL_BASE64>` (required) — a standard-base64 XDR `ScVal` install parameter (not base64url). It is passed to `add_policy` without further validation (raw passthrough); use the XDR tooling to produce the correct encoding for the policy.
+- `--policy-address <C_STRKEY>` — policy contract address. Required with `--kind raw`; rejected with `--kind spending-limit` (use `--policy` there instead).
+- `--install-param <SCVAL_BASE64>` — a standard-base64 XDR `ScVal` install parameter (not base64url), passed to `add_policy` without further validation (raw passthrough). Required with `--kind raw`; rejected with `--kind spending-limit`.
+- `--limit <STROOPS>` — spending limit in stroops (`--kind spending-limit`, required). The `i128` amount the rolling window admits before the policy panics `SpendingLimitExceeded`.
+- `--period <LEDGERS>` — rolling-window length in ledgers (`--kind spending-limit`, required).
+- `--policy <C_STRKEY>` — spending-limit policy contract override (`--kind spending-limit`). When omitted, resolves from the registry populated by `smart-account deploy-spending-limit-policy`; fails closed with a deploy-first hint if absent.
 - `--auth-rule-id <U32>` (optional) — authorizing rule id(s). Repeatable. Defaults to `--rule-id`.
 - Shared: `--profile`, signer-source group, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
 
@@ -171,6 +180,16 @@ stellar-agent smart-account rules add-policy \
   --rule-id 1 \
   --policy-address CPOL...WXYZ \
   --install-param AAAAAQ== \
+  --signer-secret-env WALLET_SK
+```
+
+```bash
+stellar-agent smart-account rules add-policy \
+  --account CABC...WXYZ \
+  --rule-id 1 \
+  --kind spending-limit \
+  --limit 50000000 \
+  --period 17280 \
   --signer-secret-env WALLET_SK
 ```
 
@@ -241,7 +260,8 @@ Adds one signer to a rule (OZ `add_signer`). Signs and submits. Testnet only. Th
 Exactly one of the following signer-source forms is required (mutually exclusive group):
 
 - `--signer-delegated <G_STRKEY>` (alias `--new-signer`) — a delegated ed25519 signer.
-- `--signer-external <C_STRKEY>` — a custom external-verifier signer. Requires `--signer-key-data <HEX>`.
+- `--signer-ed25519 <HEX_PUBKEY_64>` — a first-class external Ed25519 signer: the raw 32-byte public key, hex-encoded. The recommended signer shape for an autonomous agent's own key — see [Agent delegation](../agent-delegation.md). Optional `--verifier <C_STRKEY>` overrides the verifier contract; when omitted it resolves from the verifier registry's registered Ed25519 verifier for the target network (deploy one via `smart-account deploy-ed25519-verifier`), failing closed if none is registered.
+- `--signer-external <C_STRKEY>` — a custom external-verifier signer with caller-supplied key data. Requires `--signer-key-data <HEX>`. `--signer-ed25519` is the typed equivalent for the Ed25519 verifier specifically and produces the identical on-chain signer entry.
 - `--signer-webauthn <CREDENTIAL_NAME>` — a passkey signer resolved from the profile's passkey registry; the verifier address is read from the verifier registry.
 
 Plus:
@@ -254,6 +274,14 @@ stellar-agent smart-account signers add \
   --account CABC...WXYZ \
   --rule-id 0 \
   --signer-delegated GNEW...WXYZ \
+  --signer-secret-env WALLET_SK
+```
+
+```bash
+stellar-agent smart-account signers add \
+  --account CABC...WXYZ \
+  --rule-id 1 \
+  --signer-ed25519 3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29 \
   --signer-secret-env WALLET_SK
 ```
 
@@ -342,6 +370,22 @@ Flags:
 
 ```bash
 stellar-agent smart-account deploy-webauthn-verifier --deployer-secret-env DEPLOYER_SK
+```
+
+### `smart-account deploy-ed25519-verifier`
+
+Deploys the OpenZeppelin Ed25519-verifier WASM and records its address in the verifier registry. Same idempotency, signer modes, and flags as `deploy-webauthn-verifier` above. This is the verifier bootstrap for first-class external Ed25519 signers (`smart-account signers add --signer-ed25519`) — see [Agent delegation](../agent-delegation.md).
+
+```bash
+stellar-agent smart-account deploy-ed25519-verifier --deployer-secret-env DEPLOYER_SK
+```
+
+### `smart-account deploy-spending-limit-policy`
+
+Deploys the OpenZeppelin spending-limit-policy WASM and records its address in the verifier registry. Same idempotency, signer modes, and flags as `deploy-webauthn-verifier` above. The policy is a per-network singleton: one deployed instance serves every account and context rule on the network, so this only needs to run once per network. Attach the deployed policy to a rule via [`smart-account rules add-policy --kind spending-limit`](#smart-account-rules-add-policy).
+
+```bash
+stellar-agent smart-account deploy-spending-limit-policy --deployer-secret-env DEPLOYER_SK
 ```
 
 ### `smart-account migrate-verifier`
@@ -497,3 +541,4 @@ stellar-agent smart-account timelock list-pending --timelock CTLCK...WXYZ
 - [CLI reference index](index.md) — shared flags, output envelope, mainnet-write refusal.
 - [Concepts](../concepts.md) — context rules, auth digest, policy engine, approval spine, audit log.
 - [Profiles](../profiles.md) — profile schema, keyring entry references, thresholds.
+- [Agent delegation](../agent-delegation.md) — scoping an autonomous agent to one contract under a spending cap.

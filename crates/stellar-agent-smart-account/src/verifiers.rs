@@ -1,17 +1,33 @@
-//! WebAuthn-verifier contract registry (`~/.config/stellar-agent/networks.toml`).
+//! Deployed-contract registry (`~/.config/stellar-agent/networks.toml`).
 //!
-//! Maps Stellar network passphrases to deployed WebAuthn-verifier contract addresses
-//! and their vendored WASM SHA-256 fingerprints.  Backed by a TOML file at the
-//! OS-conventional config path (`~/.config/stellar-agent/networks.toml` on macOS/Linux,
-//! overridable via `STELLAR_AGENT_NETWORKS_TOML` for tests and non-standard deployments).
+//! Maps Stellar network passphrases to the wallet's per-network deployed
+//! contracts — the WebAuthn verifier, the Ed25519 verifier, and the
+//! spending-limit policy — together with their vendored WASM SHA-256
+//! fingerprints.  Backed by a TOML file at the OS-conventional config path
+//! (`~/.config/stellar-agent/networks.toml` on macOS/Linux, overridable via
+//! `STELLAR_AGENT_NETWORKS_TOML` for tests and non-standard deployments).
+//!
+//! # Additive schema contract
+//!
+//! Each per-network record has three independently-optional contract slots
+//! (WebAuthn verifier, Ed25519 verifier, spending-limit policy).  The on-disk
+//! TOML fields are all optional with `#[serde(default, skip_serializing_if =
+//! "Option::is_none")]`, so:
+//!
+//! - TOML written before the schema was widened (WebAuthn-only, carrying the
+//!   three `webauthn_verifier_*` fields) parses unchanged.
+//! - A network entry with only an Ed25519 verifier, only a spending-limit
+//!   policy, or any subset is representable; absent slots are omitted from the
+//!   serialised output rather than written as explicit nulls.
+//! - Adding a new contract slot never requires migrating an existing file.
 //!
 //! # Key types
 //!
 //! - [`VerifierRegistry`] — the registry itself; load with [`VerifierRegistry::open`],
-//!   mutate with [`VerifierRegistry::record_webauthn_verifier`], persist with
-//!   [`VerifierRegistry::persist`].
-//! - [`WebAuthnVerifierEntry`] — a single network → verifier mapping record.
-//! - [`RecordOutcome`] — result of a [`VerifierRegistry::record_webauthn_verifier`] call.
+//!   mutate with the `record_*` methods, persist with [`VerifierRegistry::persist`].
+//! - [`WebAuthnVerifierEntry`] / [`Ed25519VerifierEntry`] /
+//!   [`SpendingLimitPolicyEntry`] — the three per-network contract records.
+//! - [`RecordOutcome`] — result of a `record_*` call.
 //!
 //! # Invariants enforced
 //!
@@ -117,6 +133,81 @@ pub struct WebAuthnVerifierEntry {
     pub deployed_at_unix_ms: u64,
 }
 
+/// A single network → Ed25519-verifier mapping entry.
+///
+/// Mirrors [`WebAuthnVerifierEntry`]: all fields are non-secret (a contract
+/// C-strkey, a WASM sha256 digest, and a deploy timestamp).  Records the
+/// per-network deployment of the OZ `multisig-ed25519-verifier-example`
+/// contract used by External-Ed25519 signers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ed25519VerifierEntry {
+    /// Deployed Ed25519-verifier contract C-strkey on the Stellar network.
+    ///
+    /// Full C-strkey (56 characters, starting with `C`).  Not redacted here;
+    /// call sites that log this value apply
+    /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
+    pub address: String,
+
+    /// SHA-256 of the vendored WASM that was deployed, as 64-char lowercase hex.
+    ///
+    /// Verified against `crate::ed25519_verifier::ED25519_VERIFIER_WASM_SHA256`
+    /// at deploy time by the runtime SHA gate in `deploy_ed25519_verifier`.
+    pub wasm_sha256: String,
+
+    /// Unix timestamp in milliseconds at which this entry was recorded.
+    pub deployed_at_unix_ms: u64,
+}
+
+/// A single network → spending-limit-policy mapping entry.
+///
+/// Mirrors [`WebAuthnVerifierEntry`]: all fields are non-secret.  Records the
+/// per-network deployment of the OZ `multisig-spending-limit-policy-example`
+/// singleton.  One deployed instance serves every account and context rule on
+/// the network (the policy keys all state by
+/// `AccountContext(smart_account, context_rule_id)`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpendingLimitPolicyEntry {
+    /// Deployed spending-limit-policy contract C-strkey on the Stellar network.
+    ///
+    /// Full C-strkey (56 characters, starting with `C`).  Not redacted here.
+    pub address: String,
+
+    /// SHA-256 of the vendored WASM that was deployed, as 64-char lowercase hex.
+    ///
+    /// Verified against
+    /// `crate::spending_limit_policy::SPENDING_LIMIT_POLICY_WASM_SHA256` at
+    /// deploy time by the runtime SHA gate in `deploy_spending_limit_policy`.
+    pub wasm_sha256: String,
+
+    /// Unix timestamp in milliseconds at which this entry was recorded.
+    pub deployed_at_unix_ms: u64,
+}
+
+// ── In-memory record ──────────────────────────────────────────────────────────
+
+/// In-memory per-network record aggregating all deployed contracts.
+///
+/// Each contract slot is independently optional: a network may have only a
+/// WebAuthn verifier, only an Ed25519 verifier, only a spending-limit policy,
+/// any combination, or none.  This is the load-bearing part of the additive
+/// schema — a network entry is representable with any subset present.
+#[derive(Debug, Clone, Default)]
+struct NetworkRecord {
+    /// Deployed WebAuthn verifier, if any.
+    webauthn: Option<WebAuthnVerifierEntry>,
+    /// Deployed Ed25519 verifier, if any.
+    ed25519: Option<Ed25519VerifierEntry>,
+    /// Deployed spending-limit policy, if any.
+    spending_limit_policy: Option<SpendingLimitPolicyEntry>,
+}
+
+impl NetworkRecord {
+    /// Returns `true` when no contract slot is populated.
+    fn is_empty(&self) -> bool {
+        self.webauthn.is_none() && self.ed25519.is_none() && self.spending_limit_policy.is_none()
+    }
+}
+
 // ── Wire schema for TOML file ─────────────────────────────────────────────────
 
 /// On-disk TOML schema root: `{ networks: { "<passphrase>": <NetworkEntry> } }`.
@@ -129,34 +220,122 @@ struct RegistryFile {
 
 /// Per-network fields in the on-disk TOML representation.
 ///
-/// Uses flat snake_case field names with a `webauthn_verifier_` prefix
-/// (keeps all verifier fields at the same TOML level).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Uses flat snake_case field names with a per-contract prefix (keeps all
+/// contract fields at the same TOML level).  Every field is optional with
+/// `#[serde(default, skip_serializing_if = "Option::is_none")]`, so:
+///
+/// - TOML written before the schema widening (WebAuthn-only, with the three
+///   `webauthn_verifier_*` fields present) parses unchanged.
+/// - A network entry with only an Ed25519 verifier, only a spending-limit
+///   policy, or any subset is representable, and absent contract slots are
+///   omitted from the serialised output rather than written as explicit nulls.
+///
+/// A contract slot is materialised into its typed entry only when all three of
+/// its fields are present; a partially-populated slot (e.g. an address without a
+/// sha256) is treated as absent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct NetworkEntry {
-    /// Deployed verifier contract C-strkey.
-    webauthn_verifier_address: String,
-    /// SHA-256 of the deployed WASM, 64-char lowercase hex.
-    webauthn_verifier_wasm_sha256: String,
-    /// Unix timestamp in milliseconds when this entry was recorded.
-    webauthn_verifier_deployed_at_unix_ms: u64,
+    /// Deployed WebAuthn-verifier contract C-strkey.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    webauthn_verifier_address: Option<String>,
+    /// SHA-256 of the deployed WebAuthn-verifier WASM, 64-char lowercase hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    webauthn_verifier_wasm_sha256: Option<String>,
+    /// Unix timestamp in milliseconds when the WebAuthn-verifier entry was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    webauthn_verifier_deployed_at_unix_ms: Option<u64>,
+
+    /// Deployed Ed25519-verifier contract C-strkey.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ed25519_verifier_address: Option<String>,
+    /// SHA-256 of the deployed Ed25519-verifier WASM, 64-char lowercase hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ed25519_verifier_wasm_sha256: Option<String>,
+    /// Unix timestamp in milliseconds when the Ed25519-verifier entry was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ed25519_verifier_deployed_at_unix_ms: Option<u64>,
+
+    /// Deployed spending-limit-policy contract C-strkey.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spending_limit_policy_address: Option<String>,
+    /// SHA-256 of the deployed spending-limit-policy WASM, 64-char lowercase hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spending_limit_policy_wasm_sha256: Option<String>,
+    /// Unix timestamp in milliseconds when the spending-limit-policy entry was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spending_limit_policy_deployed_at_unix_ms: Option<u64>,
 }
 
-impl From<&WebAuthnVerifierEntry> for NetworkEntry {
-    fn from(e: &WebAuthnVerifierEntry) -> Self {
-        Self {
-            webauthn_verifier_address: e.address.clone(),
-            webauthn_verifier_wasm_sha256: e.wasm_sha256.clone(),
-            webauthn_verifier_deployed_at_unix_ms: e.deployed_at_unix_ms,
+impl From<&NetworkRecord> for NetworkEntry {
+    fn from(r: &NetworkRecord) -> Self {
+        let mut e = NetworkEntry::default();
+        if let Some(w) = &r.webauthn {
+            e.webauthn_verifier_address = Some(w.address.clone());
+            e.webauthn_verifier_wasm_sha256 = Some(w.wasm_sha256.clone());
+            e.webauthn_verifier_deployed_at_unix_ms = Some(w.deployed_at_unix_ms);
         }
+        if let Some(v) = &r.ed25519 {
+            e.ed25519_verifier_address = Some(v.address.clone());
+            e.ed25519_verifier_wasm_sha256 = Some(v.wasm_sha256.clone());
+            e.ed25519_verifier_deployed_at_unix_ms = Some(v.deployed_at_unix_ms);
+        }
+        if let Some(p) = &r.spending_limit_policy {
+            e.spending_limit_policy_address = Some(p.address.clone());
+            e.spending_limit_policy_wasm_sha256 = Some(p.wasm_sha256.clone());
+            e.spending_limit_policy_deployed_at_unix_ms = Some(p.deployed_at_unix_ms);
+        }
+        e
     }
 }
 
-impl From<NetworkEntry> for WebAuthnVerifierEntry {
+impl From<NetworkEntry> for NetworkRecord {
     fn from(n: NetworkEntry) -> Self {
+        let webauthn = match (
+            n.webauthn_verifier_address,
+            n.webauthn_verifier_wasm_sha256,
+            n.webauthn_verifier_deployed_at_unix_ms,
+        ) {
+            (Some(address), Some(wasm_sha256), Some(deployed_at_unix_ms)) => {
+                Some(WebAuthnVerifierEntry {
+                    address,
+                    wasm_sha256,
+                    deployed_at_unix_ms,
+                })
+            }
+            _ => None,
+        };
+        let ed25519 = match (
+            n.ed25519_verifier_address,
+            n.ed25519_verifier_wasm_sha256,
+            n.ed25519_verifier_deployed_at_unix_ms,
+        ) {
+            (Some(address), Some(wasm_sha256), Some(deployed_at_unix_ms)) => {
+                Some(Ed25519VerifierEntry {
+                    address,
+                    wasm_sha256,
+                    deployed_at_unix_ms,
+                })
+            }
+            _ => None,
+        };
+        let spending_limit_policy = match (
+            n.spending_limit_policy_address,
+            n.spending_limit_policy_wasm_sha256,
+            n.spending_limit_policy_deployed_at_unix_ms,
+        ) {
+            (Some(address), Some(wasm_sha256), Some(deployed_at_unix_ms)) => {
+                Some(SpendingLimitPolicyEntry {
+                    address,
+                    wasm_sha256,
+                    deployed_at_unix_ms,
+                })
+            }
+            _ => None,
+        };
         Self {
-            address: n.webauthn_verifier_address,
-            wasm_sha256: n.webauthn_verifier_wasm_sha256,
-            deployed_at_unix_ms: n.webauthn_verifier_deployed_at_unix_ms,
+            webauthn,
+            ed25519,
+            spending_limit_policy,
         }
     }
 }
@@ -189,8 +368,8 @@ impl From<NetworkEntry> for WebAuthnVerifierEntry {
 pub struct VerifierRegistry {
     /// The resolved path to `networks.toml` (used by [`VerifierRegistry::persist`]).
     path: PathBuf,
-    /// In-memory verifier entries keyed by network passphrase.
-    entries: HashMap<String, WebAuthnVerifierEntry>,
+    /// In-memory per-network records keyed by network passphrase.
+    entries: HashMap<String, NetworkRecord>,
 }
 
 impl VerifierRegistry {
@@ -283,7 +462,7 @@ impl VerifierRegistry {
         let entries = file
             .networks
             .into_iter()
-            .map(|(passphrase, net)| (passphrase, WebAuthnVerifierEntry::from(net)))
+            .map(|(passphrase, net)| (passphrase, NetworkRecord::from(net)))
             .collect();
 
         Ok(Self { path, entries })
@@ -307,7 +486,50 @@ impl VerifierRegistry {
         &self,
         network_passphrase: &str,
     ) -> Option<&WebAuthnVerifierEntry> {
-        self.entries.get(network_passphrase)
+        self.entries
+            .get(network_passphrase)
+            .and_then(|r| r.webauthn.as_ref())
+    }
+
+    /// Returns the [`Ed25519VerifierEntry`] for the given network passphrase, or
+    /// `None` if no Ed25519 verifier is recorded.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use stellar_agent_smart_account::verifiers::VerifierRegistry;
+    /// # let dir = tempfile::tempdir().expect("tempdir");
+    /// # let path = dir.path().join("networks.toml");
+    /// let reg = VerifierRegistry::open_at(path).expect("open");
+    /// assert!(reg.ed25519_verifier_for("Test SDF Network ; September 2015").is_none());
+    /// ```
+    #[must_use]
+    pub fn ed25519_verifier_for(&self, network_passphrase: &str) -> Option<&Ed25519VerifierEntry> {
+        self.entries
+            .get(network_passphrase)
+            .and_then(|r| r.ed25519.as_ref())
+    }
+
+    /// Returns the [`SpendingLimitPolicyEntry`] for the given network passphrase,
+    /// or `None` if no spending-limit policy is recorded.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use stellar_agent_smart_account::verifiers::VerifierRegistry;
+    /// # let dir = tempfile::tempdir().expect("tempdir");
+    /// # let path = dir.path().join("networks.toml");
+    /// let reg = VerifierRegistry::open_at(path).expect("open");
+    /// assert!(reg.spending_limit_policy_for("Test SDF Network ; September 2015").is_none());
+    /// ```
+    #[must_use]
+    pub fn spending_limit_policy_for(
+        &self,
+        network_passphrase: &str,
+    ) -> Option<&SpendingLimitPolicyEntry> {
+        self.entries
+            .get(network_passphrase)
+            .and_then(|r| r.spending_limit_policy.as_ref())
     }
 
     /// Records a newly deployed WebAuthn-verifier entry for the given network.
@@ -355,7 +577,11 @@ impl VerifierRegistry {
         address: String,
         wasm_sha256: String,
     ) -> Result<RecordOutcome, SaError> {
-        if let Some(existing) = self.entries.get(network_passphrase) {
+        let record = self
+            .entries
+            .entry(network_passphrase.to_owned())
+            .or_default();
+        if let Some(existing) = &record.webauthn {
             if existing.wasm_sha256 == wasm_sha256 {
                 // Same sha256 → idempotent; no modification needed.
                 return Ok(RecordOutcome::AlreadyRecorded);
@@ -368,16 +594,134 @@ impl VerifierRegistry {
             });
         }
 
-        // New entry.
-        let deployed_at_unix_ms = unix_now_ms();
-        self.entries.insert(
-            network_passphrase.to_owned(),
-            WebAuthnVerifierEntry {
-                address,
-                wasm_sha256,
-                deployed_at_unix_ms,
-            },
-        );
+        record.webauthn = Some(WebAuthnVerifierEntry {
+            address,
+            wasm_sha256,
+            deployed_at_unix_ms: unix_now_ms(),
+        });
+        Ok(RecordOutcome::Recorded)
+    }
+
+    /// Records a newly deployed Ed25519-verifier entry for the given network.
+    ///
+    /// Mirrors [`VerifierRegistry::record_webauthn_verifier`]: idempotent when
+    /// the `wasm_sha256` matches an existing Ed25519-verifier entry for the
+    /// network, and refused with [`SaError::Ed25519VerifierSha256Drift`] when an
+    /// existing entry uses a different `wasm_sha256`.  The record is stored
+    /// alongside (not replacing) any existing WebAuthn-verifier or
+    /// spending-limit-policy entry for the same network.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::Ed25519VerifierSha256Drift`] — existing Ed25519-verifier
+    ///   entry for this network uses a different `wasm_sha256`.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use stellar_agent_smart_account::verifiers::{VerifierRegistry, RecordOutcome};
+    /// # let dir = tempfile::tempdir().expect("tempdir");
+    /// # let path = dir.path().join("networks.toml");
+    /// let mut reg = VerifierRegistry::open_at(path).expect("open");
+    /// let addr = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned();
+    /// let sha = "ea13b07083a8275e7bade954e4ccc1827495f253c18dc06edcc49104c11fb725".to_owned();
+    /// let outcome = reg
+    ///     .record_ed25519_verifier("Test SDF Network ; September 2015", addr, sha)
+    ///     .expect("record");
+    /// assert_eq!(outcome, RecordOutcome::Recorded);
+    /// ```
+    pub fn record_ed25519_verifier(
+        &mut self,
+        network_passphrase: &str,
+        address: String,
+        wasm_sha256: String,
+    ) -> Result<RecordOutcome, SaError> {
+        let record = self
+            .entries
+            .entry(network_passphrase.to_owned())
+            .or_default();
+        if let Some(existing) = &record.ed25519 {
+            if existing.wasm_sha256 == wasm_sha256 {
+                return Ok(RecordOutcome::AlreadyRecorded);
+            }
+            return Err(SaError::Ed25519VerifierSha256Drift {
+                network: network_passphrase.to_owned(),
+                recorded: existing.wasm_sha256.clone(),
+                attempted: wasm_sha256,
+            });
+        }
+
+        record.ed25519 = Some(Ed25519VerifierEntry {
+            address,
+            wasm_sha256,
+            deployed_at_unix_ms: unix_now_ms(),
+        });
+        Ok(RecordOutcome::Recorded)
+    }
+
+    /// Records a newly deployed spending-limit-policy entry for the given
+    /// network.
+    ///
+    /// Mirrors [`VerifierRegistry::record_webauthn_verifier`]: idempotent when
+    /// the `wasm_sha256` matches an existing spending-limit-policy entry for the
+    /// network, and refused with [`SaError::SpendingLimitPolicySha256Drift`] when
+    /// an existing entry uses a different `wasm_sha256`.  The record is stored
+    /// alongside (not replacing) any existing verifier entry for the network.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::SpendingLimitPolicySha256Drift`] — existing
+    ///   spending-limit-policy entry for this network uses a different
+    ///   `wasm_sha256`.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use stellar_agent_smart_account::verifiers::{VerifierRegistry, RecordOutcome};
+    /// # let dir = tempfile::tempdir().expect("tempdir");
+    /// # let path = dir.path().join("networks.toml");
+    /// let mut reg = VerifierRegistry::open_at(path).expect("open");
+    /// let addr = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned();
+    /// let sha = "0e8da0ccff5c444520085ac1973d3c8023fdd04f727ee11ae7290a49dffbbaf5".to_owned();
+    /// let outcome = reg
+    ///     .record_spending_limit_policy("Test SDF Network ; September 2015", addr, sha)
+    ///     .expect("record");
+    /// assert_eq!(outcome, RecordOutcome::Recorded);
+    /// ```
+    pub fn record_spending_limit_policy(
+        &mut self,
+        network_passphrase: &str,
+        address: String,
+        wasm_sha256: String,
+    ) -> Result<RecordOutcome, SaError> {
+        let record = self
+            .entries
+            .entry(network_passphrase.to_owned())
+            .or_default();
+        if let Some(existing) = &record.spending_limit_policy {
+            if existing.wasm_sha256 == wasm_sha256 {
+                return Ok(RecordOutcome::AlreadyRecorded);
+            }
+            return Err(SaError::SpendingLimitPolicySha256Drift {
+                network: network_passphrase.to_owned(),
+                recorded: existing.wasm_sha256.clone(),
+                attempted: wasm_sha256,
+            });
+        }
+
+        record.spending_limit_policy = Some(SpendingLimitPolicyEntry {
+            address,
+            wasm_sha256,
+            deployed_at_unix_ms: unix_now_ms(),
+        });
         Ok(RecordOutcome::Recorded)
     }
 
@@ -429,11 +773,14 @@ impl VerifierRegistry {
             path: parent.to_path_buf(),
         })?;
 
-        // Build the TOML file contents.
+        // Build the TOML file contents.  Fully-empty records (no contract slot
+        // populated) are omitted so a transiently-created-then-emptied entry
+        // does not persist an all-null network table.
         let file = RegistryFile {
             networks: self
                 .entries
                 .iter()
+                .filter(|(_, v)| !v.is_empty())
                 .map(|(k, v)| (k.clone(), NetworkEntry::from(v)))
                 .collect(),
         };
@@ -765,6 +1112,149 @@ mod tests {
                 } if network == testnet()
                     && recorded == &fake_sha256()
                     && attempted == &alt_sha256()
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    fn ed25519_sha256() -> String {
+        "ea13b07083a8275e7bade954e4ccc1827495f253c18dc06edcc49104c11fb725".to_owned()
+    }
+
+    fn spending_limit_sha256() -> String {
+        "0e8da0ccff5c444520085ac1973d3c8023fdd04f727ee11ae7290a49dffbbaf5".to_owned()
+    }
+
+    /// A pre-widening on-disk TOML fixture (WebAuthn-only, using the three
+    /// `webauthn_verifier_*` fields) still parses unchanged, and the WebAuthn
+    /// entry is materialised while the Ed25519 / spending-limit slots are absent.
+    #[test]
+    fn legacy_webauthn_only_toml_parses_unchanged() {
+        use std::io::Write as _;
+
+        let (_guard, path) = temp_registry();
+        let mut f = std::fs::File::create(&path).expect("create");
+        write!(
+            f,
+            "[networks.\"{net}\"]\n\
+             webauthn_verifier_address = \"{addr}\"\n\
+             webauthn_verifier_wasm_sha256 = \"{sha}\"\n\
+             webauthn_verifier_deployed_at_unix_ms = 1747000000000\n",
+            net = testnet(),
+            addr = fake_address(),
+            sha = fake_sha256(),
+        )
+        .expect("write legacy toml");
+        drop(f);
+
+        let reg = VerifierRegistry::open_at(path).expect("open legacy toml");
+        let webauthn = reg
+            .webauthn_verifier_for(testnet())
+            .expect("legacy webauthn entry must survive");
+        assert_eq!(webauthn.address, fake_address());
+        assert_eq!(webauthn.wasm_sha256, fake_sha256());
+        assert_eq!(webauthn.deployed_at_unix_ms, 1_747_000_000_000);
+        assert!(
+            reg.ed25519_verifier_for(testnet()).is_none(),
+            "legacy toml has no ed25519 verifier"
+        );
+        assert!(
+            reg.spending_limit_policy_for(testnet()).is_none(),
+            "legacy toml has no spending-limit policy"
+        );
+    }
+
+    /// An Ed25519-only entry round-trips through persist + re-open with no
+    /// WebAuthn or spending-limit slot materialised.
+    #[test]
+    fn ed25519_only_entry_round_trips() {
+        let (_guard, path) = temp_registry();
+        let mut reg = VerifierRegistry::open_at(path.clone()).expect("open");
+        let outcome = reg
+            .record_ed25519_verifier(testnet(), fake_address(), ed25519_sha256())
+            .expect("record");
+        assert_eq!(outcome, RecordOutcome::Recorded);
+        reg.persist().expect("persist");
+
+        let reg2 = VerifierRegistry::open_at(path).expect("re-open");
+        let entry = reg2
+            .ed25519_verifier_for(testnet())
+            .expect("ed25519 entry must survive round-trip");
+        assert_eq!(entry.address, fake_address());
+        assert_eq!(entry.wasm_sha256, ed25519_sha256());
+        assert!(entry.deployed_at_unix_ms > 0);
+        assert!(reg2.webauthn_verifier_for(testnet()).is_none());
+        assert!(reg2.spending_limit_policy_for(testnet()).is_none());
+    }
+
+    /// A spending-limit-only entry round-trips independently of any verifier.
+    #[test]
+    fn spending_limit_only_entry_round_trips() {
+        let (_guard, path) = temp_registry();
+        let mut reg = VerifierRegistry::open_at(path.clone()).expect("open");
+        reg.record_spending_limit_policy(testnet(), fake_address(), spending_limit_sha256())
+            .expect("record");
+        reg.persist().expect("persist");
+
+        let reg2 = VerifierRegistry::open_at(path).expect("re-open");
+        let entry = reg2
+            .spending_limit_policy_for(testnet())
+            .expect("spending-limit entry must survive round-trip");
+        assert_eq!(entry.wasm_sha256, spending_limit_sha256());
+        assert!(reg2.webauthn_verifier_for(testnet()).is_none());
+        assert!(reg2.ed25519_verifier_for(testnet()).is_none());
+    }
+
+    /// All three contract slots populated for one network round-trip together
+    /// without clobbering each other.
+    #[test]
+    fn all_three_slots_round_trip_together() {
+        let (_guard, path) = temp_registry();
+        let mut reg = VerifierRegistry::open_at(path.clone()).expect("open");
+        reg.record_webauthn_verifier(testnet(), fake_address(), fake_sha256())
+            .expect("record webauthn");
+        reg.record_ed25519_verifier(testnet(), fake_address(), ed25519_sha256())
+            .expect("record ed25519");
+        reg.record_spending_limit_policy(testnet(), fake_address(), spending_limit_sha256())
+            .expect("record spending-limit");
+        reg.persist().expect("persist");
+
+        let reg2 = VerifierRegistry::open_at(path).expect("re-open");
+        assert_eq!(
+            reg2.webauthn_verifier_for(testnet())
+                .expect("webauthn")
+                .wasm_sha256,
+            fake_sha256()
+        );
+        assert_eq!(
+            reg2.ed25519_verifier_for(testnet())
+                .expect("ed25519")
+                .wasm_sha256,
+            ed25519_sha256()
+        );
+        assert_eq!(
+            reg2.spending_limit_policy_for(testnet())
+                .expect("spending-limit")
+                .wasm_sha256,
+            spending_limit_sha256()
+        );
+    }
+
+    /// Re-recording an Ed25519 verifier with a different sha256 is refused with
+    /// the dedicated drift error, mirroring the WebAuthn drift guard.
+    #[test]
+    fn ed25519_record_rejects_sha256_drift() {
+        let (_guard, path) = temp_registry();
+        let mut reg = VerifierRegistry::open_at(path).expect("open");
+        reg.record_ed25519_verifier(testnet(), fake_address(), ed25519_sha256())
+            .expect("first record");
+        let err = reg
+            .record_ed25519_verifier(testnet(), fake_address(), alt_sha256())
+            .expect_err("must reject different sha256");
+        assert!(
+            matches!(
+                err,
+                SaError::Ed25519VerifierSha256Drift { ref network, .. } if network == testnet()
             ),
             "unexpected error: {err:?}"
         );

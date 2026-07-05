@@ -113,13 +113,13 @@ use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::{
     Signer, SoftwareSigningKey, StellarRpcClient, fetch_account, submit_transaction_and_wait,
 };
-use stellar_agent_smart_account::bindings::ContextRuleType;
 use stellar_agent_smart_account::deployment::{
     DeployerKeypair, DeploymentArgs, ResolvedFeePerOp, TimelockControllerDeployArgs,
     deploy_smart_account, deploy_timelock_controller, derive_smart_account_address,
 };
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::credentials::{CredentialsError, CredentialsManager};
+use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRulePolicy,
     ContextRuleSignerInput, parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
@@ -558,7 +558,7 @@ async fn pin_and_install_with_canonical_oz_threshold_policy_no_drift() {
     let threshold_params = encode_simple_threshold_params(1);
 
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "p1-pin-test".to_owned(),
         None,
         vec![ContextRuleSignerInput::Delegated {
@@ -699,7 +699,7 @@ async fn install_rule_refuses_unknown_wasm_verifier_without_override() {
     // This address is on-chain and has a wasm hash, but it is NOT the webauthn-
     // verifier wasm — so identify_verifier rejects it.
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "p2-unknown-wasm".to_owned(),
         None,
         vec![ContextRuleSignerInput::External {
@@ -812,7 +812,7 @@ async fn p3_policy_hash_drift_detection_at_signing_time() {
     let threshold_params = encode_simple_threshold_params(1);
 
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "p3-drift-test".to_owned(),
         None,
         vec![ContextRuleSignerInput::Delegated {
@@ -1074,7 +1074,7 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
     let threshold_params = encode_simple_threshold_params(1);
 
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "p4-blocker1-test".to_owned(),
         None,
         vec![ContextRuleSignerInput::Delegated {
@@ -1374,7 +1374,7 @@ async fn p5_drift_check_infra_failure_routes_to_drift_check_unavailable_not_drif
     let threshold_params = encode_simple_threshold_params(1);
 
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "p5-infra".to_owned(),
         None,
         vec![ContextRuleSignerInput::Delegated {
@@ -1674,7 +1674,7 @@ async fn install_rule_refuses_mutable_verifier_without_override() {
     // Then (2) detect_contract_mutability finds Admin key →
     //   accept_mutable_verifier=false → VerifierMutable.
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "p6-mutable-refuse".to_owned(),
         None,
         vec![ContextRuleSignerInput::External {
@@ -1837,7 +1837,7 @@ async fn accept_mutable_verifier_override_emits_audit_row() {
     let manager = fresh_pinning_rule_manager(Arc::clone(&audit_writer), Arc::clone(&sm));
 
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "p7-mutable-accept".to_owned(),
         None,
         vec![ContextRuleSignerInput::External {
@@ -2007,7 +2007,7 @@ async fn accept_unknown_verifier_override_emits_audit_row() {
     let manager = fresh_pinning_rule_manager(Arc::clone(&audit_writer), Arc::clone(&sm));
 
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "p8-unknown-accept".to_owned(),
         None,
         vec![ContextRuleSignerInput::External {

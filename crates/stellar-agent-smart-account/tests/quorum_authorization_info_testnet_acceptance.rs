@@ -53,7 +53,6 @@ use serial_test::serial;
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::{Signer, SoftwareSigningKey, StellarRpcClient, fetch_account};
-use stellar_agent_smart_account::bindings::ContextRuleType;
 use stellar_agent_smart_account::deployment::{
     DeployerKeypair, DeploymentArgs, ResolvedFeePerOp, deploy_smart_account,
     derive_smart_account_address,
@@ -64,6 +63,7 @@ use stellar_agent_smart_account::managers::auth_entry::test_helpers::{
 use stellar_agent_smart_account::managers::authorization::{
     AuthorizationInfo, Combinator, QuorumError, SignerGroup, collect_quorum_signatures,
 };
+use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRulePolicy,
     ContextRuleSignerInput, parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
@@ -435,7 +435,7 @@ async fn install_multisigner_threshold_rule(
         .collect();
 
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "quorum-test-rule".to_owned(), // OZ MAX_NAME_SIZE = 20 chars
         None,
         signer_inputs,

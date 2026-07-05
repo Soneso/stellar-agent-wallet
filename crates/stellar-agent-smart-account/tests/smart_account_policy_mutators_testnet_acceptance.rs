@@ -60,11 +60,11 @@ use stellar_agent_network::{
     Signer, SoftwareSigningKey, StellarRpcClient, fetch_account, submit_transaction_and_wait,
 };
 use stellar_agent_smart_account::SaError;
-use stellar_agent_smart_account::bindings::ContextRuleType;
 use stellar_agent_smart_account::deployment::{
     DeployerKeypair, DeploymentArgs, ResolvedFeePerOp, deploy_smart_account,
     derive_smart_account_address,
 };
+use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRulePolicy,
     ContextRuleSignerInput, decode_policy_count_from_scval, parse_c_strkey_to_smart_account,
@@ -519,7 +519,7 @@ async fn h3_add_policy_increments_count_and_emits_audit_row() {
 
     let rule_manager = fresh_rule_manager();
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "h3-add-policy-test".to_owned(),
         None,
         vec![ContextRuleSignerInput::Delegated {
@@ -767,7 +767,7 @@ async fn h4_remove_policy_decrements_count_and_emits_audit_row() {
 
     let rule_manager = fresh_rule_manager();
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "h4-rm-policy-test".to_owned(),
         None,
         vec![ContextRuleSignerInput::Delegated {
@@ -1064,7 +1064,7 @@ async fn h5_add_policy_type_mismatched_install_param_no_success_audit() {
 
     let rule_manager = fresh_rule_manager();
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "h5-type-mismatch".to_owned(),
         None,
         vec![ContextRuleSignerInput::Delegated {

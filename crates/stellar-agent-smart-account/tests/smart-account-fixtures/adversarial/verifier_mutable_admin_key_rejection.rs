@@ -14,8 +14,8 @@
 use std::sync::Arc;
 
 use stellar_agent_smart_account::VERIFIER_ALLOWLIST;
-use stellar_agent_smart_account::bindings::ContextRuleType;
 use stellar_agent_smart_account::error::SaError;
+use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{ContextRuleDefinition, ContextRuleSignerInput};
 use stellar_agent_smart_account::managers::verifiers::pin_referenced_contracts;
 use stellar_xdr::{
@@ -127,7 +127,7 @@ async fn verifier_with_admin_key_rejected_without_override() {
 
     // Build a rule definition with one External signer referencing the mutable verifier.
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "mutable-verifier-test".to_owned(),
         None,
         vec![ContextRuleSignerInput::External {

@@ -56,11 +56,11 @@ use sha2::{Digest as _, Sha256};
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::{StellarRpcClient, fetch_account, submit_transaction_and_wait};
-use stellar_agent_smart_account::bindings::ContextRuleType;
 use stellar_agent_smart_account::deployment::{
     DeployerKeypair, DeploymentArgs, ResolvedFeePerOp, deploy_smart_account,
     derive_smart_account_address,
 };
+use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRulePolicy,
     ContextRuleSignerInput, OZ_MAX_POLICIES, decode_policy_count_from_scval,
@@ -297,7 +297,7 @@ async fn h1_16th_signer_refused() {
     let rule_manager = fresh_rule_manager();
 
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "h1-cap-test-rule".to_owned(),
         None, // permanent
         signers,
@@ -838,7 +838,7 @@ async fn h2_6th_policy_refused() {
 
     let rule_manager = fresh_rule_manager();
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "h2-cap-test-rule".to_owned(),
         None,
         vec![ContextRuleSignerInput::Delegated {

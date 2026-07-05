@@ -13,6 +13,11 @@
 //! - [`mod@deploy_webauthn_verifier`] — deploy-only path for the OZ WebAuthn-verifier
 //!   WASM; no `__constructor` args; records result in
 //!   `VerifierRegistry` (`~/.config/stellar-agent/networks.toml`).
+//! - [`mod@deploy_ed25519_verifier`] — deploy-only path for the OZ Ed25519-verifier
+//!   WASM; no `__constructor` args; records result in `VerifierRegistry`.
+//! - [`mod@deploy_spending_limit_policy`] — deploy-only path for the OZ
+//!   spending-limit-policy WASM (per-network singleton); no `__constructor` args;
+//!   records result in `VerifierRegistry`.
 //! - [`mod@deploy_timelock_controller`] — deploy path for the OZ
 //!   `timelock-controller-example` v0.7.2 WASM; takes
 //!   `__constructor` args (min_delay, proposers, executors, admin).
@@ -28,6 +33,8 @@
 
 pub mod address;
 pub mod deploy;
+pub mod deploy_ed25519_verifier;
+pub mod deploy_spending_limit_policy;
 pub mod deploy_timelock_controller;
 pub mod deploy_webauthn_verifier;
 
@@ -41,6 +48,12 @@ pub use deploy::{
 pub use address::{INTEROP_DEPLOYER_SEED, derive_interop_deployer_seed, interop_deployer_pubkey};
 #[cfg(any(test, feature = "test-helpers"))]
 pub use deploy::interop_deployer;
+pub use deploy_ed25519_verifier::{
+    Ed25519VerifierDeployArgs, Ed25519VerifierDeployResult, deploy_ed25519_verifier,
+};
+pub use deploy_spending_limit_policy::{
+    SpendingLimitPolicyDeployArgs, SpendingLimitPolicyDeployResult, deploy_spending_limit_policy,
+};
 pub use deploy_timelock_controller::{
     TIMELOCK_CONTROLLER_WASM, TIMELOCK_CONTROLLER_WASM_SHA256, TimelockControllerDeployArgs,
     TimelockControllerDeployResult, deploy_timelock_controller,

@@ -639,10 +639,14 @@ async fn collect_group_entries(
 
     // Sort by public-key bytes for deterministic ordering.
     //
-    // Sort-by-pubkey is valid for homogeneous Delegated-only groups.
-    // When External-variant signers are supported, the sort must switch to
-    // full XDR-encoded-key byte comparison over the hex-encoded signer key.
-    // Not yet supported: heterogeneous signer-set sorting.
+    // A `SignerGroup` is a homogeneous Delegated-only quorum group, so all
+    // AuthPayload keys share the `Symbol("Delegated")` tag and differ only in
+    // the Account-address suffix; sorting by pubkey bytes is therefore
+    // equivalent to sorting by the full canonical `ScVal` key order. A
+    // heterogeneous Delegated + External-Ed25519 set is signed through
+    // `auth_entry::collect_mixed_signer_entries`, which sorts the signers map
+    // by the full key `ScVal` `Ord` and skips the G-key sub-entry for External
+    // signers.
     qualifying.sort_by_key(|(pk, _)| *pk);
 
     // Take exactly `threshold` signers.

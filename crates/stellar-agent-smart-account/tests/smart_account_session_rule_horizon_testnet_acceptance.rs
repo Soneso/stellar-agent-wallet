@@ -54,10 +54,10 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
-use stellar_agent_smart_account::bindings::ContextRuleType;
 use stellar_agent_smart_account::deployment::{
     DeployerKeypair, DeploymentArgs, ResolvedFeePerOp, deploy_smart_account,
 };
+use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRuleSignerInput,
     parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
@@ -360,7 +360,7 @@ async fn h_b_update_horizon_exceeded() {
         .expect("[H-B] G-strkey must parse to signer address");
 
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "h-b-substrate".to_owned(),
         None, // permanent — no expiry
         vec![ContextRuleSignerInput::Delegated {

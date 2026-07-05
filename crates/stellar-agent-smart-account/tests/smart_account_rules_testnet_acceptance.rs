@@ -72,11 +72,11 @@ use stellar_agent_core::audit_log::schema::{EventKind, SaInvocationResult};
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::{Signer, SoftwareSigningKey};
-use stellar_agent_smart_account::bindings::ContextRuleType;
 use stellar_agent_smart_account::deployment::{
     DeployerKeypair, DeploymentArgs, ResolvedFeePerOp, deploy_smart_account,
 };
 use stellar_agent_smart_account::error::SaError;
+use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRuleSignerInput,
     parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
@@ -284,7 +284,7 @@ async fn full_metadata_only_lifecycle_on_testnet() {
         .expect("signer G-strkey must parse to ScAddress");
     // OZ `MAX_NAME_SIZE = 20` bytes — name must fit.
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "pr3-acceptance".to_owned(),
         None,
         vec![ContextRuleSignerInput::Delegated {
@@ -523,7 +523,7 @@ async fn e1_install_rule_emits_audit_rows_via_self_audit_writer() {
     let signer_addr = parse_g_strkey_to_signer_address(&signer_g)
         .expect("signer G-strkey must parse to ScAddress");
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         // OZ MAX_NAME_SIZE = 20 bytes.
         "e1-audit-test".to_owned(),
         None,
@@ -677,7 +677,7 @@ async fn e2_metadata_updates_emit_typed_forensic_rows() {
     let signer_addr = parse_g_strkey_to_signer_address(&signer_g)
         .expect("signer G-strkey must parse to ScAddress");
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "e2-audit-test".to_owned(),
         None,
         vec![ContextRuleSignerInput::Delegated {

@@ -17,12 +17,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use stellar_accounts::smart_account::ContextRuleType;
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::{EventKind, SaInvocationResult};
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::signing::{Signer, SoftwareSigningKey};
 use stellar_agent_smart_account::error::SaError;
+use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRuleSignerInput,
     parse_g_strkey_to_signer_address,
@@ -137,7 +137,7 @@ async fn build_fixture() -> DivergenceFixture {
 
 fn rule_definition(signer_address: ScAddress) -> ContextRuleDefinition {
     ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "divergence-fixture".to_owned(),
         None,
         vec![ContextRuleSignerInput::Delegated {

@@ -49,10 +49,10 @@ use rand_core::OsRng;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::{Signer, SoftwareSigningKey};
-use stellar_agent_smart_account::bindings::ContextRuleType;
 use stellar_agent_smart_account::deployment::{
     DeployerKeypair, DeploymentArgs, ResolvedFeePerOp, deploy_smart_account,
 };
+use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRuleSignerInput,
     DEFAULT_MAX_SCAN_ID, parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
@@ -219,7 +219,7 @@ async fn install_rule_with_name_and_valid_until(
 ) -> u32 {
     // The OpenZeppelin smart-account contract caps MAX_NAME_SIZE at 20 bytes.
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         name.to_owned(),
         valid_until,
         vec![ContextRuleSignerInput::Delegated {

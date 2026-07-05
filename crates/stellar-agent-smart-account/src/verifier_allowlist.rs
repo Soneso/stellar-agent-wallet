@@ -275,6 +275,32 @@ pub const VERIFIER_ALLOWLIST: &[VerifierAllowlistEntry] = &[
             audited_at: "2025-11-01",
         },
     },
+    // Index 2: OZ multisig-ed25519-verifier-example v0.7.2 (canonical Ed25519
+    // deploy verifier for External-Ed25519 signers).
+    //
+    // Wasm hash: ea13b07083a8275e7bade954e4ccc1827495f253c18dc06edcc49104c11fb725
+    // (SHA-256 verified at vendor/oz-ed25519-verifier/v0.7.2/PROVENANCE.md).
+    //
+    // OZ source SHA: a9c42169000638da937577f592ebf61a7a3c94ca (tag v0.7.2).
+    // OZ source file: examples/multisig-smart-account/ed25519-verifier/src/contract.rs
+    //
+    // Build: stellar contract build --package multisig-ed25519-verifier-example
+    //        stellar-cli 25.2.0, rustc 1.96.0 stable, wasm32v1-none target.
+    //
+    // audited_at: PROVISIONAL "2026-07-04" (not externally verified; pending
+    // independent audit) — represents the OZ internal v0.7.2 artefact review date.
+    // Update when a formal external audit date is confirmed.
+    VerifierAllowlistEntry {
+        wasm_hash: [
+            0xea, 0x13, 0xb0, 0x70, 0x83, 0xa8, 0x27, 0x5e, 0x7b, 0xad, 0xe9, 0x54, 0xe4, 0xcc,
+            0xc1, 0x82, 0x74, 0x95, 0xf2, 0x53, 0xc1, 0x8d, 0xc0, 0x6e, 0xdc, 0xc4, 0x91, 0x04,
+            0xc1, 0x1f, 0xb7, 0x25,
+        ],
+        audit_status: VerifierAuditStatus::Audited {
+            auditor: "OpenZeppelin",
+            audited_at: "2026-07-04",
+        },
+    },
     #[cfg(any(test, feature = "test-helpers"))]
     VerifierAllowlistEntry {
         wasm_hash: [0xee; 32],
@@ -373,6 +399,29 @@ mod tests {
             "VERIFIER_ALLOWLIST[1].wasm_hash must remain the OZ v0.7.1 legacy hash \
              (vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md); verifier contracts \
              already deployed on-chain rely on it staying recognised."
+        );
+    }
+
+    #[test]
+    fn verifier_allowlist_has_canonical_oz_ed25519_verifier() {
+        // Hard-coded canonical hash per vendor/oz-ed25519-verifier/v0.7.2/PROVENANCE.md.
+        // OZ source SHA: a9c42169000638da937577f592ebf61a7a3c94ca (tag v0.7.2).
+        // SHA-256: ea13b07083a8275e7bade954e4ccc1827495f253c18dc06edcc49104c11fb725
+        let canonical: [u8; 32] = [
+            0xea, 0x13, 0xb0, 0x70, 0x83, 0xa8, 0x27, 0x5e, 0x7b, 0xad, 0xe9, 0x54, 0xe4, 0xcc,
+            0xc1, 0x82, 0x74, 0x95, 0xf2, 0x53, 0xc1, 0x8d, 0xc0, 0x6e, 0xdc, 0xc4, 0x91, 0x04,
+            0xc1, 0x1f, 0xb7, 0x25,
+        ];
+        let entry = VERIFIER_ALLOWLIST
+            .iter()
+            .find(|e| e.wasm_hash == canonical)
+            .expect(
+                "VERIFIER_ALLOWLIST must contain the canonical OZ v0.7.2 ed25519-verifier hash \
+                 (vendor/oz-ed25519-verifier/v0.7.2/PROVENANCE.md)",
+            );
+        assert!(
+            matches!(entry.audit_status, VerifierAuditStatus::Audited { .. }),
+            "ed25519-verifier entry must be Audited"
         );
     }
 

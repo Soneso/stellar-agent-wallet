@@ -24,8 +24,10 @@ default = []
 #
 # Enables test-helpers: the testnet acceptance tests consume the gated
 # inspection helpers, so the documented single-feature invocation must compile
-# on its own.
-testnet-integration = ["test-helpers"]
+# on its own. Enables the test-support crate's live-network helpers only here,
+# never on the dev-dependency itself: feature unification would otherwise
+# compile those helpers into every offline workspace build.
+testnet-integration = ["test-helpers", "stellar-agent-test-support/testnet-helpers"]
 # Expose test-only inspection helpers as pub items for adversarial fixture tests.
 # Never enabled in production builds.
 test-helpers = []
@@ -53,6 +55,10 @@ required-features = ["test-helpers"]
 # testnet acceptance tests: each requires the testnet-integration feature.
 [[test]]
 name = "deploy_c_testnet_acceptance"
+required-features = ["testnet-integration"]
+
+[[test]]
+name = "smart_account_delegation_testnet_acceptance"
 required-features = ["testnet-integration"]
 
 [[test]]

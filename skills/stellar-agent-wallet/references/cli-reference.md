@@ -42,7 +42,7 @@ These recur with the same meaning across groups:
 
 Signing commands take a mutually exclusive signer-source group (exactly one):
 
-- The secret-env flag — the **name of an environment variable** holding the source-account S-strkey. Set the variable to your secret; pass the variable name, never the secret. Spelled `--secret-env` on `pay` / `accounts create`, `--deployer-secret-env` on `accounts deploy-c` / `smart-account deploy-webauthn-verifier`, `--signer-secret-env` on the `smart-account` commands.
+- The secret-env flag — the **name of an environment variable** holding the source-account S-strkey. Set the variable to your secret; pass the variable name, never the secret. Spelled `--secret-env` on `pay` / `accounts create`, `--deployer-secret-env` on `accounts deploy-c` and the `smart-account deploy-*` verbs (`deploy-webauthn-verifier`, `deploy-ed25519-verifier`, `deploy-spending-limit-policy`), `--signer-secret-env` on the `smart-account` commands.
 - `--sign-with-ledger` — sign with a connected Ledger hardware device.
 - `--account-index <INDEX>` — BIP-44 account index for the Ledger derivation path. Default `0`.
 
@@ -272,13 +272,13 @@ Each rule has a `rule_id` (u32), a name (OZ cap 20 bytes), an optional expiry le
 
 | Verb | Purpose | Key flags (plus `--account <C_STRKEY>` required everywhere, signer source on write verbs) |
 |---|---|---|
-| `create` | Install a new rule (`add_context_rule`); returns minted `rule_id` | `--name <STRING>` (required); `--signer-delegated <G_STRKEY>` (repeatable); `--signer-webauthn <CRED_NAME>` (repeatable); `--accept-no-delegated-fallback`; `--accept-mutable-verifier`; `--accept-unknown-verifier`; `--auth-rule-id <U32>`; `--valid-until <LEDGER\|none>` (default `none`). At least one signer required. |
+| `create` | Install a new rule (`add_context_rule`); returns minted `rule_id` | `--name <STRING>` (required); `--context <SPEC>` (default `default`; `call-contract:<C_STRKEY>` or `create-contract:<64_HEX_WASM_HASH>` scope the rule); `--signer-delegated <G_STRKEY>` (repeatable); `--signer-webauthn <CRED_NAME>` (repeatable); `--accept-no-delegated-fallback`; `--accept-mutable-verifier`; `--accept-unknown-verifier`; `--auth-rule-id <U32>`; `--valid-until <LEDGER\|none>` (default `none`). At least one signer required. |
 | `get` | Read one rule (`get_context_rule`); read-only, `mainnet` ok | `--rule-id <U32>` (required); `--source-account <G_STRKEY>` (required, simulation only, not debited/signed) |
 | `set-name` | Rename a rule (`update_context_rule_name`) | `--rule-id <U32>`; `--name <STRING>`; `--auth-rule-id` (optional) |
 | `set-valid-until` | Change expiry (`update_context_rule_valid_until`) | `--rule-id <U32>`; `--valid-until <LEDGER\|none>` (required) |
 | `delete` | Remove a rule (`remove_context_rule`) | `--rule-id <U32>`; `--auth-rule-id` (optional) |
 | `verify-pins` | Verify pinned verifier/policy WASM hashes vs on-chain (drift); read-only, `mainnet` ok; exit `1` on `drift` | `--rule-id <U32>`. Each `*_pin_status` is `match`/`drift`/`unavailable`/`no_pin`/`no_contracts`. |
-| `add-policy` | Add a policy (`add_policy`); cap 5; returns `policy_id` | `--rule-id <U32>`; `--policy-address <C_STRKEY>`; `--install-param <SCVAL_BASE64>` (standard base64 XDR `ScVal`, raw passthrough); `--auth-rule-id` |
+| `add-policy` | Add a policy (`add_policy`); cap 5; returns `policy_id` | `--rule-id <U32>`; `--kind <raw\|spending-limit>` (default `raw`); raw: `--policy-address <C_STRKEY>`, `--install-param <SCVAL_BASE64>` (standard base64 XDR `ScVal`, raw passthrough); spending-limit: `--limit <STROOPS>`, `--period <LEDGERS>`, optional `--policy <C_STRKEY>` override; `--auth-rule-id` |
 | `remove-policy` | Remove a policy by id (`remove_policy`) | `--rule-id <U32>`; `--policy-id <U32>`; `--auth-rule-id` |
 | `list` | Enumerate active rules by on-chain scan; read-only, `mainnet` ok; alias of `smart-account list-rules` | see `smart-account list-rules` |
 
@@ -295,7 +295,7 @@ All verbs take `--account <C_STRKEY>` and `--rule-id <U32>` (both required), the
 |---|---|---|
 | `list` | Read on-chain signer set; baselines `SaSignerSetBaselined` if no prior baseline. Reports `signer_count`, `threshold`, `signer_ids`, `signer_kinds` | — |
 | `refresh` | Unconditionally re-anchor the signer-set baseline | — |
-| `add` | Add one signer (`add_signer`); cap 15; returns `new_signer_id` | exactly one of `--signer-delegated <G_STRKEY>` (alias `--new-signer`) / `--signer-external <C_STRKEY>` (requires `--signer-key-data <HEX>`) / `--signer-webauthn <CRED_NAME>` |
+| `add` | Add one signer (`add_signer`); cap 15; returns `new_signer_id` | exactly one of `--signer-delegated <G_STRKEY>` (alias `--new-signer`) / `--signer-ed25519 <HEX_PUBKEY_64>` (optional `--verifier <C_STRKEY>` override, else registry) / `--signer-external <C_STRKEY>` (requires `--signer-key-data <HEX>`) / `--signer-webauthn <CRED_NAME>`. `--signer-ed25519` is the recommended shape for an agent's own key — no funded account, HSM/keyring-holdable. |
 | `remove` | Remove a signer (`remove_signer`); refuses if it would drop count below threshold | `--signer-id <U32>` (required) |
 | `set-threshold` | Change threshold via threshold-policy `set_threshold` | `--new-threshold <U32>` (required); no `--auth-rule-id` override |
 
@@ -327,6 +327,8 @@ stellar-agent smart-account multicall --smart-account CABC...WXYZ --rule-id 0 \
 | Verb | Purpose | Key flags |
 |---|---|---|
 | `deploy-webauthn-verifier` | Deploy OZ WebAuthn-verifier WASM, record in registry; idempotent (`status:"already_deployed"`); testnet only | `--deployer-secret-env <VAR>` xor `--sign-with-ledger`; `--account-index`; `--network`; `--rpc-url`; `--fee`; `--timeout-seconds`; `--output`; `--dry-run` (`status:"dry_run"`) |
+| `deploy-ed25519-verifier` | Deploy OZ Ed25519-verifier WASM, record in registry; same flags/idempotency as above; backs `--signer-ed25519`; testnet only | same as `deploy-webauthn-verifier` |
+| `deploy-spending-limit-policy` | Deploy OZ spending-limit-policy WASM (per-network singleton), record in registry; same flags/idempotency as above; backs `rules add-policy --kind spending-limit`; testnet only | same as `deploy-webauthn-verifier` |
 | `migrate-verifier` | Move all `External` signers from one verifier to another across rules; dry-run renders plan; mainnet submit needs `--confirm-mainnet-migrate` | `--account <C_STRKEY>`; `--from <HASH_HEX>` (64-char SHA-256 of source WASM); `--to <C_STRKEY>`; `--dry-run`; `--confirm-mainnet-migrate`; signer source (submit) |
 | `list-verifiers` | Enumerate compile-time verifier allowlist + audit-status taxonomy; read-only, no network | `--output` |
 | `list-rules` | Enumerate active rules by scanning `[0, max_scan_id)`; read-only, `mainnet` ok; backs `smart-account rules list` | `--account <C_STRKEY>`; `--source-account <G_STRKEY>` (sim source); `--rpc-url`; `--secondary-rpc-url`; `--network`; `--profile`; `--max-scan-id <1..=10000>` (else profile, else 50); `--timeout-seconds`; `--output` (table deferred) |

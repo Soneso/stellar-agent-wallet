@@ -155,6 +155,9 @@ pub enum SignersSubcommand {
     /// - `--signer-external <verifier-C-strkey> --signer-key-data <hex>` —
     ///   external-verifier signer with raw hex key-data.
     /// - `--signer-webauthn <credential-name>` — WebAuthn passkey signer.
+    /// - `--signer-ed25519 <64-hex-pubkey> [--verifier <C-strkey>]` — first-class
+    ///   Ed25519 external signer (verifier resolved from the registry when
+    ///   `--verifier` is omitted).
     Add(Box<AddArgs>),
 
     /// Remove a signer from a context rule.
@@ -473,11 +476,16 @@ async fn refresh_run(args: &RefreshArgs) -> i32 {
 ///   credential_id_bytes` per the OZ WebAuthn verifier
 ///   (`canonicalize_key` strips credential ID at verify time; full concat stored).
 ///   The verifier address is read from the `VerifierRegistry` for the target network.
+/// - `--signer-ed25519 <64-hex-pubkey>` — first-class Ed25519 external signer;
+///   encoded as OZ `Signer::External(verifier, key_data)` where `key_data` is the
+///   raw 32-byte Ed25519 public key. The verifier address resolves from
+///   `--verifier <C-strkey>` when supplied, else from the `VerifierRegistry`'s
+///   registered Ed25519 verifier for the target network (fail-closed if neither).
 #[non_exhaustive]
 #[derive(Debug, Args)]
 #[command(
     group(ArgGroup::new("new_signer_source")
-        .args(["signer_delegated", "signer_external", "signer_webauthn"])
+        .args(["signer_delegated", "signer_external", "signer_webauthn", "signer_ed25519"])
         .required(true)
         .multiple(false))
 )]
@@ -540,6 +548,35 @@ pub struct AddArgs {
     )]
     pub signer_webauthn: Option<String>,
 
+    /// 64-hex-character raw Ed25519 public key of a first-class external signer.
+    ///
+    /// Decoded to exactly 32 bytes (invalid hex or a non-64-char length is
+    /// refused fail-closed, never silently truncated or padded) and encoded as
+    /// OZ `Signer::External(verifier, key_data)` where `key_data` is the raw
+    /// public key. The verifier contract address resolves from `--verifier` when
+    /// supplied, else from the `VerifierRegistry`'s registered Ed25519 verifier
+    /// for the target network (deploy one via
+    /// `smart-account deploy-ed25519-verifier`).
+    /// Mutually exclusive with `--signer-delegated`, `--signer-external`, and
+    /// `--signer-webauthn`.
+    #[arg(
+        long = "signer-ed25519",
+        value_name = "HEX_PUBKEY_64",
+        group = "new_signer_source"
+    )]
+    pub signer_ed25519: Option<String>,
+
+    /// Ed25519 verifier contract C-strkey override for `--signer-ed25519`.
+    ///
+    /// When omitted, the verifier address resolves from the `VerifierRegistry`
+    /// for the target network. Only meaningful with `--signer-ed25519`.
+    #[arg(
+        long = "verifier",
+        value_name = "C_STRKEY",
+        requires = "signer_ed25519"
+    )]
+    pub verifier: Option<String>,
+
     /// Profile name for audit-log path resolution and credential store lookup
     /// (used by `--signer-webauthn`).
     #[arg(long, value_name = "NAME")]
@@ -576,7 +613,7 @@ pub struct AddResult {
     pub new_signer_id: u32,
     /// Human-readable signer-source type label.
     ///
-    /// One of `"delegated"`, `"external"`, or `"webauthn"`.
+    /// One of `"delegated"`, `"external"`, `"webauthn"`, or `"ed25519"`.
     pub signer_source: String,
     /// Display string for the added signer (G-strkey for delegated; verifier
     /// C-strkey for external/webauthn; redacted to first-5-last-5 for
@@ -881,8 +918,117 @@ async fn add_run(args: &AddArgs) -> i32 {
                 "webauthn".to_owned(),
                 credential_name.clone(),
             )
+        } else if let Some(hex_pubkey) = &args.signer_ed25519 {
+            // ── First-class Ed25519 external signer ───────────────────────────
+            // key_data is the raw 32-byte Ed25519 public key; encoded as OZ
+            // `Signer::External(verifier, key_data)` — the same on-chain shape as
+            // `--signer-external`, resolved through the same
+            // `build_external_signer_scval`. The OZ Ed25519 verifier's
+            // `canonicalize_key` returns the 32-byte key verbatim
+            // (`packages/accounts/src/verifiers/ed25519.rs`, SHA `a9c4216`).
+
+            // Decode exactly 32 bytes; fail closed on invalid hex or wrong length.
+            let key_data = match hex::decode(hex_pubkey) {
+                Ok(b) => b,
+                Err(e) => {
+                    return emit_error(
+                        &WalletError::Validation(ValidationError::AddressInvalid {
+                            input: format!("--signer-ed25519 is not valid hex: {e}"),
+                        }),
+                        &request_id,
+                    );
+                }
+            };
+            if key_data.len() != 32 {
+                return emit_error(
+                    &WalletError::Validation(ValidationError::AddressInvalid {
+                        input: format!(
+                            "--signer-ed25519 must decode to exactly 32 bytes (a raw Ed25519 \
+                             public key), got {} bytes",
+                            key_data.len()
+                        ),
+                    }),
+                    &request_id,
+                );
+            }
+
+            // Resolve the verifier address: explicit `--verifier` override, else
+            // the network's registered Ed25519 verifier. Fail closed if neither
+            // is available.
+            let verifier_c_strkey = if let Some(explicit) = &args.verifier {
+                explicit.clone()
+            } else {
+                let verifier_registry = match VerifierRegistry::open() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return emit_error(
+                            &WalletError::Validation(ValidationError::AddressInvalid {
+                                input: format!("could not open verifier registry: {e}"),
+                            }),
+                            &request_id,
+                        );
+                    }
+                };
+                let network_passphrase = args.network.passphrase();
+                match verifier_registry.ed25519_verifier_for(network_passphrase) {
+                    Some(entry) => entry.address.clone(),
+                    None => {
+                        return emit_error(
+                            &WalletError::Validation(ValidationError::AddressInvalid {
+                                input: format!(
+                                    "no Ed25519 verifier registered for network \
+                                     '{network_passphrase}'; run: \
+                                     smart-account deploy-ed25519-verifier (or pass --verifier)"
+                                ),
+                            }),
+                            &request_id,
+                        );
+                    }
+                }
+            };
+
+            let verifier_sc_addr = match parse_c_strkey_to_smart_account(&verifier_c_strkey) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    return emit_error(
+                        &WalletError::SmartAccount {
+                            wire_code: e.wire_code(),
+                            message: format!(
+                                "--signer-ed25519 verifier '{verifier_c_strkey}': {e}"
+                            ),
+                        },
+                        &request_id,
+                    );
+                }
+            };
+
+            let scval = match build_external_signer_scval(verifier_sc_addr, &key_data) {
+                Ok(v) => v,
+                Err(e) => {
+                    return emit_error(
+                        &WalletError::SmartAccount {
+                            wire_code: e.wire_code(),
+                            message: format!("--signer-ed25519 ScVal encode: {e}"),
+                        },
+                        &request_id,
+                    );
+                }
+            };
+
+            // key_data_first16 for audit-log display (an Ed25519 external signer
+            // IS an OZ `Signer::External`; reuse the External audit representation).
+            let key_data_first16: [u8; 16] = {
+                let mut arr = [0u8; 16];
+                arr.copy_from_slice(&key_data[..16]);
+                arr
+            };
+            let pubkey = SignerPubkey::External {
+                verifier_contract: verifier_c_strkey.clone(),
+                key_data_first16,
+            };
+            (scval, pubkey, "ed25519".to_owned(), verifier_c_strkey)
         } else {
-            // ArgGroup enforces that one of the three is always set; this branch
+            // ArgGroup enforces that one of the four is always set; this branch
             // is unreachable at runtime but required for exhaustive match.
             unreachable!("ArgGroup `new_signer_source` guarantees one signer-source flag is set")
         };
@@ -1318,6 +1464,7 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
+        clippy::panic,
         reason = "test-only assertions"
     )]
 
@@ -1853,6 +2000,136 @@ mod tests {
         assert!(
             !json.contains("baselined"),
             "ListResult JSON must not contain the removed baselined field"
+        );
+    }
+
+    // ── signers add --signer-ed25519 tests ───────────────────────────────────
+
+    /// A canonical all-zeros verifier C-strkey fixture (never a real verifier;
+    /// only exercises the encode path).
+    const ED25519_TEST_VERIFIER: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+
+    fn add_args_ed25519(hex_pubkey: &str, verifier: Option<String>) -> AddArgs {
+        AddArgs {
+            account: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+            rule_id: 1,
+            signer_delegated: None,
+            signer_external: None,
+            signer_key_data: None,
+            signer_webauthn: None,
+            signer_ed25519: Some(hex_pubkey.to_owned()),
+            verifier,
+            profile: None,
+            signer_source: SignerSourceFlags {
+                signer_secret_env: Some("__STELLAR_AGENT_SIGNERS_ED25519_DUMMY".to_owned()),
+                sign_with_ledger: false,
+                account_index: Some(0),
+            },
+            network: TargetNetwork::Testnet,
+            rpc_url: TESTNET_RPC_URL.to_owned(),
+            secondary_rpc_url: None,
+            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+        }
+    }
+
+    /// The typed `--signer-ed25519` attach produces the exact same on-chain
+    /// `Signer::External(verifier, key_data)` ScVal as the raw
+    /// `--signer-external <C> --signer-key-data <same-hex>` escape hatch, because
+    /// both funnel through `build_external_signer_scval` with identical inputs.
+    /// The wire shape is byte-asserted so the equivalence is not tautological.
+    #[test]
+    fn signer_ed25519_scval_equals_raw_external_scval() {
+        use stellar_xdr::ScBytes;
+
+        let pubkey_hex = "ab".repeat(32); // 64 hex chars → 32 bytes.
+
+        // ed25519 branch decode: exactly 32 bytes.
+        let kd_ed25519 = hex::decode(&pubkey_hex).unwrap();
+        assert_eq!(kd_ed25519.len(), 32);
+
+        // raw --signer-external branch decode: same hex, any non-empty length.
+        let kd_external = hex::decode(&pubkey_hex).unwrap();
+
+        let addr_ed25519 = parse_c_strkey_to_smart_account(ED25519_TEST_VERIFIER).unwrap();
+        let addr_external = parse_c_strkey_to_smart_account(ED25519_TEST_VERIFIER).unwrap();
+
+        let sc_ed25519 = build_external_signer_scval(addr_ed25519.clone(), &kd_ed25519).unwrap();
+        let sc_external = build_external_signer_scval(addr_external, &kd_external).unwrap();
+
+        assert_eq!(
+            sc_ed25519, sc_external,
+            "typed ed25519 attach must produce byte-identical ScVal to raw external"
+        );
+
+        // Byte-exact OZ External wire shape: Vec([Symbol("External"), Address, Bytes]).
+        let ScVal::Vec(Some(ScVec(elems))) = &sc_ed25519 else {
+            panic!("expected ScVal::Vec, got {sc_ed25519:?}");
+        };
+        assert_eq!(elems.len(), 3, "External encodes as a 3-element Vec");
+        let ScVal::Symbol(tag) = &elems[0] else {
+            panic!("expected Symbol tag, got {:?}", elems[0]);
+        };
+        assert_eq!(tag.to_utf8_string_lossy(), "External");
+        assert!(
+            matches!(&elems[1], ScVal::Address(a) if *a == addr_ed25519),
+            "vec[1] must be the verifier Address"
+        );
+        let ScVal::Bytes(ScBytes(b)) = &elems[2] else {
+            panic!("expected Bytes payload, got {:?}", elems[2]);
+        };
+        assert_eq!(b.as_slice(), &kd_ed25519[..], "key_data bytes must match");
+    }
+
+    /// `--signer-ed25519` with invalid hex is refused fail-closed before any
+    /// network call.
+    #[tokio::test]
+    async fn signer_ed25519_rejects_invalid_hex() {
+        let args = add_args_ed25519(&"zz".repeat(32), Some(ED25519_TEST_VERIFIER.to_owned()));
+        let code = add_run(&args).await;
+        assert_eq!(code, 1, "invalid hex must be refused");
+    }
+
+    /// `--signer-ed25519` that decodes to a non-32-byte length is refused
+    /// fail-closed (never silently truncated or padded) before any network call.
+    #[tokio::test]
+    async fn signer_ed25519_rejects_wrong_length() {
+        // 62 hex chars → 31 bytes.
+        let args = add_args_ed25519(&"ab".repeat(31), Some(ED25519_TEST_VERIFIER.to_owned()));
+        let code = add_run(&args).await;
+        assert_eq!(code, 1, "a 31-byte key must be refused");
+    }
+
+    /// `--signer-ed25519` with no `--verifier` and no registered Ed25519 verifier
+    /// for the network fails closed before any network call.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn signer_ed25519_missing_verifier_and_registry_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry_path = dir.path().join("networks.toml");
+
+        // SAFETY: serialised by #[serial]; no concurrent env access.
+        #[allow(unsafe_code, reason = "test-only env override; #[serial] serialises")]
+        unsafe {
+            std::env::set_var(
+                stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
+                &registry_path,
+            );
+        }
+
+        let args = add_args_ed25519(&"ab".repeat(32), None);
+        let code = add_run(&args).await;
+
+        // SAFETY: same as set; serialised by #[serial].
+        #[allow(unsafe_code, reason = "test-only env cleanup; #[serial] serialises")]
+        unsafe {
+            std::env::remove_var(
+                stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
+            );
+        }
+
+        assert_eq!(
+            code, 1,
+            "missing verifier and empty registry must fail closed"
         );
     }
 }

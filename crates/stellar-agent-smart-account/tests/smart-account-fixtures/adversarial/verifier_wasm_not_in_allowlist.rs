@@ -17,8 +17,8 @@
 use std::sync::Arc;
 
 use stellar_agent_core::observability::RedactedStrkey;
-use stellar_agent_smart_account::bindings::ContextRuleType;
 use stellar_agent_smart_account::error::SaError;
+use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{ContextRuleDefinition, ContextRuleSignerInput};
 use stellar_agent_smart_account::managers::verifiers::pin_referenced_contracts;
 use stellar_xdr::{ContractId, Hash, ScAddress};
@@ -71,7 +71,7 @@ async fn verifier_unknown_wasm_hash_rejected_without_override() {
     let manager = manager_one_url(&server.uri(), Arc::clone(&audit_writer), audit_log_path);
 
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "unknown-wasm-test".to_owned(),
         None,
         vec![ContextRuleSignerInput::External {

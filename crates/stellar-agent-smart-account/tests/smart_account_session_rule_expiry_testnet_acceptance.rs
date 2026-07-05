@@ -57,10 +57,10 @@ use stellar_agent_core::audit_log::schema::{EventKind, SaInvocationResult};
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_smart_account::SaError;
-use stellar_agent_smart_account::bindings::ContextRuleType;
 use stellar_agent_smart_account::deployment::{
     DeployerKeypair, DeploymentArgs, ResolvedFeePerOp, deploy_smart_account,
 };
+use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRuleSignerInput,
     parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
@@ -312,7 +312,7 @@ async fn h_1_revocation_audit_log_timeline() {
     let signer_addr = parse_g_strkey_to_signer_address(&signer_g).expect("G-strkey must parse");
 
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "h-1-session-rule".to_owned(),
         Some(session_valid_until),
         vec![ContextRuleSignerInput::Delegated {
@@ -473,7 +473,7 @@ async fn h_2_post_revocation_new_sign_refused() {
     let signer_addr = parse_g_strkey_to_signer_address(&signer_g).expect("G-strkey must parse");
 
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "h-2-session-rule".to_owned(),
         Some(session_valid_until),
         vec![ContextRuleSignerInput::Delegated {

@@ -701,6 +701,118 @@ pub enum SaError {
         attempted: String,
     },
 
+    /// The runtime SHA gate for the Ed25519-verifier WASM (performed at the start
+    /// of `deploy_ed25519_verifier` before any submission) disagrees with
+    /// `ED25519_VERIFIER_WASM_SHA256`.  Second line of defence after the
+    /// `cargo test` compile-time gate
+    /// (`tests::ed25519_verifier_wasm_sha256_matches_provenance` in
+    /// `ed25519_verifier.rs`).
+    ///
+    /// # Security
+    ///
+    /// `expected` and `actual` carry 64-char lowercase hex strings of SHA-256
+    /// digests.  SHA-256 digests are not secret; no key material is present.
+    #[error(
+        "Ed25519-verifier WASM provenance mismatch: \
+         expected sha256 {expected}, actual sha256 {actual}"
+    )]
+    #[serde(rename = "sa.ed25519_verifier_provenance_mismatch")]
+    Ed25519VerifierProvenanceMismatch {
+        /// The SHA-256 hex string recorded in `ED25519_VERIFIER_WASM_SHA256`.
+        expected: String,
+        /// The SHA-256 hex string actually computed from the in-memory WASM bytes.
+        actual: String,
+    },
+
+    /// The verifier registry already contains an Ed25519-verifier entry for the
+    /// given network with a DIFFERENT `wasm_sha256`.  Refuses to overwrite
+    /// silently.
+    ///
+    /// Operator action: re-vendor the WASM (update `vendor/oz-ed25519-verifier/v0.7.2/`),
+    /// update `ED25519_VERIFIER_WASM_SHA256`, and re-run
+    /// `smart-account deploy-ed25519-verifier` so the registry entry and the
+    /// pinned SHA-256 stay in sync.
+    ///
+    /// `network` is the Stellar network passphrase (not secret).
+    /// `recorded` and `attempted` are 64-char lowercase hex SHA-256 digests (not secret).
+    #[error(
+        "Ed25519-verifier sha256 drift for network {network}: \
+         registry records {recorded}, attempted deployment uses {attempted}"
+    )]
+    #[serde(rename = "sa.ed25519_verifier_sha256_drift")]
+    Ed25519VerifierSha256Drift {
+        /// The Stellar network passphrase for which the registry entry exists.
+        network: String,
+        /// The SHA-256 hex string already recorded in the registry for this network.
+        recorded: String,
+        /// The SHA-256 hex string of the WASM that the caller attempted to record.
+        attempted: String,
+    },
+
+    /// The runtime SHA gate for the spending-limit-policy WASM (performed at the
+    /// start of `deploy_spending_limit_policy` before any submission) disagrees
+    /// with `SPENDING_LIMIT_POLICY_WASM_SHA256`.  Second line of defence after
+    /// the `cargo test` compile-time gate
+    /// (`tests::spending_limit_policy_wasm_sha256_matches_provenance` in
+    /// `spending_limit_policy.rs`).
+    ///
+    /// # Security
+    ///
+    /// `expected` and `actual` carry 64-char lowercase hex strings of SHA-256
+    /// digests.  SHA-256 digests are not secret; no key material is present.
+    #[error(
+        "spending-limit-policy WASM provenance mismatch: \
+         expected sha256 {expected}, actual sha256 {actual}"
+    )]
+    #[serde(rename = "sa.spending_limit_policy_provenance_mismatch")]
+    SpendingLimitPolicyProvenanceMismatch {
+        /// The SHA-256 hex string recorded in `SPENDING_LIMIT_POLICY_WASM_SHA256`.
+        expected: String,
+        /// The SHA-256 hex string actually computed from the in-memory WASM bytes.
+        actual: String,
+    },
+
+    /// The registry already contains a spending-limit-policy entry for the given
+    /// network with a DIFFERENT `wasm_sha256`.  Refuses to overwrite silently.
+    ///
+    /// Operator action: re-vendor the WASM (update `vendor/oz-spending-limit-policy/v0.7.2/`),
+    /// update `SPENDING_LIMIT_POLICY_WASM_SHA256`, and re-run
+    /// `smart-account deploy-spending-limit-policy` so the registry entry and the
+    /// pinned SHA-256 stay in sync.
+    ///
+    /// `network` is the Stellar network passphrase (not secret).
+    /// `recorded` and `attempted` are 64-char lowercase hex SHA-256 digests (not secret).
+    #[error(
+        "spending-limit-policy sha256 drift for network {network}: \
+         registry records {recorded}, attempted deployment uses {attempted}"
+    )]
+    #[serde(rename = "sa.spending_limit_policy_sha256_drift")]
+    SpendingLimitPolicySha256Drift {
+        /// The Stellar network passphrase for which the registry entry exists.
+        network: String,
+        /// The SHA-256 hex string already recorded in the registry for this network.
+        recorded: String,
+        /// The SHA-256 hex string of the WASM that the caller attempted to record.
+        attempted: String,
+    },
+
+    /// A typed spending-limit policy install was refused client-side before any
+    /// simulate/submit.  Fires when the target rule's context type is not
+    /// `CallContract` (OZ `install` rejects non-`CallContract` rules with
+    /// `OnlyCallContractAllowed`, `spending_limit.rs:376-377`, SHA `a9c4216`),
+    /// when `limit <= 0` or `period == 0` (OZ `InvalidLimitOrPeriod`,
+    /// `spending_limit.rs:380-381`, SHA `a9c4216`), or when the wallet cannot
+    /// build the install parameter.  Catching this off-chain avoids a wasted
+    /// round-trip and names the constraint.
+    ///
+    /// `reason` is a human-readable description with no secret material.
+    #[error("spending-limit policy install refused: {reason}")]
+    #[serde(rename = "sa.spending_limit_install_refused")]
+    SpendingLimitInstallRefused {
+        /// Human-readable description of why the install was refused.
+        reason: String,
+    },
+
     /// File I/O error reading or writing `~/.config/stellar-agent/networks.toml`
     /// (or the `STELLAR_AGENT_NETWORKS_TOML` override path).
     ///
@@ -1591,6 +1703,7 @@ pub(crate) const ALL_AUTH_ENTRY_STAGES: &[&str] = &[
     "strkey_parse",
     "quorum_external_contract_guard",
     "quorum_signatures",
+    "ed25519_rule_signer_quorum_guard",
 ];
 
 /// Pre-signing simulation-divergence attribution sub-code.
@@ -1965,6 +2078,15 @@ impl SaError {
                 "sa.webauthn_verifier_provenance_mismatch"
             }
             Self::WebAuthnVerifierSha256Drift { .. } => "sa.webauthn_verifier_sha256_drift",
+            Self::Ed25519VerifierProvenanceMismatch { .. } => {
+                "sa.ed25519_verifier_provenance_mismatch"
+            }
+            Self::Ed25519VerifierSha256Drift { .. } => "sa.ed25519_verifier_sha256_drift",
+            Self::SpendingLimitPolicyProvenanceMismatch { .. } => {
+                "sa.spending_limit_policy_provenance_mismatch"
+            }
+            Self::SpendingLimitPolicySha256Drift { .. } => "sa.spending_limit_policy_sha256_drift",
+            Self::SpendingLimitInstallRefused { .. } => "sa.spending_limit_install_refused",
             Self::NetworksTomlIo { .. } => "sa.networks_toml_io",
             Self::NetworksTomlParse { .. } => "sa.networks_toml_parse",
             Self::WebAuthnAssertionInvalid { reason } => match reason {
@@ -2313,6 +2435,42 @@ mod tests {
                     network: "Test SDF Network ; September 2015".to_owned(),
                     recorded: "abc".to_owned(),
                     attempted: "def".to_owned(),
+                },
+            ),
+            (
+                "sa.ed25519_verifier_provenance_mismatch",
+                SaError::Ed25519VerifierProvenanceMismatch {
+                    expected: "abc".to_owned(),
+                    actual: "def".to_owned(),
+                },
+            ),
+            (
+                "sa.ed25519_verifier_sha256_drift",
+                SaError::Ed25519VerifierSha256Drift {
+                    network: "Test SDF Network ; September 2015".to_owned(),
+                    recorded: "abc".to_owned(),
+                    attempted: "def".to_owned(),
+                },
+            ),
+            (
+                "sa.spending_limit_policy_provenance_mismatch",
+                SaError::SpendingLimitPolicyProvenanceMismatch {
+                    expected: "abc".to_owned(),
+                    actual: "def".to_owned(),
+                },
+            ),
+            (
+                "sa.spending_limit_policy_sha256_drift",
+                SaError::SpendingLimitPolicySha256Drift {
+                    network: "Test SDF Network ; September 2015".to_owned(),
+                    recorded: "abc".to_owned(),
+                    attempted: "def".to_owned(),
+                },
+            ),
+            (
+                "sa.spending_limit_install_refused",
+                SaError::SpendingLimitInstallRefused {
+                    reason: "test".to_owned(),
                 },
             ),
             (
@@ -2779,6 +2937,47 @@ mod tests {
                 &["network", "recorded", "attempted"],
             ),
             (
+                "sa.ed25519_verifier_provenance_mismatch",
+                SaError::Ed25519VerifierProvenanceMismatch {
+                    expected: "abc".to_owned(),
+                    actual: "def".to_owned(),
+                },
+                &["expected", "actual"],
+            ),
+            (
+                "sa.ed25519_verifier_sha256_drift",
+                SaError::Ed25519VerifierSha256Drift {
+                    network: "Test SDF Network ; September 2015".to_owned(),
+                    recorded: "abc".to_owned(),
+                    attempted: "def".to_owned(),
+                },
+                &["network", "recorded", "attempted"],
+            ),
+            (
+                "sa.spending_limit_policy_provenance_mismatch",
+                SaError::SpendingLimitPolicyProvenanceMismatch {
+                    expected: "abc".to_owned(),
+                    actual: "def".to_owned(),
+                },
+                &["expected", "actual"],
+            ),
+            (
+                "sa.spending_limit_policy_sha256_drift",
+                SaError::SpendingLimitPolicySha256Drift {
+                    network: "Test SDF Network ; September 2015".to_owned(),
+                    recorded: "abc".to_owned(),
+                    attempted: "def".to_owned(),
+                },
+                &["network", "recorded", "attempted"],
+            ),
+            (
+                "sa.spending_limit_install_refused",
+                SaError::SpendingLimitInstallRefused {
+                    reason: "test".to_owned(),
+                },
+                &["reason"],
+            ),
+            (
                 "sa.networks_toml_io",
                 SaError::NetworksTomlIo {
                     source: io::Error::other("mock io error"),
@@ -3141,6 +3340,27 @@ mod tests {
                 recorded: "abc".to_owned(),
                 attempted: "def".to_owned(),
             },
+            SaError::Ed25519VerifierProvenanceMismatch {
+                expected: "abc".to_owned(),
+                actual: "def".to_owned(),
+            },
+            SaError::Ed25519VerifierSha256Drift {
+                network: "Test SDF Network ; September 2015".to_owned(),
+                recorded: "abc".to_owned(),
+                attempted: "def".to_owned(),
+            },
+            SaError::SpendingLimitPolicyProvenanceMismatch {
+                expected: "abc".to_owned(),
+                actual: "def".to_owned(),
+            },
+            SaError::SpendingLimitPolicySha256Drift {
+                network: "Test SDF Network ; September 2015".to_owned(),
+                recorded: "abc".to_owned(),
+                attempted: "def".to_owned(),
+            },
+            SaError::SpendingLimitInstallRefused {
+                reason: "test".to_owned(),
+            },
             SaError::NetworksTomlIo {
                 source: io::Error::other("mock io error"),
                 path: PathBuf::from("/mock/path"),
@@ -3312,6 +3532,11 @@ mod tests {
             "sa.webauthn_assertion_invalid:malformed_client_data_json",
             "sa.webauthn_verifier_provenance_mismatch",
             "sa.webauthn_verifier_sha256_drift",
+            "sa.ed25519_verifier_provenance_mismatch",
+            "sa.ed25519_verifier_sha256_drift",
+            "sa.spending_limit_policy_provenance_mismatch",
+            "sa.spending_limit_policy_sha256_drift",
+            "sa.spending_limit_install_refused",
             "sa.networks_toml_io",
             "sa.networks_toml_parse",
             "sa.threshold_policy_not_installed",
@@ -3365,7 +3590,7 @@ mod tests {
             );
         }
 
-        assert_eq!(seen.len(), 57, "closed set must have exactly 57 wire codes");
+        assert_eq!(seen.len(), 62, "closed set must have exactly 62 wire codes");
     }
 
     /// Verifies the sub-code closed set is exhaustively matched by tests.
@@ -3615,12 +3840,12 @@ mod tests {
             stray_literals.join("\n")
         );
 
-        // Also assert that ALL_AUTH_ENTRY_STAGES has the expected 7 entries
+        // Also assert that ALL_AUTH_ENTRY_STAGES has the expected 8 entries
         // so a silent truncation of the const is caught.
         assert_eq!(
             ALL_AUTH_ENTRY_STAGES.len(),
-            7,
-            "ALL_AUTH_ENTRY_STAGES must contain exactly 7 entries"
+            8,
+            "ALL_AUTH_ENTRY_STAGES must contain exactly 8 entries"
         );
     }
 

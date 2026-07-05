@@ -418,6 +418,91 @@ pub async fn complete_authorization_entry(
     })
 }
 
+/// One signer's contribution to the `AuthPayload` `signers` map.
+///
+/// Discriminates how the signer is keyed in the map and carries the 64-byte
+/// signature that becomes the map value. All variants sign the **same**
+/// `auth_digest`; the only difference is the map-key shape and whether the
+/// on-chain `authenticate` branch verifies the signature.
+///
+/// Byte-layout source: OZ `packages/accounts/src/smart_account/storage.rs:96-102`
+/// (SHA `a9c4216`), `pub enum Signer { Delegated(Address), External(Address, Bytes) }`.
+#[derive(Clone, Debug)]
+pub(crate) enum AuthPayloadSigner {
+    /// OZ `Signer::Delegated(Address)`. Map key
+    /// `Vec([Symbol("Delegated"), Address(g_key)])`; the signature is the raw
+    /// ed25519 signature over `auth_digest`, stored for audit-trail
+    /// completeness (the on-chain `authenticate(Delegated)` branch does NOT
+    /// verify this value — it calls `addr.require_auth_for_args((auth_digest,))`
+    /// instead, satisfied by a separate G-key sub-entry;
+    /// `storage.rs:352-354`, SHA `a9c4216`).
+    Delegated {
+        /// The signer's raw ed25519 public-key bytes.
+        pubkey: [u8; 32],
+        /// The raw 64-byte ed25519 signature over `auth_digest`.
+        signature: [u8; 64],
+    },
+    /// OZ `Signer::External(Address, Bytes)` verified by an Ed25519 verifier
+    /// contract. Map key `Vec([Symbol("External"), Address(verifier),
+    /// Bytes(pubkey32)])`; the signature is the raw 64-byte ed25519 signature
+    /// over the 32-byte `auth_digest` and is **load-bearing** — on-chain
+    /// `authenticate(External)` passes `sig_payload = auth_digest.to_bytes()`,
+    /// `key_data`, and this value to `VerifierClient::verify`
+    /// (`storage.rs:341-350`, SHA `a9c4216`), which for the Ed25519 verifier is
+    /// `e.crypto().ed25519_verify(pubkey, auth_digest, signature)`
+    /// (`packages/accounts/src/verifiers/ed25519.rs:31-40`, SHA `a9c4216`).
+    /// There is NO nested host-level auth entry for an External signer.
+    ExternalEd25519 {
+        /// The Ed25519 verifier contract address named by the External signer.
+        verifier: ScAddress,
+        /// The signer's raw 32-byte ed25519 public key (the `key_data`).
+        pubkey: [u8; 32],
+        /// The raw 64-byte ed25519 signature over the 32-byte `auth_digest`.
+        signature: [u8; 64],
+    },
+}
+
+impl AuthPayloadSigner {
+    /// Builds the `signers`-map KEY ScVal for this signer.
+    ///
+    /// - Delegated → `Vec([Symbol("Delegated"), Address(Account(pubkey))])`.
+    /// - ExternalEd25519 → `Vec([Symbol("External"), Address(verifier),
+    ///   Bytes(pubkey32)])` (built via
+    ///   [`crate::managers::signers::build_external_signer_scval`], the
+    ///   single canonical source for the External signer ScVal shape).
+    fn map_key(&self) -> Result<ScVal, SaError> {
+        let auth_payload_err = |reason: String| SaError::AuthEntryConstructionFailed {
+            stage: "auth_payload",
+            redacted_reason: reason,
+        };
+        match self {
+            AuthPayloadSigner::Delegated { pubkey, .. } => {
+                let user_address = ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(
+                    Uint256(*pubkey),
+                )));
+                let delegated_sym = ScSymbol::try_from("Delegated")
+                    .map_err(|e| auth_payload_err(format!("encode Delegated symbol: {e:?}")))?;
+                let key_vec: VecM<ScVal> =
+                    vec![ScVal::Symbol(delegated_sym), ScVal::Address(user_address)]
+                        .try_into()
+                        .map_err(|e| auth_payload_err(format!("encode signer-key ScVec: {e:?}")))?;
+                Ok(ScVal::Vec(Some(ScVec(key_vec))))
+            }
+            AuthPayloadSigner::ExternalEd25519 {
+                verifier, pubkey, ..
+            } => crate::managers::signers::build_external_signer_scval(verifier.clone(), pubkey),
+        }
+    }
+
+    /// Returns the 64-byte signature that becomes the `signers`-map value.
+    fn signature(&self) -> &[u8; 64] {
+        match self {
+            AuthPayloadSigner::Delegated { signature, .. }
+            | AuthPayloadSigner::ExternalEd25519 { signature, .. } => signature,
+        }
+    }
+}
+
 /// Constructs the on-chain canonical `AuthPayload` ScVal for a single
 /// Delegated ed25519 signer.
 ///
@@ -427,37 +512,50 @@ fn build_auth_payload_scval(
     signature_bytes: &[u8; 64],
     context_rule_ids: &[ContextRuleId],
 ) -> Result<ScVal, SaError> {
-    build_multi_signer_auth_payload_scval(&[(pubkey_bytes, *signature_bytes)], context_rule_ids)
+    build_multi_signer_auth_payload_scval(
+        &[AuthPayloadSigner::Delegated {
+            pubkey: pubkey_bytes,
+            signature: *signature_bytes,
+        }],
+        context_rule_ids,
+    )
 }
 
-/// Constructs the on-chain canonical `AuthPayload` ScVal for multiple
-/// Delegated ed25519 signers.
+/// Constructs the on-chain canonical `AuthPayload` ScVal for a heterogeneous
+/// set of Delegated and/or External-Ed25519 signers.
 ///
 /// All signers contribute signatures over the **same** auth digest (produced by
-/// [`build_authorization_entry`] for the shared invocation root). The entries
-/// in the `signers` map are sorted by XDR-encoded key (`Vec([Symbol("Delegated"),
-/// Address(...)])`) in ascending byte order, which is the canonical
-/// `ScMap` sort order enforced by the Soroban host.
+/// [`build_authorization_entry`] for the shared invocation root).
 ///
-/// In practice, because the key XDR encodes as `[discriminant(Vec), ...,
-/// discriminant(Symbol), "Delegated", discriminant(Address),
-/// discriminant(AccountId), pubkey_bytes]`, sorting by pubkey bytes is
-/// equivalent to sorting by the full key XDR for Delegated signers — the
-/// common prefix is identical for all entries.  Both orderings are applied
-/// (sort by pubkey bytes first; XDR-level order is maintained by construction
-/// since pubkey bytes are the only differing suffix for the `Delegated` variant).
+/// # ScMap key ordering
+///
+/// The entries in the `signers` map are sorted by their full key `ScVal` in
+/// ascending order using the `ScVal` `Ord` implementation. `stellar_xdr::ScVal`
+/// derives `Ord`; for `ScVal::Vec` this compares element-wise lexicographically
+/// (with length as the tie-breaker), matching the soroban host's
+/// `Compare<ScVal>` total order that the on-chain `ScMap` validity check
+/// enforces. This is the canonical rule for a heterogeneous signer set: a
+/// Delegated key `Vec([Symbol("Delegated"), Address])` and an External key
+/// `Vec([Symbol("External"), Address, Bytes])` differ at element 0
+/// (`"Delegated"` < `"External"`), so all Delegated entries precede all External
+/// entries; within a kind the order reduces to the differing suffix (pubkey /
+/// verifier). For an all-Delegated set this is byte-identical to sorting by
+/// pubkey bytes (the keys share the `"Delegated"` tag and differ only in the
+/// Account address suffix), so there is no regression for the existing
+/// quorum/multi-signer paths.
 ///
 /// The on-chain canonical shape is
 /// `AuthPayload { signers: Map<Signer, Bytes>, context_rule_ids: Vec<u32> }`
-/// per the OpenZeppelin smart-account contract, with the outer map keys in
-/// canonical order and the signers map encoded over the signer keys.
+/// per the OpenZeppelin smart-account contract
+/// (`packages/accounts/src/smart_account/storage.rs:105-138`, SHA `a9c4216`),
+/// with the outer map keys in canonical alphabetical order.
 ///
 /// # Errors
 ///
 /// Returns [`SaError::AuthEntryConstructionFailed`] with `stage = "auth_payload"` on
 /// any XDR encoding failure or `signers` empty.
 fn build_multi_signer_auth_payload_scval(
-    signers: &[([u8; 32], [u8; 64])],
+    signers: &[AuthPayloadSigner],
     context_rule_ids: &[ContextRuleId],
 ) -> Result<ScVal, SaError> {
     let auth_payload_err = |reason: String| SaError::AuthEntryConstructionFailed {
@@ -471,48 +569,27 @@ fn build_multi_signer_auth_payload_scval(
         ));
     }
 
-    // Sort signers by pubkey bytes for canonical ScMap key order.
-    // For Delegated signers the XDR key is Vec([Symbol("Delegated"), Address(pubkey)]);
-    // since the Symbol prefix is identical for all entries, pubkey bytes are the
-    // effective sort key.
-    //
-    // Sort-by-pubkey is valid only for homogeneous Delegated-only groups.
-    // When External-variant signers are added the Symbol prefix differs
-    // across entries (ScVal::Vec([Symbol("External"), ...])); the sort must
-    // switch to full XDR-encoded-key byte comparison over the hex-encoded
-    // canonical key.
-    // Not yet supported: heterogeneous signer-set sorting.
-    let mut sorted = signers.to_vec();
-    sorted.sort_by_key(|(pk, _)| *pk);
-
-    // Build the signers Map entries.
-    // Key: Vec([Symbol("Delegated"), Address(g_strkey)]) per the OpenZeppelin
-    // smart-account contract's tuple-variant encoding.
-    // Value: Bytes(64-byte signature).
-    let mut signers_map_entries: Vec<ScMapEntry> = Vec::with_capacity(sorted.len());
-    for (pubkey_bytes, sig_bytes) in &sorted {
-        let user_address = ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
-            *pubkey_bytes,
-        ))));
-        let delegated_sym = ScSymbol::try_from("Delegated")
-            .map_err(|e| auth_payload_err(format!("encode Delegated symbol: {e:?}")))?;
-        let signer_key_vec: VecM<ScVal> =
-            vec![ScVal::Symbol(delegated_sym), ScVal::Address(user_address)]
-                .try_into()
-                .map_err(|e| auth_payload_err(format!("encode signer-key ScVec: {e:?}")))?;
-        let signer_key = ScVal::Vec(Some(ScVec(signer_key_vec)));
-
-        let signature_bytes_m: BytesM = sig_bytes
+    // Build (key, value) pairs, then sort by the key ScVal's canonical Ord.
+    let mut keyed: Vec<(ScVal, ScVal)> = Vec::with_capacity(signers.len());
+    for signer in signers {
+        let signer_key = signer.map_key()?;
+        let signature_bytes_m: BytesM = signer
+            .signature()
             .to_vec()
             .try_into()
             .map_err(|e| auth_payload_err(format!("encode signature BytesM: {e:?}")))?;
         let signature_value = ScVal::Bytes(ScBytes(signature_bytes_m));
-
-        signers_map_entries.push(ScMapEntry {
-            key: signer_key,
-            val: signature_value,
-        });
+        keyed.push((signer_key, signature_value));
     }
+
+    // Canonical ScMap key order: ascending by the key ScVal (element-wise for
+    // ScVal::Vec), matching the soroban host's Compare<ScVal>.
+    keyed.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    let signers_map_entries: Vec<ScMapEntry> = keyed
+        .into_iter()
+        .map(|(key, val)| ScMapEntry { key, val })
+        .collect();
 
     let signers_entries: VecM<ScMapEntry> = signers_map_entries
         .try_into()
@@ -608,8 +685,11 @@ pub async fn complete_authorization_entry_multi_signer(
         });
     }
 
-    // Collect (pubkey, signature) pairs for all qualifying signers.
-    let mut signer_pairs: Vec<([u8; 32], [u8; 64])> = Vec::with_capacity(signers.len());
+    // Collect Delegated AuthPayload descriptors for all qualifying signers.
+    // This is the homogeneous Delegated quorum path; the External-Ed25519 arm
+    // is driven through `sign_with_ed25519_rule` /
+    // `complete_authorization_entry_mixed`.
+    let mut descriptors: Vec<AuthPayloadSigner> = Vec::with_capacity(signers.len());
     for signer in signers {
         let pubkey =
             signer
@@ -628,11 +708,14 @@ pub async fn complete_authorization_entry_multi_signer(
                 redacted_reason: format!("auth-digest signing failed: {e}"),
             })?;
 
-        signer_pairs.push((pubkey.0, signature_bytes));
+        descriptors.push(AuthPayloadSigner::Delegated {
+            pubkey: pubkey.0,
+            signature: signature_bytes,
+        });
     }
 
     let auth_payload =
-        build_multi_signer_auth_payload_scval(&signer_pairs, &partial.context_rule_ids)?;
+        build_multi_signer_auth_payload_scval(&descriptors, &partial.context_rule_ids)?;
 
     let credentials = SorobanCredentials::Address(SorobanAddressCredentials {
         address: partial.smart_account,
@@ -645,6 +728,245 @@ pub async fn complete_authorization_entry_multi_signer(
         credentials,
         root_invocation: partial.root_invocation,
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Heterogeneous (Delegated + External-Ed25519) signing
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How one signer authenticates against the smart-account rule.
+///
+/// Byte-layout source: OZ `packages/accounts/src/smart_account/storage.rs:96-102`
+/// (SHA `a9c4216`), `pub enum Signer { Delegated(Address), External(Address, Bytes) }`.
+#[derive(Clone, Debug)]
+pub(crate) enum MixedSignerKind {
+    /// OZ `Signer::Delegated(Address)`: authenticated via a nested host-level
+    /// `require_auth_for_args((auth_digest,))`, which requires a **separate**
+    /// G-key `SorobanAuthorizationEntry` (`storage.rs:352-354`, SHA `a9c4216`).
+    ///
+    /// Part of the heterogeneous-signer contract [`collect_mixed_signer_entries`]
+    /// implements (a caller may mix Delegated and External signers); the
+    /// production caller that supplies a Delegated kind through the mixed
+    /// collector is the CLI submit path, wired alongside the delegation
+    /// acceptance. Exercised by the mixed-set unit tests in the meantime.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "spec-mandated heterogeneous-signer variant; production mixed-collector \
+                      caller lands with the CLI submit wiring; unit-tested now"
+        )
+    )]
+    Delegated,
+    /// OZ `Signer::External(Address, Bytes)` verified by an Ed25519 verifier
+    /// contract at `verifier`: authenticated entirely inside the WASM-to-WASM
+    /// `VerifierClient::verify` call (`storage.rs:341-350`, SHA `a9c4216`).
+    /// There is NO nested host-level auth call, so an External signer needs NO
+    /// secondary G-key sub-entry.
+    ExternalEd25519 {
+        /// The Ed25519 verifier contract address named by the External signer.
+        verifier: ScAddress,
+    },
+}
+
+/// A signer paired with the way it authenticates against the rule.
+///
+/// Used by [`collect_mixed_signer_entries`] to build a heterogeneous signer set
+/// (any mix of Delegated and External-Ed25519 signers) that all sign the same
+/// `auth_digest`.
+pub(crate) struct MixedSigner<'a> {
+    /// The signing capability (raw ed25519 key held by software or keyring).
+    pub signer: &'a (dyn Signer + Send + Sync),
+    /// How this signer authenticates (drives both the AuthPayload key shape and
+    /// whether a G-key sub-entry is emitted).
+    pub kind: MixedSignerKind,
+}
+
+/// Completes a [`PartialSorobanAuthorizationEntry`] for a heterogeneous set of
+/// Delegated and/or External-Ed25519 signers, returning the smart-account auth
+/// entry **plus** exactly one Delegated G-key sub-entry per Delegated signer.
+///
+/// This is the External-Ed25519-capable counterpart to
+/// [`complete_authorization_entry_multi_signer`] +
+/// [`crate::managers::authorization`]'s G-key loop. Every signer signs the same
+/// `partial.auth_digest` via [`Signer::sign_auth_digest`], which for both kinds
+/// produces the raw 64-byte ed25519 signature over the 32-byte digest.
+///
+/// # Delegated vs External routing
+///
+/// - **Delegated** signers are keyed as
+///   `Vec([Symbol("Delegated"), Address(g_key)])` in the AuthPayload `signers`
+///   map, and each one gets a secondary G-key `SorobanAuthorizationEntry` (the
+///   OZ `authenticate(Delegated)` branch calls
+///   `addr.require_auth_for_args((auth_digest,))`, which the host requires an
+///   explicit entry for — `storage.rs:352-354`, SHA `a9c4216`).
+/// - **External-Ed25519** signers are keyed as
+///   `Vec([Symbol("External"), Address(verifier), Bytes(pubkey32)])`, and the
+///   signature value is **load-bearing**: the OZ `authenticate(External)` branch
+///   verifies it inside `VerifierClient::verify` (`storage.rs:341-350`,
+///   SHA `a9c4216`). An External signer therefore gets **no** G-key sub-entry —
+///   building one would target a non-existent G-key address and is unnecessary
+///   because possession is already proven by the verifier-contract call.
+///
+/// The returned vector is `[smart_account_entry, delegated_g_key_entry*]`; its
+/// length is `1 + (number of Delegated signers)`.
+///
+/// # Errors
+///
+/// Returns [`SaError::AuthEntryConstructionFailed`] with `stage = "auth_payload"`
+/// when `signers` is empty, when any signer's `public_key()` / `sign_auth_digest()`
+/// fails, or on any XDR encoding failure.
+pub(crate) async fn collect_mixed_signer_entries(
+    partial: PartialSorobanAuthorizationEntry,
+    signers: &[MixedSigner<'_>],
+    signature_expiration_ledger: u32,
+    network_passphrase: &str,
+) -> Result<Vec<SorobanAuthorizationEntry>, SaError> {
+    if signers.is_empty() {
+        return Err(SaError::AuthEntryConstructionFailed {
+            stage: "auth_payload",
+            redacted_reason: "collect_mixed_signer_entries: signers must not be empty".to_owned(),
+        });
+    }
+
+    let auth_digest: [u8; 32] = partial.auth_digest;
+    let smart_account = partial.smart_account.clone();
+
+    // Build the AuthPayload descriptors: sign the shared auth_digest with each
+    // signer's raw ed25519 key and route by kind.
+    let mut descriptors: Vec<AuthPayloadSigner> = Vec::with_capacity(signers.len());
+    for entry in signers {
+        let pubkey =
+            entry
+                .signer
+                .public_key()
+                .await
+                .map_err(|e| SaError::AuthEntryConstructionFailed {
+                    stage: "auth_payload",
+                    redacted_reason: format!("signer public_key fetch failed: {e}"),
+                })?;
+        let signature_bytes = entry
+            .signer
+            .sign_auth_digest(&auth_digest)
+            .await
+            .map_err(|e| SaError::AuthEntryConstructionFailed {
+                stage: "auth_payload",
+                redacted_reason: format!("auth-digest signing failed: {e}"),
+            })?;
+
+        let descriptor = match &entry.kind {
+            MixedSignerKind::Delegated => AuthPayloadSigner::Delegated {
+                pubkey: pubkey.0,
+                signature: signature_bytes,
+            },
+            MixedSignerKind::ExternalEd25519 { verifier } => AuthPayloadSigner::ExternalEd25519 {
+                verifier: verifier.clone(),
+                pubkey: pubkey.0,
+                signature: signature_bytes,
+            },
+        };
+        descriptors.push(descriptor);
+    }
+
+    let auth_payload =
+        build_multi_signer_auth_payload_scval(&descriptors, &partial.context_rule_ids)?;
+
+    let smart_account_entry = SorobanAuthorizationEntry {
+        credentials: SorobanCredentials::Address(SorobanAddressCredentials {
+            address: partial.smart_account,
+            nonce: partial.nonce,
+            signature_expiration_ledger: partial.signature_expiration_ledger,
+            signature: auth_payload,
+        }),
+        root_invocation: partial.root_invocation,
+    };
+
+    let mut entries: Vec<SorobanAuthorizationEntry> = Vec::with_capacity(1 + signers.len());
+    entries.push(smart_account_entry);
+
+    // Emit a G-key sub-entry ONLY for Delegated signers; External-Ed25519
+    // signers are proven by the verifier-contract call and require none.
+    for entry in signers {
+        if !matches!(entry.kind, MixedSignerKind::Delegated) {
+            continue;
+        }
+        let delegated = build_and_sign_delegated_g_key_entry(
+            &smart_account,
+            &auth_digest,
+            signature_expiration_ledger,
+            entry.signer,
+            network_passphrase,
+        )
+        .await?;
+        entries.push(delegated);
+    }
+
+    Ok(entries)
+}
+
+/// Produces the signed `SorobanAuthorizationEntry` set for an invocation
+/// authorised by a single External-Ed25519 signer.
+///
+/// This is the External-Ed25519 analog of the WebAuthn `sign_with_passkey_rule`
+/// path, without the browser-bridge / ceremony machinery: an External-Ed25519
+/// signer holds a raw ed25519 key, so it signs the auth digest directly with no
+/// UI ceremony, no bridge address, and no polling.
+///
+/// It builds the pre-signature state via [`build_authorization_entry`] — which
+/// runs the rule-ID / simulation-divergence checks that defend every signing
+/// path in this crate — then signs the `auth_digest` with the supplied ed25519
+/// capability and assembles the AuthPayload with the OZ `External` signers-map
+/// entry via the crate-internal mixed-signer collector. Because the signer is
+/// External, the returned set contains exactly the smart-account entry and NO
+/// G-key sub-entry (`storage.rs:341-350`, SHA `a9c4216`).
+///
+/// The `signature_payload` fed to the OZ verifier is the raw 32-byte
+/// `auth_digest` (`storage.rs:346`, SHA `a9c4216`), so [`Signer::sign_auth_digest`]
+/// — which produces a raw ed25519 signature over exactly those 32 bytes — is the
+/// correct primitive.
+///
+/// # Errors
+///
+/// - [`SaError::RuleIdMismatch`] — `rule_ids` empty or misaligned with the
+///   simulation auth-context list.
+/// - [`SaError::SimulationDivergence`] — the simulation context diverges from
+///   the to-be-submitted envelope.
+/// - [`SaError::AuthEntryConstructionFailed`] — signing or XDR-encoding failure.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "irreducible invocation (contract/fn/args/rule_ids) + simulation + envelope + \
+              signer + verifier + passphrase context for the External-Ed25519 signing path; \
+              collapsing into a struct would hide the per-call lifetime contracts of the \
+              borrowed signer and simulation/envelope references"
+)]
+pub async fn sign_with_ed25519_rule(
+    target_contract: ScAddress,
+    function_name: ScSymbol,
+    args: Vec<ScVal>,
+    rule_ids: Vec<ContextRuleId>,
+    simulation: &AuthorizationSimulation,
+    envelope: &EnvelopeContext,
+    signer: &(dyn Signer + Send + Sync),
+    verifier: ScAddress,
+    network_passphrase: &str,
+) -> Result<Vec<SorobanAuthorizationEntry>, SaError> {
+    let partial = build_authorization_entry(
+        target_contract,
+        function_name,
+        args,
+        rule_ids,
+        simulation,
+        envelope,
+    )
+    .await?;
+
+    let expiry = partial.signature_expiration_ledger;
+    let signers = [MixedSigner {
+        signer,
+        kind: MixedSignerKind::ExternalEd25519 { verifier },
+    }];
+
+    collect_mixed_signer_entries(partial, &signers, expiry, network_passphrase).await
 }
 
 /// Builds and signs the secondary "Delegated G-key" auth entry that OZ
@@ -1207,7 +1529,8 @@ mod tests {
     #[test]
     fn multi_signer_auth_payload_empty_signers_returns_error() {
         let rule_ids = vec![ContextRuleId::new(7)];
-        let err = build_multi_signer_auth_payload_scval(&[], &rule_ids).unwrap_err();
+        let empty: &[AuthPayloadSigner] = &[];
+        let err = build_multi_signer_auth_payload_scval(empty, &rule_ids).unwrap_err();
 
         assert!(
             matches!(
@@ -1240,8 +1563,11 @@ mod tests {
         let signature = [0xAAu8; 64];
         let rule_ids = vec![ContextRuleId::new(1), ContextRuleId::new(5)];
 
-        let scval = build_multi_signer_auth_payload_scval(&[(pubkey, signature)], &rule_ids)
-            .expect("single signer must succeed");
+        let scval = build_multi_signer_auth_payload_scval(
+            &[AuthPayloadSigner::Delegated { pubkey, signature }],
+            &rule_ids,
+        )
+        .expect("single signer must succeed");
 
         let ScVal::Map(Some(ScMap(outer))) = &scval else {
             panic!("AuthPayload must be ScVal::Map");
@@ -1308,9 +1634,20 @@ mod tests {
         let rule_ids = vec![ContextRuleId::new(3)];
 
         // Supply in reversed order — hi before lo.
-        let scval =
-            build_multi_signer_auth_payload_scval(&[(pk_hi, sig_hi), (pk_lo, sig_lo)], &rule_ids)
-                .expect("two signers must succeed");
+        let scval = build_multi_signer_auth_payload_scval(
+            &[
+                AuthPayloadSigner::Delegated {
+                    pubkey: pk_hi,
+                    signature: sig_hi,
+                },
+                AuthPayloadSigner::Delegated {
+                    pubkey: pk_lo,
+                    signature: sig_lo,
+                },
+            ],
+            &rule_ids,
+        )
+        .expect("two signers must succeed");
 
         let ScVal::Map(Some(ScMap(outer))) = &scval else {
             panic!("outer must be Map")
@@ -1848,5 +2185,268 @@ mod tests {
         let vk = VerifyingKey::from_bytes(&pubkey.0).unwrap();
         vk.verify(&saved_auth_digest, &signature)
             .expect("signature must verify against auth_digest using signer pubkey");
+    }
+
+    // ── External-Ed25519 auth-payload arm ────────────────────────────────────
+
+    fn ed25519_signature_over(seed: [u8; 32], digest: &[u8; 32]) -> ([u8; 32], [u8; 64]) {
+        use ed25519_dalek::{Signer as _, SigningKey};
+        let sk = SigningKey::from_bytes(&seed);
+        let pk = sk.verifying_key().to_bytes();
+        let sig = sk.sign(digest).to_bytes();
+        (pk, sig)
+    }
+
+    /// A single External-Ed25519 signer produces the OZ External signers-map
+    /// entry: key `Vec([Symbol("External"), Address(verifier), Bytes(pubkey32)])`
+    /// and value `Bytes(sig64)`, where the signature is a RAW ed25519 signature
+    /// over the 32-byte `auth_digest` (not a preimage-wrapped variant) that
+    /// independently verifies against the pubkey.
+    ///
+    /// Byte-layout: OZ `storage.rs:96-102` (Signer::External three-element key)
+    /// and `storage.rs:341-350` (`sig_payload = auth_digest.to_bytes()`),
+    /// SHA `a9c4216`.
+    #[test]
+    fn external_ed25519_auth_payload_shape_and_signature() {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        let auth_digest = [0x33u8; 32];
+        let verifier = contract_address(0x99);
+        let (pubkey, signature) = ed25519_signature_over([0x05u8; 32], &auth_digest);
+        let rule_ids = vec![ContextRuleId::new(4)];
+
+        let scval = build_multi_signer_auth_payload_scval(
+            &[AuthPayloadSigner::ExternalEd25519 {
+                verifier: verifier.clone(),
+                pubkey,
+                signature,
+            }],
+            &rule_ids,
+        )
+        .expect("external signer must succeed");
+
+        let ScVal::Map(Some(ScMap(outer))) = &scval else {
+            panic!("AuthPayload must be Map");
+        };
+        let ScVal::Map(Some(ScMap(signers_map))) = &outer[1].val else {
+            panic!("signers val must be Map");
+        };
+        assert_eq!(signers_map.len(), 1);
+
+        // Key: Vec([Symbol("External"), Address(verifier), Bytes(pubkey32)]).
+        let ScVal::Vec(Some(ScVec(key_vec))) = &signers_map[0].key else {
+            panic!("signer key must be Vec")
+        };
+        assert_eq!(key_vec.len(), 3, "External key has three elements");
+        let ScVal::Symbol(tag) = &key_vec[0] else {
+            panic!("tag must be Symbol")
+        };
+        assert_eq!(tag.to_utf8_string_lossy(), "External");
+        assert_eq!(
+            key_vec[1],
+            ScVal::Address(verifier),
+            "element 1 must be the verifier address"
+        );
+        let ScVal::Bytes(ScBytes(kd)) = &key_vec[2] else {
+            panic!("element 2 must be Bytes")
+        };
+        let kd_vec: Vec<u8> = kd.clone().into();
+        assert_eq!(
+            kd_vec.as_slice(),
+            &pubkey,
+            "key_data must be the raw pubkey"
+        );
+
+        // Value: Bytes(64) — the raw ed25519 signature over auth_digest.
+        let ScVal::Bytes(ScBytes(sig_bytesm)) = &signers_map[0].val else {
+            panic!("signer val must be Bytes")
+        };
+        let sig_vec: Vec<u8> = sig_bytesm.clone().into();
+        assert_eq!(sig_vec.len(), 64);
+        let sig_arr: [u8; 64] = sig_vec.try_into().unwrap();
+        assert_eq!(sig_arr, signature);
+
+        // The signature must verify against pubkey + the RAW auth_digest.
+        let vk = VerifyingKey::from_bytes(&pubkey).unwrap();
+        vk.verify(&auth_digest, &Signature::from_bytes(&sig_arr))
+            .expect("External Ed25519 signature must verify over the raw auth_digest");
+    }
+
+    /// A mixed Delegated + External signer set orders the `signers` map by
+    /// canonical `ScVal` `Ord`: the Delegated entry (tag `"Delegated"`) precedes
+    /// the External entry (tag `"External"`) because element 0 differs and
+    /// `"Delegated" < "External"`. Verified regardless of insertion order.
+    #[test]
+    fn mixed_delegated_external_scmap_ordering() {
+        let auth_digest = [0x44u8; 32];
+        let verifier = contract_address(0xAB);
+        let (ext_pk, ext_sig) = ed25519_signature_over([0x06u8; 32], &auth_digest);
+        // Delegated pubkey chosen high (0xff..) to prove ordering is by tag,
+        // not by pubkey bytes — a pubkey-only sort could otherwise misorder.
+        let del_pk = [0xffu8; 32];
+        let del_sig = [0x01u8; 64];
+        let rule_ids = vec![ContextRuleId::new(9)];
+
+        // Insert External first to prove the sort reorders it after Delegated.
+        let scval = build_multi_signer_auth_payload_scval(
+            &[
+                AuthPayloadSigner::ExternalEd25519 {
+                    verifier,
+                    pubkey: ext_pk,
+                    signature: ext_sig,
+                },
+                AuthPayloadSigner::Delegated {
+                    pubkey: del_pk,
+                    signature: del_sig,
+                },
+            ],
+            &rule_ids,
+        )
+        .expect("mixed signer set must succeed");
+
+        let ScVal::Map(Some(ScMap(outer))) = &scval else {
+            panic!("AuthPayload must be Map")
+        };
+        let ScVal::Map(Some(ScMap(signers_map))) = &outer[1].val else {
+            panic!("signers val must be Map")
+        };
+        assert_eq!(signers_map.len(), 2);
+
+        // First entry must be Delegated, second External.
+        let ScVal::Vec(Some(ScVec(k0))) = &signers_map[0].key else {
+            panic!("k0 must be Vec")
+        };
+        let ScVal::Symbol(t0) = &k0[0] else {
+            panic!("k0[0] Symbol")
+        };
+        assert_eq!(
+            t0.to_utf8_string_lossy(),
+            "Delegated",
+            "Delegated must sort before External"
+        );
+        let ScVal::Vec(Some(ScVec(k1))) = &signers_map[1].key else {
+            panic!("k1 must be Vec")
+        };
+        let ScVal::Symbol(t1) = &k1[0] else {
+            panic!("k1[0] Symbol")
+        };
+        assert_eq!(t1.to_utf8_string_lossy(), "External");
+
+        // The map key ordering must equal the canonical ScVal Ord (the rule the
+        // soroban host enforces): sorting the keys must be a no-op.
+        let mut keys: Vec<&ScVal> = signers_map.iter().map(|e| &e.key).collect();
+        let before = keys.clone();
+        keys.sort();
+        assert_eq!(
+            keys, before,
+            "signers map keys must already be in ScVal Ord"
+        );
+    }
+
+    /// `collect_mixed_signer_entries` emits a Delegated G-key sub-entry ONLY for
+    /// Delegated signers: an External-only set yields exactly one entry (the
+    /// smart-account entry, no G-key), and a mixed set yields one smart-account
+    /// entry plus exactly one G-key entry per Delegated signer.
+    #[tokio::test]
+    async fn collect_mixed_signer_entries_gkey_only_for_delegated() {
+        use stellar_agent_network::SoftwareSigningKey;
+
+        let (simulation, envelope) = contexts();
+        let rule_ids = vec![ContextRuleId::new(42)];
+        let network_passphrase = "Test SDF Network ; September 2015";
+        let verifier = contract_address(0xC1);
+
+        let make_partial = || {
+            build_authorization_entry(
+                contract_address(7),
+                symbol("transfer"),
+                vec![],
+                rule_ids.clone(),
+                &simulation,
+                &envelope,
+            )
+        };
+
+        let del_a = SoftwareSigningKey::new_from_bytes([0x11u8; 32]);
+        let del_b = SoftwareSigningKey::new_from_bytes([0x12u8; 32]);
+        let ext = SoftwareSigningKey::new_from_bytes([0x13u8; 32]);
+
+        // External-only qualifying set → one entry, no G-key sub-entry.
+        {
+            let partial = make_partial().await.unwrap();
+            let signers = [MixedSigner {
+                signer: &ext,
+                kind: MixedSignerKind::ExternalEd25519 {
+                    verifier: verifier.clone(),
+                },
+            }];
+            let entries = collect_mixed_signer_entries(
+                partial,
+                &signers,
+                simulation.signature_expiration_ledger,
+                network_passphrase,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                entries.len(),
+                1,
+                "External-only set must produce zero G-key sub-entries"
+            );
+        }
+
+        // Mixed set (2 Delegated + 1 External) → 1 + 2 = 3 entries.
+        {
+            let partial = make_partial().await.unwrap();
+            let signers = [
+                MixedSigner {
+                    signer: &del_a,
+                    kind: MixedSignerKind::Delegated,
+                },
+                MixedSigner {
+                    signer: &ext,
+                    kind: MixedSignerKind::ExternalEd25519 {
+                        verifier: verifier.clone(),
+                    },
+                },
+                MixedSigner {
+                    signer: &del_b,
+                    kind: MixedSignerKind::Delegated,
+                },
+            ];
+            let entries = collect_mixed_signer_entries(
+                partial,
+                &signers,
+                simulation.signature_expiration_ledger,
+                network_passphrase,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                entries.len(),
+                3,
+                "mixed set must produce exactly one G-key sub-entry per Delegated signer"
+            );
+
+            // The first entry is the smart-account entry (its credentials
+            // address is the smart-account contract, not a G-key).
+            let SorobanCredentials::Address(sa) = &entries[0].credentials else {
+                panic!("first entry must be Address credentials")
+            };
+            assert!(
+                matches!(sa.address, ScAddress::Contract(_)),
+                "first entry must be the smart-account contract entry"
+            );
+            // The two sub-entries must be G-key (Account) credentials.
+            for e in &entries[1..] {
+                let SorobanCredentials::Address(c) = &e.credentials else {
+                    panic!("sub-entry must be Address credentials")
+                };
+                assert!(
+                    matches!(c.address, ScAddress::Account(_)),
+                    "sub-entries must be Delegated G-key (Account) entries"
+                );
+            }
+        }
     }
 }

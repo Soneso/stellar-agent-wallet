@@ -124,6 +124,53 @@ pub struct MulticallCheck {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Ed25519RuleSigner
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// External-Ed25519 rule signer for the single-signer submit path.
+///
+/// Selects the OZ `Signer::External(Address, Bytes)` authentication branch
+/// (`packages/accounts/src/smart_account/storage.rs:96-102`, SHA `a9c4216`)
+/// instead of the default `Signer::Delegated(Address)` branch used by the
+/// single-signer path when [`SubmitInvokeArgs::ed25519_rule_signer`] is
+/// `None`. An External-Ed25519 signer authenticates entirely inside the
+/// `VerifierClient::verify` WASM-to-WASM call (`storage.rs:341-350`, SHA
+/// `a9c4216`) and therefore needs no G-key sub-entry: [`submit_signed_invoke`]
+/// routes to the crate-internal `collect_mixed_signer_entries` mixed-signer
+/// collector with a single `MixedSignerKind::ExternalEd25519` descriptor
+/// instead of calling `complete_authorization_entry` +
+/// `build_and_sign_delegated_g_key_entry`.
+///
+/// # Recommended agent-signer doctrine
+///
+/// This is the preferred signer shape for an autonomous agent's own signing
+/// key: it needs no funded classic (`G...`) account (unlike `Delegated`,
+/// which requires a G-key `SorobanAuthorizationEntry` satisfied by a live
+/// classic account), can be held in an HSM or keyring, and rotates cheaply
+/// (updating the OZ `External` signer entry is a policy-mutator call, not an
+/// account-funding operation).
+///
+/// # Mutual exclusivity
+///
+/// Mutually exclusive with [`SubmitInvokeArgs::authorization`] (the quorum
+/// path): supplying both returns [`SaError::AuthEntryConstructionFailed`]
+/// before any network I/O (checked at the top of [`submit_signed_invoke`],
+/// ahead of the required-check enforcement).
+pub struct Ed25519RuleSigner<'a> {
+    /// The raw ed25519 signing capability that authenticates via the
+    /// `verifier` contract.
+    ///
+    /// Distinct from [`SubmitInvokeArgs::signer`], which remains the
+    /// source-account / envelope-signing key in both the Delegated and
+    /// External-Ed25519 paths.
+    pub signer: &'a (dyn Signer + Send + Sync),
+
+    /// The Ed25519 verifier contract address named by the OZ
+    /// `Signer::External(Address, Bytes)` entry.
+    pub verifier: ScAddress,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ResolvedFeePerOp
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -220,6 +267,10 @@ pub struct SubmitInvokeResult {
 ///   - `multicall_check: None`
 ///   - `required_checks: &[]`
 ///   - `emit_observability_logs: false`
+/// - Callers signing with an External-Ed25519 rule signer (see the
+///   recommended-agent-signer doctrine on [`Ed25519RuleSigner`]) pass:
+///   - `ed25519_rule_signer: Some(Ed25519RuleSigner { signer, verifier })`
+///   - `authorization: None` (mutually exclusive; see [`Ed25519RuleSigner`])
 const EMPTY_REQUIRED_CHECKS: &[&str] = &[];
 
 /// Arguments for [`submit_signed_invoke`].
@@ -366,6 +417,25 @@ pub struct SubmitInvokeArgs<'a> {
     /// participant.
     #[builder(default = &[])]
     pub signers: &'a [&'a (dyn Signer + Send + Sync)],
+
+    /// External-Ed25519 rule signer for the single-signer path (`None` for
+    /// single-signer callers, which keeps the original `Signer::Delegated`
+    /// G-key path unchanged).
+    ///
+    /// When `Some`, `submit_signed_invoke`'s single-signer branch routes to
+    /// the crate-internal `collect_mixed_signer_entries` mixed-signer
+    /// collector with a single `ExternalEd25519` descriptor instead of
+    /// calling `complete_authorization_entry` +
+    /// `build_and_sign_delegated_g_key_entry` — see [`Ed25519RuleSigner`] for
+    /// the on-chain rationale and the recommended-agent-signer doctrine.
+    ///
+    /// # Fail-closed invariant
+    ///
+    /// Mutually exclusive with `authorization` (the quorum path): supplying
+    /// both is a caller programming error and `submit_signed_invoke` refuses
+    /// immediately with [`SaError::AuthEntryConstructionFailed`], before any
+    /// network I/O.
+    pub ed25519_rule_signer: Option<Ed25519RuleSigner<'a>>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -427,6 +497,23 @@ pub async fn submit_signed_invoke(
     args: SubmitInvokeArgs<'_>,
 ) -> Result<SubmitInvokeResult, SaError> {
     assert_submit_invoke_args_invariants(&args);
+
+    // ── Signing-path mutual-exclusivity guard — execute FIRST before any I/O ──
+    // `ed25519_rule_signer` (External-Ed25519, no G-key sub-entry) and
+    // `authorization` (the quorum path) select different auth-entry
+    // construction strategies; supplying both is a caller programming error.
+    // Fail-CLOSED before any network round-trip, mirroring the required-check
+    // enforcement below.
+    if args.authorization.is_some() && args.ed25519_rule_signer.is_some() {
+        return Err(SaError::AuthEntryConstructionFailed {
+            stage: "ed25519_rule_signer_quorum_guard",
+            redacted_reason: format!(
+                "{}: ed25519_rule_signer and authorization (quorum) are mutually exclusive; \
+                 a caller must supply at most one signing-path selector",
+                args.op_label
+            ),
+        });
+    }
 
     let auth_payload_err = |reason: String| SaError::AuthEntryConstructionFailed {
         stage: "auth_payload",
@@ -980,23 +1067,53 @@ pub async fn submit_signed_invoke(
         // Patch credential address: the simulate-returned root_invocation's
         // contract may differ from the credential address when an external
         // contract calls `wallet.require_auth()`.  The credential MUST identify
-        // the wallet, not the external contract.
+        // the wallet, not the external contract.  This patch applies
+        // identically to both signing arms below — the credential address is
+        // orthogonal to which OZ `Signer` variant authenticates it.
         partial.smart_account = auth_scaddr.clone();
 
-        // Sign the auth-digest.
-        let signed_entry = complete_authorization_entry(partial.clone(), args.signer).await?;
+        // Route on `ed25519_rule_signer`: External-Ed25519 (no G-key
+        // sub-entry, authenticated inside `VerifierClient::verify`) vs the
+        // default Delegated G-key path (nested `require_auth_for_args`
+        // satisfied by a separate G-key entry).  See `Ed25519RuleSigner`'s
+        // rustdoc for the on-chain rationale.
+        if let Some(rule_signer) = &args.ed25519_rule_signer {
+            // External-Ed25519 arm: sign via the crate-internal mixed-signer
+            // collector with a single descriptor.  Reuses the SAME
+            // `collect_mixed_signer_entries` substrate the quorum path uses
+            // for heterogeneous signer sets (auth_entry.rs), so the
+            // `AuthPayload` ScVal shape and the "no G-key for External"
+            // omission are covered by that function's own offline tests.
+            let mixed_signers = [crate::managers::auth_entry::MixedSigner {
+                signer: rule_signer.signer,
+                kind: crate::managers::auth_entry::MixedSignerKind::ExternalEd25519 {
+                    verifier: rule_signer.verifier.clone(),
+                },
+            }];
+            crate::managers::auth_entry::collect_mixed_signer_entries(
+                partial,
+                &mixed_signers,
+                signature_expiration_ledger,
+                args.network_passphrase,
+            )
+            .await?
+        } else {
+            // Delegated arm (unchanged): sign the auth-digest, then build the
+            // secondary G-key sub-auth entry `__check_auth` requires for
+            // `Signer::Delegated(addr)`.
+            let signed_entry = complete_authorization_entry(partial.clone(), args.signer).await?;
 
-        // OZ Delegated G-key sub-auth entry (required by __check_auth).
-        let delegated_entry: SorobanAuthorizationEntry = build_and_sign_delegated_g_key_entry(
-            &auth_scaddr,
-            &partial.auth_digest,
-            signature_expiration_ledger,
-            args.signer,
-            args.network_passphrase,
-        )
-        .await?;
+            let delegated_entry: SorobanAuthorizationEntry = build_and_sign_delegated_g_key_entry(
+                &auth_scaddr,
+                &partial.auth_digest,
+                signature_expiration_ledger,
+                args.signer,
+                args.network_passphrase,
+            )
+            .await?;
 
-        vec![signed_entry, delegated_entry]
+            vec![signed_entry, delegated_entry]
+        }
     };
 
     // ── Simulation-audit fingerprint capture ─────────────────────────────────
@@ -1572,6 +1689,163 @@ mod tests {
             fp_from_vec, fp_from_xdr,
             "byte-identity invariant violated: auth entries extracted from \
              the envelope XDR do not match the entries embedded in it"
+        );
+    }
+
+    // ── Ed25519RuleSigner: mutual-exclusivity guard ──────────────────────────
+
+    /// `submit_signed_invoke` refuses immediately — before any network I/O —
+    /// when a caller supplies both `authorization` (quorum) and
+    /// `ed25519_rule_signer`. The guard is the first statement in the
+    /// function body, ahead of the required-check loop and every `.await`
+    /// that touches the network, so this test drives the real production
+    /// function (not a stand-in) without a live RPC endpoint: `primary_rpc_url`
+    /// is a URL that is never dialed.
+    #[tokio::test]
+    async fn submit_signed_invoke_rejects_ed25519_rule_signer_with_quorum_before_network_io() {
+        use crate::managers::authorization::{AuthorizationInfo, Combinator};
+        use stellar_agent_network::SoftwareSigningKey;
+
+        let dummy_strkey = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        let rule_signer_key = SoftwareSigningKey::new_from_bytes([0x21u8; 32]);
+        let verifier = ScAddress::Contract(ContractId(Hash([0x22u8; 32])));
+        let authz = AuthorizationInfo::new(vec![], Combinator::And);
+
+        let args = SubmitInvokeArgs::builder()
+            .target_contract(dummy_strkey)
+            .auth_rule_ids(&[])
+            .host_function(HostFunction::InvokeContract(InvokeContractArgs {
+                contract_address: ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+                function_name: ScSymbol::try_from("fn").unwrap(),
+                args: VecM::default(),
+            }))
+            .signer(&STUB_SIGNER)
+            .primary_rpc_url("http://stub-must-not-be-dialed.invalid")
+            .network_passphrase("stub")
+            .chain_id("stub")
+            .timeout(std::time::Duration::from_secs(10))
+            .op_label("test_op")
+            .maybe_authorization(Some(&authz))
+            .ed25519_rule_signer(Ed25519RuleSigner {
+                signer: &rule_signer_key,
+                verifier,
+            })
+            .build();
+
+        let err = submit_signed_invoke(args).await.unwrap_err();
+        assert_eq!(err.wire_code(), "sa.auth_entry_construction_failed");
+    }
+
+    // ── Ed25519RuleSigner: single-signer routing composition ────────────────
+
+    /// The External-Ed25519 single-signer arm added to `submit_signed_invoke`
+    /// (Step 5) reuses `collect_mixed_signer_entries` with a single
+    /// `ExternalEd25519` descriptor. This test exercises the exact composition
+    /// the arm performs — build a partial via `build_authorization_entry`
+    /// (pure computation, no network I/O), patch `partial.smart_account` to
+    /// the wallet address (the same credential patch the arm applies for
+    /// external-contract calls), then sign via the mixed-signer collector —
+    /// and asserts:
+    ///  - exactly one `SorobanAuthorizationEntry` is produced (no G-key
+    ///    sub-entry, per the OZ `authenticate(External)` on-chain branch,
+    ///    `storage.rs:341-350`, SHA `a9c4216`);
+    ///  - the entry's credential address is the patched wallet address, not
+    ///    the invocation-target contract the partial was originally built for
+    ///    (the external-contract shape, e.g. `SAC.transfer` invoked as a
+    ///    sub-invocation of an external router).
+    #[tokio::test]
+    async fn ed25519_rule_signer_arm_patches_credential_and_omits_g_key() {
+        use crate::managers::auth_entry::{
+            MixedSigner, MixedSignerKind, build_authorization_entry, collect_mixed_signer_entries,
+        };
+        use crate::signing::divergence::AuthContextFingerprint;
+        use stellar_agent_network::SoftwareSigningKey;
+
+        let rule_ids = vec![ContextRuleId::new(0)];
+        let context = SimulationContext {
+            context_rule_ids: rule_ids.clone(),
+            auth_contexts: vec![AuthContextFingerprint::new(
+                "invoke:ed25519-rule-test".to_owned(),
+            )],
+            network: NetworkContext {
+                passphrase_fingerprint: "testnet".to_owned(),
+                ledger_protocol_version: 23,
+                chain_id_fingerprint: "00112233".to_owned(),
+            },
+            sequence: SequenceContext {
+                source_account_sequence: 100,
+                min_sequence_number: None,
+            },
+            fee_envelope: FeeEnvelopeContext {
+                tx_fee: 100,
+                resource_fee: 1000,
+            },
+        };
+        let envelope = EnvelopeContext {
+            context_rule_ids: context.context_rule_ids.clone(),
+            auth_contexts: context.auth_contexts.clone(),
+            network: context.network.clone(),
+            sequence: context.sequence.clone(),
+            fee_envelope: context.fee_envelope.clone(),
+        };
+        let simulation = AuthorizationSimulation {
+            context,
+            network_id: [9; 32],
+            nonce: 123,
+            signature_expiration_ledger: 456,
+        };
+
+        // The invocation-target contract differs from the wallet address —
+        // mirroring the external-contract shape.
+        let invocation_target = ScAddress::Contract(ContractId(Hash([0x30u8; 32])));
+        let wallet_address = ScAddress::Contract(ContractId(Hash([0x40u8; 32])));
+        let verifier = ScAddress::Contract(ContractId(Hash([0x50u8; 32])));
+
+        let mut partial = build_authorization_entry(
+            invocation_target,
+            ScSymbol::try_from("transfer").unwrap(),
+            vec![],
+            rule_ids,
+            &simulation,
+            &envelope,
+        )
+        .await
+        .unwrap();
+
+        // The credential-address patch `submit_signed_invoke`'s single-signer
+        // branch applies before routing to either signing arm.
+        partial.smart_account = wallet_address.clone();
+
+        let rule_signer_key = SoftwareSigningKey::new_from_bytes([0x60u8; 32]);
+        let mixed_signers = [MixedSigner {
+            signer: &rule_signer_key,
+            kind: MixedSignerKind::ExternalEd25519 {
+                verifier: verifier.clone(),
+            },
+        }];
+
+        let entries = collect_mixed_signer_entries(
+            partial,
+            &mixed_signers,
+            simulation.signature_expiration_ledger,
+            "Test SDF Network ; September 2015",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            entries.len(),
+            1,
+            "External-Ed25519 single-signer arm must produce exactly one entry \
+             (no G-key sub-entry)"
+        );
+        let SorobanCredentials::Address(creds) = &entries[0].credentials else {
+            panic!("entry must carry Address credentials");
+        };
+        assert_eq!(
+            creds.address, wallet_address,
+            "credential address must be the patched wallet address, not the \
+             invocation-target contract"
         );
     }
 }

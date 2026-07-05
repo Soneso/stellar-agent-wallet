@@ -51,6 +51,22 @@ const WASM_PINS: &[WasmPin] = &[
         path: "../../vendor/oz-threshold-policy/v0.7.2/multisig_threshold_policy_example.wasm",
         expected_sha256: "4c14f402df29675d4155283698c436ee588aacb39adc313845010a565c07567d",
     },
+    // OZ multisig-ed25519-verifier-example v0.7.2 WASM. Deploy-time artefact
+    // embedded by ed25519_verifier.rs::ED25519_VERIFIER_WASM; the deployable
+    // Ed25519 signature verifier for External-Ed25519 signers.
+    WasmPin {
+        label: "multisig_ed25519_verifier_example.wasm",
+        path: "../../vendor/oz-ed25519-verifier/v0.7.2/multisig_ed25519_verifier_example.wasm",
+        expected_sha256: "ea13b07083a8275e7bade954e4ccc1827495f253c18dc06edcc49104c11fb725",
+    },
+    // OZ multisig-spending-limit-policy-example v0.7.2 WASM. Deploy-time artefact
+    // embedded by spending_limit_policy.rs::SPENDING_LIMIT_POLICY_WASM; the
+    // deployable per-network spending-limit policy singleton.
+    WasmPin {
+        label: "multisig_spending_limit_policy_example.wasm",
+        path: "../../vendor/oz-spending-limit-policy/v0.7.2/multisig_spending_limit_policy_example.wasm",
+        expected_sha256: "0e8da0ccff5c444520085ac1973d3c8023fdd04f727ee11ae7290a49dffbbaf5",
+    },
 ];
 
 fn main() {

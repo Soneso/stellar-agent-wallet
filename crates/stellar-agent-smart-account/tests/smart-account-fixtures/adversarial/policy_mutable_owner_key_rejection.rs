@@ -13,8 +13,8 @@
 
 use std::sync::Arc;
 
-use stellar_agent_smart_account::bindings::ContextRuleType;
 use stellar_agent_smart_account::error::SaError;
+use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRulePolicy, ContextRuleSignerInput,
 };
@@ -132,7 +132,7 @@ async fn policy_with_owner_key_rejected_without_override() {
 
     // Rule with one Delegated signer (no verifier) and one mutable policy.
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "mutable-policy-test".to_owned(),
         None,
         vec![ContextRuleSignerInput::Delegated {

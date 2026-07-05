@@ -76,13 +76,13 @@ use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::{
     Signer, SoftwareSigningKey, StellarRpcClient, fetch_account, submit_transaction_and_wait,
 };
-use stellar_agent_smart_account::bindings::ContextRuleType;
 use stellar_agent_smart_account::deployment::{
     DeployerKeypair, DeploymentArgs, ResolvedFeePerOp, deploy_smart_account,
     derive_smart_account_address,
 };
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::credentials::{CredentialsError, CredentialsManager};
+use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRulePolicy,
     ContextRuleSignerInput, parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
@@ -526,7 +526,7 @@ async fn install_threshold_policy_on_fresh_sa(
     let threshold_params = encode_simple_threshold_params(1); // 1-of-1 rule
 
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "b-test-rule".to_owned(),
         None,
         vec![ContextRuleSignerInput::Delegated {
@@ -1471,7 +1471,7 @@ async fn b2_set_threshold_single_op() {
     let threshold_params = encode_simple_threshold_params(1); // install with threshold=1
 
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "b2-set-threshold".to_owned(),
         None,
         vec![

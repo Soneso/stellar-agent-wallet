@@ -82,6 +82,7 @@ SUITES=(
   "stellar-agent-smart-account testnet-integration smart_account_multicall_testnet_acceptance"
   "stellar-agent-smart-account testnet-integration smart_account_timelock_testnet_acceptance"
   "stellar-agent-smart-account testnet-integration smart_account_rules_webauthn_testnet_acceptance"
+  "stellar-agent-smart-account testnet-integration smart_account_delegation_testnet_acceptance"
   "stellar-agent-approval-remote testnet-acceptance remote_approval_browser_testnet_acceptance"
 )
 

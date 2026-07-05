@@ -30,11 +30,13 @@
 
 pub mod bindings;
 pub mod deployment;
+pub mod ed25519_verifier;
 pub mod error;
 pub mod managers;
 pub mod multicall;
 pub mod signers;
 pub mod signing;
+pub mod spending_limit_policy;
 pub mod submit;
 pub mod timelock;
 pub(crate) mod timelock_submit;

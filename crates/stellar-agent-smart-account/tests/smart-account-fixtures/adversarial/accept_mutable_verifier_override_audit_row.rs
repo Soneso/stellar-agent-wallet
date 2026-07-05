@@ -15,7 +15,7 @@ use std::sync::Arc;
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::{ContractKind, EventKind};
 use stellar_agent_smart_account::VERIFIER_ALLOWLIST;
-use stellar_agent_smart_account::bindings::ContextRuleType;
+use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{ContextRuleDefinition, ContextRuleSignerInput};
 use stellar_agent_smart_account::managers::verifiers::pin_referenced_contracts;
 use stellar_xdr::{
@@ -144,7 +144,7 @@ async fn accept_mutable_verifier_succeeds_and_emits_override_audit_row() {
     );
 
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         "accept-mutable-verifier-test".to_owned(),
         None,
         vec![ContextRuleSignerInput::External {

@@ -104,7 +104,6 @@ use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::is_loopback_http_url;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::{Signer, SoftwareSigningKey};
-use stellar_agent_smart_account::bindings::ContextRuleType;
 use stellar_agent_smart_account::deployment::{
     DeployerKeypair, DeploymentArgs, ResolvedFeePerOp, deploy_smart_account,
     deploy_webauthn_verifier,
@@ -112,6 +111,7 @@ use stellar_agent_smart_account::deployment::{
 use stellar_agent_smart_account::managers::credentials::{
     AddPasskeyOutcome, CredentialsManager, SignWithPasskeyOutcome,
 };
+use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRuleSignerInput,
     parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
@@ -746,7 +746,7 @@ async fn webauthn_passkey_signing_testnet_acceptance() {
         parse_g_strkey_to_signer_address(&signer_g).expect("signer G-strkey must parse");
 
     let definition = ContextRuleDefinition::new(
-        ContextRuleType::Default,
+        RuleContext::Default,
         // OZ MAX_NAME_SIZE = 20 bytes.
         "c10-webauthn".to_owned(),
         None,
