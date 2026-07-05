@@ -24,7 +24,10 @@
 # and the rule-proposal remote browser suite
 # (rule_proposal_remote_browser_testnet_acceptance) each launch a headless
 # Chromium and need chromium/google-chrome on PATH or the CHROME env var
-# pointing at the executable.
+# pointing at the executable. The ergonomics suite
+# (smart_account_ergonomics_testnet_acceptance) has the same Chromium
+# dependency for its ONE `#[ignore]`d passkey-genesis test only — its other
+# five tests need no browser.
 #
 # The multicall suite's happy-path test additionally wants
 # STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS and
@@ -86,6 +89,7 @@ SUITES=(
   "stellar-agent-smart-account testnet-integration smart_account_rules_webauthn_testnet_acceptance"
   "stellar-agent-smart-account testnet-integration smart_account_delegation_testnet_acceptance"
   "stellar-agent-smart-account testnet-integration smart_account_policy_observability_testnet_acceptance"
+  "stellar-agent-smart-account testnet-integration smart_account_ergonomics_testnet_acceptance"
   "stellar-agent-approval-remote testnet-acceptance remote_approval_browser_testnet_acceptance"
   "stellar-agent-approval-remote testnet-acceptance rule_proposal_remote_browser_testnet_acceptance"
 )

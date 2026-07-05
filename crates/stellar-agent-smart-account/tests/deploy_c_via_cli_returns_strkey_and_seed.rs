@@ -132,6 +132,7 @@ fn dry_run_args(deployer: DeployerKeypair, rpc_url: &str, salt: [u8; 32]) -> Dep
             percentile_label: "profile_default".to_owned(),
         },
         dry_run: true,
+        genesis_signer_scval_override: None,
     }
 }
 
@@ -382,6 +383,7 @@ async fn invalid_initial_signer_returns_constructor_phase_error() {
         },
         // dry_run = false triggers the constructor-arg build path before any RPC call.
         dry_run: false,
+        genesis_signer_scval_override: None,
     };
 
     let err = deploy_smart_account(args, None)
@@ -611,6 +613,7 @@ async fn malformed_simulation_response_without_min_fee_returns_simulate_phase_er
             percentile_label: "profile_default".to_owned(),
         },
         dry_run: false,
+        genesis_signer_scval_override: None,
     };
 
     let err = deploy_smart_account(args, None)
@@ -694,6 +697,7 @@ async fn valid_simulation_response_proceeds_past_simulate_phase() {
             percentile_label: "profile_default".to_owned(),
         },
         dry_run: false,
+        genesis_signer_scval_override: None,
     };
 
     let err = deploy_smart_account(args, None)
@@ -1555,6 +1559,7 @@ fn stateful_deploy_args(
             percentile_label: "profile_default".to_owned(),
         },
         dry_run: false,
+        genesis_signer_scval_override: None,
     }
 }
 
@@ -1596,6 +1601,7 @@ fn stateful_deploy_args_with_failing_signer(
                 percentile_label: "profile_default".to_owned(),
             },
             dry_run: false,
+            genesis_signer_scval_override: None,
         },
         sign_calls,
     )

@@ -640,6 +640,11 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
                 // No rotation-handoff tracking needed; the hash-chain is
                 // maintained by the surrounding hash check.
             }
+            EventKind::SaWeightedThresholdChanged { .. }
+            | EventKind::SaSignerWeightChanged { .. } => {
+                // No rotation-handoff tracking needed; the hash-chain is
+                // maintained by the surrounding hash check.
+            }
             EventKind::SaMulticallBundleSubmitted { .. } => {
                 // No rotation-handoff tracking needed; the hash-chain is
                 // maintained by the surrounding hash check.
@@ -1207,6 +1212,8 @@ mod tests {
             EventKind::SaPolicyAdded { .. } => "sa_policy_added",
             EventKind::SaPolicyRemoved { .. } => "sa_policy_removed",
             EventKind::SaSpendingLimitRetuned { .. } => "sa_spending_limit_retuned",
+            EventKind::SaWeightedThresholdChanged { .. } => "sa_weighted_threshold_changed",
+            EventKind::SaSignerWeightChanged { .. } => "sa_signer_weight_changed",
             EventKind::SaMulticallBundleSubmitted { .. } => "sa_multicall_bundle_submitted",
             EventKind::SaMulticallInnerExecuted { .. } => "sa_multicall_inner_executed",
             EventKind::SaMulticallBundleDenied { .. } => "sa_multicall_bundle_denied",
@@ -1426,6 +1433,23 @@ mod tests {
                 old_limit: 10_000_000,
                 new_limit: 20_000_000,
                 period_ledgers: 17_280,
+                policy_address_redacted: RedactedStrkey::from_already_redacted("CPOLI...YYYYY"),
+                transaction_hash_redacted: "aabb1122...ccdd3344".to_owned(),
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CDABC...12345"),
+            },
+            EventKind::SaWeightedThresholdChanged {
+                rule_id: 12,
+                old_threshold: 1,
+                new_threshold: 2,
+                policy_address_redacted: RedactedStrkey::from_already_redacted("CPOLI...YYYYY"),
+                transaction_hash_redacted: "aabb1122...ccdd3344".to_owned(),
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CDABC...12345"),
+            },
+            EventKind::SaSignerWeightChanged {
+                rule_id: 13,
+                signer_identity_redacted: "delegated:GAAAA...BBBBB".to_owned(),
+                old_weight: 1,
+                new_weight: 2,
                 policy_address_redacted: RedactedStrkey::from_already_redacted("CPOLI...YYYYY"),
                 transaction_hash_redacted: "aabb1122...ccdd3344".to_owned(),
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CDABC...12345"),
@@ -1776,6 +1800,8 @@ mod tests {
                 "sa_policy_added",
                 "sa_policy_removed",
                 "sa_spending_limit_retuned",
+                "sa_weighted_threshold_changed",
+                "sa_signer_weight_changed",
                 "sa_multicall_bundle_submitted",
                 "sa_multicall_inner_executed",
                 "sa_multicall_bundle_denied",

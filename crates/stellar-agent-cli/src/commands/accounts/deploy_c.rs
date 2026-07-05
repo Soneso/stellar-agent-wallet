@@ -56,11 +56,16 @@ use stellar_agent_network::{
 use stellar_agent_smart_account::deployment::{
     DeployerKeypair, DeploymentArgs, DeploymentResult, ResolvedFeePerOp, deploy_smart_account,
 };
+use stellar_agent_smart_account::managers::credentials::CredentialsManager;
+use stellar_agent_smart_account::managers::rules::parse_c_strkey_to_smart_account;
+use stellar_agent_smart_account::managers::signers::build_external_signer_scval;
+use stellar_agent_smart_account::verifiers::VerifierRegistry;
 use tracing::info;
 use zeroize::Zeroizing;
 
 use crate::common::network::TargetNetwork;
 use crate::common::render::{render_json, sanitize_for_table};
+use crate::common::{resolve_profile_name, validate_path_component_ascii_safe};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -108,16 +113,83 @@ const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
             .args(["salt_hex", "salt_random"])
             .required(false)
     ),
+    group(
+        ArgGroup::new("genesis_signer_source")
+            .args(["initial_signer", "signer_webauthn", "signer_ed25519", "signer_external"])
+            .required(true)
+            .multiple(false)
+    ),
 )]
 pub struct DeployCArgs {
-    /// Initial signer G-strkey to install via `__constructor`.
+    /// Initial signer G-strkey to install via `__constructor` (current
+    /// default behavior).
     ///
-    /// Required (no profile resolution; an explicit flag avoids ambiguity).
     /// This G-strkey becomes the `Signer::Delegated(Address)` argument in the
     /// OZ `__constructor(signers, policies)` call. Any funded ed25519 G-strkey
-    /// is accepted.
-    #[arg(long, value_name = "G_STRKEY", required = true)]
-    pub initial_signer: String,
+    /// is accepted. Mutually exclusive with `--signer-webauthn`,
+    /// `--signer-ed25519`, and `--signer-external`.
+    #[arg(long, value_name = "G_STRKEY", group = "genesis_signer_source")]
+    pub initial_signer: Option<String>,
+
+    /// Credential name from the local passkeys registry to install as the
+    /// GENESIS signer.
+    ///
+    /// Encodes as OZ `Signer::External(verifier, key_data)`. The verifier
+    /// contract address resolves from the `VerifierRegistry` for the target
+    /// network (deploy one via `smart-account deploy-webauthn-verifier`).
+    /// Mutually exclusive with `--initial-signer`, `--signer-ed25519`, and
+    /// `--signer-external`. Implies the `--accept-no-delegated-fallback`
+    /// guard (see below) unless the fallback is otherwise satisfied — a
+    /// passkey-only genesis has no CLI secret-env signing path.
+    #[arg(long, value_name = "CREDENTIAL_NAME", group = "genesis_signer_source")]
+    pub signer_webauthn: Option<String>,
+
+    /// 64-hex-character raw Ed25519 public key of a first-class external
+    /// signer to install as the GENESIS signer.
+    ///
+    /// Encodes as OZ `Signer::External(verifier, key_data)` where `key_data`
+    /// is the raw 32-byte public key. The verifier resolves from `--verifier`
+    /// when supplied, else from the `VerifierRegistry`'s registered Ed25519
+    /// verifier for the target network. Mutually exclusive with
+    /// `--initial-signer`, `--signer-webauthn`, and `--signer-external`.
+    #[arg(long, value_name = "HEX_PUBKEY_64", group = "genesis_signer_source")]
+    pub signer_ed25519: Option<String>,
+
+    /// Ed25519 verifier contract C-strkey override for `--signer-ed25519`.
+    ///
+    /// Only meaningful with `--signer-ed25519`.
+    #[arg(long, value_name = "C_STRKEY", requires = "signer_ed25519")]
+    pub verifier: Option<String>,
+
+    /// C-strkey of the deployed verifier contract for a raw External genesis
+    /// signer (escape hatch).
+    ///
+    /// Must be paired with `--signer-key-data`. Mutually exclusive with
+    /// `--initial-signer`, `--signer-webauthn`, and `--signer-ed25519`.
+    #[arg(
+        long,
+        value_name = "C_STRKEY",
+        requires = "signer_key_data",
+        group = "genesis_signer_source"
+    )]
+    pub signer_external: Option<String>,
+
+    /// Hex-encoded raw key-data for the raw External genesis signer.
+    ///
+    /// Required when `--signer-external` is supplied.
+    #[arg(long, value_name = "HEX", requires = "signer_external")]
+    pub signer_key_data: Option<String>,
+
+    /// Acknowledge that the genesis signer has no delegated (ed25519)
+    /// fallback and the passkey/external authenticator is the sole signing
+    /// authority for the account's first rule.
+    ///
+    /// Required when `--signer-webauthn`, `--signer-ed25519`, or
+    /// `--signer-external` is chosen for the genesis signer (mirrors
+    /// `smart-account rules create`'s passkey-only refusal). If omitted, the
+    /// command is refused before any RPC or signing call.
+    #[arg(long)]
+    pub accept_no_delegated_fallback: bool,
 
     /// Name of the environment variable holding the deployer S-strkey.
     ///
@@ -247,15 +319,39 @@ where
         return 1;
     }
 
-    // Validate --initial-signer is a valid G-strkey.
-    if let Err(e) = stellar_strkey::ed25519::PublicKey::from_string(&args.initial_signer) {
-        let err = WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("--initial-signer: {e}"),
+    // GUARD: an External-only genesis signer set (no delegated fallback) has
+    // no CLI secret-env signing path for the account's first rule. Checked
+    // directly against the args (before any registry/credential resolution)
+    // so the refusal fires fast and independent of whether the referenced
+    // verifier/credential actually resolves. Mirrors the `smart-account
+    // rules create` passkey-only refusal precedent — a hard refusal, not a
+    // warning.
+    let genesis_is_external_shaped = args.signer_webauthn.is_some()
+        || args.signer_ed25519.is_some()
+        || args.signer_external.is_some();
+    if genesis_is_external_shaped && !args.accept_no_delegated_fallback {
+        let err = WalletError::Validation(ValidationError::PasskeyOnlyRuleNoDelegatedFallback {
+            credential_count: 1,
         });
         let envelope = Envelope::<()>::err(&err);
         print_error(&envelope, args.output);
         return 1;
     }
+
+    // ── Resolve the genesis signer source ─────────────────────────────────────
+    //
+    // Exactly one of `initial_signer` / `signer_webauthn` / `signer_ed25519` /
+    // `signer_external` is non-None, enforced by the `genesis_signer_source`
+    // ArgGroup at parse time.
+    let (initial_signer_display, genesis_signer_scval_override) =
+        match resolve_genesis_signer_source(args).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                let envelope = Envelope::<()>::err(&e);
+                print_error(&envelope, args.output);
+                return 1;
+            }
+        };
 
     // Resolve the 32-byte salt.
     let salt = match resolve_salt(args) {
@@ -323,13 +419,14 @@ where
 
     let deploy_args = DeploymentArgs {
         deployer,
-        initial_signer: args.initial_signer.clone(),
+        initial_signer: initial_signer_display,
         salt,
         network_passphrase: passphrase.to_owned(),
         rpc_url: args.rpc_url.clone(),
         timeout: Duration::from_secs(args.timeout_seconds),
         fee: resolved_fee,
         dry_run: args.dry_run,
+        genesis_signer_scval_override,
     };
 
     let audit_writer_arc =
@@ -510,6 +607,220 @@ fn load_audit_hmac_key(profile: &Profile) -> Result<Zeroizing<[u8; 32]>, WalletE
     let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(decoded.as_slice());
     Ok(key)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Genesis-signer resolution
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Resolves the GENESIS signer source into a display label and, for the
+/// External-shaped modes, a pre-built `Signer::External(verifier, key_data)`
+/// `ScVal` override for [`DeploymentArgs::genesis_signer_scval_override`].
+///
+/// Returns `(display_label, None)` for `--initial-signer` (the existing
+/// `Signer::Delegated` path, built downstream from `initial_signer` as
+/// before) and `(display_label, Some(scval))` for the three External-shaped
+/// modes (`--signer-webauthn`, `--signer-ed25519`, `--signer-external`).
+///
+/// # Errors
+///
+/// Returns [`WalletError::Validation`] for a malformed G-strkey, credential
+/// lookup failure, or missing verifier registration; wraps
+/// [`SaError`](stellar_agent_smart_account::error::SaError) encode failures
+/// as [`WalletError::SmartAccount`].
+async fn resolve_genesis_signer_source(
+    args: &DeployCArgs,
+) -> Result<(String, Option<stellar_xdr::ScVal>), WalletError> {
+    if let Some(g_strkey) = &args.initial_signer {
+        if let Err(e) = stellar_strkey::ed25519::PublicKey::from_string(g_strkey) {
+            return Err(WalletError::Validation(ValidationError::AddressInvalid {
+                input: format!("--initial-signer: {e}"),
+            }));
+        }
+        return Ok((g_strkey.clone(), None));
+    }
+
+    if let Some(credential_name) = &args.signer_webauthn {
+        let verifier_registry = VerifierRegistry::open().map_err(|e| {
+            WalletError::Validation(ValidationError::AddressInvalid {
+                input: format!("could not open verifier registry: {e}"),
+            })
+        })?;
+        let network_passphrase = args.network.passphrase();
+        let verifier_entry = verifier_registry
+            .webauthn_verifier_for(network_passphrase)
+            .ok_or_else(|| {
+                WalletError::Validation(ValidationError::AddressInvalid {
+                    input: format!(
+                        "no WebAuthn verifier deployed for network '{network_passphrase}'; \
+                         run: smart-account deploy-webauthn-verifier"
+                    ),
+                })
+            })?;
+        let verifier_sc_addr =
+            parse_c_strkey_to_smart_account(&verifier_entry.address).map_err(|e| {
+                WalletError::SmartAccount {
+                    wire_code: e.wire_code(),
+                    message: format!(
+                        "verifier registry address '{}' is not a valid C-strkey: {e}",
+                        verifier_entry.address
+                    ),
+                }
+            })?;
+
+        let profile = resolve_profile_name(args.profile.as_deref());
+        validate_path_component_ascii_safe(&profile).map_err(|reason| {
+            WalletError::Validation(ValidationError::AddressInvalid {
+                input: format!("invalid profile name '{profile}': {reason}"),
+            })
+        })?;
+        let creds_mgr =
+            CredentialsManager::from_defaults_readonly(&profile, "localhost").map_err(|e| {
+                WalletError::Validation(ValidationError::AddressInvalid {
+                    input: format!("could not open passkeys registry: {e}"),
+                })
+            })?;
+        let metadata = creds_mgr.show(credential_name).map_err(|e| {
+            WalletError::Validation(ValidationError::AddressInvalid {
+                input: format!("--signer-webauthn '{credential_name}': {e}"),
+            })
+        })?;
+        if metadata.public_key_sec1_b64.is_empty() {
+            return Err(WalletError::Validation(ValidationError::AddressInvalid {
+                input: format!(
+                    "--signer-webauthn '{credential_name}': credential is missing \
+                     public_key_sec1_b64 (delete and re-register)"
+                ),
+            }));
+        }
+        let pubkey_bytes = URL_SAFE_NO_PAD
+            .decode(&metadata.public_key_sec1_b64)
+            .map_err(|_| {
+                WalletError::Validation(ValidationError::AddressInvalid {
+                    input: format!(
+                        "--signer-webauthn '{credential_name}': public_key_sec1_b64 is not \
+                         valid base64url"
+                    ),
+                })
+            })?;
+        if pubkey_bytes.len() != 65 {
+            return Err(WalletError::Validation(ValidationError::AddressInvalid {
+                input: format!(
+                    "--signer-webauthn '{credential_name}': public_key_sec1_b64 decodes to \
+                     {} bytes, expected 65",
+                    pubkey_bytes.len()
+                ),
+            }));
+        }
+        let credential_id_bytes = URL_SAFE_NO_PAD
+            .decode(&metadata.credential_id_b64url)
+            .map_err(|_| {
+                WalletError::Validation(ValidationError::AddressInvalid {
+                    input: format!(
+                        "--signer-webauthn '{credential_name}': credential_id_b64url is not \
+                         valid base64url"
+                    ),
+                })
+            })?;
+        let mut key_data = Vec::with_capacity(65 + credential_id_bytes.len());
+        key_data.extend_from_slice(&pubkey_bytes);
+        key_data.extend_from_slice(&credential_id_bytes);
+
+        let scval = build_external_signer_scval(verifier_sc_addr, &key_data).map_err(|e| {
+            WalletError::SmartAccount {
+                wire_code: e.wire_code(),
+                message: format!("--signer-webauthn ScVal encode: {e}"),
+            }
+        })?;
+        return Ok((credential_name.clone(), Some(scval)));
+    }
+
+    if let Some(hex_pubkey) = &args.signer_ed25519 {
+        let key_data = hex::decode(hex_pubkey).map_err(|e| {
+            WalletError::Validation(ValidationError::AddressInvalid {
+                input: format!("--signer-ed25519 is not valid hex: {e}"),
+            })
+        })?;
+        if key_data.len() != 32 {
+            return Err(WalletError::Validation(ValidationError::AddressInvalid {
+                input: format!(
+                    "--signer-ed25519 must decode to exactly 32 bytes (a raw Ed25519 public \
+                     key), got {} bytes",
+                    key_data.len()
+                ),
+            }));
+        }
+
+        let verifier_c_strkey = if let Some(explicit) = &args.verifier {
+            explicit.clone()
+        } else {
+            let verifier_registry = VerifierRegistry::open().map_err(|e| {
+                WalletError::Validation(ValidationError::AddressInvalid {
+                    input: format!("could not open verifier registry: {e}"),
+                })
+            })?;
+            let network_passphrase = args.network.passphrase();
+            verifier_registry
+                .ed25519_verifier_for(network_passphrase)
+                .map(|entry| entry.address.clone())
+                .ok_or_else(|| {
+                    WalletError::Validation(ValidationError::AddressInvalid {
+                        input: format!(
+                            "no Ed25519 verifier registered for network \
+                             '{network_passphrase}'; run: smart-account \
+                             deploy-ed25519-verifier (or pass --verifier)"
+                        ),
+                    })
+                })?
+        };
+        let verifier_sc_addr =
+            parse_c_strkey_to_smart_account(&verifier_c_strkey).map_err(|e| {
+                WalletError::SmartAccount {
+                    wire_code: e.wire_code(),
+                    message: format!("--signer-ed25519 verifier '{verifier_c_strkey}': {e}"),
+                }
+            })?;
+        let scval = build_external_signer_scval(verifier_sc_addr, &key_data).map_err(|e| {
+            WalletError::SmartAccount {
+                wire_code: e.wire_code(),
+                message: format!("--signer-ed25519 ScVal encode: {e}"),
+            }
+        })?;
+        return Ok((hex_pubkey.clone(), Some(scval)));
+    }
+
+    if let Some(verifier_c_strkey) = &args.signer_external {
+        let key_data_hex = args.signer_key_data.as_deref().unwrap_or("");
+        let key_data = hex::decode(key_data_hex).map_err(|e| {
+            WalletError::Validation(ValidationError::AddressInvalid {
+                input: format!("--signer-key-data is not valid hex: {e}"),
+            })
+        })?;
+        if key_data.is_empty() {
+            return Err(WalletError::Validation(ValidationError::AddressInvalid {
+                input: "--signer-key-data must be non-empty".to_owned(),
+            }));
+        }
+        let verifier_sc_addr = parse_c_strkey_to_smart_account(verifier_c_strkey).map_err(|e| {
+            WalletError::SmartAccount {
+                wire_code: e.wire_code(),
+                message: format!("--signer-external: {e}"),
+            }
+        })?;
+        let scval = build_external_signer_scval(verifier_sc_addr, &key_data).map_err(|e| {
+            WalletError::SmartAccount {
+                wire_code: e.wire_code(),
+                message: format!("--signer-external ScVal encode: {e}"),
+            }
+        })?;
+        return Ok((verifier_c_strkey.clone(), Some(scval)));
+    }
+
+    // Unreachable: the `genesis_signer_source` ArgGroup requires exactly one
+    // of the four flags above.
+    Err(WalletError::Validation(ValidationError::AddressInvalid {
+        input: "no genesis signer source supplied".to_owned(),
+    }))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -794,7 +1105,13 @@ mod tests {
     fn deploy_args(profile: Option<String>, dry_run: bool) -> (DeployCArgs, EnvGuard) {
         let guard = EnvGuard::set(TEST_DEPLOYER_ENV_VAR, &test_deployer_skey());
         let args = DeployCArgs {
-            initial_signer: INITIAL_SIGNER_G.to_owned(),
+            initial_signer: Some(INITIAL_SIGNER_G.to_owned()),
+            signer_webauthn: None,
+            signer_ed25519: None,
+            verifier: None,
+            signer_external: None,
+            signer_key_data: None,
+            accept_no_delegated_fallback: false,
             deployer_secret_env: Some(TEST_DEPLOYER_ENV_VAR.to_owned()),
             sign_with_ledger: false,
             account_index: 0,
@@ -817,6 +1134,75 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    /// `--signer-ed25519` (External-shaped genesis) without
+    /// `--accept-no-delegated-fallback` is refused before any RPC, registry,
+    /// or credential lookup.
+    #[tokio::test]
+    #[serial]
+    async fn deploy_c_external_genesis_without_ack_is_refused() {
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let (mut args, _env_guard) = deploy_args(None, true);
+        args.initial_signer = None;
+        args.signer_ed25519 = Some("11".repeat(32));
+        args.accept_no_delegated_fallback = false;
+
+        let code = run_with_dependencies(&args, |_| unreachable!(), || Ok(())).await;
+        assert_eq!(
+            code, 1,
+            "External-only genesis without the ack flag must be refused"
+        );
+    }
+
+    /// `--signer-external` without `--signer-key-data` is a clap grammar
+    /// error (the `requires` constraint), not a runtime refusal.
+    #[test]
+    fn deploy_c_args_signer_external_requires_key_data() {
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct Harness {
+            #[command(flatten)]
+            args: DeployCArgs,
+        }
+        let result = Harness::try_parse_from([
+            "test",
+            "--signer-external",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--accept-no-delegated-fallback",
+            "--deployer-secret-env",
+            "__STELLAR_AGENT_DEPLOY_C_DUMMY",
+        ]);
+        assert!(
+            result.is_err(),
+            "--signer-external without --signer-key-data must be a clap parse error"
+        );
+    }
+
+    /// The `genesis_signer_source` ArgGroup refuses supplying both
+    /// `--initial-signer` and `--signer-ed25519`.
+    #[test]
+    fn deploy_c_args_genesis_signer_source_is_mutually_exclusive() {
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct Harness {
+            #[command(flatten)]
+            args: DeployCArgs,
+        }
+        let result = Harness::try_parse_from([
+            "test",
+            "--initial-signer",
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            "--signer-ed25519",
+            "11".repeat(32).as_str(),
+            "--accept-no-delegated-fallback",
+            "--deployer-secret-env",
+            "__STELLAR_AGENT_DEPLOY_C_DUMMY",
+        ]);
+        assert!(
+            result.is_err(),
+            "--initial-signer and --signer-ed25519 must be mutually exclusive"
+        );
     }
 
     #[test]

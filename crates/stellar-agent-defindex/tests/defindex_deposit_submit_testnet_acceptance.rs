@@ -219,6 +219,7 @@ async fn deploy_testnet_smart_account(
             percentile_label: "explicit".to_owned(),
         },
         dry_run: false,
+        genesis_signer_scval_override: None,
     };
     let result = deploy_smart_account(deploy_args, None).await?;
     Ok(DeploySmartAccountOutcome {

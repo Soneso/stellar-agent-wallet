@@ -147,6 +147,7 @@ async fn sim_audit_happy_path_on_chain_submit() {
             percentile_label: "explicit".to_owned(),
         },
         dry_run: false,
+        genesis_signer_scval_override: None,
     };
     let deploy_result = deploy_smart_account(deploy_args, None)
         .await

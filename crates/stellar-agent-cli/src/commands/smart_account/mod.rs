@@ -56,6 +56,7 @@
 
 pub mod common;
 pub mod deploy_ed25519_verifier;
+pub mod deploy_policy;
 pub mod deploy_spending_limit_policy;
 pub mod deploy_webauthn_verifier;
 pub mod list_rules;
@@ -218,6 +219,29 @@ pub enum SmartAccountSubcommand {
     #[command(name = "deploy-spending-limit-policy")]
     DeploySpendingLimitPolicy(Box<deploy_spending_limit_policy::DeploySpendingLimitPolicyArgs>),
 
+    /// Deploy one of the three OZ policy contracts (`--kind simple-threshold`,
+    /// `--kind spending-limit`, or `--kind weighted-threshold`) and record the
+    /// address in the verifier registry
+    /// (`~/.config/stellar-agent/networks.toml`).
+    ///
+    /// Supports two mutually-exclusive deployer-source modes:
+    ///
+    /// - `--deployer-secret-env <VAR>` — read deployer S-strkey from an env var.
+    /// - `--sign-with-ledger` — use a connected Ledger hardware wallet.
+    ///
+    /// Mainnet is structurally refused. Use `--dry-run` to derive the
+    /// deterministic policy address without any network access.
+    ///
+    /// `--kind spending-limit` routes to the same substrate as the standalone
+    /// `smart-account deploy-spending-limit-policy` verb, which remains
+    /// available unchanged.
+    ///
+    /// Each kind's WASM SHA-256 is re-verified at runtime before any
+    /// submission. Idempotent per network + kind: re-running with the same
+    /// WASM sha256 returns `status: "already_deployed"` with no RPC traffic.
+    #[command(name = "deploy-policy")]
+    DeployPolicy(Box<deploy_policy::DeployPolicyArgs>),
+
     /// Construct a migration plan for moving `External` signers from one verifier
     /// contract to another across all context rules on a smart account.
     ///
@@ -322,6 +346,7 @@ pub async fn run(args: &SmartAccountArgs) -> i32 {
         SmartAccountSubcommand::DeploySpendingLimitPolicy(deploy_args) => {
             deploy_spending_limit_policy::run(deploy_args).await
         }
+        SmartAccountSubcommand::DeployPolicy(deploy_args) => deploy_policy::run(deploy_args).await,
         SmartAccountSubcommand::MigrateVerifier(migrate_args) => {
             migrate_verifier::run(migrate_args).await
         }

@@ -99,6 +99,7 @@ async fn deploy_smart_account_on_testnet_matches_derived_address() {
             percentile_label: "explicit".to_owned(),
         },
         dry_run: false,
+        genesis_signer_scval_override: None,
     };
 
     let result = deploy_smart_account(args, None)
@@ -159,6 +160,7 @@ async fn recover_c_strkey_from_same_deployer_and_salt() {
             percentile_label: "explicit".to_owned(),
         },
         dry_run: false,
+        genesis_signer_scval_override: None,
     };
 
     let result = deploy_smart_account(args, None)
@@ -211,6 +213,7 @@ async fn deploy_smart_account_via_interop_deployer() {
             percentile_label: "explicit".to_owned(),
         },
         dry_run: false,
+        genesis_signer_scval_override: None,
     };
 
     let result = deploy_smart_account(args, None)

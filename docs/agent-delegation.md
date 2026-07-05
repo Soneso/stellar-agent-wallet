@@ -199,6 +199,30 @@ uses: `smart-account rules delete`, `smart-account rules set-valid-until`
 to set an expiry, or `smart-account signers remove` to drop just the
 agent's key while leaving the rule (and any other signers on it) intact.
 
+## Weighted quorums for multiple agents
+
+The simple threshold-policy above is signer-count based: any `N` of the
+configured signers authorize equally. When a rule delegates to several
+agents (or an operator plus several agents) whose keys should NOT carry
+equal authority — for example, an agent that alone can authorize small
+transfers but needs a co-signer for larger ones — attach a
+weighted-threshold policy instead
+([`smart-account deploy-policy --kind weighted-threshold`](cli-reference/smart-account.md#smart-account-deploy-policy),
+[`rules add-policy --kind weighted-threshold`](cli-reference/smart-account.md#smart-account-rules-add-policy)).
+Each signer (Delegated or External — a passkey or an agent's own
+External-Ed25519 key work the same as above) carries an independent weight;
+the policy's `enforce` sums the weights of whichever signers are present in
+the auth entry and compares against the configured threshold. Retune the
+threshold or an individual signer's weight without reinstalling the rule via
+[`signers set-weighted-threshold`](cli-reference/smart-account.md#smart-account-signers-set-weighted-threshold)
+/
+[`signers set-signer-weight`](cli-reference/smart-account.md#smart-account-signers-set-signer-weight).
+A submission that needs more than one signer's weight to clear the
+threshold is built the same multi-signer way any other quorum-authorized
+call is (`AuthorizationInfo` / `SignerGroup`) — the weighted-threshold
+policy does not change how the wallet gathers signatures, only how the
+policy contract itself decides whether the gathered set is sufficient.
+
 The signing substrate that authenticates an External-Ed25519 call — supplying
 the agent's key alongside the verifier address to the same production
 submission path every other smart-account operation uses — is what makes

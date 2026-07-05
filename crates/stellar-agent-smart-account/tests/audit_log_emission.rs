@@ -82,6 +82,7 @@ fn dry_run_args(salt: [u8; 32]) -> DeploymentArgs {
             percentile_label: "profile_default".to_owned(),
         },
         dry_run: true,
+        genesis_signer_scval_override: None,
     }
 }
 
@@ -109,6 +110,7 @@ fn build_failure_args() -> DeploymentArgs {
             percentile_label: "profile_default".to_owned(),
         },
         dry_run: false,
+        genesis_signer_scval_override: None,
     }
 }
 
@@ -281,6 +283,7 @@ async fn deploy_smart_account_emits_sa_raw_invocation_on_simulate_phase_failure(
             percentile_label: "profile_default".to_owned(),
         },
         dry_run: false,
+        genesis_signer_scval_override: None,
     };
 
     let result = deploy_smart_account(args, Some(&mut writer)).await;

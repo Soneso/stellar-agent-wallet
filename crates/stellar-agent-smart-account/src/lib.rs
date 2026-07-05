@@ -36,6 +36,7 @@ pub mod managers;
 pub mod multicall;
 pub mod signers;
 pub mod signing;
+pub mod simple_threshold_policy;
 pub mod spending_limit_policy;
 pub mod submit;
 pub mod timelock;
@@ -44,6 +45,7 @@ pub mod verifier_allowlist;
 pub mod verifiers;
 pub mod webauthn;
 pub mod webauthn_verifier;
+pub mod weighted_threshold_policy;
 
 pub use error::{AdminOrOwnerKey, SaError};
 pub use managers::migration::{

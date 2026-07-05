@@ -121,6 +121,10 @@ required-features = ["testnet-integration"]
 name = "smart_account_policy_observability_testnet_acceptance"
 required-features = ["testnet-integration"]
 
+[[test]]
+name = "smart_account_ergonomics_testnet_acceptance"
+required-features = ["testnet-integration"]
+
 [dependencies]
 bon = { workspace = true }
 stellar-accounts = { workspace = true }

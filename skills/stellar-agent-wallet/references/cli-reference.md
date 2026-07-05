@@ -89,13 +89,17 @@ stellar-agent accounts create --generate --sponsor GABC...WXYZ \
 
 ### `accounts deploy-c [flags]`
 
-Deploys a new OpenZeppelin smart-account (C-account) contract via `CreateContractV2`; the initial signer is installed through the contract `__constructor`. Signs source-account credentials with the deployer key (except `--dry-run`, which derives the C-strkey deterministically with no signing or RPC). Only `testnet` accepted.
+Deploys a new OpenZeppelin smart-account (C-account) contract via `CreateContractV2`; the genesis signer is installed through the contract `__constructor`. Signs source-account credentials with the deployer key (except `--dry-run`, which derives the C-strkey deterministically with no signing or RPC). Only `testnet` accepted.
 
-Argument groups: deployer (exactly one) `--deployer-secret-env` xor `--sign-with-ledger`; salt (at most one) `--salt-hex` xor `--salt-random` (random when neither given).
+Argument groups: deployer (exactly one) `--deployer-secret-env` xor `--sign-with-ledger`; salt (at most one) `--salt-hex` xor `--salt-random` (random when neither given); genesis signer source (exactly one) `--initial-signer` xor `--signer-webauthn` xor `--signer-ed25519` xor `--signer-external` (with `--signer-key-data`). `__constructor` takes a single-element signer vec, so exactly one genesis signer is ever installed.
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--initial-signer <G_STRKEY>` (required) | Initial signer installed via `__constructor` | — |
+| `--initial-signer <G_STRKEY>` | Delegated (native) genesis signer | — |
+| `--signer-webauthn <CRED_NAME>` | Genesis signer = an already-registered passkey, resolved from the local passkeys registry; needs a WebAuthn verifier already deployed (`deploy-webauthn-verifier`) | — |
+| `--signer-ed25519 <HEX_PUBKEY_64>` | Genesis signer = raw 32-byte ed25519 pubkey, verified via `--signer-external`'s verifier | — |
+| `--signer-external <C_STRKEY>` + `--signer-key-data <HEX>` | Genesis signer = verified by this verifier contract with this key data | — |
+| `--accept-no-delegated-fallback` | Required with any non-`--initial-signer` genesis source: acknowledges NO G-key fallback exists at genesis (`validation.passkey_only_rule_no_delegated_fallback` otherwise) | `false` |
 | `--deployer-secret-env <VAR>` | Env-var name holding deployer S-strkey | — |
 | `--sign-with-ledger` / `--account-index <INDEX>` | Ledger deployer / BIP-44 index | `false` / `0` |
 | `--salt-hex <HEX64>` | 32-byte salt as 64-char lowercase hex (re-deploy a known C-strkey) | — |
@@ -103,6 +107,8 @@ Argument groups: deployer (exactly one) `--deployer-secret-env` xor `--sign-with
 | `--profile <NAME>` | Profile whose audit writer receives deploy entries | none |
 | `--network` / `--rpc-url` / `--fee` / `--timeout-seconds` / `--output` | shared | as above |
 | `--dry-run` | Derive C-strkey only; no signing, no RPC | `false` |
+
+A non-Delegated genesis signer cannot itself authorize any further rule mutation (`smart-account rules`/`signers` authorize only via a Delegated signer); follow up with `smart-account signers add` to attach a Delegated co-signer once a policy is attached to the target rule.
 
 ```bash
 export DEPLOYER_SK="S..."
@@ -278,7 +284,7 @@ Each rule has a `rule_id` (u32), a name (OZ cap 20 bytes), an optional expiry le
 | `set-valid-until` | Change expiry (`update_context_rule_valid_until`) | `--rule-id <U32>`; `--valid-until <LEDGER\|none>` (required) |
 | `delete` | Remove a rule (`remove_context_rule`) | `--rule-id <U32>`; `--auth-rule-id` (optional) |
 | `verify-pins` | Verify pinned verifier/policy WASM hashes vs on-chain (drift); read-only, `mainnet` ok; exit `1` on `drift` | `--rule-id <U32>`. Each `*_pin_status` is `match`/`drift`/`unavailable`/`no_pin`/`no_contracts`. |
-| `add-policy` | Add a policy (`add_policy`); cap 5; returns `policy_id` | `--rule-id <U32>`; `--kind <raw\|spending-limit>` (default `raw`); raw: `--policy-address <C_STRKEY>`, `--install-param <SCVAL_BASE64>` (standard base64 XDR `ScVal`, raw passthrough); spending-limit: `--limit <STROOPS>`, `--period <LEDGERS>`, optional `--policy <C_STRKEY>` override; `--auth-rule-id` |
+| `add-policy` | Add a policy (`add_policy`); cap 5; returns `policy_id` | `--rule-id <U32>`; `--kind <raw\|spending-limit\|simple-threshold\|weighted-threshold>` (default `raw`); raw: `--policy-address <C_STRKEY>`, `--install-param <SCVAL_BASE64>` (standard base64 XDR `ScVal`, raw passthrough); spending-limit: `--limit <STROOPS>`, `--period <LEDGERS>`, optional `--policy <C_STRKEY>` override; simple-threshold: `--threshold <U32>`; weighted-threshold: `--threshold <U32>` plus one or more `--weighted-signer-delegated <G_STRKEY=WEIGHT>` / `--weighted-signer-webauthn <CRED_NAME=WEIGHT>`; `--auth-rule-id` |
 | `remove-policy` | Remove a policy by id (`remove_policy`) | `--rule-id <U32>`; `--policy-id <U32>`; `--auth-rule-id` |
 | `list` | Enumerate active rules by on-chain scan; read-only, `mainnet` ok; alias of `smart-account list-rules` | see `smart-account list-rules` |
 | `get-spending-limit` | Read an installed spending-limit policy's budget state; read-only, `mainnet` ok | `--rule-id <U32>`; `--source-account <G_STRKEY>` (required, simulation only). Returns `spending_limit`, `period_ledgers`, `in_window_spent`, `remaining_budget`, `as_of_ledger`, `window_cutoff_ledger`, `history_entries`, `cached_total_spent`. `in_window_spent`/`remaining_budget` are exact only as of `as_of_ledger`. |
@@ -300,6 +306,9 @@ All verbs take `--account <C_STRKEY>` and `--rule-id <U32>` (both required), the
 | `add` | Add one signer (`add_signer`); cap 15; returns `new_signer_id` | exactly one of `--signer-delegated <G_STRKEY>` (alias `--new-signer`) / `--signer-ed25519 <HEX_PUBKEY_64>` (optional `--verifier <C_STRKEY>` override, else registry) / `--signer-external <C_STRKEY>` (requires `--signer-key-data <HEX>`) / `--signer-webauthn <CRED_NAME>`. `--signer-ed25519` is the recommended shape for an agent's own key — no funded account, HSM/keyring-holdable. |
 | `remove` | Remove a signer (`remove_signer`); refuses if it would drop count below threshold | `--signer-id <U32>` (required) |
 | `set-threshold` | Change threshold via threshold-policy `set_threshold` | `--new-threshold <U32>` (required); no `--auth-rule-id` override |
+| `set-weighted-threshold` | Change a weighted-threshold policy's threshold (`set_threshold` on the weighted-threshold policy) | `--new-threshold <U32>` (required); `--auth-rule-id` (default `--rule-id`; use an admin rule if `--rule-id` is scoped) |
+| `set-signer-weight` | Change one signer's weight in a weighted-threshold policy (`set_signer_weight`) | `--new-weight <U32>` (required); target signer: one of `--signer-delegated <G_STRKEY>` / `--signer-ed25519 <HEX_PUBKEY_64>` (optional `--verifier`) / `--signer-external <C_STRKEY>` (requires `--signer-key-data`) / `--signer-webauthn <CRED_NAME>`; `--auth-rule-id` (same default as `set-weighted-threshold`) |
+| `batch-add` | Add MULTIPLE signers in ONE transaction (`batch_add_signer`); cap 15; returns `new_signer_ids` | one or more, any combination, repeatable: `--signer-delegated <G_STRKEY>` / `--signer-webauthn <CRED_NAME>` / `--signer-ed25519 <HEX_PUBKEY_64>` (optional `--verifier` override for all `--signer-ed25519` entries). Refuses an empty batch. Post-op result-fetch needs a SIMPLE-threshold policy on the target rule — attach one first if the rule only has a weighted-threshold policy. |
 
 ```bash
 stellar-agent smart-account signers set-threshold --account CABC...WXYZ \
@@ -331,6 +340,7 @@ stellar-agent smart-account multicall --smart-account CABC...WXYZ --rule-id 0 \
 | `deploy-webauthn-verifier` | Deploy OZ WebAuthn-verifier WASM, record in registry; idempotent (`status:"already_deployed"`); testnet only | `--deployer-secret-env <VAR>` xor `--sign-with-ledger`; `--account-index`; `--network`; `--rpc-url`; `--fee`; `--timeout-seconds`; `--output`; `--dry-run` (`status:"dry_run"`) |
 | `deploy-ed25519-verifier` | Deploy OZ Ed25519-verifier WASM, record in registry; same flags/idempotency as above; backs `--signer-ed25519`; testnet only | same as `deploy-webauthn-verifier` |
 | `deploy-spending-limit-policy` | Deploy OZ spending-limit-policy WASM (per-network singleton), record in registry; same flags/idempotency as above; backs `rules add-policy --kind spending-limit`; testnet only | same as `deploy-webauthn-verifier` |
+| `deploy-policy` | Deploy any of the three OZ policy contracts through one verb; same flags/idempotency as above; recommended over `deploy-spending-limit-policy`; testnet only | `--kind <simple-threshold\|spending-limit\|weighted-threshold>` (required) plus same as `deploy-webauthn-verifier` |
 | `migrate-verifier` | Move all `External` signers from one verifier to another across rules; dry-run renders plan; mainnet submit needs `--confirm-mainnet-migrate` | `--account <C_STRKEY>`; `--from <HASH_HEX>` (64-char SHA-256 of source WASM); `--to <C_STRKEY>`; `--dry-run`; `--confirm-mainnet-migrate`; signer source (submit) |
 | `list-verifiers` | Enumerate compile-time verifier allowlist + audit-status taxonomy; read-only, no network | `--output` |
 | `list-rules` | Enumerate active rules by scanning `[0, max_scan_id)`; read-only, `mainnet` ok; backs `smart-account rules list` | `--account <C_STRKEY>`; `--source-account <G_STRKEY>` (sim source); `--rpc-url`; `--secondary-rpc-url`; `--network`; `--profile`; `--max-scan-id <1..=10000>` (else profile, else 50); `--timeout-seconds`; `--output` (table deferred) |

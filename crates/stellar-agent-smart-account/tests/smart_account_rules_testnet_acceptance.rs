@@ -237,6 +237,7 @@ async fn deploy_fresh_smart_account_with_initial_signer(signer_g: &str) -> Strin
             percentile_label: "explicit".to_owned(),
         },
         dry_run: false,
+        genesis_signer_scval_override: None,
     };
     let result = deploy_smart_account(args, None)
         .await

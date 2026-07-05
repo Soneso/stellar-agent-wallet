@@ -183,6 +183,57 @@ pub struct SpendingLimitPolicyEntry {
     pub deployed_at_unix_ms: u64,
 }
 
+/// A single network → simple-threshold-policy mapping entry.
+///
+/// Mirrors [`WebAuthnVerifierEntry`]: all fields are non-secret.  Records the
+/// per-network deployment of the OZ `multisig-threshold-policy-example`
+/// singleton (`smart-account deploy-policy --kind simple-threshold`).  One
+/// deployed instance serves every account and context rule on the network.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimpleThresholdPolicyEntry {
+    /// Deployed simple-threshold-policy contract C-strkey on the Stellar network.
+    ///
+    /// Full C-strkey (56 characters, starting with `C`).  Not redacted here.
+    pub address: String,
+
+    /// SHA-256 of the vendored WASM that was deployed, as 64-char lowercase hex.
+    ///
+    /// Verified against
+    /// `crate::signers::policy_identification::THRESHOLD_POLICY_WASM_HASHES[0]`
+    /// at deploy time by the runtime SHA gate in the unified deploy-policy
+    /// substrate.
+    pub wasm_sha256: String,
+
+    /// Unix timestamp in milliseconds at which this entry was recorded.
+    pub deployed_at_unix_ms: u64,
+}
+
+/// A single network → weighted-threshold-policy mapping entry.
+///
+/// Mirrors [`WebAuthnVerifierEntry`]: all fields are non-secret.  Records the
+/// per-network deployment of the OZ
+/// `multisig-weighted-threshold-policy-example` singleton
+/// (`smart-account deploy-policy --kind weighted-threshold`).  One deployed
+/// instance serves every account and context rule on the network.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeightedThresholdPolicyEntry {
+    /// Deployed weighted-threshold-policy contract C-strkey on the Stellar network.
+    ///
+    /// Full C-strkey (56 characters, starting with `C`).  Not redacted here.
+    pub address: String,
+
+    /// SHA-256 of the vendored WASM that was deployed, as 64-char lowercase hex.
+    ///
+    /// Verified against
+    /// `crate::weighted_threshold_policy::WEIGHTED_THRESHOLD_POLICY_WASM_SHA256`
+    /// at deploy time by the runtime SHA gate in the unified deploy-policy
+    /// substrate.
+    pub wasm_sha256: String,
+
+    /// Unix timestamp in milliseconds at which this entry was recorded.
+    pub deployed_at_unix_ms: u64,
+}
+
 // ── In-memory record ──────────────────────────────────────────────────────────
 
 /// In-memory per-network record aggregating all deployed contracts.
@@ -199,12 +250,20 @@ struct NetworkRecord {
     ed25519: Option<Ed25519VerifierEntry>,
     /// Deployed spending-limit policy, if any.
     spending_limit_policy: Option<SpendingLimitPolicyEntry>,
+    /// Deployed simple-threshold policy, if any.
+    simple_threshold_policy: Option<SimpleThresholdPolicyEntry>,
+    /// Deployed weighted-threshold policy, if any.
+    weighted_threshold_policy: Option<WeightedThresholdPolicyEntry>,
 }
 
 impl NetworkRecord {
     /// Returns `true` when no contract slot is populated.
     fn is_empty(&self) -> bool {
-        self.webauthn.is_none() && self.ed25519.is_none() && self.spending_limit_policy.is_none()
+        self.webauthn.is_none()
+            && self.ed25519.is_none()
+            && self.spending_limit_policy.is_none()
+            && self.simple_threshold_policy.is_none()
+            && self.weighted_threshold_policy.is_none()
     }
 }
 
@@ -264,6 +323,26 @@ struct NetworkEntry {
     /// Unix timestamp in milliseconds when the spending-limit-policy entry was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     spending_limit_policy_deployed_at_unix_ms: Option<u64>,
+
+    /// Deployed simple-threshold-policy contract C-strkey.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    simple_threshold_policy_address: Option<String>,
+    /// SHA-256 of the deployed simple-threshold-policy WASM, 64-char lowercase hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    simple_threshold_policy_wasm_sha256: Option<String>,
+    /// Unix timestamp in milliseconds when the simple-threshold-policy entry was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    simple_threshold_policy_deployed_at_unix_ms: Option<u64>,
+
+    /// Deployed weighted-threshold-policy contract C-strkey.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    weighted_threshold_policy_address: Option<String>,
+    /// SHA-256 of the deployed weighted-threshold-policy WASM, 64-char lowercase hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    weighted_threshold_policy_wasm_sha256: Option<String>,
+    /// Unix timestamp in milliseconds when the weighted-threshold-policy entry was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    weighted_threshold_policy_deployed_at_unix_ms: Option<u64>,
 }
 
 impl From<&NetworkRecord> for NetworkEntry {
@@ -283,6 +362,16 @@ impl From<&NetworkRecord> for NetworkEntry {
             e.spending_limit_policy_address = Some(p.address.clone());
             e.spending_limit_policy_wasm_sha256 = Some(p.wasm_sha256.clone());
             e.spending_limit_policy_deployed_at_unix_ms = Some(p.deployed_at_unix_ms);
+        }
+        if let Some(p) = &r.simple_threshold_policy {
+            e.simple_threshold_policy_address = Some(p.address.clone());
+            e.simple_threshold_policy_wasm_sha256 = Some(p.wasm_sha256.clone());
+            e.simple_threshold_policy_deployed_at_unix_ms = Some(p.deployed_at_unix_ms);
+        }
+        if let Some(p) = &r.weighted_threshold_policy {
+            e.weighted_threshold_policy_address = Some(p.address.clone());
+            e.weighted_threshold_policy_wasm_sha256 = Some(p.wasm_sha256.clone());
+            e.weighted_threshold_policy_deployed_at_unix_ms = Some(p.deployed_at_unix_ms);
         }
         e
     }
@@ -332,10 +421,40 @@ impl From<NetworkEntry> for NetworkRecord {
             }
             _ => None,
         };
+        let simple_threshold_policy = match (
+            n.simple_threshold_policy_address,
+            n.simple_threshold_policy_wasm_sha256,
+            n.simple_threshold_policy_deployed_at_unix_ms,
+        ) {
+            (Some(address), Some(wasm_sha256), Some(deployed_at_unix_ms)) => {
+                Some(SimpleThresholdPolicyEntry {
+                    address,
+                    wasm_sha256,
+                    deployed_at_unix_ms,
+                })
+            }
+            _ => None,
+        };
+        let weighted_threshold_policy = match (
+            n.weighted_threshold_policy_address,
+            n.weighted_threshold_policy_wasm_sha256,
+            n.weighted_threshold_policy_deployed_at_unix_ms,
+        ) {
+            (Some(address), Some(wasm_sha256), Some(deployed_at_unix_ms)) => {
+                Some(WeightedThresholdPolicyEntry {
+                    address,
+                    wasm_sha256,
+                    deployed_at_unix_ms,
+                })
+            }
+            _ => None,
+        };
         Self {
             webauthn,
             ed25519,
             spending_limit_policy,
+            simple_threshold_policy,
+            weighted_threshold_policy,
         }
     }
 }
@@ -532,6 +651,50 @@ impl VerifierRegistry {
             .and_then(|r| r.spending_limit_policy.as_ref())
     }
 
+    /// Returns the [`SimpleThresholdPolicyEntry`] for the given network
+    /// passphrase, or `None` if no simple-threshold policy is recorded.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use stellar_agent_smart_account::verifiers::VerifierRegistry;
+    /// # let dir = tempfile::tempdir().expect("tempdir");
+    /// # let path = dir.path().join("networks.toml");
+    /// let reg = VerifierRegistry::open_at(path).expect("open");
+    /// assert!(reg.simple_threshold_policy_for("Test SDF Network ; September 2015").is_none());
+    /// ```
+    #[must_use]
+    pub fn simple_threshold_policy_for(
+        &self,
+        network_passphrase: &str,
+    ) -> Option<&SimpleThresholdPolicyEntry> {
+        self.entries
+            .get(network_passphrase)
+            .and_then(|r| r.simple_threshold_policy.as_ref())
+    }
+
+    /// Returns the [`WeightedThresholdPolicyEntry`] for the given network
+    /// passphrase, or `None` if no weighted-threshold policy is recorded.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use stellar_agent_smart_account::verifiers::VerifierRegistry;
+    /// # let dir = tempfile::tempdir().expect("tempdir");
+    /// # let path = dir.path().join("networks.toml");
+    /// let reg = VerifierRegistry::open_at(path).expect("open");
+    /// assert!(reg.weighted_threshold_policy_for("Test SDF Network ; September 2015").is_none());
+    /// ```
+    #[must_use]
+    pub fn weighted_threshold_policy_for(
+        &self,
+        network_passphrase: &str,
+    ) -> Option<&WeightedThresholdPolicyEntry> {
+        self.entries
+            .get(network_passphrase)
+            .and_then(|r| r.weighted_threshold_policy.as_ref())
+    }
+
     /// Records a newly deployed WebAuthn-verifier entry for the given network.
     ///
     /// # Idempotency
@@ -718,6 +881,100 @@ impl VerifierRegistry {
         }
 
         record.spending_limit_policy = Some(SpendingLimitPolicyEntry {
+            address,
+            wasm_sha256,
+            deployed_at_unix_ms: unix_now_ms(),
+        });
+        Ok(RecordOutcome::Recorded)
+    }
+
+    /// Records a newly deployed simple-threshold-policy entry for the given
+    /// network.
+    ///
+    /// Mirrors [`VerifierRegistry::record_spending_limit_policy`]: idempotent
+    /// when the `wasm_sha256` matches an existing simple-threshold-policy
+    /// entry for the network, and refused with
+    /// [`SaError::SimpleThresholdPolicySha256Drift`] when an existing entry
+    /// uses a different `wasm_sha256`.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::SimpleThresholdPolicySha256Drift`] — existing
+    ///   simple-threshold-policy entry for this network uses a different
+    ///   `wasm_sha256`.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    pub fn record_simple_threshold_policy(
+        &mut self,
+        network_passphrase: &str,
+        address: String,
+        wasm_sha256: String,
+    ) -> Result<RecordOutcome, SaError> {
+        let record = self
+            .entries
+            .entry(network_passphrase.to_owned())
+            .or_default();
+        if let Some(existing) = &record.simple_threshold_policy {
+            if existing.wasm_sha256 == wasm_sha256 {
+                return Ok(RecordOutcome::AlreadyRecorded);
+            }
+            return Err(SaError::SimpleThresholdPolicySha256Drift {
+                network: network_passphrase.to_owned(),
+                recorded: existing.wasm_sha256.clone(),
+                attempted: wasm_sha256,
+            });
+        }
+
+        record.simple_threshold_policy = Some(SimpleThresholdPolicyEntry {
+            address,
+            wasm_sha256,
+            deployed_at_unix_ms: unix_now_ms(),
+        });
+        Ok(RecordOutcome::Recorded)
+    }
+
+    /// Records a newly deployed weighted-threshold-policy entry for the given
+    /// network.
+    ///
+    /// Mirrors [`VerifierRegistry::record_spending_limit_policy`]: idempotent
+    /// when the `wasm_sha256` matches an existing weighted-threshold-policy
+    /// entry for the network, and refused with
+    /// [`SaError::WeightedThresholdPolicySha256Drift`] when an existing entry
+    /// uses a different `wasm_sha256`.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::WeightedThresholdPolicySha256Drift`] — existing
+    ///   weighted-threshold-policy entry for this network uses a different
+    ///   `wasm_sha256`.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    pub fn record_weighted_threshold_policy(
+        &mut self,
+        network_passphrase: &str,
+        address: String,
+        wasm_sha256: String,
+    ) -> Result<RecordOutcome, SaError> {
+        let record = self
+            .entries
+            .entry(network_passphrase.to_owned())
+            .or_default();
+        if let Some(existing) = &record.weighted_threshold_policy {
+            if existing.wasm_sha256 == wasm_sha256 {
+                return Ok(RecordOutcome::AlreadyRecorded);
+            }
+            return Err(SaError::WeightedThresholdPolicySha256Drift {
+                network: network_passphrase.to_owned(),
+                recorded: existing.wasm_sha256.clone(),
+                attempted: wasm_sha256,
+            });
+        }
+
+        record.weighted_threshold_policy = Some(WeightedThresholdPolicyEntry {
             address,
             wasm_sha256,
             deployed_at_unix_ms: unix_now_ms(),
@@ -1162,6 +1419,14 @@ mod tests {
             reg.spending_limit_policy_for(testnet()).is_none(),
             "legacy toml has no spending-limit policy"
         );
+        assert!(
+            reg.simple_threshold_policy_for(testnet()).is_none(),
+            "legacy toml has no simple-threshold policy"
+        );
+        assert!(
+            reg.weighted_threshold_policy_for(testnet()).is_none(),
+            "legacy toml has no weighted-threshold policy"
+        );
     }
 
     /// An Ed25519-only entry round-trips through persist + re-open with no
@@ -1382,5 +1647,190 @@ mod tests {
         let json = serde_json::to_string(&err).expect("serialize");
         assert!(json.contains("\"wire_code\""));
         assert!(json.contains("sa.networks_toml_parse"));
+    }
+
+    fn simple_threshold_sha256() -> String {
+        "4c14f402df29675d4155283698c436ee588aacb39adc313845010a565c07567d".to_owned()
+    }
+
+    fn weighted_threshold_sha256() -> String {
+        "e3d8cc5ab9668526d5cf2bab17ee42e84ee4b972ba7cca8d3a37b2ed8d9baee3".to_owned()
+    }
+
+    /// A simple-threshold-policy-only entry round-trips independently of any
+    /// other slot.
+    #[test]
+    fn simple_threshold_only_entry_round_trips() {
+        let (_guard, path) = temp_registry();
+        let mut reg = VerifierRegistry::open_at(path.clone()).expect("open");
+        reg.record_simple_threshold_policy(testnet(), fake_address(), simple_threshold_sha256())
+            .expect("record");
+        reg.persist().expect("persist");
+
+        let reg2 = VerifierRegistry::open_at(path).expect("re-open");
+        let entry = reg2
+            .simple_threshold_policy_for(testnet())
+            .expect("simple-threshold entry must survive round-trip");
+        assert_eq!(entry.address, fake_address());
+        assert_eq!(entry.wasm_sha256, simple_threshold_sha256());
+        assert!(entry.deployed_at_unix_ms > 0);
+        assert!(reg2.webauthn_verifier_for(testnet()).is_none());
+        assert!(reg2.ed25519_verifier_for(testnet()).is_none());
+        assert!(reg2.spending_limit_policy_for(testnet()).is_none());
+        assert!(reg2.weighted_threshold_policy_for(testnet()).is_none());
+    }
+
+    /// A weighted-threshold-policy-only entry round-trips independently of
+    /// any other slot.
+    #[test]
+    fn weighted_threshold_only_entry_round_trips() {
+        let (_guard, path) = temp_registry();
+        let mut reg = VerifierRegistry::open_at(path.clone()).expect("open");
+        reg.record_weighted_threshold_policy(
+            testnet(),
+            fake_address(),
+            weighted_threshold_sha256(),
+        )
+        .expect("record");
+        reg.persist().expect("persist");
+
+        let reg2 = VerifierRegistry::open_at(path).expect("re-open");
+        let entry = reg2
+            .weighted_threshold_policy_for(testnet())
+            .expect("weighted-threshold entry must survive round-trip");
+        assert_eq!(entry.address, fake_address());
+        assert_eq!(entry.wasm_sha256, weighted_threshold_sha256());
+        assert!(entry.deployed_at_unix_ms > 0);
+        assert!(reg2.webauthn_verifier_for(testnet()).is_none());
+        assert!(reg2.ed25519_verifier_for(testnet()).is_none());
+        assert!(reg2.spending_limit_policy_for(testnet()).is_none());
+        assert!(reg2.simple_threshold_policy_for(testnet()).is_none());
+    }
+
+    /// All five contract slots populated for one network round-trip together
+    /// without clobbering each other.
+    #[test]
+    fn all_five_slots_round_trip_together() {
+        let (_guard, path) = temp_registry();
+        let mut reg = VerifierRegistry::open_at(path.clone()).expect("open");
+        reg.record_webauthn_verifier(testnet(), fake_address(), fake_sha256())
+            .expect("record webauthn");
+        reg.record_ed25519_verifier(testnet(), fake_address(), ed25519_sha256())
+            .expect("record ed25519");
+        reg.record_spending_limit_policy(testnet(), fake_address(), spending_limit_sha256())
+            .expect("record spending-limit");
+        reg.record_simple_threshold_policy(testnet(), fake_address(), simple_threshold_sha256())
+            .expect("record simple-threshold");
+        reg.record_weighted_threshold_policy(
+            testnet(),
+            fake_address(),
+            weighted_threshold_sha256(),
+        )
+        .expect("record weighted-threshold");
+        reg.persist().expect("persist");
+
+        let reg2 = VerifierRegistry::open_at(path).expect("re-open");
+        assert_eq!(
+            reg2.simple_threshold_policy_for(testnet())
+                .expect("simple-threshold")
+                .wasm_sha256,
+            simple_threshold_sha256()
+        );
+        assert_eq!(
+            reg2.weighted_threshold_policy_for(testnet())
+                .expect("weighted-threshold")
+                .wasm_sha256,
+            weighted_threshold_sha256()
+        );
+        assert_eq!(
+            reg2.spending_limit_policy_for(testnet())
+                .expect("spending-limit")
+                .wasm_sha256,
+            spending_limit_sha256()
+        );
+    }
+
+    /// Re-recording a simple-threshold policy with a different sha256 is
+    /// refused with the dedicated drift error.
+    #[test]
+    fn simple_threshold_record_rejects_sha256_drift() {
+        let (_guard, path) = temp_registry();
+        let mut reg = VerifierRegistry::open_at(path).expect("open");
+        reg.record_simple_threshold_policy(testnet(), fake_address(), simple_threshold_sha256())
+            .expect("first record");
+        let err = reg
+            .record_simple_threshold_policy(testnet(), fake_address(), alt_sha256())
+            .expect_err("must reject different sha256");
+        assert!(
+            matches!(
+                err,
+                SaError::SimpleThresholdPolicySha256Drift { ref network, .. } if network == testnet()
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Re-recording a simple-threshold policy with the SAME sha256 is
+    /// idempotent.
+    #[test]
+    fn simple_threshold_record_idempotent_when_sha256_matches() {
+        let (_guard, path) = temp_registry();
+        let mut reg = VerifierRegistry::open_at(path).expect("open");
+        let first = reg
+            .record_simple_threshold_policy(testnet(), fake_address(), simple_threshold_sha256())
+            .expect("first record");
+        let second = reg
+            .record_simple_threshold_policy(testnet(), fake_address(), simple_threshold_sha256())
+            .expect("second record");
+        assert_eq!(first, RecordOutcome::Recorded);
+        assert_eq!(second, RecordOutcome::AlreadyRecorded);
+    }
+
+    /// Re-recording a weighted-threshold policy with a different sha256 is
+    /// refused with the dedicated drift error.
+    #[test]
+    fn weighted_threshold_record_rejects_sha256_drift() {
+        let (_guard, path) = temp_registry();
+        let mut reg = VerifierRegistry::open_at(path).expect("open");
+        reg.record_weighted_threshold_policy(
+            testnet(),
+            fake_address(),
+            weighted_threshold_sha256(),
+        )
+        .expect("first record");
+        let err = reg
+            .record_weighted_threshold_policy(testnet(), fake_address(), alt_sha256())
+            .expect_err("must reject different sha256");
+        assert!(
+            matches!(
+                err,
+                SaError::WeightedThresholdPolicySha256Drift { ref network, .. } if network == testnet()
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Re-recording a weighted-threshold policy with the SAME sha256 is
+    /// idempotent.
+    #[test]
+    fn weighted_threshold_record_idempotent_when_sha256_matches() {
+        let (_guard, path) = temp_registry();
+        let mut reg = VerifierRegistry::open_at(path).expect("open");
+        let first = reg
+            .record_weighted_threshold_policy(
+                testnet(),
+                fake_address(),
+                weighted_threshold_sha256(),
+            )
+            .expect("first record");
+        let second = reg
+            .record_weighted_threshold_policy(
+                testnet(),
+                fake_address(),
+                weighted_threshold_sha256(),
+            )
+            .expect("second record");
+        assert_eq!(first, RecordOutcome::Recorded);
+        assert_eq!(second, RecordOutcome::AlreadyRecorded);
     }
 }

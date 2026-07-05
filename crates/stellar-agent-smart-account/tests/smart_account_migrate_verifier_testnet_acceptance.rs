@@ -796,6 +796,7 @@ async fn d1_migrate_verifier_dry_run_constructs_plan_without_submitting() {
                 percentile_label: "explicit".to_owned(),
             },
             dry_run: false,
+            genesis_signer_scval_override: None,
         },
         None,
     )
@@ -1004,6 +1005,7 @@ async fn d2_migrate_verifier_dry_run_identifies_one_external_signer() {
                 percentile_label: "explicit".to_owned(),
             },
             dry_run: false,
+            genesis_signer_scval_override: None,
         },
         None,
     )
@@ -1356,6 +1358,7 @@ async fn d3_migrate_verifier_on_chain_submit() {
                 percentile_label: "explicit".to_owned(),
             },
             dry_run: false,
+            genesis_signer_scval_override: None,
         },
         None,
     )

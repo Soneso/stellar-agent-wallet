@@ -35,6 +35,9 @@
 //! | [`spending_limit_policy_identification_zero_match`] | `SpendingLimitNotInstalled` on zero-match / empty policies |
 //! | [`spending_limit_policy_identification_multi_match`] | `SpendingLimitPolicyIdentificationFailed` |
 //! | [`spending_limit_policy_identification_rpc_divergence`] | `NetworkRpcDivergence` on hash mismatch |
+//! | [`weighted_threshold_policy_identification_zero_match`] | `WeightedThresholdNotInstalled` on zero-match / empty policies |
+//! | [`weighted_threshold_policy_identification_multi_match`] | `WeightedThresholdPolicyIdentificationFailed` |
+//! | [`weighted_threshold_policy_identification_rpc_divergence`] | `NetworkRpcDivergence` on hash mismatch |
 //! | [`spending_limit_data_read_wiring`] | `get_spending_limit_data` end-to-end: decode + as-of-ledger + 3220 mapping |
 //! | [`timelock_salt_collision`] (`test-helpers`) | Timelock salt-derivation collision resistance: dual-component source-lock + uniqueness under distinct request\_ids + timestamps; tests 3/4/5 call `derive_schedule_salt` directly |
 //! | [`verifier_migration_dry_run`] | Verifier-migration planner dry-run mock fixtures |
@@ -154,6 +157,15 @@ mod spending_limit_policy_identification_rpc_divergence;
 
 #[path = "smart-account-fixtures/adversarial/spending_limit_data_read_wiring.rs"]
 mod spending_limit_data_read_wiring;
+
+#[path = "smart-account-fixtures/adversarial/weighted_threshold_policy_identification_zero_match.rs"]
+mod weighted_threshold_policy_identification_zero_match;
+
+#[path = "smart-account-fixtures/adversarial/weighted_threshold_policy_identification_multi_match.rs"]
+mod weighted_threshold_policy_identification_multi_match;
+
+#[path = "smart-account-fixtures/adversarial/weighted_threshold_policy_identification_rpc_divergence.rs"]
+mod weighted_threshold_policy_identification_rpc_divergence;
 
 // Tests 3/4/5 call `derive_schedule_salt` which is only visible when the
 // `test-helpers` feature is active (re-exported in lib.rs under that gate).

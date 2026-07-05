@@ -68,7 +68,8 @@ use stellar_rpc_client::Client;
 use stellar_xdr::LedgerKey;
 use stellar_xdr::{
     ContractId, Hash, HostFunction, Int128Parts, InvokeContractArgs, InvokeHostFunctionOp,
-    Operation, OperationBody, PublicKey, ScAddress, ScBytes, ScSymbol, ScVal, ScVec, Uint256, VecM,
+    Operation, OperationBody, PublicKey, ScAddress, ScBytes, ScMap, ScSymbol, ScVal, ScVec,
+    Uint256, VecM,
 };
 use tracing::{debug, info, warn};
 
@@ -81,6 +82,7 @@ use crate::signers::policy_identification::THRESHOLD_POLICY_WASM_HASHES;
 use crate::signers::types::{
     FrozenChainStateTuple, PolicyIdentifiedKind, ThresholdAffectingOp, WasmHashSummary,
 };
+use crate::weighted_threshold_policy::WEIGHTED_THRESHOLD_POLICY_WASM_HASHES;
 
 /// Context passed to wasm-hash allowlist error constructors.
 pub(crate) struct NotInAllowlistContext {
@@ -92,6 +94,76 @@ pub(crate) struct NotInAllowlistContext {
     pub(crate) observed_hash_first8: String,
     /// Request correlation ID.
     pub(crate) request_id: String,
+}
+
+/// Weighted-threshold policy's on-chain view state: the current threshold
+/// and per-signer weight map.
+///
+/// The `signer_weights` map is decoded generically as `(key ScVal, weight)`
+/// pairs — byte-equality against a target signer's canonical key (built via
+/// [`build_delegated_signer_scval`] / [`build_external_signer_scval`]),
+/// never a semantic `Signer` decode.
+pub struct WeightedThresholdView {
+    /// Current on-chain threshold.
+    pub threshold: u32,
+    /// Per-signer weight map, decoded generically as `(key ScVal, weight)`
+    /// pairs. Look up a specific signer's weight via [`Self::weight_of`]
+    /// using a canonical key built via [`build_delegated_signer_scval`] /
+    /// [`build_external_signer_scval`] — never decode the key semantically.
+    pub signer_weights: Vec<(ScVal, u32)>,
+}
+
+impl WeightedThresholdView {
+    /// Returns the checked sum of all signer weights.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SaError::WeightedThresholdInstallRefused`] if the sum
+    /// overflows `u32` (mirrors OZ `MathOverflow`, code 3212).
+    pub fn total_weight(&self) -> Result<u32, SaError> {
+        let mut total: u32 = 0;
+        for (_, weight) in &self.signer_weights {
+            total = total.checked_add(*weight).ok_or_else(|| {
+                SaError::WeightedThresholdInstallRefused {
+                    reason: "sum of on-chain signer weights overflows u32".to_owned(),
+                }
+            })?;
+        }
+        Ok(total)
+    }
+
+    /// Returns the weight for the signer whose canonical key ScVal equals
+    /// `key`, or `0` if absent (matching OZ "no weight configured
+    /// contributes zero" semantics, `weighted_threshold.rs:257-264`, SHA
+    /// `a9c4216`).
+    pub fn weight_of(&self, key: &ScVal) -> u32 {
+        self.signer_weights
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, w)| *w)
+            .unwrap_or(0)
+    }
+}
+
+/// Returns a redacted, kind-labelled identity string for a weighted-threshold
+/// signer, for audit-log display (never the raw G-strkey or key material).
+fn redact_weighted_signer_identity(
+    input: &crate::weighted_threshold_policy::WeightedThresholdSignerInput,
+) -> String {
+    match input {
+        crate::weighted_threshold_policy::WeightedThresholdSignerInput::Delegated { g_strkey } => {
+            format!("delegated:{}", redact_strkey_first5_last5(g_strkey))
+        }
+        crate::weighted_threshold_policy::WeightedThresholdSignerInput::External {
+            verifier,
+            ..
+        } => {
+            let verifier_display = scaddress_to_strkey(verifier)
+                .map(|s| redact_strkey_first5_last5(&s))
+                .unwrap_or_else(|_| "unknown".to_owned());
+            format!("external:{verifier_display}")
+        }
+    }
 }
 
 // ── On-chain constants (OZ stellar-contracts v0.7.2) ────────────
@@ -2217,6 +2289,1079 @@ impl SignersManager {
         Ok((data, as_of_ledger))
     }
 
+    // ── identify_weighted_threshold_policy ────────────────────────────────────
+
+    /// Identifies the weighted-threshold-policy contract for a context rule.
+    ///
+    /// Mirrors [`SignersManager::identify_spending_limit_policy`]: fetches the
+    /// wasm-hash of each `Address` in the rule's `policies` list via batched
+    /// `getLedgerEntries` on BOTH RPCs in parallel (two-RPC consultation),
+    /// then matches against [`WEIGHTED_THRESHOLD_POLICY_WASM_HASHES`] (a
+    /// single-entry allowlist, separate from [`THRESHOLD_POLICY_WASM_HASHES`]
+    /// — the two policy kinds cannot cross-identify). Exactly one match is
+    /// required (fail-closed).
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::WeightedThresholdNotInstalled`] — the rule's `policies`
+    ///   list is empty, or none of the attached policies' wasm-hash matches
+    ///   the allowlist.
+    /// - [`SaError::WeightedThresholdPolicyIdentificationFailed`] — more than
+    ///   one attached policy matches the allowlist (ambiguous).
+    /// - [`SaError::NetworkRpcDivergence`] — primary and secondary RPC
+    ///   disagree on wasm-hash.
+    /// - [`SaError::DeploymentFailed`] — RPC `getLedgerEntries` failure.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic in practice: the infallible `expect` on a SHA-256
+    /// slice and on the `Option<ScAddress>` guarded by `match_count == 1`
+    /// are provably safe. See inline comments.
+    #[allow(
+        clippy::expect_used,
+        reason = "infallible: match_count == 1 guarantees Some"
+    )]
+    pub async fn identify_weighted_threshold_policy(
+        &self,
+        smart_account: ScAddress,
+        rule_id: u32,
+        source_account_strkey: Option<&str>,
+        request_id: String,
+    ) -> Result<ScAddress, SaError> {
+        let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
+        let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
+
+        let context_rule = self
+            .fetch_context_rule_primary(smart_account.clone(), rule_id, source_account_strkey)
+            .await?;
+
+        if context_rule.policies.is_empty() {
+            return Err(SaError::WeightedThresholdNotInstalled {
+                rule_id,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
+                ),
+                request_id,
+            });
+        }
+
+        let policy_keys: Vec<LedgerKey> = context_rule
+            .policies
+            .iter()
+            .map(contract_instance_key)
+            .collect();
+
+        if policy_keys.is_empty() {
+            return Err(SaError::WeightedThresholdNotInstalled {
+                rule_id,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
+                ),
+                request_id,
+            });
+        }
+
+        let (primary_hashes_result, secondary_hashes_result) = tokio::join!(
+            fetch_contract_wasm_hashes(&self.primary_rpc_client, &policy_keys),
+            fetch_contract_wasm_hashes(&self.secondary_rpc_client, &policy_keys),
+        );
+
+        let primary_hashes = primary_hashes_result.map_err(|e| SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason: format!("primary RPC policy wasm-hash fetch failed: {e}"),
+        })?;
+        let secondary_hashes = secondary_hashes_result.map_err(|e| SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason: format!("secondary RPC policy wasm-hash fetch failed: {e}"),
+        })?;
+
+        if primary_hashes.len() != secondary_hashes.len() || primary_hashes != secondary_hashes {
+            let primary_digest: [u8; 32] = Sha256::digest(
+                primary_hashes
+                    .iter()
+                    .flat_map(|h| h.iter().flat_map(|b| b.iter()).copied())
+                    .collect::<Vec<u8>>(),
+            )
+            .into();
+            let secondary_digest: [u8; 32] = Sha256::digest(
+                secondary_hashes
+                    .iter()
+                    .flat_map(|h| h.iter().flat_map(|b| b.iter()).copied())
+                    .collect::<Vec<u8>>(),
+            )
+            .into();
+            let primary_first8 = primary_digest[..8]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            let secondary_first8 = secondary_digest[..8]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            return Err(SaError::NetworkRpcDivergence {
+                rule_id,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
+                ),
+                primary_view_digest_first8: primary_first8,
+                secondary_view_digest_first8: secondary_first8,
+                request_id,
+            });
+        }
+
+        let mut matched_policy_addr: Option<ScAddress> = None;
+        let mut match_count = 0usize;
+        let first_first8: Option<[u8; 8]> = primary_hashes
+            .iter()
+            .find_map(|opt_h| opt_h.as_ref())
+            .map(|h| <[u8; 8]>::try_from(&h[..8]).expect("sha256 is 32 bytes"));
+
+        for (opt_hash, policy_addr) in primary_hashes.iter().zip(context_rule.policies.iter()) {
+            let Some(hash) = opt_hash else { continue };
+            debug!(
+                policy_wasm_hash_first8 = %hash[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                "identify_weighted_threshold_policy: observed policy wasm hash"
+            );
+            if WEIGHTED_THRESHOLD_POLICY_WASM_HASHES
+                .iter()
+                .any(|allowed| allowed == hash)
+            {
+                match_count += 1;
+                matched_policy_addr = Some(policy_addr.clone());
+            }
+        }
+
+        match match_count {
+            1 => Ok(matched_policy_addr.expect("match_count == 1 guarantees Some")),
+            0 => Err(SaError::WeightedThresholdNotInstalled {
+                rule_id,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
+                ),
+                request_id,
+            }),
+            _ => {
+                let count = u32::try_from(primary_hashes.len()).unwrap_or(u32::MAX);
+                Err(SaError::WeightedThresholdPolicyIdentificationFailed {
+                    rule_id,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted(
+                        smart_account_redacted,
+                    ),
+                    observed_wasm_hashes_summary: WasmHashSummary {
+                        count,
+                        first_first8,
+                    },
+                    request_id,
+                })
+            }
+        }
+    }
+
+    // ── get_weighted_threshold_data ────────────────────────────────────────────
+
+    /// Reads the current on-chain `threshold` and `signer_weights` map for an
+    /// installed weighted-threshold policy — the public read side of the
+    /// weighted-threshold surface, mirroring [`Self::get_spending_limit_data`].
+    ///
+    /// `policy` MUST be the result of a prior
+    /// [`SignersManager::identify_weighted_threshold_policy`] call — callers
+    /// are responsible for identifying the policy first and passing the
+    /// result here (fail-closed: no unvalidated address is read).
+    ///
+    /// Fetches the rule's [`crate::managers::rules::ContextRuleDefinition`]
+    /// (`get_signer_weights` takes the full context-rule value, not just its
+    /// ID — OZ `weighted_threshold.rs` exported view), then reads the
+    /// on-chain `threshold` and `signer_weights` map.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::WeightedThresholdNotInstalled`] — `install` was never
+    ///   called for this `(smart_account, rule_id)` pair on the policy
+    ///   contract.
+    /// - [`SaError::DeploymentFailed`] — simulation or decode failure.
+    ///
+    /// # Implements
+    ///
+    /// Weighted-threshold policy observability: reading back the threshold
+    /// and per-signer weight map a mutator (`set_weighted_threshold`,
+    /// `set_signer_weight`) or the initial `install` produced.
+    pub async fn get_weighted_threshold_data(
+        &self,
+        policy: ScAddress,
+        rule_id: u32,
+        smart_account: ScAddress,
+        source_account_strkey: Option<&str>,
+        request_id: String,
+    ) -> Result<WeightedThresholdView, SaError> {
+        let context_rule = self
+            .fetch_context_rule_primary(smart_account.clone(), rule_id, source_account_strkey)
+            .await?;
+        let context_rule_scval = context_rule.as_scval()?;
+        self.get_weighted_threshold_view(
+            policy,
+            rule_id,
+            smart_account,
+            context_rule_scval,
+            source_account_strkey,
+            request_id,
+        )
+        .await
+    }
+
+    // ── get_weighted_threshold_view ───────────────────────────────────────────
+
+    /// Reads the current on-chain `threshold` and `signer_weights` map for an
+    /// installed weighted-threshold policy.
+    ///
+    /// Calls the policy contract's exported `get_threshold(context_rule_id,
+    /// smart_account)` and `get_signer_weights(context_rule, smart_account)`
+    /// views (`examples/multisig-smart-account/weighted-threshold-policy/src/contract.rs:46,50`,
+    /// SHA `a9c4216`). The signer-weights map is decoded generically as
+    /// `(key ScVal, weight)` pairs — byte-equality against a target signer's
+    /// canonical key (built via [`build_delegated_signer_scval`] /
+    /// [`build_external_signer_scval`]), never a semantic `Signer` decode.
+    ///
+    /// Called both by [`Self::get_weighted_threshold_data`] (the public read
+    /// path) and internally by the mutators' mandatory pre-flight read.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::WeightedThresholdNotInstalled`] — the policy's
+    ///   `get_threshold` view panics `WeightedThresholdError::SmartAccountNotInstalled`
+    ///   (code 3210, `weighted_threshold.rs:180-196`, SHA `a9c4216`), meaning
+    ///   `install` was never called for this `(smart_account, rule_id)` pair.
+    /// - [`SaError::DeploymentFailed`] — simulation or decode failure.
+    async fn get_weighted_threshold_view(
+        &self,
+        policy: ScAddress,
+        rule_id: u32,
+        smart_account: ScAddress,
+        context_rule_scval: ScVal,
+        source_account_strkey: Option<&str>,
+        request_id: String,
+    ) -> Result<WeightedThresholdView, SaError> {
+        let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
+        let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
+
+        let threshold_args = vec![ScVal::U32(rule_id), ScVal::Address(smart_account.clone())];
+        let threshold_sim = simulate_read_only_with_ledger(
+            self.primary_rpc_client.url(),
+            policy.clone(),
+            "get_threshold",
+            threshold_args,
+            source_account_strkey,
+            &self.network_passphrase,
+            self.timeout,
+        )
+        .await;
+
+        let (threshold_scval, _as_of_ledger) = match threshold_sim {
+            Ok(v) => v,
+            Err(SaError::DeploymentFailed {
+                phase,
+                redacted_reason,
+            }) if phase == "simulate"
+                && (redacted_reason.contains("SmartAccountNotInstalled")
+                    || redacted_reason.contains("Error(Contract, #3210)")) =>
+            {
+                return Err(SaError::WeightedThresholdNotInstalled {
+                    rule_id,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted(
+                        smart_account_redacted,
+                    ),
+                    request_id,
+                });
+            }
+            Err(other) => return Err(other),
+        };
+
+        let threshold = extract_u32_return(&threshold_scval, "get_threshold")?;
+
+        let weights_args = vec![context_rule_scval, ScVal::Address(smart_account)];
+        let (weights_scval, _as_of_ledger) = simulate_read_only_with_ledger(
+            self.primary_rpc_client.url(),
+            policy,
+            "get_signer_weights",
+            weights_args,
+            source_account_strkey,
+            &self.network_passphrase,
+            self.timeout,
+        )
+        .await?;
+
+        let signer_weights = match weights_scval {
+            ScVal::Map(Some(ScMap(entries))) => {
+                let mut out = Vec::with_capacity(entries.len());
+                for entry in entries.iter() {
+                    let weight = extract_u32_return(&entry.val, "get_signer_weights entry")?;
+                    out.push((entry.key.clone(), weight));
+                }
+                out
+            }
+            other => {
+                return Err(SaError::DeploymentFailed {
+                    phase: "simulate",
+                    redacted_reason: format!(
+                        "get_signer_weights: expected ScVal::Map return, got {other:?}"
+                    ),
+                });
+            }
+        };
+
+        Ok(WeightedThresholdView {
+            threshold,
+            signer_weights,
+        })
+    }
+
+    // ── set_weighted_threshold ─────────────────────────────────────────────────
+
+    /// Changes the `threshold` of an installed weighted-threshold policy.
+    ///
+    /// Acquires the per-rule mutex, then:
+    ///
+    /// 1. Identifies the weighted-threshold-policy address.
+    /// 2. Pre-reads the current `threshold` and `signer_weights` (MANDATORY
+    ///    pre-flight — the vendored example contract exports both views).
+    /// 3. Refuses client-side if `new_threshold == 0` or `new_threshold`
+    ///    exceeds the checked sum of current signer weights (mirrors OZ
+    ///    `InvalidThreshold`, code 3211, `weighted_threshold.rs:352-383`, SHA
+    ///    `a9c4216` — defense in depth, not a substitute for the on-chain check).
+    /// 4. Submits `set_threshold(threshold, context_rule, smart_account)`
+    ///    routed through the smart account's `execute()` entrypoint (avoids
+    ///    Soroban re-entry; same rationale as `set_threshold_locked_inner`).
+    /// 5. Emits `SaWeightedThresholdChanged` audit row with the pre-read old
+    ///    threshold.
+    ///
+    /// `compute_post_op_invariant` does NOT apply here: weighted-threshold
+    /// reachability is a weight-sum invariant, not a signer-count invariant.
+    ///
+    /// # Arguments
+    ///
+    /// - `smart_account` — the smart-account contract's [`ScAddress`].
+    /// - `rule_id` — the context rule whose weighted-threshold policy is
+    ///   changed (the ARGUMENT rule; keys the policy's storage mutation).
+    /// - `new_threshold` — the desired new threshold.
+    /// - `auth_rule_ids` — the rule(s) AUTHORIZING the change. Defaults to
+    ///   `[rule_id]` at the CLI layer (a weighted policy commonly sits on a
+    ///   Default-scoped rule that self-authorizes); pass an explicit
+    ///   admin-capable rule when the target rule is scoped (a CallContract- or
+    ///   CreateContract-scoped rule cannot validate the `execute` auth context
+    ///   and refuses with `UnvalidatedContext`, 3002).
+    /// - `signer` — the ed25519 signer.
+    /// - `request_id` — caller-supplied UUID.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::WeightedThresholdInstallRefused`] — `new_threshold == 0`
+    ///   or exceeds the current weight sum, or `auth_rule_ids` is empty.
+    /// - [`SaError::WeightedThresholdNotInstalled`] /
+    ///   [`SaError::WeightedThresholdPolicyIdentificationFailed`] —
+    ///   identification failure.
+    /// - [`SaError::NetworkRpcDivergence`] — two-RPC disagreement.
+    /// - [`SaError::DeploymentFailed`] — submission or on-chain rejection.
+    pub async fn set_weighted_threshold(
+        &self,
+        smart_account: ScAddress,
+        rule_id: u32,
+        new_threshold: u32,
+        auth_rule_ids: &[ContextRuleId],
+        signer: &(dyn Signer + Send + Sync),
+        request_id: String,
+    ) -> Result<(), SaError> {
+        if auth_rule_ids.is_empty() {
+            return Err(SaError::WeightedThresholdInstallRefused {
+                reason: "set-weighted-threshold refused: auth_rule_ids must not be empty"
+                    .to_owned(),
+            });
+        }
+
+        let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
+        let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
+
+        let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, &smart_account_strkey);
+        let _guard = mutex.lock().await;
+
+        let outcome = self
+            .set_weighted_threshold_locked_inner(
+                smart_account.clone(),
+                rule_id,
+                auth_rule_ids,
+                new_threshold,
+                signer,
+                &request_id,
+            )
+            .await;
+
+        match &outcome {
+            Ok((old_threshold, policy_addr, tx_hash)) => {
+                let policy_addr_redacted = scaddress_to_strkey(policy_addr)
+                    .map(|s| redact_strkey_first5_last5(&s))
+                    .unwrap_or_else(|_| "unknown".to_owned());
+                let tx_hash_redacted = stellar_agent_network::redact_tx_hash(tx_hash);
+                match self.audit_writer.lock() {
+                    Ok(mut writer) => {
+                        let entry = AuditEntry::new_sa_weighted_threshold_changed(
+                            rule_id,
+                            *old_threshold,
+                            new_threshold,
+                            RedactedStrkey::from_already_redacted(policy_addr_redacted.clone()),
+                            tx_hash_redacted.clone(),
+                            RedactedStrkey::from_already_redacted(smart_account_redacted.clone()),
+                            self.chain_id.as_str(),
+                            request_id.clone(),
+                        );
+                        if let Err(e) = writer.write_entry(entry) {
+                            warn!(
+                                error = %e,
+                                "set_weighted_threshold: SaWeightedThresholdChanged audit write failed"
+                            );
+                        }
+                    }
+                    Err(_poison) => {
+                        self.mark_audit_writer_degraded();
+                        warn!(
+                            target: "stellar_agent::audit",
+                            rule_id,
+                            old_threshold = *old_threshold,
+                            new_threshold,
+                            policy_address_redacted = %policy_addr_redacted,
+                            transaction_hash_redacted = %tx_hash_redacted,
+                            smart_account_redacted = %smart_account_redacted,
+                            chain_id = %self.chain_id,
+                            request_id = %request_id,
+                            "audit-writer mutex poisoned; SaWeightedThresholdChanged row dropped"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    rule_id,
+                    smart_account = %smart_account_redacted,
+                    "set_weighted_threshold: operation failed"
+                );
+            }
+        }
+
+        outcome.map(|_| ())
+    }
+
+    async fn set_weighted_threshold_locked_inner(
+        &self,
+        smart_account: ScAddress,
+        rule_id: u32,
+        auth_rule_ids: &[ContextRuleId],
+        new_threshold: u32,
+        signer: &(dyn Signer + Send + Sync),
+        request_id: &str,
+    ) -> Result<(u32, ScAddress, String), SaError> {
+        let source_pubkey =
+            signer
+                .public_key()
+                .await
+                .map_err(|e| SaError::AuthEntryConstructionFailed {
+                    stage: "auth_payload",
+                    redacted_reason: format!("signer public_key fetch failed: {e}"),
+                })?;
+        let source_pubkey_strkey = stellar_strkey::ed25519::PublicKey(source_pubkey.0).to_string();
+
+        let policy_addr = self
+            .identify_weighted_threshold_policy(
+                smart_account.clone(),
+                rule_id,
+                Some(&source_pubkey_strkey),
+                request_id.to_owned(),
+            )
+            .await?;
+
+        let context_rule = self
+            .fetch_context_rule_primary(smart_account.clone(), rule_id, Some(&source_pubkey_strkey))
+            .await?;
+        let context_rule_scval = context_rule.as_scval()?;
+
+        let view = self
+            .get_weighted_threshold_view(
+                policy_addr.clone(),
+                rule_id,
+                smart_account.clone(),
+                context_rule_scval.clone(),
+                Some(&source_pubkey_strkey),
+                request_id.to_owned(),
+            )
+            .await?;
+        let old_threshold = view.threshold;
+        let total_weight = view.total_weight()?;
+
+        if new_threshold == 0 {
+            return Err(SaError::WeightedThresholdInstallRefused {
+                reason: "--threshold must be non-zero (OZ set_threshold rejects threshold == 0 \
+                         with InvalidThreshold)"
+                    .to_owned(),
+            });
+        }
+        if new_threshold > total_weight {
+            return Err(SaError::WeightedThresholdInstallRefused {
+                reason: format!(
+                    "--threshold ({new_threshold}) must not exceed the sum of current signer \
+                     weights ({total_weight}); OZ set_threshold rejects this with \
+                     InvalidThreshold"
+                ),
+            });
+        }
+
+        let set_threshold_sym = ScSymbol::try_from("set_threshold").map_err(|e| {
+            SaError::AuthEntryConstructionFailed {
+                stage: "auth_payload",
+                redacted_reason: format!("encode set_threshold symbol: {e:?}"),
+            }
+        })?;
+        let target_args_vec: VecM<ScVal> = vec![
+            ScVal::U32(new_threshold),
+            context_rule_scval,
+            ScVal::Address(smart_account.clone()),
+        ]
+        .try_into()
+        .map_err(|e| SaError::AuthEntryConstructionFailed {
+            stage: "auth_contexts_args",
+            redacted_reason: format!("encode set_threshold target_args VecM: {e:?}"),
+        })?;
+        let execute_args = vec![
+            ScVal::Address(policy_addr.clone()),
+            ScVal::Symbol(set_threshold_sym),
+            ScVal::Vec(Some(ScVec(target_args_vec))),
+        ];
+
+        let expiry_rule_id = auth_rule_ids
+            .first()
+            .map(ContextRuleId::as_u32)
+            .unwrap_or(rule_id);
+        let submit_result = self
+            .submit_signed_invoke(
+                smart_account.clone(),
+                &smart_account,
+                "execute",
+                execute_args,
+                auth_rule_ids,
+                signer,
+                &source_pubkey_strkey,
+                "execute",
+                Some(ExpiryCheck {
+                    rule_id: expiry_rule_id,
+                }),
+            )
+            .await?;
+
+        Ok((old_threshold, policy_addr, submit_result.tx_hash))
+    }
+
+    // ── set_signer_weight ──────────────────────────────────────────────────────
+
+    /// Changes one signer's `weight` in an installed weighted-threshold policy.
+    ///
+    /// Acquires the per-rule mutex, then:
+    ///
+    /// 1. Identifies the weighted-threshold-policy address.
+    /// 2. Pre-reads the current `threshold` and `signer_weights` (MANDATORY
+    ///    pre-flight). The target signer's OLD weight is looked up by
+    ///    canonical-key byte-equality — `0` if the signer is absent from the
+    ///    map (matching OZ "no weight configured contributes zero" semantics).
+    /// 3. Refuses client-side if the adjusted weight sum (current sum minus
+    ///    the old weight plus the new weight) would fall below the current
+    ///    threshold (mirrors OZ `InvalidThreshold`, code 3211,
+    ///    `weighted_threshold.rs:413-447`, SHA `a9c4216` — defense in depth).
+    /// 4. Submits `set_signer_weight(signer, weight, context_rule,
+    ///    smart_account)` routed through `execute()`.
+    /// 5. Emits `SaSignerWeightChanged` audit row with the pre-read old weight.
+    ///
+    /// `compute_post_op_invariant` does NOT apply (weight-sum semantics).
+    ///
+    /// # Arguments
+    ///
+    /// See [`Self::set_weighted_threshold`] for the shared argument shapes;
+    /// `target_signer` identifies the signer whose weight changes, and
+    /// `new_weight` is the desired weight.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::set_weighted_threshold`] for the error taxonomy.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "irreducible signer + auth + audit arg set"
+    )]
+    pub async fn set_signer_weight(
+        &self,
+        smart_account: ScAddress,
+        rule_id: u32,
+        target_signer: crate::weighted_threshold_policy::WeightedThresholdSignerInput,
+        new_weight: u32,
+        auth_rule_ids: &[ContextRuleId],
+        signer: &(dyn Signer + Send + Sync),
+        request_id: String,
+    ) -> Result<(), SaError> {
+        if auth_rule_ids.is_empty() {
+            return Err(SaError::WeightedThresholdInstallRefused {
+                reason: "set-signer-weight refused: auth_rule_ids must not be empty".to_owned(),
+            });
+        }
+
+        let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
+        let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
+        let signer_identity_redacted = redact_weighted_signer_identity(&target_signer);
+
+        let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, &smart_account_strkey);
+        let _guard = mutex.lock().await;
+
+        let outcome = self
+            .set_signer_weight_locked_inner(
+                smart_account.clone(),
+                rule_id,
+                auth_rule_ids,
+                target_signer,
+                new_weight,
+                signer,
+                &request_id,
+            )
+            .await;
+
+        match &outcome {
+            Ok((old_weight, policy_addr, tx_hash)) => {
+                let policy_addr_redacted = scaddress_to_strkey(policy_addr)
+                    .map(|s| redact_strkey_first5_last5(&s))
+                    .unwrap_or_else(|_| "unknown".to_owned());
+                let tx_hash_redacted = stellar_agent_network::redact_tx_hash(tx_hash);
+                match self.audit_writer.lock() {
+                    Ok(mut writer) => {
+                        let entry = AuditEntry::new_sa_signer_weight_changed(
+                            rule_id,
+                            signer_identity_redacted.clone(),
+                            *old_weight,
+                            new_weight,
+                            RedactedStrkey::from_already_redacted(policy_addr_redacted.clone()),
+                            tx_hash_redacted.clone(),
+                            RedactedStrkey::from_already_redacted(smart_account_redacted.clone()),
+                            self.chain_id.as_str(),
+                            request_id.clone(),
+                        );
+                        if let Err(e) = writer.write_entry(entry) {
+                            warn!(
+                                error = %e,
+                                "set_signer_weight: SaSignerWeightChanged audit write failed"
+                            );
+                        }
+                    }
+                    Err(_poison) => {
+                        self.mark_audit_writer_degraded();
+                        warn!(
+                            target: "stellar_agent::audit",
+                            rule_id,
+                            signer_identity_redacted = %signer_identity_redacted,
+                            old_weight = *old_weight,
+                            new_weight,
+                            policy_address_redacted = %policy_addr_redacted,
+                            transaction_hash_redacted = %tx_hash_redacted,
+                            smart_account_redacted = %smart_account_redacted,
+                            chain_id = %self.chain_id,
+                            request_id = %request_id,
+                            "audit-writer mutex poisoned; SaSignerWeightChanged row dropped"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    rule_id,
+                    smart_account = %smart_account_redacted,
+                    "set_signer_weight: operation failed"
+                );
+            }
+        }
+
+        outcome.map(|_| ())
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "irreducible signer + auth + audit arg set"
+    )]
+    async fn set_signer_weight_locked_inner(
+        &self,
+        smart_account: ScAddress,
+        rule_id: u32,
+        auth_rule_ids: &[ContextRuleId],
+        target_signer: crate::weighted_threshold_policy::WeightedThresholdSignerInput,
+        new_weight: u32,
+        signer: &(dyn Signer + Send + Sync),
+        request_id: &str,
+    ) -> Result<(u32, ScAddress, String), SaError> {
+        let source_pubkey =
+            signer
+                .public_key()
+                .await
+                .map_err(|e| SaError::AuthEntryConstructionFailed {
+                    stage: "auth_payload",
+                    redacted_reason: format!("signer public_key fetch failed: {e}"),
+                })?;
+        let source_pubkey_strkey = stellar_strkey::ed25519::PublicKey(source_pubkey.0).to_string();
+
+        let policy_addr = self
+            .identify_weighted_threshold_policy(
+                smart_account.clone(),
+                rule_id,
+                Some(&source_pubkey_strkey),
+                request_id.to_owned(),
+            )
+            .await?;
+
+        let context_rule = self
+            .fetch_context_rule_primary(smart_account.clone(), rule_id, Some(&source_pubkey_strkey))
+            .await?;
+        let context_rule_scval = context_rule.as_scval()?;
+
+        let view = self
+            .get_weighted_threshold_view(
+                policy_addr.clone(),
+                rule_id,
+                smart_account.clone(),
+                context_rule_scval.clone(),
+                Some(&source_pubkey_strkey),
+                request_id.to_owned(),
+            )
+            .await?;
+
+        let target_signer_scval = match &target_signer {
+            crate::weighted_threshold_policy::WeightedThresholdSignerInput::Delegated {
+                g_strkey,
+            } => build_delegated_signer_scval(g_strkey)?,
+            crate::weighted_threshold_policy::WeightedThresholdSignerInput::External {
+                verifier,
+                key_data,
+            } => build_external_signer_scval(verifier.clone(), key_data)?,
+        };
+
+        let old_weight = view.weight_of(&target_signer_scval);
+        let current_threshold = view.threshold;
+        let current_total = view.total_weight()?;
+
+        let adjusted_total = current_total
+            .checked_sub(old_weight)
+            .and_then(|t| t.checked_add(new_weight))
+            .ok_or_else(|| SaError::WeightedThresholdInstallRefused {
+                reason: "adjusted signer-weight sum overflows/underflows u32".to_owned(),
+            })?;
+
+        if current_threshold > adjusted_total {
+            return Err(SaError::WeightedThresholdInstallRefused {
+                reason: format!(
+                    "--weight ({new_weight}) would drop the adjusted signer-weight sum \
+                     ({adjusted_total}) below the current threshold ({current_threshold}); \
+                     OZ set_signer_weight rejects this with InvalidThreshold"
+                ),
+            });
+        }
+
+        let set_signer_weight_sym = ScSymbol::try_from("set_signer_weight").map_err(|e| {
+            SaError::AuthEntryConstructionFailed {
+                stage: "auth_payload",
+                redacted_reason: format!("encode set_signer_weight symbol: {e:?}"),
+            }
+        })?;
+        let target_args_vec: VecM<ScVal> = vec![
+            target_signer_scval,
+            ScVal::U32(new_weight),
+            context_rule_scval,
+            ScVal::Address(smart_account.clone()),
+        ]
+        .try_into()
+        .map_err(|e| SaError::AuthEntryConstructionFailed {
+            stage: "auth_contexts_args",
+            redacted_reason: format!("encode set_signer_weight target_args VecM: {e:?}"),
+        })?;
+        let execute_args = vec![
+            ScVal::Address(policy_addr.clone()),
+            ScVal::Symbol(set_signer_weight_sym),
+            ScVal::Vec(Some(ScVec(target_args_vec))),
+        ];
+
+        let expiry_rule_id = auth_rule_ids
+            .first()
+            .map(ContextRuleId::as_u32)
+            .unwrap_or(rule_id);
+        let submit_result = self
+            .submit_signed_invoke(
+                smart_account.clone(),
+                &smart_account,
+                "execute",
+                execute_args,
+                auth_rule_ids,
+                signer,
+                &source_pubkey_strkey,
+                "execute",
+                Some(ExpiryCheck {
+                    rule_id: expiry_rule_id,
+                }),
+            )
+            .await?;
+
+        Ok((old_weight, policy_addr, submit_result.tx_hash))
+    }
+
+    // ── batch_add_signers ──────────────────────────────────────────────────────
+
+    /// Adds multiple signers to a context rule in ONE transaction via OZ
+    /// `batch_add_signer(context_rule_id, Vec<Signer>)`
+    /// (`examples/multisig-smart-account/account/src/contract.rs:43`,
+    /// `packages/accounts/src/smart_account/storage.rs:1053`, SHA `a9c4216`
+    /// — on-chain dup-check across existing + new signers, one
+    /// `SignerAdded` event per signer).
+    ///
+    /// Acquires the per-rule mutex, then:
+    ///
+    /// 1. Refuses client-side if `existing_signer_count + batch.len() >
+    ///    MAX_SIGNERS` (OZ `MAX_SIGNERS = 15`,
+    ///    `packages/accounts/src/smart_account/mod.rs:526`, SHA `a9c4216`;
+    ///    enforced on-chain via a raw panic, `storage.rs:1072` → `:379`).
+    /// 2. Submits `batch_add_signer(rule_id, signers)` as a single
+    ///    `InvokeHostFunctionOp`.
+    /// 3. Emits one `SaSignerAdded` row per signer (reusing the existing
+    ///    audit kind) plus the raw-invocation row.
+    ///
+    /// The single-signer `add_signer` verb and its arg contract are
+    /// unchanged; this is an additive verb for the batch case.
+    ///
+    /// The post-op result-fetch identifies the rule's threshold policy via
+    /// [`Self::identify_threshold_policy`], which recognizes only
+    /// simple-threshold policies. On a rule whose only attached threshold
+    /// policy is weighted-threshold, batch-adding signers requires first
+    /// attaching a simple-threshold policy to that rule. In practice this
+    /// call refuses BEFORE identification is ever reached:
+    /// `batch_add_signers_locked_inner` reads the audit-log baseline first,
+    /// and a baseline can only exist once `identify_threshold_policy` has
+    /// ALREADY succeeded for that rule (every path that writes one —
+    /// `refresh_signer_baseline`, `add_signer`, this function itself — calls
+    /// it first), so a weighted-only rule has no baseline to read and this
+    /// call fails closed with [`SaError::SignerSetMissingBaseline`] instead.
+    /// [`SaError::ThresholdPolicyNotInstalled`] /
+    /// [`SaError::ThresholdPolicyIdentificationFailed`] from THIS call are
+    /// effectively unreachable for a weighted-only rule for that reason —
+    /// they remain listed below because the closed-set `# Errors` contract
+    /// covers every code path this function's own `identify_threshold_policy`
+    /// call can return, not just the practically-reachable ones. Either way,
+    /// identification (when it does run) precedes any `batch_add_signer`
+    /// submission, so refusal leaves no partial on-chain state.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::BatchSignerAddRefused`] — the batch is empty (nothing to
+    ///   add); refused before acquiring the per-rule mutex.
+    /// - [`SaError::ContextRuleCapsExceeded`] — the batch would exceed
+    ///   `MAX_SIGNERS`.
+    /// - [`SaError::SignerSetMissingBaseline`] — no audit-log baseline; the
+    ///   practical refusal for a weighted-only rule (see above).
+    /// - [`SaError::ThresholdPolicyNotInstalled`] /
+    ///   [`SaError::ThresholdPolicyIdentificationFailed`] — the rule has no
+    ///   uniquely-identifiable simple-threshold policy for the post-op
+    ///   result-fetch; reachable only when a baseline already exists but the
+    ///   rule's policy set changed since (see above).
+    /// - [`SaError::DeploymentFailed`] — submission or on-chain rejection.
+    pub async fn batch_add_signers(
+        &self,
+        smart_account: ScAddress,
+        rule_id: u32,
+        new_signers: Vec<(ScVal, SignerPubkey)>,
+        signer: &(dyn Signer + Send + Sync),
+        request_id: String,
+    ) -> Result<Vec<u32>, SaError> {
+        if new_signers.is_empty() {
+            return Err(SaError::BatchSignerAddRefused {
+                reason: "batch is empty: at least one signer is required".to_owned(),
+            });
+        }
+
+        let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
+        let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
+
+        let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, &smart_account_strkey);
+        let _guard = mutex.lock().await;
+
+        let outcome = self
+            .batch_add_signers_locked_inner(
+                smart_account.clone(),
+                rule_id,
+                &smart_account_redacted,
+                new_signers,
+                signer,
+                &request_id,
+            )
+            .await;
+
+        match &outcome {
+            Ok((signer_ids, resulting)) => {
+                let pubkeys_first8 = pubkeys_first8(&resulting.signer_pubkeys);
+                match self.audit_writer.lock() {
+                    Ok(mut writer) => {
+                        for signer_id in signer_ids {
+                            let entry = AuditEntry::new_sa_signer_added(
+                                rule_id,
+                                *signer_id,
+                                resulting,
+                                pubkeys_first8.clone(),
+                                RedactedStrkey::from_already_redacted(
+                                    smart_account_redacted.clone(),
+                                ),
+                                self.chain_id.as_str(),
+                                request_id.clone(),
+                            );
+                            if let Err(e) = writer.write_entry(entry) {
+                                warn!(
+                                    error = %e,
+                                    signer_id,
+                                    "batch_add_signers: SaSignerAdded audit write failed"
+                                );
+                            }
+                        }
+                    }
+                    Err(_poison) => {
+                        self.mark_audit_writer_degraded();
+                        warn!(
+                            target: "stellar_agent::audit",
+                            rule_id,
+                            signer_ids = ?signer_ids,
+                            resulting_signer_count = resulting.signer_count,
+                            resulting_threshold = resulting.threshold,
+                            smart_account_redacted = %smart_account_redacted,
+                            chain_id = %self.chain_id,
+                            request_id = %request_id,
+                            "audit-writer mutex poisoned; SaSignerAdded rows dropped"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    rule_id,
+                    smart_account = %smart_account_redacted,
+                    "batch_add_signers: operation failed"
+                );
+            }
+        }
+
+        outcome.map(|(signer_ids, _)| signer_ids)
+    }
+
+    async fn batch_add_signers_locked_inner(
+        &self,
+        smart_account: ScAddress,
+        rule_id: u32,
+        smart_account_redacted: &str,
+        new_signers: Vec<(ScVal, SignerPubkey)>,
+        signer: &(dyn Signer + Send + Sync),
+        request_id: &str,
+    ) -> Result<(Vec<u32>, ObservedSignerSet), SaError> {
+        let source_pubkey =
+            signer
+                .public_key()
+                .await
+                .map_err(|e| SaError::AuthEntryConstructionFailed {
+                    stage: "auth_payload",
+                    redacted_reason: format!("signer public_key fetch failed: {e}"),
+                })?;
+        let source_pubkey_strkey = stellar_strkey::ed25519::PublicKey(source_pubkey.0).to_string();
+
+        let baseline = self
+            .read_audit_log_baseline(rule_id, smart_account_redacted)?
+            .ok_or_else(|| SaError::SignerSetMissingBaseline {
+                rule_id,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
+                ),
+                request_id: request_id.to_owned(),
+            })?;
+
+        let current_signer_count = baseline.state().signer_count;
+        let batch_len = u32::try_from(new_signers.len()).unwrap_or(u32::MAX);
+        let post_op_signer_count = current_signer_count.saturating_add(batch_len);
+
+        // Mandatory pre-check (OZ MAX_SIGNERS = 15, mod.rs:526): the batch is
+        // refused client-side BEFORE any submission if it would exceed the
+        // cap — the on-chain enforcement is a raw panic (storage.rs:1072 ->
+        // :379), so this check names the cap explicitly for the operator.
+        if post_op_signer_count > MAX_SIGNERS {
+            return Err(SaError::ContextRuleCapsExceeded {
+                kind: "signers",
+                cur: current_signer_count,
+                max: MAX_SIGNERS,
+            });
+        }
+
+        let signers_vec: VecM<ScVal> = new_signers
+            .iter()
+            .map(|(scval, _)| scval.clone())
+            .collect::<Vec<_>>()
+            .try_into()
+            .map_err(|e| SaError::AuthEntryConstructionFailed {
+                stage: "auth_contexts_args",
+                redacted_reason: format!("encode batch_add_signer signers VecM: {e:?}"),
+            })?;
+        let batch_add_signer_args = vec![ScVal::U32(rule_id), ScVal::Vec(Some(ScVec(signers_vec)))];
+
+        // Identify the threshold policy BEFORE submission so the post-op
+        // result-fetch (which needs a policy address to read the resulting
+        // threshold) receives a validated address, mirroring
+        // `add_signer_locked_inner`.
+        let policy_addr = self
+            .identify_threshold_policy(
+                smart_account.clone(),
+                rule_id,
+                Some(&source_pubkey_strkey),
+                request_id.to_owned(),
+            )
+            .await?;
+
+        let auth_rule_ids = vec![ContextRuleId::from(rule_id)];
+        self.submit_single_op(
+            smart_account.clone(),
+            &smart_account,
+            rule_id,
+            "batch_add_signer",
+            batch_add_signer_args,
+            &auth_rule_ids,
+            signer,
+            &source_pubkey_strkey,
+            Some(ExpiryCheck { rule_id }),
+        )
+        .await?;
+
+        let resulting = self
+            .fetch_signer_set(
+                &self.primary_rpc_client,
+                smart_account,
+                rule_id,
+                Some(&source_pubkey_strkey),
+                &policy_addr,
+                request_id,
+            )
+            .await?;
+
+        // The newly-added signer IDs are the LAST `batch_len` entries of the
+        // resulting `signer_ids` (on-chain `register_signer` appends
+        // monotonically; `batch_add_signer` iterates `signers` in order and
+        // pushes each new ID in turn, storage.rs:1064-1067, SHA `a9c4216`).
+        let new_signer_ids: Vec<u32> = resulting
+            .signer_ids
+            .iter()
+            .rev()
+            .take(new_signers.len())
+            .rev()
+            .copied()
+            .collect();
+
+        Ok((new_signer_ids, resulting))
+    }
+
     // ── classify_rule_policies ─────────────────────────────────────────────────
 
     /// Classifies every policy attached to a context rule by its own on-chain
@@ -2668,6 +3813,32 @@ impl SignersManager {
             source_account_strkey,
         )
         .await
+    }
+
+    /// Reads a context rule's raw `(signer_id, pubkey)` set directly from the
+    /// on-chain `ContextRule` — policy-independent (no threshold-policy
+    /// identification is performed, unlike [`Self::identify_threshold_policy`]
+    /// + the internal `fetch_signer_set`).
+    ///
+    /// Use this to inspect a rule's signer set when the rule may carry no
+    /// policy at all (e.g. immediately after `deploy_smart_account`, before
+    /// any policy is attached), or a weighted-threshold policy instead of a
+    /// simple-threshold one.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::DeploymentFailed`] — simulation or decode failure (the
+    ///   rule does not exist, or the `ContextRule` ScVal is malformed).
+    pub async fn get_rule_signers(
+        &self,
+        smart_account: ScAddress,
+        rule_id: u32,
+        source_account_strkey: Option<&str>,
+    ) -> Result<Vec<(u32, SignerPubkey)>, SaError> {
+        let rule = self
+            .fetch_context_rule_primary(smart_account, rule_id, source_account_strkey)
+            .await?;
+        Ok(rule.signers)
     }
 
     async fn fetch_context_rule(
@@ -6052,5 +7223,180 @@ mod tests {
             .is_ok(),
             "untrusted_decode_limits must accept N=124 nesting levels (simultaneous depth 499 ≤ 500)"
         );
+    }
+
+    // ── WeightedThresholdView ──────────────────────────────────────────────────
+
+    fn weighted_signer_key(byte_fill: u8) -> ScVal {
+        let g_strkey = stellar_strkey::ed25519::PublicKey([byte_fill; 32])
+            .to_string()
+            .as_str()
+            .to_owned();
+        build_delegated_signer_scval(&g_strkey).expect("build delegated key")
+    }
+
+    #[test]
+    fn weighted_threshold_view_total_weight_sums_all_entries() {
+        let view = WeightedThresholdView {
+            threshold: 3,
+            signer_weights: vec![(weighted_signer_key(1), 2), (weighted_signer_key(2), 5)],
+        };
+        assert_eq!(view.total_weight().unwrap(), 7);
+    }
+
+    #[test]
+    fn weighted_threshold_view_total_weight_refuses_overflow() {
+        let view = WeightedThresholdView {
+            threshold: 1,
+            signer_weights: vec![
+                (weighted_signer_key(1), u32::MAX),
+                (weighted_signer_key(2), 1),
+            ],
+        };
+        assert!(matches!(
+            view.total_weight(),
+            Err(SaError::WeightedThresholdInstallRefused { .. })
+        ));
+    }
+
+    #[test]
+    fn weighted_threshold_view_weight_of_returns_zero_for_absent_signer() {
+        let present = weighted_signer_key(1);
+        let absent = weighted_signer_key(2);
+        let view = WeightedThresholdView {
+            threshold: 1,
+            signer_weights: vec![(present.clone(), 5)],
+        };
+        assert_eq!(view.weight_of(&present), 5);
+        assert_eq!(
+            view.weight_of(&absent),
+            0,
+            "a signer absent from the map contributes zero weight"
+        );
+    }
+
+    // ── redact_weighted_signer_identity ────────────────────────────────────────
+
+    #[test]
+    fn redact_weighted_signer_identity_delegated_is_kind_labelled_and_redacted() {
+        let g_strkey = stellar_strkey::ed25519::PublicKey([7u8; 32])
+            .to_string()
+            .as_str()
+            .to_owned();
+        let input = crate::weighted_threshold_policy::WeightedThresholdSignerInput::Delegated {
+            g_strkey: g_strkey.clone(),
+        };
+        let redacted = redact_weighted_signer_identity(&input);
+        assert!(redacted.starts_with("delegated:"));
+        assert!(
+            !redacted.contains(&g_strkey),
+            "redacted identity must not contain the full G-strkey"
+        );
+    }
+
+    #[test]
+    fn redact_weighted_signer_identity_external_is_kind_labelled() {
+        let verifier = ScAddress::Contract(ContractId(Hash([9u8; 32])));
+        let input = crate::weighted_threshold_policy::WeightedThresholdSignerInput::External {
+            verifier,
+            key_data: vec![0xAAu8; 32],
+        };
+        let redacted = redact_weighted_signer_identity(&input);
+        assert!(redacted.starts_with("external:"));
+    }
+
+    // ── batch_add_signers: empty-batch refusal ────────────────────────────────
+
+    /// Minimal `Signer` stub for the empty-batch test, which must refuse
+    /// before ever calling into the signer or the network.
+    struct UnreachableSigner;
+
+    #[async_trait::async_trait]
+    impl stellar_agent_network::signing::Signer for UnreachableSigner {
+        async fn sign_tx_payload(
+            &self,
+            _: &[u8; 32],
+        ) -> Result<[u8; 64], stellar_agent_core::error::WalletError> {
+            unimplemented!("stub — must not be called by the empty-batch refusal test")
+        }
+        async fn sign_auth_digest(
+            &self,
+            _: &[u8; 32],
+        ) -> Result<[u8; 64], stellar_agent_core::error::WalletError> {
+            unimplemented!("stub — must not be called by the empty-batch refusal test")
+        }
+        async fn sign_soroban_address_auth_payload(
+            &self,
+            _: &[u8; 32],
+        ) -> Result<[u8; 64], stellar_agent_core::error::WalletError> {
+            unimplemented!("stub — must not be called by the empty-batch refusal test")
+        }
+        async fn sign_webauthn_assertion(
+            &self,
+            _: &[u8; 32],
+            _: &[u8],
+        ) -> Result<
+            stellar_agent_network::signing::WebAuthnAssertion,
+            stellar_agent_core::error::WalletError,
+        > {
+            unimplemented!("stub — must not be called by the empty-batch refusal test")
+        }
+        async fn public_key(
+            &self,
+        ) -> Result<stellar_strkey::ed25519::PublicKey, stellar_agent_core::error::WalletError>
+        {
+            unimplemented!("stub — must not be called by the empty-batch refusal test")
+        }
+    }
+
+    /// `batch_add_signers` with an empty `new_signers` vec must refuse with
+    /// `SaError::BatchSignerAddRefused` before acquiring the per-rule mutex,
+    /// touching the audit log, or making any network call — the guard lives
+    /// in the public manager function itself, not only at the CLI layer.
+    #[tokio::test]
+    async fn batch_add_signers_refuses_empty_batch_before_any_io() {
+        let dir = tempfile::tempdir().expect("tempdir must succeed");
+        let audit_log_path = dir.path().join("audit.jsonl");
+        let audit_writer = Arc::new(Mutex::new(
+            AuditWriter::open(audit_log_path.clone(), None)
+                .expect("AuditWriter::open must succeed"),
+        ));
+
+        // Deliberately unreachable RPC endpoints and a nonexistent audit-log
+        // baseline: if the guard did not fire before any I/O, this test
+        // would fail on the network call or the missing baseline instead of
+        // asserting the refusal reason.
+        let manager = SignersManager::new(SignersManagerConfig::new(
+            "http://127.0.0.1:1".to_owned(),
+            "http://127.0.0.1:1".to_owned(),
+            audit_writer,
+            audit_log_path,
+            "Test SDF Network ; September 2015".to_owned(),
+            "test-profile".to_owned(),
+            Duration::from_secs(1),
+            "stellar:testnet".to_owned(),
+        ))
+        .expect("manager construction must succeed");
+
+        let smart_account = ScAddress::Contract(ContractId(Hash([1u8; 32])));
+        let result = manager
+            .batch_add_signers(
+                smart_account,
+                7,
+                Vec::new(),
+                &UnreachableSigner,
+                "req-empty-batch".to_owned(),
+            )
+            .await;
+
+        match result {
+            Err(SaError::BatchSignerAddRefused { reason }) => {
+                assert!(
+                    reason.contains("empty"),
+                    "refusal reason must name the empty batch: {reason}"
+                );
+            }
+            other => panic!("expected SaError::BatchSignerAddRefused, got {other:?}"),
+        }
     }
 }

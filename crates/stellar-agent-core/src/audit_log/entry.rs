@@ -1528,6 +1528,100 @@ impl AuditEntry {
         }
     }
 
+    /// Constructs a `SaWeightedThresholdChanged` audit entry.
+    ///
+    /// Emitted by `SignersManager::set_weighted_threshold` after a successful
+    /// on-chain `set_threshold` invocation against the weighted-threshold-policy
+    /// contract. Mirrors [`Self::new_sa_threshold_changed`] for the simple-threshold
+    /// policy, but carries the policy contract address (a separate deployed
+    /// contract, unlike simple-threshold's baseline-derived resulting signer set).
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors new_sa_spending_limit_retuned"
+    )]
+    pub fn new_sa_weighted_threshold_changed(
+        rule_id: u32,
+        old_threshold: u32,
+        new_threshold: u32,
+        policy_address_redacted: impl Into<RedactedStrkey>,
+        transaction_hash_redacted: impl Into<String>,
+        smart_account_redacted: impl Into<RedactedStrkey>,
+        chain_id: impl IntoOptionalChainId,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "sa.weighted_threshold_changed".to_owned(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::SaWeightedThresholdChanged {
+                rule_id,
+                old_threshold,
+                new_threshold,
+                policy_address_redacted: policy_address_redacted.into(),
+                transaction_hash_redacted: transaction_hash_redacted.into(),
+                smart_account_redacted: smart_account_redacted.into(),
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
+    /// Constructs a `SaSignerWeightChanged` audit entry.
+    ///
+    /// Emitted by `SignersManager::set_signer_weight` after a successful
+    /// on-chain `set_signer_weight` invocation against the
+    /// weighted-threshold-policy contract. `signer_identity_redacted` MUST be
+    /// pre-redacted (kind-labelled, e.g. `"delegated:GABC...WXYZ"`) at the
+    /// call site — never the raw G-strkey or key material.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors new_sa_spending_limit_retuned"
+    )]
+    pub fn new_sa_signer_weight_changed(
+        rule_id: u32,
+        signer_identity_redacted: impl Into<String>,
+        old_weight: u32,
+        new_weight: u32,
+        policy_address_redacted: impl Into<RedactedStrkey>,
+        transaction_hash_redacted: impl Into<String>,
+        smart_account_redacted: impl Into<RedactedStrkey>,
+        chain_id: impl IntoOptionalChainId,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "sa.signer_weight_changed".to_owned(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::SaSignerWeightChanged {
+                rule_id,
+                signer_identity_redacted: signer_identity_redacted.into(),
+                old_weight,
+                new_weight,
+                policy_address_redacted: policy_address_redacted.into(),
+                transaction_hash_redacted: transaction_hash_redacted.into(),
+                smart_account_redacted: smart_account_redacted.into(),
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
     /// Constructs a `PasskeyRegistered` audit entry.
     ///
     /// Emitted by `CredentialsManager::add_passkey` on completion (success or

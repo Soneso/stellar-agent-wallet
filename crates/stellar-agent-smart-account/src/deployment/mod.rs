@@ -34,6 +34,7 @@
 pub mod address;
 pub mod deploy;
 pub mod deploy_ed25519_verifier;
+pub mod deploy_policy;
 pub mod deploy_spending_limit_policy;
 pub mod deploy_timelock_controller;
 pub mod deploy_webauthn_verifier;
@@ -51,6 +52,7 @@ pub use deploy::interop_deployer;
 pub use deploy_ed25519_verifier::{
     Ed25519VerifierDeployArgs, Ed25519VerifierDeployResult, deploy_ed25519_verifier,
 };
+pub use deploy_policy::{PolicyDeployArgs, PolicyDeployKind, PolicyDeployResult, deploy_policy};
 pub use deploy_spending_limit_policy::{
     SpendingLimitPolicyDeployArgs, SpendingLimitPolicyDeployResult, deploy_spending_limit_policy,
 };

@@ -1317,6 +1317,91 @@ pub enum EventKind {
         smart_account_redacted: RedactedStrkey,
     },
 
+    /// A weighted-threshold policy's `threshold` value was changed via
+    /// `smart-account signers set-weighted-threshold`.
+    ///
+    /// Emitted by `SignersManager::set_weighted_threshold` after a
+    /// successful on-chain `set_threshold(threshold, context_rule,
+    /// smart_account)` invocation on the weighted-threshold-policy contract.
+    /// Carries both old and new threshold values for forensic correlation;
+    /// `old_threshold` is sourced from a pre-read `get_threshold` view call
+    /// made before submission.
+    ///
+    /// # Field redaction
+    ///
+    /// `smart_account_redacted` is the C-strkey redacted first-5-last-5.
+    /// `policy_address_redacted` is the weighted-threshold-policy contract
+    /// C-strkey redacted first-5-last-5. `transaction_hash_redacted` is
+    /// first-8-last-8 of the Stellar transaction hash.
+    ///
+    /// `rule_id`, `old_threshold`, and `new_threshold` are on-chain public
+    /// values — redaction would be performative.
+    ///
+    /// Per-invocation request correlation ID is carried by the top-level
+    /// [`AuditEntry::request_id`](super::entry::AuditEntry::request_id) field.
+    /// This variant intentionally has NO field named `request_id`.
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    SaWeightedThresholdChanged {
+        /// On-chain context rule ID whose weighted-threshold policy was changed.
+        rule_id: u32,
+        /// Threshold before the change (from the pre-read `get_threshold` view).
+        old_threshold: u32,
+        /// Threshold requested by the caller.
+        new_threshold: u32,
+        /// Weighted-threshold-policy contract C-strkey, redacted first-5-last-5.
+        policy_address_redacted: RedactedStrkey,
+        /// Stellar transaction hash, redacted first-8-last-8.
+        transaction_hash_redacted: String,
+        /// Target smart-account C-strkey, redacted first-5-last-5.
+        smart_account_redacted: RedactedStrkey,
+    },
+
+    /// A signer's weight in a weighted-threshold policy was changed via
+    /// `smart-account signers set-signer-weight`.
+    ///
+    /// Emitted by `SignersManager::set_signer_weight` after a successful
+    /// on-chain `set_signer_weight(signer, weight, context_rule,
+    /// smart_account)` invocation. `old_weight` is sourced from a pre-read
+    /// `get_signer_weights` view call made before submission (`0` if the
+    /// signer was absent from the map, matching the OZ "no weight configured
+    /// contributes zero" semantics).
+    ///
+    /// # Field redaction
+    ///
+    /// `signer_identity_redacted` is a redacted, kind-labelled identity string
+    /// (`"delegated:<first5>...<last5>"` or `"external:<first5>...<last5>"` of
+    /// the verifier address) — never the raw G-strkey or key material.
+    /// `policy_address_redacted` and `smart_account_redacted` are C-strkeys
+    /// redacted first-5-last-5. `transaction_hash_redacted` is
+    /// first-8-last-8 of the Stellar transaction hash.
+    ///
+    /// Per-invocation request correlation ID is carried by the top-level
+    /// [`AuditEntry::request_id`](super::entry::AuditEntry::request_id) field.
+    /// This variant intentionally has NO field named `request_id`.
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    SaSignerWeightChanged {
+        /// On-chain context rule ID whose weighted-threshold policy was changed.
+        rule_id: u32,
+        /// Redacted, kind-labelled identity of the signer whose weight changed.
+        signer_identity_redacted: String,
+        /// Weight before the change (from the pre-read `get_signer_weights` view).
+        old_weight: u32,
+        /// Weight requested by the caller.
+        new_weight: u32,
+        /// Weighted-threshold-policy contract C-strkey, redacted first-5-last-5.
+        policy_address_redacted: RedactedStrkey,
+        /// Stellar transaction hash, redacted first-8-last-8.
+        transaction_hash_redacted: String,
+        /// Target smart-account C-strkey, redacted first-5-last-5.
+        smart_account_redacted: RedactedStrkey,
+    },
+
     /// A multicall bundle was successfully submitted and confirmed on-chain.
     ///
     /// Emitted by `multicall::submit_multicall_bundle` after a successful
@@ -3096,6 +3181,168 @@ mod tests {
             result.is_err(),
             "missing-field deserialisation must fail for SaSpendingLimitRetuned"
         );
+    }
+
+    /// Asserts `SaWeightedThresholdChanged` serialises with the correct wire
+    /// discriminant and all required fields, and round-trips cleanly.
+    #[test]
+    fn event_kind_sa_weighted_threshold_changed_round_trip() {
+        let ev = EventKind::SaWeightedThresholdChanged {
+            rule_id: 4,
+            old_threshold: 1,
+            new_threshold: 2,
+            policy_address_redacted: RedactedStrkey::from_already_redacted("CPOLI...YYYYY"),
+            transaction_hash_redacted: "aabb1122...ccdd3344".to_owned(),
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...BBBBB"),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: EventKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(
+            ev, back,
+            "SaWeightedThresholdChanged must round-trip cleanly"
+        );
+        assert!(
+            s.contains("\"sa_weighted_threshold_changed\""),
+            "wire discriminant must be 'sa_weighted_threshold_changed': {s}"
+        );
+        assert!(s.contains("\"rule_id\""), "rule_id field: {s}");
+        assert!(s.contains("\"old_threshold\""), "old_threshold field: {s}");
+        assert!(s.contains("\"new_threshold\""), "new_threshold field: {s}");
+        assert!(
+            s.contains("\"policy_address_redacted\""),
+            "policy_address_redacted field: {s}"
+        );
+        assert!(
+            s.contains("\"transaction_hash_redacted\""),
+            "transaction_hash_redacted field: {s}"
+        );
+        assert!(
+            s.contains("\"smart_account_redacted\""),
+            "smart_account_redacted field: {s}"
+        );
+        assert!(
+            !s.contains("\"request_id\""),
+            "SaWeightedThresholdChanged must not carry a request_id field: {s}"
+        );
+    }
+
+    /// `SaWeightedThresholdChanged` with missing fields MUST fail to deserialise.
+    #[test]
+    fn event_kind_sa_weighted_threshold_changed_missing_fields_fail() {
+        let json = r#"{"kind":"sa_weighted_threshold_changed"}"#;
+        let result: Result<EventKind, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "missing-field deserialisation must fail for SaWeightedThresholdChanged"
+        );
+    }
+
+    /// Asserts `SaSignerWeightChanged` serialises with the correct wire
+    /// discriminant and all required fields, and round-trips cleanly.
+    #[test]
+    fn event_kind_sa_signer_weight_changed_round_trip() {
+        let ev = EventKind::SaSignerWeightChanged {
+            rule_id: 4,
+            signer_identity_redacted: "delegated:GAAAA...BBBBB".to_owned(),
+            old_weight: 1,
+            new_weight: 2,
+            policy_address_redacted: RedactedStrkey::from_already_redacted("CPOLI...YYYYY"),
+            transaction_hash_redacted: "aabb1122...ccdd3344".to_owned(),
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...BBBBB"),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: EventKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(ev, back, "SaSignerWeightChanged must round-trip cleanly");
+        assert!(
+            s.contains("\"sa_signer_weight_changed\""),
+            "wire discriminant must be 'sa_signer_weight_changed': {s}"
+        );
+        assert!(s.contains("\"rule_id\""), "rule_id field: {s}");
+        assert!(
+            s.contains("\"signer_identity_redacted\""),
+            "signer_identity_redacted field: {s}"
+        );
+        assert!(s.contains("\"old_weight\""), "old_weight field: {s}");
+        assert!(s.contains("\"new_weight\""), "new_weight field: {s}");
+        assert!(
+            s.contains("\"policy_address_redacted\""),
+            "policy_address_redacted field: {s}"
+        );
+        assert!(
+            s.contains("\"transaction_hash_redacted\""),
+            "transaction_hash_redacted field: {s}"
+        );
+        assert!(
+            s.contains("\"smart_account_redacted\""),
+            "smart_account_redacted field: {s}"
+        );
+        assert!(
+            !s.contains("\"request_id\""),
+            "SaSignerWeightChanged must not carry a request_id field: {s}"
+        );
+    }
+
+    /// `SaSignerWeightChanged` with missing fields MUST fail to deserialise.
+    #[test]
+    fn event_kind_sa_signer_weight_changed_missing_fields_fail() {
+        let json = r#"{"kind":"sa_signer_weight_changed"}"#;
+        let result: Result<EventKind, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "missing-field deserialisation must fail for SaSignerWeightChanged"
+        );
+    }
+
+    /// Neither `SaWeightedThresholdChanged` nor `SaSignerWeightChanged`
+    /// collides with the flattened outer `AuditEntry::request_id` — a full
+    /// `AuditEntry` round-trip must produce exactly one `request_id` key and
+    /// deserialise back cleanly (the serde-flatten collision class documented
+    /// on `SaContextRuleNameUpdated`). The variant-level round-trip tests
+    /// above only exercise `EventKind` in isolation and would NOT catch this
+    /// collision, since it only manifests once the variant is flattened into
+    /// `AuditEntry`.
+    #[test]
+    fn sa_weighted_threshold_and_signer_weight_changed_do_not_collide_with_outer_request_id() {
+        use crate::audit_log::entry::AuditEntry;
+
+        let threshold_changed = AuditEntry::new_sa_weighted_threshold_changed(
+            4,
+            1,
+            2,
+            RedactedStrkey::from_already_redacted("CPOLI...YYYYY"),
+            "aabb1122...ccdd3344",
+            RedactedStrkey::from_already_redacted("CAAAA...BBBBB"),
+            "stellar:testnet",
+            "00000000-0000-0000-0000-0000000000b1",
+        );
+        let s = serde_json::to_string(&threshold_changed).unwrap();
+        assert_eq!(
+            s.matches("\"request_id\"").count(),
+            1,
+            "exactly one request_id key must appear: {s}"
+        );
+        let back: AuditEntry = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.request_id, threshold_changed.request_id);
+
+        let weight_changed = AuditEntry::new_sa_signer_weight_changed(
+            4,
+            "delegated:GAAAA...BBBBB",
+            1,
+            2,
+            RedactedStrkey::from_already_redacted("CPOLI...YYYYY"),
+            "aabb1122...ccdd3344",
+            RedactedStrkey::from_already_redacted("CAAAA...BBBBB"),
+            "stellar:testnet",
+            "00000000-0000-0000-0000-0000000000b2",
+        );
+        let s = serde_json::to_string(&weight_changed).unwrap();
+        assert_eq!(
+            s.matches("\"request_id\"").count(),
+            1,
+            "exactly one request_id key must appear: {s}"
+        );
+        let back: AuditEntry = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.request_id, weight_changed.request_id);
     }
 
     /// Asserts `ApprovalAttested` serialises with the correct wire discriminant

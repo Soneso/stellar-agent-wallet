@@ -4629,6 +4629,12 @@ fn sa_error_to_invocation_result(
         | SaError::SpendingLimitPolicyProvenanceMismatch { .. }
         | SaError::SpendingLimitPolicySha256Drift { .. }
         | SaError::SpendingLimitInstallRefused { .. }
+        | SaError::SimpleThresholdInstallRefused { .. }
+        | SaError::WeightedThresholdInstallRefused { .. }
+        | SaError::SimpleThresholdPolicyProvenanceMismatch { .. }
+        | SaError::SimpleThresholdPolicySha256Drift { .. }
+        | SaError::WeightedThresholdPolicyProvenanceMismatch { .. }
+        | SaError::WeightedThresholdPolicySha256Drift { .. }
         | SaError::NetworksTomlIo { .. }
         | SaError::NetworksTomlParse { .. }
         // Signer-threshold pre-submission refusal variants.
@@ -4645,6 +4651,14 @@ fn sa_error_to_invocation_result(
         // can fire after a submission attempt.
         | SaError::SpendingLimitNotInstalled { .. }
         | SaError::SpendingLimitPolicyIdentificationFailed { .. }
+        // Weighted-threshold-policy identification and read-path errors: both
+        // `identify_weighted_threshold_policy` and `get_weighted_threshold_data`
+        // are read-only; neither variant can fire after a submission attempt.
+        | SaError::WeightedThresholdNotInstalled { .. }
+        | SaError::WeightedThresholdPolicyIdentificationFailed { .. }
+        // Batch signer-add client-side refusal (e.g. empty batch): fires
+        // before any simulate/submit call.
+        | SaError::BatchSignerAddRefused { .. }
         | SaError::AuditLog(_) => SaInvocationResult::PreSubmissionRefused,
         SaError::AuthDigestMismatch { .. } => SaInvocationResult::OnChainRejected,
         // Wasm-hash pinning pre-submission refusals.

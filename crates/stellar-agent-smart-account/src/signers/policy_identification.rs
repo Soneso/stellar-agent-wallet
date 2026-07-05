@@ -101,9 +101,9 @@ pub const THRESHOLD_POLICY_WASM_HASHES: &[[u8; 32]] = &[
 /// The vendored `multisig_threshold_policy_example.wasm` binary, embedded at
 /// compile time.
 ///
-/// Embedded so the deploy CLI (`smart-account deploy-threshold-policy`) can upload
-/// the WASM via `UploadContractWasm` without re-fetching from disk at runtime.
-/// Also ensures the SHA-256 check in
+/// Embedded so the deploy CLI (`smart-account deploy-policy --kind
+/// simple-threshold`) can upload the WASM via `UploadContractWasm` without
+/// re-fetching from disk at runtime. Also ensures the SHA-256 check in
 /// `tests::vendored_wasm_hash_matches_allowlist_entry` can verify the
 /// artefact at `cargo test` time.
 ///
@@ -122,7 +122,12 @@ pub const THRESHOLD_POLICY_WASM_HASHES: &[[u8; 32]] = &[
 // per Rust `include_bytes!` semantics — NOT the crate root or workspace root.
 // Resolves to `<repo-root>/vendor/oz-threshold-policy/
 // v0.7.2/multisig_threshold_policy_example.wasm`.
-#[cfg(any(test, feature = "deploy-cli", feature = "testnet-integration"))]
+//
+// Unconditionally embedded (no feature gate), matching every other
+// deploy-time policy/verifier WASM in this crate (spending-limit,
+// weighted-threshold, ed25519-verifier, webauthn-verifier): the unified
+// `smart-account deploy-policy --kind simple-threshold` verb consumes this
+// constant in production, not only under `deploy-cli`/`testnet-integration`.
 pub const THRESHOLD_POLICY_WASM: &[u8] = include_bytes!(
     "../../../../vendor/oz-threshold-policy/v0.7.2/multisig_threshold_policy_example.wasm"
 );

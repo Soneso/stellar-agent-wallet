@@ -234,6 +234,7 @@ async fn deploy_fresh_smart_account(signer_g: &str) -> String {
                 percentile_label: "explicit".to_owned(),
             },
             dry_run: false,
+            genesis_signer_scval_override: None,
         },
         None,
     )

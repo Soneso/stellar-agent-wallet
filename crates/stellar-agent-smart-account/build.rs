@@ -67,6 +67,15 @@ const WASM_PINS: &[WasmPin] = &[
         path: "../../vendor/oz-spending-limit-policy/v0.7.2/multisig_spending_limit_policy_example.wasm",
         expected_sha256: "0e8da0ccff5c444520085ac1973d3c8023fdd04f727ee11ae7290a49dffbbaf5",
     },
+    // OZ multisig-weighted-threshold-policy-example v0.7.2 WASM. Deploy-time
+    // artefact embedded by
+    // weighted_threshold_policy.rs::WEIGHTED_THRESHOLD_POLICY_WASM; the
+    // deployable per-network weighted-threshold policy singleton.
+    WasmPin {
+        label: "multisig_weighted_threshold_policy_example.wasm",
+        path: "../../vendor/oz-weighted-threshold-policy/v0.7.2/multisig_weighted_threshold_policy_example.wasm",
+        expected_sha256: "e3d8cc5ab9668526d5cf2bab17ee42e84ee4b972ba7cca8d3a37b2ed8d9baee3",
+    },
 ];
 
 fn main() {

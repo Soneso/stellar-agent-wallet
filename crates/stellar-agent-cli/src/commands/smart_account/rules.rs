@@ -72,11 +72,15 @@ use stellar_agent_smart_account::managers::rules::{
     decode_policy_count_from_scval, parse_c_strkey_to_smart_account,
     parse_g_strkey_to_signer_address,
 };
+use stellar_agent_smart_account::simple_threshold_policy::build_simple_threshold_install_param;
 use stellar_agent_smart_account::spending_limit_policy::{
     build_spending_limit_install_param, ensure_call_contract_context_for_spending_limit,
     ensure_valid_spending_limit_params,
 };
 use stellar_agent_smart_account::verifiers::VerifierRegistry;
+use stellar_agent_smart_account::weighted_threshold_policy::{
+    WeightedThresholdSignerInput, build_weighted_threshold_install_param,
+};
 use stellar_xdr::ReadXdr as _;
 use tracing::info;
 use uuid::Uuid;
@@ -1566,6 +1570,20 @@ pub enum PolicyKind {
     /// the `SpendingLimitAccountParams` install param from `--limit` + `--period`,
     /// and refuses non-`CallContract` rules client-side.
     SpendingLimit,
+    /// Typed simple-threshold policy: the wallet resolves the deployed
+    /// simple-threshold policy from the registry (or `--policy` override) and
+    /// builds the one-entry `SimpleThresholdAccountParams` install param from
+    /// `--threshold`. No context-type restriction.
+    #[value(name = "simple-threshold")]
+    SimpleThreshold,
+    /// Typed weighted-threshold policy: the wallet resolves the deployed
+    /// weighted-threshold policy from the registry (or `--policy` override)
+    /// and builds the `WeightedThresholdAccountParams` install param from one
+    /// or more `--weighted-signer-delegated` / `--weighted-signer-webauthn`
+    /// flags (each `<identity>=<weight>`) plus `--threshold`. No
+    /// context-type restriction (unlike spending-limit).
+    #[value(name = "weighted-threshold")]
+    WeightedThreshold,
 }
 
 /// Arguments for `smart-account rules add-policy`.
@@ -1603,7 +1621,12 @@ pub struct AddPolicyArgs {
     pub rule_id: u32,
 
     /// Install-parameter mode. Default: `raw`.
-    #[arg(long, value_enum, default_value_t = PolicyKind::Raw, value_name = "raw|spending-limit")]
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = PolicyKind::Raw,
+        value_name = "raw|spending-limit|simple-threshold|weighted-threshold"
+    )]
     pub kind: PolicyKind,
 
     /// Policy contract C-strkey (raw mode).
@@ -1643,6 +1666,30 @@ pub struct AddPolicyArgs {
     /// `--kind spending-limit`.
     #[arg(long, value_name = "C_STRKEY")]
     pub policy: Option<String>,
+
+    /// Signer threshold (`--kind simple-threshold` / `--kind weighted-threshold`).
+    ///
+    /// Required with both threshold-policy kinds. For `simple-threshold` this
+    /// is the minimum number of signers; for `weighted-threshold` this is the
+    /// minimum total weight.
+    #[arg(long, value_name = "U32")]
+    pub threshold: Option<u32>,
+
+    /// One weighted-threshold delegated (ed25519) signer as `<G_STRKEY>=<WEIGHT>`
+    /// (`--kind weighted-threshold`). Repeatable.
+    #[arg(long = "weighted-signer-delegated", value_name = "G_STRKEY=WEIGHT",
+          num_args = 1.., action = clap::ArgAction::Append)]
+    pub weighted_signer_delegated: Vec<String>,
+
+    /// One weighted-threshold WebAuthn (passkey) signer as
+    /// `<CREDENTIAL_NAME>=<WEIGHT>` (`--kind weighted-threshold`). Repeatable.
+    ///
+    /// The credential name is resolved from the passkeys registry (as stored
+    /// by `credentials add-passkey`), exactly as `smart-account rules create
+    /// --signer-webauthn` resolves it.
+    #[arg(long = "weighted-signer-webauthn", value_name = "CREDENTIAL_NAME=WEIGHT",
+          num_args = 1.., action = clap::ArgAction::Append)]
+    pub weighted_signer_webauthn: Vec<String>,
 
     /// Auth rule-id(s) whose signers authorise this operation. Default: the
     /// `--rule-id` value (the rule being modified is also the authorising rule).
@@ -1944,6 +1991,260 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                     );
                 }
             };
+
+            (policy_address, policy_sc_address, install_param)
+        }
+        PolicyKind::SimpleThreshold => {
+            let threshold = match args.threshold {
+                Some(v) => v,
+                None => {
+                    return emit_error(
+                        &WalletError::Validation(ValidationError::AddressInvalid {
+                            input: "--kind simple-threshold requires --threshold".to_owned(),
+                        }),
+                        args.output,
+                        &request_id,
+                    );
+                }
+            };
+            if args.policy_address.is_some()
+                || args.install_param.is_some()
+                || args.limit.is_some()
+                || args.period.is_some()
+                || !args.weighted_signer_delegated.is_empty()
+                || !args.weighted_signer_webauthn.is_empty()
+            {
+                return emit_error(
+                    &WalletError::Validation(ValidationError::AddressInvalid {
+                        input: "--policy-address / --install-param / --limit / --period / \
+                                --weighted-signer-* are only valid with the matching --kind"
+                            .to_owned(),
+                    }),
+                    args.output,
+                    &request_id,
+                );
+            }
+
+            let policy_address = match resolve_policy_address_override_or_registry(
+                &args.policy,
+                args.network.passphrase(),
+                "simple-threshold",
+                |reg, net| {
+                    reg.simple_threshold_policy_for(net)
+                        .map(|e| e.address.clone())
+                },
+                "smart-account deploy-policy --kind simple-threshold",
+            ) {
+                Ok(a) => a,
+                Err(e) => return emit_error(&e, args.output, &request_id),
+            };
+
+            let policy_sc_address = match parse_c_strkey_to_smart_account(&policy_address) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    return emit_error(
+                        &WalletError::Validation(ValidationError::AddressInvalid {
+                            input: format!("simple-threshold policy address: {e}"),
+                        }),
+                        args.output,
+                        &request_id,
+                    );
+                }
+            };
+
+            let install_param = match build_simple_threshold_install_param(threshold) {
+                Ok(v) => v,
+                Err(e) => {
+                    return emit_error(
+                        &WalletError::SmartAccount {
+                            wire_code: e.wire_code(),
+                            message: e.to_string(),
+                        },
+                        args.output,
+                        &request_id,
+                    );
+                }
+            };
+
+            (policy_address, policy_sc_address, install_param)
+        }
+        PolicyKind::WeightedThreshold => {
+            let threshold = match args.threshold {
+                Some(v) => v,
+                None => {
+                    return emit_error(
+                        &WalletError::Validation(ValidationError::AddressInvalid {
+                            input: "--kind weighted-threshold requires --threshold".to_owned(),
+                        }),
+                        args.output,
+                        &request_id,
+                    );
+                }
+            };
+            if args.policy_address.is_some()
+                || args.install_param.is_some()
+                || args.limit.is_some()
+                || args.period.is_some()
+            {
+                return emit_error(
+                    &WalletError::Validation(ValidationError::AddressInvalid {
+                        input: "--policy-address / --install-param / --limit / --period are \
+                                only valid with the matching --kind"
+                            .to_owned(),
+                    }),
+                    args.output,
+                    &request_id,
+                );
+            }
+            if args.weighted_signer_delegated.is_empty() && args.weighted_signer_webauthn.is_empty()
+            {
+                return emit_error(
+                    &WalletError::Validation(ValidationError::AddressInvalid {
+                        input: "--kind weighted-threshold requires at least one \
+                                --weighted-signer-delegated or --weighted-signer-webauthn"
+                            .to_owned(),
+                    }),
+                    args.output,
+                    &request_id,
+                );
+            }
+
+            let policy_address = match resolve_policy_address_override_or_registry(
+                &args.policy,
+                args.network.passphrase(),
+                "weighted-threshold",
+                |reg, net| {
+                    reg.weighted_threshold_policy_for(net)
+                        .map(|e| e.address.clone())
+                },
+                "smart-account deploy-policy --kind weighted-threshold",
+            ) {
+                Ok(a) => a,
+                Err(e) => return emit_error(&e, args.output, &request_id),
+            };
+
+            let policy_sc_address = match parse_c_strkey_to_smart_account(&policy_address) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    return emit_error(
+                        &WalletError::Validation(ValidationError::AddressInvalid {
+                            input: format!("weighted-threshold policy address: {e}"),
+                        }),
+                        args.output,
+                        &request_id,
+                    );
+                }
+            };
+
+            let mut signer_weights: Vec<(WeightedThresholdSignerInput, u32)> = Vec::with_capacity(
+                args.weighted_signer_delegated.len() + args.weighted_signer_webauthn.len(),
+            );
+
+            for spec in &args.weighted_signer_delegated {
+                let (g_strkey, weight) = match parse_weighted_signer_flag(spec) {
+                    Ok(pair) => pair,
+                    Err(e) => return emit_error(&e, args.output, &request_id),
+                };
+                if let Err(e) = parse_g_strkey_for_signer(&g_strkey) {
+                    return emit_error(&e, args.output, &request_id);
+                }
+                signer_weights.push((WeightedThresholdSignerInput::Delegated { g_strkey }, weight));
+            }
+
+            if !args.weighted_signer_webauthn.is_empty() {
+                let verifier_registry = match VerifierRegistry::open() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return emit_error(
+                            &WalletError::Validation(ValidationError::AddressInvalid {
+                                input: format!("could not open verifier registry: {e}"),
+                            }),
+                            args.output,
+                            &request_id,
+                        );
+                    }
+                };
+                let network_passphrase = args.network.passphrase();
+                let verifier_entry = match verifier_registry
+                    .webauthn_verifier_for(network_passphrase)
+                {
+                    Some(e) => e,
+                    None => {
+                        return emit_error(
+                            &WalletError::Validation(ValidationError::AddressInvalid {
+                                input: format!(
+                                    "no WebAuthn verifier deployed for network '{network_passphrase}'; \
+                                     run: smart-account deploy-webauthn-verifier"
+                                ),
+                            }),
+                            args.output,
+                            &request_id,
+                        );
+                    }
+                };
+                let verifier_sc_addr = match parse_c_strkey(&verifier_entry.address) {
+                    Ok(addr) => addr,
+                    Err(e) => return emit_error(&e, args.output, &request_id),
+                };
+
+                let profile = resolve_profile_name(args.profile.as_deref());
+                if let Err(reason) = validate_path_component_ascii_safe(&profile) {
+                    return emit_error(
+                        &WalletError::Validation(ValidationError::AddressInvalid {
+                            input: format!("invalid profile name '{profile}': {reason}"),
+                        }),
+                        args.output,
+                        &request_id,
+                    );
+                }
+                let creds_mgr =
+                    match CredentialsManager::from_defaults_readonly(&profile, "localhost") {
+                        Ok(m) => m,
+                        Err(e) => {
+                            return emit_error(
+                                &WalletError::Validation(ValidationError::AddressInvalid {
+                                    input: format!("could not open passkeys registry: {e}"),
+                                }),
+                                args.output,
+                                &request_id,
+                            );
+                        }
+                    };
+
+                for spec in &args.weighted_signer_webauthn {
+                    let (credential_name, weight) = match parse_weighted_signer_flag(spec) {
+                        Ok(pair) => pair,
+                        Err(e) => return emit_error(&e, args.output, &request_id),
+                    };
+                    let key_data =
+                        match resolve_weighted_webauthn_key_data(&creds_mgr, &credential_name) {
+                            Ok(kd) => kd,
+                            Err(e) => return emit_error(&e, args.output, &request_id),
+                        };
+                    signer_weights.push((
+                        WeightedThresholdSignerInput::External {
+                            verifier: verifier_sc_addr.clone(),
+                            key_data,
+                        },
+                        weight,
+                    ));
+                }
+            }
+
+            let install_param =
+                match build_weighted_threshold_install_param(&signer_weights, threshold) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return emit_error(
+                            &WalletError::SmartAccount {
+                                wire_code: e.wire_code(),
+                                message: e.to_string(),
+                            },
+                            args.output,
+                            &request_id,
+                        );
+                    }
+                };
 
             (policy_address, policy_sc_address, install_param)
         }
@@ -2653,6 +2954,122 @@ fn parse_g_strkey_for_signer(s: &str) -> Result<SmartAccountAddress, WalletError
             input: format!("--signer-delegated: {e}"),
         })
     })
+}
+
+/// Resolves a policy contract address for `add-policy`: an explicit
+/// `--policy` override, else the network's registered address for `kind`
+/// looked up via `getter`. Fail-closed with an actionable hint naming
+/// `deploy_verb` if neither is available.
+fn resolve_policy_address_override_or_registry(
+    policy_override: &Option<String>,
+    network_passphrase: &str,
+    kind: &str,
+    getter: impl FnOnce(&VerifierRegistry, &str) -> Option<String>,
+    deploy_verb: &str,
+) -> Result<String, WalletError> {
+    if let Some(explicit) = policy_override {
+        return Ok(explicit.clone());
+    }
+    let registry = VerifierRegistry::open().map_err(|e| {
+        WalletError::Validation(ValidationError::AddressInvalid {
+            input: format!("could not open verifier registry: {e}"),
+        })
+    })?;
+    getter(&registry, network_passphrase).ok_or_else(|| {
+        WalletError::Validation(ValidationError::AddressInvalid {
+            input: format!(
+                "no {kind} policy deployed for network '{network_passphrase}'; \
+                 run: {deploy_verb} (or pass --policy)"
+            ),
+        })
+    })
+}
+
+/// Parses one `--weighted-signer-{delegated,webauthn} <identity>=<weight>`
+/// flag value into its `(identity, weight)` parts.
+///
+/// Splits on the LAST `=` so a `--weighted-signer-delegated` G-strkey (which
+/// never contains `=`) and a `--weighted-signer-webauthn` credential name
+/// (operator-chosen, also not expected to contain `=`) both parse
+/// unambiguously.
+fn parse_weighted_signer_flag(spec: &str) -> Result<(String, u32), WalletError> {
+    let (identity, weight_str) = spec.rsplit_once('=').ok_or_else(|| {
+        WalletError::Validation(ValidationError::AddressInvalid {
+            input: format!("'{spec}': expected '<identity>=<weight>'"),
+        })
+    })?;
+    let weight = weight_str.parse::<u32>().map_err(|_| {
+        WalletError::Validation(ValidationError::AddressInvalid {
+            input: format!("'{spec}': weight '{weight_str}' is not a valid u32"),
+        })
+    })?;
+    if identity.is_empty() {
+        return Err(WalletError::Validation(ValidationError::AddressInvalid {
+            input: format!("'{spec}': identity must not be empty"),
+        }));
+    }
+    Ok((identity.to_owned(), weight))
+}
+
+/// Resolves one `--weighted-signer-webauthn` credential name to the raw
+/// External-signer `key_data` bytes (`pubkey_65_bytes || credential_id_bytes`),
+/// mirroring the decode step in `smart-account rules create --signer-webauthn`.
+fn resolve_weighted_webauthn_key_data(
+    creds_mgr: &CredentialsManager,
+    credential_name: &str,
+) -> Result<Vec<u8>, WalletError> {
+    let metadata = creds_mgr.show(credential_name).map_err(|e| {
+        WalletError::Validation(ValidationError::AddressInvalid {
+            input: format!("--weighted-signer-webauthn '{credential_name}': {e}"),
+        })
+    })?;
+
+    if metadata.public_key_sec1_b64.is_empty() {
+        return Err(WalletError::Validation(ValidationError::AddressInvalid {
+            input: format!(
+                "--weighted-signer-webauthn '{credential_name}': credential is missing \
+                 public_key_sec1_b64 (delete and re-register)"
+            ),
+        }));
+    }
+
+    let pubkey_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&metadata.public_key_sec1_b64)
+        .map_err(|_| {
+            WalletError::Validation(ValidationError::AddressInvalid {
+                input: format!(
+                    "--weighted-signer-webauthn '{credential_name}': public_key_sec1_b64 \
+                     is not valid base64url"
+                ),
+            })
+        })?;
+    if pubkey_bytes.len() != 65 {
+        return Err(WalletError::Validation(ValidationError::AddressInvalid {
+            input: format!(
+                "--weighted-signer-webauthn '{credential_name}': public_key_sec1_b64 decodes \
+                 to {} bytes, expected 65",
+                pubkey_bytes.len()
+            ),
+        }));
+    }
+
+    let credential_id_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&metadata.credential_id_b64url)
+        .map_err(|_| {
+            WalletError::Validation(ValidationError::AddressInvalid {
+                input: format!(
+                    "--weighted-signer-webauthn '{credential_name}': credential_id_b64url \
+                     is not valid base64url"
+                ),
+            })
+        })?;
+
+    // pubkey_data = pubkey_65_bytes || credential_id_bytes, per the OZ
+    // `canonicalize_key` WebAuthn verifier convention. Must not be reordered.
+    let mut pubkey_data = Vec::with_capacity(65 + credential_id_bytes.len());
+    pubkey_data.extend_from_slice(&pubkey_bytes);
+    pubkey_data.extend_from_slice(&credential_id_bytes);
+    Ok(pubkey_data)
 }
 
 /// Parses a `--valid-until <LEDGER | none>` arg.
@@ -3800,6 +4217,53 @@ mod tests {
         );
     }
 
+    /// An unrecognised `--kind` value is a clap grammar error, not a runtime
+    /// refusal — the four valid values are `raw`, `spending-limit`,
+    /// `simple-threshold`, `weighted-threshold`.
+    #[test]
+    fn add_policy_args_unknown_kind_is_grammar_error() {
+        let result = AddPolicyArgsHarness::try_parse_from([
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rule-id",
+            "3",
+            "--kind",
+            "not-a-real-kind",
+            "--signer-secret-env",
+            "__STELLAR_AGENT_RULES_TEST_DUMMY_VAR",
+        ]);
+        assert!(
+            result.is_err(),
+            "an unrecognised --kind value must be a clap parse error"
+        );
+    }
+
+    /// Each of the three typed `--kind` values (`simple-threshold`,
+    /// `spending-limit`, `weighted-threshold`) parses to the matching
+    /// `PolicyKind` variant.
+    #[test]
+    fn add_policy_args_kind_grammar_accepts_all_typed_values() {
+        for (label, expected) in [
+            ("simple-threshold", PolicyKind::SimpleThreshold),
+            ("spending-limit", PolicyKind::SpendingLimit),
+            ("weighted-threshold", PolicyKind::WeightedThreshold),
+        ] {
+            let parsed = AddPolicyArgsHarness::parse_from([
+                "test",
+                "--account",
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+                "--rule-id",
+                "3",
+                "--kind",
+                label,
+                "--signer-secret-env",
+                "__STELLAR_AGENT_RULES_TEST_DUMMY_VAR",
+            ]);
+            assert_eq!(parsed.args.kind, expected, "--kind {label} must parse");
+        }
+    }
+
     /// Verifies that `AddPolicyArgs` accepts multiple `--auth-rule-id` flags.
     #[test]
     fn add_policy_args_accept_multiple_auth_rule_ids() {
@@ -4343,6 +4807,9 @@ mod tests {
     const ADD_POLICY_TEST_ACCOUNT: &str =
         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
 
+    const ADD_POLICY_TEST_ACCOUNT_G: &str =
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
     fn add_policy_args(kind: PolicyKind) -> AddPolicyArgs {
         AddPolicyArgs {
             account: ADD_POLICY_TEST_ACCOUNT.to_owned(),
@@ -4353,6 +4820,9 @@ mod tests {
             limit: None,
             period: None,
             policy: None,
+            threshold: None,
+            weighted_signer_delegated: vec![],
+            weighted_signer_webauthn: vec![],
             auth_rule_id: vec![],
             profile: None,
             signer_source: SignerSourceFlags {
@@ -4473,6 +4943,210 @@ mod tests {
         args.period = Some(0);
         let code = add_policy_run(&args).await;
         assert_eq!(code, 1, "period == 0 must be refused");
+    }
+
+    // ── add-policy --kind simple-threshold pre-flight tests ───────────────────
+
+    /// `--kind simple-threshold` without `--threshold` is refused before any
+    /// network call.
+    #[tokio::test]
+    async fn add_policy_simple_threshold_requires_threshold() {
+        let args = add_policy_args(PolicyKind::SimpleThreshold);
+        let code = add_policy_run(&args).await;
+        assert_eq!(
+            code, 1,
+            "simple-threshold mode without --threshold must be refused"
+        );
+    }
+
+    /// `--kind simple-threshold --threshold 0` is refused before any registry
+    /// lookup (the builder's client-side `InvalidThreshold` pre-flight fires
+    /// even when `--policy` is supplied, so no registry access is needed for
+    /// this assertion).
+    #[tokio::test]
+    async fn add_policy_simple_threshold_rejects_zero_threshold() {
+        let mut args = add_policy_args(PolicyKind::SimpleThreshold);
+        args.threshold = Some(0);
+        args.policy = Some(ADD_POLICY_TEST_ACCOUNT.to_owned());
+        let code = add_policy_run(&args).await;
+        assert_eq!(code, 1, "threshold == 0 must be refused");
+    }
+
+    /// `--kind simple-threshold` combined with the raw-mode `--policy-address`
+    /// flag is refused (mode conflict) before any network call.
+    #[tokio::test]
+    async fn add_policy_simple_threshold_rejects_raw_flags() {
+        let mut args = add_policy_args(PolicyKind::SimpleThreshold);
+        args.threshold = Some(2);
+        args.policy_address = Some(ADD_POLICY_TEST_ACCOUNT.to_owned());
+        let code = add_policy_run(&args).await;
+        assert_eq!(
+            code, 1,
+            "simple-threshold mode must reject the raw --policy-address flag"
+        );
+    }
+
+    /// `--kind simple-threshold` with no `--policy` override and no
+    /// registered policy for the network fails closed before any network call.
+    #[tokio::test]
+    #[serial]
+    async fn add_policy_simple_threshold_missing_registry_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry_path = dir.path().join("networks.toml");
+
+        #[allow(unsafe_code, reason = "test-only env override; #[serial] serialises")]
+        unsafe {
+            std::env::set_var(
+                stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
+                &registry_path,
+            );
+        }
+
+        let mut args = add_policy_args(PolicyKind::SimpleThreshold);
+        args.threshold = Some(2);
+        let code = add_policy_run(&args).await;
+
+        #[allow(unsafe_code, reason = "test-only env cleanup; #[serial] serialises")]
+        unsafe {
+            std::env::remove_var(
+                stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
+            );
+        }
+
+        assert_eq!(
+            code, 1,
+            "simple-threshold mode must fail closed when no policy is registered"
+        );
+    }
+
+    // ── add-policy --kind weighted-threshold pre-flight tests ─────────────────
+
+    /// `--kind weighted-threshold` without `--threshold` is refused before any
+    /// network call.
+    #[tokio::test]
+    async fn add_policy_weighted_threshold_requires_threshold() {
+        let mut args = add_policy_args(PolicyKind::WeightedThreshold);
+        args.weighted_signer_delegated = vec![format!("{ADD_POLICY_TEST_ACCOUNT_G}=1")];
+        let code = add_policy_run(&args).await;
+        assert_eq!(
+            code, 1,
+            "weighted-threshold mode without --threshold must be refused"
+        );
+    }
+
+    /// `--kind weighted-threshold` without any `--weighted-signer-*` flag is
+    /// refused before any network call.
+    #[tokio::test]
+    async fn add_policy_weighted_threshold_requires_a_signer() {
+        let mut args = add_policy_args(PolicyKind::WeightedThreshold);
+        args.threshold = Some(1);
+        let code = add_policy_run(&args).await;
+        assert_eq!(
+            code, 1,
+            "weighted-threshold mode without any weighted-signer flag must be refused"
+        );
+    }
+
+    /// `--kind weighted-threshold` combined with the raw-mode `--policy-address`
+    /// flag is refused (mode conflict) before any network call.
+    #[tokio::test]
+    async fn add_policy_weighted_threshold_rejects_raw_flags() {
+        let mut args = add_policy_args(PolicyKind::WeightedThreshold);
+        args.threshold = Some(1);
+        args.weighted_signer_delegated = vec![format!("{ADD_POLICY_TEST_ACCOUNT_G}=1")];
+        args.policy_address = Some(ADD_POLICY_TEST_ACCOUNT.to_owned());
+        let code = add_policy_run(&args).await;
+        assert_eq!(
+            code, 1,
+            "weighted-threshold mode must reject the raw --policy-address flag"
+        );
+    }
+
+    /// A malformed `--weighted-signer-delegated` flag (missing `=<weight>`) is
+    /// refused before any network call.
+    #[tokio::test]
+    async fn add_policy_weighted_threshold_rejects_malformed_signer_flag() {
+        let mut args = add_policy_args(PolicyKind::WeightedThreshold);
+        args.threshold = Some(1);
+        args.weighted_signer_delegated = vec![ADD_POLICY_TEST_ACCOUNT_G.to_owned()];
+        let code = add_policy_run(&args).await;
+        assert_eq!(
+            code, 1,
+            "a weighted-signer flag missing '=<weight>' must be refused"
+        );
+    }
+
+    /// A non-numeric weight suffix is refused before any network call.
+    #[tokio::test]
+    async fn add_policy_weighted_threshold_rejects_non_numeric_weight() {
+        let mut args = add_policy_args(PolicyKind::WeightedThreshold);
+        args.threshold = Some(1);
+        args.weighted_signer_delegated = vec![format!("{ADD_POLICY_TEST_ACCOUNT_G}=not-a-number")];
+        let code = add_policy_run(&args).await;
+        assert_eq!(code, 1, "a non-numeric weight must be refused");
+    }
+
+    /// `--kind weighted-threshold` with no `--policy` override and no
+    /// registered policy for the network fails closed before any network call.
+    #[tokio::test]
+    #[serial]
+    async fn add_policy_weighted_threshold_missing_registry_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry_path = dir.path().join("networks.toml");
+
+        #[allow(unsafe_code, reason = "test-only env override; #[serial] serialises")]
+        unsafe {
+            std::env::set_var(
+                stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
+                &registry_path,
+            );
+        }
+
+        let mut args = add_policy_args(PolicyKind::WeightedThreshold);
+        args.threshold = Some(1);
+        args.weighted_signer_delegated = vec![format!("{ADD_POLICY_TEST_ACCOUNT_G}=1")];
+        let code = add_policy_run(&args).await;
+
+        #[allow(unsafe_code, reason = "test-only env cleanup; #[serial] serialises")]
+        unsafe {
+            std::env::remove_var(
+                stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
+            );
+        }
+
+        assert_eq!(
+            code, 1,
+            "weighted-threshold mode must fail closed when no policy is registered"
+        );
+    }
+
+    // ── parse_weighted_signer_flag ─────────────────────────────────────────────
+
+    /// A well-formed `<identity>=<weight>` flag parses to the expected pair.
+    #[test]
+    fn parse_weighted_signer_flag_parses_valid_spec() {
+        let (identity, weight) =
+            parse_weighted_signer_flag(&format!("{ADD_POLICY_TEST_ACCOUNT_G}=7")).unwrap();
+        assert_eq!(identity, ADD_POLICY_TEST_ACCOUNT_G);
+        assert_eq!(weight, 7);
+    }
+
+    /// A flag with no `=` is refused.
+    #[test]
+    fn parse_weighted_signer_flag_rejects_missing_equals() {
+        assert!(parse_weighted_signer_flag(ADD_POLICY_TEST_ACCOUNT_G).is_err());
+    }
+
+    /// A flag with a non-numeric weight is refused.
+    #[test]
+    fn parse_weighted_signer_flag_rejects_non_numeric_weight() {
+        assert!(parse_weighted_signer_flag(&format!("{ADD_POLICY_TEST_ACCOUNT_G}=abc")).is_err());
+    }
+
+    /// A flag with an empty identity is refused.
+    #[test]
+    fn parse_weighted_signer_flag_rejects_empty_identity() {
+        assert!(parse_weighted_signer_flag("=5").is_err());
     }
 
     // ── get-spending-limit ────────────────────────────────────────────────────

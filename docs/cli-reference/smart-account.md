@@ -157,20 +157,25 @@ stellar-agent smart-account rules verify-pins \
 
 Adds a policy contract to a rule (OZ `add_policy`). The per-rule policy cap (5) is checked before simulation via a `get_context_rule` pre-fetch. Signs and submits. Testnet only. Returns the assigned `policy_id`.
 
-`--kind <raw|spending-limit>` (default `raw`) selects the install-parameter mode:
+`--kind <raw|spending-limit|simple-threshold|weighted-threshold>` (default `raw`) selects the install-parameter mode:
 
 - `--kind raw` (default) — the caller supplies `--policy-address` and a hand-encoded `--install-param`. Works with any policy contract.
 - `--kind spending-limit` — the wallet resolves the deployed OZ spending-limit policy from the [`VerifierRegistry`](../agent-delegation.md) (or an explicit `--policy` override) and builds the typed `SpendingLimitAccountParams` install parameter internally. Refused client-side before any network call when `--limit <= 0` or `--period == 0` (mirroring the on-chain `InvalidLimitOrPeriod` constraint), and when the target rule's context type is not `call-contract` (mirroring `OnlyCallContractAllowed`) — see [Agent delegation](../agent-delegation.md).
+- `--kind simple-threshold` — the wallet resolves the deployed OZ simple threshold-policy (signer-count based; use `smart-account deploy-policy --kind simple-threshold` first) and builds the `SimpleThresholdAccountParams { threshold }` install parameter from `--threshold`. Refused client-side when `--threshold == 0`.
+- `--kind weighted-threshold` — the wallet resolves the deployed OZ weighted-threshold policy (`smart-account deploy-policy --kind weighted-threshold`) and builds the `WeightedThresholdAccountParams { signer_weights, threshold }` install parameter from one or more `--weighted-signer-delegated` / `--weighted-signer-webauthn` flags plus `--threshold`. Refused client-side when the signer-weight set is empty, when `--threshold == 0`, or when `--threshold` exceeds the sum of the supplied weights.
 
 Flags:
 
 - `--account <C_STRKEY>` (required).
 - `--rule-id <U32>` (required) — rule to add the policy to.
-- `--policy-address <C_STRKEY>` — policy contract address. Required with `--kind raw`; rejected with `--kind spending-limit` (use `--policy` there instead).
-- `--install-param <SCVAL_BASE64>` — a standard-base64 XDR `ScVal` install parameter (not base64url), passed to `add_policy` without further validation (raw passthrough). Required with `--kind raw`; rejected with `--kind spending-limit`.
+- `--policy-address <C_STRKEY>` — policy contract address. Required with `--kind raw`; rejected with the other kinds.
+- `--install-param <SCVAL_BASE64>` — a standard-base64 XDR `ScVal` install parameter (not base64url), passed to `add_policy` without further validation (raw passthrough). Required with `--kind raw`; rejected with the other kinds.
 - `--limit <STROOPS>` — spending limit in stroops (`--kind spending-limit`, required). The `i128` amount the rolling window admits before the policy panics `SpendingLimitExceeded`.
 - `--period <LEDGERS>` — rolling-window length in ledgers (`--kind spending-limit`, required).
 - `--policy <C_STRKEY>` — spending-limit policy contract override (`--kind spending-limit`). When omitted, resolves from the registry populated by `smart-account deploy-spending-limit-policy`; fails closed with a deploy-first hint if absent.
+- `--threshold <U32>` — signer threshold (`--kind simple-threshold` / `--kind weighted-threshold`, required with both). For `simple-threshold` this is the minimum signer count; for `weighted-threshold` this is the minimum total weight.
+- `--weighted-signer-delegated <G_STRKEY=WEIGHT>` — one Delegated (ed25519) signer-weight pair (`--kind weighted-threshold`). Repeatable.
+- `--weighted-signer-webauthn <CREDENTIAL_NAME=WEIGHT>` — one External WebAuthn signer-weight pair, resolved by credential name from the passkeys registry (`--kind weighted-threshold`). Repeatable.
 - `--auth-rule-id <U32>` (optional) — authorizing rule id(s). Repeatable. Defaults to `--rule-id`.
 - Shared: `--profile`, signer-source group, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
 
@@ -190,6 +195,17 @@ stellar-agent smart-account rules add-policy \
   --kind spending-limit \
   --limit 50000000 \
   --period 17280 \
+  --signer-secret-env WALLET_SK
+```
+
+```bash
+stellar-agent smart-account rules add-policy \
+  --account CABC...WXYZ \
+  --rule-id 1 \
+  --kind weighted-threshold \
+  --weighted-signer-delegated GOPER...WXYZ=2 \
+  --weighted-signer-webauthn my-passkey=1 \
+  --threshold 2 \
   --signer-secret-env WALLET_SK
 ```
 
@@ -367,6 +383,70 @@ stellar-agent smart-account signers set-threshold \
   --signer-secret-env WALLET_SK
 ```
 
+### `smart-account signers set-weighted-threshold`
+
+Changes a rule's weighted-threshold policy's `threshold` (OZ `set_threshold` on the weighted-threshold policy contract). Signs and submits. Testnet only. The policy is identified by wasm-hash allowlist lookup (a SEPARATE allowlist from the simple threshold-policy's — the two kinds never cross-identify); zero or multiple matches refuse with the typed `WeightedThresholdNotInstalled` / `WeightedThresholdPolicyIdentificationFailed`. Refused client-side before any network call when the new threshold is `0` or exceeds the checked sum of current signer weights.
+
+Extra flags:
+
+- `--new-threshold <U32>` (required).
+- `--auth-rule-id <U32>` (optional) — rule that AUTHORIZES the change. Defaults to `--rule-id`: a weighted policy commonly sits on a Default-scoped rule that self-authorizes. Pass an explicit admin-capable rule id when `--rule-id` names a CallContract- or CreateContract-scoped rule — a scoped rule cannot validate the `execute` auth context and can never authorize its own retune (the same constraint documented for `rules set-spending-limit`).
+
+```bash
+stellar-agent smart-account signers set-weighted-threshold \
+  --account CABC...WXYZ \
+  --rule-id 1 \
+  --new-threshold 2 \
+  --signer-secret-env WALLET_SK
+```
+
+### `smart-account signers set-signer-weight`
+
+Changes one signer's weight in a rule's weighted-threshold policy (OZ `set_signer_weight`). Signs and submits. Testnet only. Refused client-side when the adjusted weight sum (current sum minus the target signer's old weight plus the new weight) would fall below the current threshold.
+
+Exactly one of the following identifies the TARGET signer (mutually exclusive group):
+
+- `--signer-delegated <G_STRKEY>` — a delegated ed25519 signer.
+- `--signer-ed25519 <HEX_PUBKEY_64>` — a first-class external Ed25519 signer; optional `--verifier <C_STRKEY>` override.
+- `--signer-external <C_STRKEY>` — a custom external-verifier signer; requires `--signer-key-data <HEX>`.
+- `--signer-webauthn <CREDENTIAL_NAME>` — a passkey signer resolved from the profile's passkey registry.
+
+Plus:
+
+- `--new-weight <U32>` (required) — the target signer's new weight.
+- `--auth-rule-id <U32>` (optional) — same default-to-`--rule-id` / scoped-rule override rule as `set-weighted-threshold`.
+
+```bash
+stellar-agent smart-account signers set-signer-weight \
+  --account CABC...WXYZ \
+  --rule-id 1 \
+  --signer-delegated GTARGET...WXYZ \
+  --new-weight 2 \
+  --signer-secret-env WALLET_SK
+```
+
+### `smart-account signers batch-add`
+
+Adds MULTIPLE signers to a rule in ONE transaction (OZ `batch_add_signer`). Signs and submits. Testnet only. Refused client-side if the batch is empty, or if `current_signer_count + batch_len` would exceed the per-rule signer cap (15). Emits one `SaSignerAdded` audit row per signer, plus the raw-invocation row. Returns `new_signer_ids` in the order supplied.
+
+The rule's post-op result-fetch identifies a SIMPLE-threshold policy (`identify_threshold_policy`); on a rule whose only threshold policy is weighted-threshold, this call fails closed with a typed pre-submission error and no on-chain side effect. Attach a simple-threshold policy to the target rule first (`rules add-policy --kind simple-threshold`) if it does not already have one.
+
+Flags (each repeatable, any combination, at least one signer required across all three):
+
+- `--signer-delegated <G_STRKEY>` — one Delegated (ed25519) signer per occurrence.
+- `--signer-webauthn <CREDENTIAL_NAME>` — one WebAuthn passkey signer (resolved from the profile's passkey registry) per occurrence.
+- `--signer-ed25519 <HEX_PUBKEY_64>` — one first-class External-Ed25519 signer per occurrence; `--verifier <C_STRKEY>` (optional) overrides the verifier used for ALL `--signer-ed25519` entries in the call.
+
+```bash
+stellar-agent smart-account signers batch-add \
+  --account CABC...WXYZ \
+  --rule-id 1 \
+  --signer-delegated GNEW1...WXYZ \
+  --signer-ed25519 3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29 \
+  --signer-webauthn my-passkey \
+  --signer-secret-env WALLET_SK
+```
+
 ---
 
 ## `smart-account multicall`
@@ -436,6 +516,23 @@ Deploys the OpenZeppelin spending-limit-policy WASM and records its address in t
 
 ```bash
 stellar-agent smart-account deploy-spending-limit-policy --deployer-secret-env DEPLOYER_SK
+```
+
+### `smart-account deploy-policy`
+
+Deploys any one of the three OpenZeppelin policy contracts through a single verb, selected by `--kind`. Same idempotency (`status: "already_deployed"` on a repeat run with the same deployer, no RPC traffic), signer modes, and shared flags as `deploy-webauthn-verifier` above. Each kind uses its OWN salt-domain prefix, so different kinds deployed by the same deployer on the same network derive DIFFERENT addresses. This is the recommended entry point for deploying any policy; `deploy-spending-limit-policy` remains for backward compatibility and delegates to the same substrate for that kind.
+
+Extra flag:
+
+- `--kind <simple-threshold|spending-limit|weighted-threshold>` (required) — which policy contract to deploy.
+  - `simple-threshold` — signer-count-based threshold policy. Attach via [`rules add-policy --kind simple-threshold`](#smart-account-rules-add-policy).
+  - `spending-limit` — rolling-window spending-limit policy. Attach via [`rules add-policy --kind spending-limit`](#smart-account-rules-add-policy).
+  - `weighted-threshold` — weighted-signer quorum policy. Attach via [`rules add-policy --kind weighted-threshold`](#smart-account-rules-add-policy); tune via [`signers set-weighted-threshold`](#smart-account-signers-set-weighted-threshold) / [`signers set-signer-weight`](#smart-account-signers-set-signer-weight).
+
+```bash
+stellar-agent smart-account deploy-policy \
+  --kind weighted-threshold \
+  --deployer-secret-env DEPLOYER_SK
 ```
 
 ### `smart-account migrate-verifier`

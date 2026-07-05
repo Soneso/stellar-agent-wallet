@@ -73,21 +73,28 @@ stellar-agent accounts create \
 
 ### `stellar-agent accounts deploy-c [flags]`
 
-Deploys a new OpenZeppelin smart-account (C-account) contract instance on Soroban via `CreateContractV2`. The initial signer is installed through the contract's `__constructor`.
+Deploys a new OpenZeppelin smart-account (C-account) contract instance on Soroban via `CreateContractV2`. The genesis signer is installed through the contract's `__constructor`.
 
 - **Signing.** Signs the transaction's source-account credentials with the deployer key. The exception is `--dry-run`, which derives the resulting C-strkey deterministically with no signing and no RPC traffic.
 - **Network.** `--network` accepts only `testnet`; `mainnet` is structurally refused (`network.mainnet_write_forbidden`) before any RPC or key access, with a passphrase-layer refusal at submit as defence in depth.
 - **Salt.** The salt determines the deployed C-strkey. By default a fresh random 32-byte salt is generated. Pass `--salt-hex` to re-derive a known address (for example, recovery or interop verification); the same deployer plus the same salt always recovers the same C-strkey.
 - **Audit.** Pass `--profile` to route deployment entries to that profile's audit-log writer. When omitted, the handler emits no `deploy-c` audit entries.
+- **Genesis signer source.** Exactly one signer is installed at genesis — `__constructor` takes a single-element `Vec<Signer>`. Four mutually exclusive sources cover this: a Delegated (native) G-key, an already-registered WebAuthn passkey by name, a raw External-Ed25519 public key, or a generic External signer against any registered verifier contract. Only the Delegated source is fail-open by default; the other three require an explicit acknowledgement flag because the resulting account has no built-in G-key fallback until a second signer is added post-deploy.
 
 Argument groups (enforced by the parser):
 
 - Deployer (required, exactly one): `--deployer-secret-env` xor `--sign-with-ledger`.
 - Salt (at most one): `--salt-hex` xor `--salt-random`; defaults to random when neither is given.
+- Genesis signer source (required, exactly one): `--initial-signer` xor `--signer-webauthn` xor `--signer-ed25519` xor `--signer-external` (with `--signer-key-data`).
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--initial-signer <G_STRKEY>` | Initial signer installed via `__constructor` | yes | — |
+| `--initial-signer <G_STRKEY>` | Delegated (native) genesis signer | one of the genesis-signer group | — |
+| `--signer-webauthn <CREDENTIAL_NAME>` | Genesis signer is an already-registered WebAuthn passkey, looked up by name in the local passkeys registry; requires a WebAuthn verifier already deployed for the target network (`smart-account deploy-webauthn-verifier`) | one of the genesis-signer group | — |
+| `--signer-ed25519 <HEX_PUBKEY_64>` | Genesis signer is a raw 32-byte ed25519 public key (64 hex chars), verified against `--signer-external`'s verifier | one of the genesis-signer group | — |
+| `--signer-external <C_STRKEY>` | Genesis signer is verified by this verifier contract; requires `--signer-key-data` | one of the genesis-signer group | — |
+| `--signer-key-data <HEX>` | Verifier-specific key material for `--signer-external` | required with `--signer-external` | — |
+| `--accept-no-delegated-fallback` | Acknowledges that `--signer-webauthn` / `--signer-ed25519` / `--signer-external` leaves the account with NO Delegated (G-key) fallback signer at genesis; refused without this flag (`validation.passkey_only_rule_no_delegated_fallback`) | required with a non-Delegated genesis source | `false` |
 | `--deployer-secret-env <VAR>` | Env-var name holding the deployer S-strkey | one of the deployer group | — |
 | `--sign-with-ledger` | Use a Ledger as the deployer | one of the deployer group | `false` |
 | `--account-index <INDEX>` | Ledger BIP-44 account index | optional | `0` |
@@ -103,12 +110,25 @@ Argument groups (enforced by the parser):
 
 The deployer account must be funded; it pays the deployment fee.
 
+A genesis signer that is not Delegated cannot itself authorize any further rule mutation (`smart-account rules`, `smart-account signers`) on the account: `add_signer` / `batch_add_signers` / rule installs authorize only via a Delegated signer's key. Deployments using `--signer-webauthn` / `--signer-ed25519` / `--signer-external` should follow up promptly with `smart-account signers add` to attach a Delegated co-signer capable of administering the account, once a policy is attached to the target rule (see [`smart-account rules add-policy`](smart-account.md#smart-account-rules-add-policy) and [`smart-account signers add`](smart-account.md#smart-account-signers-add)).
+
 Example — deploy with a random salt, signing from an env-var secret:
 
 ```bash
 export DEPLOYER_SK="S..."   # deployer account secret key
 stellar-agent accounts deploy-c \
   --initial-signer GABC...WXYZ \
+  --deployer-secret-env DEPLOYER_SK \
+  --salt-random
+```
+
+Example — deploy with a registered WebAuthn passkey as the sole genesis signer:
+
+```bash
+export DEPLOYER_SK="S..."   # deployer account secret key
+stellar-agent accounts deploy-c \
+  --signer-webauthn my-passkey \
+  --accept-no-delegated-fallback \
   --deployer-secret-env DEPLOYER_SK \
   --salt-random
 ```

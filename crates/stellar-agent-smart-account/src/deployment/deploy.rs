@@ -233,6 +233,21 @@ pub struct DeploymentArgs {
     pub fee: ResolvedFeePerOp,
     /// If `true`, compute and return the derived address without any network access.
     pub dry_run: bool,
+    /// Pre-built genesis-signer `ScVal` override.
+    ///
+    /// When `Some`, used DIRECTLY as the sole element of the constructor's
+    /// `signers: Vec<Signer>` argument instead of building
+    /// `Signer::Delegated(Address)` from `initial_signer`. Set this to swap
+    /// in an External-shaped genesis signer (WebAuthn passkey, first-class
+    /// Ed25519, or the raw External escape hatch) built via the canonical
+    /// [`crate::managers::signers::build_external_signer_scval`] — the OZ
+    /// constructor accepts any `Signer` variant
+    /// (`examples/multisig-smart-account/account/src/contract.rs:32`,
+    /// `storage.rs:96-102`, SHA `a9c4216`).
+    ///
+    /// `initial_signer` remains the result envelope's display field
+    /// regardless of which mode is used.
+    pub genesis_signer_scval_override: Option<ScVal>,
 }
 
 /// Result of a successful `deploy_smart_account` call.
@@ -1037,7 +1052,14 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
 
     // Build the constructor arguments ScVec.
     // The signers argument is a single-element vec; the policies argument is an empty map.
-    let signer_scval = build_signer_delegated_scval(&args.initial_signer)?;
+    // `genesis_signer_scval_override` swaps in an External-shaped genesis
+    // signer (built by the caller via the canonical
+    // `build_external_signer_scval`) when present; the OZ constructor
+    // accepts any `Signer` variant.
+    let signer_scval = match &args.genesis_signer_scval_override {
+        Some(scval) => scval.clone(),
+        None => build_signer_delegated_scval(&args.initial_signer)?,
+    };
 
     // signers: Vec<Signer> — wrap the single signer in a ScVec.
     let signers_vec: VecM<ScVal> =

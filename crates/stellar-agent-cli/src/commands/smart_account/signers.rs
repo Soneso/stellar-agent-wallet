@@ -180,6 +180,43 @@ pub enum SignersSubcommand {
     /// lookup (`THRESHOLD_POLICY_WASM_HASHES`); zero or multiple matches
     /// refuse with `sa.threshold_policy_identification_failed`.
     SetThreshold(Box<SetThresholdArgs>),
+
+    /// Change the threshold of an installed weighted-threshold policy.
+    ///
+    /// Constructs and submits `set_threshold(threshold, context_rule,
+    /// smart_account)` against the weighted-threshold-policy contract,
+    /// routed through the smart account's `execute()` entrypoint. Emits
+    /// `SaWeightedThresholdChanged`.
+    ///
+    /// `--auth-rule-id` defaults to `--rule-id` (a weighted policy commonly
+    /// sits on a Default-scoped rule that self-authorizes); pass an explicit
+    /// admin-capable rule when the target rule is scoped (a CallContract- or
+    /// CreateContract-scoped rule cannot authorize the `execute` context).
+    #[command(name = "set-weighted-threshold")]
+    SetWeightedThreshold(Box<SetWeightedThresholdArgs>),
+
+    /// Change one signer's weight in an installed weighted-threshold policy.
+    ///
+    /// Constructs and submits `set_signer_weight(signer, weight,
+    /// context_rule, smart_account)` against the weighted-threshold-policy
+    /// contract, routed through `execute()`. Emits `SaSignerWeightChanged`.
+    /// Accepts the same signer-source flags as `signers add` to identify the
+    /// TARGET signer.
+    ///
+    /// `--auth-rule-id` defaults to `--rule-id`, same convention as
+    /// `set-weighted-threshold`.
+    #[command(name = "set-signer-weight")]
+    SetSignerWeight(Box<SetSignerWeightArgs>),
+
+    /// Add multiple signers to a context rule in ONE transaction via OZ
+    /// `batch_add_signer(rule_id, signers)`.
+    ///
+    /// Accepts REPEATED typed signer flags (each occurrence adds one signer;
+    /// mixed kinds allowed) — `signers add` keeps its single-select
+    /// semantics unchanged. Refuses client-side if the batch would exceed
+    /// `OZ_MAX_SIGNERS` (15). Emits one `SaSignerAdded` row per signer.
+    #[command(name = "batch-add")]
+    BatchAdd(Box<BatchAddArgs>),
 }
 
 /// Runs the `smart-account signers` subcommand group.
@@ -198,6 +235,9 @@ pub async fn run(args: &SignersArgs) -> i32 {
         SignersSubcommand::Add(a) => add_run(a).await,
         SignersSubcommand::Remove(a) => remove_run(a).await,
         SignersSubcommand::SetThreshold(a) => set_threshold_run(a).await,
+        SignersSubcommand::SetWeightedThreshold(a) => set_weighted_threshold_run(a).await,
+        SignersSubcommand::SetSignerWeight(a) => set_signer_weight_run(a).await,
+        SignersSubcommand::BatchAdd(a) => batch_add_run(a).await,
     }
 }
 
@@ -1406,6 +1446,810 @@ async fn set_threshold_run(args: &SetThresholdArgs) -> i32 {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// `smart-account signers set-weighted-threshold`
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Arguments for `smart-account signers set-weighted-threshold`.
+#[non_exhaustive]
+#[derive(Debug, Args)]
+pub struct SetWeightedThresholdArgs {
+    /// Smart-account contract C-strkey.
+    #[arg(long, value_name = "C_STRKEY", required = true)]
+    pub account: String,
+
+    /// Context rule ID whose weighted-threshold policy to change.
+    #[arg(long = "rule-id", value_name = "U32", required = true)]
+    pub rule_id: u32,
+
+    /// New threshold value.
+    #[arg(long = "new-threshold", value_name = "U32", required = true)]
+    pub new_threshold: u32,
+
+    /// Auth rule-id whose signers authorise this update. Default: `--rule-id`
+    /// (a weighted policy commonly sits on a Default-scoped rule that
+    /// self-authorizes). Pass an explicit admin-capable rule when the target
+    /// rule is scoped — a CallContract- or CreateContract-scoped rule cannot
+    /// validate the `execute` auth context (mirrors the `set-spending-limit`
+    /// lesson: a scoped target rule can never authorize its own retune).
+    #[arg(long, value_name = "U32")]
+    pub auth_rule_id: Option<u32>,
+
+    /// Profile name for audit-log path resolution.
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
+
+    #[command(flatten)]
+    pub signer_source: SignerSourceFlags,
+
+    /// Network to target (testnet / mainnet).
+    #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
+    pub network: TargetNetwork,
+
+    /// Soroban RPC endpoint URL.
+    #[arg(long, default_value = TESTNET_RPC_URL, value_name = "URL")]
+    pub rpc_url: String,
+
+    /// Secondary RPC URL for two-RPC consultation.
+    #[arg(long, value_name = "URL")]
+    pub secondary_rpc_url: Option<String>,
+
+    /// Submission timeout in seconds.
+    #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECONDS, value_name = "SECONDS")]
+    pub timeout_seconds: u64,
+}
+
+/// Result envelope for `smart-account signers set-weighted-threshold`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetWeightedThresholdResult {
+    /// Smart-account C-strkey.
+    pub smart_account: String,
+    /// Context rule ID.
+    pub rule_id: u32,
+    /// The new threshold value that was applied.
+    pub new_threshold: u32,
+}
+
+impl_common_args_view!(SetWeightedThresholdArgs);
+
+async fn set_weighted_threshold_run(args: &SetWeightedThresholdArgs) -> i32 {
+    let request_id = new_request_id();
+
+    if args.network == TargetNetwork::Mainnet {
+        return emit_error(
+            &WalletError::Network(NetworkError::MainnetWriteForbidden),
+            &request_id,
+        );
+    }
+
+    let ctx = match CommonHandlerContext::new(args).await {
+        Ok(ctx) => ctx,
+        Err(e) => return emit_error(&e, &request_id),
+    };
+
+    let manager = match ctx.signers_manager() {
+        Ok(m) => m,
+        Err(e) => return emit_error(&e, &request_id),
+    };
+
+    let auth_rule_ids = vec![
+        stellar_agent_core::smart_account::rule_id::ContextRuleId::new(
+            args.auth_rule_id.unwrap_or(args.rule_id),
+        ),
+    ];
+
+    info!(
+        rule_id = args.rule_id,
+        new_threshold = args.new_threshold,
+        account = %redact_strkey_first5_last5(&args.account),
+        "smart-account signers set-weighted-threshold: submitting set_threshold"
+    );
+
+    match manager
+        .set_weighted_threshold(
+            ctx.smart_account,
+            args.rule_id,
+            args.new_threshold,
+            &auth_rule_ids,
+            ctx.signer.as_ref(),
+            request_id.clone(),
+        )
+        .await
+    {
+        Ok(()) => {
+            let result = SetWeightedThresholdResult {
+                smart_account: args.account.clone(),
+                rule_id: args.rule_id,
+                new_threshold: args.new_threshold,
+            };
+            emit_success(&result, &request_id)
+        }
+        Err(e) => emit_error_sa(&e, &request_id),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `smart-account signers set-signer-weight`
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Arguments for `smart-account signers set-signer-weight`.
+///
+/// Accepts the same signer-source flags as `smart-account signers add` to
+/// identify the TARGET signer whose weight changes.
+#[non_exhaustive]
+#[derive(Debug, Args)]
+#[command(
+    group(ArgGroup::new("target_signer_source")
+        .args(["signer_delegated", "signer_external", "signer_webauthn", "signer_ed25519"])
+        .required(true)
+        .multiple(false))
+)]
+pub struct SetSignerWeightArgs {
+    /// Smart-account contract C-strkey.
+    #[arg(long, value_name = "C_STRKEY", required = true)]
+    pub account: String,
+
+    /// Context rule ID whose weighted-threshold policy to change.
+    #[arg(long = "rule-id", value_name = "U32", required = true)]
+    pub rule_id: u32,
+
+    /// New weight value for the target signer.
+    #[arg(long = "new-weight", value_name = "U32", required = true)]
+    pub new_weight: u32,
+
+    /// G-strkey of the TARGET delegated signer.
+    #[arg(
+        long = "signer-delegated",
+        value_name = "G_STRKEY",
+        group = "target_signer_source"
+    )]
+    pub signer_delegated: Option<String>,
+
+    /// C-strkey of the TARGET signer's verifier contract (raw escape hatch).
+    #[arg(
+        long = "signer-external",
+        value_name = "C_STRKEY",
+        requires = "signer_key_data",
+        group = "target_signer_source"
+    )]
+    pub signer_external: Option<String>,
+
+    /// Hex-encoded raw key-data for the TARGET external signer.
+    #[arg(
+        long = "signer-key-data",
+        value_name = "HEX",
+        requires = "signer_external"
+    )]
+    pub signer_key_data: Option<String>,
+
+    /// Credential name of the TARGET WebAuthn signer.
+    #[arg(
+        long = "signer-webauthn",
+        value_name = "CREDENTIAL_NAME",
+        group = "target_signer_source"
+    )]
+    pub signer_webauthn: Option<String>,
+
+    /// 64-hex-character raw Ed25519 public key of the TARGET first-class
+    /// external signer.
+    #[arg(
+        long = "signer-ed25519",
+        value_name = "HEX_PUBKEY_64",
+        group = "target_signer_source"
+    )]
+    pub signer_ed25519: Option<String>,
+
+    /// Ed25519 verifier contract C-strkey override for `--signer-ed25519`.
+    #[arg(
+        long = "verifier",
+        value_name = "C_STRKEY",
+        requires = "signer_ed25519"
+    )]
+    pub verifier: Option<String>,
+
+    /// Auth rule-id whose signers authorise this update. Default: `--rule-id`.
+    /// See `set-weighted-threshold` for the scoped-rule override rationale.
+    #[arg(long, value_name = "U32")]
+    pub auth_rule_id: Option<u32>,
+
+    /// Profile name for audit-log path resolution and credential store lookup.
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
+
+    #[command(flatten)]
+    pub signer_source: SignerSourceFlags,
+
+    /// Network to target (testnet / mainnet).
+    #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
+    pub network: TargetNetwork,
+
+    /// Soroban RPC endpoint URL.
+    #[arg(long, default_value = TESTNET_RPC_URL, value_name = "URL")]
+    pub rpc_url: String,
+
+    /// Secondary RPC URL for two-RPC consultation.
+    #[arg(long, value_name = "URL")]
+    pub secondary_rpc_url: Option<String>,
+
+    /// Submission timeout in seconds.
+    #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECONDS, value_name = "SECONDS")]
+    pub timeout_seconds: u64,
+}
+
+/// Result envelope for `smart-account signers set-signer-weight`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetSignerWeightResult {
+    /// Smart-account C-strkey.
+    pub smart_account: String,
+    /// Context rule ID.
+    pub rule_id: u32,
+    /// The new weight value that was applied.
+    pub new_weight: u32,
+}
+
+impl_common_args_view!(SetSignerWeightArgs);
+
+async fn set_signer_weight_run(args: &SetSignerWeightArgs) -> i32 {
+    let request_id = new_request_id();
+
+    if args.network == TargetNetwork::Mainnet {
+        return emit_error(
+            &WalletError::Network(NetworkError::MainnetWriteForbidden),
+            &request_id,
+        );
+    }
+
+    let target_signer = match resolve_weighted_signer_input(
+        WeightedSignerSourceSpec {
+            delegated: args.signer_delegated.as_deref(),
+            external_verifier: args.signer_external.as_deref(),
+            external_key_data_hex: args.signer_key_data.as_deref(),
+            webauthn_credential: args.signer_webauthn.as_deref(),
+            ed25519_hex_pubkey: args.signer_ed25519.as_deref(),
+            ed25519_verifier_override: args.verifier.as_deref(),
+        },
+        args.network,
+        args.profile.as_deref(),
+    )
+    .await
+    {
+        Ok(input) => input,
+        Err(e) => return emit_error(&e, &request_id),
+    };
+
+    let ctx = match CommonHandlerContext::new(args).await {
+        Ok(ctx) => ctx,
+        Err(e) => return emit_error(&e, &request_id),
+    };
+
+    let manager = match ctx.signers_manager() {
+        Ok(m) => m,
+        Err(e) => return emit_error(&e, &request_id),
+    };
+
+    let auth_rule_ids = vec![
+        stellar_agent_core::smart_account::rule_id::ContextRuleId::new(
+            args.auth_rule_id.unwrap_or(args.rule_id),
+        ),
+    ];
+
+    info!(
+        rule_id = args.rule_id,
+        new_weight = args.new_weight,
+        account = %redact_strkey_first5_last5(&args.account),
+        "smart-account signers set-signer-weight: submitting set_signer_weight"
+    );
+
+    match manager
+        .set_signer_weight(
+            ctx.smart_account,
+            args.rule_id,
+            target_signer,
+            args.new_weight,
+            &auth_rule_ids,
+            ctx.signer.as_ref(),
+            request_id.clone(),
+        )
+        .await
+    {
+        Ok(()) => {
+            let result = SetSignerWeightResult {
+                smart_account: args.account.clone(),
+                rule_id: args.rule_id,
+                new_weight: args.new_weight,
+            };
+            emit_success(&result, &request_id)
+        }
+        Err(e) => emit_error_sa(&e, &request_id),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `smart-account signers batch-add`
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Arguments for `smart-account signers batch-add`.
+///
+/// Accepts REPEATED typed signer flags (each occurrence adds one signer to
+/// the batch; mixed kinds allowed). `smart-account signers add` keeps its
+/// single-select semantics — this is an additive verb for the batch case.
+#[non_exhaustive]
+#[derive(Debug, Args)]
+pub struct BatchAddArgs {
+    /// Smart-account contract C-strkey.
+    #[arg(long, value_name = "C_STRKEY", required = true)]
+    pub account: String,
+
+    /// Context rule ID to add signers to.
+    #[arg(long = "rule-id", value_name = "U32", required = true)]
+    pub rule_id: u32,
+
+    /// One delegated (ed25519) signer G-strkey per occurrence. Repeatable.
+    #[arg(long = "signer-delegated", value_name = "G_STRKEY",
+          num_args = 1.., action = clap::ArgAction::Append)]
+    pub signer_delegated: Vec<String>,
+
+    /// One WebAuthn passkey credential name per occurrence. Repeatable.
+    #[arg(long = "signer-webauthn", value_name = "CREDENTIAL_NAME",
+          num_args = 1.., action = clap::ArgAction::Append)]
+    pub signer_webauthn: Vec<String>,
+
+    /// One first-class Ed25519 external signer (64-hex pubkey) per
+    /// occurrence. Repeatable. Uses `--verifier` (if given) or the
+    /// network's registered Ed25519 verifier for ALL entries in this flag.
+    #[arg(long = "signer-ed25519", value_name = "HEX_PUBKEY_64",
+          num_args = 1.., action = clap::ArgAction::Append)]
+    pub signer_ed25519: Vec<String>,
+
+    /// Ed25519 verifier contract C-strkey override for `--signer-ed25519`
+    /// entries.
+    #[arg(long = "verifier", value_name = "C_STRKEY")]
+    pub verifier: Option<String>,
+
+    /// Profile name for audit-log path resolution and credential store lookup.
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
+
+    #[command(flatten)]
+    pub signer_source: SignerSourceFlags,
+
+    /// Network to target (testnet / mainnet).
+    #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
+    pub network: TargetNetwork,
+
+    /// Soroban RPC endpoint URL.
+    #[arg(long, default_value = TESTNET_RPC_URL, value_name = "URL")]
+    pub rpc_url: String,
+
+    /// Secondary RPC URL for two-RPC consultation.
+    #[arg(long, value_name = "URL")]
+    pub secondary_rpc_url: Option<String>,
+
+    /// Submission timeout in seconds.
+    #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECONDS, value_name = "SECONDS")]
+    pub timeout_seconds: u64,
+}
+
+/// Result envelope for `smart-account signers batch-add`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchAddResult {
+    /// Smart-account C-strkey.
+    pub smart_account: String,
+    /// Context rule ID.
+    pub rule_id: u32,
+    /// On-chain IDs assigned to the new signers, in the order supplied.
+    pub new_signer_ids: Vec<u32>,
+}
+
+impl_common_args_view!(BatchAddArgs);
+
+async fn batch_add_run(args: &BatchAddArgs) -> i32 {
+    let request_id = new_request_id();
+
+    if args.network == TargetNetwork::Mainnet {
+        return emit_error(
+            &WalletError::Network(NetworkError::MainnetWriteForbidden),
+            &request_id,
+        );
+    }
+
+    if args.signer_delegated.is_empty()
+        && args.signer_webauthn.is_empty()
+        && args.signer_ed25519.is_empty()
+    {
+        return emit_error(
+            &WalletError::Validation(ValidationError::AddressInvalid {
+                input: "batch-add requires at least one --signer-delegated / \
+                        --signer-webauthn / --signer-ed25519"
+                    .to_owned(),
+            }),
+            &request_id,
+        );
+    }
+
+    let mut new_signers: Vec<(stellar_xdr::ScVal, SignerPubkey)> = Vec::with_capacity(
+        args.signer_delegated.len() + args.signer_webauthn.len() + args.signer_ed25519.len(),
+    );
+
+    for g_strkey in &args.signer_delegated {
+        let spec = WeightedSignerSourceSpec {
+            delegated: Some(g_strkey.as_str()),
+            external_verifier: None,
+            external_key_data_hex: None,
+            webauthn_credential: None,
+            ed25519_hex_pubkey: None,
+            ed25519_verifier_override: None,
+        };
+        match resolve_batch_signer_scval_and_pubkey(spec, args.network, args.profile.as_deref())
+            .await
+        {
+            Ok(pair) => new_signers.push(pair),
+            Err(e) => return emit_error(&e, &request_id),
+        }
+    }
+    for credential_name in &args.signer_webauthn {
+        let spec = WeightedSignerSourceSpec {
+            delegated: None,
+            external_verifier: None,
+            external_key_data_hex: None,
+            webauthn_credential: Some(credential_name.as_str()),
+            ed25519_hex_pubkey: None,
+            ed25519_verifier_override: None,
+        };
+        match resolve_batch_signer_scval_and_pubkey(spec, args.network, args.profile.as_deref())
+            .await
+        {
+            Ok(pair) => new_signers.push(pair),
+            Err(e) => return emit_error(&e, &request_id),
+        }
+    }
+    for hex_pubkey in &args.signer_ed25519 {
+        let spec = WeightedSignerSourceSpec {
+            delegated: None,
+            external_verifier: None,
+            external_key_data_hex: None,
+            webauthn_credential: None,
+            ed25519_hex_pubkey: Some(hex_pubkey.as_str()),
+            ed25519_verifier_override: args.verifier.as_deref(),
+        };
+        match resolve_batch_signer_scval_and_pubkey(spec, args.network, args.profile.as_deref())
+            .await
+        {
+            Ok(pair) => new_signers.push(pair),
+            Err(e) => return emit_error(&e, &request_id),
+        }
+    }
+
+    let ctx = match CommonHandlerContext::new(args).await {
+        Ok(ctx) => ctx,
+        Err(e) => return emit_error(&e, &request_id),
+    };
+
+    let manager = match ctx.signers_manager() {
+        Ok(m) => m,
+        Err(e) => return emit_error(&e, &request_id),
+    };
+
+    info!(
+        rule_id = args.rule_id,
+        batch_len = new_signers.len(),
+        account = %redact_strkey_first5_last5(&args.account),
+        "smart-account signers batch-add: submitting batch_add_signer"
+    );
+
+    match manager
+        .batch_add_signers(
+            ctx.smart_account,
+            args.rule_id,
+            new_signers,
+            ctx.signer.as_ref(),
+            request_id.clone(),
+        )
+        .await
+    {
+        Ok(new_signer_ids) => {
+            let result = BatchAddResult {
+                smart_account: args.account.clone(),
+                rule_id: args.rule_id,
+                new_signer_ids,
+            };
+            emit_success(&result, &request_id)
+        }
+        Err(e) => emit_error_sa(&e, &request_id),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared signer-source resolution (set-signer-weight target + batch-add)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One signer-source specification, mirroring `AddArgs`'s four mutually
+/// exclusive flag kinds. Exactly one field group should be populated by the
+/// caller (delegated / external / webauthn / ed25519).
+struct WeightedSignerSourceSpec<'a> {
+    delegated: Option<&'a str>,
+    external_verifier: Option<&'a str>,
+    external_key_data_hex: Option<&'a str>,
+    webauthn_credential: Option<&'a str>,
+    ed25519_hex_pubkey: Option<&'a str>,
+    ed25519_verifier_override: Option<&'a str>,
+}
+
+/// Resolves a webauthn-credential-name signer source to `(verifier_sc_addr,
+/// key_data)`, shared by `set-signer-weight` and `batch-add`.
+async fn resolve_webauthn_source(
+    credential_name: &str,
+    network: TargetNetwork,
+    profile: Option<&str>,
+) -> Result<(stellar_xdr::ScAddress, Vec<u8>), WalletError> {
+    let verifier_registry = VerifierRegistry::open().map_err(|e| {
+        WalletError::Validation(ValidationError::AddressInvalid {
+            input: format!("could not open verifier registry: {e}"),
+        })
+    })?;
+    let network_passphrase = network.passphrase();
+    let verifier_entry = verifier_registry
+        .webauthn_verifier_for(network_passphrase)
+        .ok_or_else(|| {
+            WalletError::Validation(ValidationError::AddressInvalid {
+                input: format!(
+                    "no WebAuthn verifier deployed for network '{network_passphrase}'; run: \
+                     smart-account deploy-webauthn-verifier"
+                ),
+            })
+        })?;
+    let verifier_sc_addr =
+        parse_c_strkey_to_smart_account(&verifier_entry.address).map_err(|e| {
+            WalletError::SmartAccount {
+                wire_code: e.wire_code(),
+                message: format!(
+                    "verifier registry address '{}' is not a valid C-strkey: {e}",
+                    verifier_entry.address
+                ),
+            }
+        })?;
+
+    let profile_name = resolve_profile_name(profile);
+    validate_path_component_ascii_safe(&profile_name).map_err(|reason| {
+        WalletError::Validation(ValidationError::AddressInvalid {
+            input: format!("invalid profile name '{profile_name}': {reason}"),
+        })
+    })?;
+    let creds_mgr = CredentialsManager::from_defaults_readonly(&profile_name, "localhost")
+        .map_err(|e| {
+            WalletError::Validation(ValidationError::AddressInvalid {
+                input: format!("could not open passkeys registry: {e}"),
+            })
+        })?;
+    let metadata = creds_mgr.show(credential_name).map_err(|e| {
+        WalletError::Validation(ValidationError::AddressInvalid {
+            input: format!("--signer-webauthn '{credential_name}': {e}"),
+        })
+    })?;
+    if metadata.public_key_sec1_b64.is_empty() {
+        return Err(WalletError::Validation(ValidationError::AddressInvalid {
+            input: format!(
+                "--signer-webauthn '{credential_name}': credential is missing \
+                 public_key_sec1_b64 (delete and re-register)"
+            ),
+        }));
+    }
+    let pubkey_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&metadata.public_key_sec1_b64)
+        .map_err(|_| {
+            WalletError::Validation(ValidationError::AddressInvalid {
+                input: format!(
+                    "--signer-webauthn '{credential_name}': public_key_sec1_b64 is not valid \
+                     base64url"
+                ),
+            })
+        })?;
+    if pubkey_bytes.len() != 65 {
+        return Err(WalletError::Validation(ValidationError::AddressInvalid {
+            input: format!(
+                "--signer-webauthn '{credential_name}': public_key_sec1_b64 decodes to {} \
+                 bytes, expected 65",
+                pubkey_bytes.len()
+            ),
+        }));
+    }
+    let credential_id_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&metadata.credential_id_b64url)
+        .map_err(|_| {
+            WalletError::Validation(ValidationError::AddressInvalid {
+                input: format!(
+                    "--signer-webauthn '{credential_name}': credential_id_b64url is not valid \
+                     base64url"
+                ),
+            })
+        })?;
+    let mut key_data = Vec::with_capacity(65 + credential_id_bytes.len());
+    key_data.extend_from_slice(&pubkey_bytes);
+    key_data.extend_from_slice(&credential_id_bytes);
+    Ok((verifier_sc_addr, key_data))
+}
+
+/// Resolves an ed25519-hex-pubkey signer source to `(verifier_sc_addr,
+/// key_data)`, shared by `set-signer-weight` and `batch-add`.
+fn resolve_ed25519_source(
+    hex_pubkey: &str,
+    verifier_override: Option<&str>,
+    network: TargetNetwork,
+) -> Result<(stellar_xdr::ScAddress, Vec<u8>), WalletError> {
+    let key_data = hex::decode(hex_pubkey).map_err(|e| {
+        WalletError::Validation(ValidationError::AddressInvalid {
+            input: format!("--signer-ed25519 is not valid hex: {e}"),
+        })
+    })?;
+    if key_data.len() != 32 {
+        return Err(WalletError::Validation(ValidationError::AddressInvalid {
+            input: format!(
+                "--signer-ed25519 must decode to exactly 32 bytes (a raw Ed25519 public key), \
+                 got {} bytes",
+                key_data.len()
+            ),
+        }));
+    }
+    let verifier_c_strkey = if let Some(explicit) = verifier_override {
+        explicit.to_owned()
+    } else {
+        let verifier_registry = VerifierRegistry::open().map_err(|e| {
+            WalletError::Validation(ValidationError::AddressInvalid {
+                input: format!("could not open verifier registry: {e}"),
+            })
+        })?;
+        let network_passphrase = network.passphrase();
+        verifier_registry
+            .ed25519_verifier_for(network_passphrase)
+            .map(|entry| entry.address.clone())
+            .ok_or_else(|| {
+                WalletError::Validation(ValidationError::AddressInvalid {
+                    input: format!(
+                        "no Ed25519 verifier registered for network '{network_passphrase}'; \
+                         run: smart-account deploy-ed25519-verifier (or pass --verifier)"
+                    ),
+                })
+            })?
+    };
+    let verifier_sc_addr = parse_c_strkey_to_smart_account(&verifier_c_strkey).map_err(|e| {
+        WalletError::SmartAccount {
+            wire_code: e.wire_code(),
+            message: format!("--signer-ed25519 verifier '{verifier_c_strkey}': {e}"),
+        }
+    })?;
+    Ok((verifier_sc_addr, key_data))
+}
+
+/// Resolves a [`WeightedSignerSourceSpec`] to a
+/// [`stellar_agent_smart_account::weighted_threshold_policy::WeightedThresholdSignerInput`]
+/// for `set-signer-weight`'s TARGET-signer identification.
+async fn resolve_weighted_signer_input(
+    spec: WeightedSignerSourceSpec<'_>,
+    network: TargetNetwork,
+    profile: Option<&str>,
+) -> Result<
+    stellar_agent_smart_account::weighted_threshold_policy::WeightedThresholdSignerInput,
+    WalletError,
+> {
+    use stellar_agent_smart_account::weighted_threshold_policy::WeightedThresholdSignerInput;
+
+    if let Some(g_strkey) = spec.delegated {
+        if let Err(e) = stellar_strkey::ed25519::PublicKey::from_string(g_strkey) {
+            return Err(WalletError::Validation(ValidationError::AddressInvalid {
+                input: format!("--signer-delegated: {e}"),
+            }));
+        }
+        return Ok(WeightedThresholdSignerInput::Delegated {
+            g_strkey: g_strkey.to_owned(),
+        });
+    }
+    if let Some(verifier_c_strkey) = spec.external_verifier {
+        let key_data_hex = spec.external_key_data_hex.unwrap_or("");
+        let key_data = hex::decode(key_data_hex).map_err(|e| {
+            WalletError::Validation(ValidationError::AddressInvalid {
+                input: format!("--signer-key-data is not valid hex: {e}"),
+            })
+        })?;
+        if key_data.is_empty() {
+            return Err(WalletError::Validation(ValidationError::AddressInvalid {
+                input: "--signer-key-data must be non-empty".to_owned(),
+            }));
+        }
+        let verifier_sc_addr = parse_c_strkey_to_smart_account(verifier_c_strkey).map_err(|e| {
+            WalletError::SmartAccount {
+                wire_code: e.wire_code(),
+                message: format!("--signer-external: {e}"),
+            }
+        })?;
+        return Ok(WeightedThresholdSignerInput::External {
+            verifier: verifier_sc_addr,
+            key_data,
+        });
+    }
+    if let Some(credential_name) = spec.webauthn_credential {
+        let (verifier, key_data) =
+            resolve_webauthn_source(credential_name, network, profile).await?;
+        return Ok(WeightedThresholdSignerInput::External { verifier, key_data });
+    }
+    if let Some(hex_pubkey) = spec.ed25519_hex_pubkey {
+        let (verifier, key_data) =
+            resolve_ed25519_source(hex_pubkey, spec.ed25519_verifier_override, network)?;
+        return Ok(WeightedThresholdSignerInput::External { verifier, key_data });
+    }
+
+    // Unreachable: the `target_signer_source` ArgGroup requires exactly one.
+    Err(WalletError::Validation(ValidationError::AddressInvalid {
+        input: "no target signer source supplied".to_owned(),
+    }))
+}
+
+/// Resolves a [`WeightedSignerSourceSpec`] to a `(ScVal, SignerPubkey)` pair
+/// for `batch-add`'s per-flag signer resolution.
+async fn resolve_batch_signer_scval_and_pubkey(
+    spec: WeightedSignerSourceSpec<'_>,
+    network: TargetNetwork,
+    profile: Option<&str>,
+) -> Result<(stellar_xdr::ScVal, SignerPubkey), WalletError> {
+    if let Some(g_strkey) = spec.delegated {
+        let scval =
+            build_delegated_signer_scval(g_strkey).map_err(|e| WalletError::SmartAccount {
+                wire_code: e.wire_code(),
+                message: format!("--signer-delegated: {e}"),
+            })?;
+        let pubkey = build_ed25519_signer_pubkey(g_strkey)?;
+        return Ok((scval, pubkey));
+    }
+    if let Some(credential_name) = spec.webauthn_credential {
+        let (verifier, key_data) =
+            resolve_webauthn_source(credential_name, network, profile).await?;
+        let scval = build_external_signer_scval(verifier, &key_data).map_err(|e| {
+            WalletError::SmartAccount {
+                wire_code: e.wire_code(),
+                message: format!("--signer-webauthn ScVal encode: {e}"),
+            }
+        })?;
+        let credential_id_first16: [u8; 16] = {
+            let mut arr = [0u8; 16];
+            let len = key_data.len().min(16);
+            let tail = &key_data[key_data.len().saturating_sub(len)..];
+            arr[..tail.len()].copy_from_slice(tail);
+            arr
+        };
+        return Ok((
+            scval,
+            SignerPubkey::WebAuthn {
+                credential_id_first16,
+            },
+        ));
+    }
+    if let Some(hex_pubkey) = spec.ed25519_hex_pubkey {
+        let (verifier, key_data) =
+            resolve_ed25519_source(hex_pubkey, spec.ed25519_verifier_override, network)?;
+        let scval = build_external_signer_scval(verifier, &key_data).map_err(|e| {
+            WalletError::SmartAccount {
+                wire_code: e.wire_code(),
+                message: format!("--signer-ed25519 ScVal encode: {e}"),
+            }
+        })?;
+        let key_data_first16: [u8; 16] = {
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(&key_data[..16]);
+            arr
+        };
+        return Ok((
+            scval,
+            SignerPubkey::External {
+                verifier_contract: hex_pubkey.to_owned(),
+                key_data_first16,
+            },
+        ));
+    }
+
+    Err(WalletError::Validation(ValidationError::AddressInvalid {
+        input: "no batch signer source supplied".to_owned(),
+    }))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Shared helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1943,6 +2787,200 @@ mod tests {
         .err()
         .expect("--output should be rejected");
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    // ── set-weighted-threshold ────────────────────────────────────────────────
+
+    #[derive(Parser)]
+    struct SetWeightedThresholdArgsHarness {
+        #[command(flatten)]
+        args: SetWeightedThresholdArgs,
+    }
+
+    /// `--auth-rule-id` is optional and defaults to `None` (the handler
+    /// defaults to `--rule-id` at call time).
+    #[test]
+    fn set_weighted_threshold_args_auth_rule_id_defaults_to_none() {
+        let parsed = SetWeightedThresholdArgsHarness::parse_from([
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rule-id",
+            "1",
+            "--new-threshold",
+            "2",
+            "--signer-secret-env",
+            "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
+        ]);
+        assert_eq!(parsed.args.auth_rule_id, None);
+        assert_eq!(parsed.args.new_threshold, 2);
+    }
+
+    /// An explicit `--auth-rule-id` overrides the default.
+    #[test]
+    fn set_weighted_threshold_args_accepts_explicit_auth_rule_id() {
+        let parsed = SetWeightedThresholdArgsHarness::parse_from([
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rule-id",
+            "3",
+            "--new-threshold",
+            "2",
+            "--auth-rule-id",
+            "0",
+            "--signer-secret-env",
+            "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
+        ]);
+        assert_eq!(parsed.args.auth_rule_id, Some(0));
+    }
+
+    // ── set-signer-weight ──────────────────────────────────────────────────────
+
+    #[derive(Parser)]
+    struct SetSignerWeightArgsHarness {
+        #[command(flatten)]
+        args: SetSignerWeightArgs,
+    }
+
+    #[test]
+    fn set_signer_weight_args_parse_minimal_delegated() {
+        let parsed = SetSignerWeightArgsHarness::parse_from([
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rule-id",
+            "1",
+            "--new-weight",
+            "3",
+            "--signer-delegated",
+            SIMULATE_SENTINEL_G,
+            "--signer-secret-env",
+            "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
+        ]);
+        assert_eq!(parsed.args.new_weight, 3);
+        assert_eq!(
+            parsed.args.signer_delegated.as_deref(),
+            Some(SIMULATE_SENTINEL_G)
+        );
+    }
+
+    /// The `target_signer_source` ArgGroup requires exactly one of
+    /// `--signer-delegated` / `--signer-external` / `--signer-webauthn` /
+    /// `--signer-ed25519`; supplying none is a clap grammar error.
+    #[test]
+    fn set_signer_weight_args_requires_one_target_signer_source() {
+        let result = SetSignerWeightArgsHarness::try_parse_from([
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rule-id",
+            "1",
+            "--new-weight",
+            "3",
+            "--signer-secret-env",
+            "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
+        ]);
+        assert!(
+            result.is_err(),
+            "no target signer source flag must be a clap grammar error"
+        );
+    }
+
+    /// Supplying both `--signer-delegated` and `--signer-webauthn` is
+    /// refused (mutual exclusivity).
+    #[test]
+    fn set_signer_weight_args_target_signer_source_is_mutually_exclusive() {
+        let result = SetSignerWeightArgsHarness::try_parse_from([
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rule-id",
+            "1",
+            "--new-weight",
+            "3",
+            "--signer-delegated",
+            SIMULATE_SENTINEL_G,
+            "--signer-webauthn",
+            "some-credential",
+            "--signer-secret-env",
+            "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
+        ]);
+        assert!(
+            result.is_err(),
+            "--signer-delegated and --signer-webauthn must be mutually exclusive"
+        );
+    }
+
+    // ── batch-add ──────────────────────────────────────────────────────────────
+
+    #[derive(Parser)]
+    struct BatchAddArgsHarness {
+        #[command(flatten)]
+        args: BatchAddArgs,
+    }
+
+    #[test]
+    fn batch_add_args_accept_repeated_mixed_signer_flags() {
+        let parsed = BatchAddArgsHarness::parse_from([
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rule-id",
+            "1",
+            "--signer-delegated",
+            SIMULATE_SENTINEL_G,
+            "--signer-delegated",
+            SIMULATE_SENTINEL_G,
+            "--signer-webauthn",
+            "some-credential",
+            "--signer-secret-env",
+            "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
+        ]);
+        assert_eq!(parsed.args.signer_delegated.len(), 2);
+        assert_eq!(
+            parsed.args.signer_webauthn,
+            vec!["some-credential".to_owned()]
+        );
+    }
+
+    /// `batch-add` with no signer flags at all is a clap grammar error only
+    /// if `num_args = 1..` alone enforced it — it does NOT (each flag is
+    /// independently optional); the runtime refusal fires in `batch_add_run`
+    /// instead. This test documents that the args struct itself parses fine
+    /// with zero signer flags (the empty-batch guard is a runtime check).
+    #[test]
+    fn batch_add_args_parse_with_no_signer_flags() {
+        let parsed = BatchAddArgsHarness::parse_from([
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rule-id",
+            "1",
+            "--signer-secret-env",
+            "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
+        ]);
+        assert!(parsed.args.signer_delegated.is_empty());
+        assert!(parsed.args.signer_webauthn.is_empty());
+        assert!(parsed.args.signer_ed25519.is_empty());
+    }
+
+    /// `batch-add` with zero signer flags is refused at runtime (client-side,
+    /// before any RPC call).
+    #[tokio::test]
+    async fn batch_add_run_refuses_empty_batch() {
+        let args = BatchAddArgsHarness::parse_from([
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rule-id",
+            "1",
+            "--signer-secret-env",
+            "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
+        ])
+        .args;
+        let code = batch_add_run(&args).await;
+        assert_eq!(code, 1, "an empty signer batch must be refused");
     }
 
     // ── signer_kind_label ─────────────────────────────────────────────────────
