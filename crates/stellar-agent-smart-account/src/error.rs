@@ -813,6 +813,76 @@ pub enum SaError {
         reason: String,
     },
 
+    /// No accessible spending-limit policy for `(rule_id, smart_account)`.
+    ///
+    /// Fired by two independent call sites:
+    ///
+    /// - `SignersManager::identify_spending_limit_policy` — the rule's
+    ///   `policies` list is empty, or none of the attached policies' wasm-hash
+    ///   matches `SPENDING_LIMIT_POLICY_WASM_SHA256` (client-side, before any
+    ///   read of the policy's storage).
+    /// - `SignersManager::get_spending_limit_data` — the identified policy
+    ///   contract's on-chain view call panics `SpendingLimitError::SmartAccountNotInstalled`
+    ///   (code 3220, `packages/accounts/src/policies/spending_limit.rs:124-127`,
+    ///   SHA `a9c4216`), meaning `install` was never called for this
+    ///   `(smart_account, rule_id)` pair on the per-network singleton policy
+    ///   contract (defense in depth: the identification step can succeed on a
+    ///   raw-attached policy address whose storage was never initialised).
+    ///
+    /// Both call sites surface the same wire code: from the operator's
+    /// perspective, "no spending-limit policy usable for this rule" is a
+    /// single actionable situation regardless of which layer detected it.
+    ///
+    /// `smart_account_redacted` MUST be pre-redacted (first-5-last-5 C-strkey)
+    /// at the call site.
+    #[error(
+        "spending-limit policy not installed for rule {rule_id} (smart_account={smart_account_redacted}); \
+         run 'smart-account rules add-policy --rule-id {rule_id} --kind spending-limit' to install one"
+    )]
+    #[serde(rename = "sa.spending_limit_not_installed")]
+    SpendingLimitNotInstalled {
+        /// Context-rule identifier for which no spending-limit policy was found.
+        rule_id: u32,
+        /// Redacted smart-account contract address (first-5-last-5 C-strkey).
+        smart_account_redacted: RedactedStrkey,
+        /// Per-request correlation identifier (UUIDv4).
+        request_id: String,
+    },
+
+    /// Spending-limit-policy identification found more than one attached
+    /// policy matching `SPENDING_LIMIT_POLICY_WASM_SHA256`.
+    ///
+    /// Fired by `SignersManager::identify_spending_limit_policy` when the
+    /// rule's `policies` list contains two or more addresses whose observed
+    /// wasm-hash matches the single-entry allowlist — ambiguous, fail-closed.
+    /// Unlike the zero-match case (`SaError::SpendingLimitNotInstalled`), a
+    /// multi-match means a policy IS installed but the wallet cannot safely
+    /// pick which attached address to operate on; the operator must remove
+    /// the duplicate attachment via `smart-account rules remove-policy`.
+    ///
+    /// `observed_wasm_hashes_summary` carries `count` (number of policies
+    /// observed on the rule) and `first_first8` (first 8 bytes of the first
+    /// observed hash) for forensic correlation without leaking full hash
+    /// preimages.
+    ///
+    /// `smart_account_redacted` MUST be pre-redacted (first-5-last-5 C-strkey)
+    /// at the call site.
+    #[error(
+        "spending-limit-policy identification failed on rule {rule_id}: \
+         observed {observed_wasm_hashes_summary}"
+    )]
+    #[serde(rename = "sa.spending_limit_policy_identification_failed")]
+    SpendingLimitPolicyIdentificationFailed {
+        /// Context-rule identifier for which identification failed.
+        rule_id: u32,
+        /// Redacted smart-account contract address (first-5-last-5 C-strkey).
+        smart_account_redacted: RedactedStrkey,
+        /// Summary of observed wasm-hashes for forensic correlation.
+        observed_wasm_hashes_summary: WasmHashSummary,
+        /// Per-request correlation identifier (UUIDv4).
+        request_id: String,
+    },
+
     /// File I/O error reading or writing `~/.config/stellar-agent/networks.toml`
     /// (or the `STELLAR_AGENT_NETWORKS_TOML` override path).
     ///
@@ -2087,6 +2157,10 @@ impl SaError {
             }
             Self::SpendingLimitPolicySha256Drift { .. } => "sa.spending_limit_policy_sha256_drift",
             Self::SpendingLimitInstallRefused { .. } => "sa.spending_limit_install_refused",
+            Self::SpendingLimitNotInstalled { .. } => "sa.spending_limit_not_installed",
+            Self::SpendingLimitPolicyIdentificationFailed { .. } => {
+                "sa.spending_limit_policy_identification_failed"
+            }
             Self::NetworksTomlIo { .. } => "sa.networks_toml_io",
             Self::NetworksTomlParse { .. } => "sa.networks_toml_parse",
             Self::WebAuthnAssertionInvalid { reason } => match reason {
@@ -2471,6 +2545,26 @@ mod tests {
                 "sa.spending_limit_install_refused",
                 SaError::SpendingLimitInstallRefused {
                     reason: "test".to_owned(),
+                },
+            ),
+            (
+                "sa.spending_limit_not_installed",
+                SaError::SpendingLimitNotInstalled {
+                    rule_id: 1,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    request_id: "test-req-sl-001".to_owned(),
+                },
+            ),
+            (
+                "sa.spending_limit_policy_identification_failed",
+                SaError::SpendingLimitPolicyIdentificationFailed {
+                    rule_id: 1,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    observed_wasm_hashes_summary: WasmHashSummary {
+                        count: 2,
+                        first_first8: Some([0xabu8; 8]),
+                    },
+                    request_id: "test-req-sl-002".to_owned(),
                 },
             ),
             (
@@ -2978,6 +3072,33 @@ mod tests {
                 &["reason"],
             ),
             (
+                "sa.spending_limit_not_installed",
+                SaError::SpendingLimitNotInstalled {
+                    rule_id: 1,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    request_id: "test-req-sl-001".to_owned(),
+                },
+                &["rule_id", "smart_account_redacted", "request_id"],
+            ),
+            (
+                "sa.spending_limit_policy_identification_failed",
+                SaError::SpendingLimitPolicyIdentificationFailed {
+                    rule_id: 1,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    observed_wasm_hashes_summary: WasmHashSummary {
+                        count: 2,
+                        first_first8: Some([0xabu8; 8]),
+                    },
+                    request_id: "test-req-sl-002".to_owned(),
+                },
+                &[
+                    "rule_id",
+                    "smart_account_redacted",
+                    "observed_wasm_hashes_summary",
+                    "request_id",
+                ],
+            ),
+            (
                 "sa.networks_toml_io",
                 SaError::NetworksTomlIo {
                     source: io::Error::other("mock io error"),
@@ -3361,6 +3482,20 @@ mod tests {
             SaError::SpendingLimitInstallRefused {
                 reason: "test".to_owned(),
             },
+            SaError::SpendingLimitNotInstalled {
+                rule_id: 1,
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                request_id: "test-req-sl-001".to_owned(),
+            },
+            SaError::SpendingLimitPolicyIdentificationFailed {
+                rule_id: 1,
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                observed_wasm_hashes_summary: WasmHashSummary {
+                    count: 2,
+                    first_first8: Some([0xabu8; 8]),
+                },
+                request_id: "test-req-sl-002".to_owned(),
+            },
             SaError::NetworksTomlIo {
                 source: io::Error::other("mock io error"),
                 path: PathBuf::from("/mock/path"),
@@ -3537,6 +3672,8 @@ mod tests {
             "sa.spending_limit_policy_provenance_mismatch",
             "sa.spending_limit_policy_sha256_drift",
             "sa.spending_limit_install_refused",
+            "sa.spending_limit_not_installed",
+            "sa.spending_limit_policy_identification_failed",
             "sa.networks_toml_io",
             "sa.networks_toml_parse",
             "sa.threshold_policy_not_installed",
@@ -3590,7 +3727,7 @@ mod tests {
             );
         }
 
-        assert_eq!(seen.len(), 62, "closed set must have exactly 62 wire codes");
+        assert_eq!(seen.len(), 64, "closed set must have exactly 64 wire codes");
     }
 
     /// Verifies the sub-code closed set is exhaustively matched by tests.
@@ -3982,6 +4119,51 @@ mod tests {
         assert_eq!(
             value.get("wire_code").and_then(|v| v.as_str()),
             Some("sa.threshold_policy_identification_failed")
+        );
+    }
+
+    /// Verifies that a `SpendingLimitNotInstalled` error round-trips via
+    /// serde and has the correct wire code.
+    #[test]
+    fn spending_limit_not_installed_round_trip() {
+        let err = SaError::SpendingLimitNotInstalled {
+            rule_id: 5,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            request_id: "req-sl-001".to_owned(),
+        };
+        assert_eq!(err.wire_code(), "sa.spending_limit_not_installed");
+        let json = serde_json::to_string(&err).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value.get("wire_code").and_then(|v| v.as_str()),
+            Some("sa.spending_limit_not_installed")
+        );
+        let ctx = value.get("context").unwrap();
+        assert_eq!(ctx.get("rule_id").and_then(|v| v.as_u64()), Some(5));
+    }
+
+    /// Verifies that a `SpendingLimitPolicyIdentificationFailed` error
+    /// round-trips via serde and has the correct wire code.
+    #[test]
+    fn spending_limit_policy_identification_failed_round_trip() {
+        let err = SaError::SpendingLimitPolicyIdentificationFailed {
+            rule_id: 2,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            observed_wasm_hashes_summary: WasmHashSummary {
+                count: 2,
+                first_first8: Some([0x11u8; 8]),
+            },
+            request_id: "req-sl-002".to_owned(),
+        };
+        assert_eq!(
+            err.wire_code(),
+            "sa.spending_limit_policy_identification_failed"
+        );
+        let json = serde_json::to_string(&err).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value.get("wire_code").and_then(|v| v.as_str()),
+            Some("sa.spending_limit_policy_identification_failed")
         );
     }
 

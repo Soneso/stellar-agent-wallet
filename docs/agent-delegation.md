@@ -151,6 +151,35 @@ the one contract the rule names, up to the spending cap, and nothing else:
   administrative smart-account calls — is refused; the spending-limit
   policy's `enforce` only recognizes that one invocation shape.
 
+## Observing and retuning the spending cap
+
+`SpendingLimitExceeded` and `RuleExpired` do not have to be surprises the
+agent discovers mid-task. The operator can read the cap's current state at
+any time with `smart-account rules get-spending-limit`: the configured
+limit, the rolling-window period, how much of the window is already spent,
+and the remaining budget as of the ledger the read observed. The agent can
+read the same state about its own rules through the read-only MCP tools
+`stellar_rules_list` and `stellar_rules_get` — no new write authority is
+granted by exposing these; both tools are `read_only_hint=true,
+destructive_hint=false`. `stellar_rules_get`'s `policies` field also reports
+each attached policy's best-effort classification (`threshold`,
+`spending-limit`, or `unknown`), degrading rather than failing when a policy
+cannot be identified.
+
+The returned budget numbers are a point-in-time estimate, not a guarantee:
+they are exact only as of the `as_of_ledger` they were read at. Forward
+ledger movement only grows headroom (older spend entries fall out of the
+rolling window), but an intervening spend shrinks it — a submission that
+looked affordable a moment earlier can still fail `SpendingLimitExceeded`.
+
+The operator retunes the limit without tearing the rule down via
+`smart-account rules set-spending-limit --rule-id <N> --limit <STROOPS>`.
+This changes only the limit; the rolling spend history is preserved, so a
+retune cannot be used to reset the window early. The period is immutable
+once installed — changing it requires removing and re-adding the policy,
+which does reset the history (see [CLI reference:
+smart-account](cli-reference/smart-account.md#smart-account-rules-set-spending-limit)).
+
 Revoking the delegation is the same lifecycle every other context rule
 uses: `smart-account rules delete`, `smart-account rules set-valid-until`
 to set an expiry, or `smart-account signers remove` to drop just the

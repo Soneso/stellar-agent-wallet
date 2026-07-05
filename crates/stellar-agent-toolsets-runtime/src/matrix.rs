@@ -106,6 +106,19 @@ pub const SUGGEST_DESTINATION_GRANTS: &[&str] = &[
 /// here when the event-stream surface lands.
 pub const OBSERVE_EVENT_GRANTS: &[&str] = &[];
 
+// ── ReadRules grant ───────────────────────────────────────────────────────────
+
+/// Tools granted by [`Capability::ReadRules`].
+///
+/// - `stellar_rules_list` — enumerate active context rules (read-only).
+/// - `stellar_rules_get` — read a single context rule's metadata and, when
+///   exactly one spending-limit policy identifies, its budget snapshot
+///   (read-only).
+///
+/// Separately grantable from `read-balance`: rule visibility and balance
+/// visibility are distinct concerns.
+pub const READ_RULES_GRANTS: &[&str] = &["stellar_rules_list", "stellar_rules_get"];
+
 // ── Flat matrix entries for iteration ────────────────────────────────────────
 
 /// All (action_name, granting_capability) pairs in the matrix.
@@ -125,6 +138,9 @@ pub const ALL_MATRIX_ENTRIES: &[(&str, Capability)] = &[
     ),
     ("stellar_sep7_parse_uri", Capability::SuggestDestination),
     // ObserveEvent — empty; no entries.
+    // ReadRules
+    ("stellar_rules_list", Capability::ReadRules),
+    ("stellar_rules_get", Capability::ReadRules),
 ];
 
 /// All tool names that appear in the UNGATED matrix (deduped, in stable order).
@@ -139,6 +155,8 @@ pub const ALL_MATRIX_TOOL_NAMES: &[&str] = &[
     "stellar_sep47_discover",
     "stellar_sep48_preview_invocation",
     "stellar_sep7_parse_uri",
+    "stellar_rules_list",
+    "stellar_rules_get",
 ];
 
 // ── GATED capability→tool matrix ─────────────────────────────────────────────
@@ -263,6 +281,7 @@ pub fn grants_for_capability(cap: Capability) -> &'static [&'static str] {
         // SignPayment is gated — ungated path always returns empty.
         // The gated resolver is the sole admission path.
         Capability::SignPayment => &[],
+        Capability::ReadRules => READ_RULES_GRANTS,
         // New variants fail closed (empty grant).
         _ => &[],
     }
@@ -349,6 +368,9 @@ mod tests {
         for t in OBSERVE_EVENT_GRANTS {
             from_grants.insert(t);
         }
+        for t in READ_RULES_GRANTS {
+            from_grants.insert(t);
+        }
 
         // Collect all tools from ALL_MATRIX_ENTRIES.
         let from_entries: HashSet<&str> = ALL_MATRIX_ENTRIES.iter().map(|(t, _)| *t).collect();
@@ -422,6 +444,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn resolve_read_rules_tools() {
+        for tool in ["stellar_rules_list", "stellar_rules_get"] {
+            let (resolved, cap) = resolve_action(tool).unwrap();
+            assert_eq!(resolved, tool);
+            assert_eq!(cap, Capability::ReadRules);
+        }
+    }
+
     // ── resolve_action: signing tools not in matrix ───────────────────────────
 
     #[test]
@@ -469,6 +500,13 @@ mod tests {
     fn grants_for_observe_event() {
         let grants = grants_for_capability(Capability::ObserveEvent);
         assert!(grants.is_empty());
+    }
+
+    #[test]
+    fn grants_for_read_rules() {
+        let grants = grants_for_capability(Capability::ReadRules);
+        assert_eq!(grants, READ_RULES_GRANTS);
+        assert_eq!(grants, &["stellar_rules_list", "stellar_rules_get"]);
     }
 
     // ── grants_for_capability: SignPayment returns empty from ungated path ────

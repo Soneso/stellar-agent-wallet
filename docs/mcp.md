@@ -178,7 +178,7 @@ names and lifecycle metadata are recorded. Verify the chain with
 
 ## Tool catalog
 
-The server registers 34 tools. For each tool below: the exact registered name,
+The server registers 36 tools. For each tool below: the exact registered name,
 its purpose, and whether it is read-only, signs without submitting, or signs and
 submits. Every tool except `stellar_x402_parse_receipt`, `stellar_toolset_list`,
 and `stellar_toolset_invoke` requires a `chain_id` argument carrying the CAIP-2
@@ -212,6 +212,22 @@ supplied.
 | Tool | Purpose | Gating |
 | --- | --- | --- |
 | `stellar_fee_stats` | Fetch network fee statistics (classic and Soroban inclusion-fee distributions) for fee estimation. | Read-only. |
+
+### Smart-account rules
+
+| Tool | Purpose | Gating |
+| --- | --- | --- |
+| `stellar_rules_list` | Enumerate active context rules on a smart account: `rule_id`, `name`, `context_type_label`, `valid_until`, `signer_count`, `policy_count`, plus `as_of_ledger`. Scans up to the same `max_scan_id` default as the CLI `smart-account rules list`. | Read-only. |
+| `stellar_rules_get` | Read one context rule's metadata plus its attached policies (`address`, `identified_kind`: `threshold`, `spending-limit`, or `unknown`), and, when exactly one policy identifies as `spending-limit`, the budget snapshot (`spending_limit`, `period_ledgers`, `in_window_spent`, `remaining_budget`, `as_of_ledger`). Identification failure or an absent policy degrades to the metadata-only shape rather than failing. | Read-only. |
+
+`in_window_spent` and `remaining_budget` are exact only as of `as_of_ledger`:
+forward ledger movement past that point only grows headroom (older spend
+entries fall out of the rolling window), but an intervening spend shrinks it.
+The numbers are a point-in-time estimate, not a guarantee for a future
+submission — a later write can still fail with `SpendingLimitExceeded`.
+
+Both tools are grantable to a toolset via the `read-rules` capability token,
+separately from `read-balance`. See [Toolsets](./toolsets.md).
 
 ### DeFi
 

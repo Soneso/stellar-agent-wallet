@@ -279,6 +279,9 @@ pub use crate::tools::fee_stats::StellarFeeStatsArgs;
 pub use crate::tools::friendbot::StellarFriendbotArgs;
 /// Re-exported for back-compat: argument types for `stellar_pay`.
 pub use crate::tools::pay::{StellarPayArgs, StellarPayCommitArgs};
+/// Re-exported for testnet acceptance tests: argument types for
+/// `stellar_rules_list` / `stellar_rules_get`.
+pub use crate::tools::rules::{StellarRulesGetArgs, StellarRulesListArgs};
 /// Re-exported for testnet acceptance and integration tests.
 pub use crate::tools::sep43_sign_and_submit_transaction::Sep43SignAndSubmitTransactionArgs;
 pub use crate::tools::toolsets::StellarToolsetInvokeArgs;
@@ -754,6 +757,9 @@ impl WalletServer {
         // Stablecoin substrate — trustline verb.
         router.merge(Self::trustline_tool_router());
         router.merge(Self::claim_tool_router());
+        // Smart-account rules observability — read-only.
+        router.merge(Self::rules_tool_router());
+        router.merge(Self::rules_get_tool_router());
         router
     }
 }
@@ -992,7 +998,16 @@ impl ServerHandler for WalletServer {
              stellar_toolset_list (enumerate installed toolsets and their invocable \
              actions, read-only); \
              stellar_toolset_invoke (invoke a named action of an installed toolset, \
-             routed to a trusted tool through capability enforcement). \
+             routed to a trusted tool through capability enforcement); \
+             stellar_rules_list (enumerate active context rules on a smart account: \
+             rule_id, name, context_type_label, valid_until, signer_count, \
+             policy_count, plus as_of_ledger, read_only=true); \
+             stellar_rules_get (read a single context rule's metadata, its policies \
+             with best-effort identified_kind classification, and — when exactly \
+             one attached policy identifies as spending-limit — the budget \
+             snapshot (spending_limit, period_ledgers, in_window_spent, \
+             remaining_budget, as_of_ledger); in_window_spent/remaining_budget are \
+             exact only as of as_of_ledger, read_only=true). \
              Resources: mcp-resource://usage.md (tool documentation), \
              mcp-resource://profiles/<name> (non-secret profile metadata), \
              mcp-resource://accounts/<G> (public account directory). \

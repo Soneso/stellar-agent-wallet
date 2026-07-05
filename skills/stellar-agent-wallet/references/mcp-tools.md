@@ -274,6 +274,50 @@ byte-match the presented `envelope_xdr` returns `simulation.divergence`.
 
 Arguments: `chain_id` only.
 
+## Smart-account rules
+
+| Tool | Purpose | Gating |
+| --- | --- | --- |
+| `stellar_rules_list` | Enumerate active context rules on a smart account: `rule_id`, `name`, `context_type_label`, `valid_until`, `signer_count`, `policy_count`, plus `as_of_ledger`. | Read-only. |
+| `stellar_rules_get` | Read one context rule's metadata, its policies (`address`, `identified_kind`), and — when exactly one policy identifies as `spending-limit` — the budget snapshot. | Read-only. |
+
+Both tools are grantable to a toolset via the `read-rules` capability token,
+separately from `read-balance` (see [Toolsets](toolsets-feature.md)).
+
+### stellar_rules_list arguments
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `chain_id` | string | yes | |
+| `smart_account` | string | yes | Smart-account contract C-strkey. |
+
+Scans up to the same `max_scan_id` default the CLI `smart-account rules
+list` uses. Returns `{ rules: [{ rule_id, name, context_type_label,
+valid_until, signer_count, policy_count }], as_of_ledger }`.
+
+### stellar_rules_get arguments
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `chain_id` | string | yes | |
+| `smart_account` | string | yes | Smart-account contract C-strkey. |
+| `rule_id` | integer (u32) | yes | Context rule id to read. |
+
+Returns the list fields for that one rule, plus `expires_in_ledgers`
+(derived from `valid_until − as_of_ledger` when `valid_until` is set),
+`policies: [{ address, identified_kind }]` (`identified_kind` is
+`"threshold"`, `"spending-limit"`, or `"unknown"` — identification failure
+degrades to `"unknown"` rather than failing the call), and, when exactly one
+policy identifies as `spending-limit`, a `spending_limit` block:
+`{ spending_limit, period_ledgers, in_window_spent, remaining_budget,
+as_of_ledger }`.
+
+`in_window_spent` and `remaining_budget` are exact only as of
+`as_of_ledger`: forward ledger movement only grows headroom (older spend
+entries fall out of the rolling window), but an intervening spend shrinks
+it — the numbers are a point-in-time estimate, not a guarantee for a future
+submission, which can still fail `SpendingLimitExceeded`.
+
 ## DeFi
 
 | Tool | Purpose | Gating |

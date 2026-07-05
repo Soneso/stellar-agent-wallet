@@ -281,6 +281,8 @@ Each rule has a `rule_id` (u32), a name (OZ cap 20 bytes), an optional expiry le
 | `add-policy` | Add a policy (`add_policy`); cap 5; returns `policy_id` | `--rule-id <U32>`; `--kind <raw\|spending-limit>` (default `raw`); raw: `--policy-address <C_STRKEY>`, `--install-param <SCVAL_BASE64>` (standard base64 XDR `ScVal`, raw passthrough); spending-limit: `--limit <STROOPS>`, `--period <LEDGERS>`, optional `--policy <C_STRKEY>` override; `--auth-rule-id` |
 | `remove-policy` | Remove a policy by id (`remove_policy`) | `--rule-id <U32>`; `--policy-id <U32>`; `--auth-rule-id` |
 | `list` | Enumerate active rules by on-chain scan; read-only, `mainnet` ok; alias of `smart-account list-rules` | see `smart-account list-rules` |
+| `get-spending-limit` | Read an installed spending-limit policy's budget state; read-only, `mainnet` ok | `--rule-id <U32>`; `--source-account <G_STRKEY>` (required, simulation only). Returns `spending_limit`, `period_ledgers`, `in_window_spent`, `remaining_budget`, `as_of_ledger`, `window_cutoff_ledger`, `history_entries`, `cached_total_spent`. `in_window_spent`/`remaining_budget` are exact only as of `as_of_ledger`. |
+| `set-spending-limit` | Retune the limit (`set_spending_limit`) without resetting spend history | `--rule-id <U32>`; `--auth-rule-id <U32>` (default 0: the CallContract rule being retuned can never authorize its own retune — an admin-capable rule must); `--limit <STROOPS>` (required, must be positive). Mutates ONLY the limit; the period is immutable post-install (changing it needs `remove-policy` + `add-policy`, which resets history). |
 
 ```bash
 stellar-agent smart-account rules create --account CABC...WXYZ --name agent-ops \

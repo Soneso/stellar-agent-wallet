@@ -48,7 +48,8 @@ pub use policy_identification::THRESHOLD_POLICY_WASM;
 pub use policy_identification::THRESHOLD_POLICY_WASM_HASHES;
 
 pub use types::{
-    FrozenChainStateTuple, ThresholdAffectingOp, WasmHashSummary, WasmHashSummaryError,
+    FrozenChainStateTuple, PolicyIdentifiedKind, ThresholdAffectingOp, WasmHashSummary,
+    WasmHashSummaryError,
 };
 
 /// Re-exports of signer-set value types from `stellar-agent-core`.

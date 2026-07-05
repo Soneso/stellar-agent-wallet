@@ -20,4 +20,5 @@ pub mod migration;
 pub mod policies;
 pub mod rules;
 pub mod signers;
+pub mod spending_limit_data;
 pub mod verifiers;

@@ -65,6 +65,7 @@ The capability manifest is the space-separated value of
 | `suggest-destination` | Suggest a destination via read-only discovery/preview tools. |
 | `observe-event` | Observe a ledger event. No tool is wired to this capability yet, so it grants nothing. |
 | `sign-payment` | Sign and submit a classic payment. Signing-adjacent and gated; inert until the first-invoke gate converts it to a runtime grant. |
+| `read-rules` | Read the agent's own context rules (spending-limit budgets, expiry, signer/policy counts). Separately grantable from `read-balance`. |
 
 The bare token `sign-transaction` is always refused with a format error. There
 is no flat "sign" capability. Signing is never grantable as a plain manifest
@@ -86,6 +87,7 @@ trusted tool names:
 | `propose-transaction` | `stellar_pay` (build unsigned only) |
 | `suggest-destination` | `stellar_sep47_discover`, `stellar_sep48_preview_invocation`, `stellar_sep7_parse_uri` |
 | `observe-event` | (none) |
+| `read-rules` | `stellar_rules_list`, `stellar_rules_get` |
 
 The ungated matrix contains no signing, key-derivation, or policy-mutation tool.
 A toolset that declares every capability still cannot resolve a signing tool

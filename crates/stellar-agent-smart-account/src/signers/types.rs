@@ -386,6 +386,41 @@ pub enum ThresholdAffectingOp {
 
 // ── (AtomicBundleAlternative removed — CAP-46 makes atomic bundles infeasible) ──
 
+// ── PolicyIdentifiedKind ──────────────────────────────────────────────────────
+
+/// Closed-set per-policy classification returned by
+/// `SignersManager::classify_rule_policies`.
+///
+/// Unlike `identify_threshold_policy` / `identify_spending_limit_policy`
+/// (which fail-closed when a rule's policies do not resolve to exactly one
+/// allowlisted contract of the requested kind), this classification is for
+/// read-only observability: each policy address attached to a rule is
+/// independently classified by its own on-chain wasm-hash, and an
+/// unrecognised or unreachable hash degrades to `Unknown` rather than
+/// failing the whole read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PolicyIdentifiedKind {
+    /// Wasm-hash matches an entry in `THRESHOLD_POLICY_WASM_HASHES`.
+    Threshold,
+    /// Wasm-hash matches the spending-limit-policy allowlist entry
+    /// (`SPENDING_LIMIT_POLICY_WASM_SHA256`).
+    SpendingLimit,
+    /// Wasm-hash did not match any recognised policy allowlist, or could
+    /// not be observed (RPC gap, non-wasm entry).
+    Unknown,
+}
+
+impl fmt::Display for PolicyIdentifiedKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Threshold => f.write_str("threshold"),
+            Self::SpendingLimit => f.write_str("spending-limit"),
+            Self::Unknown => f.write_str("unknown"),
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -604,5 +639,15 @@ mod tests {
                 SignerPubkey::Ed25519 { pubkey: [2u8; 32] },
             ],
         }
+    }
+
+    #[test]
+    fn policy_identified_kind_display_renders_wire_labels() {
+        assert_eq!(PolicyIdentifiedKind::Threshold.to_string(), "threshold");
+        assert_eq!(
+            PolicyIdentifiedKind::SpendingLimit.to_string(),
+            "spending-limit"
+        );
+        assert_eq!(PolicyIdentifiedKind::Unknown.to_string(), "unknown");
     }
 }

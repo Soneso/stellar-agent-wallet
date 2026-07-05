@@ -82,7 +82,8 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
-    CommonArgsView, CommonHandlerContext, SignerSourceFlags,
+    CommonArgsView, CommonHandlerContext, SignerSourceFlags, construct_signers_manager_from_fields,
+    network_to_chain_id, open_audit_writer,
 };
 use crate::commands::smart_account::list_rules as sa_list_rules;
 use crate::common::network::TargetNetwork;
@@ -311,6 +312,27 @@ pub enum RulesSubcommand {
     /// `remove_policy(rule_id, policy_id)`, simulates, signs, and submits.
     RemovePolicy(Box<RemovePolicyArgs>),
 
+    /// Read an installed spending-limit policy's budget state (read-only).
+    ///
+    /// Identifies the spending-limit policy via wasm-hash allowlist lookup,
+    /// reads `get_spending_limit_data`, and computes the rolling-window
+    /// budget snapshot. No signing, no submission, no audit-log emission.
+    ///
+    /// The returned `in_window_spent` / `remaining_budget` are exact only as
+    /// of `as_of_ledger` — a point-in-time estimate, not a guarantee for a
+    /// future submission (an intervening spend can still cause
+    /// `SpendingLimitExceeded`).
+    GetSpendingLimit(Box<GetSpendingLimitArgs>),
+
+    /// Retune an installed spending-limit policy's limit (OZ
+    /// `set_spending_limit`), without resetting rolling spend history.
+    ///
+    /// `period_ledgers` is immutable post-install: OZ `set_spending_limit`
+    /// mutates only the limit. Retuning the period requires
+    /// `remove-policy` + `add-policy --kind spending-limit`, which resets
+    /// the rolling spend history.
+    SetSpendingLimit(Box<SetSpendingLimitArgs>),
+
     /// Enumerate all active context rules on a smart account (canonical name).
     ///
     /// **Canonical command:** `smart-account rules list`. Delegates directly to
@@ -355,6 +377,8 @@ pub async fn run(args: &RulesArgs) -> i32 {
         RulesSubcommand::VerifyPins(a) => verify_pins_run(a).await,
         RulesSubcommand::AddPolicy(a) => add_policy_run(a).await,
         RulesSubcommand::RemovePolicy(a) => remove_policy_run(a).await,
+        RulesSubcommand::GetSpendingLimit(a) => get_spending_limit_run(a).await,
+        RulesSubcommand::SetSpendingLimit(a) => set_spending_limit_run(a).await,
         RulesSubcommand::List(a) => list_rules_run(a).await,
     }
 }
@@ -2227,6 +2251,361 @@ async fn remove_policy_run(args: &RemovePolicyArgs) -> i32 {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// `smart-account rules get-spending-limit`
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Arguments for `smart-account rules get-spending-limit`.
+///
+/// Read-only: identifies the spending-limit policy attached to `rule_id`,
+/// reads its on-chain data, and computes the rolling-window budget snapshot.
+/// No signing, no submission, no audit-log emission.
+#[non_exhaustive]
+#[derive(Debug, Args)]
+pub struct GetSpendingLimitArgs {
+    /// Network, RPC, timeout, and output shared with read subcommands.
+    #[command(flatten)]
+    pub common: CommonRulesReadArgs,
+
+    /// Context rule ID whose spending-limit policy to read.
+    #[arg(long, value_name = "U32", required = true)]
+    pub rule_id: u32,
+
+    /// Source-account strkey for the simulation envelope. Any funded
+    /// account on the target network works (read-only path; no signing).
+    #[arg(long, value_name = "G_STRKEY", required = true)]
+    pub source_account: String,
+}
+
+/// Result envelope for `smart-account rules get-spending-limit`.
+///
+/// # Point-in-time caveat
+///
+/// `in_window_spent` and `remaining_budget` are exact only as of
+/// `as_of_ledger`. Forward ledger movement past that point only grows
+/// headroom (older entries fall out of the rolling window), but any
+/// intervening spend shrinks it — these values are an estimate, not a
+/// guarantee for a future submission, which can still fail
+/// `SpendingLimitExceeded` (OZ error 3221).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetSpendingLimitResult {
+    /// Smart-account C-strkey.
+    pub smart_account: String,
+    /// Context rule ID that was queried.
+    pub rule_id: u32,
+    /// Spending-limit-policy contract C-strkey (unredacted; on-chain public
+    /// identifier).
+    pub policy_address: String,
+    /// The configured spending limit, in stroops.
+    pub spending_limit: i128,
+    /// The rolling-window period, in ledgers.
+    pub period_ledgers: u32,
+    /// Sum of spend-history entries within the rolling window as of
+    /// `as_of_ledger`. See the point-in-time caveat above.
+    pub in_window_spent: i128,
+    /// `max(0, spending_limit - in_window_spent)`. See the point-in-time
+    /// caveat above.
+    pub remaining_budget: i128,
+    /// Ledger sequence the simulation observed; the "as of" ledger for
+    /// `in_window_spent` / `remaining_budget`.
+    pub as_of_ledger: u32,
+    /// Ledger sequence at and before which history entries are excluded
+    /// from `in_window_spent` (`as_of_ledger.saturating_sub(period_ledgers)`).
+    pub window_cutoff_ledger: u32,
+    /// Number of entries in the on-chain spend history (bounded by the OZ
+    /// `MAX_HISTORY_ENTRIES = 1000` cap; not all necessarily in-window).
+    pub history_entries: u32,
+    /// The on-chain cached total, verbatim, for transparency. NOT used to
+    /// compute `in_window_spent` — `get_spending_limit_data` performs no
+    /// eviction on read, so this total can include entries that have since
+    /// fallen outside the rolling window.
+    pub cached_total_spent: i128,
+}
+
+async fn get_spending_limit_run(args: &GetSpendingLimitArgs) -> i32 {
+    let request_id = new_request_id();
+    let account_redacted = redact_strkey_first5_last5(&args.common.account);
+
+    let smart_account = match parse_c_strkey(&args.common.account) {
+        Ok(addr) => addr,
+        Err(e) => return emit_error(&e, args.common.output, &request_id),
+    };
+
+    if let Err(e) = stellar_strkey::ed25519::PublicKey::from_string(&args.source_account) {
+        return emit_error(
+            &WalletError::Validation(ValidationError::AddressInvalid {
+                input: format!("--source-account: invalid G-strkey ({e})"),
+            }),
+            args.common.output,
+            &request_id,
+        );
+    }
+
+    // Read-only path: a SignersManager is still required (identify_spending_limit_policy
+    // and get_spending_limit_data are its methods), but no Signer is resolved —
+    // both methods take `source_account_strkey: Option<&str>`, not a `Signer`.
+    // `CommonRulesReadArgs` has no `--profile` flag; resolve the default profile
+    // (matches the read-only precedent set by `smart-account rules get`).
+    let profile_name = resolve_profile_name(None);
+    let (audit_writer, audit_log_path) = match open_audit_writer(&profile_name) {
+        Ok(pair) => pair,
+        Err(e) => return emit_error(&e, args.common.output, &request_id),
+    };
+    let chain_id = network_to_chain_id(args.common.network);
+    let manager = match construct_signers_manager_from_fields(
+        &profile_name,
+        args.common.network.passphrase(),
+        chain_id,
+        &args.common.rpc_url,
+        &args.common.rpc_url,
+        Duration::from_secs(args.common.timeout_seconds),
+        audit_writer,
+        &audit_log_path,
+    ) {
+        Ok(m) => m,
+        Err(e) => return emit_error(&e, args.common.output, &request_id),
+    };
+
+    let policy_addr = match manager
+        .identify_spending_limit_policy(
+            smart_account.clone(),
+            args.rule_id,
+            Some(&args.source_account),
+            request_id.clone(),
+        )
+        .await
+    {
+        Ok(addr) => addr,
+        Err(e) => return emit_error_sa(&e, args.common.output, &request_id),
+    };
+
+    let (data, as_of_ledger) = match manager
+        .get_spending_limit_data(
+            policy_addr.clone(),
+            args.rule_id,
+            smart_account,
+            Some(&args.source_account),
+            request_id.clone(),
+        )
+        .await
+    {
+        Ok(pair) => pair,
+        Err(e) => return emit_error_sa(&e, args.common.output, &request_id),
+    };
+
+    let window =
+        stellar_agent_smart_account::managers::spending_limit_data::compute_spending_window(
+            &data,
+            as_of_ledger,
+        );
+
+    let policy_address = match contract_scaddress_to_strkey(&policy_addr) {
+        Ok(s) => s,
+        Err(e) => return emit_error(&e, args.common.output, &request_id),
+    };
+
+    info!(
+        smart_account = %account_redacted,
+        rule_id = args.rule_id,
+        as_of_ledger,
+        "smart-account rules get-spending-limit: read",
+    );
+
+    let history_entries = u32::try_from(data.spending_history.len()).unwrap_or(u32::MAX);
+    let result = GetSpendingLimitResult {
+        smart_account: args.common.account.clone(),
+        rule_id: args.rule_id,
+        policy_address,
+        spending_limit: data.spending_limit,
+        period_ledgers: data.period_ledgers,
+        in_window_spent: window.in_window_spent,
+        remaining_budget: window.remaining,
+        as_of_ledger,
+        window_cutoff_ledger: window.window_cutoff_ledger,
+        history_entries,
+        cached_total_spent: data.cached_total_spent,
+    };
+    emit_success(&result, args.common.output, &request_id, 0)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `smart-account rules set-spending-limit`
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Arguments for `smart-account rules set-spending-limit`.
+///
+/// Retunes the spending limit of an installed spending-limit policy. Does
+/// NOT reset the rolling spend history (OZ `set_spending_limit` mutates only
+/// the limit; the period is immutable post-install).
+///
+/// # Mainnet write defence
+///
+/// Structurally refuses mainnet before any RPC or signing call.
+#[non_exhaustive]
+#[derive(Debug, Args)]
+pub struct SetSpendingLimitArgs {
+    /// Smart-account contract C-strkey.
+    #[arg(long, value_name = "C_STRKEY", required = true)]
+    pub account: String,
+
+    /// Context rule ID whose spending-limit policy to retune.
+    #[arg(long = "rule-id", value_name = "U32", required = true)]
+    pub rule_id: u32,
+
+    /// Context rule ID that AUTHORIZES the retune (default: the genesis
+    /// admin rule, 0). Must be admin-capable: the retune executes on the
+    /// smart account itself, an auth context the CallContract-scoped rule
+    /// named by `--rule-id` always refuses on-chain (UnvalidatedContext) —
+    /// the target rule can never authorize its own retune.
+    #[arg(long = "auth-rule-id", value_name = "U32", default_value_t = 0)]
+    pub auth_rule_id: u32,
+
+    /// New spending limit, in stroops. Must be positive.
+    #[arg(long, value_name = "STROOPS", required = true)]
+    pub limit: i128,
+
+    /// Profile name for audit-log path resolution.
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
+
+    #[command(flatten)]
+    pub signer_source: SignerSourceFlags,
+
+    /// Network to target (testnet / mainnet).
+    #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
+    pub network: TargetNetwork,
+
+    /// Soroban RPC endpoint URL.
+    #[arg(long, default_value = TESTNET_RPC_URL, value_name = "URL")]
+    pub rpc_url: String,
+
+    /// Secondary RPC URL for two-RPC consultation.
+    #[arg(long, value_name = "URL")]
+    pub secondary_rpc_url: Option<String>,
+
+    /// Submission timeout in seconds.
+    #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECONDS, value_name = "SECONDS")]
+    pub timeout_seconds: u64,
+
+    /// Output format: `json` (default) or `table`.
+    #[arg(long, default_value_t = OutputFormat::DEFAULT, value_name = "FORMAT")]
+    pub output: OutputFormat,
+}
+
+impl CommonArgsView for SetSpendingLimitArgs {
+    fn account(&self) -> &str {
+        &self.account
+    }
+
+    fn profile(&self) -> Option<&str> {
+        self.profile.as_deref()
+    }
+
+    fn signer_source(&self) -> &SignerSourceFlags {
+        &self.signer_source
+    }
+
+    fn network(&self) -> TargetNetwork {
+        self.network
+    }
+
+    fn rpc_url(&self) -> &str {
+        &self.rpc_url
+    }
+
+    fn secondary_rpc_url(&self) -> Option<&str> {
+        self.secondary_rpc_url.as_deref()
+    }
+
+    fn timeout_seconds(&self) -> u64 {
+        self.timeout_seconds
+    }
+}
+
+/// Result envelope for `smart-account rules set-spending-limit`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetSpendingLimitResult {
+    /// Smart-account C-strkey.
+    pub smart_account: String,
+    /// Context rule ID whose spending-limit policy was retuned.
+    pub rule_id: u32,
+    /// The new spending limit that was applied, in stroops.
+    pub new_limit: i128,
+}
+
+async fn set_spending_limit_run(args: &SetSpendingLimitArgs) -> i32 {
+    let request_id = new_request_id();
+    let account_redacted = redact_strkey_first5_last5(&args.account);
+
+    // Mainnet write defence — structurally refuse before any RPC call.
+    if args.network == TargetNetwork::Mainnet {
+        return emit_error(
+            &WalletError::Network(NetworkError::MainnetWriteForbidden),
+            args.output,
+            &request_id,
+        );
+    }
+
+    // Value pre-flight: refuse a non-positive limit before resolving a signer
+    // or building any manager. `SignersManager::set_spending_limit` repeats
+    // this check (defense in depth for non-CLI callers); this CLI-level copy
+    // avoids requiring a signer for an input that will always be refused.
+    if args.limit <= 0 {
+        return emit_error_sa(
+            &SaError::SpendingLimitInstallRefused {
+                reason: format!(
+                    "set-spending-limit refused: --limit must be positive; got {} \
+                     (OZ set_spending_limit rejects non-positive values with \
+                     InvalidLimitOrPeriod)",
+                    args.limit
+                ),
+            },
+            args.output,
+            &request_id,
+        );
+    }
+
+    let ctx = match CommonHandlerContext::new(args).await {
+        Ok(ctx) => ctx,
+        Err(e) => return emit_error(&e, args.output, &request_id),
+    };
+
+    let manager = match ctx.signers_manager() {
+        Ok(m) => m,
+        Err(e) => return emit_error(&e, args.output, &request_id),
+    };
+
+    info!(
+        rule_id = args.rule_id,
+        new_limit = args.limit,
+        account = %account_redacted,
+        "smart-account rules set-spending-limit: submitting set_spending_limit"
+    );
+
+    let auth_rule_ids = vec![ContextRuleId::new(args.auth_rule_id)];
+    match manager
+        .set_spending_limit(
+            ctx.smart_account,
+            args.rule_id,
+            &auth_rule_ids,
+            args.limit,
+            ctx.signer.as_ref(),
+            request_id.clone(),
+        )
+        .await
+    {
+        Ok(()) => {
+            let result = SetSpendingLimitResult {
+                smart_account: args.account.clone(),
+                rule_id: args.rule_id,
+                new_limit: args.limit,
+            };
+            emit_success(&result, args.output, &request_id, 0)
+        }
+        Err(e) => emit_error_sa(&e, args.output, &request_id),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2238,6 +2617,32 @@ fn parse_c_strkey(s: &str) -> Result<SmartAccountAddress, WalletError> {
             input: format!("--account: {e}"),
         })
     })
+}
+
+/// Renders a contract [`stellar_xdr::ScAddress`] as its C-strkey form.
+///
+/// Used for `get-spending-limit`'s `policy_address` output field.
+/// `identify_spending_limit_policy` always returns a contract address in
+/// practice (policies are on-chain contracts, never G-accounts) — the
+/// `Account` arm is a typed refusal rather than a silent placeholder, so a
+/// future decode-path change cannot surface a fabricated all-zero address.
+fn contract_scaddress_to_strkey(addr: &stellar_xdr::ScAddress) -> Result<String, WalletError> {
+    match addr {
+        stellar_xdr::ScAddress::Contract(stellar_xdr::ContractId(stellar_xdr::Hash(bytes))) => {
+            // `stellar_strkey` 0.0.18 returns `heapless::String<56>` from
+            // `to_string()`, not `std::string::String`.
+            Ok(stellar_strkey::Contract(*bytes)
+                .to_string()
+                .as_str()
+                .to_owned())
+        }
+        other => Err(WalletError::Validation(ValidationError::AddressInvalid {
+            input: format!(
+                "policy address is not a contract address; expected a spending-limit-policy \
+                 contract, got {other:?}"
+            ),
+        })),
+    }
 }
 
 /// Parses a G-strkey via the smart_account-crate helper, used for
@@ -4068,5 +4473,193 @@ mod tests {
         args.period = Some(0);
         let code = add_policy_run(&args).await;
         assert_eq!(code, 1, "period == 0 must be refused");
+    }
+
+    // ── get-spending-limit ────────────────────────────────────────────────────
+
+    #[derive(Parser)]
+    struct GetSpendingLimitArgsHarness {
+        #[command(flatten)]
+        args: GetSpendingLimitArgs,
+    }
+
+    #[test]
+    fn get_spending_limit_args_parse_required_fields() {
+        let parsed = GetSpendingLimitArgsHarness::parse_from([
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rule-id",
+            "3",
+            "--source-account",
+            SIMULATE_SENTINEL_G,
+        ]);
+        assert_eq!(parsed.args.rule_id, 3);
+        assert_eq!(parsed.args.source_account, SIMULATE_SENTINEL_G);
+        assert_eq!(parsed.args.common.network, TargetNetwork::Testnet);
+    }
+
+    #[test]
+    fn get_spending_limit_args_requires_rule_id_and_source_account() {
+        assert!(
+            GetSpendingLimitArgsHarness::try_parse_from([
+                "test",
+                "--account",
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+                "--source-account",
+                SIMULATE_SENTINEL_G,
+            ])
+            .is_err(),
+            "--rule-id is required"
+        );
+        assert!(
+            GetSpendingLimitArgsHarness::try_parse_from([
+                "test",
+                "--account",
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+                "--rule-id",
+                "1",
+            ])
+            .is_err(),
+            "--source-account is required"
+        );
+    }
+
+    /// An invalid `--source-account` G-strkey is refused before any manager
+    /// construction or network call.
+    #[tokio::test]
+    async fn get_spending_limit_run_rejects_invalid_source_account() {
+        let args = GetSpendingLimitArgs {
+            common: CommonRulesReadArgs {
+                account: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+                network: TargetNetwork::Testnet,
+                rpc_url: TESTNET_RPC_URL.to_owned(),
+                timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+                output: OutputFormat::Json,
+            },
+            rule_id: 1,
+            source_account: "not-a-valid-g-strkey".to_owned(),
+        };
+        let code = get_spending_limit_run(&args).await;
+        assert_eq!(code, 1, "invalid --source-account must be refused");
+    }
+
+    // ── set-spending-limit ────────────────────────────────────────────────────
+
+    #[derive(Parser)]
+    struct SetSpendingLimitArgsHarness {
+        #[command(flatten)]
+        args: SetSpendingLimitArgs,
+    }
+
+    #[test]
+    fn set_spending_limit_args_parse_required_fields() {
+        let parsed = SetSpendingLimitArgsHarness::parse_from([
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rule-id",
+            "4",
+            "--limit",
+            "10000000",
+            "--signer-secret-env",
+            "__STELLAR_AGENT_RULES_SET_SPENDING_LIMIT_DUMMY",
+        ]);
+        assert_eq!(parsed.args.rule_id, 4);
+        assert_eq!(parsed.args.limit, 10_000_000_i128);
+        // --auth-rule-id omitted: MUST default to 0 (the genesis admin rule),
+        // never to --rule-id — the CallContract rule being retuned can never
+        // authorize its own retune (on-chain UnvalidatedContext, 3002).
+        assert_eq!(parsed.args.auth_rule_id, 0);
+    }
+
+    #[test]
+    fn set_spending_limit_args_parses_explicit_auth_rule_id() {
+        let parsed = SetSpendingLimitArgsHarness::parse_from([
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rule-id",
+            "4",
+            "--auth-rule-id",
+            "7",
+            "--limit",
+            "10000000",
+            "--signer-secret-env",
+            "__STELLAR_AGENT_RULES_SET_SPENDING_LIMIT_DUMMY",
+        ]);
+        assert_eq!(parsed.args.auth_rule_id, 7);
+        assert_eq!(
+            parsed.args.rule_id, 4,
+            "--auth-rule-id must not alias --rule-id"
+        );
+    }
+
+    #[test]
+    fn set_spending_limit_args_accepts_large_i128_limit() {
+        // Regression-lock: --limit must accept a value well beyond i64::MAX,
+        // since it is typed i128 end-to-end (stroop amounts are not bounded
+        // by i64).
+        let large = i128::from(i64::MAX) * 1000;
+        let parsed = SetSpendingLimitArgsHarness::parse_from([
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rule-id",
+            "4",
+            "--limit",
+            &large.to_string(),
+            "--signer-secret-env",
+            "__STELLAR_AGENT_RULES_SET_SPENDING_LIMIT_DUMMY",
+        ]);
+        assert_eq!(parsed.args.limit, large);
+    }
+
+    fn set_spending_limit_args(limit: i128) -> SetSpendingLimitArgs {
+        SetSpendingLimitArgs {
+            account: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+            rule_id: 1,
+            auth_rule_id: 0,
+            limit,
+            profile: None,
+            signer_source: SignerSourceFlags {
+                signer_secret_env: Some(
+                    "__STELLAR_AGENT_RULES_SET_SPENDING_LIMIT_DUMMY".to_owned(),
+                ),
+                sign_with_ledger: false,
+                account_index: Some(0),
+            },
+            network: TargetNetwork::Testnet,
+            rpc_url: TESTNET_RPC_URL.to_owned(),
+            secondary_rpc_url: None,
+            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            output: OutputFormat::Json,
+        }
+    }
+
+    /// `--limit 0` is refused before any signer resolution or network call.
+    #[tokio::test]
+    async fn set_spending_limit_rejects_zero_limit() {
+        let args = set_spending_limit_args(0);
+        let code = set_spending_limit_run(&args).await;
+        assert_eq!(code, 1, "limit == 0 must be refused");
+    }
+
+    /// `--limit -1` is refused before any signer resolution or network call.
+    #[tokio::test]
+    async fn set_spending_limit_rejects_negative_limit() {
+        let args = set_spending_limit_args(-1);
+        let code = set_spending_limit_run(&args).await;
+        assert_eq!(code, 1, "negative limit must be refused");
+    }
+
+    /// Mainnet is refused before the limit check (and before any signer
+    /// resolution).
+    #[tokio::test]
+    async fn set_spending_limit_rejects_mainnet() {
+        let mut args = set_spending_limit_args(10_000_000);
+        args.network = TargetNetwork::Mainnet;
+        let code = set_spending_limit_run(&args).await;
+        assert_eq!(code, 1, "mainnet must be refused");
     }
 }

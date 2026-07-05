@@ -1466,6 +1466,68 @@ impl AuditEntry {
         }
     }
 
+    /// Constructs a `SaSpendingLimitRetuned` audit entry.
+    ///
+    /// Emitted by `SignersManager::set_spending_limit` after a successful
+    /// on-chain `set_spending_limit` invocation.
+    ///
+    /// # Arguments
+    ///
+    /// - `rule_id` — on-chain context rule ID whose spending-limit policy was
+    ///   retuned.
+    /// - `old_limit` — spending limit before the change, in stroops.
+    /// - `new_limit` — spending limit requested by the caller, in stroops.
+    /// - `period_ledgers` — the policy's rolling-window period (unchanged by
+    ///   this operation).
+    /// - `policy_address_redacted` — spending-limit-policy contract C-strkey,
+    ///   already redacted first-5-last-5. Callers MUST NOT pass the
+    ///   unredacted address.
+    /// - `transaction_hash_redacted` — Stellar transaction hash, already
+    ///   redacted first-8-last-8 via `stellar_agent_network::redact_tx_hash`.
+    /// - `smart_account_redacted` — smart-account C-strkey, already redacted
+    ///   first-5-last-5. Callers MUST NOT pass the unredacted address.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors new_sa_policy_added's argument shape plus the two spending-limit \
+                  numeric fields; all fields are load-bearing forensic detail"
+    )]
+    pub fn new_sa_spending_limit_retuned(
+        rule_id: u32,
+        old_limit: i128,
+        new_limit: i128,
+        period_ledgers: u32,
+        policy_address_redacted: impl Into<RedactedStrkey>,
+        transaction_hash_redacted: impl Into<String>,
+        smart_account_redacted: impl Into<RedactedStrkey>,
+        chain_id: impl IntoOptionalChainId,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "sa.spending_limit_retuned".to_owned(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::SaSpendingLimitRetuned {
+                rule_id,
+                old_limit,
+                new_limit,
+                period_ledgers,
+                policy_address_redacted: policy_address_redacted.into(),
+                transaction_hash_redacted: transaction_hash_redacted.into(),
+                smart_account_redacted: smart_account_redacted.into(),
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
     /// Constructs a `PasskeyRegistered` audit entry.
     ///
     /// Emitted by `CredentialsManager::add_passkey` on completion (success or

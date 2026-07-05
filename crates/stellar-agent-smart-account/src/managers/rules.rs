@@ -4282,6 +4282,12 @@ fn sa_error_to_invocation_result(
         | SaError::ThresholdPolicyIdentificationFailed { .. }
         | SaError::ThresholdReadFailed { .. }
         | SaError::NetworkRpcDivergence { .. }
+        // Spending-limit-policy identification and read-path errors: both
+        // `identify_spending_limit_policy` and `get_spending_limit_data` are
+        // read-only (simulate-only, no `submit_transaction`); neither variant
+        // can fire after a submission attempt.
+        | SaError::SpendingLimitNotInstalled { .. }
+        | SaError::SpendingLimitPolicyIdentificationFailed { .. }
         | SaError::AuditLog(_) => SaInvocationResult::PreSubmissionRefused,
         SaError::AuthDigestMismatch { .. } => SaInvocationResult::OnChainRejected,
         // Wasm-hash pinning pre-submission refusals.

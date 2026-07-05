@@ -32,6 +32,10 @@
 //! | [`multicall_bundle_aggregate_cap`] | Split-and-scatter via `evaluate_bundle` (sum-over-cap deny + boundary) |
 //! | [`multicall_upper_bound_assertion`] | Multicall trust-anchor ceiling: const-context invariant runtime witness |
 //! | [`cross_rpc_consumer_audit`] | Cross-RPC primitive consumer enumeration + source-grep regression-lock |
+//! | [`spending_limit_policy_identification_zero_match`] | `SpendingLimitNotInstalled` on zero-match / empty policies |
+//! | [`spending_limit_policy_identification_multi_match`] | `SpendingLimitPolicyIdentificationFailed` |
+//! | [`spending_limit_policy_identification_rpc_divergence`] | `NetworkRpcDivergence` on hash mismatch |
+//! | [`spending_limit_data_read_wiring`] | `get_spending_limit_data` end-to-end: decode + as-of-ledger + 3220 mapping |
 //! | [`timelock_salt_collision`] (`test-helpers`) | Timelock salt-derivation collision resistance: dual-component source-lock + uniqueness under distinct request\_ids + timestamps; tests 3/4/5 call `derive_schedule_salt` directly |
 //! | [`verifier_migration_dry_run`] | Verifier-migration planner dry-run mock fixtures |
 //! | [`verifier_migration_submit`] | Verifier-migration submit mock fixtures |
@@ -138,6 +142,18 @@ mod multicall_upper_bound_assertion;
 
 #[path = "smart-account-fixtures/adversarial/cross_rpc_consumer_audit.rs"]
 mod cross_rpc_consumer_audit;
+
+#[path = "smart-account-fixtures/adversarial/spending_limit_policy_identification_zero_match.rs"]
+mod spending_limit_policy_identification_zero_match;
+
+#[path = "smart-account-fixtures/adversarial/spending_limit_policy_identification_multi_match.rs"]
+mod spending_limit_policy_identification_multi_match;
+
+#[path = "smart-account-fixtures/adversarial/spending_limit_policy_identification_rpc_divergence.rs"]
+mod spending_limit_policy_identification_rpc_divergence;
+
+#[path = "smart-account-fixtures/adversarial/spending_limit_data_read_wiring.rs"]
+mod spending_limit_data_read_wiring;
 
 // Tests 3/4/5 call `derive_schedule_salt` which is only visible when the
 // `test-helpers` feature is active (re-exported in lib.rs under that gate).

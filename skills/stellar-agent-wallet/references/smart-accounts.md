@@ -21,7 +21,7 @@ Exceptions:
 | `smart-account migrate-verifier` | Mainnet dry-run allowed; mainnet submit allowed only with `--confirm-mainnet-migrate`; never returns `network.mainnet_write_forbidden`. |
 | `smart-account multicall` | `mainnet` accepted at the flag level but requires a router registered for mainnet. |
 | `smart-account register-multicall` / `unregister-multicall` | Accept `mainnet` as a local-registry key. |
-| Read-only verbs | `smart-account rules get`, `smart-account rules verify-pins`, `smart-account rules list` / `smart-account list-rules`, `smart-account list-verifiers`, `smart-account timelock list-pending` accept `mainnet` unconditionally. |
+| Read-only verbs | `smart-account rules get`, `smart-account rules get-spending-limit`, `smart-account rules verify-pins`, `smart-account rules list` / `smart-account list-rules`, `smart-account list-verifiers`, `smart-account timelock list-pending` accept `mainnet` unconditionally. |
 
 ## Signer source (write verbs)
 
@@ -52,6 +52,8 @@ A context rule has a `rule_id` (`u32`), a name (OZ cap: 20 bytes), an optional e
 | `add-policy` | Attach a policy (OZ `add_policy`); returns `policy_id` | `--account`, `--rule-id` (req); `--kind <raw\|spending-limit>` (default `raw`); raw: `--policy-address <C>`, `--install-param <SCVAL_BASE64>` (req); spending-limit: `--limit <STROOPS>`, `--period <LEDGERS>` (req), `--policy <C>` (opt override); `--auth-rule-id` (opt, repeatable) | Testnet only. Per-rule cap of 5 enforced via pre-fetch. Raw `--install-param` is standard-base64 XDR `ScVal` (not base64url), passed through raw. `--kind spending-limit` resolves the deployed policy from the registry, builds the typed install param, and refuses client-side if `--limit <= 0`, `--period == 0`, or the rule's context type is not `call-contract`. |
 | `remove-policy` | Detach a policy (OZ `remove_policy`) | `--account`, `--rule-id`, `--policy-id <U32>` (all req), `--auth-rule-id` (opt, repeatable) | Testnet only. |
 | `list` | Enumerate active rules (on-chain scan) | same as `smart-account list-rules` | Read-only, mainnet OK. Alias of `smart-account list-rules`. |
+| `get-spending-limit` | Read an installed spending-limit policy's budget state | `--account`, `--rule-id`, `--source-account <G>` (all req) | Read-only, mainnet OK. Identifies the policy, reads `get_spending_limit_data`, computes the rolling-window snapshot. Envelope includes `spending_limit`, `period_ledgers`, `in_window_spent`, `remaining_budget`, `as_of_ledger`, `window_cutoff_ledger`, `history_entries`, `cached_total_spent`. `in_window_spent`/`remaining_budget` are exact only as of `as_of_ledger` — a point-in-time estimate, not a guarantee for a future submission. |
+| `set-spending-limit` | Retune the limit (OZ `set_spending_limit`) without resetting spend history | `--account`, `--rule-id`, `--limit <STROOPS>` (all req) | Testnet only. Refuses client-side if `--limit <= 0`. Mutates ONLY the limit — the period is immutable post-install; changing it requires `remove-policy` + `add-policy`, which DOES reset history. |
 
 Name-related errors: a name over 20 bytes is refused with `validation.rule_name_too_long`. A rule with only `--signer-webauthn` signers and no `--accept-no-delegated-fallback` is refused with `validation.passkey_only_rule_no_delegated_fallback`.
 

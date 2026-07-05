@@ -276,12 +276,12 @@ fn instructions_string_names_every_registered_tool() {
 /// The count assertion guards against a tool being accidentally added or dropped.
 /// When the tool set changes, update the expected count and the name list below.
 #[test]
-fn registry_contains_thirty_four_tools() {
+fn registry_contains_thirty_six_tools() {
     let registry = collect_registry_names();
     assert_eq!(
         registry.len(),
-        34,
-        "registry must contain exactly 34 tools \
+        36,
+        "registry must contain exactly 36 tools \
          (stellar_balances + stellar_friendbot + stellar_create_account \
          + stellar_create_account_commit + stellar_pay + stellar_pay_commit \
          + stellar_fee_stats + stellar_sep43_get_address + stellar_sep43_get_network \
@@ -296,7 +296,8 @@ fn registry_contains_thirty_four_tools() {
          + stellar_defindex_vault_deposit + stellar_defindex_vault_withdraw \
          + stellar_dex_trade + stellar_dex_quote \
          + stellar_trustline + stellar_trustline_commit \
-         + stellar_claim + stellar_claim_commit); \
+         + stellar_claim + stellar_claim_commit \
+         + stellar_rules_list + stellar_rules_get); \
          got: {registry:?}"
     );
     assert!(
@@ -439,6 +440,15 @@ fn registry_contains_thirty_four_tools() {
     assert!(
         registry.contains("stellar_claim_commit"),
         "registry must contain stellar_claim_commit; got: {registry:?}"
+    );
+    // Smart-account rules observability — read-only.
+    assert!(
+        registry.contains("stellar_rules_list"),
+        "registry must contain stellar_rules_list; got: {registry:?}"
+    );
+    assert!(
+        registry.contains("stellar_rules_get"),
+        "registry must contain stellar_rules_get; got: {registry:?}"
     );
 }
 
@@ -1133,5 +1143,49 @@ fn wallet_server_new_succeeds_with_production_registry() {
     assert!(
         WalletServer::new(profile).is_ok(),
         "WalletServer::new must succeed with the production registry (no duplicates expected)"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rules-observability tool annotation tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Verifies `stellar_rules_list` annotations: read-only, not destructive,
+/// chain_id required.
+#[test]
+fn stellar_rules_list_annotations_correct() {
+    let reg = find_registration("stellar_rules_list")
+        .expect("stellar_rules_list McpToolRegistration not found in inventory registry");
+    assert!(
+        !reg.destructive_hint,
+        "stellar_rules_list: destructive_hint must be false (read-only enumeration)"
+    );
+    assert!(
+        reg.read_only_hint,
+        "stellar_rules_list: read_only_hint must be true (does not modify state)"
+    );
+    assert!(
+        reg.chain_id_required,
+        "stellar_rules_list: chain_id_required must be true"
+    );
+}
+
+/// Verifies `stellar_rules_get` annotations: read-only, not destructive,
+/// chain_id required.
+#[test]
+fn stellar_rules_get_annotations_correct() {
+    let reg = find_registration("stellar_rules_get")
+        .expect("stellar_rules_get McpToolRegistration not found in inventory registry");
+    assert!(
+        !reg.destructive_hint,
+        "stellar_rules_get: destructive_hint must be false (read-only read)"
+    );
+    assert!(
+        reg.read_only_hint,
+        "stellar_rules_get: read_only_hint must be true (does not modify state)"
+    );
+    assert!(
+        reg.chain_id_required,
+        "stellar_rules_get: chain_id_required must be true"
     );
 }

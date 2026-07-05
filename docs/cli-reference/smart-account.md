@@ -7,7 +7,7 @@ Most on-chain signing verbs that mutate context-rule, signer, or timelock state 
 - `smart-account migrate-verifier` allows a mainnet dry-run and permits a mainnet submit only when `--confirm-mainnet-migrate` is supplied; it never returns `network.mainnet_write_forbidden`.
 - `smart-account multicall` accepts `mainnet` at the flag level but requires a multicall router registered for mainnet.
 - `smart-account register-multicall` / `smart-account unregister-multicall` accept `mainnet` as a local-registry key.
-- The read-only verbs (`smart-account rules get`, `smart-account rules verify-pins`, `smart-account rules list` / `smart-account list-rules`, `smart-account list-verifiers`, `smart-account timelock list-pending`) accept `mainnet` unconditionally.
+- The read-only verbs (`smart-account rules get`, `smart-account rules get-spending-limit`, `smart-account rules verify-pins`, `smart-account rules list` / `smart-account list-rules`, `smart-account list-verifiers`, `smart-account timelock list-pending`) accept `mainnet` unconditionally.
 
 For the terms used here — [profile](../profiles.md), policy engine, approval spine, audit log, [context rule](../concepts.md), auth digest — see [concepts](../concepts.md). The shared flags (`--profile`, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`, and the signer-source group) are defined once on the [CLI reference index](index.md#global-conventions); this page names each flag a command takes and only describes the flags specific to that command.
 
@@ -27,7 +27,7 @@ export WALLET_SK="S..."   # source-account secret key; pass the var name, never 
 
 Manages the OpenZeppelin context rules on a smart-account. Each rule has a `rule_id` (a `u32`), a name (OZ cap: 20 bytes), an optional expiry ledger, a signer set (OZ cap: 15 signers), and up to 5 policy contracts.
 
-The `--auth-rule-id` flag on the write verbs names the rule whose signers authorize the operation; where it is optional it defaults to the rule being modified (`--rule-id`).
+The `--auth-rule-id` flag on the write verbs names the rule whose signers authorize the operation; where it is optional it defaults to the rule being modified (`--rule-id`). The exception is `rules set-spending-limit`, whose default is `0`: a spending-limit rule is CallContract-scoped and can never authorize its own retune (see that verb's entry).
 
 ### `smart-account rules create`
 
@@ -219,6 +219,56 @@ Enumerates the active context rules on a smart-account via on-chain scan. Read-o
 
 ```bash
 stellar-agent smart-account rules list --account CABC...WXYZ
+```
+
+### `smart-account rules get-spending-limit`
+
+Reads an installed spending-limit policy's budget state: identifies the policy attached to `--rule-id` via wasm-hash allowlist lookup, reads its on-chain `get_spending_limit_data`, and computes the rolling-window budget snapshot. Read-only; no signing; no submission; no audit-log emission. `mainnet` is accepted.
+
+The returned `in_window_spent` and `remaining_budget` are exact only as of `as_of_ledger` — a point-in-time estimate, not a guarantee for a future submission. Forward ledger movement past that point only grows headroom (older spend entries fall out of the rolling window), but an intervening spend shrinks it; a later `set-spending-limit` or agent transfer can still cause `SpendingLimitExceeded`.
+
+Trust boundary: this read consults a single RPC endpoint (no two-RPC cross-check) — an advisory view, not a signing input. The write verbs keep the full two-RPC consultation.
+
+Flags:
+
+- `--account <C_STRKEY>` (required).
+- `--rule-id <U32>` (required) — rule whose spending-limit policy to read.
+- `--source-account <G_STRKEY>` (required) — source account for the simulation envelope. Any funded account on the target network works (read-only path; no signing).
+- Shared: `--network`, `--rpc-url`, `--timeout-seconds`, `--output`.
+
+Envelope: `{ smart_account, rule_id, policy_address, spending_limit, period_ledgers, in_window_spent, remaining_budget, as_of_ledger, window_cutoff_ledger, history_entries, cached_total_spent }`. `cached_total_spent` is the on-chain cached total verbatim, for transparency — it is NOT used to compute `in_window_spent` (the on-chain cache is not evicted on read, so it can include entries already outside the rolling window).
+
+```bash
+stellar-agent smart-account rules get-spending-limit \
+  --account CABC...WXYZ \
+  --rule-id 1 \
+  --source-account GABC...WXYZ
+```
+
+### `smart-account rules set-spending-limit`
+
+Retunes an installed spending-limit policy's limit (OZ `set_spending_limit`) without resetting the rolling spend history. Signs and submits. Testnet only.
+
+HONESTY CONSTRAINT: `set_spending_limit` mutates ONLY the limit; the period is immutable once installed. Retuning the period requires `remove-policy` followed by `add-policy --kind spending-limit`, which DOES reset the spend history (the OZ contract's `install` initializes empty history) — there is no way to change the period without that reset.
+
+Refused client-side before any network call when `--limit <= 0` (mirroring the on-chain `InvalidLimitOrPeriod` constraint). Pre-reads the current spending-limit data before submitting, both to report `old_limit` in the audit row and to fail closed early if no spending-limit policy is installed on the rule.
+
+Flags:
+
+- `--account <C_STRKEY>` (required).
+- `--rule-id <U32>` (required) — rule whose spending-limit policy to retune. This rule keys the policy's storage; it does NOT authorize the call.
+- `--auth-rule-id <U32>` — rule that AUTHORIZES the retune. Default `0` (the bootstrap rule installed at deploy time), NOT `--rule-id`: the retune executes on the smart account itself, an auth context the CallContract-scoped rule named by `--rule-id` always refuses on-chain (`UnvalidatedContext`) — the target rule can never authorize its own retune. Supply a different admin-capable rule id if the bootstrap rule has been replaced.
+- `--limit <STROOPS>` (required) — new spending limit, in stroops. Must be positive.
+- `--profile <NAME>` — profile name for audit-log path resolution.
+- Signer-source group (see [Signer source](#signer-source)); the signer must satisfy the `--auth-rule-id` rule.
+- Shared: `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
+
+```bash
+stellar-agent smart-account rules set-spending-limit \
+  --account CABC...WXYZ \
+  --rule-id 1 \
+  --limit 80000000 \
+  --signer-secret-env WALLET_SK
 ```
 
 ---

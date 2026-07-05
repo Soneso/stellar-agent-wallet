@@ -117,6 +117,10 @@ required-features = ["testnet-integration"]
 name = "smart_account_rules_webauthn_testnet_acceptance"
 required-features = ["testnet-integration"]
 
+[[test]]
+name = "smart_account_policy_observability_testnet_acceptance"
+required-features = ["testnet-integration"]
+
 [dependencies]
 bon = { workspace = true }
 stellar-accounts = { workspace = true }
@@ -188,6 +192,16 @@ futures = { workspace = true }
 # stellar-agent-webauthn-bridge: the bridge listener driven by the WebAuthn
 # acceptance test.
 stellar-agent-webauthn-bridge = { workspace = true }
+# stellar-agent-mcp: real WalletServer dispatch (registry/matrix/toolsets) for
+# the MCP-dispatch leg of smart_account_policy_observability_testnet_acceptance.rs.
+# test-helpers exposes the call_stellar_*/set_*_for_test cross-crate test hooks;
+# this dev-only back-edge (mcp depends on smart-account normally) is supported
+# by cargo because dev-dependencies are not part of the library build graph.
+stellar-agent-mcp = { workspace = true, features = ["test-helpers"] }
+# keyring-core: seeds the mock in-memory keyring store for WalletServer::new.
+keyring-core = { workspace = true }
+# rmcp: inspects CallToolResult from the MCP-dispatch leg.
+rmcp = { workspace = true }
 
 [lints]
 workspace = true

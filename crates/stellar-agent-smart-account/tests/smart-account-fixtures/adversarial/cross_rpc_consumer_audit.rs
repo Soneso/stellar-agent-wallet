@@ -67,6 +67,14 @@ const CROSS_RPC_CONSUMER_SITES: &[(&str, &str)] = &[
         "crates/stellar-agent-smart-account/src/managers/signers.rs",
         "identify_threshold_policy",
     ),
+    // Spending-limit-policy identification — 1 consumer in signers.rs.
+    // identify_spending_limit_policy is the 10th cross-RPC consumer; mirrors
+    // identify_threshold_policy's two-RPC wasm-hash agreement check against a
+    // single-entry allowlist.
+    (
+        "crates/stellar-agent-smart-account/src/managers/signers.rs",
+        "identify_spending_limit_policy",
+    ),
     // Wasm-hash drift detection — 1 consumer in signers.rs
     (
         "crates/stellar-agent-smart-account/src/managers/signers.rs",
@@ -165,10 +173,10 @@ fn count_emit_sites(workspace: &Path, file_path: &str) -> usize {
 /// Asserts every cross-RPC consumer call site enumerated in
 /// `CROSS_RPC_CONSUMER_SITES` matches the actual source-grep count.
 ///
-/// There are 5 `SaError::NetworkRpcDivergence` emit sites in `signers.rs`,
+/// There are 6 `SaError::NetworkRpcDivergence` emit sites in `signers.rs`,
 /// 1 in `verifiers.rs`, and 3 in `timelock.rs`
 /// (`query_operation_state_cross_rpc`, `cross_confirm_event`, `simulate_hash_operation`)
-/// = 9 total. The `CROSS_RPC_CONSUMER_SITES` list above MUST account for all 9.
+/// = 10 total. The `CROSS_RPC_CONSUMER_SITES` list above MUST account for all 10.
 ///
 /// A new cross-RPC consumer MUST add an entry here, OR this test fails.
 #[test]
@@ -259,10 +267,10 @@ fn cross_rpc_consumer_audit_covers_both_threat_surfaces() {
         .count();
 
     assert!(
-        signers_count >= 4,
-        "signer-set divergence detection must have ≥4 cross-RPC consumers \
+        signers_count >= 5,
+        "signer-set divergence detection must have ≥5 cross-RPC consumers \
          (list_signers + refresh_signer_baseline + verify_signer_set_against_chain + \
-         identify_threshold_policy); got {signers_count}",
+         identify_threshold_policy + identify_spending_limit_policy); got {signers_count}",
     );
     assert!(
         verifiers_count >= 1,
@@ -285,5 +293,16 @@ fn cross_rpc_consumer_audit_covers_both_threat_surfaces() {
         has_wasm_hash_consumer,
         "wasm-hash drift detection must have its `fetch_observed_wasm_hash` \
          consumer enumerated",
+    );
+
+    // The spending-limit-policy identification consumer must be enumerated
+    // explicitly, not merely covered by the >= bound above.
+    let has_spending_limit_consumer = CROSS_RPC_CONSUMER_SITES
+        .iter()
+        .any(|(_, fn_name)| *fn_name == "identify_spending_limit_policy");
+    assert!(
+        has_spending_limit_consumer,
+        "spending-limit-policy identification must have its \
+         `identify_spending_limit_policy` consumer enumerated",
     );
 }

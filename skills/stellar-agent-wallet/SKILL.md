@@ -92,6 +92,15 @@ Read-only tools never sign and are safe to call freely.
 `stellar_fee_stats` returns network fee statistics; `stellar_dex_quote` returns an
 on-chain Soroswap quote. On testnet, fund a fresh account with `stellar_friendbot`.
 
+`stellar_rules_list` and `stellar_rules_get` read the agent's own context rules —
+including any spending-limit budget (`spending_limit`, `in_window_spent`,
+`remaining_budget`) and expiry (`expires_in_ledgers`). Read these before a
+transfer that might be near a cap: `in_window_spent`/`remaining_budget` are
+exact only as of the `as_of_ledger` they were read at, so treat them as an
+estimate, not a guarantee — an intervening spend can still make a later
+submission fail `SpendingLimitExceeded`. See
+[references/smart-accounts.md](references/smart-accounts.md).
+
 ## 3. Sending a payment — the two-phase pattern
 
 Fund-moving classic verbs split into a **build** call and a **commit** call. This

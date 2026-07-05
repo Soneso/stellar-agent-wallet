@@ -81,6 +81,14 @@ pub enum Capability {
     /// replaces per-action approval; it is an additive first-invoke consent
     /// layered before it.
     SignPayment,
+
+    /// Read the agent's own context rules (spending-limit budgets, expiry,
+    /// signer/policy counts) via the read-only rules-observability tools.
+    ///
+    /// Maps to the `read-rules` token. Separately grantable from
+    /// `read-balance`: rule visibility and balance visibility are distinct
+    /// concerns, so a toolset must request each independently.
+    ReadRules,
 }
 
 impl Capability {
@@ -121,6 +129,7 @@ impl Capability {
             Self::SuggestDestination => false,
             Self::ObserveEvent => false,
             Self::SignPayment => true,
+            Self::ReadRules => false,
         }
     }
 }
@@ -133,6 +142,7 @@ impl fmt::Display for Capability {
             Self::SuggestDestination => f.write_str("suggest-destination"),
             Self::ObserveEvent => f.write_str("observe-event"),
             Self::SignPayment => f.write_str("sign-payment"),
+            Self::ReadRules => f.write_str("read-rules"),
         }
     }
 }
@@ -376,6 +386,7 @@ fn match_capability_token(token: &str) -> Result<Capability, ToolsetFormatError>
         // sign-payment is declarable but INERT at parse/install time.
         // The first-invoke gate is the sole admission control for this code path.
         SIGN_PAYMENT_TOKEN => Ok(Capability::SignPayment),
+        "read-rules" => Ok(Capability::ReadRules),
         other => Err(ToolsetFormatError::UnknownCapability {
             token: other.to_owned(),
         }),
@@ -701,6 +712,7 @@ mod tests {
             (Capability::SuggestDestination, false),
             (Capability::ObserveEvent, false),
             (Capability::SignPayment, true),
+            (Capability::ReadRules, false),
         ];
         for (cap, expected) in table {
             assert_eq!(

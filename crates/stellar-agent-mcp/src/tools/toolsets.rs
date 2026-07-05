@@ -772,6 +772,26 @@ impl WalletServer {
                 })?;
                 self.invoke_stellar_sep7_parse_uri(typed).await
             }
+            "stellar_rules_list" => {
+                let typed: super::rules::StellarRulesListArgs = serde_json::from_value(args)
+                    .map_err(|e| {
+                        rmcp::ErrorData::invalid_params(
+                            format!("toolset.args_deserialise: stellar_rules_list: {e}"),
+                            None,
+                        )
+                    })?;
+                self.invoke_stellar_rules_list(typed).await
+            }
+            "stellar_rules_get" => {
+                let typed: super::rules::StellarRulesGetArgs = serde_json::from_value(args)
+                    .map_err(|e| {
+                        rmcp::ErrorData::invalid_params(
+                            format!("toolset.args_deserialise: stellar_rules_get: {e}"),
+                            None,
+                        )
+                    })?;
+                self.invoke_stellar_rules_get(typed).await
+            }
             // Forward-compat: if the matrix gains a new tool that this binary
             // does not yet have a routing arm for, fail closed with an internal
             // error rather than panicking.  This should never happen in a
@@ -838,6 +858,8 @@ mod tests {
             "stellar_sep47_discover",
             "stellar_sep48_preview_invocation",
             "stellar_sep7_parse_uri",
+            "stellar_rules_list",
+            "stellar_rules_get",
         ];
         for name in ALL_MATRIX_TOOL_NAMES {
             assert!(

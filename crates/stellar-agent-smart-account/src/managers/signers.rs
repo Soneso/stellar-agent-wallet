@@ -67,8 +67,8 @@ use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilde
 use stellar_rpc_client::Client;
 use stellar_xdr::LedgerKey;
 use stellar_xdr::{
-    ContractId, Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp, Operation,
-    OperationBody, PublicKey, ScAddress, ScBytes, ScSymbol, ScVal, ScVec, Uint256, VecM,
+    ContractId, Hash, HostFunction, Int128Parts, InvokeContractArgs, InvokeHostFunctionOp,
+    Operation, OperationBody, PublicKey, ScAddress, ScBytes, ScSymbol, ScVal, ScVec, Uint256, VecM,
 };
 use tracing::{debug, info, warn};
 
@@ -78,7 +78,9 @@ use crate::managers::rules::{
     scaddress_to_strkey,
 };
 use crate::signers::policy_identification::THRESHOLD_POLICY_WASM_HASHES;
-use crate::signers::types::{FrozenChainStateTuple, ThresholdAffectingOp, WasmHashSummary};
+use crate::signers::types::{
+    FrozenChainStateTuple, PolicyIdentifiedKind, ThresholdAffectingOp, WasmHashSummary,
+};
 
 /// Context passed to wasm-hash allowlist error constructors.
 pub(crate) struct NotInAllowlistContext {
@@ -1430,6 +1432,311 @@ impl SignersManager {
         outcome.map(|_| ())
     }
 
+    // ── set_spending_limit ─────────────────────────────────────────────────────
+
+    /// Retunes the spending limit of an installed spending-limit policy
+    /// (without resetting rolling spend history).
+    ///
+    /// Acquires the per-rule mutex, then:
+    ///
+    /// 1. Refuses `new_limit <= 0` client-side (OZ `set_spending_limit` panics
+    ///    `InvalidLimitOrPeriod`, code 3222, for a non-positive value).
+    /// 2. Identifies the spending-limit-policy address via wasm-hash lookup.
+    /// 3. Reads the current on-chain data (`old_limit` for the audit row;
+    ///    this also fails closed early with
+    ///    [`SaError::SpendingLimitNotInstalled`] if the policy's storage was
+    ///    never initialised, before any submission).
+    /// 4. Constructs and submits a single `InvokeHostFunctionOp` routed
+    ///    through the smart account's `execute()` entrypoint (avoids Soroban
+    ///    re-entry — see the inline rationale in
+    ///    `set_threshold_locked_inner`).
+    /// 5. Emits `SaSpendingLimitRetuned` audit row.
+    ///
+    /// `period_ledgers` is immutable post-install: OZ `set_spending_limit`
+    /// mutates only the limit (`spending_limit.rs:314-339`, SHA `a9c4216`).
+    /// Retuning the period requires remove-policy + add-policy, which resets
+    /// rolling spend history (`install` initialises an empty history,
+    /// `spending_limit.rs:367-425`). This method does not attempt to change
+    /// the period.
+    ///
+    /// # Arguments
+    ///
+    /// - `smart_account` — the smart-account contract's [`ScAddress`].
+    /// - `rule_id` — the context rule whose spending-limit policy is retuned
+    ///   (the ARGUMENT rule: it keys the policy's storage mutation, but does
+    ///   NOT authorize the call).
+    /// - `auth_rule_ids` — the rule(s) AUTHORIZING the retune. Must be
+    ///   admin-capable (typically the genesis Default rule): the auth context
+    ///   is `execute` on the smart account, which a CallContract-scoped rule
+    ///   refuses with `UnvalidatedContext` (3002) — so the target rule can
+    ///   never authorize its own retune. The client-side expiry pre-flight
+    ///   covers only the FIRST entry; expiry of any additional auth rule is
+    ///   still enforced on-chain, just without the early local refusal.
+    /// - `new_limit` — the desired new spending limit, in stroops.
+    /// - `signer` — the ed25519 signer (must satisfy the auth rule).
+    /// - `request_id` — caller-supplied UUID.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::SpendingLimitInstallRefused`] — `new_limit <= 0`, or
+    ///   `auth_rule_ids` empty.
+    /// - [`SaError::SpendingLimitNotInstalled`] — no accessible spending-limit
+    ///   policy for this rule (client-side identification, or on-chain 3220).
+    /// - [`SaError::SpendingLimitPolicyIdentificationFailed`] — ambiguous
+    ///   multi-match.
+    /// - [`SaError::NetworkRpcDivergence`] — two-RPC disagreement on policy
+    ///   hash.
+    /// - [`SaError::DeploymentFailed`] — submission or on-chain rejection.
+    ///
+    /// # Implements
+    ///
+    /// Policy observability: the write side of the spending-limit budget
+    /// surface — retuning the limit without tearing down rolling spend
+    /// history (GH issue #7).
+    pub async fn set_spending_limit(
+        &self,
+        smart_account: ScAddress,
+        rule_id: u32,
+        auth_rule_ids: &[ContextRuleId],
+        new_limit: i128,
+        signer: &(dyn Signer + Send + Sync),
+        request_id: String,
+    ) -> Result<(), SaError> {
+        // The AUTHORIZING rule must be admin-capable (typically the genesis
+        // Default rule): the retune's auth context is `execute` on the smart
+        // account itself, and the CallContract-scoped rule being retuned can
+        // never validate that context — on-chain `get_validated_context_by_id`
+        // refuses it with `UnvalidatedContext` (3002, OZ storage.rs:272-324,
+        // SHA `a9c4216`). This is why `auth_rule_ids` is caller-supplied
+        // rather than derived from `rule_id` (the `set_threshold` convention
+        // of auth == target only works because threshold policies sit on
+        // Default-scoped rules).
+        if auth_rule_ids.is_empty() {
+            return Err(SaError::SpendingLimitInstallRefused {
+                reason: "set-spending-limit refused: auth_rule_ids must not be empty; supply \
+                         an admin-capable rule (the CallContract rule being retuned cannot \
+                         authorize a smart-account admin call)"
+                    .to_owned(),
+            });
+        }
+        if new_limit <= 0 {
+            return Err(SaError::SpendingLimitInstallRefused {
+                reason: format!(
+                    "set-spending-limit refused: --limit must be positive; got {new_limit} \
+                     (OZ set_spending_limit rejects non-positive values with \
+                     InvalidLimitOrPeriod)"
+                ),
+            });
+        }
+
+        let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
+        let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
+
+        // Per-rule mutex acquire.
+        let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, &smart_account_strkey);
+        let _guard = mutex.lock().await;
+
+        let outcome = self
+            .set_spending_limit_locked_inner(
+                smart_account.clone(),
+                rule_id,
+                auth_rule_ids,
+                new_limit,
+                signer,
+                &request_id,
+            )
+            .await;
+
+        match &outcome {
+            Ok((old_limit, period_ledgers, policy_addr, tx_hash)) => {
+                let policy_addr_redacted = scaddress_to_strkey(policy_addr)
+                    .map(|s| redact_strkey_first5_last5(&s))
+                    .unwrap_or_else(|_| "unknown".to_owned());
+                let tx_hash_redacted = stellar_agent_network::redact_tx_hash(tx_hash);
+                match self.audit_writer.lock() {
+                    Ok(mut writer) => {
+                        let entry = AuditEntry::new_sa_spending_limit_retuned(
+                            rule_id,
+                            *old_limit,
+                            new_limit,
+                            *period_ledgers,
+                            RedactedStrkey::from_already_redacted(policy_addr_redacted.clone()),
+                            tx_hash_redacted.clone(),
+                            RedactedStrkey::from_already_redacted(smart_account_redacted.clone()),
+                            self.chain_id.as_str(),
+                            request_id.clone(),
+                        );
+                        if let Err(e) = writer.write_entry(entry) {
+                            warn!(
+                                error = %e,
+                                "set_spending_limit: SaSpendingLimitRetuned audit write failed"
+                            );
+                        }
+                    }
+                    Err(_poison) => {
+                        self.mark_audit_writer_degraded();
+                        warn!(
+                            target: "stellar_agent::audit",
+                            rule_id,
+                            old_limit = *old_limit,
+                            new_limit,
+                            period_ledgers = *period_ledgers,
+                            policy_address_redacted = %policy_addr_redacted,
+                            transaction_hash_redacted = %tx_hash_redacted,
+                            smart_account_redacted = %smart_account_redacted,
+                            chain_id = %self.chain_id,
+                            request_id = %request_id,
+                            "audit-writer mutex poisoned; SaSpendingLimitRetuned row dropped"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    rule_id,
+                    smart_account = %smart_account_redacted,
+                    "set_spending_limit: operation failed"
+                );
+            }
+        }
+
+        outcome.map(|_| ())
+    }
+
+    /// Core logic for `set_spending_limit` (called inside the per-rule mutex).
+    ///
+    /// Returns `(old_limit, period_ledgers, policy_addr, tx_hash)` on success.
+    async fn set_spending_limit_locked_inner(
+        &self,
+        smart_account: ScAddress,
+        rule_id: u32,
+        auth_rule_ids: &[ContextRuleId],
+        new_limit: i128,
+        signer: &(dyn Signer + Send + Sync),
+        request_id: &str,
+    ) -> Result<(i128, u32, ScAddress, String), SaError> {
+        let source_pubkey =
+            signer
+                .public_key()
+                .await
+                .map_err(|e| SaError::AuthEntryConstructionFailed {
+                    stage: "auth_payload",
+                    redacted_reason: format!("signer public_key fetch failed: {e}"),
+                })?;
+        let source_pubkey_strkey = stellar_strkey::ed25519::PublicKey(source_pubkey.0).to_string();
+
+        // Identify the spending-limit policy (fail-closed).
+        let policy_addr = self
+            .identify_spending_limit_policy(
+                smart_account.clone(),
+                rule_id,
+                Some(&source_pubkey_strkey),
+                request_id.to_owned(),
+            )
+            .await?;
+
+        // Pre-read the current data: `old_limit` for the audit row, and an
+        // early fail-closed check on the on-chain 3220 case before any
+        // submission is attempted.
+        let (current_data, _as_of_ledger) = self
+            .get_spending_limit_data(
+                policy_addr.clone(),
+                rule_id,
+                smart_account.clone(),
+                Some(&source_pubkey_strkey),
+                request_id.to_owned(),
+            )
+            .await?;
+        let old_limit = current_data.spending_limit;
+        let period_ledgers = current_data.period_ledgers;
+
+        // Fetch context rule for the set_spending_limit args.
+        let context_rule = self
+            .fetch_context_rule_primary(smart_account.clone(), rule_id, Some(&source_pubkey_strkey))
+            .await?;
+
+        // Route `set_spending_limit` through the smart account's `execute()`
+        // entrypoint to avoid Soroban re-entry — the same rationale as
+        // `set_threshold_locked_inner`: a direct call would re-enter
+        // `smart_account.require_auth()` via the policy's own
+        // `require_auth` call.
+        let set_spending_limit_sym = ScSymbol::try_from("set_spending_limit").map_err(|e| {
+            SaError::AuthEntryConstructionFailed {
+                stage: "auth_payload",
+                redacted_reason: format!("encode set_spending_limit symbol: {e:?}"),
+            }
+        })?;
+        let context_rule_scval = context_rule.as_scval()?;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "canonical i128 -> Int128Parts split: hi = high 64 bits, lo = low 64 bits"
+        )]
+        let new_limit_parts = Int128Parts {
+            hi: (new_limit >> 64) as i64,
+            lo: new_limit as u64,
+        };
+        // `target_args` = [spending_limit: i128, context_rule: ContextRule,
+        // smart_account: Address], per the example contract signature
+        // `set_spending_limit(e, spending_limit, context_rule, smart_account)`
+        // (examples/multisig-smart-account/spending-limit-policy/src/contract.rs:79-86,
+        // SHA `a9c4216`).
+        let target_args_vec: VecM<ScVal> = vec![
+            ScVal::I128(new_limit_parts),
+            context_rule_scval,
+            ScVal::Address(smart_account.clone()),
+        ]
+        .try_into()
+        .map_err(|e| SaError::AuthEntryConstructionFailed {
+            stage: "auth_contexts_args",
+            redacted_reason: format!("encode set_spending_limit target_args VecM: {e:?}"),
+        })?;
+        let execute_args = vec![
+            ScVal::Address(policy_addr.clone()),
+            ScVal::Symbol(set_spending_limit_sym),
+            ScVal::Vec(Some(ScVec(target_args_vec))),
+        ];
+
+        // Both contract and auth_address are the smart account; `execute()`
+        // calls `e.current_contract_address().require_auth()`. That auth
+        // context (`execute` on the smart account) is validated against
+        // `auth_rule_ids` — the caller-supplied ADMIN rule — never against
+        // `rule_id`: the CallContract-scoped rule being retuned refuses this
+        // context with `UnvalidatedContext` (3002). The target rule enters
+        // the call only through the `context_rule` ARGUMENT, which is what
+        // keys the policy's storage mutation
+        // (`AccountContext(smart_account, context_rule.id)`,
+        // spending_limit.rs:328, SHA `a9c4216`).
+        let expiry_rule_id = auth_rule_ids
+            .first()
+            .map(ContextRuleId::as_u32)
+            .unwrap_or(rule_id);
+        let submit_result = self
+            .submit_signed_invoke(
+                smart_account.clone(),
+                &smart_account,
+                "execute",
+                execute_args,
+                auth_rule_ids,
+                signer,
+                &source_pubkey_strkey,
+                "execute",
+                // Expiry check on the AUTHORIZING rule at signing-path entry
+                // (the on-chain expiry refusal applies to the auth rule).
+                Some(ExpiryCheck {
+                    rule_id: expiry_rule_id,
+                }),
+            )
+            .await?;
+
+        Ok((
+            old_limit,
+            period_ledgers,
+            policy_addr,
+            submit_result.tx_hash,
+        ))
+    }
+
     // ── identify_threshold_policy ─────────────────────────────────────────────
 
     /// Identifies the threshold-policy contract for a context rule.
@@ -1608,6 +1915,423 @@ impl SignersManager {
         }
 
         Ok(matched_policy_addr.expect("match_count == 1 guarantees Some"))
+    }
+
+    // ── identify_spending_limit_policy ────────────────────────────────────────
+
+    /// Identifies the spending-limit-policy contract for a context rule.
+    ///
+    /// Mirrors [`SignersManager::identify_threshold_policy`]: fetches the
+    /// wasm-hash of each `Address` in the rule's `policies` list via batched
+    /// `getLedgerEntries` on BOTH RPCs in parallel (two-RPC consultation),
+    /// then matches against the spending-limit-policy wasm-hash allowlist.
+    /// Exactly one match is required (fail-closed).
+    ///
+    /// Unlike `identify_threshold_policy`'s two-entry allowlist (current
+    /// deploy hash plus one grandfathered legacy version), the spending-limit
+    /// allowlist has exactly one entry — decoded at call time from
+    /// [`crate::spending_limit_policy::SPENDING_LIMIT_POLICY_WASM_SHA256`],
+    /// the same hex string the deploy-time
+    /// `deployment::deploy::verify_post_deploy_wasm_hash` check
+    /// already verifies equals `SHA256(SPENDING_LIMIT_POLICY_WASM)` and
+    /// byte-matches the on-chain `ContractExecutable::Wasm(Hash)` value: both
+    /// this allowlist and `THRESHOLD_POLICY_WASM_HASHES` compare against the
+    /// identical on-chain domain (raw SHA-256 of the deployed WASM), so the
+    /// constant is reusable here without re-deriving it.
+    ///
+    /// # Arguments
+    ///
+    /// - `smart_account` — the smart-account contract's [`ScAddress`].
+    /// - `rule_id` — the context rule whose policies are examined.
+    /// - `source_account_strkey` — G-strkey of the fee-paying account.
+    /// - `request_id` — caller-supplied UUID for error reporting.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::SpendingLimitNotInstalled`] — the rule's `policies` list
+    ///   is empty, or none of the attached policies' wasm-hash matches the
+    ///   allowlist entry.
+    /// - [`SaError::SpendingLimitPolicyIdentificationFailed`] — more than one
+    ///   attached policy matches the allowlist entry (ambiguous).
+    /// - [`SaError::NetworkRpcDivergence`] — primary and secondary RPC
+    ///   disagree on wasm-hash.
+    /// - [`SaError::DeploymentFailed`] — RPC `getLedgerEntries` failure, or
+    ///   the pinned `SPENDING_LIMIT_POLICY_WASM_SHA256` constant is not
+    ///   valid 64-char hex (unreachable in practice; guarded by
+    ///   `spending_limit_policy::tests::spending_limit_policy_wasm_sha256_matches_provenance`).
+    ///
+    /// # Panics
+    ///
+    /// Does not panic in practice: the infallible `expect` on the
+    /// `Option<ScAddress>` guarded by `match_count == 1` is provably safe.
+    /// See inline comment.
+    ///
+    /// # Implements
+    ///
+    /// Spending-limit-policy identification: locates the single installed
+    /// spending-limit policy by matching its wasm-hash against the allowlist,
+    /// ensuring `get_spending_limit_data` / `set_spending_limit` target the
+    /// correct contract.
+    #[allow(
+        clippy::expect_used,
+        reason = "infallible: match_count == 1 guarantees Some"
+    )]
+    pub async fn identify_spending_limit_policy(
+        &self,
+        smart_account: ScAddress,
+        rule_id: u32,
+        source_account_strkey: Option<&str>,
+        request_id: String,
+    ) -> Result<ScAddress, SaError> {
+        let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
+        let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
+
+        let allowed_hash = stellar_agent_core::hex::decode_hex32(
+            crate::spending_limit_policy::SPENDING_LIMIT_POLICY_WASM_SHA256,
+        )
+        .map_err(|_| SaError::DeploymentFailed {
+            phase: "build",
+            redacted_reason: "SPENDING_LIMIT_POLICY_WASM_SHA256 const is not valid 64-char hex"
+                .to_owned(),
+        })?;
+
+        // Fetch the on-chain context rule to get the policies list.
+        let context_rule = self
+            .fetch_context_rule_primary(smart_account.clone(), rule_id, source_account_strkey)
+            .await?;
+
+        // Empty policies list: nothing to check (fail-closed, same reported
+        // outcome as a zero-match against a non-empty list).
+        if context_rule.policies.is_empty() {
+            return Err(SaError::SpendingLimitNotInstalled {
+                rule_id,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
+                ),
+                request_id,
+            });
+        }
+
+        // Build LedgerKey::ContractData(ContractInstance) keys for each policy address.
+        let policy_keys: Vec<LedgerKey> = context_rule
+            .policies
+            .iter()
+            .map(contract_instance_key)
+            .collect();
+
+        if policy_keys.is_empty() {
+            return Err(SaError::SpendingLimitNotInstalled {
+                rule_id,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
+                ),
+                request_id,
+            });
+        }
+
+        // Two-RPC parallel wasm-hash fetch.
+        let (primary_hashes_result, secondary_hashes_result) = tokio::join!(
+            fetch_contract_wasm_hashes(&self.primary_rpc_client, &policy_keys),
+            fetch_contract_wasm_hashes(&self.secondary_rpc_client, &policy_keys),
+        );
+
+        let primary_hashes = primary_hashes_result.map_err(|e| SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason: format!("primary RPC policy wasm-hash fetch failed: {e}"),
+        })?;
+        let secondary_hashes = secondary_hashes_result.map_err(|e| SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason: format!("secondary RPC policy wasm-hash fetch failed: {e}"),
+        })?;
+
+        // Two-RPC agreement check.
+        if primary_hashes.len() != secondary_hashes.len() || primary_hashes != secondary_hashes {
+            let primary_digest: [u8; 32] = Sha256::digest(
+                primary_hashes
+                    .iter()
+                    .flat_map(|h| h.iter().flat_map(|b| b.iter()).copied())
+                    .collect::<Vec<u8>>(),
+            )
+            .into();
+            let secondary_digest: [u8; 32] = Sha256::digest(
+                secondary_hashes
+                    .iter()
+                    .flat_map(|h| h.iter().flat_map(|b| b.iter()).copied())
+                    .collect::<Vec<u8>>(),
+            )
+            .into();
+            let primary_first8 = primary_digest[..8]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            let secondary_first8 = secondary_digest[..8]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            return Err(SaError::NetworkRpcDivergence {
+                rule_id,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
+                ),
+                primary_view_digest_first8: primary_first8,
+                secondary_view_digest_first8: secondary_first8,
+                request_id,
+            });
+        }
+
+        // Single-entry allowlist match: exactly-one-match required, fail-closed.
+        let mut matched_policy_addr: Option<ScAddress> = None;
+        let mut match_count = 0usize;
+        let first_first8: Option<[u8; 8]> = primary_hashes
+            .iter()
+            .find_map(|opt_h| opt_h.as_ref())
+            .map(|h| <[u8; 8]>::try_from(&h[..8]).expect("sha256 is 32 bytes"));
+
+        for (opt_hash, policy_addr) in primary_hashes.iter().zip(context_rule.policies.iter()) {
+            let Some(hash) = opt_hash else { continue };
+            debug!(
+                policy_wasm_hash_first8 = %hash[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                "identify_spending_limit_policy: observed policy wasm hash"
+            );
+            if hash == &allowed_hash {
+                match_count += 1;
+                matched_policy_addr = Some(policy_addr.clone());
+            }
+        }
+
+        match match_count {
+            1 => Ok(matched_policy_addr.expect("match_count == 1 guarantees Some")),
+            0 => Err(SaError::SpendingLimitNotInstalled {
+                rule_id,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
+                ),
+                request_id,
+            }),
+            _ => {
+                let count = u32::try_from(primary_hashes.len()).unwrap_or(u32::MAX);
+                Err(SaError::SpendingLimitPolicyIdentificationFailed {
+                    rule_id,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted(
+                        smart_account_redacted,
+                    ),
+                    observed_wasm_hashes_summary: WasmHashSummary {
+                        count,
+                        first_first8,
+                    },
+                    request_id,
+                })
+            }
+        }
+    }
+
+    // ── get_spending_limit_data ────────────────────────────────────────────────
+
+    /// Reads the on-chain `SpendingLimitData` for `(rule_id, smart_account)`
+    /// from the spending-limit-policy contract.
+    ///
+    /// `policy` MUST be the result of a prior
+    /// [`SignersManager::identify_spending_limit_policy`] call — callers are
+    /// responsible for identifying the policy first and passing the result
+    /// here (fail-closed: no unvalidated address is read).
+    ///
+    /// Calls `get_spending_limit_data(context_rule_id: u32, smart_account:
+    /// Address) -> SpendingLimitData` via the primary-RPC read-only simulate
+    /// path (`simulate_read_only_with_ledger`), decodes the return value, and
+    /// returns it alongside the ledger sequence the simulation observed
+    /// (the "as of" ledger for [`crate::managers::spending_limit_data::compute_spending_window`]).
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::SpendingLimitNotInstalled`] — the on-chain call panics
+    ///   `SpendingLimitError::SmartAccountNotInstalled` (code 3220,
+    ///   `packages/accounts/src/policies/spending_limit.rs:124-127`, SHA
+    ///   `a9c4216`), meaning `install` was never called for this
+    ///   `(smart_account, rule_id)` pair on the policy contract. This is
+    ///   defense in depth: `identify_spending_limit_policy` can succeed
+    ///   against a raw-attached policy address whose storage was never
+    ///   initialised.
+    /// - [`SaError::DeploymentFailed`] — any other simulation failure, or a
+    ///   malformed / unexpected-shape return value.
+    /// - [`SaError::AuthEntryConstructionFailed`] — strkey or XDR
+    ///   construction failure.
+    ///
+    /// # Implements
+    ///
+    /// Policy observability: the read side of the spending-limit budget
+    /// surface (limit, period, spend history, remaining budget).
+    pub async fn get_spending_limit_data(
+        &self,
+        policy: ScAddress,
+        rule_id: u32,
+        smart_account: ScAddress,
+        source_account_strkey: Option<&str>,
+        request_id: String,
+    ) -> Result<(crate::managers::spending_limit_data::SpendingLimitData, u32), SaError> {
+        let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
+        let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
+
+        let invoke_args = vec![ScVal::U32(rule_id), ScVal::Address(smart_account)];
+
+        let sim_result = simulate_read_only_with_ledger(
+            self.primary_rpc_client.url(),
+            policy,
+            "get_spending_limit_data",
+            invoke_args,
+            source_account_strkey,
+            &self.network_passphrase,
+            self.timeout,
+        )
+        .await;
+
+        // Mirrors the `ContextRuleNotFound` decode pattern
+        // (`managers::rules::get_rule`) — the on-chain panic is surfaced as a
+        // simulation `error` string containing `Error(Contract, #3220)`
+        // (optionally augmented with the symbolic `[OZ:SmartAccountNotInstalled]`
+        // name by `augment_with_oz_error_name`). Unlike `get_rule`, absence of
+        // the policy here is an operator mistake, not a benign gap, so this
+        // maps to a typed error rather than `Ok(None)`.
+        let (scval, as_of_ledger) = match sim_result {
+            Ok(v) => v,
+            Err(SaError::DeploymentFailed {
+                phase,
+                redacted_reason,
+            }) if phase == "simulate"
+                && (redacted_reason.contains("SmartAccountNotInstalled")
+                    // Exact bracketed form only: a bare "#3220" substring
+                    // would prefix-over-match hypothetical codes 3220x.
+                    || redacted_reason.contains("Error(Contract, #3220)")) =>
+            {
+                return Err(SaError::SpendingLimitNotInstalled {
+                    rule_id,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted(
+                        smart_account_redacted,
+                    ),
+                    request_id,
+                });
+            }
+            Err(other) => return Err(other),
+        };
+
+        let data = crate::managers::spending_limit_data::decode_spending_limit_data(&scval)?;
+        Ok((data, as_of_ledger))
+    }
+
+    // ── classify_rule_policies ─────────────────────────────────────────────────
+
+    /// Classifies every policy attached to a context rule by its own on-chain
+    /// wasm-hash, for read-only observability (`stellar_rules_get`).
+    ///
+    /// Unlike [`Self::identify_threshold_policy`] / [`Self::identify_spending_limit_policy`]
+    /// (which fail-closed unless the rule's policies resolve to exactly one
+    /// allowlisted contract of the requested kind), this is a per-address,
+    /// best-effort classification for display purposes: each attached policy
+    /// is independently checked against both allowlists, and an unrecognised
+    /// or unobservable hash degrades to [`PolicyIdentifiedKind::Unknown`]
+    /// rather than failing the whole read.
+    ///
+    /// Uses a single-RPC (primary only) wasm-hash fetch — this is a read-only
+    /// display aid, not a security gate, so the two-RPC divergence check used
+    /// by the identify_* functions is not warranted here.
+    ///
+    /// # Arguments
+    ///
+    /// - `smart_account` — the smart-account contract's [`ScAddress`].
+    /// - `rule_id` — the context rule whose policies are classified.
+    /// - `source_account_strkey` — G-strkey of the fee-paying account.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::DeploymentFailed`] — the `get_context_rule` simulation or
+    ///   the `getLedgerEntries` wasm-hash fetch failed. Per-policy hash
+    ///   absence/mismatch does NOT error; it classifies as `Unknown`.
+    ///
+    /// # Implements
+    ///
+    /// Policy observability: `stellar_rules_get`'s `policies: [{ address,
+    /// identified_kind }]` field (GH issue #7).
+    pub async fn classify_rule_policies(
+        &self,
+        smart_account: ScAddress,
+        rule_id: u32,
+        source_account_strkey: Option<&str>,
+    ) -> Result<Vec<(ScAddress, PolicyIdentifiedKind)>, SaError> {
+        let context_rule = self
+            .fetch_context_rule_primary(smart_account, rule_id, source_account_strkey)
+            .await?;
+
+        if context_rule.policies.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let policy_keys: Vec<LedgerKey> = context_rule
+            .policies
+            .iter()
+            .map(contract_instance_key)
+            .collect();
+
+        let primary_hashes = fetch_contract_wasm_hashes(&self.primary_rpc_client, &policy_keys)
+            .await
+            .map_err(|e| SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: format!("policy classification wasm-hash fetch failed: {e}"),
+            })?;
+
+        let spending_limit_hash = stellar_agent_core::hex::decode_hex32(
+            crate::spending_limit_policy::SPENDING_LIMIT_POLICY_WASM_SHA256,
+        )
+        .map_err(|_| SaError::DeploymentFailed {
+            phase: "build",
+            redacted_reason: "SPENDING_LIMIT_POLICY_WASM_SHA256 const is not valid 64-char hex"
+                .to_owned(),
+        })?;
+
+        let mut out = Vec::with_capacity(context_rule.policies.len());
+        for (addr, hash_opt) in context_rule.policies.iter().zip(primary_hashes.iter()) {
+            let kind = match hash_opt {
+                Some(hash) if THRESHOLD_POLICY_WASM_HASHES.iter().any(|h| h == hash) => {
+                    PolicyIdentifiedKind::Threshold
+                }
+                Some(hash) if *hash == spending_limit_hash => PolicyIdentifiedKind::SpendingLimit,
+                _ => PolicyIdentifiedKind::Unknown,
+            };
+            out.push((addr.clone(), kind));
+        }
+
+        Ok(out)
+    }
+
+    // ── fetch_current_ledger ───────────────────────────────────────────────────
+
+    /// Fetches the current ledger sequence via a cheap read-only simulation
+    /// against the smart account's `get_context_rules_count` entrypoint
+    /// (always available; no arguments).
+    ///
+    /// Used by callers that need a shared "as of" ledger stamp for a batch of
+    /// otherwise ledger-oblivious reads (`ContextRuleManager::list_active_context_rules`,
+    /// `ContextRuleManager::get_rule`), e.g. the `stellar_rules_list` /
+    /// `stellar_rules_get` MCP tools' `as_of_ledger` / `expires_in_ledgers` fields.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::DeploymentFailed`] — the simulation failed.
+    /// - [`SaError::AuthEntryConstructionFailed`] — RPC or XDR construction failure.
+    pub async fn fetch_current_ledger(
+        &self,
+        smart_account: ScAddress,
+        source_account_strkey: Option<&str>,
+    ) -> Result<u32, SaError> {
+        let (_scval, ledger) = simulate_read_only_with_ledger(
+            self.primary_rpc_client.url(),
+            smart_account,
+            "get_context_rules_count",
+            vec![],
+            source_account_strkey,
+            &self.network_passphrase,
+            self.timeout,
+        )
+        .await?;
+        Ok(ledger)
     }
 
     // ── identify_verifier ─────────────────────────────────────────────────────
@@ -2987,8 +3711,9 @@ fn signer_pubkey_type_label(pk: &SignerPubkey) -> &'static str {
 
 /// Standalone read-only simulate helper (no auth, no signing).
 ///
-/// When `source_account_strkey` is `None`, uses [`SIMULATE_SENTINEL_G`] with
-/// sequence number `"0"` and skips the `fetch_account` RPC call.
+/// Thin wrapper over [`simulate_read_only_with_ledger`] that discards the
+/// simulation's `latestLedger`; see that function's rustdoc for the full
+/// argument and behavior contract.
 ///
 /// `pub(crate)` — used by `managers::migration::MigrationPlanner` for
 /// `get_context_rules_count` and `get_context_rule` read-only calls.
@@ -3002,6 +3727,42 @@ pub(crate) async fn simulate_read_only(
     network_passphrase: &str,
     timeout: Duration,
 ) -> Result<ScVal, SaError> {
+    simulate_read_only_with_ledger(
+        rpc_url,
+        smart_account,
+        entrypoint,
+        invoke_args,
+        source_account_strkey,
+        network_passphrase,
+        timeout,
+    )
+    .await
+    .map(|(return_val, _latest_ledger)| return_val)
+}
+
+/// Standalone read-only simulate helper (no auth, no signing) that also
+/// returns the simulation's `latestLedger`.
+///
+/// When `source_account_strkey` is `None`, uses [`SIMULATE_SENTINEL_G`] with
+/// sequence number `"0"` and skips the `fetch_account` RPC call.
+///
+/// The returned `u32` is the ledger sequence the RPC node observed while
+/// simulating (`SimulateTransactionResponse::latest_ledger`) — the "as of"
+/// ledger for any budget or expiry computation derived from the return
+/// value. [`simulate_read_only`] is a thin wrapper that discards it for
+/// callers that only need the decoded `ScVal`.
+///
+/// `pub(crate)` — used by `SignersManager::get_spending_limit_data`, which
+/// needs the as-of ledger for `compute_spending_window`.
+pub(crate) async fn simulate_read_only_with_ledger(
+    rpc_url: &str,
+    smart_account: ScAddress,
+    entrypoint: &str,
+    invoke_args: Vec<ScVal>,
+    source_account_strkey: Option<&str>,
+    network_passphrase: &str,
+    timeout: Duration,
+) -> Result<(ScVal, u32), SaError> {
     let auth_payload_err = |reason: String| SaError::AuthEntryConstructionFailed {
         stage: "auth_payload",
         redacted_reason: reason,
@@ -3082,6 +3843,8 @@ pub(crate) async fn simulate_read_only(
         });
     }
 
+    let latest_ledger = sim.latest_ledger;
+
     let return_val = sim
         .results()
         .map_err(|e| SaError::DeploymentFailed {
@@ -3096,7 +3859,7 @@ pub(crate) async fn simulate_read_only(
         })?
         .xdr;
 
-    Ok(return_val)
+    Ok((return_val, latest_ledger))
 }
 
 // ── OnChainContextRule ────────────────────────────────────────────────────────

@@ -12,6 +12,42 @@ use serde::{Deserialize, Serialize};
 use super::signer_set::{BaselineReason, SignerPubkey};
 use crate::observability::RedactedStrkey;
 
+// ── i128 wire encoding ────────────────────────────────────────────────────────
+
+/// Serializes/deserializes `i128` as a decimal string.
+///
+/// `EventKind` is an internally-tagged enum (`#[serde(tag = "kind")]`), which
+/// serde deserializes by first buffering the input into a generic `Content`
+/// tree to peek at the tag. That buffering step has no `i128`/`u128`
+/// representation ("Cannot capture externally tagged enums, `i128` and
+/// `u128`" — `serde::private::de`), so a bare `i128` field on any
+/// internally-tagged variant fails deserialization with "i128 is not
+/// supported" regardless of any per-field `deserialize_with`. Routing the
+/// wire form through a JSON string sidesteps the buffering limitation (a
+/// string is representable in `Content`) and, as a side effect, avoids
+/// precision loss in consumers whose JSON numbers are IEEE-754 doubles
+/// (safe integer range ±2^53) — appropriate for stroop amounts that can
+/// exceed that range.
+mod i128_decimal_str {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S>(value: &i128, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<i128, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse::<i128>()
+            .map_err(|e| serde::de::Error::custom(format!("invalid decimal i128 '{s}': {e}")))
+    }
+}
+
 // ── PolicyDecision ────────────────────────────────────────────────────────────
 
 /// The outcome of a policy-engine evaluation, serialised into each audit entry.
@@ -1216,6 +1252,65 @@ pub enum EventKind {
         rule_id: u32,
         /// On-chain policy ID that was removed.
         policy_id: u32,
+        /// Stellar transaction hash, redacted first-8-last-8.
+        transaction_hash_redacted: String,
+        /// Target smart-account C-strkey, redacted first-5-last-5.
+        smart_account_redacted: RedactedStrkey,
+    },
+
+    /// A spending-limit policy's `spending_limit` value was retuned via
+    /// `smart-account rules set-spending-limit`.
+    ///
+    /// Emitted by `SignersManager::set_spending_limit` after a successful
+    /// on-chain `set_spending_limit(spending_limit, context_rule, smart_account)`
+    /// invocation. Carries both old and new limit values for forensic
+    /// correlation; `period_ledgers` is included because the OZ contract does
+    /// not allow retuning it (immutable post-install — retuning the period
+    /// requires remove-policy + add-policy, which resets rolling spend
+    /// history) and its presence here confirms which policy configuration was
+    /// retuned.
+    ///
+    /// # Field redaction
+    ///
+    /// `smart_account_redacted` is the C-strkey redacted first-5-last-5.
+    /// `policy_address_redacted` is the spending-limit-policy contract
+    /// C-strkey redacted first-5-last-5. `transaction_hash_redacted` is
+    /// first-8-last-8 of the Stellar transaction hash.
+    ///
+    /// `rule_id`, `old_limit`, `new_limit`, and `period_ledgers` are on-chain
+    /// public values — redaction would be performative (visible to any RPC
+    /// observer).
+    ///
+    /// Per-invocation request correlation ID is carried by the top-level
+    /// [`AuditEntry::request_id`](super::entry::AuditEntry::request_id) field.
+    /// This variant intentionally has NO field named `request_id`: `EventKind`
+    /// is flattened into `AuditEntry` via `#[serde(flatten)]`, so a same-named
+    /// variant field would collide with the top-level field on deserialize.
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    SaSpendingLimitRetuned {
+        /// On-chain context rule ID whose spending-limit policy was retuned
+        /// (non-sensitive).
+        rule_id: u32,
+        /// Spending limit before the change, in stroops.
+        ///
+        /// Wire-encoded as a decimal string (`i128_decimal_str`) — see that
+        /// module's rustdoc for why a bare `i128` cannot appear on this
+        /// internally-tagged enum.
+        #[serde(with = "i128_decimal_str")]
+        old_limit: i128,
+        /// Spending limit requested by the caller, in stroops.
+        ///
+        /// Wire-encoded as a decimal string; see `old_limit`.
+        #[serde(with = "i128_decimal_str")]
+        new_limit: i128,
+        /// The policy's rolling-window period in ledgers (unchanged by this
+        /// operation; OZ `set_spending_limit` mutates only the limit).
+        period_ledgers: u32,
+        /// Spending-limit-policy contract C-strkey, redacted first-5-last-5.
+        policy_address_redacted: RedactedStrkey,
         /// Stellar transaction hash, redacted first-8-last-8.
         transaction_hash_redacted: String,
         /// Target smart-account C-strkey, redacted first-5-last-5.
@@ -2929,6 +3024,77 @@ mod tests {
         assert!(
             result.is_err(),
             "missing-field deserialisation must fail for SaPolicyRemoved"
+        );
+    }
+
+    /// Asserts `SaSpendingLimitRetuned` serialises with the correct wire
+    /// discriminant and all required fields, and round-trips cleanly.
+    ///
+    /// Also asserts the serde-flatten field-collision rule: the wire JSON
+    /// must NOT carry a `context.request_id`-shaped duplicate of the
+    /// top-level `AuditEntry::request_id` field — this variant has no field
+    /// named `request_id`.
+    #[test]
+    fn event_kind_sa_spending_limit_retuned_round_trip() {
+        let ev = EventKind::SaSpendingLimitRetuned {
+            rule_id: 4,
+            old_limit: 10_000_000,
+            new_limit: 25_000_000,
+            period_ledgers: 17_280,
+            policy_address_redacted: RedactedStrkey::from_already_redacted("CPOLI...YYYYY"),
+            transaction_hash_redacted: "aabb1122...ccdd3344".to_owned(),
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...BBBBB"),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: EventKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(ev, back, "SaSpendingLimitRetuned must round-trip cleanly");
+        assert!(
+            s.contains("\"sa_spending_limit_retuned\""),
+            "wire discriminant must be 'sa_spending_limit_retuned': {s}"
+        );
+        assert!(
+            s.contains("\"rule_id\""),
+            "rule_id field must be present: {s}"
+        );
+        assert!(
+            s.contains("\"old_limit\""),
+            "old_limit field must be present: {s}"
+        );
+        assert!(
+            s.contains("\"new_limit\""),
+            "new_limit field must be present: {s}"
+        );
+        assert!(
+            s.contains("\"period_ledgers\""),
+            "period_ledgers field must be present: {s}"
+        );
+        assert!(
+            s.contains("\"policy_address_redacted\""),
+            "policy_address_redacted field must be present: {s}"
+        );
+        assert!(
+            s.contains("\"transaction_hash_redacted\""),
+            "transaction_hash_redacted field must be present: {s}"
+        );
+        assert!(
+            s.contains("\"smart_account_redacted\""),
+            "smart_account_redacted field must be present: {s}"
+        );
+        assert!(
+            !s.contains("\"request_id\""),
+            "SaSpendingLimitRetuned must not carry a request_id field (would collide \
+             with AuditEntry's flattened top-level request_id): {s}"
+        );
+    }
+
+    /// `SaSpendingLimitRetuned` with missing fields MUST fail to deserialise.
+    #[test]
+    fn event_kind_sa_spending_limit_retuned_missing_fields_fail() {
+        let json = r#"{"kind":"sa_spending_limit_retuned"}"#;
+        let result: Result<EventKind, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "missing-field deserialisation must fail for SaSpendingLimitRetuned"
         );
     }
 

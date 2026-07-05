@@ -31,6 +31,9 @@ pkg-fmt = "zip"
 [dependencies]
 stellar-agent-core       = { workspace = true }
 stellar-agent-network    = { workspace = true }
+# Smart-account rules observability — SignersManager / ContextRuleManager for
+# the stellar_rules_list / stellar_rules_get read-only tools.
+stellar-agent-smart-account = { workspace = true }
 
 # Blend lending adapter — `lend` verb.
 stellar-agent-blend      = { workspace = true }
@@ -105,6 +108,13 @@ tracing-subscriber = { workspace = true }
 
 # JSON value manipulation for the policy-engine dispatch site.
 serde_json = { workspace = true }
+
+# Serde derive for the rules-observability output structs (Envelope<T: Serialize>).
+serde = { workspace = true }
+
+# Per-request correlation IDs for the rules-observability tools' smart-account
+# manager calls.
+uuid = { workspace = true }
 
 # URL parsing for same-endpoint cross-check diagnostics.
 url = { workspace = true }

@@ -636,6 +636,10 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
                 // No rotation-handoff tracking needed; the hash-chain is
                 // maintained by the surrounding hash check.
             }
+            EventKind::SaSpendingLimitRetuned { .. } => {
+                // No rotation-handoff tracking needed; the hash-chain is
+                // maintained by the surrounding hash check.
+            }
             EventKind::SaMulticallBundleSubmitted { .. } => {
                 // No rotation-handoff tracking needed; the hash-chain is
                 // maintained by the surrounding hash check.
@@ -1202,6 +1206,7 @@ mod tests {
             EventKind::SaVerifierAllowlistAdvisory { .. } => "sa_verifier_allowlist_advisory",
             EventKind::SaPolicyAdded { .. } => "sa_policy_added",
             EventKind::SaPolicyRemoved { .. } => "sa_policy_removed",
+            EventKind::SaSpendingLimitRetuned { .. } => "sa_spending_limit_retuned",
             EventKind::SaMulticallBundleSubmitted { .. } => "sa_multicall_bundle_submitted",
             EventKind::SaMulticallInnerExecuted { .. } => "sa_multicall_inner_executed",
             EventKind::SaMulticallBundleDenied { .. } => "sa_multicall_bundle_denied",
@@ -1413,6 +1418,15 @@ mod tests {
             EventKind::SaPolicyRemoved {
                 rule_id: 9,
                 policy_id: 0,
+                transaction_hash_redacted: "aabb1122...ccdd3344".to_owned(),
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CDABC...12345"),
+            },
+            EventKind::SaSpendingLimitRetuned {
+                rule_id: 11,
+                old_limit: 10_000_000,
+                new_limit: 20_000_000,
+                period_ledgers: 17_280,
+                policy_address_redacted: RedactedStrkey::from_already_redacted("CPOLI...YYYYY"),
                 transaction_hash_redacted: "aabb1122...ccdd3344".to_owned(),
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CDABC...12345"),
             },
@@ -1761,6 +1775,7 @@ mod tests {
                 "sa_verifier_allowlist_advisory",
                 "sa_policy_added",
                 "sa_policy_removed",
+                "sa_spending_limit_retuned",
                 "sa_multicall_bundle_submitted",
                 "sa_multicall_inner_executed",
                 "sa_multicall_bundle_denied",

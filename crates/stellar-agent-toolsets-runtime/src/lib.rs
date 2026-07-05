@@ -978,6 +978,50 @@ mod tests {
         assert_eq!(tool, "stellar_pay");
     }
 
+    // ── Happy-path: ReadRules → stellar_rules_list / stellar_rules_get ───────
+
+    /// A toolset granting ONLY `read-rules` resolves exactly the two
+    /// rules-observability tools through the runtime grant path
+    /// (`check_toolset_action` → `resolve_action` → `grants_for_capability`)
+    /// — the offline guard against the `grants_for_capability` `_ => &[]`
+    /// wildcard silently swallowing the new capability.
+    #[test]
+    fn read_rules_grants_exactly_stellar_rules_list_and_get() {
+        let caps = stellar_agent_toolsets::parse_capability_value_pub("read-rules").unwrap();
+
+        let list_tool = check_toolset_action("stellar_rules_list", &caps, &[]).unwrap();
+        assert_eq!(list_tool, "stellar_rules_list");
+
+        let get_tool = check_toolset_action("stellar_rules_get", &caps, &[]).unwrap();
+        assert_eq!(get_tool, "stellar_rules_get");
+
+        // Negative: read-rules must NOT grant any other matrix tool.
+        for other in matrix::ALL_MATRIX_TOOL_NAMES {
+            if *other == "stellar_rules_list" || *other == "stellar_rules_get" {
+                continue;
+            }
+            let err = check_toolset_action(other, &caps, &[]).unwrap_err();
+            assert!(
+                matches!(err, ToolsetRuntimeError::CapabilityNotDeclared { .. }),
+                "read-rules must not grant '{other}'; got {err:?}"
+            );
+        }
+    }
+
+    /// A toolset that does NOT declare `read-rules` cannot invoke either
+    /// rules-observability tool.
+    #[test]
+    fn toolset_without_read_rules_cannot_invoke_rules_tools() {
+        let caps = stellar_agent_toolsets::parse_capability_value_pub("read-balance").unwrap();
+        for tool in ["stellar_rules_list", "stellar_rules_get"] {
+            let err = check_toolset_action(tool, &caps, &[]).unwrap_err();
+            assert!(
+                matches!(err, ToolsetRuntimeError::CapabilityNotDeclared { .. }),
+                "expected CapabilityNotDeclared for '{tool}', got: {err:?}"
+            );
+        }
+    }
+
     // ── list_pinned_toolsets: empty toolsets_root ─────────────────────────────────
 
     #[test]

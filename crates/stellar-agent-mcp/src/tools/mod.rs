@@ -75,3 +75,5 @@ pub(crate) mod dex_trade;
 pub(crate) mod trustline;
 
 pub(crate) mod claim;
+// Smart-account rules observability — stellar_rules_list / stellar_rules_get.
+pub(crate) mod rules;
