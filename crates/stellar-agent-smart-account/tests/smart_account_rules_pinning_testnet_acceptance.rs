@@ -1076,7 +1076,7 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
 
     let definition = ContextRuleDefinition::new(
         RuleContext::Default,
-        "p4-blocker1-test".to_owned(),
+        "pin-verify-test".to_owned(),
         None,
         vec![ContextRuleSignerInput::Delegated {
             address: signer_addr,
