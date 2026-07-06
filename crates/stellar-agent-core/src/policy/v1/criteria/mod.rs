@@ -29,6 +29,7 @@ use crate::policy::v1::EvalContext;
 use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
 use crate::policy::{DenyReason, PolicyError};
 
+pub(crate) mod amount_extract;
 pub mod bundle_aggregate_cap;
 pub mod bundle_per_period_cap;
 pub mod bundle_per_tx_cap;

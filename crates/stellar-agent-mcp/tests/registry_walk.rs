@@ -1235,3 +1235,219 @@ fn stellar_rule_create_commit_annotations_correct() {
         "stellar_rule_create_commit: chain_id_required must be true"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wire-format drift guard: every tool INPUT schema must not carry a raw
+// integer/number-typed value-denominated property.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A JSON-Schema property discovered under a value-denominated-looking name
+/// that is typed as a raw integer/number rather than a string.
+#[derive(Debug)]
+struct NumericValueField {
+    tool_name: String,
+    field_name: String,
+    json_type: String,
+}
+
+/// Exact field names allowed to be integer/number-typed despite matching the
+/// value-denominated name pattern below. Each entry is a COUNT-like or
+/// budget-like field that is genuinely not a stroop/base-unit amount, or a
+/// third-party passthrough field explicitly out of scope for this wire
+/// convention (see the crate-level amount-wire rustdoc for the class rule).
+///
+/// Built empirically: run `wire_drift_guard_input_schemas_have_no_raw_numeric_amount_fields`
+/// with this set emptied to regenerate, then re-populate with a one-line
+/// justification per entry.
+const ALLOWED_NUMERIC_FIELD_NAMES: &[(&str, &str)] = &[];
+
+/// Returns `true` if a JSON-Schema `"type"` value denotes `"integer"` or
+/// `"number"`.
+///
+/// `schemars` (draft 2020-12) renders a required field's type as a bare
+/// string (`"type": "integer"`) but an `Option<T>` field's type as an array
+/// including `"null"` (`"type": ["integer", "null"]`) — both forms must be
+/// checked, or every optional numeric field silently evades this guard.
+fn schema_type_is_numeric(type_value: &serde_json::Value) -> bool {
+    match type_value {
+        serde_json::Value::String(s) => s == "integer" || s == "number",
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .any(|v| v.as_str().is_some_and(|s| s == "integer" || s == "number")),
+        _ => false,
+    }
+}
+
+/// Resolves a `{"$ref": "#/$defs/Name"}` node against `root`'s `$defs` map.
+///
+/// Returns `None` when `node` is not a `$ref` object or the target is absent
+/// from `$defs` (schemars always emits a resolvable local `$defs` ref for
+/// this crate's schemas, so an absent target indicates a walker bug, not a
+/// production schema issue — returning `None` here simply skips the branch
+/// rather than panicking).
+fn resolve_ref<'a>(
+    root: &'a serde_json::Value,
+    node: &serde_json::Value,
+) -> Option<&'a serde_json::Value> {
+    let ref_path = node.get("$ref")?.as_str()?;
+    let name = ref_path.strip_prefix("#/$defs/")?;
+    root.get("$defs")?.get(name)
+}
+
+/// Returns `true` if `node` (or, when `node` is a `$ref`, its resolved
+/// target) is directly typed as `"integer"`/`"number"` — checked via
+/// [`schema_type_is_numeric`] on `node`'s own `"type"` key only (does not
+/// recurse into nested `anyOf`; the caller handles the `anyOf` fan-out).
+fn node_is_numeric(root: &serde_json::Value, node: &serde_json::Value) -> bool {
+    if let Some(type_value) = node.get("type")
+        && schema_type_is_numeric(type_value)
+    {
+        return true;
+    }
+    if let Some(resolved) = resolve_ref(root, node) {
+        return node_is_numeric(root, resolved);
+    }
+    false
+}
+
+/// Recursively walks a JSON-Schema node, looking for `properties` entries
+/// whose name matches `(?i)(_stroops|amount|balance|limit|fee|budget|qty|spend|price)`
+/// and whose type resolves to `"integer"`/`"number"` (rather than
+/// `"string"`), across every representation `schemars` (draft 2020-12) emits:
+///
+/// - Required field: bare `"type": "integer"`.
+/// - `Option<primitive>`: `"type": ["integer", "null"]`.
+/// - `Option<RefType>` / enum-shaped field: `"anyOf": [{"$ref": "..."}, {"type": "null"}]`
+///   — each `anyOf` branch is checked, resolving `$ref` against the tool's
+///   own `$defs` map.
+///
+/// Also walks into `items` (array schemas) and `properties` (nested object
+/// schemas) so a `Vec<Struct>` or nested-object input field is covered, AND
+/// descends into each `anyOf` branch's `$ref`-resolved target so a field
+/// shaped `Option<Struct { amount: u64 }>` — an object hidden behind an
+/// `anyOf`/`$ref` indirection rather than exposed as a direct `properties`
+/// entry — cannot evade the guard.
+fn walk_schema_for_numeric_value_fields(
+    tool_name: &str,
+    root: &serde_json::Value,
+    schema: &serde_json::Value,
+    findings: &mut Vec<NumericValueField>,
+) {
+    let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) else {
+        return;
+    };
+
+    for (field_name, field_schema) in properties {
+        if matches_value_denominated_name(field_name) {
+            let mut hit_type: Option<String> = None;
+            if let Some(type_value) = field_schema.get("type")
+                && schema_type_is_numeric(type_value)
+            {
+                hit_type = Some(type_value.to_string());
+            }
+            if hit_type.is_none()
+                && let Some(branches) = field_schema.get("anyOf").and_then(|v| v.as_array())
+            {
+                for branch in branches {
+                    if node_is_numeric(root, branch) {
+                        hit_type = Some(format!("anyOf branch: {branch}"));
+                        break;
+                    }
+                }
+            }
+            if let Some(json_type) = hit_type {
+                findings.push(NumericValueField {
+                    tool_name: tool_name.to_owned(),
+                    field_name: field_name.clone(),
+                    json_type,
+                });
+            }
+        }
+        // Recurse into nested object schemas.
+        walk_schema_for_numeric_value_fields(tool_name, root, field_schema, findings);
+        // Recurse into each `anyOf` branch's `$ref`-resolved target (e.g.
+        // `Option<Struct>`, where the struct's own `amount`-shaped fields
+        // live behind the ref, not as direct properties on this node).
+        if let Some(branches) = field_schema.get("anyOf").and_then(|v| v.as_array()) {
+            for branch in branches {
+                if let Some(resolved) = resolve_ref(root, branch) {
+                    walk_schema_for_numeric_value_fields(tool_name, root, resolved, findings);
+                } else {
+                    walk_schema_for_numeric_value_fields(tool_name, root, branch, findings);
+                }
+            }
+        }
+        // Recurse into array item schemas (e.g. Vec<Struct> fields).
+        if let Some(items) = field_schema.get("items") {
+            walk_schema_for_numeric_value_fields(tool_name, root, items, findings);
+        }
+    }
+}
+
+/// Case-insensitive match against the value-denominated name pattern:
+/// `(?i)(_stroops|amount|balance|limit|fee|budget|qty|spend|price)`.
+fn matches_value_denominated_name(field_name: &str) -> bool {
+    let lower = field_name.to_ascii_lowercase();
+    [
+        "_stroops", "amount", "balance", "limit", "fee", "budget", "qty", "spend", "price",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// Wire-format drift guard (input schemas only).
+///
+/// Walks every registered tool's rmcp `input_schema` and fails if any
+/// property whose name matches the value-denominated pattern above is typed
+/// as a raw JSON integer/number rather than a string. A JSON number backed by
+/// `f64` cannot represent a stroop/base-unit amount exactly once it exceeds
+/// `2^53`; every value-denominated MCP tool input MUST be a decimal string
+/// (see `amount_wire.rs` / `stellar_agent_core::wire_stroops` for the
+/// convention this enforces).
+///
+/// # Scope
+///
+/// This guard covers INPUT schemas only. It does NOT protect the reader/output
+/// side of the convention (a tool could still emit a numeric-typed field in
+/// its `CallToolResult` JSON body — rmcp tools do not declare
+/// `#[tool(output_schema)]` here, so there is no machine-checkable output
+/// schema to walk). Response-side conformance is pinned by the per-tool wire
+/// shape tests added alongside the string-encoding migration (see
+/// `pay_integration.rs`, `create_account_integration.rs`,
+/// `trustline_integration.rs`, `claim_integration.rs`, and the `wire_stroops`
+/// unit tests) — this guard and those tests are complementary, not
+/// substitutes for each other.
+#[test]
+fn wire_drift_guard_input_schemas_have_no_raw_numeric_amount_fields() {
+    let allowed: std::collections::HashSet<&str> = ALLOWED_NUMERIC_FIELD_NAMES
+        .iter()
+        .map(|(name, _reason)| *name)
+        .collect();
+
+    let mut findings = Vec::new();
+    for tool in WalletServer::all_registered_tools() {
+        let schema = serde_json::Value::Object((*tool.input_schema).clone());
+        walk_schema_for_numeric_value_fields(&tool.name, &schema, &schema, &mut findings);
+    }
+
+    let unallowed: Vec<&NumericValueField> = findings
+        .iter()
+        .filter(|f| !allowed.contains(f.field_name.as_str()))
+        .collect();
+
+    let summary: Vec<String> = unallowed
+        .iter()
+        .map(|f| format!("{}.{} (type: {})", f.tool_name, f.field_name, f.json_type))
+        .collect();
+
+    assert!(
+        unallowed.is_empty(),
+        "the following INPUT schema properties look value-denominated \
+         (name matches _stroops/amount/balance/limit/fee/budget/qty/spend/price) \
+         but are typed as a raw JSON {{integer,number}} rather than a decimal \
+         string: {summary:#?}\n\
+         Either retype the field as a decimal string on the wire, or — if it is \
+         genuinely a count/id/budget rather than a stroop amount — add its exact \
+         field name to ALLOWED_NUMERIC_FIELD_NAMES with a one-line justification."
+    );
+}

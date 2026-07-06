@@ -380,8 +380,8 @@ async fn simulate_happy_path_returns_envelope_nonce_and_preview() {
     assert_eq!(
         preview
             .get("amount_stroops")
-            .and_then(serde_json::Value::as_i64),
-        Some(CLAIM_AMOUNT_STROOPS)
+            .and_then(serde_json::Value::as_str),
+        Some(CLAIM_AMOUNT_STROOPS.to_string().as_str())
     );
 }
 
@@ -837,5 +837,186 @@ async fn commit_entry_gone_returns_balance_not_found() {
         call_result_text(&result).contains("claim.balance_not_found"),
         "commit re-fetch of a vanished entry must return claim.balance_not_found, got: {}",
         call_result_text(&result)
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Full round trip: simulate → commit → submit succeeds; the decimal-string
+// wire encoding survives every hop, not just each phase in isolation.
+//
+// Uses a freshly generated signer keypair (not `SOURCE_G`, whose private key
+// is unknown) as the claimant, so the commit step can reach real keyring
+// signing and a mocked submit.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Derives the G-strkey for a 32-byte ed25519 seed.
+fn gstrkey_for_seed(seed: [u8; 32]) -> String {
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let vk = signing_key.verifying_key();
+    stellar_strkey::ed25519::PublicKey(vk.to_bytes())
+        .to_string()
+        .to_string()
+}
+
+/// Derives the S-strkey (seed strkey) for a 32-byte ed25519 seed.
+fn sstrkey_for_seed(seed: [u8; 32]) -> String {
+    stellar_strkey::ed25519::PrivateKey(seed)
+        .as_unredacted()
+        .to_string()
+        .to_string()
+}
+
+/// RPC responder serving the claimable-balance entry and the claimant's
+/// source account identically on both the simulate fetch and the commit
+/// re-fetch (so the rebuilt envelope is byte-identical — the divergence
+/// check passes), followed by `sendTransaction` (PENDING) and
+/// `getTransaction` (SUCCESS).
+struct ClaimSubmitSuccessRpcResponder {
+    cb_key_xdr: String,
+    entry_xdr: String,
+    account_key_xdr: String,
+    account_xdr: String,
+}
+
+#[async_trait]
+impl Respond for ClaimSubmitSuccessRpcResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let (req_id, method) = request_id_and_method(request);
+        let result = match method.as_str() {
+            "getLedgerEntries" => {
+                let body = String::from_utf8_lossy(&request.body);
+                if body.contains(&self.cb_key_xdr) {
+                    ledger_entries_result(&self.cb_key_xdr, &self.entry_xdr)
+                } else if body.contains(&self.account_key_xdr) {
+                    ledger_entries_result(&self.account_key_xdr, &self.account_xdr)
+                } else {
+                    empty_ledger_entries_result()
+                }
+            }
+            "sendTransaction" => serde_json::json!({
+                "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "status": "PENDING",
+                "latestLedger": 1001,
+                "latestLedgerCloseTime": "1234567890"
+            }),
+            "getTransaction" => serde_json::json!({
+                "status": "SUCCESS",
+                "ledger": 1005,
+                "txHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }),
+            _ => serde_json::json!({}),
+        };
+        json_rpc_response(&req_id, &result)
+    }
+}
+
+/// End-to-end success path: `stellar_claim` (simulate) mints a nonce;
+/// `stellar_claim_commit` reuses the exact `(nonce, expires_at_unix_ms,
+/// envelope_xdr)` triple, signs via a keyring-backed signer, and submits.
+/// Asserts the committed `amount_stroops` is the decimal string carried
+/// through the entire round trip, not just that each phase in isolation
+/// accepts the new wire shape.
+#[tokio::test]
+#[serial]
+async fn claim_commit_full_round_trip_succeeds_with_string_encoded_amount() {
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key();
+
+    // Fresh signer keypair; populates the mock keyring's default signer entry
+    // ("svc", "acct" — matching `testnet_profile_with_rpc`'s
+    // `Profile::builder_testnet("svc", "acct", ...)`) with its S-strkey. This
+    // account is both the claimable-balance claimant and the commit signer.
+    let seed = [0x45_u8; 32];
+    let claimant_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+
+    let id = test_balance_id();
+    let cb_key_xdr = claim_key_xdr(&id);
+    let entry_xdr = claim_entry_xdr(
+        &id,
+        &claimant_g,
+        stellar_xdr::ClaimPredicate::Unconditional,
+        CLAIM_AMOUNT_STROOPS,
+    );
+    let account_key_xdr = account_ledger_key_xdr(&claimant_g);
+    let account_xdr =
+        account_entry_xdr_with_seq(&claimant_g, SOURCE_BALANCE_STROOPS, 0, SOURCE_SEQ);
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ClaimSubmitSuccessRpcResponder {
+            cb_key_xdr,
+            entry_xdr,
+            account_key_xdr,
+            account_xdr,
+        })
+        .mount(&mock_server)
+        .await;
+
+    let profile = testnet_profile_with_rpc(&mock_server.uri());
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    // ── Simulate ───────────────────────────────────────────────────────────
+    let simulate_args = StellarClaimArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        balance_id: "ab".repeat(32),
+        source_account: Some(claimant_g.clone()),
+    };
+    let sim_result = server
+        .call_stellar_claim(simulate_args)
+        .await
+        .expect("simulate must not error");
+    assert_ne!(sim_result.is_error, Some(true), "simulate must succeed");
+    let sim_json = call_result_json(&sim_result);
+    let sim_data = sim_json.get("data").expect("simulate success carries data");
+
+    assert_eq!(
+        sim_data.pointer("/preview/amount_stroops"),
+        Some(&serde_json::json!(CLAIM_AMOUNT_STROOPS.to_string())),
+        "preview must report amount_stroops as a decimal string: {sim_data}"
+    );
+
+    let (nonce, expires_at_unix_ms, envelope_xdr) = extract_commit_triple(&sim_result);
+
+    // ── Commit ─────────────────────────────────────────────────────────────
+    let commit_args = StellarClaimCommitArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        balance_id: "ab".repeat(32),
+        source_account: Some(claimant_g),
+        nonce,
+        expires_at_unix_ms,
+        envelope_xdr,
+        approval_nonce: None,
+        approval_attestation: None,
+    };
+    let commit_result = server
+        .call_stellar_claim_commit(commit_args)
+        .await
+        .expect("commit must not error");
+    let commit_json = call_result_json(&commit_result);
+    assert_ne!(
+        commit_result.is_error,
+        Some(true),
+        "commit must succeed, got: {commit_json}"
+    );
+    let commit_data = commit_json
+        .get("data")
+        .expect("commit success carries data");
+    assert!(
+        commit_data
+            .get("tx_hash")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "committed response must carry tx_hash: {commit_data}"
+    );
+    assert_eq!(
+        commit_data
+            .get("ledger")
+            .and_then(serde_json::Value::as_u64),
+        Some(1005),
+        "committed response must carry the submitted ledger: {commit_data}"
     );
 }

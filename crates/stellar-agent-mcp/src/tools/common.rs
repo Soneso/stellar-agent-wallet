@@ -208,8 +208,8 @@ pub(crate) fn enforce_classic_fee_cap(
         return Err(ErrorData::invalid_params(
             "fees.percentile_exceeds_cap",
             Some(serde_json::json!({
-                "selected_fee_per_op_stroops": per_op_stroops,
-                "classic_max_fee_per_op_stroops": cap,
+                "selected_fee_per_op_stroops": per_op_stroops.to_string(),
+                "classic_max_fee_per_op_stroops": cap.to_string(),
                 "selected_fee_percentile": selected_percentile,
             })),
         ));

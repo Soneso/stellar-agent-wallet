@@ -36,11 +36,18 @@
 //!
 //! # Tool argument parsing
 //!
-//! For `stellar_pay`: reads `args["amount"]` (a `"N.NNNNNNN XLM"` string) and
-//! `args["asset"]` (e.g. `"native"` or `"CODE:Gissuer"`).
+//! For `stellar_pay` / `stellar_pay_commit`: reads `args["amount_stroops"]`
+//! (a decimal string; a legacy JSON number is tolerated for version-crossing)
+//! and `args["asset"]` (e.g. `"native"` or `"CODE:Gissuer"`). Falls back to
+//! the legacy `args["amount"]` (a `"N.NNNNNNN XLM"` string) only when
+//! `amount_stroops` is absent — every args shape this criterion actually
+//! receives in production (simulate-time `args_value` and commit-time
+//! `authoritative_args`) carries `amount_stroops`.
 //!
-//! For `stellar_create_account`: reads `args["starting_balance"]` and treats
-//! the asset as implicitly native.
+//! For `stellar_create_account` / `stellar_create_account_commit`: reads
+//! `args["starting_balance_stroops"]` the same way (falling back to the
+//! legacy `args["starting_balance"]`) and treats the asset as implicitly
+//! native.
 //!
 //! For `stellar_axelar_bridge`: reads `args["qty"]` (a raw i128 on-chain
 //! integer) and `args["token_address"]` (the resolved C-strkey from the
@@ -53,6 +60,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
 use crate::policy::v1::criteria::Criterion;
+use crate::policy::v1::criteria::amount_extract::extract_pay_or_create_account_stroops;
 use crate::policy::v1::criteria::state_store::StateKey;
 use crate::policy::{DenyReason, PolicyError};
 
@@ -235,14 +243,23 @@ impl Criterion for PerPeriodCapCriterion {
 
         let (attempted_stroops, tool_asset) = match tool_name {
             "stellar_pay" | "stellar_pay_commit" => {
-                let amount_str = extract_string_field(ctx, "amount")?;
                 let asset_str = extract_string_field(ctx, "asset")?;
-                let stroops = parse_amount_to_stroops(&amount_str, ctx)?;
+                let stroops = extract_pay_or_create_account_stroops(ctx, "per_period_cap")?
+                    .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+                        detail: format!(
+                            "per_period_cap: missing amount_stroops/amount field for tool '{tool_name}'"
+                        ),
+                    })?;
                 (stroops, asset_normalise(asset_str))
             }
             "stellar_create_account" | "stellar_create_account_commit" => {
-                let amount_str = extract_string_field(ctx, "starting_balance")?;
-                let stroops = parse_amount_to_stroops(&amount_str, ctx)?;
+                let stroops = extract_pay_or_create_account_stroops(ctx, "per_period_cap")?
+                    .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+                        detail: format!(
+                            "per_period_cap: missing starting_balance_stroops/starting_balance \
+                             field for tool '{tool_name}'"
+                        ),
+                    })?;
                 (stroops, "native".to_owned())
             }
             "stellar_axelar_bridge" => {
@@ -368,20 +385,6 @@ fn extract_string_field(ctx: &EvalContext<'_>, field: &str) -> Result<String, Po
             detail: format!(
                 "per_period_cap: missing or non-string field '{}' in args for tool '{}'",
                 field, ctx.tool.name
-            ),
-        })
-}
-
-fn parse_amount_to_stroops(amount_str: &str, ctx: &EvalContext<'_>) -> Result<i64, PolicyError> {
-    if let Ok(amt) = crate::amount::StellarAmount::parse_with_unit(amount_str) {
-        return Ok(amt.as_stroops());
-    }
-    crate::amount::StellarAmount::parse_stroops(amount_str)
-        .map(|a| a.as_stroops())
-        .map_err(|e| PolicyError::CriterionEvaluationFailed {
-            detail: format!(
-                "per_period_cap: failed to parse amount '{}' for tool '{}': {e}",
-                amount_str, ctx.tool.name
             ),
         })
 }
@@ -829,6 +832,146 @@ mod tests {
         assert!(
             matches!(result, Err(PolicyError::CriterionEvaluationFailed { .. })),
             "missing qty must return CriterionEvaluationFailed: {result:?}"
+        );
+    }
+
+    // ── Real production args shapes (resolved-key re-point) ────────────────
+
+    /// Simulate-time `stellar_pay` args_value shape when the caller used
+    /// `amount_in_stroops`.
+    #[test]
+    #[serial]
+    fn pay_simulate_amount_in_stroops_shape_cap_under_passes() {
+        let tool = make_tool("stellar_pay");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let w = Window::parse("1d").unwrap();
+        let criterion = PerPeriodCapCriterion::new("native".into(), w, 1_000_000_000); // 100 XLM
+        let args = json!({
+            "chain_id": "stellar:testnet",
+            "source": "GAAA",
+            "destination": "GBBB",
+            "amount": serde_json::Value::Null,
+            "amount_in_stroops": "500000000",
+            "amount_stroops": "500000000",
+            "asset": "native",
+        });
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(result.is_none(), "50 XLM should pass a 100 XLM period cap");
+    }
+
+    /// Commit-time `stellar_pay_commit` authoritative_args shape, exactly as
+    /// `envelope_decode::decode_authoritative_args` emits it.
+    #[test]
+    #[serial]
+    fn pay_commit_authoritative_args_shape_cap_over_denies() {
+        let tool = make_tool("stellar_pay_commit");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let w = Window::parse("1d").unwrap();
+        let criterion = PerPeriodCapCriterion::new("native".into(), w, 1_000_000_000); // 100 XLM
+        let args = json!({
+            "source": "GAAA",
+            "total_fee_stroops": 100u32,
+            "destination": "GBBB",
+            "amount_stroops": "1500000000",
+            "asset": "XLM",
+            "memo": serde_json::Value::Null,
+        });
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::PerPeriodCapExceeded { .. })),
+            "150 XLM commit should be denied by a 100 XLM period cap; this is the \
+             pre-existing fail-closed bug this re-point fixes (authoritative_args never \
+             carried 'amount', only 'amount_stroops'): {result:?}"
+        );
+    }
+
+    /// Simulate-time `stellar_create_account` args_value shape: ONLY
+    /// `starting_balance_stroops` is ever present.
+    #[test]
+    #[serial]
+    fn create_account_simulate_resolved_only_shape_cap_over_denies() {
+        let tool = make_tool("stellar_create_account");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let w = Window::parse("1d").unwrap();
+        let criterion = PerPeriodCapCriterion::new("native".into(), w, 1_000_000_000); // 100 XLM
+        let args = json!({
+            "chain_id": "stellar:testnet",
+            "source": "GAAA",
+            "destination": "GBBB",
+            "starting_balance_stroops": "1500000000",
+        });
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::PerPeriodCapExceeded { .. })),
+            "150 XLM should be denied by a 100 XLM period cap; this is the pre-existing \
+             fail-closed bug this re-point fixes: {result:?}"
+        );
+    }
+
+    /// Commit-time `stellar_create_account_commit` authoritative_args shape.
+    #[test]
+    #[serial]
+    fn create_account_commit_authoritative_args_shape_cap_over_denies() {
+        let tool = make_tool("stellar_create_account_commit");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let w = Window::parse("1d").unwrap();
+        let criterion = PerPeriodCapCriterion::new("native".into(), w, 1_000_000_000); // 100 XLM
+        let args = json!({
+            "source": "GAAA",
+            "total_fee_stroops": 100u32,
+            "destination": "GBBB",
+            "starting_balance_stroops": "1500000000",
+        });
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::PerPeriodCapExceeded { .. })),
+            "150 XLM commit should be denied by a 100 XLM period cap: {result:?}"
+        );
+    }
+
+    /// Regression: the legacy unit-string-only shape must still evaluate to
+    /// the identical verdict as before this re-point.
+    #[test]
+    #[serial]
+    fn legacy_amount_only_shape_still_evaluates_identically() {
+        let tool = make_tool("stellar_pay");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let w = Window::parse("1d").unwrap();
+        let criterion = PerPeriodCapCriterion::new("native".into(), w, 1_000_000_000); // 100 XLM
+        let args = json!({ "amount": "150 XLM", "asset": "native" });
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::PerPeriodCapExceeded { .. })),
+            "legacy-only shape must still deny 150 XLM against a 100 XLM period cap"
+        );
+    }
+
+    /// Version-crossing: a resolved key carrying a legacy JSON number must
+    /// still parse correctly.
+    #[test]
+    #[serial]
+    fn version_crossing_numeric_amount_stroops_still_parses() {
+        let tool = make_tool("stellar_pay");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let w = Window::parse("1d").unwrap();
+        let criterion = PerPeriodCapCriterion::new("native".into(), w, 1_000_000_000); // 100 XLM
+        let args = json!({ "amount_stroops": 1_500_000_000i64, "asset": "native" });
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::PerPeriodCapExceeded { .. })),
+            "numeric amount_stroops must still be denied by the period cap"
         );
     }
 }

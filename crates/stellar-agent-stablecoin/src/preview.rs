@@ -56,7 +56,17 @@ pub struct TrustlinePreview {
     ///
     /// `None` indicates the default maximum limit (`i64::MAX`, per Stellar
     /// convention when no explicit limit is supplied).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    ///
+    /// Encoded as a decimal string on the wire (`serde(with =
+    /// "stellar_agent_core::wire_stroops::i64_opt")`): a JSON number backed
+    /// by `f64` cannot represent an `i64` stroop limit exactly once it
+    /// exceeds `2^53`. The field's Rust type stays `Option<i64>` for
+    /// internal use.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "stellar_agent_core::wire_stroops::i64_opt"
+    )]
     pub limit_stroops: Option<i64>,
 
     /// Whether this asset was resolved through the pin table.
@@ -238,6 +248,42 @@ mod tests {
         let limit = 1_000_000_000i64; // 100 USDC at 7 decimals
         let preview = TrustlinePreview::build(asset, Some(limit), Some(&flags), false);
         assert_eq!(preview.limit_stroops, Some(1_000_000_000));
+
+        let json = serde_json::to_value(&preview).unwrap();
+        assert_eq!(
+            json["limit_stroops"], "1000000000",
+            "limit_stroops must serialize as a decimal string"
+        );
+    }
+
+    #[test]
+    fn preview_limit_stroops_omitted_from_json_when_none() {
+        let asset = make_asset("USDC", TESTNET_USDC_ISSUER, true);
+        let flags = AccountFlagsView::from_raw(0x0);
+        let preview = TrustlinePreview::build(asset, None, Some(&flags), false);
+
+        let json = serde_json::to_value(&preview).unwrap();
+        assert!(json.get("limit_stroops").is_none());
+
+        // The `with = "...::i64_opt"` custom deserializer suppresses serde's
+        // implicit missing-field-means-None for `Option<T>`; `#[serde(default)]`
+        // restores it. Without it, deserializing this None-produced,
+        // field-omitted JSON would fail with "missing field `limit_stroops`".
+        let round_tripped: TrustlinePreview = serde_json::from_value(json)
+            .expect("omitted limit_stroops must deserialize back to None, not error");
+        assert_eq!(round_tripped.limit_stroops, None);
+    }
+
+    #[test]
+    fn preview_limit_stroops_round_trips_i64_max() {
+        let asset = make_asset("USDC", TESTNET_USDC_ISSUER, true);
+        let flags = AccountFlagsView::from_raw(0x0);
+        let preview = TrustlinePreview::build(asset, Some(i64::MAX), Some(&flags), false);
+
+        let json = serde_json::to_value(&preview).unwrap();
+        assert_eq!(json["limit_stroops"], "9223372036854775807");
+        let round_tripped: TrustlinePreview = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped.limit_stroops, Some(i64::MAX));
     }
 
     #[test]

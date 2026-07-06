@@ -41,35 +41,58 @@ pub enum RpcUrlError {
 
 /// Per-fee-class distribution returned by `getFeeStats`. Stroops are
 /// per-operation, not per-transaction.
+///
+/// Every fee-denominated field (`max`, `min`, `mode`, `p10`..`p99`) is
+/// encoded as a decimal string on the wire (`serde(with =
+/// "stellar_agent_core::wire_stroops::u64")`): a JSON number backed by
+/// `f64` cannot represent a `u64` stroop amount exactly once it exceeds
+/// `2^53`. `transaction_count` and `ledger_count` are counts, not
+/// stroop amounts, and stay plain JSON numbers. The Rust field types stay
+/// `u64` throughout — `select()`/`from_rpc` arithmetic is unaffected — only
+/// the wire encoding changes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeeDistribution {
     /// Maximum fee observed.
+    #[serde(with = "stellar_agent_core::wire_stroops::u64")]
     pub max: u64,
     /// Minimum fee observed.
+    #[serde(with = "stellar_agent_core::wire_stroops::u64")]
     pub min: u64,
     /// Most frequently observed fee.
+    #[serde(with = "stellar_agent_core::wire_stroops::u64")]
     pub mode: u64,
     /// 10th percentile.
+    #[serde(with = "stellar_agent_core::wire_stroops::u64")]
     pub p10: u64,
     /// 20th percentile.
+    #[serde(with = "stellar_agent_core::wire_stroops::u64")]
     pub p20: u64,
     /// 30th percentile.
+    #[serde(with = "stellar_agent_core::wire_stroops::u64")]
     pub p30: u64,
     /// 40th percentile.
+    #[serde(with = "stellar_agent_core::wire_stroops::u64")]
     pub p40: u64,
     /// 50th percentile.
+    #[serde(with = "stellar_agent_core::wire_stroops::u64")]
     pub p50: u64,
     /// 60th percentile.
+    #[serde(with = "stellar_agent_core::wire_stroops::u64")]
     pub p60: u64,
     /// 70th percentile.
+    #[serde(with = "stellar_agent_core::wire_stroops::u64")]
     pub p70: u64,
     /// 80th percentile.
+    #[serde(with = "stellar_agent_core::wire_stroops::u64")]
     pub p80: u64,
     /// 90th percentile.
+    #[serde(with = "stellar_agent_core::wire_stroops::u64")]
     pub p90: u64,
     /// 95th percentile.
+    #[serde(with = "stellar_agent_core::wire_stroops::u64")]
     pub p95: u64,
     /// 99th percentile.
+    #[serde(with = "stellar_agent_core::wire_stroops::u64")]
     pub p99: u64,
     /// Transactions included in the distribution.
     pub transaction_count: u64,
@@ -207,6 +230,11 @@ pub enum ClassicFeeChoice {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClassicFeeSelection {
     /// Selected per-operation fee in stroops.
+    ///
+    /// Encoded as a decimal string on the wire (`serde(with =
+    /// "stellar_agent_core::wire_stroops::u32")`). The Rust field type
+    /// stays `u32` — arithmetic call sites are unaffected.
+    #[serde(with = "stellar_agent_core::wire_stroops::u32")]
     pub per_op_stroops: u32,
     /// Selection label (`explicit`, `profile_default`, or percentile label).
     pub selected_fee_percentile: String,

@@ -473,7 +473,7 @@ impl WalletServer {
             .to_owned();
         let amount_stroops = authoritative_args
             .get("amount_stroops")
-            .and_then(|v| v.as_i64())
+            .and_then(crate::tools::amount_wire::value_as_stroops_i64)
             .unwrap_or(0_i64);
 
         // Validate: destination must be a G-strkey (ed25519 public key).

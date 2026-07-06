@@ -104,17 +104,20 @@ A mismatch is refused before any network call.
   an explicit unit suffix, never JSON numbers. Example: `"10 XLM"`, `"1 XLM"`.
 - Asset descriptors: `"native"` or `"XLM"` (case-insensitive) for XLM, or
   `"CODE:GISSUER"` for non-native assets.
-- Raw on-chain integer fields use distinct names and carry NO unit label:
-  `amount_in_stroops` (u64), `limit_stroops` (i64) are JSON numbers; they are
-  exact only up to `2^53` (about 900 million XLM in stroops) — an `f64`-backed
-  JSON parser silently rounds larger values. `qty_in` / `qty_out_min` / `qty`
-  (i128),
-  `amounts_desired` / `amounts_min` / `min_amounts_out` (i128 arrays), and
-  `withdraw_shares` (i128) are DECIMAL STRINGS, not JSON numbers — a raw JSON
-  number above `2^53` cannot be represented exactly by an `f64`-backed parser,
-  so these fields are String-typed and a raw number is rejected. Anchor-facing
-  amounts (`deposit_hint`) are plain decimal strings without XLM-stroop
-  semantics.
+- Every value-denominated field is a decimal string, never a JSON number, on
+  BOTH inputs and outputs. This includes raw stroop/base-unit fields with no
+  unit label (`amount_in_stroops`, `amount_stroops`, `starting_balance_stroops`,
+  `limit_stroops`, fee fields, fee-stats percentiles) as well as the i128
+  on-chain quantities (`qty_in` / `qty_out_min` / `qty`, `amounts_desired` /
+  `amounts_min` / `min_amounts_out`, `withdraw_shares`). A JSON number backed
+  by `f64` cannot represent an integer exactly once it exceeds `2^53`, so a
+  raw JSON number is rejected on every input of this class — the field is
+  String-typed and the schema itself refuses a number. Anchor-facing amounts
+  (`deposit_hint`) are plain decimal strings without XLM-stroop semantics.
+  The one documented exception is the SEP-6 passthrough fields
+  (`sep6_deposit_info`'s `fee_fixed` / `fee_percent` / `min_amount` /
+  `max_amount`): these relay a third-party anchor's own SEP-6 payload
+  verbatim and stay whatever type the anchor sent.
 - Classic fee selector (`fee` field): `<stroops>`, `auto`, or `auto:pNN`.
 
 ## Payments and accounts
@@ -136,7 +139,7 @@ A mismatch is refused before any network call.
 | `source` | string | yes | G-strkey of the funding account. |
 | `destination` | string | yes | G-strkey of the recipient. |
 | `amount` | string | one of amount/stroops | Decimal + unit, e.g. `"10 XLM"`. |
-| `amount_in_stroops` | integer (u64) | one of amount/stroops | Raw stroops, no unit; mutually exclusive with `amount`; rejected if > i64::MAX. |
+| `amount_in_stroops` | decimal string | one of amount/stroops | Raw stroops, no unit; mutually exclusive with `amount`; rejected if negative, malformed, or > i64::MAX. |
 | `asset` | string | yes | `"native"`/`"XLM"` or `"CODE:GISSUER"`. |
 | `memo_text` | string | no | UTF-8, at most 28 bytes; mutually exclusive with other memo fields. |
 | `memo_id` | integer (u64) | no | Mutually exclusive with other memo fields. |
@@ -214,7 +217,7 @@ resolved chain is used when omitted.)
 | `chain_id` | string | yes | |
 | `from` | string | yes | G-strkey of the account that will hold the trustline. |
 | `asset` | string | yes | `"USDC"` (bare code, pin-table resolved) or `"USDC:GISSUER"`. A 56-char `C...` SAC address is parsed but deferred and returns a typed error. |
-| `limit_stroops` | integer (i64) | no | Absent/null → protocol default (unlimited). `0` removes the trustline. |
+| `limit_stroops` | decimal string | no | Absent/null → protocol default (unlimited, `"9223372036854775807"`). `"0"` removes the trustline. Accepted range `0..=i64::MAX`. |
 | `fee` | string | no | Classic fee selector. |
 
 Commit: `chain_id`, `from`, plus the binding triple (`nonce`,

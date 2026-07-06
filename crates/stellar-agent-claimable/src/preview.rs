@@ -69,6 +69,13 @@ pub struct ClaimPreview {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub asset_issuer: Option<String>,
     /// The balance amount, in stroops.
+    ///
+    /// Encoded as a decimal string on the wire (`serde(with =
+    /// "stellar_agent_core::wire_stroops::i64")`): a JSON number backed by
+    /// `f64` cannot represent an `i64` stroop amount exactly once it exceeds
+    /// `2^53`. The field's Rust type stays `i64` for internal arithmetic
+    /// (`check_trustline`, headroom checks); only the wire encoding changes.
+    #[serde(with = "stellar_agent_core::wire_stroops::i64")]
     pub amount_stroops: i64,
     /// The balance amount, formatted as a fixed-point decimal string at the
     /// Stellar protocol's 7-decimal-place unit (e.g. `"12.5000000"`).
@@ -395,6 +402,12 @@ mod tests {
         assert!(!preview.clawback_enabled);
         assert_eq!(preview.claimants.len(), 1);
         assert_eq!(preview.claimants[0].destination, CLAIMANT_G);
+
+        let json = serde_json::to_value(&preview).unwrap();
+        assert_eq!(
+            json["amount_stroops"], "50000000",
+            "amount_stroops must serialize as a decimal string"
+        );
     }
 
     // ─── build: not a claimant ──────────────────────────────────────────────

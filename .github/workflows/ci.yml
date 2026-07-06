@@ -99,6 +99,10 @@ jobs:
       # reaches the network. --all-features is deliberately avoided here: it
       # would enable the live tiers and attempt real RPC and Friendbot access.
       - run: cargo test --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry
+      # stellar-agent-cli does not declare test-hooks/test-loopback/verifier-registry,
+      # so cargo silently drops it from the --workspace --features run above
+      # without erroring; run it explicitly so this job actually covers it.
+      - run: cargo test -p stellar-agent-cli --features test-helpers
 
   machete:
     name: unused-deps

@@ -552,7 +552,7 @@ fn render_preview(preview: &ClaimPreview, format: OutputFormat) {
         "balance_id_strkey": &preview.balance_id_strkey,
         "asset_code": &preview.asset_code,
         "asset_issuer": &preview.asset_issuer,
-        "amount_stroops": preview.amount_stroops,
+        "amount_stroops": preview.amount_stroops.to_string(),
         "amount_display": &preview.amount_display,
         "claimants": &preview.claimants,
         "is_claimant": preview.is_claimant,

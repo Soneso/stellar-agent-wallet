@@ -348,7 +348,7 @@ impl WalletServer {
             "chain_id": &args.chain_id,
             "source": &args.source,
             "destination": &args.destination,
-            "starting_balance_stroops": args.starting_balance.as_stroops(),
+            "starting_balance_stroops": args.starting_balance.as_stroops().to_string(),
         });
         // ── Validate G-strkeys ────────────────────────────────────────────────
         if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(&args.source) {
@@ -567,10 +567,10 @@ impl WalletServer {
                     "expires_at_unix_ms": entry.expires_at_unix_ms,
                     "summary": {
                         "to": &args.destination,
-                        "amount_stroops": starting_balance_stroops,
+                        "amount_stroops": starting_balance_stroops.to_string(),
                         "asset": "XLM",
                         "memo": null,
-                        "simulated_fee_stroops": total_fee_stroops,
+                        "simulated_fee_stroops": total_fee_stroops.to_string(),
                         "simulated_seq_num": source_sequence.saturating_add(1),
                     }
                 })),
@@ -591,7 +591,7 @@ impl WalletServer {
             "source_sequence": source_sequence.to_string(),
             "source_native_balance_stroops": native_balance_stroops.to_string(),
             "fee_stroops": total_fee_stroops.to_string(),
-            "selected_fee_per_op_stroops": fee_per_op_stroops,
+            "selected_fee_per_op_stroops": fee_per_op_stroops.to_string(),
             "selected_fee_percentile": &fee_selection.selected_fee_percentile,
             "operation": {
                 "type": "create_account",
@@ -906,7 +906,7 @@ impl WalletServer {
         {
             let starting_balance_stroops: i64 = authoritative_args
                 .get("starting_balance_stroops")
-                .and_then(serde_json::Value::as_i64)
+                .and_then(crate::tools::amount_wire::value_as_stroops_i64)
                 .ok_or_else(|| {
                     rmcp::ErrorData::internal_error(
                         "simulation.divergence: authoritative_args missing required \

@@ -11,7 +11,16 @@
 //!
 //! This module generalises the parse-at-use error shape already established
 //! by `stellar_rule_create.policies[].limit_stroops` (`rule_create.rs`) and
-//! both x402 tools (`amount: String` end-to-end).
+//! both x402 tools (`amount: String` end-to-end). The same convention
+//! applies to every raw `i64` Stellar stroop field (payment amounts,
+//! trustline limits, starting balances): [`parse_stroops_i64_field`] and
+//! [`parse_stroops_u64_field`] are the `i64`/`u64`-width siblings of
+//! [`parse_i128_field`], and [`value_as_stroops_i64`] reads a stroop field
+//! back out of a `serde_json::Value` that may carry either the current
+//! decimal-string encoding or a legacy JSON number, for callers decoding
+//! [`crate::server::WalletServer`]-internal values that cross a version
+//! boundary (e.g. [`stellar_agent_core::envelope_decode::decode_authoritative_args`]
+//! output).
 //!
 //! # Dispatch-safety
 //!
@@ -60,6 +69,80 @@ pub(crate) fn parse_i128_vec_field(field: &str, v: &[String]) -> Result<Vec<i128
         .map(|(idx, s)| parse_i128_field(&format!("{field}[{idx}]"), s))
         .collect()
 }
+
+/// Parses a single decimal-string field to `i64` (a raw Stellar stroop
+/// amount).
+///
+/// Accepts an optional leading `-` or `+` sign followed by ASCII digits
+/// only, identically to [`parse_i128_field`] but bounded to `i64::MIN..=
+/// i64::MAX` — the width of every classic-operation amount and limit field
+/// in Stellar XDR (`Payment.amount`, `ChangeTrustOp.limit`,
+/// `CreateAccountOp.starting_balance`). This function only proves `s`
+/// denotes a well-formed decimal `i64` — domain constraints such as
+/// non-negativity are enforced by the caller after a successful parse, the
+/// same discipline as [`parse_i128_field`].
+///
+/// # Errors
+///
+/// Returns `rmcp::ErrorData::invalid_params` naming `field` and the raw
+/// value when `s` is not a valid decimal `i64`.
+pub(crate) fn parse_stroops_i64_field(field: &str, s: &str) -> Result<i64, ErrorData> {
+    s.parse::<i64>().map_err(|_| {
+        ErrorData::invalid_params(
+            format!("{field}: not a valid decimal i64 (stroops): {s:?}"),
+            None,
+        )
+    })
+}
+
+/// Parses an optional decimal-string field to `Option<i64>` via
+/// [`parse_stroops_i64_field`]. `None` maps to `Ok(None)`.
+///
+/// # Errors
+///
+/// Returns the same error as [`parse_stroops_i64_field`] when `s` is
+/// `Some` and not a valid decimal `i64`.
+pub(crate) fn parse_stroops_i64_opt_field(
+    field: &str,
+    s: Option<&str>,
+) -> Result<Option<i64>, ErrorData> {
+    s.map(|s| parse_stroops_i64_field(field, s)).transpose()
+}
+
+/// Parses a single decimal-string field to `u64` (a raw, structurally
+/// non-negative Stellar stroop amount).
+///
+/// Used where the field's domain never permits a sign — e.g. an input
+/// amount before its `<= i64::MAX` bound is checked — so that the
+/// non-negativity guarantee formerly carried by a `u64` Rust type is now
+/// carried by this parse instead (a decimal string has no type-level
+/// sign restriction otherwise).
+///
+/// # Errors
+///
+/// Returns `rmcp::ErrorData::invalid_params` naming `field` and the raw
+/// value when `s` is not a valid non-negative decimal `u64`.
+pub(crate) fn parse_stroops_u64_field(field: &str, s: &str) -> Result<u64, ErrorData> {
+    s.parse::<u64>().map_err(|_| {
+        ErrorData::invalid_params(
+            format!("{field}: not a valid non-negative decimal u64 (stroops): {s:?}"),
+            None,
+        )
+    })
+}
+
+/// Reads a stroop amount from a decoded `serde_json::Value`, tolerating
+/// both the current decimal-string wire encoding and a legacy JSON number.
+///
+/// `stellar_agent_core::envelope_decode::decode_authoritative_args` emits
+/// `amount_stroops` / `starting_balance_stroops` / `limit_stroops` as decimal
+/// strings; this reader accepts both forms so a caller on either side of the
+/// wire-format migration can decode a value produced by either an old or a
+/// new build of this crate. Delegates to the single shared implementation in
+/// [`stellar_agent_core::wire_stroops::value_as_stroops_i64`], which also
+/// rejects a negative value (every consumer here is a non-negative amount or
+/// a `0..=i64::MAX` limit).
+pub(crate) use stellar_agent_core::wire_stroops::value_as_stroops_i64;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
@@ -203,5 +286,157 @@ mod tests {
             parse_i128_vec_field("amounts_desired", &[]).unwrap(),
             Vec::<i128>::new()
         );
+    }
+
+    // ── parse_stroops_i64_field / parse_stroops_u64_field ──────────────────
+
+    #[test]
+    fn stroops_i64_parses_ordinary_decimal() {
+        assert_eq!(
+            parse_stroops_i64_field("amount_stroops", "250000000").unwrap(),
+            250_000_000
+        );
+    }
+
+    #[test]
+    fn stroops_i64_parses_negative_leaving_domain_check_to_caller() {
+        assert_eq!(parse_stroops_i64_field("limit_stroops", "-5").unwrap(), -5);
+    }
+
+    #[test]
+    fn stroops_i64_parses_i64_max_exactly() {
+        let s = i64::MAX.to_string();
+        assert_eq!(
+            parse_stroops_i64_field("limit_stroops", &s).unwrap(),
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn stroops_i64_parses_i64_min_exactly() {
+        let s = i64::MIN.to_string();
+        assert_eq!(
+            parse_stroops_i64_field("limit_stroops", &s).unwrap(),
+            i64::MIN
+        );
+    }
+
+    #[test]
+    fn stroops_i64_rejects_overflow_beyond_i64_max() {
+        let overflow = format!("{}0", i64::MAX);
+        assert!(parse_stroops_i64_field("limit_stroops", &overflow).is_err());
+    }
+
+    #[test]
+    fn stroops_i64_rejects_decimal_point() {
+        assert!(parse_stroops_i64_field("amount_stroops", "1.5").is_err());
+    }
+
+    #[test]
+    fn stroops_i64_rejects_empty_string() {
+        assert!(parse_stroops_i64_field("amount_stroops", "").is_err());
+    }
+
+    #[test]
+    fn stroops_i64_error_names_field_and_raw_value() {
+        let err = parse_stroops_i64_field("limit_stroops", "1.5").unwrap_err();
+        let msg = err.message.to_string();
+        assert!(msg.contains("limit_stroops"));
+        assert!(msg.contains("1.5"));
+    }
+
+    #[test]
+    fn stroops_i64_opt_none_maps_to_ok_none() {
+        assert_eq!(
+            parse_stroops_i64_opt_field("limit_stroops", None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn stroops_i64_opt_some_parses() {
+        assert_eq!(
+            parse_stroops_i64_opt_field("limit_stroops", Some("42")).unwrap(),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn stroops_i64_opt_some_invalid_errors() {
+        assert!(parse_stroops_i64_opt_field("limit_stroops", Some("nope")).is_err());
+    }
+
+    #[test]
+    fn stroops_u64_parses_ordinary_decimal() {
+        assert_eq!(
+            parse_stroops_u64_field("amount_in_stroops", "250000000").unwrap(),
+            250_000_000
+        );
+    }
+
+    #[test]
+    fn stroops_u64_rejects_negative() {
+        assert!(parse_stroops_u64_field("amount_in_stroops", "-5").is_err());
+    }
+
+    #[test]
+    fn stroops_u64_parses_u64_max_exactly() {
+        let s = u64::MAX.to_string();
+        assert_eq!(
+            parse_stroops_u64_field("amount_in_stroops", &s).unwrap(),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn stroops_u64_rejects_decimal_point() {
+        assert!(parse_stroops_u64_field("amount_in_stroops", "1.5").is_err());
+    }
+
+    #[test]
+    fn stroops_u64_rejects_empty_string() {
+        assert!(parse_stroops_u64_field("amount_in_stroops", "").is_err());
+    }
+
+    // ── value_as_stroops_i64 ─────────────────────────────────────────────────
+
+    #[test]
+    fn value_as_stroops_i64_reads_string() {
+        let v = serde_json::json!("9007199254740993");
+        assert_eq!(value_as_stroops_i64(&v), Some(9_007_199_254_740_993_i64));
+    }
+
+    #[test]
+    fn value_as_stroops_i64_reads_number() {
+        let v = serde_json::json!(42);
+        assert_eq!(value_as_stroops_i64(&v), Some(42_i64));
+    }
+
+    #[test]
+    fn value_as_stroops_i64_rejects_malformed_string() {
+        let v = serde_json::json!("not-a-number");
+        assert_eq!(value_as_stroops_i64(&v), None);
+    }
+
+    #[test]
+    fn value_as_stroops_i64_rejects_null() {
+        assert_eq!(value_as_stroops_i64(&serde_json::Value::Null), None);
+    }
+
+    #[test]
+    fn value_as_stroops_i64_string_round_trips_i64_max() {
+        let s = i64::MAX.to_string();
+        let v = serde_json::json!(s);
+        assert_eq!(value_as_stroops_i64(&v), Some(i64::MAX));
+    }
+
+    #[test]
+    fn value_as_stroops_i64_rejects_negative() {
+        // Delegated to `stellar_agent_core::wire_stroops::value_as_stroops_i64`:
+        // every reader call site in this crate (amount_stroops,
+        // starting_balance_stroops, limit_stroops) is a non-negative amount or
+        // a 0..=MAX limit, so a negative value is always forged/corrupted.
+        assert_eq!(value_as_stroops_i64(&serde_json::json!("-1")), None);
+        assert_eq!(value_as_stroops_i64(&serde_json::json!(-1)), None);
     }
 }

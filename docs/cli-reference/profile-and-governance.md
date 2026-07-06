@@ -221,7 +221,7 @@ agent relaying a nonce.
   entry with an expires-in countdown.
 
 ```json
-{"ok":true,"data":{"profile":"default","pending":[{"approval_nonce":"ABCxyzNonce","kind_name":"PaymentSimulated","created_at_unix_ms":1717000000000,"expires_at_unix_ms":1717086400000,"expired":false,"attested":false,"summary":{"kind":"payment","to":"GDEST...","amount_stroops":100000000,"asset":"XLM","memo":null,"fee_stroops":100,"seq_num":12345}}],"expired_count":0},"request_id":"..."}
+{"ok":true,"data":{"profile":"default","pending":[{"approval_nonce":"ABCxyzNonce","kind_name":"PaymentSimulated","created_at_unix_ms":1717000000000,"expires_at_unix_ms":1717086400000,"expired":false,"attested":false,"summary":{"kind":"payment","to":"GDEST...","amount_stroops":"100000000","asset":"XLM","memo":null,"fee_stroops":"100","seq_num":12345}}],"expired_count":0},"request_id":"..."}
 ```
 
 ### `approve serve`

@@ -182,7 +182,15 @@ pub struct CreateAccountResult {
     pub friendbot_url_used: Option<String>,
 
     /// Selected per-operation fee in stroops for sponsored mode.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    ///
+    /// Encoded as a decimal string on the wire (`serde(with =
+    /// "stellar_agent_core::wire_stroops::u32_opt")`). The Rust field type
+    /// stays `Option<u32>`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "stellar_agent_core::wire_stroops::u32_opt"
+    )]
     pub selected_fee_per_op_stroops: Option<u32>,
 
     /// Fee selection source for sponsored mode.
@@ -1185,8 +1193,33 @@ mod tests {
             selected_fee_percentile: Some(built.fee_selection.selected_fee_percentile),
         };
         let json = serde_json::to_value(result).expect("CreateAccountResult serialises");
-        assert_eq!(json["selected_fee_per_op_stroops"], 250);
+        assert_eq!(json["selected_fee_per_op_stroops"], "250");
         assert_eq!(json["selected_fee_percentile"], "explicit");
+    }
+
+    #[test]
+    fn create_account_result_selected_fee_per_op_stroops_none_round_trips() {
+        // The `with = "...::u32_opt"` custom deserializer suppresses serde's
+        // implicit missing-field-means-None for `Option<T>`; `#[serde(default)]`
+        // restores it. Without it, deserializing this None-produced,
+        // field-omitted JSON would fail with "missing field
+        // `selected_fee_per_op_stroops`".
+        let result = CreateAccountResult {
+            account_id: DEST_G.to_owned(),
+            secret_key: None,
+            mode: CreateMode::Sponsored,
+            tx_hash: None,
+            ledger: None,
+            friendbot_url_used: None,
+            selected_fee_per_op_stroops: None,
+            selected_fee_percentile: None,
+        };
+        let json = serde_json::to_value(&result).expect("CreateAccountResult serialises");
+        assert!(json.get("selected_fee_per_op_stroops").is_none());
+
+        let round_tripped: CreateAccountResult = serde_json::from_value(json)
+            .expect("omitted selected_fee_per_op_stroops must deserialize back to None");
+        assert_eq!(round_tripped.selected_fee_per_op_stroops, None);
     }
 
     #[tokio::test]

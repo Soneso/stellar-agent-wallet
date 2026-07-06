@@ -126,6 +126,11 @@ pub mod protocol_consts;
 /// Shared timestamp formatting helpers (ISO-8601 UTC, epoch decomposition).
 pub mod timefmt;
 
+/// `serde(with = ...)` boundary encoders for stroop-denominated struct
+/// fields: keeps a struct's internal numeric type, encodes it as a decimal
+/// string on the wire, and tolerates a legacy JSON number on deserialize.
+pub mod wire_stroops;
+
 /// Short-in-memory-unlock window: `mlock`-protected signing seed with RAII dispose.
 ///
 /// Provides [`wallet::Wallet`] (unlock + TTL + RAII dispose),

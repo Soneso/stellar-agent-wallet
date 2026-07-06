@@ -14,11 +14,18 @@
 //!
 //! # Tool argument parsing
 //!
-//! For `stellar_pay`: reads `args["amount"]` (a `"N.NNNNNNN XLM"` string) and
-//! `args["asset"]` (e.g. `"native"` or `"CODE:Gissuer"`).
+//! For `stellar_pay` / `stellar_pay_commit`: reads `args["amount_stroops"]`
+//! (a decimal string; a legacy JSON number is tolerated for version-crossing)
+//! and `args["asset"]` (e.g. `"native"` or `"CODE:Gissuer"`). Falls back to
+//! the legacy `args["amount"]` (a `"N.NNNNNNN XLM"` string) only when
+//! `amount_stroops` is absent — every args shape this criterion actually
+//! receives in production (simulate-time `args_value` and commit-time
+//! `authoritative_args`) carries `amount_stroops`.
 //!
-//! For `stellar_create_account`: reads `args["starting_balance"]` and treats
-//! the asset as implicitly native.
+//! For `stellar_create_account` / `stellar_create_account_commit`: reads
+//! `args["starting_balance_stroops"]` the same way (falling back to the
+//! legacy `args["starting_balance"]`) and treats the asset as implicitly
+//! native.
 //!
 //! For `stellar_axelar_bridge`: reads `args["qty"]` (a raw i128 on-chain
 //! integer) and `args["token_address"]` (the resolved C-strkey from the
@@ -28,9 +35,9 @@
 //! For other tools: the criterion returns `Ok(None)` (does not apply).
 //!
 
-use crate::amount::StellarAmount;
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::criteria::Criterion;
+use crate::policy::v1::criteria::amount_extract::extract_pay_or_create_account_stroops;
 use crate::policy::{DenyReason, PolicyError};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -117,14 +124,23 @@ impl Criterion for PerTxCapCriterion {
         // Extract (attempted_stroops, tool_asset) per tool type.
         let (attempted_stroops, tool_asset) = match tool_name {
             "stellar_pay" | "stellar_pay_commit" => {
-                let amount_str = extract_string_field(ctx, "amount")?;
                 let asset_str = extract_string_field(ctx, "asset")?;
-                let stroops = parse_amount_to_stroops(&amount_str, ctx)?;
+                let stroops = extract_pay_or_create_account_stroops(ctx, "per_tx_cap")?
+                    .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+                        detail: format!(
+                            "per_tx_cap: missing amount_stroops/amount field for tool '{tool_name}'"
+                        ),
+                    })?;
                 (stroops, asset_normalise(asset_str))
             }
             "stellar_create_account" | "stellar_create_account_commit" => {
-                let amount_str = extract_string_field(ctx, "starting_balance")?;
-                let stroops = parse_amount_to_stroops(&amount_str, ctx)?;
+                let stroops = extract_pay_or_create_account_stroops(ctx, "per_tx_cap")?
+                    .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+                        detail: format!(
+                            "per_tx_cap: missing starting_balance_stroops/starting_balance \
+                             field for tool '{tool_name}'"
+                        ),
+                    })?;
                 (stroops, "native".to_owned())
             }
             "stellar_axelar_bridge" => {
@@ -188,31 +204,6 @@ fn extract_string_field(ctx: &EvalContext<'_>, field: &str) -> Result<String, Po
             detail: format!(
                 "per_tx_cap: missing or non-string field '{}' in args for tool '{}'",
                 field, ctx.tool.name
-            ),
-        })
-}
-
-/// Parses an amount string to stroops.
-///
-/// The amount can be either:
-/// - `"N.NNNNNNN XLM"` (decimal XLM string from `stellar_pay` args).
-/// - A bare stroop integer string (uncommon; forward-compat).
-///
-/// Prefers `StellarAmount::parse_with_unit` which handles the decimal form.
-/// Falls back to `StellarAmount::parse_stroops` for bare integers.
-fn parse_amount_to_stroops(amount_str: &str, ctx: &EvalContext<'_>) -> Result<i64, PolicyError> {
-    // Try the unit-bearing form first ("N.NNNNNNN XLM").
-    if let Ok(amt) = StellarAmount::parse_with_unit(amount_str) {
-        return Ok(amt.as_stroops());
-    }
-
-    // Try bare stroop integer.
-    StellarAmount::parse_stroops(amount_str)
-        .map(|a| a.as_stroops())
-        .map_err(|e| PolicyError::CriterionEvaluationFailed {
-            detail: format!(
-                "per_tx_cap: failed to parse amount '{}' for tool '{}': {e}",
-                amount_str, ctx.tool.name
             ),
         })
 }
@@ -530,6 +521,254 @@ mod tests {
         assert!(
             result.is_none(),
             "qty == cap must pass (inclusive bound): {result:?}"
+        );
+    }
+
+    // ── Real production args shapes (resolved-key re-point) ────────────────
+
+    /// Simulate-time `stellar_pay` args_value shape when the caller used
+    /// `amount_in_stroops` (exact fields `stellar_pay`'s handler emits).
+    #[test]
+    fn pay_simulate_amount_in_stroops_shape_cap_under_passes() {
+        let tool = make_tool("stellar_pay");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = PerTxCapCriterion::new("native".into(), 1_000_000_000); // 100 XLM
+        let args = json!({
+            "chain_id": "stellar:testnet",
+            "source": "GAAA",
+            "destination": "GBBB",
+            "amount": serde_json::Value::Null,
+            "amount_in_stroops": "500000000",
+            "amount_stroops": "500000000",
+            "asset": "native",
+        });
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(result.is_none(), "50 XLM should pass a 100 XLM cap");
+    }
+
+    #[test]
+    fn pay_simulate_amount_in_stroops_shape_cap_over_denies() {
+        let tool = make_tool("stellar_pay");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = PerTxCapCriterion::new("native".into(), 1_000_000_000); // 100 XLM
+        let args = json!({
+            "chain_id": "stellar:testnet",
+            "source": "GAAA",
+            "destination": "GBBB",
+            "amount": serde_json::Value::Null,
+            "amount_in_stroops": "1500000000",
+            "amount_stroops": "1500000000",
+            "asset": "native",
+        });
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::PerTxCapExceeded { .. })),
+            "150 XLM should be denied by a 100 XLM cap"
+        );
+    }
+
+    /// A cap configured for a NON-native asset must apply and deny on a pay
+    /// simulate args_value carrying that same asset — pins the asset-match
+    /// branch through the resolved `amount_stroops` key (not just the
+    /// legacy-shape tests above, which only exercise the native path).
+    #[test]
+    fn pay_simulate_non_native_asset_cap_over_denies() {
+        let tool = make_tool("stellar_pay");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let usdc_asset = "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+        let criterion = PerTxCapCriterion::new(usdc_asset.to_owned(), 1_000_000_000); // 100 USDC
+        let args = json!({
+            "chain_id": "stellar:testnet",
+            "source": "GAAA",
+            "destination": "GBBB",
+            "amount": serde_json::Value::Null,
+            "amount_in_stroops": "1500000000",
+            "amount_stroops": "1500000000",
+            "asset": usdc_asset,
+        });
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::PerTxCapExceeded { .. })),
+            "150 USDC should be denied by a 100 USDC cap on the matching non-native asset: \
+             {result:?}"
+        );
+    }
+
+    /// A cap configured for a DIFFERENT non-native asset must not apply to a
+    /// pay simulate args_value carrying a distinct asset — the asset mismatch
+    /// branch is still reachable through the resolved key.
+    #[test]
+    fn pay_simulate_non_native_asset_mismatch_does_not_apply() {
+        let tool = make_tool("stellar_pay");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let usdc_asset = "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+        let other_asset = "EURC:GDHU6WRG4IEQXM5NZ4BMPKOXHW76MZM4Y2IEMFDVXBSDP6SJY4ITNPP2";
+        let criterion = PerTxCapCriterion::new(usdc_asset.to_owned(), 1_000_000_000);
+        let args = json!({
+            "chain_id": "stellar:testnet",
+            "source": "GAAA",
+            "destination": "GBBB",
+            "amount": serde_json::Value::Null,
+            "amount_in_stroops": "9999999999",
+            "amount_stroops": "9999999999",
+            "asset": other_asset,
+        });
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            result.is_none(),
+            "a cap configured for USDC must not apply to an EURC payment: {result:?}"
+        );
+    }
+
+    /// Commit-time `stellar_pay_commit` authoritative_args shape, exactly as
+    /// `envelope_decode::decode_authoritative_args` emits it: no legacy
+    /// "amount" key at all, `total_fee_stroops` numeric, `asset` present.
+    #[test]
+    fn pay_commit_authoritative_args_shape_cap_under_passes() {
+        let tool = make_tool("stellar_pay_commit");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = PerTxCapCriterion::new("native".into(), 1_000_000_000); // 100 XLM
+        let args = json!({
+            "source": "GAAA",
+            "total_fee_stroops": 100u32,
+            "destination": "GBBB",
+            "amount_stroops": "500000000",
+            "asset": "XLM",
+            "memo": serde_json::Value::Null,
+        });
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(result.is_none(), "50 XLM commit should pass a 100 XLM cap");
+    }
+
+    #[test]
+    fn pay_commit_authoritative_args_shape_cap_over_denies() {
+        let tool = make_tool("stellar_pay_commit");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = PerTxCapCriterion::new("native".into(), 1_000_000_000); // 100 XLM
+        let args = json!({
+            "source": "GAAA",
+            "total_fee_stroops": 100u32,
+            "destination": "GBBB",
+            "amount_stroops": "1500000000",
+            "asset": "XLM",
+            "memo": serde_json::Value::Null,
+        });
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::PerTxCapExceeded { .. })),
+            "150 XLM commit should be denied by a 100 XLM cap; this is the pre-existing \
+             fail-closed bug this re-point fixes (authoritative_args never carried \
+             'amount', only 'amount_stroops')"
+        );
+    }
+
+    /// Simulate-time `stellar_create_account` args_value shape: ONLY
+    /// `starting_balance_stroops` is ever present — the legacy
+    /// `starting_balance` key never appears in production args.
+    #[test]
+    fn create_account_simulate_resolved_only_shape_cap_under_passes() {
+        let tool = make_tool("stellar_create_account");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = PerTxCapCriterion::new("native".into(), 1_000_000_000); // 100 XLM
+        let args = json!({
+            "chain_id": "stellar:testnet",
+            "source": "GAAA",
+            "destination": "GBBB",
+            "starting_balance_stroops": "500000000",
+        });
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(result.is_none(), "50 XLM should pass a 100 XLM cap");
+    }
+
+    #[test]
+    fn create_account_simulate_resolved_only_shape_cap_over_denies() {
+        let tool = make_tool("stellar_create_account");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = PerTxCapCriterion::new("native".into(), 1_000_000_000); // 100 XLM
+        let args = json!({
+            "chain_id": "stellar:testnet",
+            "source": "GAAA",
+            "destination": "GBBB",
+            "starting_balance_stroops": "1500000000",
+        });
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::PerTxCapExceeded { .. })),
+            "150 XLM should be denied by a 100 XLM cap; this is the pre-existing \
+             fail-closed bug this re-point fixes (create_account args_value never \
+             carried 'starting_balance', only 'starting_balance_stroops')"
+        );
+    }
+
+    /// Commit-time `stellar_create_account_commit` authoritative_args shape.
+    #[test]
+    fn create_account_commit_authoritative_args_shape_cap_over_denies() {
+        let tool = make_tool("stellar_create_account_commit");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = PerTxCapCriterion::new("native".into(), 1_000_000_000); // 100 XLM
+        let args = json!({
+            "source": "GAAA",
+            "total_fee_stroops": 100u32,
+            "destination": "GBBB",
+            "starting_balance_stroops": "1500000000",
+        });
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::PerTxCapExceeded { .. })),
+            "150 XLM commit should be denied by a 100 XLM cap"
+        );
+    }
+
+    /// Regression: the legacy unit-string-only shape (no resolved key present
+    /// at all) must still evaluate to the identical verdict as before this
+    /// re-point.
+    #[test]
+    fn legacy_amount_only_shape_still_evaluates_identically() {
+        let tool = make_tool("stellar_pay");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = PerTxCapCriterion::new("native".into(), 1_000_000_000); // 100 XLM
+        let args = json!({ "amount": "150 XLM", "asset": "native" });
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::PerTxCapExceeded { .. })),
+            "legacy-only shape must still deny 150 XLM against a 100 XLM cap"
+        );
+    }
+
+    /// Version-crossing: a resolved key carrying a legacy JSON number (rather
+    /// than the current decimal-string encoding) must still parse correctly.
+    #[test]
+    fn version_crossing_numeric_amount_stroops_still_parses() {
+        let tool = make_tool("stellar_pay");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = PerTxCapCriterion::new("native".into(), 1_000_000_000); // 100 XLM
+        let args = json!({ "amount_stroops": 1_500_000_000i64, "asset": "native" });
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::PerTxCapExceeded { .. })),
+            "numeric amount_stroops must still be denied by the cap"
         );
     }
 }

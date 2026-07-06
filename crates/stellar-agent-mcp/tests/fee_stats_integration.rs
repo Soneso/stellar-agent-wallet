@@ -107,11 +107,11 @@ async fn stellar_fee_stats_with_mock_rpc_succeeds() {
     );
     assert_eq!(
         json.pointer("/data/inclusion_fee/p95"),
-        Some(&serde_json::json!(200))
+        Some(&serde_json::json!("200"))
     );
     assert_eq!(
         json.pointer("/data/soroban_inclusion_fee/p95"),
-        Some(&serde_json::json!(300))
+        Some(&serde_json::json!("300"))
     );
 }
 

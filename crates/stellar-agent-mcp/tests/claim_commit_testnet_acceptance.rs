@@ -346,8 +346,8 @@ async fn t1_claim_two_phase_happy_path() {
         "preview must report the native asset (no code/issuer): {preview}"
     );
     assert_eq!(
-        preview["amount_stroops"].as_i64(),
-        Some(CLAIM_AMOUNT_STROOPS),
+        preview["amount_stroops"].as_str(),
+        Some(CLAIM_AMOUNT_STROOPS.to_string().as_str()),
         "preview must report the locked amount: {preview}"
     );
     let claimants = preview["claimants"]

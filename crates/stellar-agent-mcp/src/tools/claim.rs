@@ -522,9 +522,9 @@ impl WalletServer {
                         "balance_id_hex72": &preview.balance_id_hex72,
                         "balance_id_strkey": &preview.balance_id_strkey,
                         "asset": &asset_str,
-                        "amount_stroops": preview.amount_stroops,
+                        "amount_stroops": preview.amount_stroops.to_string(),
                         "source": &source,
-                        "simulated_fee_stroops": total_fee_stroops,
+                        "simulated_fee_stroops": total_fee_stroops.to_string(),
                         "simulated_seq_num": source_sequence.saturating_add(1),
                     }
                 })),

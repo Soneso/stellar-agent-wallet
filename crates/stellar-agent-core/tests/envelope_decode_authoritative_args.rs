@@ -113,7 +113,7 @@ fn it_decodes_payment_xlm_with_text_memo() {
 
     assert_eq!(result["source"].as_str().unwrap(), SOURCE_G);
     assert_eq!(result["destination"].as_str().unwrap(), DEST_G);
-    assert_eq!(result["amount_stroops"].as_i64().unwrap(), 10_000_000_i64);
+    assert_eq!(result["amount_stroops"].as_str().unwrap(), "10000000");
     assert_eq!(result["asset"].as_str().unwrap(), "XLM");
     assert_eq!(result["memo"].as_str().unwrap(), "hello-memo");
 }
@@ -146,7 +146,7 @@ fn it_decodes_payment_usdc_non_native() {
 
     assert_eq!(result["source"].as_str().unwrap(), SOURCE_G);
     assert_eq!(result["destination"].as_str().unwrap(), DEST_G);
-    assert_eq!(result["amount_stroops"].as_i64().unwrap(), 50_000_000_i64);
+    assert_eq!(result["amount_stroops"].as_str().unwrap(), "50000000");
     let expected_asset = format!("USDC:{USDC_ISSUER_G}");
     assert_eq!(result["asset"].as_str().unwrap(), &expected_asset);
     assert!(
@@ -176,8 +176,8 @@ fn it_decodes_create_account() {
     assert_eq!(result["source"].as_str().unwrap(), SOURCE_G);
     assert_eq!(result["destination"].as_str().unwrap(), DEST_G);
     assert_eq!(
-        result["starting_balance_stroops"].as_i64().unwrap(),
-        20_000_000_i64
+        result["starting_balance_stroops"].as_str().unwrap(),
+        "20000000"
     );
 }
 

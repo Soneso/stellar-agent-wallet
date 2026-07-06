@@ -293,6 +293,8 @@ pub use crate::tools::rules::{StellarRulesGetArgs, StellarRulesListArgs};
 /// Re-exported for testnet acceptance and integration tests.
 pub use crate::tools::sep43_sign_and_submit_transaction::Sep43SignAndSubmitTransactionArgs;
 pub use crate::tools::toolsets::StellarToolsetInvokeArgs;
+/// Re-exported for back-compat: argument types for `stellar_trustline`.
+pub use crate::tools::trustline::{StellarTrustlineArgs, StellarTrustlineCommitArgs};
 /// Re-exported for testnet acceptance and integration tests: x402 authenticated-payment args.
 pub use crate::tools::x402_authenticated_payment::X402AuthenticatedPaymentArgs;
 /// Re-exported for integration tests: x402 create-payment args.
@@ -715,6 +717,19 @@ impl WalletServer {
             .into_iter()
             .map(|tool| tool.name.to_string())
             .collect()
+    }
+
+    /// Returns every registered tool's full rmcp `Tool` descriptor, including
+    /// its JSON Schema `input_schema`.
+    ///
+    /// Used by `registry_walk.rs`'s wire-format drift guard, which walks every
+    /// tool's input schema for integer/number-typed properties whose names
+    /// match a value-denominated pattern (see that test for the allowlist).
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn all_registered_tools() -> Vec<rmcp::model::Tool> {
+        Self::merged_tool_router().list_all()
     }
 
     /// Single source of truth for sub-router composition.

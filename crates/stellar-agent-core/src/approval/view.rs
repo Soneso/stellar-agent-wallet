@@ -70,6 +70,15 @@ pub struct PendingApprovalView {
 /// `"toolset_first_invoke_gate"`, `"trustline_clawback_opt_in"`,
 /// `"rule_proposal"`, `"rejected"`), the same tagging convention as
 /// `stellar_agent_stablecoin::preview::GateDecisionView`.
+///
+/// Every value-denominated field (`amount_stroops`, `fee_stroops`,
+/// `amount_min_stroops`, `amount_max_stroops`) is encoded as a decimal
+/// string via [`crate::wire_stroops`]: a JSON number backed by `f64` cannot
+/// represent an `i64`/`u32` stroop amount exactly once it exceeds `2^53`.
+/// `seq_num` and rule id lists are counts/ids, not value-denominated, and
+/// stay plain JSON numbers. The internal Rust field types are unchanged —
+/// only the served wire encoding differs — so the store schema and every
+/// in-crate consumer of these variants by field access are unaffected.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -78,13 +87,16 @@ pub enum ApprovalSummaryView {
     Payment {
         /// Destination G-strkey.
         to: String,
-        /// Amount in stroops.
+        /// Amount in stroops, decimal-string encoded on the wire (see
+        /// [`stellar_agent_core::wire_stroops`](crate::wire_stroops)).
+        #[serde(with = "crate::wire_stroops::i64")]
         amount_stroops: i64,
         /// Asset identifier (`"XLM"` or `"<code>:<issuer>"`).
         asset: String,
         /// Optional memo text.
         memo: Option<String>,
-        /// Simulated transaction fee in stroops.
+        /// Simulated transaction fee in stroops, decimal-string encoded.
+        #[serde(with = "crate::wire_stroops::u32")]
         fee_stroops: u32,
         /// Simulated sequence number.
         seq_num: i64,
@@ -96,11 +108,13 @@ pub enum ApprovalSummaryView {
         balance_id_strkey: String,
         /// Asset identifier.
         asset: String,
-        /// Claim amount in stroops.
+        /// Claim amount in stroops, decimal-string encoded.
+        #[serde(with = "crate::wire_stroops::i64")]
         amount_stroops: i64,
         /// Claiming (source) account G-strkey.
         source: String,
-        /// Simulated transaction fee in stroops.
+        /// Simulated transaction fee in stroops, decimal-string encoded.
+        #[serde(with = "crate::wire_stroops::u32")]
         fee_stroops: u32,
         /// Simulated sequence number.
         seq_num: i64,
@@ -136,9 +150,11 @@ pub enum ApprovalSummaryView {
         destination_redacted: String,
         /// Asset identifier.
         asset: String,
-        /// Minimum grant-bucket bound in stroops.
+        /// Minimum grant-bucket bound in stroops, decimal-string encoded.
+        #[serde(with = "crate::wire_stroops::i64")]
         amount_min_stroops: i64,
-        /// Maximum grant-bucket bound in stroops.
+        /// Maximum grant-bucket bound in stroops, decimal-string encoded.
+        #[serde(with = "crate::wire_stroops::i64")]
         amount_max_stroops: i64,
     },
 
@@ -686,6 +702,14 @@ mod tests {
         };
         let json = serde_json::to_value(&payment).unwrap();
         assert_eq!(json["kind"], "payment");
+        assert_eq!(
+            json["amount_stroops"], "1",
+            "amount_stroops must serialize as a decimal string"
+        );
+        assert_eq!(
+            json["fee_stroops"], "100",
+            "fee_stroops must serialize as a decimal string"
+        );
 
         let rejected = ApprovalSummaryView::Rejected {
             original_kind_name: "PaymentSimulated".to_owned(),
@@ -693,6 +717,39 @@ mod tests {
         let json = serde_json::to_value(&rejected).unwrap();
         assert_eq!(json["kind"], "rejected");
         assert_eq!(json["original_kind_name"], "PaymentSimulated");
+    }
+
+    #[test]
+    fn claim_summary_view_encodes_stroop_fields_as_strings() {
+        let claim = ApprovalSummaryView::Claim {
+            balance_id_strkey: "B".to_owned() + &"A".repeat(57),
+            asset: "XLM".to_owned(),
+            amount_stroops: 9_007_199_254_740_993_i64, // 2^53 + 1
+            source: "GAAA".to_owned(),
+            fee_stroops: 100,
+            seq_num: 1,
+        };
+        let json = serde_json::to_value(&claim).unwrap();
+        assert_eq!(
+            json["amount_stroops"], "9007199254740993",
+            "amount_stroops must survive the f64 precision boundary as a string"
+        );
+        assert_eq!(json["fee_stroops"], "100");
+    }
+
+    #[test]
+    fn toolset_first_invoke_gate_summary_view_encodes_stroop_fields_as_strings() {
+        let gate = ApprovalSummaryView::ToolsetFirstInvokeGate {
+            toolset_name: "my-toolset".to_owned(),
+            capability: "sign-payment".to_owned(),
+            destination_redacted: "GAAAA...ZZZZZ".to_owned(),
+            asset: "XLM".to_owned(),
+            amount_min_stroops: 0,
+            amount_max_stroops: i64::MAX,
+        };
+        let json = serde_json::to_value(&gate).unwrap();
+        assert_eq!(json["amount_min_stroops"], "0");
+        assert_eq!(json["amount_max_stroops"], "9223372036854775807");
     }
 
     #[test]

@@ -135,9 +135,20 @@ Controls the unlock window — the short, TTL-bounded period during which the
 These conventions apply throughout the wallet and matter when reading or writing
 profile-driven values.
 
-- Amounts are decimal strings with a unit, e.g. `"10 XLM"`. Never JSON numbers.
+- Human-scale amounts are decimal strings with a unit, e.g. `"10 XLM"`. Never
+  JSON numbers.
+- Every value-denominated field on the MCP tool wire (`amount_in_stroops`,
+  `amount_stroops`, `starting_balance_stroops`, `limit_stroops`, fee fields,
+  fee-stats percentiles) is a bare decimal string in stroops/base units — no
+  unit suffix, e.g. `"100000000"`. A raw JSON number is rejected on inputs: a
+  JSON number backed by `f64` cannot represent a stroop amount exactly once
+  it exceeds `2^53`. The SEP-6 anchor passthrough fields
+  (`sep6_deposit_info` fee/min/max amounts) are the one documented exception —
+  they relay a third-party anchor's own SEP-6 payload verbatim.
 - Stroop-denominated profile fields (`usd_threshold`, fee fields) are TOML
-  integers in stroops; 1 XLM = 10^7 stroops.
+  integers in stroops; 1 XLM = 10^7 stroops. This is a separate convention
+  from the MCP wire fields above — profile.toml is an operator-authored
+  config file, not a JSON wire message.
 - An asset is `native`/`XLM`, or `CODE:GISSUER` (code, colon, issuer G-address).
 - `chain_id` is the CAIP-2 id (`stellar:testnet` or `stellar:mainnet`) and is
   required by most MCP tools.

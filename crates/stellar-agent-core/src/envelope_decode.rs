@@ -11,6 +11,20 @@
 //! shape that `WalletServer::dispatch_gate` forwards to the
 //! `PolicyEngine::evaluate` call.
 //!
+//! # Value-denominated fields are decimal strings
+//!
+//! `amount_stroops`, `starting_balance_stroops`, and `limit_stroops` are
+//! encoded as decimal strings, not JSON numbers: a JSON number backed by
+//! `f64` cannot represent an `i64` stroop amount exactly once it exceeds
+//! `2^53`, so a caller re-deriving these fields from a raw
+//! `serde_json::Value` MUST tolerate both the string form and a legacy
+//! number (see `stellar_agent_mcp::tools::amount_wire::value_as_stroops_i64`
+//! for the tolerant reader). `total_fee_stroops` is the one exception: it is
+//! always a JSON number. That field never crosses the MCP wire on its own —
+//! it is an internal-only value consumed exclusively by the same-process
+//! commit handler that called this function — so it carries no `2^53`
+//! precision risk and stays numeric for readability.
+//!
 //! # XDR semantics — source account resolution
 //!
 //! In Stellar XDR a `TransactionV1Envelope` carries a transaction-level
@@ -324,7 +338,7 @@ fn structured_memo_field(memo: &stellar_xdr::Memo) -> Option<(&'static str, Stri
 ///   "source": "G...",
 ///   "total_fee_stroops": <u32>,
 ///   "destination": "G...",
-///   "amount_stroops": <i64>,
+///   "amount_stroops": "<decimal i64 stroops>",
 ///   "asset": "XLM" | "CODE:Gissuer",
 ///   "memo": "text" | null,
 ///   "memo_hash": "<64 lowercase hex chars, only for Memo::Hash>",
@@ -344,7 +358,7 @@ fn structured_memo_field(memo: &stellar_xdr::Memo) -> Option<(&'static str, Stri
 ///   "source": "G...",
 ///   "total_fee_stroops": <u32>,
 ///   "destination": "G...",
-///   "starting_balance_stroops": <i64>
+///   "starting_balance_stroops": "<decimal i64 stroops>"
 /// }
 /// ```
 ///
@@ -357,11 +371,11 @@ fn structured_memo_field(memo: &stellar_xdr::Memo) -> Option<(&'static str, Stri
 ///   "total_fee_stroops": <u32>,
 ///   "asset_code": "USDC",
 ///   "asset_issuer": "G...",
-///   "limit_stroops": <i64>
+///   "limit_stroops": "<decimal i64 stroops>"
 /// }
 /// ```
 ///
-/// `limit_stroops` is `i64::MAX` (`9223372036854775807`) when the caller
+/// `limit_stroops` is the decimal string `"9223372036854775807"` (`i64::MAX`) when the caller
 /// built the envelope with the Stellar "unlimited trustline" default.
 /// `asset_code` is uppercase, null-trimmed.
 /// `asset_issuer` is the canonical G-strkey of the issuer.
@@ -529,7 +543,7 @@ fn decode_pay_args(
         "source": source_strkey,
         "total_fee_stroops": total_fee_stroops,
         "destination": dest_strkey,
-        "amount_stroops": amount_stroops,
+        "amount_stroops": amount_stroops.to_string(),
         "asset": asset_str,
         "memo": memo_opt,
     });
@@ -570,7 +584,7 @@ fn decode_create_account_args(
         "source": source_strkey,
         "total_fee_stroops": total_fee_stroops,
         "destination": dest_strkey,
-        "starting_balance_stroops": ca.starting_balance,
+        "starting_balance_stroops": ca.starting_balance.to_string(),
     }))
 }
 
@@ -585,11 +599,12 @@ fn decode_create_account_args(
 ///   "total_fee_stroops": <u32>,
 ///   "asset_code": "USDC",
 ///   "asset_issuer": "G...",
-///   "limit_stroops": <i64>
+///   "limit_stroops": "<decimal i64 stroops>"
 /// }
 /// ```
 ///
-/// `limit_stroops` mirrors `ChangeTrustOp.limit` exactly.  When the caller
+/// `limit_stroops` mirrors `ChangeTrustOp.limit` exactly, as a decimal
+/// string.  When the caller
 /// built the envelope without an explicit limit, the baselib sets
 /// `ChangeTrustOp.limit = i64::MAX` (Stellar default unlimited trustline).
 ///
@@ -658,7 +673,7 @@ fn decode_change_trust_args(
         "total_fee_stroops": total_fee_stroops,
         "asset_code": asset_code,
         "asset_issuer": asset_issuer,
-        "limit_stroops": ct.limit,
+        "limit_stroops": ct.limit.to_string(),
     }))
 }
 
@@ -903,7 +918,7 @@ mod tests {
 
         assert_eq!(result["source"], SOURCE_G);
         assert_eq!(result["destination"], DEST_G);
-        assert_eq!(result["amount_stroops"], serde_json::json!(10_000_000_i64));
+        assert_eq!(result["amount_stroops"], "10000000");
         assert_eq!(result["asset"], "XLM");
         assert_eq!(result["memo"], "test-memo");
         assert!(result.get("memo_hash").is_none());
@@ -937,7 +952,7 @@ mod tests {
 
         assert_eq!(result["source"], SOURCE_G);
         assert_eq!(result["destination"], DEST_G);
-        assert_eq!(result["amount_stroops"], serde_json::json!(50_000_000_i64));
+        assert_eq!(result["amount_stroops"], "50000000");
         let expected_asset = format!("USDC:{USDC_ISSUER_G}");
         assert_eq!(result["asset"], expected_asset);
         assert_eq!(result["memo"], serde_json::Value::Null);
@@ -965,10 +980,7 @@ mod tests {
 
         assert_eq!(result["source"], SOURCE_G);
         assert_eq!(result["destination"], DEST_G);
-        assert_eq!(
-            result["starting_balance_stroops"],
-            serde_json::json!(10_000_000_i64)
-        );
+        assert_eq!(result["starting_balance_stroops"], "10000000");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1301,7 +1313,7 @@ mod tests {
         let xdr_b64 = to_b64(&env);
 
         let result = decode_authoritative_args(&xdr_b64, "stellar_pay_commit").unwrap();
-        assert_eq!(result["amount_stroops"], serde_json::json!(5_000_000_i64));
+        assert_eq!(result["amount_stroops"], "5000000");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1332,10 +1344,7 @@ mod tests {
         assert_eq!(result["total_fee_stroops"], serde_json::json!(100_u32));
         assert_eq!(result["asset_code"], "USDC");
         assert_eq!(result["asset_issuer"], USDC_ISSUER_G);
-        assert_eq!(
-            result["limit_stroops"],
-            serde_json::json!(1_000_000_000_i64)
-        );
+        assert_eq!(result["limit_stroops"], "1000000000");
     }
 
     /// Happy path: ChangeTrust with unlimited limit (`i64::MAX`) — the Stellar
@@ -1360,7 +1369,16 @@ mod tests {
 
         let result = decode_authoritative_args(&xdr_b64, "stellar_trustline_commit").unwrap();
         assert_eq!(result["asset_code"], "USDC");
-        assert_eq!(result["limit_stroops"], serde_json::json!(i64::MAX));
+        assert_eq!(result["limit_stroops"], "9223372036854775807");
+        // The decimal-string encoding round-trips i64::MAX exactly — the
+        // concrete precision loss a JSON number would have introduced
+        // (f64 cannot represent 9_223_372_036_854_775_807 exactly).
+        let round_tripped: i64 = result["limit_stroops"]
+            .as_str()
+            .expect("limit_stroops is a decimal string")
+            .parse()
+            .expect("limit_stroops decimal string must parse as i64");
+        assert_eq!(round_tripped, i64::MAX);
     }
 
     /// Happy path: ChangeTrust with an alphanum12 asset code (12-byte code field).
@@ -1386,7 +1404,7 @@ mod tests {
         let result = decode_authoritative_args(&xdr_b64, "stellar_trustline_commit").unwrap();
         assert_eq!(result["asset_code"], "STELARGO");
         assert_eq!(result["asset_issuer"], USDC_ISSUER_G);
-        assert_eq!(result["limit_stroops"], serde_json::json!(500_000_000_i64));
+        assert_eq!(result["limit_stroops"], "500000000");
     }
 
     /// Error path: Payment operation presented as stellar_trustline_commit →

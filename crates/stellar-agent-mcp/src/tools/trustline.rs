@@ -140,12 +140,16 @@ pub struct StellarTrustlineArgs {
     /// - `"C…"` (56-char) — SAC address (deferred; returns a typed error).
     pub asset: String,
 
-    /// Optional explicit trustline limit in stroops.
+    /// Optional explicit trustline limit in stroops, decimal-string encoded.
     ///
     /// `null` or absent → the Stellar protocol default (`i64::MAX`, unlimited).
-    /// `0` removes the trustline.
+    /// `"0"` removes the trustline. Accepted range is `0..=i64::MAX`
+    /// (a client-side tightening over the raw `ChangeTrustOp.limit` field,
+    /// which is a signed `i64`: a negative limit is always refused
+    /// server-side, so this rejects it earlier, at the wallet boundary,
+    /// with a clearer error). A raw JSON number is rejected by the schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit_stroops: Option<i64>,
+    pub limit_stroops: Option<String>,
 
     /// Classic fee per operation: `<stroops>`, `auto`, or `auto:pNN`.
     #[serde(default, rename = "fee", skip_serializing_if = "Option::is_none")]
@@ -386,6 +390,22 @@ impl WalletServer {
             .dispatch_gate("stellar_trustline", &args_value, &args.chain_id)
             .await?;
 
+        // ── Parse limit_stroops (0..=i64::MAX; see the field rustdoc for the
+        // client-side lower-bound tightening) ─────────────────────────────
+        let limit_stroops = crate::tools::amount_wire::parse_stroops_i64_opt_field(
+            "limit_stroops",
+            args.limit_stroops.as_deref(),
+        )?;
+        if let Some(v) = limit_stroops
+            && v < 0
+        {
+            return Err(rmcp::ErrorData::invalid_params(
+                "limit_stroops must be >= 0 (0 removes the trustline; omit or pass null for \
+                 the default unlimited i64::MAX)",
+                None,
+            ));
+        }
+
         // ── Validate G-strkey (from account) ─────────────────────────────────
         if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(&args.from) {
             return Err(rmcp::ErrorData::invalid_params(
@@ -535,7 +555,7 @@ impl WalletServer {
         // ── Step 4: Build trustline preview (includes clawback gate decision) ─
         let preview = TrustlinePreview::build(
             resolved.clone(),
-            args.limit_stroops,
+            limit_stroops,
             issuer_flags.as_ref(),
             opt_in_present,
         );
@@ -741,7 +761,7 @@ impl WalletServer {
             &self.profile.network_passphrase,
             fee_per_op_stroops,
         );
-        if let Err(err) = builder.change_trust(&asset, args.limit_stroops) {
+        if let Err(err) = builder.change_trust(&asset, limit_stroops) {
             return Err(rmcp::ErrorData::internal_error(
                 format!("envelope_build_error: change_trust: {err}"),
                 None,
@@ -798,7 +818,7 @@ impl WalletServer {
                 &args.from,
                 &resolved.code,
                 &resolved.issuer,
-                args.limit_stroops,
+                limit_stroops,
                 total_fee_stroops,
                 source_sequence.saturating_add(1),
                 &profile_name,
@@ -812,8 +832,8 @@ impl WalletServer {
                         "summary": {
                             "asset_code": &resolved.code,
                             "asset_issuer": redact_strkey_first5_last5(&resolved.issuer),
-                            "limit_stroops": args.limit_stroops,
-                            "simulated_fee_stroops": total_fee_stroops,
+                            "limit_stroops": limit_stroops.map(|v| v.to_string()),
+                            "simulated_fee_stroops": total_fee_stroops.to_string(),
                             "simulated_seq_num": source_sequence + 1,
                         }
                     }))
@@ -841,13 +861,13 @@ impl WalletServer {
             "source_account_id": &args.from,
             "source_sequence": source_sequence.to_string(),
             "fee_stroops": total_fee_stroops.to_string(),
-            "selected_fee_per_op_stroops": fee_per_op_stroops,
+            "selected_fee_per_op_stroops": fee_per_op_stroops.to_string(),
             "selected_fee_percentile": &fee_selection.selected_fee_percentile,
             "operation": {
                 "type": "change_trust",
                 "asset_code": &resolved.code,
                 "asset_issuer": redact_strkey_first5_last5(&resolved.issuer),
-                "limit_stroops": args.limit_stroops,
+                "limit_stroops": limit_stroops.map(|v| v.to_string()),
             },
         });
 
@@ -982,7 +1002,7 @@ impl WalletServer {
             .to_owned();
         let auth_limit_stroops = authoritative_args
             .get("limit_stroops")
-            .and_then(serde_json::Value::as_i64);
+            .and_then(crate::tools::amount_wire::value_as_stroops_i64);
 
         let total_fee_from_envelope = authoritative_args
             .get("total_fee_stroops")

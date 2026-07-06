@@ -890,7 +890,7 @@ async fn simulate_fee_auto_selects_p95_and_binds_envelope_fee() {
     let data = json.get("data").expect("success envelope has data");
     assert_eq!(
         data.pointer("/simulation/selected_fee_per_op_stroops"),
-        Some(&serde_json::json!(333))
+        Some(&serde_json::json!("333"))
     );
     assert_eq!(
         data.pointer("/simulation/selected_fee_percentile"),
@@ -943,7 +943,7 @@ async fn simulate_fee_auto_p99_selects_p99() {
     let data = json.get("data").expect("success envelope has data");
     assert_eq!(
         data.pointer("/simulation/selected_fee_per_op_stroops"),
-        Some(&serde_json::json!(999))
+        Some(&serde_json::json!("999"))
     );
     assert_eq!(
         data.pointer("/simulation/selected_fee_percentile"),
@@ -2280,5 +2280,223 @@ async fn pay_commit_below_threshold_skips_cross_check_unconditionally() {
         0,
         "oracle mock must receive 0 requests for below-threshold payment; received: {}",
         oracle_requests.len()
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Full round trip: simulate → commit → submit succeeds; the decimal-string
+// wire encoding survives every hop, not just each phase in isolation.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Derives the G-strkey for a 32-byte ed25519 seed.
+fn gstrkey_for_seed(seed: [u8; 32]) -> String {
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let vk = signing_key.verifying_key();
+    stellar_strkey::ed25519::PublicKey(vk.to_bytes())
+        .to_string()
+        .to_string()
+}
+
+/// Derives the S-strkey (seed strkey) for a 32-byte ed25519 seed.
+fn sstrkey_for_seed(seed: [u8; 32]) -> String {
+    stellar_strkey::ed25519::PrivateKey(seed)
+        .as_unredacted()
+        .to_string()
+        .to_string()
+}
+
+/// RPC responder for a full simulate → commit → submit round trip.
+///
+/// Serves the SAME funded-account `getLedgerEntries` response on both the
+/// simulate fetch and the commit re-fetch, so the rebuilt envelope is
+/// byte-identical to the presented one (the divergence check passes), then
+/// `sendTransaction` (PENDING) followed by `getTransaction` (SUCCESS).
+struct PaySubmitSuccessRpcResponder {
+    account_key_xdr: String,
+    account_xdr: String,
+}
+
+#[async_trait]
+impl Respond for PaySubmitSuccessRpcResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let request_value = serde_json::from_slice::<serde_json::Value>(&request.body)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let req_id = request_value
+            .get("id")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(1));
+        let method = request_value
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+
+        let result = match method {
+            "getLedgerEntries" => {
+                let body = String::from_utf8_lossy(&request.body);
+                if body.contains(&self.account_key_xdr) {
+                    serde_json::json!({
+                        "entries": [
+                            {
+                                "key": self.account_key_xdr,
+                                "xdr": self.account_xdr,
+                                "lastModifiedLedgerSeq": 1000
+                            }
+                        ],
+                        "latestLedger": 1001
+                    })
+                } else {
+                    serde_json::json!({ "entries": [], "latestLedger": 1001 })
+                }
+            }
+            "sendTransaction" => serde_json::json!({
+                "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "status": "PENDING",
+                "latestLedger": 1001,
+                "latestLedgerCloseTime": "1234567890"
+            }),
+            "getTransaction" => serde_json::json!({
+                "status": "SUCCESS",
+                "ledger": 1005,
+                "txHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }),
+            _ => serde_json::json!({}),
+        };
+
+        ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": result,
+            }))
+            .insert_header("content-type", "application/json")
+    }
+}
+
+/// End-to-end success path: `stellar_pay` (simulate) with the payment amount
+/// supplied via `amount_in_stroops` — the decimal-string field this migration
+/// changed from `u64` — mints a nonce; `stellar_pay_commit` reuses the exact
+/// `(nonce, expires_at_unix_ms, envelope_xdr)` triple, re-derives the same
+/// decimal-string `amount_stroops` from the HMAC-bound envelope, signs via a
+/// keyring-backed signer, and submits. Asserts the committed values, not just
+/// that each phase in isolation accepts the new wire shape.
+#[tokio::test]
+#[serial]
+async fn pay_commit_full_round_trip_succeeds_with_string_encoded_amounts() {
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(200);
+
+    // Fresh signer keypair; populates the mock keyring's default signer entry
+    // ("svc", "acct" — matching `testnet_profile_with_rpc`'s
+    // `Profile::builder_testnet("svc", "acct", ...)`) with its S-strkey.
+    let seed = [0x42_u8; 32];
+    let source_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+
+    let account_key_xdr = account_ledger_key_xdr(&source_g);
+    // 10_000_000 XLM: comfortably covers the 100 XLM payment, base reserve, and fee.
+    let account_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(PaySubmitSuccessRpcResponder {
+            account_key_xdr,
+            account_xdr,
+        })
+        .mount(&mock_server)
+        .await;
+
+    let profile = testnet_profile_with_rpc(&mock_server.uri());
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    // ── Simulate ───────────────────────────────────────────────────────────
+    let simulate_args = StellarPayArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        source: source_g.clone(),
+        destination: DEST_G.to_owned(),
+        amount: None,
+        amount_in_stroops: Some("1000000000".to_owned()), // 100 XLM
+        asset: "native".to_owned(),
+        memo_text: None,
+        memo_id: None,
+        memo_hash_hex: None,
+        memo_return_hex: None,
+        classic_base: None,
+    };
+    let sim_result = server
+        .call_stellar_pay(simulate_args.clone())
+        .await
+        .expect("simulate must not error");
+    assert_ne!(sim_result.is_error, Some(true), "simulate must succeed");
+    let sim_json = call_result_json(&sim_result);
+    let sim_data = sim_json.get("data").expect("simulate success carries data");
+
+    assert_eq!(
+        sim_data.pointer("/simulation/operation/amount_stroops"),
+        Some(&serde_json::json!("1000000000")),
+        "simulate must report amount_stroops as a decimal string: {sim_data}"
+    );
+
+    let nonce = sim_data
+        .get("nonce")
+        .and_then(serde_json::Value::as_str)
+        .expect("nonce present")
+        .to_owned();
+    let expires_at_unix_ms = sim_data
+        .get("expires_at_unix_ms")
+        .and_then(serde_json::Value::as_u64)
+        .expect("expires_at_unix_ms present");
+    let envelope_xdr = sim_data
+        .get("envelope_xdr")
+        .and_then(serde_json::Value::as_str)
+        .expect("envelope_xdr present")
+        .to_owned();
+
+    // ── Commit ─────────────────────────────────────────────────────────────
+    let commit_args = StellarPayCommitArgs {
+        chain_id: simulate_args.chain_id.clone(),
+        source: simulate_args.source.clone(),
+        destination: simulate_args.destination.clone(),
+        amount: simulate_args.amount.clone(),
+        amount_in_stroops: simulate_args.amount_in_stroops.clone(),
+        asset: simulate_args.asset.clone(),
+        memo_text: None,
+        memo_id: None,
+        memo_hash_hex: None,
+        memo_return_hex: None,
+        nonce,
+        expires_at_unix_ms,
+        envelope_xdr,
+        approval_nonce: None,
+        approval_attestation: None,
+    };
+    let commit_result = server
+        .call_stellar_pay_commit(commit_args)
+        .await
+        .expect("commit must not error");
+    let commit_json = call_result_json(&commit_result);
+    assert_ne!(
+        commit_result.is_error,
+        Some(true),
+        "commit must succeed, got: {commit_json}"
+    );
+    let commit_data = commit_json
+        .get("data")
+        .expect("commit success carries data");
+    assert!(
+        commit_data
+            .get("tx_hash")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "committed response must carry tx_hash: {commit_data}"
+    );
+    assert_eq!(
+        commit_data
+            .get("ledger")
+            .and_then(serde_json::Value::as_u64),
+        Some(1005),
+        "committed response must carry the submitted ledger: {commit_data}"
     );
 }

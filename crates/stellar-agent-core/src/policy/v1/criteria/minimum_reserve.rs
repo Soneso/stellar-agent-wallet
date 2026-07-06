@@ -38,6 +38,7 @@
 
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::criteria::Criterion;
+use crate::policy::v1::criteria::amount_extract::extract_pay_or_create_account_stroops;
 use crate::policy::{DenyReason, PolicyError};
 use crate::protocol_consts::BASE_RESERVE_STROOPS;
 
@@ -131,6 +132,10 @@ impl Criterion for MinimumReserveCriterion {
     /// - [`PolicyError::CriterionEvaluationFailed`] when
     ///   `account_view.balance_stroops()` returns an error (balance
     ///   unreadable or parse failure).
+    /// - [`PolicyError::CriterionEvaluationFailed`] when a present
+    ///   `amount_stroops` / `starting_balance_stroops` (or legacy `amount` /
+    ///   `starting_balance`) field fails to parse — a malformed
+    ///   server-derived amount refuses rather than passing as a zero debit.
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
         // Fail-closed: account_view = None means the dispatch site has not
         // wired up the account state.  Silently passing would allow every
@@ -156,7 +161,7 @@ impl Criterion for MinimumReserveCriterion {
                     ),
                 })?;
 
-        let amount_stroops = extract_amount_stroops(ctx);
+        let amount_stroops = extract_amount_stroops(ctx)?;
         let fee_stroops = extract_fee_stroops(ctx);
 
         // Compute post-balance using saturating arithmetic to avoid wrapping on
@@ -186,28 +191,37 @@ impl Criterion for MinimumReserveCriterion {
 
 /// Extracts the transaction amount in stroops from args.
 ///
-/// Returns 0 when the field is absent or unparseable (fail-open for fee-only
-/// transactions; the reserve check will still fire on the fee alone).
-fn extract_amount_stroops(ctx: &EvalContext<'_>) -> i64 {
-    let tool = ctx.tool.name.as_str();
-    let amount_str = match tool {
-        "stellar_pay" | "stellar_pay_commit" => ctx
-            .args
-            .get("amount")
-            .and_then(|v| v.as_str())
-            .unwrap_or("0 XLM"),
-        "stellar_create_account" | "stellar_create_account_commit" => ctx
-            .args
-            .get("starting_balance")
-            .and_then(|v| v.as_str())
-            .unwrap_or("0 XLM"),
-        _ => "0 XLM",
-    };
-
-    crate::amount::StellarAmount::parse_with_unit(amount_str)
-        .or_else(|_| crate::amount::StellarAmount::parse_stroops(amount_str))
-        .map(|a| a.as_stroops())
-        .unwrap_or(0)
+/// For `stellar_pay(_commit)` and `stellar_create_account(_commit)`, resolves
+/// the amount via [`extract_pay_or_create_account_stroops`] (resolved
+/// `amount_stroops` / `starting_balance_stroops` key first, legacy
+/// unit-string key as fallback) — every args shape these tools produce in
+/// production carries the resolved key, so the reserve guard sees the real
+/// debit on every path (simulate AND commit).
+///
+/// # Invariant
+///
+/// [`extract_pay_or_create_account_stroops`] distinguishes `Err` (a
+/// recognised tool's amount field IS present but malformed) from `Ok(None)`
+/// (the tool is not one this criterion knows how to extract a debit for, or
+/// — for pay/create_account — genuinely carries neither key). This function
+/// preserves that distinction rather than collapsing both to a silent 0:
+///
+/// - `Ok(Some(stroops))` → the real debit.
+/// - `Ok(None)` → a genuinely amount-less tool; defaults to 0 (fail-open ONLY
+///   here, matching the pre-existing "fee-only" fallback posture — the
+///   reserve check still fires on the fee alone via `extract_fee_stroops`).
+/// - `Err(_)` → a server-derived amount field is present but malformed; this
+///   is propagated as [`PolicyError::CriterionEvaluationFailed`] (refuse),
+///   the same fail-closed posture `per_tx_cap` / `per_period_cap` apply to
+///   the identical condition. Silently treating a malformed amount as 0 would
+///   let an attacker suppress the reserve debit by corrupting the field.
+///
+/// # Errors
+///
+/// Returns [`PolicyError::CriterionEvaluationFailed`] when a present resolved
+/// or legacy amount field fails to parse.
+fn extract_amount_stroops(ctx: &EvalContext<'_>) -> Result<i64, PolicyError> {
+    Ok(extract_pay_or_create_account_stroops(ctx, "minimum_reserve")?.unwrap_or(0))
 }
 
 /// Extracts the transaction fee in stroops from args.
@@ -487,5 +501,197 @@ mod tests {
         let ctx = make_ctx(&tool, &profile, &args, &store, None);
 
         assert_eq!(extract_fee_stroops(&ctx), 12_345);
+    }
+
+    // ── Real production args shapes (resolved-key re-point; closes the
+    // pre-existing FAIL-OPEN where the absent legacy key silently counted the
+    // debit as 0) ────────────────────────────────────────────────────────────
+
+    /// Commit-time `stellar_pay_commit` authoritative_args shape breaches the
+    /// reserve on the real debit — before this re-point, the absent "amount"
+    /// key silently defaulted to 0 and this call would have passed.
+    #[test]
+    fn pay_commit_authoritative_args_shape_breach_is_now_caught() {
+        let store = PolicyStateStore::new();
+        let criterion = MinimumReserveCriterion::new(5_000_000);
+
+        let view = MockAccountView {
+            balance: 120_000_000, // 12 XLM
+            subentries: 0,
+        };
+        // Reserve: (2+0)*5_000_000 = 10_000_000 + 5_000_000 margin = 15_000_000.
+        // Sending 11 XLM (110_000_000 stroops): post = 120_000_000 - 110_000_000
+        // = 10_000_000 < 15_000_000 → breach.
+        let args = json!({
+            "source": "GAAA",
+            "total_fee_stroops": 100u32,
+            "destination": "GBBB",
+            "amount_stroops": "110000000",
+            "asset": "XLM",
+            "memo": serde_json::Value::Null,
+        });
+        let tool = make_tool("stellar_pay_commit");
+        let profile = make_profile();
+        let ctx = make_ctx(&tool, &profile, &args, &store, Some(&view));
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::MinimumReserveBreached { .. })),
+            "the real debit from amount_stroops must be seen, not silently \
+             defaulted to 0: {result:?}"
+        );
+    }
+
+    /// Simulate-time `stellar_create_account` args_value shape (only
+    /// `starting_balance_stroops`, never the legacy `starting_balance` key)
+    /// breaches the reserve on the real debit.
+    #[test]
+    fn create_account_simulate_resolved_only_shape_breach_is_now_caught() {
+        let store = PolicyStateStore::new();
+        let criterion = MinimumReserveCriterion::new(5_000_000);
+
+        let view = MockAccountView {
+            balance: 120_000_000,
+            subentries: 0,
+        };
+        let args = json!({
+            "chain_id": "stellar:testnet",
+            "source": "GAAA",
+            "destination": "GBBB",
+            "starting_balance_stroops": "110000000",
+        });
+        let tool = make_tool("stellar_create_account");
+        let profile = make_profile();
+        let ctx = make_ctx(&tool, &profile, &args, &store, Some(&view));
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::MinimumReserveBreached { .. })),
+            "the real debit from starting_balance_stroops must be seen: {result:?}"
+        );
+    }
+
+    /// Commit-time `stellar_create_account_commit` authoritative_args shape.
+    #[test]
+    fn create_account_commit_authoritative_args_shape_breach_is_now_caught() {
+        let store = PolicyStateStore::new();
+        let criterion = MinimumReserveCriterion::new(5_000_000);
+
+        let view = MockAccountView {
+            balance: 120_000_000,
+            subentries: 0,
+        };
+        let args = json!({
+            "source": "GAAA",
+            "total_fee_stroops": 100u32,
+            "destination": "GBBB",
+            "starting_balance_stroops": "110000000",
+        });
+        let tool = make_tool("stellar_create_account_commit");
+        let profile = make_profile();
+        let ctx = make_ctx(&tool, &profile, &args, &store, Some(&view));
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::MinimumReserveBreached { .. })),
+            "the real debit must be seen at commit time too: {result:?}"
+        );
+    }
+
+    /// Regression: the legacy unit-string-only shape must still evaluate to
+    /// the identical verdict as before this re-point.
+    #[test]
+    fn legacy_starting_balance_only_shape_still_evaluates_identically() {
+        let store = PolicyStateStore::new();
+        let criterion = MinimumReserveCriterion::new(5_000_000);
+
+        let view = MockAccountView {
+            balance: 120_000_000,
+            subentries: 0,
+        };
+        let args = json!({ "starting_balance": "11 XLM" });
+        let tool = make_tool("stellar_create_account");
+        let profile = make_profile();
+        let ctx = make_ctx(&tool, &profile, &args, &store, Some(&view));
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::MinimumReserveBreached { .. })),
+            "legacy-only shape must still breach identically to before this re-point"
+        );
+    }
+
+    /// Version-crossing: a resolved key carrying a legacy JSON number must
+    /// still parse correctly.
+    #[test]
+    fn version_crossing_numeric_amount_stroops_still_parses() {
+        let store = PolicyStateStore::new();
+        let criterion = MinimumReserveCriterion::new(5_000_000);
+
+        let view = MockAccountView {
+            balance: 120_000_000,
+            subentries: 0,
+        };
+        let args = json!({ "amount_stroops": 110_000_000i64, "asset": "native" });
+        let tool = make_tool("stellar_pay");
+        let profile = make_profile();
+        let ctx = make_ctx(&tool, &profile, &args, &store, Some(&view));
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::MinimumReserveBreached { .. })),
+            "numeric amount_stroops must still be seen as the real debit"
+        );
+    }
+
+    /// A genuinely amount-less tool still gets the 0-default fail-open
+    /// posture (the reserve check fires on the fee alone, via
+    /// `extract_fee_stroops`, not on a fabricated amount).
+    #[test]
+    fn genuinely_amount_less_tool_still_defaults_amount_to_zero() {
+        let store = PolicyStateStore::new();
+        let criterion = MinimumReserveCriterion::new(5_000_000);
+
+        let view = MockAccountView {
+            balance: 120_000_000,
+            subentries: 0,
+        };
+        let args = json!({});
+        let tool = make_tool("stellar_balances");
+        let profile = make_profile();
+        let ctx = make_ctx(&tool, &profile, &args, &store, Some(&view));
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            result.is_none(),
+            "an amount-less tool with ample balance must pass (0 debit + 0 fee)"
+        );
+    }
+
+    /// A present-but-malformed resolved-key amount must be refused, not
+    /// silently treated as a 0 debit. Before this fix, `extract_amount_stroops`
+    /// swallowed `Err` from the shared extractor via `.ok().flatten().unwrap_or(0)`,
+    /// which would have let a corrupted `amount_stroops` field bypass the
+    /// reserve guard entirely.
+    #[test]
+    fn malformed_resolved_key_amount_is_refused_not_silently_zeroed() {
+        let store = PolicyStateStore::new();
+        let criterion = MinimumReserveCriterion::new(5_000_000);
+
+        let view = MockAccountView {
+            balance: 120_000_000,
+            subentries: 0,
+        };
+        let args = json!({
+            "source": "GAAA",
+            "total_fee_stroops": 100u32,
+            "destination": "GBBB",
+            "amount_stroops": "not-a-number",
+            "asset": "XLM",
+            "memo": serde_json::Value::Null,
+        });
+        let tool = make_tool("stellar_pay_commit");
+        let profile = make_profile();
+        let ctx = make_ctx(&tool, &profile, &args, &store, Some(&view));
+        let result = criterion.evaluate(&ctx);
+        assert!(
+            matches!(result, Err(PolicyError::CriterionEvaluationFailed { .. })),
+            "a malformed amount_stroops value must refuse (CriterionEvaluationFailed), \
+             not silently pass with a 0 debit: {result:?}"
+        );
     }
 }

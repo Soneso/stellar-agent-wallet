@@ -117,13 +117,16 @@ pub struct StellarPayArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amount: Option<McpAmountArgument>,
 
-    /// Payment amount as a raw stroop integer.
+    /// Payment amount as a raw stroop integer, decimal-string encoded.
     ///
-    /// Mutually exclusive with `amount`. When set, the value is the
-    /// stroop-typed integer with no unit suffix. Stellar wire amounts are i64
-    /// stroops; this u64 input is rejected if it exceeds `i64::MAX`.
+    /// Mutually exclusive with `amount`. When set, the value is a decimal
+    /// string of a non-negative stroop-typed integer with no unit suffix
+    /// (e.g. `"10000000"`). Stellar wire amounts are i64 stroops; this value
+    /// is rejected if it is negative, malformed, or exceeds `i64::MAX`. A raw
+    /// JSON number is rejected by the schema: a JSON number backed by `f64`
+    /// cannot represent a stroop amount exactly once it exceeds `2^53`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub amount_in_stroops: Option<u64>,
+    pub amount_in_stroops: Option<String>,
 
     /// Asset descriptor.
     ///
@@ -222,11 +225,12 @@ pub struct StellarPayCommitArgs {
 
     /// Payment amount as a raw stroop integer (same as simulate step).
     ///
-    /// Mutually exclusive with `amount`. When set, the value is the
-    /// stroop-typed integer with no unit suffix. Stellar wire amounts are i64
-    /// stroops; this u64 input is rejected if it exceeds `i64::MAX`.
+    /// Mutually exclusive with `amount`. When set, the value is a decimal
+    /// string of a non-negative stroop-typed integer with no unit suffix.
+    /// Stellar wire amounts are i64 stroops; this value is rejected if it is
+    /// negative, malformed, or exceeds `i64::MAX`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub amount_in_stroops: Option<u64>,
+    pub amount_in_stroops: Option<String>,
 
     /// Asset descriptor (same as simulate step).
     pub asset: String,
@@ -360,7 +364,7 @@ fn memo_summary(memo: &Memo) -> Option<String> {
 
 fn resolve_payment_amount(
     amount: Option<McpAmountArgument>,
-    amount_in_stroops: Option<u64>,
+    amount_in_stroops: Option<String>,
 ) -> Result<StellarAmount, rmcp::ErrorData> {
     match (amount, amount_in_stroops) {
         (Some(_), Some(_)) => Err(rmcp::ErrorData::invalid_params(
@@ -372,11 +376,19 @@ fn resolve_payment_amount(
             None,
         )),
         (Some(amount), None) => Ok(amount.into_stellar_amount()),
-        (None, Some(0)) => Err(rmcp::ErrorData::invalid_params(
-            "amount_in_stroops must be positive",
-            None,
-        )),
-        (None, Some(stroops)) => {
+        (None, Some(raw)) => {
+            // Non-negativity is enforced here by parsing into `u64` (the
+            // bound the field's Rust type used to carry before it became a
+            // decimal string); the `<= i64::MAX` bound is then enforced
+            // explicitly by the `i64::try_from` below.
+            let stroops =
+                crate::tools::amount_wire::parse_stroops_u64_field("amount_in_stroops", &raw)?;
+            if stroops == 0 {
+                return Err(rmcp::ErrorData::invalid_params(
+                    "amount_in_stroops must be positive",
+                    None,
+                ));
+            }
             let stroops = i64::try_from(stroops).map_err(|_| {
                 rmcp::ErrorData::invalid_params("amount_in_stroops exceeds i64 max", None)
             })?;
@@ -553,14 +565,16 @@ impl WalletServer {
         Parameters(args): Parameters<StellarPayArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         // ── Dispatch gate ─────────────────────────────────────────────────────
-        let payment_amount = resolve_payment_amount(args.amount.clone(), args.amount_in_stroops)?;
+        let payment_amount =
+            resolve_payment_amount(args.amount.clone(), args.amount_in_stroops.clone())?;
         let args_value = json!({
             "chain_id": &args.chain_id,
             "source": &args.source,
             "destination": &args.destination,
             "amount": args.amount.as_ref().map(ToString::to_string),
-            "amount_in_stroops": args.amount_in_stroops,
-            "amount_stroops": payment_amount.as_stroops(),
+            "amount_in_stroops": &args.amount_in_stroops,
+            "amount_stroops": payment_amount.as_stroops().to_string(),
+            "asset": &args.asset,
         });
         // ── Validate G-strkeys ────────────────────────────────────────────────
         if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(&args.source) {
@@ -960,10 +974,10 @@ impl WalletServer {
                         "expires_at_unix_ms": approval_expires,
                         "summary": {
                             "to": &args.destination,
-                            "amount_stroops": amount_stroops_i64,
+                            "amount_stroops": amount_stroops_i64.to_string(),
                             "asset": &asset_str,
                             "memo": memo_summary_for_json(&memo),
-                            "simulated_fee_stroops": total_fee_stroops,
+                            "simulated_fee_stroops": total_fee_stroops.to_string(),
                             "simulated_seq_num": source_sequence + 1,
                         }
                     }))
@@ -985,7 +999,7 @@ impl WalletServer {
             "source_sequence": source_sequence.to_string(),
             "source_native_balance_stroops": native_balance_stroops.to_string(),
             "fee_stroops": total_fee_stroops.to_string(),
-            "selected_fee_per_op_stroops": fee_per_op_stroops,
+            "selected_fee_per_op_stroops": fee_per_op_stroops.to_string(),
             "selected_fee_percentile": &fee_selection.selected_fee_percentile,
             "operation": {
                 "type": "payment",
@@ -1378,7 +1392,7 @@ impl WalletServer {
         {
             let amount_stroops: i64 = authoritative_args
                 .get("amount_stroops")
-                .and_then(serde_json::Value::as_i64)
+                .and_then(crate::tools::amount_wire::value_as_stroops_i64)
                 .ok_or_else(|| {
                     rmcp::ErrorData::internal_error(
                         "simulation.divergence: authoritative_args missing required \
@@ -1704,7 +1718,7 @@ impl WalletServer {
                 .to_owned();
             let summary_amount_stroops = authoritative
                 .get("amount_stroops")
-                .and_then(|v| v.as_i64())
+                .and_then(crate::tools::amount_wire::value_as_stroops_i64)
                 .unwrap_or(0_i64);
             let summary_asset = authoritative
                 .get("asset")
@@ -1960,7 +1974,7 @@ mod tests {
             Ok(amount) => amount,
             Err(err) => panic!("valid amount must parse: {err}"),
         };
-        let err = match resolve_payment_amount(Some(amount), Some(1)) {
+        let err = match resolve_payment_amount(Some(amount), Some("1".to_owned())) {
             Ok(amount) => panic!("both amount forms must reject, got {amount}"),
             Err(err) => err,
         };
@@ -1982,7 +1996,7 @@ mod tests {
 
     #[test]
     fn resolve_payment_amount_accepts_stroops() {
-        let amount = match resolve_payment_amount(None, Some(123)) {
+        let amount = match resolve_payment_amount(None, Some("123".to_owned())) {
             Ok(amount) => amount,
             Err(err) => panic!("stroops amount must parse: {err}"),
         };
@@ -1991,8 +2005,21 @@ mod tests {
     }
 
     #[test]
+    fn resolve_payment_amount_accepts_stroops_above_f64_precision_limit() {
+        // 2^53 + 1: the first integer an f64-backed JSON number cannot
+        // represent exactly. The decimal-string field must round-trip it
+        // byte-for-byte.
+        let amount = match resolve_payment_amount(None, Some("9007199254740993".to_owned())) {
+            Ok(amount) => amount,
+            Err(err) => panic!("stroops amount must parse: {err}"),
+        };
+
+        assert_eq!(amount.as_stroops(), 9_007_199_254_740_993_i64);
+    }
+
+    #[test]
     fn resolve_payment_amount_rejects_zero_stroops() {
-        let err = match resolve_payment_amount(None, Some(0)) {
+        let err = match resolve_payment_amount(None, Some("0".to_owned())) {
             Ok(amount) => panic!("zero stroops must reject, got {amount}"),
             Err(err) => err,
         };
@@ -2003,12 +2030,32 @@ mod tests {
 
     #[test]
     fn resolve_payment_amount_rejects_u64_overflow() {
-        let err = match resolve_payment_amount(None, Some(u64::MAX)) {
+        let err = match resolve_payment_amount(None, Some(u64::MAX.to_string())) {
             Ok(amount) => panic!("u64 overflow must reject, got {amount}"),
             Err(err) => err,
         };
 
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         assert!(err.message.contains("i64 max"));
+    }
+
+    #[test]
+    fn resolve_payment_amount_rejects_negative_stroops() {
+        let err = match resolve_payment_amount(None, Some("-5".to_owned())) {
+            Ok(amount) => panic!("negative stroops must reject, got {amount}"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn resolve_payment_amount_rejects_malformed_decimal_string() {
+        let err = match resolve_payment_amount(None, Some("not-a-number".to_owned())) {
+            Ok(amount) => panic!("malformed stroops string must reject, got {amount}"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
     }
 }
