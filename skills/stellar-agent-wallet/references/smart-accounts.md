@@ -104,16 +104,17 @@ stellar-agent smart-account signers remove --account CABC...WXYZ --rule-id 0 --s
 
 ## Verifier and policy WASM-hash pinning
 
-Verifier contracts are governed by a compile-time allowlist; no central server is consulted. Each entry carries a SHA-256 WASM hash and an audit status with `kind` discriminator `audited`, `unaudited`, `revoked`, or `retired`:
+Verifier contracts are governed by a compile-time allowlist; no central server is consulted. Each entry carries a SHA-256 WASM hash and an audit status with `kind` discriminator `audited`, `provisional`, `unaudited`, `revoked`, or `retired`:
 
 | Status | Meaning | Install gate | Advisory |
 |--------|---------|--------------|----------|
 | `audited` | Auditor-attested (`auditor` + `audited_at` fields) | Allowed | None |
+| `provisional` | Named-party internal artefact review; no external audit report yet (`attested_by` + `attested_at` fields) | Allowed | None |
 | `unaudited` | No audit attached | Operator-acknowledged risk required | None |
 | `revoked` | Disclosed-vulnerable (`revoked_at` + `reason`) | Blocked unless overridden | Fires on every CLI invocation until migrated |
 | `retired` | `revoked` past 24-month retention (`revoked_at` + `retired_at`; reason dropped) | Blocked unless overridden | Still fires |
 
-`smart-account list-verifiers` enumerates the allowlist with this taxonomy (read-only, no network, only flag is `--output`). It has two `audited` OZ `multisig-webauthn-verifier-example` entries: the canonical v0.7.2 (WASM SHA-256 `9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7`), which new deployments use, and the legacy v0.7.1 (WASM SHA-256 `678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a`), still recognised for verifier contracts already deployed on-chain. The two versions share an identical ABI.
+`smart-account list-verifiers` enumerates the allowlist with this taxonomy (read-only, no network, only flag is `--output`). It has two `provisional` OZ `multisig-webauthn-verifier-example` entries: the canonical v0.7.2 (WASM SHA-256 `9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7`), which new deployments use, and the legacy v0.7.1 (WASM SHA-256 `678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a`), still recognised for verifier contracts already deployed on-chain. The two versions share an identical ABI.
 
 Override flags on `smart-account rules create`:
 
@@ -149,7 +150,7 @@ stellar-agent smart-account deploy-spending-limit-policy --deployer-secret-env D
 stellar-agent smart-account deploy-policy --kind weighted-threshold --deployer-secret-env DEPLOYER_SK
 ```
 
-`smart-account migrate-verifier` builds and optionally executes a plan that moves all `external` signers from one verifier to another across every context rule. Dry-run is read-only and renders the plan as JSON; without `--dry-run` it signs and submits `remove_signer` / `add_signer` pairs. Mainnet dry-run allowed; mainnet submit additionally requires `--confirm-mainnet-migrate`. Pre-flight gates (fail-closed): destination verifier hash must be allowlisted, its audit status must be `audited` or `unaudited`, and the destination contract must be immutable.
+`smart-account migrate-verifier` builds and optionally executes a plan that moves all `external` signers from one verifier to another across every context rule. Dry-run is read-only and renders the plan as JSON; without `--dry-run` it signs and submits `remove_signer` / `add_signer` pairs. Mainnet dry-run allowed; mainnet submit additionally requires `--confirm-mainnet-migrate`. Pre-flight gates (fail-closed): destination verifier hash must be allowlisted, its audit status must be `audited`, `provisional`, or `unaudited`, and the destination contract must be immutable.
 
 - `--account <C>` (req), `--from <HASH_HEX>` (req, 64-char hex SHA-256 of the source verifier WASM), `--to <C>` (req, destination verifier), `--dry-run`, `--confirm-mainnet-migrate`, signer-source group (required for submit, not for dry-run).
 

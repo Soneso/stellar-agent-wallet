@@ -252,7 +252,7 @@ pub enum SmartAccountSubcommand {
     /// Pre-flight gates (fail-CLOSED):
     ///
     /// 1. Destination verifier hash MUST be in `VERIFIER_ALLOWLIST`.
-    /// 2. Destination audit status MUST be `Audited` or `Unaudited`.
+    /// 2. Destination audit status MUST be `Audited`, `Provisional`, or `Unaudited`.
     /// 3. Destination contract MUST be immutable (no admin/owner key).
     ///
     /// Mainnet submit requires `--confirm-mainnet-migrate`.

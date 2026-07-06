@@ -261,7 +261,9 @@ fn advisory_impl(audit_log_path: &Path, allowlist: &[VerifierAllowlistEntry]) ->
 /// - `Some(Retired)` — entry found with `Retired` status.
 /// - `Some(Revoked)` — entry found with an unrecognised future status
 ///   (default-emit on unknown).
-/// - `None` — entry found with `Audited` or `Unaudited` status (no advisory needed).
+/// - `None` — entry found with `Audited`, `Provisional`, or `Unaudited` status
+///   (no advisory needed; `Provisional` is a normal healthy state for a young
+///   allowlist, not a disclosed vulnerability).
 /// - `None` — hash not in allowlist (unknown hashes are not flagged; the
 ///   install-time gate already rejected them without `--accept-unknown-verifier`).
 pub(crate) fn find_advisory_kind_in(
@@ -274,7 +276,9 @@ pub(crate) fn find_advisory_kind_in(
             return match &entry.audit_status {
                 VerifierAuditStatus::Revoked { .. } => Some(VerifierAdvisoryKind::Revoked),
                 VerifierAuditStatus::Retired { .. } => Some(VerifierAdvisoryKind::Retired),
-                VerifierAuditStatus::Audited { .. } | VerifierAuditStatus::Unaudited => None,
+                VerifierAuditStatus::Audited { .. }
+                | VerifierAuditStatus::Provisional { .. }
+                | VerifierAuditStatus::Unaudited => None,
                 // Default-emit on unknown for future VerifierAuditStatus variants:
                 // an unrecognised status defaults to Revoked rather than silently
                 // swallowing the advisory.  Update this arm when a new
@@ -434,7 +438,7 @@ mod tests {
 
     #[test]
     fn advisory_returns_empty_when_hash_not_in_allowlist() {
-        // Production VERIFIER_ALLOWLIST has two Audited entries (OZ v0.7.2 at
+        // Production VERIFIER_ALLOWLIST has two Provisional entries (OZ v0.7.2 at
         // index 0, OZ v0.7.1 at index 1).
         // "deadbeef" is not in the allowlist → advisory must NOT trigger.
         // Positive trigger paths (Revoked + Retired) are tested in
@@ -455,21 +459,21 @@ mod tests {
         );
     }
 
-    // ── Test 4: advisory does NOT fire on Audited entry ────────────────────────
+    // ── Test 4: advisory does NOT fire on Provisional entry ────────────────────
 
     #[test]
-    fn advisory_does_not_fire_on_audited_entry() {
+    fn advisory_does_not_fire_on_provisional_entry() {
         let dir = TempDir::new().unwrap();
         let path = tmp_log(&dir);
         let writer = open_writer(path.clone());
-        // OZ v0.7.1 wasm_hash first-8-hex = "67800690" — Audited in VERIFIER_ALLOWLIST.
+        // OZ v0.7.1 wasm_hash first-8-hex = "67800690" — Provisional in VERIFIER_ALLOWLIST.
         write_context_rule_created(&writer, 1, "CDABC...12345", vec!["67800690".to_owned()]);
         drop(writer);
 
         let result = run_startup_advisory(&path);
         assert!(
             result.triggered_rule_ids.is_empty(),
-            "Audited entry must not trigger advisory; triggered={:?}",
+            "Provisional entry must not trigger advisory; triggered={:?}",
             result.triggered_rule_ids
         );
     }
@@ -545,12 +549,31 @@ mod tests {
     // ── Unit tests: find_advisory_kind_in ────────────────────────────────────
 
     #[test]
-    fn find_advisory_kind_in_returns_none_for_audited_oz_v071() {
-        // OZ v0.7.1 hash first-8: "67800690" — Audited → no advisory kind.
+    fn find_advisory_kind_in_returns_none_for_provisional_oz_v071() {
+        // OZ v0.7.1 hash first-8: "67800690" — Provisional → no advisory kind.
         let kind = find_advisory_kind_in("67800690", VERIFIER_ALLOWLIST);
         assert!(
             kind.is_none(),
-            "Audited OZ v0.7.1 must not produce an advisory kind"
+            "Provisional OZ v0.7.1 must not produce an advisory kind"
+        );
+    }
+
+    #[test]
+    fn find_advisory_kind_in_returns_none_for_provisional_status() {
+        // Synthetic Provisional entry, independent of production allowlist
+        // contents — pins the explicit arm against the alarming `_` wildcard.
+        let allowlist = [VerifierAllowlistEntry::new_for_test(
+            [0x12u8; 32],
+            VerifierAuditStatus::Provisional {
+                attested_by: "OpenZeppelin",
+                attested_at: "2026-01-01",
+            },
+        )];
+        let entry_first8 = wasm_hash_first8_hex(&[0x12u8; 32]);
+        let kind = find_advisory_kind_in(&entry_first8, &allowlist);
+        assert!(
+            kind.is_none(),
+            "Provisional status must not produce an advisory kind"
         );
     }
 

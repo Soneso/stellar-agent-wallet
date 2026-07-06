@@ -67,10 +67,11 @@
   vendored OZ WASM; it is deployed once per network and referenced by the `External`
   signer arm's `verifier` field in installed context rules.
 - **Verifier allowlist posture:** this v0.7.2 hash is `VERIFIER_ALLOWLIST[0]`
-  (`VerifierAuditStatus::Audited { auditor: "OpenZeppelin", audited_at: "2026-07-04" }`),
-  the entry the deploy CLI uploads for new verifiers; the v0.7.1 hash remains at index 1
-  (`Audited { auditor: "OpenZeppelin", audited_at: "2025-11-01" }`) as a still-recognised
-  legacy entry.
+  (`VerifierAuditStatus::Provisional { attested_by: "OpenZeppelin", attested_at: "2026-07-04" }`
+  — an OZ internal artefact review; no external audit report yet), the entry the
+  deploy CLI uploads for new verifiers; the v0.7.1 hash remains at index 1
+  (`Provisional { attested_by: "OpenZeppelin", attested_at: "2025-11-01" }`) as a
+  still-recognised legacy entry.
 - **24-month retention policy:** `VERIFIER_ALLOWLIST` entries are never dropped
   immediately on revocation. `Revoked` entries persist for at least 24 months, then
   rotate to `Retired`, so operators running older wallet releases still receive the

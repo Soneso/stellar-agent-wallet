@@ -6,7 +6,8 @@
 //! The compile-time allowlist of audited verifier wasm SHA-256 hashes is
 //! `crate::VERIFIER_ALLOWLIST` (`crates/stellar-agent-smart-account/src/verifier_allowlist.rs`),
 //! populated with audit-status taxonomy
-//! (`VerifierAuditStatus`: `Audited` / `Unaudited` / `Revoked` / `Retired`).
+//! (`VerifierAuditStatus`: `Audited` / `Provisional` / `Unaudited` / `Revoked` /
+//! `Retired`).
 //! This is the canonical allowlist source.
 //! Use `VERIFIER_ALLOWLIST[i].wasm_hash` to access the raw hash bytes.
 //!

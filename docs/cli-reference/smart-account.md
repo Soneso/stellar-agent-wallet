@@ -539,7 +539,7 @@ stellar-agent smart-account deploy-policy \
 
 Builds and optionally executes a plan that moves all `External` signers from one verifier to another across every context rule on a smart-account. Dry-run is read-only and renders the plan as JSON; without `--dry-run` it signs and submits `remove_signer` / `add_signer` pairs. Mainnet dry-run is allowed; mainnet submit additionally requires `--confirm-mainnet-migrate`.
 
-Pre-flight gates (fail-closed): the destination verifier hash must be in the allowlist, its audit status must be `Audited` or `Unaudited`, and the destination contract must be immutable.
+Pre-flight gates (fail-closed): the destination verifier hash must be in the allowlist, its audit status must be `Audited`, `Provisional`, or `Unaudited`, and the destination contract must be immutable.
 
 Flags:
 

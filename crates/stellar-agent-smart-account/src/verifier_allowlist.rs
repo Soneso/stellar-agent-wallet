@@ -16,8 +16,8 @@
 //!
 //! [`VerifierAuditStatus`] serialises with `#[serde(rename_all = "snake_case",
 //! tag = "kind")]` so the `kind` discriminator appears as `"audited"`,
-//! `"unaudited"`, `"revoked"`, or `"retired"`. This is the canonical wire format
-//! consumed by `smart-account list-verifiers --output json`.
+//! `"provisional"`, `"unaudited"`, `"revoked"`, or `"retired"`. This is the
+//! canonical wire format consumed by `smart-account list-verifiers --output json`.
 //!
 //! # 24-month retention
 //!
@@ -30,12 +30,12 @@ use serde::Serialize;
 
 /// Audit status of an entry in [`VERIFIER_ALLOWLIST`].
 ///
-/// Closed four-value set with `#[non_exhaustive]` for future extension.
+/// Closed five-value set with `#[non_exhaustive]` for future extension.
 ///
 /// # Wire format (CLI envelope)
 ///
 /// Snake_case discriminator via `#[serde(rename_all = "snake_case", tag = "kind")]`:
-/// `"audited"` / `"unaudited"` / `"revoked"` / `"retired"`.
+/// `"audited"` / `"provisional"` / `"unaudited"` / `"revoked"` / `"retired"`.
 ///
 /// # Startup-advisory posture
 ///
@@ -71,6 +71,28 @@ pub enum VerifierAuditStatus {
         auditor: &'static str,
         /// ISO-8601 UTC date of the audit report (e.g., `"2026-01-15"`).
         audited_at: &'static str,
+    },
+
+    /// A named party reviewed the artefact internally; no independent external
+    /// audit report exists yet.
+    ///
+    /// Stronger than [`Unaudited`](Self::Unaudited) — a named reviewer
+    /// examined the artefact — but weaker than [`Audited`](Self::Audited),
+    /// which is reserved for an external audit report. `attested_by` names the
+    /// reviewing party (e.g., the artefact vendor's own internal review);
+    /// `attested_at` is the date of that review. When an external audit report
+    /// is obtained for the artefact, the entry is promoted to `Audited` and the
+    /// corresponding `PROVENANCE.md` is updated to reference the report.
+    ///
+    /// # Wire format
+    ///
+    /// Serialises as `{ "kind": "provisional", "attested_by": "...", "attested_at": "..." }`.
+    Provisional {
+        /// Human-readable name of the party that performed the internal
+        /// review (e.g., `"OpenZeppelin"`).
+        attested_by: &'static str,
+        /// ISO-8601 UTC date of the internal review (e.g., `"2026-01-15"`).
+        attested_at: &'static str,
     },
 
     /// No audit attached; operator-acknowledged risk required to install.
@@ -123,6 +145,7 @@ impl fmt::Display for VerifierAuditStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Audited { .. } => f.write_str("audited"),
+            Self::Provisional { .. } => f.write_str("provisional"),
             Self::Unaudited => f.write_str("unaudited"),
             Self::Revoked { .. } => f.write_str("revoked"),
             Self::Retired { .. } => f.write_str("retired"),
@@ -198,18 +221,19 @@ impl VerifierAllowlistEntry {
 ///   - SHA-256: `9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7`
 ///   - OZ source SHA: `a9c42169000638da937577f592ebf61a7a3c94ca` (tag `v0.7.2`)
 ///   - PROVENANCE: `vendor/oz-webauthn-verifier/v0.7.2/PROVENANCE.md`
-///   - Audit status: `Audited { auditor: "OpenZeppelin", audited_at: "2026-07-04" }`
-///     — PROVISIONAL (OZ internal v0.7.2 artefact review date; not externally verified).
+///   - Audit status: `Provisional { attested_by: "OpenZeppelin", attested_at: "2026-07-04" }`
+///     — OZ internal v0.7.2 artefact review; no external audit report yet.
 /// - Index 1: OZ `multisig-webauthn-verifier-example` v0.7.1 (legacy, still recognised).
 ///   - SHA-256: `678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a`
 ///   - OZ source SHA: `3f81125bed3114cc93f5fca6d13240082050269a` (tag `v0.7.1`)
 ///   - PROVENANCE: `vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md`
-///   - Audit status: `Audited { auditor: "OpenZeppelin", audited_at: "2025-11-01" }`
-///     — PROVISIONAL (not externally verified; pending independent audit).
+///   - Audit status: `Provisional { attested_by: "OpenZeppelin", attested_at: "2025-11-01" }`
+///     — OZ internal v0.7.1 artefact review; no external audit report yet.
 ///
 /// The ABI is unchanged between v0.7.1 and v0.7.2; the v0.7.2 bytes differ only
-/// because of the soroban-sdk 26.1.0 bump. When a formal external audit date is
-/// confirmed, update the corresponding `audited_at` date and PROVENANCE.md.
+/// because of the soroban-sdk 26.1.0 bump. When an external audit report is
+/// obtained, promote the corresponding entry to `Audited` and update
+/// PROVENANCE.md to reference the report.
 ///
 /// # 24-month retention
 ///
@@ -234,9 +258,9 @@ pub const VERIFIER_ALLOWLIST: &[VerifierAllowlistEntry] = &[
     // Build: stellar contract build --package multisig-webauthn-verifier-example
     //        stellar-cli 25.2.0, rustc 1.96.0 stable, wasm32v1-none target.
     //
-    // audited_at: PROVISIONAL "2026-07-04" (not externally verified; pending
-    // independent audit) — represents the OZ internal v0.7.2 artefact review date.
-    // Update when a formal external audit date is confirmed.
+    // attested_at: "2026-07-04" — OZ internal v0.7.2 artefact review date.
+    // Promote to Audited (and update PROVENANCE.md) when an external audit
+    // report for this artefact is obtained.
     VerifierAllowlistEntry {
         wasm_hash: [
             // SHA-256: 9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7
@@ -248,9 +272,9 @@ pub const VERIFIER_ALLOWLIST: &[VerifierAllowlistEntry] = &[
             0x03, 0xb3, 0x2f, 0xec, 0x56, 0x6b, 0x15, 0x14, 0x21, 0xf9, 0x91, 0xc3, 0xb4, 0xe2,
             0x48, 0xeb, 0xb1, 0xf7,
         ],
-        audit_status: VerifierAuditStatus::Audited {
-            auditor: "OpenZeppelin",
-            audited_at: "2026-07-04",
+        audit_status: VerifierAuditStatus::Provisional {
+            attested_by: "OpenZeppelin",
+            attested_at: "2026-07-04",
         },
     },
     // Index 1: OZ multisig-webauthn-verifier-example v0.7.1 (legacy, still recognised).
@@ -262,17 +286,18 @@ pub const VERIFIER_ALLOWLIST: &[VerifierAllowlistEntry] = &[
     // Still recognised for verifier contracts already deployed on-chain from the
     // v0.7.1 bytes; no longer deployed for new verifiers.
     //
-    // audited_at: PROVISIONAL "2025-11-01" (not externally verified; pending
-    // independent audit) — represents the OZ internal v0.7.1 artefact review date.
+    // attested_at: "2025-11-01" — OZ internal v0.7.1 artefact review date.
+    // Promote to Audited (and update PROVENANCE.md) when an external audit
+    // report for this artefact is obtained.
     VerifierAllowlistEntry {
         wasm_hash: [
             0x67, 0x80, 0x06, 0x90, 0x9b, 0x50, 0xc6, 0xc3, 0x65, 0xc0, 0x33, 0xf1, 0x37, 0x19,
             0x7e, 0x91, 0x0d, 0x83, 0x96, 0xa2, 0xc6, 0x8e, 0x92, 0x81, 0x32, 0x7a, 0x2e, 0xd7,
             0xdb, 0xf4, 0xb2, 0x7a,
         ],
-        audit_status: VerifierAuditStatus::Audited {
-            auditor: "OpenZeppelin",
-            audited_at: "2025-11-01",
+        audit_status: VerifierAuditStatus::Provisional {
+            attested_by: "OpenZeppelin",
+            attested_at: "2025-11-01",
         },
     },
     // Index 2: OZ multisig-ed25519-verifier-example v0.7.2 (canonical Ed25519
@@ -287,18 +312,18 @@ pub const VERIFIER_ALLOWLIST: &[VerifierAllowlistEntry] = &[
     // Build: stellar contract build --package multisig-ed25519-verifier-example
     //        stellar-cli 25.2.0, rustc 1.96.0 stable, wasm32v1-none target.
     //
-    // audited_at: PROVISIONAL "2026-07-04" (not externally verified; pending
-    // independent audit) — represents the OZ internal v0.7.2 artefact review date.
-    // Update when a formal external audit date is confirmed.
+    // attested_at: "2026-07-04" — OZ internal v0.7.2 artefact review date.
+    // Promote to Audited (and update PROVENANCE.md) when an external audit
+    // report for this artefact is obtained.
     VerifierAllowlistEntry {
         wasm_hash: [
             0xea, 0x13, 0xb0, 0x70, 0x83, 0xa8, 0x27, 0x5e, 0x7b, 0xad, 0xe9, 0x54, 0xe4, 0xcc,
             0xc1, 0x82, 0x74, 0x95, 0xf2, 0x53, 0xc1, 0x8d, 0xc0, 0x6e, 0xdc, 0xc4, 0x91, 0x04,
             0xc1, 0x1f, 0xb7, 0x25,
         ],
-        audit_status: VerifierAuditStatus::Audited {
-            auditor: "OpenZeppelin",
-            audited_at: "2026-07-04",
+        audit_status: VerifierAuditStatus::Provisional {
+            attested_by: "OpenZeppelin",
+            attested_at: "2026-07-04",
         },
     },
     #[cfg(any(test, feature = "test-helpers"))]
@@ -322,11 +347,15 @@ mod tests {
     fn verifier_allowlist_closed_set_audit_status_count() {
         // Enumerate all variants; ensures any new variant added to
         // VerifierAuditStatus triggers a deliberate test update.
-        let canonical: &[&str] = &["audited", "unaudited", "revoked", "retired"];
+        let canonical: &[&str] = &["audited", "provisional", "unaudited", "revoked", "retired"];
         let rendered: Vec<String> = [
             VerifierAuditStatus::Audited {
                 auditor: "x",
                 audited_at: "y",
+            },
+            VerifierAuditStatus::Provisional {
+                attested_by: "x",
+                attested_at: "y",
             },
             VerifierAuditStatus::Unaudited,
             VerifierAuditStatus::Revoked {
@@ -351,7 +380,7 @@ mod tests {
         let oz = &VERIFIER_ALLOWLIST[0];
         assert!(matches!(
             oz.audit_status,
-            VerifierAuditStatus::Audited { .. }
+            VerifierAuditStatus::Provisional { .. }
         ));
         // Hard-coded canonical hash per vendor/oz-webauthn-verifier/v0.7.2/PROVENANCE.md.
         // OZ source SHA: a9c42169000638da937577f592ebf61a7a3c94ca (tag v0.7.2).
@@ -385,7 +414,7 @@ mod tests {
         let legacy = &VERIFIER_ALLOWLIST[1];
         assert!(matches!(
             legacy.audit_status,
-            VerifierAuditStatus::Audited { .. }
+            VerifierAuditStatus::Provisional { .. }
         ));
         // Hard-coded canonical v0.7.1 hash per vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md.
         // SHA-256: 678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a
@@ -420,8 +449,8 @@ mod tests {
                  (vendor/oz-ed25519-verifier/v0.7.2/PROVENANCE.md)",
             );
         assert!(
-            matches!(entry.audit_status, VerifierAuditStatus::Audited { .. }),
-            "ed25519-verifier entry must be Audited"
+            matches!(entry.audit_status, VerifierAuditStatus::Provisional { .. }),
+            "ed25519-verifier entry must be Provisional"
         );
     }
 
@@ -444,6 +473,13 @@ mod tests {
                     audited_at: "2025-11-01",
                 },
                 expected_kind: "audited",
+            },
+            Case {
+                status: VerifierAuditStatus::Provisional {
+                    attested_by: "OpenZeppelin",
+                    attested_at: "2025-11-01",
+                },
+                expected_kind: "provisional",
             },
             Case {
                 status: VerifierAuditStatus::Unaudited,
@@ -492,16 +528,25 @@ mod tests {
     }
 
     #[test]
-    fn verifier_allowlist_has_at_least_one_audited_entry() {
+    fn verifier_allowlist_has_at_least_one_attested_entry() {
         // An empty allowlist or an all-unaudited allowlist would silently disable
-        // enforcement. Require at least one Audited entry.
-        let audited_count = VERIFIER_ALLOWLIST
+        // enforcement. Require at least one entry with a real named-party
+        // attestation: `Audited` (an external audit report) or `Provisional` (an
+        // internal artefact review by a named party) both satisfy this — the
+        // invariant guards against an allowlist containing nothing stronger than
+        // `Unaudited`, not specifically against the absence of an external audit.
+        let attested_count = VERIFIER_ALLOWLIST
             .iter()
-            .filter(|e| matches!(e.audit_status, VerifierAuditStatus::Audited { .. }))
+            .filter(|e| {
+                matches!(
+                    e.audit_status,
+                    VerifierAuditStatus::Audited { .. } | VerifierAuditStatus::Provisional { .. }
+                )
+            })
             .count();
         assert!(
-            audited_count >= 1,
-            "VERIFIER_ALLOWLIST must contain at least one Audited entry; \
+            attested_count >= 1,
+            "VERIFIER_ALLOWLIST must contain at least one Audited or Provisional entry; \
              an all-unaudited allowlist silently disables enforcement"
         );
     }
@@ -519,6 +564,26 @@ mod tests {
         assert!(json.contains(r#""kind":"audited""#), "json={json}");
         assert!(json.contains(r#""auditor":"OpenZeppelin""#), "json={json}");
         assert!(json.contains(r#""audited_at":"2025-11-01""#), "json={json}");
+    }
+
+    #[test]
+    fn verifier_allowlist_provisional_variant_wire_format() {
+        // Pin the exact JSON wire format so a future serde attribute change is
+        // caught immediately.
+        let status = VerifierAuditStatus::Provisional {
+            attested_by: "OpenZeppelin",
+            attested_at: "2025-11-01",
+        };
+        let json = serde_json::to_string(&status).expect("serialise");
+        assert!(json.contains(r#""kind":"provisional""#), "json={json}");
+        assert!(
+            json.contains(r#""attested_by":"OpenZeppelin""#),
+            "json={json}"
+        );
+        assert!(
+            json.contains(r#""attested_at":"2025-11-01""#),
+            "json={json}"
+        );
     }
 
     #[test]

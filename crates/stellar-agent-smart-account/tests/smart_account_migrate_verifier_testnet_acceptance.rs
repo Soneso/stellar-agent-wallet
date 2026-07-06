@@ -756,8 +756,8 @@ async fn fetch_rule_decoded(smart_account_addr: &ScAddress, rule_id: u32) -> Dec
 /// # Pre-flight gates exercised
 ///
 /// 1. Destination hash in `VERIFIER_ALLOWLIST` → passes (freshly deployed OZ v0.7.2
-///    Audited entry, `VERIFIER_ALLOWLIST[0]`).
-/// 2. Destination audit status `Audited` → passes.
+///    Provisional entry, `VERIFIER_ALLOWLIST[0]`).
+/// 2. Destination audit status `Provisional` → passes.
 /// 3. Destination contract immutable → passes (OZ vendored WASM has no Admin key).
 ///
 /// # Dry-run invariant
@@ -875,7 +875,7 @@ async fn d1_migrate_verifier_dry_run_constructs_plan_without_submitting() {
         )
         .await
         .expect(
-            "MigrationPlanner::build must succeed: destination is Audited + Immutable in VERIFIER_ALLOWLIST",
+            "MigrationPlanner::build must succeed: destination is Provisional + Immutable in VERIFIER_ALLOWLIST",
         );
 
     // ── 5. Assertions ─────────────────────────────────────────────────────────
@@ -896,13 +896,13 @@ async fn d1_migrate_verifier_dry_run_constructs_plan_without_submitting() {
         hex::encode(plan.to_hash)
     );
 
-    // Assertion 3: destination_audit_status is Audited (pre-flight 2 passed).
+    // Assertion 3: destination_audit_status is Provisional (pre-flight 2 passed).
     assert!(
         matches!(
             plan.destination_audit_status,
-            VerifierAuditStatus::Audited { .. }
+            VerifierAuditStatus::Provisional { .. }
         ),
-        "destination_audit_status must be Audited; got: {:?}",
+        "destination_audit_status must be Provisional; got: {:?}",
         plan.destination_audit_status
     );
 
@@ -1192,7 +1192,7 @@ async fn d2_migrate_verifier_dry_run_identifies_one_external_signer() {
         )
         .await
         .expect(
-            "MigrationPlanner::build must succeed: verifier is Audited + Immutable in VERIFIER_ALLOWLIST",
+            "MigrationPlanner::build must succeed: verifier is Provisional + Immutable in VERIFIER_ALLOWLIST",
         );
 
     // ── 7. Assertions ─────────────────────────────────────────────────────────
@@ -1585,7 +1585,7 @@ async fn d3_migrate_verifier_on_chain_submit() {
             &plan_request_id,
         )
         .await
-        .expect("MigrationPlanner::build must succeed — verifier-B is Audited + Immutable");
+        .expect("MigrationPlanner::build must succeed — verifier-B is Provisional + Immutable");
 
     // Pre-submit assertions.
     assert_eq!(

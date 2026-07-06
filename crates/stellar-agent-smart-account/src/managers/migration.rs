@@ -29,9 +29,9 @@
 //!
 //! 1. The destination verifier's **wasm hash** (queried from chain) MUST appear
 //!    in [`VERIFIER_ALLOWLIST`] (else `VerifierMigrationFailed { phase: "preflight_destination_unknown" }`).
-//! 2. Destination audit status MUST be [`VerifierAuditStatus::Audited`] or
-//!    [`VerifierAuditStatus::Unaudited`].  `Revoked` → `SaError::VerifierWasmRevoked`;
-//!    `Retired` → `SaError::VerifierWasmRetired`.
+//! 2. Destination audit status MUST be [`VerifierAuditStatus::Audited`],
+//!    [`VerifierAuditStatus::Provisional`], or [`VerifierAuditStatus::Unaudited`].
+//!    `Revoked` → `SaError::VerifierWasmRevoked`; `Retired` → `SaError::VerifierWasmRetired`.
 //! 3. Destination contract MUST be immutable (no admin/owner key in instance storage)
 //!    (else `VerifierMigrationFailed { phase: "preflight_destination_mutable" }`).
 //!
@@ -204,8 +204,9 @@ pub struct MigrationPlan {
     pub affected_rules: Vec<RuleMigration>,
     /// Allowlist audit status of the destination verifier.
     ///
-    /// Guaranteed to be [`VerifierAuditStatus::Audited`] or
-    /// [`VerifierAuditStatus::Unaudited`] — preflight refuses `Revoked` / `Retired`.
+    /// Guaranteed to be [`VerifierAuditStatus::Audited`],
+    /// [`VerifierAuditStatus::Provisional`], or [`VerifierAuditStatus::Unaudited`]
+    /// — preflight refuses `Revoked` / `Retired`.
     pub destination_audit_status: VerifierAuditStatus,
     /// Per-request correlation identifier (UUIDv4).
     pub request_id: String,
@@ -893,7 +894,7 @@ impl<'a> MigrationPlanner<'a> {
     ///
     /// 1. Destination verifier hash MUST be in [`VERIFIER_ALLOWLIST`]
     ///    (else `VerifierMigrationFailed { phase: "preflight_destination_unknown" }`).
-    /// 2. Destination audit status MUST be `Audited` or `Unaudited`.
+    /// 2. Destination audit status MUST be `Audited`, `Provisional`, or `Unaudited`.
     ///    `Revoked` → [`SaError::VerifierWasmRevoked`].
     ///    `Retired` → [`SaError::VerifierWasmRetired`].
     /// 3. Destination contract MUST be immutable
@@ -1005,8 +1006,13 @@ impl<'a> MigrationPlanner<'a> {
                     request_id: request_id.to_owned(),
                 });
             }
-            VerifierAuditStatus::Audited { .. } | VerifierAuditStatus::Unaudited => {
-                // Accepted — continue to mutability check.
+            VerifierAuditStatus::Audited { .. }
+            | VerifierAuditStatus::Provisional { .. }
+            | VerifierAuditStatus::Unaudited => {
+                // Accepted — continue to mutability check. Migration
+                // preflight refuses only statuses that record a disclosed
+                // problem (`Revoked`, `Retired`); allowlist membership, not
+                // the audit status, is what admits a verifier.
             }
         }
 

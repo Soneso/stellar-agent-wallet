@@ -59,7 +59,7 @@ use super::rpc_mock_helpers::{
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// OZ WebAuthn verifier v0.7.1 wasm hash — the legacy `VERIFIER_ALLOWLIST[1]`
-/// entry (one of two Audited OZ entries; still recognised).
+/// entry (one of two Provisional OZ entries; still recognised).
 ///
 /// `vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md` SHA-256 anchor.
 /// OZ source SHA: `3f81125bed3114cc93f5fca6d13240082050269a` (tag v0.7.1).
@@ -360,7 +360,7 @@ async fn revoked_destination_error_shape() {
 /// - `plan.affected_rules.is_empty()` (no rules to scan).
 /// - `plan.total_transaction_count() == 0`.
 /// - `plan.warnings.is_empty()` (0 txs → no inter-tx hazard warning).
-/// - `plan.destination_audit_status` is `Audited`.
+/// - `plan.destination_audit_status` is `Provisional`.
 /// - `plan.to_hash == OZ_VERIFIER_HASH`.
 ///
 /// # Implements
@@ -397,7 +397,7 @@ async fn empty_plan_via_planner() {
     let plan = planner
         .build(smart_account, from_hash, dest_addr, &request_id)
         .await
-        .expect("MigrationPlanner::build must succeed: OZ hash is Audited + Immutable");
+        .expect("MigrationPlanner::build must succeed: OZ hash is Provisional + Immutable");
 
     // Destination hash must be OZ hash.
     assert_eq!(
@@ -411,13 +411,13 @@ async fn empty_plan_via_planner() {
         .any(|e| e.wasm_hash == plan.to_hash);
     assert!(in_allowlist, "plan.to_hash must be in VERIFIER_ALLOWLIST");
 
-    // Destination audit status must be Audited (pre-flight 2 passed).
+    // Destination audit status must be Provisional (pre-flight 2 passed).
     assert!(
         matches!(
             plan.destination_audit_status,
-            VerifierAuditStatus::Audited { .. }
+            VerifierAuditStatus::Provisional { .. }
         ),
-        "destination_audit_status must be Audited; got: {:?}",
+        "destination_audit_status must be Provisional; got: {:?}",
         plan.destination_audit_status
     );
 
@@ -634,7 +634,7 @@ async fn t9_sparse_id_migration_planner() {
         .await
         .expect(
             "MigrationPlanner::build must succeed: \
-             OZ hash is Audited + Immutable + sparse-ID gap handled correctly",
+             OZ hash is Provisional + Immutable + sparse-ID gap handled correctly",
         );
 
     // Core regression-lock: pre-refactor returned [{rule_id: 0}] only.

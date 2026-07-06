@@ -55,7 +55,7 @@ use super::rpc_mock_helpers::{
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// OZ WebAuthn verifier v0.7.1 wasm hash — the legacy `VERIFIER_ALLOWLIST[1]`
-/// entry (one of two Audited OZ entries; still recognised).
+/// entry (Provisional: OZ-internal artefact review; still recognised).
 ///
 /// `vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md` SHA-256 anchor.
 /// OZ source SHA: `3f81125bed3114cc93f5fca6d13240082050269a` (tag v0.7.1).
@@ -198,9 +198,9 @@ async fn submit_returns_simulate_failure_on_first_step_when_rpc_simulate_errors(
         OZ_VERIFIER_HASH,
         addr(0x02),
         vec![rule],
-        VerifierAuditStatus::Audited {
-            auditor: "OpenZeppelin",
-            audited_at: "2025-11-01",
+        VerifierAuditStatus::Provisional {
+            attested_by: "OpenZeppelin",
+            attested_at: "2025-11-01",
         },
         Uuid::new_v4().to_string(),
     );
@@ -298,9 +298,9 @@ async fn submit_send_failure_error_shape() {
         OZ_VERIFIER_HASH,
         addr(0x02),
         vec![rule],
-        VerifierAuditStatus::Audited {
-            auditor: "OpenZeppelin",
-            audited_at: "2025-11-01",
+        VerifierAuditStatus::Provisional {
+            attested_by: "OpenZeppelin",
+            attested_at: "2025-11-01",
         },
         Uuid::new_v4().to_string(),
     );
@@ -393,9 +393,9 @@ async fn submit_partial_failure_result_shape() {
         OZ_VERIFIER_HASH,
         addr(0x02),
         vec![rule],
-        VerifierAuditStatus::Audited {
-            auditor: "OpenZeppelin",
-            audited_at: "2025-11-01",
+        VerifierAuditStatus::Provisional {
+            attested_by: "OpenZeppelin",
+            attested_at: "2025-11-01",
         },
         Uuid::new_v4().to_string(),
     );

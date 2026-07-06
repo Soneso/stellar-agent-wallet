@@ -12,16 +12,16 @@
 //!     {
 //!       "wasm_hash_first8": "9427e3dd",
 //!       "wasm_hash_full": "9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7",
-//!       "audit_status": "audited",
-//!       "auditor": "OpenZeppelin",
-//!       "audited_at": "2026-07-04"
+//!       "audit_status": "provisional",
+//!       "attested_by": "OpenZeppelin",
+//!       "attested_at": "2026-07-04"
 //!     },
 //!     {
 //!       "wasm_hash_first8": "67800690",
 //!       "wasm_hash_full": "678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a",
-//!       "audit_status": "audited",
-//!       "auditor": "OpenZeppelin",
-//!       "audited_at": "2025-11-01"
+//!       "audit_status": "provisional",
+//!       "attested_by": "OpenZeppelin",
+//!       "attested_at": "2025-11-01"
 //!     }
 //!   ],
 //!   "entry_count": 2
@@ -32,6 +32,9 @@
 //! use); index 1 is the legacy v0.7.1, still recognised for verifiers already
 //! deployed on-chain.
 //!
+//! `Audited` entries carry `auditor` + `audited_at` (an external audit report).
+//! `Provisional` entries carry `attested_by` + `attested_at` (a named-party
+//! internal artefact review; no external audit report yet).
 //! `Revoked` entries carry `revoked_at` + `reason`.
 //! `Retired` entries carry `revoked_at` + `retired_at`; the long-form reason is
 //! omitted per the 24-month rotation policy.
@@ -75,10 +78,11 @@ pub struct ListVerifiersArgs {
 /// JSON wire representation of one verifier allowlist entry.
 ///
 /// The `audit_status` field carries the closed-set discriminator string
-/// (`"audited"`, `"unaudited"`, `"revoked"`, `"retired"`). Additional fields
-/// depend on the status:
+/// (`"audited"`, `"provisional"`, `"unaudited"`, `"revoked"`, `"retired"`).
+/// Additional fields depend on the status:
 ///
 /// - `"audited"`: `auditor` + `audited_at`.
+/// - `"provisional"`: `attested_by` + `attested_at`.
 /// - `"revoked"`: `revoked_at` + `reason`.
 /// - `"retired"`: `revoked_at` + `retired_at` (reason omitted per rotation policy).
 /// - `"unaudited"`: no extra fields.
@@ -91,8 +95,8 @@ pub struct ListVerifiersEntry {
     /// Full 64-char lower-case hex of the wasm hash.
     pub wasm_hash_full: String,
 
-    /// Closed-set audit status discriminator (`"audited"` / `"unaudited"` /
-    /// `"revoked"` / `"retired"`).
+    /// Closed-set audit status discriminator (`"audited"` / `"provisional"` /
+    /// `"unaudited"` / `"revoked"` / `"retired"`).
     pub audit_status: String,
 
     /// Auditor name. Present only when `audit_status == "audited"`.
@@ -104,6 +108,16 @@ pub struct ListVerifiersEntry {
     /// ISO-8601 UTC audit date. Present only when `audit_status == "audited"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audited_at: Option<String>,
+
+    /// Name of the party that performed the internal artefact review. Present
+    /// only when `audit_status == "provisional"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attested_by: Option<String>,
+
+    /// ISO-8601 UTC date of the internal artefact review. Present only when
+    /// `audit_status == "provisional"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attested_at: Option<String>,
 
     /// ISO-8601 UTC revocation date. Present for `"revoked"` and `"retired"`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -157,6 +171,23 @@ impl ListVerifiersResult {
                         audit_status: "audited".to_owned(),
                         auditor: Some((*auditor).to_owned()),
                         audited_at: Some((*audited_at).to_owned()),
+                        attested_by: None,
+                        attested_at: None,
+                        revoked_at: None,
+                        reason: None,
+                        retired_at: None,
+                    },
+                    VerifierAuditStatus::Provisional {
+                        attested_by,
+                        attested_at,
+                    } => ListVerifiersEntry {
+                        wasm_hash_first8,
+                        wasm_hash_full,
+                        audit_status: "provisional".to_owned(),
+                        auditor: None,
+                        audited_at: None,
+                        attested_by: Some((*attested_by).to_owned()),
+                        attested_at: Some((*attested_at).to_owned()),
                         revoked_at: None,
                         reason: None,
                         retired_at: None,
@@ -167,6 +198,8 @@ impl ListVerifiersResult {
                         audit_status: "unaudited".to_owned(),
                         auditor: None,
                         audited_at: None,
+                        attested_by: None,
+                        attested_at: None,
                         revoked_at: None,
                         reason: None,
                         retired_at: None,
@@ -177,6 +210,8 @@ impl ListVerifiersResult {
                         audit_status: "revoked".to_owned(),
                         auditor: None,
                         audited_at: None,
+                        attested_by: None,
+                        attested_at: None,
                         revoked_at: Some((*revoked_at).to_owned()),
                         reason: Some((*reason).to_owned()),
                         retired_at: None,
@@ -190,6 +225,8 @@ impl ListVerifiersResult {
                         audit_status: "retired".to_owned(),
                         auditor: None,
                         audited_at: None,
+                        attested_by: None,
+                        attested_at: None,
                         revoked_at: Some((*revoked_at).to_owned()),
                         reason: None, // dropped for retired entries per the rotation policy
                         retired_at: Some((*retired_at).to_owned()),
@@ -202,6 +239,8 @@ impl ListVerifiersResult {
                         audit_status: "unknown".to_owned(),
                         auditor: None,
                         audited_at: None,
+                        attested_by: None,
+                        attested_at: None,
                         revoked_at: None,
                         reason: None,
                         retired_at: None,
@@ -235,6 +274,11 @@ impl ListVerifiersResult {
                     "auditor={} audited_at={}",
                     entry.auditor.as_deref().unwrap_or(""),
                     entry.audited_at.as_deref().unwrap_or("")
+                ),
+                "provisional" => format!(
+                    "attested_by={} attested_at={}",
+                    entry.attested_by.as_deref().unwrap_or(""),
+                    entry.attested_at.as_deref().unwrap_or("")
                 ),
                 "revoked" => format!(
                     "revoked_at={} reason={}",
@@ -317,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn list_verifiers_result_oz_canonical_and_legacy_entries_are_audited() {
+    fn list_verifiers_result_oz_canonical_and_legacy_entries_are_provisional() {
         let result = ListVerifiersResult::from_allowlist();
         assert!(
             result.entries.len() >= 2,
@@ -326,28 +370,32 @@ mod tests {
 
         // Index 0: canonical OZ WebAuthn verifier v0.7.2.
         let oz = &result.entries[0];
-        assert_eq!(oz.audit_status, "audited");
+        assert_eq!(oz.audit_status, "provisional");
         assert_eq!(oz.wasm_hash_first8, "9427e3dd");
         assert_eq!(
             oz.wasm_hash_full,
             "9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7"
         );
-        assert_eq!(oz.auditor.as_deref(), Some("OpenZeppelin"));
-        assert_eq!(oz.audited_at.as_deref(), Some("2026-07-04"));
+        assert_eq!(oz.attested_by.as_deref(), Some("OpenZeppelin"));
+        assert_eq!(oz.attested_at.as_deref(), Some("2026-07-04"));
+        assert!(oz.auditor.is_none());
+        assert!(oz.audited_at.is_none());
         assert!(oz.revoked_at.is_none());
         assert!(oz.reason.is_none());
         assert!(oz.retired_at.is_none());
 
         // Index 1: legacy OZ WebAuthn verifier v0.7.1 (still recognised).
         let legacy = &result.entries[1];
-        assert_eq!(legacy.audit_status, "audited");
+        assert_eq!(legacy.audit_status, "provisional");
         assert_eq!(legacy.wasm_hash_first8, "67800690");
         assert_eq!(
             legacy.wasm_hash_full,
             "678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a"
         );
-        assert_eq!(legacy.auditor.as_deref(), Some("OpenZeppelin"));
-        assert_eq!(legacy.audited_at.as_deref(), Some("2025-11-01"));
+        assert_eq!(legacy.attested_by.as_deref(), Some("OpenZeppelin"));
+        assert_eq!(legacy.attested_at.as_deref(), Some("2025-11-01"));
+        assert!(legacy.auditor.is_none());
+        assert!(legacy.audited_at.is_none());
     }
 
     #[test]
@@ -382,6 +430,8 @@ mod tests {
             audit_status: "audited".to_owned(),
             auditor: Some("OpenZeppelin".to_owned()),
             audited_at: Some("2026-07-04".to_owned()),
+            attested_by: None,
+            attested_at: None,
             revoked_at: None,
             reason: None,
             retired_at: None,
@@ -390,7 +440,16 @@ mod tests {
         assert!(json.contains(r#""audit_status":"audited""#), "json={json}");
         assert!(json.contains(r#""auditor":"OpenZeppelin""#), "json={json}");
         assert!(json.contains(r#""audited_at":"2026-07-04""#), "json={json}");
-        // revoked_at / reason / retired_at must be absent (skip_serializing_if).
+        // attested_by / attested_at / revoked_at / reason / retired_at must be
+        // absent (skip_serializing_if).
+        assert!(
+            !json.contains("attested_by"),
+            "attested_by must be absent for audited: {json}"
+        );
+        assert!(
+            !json.contains("attested_at"),
+            "attested_at must be absent for audited: {json}"
+        );
         assert!(
             !json.contains("revoked_at"),
             "revoked_at must be absent for audited: {json}"
@@ -406,6 +465,59 @@ mod tests {
     }
 
     #[test]
+    fn list_verifiers_entry_provisional_wire_format() {
+        // Validates the provisional-variant JSON envelope wire shape.
+        let entry = ListVerifiersEntry {
+            wasm_hash_first8: "9427e3dd".to_owned(),
+            wasm_hash_full: "9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7"
+                .to_owned(),
+            audit_status: "provisional".to_owned(),
+            auditor: None,
+            audited_at: None,
+            attested_by: Some("OpenZeppelin".to_owned()),
+            attested_at: Some("2026-07-04".to_owned()),
+            revoked_at: None,
+            reason: None,
+            retired_at: None,
+        };
+        let json = serde_json::to_string(&entry).expect("serialise");
+        assert!(
+            json.contains(r#""audit_status":"provisional""#),
+            "json={json}"
+        );
+        assert!(
+            json.contains(r#""attested_by":"OpenZeppelin""#),
+            "json={json}"
+        );
+        assert!(
+            json.contains(r#""attested_at":"2026-07-04""#),
+            "json={json}"
+        );
+        // auditor / audited_at / revoked_at / reason / retired_at must be
+        // absent (skip_serializing_if).
+        assert!(
+            !json.contains("\"auditor\""),
+            "auditor must be absent for provisional: {json}"
+        );
+        assert!(
+            !json.contains("audited_at"),
+            "audited_at must be absent for provisional: {json}"
+        );
+        assert!(
+            !json.contains("revoked_at"),
+            "revoked_at must be absent for provisional: {json}"
+        );
+        assert!(
+            !json.contains("\"reason\""),
+            "reason must be absent for provisional: {json}"
+        );
+        assert!(
+            !json.contains("retired_at"),
+            "retired_at must be absent for provisional: {json}"
+        );
+    }
+
+    #[test]
     fn list_verifiers_entry_revoked_wire_format() {
         let entry = ListVerifiersEntry {
             wasm_hash_first8: "aabbccdd".to_owned(),
@@ -414,6 +526,8 @@ mod tests {
             audit_status: "revoked".to_owned(),
             auditor: None,
             audited_at: None,
+            attested_by: None,
+            attested_at: None,
             revoked_at: Some("2026-03-01".to_owned()),
             reason: Some("CVE-2026-0001 bypass".to_owned()),
             retired_at: None,
@@ -428,6 +542,10 @@ mod tests {
         assert!(
             !json.contains("\"auditor\""),
             "auditor must be absent for revoked: {json}"
+        );
+        assert!(
+            !json.contains("attested_by"),
+            "attested_by must be absent for revoked: {json}"
         );
         assert!(
             !json.contains("retired_at"),
@@ -445,6 +563,8 @@ mod tests {
             audit_status: "retired".to_owned(),
             auditor: None,
             audited_at: None,
+            attested_by: None,
+            attested_at: None,
             revoked_at: Some("2026-03-01".to_owned()),
             reason: None,
             retired_at: Some("2028-03-01".to_owned()),
@@ -458,6 +578,10 @@ mod tests {
             !json.contains("\"reason\""),
             "reason must be absent for retired: {json}"
         );
+        assert!(
+            !json.contains("attested_by"),
+            "attested_by must be absent for retired: {json}"
+        );
     }
 
     #[test]
@@ -469,6 +593,8 @@ mod tests {
             audit_status: "unaudited".to_owned(),
             auditor: None,
             audited_at: None,
+            attested_by: None,
+            attested_at: None,
             revoked_at: None,
             reason: None,
             retired_at: None,
@@ -481,6 +607,10 @@ mod tests {
         assert!(
             !json.contains("\"auditor\""),
             "auditor must be absent for unaudited: {json}"
+        );
+        assert!(
+            !json.contains("attested_by"),
+            "attested_by must be absent for unaudited: {json}"
         );
         assert!(
             !json.contains("\"reason\""),

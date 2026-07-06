@@ -39,7 +39,7 @@
 //! All three pre-flight gates are enforced inside [`MigrationPlanner::build`]:
 //!
 //! 1. Destination verifier hash MUST be in [`stellar_agent_smart_account::VERIFIER_ALLOWLIST`].
-//! 2. Destination audit status MUST be `Audited` or `Unaudited`.
+//! 2. Destination audit status MUST be `Audited`, `Provisional`, or `Unaudited`.
 //! 3. Destination contract MUST be immutable (no admin/owner key).
 //!
 //! # Wire codes rendered
@@ -271,7 +271,7 @@ pub struct MigrateVerifierResult {
     pub to_verifier_address: String,
     /// Destination verifier audit status label.
     ///
-    /// Format: `"audited:<YYYY-MM-DD>"`, `"unaudited"`.
+    /// Format: `"audited:<YYYY-MM-DD>"`, `"provisional:<YYYY-MM-DD>"`, `"unaudited"`.
     /// Pre-flight refuses `revoked` and `retired`.
     pub destination_audit_status: String,
     /// Total number of on-chain transactions required (or that would be required
@@ -760,6 +760,9 @@ fn flattened_step_key(plan: &MigrationPlan, target_index: usize) -> Option<(u32,
 fn audit_status_label(status: &VerifierAuditStatus) -> String {
     match status {
         VerifierAuditStatus::Audited { audited_at, .. } => format!("audited:{audited_at}"),
+        VerifierAuditStatus::Provisional { attested_at, .. } => {
+            format!("provisional:{attested_at}")
+        }
         VerifierAuditStatus::Unaudited => "unaudited".to_owned(),
         VerifierAuditStatus::Revoked { revoked_at, .. } => format!("revoked:{revoked_at}"),
         VerifierAuditStatus::Retired { retired_at, .. } => format!("retired:{retired_at}"),
@@ -866,5 +869,23 @@ mod tests {
             value["request_id"], "req-partial",
             "request_id must be threaded through"
         );
+    }
+
+    #[test]
+    fn audit_status_label_formats_provisional_with_date() {
+        let status = VerifierAuditStatus::Provisional {
+            attested_by: "OpenZeppelin",
+            attested_at: "2026-07-04",
+        };
+        assert_eq!(audit_status_label(&status), "provisional:2026-07-04");
+    }
+
+    #[test]
+    fn audit_status_label_formats_audited_with_date() {
+        let status = VerifierAuditStatus::Audited {
+            auditor: "OpenZeppelin",
+            audited_at: "2026-07-04",
+        };
+        assert_eq!(audit_status_label(&status), "audited:2026-07-04");
     }
 }
