@@ -79,10 +79,11 @@ pub const MAX_TTL_SECONDS: u32 = 600;
 ///
 /// # Concurrency
 ///
-/// `Wallet` is **not** `Send + Sync`.  It holds a `LockedSeed` containing
-/// raw memory-lock state that must not be accessed from multiple threads
-/// simultaneously.  Callers that need shared access must wrap it in
-/// `Arc<Mutex<Wallet>>` or use the MCP server's per-request ownership model.
+/// `Wallet` is `Send + Sync` (auto-derived: the memory-lock guard and the
+/// clock handle are both thread-safe). Its methods take `&mut self` or
+/// consume state, so SHARED mutation still requires the caller to wrap it
+/// in `Arc<Mutex<Wallet>>` or use the MCP server's per-request ownership
+/// model; the common single-owner pattern needs neither.
 ///
 /// # Examples
 ///

@@ -246,21 +246,53 @@ pub(crate) async fn resolve_signer(
                 .to_owned(),
         })
     })?;
+    // mlock-protected seed window, mirroring `pay`'s secret-env ceremony:
+    // env -> Zeroizing<String> -> seed Zeroizing<[u8;32]> -> explicit
+    // zeroize of the `PrivateKey.0` Copy residue -> `Wallet::unlock`
+    // (LockedSeed mlock; `MlockRequired::Warn` so development hosts without
+    // mlock privileges proceed with a structured warning) -> derive the
+    // signing key -> dispose (munlock + zeroize). The derived
+    // `SoftwareSigningKey` signs from its own zeroize-on-drop seed copy, so
+    // the wallet is disposed as soon as derivation completes: the mlock
+    // window covers exactly the parse-and-derive span in which the seed
+    // exists outside the signing key.
     let s_strkey: Zeroizing<String> = Zeroizing::new(std::env::var(var_name).map_err(|_| {
         WalletError::Auth(AuthError::KeyringNotFound {
             name: format!("environment variable '{var_name}' not set"),
         })
     })?);
-    let private_key =
+    let mut private_key =
         stellar_strkey::ed25519::PrivateKey::from_string(&s_strkey).map_err(|_| {
             WalletError::Auth(AuthError::KeyringNotFound {
                 name: format!("environment variable '{var_name}' contains an invalid S-strkey"),
             })
         })?;
     let seed: Zeroizing<[u8; 32]> = Zeroizing::new(private_key.0);
-    Ok(Box::new(
-        stellar_agent_network::SoftwareSigningKey::new_from_zeroizing(seed),
-    ))
+    zeroize::Zeroize::zeroize(&mut private_key.0);
+    drop(s_strkey);
+
+    let mut wallet = stellar_agent_core::wallet::Wallet::unlock(
+        "smart-account-write".to_owned(),
+        seed,
+        stellar_agent_core::wallet::DEFAULT_TTL_SECONDS,
+        stellar_agent_core::wallet::MlockRequired::Warn,
+    )
+    .await
+    .map_err(|e| {
+        WalletError::Auth(AuthError::KeyringNotFound {
+            name: format!("Wallet::unlock failed: {e}"),
+        })
+    })?;
+
+    let signer = match stellar_agent_network::signing::wallet::signer_from_wallet(&wallet) {
+        Ok(s) => s,
+        Err(e) => {
+            wallet.dispose();
+            return Err(e);
+        }
+    };
+    wallet.dispose();
+    Ok(Box::new(signer))
 }
 
 /// Maps a [`TargetNetwork`] to its CAIP-2 chain-ID string.
@@ -411,6 +443,94 @@ mod tests {
     #![allow(clippy::expect_used, clippy::panic, reason = "test-only assertions")]
 
     use super::*;
+
+    /// The secret-env arm derives the same public key ed25519-dalek derives
+    /// from the seed, end to end through the mlock ceremony (unlock, derive,
+    /// dispose).
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(
+        unsafe_code,
+        reason = "test-only process environment mutation; the variable name is unique to this test"
+    )]
+    async fn resolve_signer_secret_env_derives_the_expected_public_key() {
+        let seed = [0x42u8; 32];
+        let s_strkey = stellar_strkey::ed25519::PrivateKey(seed)
+            .as_unredacted()
+            .to_string()
+            .to_string();
+        let expected_g = {
+            let vk = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+            stellar_strkey::ed25519::PublicKey(vk.to_bytes())
+                .to_string()
+                .to_string()
+        };
+        // Unique variable name: env mutation is process-global under the
+        // parallel harness.
+        let var = "COMMON_RESOLVE_SIGNER_CEREMONY_TEST_SK";
+        unsafe {
+            std::env::set_var(var, &s_strkey);
+        }
+        let flags = SignerSourceFlags {
+            signer_secret_env: Some(var.to_owned()),
+            sign_with_ledger: false,
+            account_index: None,
+        };
+        let signer = resolve_signer(&flags).await.expect("resolve must succeed");
+        let derived = signer.public_key().await.expect("public key must derive");
+        assert_eq!(derived.to_string().to_string(), expected_g);
+        unsafe {
+            std::env::remove_var(var);
+        }
+    }
+
+    /// An unset env var refuses with the keyring-not-found error naming the
+    /// variable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_signer_unset_env_var_is_refused() {
+        let flags = SignerSourceFlags {
+            signer_secret_env: Some("COMMON_RESOLVE_SIGNER_UNSET_VAR_TEST".to_owned()),
+            sign_with_ledger: false,
+            account_index: None,
+        };
+        let err = match resolve_signer(&flags).await {
+            Ok(_) => panic!("unset env var must refuse"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string()
+                .contains("COMMON_RESOLVE_SIGNER_UNSET_VAR_TEST"),
+            "error must name the variable: {err}"
+        );
+    }
+
+    /// A malformed S-strkey refuses before any unlock.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(
+        unsafe_code,
+        reason = "test-only process environment mutation; the variable name is unique to this test"
+    )]
+    async fn resolve_signer_invalid_s_strkey_is_refused() {
+        let var = "COMMON_RESOLVE_SIGNER_MALFORMED_TEST_SK";
+        unsafe {
+            std::env::set_var(var, "not-an-s-strkey");
+        }
+        let flags = SignerSourceFlags {
+            signer_secret_env: Some(var.to_owned()),
+            sign_with_ledger: false,
+            account_index: None,
+        };
+        let err = match resolve_signer(&flags).await {
+            Ok(_) => panic!("malformed S-strkey must refuse"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("invalid S-strkey"),
+            "error must state the malformed key: {err}"
+        );
+        unsafe {
+            std::env::remove_var(var);
+        }
+    }
 
     #[test]
     fn wallet_io_error_redacts_home_prefixed_path() {
