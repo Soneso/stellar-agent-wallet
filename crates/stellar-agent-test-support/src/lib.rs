@@ -15,6 +15,9 @@
 //! - [`testnet_helpers`] — live-network helpers (Friendbot funding, RPC) for
 //!   consumer crates' testnet-acceptance tests; behind the `testnet-helpers`
 //!   feature and exercised only by those live tests.
+//! - [`env_guard::StellarAgentHomeGuard`] — RAII guard overriding
+//!   `STELLAR_AGENT_HOME` for tests that exercise the wallet's
+//!   home-directory resolution; callers serialise with `#[serial]`.
 //!
 //! This crate is consumed only as a `[dev-dependencies]` entry
 //! (`publish = false`); it is never a runtime dependency, so its `pub` helpers
@@ -29,6 +32,7 @@
 
 #[cfg(feature = "wiremock-helpers")]
 pub mod echo_id_responder;
+pub mod env_guard;
 pub mod keyring_mock;
 pub mod log_capture;
 pub mod secret_patterns;
@@ -44,5 +48,6 @@ mod bip39_english;
 
 #[cfg(feature = "wiremock-helpers")]
 pub use echo_id_responder::EchoIdResponder;
+pub use env_guard::StellarAgentHomeGuard;
 pub use log_capture::{CaptureWriter, RedactionStrictSubscriber, with_captured_logs};
 pub use secret_patterns::assert_no_secret_bytes;

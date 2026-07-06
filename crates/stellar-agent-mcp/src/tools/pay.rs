@@ -18,7 +18,7 @@ use crate::tools::common::{
     commit_envelope_and_verify_nonce, commit_path_error_data, enforce_classic_fee_cap,
     hash_to_lower_hex, high_value_cross_check, ledger_err_result, nonce_id_prefix,
     redact_rpc_error_detail, redacted_wallet_error_envelope, resolve_classic_fee_per_op_stroops,
-    submit_timeout, total_classic_fee_stroops, verify_attestation_gate,
+    submit_timeout, total_classic_fee_stroops, validate_g_strkey, verify_attestation_gate,
 };
 // McpAmountArgument import: kept as a single-line full path so the
 // amount-boundary lint does not treat the `amount:` token in a multi-line use
@@ -577,18 +577,8 @@ impl WalletServer {
             "asset": &args.asset,
         });
         // ── Validate G-strkeys ────────────────────────────────────────────────
-        if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(&args.source) {
-            return Err(rmcp::ErrorData::invalid_params(
-                format!("invalid source (expected G-strkey): {err}"),
-                None,
-            ));
-        }
-        if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(&args.destination) {
-            return Err(rmcp::ErrorData::invalid_params(
-                format!("invalid destination (expected G-strkey): {err}"),
-                None,
-            ));
-        }
+        validate_g_strkey(&args.source, "source")?;
+        validate_g_strkey(&args.destination, "destination")?;
 
         // ── Parse asset ───────────────────────────────────────────────────────
         let asset = match Asset::parse(&args.asset) {
@@ -1224,18 +1214,8 @@ impl WalletServer {
         };
 
         // ── Validate G-strkeys ────────────────────────────────────────────────
-        if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(&args.source) {
-            return Err(rmcp::ErrorData::invalid_params(
-                format!("invalid source (expected G-strkey): {err}"),
-                None,
-            ));
-        }
-        if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(&args.destination) {
-            return Err(rmcp::ErrorData::invalid_params(
-                format!("invalid destination (expected G-strkey): {err}"),
-                None,
-            ));
-        }
+        validate_g_strkey(&args.source, "source")?;
+        validate_g_strkey(&args.destination, "destination")?;
 
         // ── Attestation verification gate ────────────────────────────────────
         //

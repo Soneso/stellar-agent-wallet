@@ -32,10 +32,11 @@
 //!
 //! # Signer model
 //!
-//! Signing follows the `pay` model: `--secret-env VAR` (mlock-protected
-//! software signing window via `Wallet::unlock`) or `--sign-with-ledger`
-//! (hardware signer; no seed ever in process memory). The public key derived
-//! from the signer is compared against `--source` before any signing.
+//! Signing follows the `pay` model: `--secret-env VAR` (the shared
+//! mlock-protected software signing ceremony via
+//! `resolve_software_signer_from_env`) or `--sign-with-ledger` (hardware
+//! signer; no seed ever in process memory). The public key derived from the
+//! signer is compared against `--source` before any signing.
 
 use std::time::Duration;
 
@@ -44,8 +45,6 @@ use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{
     AuthError, InternalError, LedgerError, NetworkError, ValidationError, WalletError,
 };
-use stellar_agent_core::wallet::{MlockRequired, Wallet};
-use zeroize::Zeroizing;
 
 use stellar_agent_claimable::entry::{fetch_claimable_balance_entry, fetch_trustline_state};
 use stellar_agent_claimable::error::ClaimError;
@@ -57,7 +56,6 @@ use stellar_agent_network::builder::ClassicOpBuilder;
 use stellar_agent_network::signing::Signer;
 use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::signing::source::signer_from_ledger;
-use stellar_agent_network::signing::wallet::signer_from_wallet;
 use stellar_agent_network::{
     BASE_RESERVE_STROOPS, ClassicFeeSelection, StellarRpcClient, SubmissionResult,
     SubmissionSignerKind, fetch_account, parse_classic_fee_choice, resolve_classic_fee_selection,
@@ -66,6 +64,7 @@ use stellar_agent_network::{
 
 use crate::common::network::TargetNetwork;
 use crate::common::render::{render_json, sanitize_for_table};
+use crate::common::signer_ceremony::resolve_software_signer_from_env;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -445,9 +444,9 @@ fn current_unix_secs() -> Result<u64, ClaimError> {
 /// Signs the given base64 XDR envelope using the configured signer.
 ///
 /// Mirrors the `pay` signer model: `--sign-with-ledger` (hardware; no seed in
-/// process memory) or `--secret-env VAR` (mlock-protected software signing
-/// window via `Wallet::unlock`). The public key derived from the signer is
-/// compared against `--source` before any signing.
+/// process memory) or `--secret-env VAR` (the shared mlock-protected software
+/// signing ceremony, `resolve_software_signer_from_env`). The public key
+/// derived from the signer is compared against `--source` before any signing.
 ///
 /// # Errors
 ///
@@ -464,44 +463,14 @@ async fn sign_envelope(args: &ClaimArgs, unsigned_xdr: &str) -> Result<String, W
     }
 
     if let Some(ref var_name) = args.secret_env {
-        // mlock-protected signing window (identical discipline to `pay`).
-        let s_strkey: Zeroizing<String> =
-            Zeroizing::new(std::env::var(var_name).map_err(|_| {
-                WalletError::Auth(AuthError::KeyringNotFound {
-                    name: format!("environment variable '{var_name}' not set"),
-                })
-            })?);
-
-        let mut private_key =
-            stellar_strkey::ed25519::PrivateKey::from_string(&s_strkey).map_err(|_| {
-                WalletError::Auth(AuthError::KeyringNotFound {
-                    name: format!("environment variable '{var_name}' contains an invalid S-strkey"),
-                })
-            })?;
-        let seed_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(private_key.0);
-        zeroize::Zeroize::zeroize(&mut private_key.0);
-        drop(s_strkey);
-
-        let mut wallet = Wallet::unlock(
-            "claim-commit".to_owned(),
-            seed_bytes,
-            stellar_agent_core::wallet::DEFAULT_TTL_SECONDS,
-            MlockRequired::Warn,
-        )
-        .await
-        .map_err(|e| {
-            WalletError::Auth(AuthError::KeyringNotFound {
-                name: format!("Wallet::unlock failed: {e}"),
-            })
-        })?;
-
-        let signer = signer_from_wallet(&wallet)?;
+        // mlock-protected signing window (shared ceremony, identical
+        // discipline to `pay`).
+        let signer = resolve_software_signer_from_env(var_name, "claim-commit", None).await?;
 
         // Public-key verification before signing.
         let signer_pk = signer.public_key().await?;
         let signer_gstrkey = signer_pk.to_string().to_string();
         if signer_gstrkey != source {
-            wallet.dispose();
             return Err(WalletError::Auth(AuthError::SignerKeyMismatch {
                 expected: source.to_owned(),
                 got: signer_gstrkey,
@@ -510,7 +479,6 @@ async fn sign_envelope(args: &ClaimArgs, unsigned_xdr: &str) -> Result<String, W
 
         let signed_xdr = attach_signature(unsigned_xdr, &signer, passphrase).await?;
         drop(signer);
-        wallet.dispose();
 
         return Ok(signed_xdr);
     }

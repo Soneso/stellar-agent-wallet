@@ -438,8 +438,9 @@ mod tests {
 
     #[test]
     fn advisory_returns_empty_when_hash_not_in_allowlist() {
-        // Production VERIFIER_ALLOWLIST has two Provisional entries (OZ v0.7.2 at
-        // index 0, OZ v0.7.1 at index 1).
+        // Production VERIFIER_ALLOWLIST has three Provisional entries (OZ WebAuthn
+        // v0.7.2 at index 0, OZ WebAuthn v0.7.1 at index 1, OZ Ed25519 v0.7.2 at
+        // index 2).
         // "deadbeef" is not in the allowlist → advisory must NOT trigger.
         // Positive trigger paths (Revoked + Retired) are tested in
         // `advisory_emits_audit_row_and_eprintln_on_revoked_hash` and

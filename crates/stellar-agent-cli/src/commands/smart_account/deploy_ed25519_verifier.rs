@@ -51,10 +51,10 @@ use stellar_agent_smart_account::deployment::{
     deploy_ed25519_verifier,
 };
 use tracing::info;
-use zeroize::Zeroizing;
 
 use crate::common::network::TargetNetwork;
 use crate::common::render::{render_json, sanitize_for_table};
+use crate::common::signer_ceremony::resolve_software_signer_from_env;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -307,23 +307,13 @@ async fn resolve_deployer(
     let var_name = args
         .deployer_secret_env
         .as_deref()
-        .ok_or_else(|| WalletError::Auth(AuthError::KeyringLocked))?;
+        .ok_or(WalletError::Auth(AuthError::KeyringLocked))?;
 
-    let s_strkey: Zeroizing<String> = Zeroizing::new(std::env::var(var_name).map_err(|_| {
-        WalletError::Auth(AuthError::KeyringNotFound {
-            name: format!("environment variable '{var_name}' not set"),
-        })
-    })?);
-
-    let private_key =
-        stellar_strkey::ed25519::PrivateKey::from_string(&s_strkey).map_err(|_| {
-            WalletError::Auth(AuthError::KeyringNotFound {
-                name: format!("environment variable '{var_name}' contains an invalid S-strkey"),
-            })
-        })?;
-
-    let seed: Zeroizing<[u8; 32]> = Zeroizing::new(private_key.0);
-    let signer = stellar_agent_network::SoftwareSigningKey::new_from_zeroizing(seed);
+    // Shared mlock-protected secret-env ceremony: no `--profile` flag exists
+    // on this verb, so the `[wallet]` posture falls back to
+    // `MlockRequired::Warn` and the default unlock TTL.
+    let signer =
+        resolve_software_signer_from_env(var_name, "deploy-ed25519-verifier", None).await?;
     let signer: Box<dyn stellar_agent_network::Signer + Send + Sync> = Box::new(signer);
 
     Ok(DeployerKeypair::SecretEnv {

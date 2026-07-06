@@ -67,7 +67,7 @@ use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
     CommonArgsView, CommonHandlerContext, SignerSourceFlags, construct_signers_manager_from_fields,
-    network_to_chain_id, open_audit_writer,
+    network_to_chain_id, open_audit_writer, wrap_sa_error,
 };
 use crate::common::network::TargetNetwork;
 use crate::common::render::render_json;
@@ -793,11 +793,7 @@ fn emit_error(err: &WalletError, request_id: &str) -> i32 {
 
 /// Maps a [`SaError`] into the `WalletError::SmartAccount` envelope shape.
 fn emit_error_sa(err: &SaError, request_id: &str) -> i32 {
-    let wrapped = WalletError::SmartAccount {
-        wire_code: err.wire_code(),
-        message: err.to_string(),
-    };
-    emit_error(&wrapped, request_id)
+    emit_error(&wrap_sa_error(err), request_id)
 }
 
 #[cfg(test)]

@@ -7,6 +7,9 @@
 //!   `FromStr` / `Display` for clap.
 //! - [`render`] — `render_json` and `sanitize_for_table` output helpers
 //!   shared by `pay` and `accounts create`.
+//! - [`signer_ceremony`] — `resolve_software_signer_from_env`, the single
+//!   mlock-protected secret-env signer ceremony shared by every write
+//!   subcommand that accepts a `--*-secret-env <VAR>` flag.
 //!
 //! # Free helpers
 //!
@@ -19,6 +22,7 @@
 
 pub mod network;
 pub mod render;
+pub mod signer_ceremony;
 
 /// Returns `true` when a graphical display is available for a browser launch.
 ///

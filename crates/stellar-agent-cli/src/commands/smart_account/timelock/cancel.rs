@@ -173,7 +173,7 @@ pub async fn run(args: &CancelArgs) -> i32 {
     };
     let operation_id = TimelockOperationId::from_bytes(op_bytes);
 
-    let signer = match resolve_signer(&args.signer_source).await {
+    let signer = match resolve_signer(&args.signer_source, Some(&profile_name)).await {
         Ok(s) => s,
         Err(e) => {
             let envelope: Envelope<()> = Envelope::err(&e);

@@ -72,17 +72,15 @@ pub enum MlockRequired {
     /// opt into `Warn` mode.
     True,
 
-    /// `mlock` failure → unprotected memory + structured audit-log entry
+    /// `mlock` failure → unprotected memory + structured `tracing::warn!`
     /// (default on Windows; opt-in elsewhere).
     ///
-    /// The wallet proceeds with the unlock window even if memory pinning fails,
-    /// but emits a `tracing::warn!` with the structured fields `profile`,
-    /// `reason`, and `errno`.  The MCP server layer wires the
-    /// `EventKind::WalletMlockFailed` audit-log entry; this layer's
-    /// responsibility is the `tracing::warn!` emission.
-    ///
-    /// Every degradation event is visible in the hash-chained audit log so the
-    /// forensic record is complete.
+    /// The wallet proceeds with the unlock window even if memory pinning
+    /// fails, but emits a `tracing::warn!` with the structured fields
+    /// `profile`, `reason`, and `errno`.  `EventKind::WalletMlockFailed` is a
+    /// reserved audit-log event kind (recognised by `audit verify`) not
+    /// currently emitted by any call site; this layer's responsibility ends
+    /// at the `tracing::warn!` emission.
     Warn,
 
     /// `mlock` is not attempted at all (operator opt-out).

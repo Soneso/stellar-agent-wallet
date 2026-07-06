@@ -108,8 +108,45 @@ fn harden_process() {
     // per-app entitlement model and operator policy.
 }
 
+/// Prints version/usage and exits when the process was invoked with
+/// `--version`/`-V` or `--help`/`-h`, before any transport or subscriber
+/// startup.
+///
+/// The server takes no other arguments: any other argv is ignored and the
+/// stdio MCP server starts normally, matching the pre-existing behaviour for
+/// operators who spawn this binary via an MCP client config.
+#[allow(clippy::print_stdout, reason = "pre-subscriber --version/--help path")]
+fn handle_version_and_help_flags() {
+    let Some(arg) = std::env::args().nth(1) else {
+        return;
+    };
+    match arg.as_str() {
+        "--version" | "-V" => {
+            println!("stellar-agent-mcp {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        "--help" | "-h" => {
+            println!("stellar-agent-mcp {}", env!("CARGO_PKG_VERSION"));
+            println!("Stdio MCP server for the Stellar agent wallet.");
+            println!(
+                "Configure it as a subprocess in your MCP client (Claude Code, Cursor, etc.)."
+            );
+            println!(
+                "Takes no arguments; profile and network are resolved from the active profile."
+            );
+            std::process::exit(0);
+        }
+        _ => {}
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    // ── 0. --version / --help intercept ──────────────────────────────────────
+    // Runs before any other startup step; a CLI probe for these flags must
+    // not touch the subscriber, keyring, or profile loader.
+    handle_version_and_help_flags();
+
     // ── 1. Process isolation (Linux prctl) ──────────────────────────────────
     // Runs before subscriber installation: even the subscriber startup itself
     // executes in the hardened process context.

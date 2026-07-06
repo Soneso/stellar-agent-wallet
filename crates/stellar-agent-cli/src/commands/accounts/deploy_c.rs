@@ -65,6 +65,7 @@ use zeroize::Zeroizing;
 
 use crate::common::network::TargetNetwork;
 use crate::common::render::{render_json, sanitize_for_table};
+use crate::common::signer_ceremony::resolve_software_signer_from_env;
 use crate::common::{resolve_profile_name, validate_path_component_ascii_safe};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -186,7 +187,7 @@ pub struct DeployCArgs {
     ///
     /// Required when `--signer-webauthn`, `--signer-ed25519`, or
     /// `--signer-external` is chosen for the genesis signer (mirrors
-    /// `smart-account rules create`'s passkey-only refusal). If omitted, the
+    /// `smart-account rules create`'s external-only refusal). If omitted, the
     /// command is refused before any RPC or signing call.
     #[arg(long)]
     pub accept_no_delegated_fallback: bool,
@@ -324,7 +325,7 @@ where
     // directly against the args (before any registry/credential resolution)
     // so the refusal fires fast and independent of whether the referenced
     // verifier/credential actually resolves. Mirrors the `smart-account
-    // rules create` passkey-only refusal precedent — a hard refusal, not a
+    // rules create` external-only refusal precedent — a hard refusal, not a
     // warning.
     let genesis_is_external_shaped = args.signer_webauthn.is_some()
         || args.signer_ed25519.is_some()
@@ -902,31 +903,18 @@ async fn resolve_deployer(args: &DeployCArgs) -> Result<DeployerKeypair, WalletE
     let var_name = args
         .deployer_secret_env
         .as_deref()
-        .ok_or_else(|| WalletError::Auth(stellar_agent_core::error::AuthError::KeyringLocked))?;
+        .ok_or(WalletError::Auth(
+            stellar_agent_core::error::AuthError::KeyringLocked,
+        ))?;
 
     // We need the G-strkey to pass to signer_from_env for the key-match check.
     // At deploy-c time, the deployer G-strkey is derived from the env-var S-strkey.
     // Unlike `create` (which has an explicit `--sponsor` G-strkey), `deploy-c` derives
     // the deployer G-strkey from the secret. We construct the signer first without
     // the mismatch check, then wrap in DeployerKeypair::SecretEnv.
-    use stellar_agent_core::error::AuthError;
-    use zeroize::Zeroizing;
-
-    let s_strkey: Zeroizing<String> = Zeroizing::new(std::env::var(var_name).map_err(|_| {
-        WalletError::Auth(AuthError::KeyringNotFound {
-            name: format!("environment variable '{var_name}' not set"),
-        })
-    })?);
-
-    let private_key =
-        stellar_strkey::ed25519::PrivateKey::from_string(&s_strkey).map_err(|_| {
-            WalletError::Auth(AuthError::KeyringNotFound {
-                name: format!("environment variable '{var_name}' contains an invalid S-strkey"),
-            })
-        })?;
-
-    let seed: Zeroizing<[u8; 32]> = Zeroizing::new(private_key.0);
-    let signer = stellar_agent_network::SoftwareSigningKey::new_from_zeroizing(seed);
+    let profile_name = resolve_profile_name(args.profile.as_deref());
+    let signer =
+        resolve_software_signer_from_env(var_name, "deploy-c", Some(&profile_name)).await?;
     let signer: Box<dyn stellar_agent_network::Signer + Send + Sync> = Box::new(signer);
 
     Ok(DeployerKeypair::SecretEnv {

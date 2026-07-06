@@ -17,7 +17,7 @@ use crate::tools::common::{
     commit_envelope_and_verify_nonce, enforce_classic_fee_cap, high_value_cross_check,
     ledger_err_result, nonce_id_prefix, redact_rpc_error_detail, redacted_wallet_error_envelope,
     resolve_classic_fee_per_op_stroops, submit_timeout, total_classic_fee_stroops,
-    verify_attestation_gate,
+    validate_g_strkey, verify_attestation_gate,
 };
 use stellar_agent_core::amount::McpAmountArgument;
 use stellar_agent_core::approval::retry::{
@@ -351,18 +351,8 @@ impl WalletServer {
             "starting_balance_stroops": args.starting_balance.as_stroops().to_string(),
         });
         // ── Validate G-strkeys ────────────────────────────────────────────────
-        if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(&args.source) {
-            return Err(rmcp::ErrorData::invalid_params(
-                format!("invalid source (expected G-strkey): {err}"),
-                None,
-            ));
-        }
-        if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(&args.destination) {
-            return Err(rmcp::ErrorData::invalid_params(
-                format!("invalid destination (expected G-strkey): {err}"),
-                None,
-            ));
-        }
+        validate_g_strkey(&args.source, "source")?;
+        validate_g_strkey(&args.destination, "destination")?;
 
         // ── Fetch source account state ────────────────────────────────────────
         let rpc_url = self.profile.rpc_url.as_str();
@@ -776,18 +766,8 @@ impl WalletServer {
             .await?;
 
         // ── Validate G-strkeys ────────────────────────────────────────────────
-        if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(&args.source) {
-            return Err(rmcp::ErrorData::invalid_params(
-                format!("invalid source (expected G-strkey): {err}"),
-                None,
-            ));
-        }
-        if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(&args.destination) {
-            return Err(rmcp::ErrorData::invalid_params(
-                format!("invalid destination (expected G-strkey): {err}"),
-                None,
-            ));
-        }
+        validate_g_strkey(&args.source, "source")?;
+        validate_g_strkey(&args.destination, "destination")?;
 
         // ── Decode nonce — map parse error to nonce.expired ──────────────────
         let nonce = match stellar_agent_nonce::Nonce::from_base64(&args.nonce) {

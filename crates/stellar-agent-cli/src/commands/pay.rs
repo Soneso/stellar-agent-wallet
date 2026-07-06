@@ -29,20 +29,22 @@
 //! # Secret-material policy
 //!
 //! `--secret-env VAR` reads the secret key from the environment variable
-//! named `VAR`.  The value is wrapped in `Zeroizing<String>` immediately,
-//! loaded into a [`stellar_agent_core::wallet::Wallet`] via
+//! named `VAR` through the shared
+//! [`crate::common::signer_ceremony::resolve_software_signer_from_env`]
+//! ceremony: the value is wrapped in `Zeroizing<String>` immediately, loaded
+//! into a [`stellar_agent_core::wallet::Wallet`] via
 //! [`stellar_agent_core::wallet::Wallet::unlock`], and consumed by
 //! [`stellar_agent_network::signing::wallet::signer_from_wallet`].  The
-//! `LockedSeed` (mlock-protected) is held only for the duration of a single
-//! `attach_signature` call; both the `SoftwareSigningKey` and the `Wallet`
-//! drop at end of the signing block, ensuring zeroization and munlock fire on
-//! every exit path.
+//! `LockedSeed` (mlock-protected) is held only for the duration of the parse
+//! and derive; the `SoftwareSigningKey` returned to this module drops at the
+//! end of the signing block, ensuring zeroization fires on every exit path.
 //!
 //! # mlock-protected signing window
 //!
-//! The `--secret-env` path routes through `Wallet::unlock` → `LockedSeed`
-//! → `signer_from_wallet` → `attach_signature` → drop. The `--sign-with-ledger`
-//! path uses `signer_from_ledger` (hardware signer; no seed ever in memory).
+//! The `--secret-env` path routes through the shared ceremony
+//! (`Wallet::unlock` → `LockedSeed` → `signer_from_wallet` → dispose) →
+//! `attach_signature` → drop. The `--sign-with-ledger` path uses
+//! `signer_from_ledger` (hardware signer; no seed ever in memory).
 //!
 //! # Behavior
 //!
@@ -57,15 +59,12 @@ use clap::{ArgGroup, Args};
 use stellar_agent_core::StellarAmount;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{AuthError, NetworkError, ValidationError, WalletError};
-use stellar_agent_core::wallet::{MlockRequired, Wallet};
 use stellar_xdr::Memo;
-use zeroize::Zeroizing;
 
 use stellar_agent_network::builder::{Asset, ClassicOpBuilder};
 use stellar_agent_network::signing::Signer;
 use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::signing::source::signer_from_ledger;
-use stellar_agent_network::signing::wallet::signer_from_wallet;
 use stellar_agent_network::{
     ClassicFeeSelection, StellarRpcClient, SubmissionResult, SubmissionSignerKind,
     parse_classic_fee_choice, parse_memo_fields, resolve_classic_fee_selection,
@@ -74,6 +73,7 @@ use stellar_agent_network::{
 
 use crate::common::network::TargetNetwork;
 use crate::common::render::{render_json, sanitize_for_table};
+use crate::common::signer_ceremony::resolve_software_signer_from_env;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -526,11 +526,10 @@ async fn build_unsigned_envelope(args: &PayArgs) -> Result<BuiltPaymentEnvelope,
 ///
 /// - `--sign-with-ledger`: delegates to `signer_from_ledger` (hardware; no
 ///   seed ever held in process memory).
-/// - `--secret-env VAR`: loads the S-strkey from the environment variable,
-///   wraps the seed bytes in a `Wallet` (mlock-protected), derives a
-///   `SoftwareSigningKey` via `signer_from_wallet`, calls `attach_signature`
-///   once, then drops both the key and the wallet. The mlock window
-///   (LockedSeed) is active only for the duration of this function.
+/// - `--secret-env VAR`: derives a `SoftwareSigningKey` via the shared
+///   [`crate::common::signer_ceremony::resolve_software_signer_from_env`]
+///   ceremony (mlock-protected `Wallet` unlock, `signer_from_wallet`, wallet
+///   dispose), then calls `attach_signature` once and drops the key.
 ///
 /// # Public-key verification
 ///
@@ -558,80 +557,29 @@ async fn sign_envelope(args: &PayArgs, unsigned_xdr: &str) -> Result<String, Wal
     }
 
     if let Some(ref var_name) = args.secret_env {
-        // mlock-protected signing window:
+        // mlock-protected signing window (shared ceremony):
         //
-        // 1. Read S-strkey from env var into Zeroizing<String>.
-        // 2. Parse into a seed [u8; 32]; wrap in Zeroizing<[u8; 32]>.
-        // 3. Explicitly zeroize the Copy residue in PrivateKey.0.
-        // 4. Move seed into Wallet::unlock (LockedSeed mlock on page).
-        // 5. Derive SoftwareSigningKey via signer_from_wallet.
-        // 6. Verify derived public key matches --source before signing.
-        // 7. attach_signature exactly once.
-        // 8. Drop SoftwareSigningKey → SecretBox zeroised.
-        // 9. wallet.dispose() → munlock + LockedSeed zeroised.
-        //
-        // The LockedSeed window is active only for steps 4-9 (this function).
-        // The explicit zeroize call is required until stellar-strkey upstream
-        // adds Drop+Zeroize to PrivateKey.
+        // 1. Derive the SoftwareSigningKey via
+        //    `resolve_software_signer_from_env` (env -> Zeroizing<String> ->
+        //    seed Zeroizing<[u8; 32]> -> zeroize PrivateKey.0 residue ->
+        //    Wallet::unlock -> signer_from_wallet -> wallet.dispose()).
+        // 2. Verify the derived public key matches --source before signing.
+        // 3. attach_signature exactly once.
+        // 4. Drop SoftwareSigningKey -> SecretBox zeroised.
+        let signer = resolve_software_signer_from_env(var_name, "pay-commit", None).await?;
 
-        // Step 1.
-        let s_strkey: Zeroizing<String> =
-            Zeroizing::new(std::env::var(var_name).map_err(|_| {
-                WalletError::Auth(AuthError::KeyringNotFound {
-                    name: format!("environment variable '{var_name}' not set"),
-                })
-            })?);
-
-        // Step 2 + 3.
-        let mut private_key =
-            stellar_strkey::ed25519::PrivateKey::from_string(&s_strkey).map_err(|_| {
-                WalletError::Auth(AuthError::KeyringNotFound {
-                    name: format!("environment variable '{var_name}' contains an invalid S-strkey"),
-                })
-            })?;
-        let seed_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(private_key.0);
-        zeroize::Zeroize::zeroize(&mut private_key.0);
-        drop(s_strkey);
-
-        // Step 4: construct the mlock-protected signing window.
-        // MlockRequired::Warn: proceed even if mlock is unavailable (e.g.
-        // CI containers with rlimit=0), but log a structured warning.  The
-        // CLI binary should not hard-fail on mlock in development environments.
-        // Operators requiring strict mlock enforcement set mlock_required = true
-        // in their profile TOML.
-        let mut wallet = Wallet::unlock(
-            "pay-commit".to_owned(),
-            seed_bytes,
-            stellar_agent_core::wallet::DEFAULT_TTL_SECONDS,
-            MlockRequired::Warn,
-        )
-        .await
-        .map_err(|e| {
-            WalletError::Auth(AuthError::KeyringNotFound {
-                name: format!("Wallet::unlock failed: {e}"),
-            })
-        })?;
-
-        // Step 5.
-        let signer = signer_from_wallet(&wallet)?;
-
-        // Step 6: public-key verification before signing.
+        // Public-key verification before signing.
         let signer_pk = signer.public_key().await?;
         let signer_gstrkey = signer_pk.to_string().to_string();
         if signer_gstrkey != source {
-            wallet.dispose();
             return Err(WalletError::Auth(AuthError::SignerKeyMismatch {
                 expected: source.to_owned(),
                 got: signer_gstrkey,
             }));
         }
 
-        // Step 7.
         let signed_xdr = attach_signature(unsigned_xdr, &signer, passphrase).await?;
-        // Step 8: signer drops here.
         drop(signer);
-        // Step 9.
-        wallet.dispose();
 
         return Ok(signed_xdr);
     }

@@ -411,7 +411,7 @@ fn webauthn_sigdata_inner_encoding_parity_with_onchain_canonical() {
     use soroban_sdk::{Bytes, BytesN, Env};
     use stellar_accounts::verifiers::webauthn::WebAuthnSigData;
     use stellar_agent_smart_account::webauthn::WebAuthnAssertion;
-    use stellar_agent_smart_account::webauthn::encode_webauthn_signature_value_bytes;
+    use stellar_agent_smart_account::webauthn::encode_webauthn_sig_data_scval;
 
     // ── Fixture: deterministic values matching the verifier verify_success test ─
 
@@ -461,8 +461,10 @@ fn webauthn_sigdata_inner_encoding_parity_with_onchain_canonical() {
         client_data_json: client_data_json_bytes.clone(),
     };
 
-    let wallet_inner_bytes = encode_webauthn_signature_value_bytes(&assertion)
-        .expect("encode_webauthn_signature_value_bytes must not fail on well-formed inputs");
+    let wallet_sig_data_scval = encode_webauthn_sig_data_scval(&assertion)
+        .expect("encode_webauthn_sig_data_scval must not fail on well-formed inputs");
+    let wallet_inner_bytes = WriteXdr::to_xdr(&wallet_sig_data_scval, Limits::none())
+        .expect("XDR-encode WebAuthnSigData ScVal must not fail on well-formed inputs");
 
     // ── On-chain canonical encode ────────────────────────────────────────────
     //

@@ -183,7 +183,7 @@ pub async fn run(args: &ScheduleArgs) -> i32 {
     let profile_name = resolve_profile_name(args.profile.as_deref());
     let request_id = Uuid::new_v4().to_string();
 
-    let signer = match resolve_signer(&args.signer_source).await {
+    let signer = match resolve_signer(&args.signer_source, Some(&profile_name)).await {
         Ok(s) => s,
         Err(e) => {
             let envelope: Envelope<()> = Envelope::err(&e);

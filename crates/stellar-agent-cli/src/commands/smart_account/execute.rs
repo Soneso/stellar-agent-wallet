@@ -14,8 +14,8 @@
 //! - **Rule signer** (`--rule-signer-ed25519-secret-env`) — the agent's
 //!   External-Ed25519 key that authorises the smart-account call. Raw
 //!   ed25519 signs the 32-byte auth digest directly (no G-key sub-entry).
-//!   Uses the full mlock-protected ceremony (`Wallet::unlock` /
-//!   `signer_from_wallet` / `Wallet::dispose`); the funded-source check other
+//!   Derived via the shared mlock-protected ceremony
+//!   (`resolve_software_signer_from_env`); the funded-source check other
 //!   secret-env signers get is skipped because a rule key has no on-chain
 //!   account.
 //! - **Fee-payer signer** (`--signer-secret-env` / `--sign-with-ledger`) —
@@ -57,9 +57,7 @@ use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{AuthError, NetworkError, ValidationError, WalletError};
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
-use stellar_agent_core::wallet::{DEFAULT_TTL_SECONDS, MlockRequired, Wallet};
 use stellar_agent_network::signing::Signer;
-use stellar_agent_network::signing::wallet::signer_from_wallet;
 use stellar_agent_network::submit::redact_tx_hash;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::rules::parse_c_strkey_to_smart_account;
@@ -70,14 +68,14 @@ use stellar_agent_smart_account::verifiers::VerifierRegistry;
 use stellar_xdr::{HostFunction, InvokeContractArgs, Limits, ReadXdr as _, ScSymbol, ScVal, VecM};
 use tracing::info;
 use uuid::Uuid;
-use zeroize::{Zeroize, Zeroizing};
 
 use crate::commands::smart_account::common::{
-    SignerSourceFlags, network_to_chain_id, open_audit_writer, resolve_signer,
+    SignerSourceFlags, network_to_chain_id, open_audit_writer, resolve_signer, wrap_sa_error,
 };
 use crate::common::network::TargetNetwork;
 use crate::common::render::{render_json, sanitize_for_table};
 use crate::common::resolve_profile_name;
+use crate::common::signer_ceremony::resolve_software_signer_from_env;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -377,72 +375,26 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
         arg_count,
     } = plan;
     let network_passphrase = args.network.passphrase();
+    let profile_name = resolve_profile_name(args.profile.as_deref());
 
-    // ── Rule-signer key ceremony (full mlock ceremony; pay.rs:552-600) ─────
+    // ── Rule-signer key ceremony (shared mlock ceremony) ─────────────────────
     // Funded-source verification is SKIPPED: a rule key has no on-chain
     // account.
-    let var_name = &args.rule_signer_ed25519_secret_env;
-    let s_strkey: Zeroizing<String> = Zeroizing::new(match std::env::var(var_name) {
-        Ok(v) => v,
-        Err(_) => {
-            return emit_error(
-                &WalletError::Auth(AuthError::KeyringNotFound {
-                    name: format!("environment variable '{var_name}' not set"),
-                }),
-                args.output,
-                &request_id,
-            );
-        }
-    });
-    let mut private_key = match stellar_strkey::ed25519::PrivateKey::from_string(&s_strkey) {
-        Ok(pk) => pk,
-        Err(_) => {
-            return emit_error(
-                &WalletError::Auth(AuthError::KeyringNotFound {
-                    name: format!("environment variable '{var_name}' contains an invalid S-strkey"),
-                }),
-                args.output,
-                &request_id,
-            );
-        }
-    };
-    let seed_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(private_key.0);
-    private_key.0.zeroize();
-    drop(s_strkey);
-
-    let mut rule_wallet = match Wallet::unlock(
-        "smart-account-execute".to_owned(),
-        seed_bytes,
-        DEFAULT_TTL_SECONDS,
-        MlockRequired::Warn,
+    let rule_signer = match resolve_software_signer_from_env(
+        &args.rule_signer_ed25519_secret_env,
+        "smart-account-execute",
+        Some(&profile_name),
     )
     .await
     {
-        Ok(w) => w,
-        Err(e) => {
-            return emit_error(
-                &WalletError::Auth(AuthError::KeyringNotFound {
-                    name: format!("Wallet::unlock failed: {e}"),
-                }),
-                args.output,
-                &request_id,
-            );
-        }
-    };
-
-    let rule_signer = match signer_from_wallet(&rule_wallet) {
         Ok(s) => s,
-        Err(e) => {
-            rule_wallet.dispose();
-            return emit_error(&e, args.output, &request_id);
-        }
+        Err(e) => return emit_error(&e, args.output, &request_id),
     };
 
     let rule_pubkey = match rule_signer.public_key().await {
         Ok(pk) => pk,
         Err(e) => {
             drop(rule_signer);
-            rule_wallet.dispose();
             return emit_error(&e, args.output, &request_id);
         }
     };
@@ -457,7 +409,6 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
         && expected_hex.to_lowercase() != rule_pubkey_hex
     {
         drop(rule_signer);
-        rule_wallet.dispose();
         return emit_error(
             &WalletError::Auth(AuthError::SignerKeyMismatch {
                 expected: expected_hex.clone(),
@@ -469,11 +420,10 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     }
 
     // ── Fee-payer signer ────────────────────────────────────────────────────
-    let fee_payer_signer = match resolve_signer(&args.signer_source).await {
+    let fee_payer_signer = match resolve_signer(&args.signer_source, Some(&profile_name)).await {
         Ok(s) => s,
         Err(e) => {
             drop(rule_signer);
-            rule_wallet.dispose();
             return emit_error(&e, args.output, &request_id);
         }
     };
@@ -508,16 +458,14 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     )
     .await;
 
-    // The mlock window is scoped to the single submit_signed_invoke call
-    // above; drop the signer and dispose the wallet immediately after.
+    // `rule_signer`'s SecretBox zeroizes on drop; the wallet it was derived
+    // from has already been disposed inside the shared ceremony helper.
     drop(rule_signer);
-    rule_wallet.dispose();
 
     // Best-effort audit writer (sibling convention): an audit-subsystem
     // failure must never mask the outcome of a submission that has already
     // confirmed on-chain.
-    let profile = resolve_profile_name(args.profile.as_deref());
-    let audit_writer = open_audit_writer(&profile)
+    let audit_writer = open_audit_writer(&profile_name)
         .map(|(writer, _path)| writer)
         .ok();
 
@@ -653,6 +601,11 @@ fn write_failure_audit_row(
 
 /// Minimal phase-based `SaError` -> `SaInvocationResult` classifier for the
 /// `execute` verb's audit boundary. See [`write_failure_audit_row`].
+///
+/// A new `SaError` variant that can fail on-chain and is reachable from
+/// `execute` must be added to this match explicitly; otherwise it is
+/// classified as `PreSubmissionRefused` by the wildcard arm below, which
+/// under-counts on-chain failures in the audit log.
 fn classify_invocation_result(err: &SaError) -> SaInvocationResult {
     match err {
         SaError::DeploymentFailed {
@@ -716,16 +669,6 @@ fn emit_error(err: &WalletError, output: OutputFormat, request_id: &str) -> i32 
     1
 }
 
-/// Maps an [`SaError`] into the `WalletError::SmartAccount` envelope shape,
-/// reusing the exact `wire_code()` + `to_string()` construction every
-/// sibling smart-account write verb uses.
-fn wrap_sa_error(err: &SaError) -> WalletError {
-    WalletError::SmartAccount {
-        wire_code: err.wire_code(),
-        message: err.to_string(),
-    }
-}
-
 fn emit_error_sa(err: &SaError, output: OutputFormat, request_id: &str) -> i32 {
     emit_error(&wrap_sa_error(err), output, request_id)
 }
@@ -745,6 +688,10 @@ mod tests {
 
     use clap::Parser;
     use serial_test::serial;
+    use stellar_agent_core::wallet::{DEFAULT_TTL_SECONDS, MlockRequired, Wallet};
+    use stellar_agent_network::signing::wallet::signer_from_wallet;
+    use stellar_agent_test_support::StellarAgentHomeGuard;
+    use zeroize::Zeroizing;
 
     use super::*;
 
@@ -1094,42 +1041,6 @@ mod tests {
             plan.host_function,
             HostFunction::InvokeContract(_)
         ));
-    }
-
-    /// RAII guard overriding `STELLAR_AGENT_HOME` for the duration of a test
-    /// (mirrors `smart_account::rules::tests::StellarAgentHomeGuard`).
-    struct StellarAgentHomeGuard {
-        previous: Option<std::ffi::OsString>,
-    }
-
-    #[allow(
-        unsafe_code,
-        reason = "test-only process environment override; #[serial] prevents sibling mutation"
-    )]
-    impl StellarAgentHomeGuard {
-        fn new(value: &std::path::Path) -> Self {
-            let previous = std::env::var_os("STELLAR_AGENT_HOME");
-            unsafe {
-                std::env::set_var("STELLAR_AGENT_HOME", value);
-            }
-            Self { previous }
-        }
-    }
-
-    #[allow(
-        unsafe_code,
-        reason = "test-only process environment restore; panic-safe via Drop"
-    )]
-    impl Drop for StellarAgentHomeGuard {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(value) = self.previous.take() {
-                    std::env::set_var("STELLAR_AGENT_HOME", value);
-                } else {
-                    std::env::remove_var("STELLAR_AGENT_HOME");
-                }
-            }
-        }
     }
 
     /// No Ed25519 verifier registered + no `--verifier` override is refused

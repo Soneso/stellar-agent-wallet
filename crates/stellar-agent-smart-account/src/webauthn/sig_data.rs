@@ -30,7 +30,7 @@
 //! for WebAuthn (External arm) the inner-XDR step encodes the full
 //! `WebAuthnSigData` ScVal::Map.
 
-use stellar_xdr::{BytesM, Limits, ScBytes, ScMap, ScMapEntry, ScSymbol, ScVal, VecM, WriteXdr};
+use stellar_xdr::{BytesM, ScBytes, ScMap, ScMapEntry, ScSymbol, ScVal, VecM};
 
 pub use stellar_agent_network::signing::WebAuthnAssertion;
 
@@ -142,32 +142,4 @@ pub fn encode_webauthn_sig_data_scval(a: &WebAuthnAssertion) -> Result<ScVal, Sa
     .map_err(|e| auth_payload_err(format!("encode WebAuthnSigData ScMap: {e:?}")))?;
 
     Ok(ScVal::Map(Some(ScMap(entries))))
-}
-
-/// Produce the `<inner-encoding>` bytes for an External-arm signer entry —
-/// the byte-string that goes into `ScVal::Bytes(<inner-encoding>)` as the
-/// value of the `AuthPayload` `signers` Map for a WebAuthn signer.
-///
-/// This is the "double-XDR" pattern: the `WebAuthnSigData` ScVal is
-/// XDR-encoded to bytes BEFORE being wrapped in `ScVal::Bytes`. For
-/// ed25519 (Delegated arm) the inner-XDR step is degenerate (raw 64 bytes
-/// pass through via `auth_entry.rs`); for WebAuthn (External arm) the
-/// inner-XDR step encodes the `WebAuthnSigData` ScVal::Map.
-///
-/// # Errors
-///
-/// Returns [`SaError::AuthEntryConstructionFailed`] with `stage: "auth_payload"`
-/// if [`encode_webauthn_sig_data_scval`] fails or if the resulting ScVal
-/// cannot be XDR-encoded (the latter is unreachable for well-formed inputs
-/// within on-chain size limits).
-pub fn encode_webauthn_signature_value_bytes(a: &WebAuthnAssertion) -> Result<Vec<u8>, SaError> {
-    let auth_payload_err = |reason: String| SaError::AuthEntryConstructionFailed {
-        stage: "auth_payload",
-        redacted_reason: reason,
-    };
-
-    let sig_data_scval = encode_webauthn_sig_data_scval(a)?;
-
-    WriteXdr::to_xdr(&sig_data_scval, Limits::none())
-        .map_err(|e| auth_payload_err(format!("XDR-encode WebAuthnSigData ScVal: {e:?}")))
 }

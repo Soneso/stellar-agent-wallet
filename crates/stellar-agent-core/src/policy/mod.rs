@@ -519,8 +519,6 @@ pub enum DenyReason {
         /// Current account balance in stroops.
         balance_stroops: i64,
     },
-    /// An approval was required but not present.
-    MissingApproval,
     /// The owner signature is stale; the key was rotated after the policy
     /// was signed.
     OwnerSignatureStale {
@@ -724,7 +722,6 @@ impl DenyReason {
             Self::RateLimitExceeded { .. } => "rate_limit_exceeded",
             Self::CounterpartyDenied { .. } => "counterparty_denied",
             Self::MinimumReserveBreached { .. } => "minimum_reserve_breached",
-            Self::MissingApproval => "missing_approval",
             Self::OwnerSignatureStale { .. } => "owner_signature_stale",
             Self::NoMatchingRule => "no_matching_rule",
             Self::CounterpartyKindUnsupported { .. } => "counterparty_kind_unsupported",
@@ -914,10 +911,9 @@ fn validate_approval_url(candidate: &str) -> Result<(), ApprovalError> {
 ///
 /// ## Layer placement note
 ///
-/// This `policy::PolicyError` lives at the policy-engine layer.  It is
-/// distinct from `error::PolicyError`, which lives in the umbrella nine-
-/// category taxonomy — do NOT consolidate them; they carry different semantic
-/// contracts.
+/// This `policy::PolicyError` lives at the policy-engine layer.  Do not
+/// consolidate it with the `error` module's `WalletError` taxonomy; the two
+/// carry different semantic contracts.
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum PolicyError {
@@ -1455,11 +1451,6 @@ mod tests {
             balance_stroops: 4_000_000,
         };
         assert_eq!(r.code(), "minimum_reserve_breached");
-    }
-
-    #[test]
-    fn deny_reason_code_missing_approval() {
-        assert_eq!(DenyReason::MissingApproval.code(), "missing_approval");
     }
 
     #[test]

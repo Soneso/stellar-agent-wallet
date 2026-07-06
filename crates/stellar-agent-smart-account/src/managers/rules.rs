@@ -4660,7 +4660,6 @@ fn sa_error_to_invocation_result(
         // before any simulate/submit call.
         | SaError::BatchSignerAddRefused { .. }
         | SaError::AuditLog(_) => SaInvocationResult::PreSubmissionRefused,
-        SaError::AuthDigestMismatch { .. } => SaInvocationResult::OnChainRejected,
         // Wasm-hash pinning pre-submission refusals.
         // All variants fire before any chain-submission attempt; signing
         // is aborted during rule-install pre-flight or on-signing re-fetch.
@@ -4762,10 +4761,6 @@ fn sa_error_to_invocation_result(
                 _ => SaInvocationResult::OnChainRejected,
             }
         }
-        // TimelockOperationNotFound: fires when the cancel path cannot locate the
-        // operation on-chain — the cancel was not submitted (OZ code 4006 returned
-        // from simulation before any tx was signed or sent).
-        SaError::TimelockOperationNotFound { .. } => SaInvocationResult::PreSubmissionRefused,
         // TimelockListPendingFailed: read-path failure (RPC unreachable or URL
         // invalid); no submission attempted. Maps to PreSubmissionRefused because
         // the operation state could not be determined before any action.

@@ -117,9 +117,10 @@ pub struct Sep24InteractiveUrlArgs {
     /// Whether the client supports receiving deposit transactions as a
     /// claimable balance (optional).
     ///
-    /// Renamed from the SEP-24 wire name `claimable_balance_supported` to keep
-    /// the MCP schema field name distinct from the `balance` policy trigger
-    /// word.  The form parameter is still sent as `claimable_balance_supported`.
+    /// The MCP schema field name differs from the SEP-24 wire name
+    /// `claimable_balance_supported` to keep it distinct from the `balance`
+    /// policy trigger word; the form parameter is sent as
+    /// `claimable_balance_supported`.
     ///
     /// Per `sep-0024.md:533`.
     #[serde(default)]

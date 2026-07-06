@@ -70,6 +70,7 @@ use crate::commands::smart_account::common::{
 use crate::common::network::TargetNetwork;
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
+use crate::common::signer_ceremony::resolve_software_signer_from_env;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -245,6 +246,8 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         return 1;
     }
 
+    let profile_name = resolve_profile_name(args.profile.as_deref());
+
     // Resolve signer.
     let signer = {
         let signer_flags = SignerSourceFlags {
@@ -252,7 +255,7 @@ pub async fn run(args: &MulticallArgs) -> i32 {
             sign_with_ledger: args.sign_with_ledger,
             account_index: Some(args.account_index),
         };
-        match resolve_signer(&signer_flags).await {
+        match resolve_signer(&signer_flags, Some(&profile_name)).await {
             Ok(s) => s,
             Err(e) => {
                 render_json(&Envelope::<()>::err(&e));
@@ -261,7 +264,6 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         }
     };
 
-    let profile_name = resolve_profile_name(args.profile.as_deref());
     let network_passphrase = args.network.passphrase().to_owned();
     let chain_id = network_to_chain_id(args.network).to_owned();
 
@@ -564,8 +566,14 @@ fn build_minimal_profile(
 }
 
 /// Resolves the signer from the two mutually-exclusive flag modes.
+///
+/// The `--signer-secret-env` path routes through the shared mlock-protected
+/// [`resolve_software_signer_from_env`] ceremony, applying `profile_name`'s
+/// `[wallet]` posture and TTL exactly like every other secret-env signer
+/// resolution in the CLI.
 async fn resolve_signer(
     flags: &SignerSourceFlags,
+    profile_name: Option<&str>,
 ) -> Result<Box<dyn stellar_agent_network::Signer + Send + Sync>, WalletError> {
     if flags.sign_with_ledger {
         use stellar_agent_network::signing::hardware::HardwareSigningKey;
@@ -586,22 +594,8 @@ async fn resolve_signer(
                 .to_owned(),
         })
     })?;
-    use zeroize::Zeroizing;
-    let s_strkey: Zeroizing<String> = Zeroizing::new(std::env::var(var_name).map_err(|_| {
-        WalletError::Auth(AuthError::KeyringNotFound {
-            name: format!("environment variable '{var_name}' not set"),
-        })
-    })?);
-    let private_key =
-        stellar_strkey::ed25519::PrivateKey::from_string(&s_strkey).map_err(|_| {
-            WalletError::Auth(AuthError::KeyringNotFound {
-                name: format!("environment variable '{var_name}' contains an invalid S-strkey"),
-            })
-        })?;
-    let seed: Zeroizing<[u8; 32]> = Zeroizing::new(private_key.0);
-    Ok(Box::new(
-        stellar_agent_network::SoftwareSigningKey::new_from_zeroizing(seed),
-    ))
+    let signer = resolve_software_signer_from_env(var_name, "multicall-cli", profile_name).await?;
+    Ok(Box::new(signer))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

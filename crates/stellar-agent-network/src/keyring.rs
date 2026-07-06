@@ -712,16 +712,11 @@ fn wallet_error_kind(err: &WalletError) -> &'static str {
         WalletError::Auth(AuthError::KeyringLocked) => "AuthError::KeyringLocked",
         WalletError::Auth(AuthError::KeyringPlatformError) => "AuthError::KeyringPlatformError",
         WalletError::Auth(AuthError::KeyringNotFound { .. }) => "AuthError::KeyringNotFound",
-        WalletError::Auth(AuthError::SignatureVerificationFailed) => {
-            "AuthError::SignatureVerificationFailed"
-        }
         WalletError::Auth(AuthError::HardwareUserRefused) => "AuthError::HardwareUserRefused",
         WalletError::Auth(AuthError::SignerKeyMismatch { .. }) => "AuthError::SignerKeyMismatch",
         WalletError::Auth(AuthError::SignerKindMismatch { .. }) => "AuthError::SignerKindMismatch",
         WalletError::Validation(_) => "WalletError::Validation",
         WalletError::Network(_) => "WalletError::Network",
-        WalletError::Policy(_) => "WalletError::Policy",
-        WalletError::Fees(_) => "WalletError::Fees",
         WalletError::WalletState(_) => "WalletError::WalletState",
         WalletError::Protocol(_) => "WalletError::Protocol",
         WalletError::Ledger(_) => "WalletError::Ledger",

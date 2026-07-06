@@ -306,7 +306,7 @@ pub struct PolicyConfig {
 /// ```toml
 /// [wallet]
 /// mlock_required = true       # default on Linux/macOS; "warn" on Windows
-/// unlock_ttl_seconds = 30     # default; downward-only configurable
+/// unlock_ttl_seconds = 30     # default; any value in (0, 600] is accepted
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -325,10 +325,10 @@ pub struct WalletConfig {
     /// approval + sign + submit; on TTL fire the seed is zeroized and
     /// the next sign attempt re-loads from the keyring.
     ///
-    /// **Downward-only configurable** — operators may shorten the window
-    /// but not extend it.  The cap of 30 seconds is enforced at
-    /// handle-construction time; values larger than 30 are clamped to 30
-    /// with a structured warning emitted via `tracing::warn!`.
+    /// Passed directly to [`crate::wallet::Wallet::unlock`], which enforces
+    /// `(0, MAX_TTL_SECONDS]` (`MAX_TTL_SECONDS` = 600 seconds): a value of
+    /// `0` or greater than 600 is refused at unlock time rather than
+    /// silently clamped.
     #[serde(default = "default_unlock_ttl_seconds")]
     pub unlock_ttl_seconds: u32,
 }

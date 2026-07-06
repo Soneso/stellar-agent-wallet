@@ -213,9 +213,11 @@ impl VerifierAllowlistEntry {
 ///
 /// # Current entries
 ///
-/// Two production entries. Index 0 is the hash new verifier deployments upload
-/// (`sha2::Sha256::digest(VERIFIER_WASM_FIXTURE)`); index 1 is the legacy hash,
-/// still recognised for verifier contracts already deployed on-chain.
+/// Three production entries. Index 0 is the hash new WebAuthn verifier
+/// deployments upload (`sha2::Sha256::digest(VERIFIER_WASM_FIXTURE)`); index 1
+/// is the legacy WebAuthn hash, still recognised for verifier contracts
+/// already deployed on-chain; index 2 is the Ed25519 verifier hash new
+/// External-Ed25519 verifier deployments upload.
 ///
 /// - Index 0: OZ `multisig-webauthn-verifier-example` v0.7.2.
 ///   - SHA-256: `9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7`
@@ -229,6 +231,13 @@ impl VerifierAllowlistEntry {
 ///   - PROVENANCE: `vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md`
 ///   - Audit status: `Provisional { attested_by: "OpenZeppelin", attested_at: "2025-11-01" }`
 ///     — OZ internal v0.7.1 artefact review; no external audit report yet.
+/// - Index 2: OZ `multisig-ed25519-verifier-example` v0.7.2 (canonical Ed25519
+///   deploy verifier for External-Ed25519 signers).
+///   - SHA-256: `ea13b07083a8275e7bade954e4ccc1827495f253c18dc06edcc49104c11fb725`
+///   - OZ source SHA: `a9c42169000638da937577f592ebf61a7a3c94ca` (tag `v0.7.2`)
+///   - PROVENANCE: `vendor/oz-ed25519-verifier/v0.7.2/PROVENANCE.md`
+///   - Audit status: `Provisional { attested_by: "OpenZeppelin", attested_at: "2026-07-04" }`
+///     — OZ internal v0.7.2 artefact review; no external audit report yet.
 ///
 /// The ABI is unchanged between v0.7.1 and v0.7.2; the v0.7.2 bytes differ only
 /// because of the soroban-sdk 26.1.0 bump. When an external audit report is

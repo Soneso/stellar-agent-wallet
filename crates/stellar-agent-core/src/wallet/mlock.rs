@@ -100,9 +100,10 @@ impl LockedSeed {
     ///   [`WalletLifecycleError::MlockUnavailable`]; the seed is zeroed and
     ///   this function does not return `Ok`.
     /// - [`MlockRequired::Warn`] — returns `Ok` with `guard: None`; emits a
-    ///   structured `tracing::warn!`.  The MCP server layer wires the
-    ///   `EventKind::WalletMlockFailed` audit-log entry; this call site only
-    ///   emits the tracing span.
+    ///   structured `tracing::warn!`.  `EventKind::WalletMlockFailed` is a
+    ///   reserved audit-log event kind (recognised by `audit verify`) not
+    ///   currently emitted by any call site; this function's responsibility
+    ///   ends at the tracing span.
     /// - [`MlockRequired::False`] — `mlock` is not attempted; always returns
     ///   `Ok` with `guard: None`.
     ///
@@ -152,9 +153,7 @@ impl LockedSeed {
                                     reason = %reason,
                                     errno = errno,
                                     "wallet.mlock_failed: mlock unavailable; \
-                                     proceeding with unprotected memory (warn mode). \
-                                     The MCP server records EventKind::WalletMlockFailed \
-                                     in the hash-chained audit log."
+                                     proceeding with unprotected memory (warn mode)."
                                 );
                                 None
                             }

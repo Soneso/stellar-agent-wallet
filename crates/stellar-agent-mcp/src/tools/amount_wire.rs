@@ -113,10 +113,9 @@ pub(crate) fn parse_stroops_i64_opt_field(
 /// non-negative Stellar stroop amount).
 ///
 /// Used where the field's domain never permits a sign — e.g. an input
-/// amount before its `<= i64::MAX` bound is checked — so that the
-/// non-negativity guarantee formerly carried by a `u64` Rust type is now
-/// carried by this parse instead (a decimal string has no type-level
-/// sign restriction otherwise).
+/// amount before its `<= i64::MAX` bound is checked — so the non-negativity
+/// guarantee is carried by this parse: a decimal string has no type-level
+/// sign restriction on its own.
 ///
 /// # Errors
 ///

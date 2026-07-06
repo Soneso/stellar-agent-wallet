@@ -28,7 +28,5 @@ pub mod sig_normalize;
 
 pub use passkey_signer::{AssertionInput, PasskeyCredentialRecord, PasskeySignHandle};
 pub use pre_verifier::pre_verify_assertion;
-pub use sig_data::{
-    WebAuthnAssertion, encode_webauthn_sig_data_scval, encode_webauthn_signature_value_bytes,
-};
+pub use sig_data::{WebAuthnAssertion, encode_webauthn_sig_data_scval};
 pub use sig_normalize::{NormalisedSignature, normalize_der_to_compact_low_s};

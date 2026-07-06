@@ -312,7 +312,6 @@ fn enumerate_deny_reason_for_test(v: &DenyReason) -> &'static str {
         DenyReason::RateLimitExceeded { .. } => "rate_limit_exceeded",
         DenyReason::CounterpartyDenied { .. } => "counterparty_denied",
         DenyReason::MinimumReserveBreached { .. } => "minimum_reserve_breached",
-        DenyReason::MissingApproval => "missing_approval",
         DenyReason::OwnerSignatureStale { .. } => "owner_signature_stale",
         DenyReason::NoMatchingRule => "no_matching_rule",
         DenyReason::ExplicitRuleDeny => "explicit_rule_deny",
@@ -386,7 +385,6 @@ fn deny_reason_wire_codes_are_unique() {
             reserve_required_stroops: 1,
             balance_stroops: 0,
         },
-        DenyReason::MissingApproval,
         DenyReason::OwnerSignatureStale {
             rotated_at: "2026-01-01T00:00:00Z".into(),
         },
@@ -456,7 +454,7 @@ fn deny_reason_wire_codes_are_unique() {
     // but forgets the corresponding entry in `variants`, this catches it.
     assert_eq!(
         variants.len(),
-        19,
+        18,
         "variants list count drifted from DenyReason variant count.  \
          Update enumerate_deny_reason_for_test, the variants vec, and this assertion."
     );
@@ -467,9 +465,9 @@ fn deny_reason_wire_codes_are_unique() {
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // Coverage scope.  These proptests cover every payload-bearing variant of
-// `DenyReason`.  The three payload-free variants (`MissingApproval`,
-// `NoMatchingRule`, `ExplicitRuleDeny`) have no random fields to vary, so
-// payload-independence reduces to a constant check; those are exercised by
+// `DenyReason`.  The two payload-free variants (`NoMatchingRule`,
+// `ExplicitRuleDeny`) have no random fields to vary, so payload-independence
+// reduces to a constant check; those are exercised by
 // `deny_reason_wire_codes_are_unique` above.
 
 proptest! {

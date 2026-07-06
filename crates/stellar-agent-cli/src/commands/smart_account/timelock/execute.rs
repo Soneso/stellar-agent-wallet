@@ -223,7 +223,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
         }
     };
 
-    let signer = match resolve_signer(&args.signer_source).await {
+    let signer = match resolve_signer(&args.signer_source, Some(&profile_name)).await {
         Ok(s) => s,
         Err(e) => {
             let envelope: Envelope<()> = Envelope::err(&e);

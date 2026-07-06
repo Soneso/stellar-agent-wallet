@@ -232,9 +232,9 @@ pub struct StellarRuleCreateArgs {
     pub accept_unknown_verifier: bool,
 
     /// Acknowledge that this rule has no delegated (ed25519) fallback
-    /// signer — required when every signer is `webauthn` and no
-    /// `delegated` entry is present. Mirrors the CLI's
-    /// `--accept-no-delegated-fallback` passkey-only refusal.
+    /// signer — required when every signer is `webauthn` and/or `external`
+    /// and no `delegated` entry is present. Mirrors the CLI's
+    /// `--accept-no-delegated-fallback` external-only refusal.
     #[serde(default)]
     pub accept_no_delegated_fallback: bool,
 }
@@ -349,7 +349,7 @@ fn context_type_to_snapshot(context: &RuleContext) -> Result<RuleProposalContext
 struct ResolvedSigners {
     typed: Vec<ContextRuleSignerInput>,
     snapshot: Vec<RuleProposalSigner>,
-    /// `true` if at least one `delegated` entry is present (passkey-only
+    /// `true` if at least one `delegated` entry is present (external-only
     /// fallback check).
     has_delegated: bool,
 }

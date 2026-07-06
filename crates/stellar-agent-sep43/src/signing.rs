@@ -832,7 +832,7 @@ mod tests {
     fn wallet_error_to_sep43_other_auth_maps_to_user_rejected() {
         use stellar_agent_core::error::{AuthError, WalletError};
 
-        let err = wallet_error_to_sep43(WalletError::Auth(AuthError::SignatureVerificationFailed));
+        let err = wallet_error_to_sep43(WalletError::Auth(AuthError::KeyringLocked));
         assert!(
             matches!(err, Sep43Error::UserRejected { .. }),
             "non-hardware AuthError must map to UserRejected, got: {err:?}"

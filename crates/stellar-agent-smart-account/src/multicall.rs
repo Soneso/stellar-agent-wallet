@@ -13,8 +13,6 @@
 //! - [`build_exec_invocations`] — pure XDR encoder for the router's `invocations` arg.
 //! - `cross_rpc_compare_simulate_responses` / `cross_rpc_compare_wasm_hashes` — comparators
 //!   consumed by the `submit_signed_invoke` Step 4 dispatch.
-//! - [`classify_required_checks`] — returns `&["multicall"]` for host-functions
-//!   targeting a registered multicall address; `&[]` otherwise.
 //!
 //! # Canonical-source citations
 //!
@@ -1034,52 +1032,6 @@ pub(crate) fn cross_rpc_compare_simulate_responses(
     Ok(())
 }
 
-// ── classify_required_checks ──────────────────────────────────────────────────
-
-/// Returns the required checks slice for a given `HostFunction`.
-///
-/// Returns `&["multicall"]` when `host_function` targets a contract address
-/// that is registered in `registry` for the active network. Returns `&[]` for
-/// all other host-function shapes.
-///
-/// The discriminator lives here (in the multicall-aware module) rather than in
-/// `submit.rs` because `submit.rs` is substrate-only and carries no knowledge
-/// of `MulticallRegistry` semantics.
-#[must_use]
-pub fn classify_required_checks(
-    host_function: &HostFunction,
-    registry: &MulticallRegistry,
-    network_passphrase: &str,
-) -> &'static [&'static str] {
-    let HostFunction::InvokeContract(inv) = host_function else {
-        return &[];
-    };
-
-    let contract_strkey: String = match &inv.contract_address {
-        ScAddress::Contract(id) => {
-            // `stellar_strkey::Contract::to_string()` returns `heapless::String<56>`;
-            // convert to `std::string::String` via `.as_str().to_owned()` so it is
-            // comparable with `entry.address: String` (mirrors scaddress_to_strkey
-            // pattern in rules.rs).
-            stellar_strkey::Contract(id.0.0)
-                .to_string()
-                .as_str()
-                .to_owned()
-        }
-        // Non-contract addresses are not multicall router targets; classify as empty.
-        ScAddress::Account(_)
-        | ScAddress::MuxedAccount(_)
-        | ScAddress::ClaimableBalance(_)
-        | ScAddress::LiquidityPool(_) => return &[],
-    };
-
-    // Check if the target contract is a registered multicall router.
-    match registry.lookup(network_passphrase) {
-        Ok(Some(entry)) if entry.address == contract_strkey => &["multicall"],
-        _ => &[],
-    }
-}
-
 // ── build_exec_invocations ────────────────────────────────────────────────────
 
 /// Encodes a `Vec<MulticallInvocation>` into the XDR `ScVal` representation
@@ -1955,7 +1907,6 @@ fn deny_reason_wire_code(reason: &DenyReason) -> String {
         DenyReason::RateLimitExceeded { .. } => "rate_limit_exceeded".to_owned(),
         DenyReason::CounterpartyDenied { .. } => "counterparty_denied".to_owned(),
         DenyReason::MinimumReserveBreached { .. } => "minimum_reserve_breached".to_owned(),
-        DenyReason::MissingApproval => "missing_approval".to_owned(),
         DenyReason::OwnerSignatureStale { .. } => "owner_signature_stale".to_owned(),
         DenyReason::NoMatchingRule => "no_matching_rule".to_owned(),
         DenyReason::ExplicitRuleDeny => "explicit_rule_deny".to_owned(),
@@ -2659,54 +2610,6 @@ wasm_sha256 = "267e94a092df01fa02ad4edf8320a98bd65e4d4d6575254ac9521cb65727f3d4"
         );
     }
 
-    // ── classify_required_checks ──────────────────────────────────────────────
-
-    #[test]
-    fn classify_required_checks_returns_multicall_for_registered_address() {
-        use stellar_xdr::{ContractId, Hash, InvokeContractArgs, ScSymbol};
-
-        let dir = TempDir::new().expect("tempdir");
-        let path = dir.path().join("networks.toml");
-        let mut reg = MulticallRegistry::load(&path).expect("load");
-        let passphrase = "Test SDF Network ; September 2015";
-        let addr = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
-        reg.entries.push(MulticallRegistryEntry {
-            network_passphrase: passphrase.to_owned(),
-            address: addr.to_owned(),
-            wasm_sha256: MULTICALL_WASM_SHA256.to_owned(),
-        });
-
-        let contract = stellar_strkey::Contract::from_string(addr).unwrap();
-        let hf = HostFunction::InvokeContract(InvokeContractArgs {
-            contract_address: ScAddress::Contract(ContractId(Hash(contract.0))),
-            function_name: ScSymbol(b"exec".as_slice().try_into().unwrap()),
-            args: VecM::default(),
-        });
-        let checks = classify_required_checks(&hf, &reg, passphrase);
-        assert_eq!(checks, &["multicall"]);
-    }
-
-    #[test]
-    fn classify_required_checks_returns_empty_for_unregistered_address() {
-        use stellar_xdr::{ContractId, Hash, InvokeContractArgs, ScSymbol};
-
-        let dir = TempDir::new().expect("tempdir");
-        let path = dir.path().join("networks.toml");
-        let reg = MulticallRegistry::load(&path).expect("load");
-
-        let contract = stellar_strkey::Contract::from_string(
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-        )
-        .unwrap();
-        let hf = HostFunction::InvokeContract(InvokeContractArgs {
-            contract_address: ScAddress::Contract(ContractId(Hash(contract.0))),
-            function_name: ScSymbol(b"exec".as_slice().try_into().unwrap()),
-            args: VecM::default(),
-        });
-        let checks = classify_required_checks(&hf, &reg, "Test SDF Network ; September 2015");
-        assert_eq!(checks, &[] as &[&str]);
-    }
-
     // ── From<&MulticallRegistryEntry> for RawMulticallEntry ───────────────────
 
     /// `From<&MulticallRegistryEntry>` produces a `RawMulticallEntry` with
@@ -3283,15 +3186,6 @@ wasm_sha256 = "{drifted_sha}"
     }
 
     #[test]
-    fn deny_reason_wire_code_missing_approval() {
-        use stellar_agent_core::policy::DenyReason;
-        assert_eq!(
-            deny_reason_wire_code(&DenyReason::MissingApproval),
-            "missing_approval"
-        );
-    }
-
-    #[test]
     fn deny_reason_wire_code_no_matching_rule() {
         use stellar_agent_core::policy::DenyReason;
         assert_eq!(
@@ -3632,21 +3526,5 @@ wasm_sha256 = "{drifted_sha}"
             .expect("unregister_force via direct match");
         assert_eq!(raw.network_passphrase, raw_safename);
         assert!(reg.entries.is_empty(), "entry must be removed");
-    }
-
-    // ── classify_required_checks — non-contract ScAddress ────────────────────
-
-    /// `classify_required_checks` returns `&[]` for a non-`InvokeContract`
-    /// host-function (e.g. `UploadContractWasm`).
-    #[test]
-    fn classify_required_checks_non_invoke_contract_returns_empty() {
-        use stellar_xdr::{BytesM, HostFunction};
-        let dir = TempDir::new().expect("tempdir");
-        let path = dir.path().join("networks.toml");
-        let reg = MulticallRegistry::load(&path).expect("load");
-        // UploadContractWasm is not InvokeContract → must return &[].
-        let hf = HostFunction::UploadContractWasm(BytesM::default());
-        let checks = classify_required_checks(&hf, &reg, "Test SDF Network ; September 2015");
-        assert_eq!(checks, &[] as &[&str]);
     }
 }

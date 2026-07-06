@@ -163,6 +163,26 @@ pub(crate) fn hash_to_lower_hex(h: &Hash) -> String {
     h.0.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Validates that `value` is a well-formed G-strkey, naming `field_label` in
+/// the refusal.
+///
+/// Used by every classic-op MCP tool (`pay`, `create_account`) that accepts
+/// operator-supplied source/destination account fields.
+///
+/// # Errors
+///
+/// Returns `rmcp::ErrorData::invalid_params` naming `field_label` and the
+/// underlying strkey parse error when `value` is not a valid G-strkey.
+pub(crate) fn validate_g_strkey(value: &str, field_label: &str) -> Result<(), ErrorData> {
+    if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(value) {
+        return Err(ErrorData::invalid_params(
+            format!("invalid {field_label} (expected G-strkey): {err}"),
+            None,
+        ));
+    }
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Classic-op fee constant — re-exported from stellar-agent-core
 // ─────────────────────────────────────────────────────────────────────────────

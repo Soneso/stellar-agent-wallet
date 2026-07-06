@@ -3378,6 +3378,7 @@ mod tests {
     use serial_test::serial;
     use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
     use stellar_agent_core::error::CapKind;
+    use stellar_agent_test_support::StellarAgentHomeGuard;
 
     const PASSKEY_PROJECT_A_TOML: &str = "[[credentials]]\ncredential_name = \"laptop-passkey\"\ncredential_id_b64url = \"cHJvamVjdC1hLWNyZWRlbnRpYWw\"\nrp_id = \"localhost\"\ntransports = \"internal\"\nregistered_at_unix_ms = 2\npublic_key_sec1_b64 = \"BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n";
 
@@ -3899,50 +3900,6 @@ mod tests {
         let meta = project_mgr.show("laptop-passkey").unwrap();
         assert_eq!(meta.credential_name, "laptop-passkey");
         assert_eq!(meta.transports, "internal");
-    }
-
-    /// RAII guard for the `STELLAR_AGENT_HOME` env-var override.
-    ///
-    /// Restores the previous value (or removes it if absent) on `Drop` —
-    /// panic-safe, unlike a manual save/restore around the work block. The
-    /// `#[allow(unsafe_code)]` attribute is applied to each of the two impl
-    /// blocks (one on `impl StellarAgentHomeGuard`, one on `impl Drop`).
-    struct StellarAgentHomeGuard {
-        previous: Option<std::ffi::OsString>,
-    }
-
-    #[allow(
-        unsafe_code,
-        reason = "test-only process environment override; #[serial] prevents sibling mutation, RAII guard unwinds on Drop"
-    )]
-    impl StellarAgentHomeGuard {
-        fn new(value: &std::path::Path) -> Self {
-            let previous = std::env::var_os("STELLAR_AGENT_HOME");
-            // SAFETY: serialised by #[serial]; mutated only by this guard
-            // and unwound on Drop.
-            unsafe {
-                std::env::set_var("STELLAR_AGENT_HOME", value);
-            }
-            Self { previous }
-        }
-    }
-
-    #[allow(
-        unsafe_code,
-        reason = "test-only process environment restore; panic-safe via Drop"
-    )]
-    impl Drop for StellarAgentHomeGuard {
-        fn drop(&mut self) {
-            // SAFETY: same as new(); serialised by #[serial], restores
-            // pre-test state regardless of panic.
-            unsafe {
-                if let Some(value) = self.previous.take() {
-                    std::env::set_var("STELLAR_AGENT_HOME", value);
-                } else {
-                    std::env::remove_var("STELLAR_AGENT_HOME");
-                }
-            }
-        }
     }
 
     #[test]

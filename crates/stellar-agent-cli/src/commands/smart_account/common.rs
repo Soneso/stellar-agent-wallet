@@ -25,11 +25,11 @@ use stellar_agent_smart_account::managers::rules::{
     parse_c_strkey_to_smart_account,
 };
 use stellar_agent_smart_account::managers::signers::{SignersManager, SignersManagerConfig};
-use zeroize::Zeroizing;
 
 use crate::common::network::TargetNetwork;
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
+use crate::common::signer_ceremony::resolve_software_signer_from_env;
 
 /// Mutually-exclusive signer source flags shared by wallet write/read handlers.
 #[derive(Debug, Args)]
@@ -108,13 +108,13 @@ impl CommonHandlerContext {
     /// Returns a wallet error when signer resolution, smart-account parsing,
     /// audit-log opening, or path setup fails.
     pub async fn new(args: &impl CommonArgsView) -> Result<Self, WalletError> {
-        let signer = resolve_signer(args.signer_source()).await?;
+        let profile_name = resolve_profile_name(args.profile());
+        let signer = resolve_signer(args.signer_source(), Some(&profile_name)).await?;
         let smart_account = parse_c_strkey_to_smart_account(args.account()).map_err(|e| {
             WalletError::Validation(ValidationError::AddressInvalid {
                 input: format!("--account: {e}"),
             })
         })?;
-        let profile_name = resolve_profile_name(args.profile());
         let network_passphrase = args.network().passphrase().to_owned();
         let rpc_url = args.rpc_url().to_owned();
         let secondary_rpc_url = args
@@ -219,12 +219,17 @@ impl CommonHandlerContext {
 /// [`CommonHandlerContext`] (e.g. timelock CLI verbs which take `--timelock`
 /// instead of `--account`).
 ///
+/// `profile_name` supplies the `[wallet]` posture and TTL for the
+/// `--signer-secret-env` path via [`resolve_software_signer_from_env`]; pass
+/// `None` when no profile is available at the call site.
+///
 /// # Errors
 ///
 /// Returns a [`WalletError`] when no signer-source flag is supplied, the
 /// Ledger device is unavailable, or the env-var S-strkey is invalid.
 pub(crate) async fn resolve_signer(
     signer_source: &SignerSourceFlags,
+    profile_name: Option<&str>,
 ) -> Result<Box<dyn Signer + Send + Sync>, WalletError> {
     if signer_source.sign_with_ledger {
         use stellar_agent_network::signing::hardware::HardwareSigningKey;
@@ -246,52 +251,8 @@ pub(crate) async fn resolve_signer(
                 .to_owned(),
         })
     })?;
-    // mlock-protected seed window, mirroring `pay`'s secret-env ceremony:
-    // env -> Zeroizing<String> -> seed Zeroizing<[u8;32]> -> explicit
-    // zeroize of the `PrivateKey.0` Copy residue -> `Wallet::unlock`
-    // (LockedSeed mlock; `MlockRequired::Warn` so development hosts without
-    // mlock privileges proceed with a structured warning) -> derive the
-    // signing key -> dispose (munlock + zeroize). The derived
-    // `SoftwareSigningKey` signs from its own zeroize-on-drop seed copy, so
-    // the wallet is disposed as soon as derivation completes: the mlock
-    // window covers exactly the parse-and-derive span in which the seed
-    // exists outside the signing key.
-    let s_strkey: Zeroizing<String> = Zeroizing::new(std::env::var(var_name).map_err(|_| {
-        WalletError::Auth(AuthError::KeyringNotFound {
-            name: format!("environment variable '{var_name}' not set"),
-        })
-    })?);
-    let mut private_key =
-        stellar_strkey::ed25519::PrivateKey::from_string(&s_strkey).map_err(|_| {
-            WalletError::Auth(AuthError::KeyringNotFound {
-                name: format!("environment variable '{var_name}' contains an invalid S-strkey"),
-            })
-        })?;
-    let seed: Zeroizing<[u8; 32]> = Zeroizing::new(private_key.0);
-    zeroize::Zeroize::zeroize(&mut private_key.0);
-    drop(s_strkey);
-
-    let mut wallet = stellar_agent_core::wallet::Wallet::unlock(
-        "smart-account-write".to_owned(),
-        seed,
-        stellar_agent_core::wallet::DEFAULT_TTL_SECONDS,
-        stellar_agent_core::wallet::MlockRequired::Warn,
-    )
-    .await
-    .map_err(|e| {
-        WalletError::Auth(AuthError::KeyringNotFound {
-            name: format!("Wallet::unlock failed: {e}"),
-        })
-    })?;
-
-    let signer = match stellar_agent_network::signing::wallet::signer_from_wallet(&wallet) {
-        Ok(s) => s,
-        Err(e) => {
-            wallet.dispose();
-            return Err(e);
-        }
-    };
-    wallet.dispose();
+    let signer =
+        resolve_software_signer_from_env(var_name, "smart-account-write", profile_name).await?;
     Ok(Box::new(signer))
 }
 
@@ -362,6 +323,21 @@ fn build_sa_error_envelope(e: &SaError) -> WalletError {
     WalletError::SmartAccount {
         wire_code: e.wire_code(),
         message: redact_path_in_message(&e.to_string()),
+    }
+}
+
+/// Maps an [`SaError`] into the `WalletError::SmartAccount { wire_code, message }`
+/// envelope shape, without path redaction.
+///
+/// Distinct from [`build_sa_error_envelope`]: this is the plain mapping used
+/// by `execute`, `signers`, and `migrate-verifier`'s `emit_error_sa` helpers,
+/// none of whose `SaError` variants carry a `path: PathBuf` in their
+/// `Display`. Call sites that do need path redaction use
+/// [`emit_sa_error`]/[`build_sa_error_envelope`] instead.
+pub(crate) fn wrap_sa_error(err: &SaError) -> WalletError {
+    WalletError::SmartAccount {
+        wire_code: err.wire_code(),
+        message: err.to_string(),
     }
 }
 
@@ -475,7 +451,9 @@ mod tests {
             sign_with_ledger: false,
             account_index: None,
         };
-        let signer = resolve_signer(&flags).await.expect("resolve must succeed");
+        let signer = resolve_signer(&flags, None)
+            .await
+            .expect("resolve must succeed");
         let derived = signer.public_key().await.expect("public key must derive");
         assert_eq!(derived.to_string().to_string(), expected_g);
         unsafe {
@@ -492,7 +470,7 @@ mod tests {
             sign_with_ledger: false,
             account_index: None,
         };
-        let err = match resolve_signer(&flags).await {
+        let err = match resolve_signer(&flags, None).await {
             Ok(_) => panic!("unset env var must refuse"),
             Err(e) => e,
         };
@@ -519,7 +497,7 @@ mod tests {
             sign_with_ledger: false,
             account_index: None,
         };
-        let err = match resolve_signer(&flags).await {
+        let err = match resolve_signer(&flags, None).await {
             Ok(_) => panic!("malformed S-strkey must refuse"),
             Err(e) => e,
         };

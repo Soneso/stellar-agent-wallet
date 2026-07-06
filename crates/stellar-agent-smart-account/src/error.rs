@@ -466,22 +466,6 @@ pub enum SaError {
         observed_len: usize,
     },
 
-    /// Computed auth digest does not match the on-chain recompute.
-    ///
-    /// `expected_prefix` and `observed_prefix` carry the first-8 hex chars of
-    /// the respective 32-byte digest (16 hex chars; sufficient for forensic
-    /// correlation without leaking the full preimage commitment).
-    #[error(
-        "auth-digest mismatch: expected first-8 {expected_prefix}, observed first-8 {observed_prefix}"
-    )]
-    #[serde(rename = "sa.auth_digest_mismatch")]
-    AuthDigestMismatch {
-        /// First-8 hex chars of the wallet-computed auth digest.
-        expected_prefix: String,
-        /// First-8 hex chars of the on-chain recomputed auth digest.
-        observed_prefix: String,
-    },
-
     /// Pre-signing simulation context diverges from the to-be-submitted envelope.
     ///
     /// Signing aborts before signature bytes are produced when simulation context
@@ -1177,11 +1161,10 @@ pub enum SaError {
     ///   ScVal/ScMap/VecM/BytesM conversions used to build the on-chain canonical
     ///   AuthPayload shape. Surfaces from
     ///   `managers/auth_entry.rs::complete_authorization_entry` and from the
-    ///   External-arm WebAuthn encoders at
-    ///   `webauthn/sig_data.rs::encode_webauthn_sig_data_scval` and
-    ///   `webauthn/sig_data.rs::encode_webauthn_signature_value_bytes`
+    ///   External-arm WebAuthn encoder at
+    ///   `webauthn/sig_data.rs::encode_webauthn_sig_data_scval`
     ///   (bounded ScSymbol/BytesM/VecM conversions for the `WebAuthnSigData`
-    ///   ScVal::Map and the double-XDR step that encodes that ScVal to bytes).
+    ///   ScVal::Map).
     /// - `"strkey_parse"` — signer public-key strkey parse failure during
     ///   auth-entry construction. Surfaces from
     ///   `managers/signers.rs`.
@@ -1813,24 +1796,6 @@ pub enum SaError {
         request_id: String,
     },
 
-    /// A timelock operation ID was not found in the on-chain state.
-    ///
-    /// Retained for routing-table compatibility (`rules.rs::sa_error_to_invocation_result`
-    /// maps this variant to `PreSubmissionRefused`). The cancel path no longer emits this
-    /// variant — OZ error code 4006 (`OperationNotScheduled`) is unreachable from the
-    /// canonical `cancel_operation` path (OZ storage.rs SHA `a9c4216`); all cancel
-    /// failures route through `TimelockCancelFailed` with `InvalidOperationState` (4002).
-    ///
-    /// Wire-code is `sa.timelock_operation_not_found`.
-    #[error("timelock operation not found: {operation_id_redacted}")]
-    #[serde(rename = "sa.timelock_operation_not_found")]
-    TimelockOperationNotFound {
-        /// Redacted operation identifier (first-8-last-8 hex).
-        operation_id_redacted: String,
-        /// Per-request correlation identifier (UUIDv4).
-        request_id: String,
-    },
-
     /// The `list_pending` read-only query failed before returning results.
     ///
     /// Distinct from [`SaError::DeploymentFailed`] (which covers the upload /
@@ -2149,8 +2114,8 @@ pub enum TimelockCancelFailureReason {
     /// The operation ID was not found in the on-chain scheduling state.
     ///
     /// Maps to OZ `TimelockError::OperationNotScheduled` (code 4006).
-    /// This sub-code is surfaced as `TimelockOperationNotFound` at the public
-    /// API level; the inner classifier returns this variant for completeness.
+    /// Unreachable from the canonical `cancel_operation` path; retained for
+    /// classifier completeness.
     OperationNotScheduled,
     /// The Soroban simulation step failed before reaching the OZ contract logic.
     SimulationFailed,
@@ -2328,7 +2293,6 @@ impl SaError {
             Self::VerifierWasmNotInAllowlist { .. } => "sa.verifier_wasm_not_in_allowlist",
             Self::PolicyWasmNotInAllowlist { .. } => "sa.policy_wasm_not_in_allowlist",
             Self::RuleIdMismatch { .. } => "sa.rule_id_mismatch",
-            Self::AuthDigestMismatch { .. } => "sa.auth_digest_mismatch",
             Self::SimulationDivergence { sub_code, .. } => match sub_code {
                 SimulationDivergenceSubCode::ContextRuleIds => {
                     "simulation.divergence.context_rule_ids"
@@ -2428,7 +2392,6 @@ impl SaError {
             Self::TimelockScheduleFailed { .. } => "sa.timelock_schedule_failed",
             Self::TimelockCancelFailed { .. } => "sa.timelock_cancel_failed",
             Self::TimelockExecuteFailed { .. } => "sa.timelock_execute_failed",
-            Self::TimelockOperationNotFound { .. } => "sa.timelock_operation_not_found",
             Self::TimelockListPendingFailed { .. } => "sa.timelock_list_pending_failed",
             // Simulation-audit mismatch.
             Self::AuthMismatch { .. } => "sa.auth_mismatch",
@@ -2554,13 +2517,6 @@ mod tests {
                 SaError::RuleIdMismatch {
                     expected_len: 3,
                     observed_len: 2,
-                },
-            ),
-            (
-                "sa.auth_digest_mismatch",
-                SaError::AuthDigestMismatch {
-                    expected_prefix: "aabbccdd".to_owned(),
-                    observed_prefix: "11223344".to_owned(),
                 },
             ),
             (
@@ -3005,13 +2961,6 @@ mod tests {
                     request_id: "test-req-tl-exec-001".to_owned(),
                 },
             ),
-            (
-                "sa.timelock_operation_not_found",
-                SaError::TimelockOperationNotFound {
-                    operation_id_redacted: "deadbeef...cafebabe".to_owned(),
-                    request_id: "test-req-tl-notfound-001".to_owned(),
-                },
-            ),
             // list_pending RPC failure.
             (
                 "sa.timelock_list_pending_failed",
@@ -3201,14 +3150,6 @@ mod tests {
                     observed_len: 2,
                 },
                 &["expected_len", "observed_len"],
-            ),
-            (
-                "sa.auth_digest_mismatch",
-                SaError::AuthDigestMismatch {
-                    expected_prefix: "aabbccdd".to_owned(),
-                    observed_prefix: "11223344".to_owned(),
-                },
-                &["expected_prefix", "observed_prefix"],
             ),
             (
                 "simulation.divergence",
@@ -3725,10 +3666,6 @@ mod tests {
                 expected_len: 3,
                 observed_len: 2,
             },
-            SaError::AuthDigestMismatch {
-                expected_prefix: "aabbccdd".to_owned(),
-                observed_prefix: "11223344".to_owned(),
-            },
             SaError::SimulationDivergence {
                 sub_code: SimulationDivergenceSubCode::ContextRuleIds,
                 redacted_reason: "simulation and envelope context_rule_ids differ".to_owned(),
@@ -4029,10 +3966,6 @@ mod tests {
                 operation_id_redacted: "deadbeef...cafebabe".to_owned(),
                 request_id: "test-req-tl-exec-001".to_owned(),
             },
-            SaError::TimelockOperationNotFound {
-                operation_id_redacted: "deadbeef...cafebabe".to_owned(),
-                request_id: "test-req-tl-notfound-001".to_owned(),
-            },
             // list_pending RPC failure.
             SaError::TimelockListPendingFailed {
                 redacted_reason: "primary RPC unreachable".to_owned(),
@@ -4054,7 +3987,6 @@ mod tests {
             "sa.verifier_wasm_not_in_allowlist",
             "sa.policy_wasm_not_in_allowlist",
             "sa.rule_id_mismatch",
-            "sa.auth_digest_mismatch",
             "simulation.divergence.context_rule_ids",
             "simulation.divergence.auth_contexts",
             "simulation.divergence.network",
@@ -4120,7 +4052,6 @@ mod tests {
             "sa.timelock_schedule_failed",
             "sa.timelock_cancel_failed",
             "sa.timelock_execute_failed",
-            "sa.timelock_operation_not_found",
             // list_pending read-path error.
             "sa.timelock_list_pending_failed",
             // Simulation-audit mismatch.
@@ -4146,7 +4077,7 @@ mod tests {
             );
         }
 
-        assert_eq!(seen.len(), 73, "closed set must have exactly 73 wire codes");
+        assert_eq!(seen.len(), 71, "closed set must have exactly 71 wire codes");
     }
 
     /// Verifies the sub-code closed set is exhaustively matched by tests.

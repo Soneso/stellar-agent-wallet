@@ -53,10 +53,10 @@
 //!
 //! This layer emits `tracing::warn!` with structured fields (`profile`,
 //! `reason`, `errno`) when `mlock` fails under `MlockRequired::Warn`.
-//! The `EventKind::WalletMlockFailed` audit-log emission and the deeper
-//! signer-from-wallet integration are wired at the MCP server layer.  This
-//! module is deliberately ignorant of the audit-log writer; the tracing span
-//! is the handover point.
+//! `EventKind::WalletMlockFailed` is a reserved audit-log event kind
+//! (recognised by `audit verify`) not currently emitted by any call site.
+//! This module is deliberately ignorant of the audit-log writer; the tracing
+//! span is the handover point for any future caller that wires the entry.
 
 pub mod config;
 pub mod error;

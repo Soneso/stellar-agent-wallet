@@ -1,8 +1,9 @@
 //! Unified `WalletError` taxonomy for the Stellar agent wallet.
 //!
 //! Every CLI command, MCP tool, and library API surfaces errors through this
-//! module.  Policy-engine and MCP-write-gate codes are stubbed in this taxonomy
-//! so the wire format is stable regardless of which engine is active.
+//! module.  Policy-engine denials are a distinct taxonomy at
+//! `stellar_agent_core::policy::PolicyError`; this module carries only the
+//! substrate-level error categories.
 //!
 //! # Taxonomy overview
 //!
@@ -10,8 +11,6 @@
 //! |-------------------|---------------|--------|
 //! | [`WalletError::Validation`]   | `validation`   | User-supplied input validation |
 //! | [`WalletError::Network`]      | `network`      | RPC / Horizon connectivity |
-//! | [`WalletError::Policy`]       | `policy`       | Policy-engine denials                 |
-//! | [`WalletError::Fees`]         | `fees`         | Classic-fee selection / cap failures |
 //! | [`WalletError::Auth`]         | `auth`         | Keyring and signing auth |
 //! | [`WalletError::WalletState`]  | `wallet_state` | Hardware-wallet / keyring state |
 //! | [`WalletError::Protocol`]     | `protocol`     | XDR / Soroban protocol errors |
@@ -75,9 +74,6 @@ use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
-use crate::observability::InitError;
-use crate::smart_account::rule_id::{EncodeContextRuleIdsError, ParseContextRuleIdError};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Top-level error enum
@@ -161,14 +157,6 @@ pub enum WalletError {
     /// A network operation (RPC, Horizon) failed.
     #[error(transparent)]
     Network(#[from] NetworkError),
-
-    /// The policy engine denied the operation.
-    #[error(transparent)]
-    Policy(#[from] PolicyError),
-
-    /// Classic-fee selection or profile-cap enforcement failed.
-    #[error(transparent)]
-    Fees(#[from] FeesError),
 
     /// An authentication or keyring operation failed.
     #[error(transparent)]
@@ -259,10 +247,6 @@ pub enum ErrorCategory {
     Validation,
     /// Network connectivity or RPC failure.
     Network,
-    /// Policy-engine denial.
-    Policy,
-    /// Classic-fee selection / cap failure.
-    Fees,
     /// Keyring or signing authentication failure.
     Auth,
     /// Hardware wallet or keyring state error.
@@ -301,8 +285,6 @@ impl WalletError {
         match self {
             Self::Validation(e) => e.code(),
             Self::Network(e) => e.code(),
-            Self::Policy(e) => e.code(),
-            Self::Fees(e) => e.code(),
             Self::Auth(e) => e.code(),
             Self::WalletState(e) => e.code(),
             Self::Protocol(e) => e.code(),
@@ -336,8 +318,6 @@ impl WalletError {
         match self {
             Self::Validation(_) => ErrorCategory::Validation,
             Self::Network(_) => ErrorCategory::Network,
-            Self::Policy(_) => ErrorCategory::Policy,
-            Self::Fees(_) => ErrorCategory::Fees,
             Self::Auth(_) => ErrorCategory::Auth,
             Self::WalletState(_) => ErrorCategory::WalletState,
             Self::Protocol(_) => ErrorCategory::Protocol,
@@ -493,34 +473,6 @@ pub enum ValidationError {
         name: String,
     },
 
-    /// A context rule ID string could not be parsed.  Constructed directly
-    /// by callers that have a free-form input string but no typed source
-    /// error.
-    ///
-    /// `input` holds the raw string provided by the caller (decimal or
-    /// `0x`-prefixed hex).  For conversions from the typed
-    /// [`ParseContextRuleIdError`] that preserve the error source chain,
-    /// see [`ValidationError::RuleIdParseFailed`].
-    #[error("rule ID '{input}' could not be parsed (expected decimal or 0x-prefixed hex u32)")]
-    RuleIdInvalid {
-        /// The raw input string that failed to parse as a context rule ID.
-        input: String,
-    },
-
-    /// A context rule ID parse failed; preserves the underlying
-    /// [`ParseContextRuleIdError`] source chain.
-    ///
-    /// Produced automatically when a [`ParseContextRuleIdError`] is
-    /// converted via [`From`].  Callers walking the error chain with
-    /// [`std::error::Error::source`] recover the original typed error.
-    #[error("rule ID could not be parsed")]
-    RuleIdParseFailed {
-        /// The underlying parse error.  Accessible via
-        /// [`std::error::Error::source`].
-        #[from]
-        source: ParseContextRuleIdError,
-    },
-
     /// An amount string failed numeric parsing.
     ///
     /// `input` holds the raw input string provided by the user or calling
@@ -582,12 +534,14 @@ pub enum ValidationError {
         reason: String,
     },
 
-    /// A passkey-only context rule was rejected because it lacks a delegated
-    /// (ed25519) fallback signer.
+    /// An external-only context rule was rejected because it lacks a
+    /// delegated (ed25519) fallback signer.
     ///
-    /// A rule with only WebAuthn passkey signers and no delegated ed25519
-    /// fallback is permanently inaccessible if the authenticator device is lost
-    /// (RP-ID binding is irrecoverable).
+    /// A rule whose signers are exclusively external (WebAuthn passkey
+    /// and/or raw Ed25519) with no delegated ed25519 fallback is permanently
+    /// inaccessible if the authenticator device or external signing key is
+    /// lost (a WebAuthn credential's RP-ID binding is irrecoverable; a raw
+    /// Ed25519 external signer has no keyring-backed recovery path either).
     ///
     /// The operator must either add a `--signer-delegated` entry or pass
     /// `--accept-no-delegated-fallback` to explicitly acknowledge the risk.
@@ -596,11 +550,13 @@ pub enum ValidationError {
     ///
     /// `"validation.passkey_only_rule_no_delegated_fallback"`.
     #[error(
-        "passkey-only rule refused: {credential_count} WebAuthn credential(s), no delegated \
-         fallback signer; pass --accept-no-delegated-fallback to acknowledge the risk"
+        "external-only rule refused: {credential_count} WebAuthn passkey and/or raw Ed25519 \
+         signer(s), no delegated fallback signer; pass --accept-no-delegated-fallback to \
+         acknowledge the risk"
     )]
     PasskeyOnlyRuleNoDelegatedFallback {
-        /// Number of WebAuthn credentials that would be the sole signers.
+        /// Number of external (WebAuthn passkey and/or raw Ed25519) signers
+        /// that would be the sole signers.
         credential_count: usize,
     },
 
@@ -821,8 +777,6 @@ impl ValidationError {
             Self::AddressInvalid { .. } => "validation.address_invalid",
             Self::AssetInvalid { .. } => "validation.asset_invalid",
             Self::ProfileNotFound { .. } => "validation.profile_not_found",
-            Self::RuleIdInvalid { .. } => "validation.rule_id_invalid",
-            Self::RuleIdParseFailed { .. } => "validation.rule_id_parse_failed",
             Self::AmountMalformed { .. } => "validation.amount_malformed",
             Self::AmountOutOfRange { .. } => "validation.amount_out_of_range",
             Self::OutputFormatInvalid { .. } => "validation.output_format_invalid",
@@ -887,8 +841,7 @@ pub enum NetworkError {
         /// free-form diagnostic string, not a typed error-source chain.
         /// Variants that preserve an error source chain do so via a
         /// dedicated `#[from] source: T` typed field (see
-        /// [`ProtocolError::XdrEncodeFailed`] and
-        /// [`InternalError::ObservabilityInitFailed`]).
+        /// [`InternalError::SerialisationFailed`]).
         reason: String,
     },
 
@@ -972,95 +925,6 @@ impl NetworkError {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Policy errors
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Errors arising from policy-engine evaluation.
-///
-/// The `EngineRequired` variant is also the MCP mainnet-write gate code;
-/// `"policy.engine_required"` is the stable identifier used in the
-/// `destructiveHint` gate surface.
-///
-/// # Secret-material policy
-///
-/// No field in any variant carries secret material.  `rule_id`, `cap`, and
-/// `value` fields hold policy-configuration identifiers and numeric thresholds
-/// — not keys or credentials.
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum PolicyError {
-    /// The policy engine must be configured before this operation is allowed.
-    #[error("a policy engine configuration is required to perform this operation")]
-    EngineRequired,
-
-    /// A policy rule explicitly denied the operation.
-    ///
-    /// `rule_id` holds the identifier of the rule that denied the request.
-    #[error("operation denied by policy rule '{rule_id}'")]
-    RuleDenied {
-        /// The identifier of the policy rule that denied the operation.
-        rule_id: String,
-    },
-
-    /// A policy capacity limit was exceeded.
-    ///
-    /// `cap` identifies the capacity constraint (e.g. `"daily_xlm_limit"`).
-    /// `value` holds the observed value that exceeded the limit (e.g.
-    /// `"1500 XLM"`).
-    #[error("policy capacity '{cap}' exceeded (observed: {value})")]
-    CapExceeded {
-        /// The name of the capacity constraint that was exceeded.
-        cap: String,
-        /// The observed value that exceeded the capacity limit.
-        value: String,
-    },
-}
-
-impl PolicyError {
-    /// Returns the stable wire-format subcode for this policy error.
-    #[must_use]
-    pub fn code(&self) -> &'static str {
-        match self {
-            Self::EngineRequired => "policy.engine_required",
-            Self::RuleDenied { .. } => "policy.rule_denied",
-            Self::CapExceeded { .. } => "policy.cap_exceeded",
-        }
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Fee errors
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Errors arising from classic-fee selection and cap enforcement.
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum FeesError {
-    /// The selected per-operation fee exceeds the profile cap.
-    #[error(
-        "selected classic fee {selected_per_op_stroops} stroops/op from {selection_source} exceeds profile cap {cap_per_op_stroops} stroops/op"
-    )]
-    PercentileExceedsCap {
-        /// Selected classic fee in stroops per operation.
-        selected_per_op_stroops: u32,
-        /// Profile cap in stroops per operation.
-        cap_per_op_stroops: u32,
-        /// Selection source (`explicit`, `profile_default`, `p95`, etc.).
-        selection_source: String,
-    },
-}
-
-impl FeesError {
-    /// Returns the stable wire-format subcode for this fee error.
-    #[must_use]
-    pub fn code(&self) -> &'static str {
-        match self {
-            Self::PercentileExceedsCap { .. } => "fees.percentile_exceeds_cap",
-        }
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
 // Auth errors
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -1102,13 +966,6 @@ pub enum AuthError {
         /// The keyring entry label that was not found.
         name: String,
     },
-
-    /// A signature could not be verified.
-    ///
-    /// This is returned when a produced signature fails the verification
-    /// round-trip check, indicating a signing implementation error.
-    #[error("signature verification failed; the produced signature is invalid")]
-    SignatureVerificationFailed,
 
     /// The user refused the signing request on the hardware device.
     #[error("the user refused the signing request on the hardware device")]
@@ -1158,7 +1015,6 @@ impl AuthError {
             Self::KeyringLocked => "auth.keyring_locked",
             Self::KeyringPlatformError => "auth.keyring_platform_error",
             Self::KeyringNotFound { .. } => "auth.keyring_not_found",
-            Self::SignatureVerificationFailed => "auth.signature_verification_failed",
             Self::HardwareUserRefused => "auth.hardware_user_refused",
             Self::SignerKeyMismatch { .. } => "auth.signer_key_mismatch",
             Self::SignerKindMismatch { .. } => "auth.signer_kind_mismatch",
@@ -1324,57 +1180,19 @@ impl WalletStateError {
 ///
 /// No field in any variant carries secret material.  `detail` fields hold
 /// non-secret diagnostic strings (XDR error descriptions, field names).
-/// `op` fields hold operation-type names.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ProtocolError {
-    /// The operation targets a protocol version that is not supported.
-    ///
-    /// `version` holds the protocol version number that was requested.
-    #[error("protocol version {version} is not supported")]
-    UnsupportedProtocol {
-        /// The protocol version number that is not supported.
-        version: u32,
-    },
-
-    /// The operation type is not supported in this wallet implementation.
-    ///
-    /// `op` holds the operation-type identifier string (e.g. `"PathPaymentStrictSend"`).
-    #[error("operation '{op}' is not supported by this wallet implementation")]
-    UnsupportedOperation {
-        /// The operation-type identifier that is not supported.
-        op: String,
-    },
-
     /// XDR codec operation (encode or decode) failed, constructed directly
     /// with a free-form diagnostic string.
     ///
     /// `detail` holds a non-secret diagnostic string describing which XDR
     /// type or field failed to encode / decode (e.g. `"TransactionEnvelope:
     /// unexpected discriminant 42"`).
-    ///
-    /// For errors that originate from a specific typed upstream error and
-    /// need to preserve the error source chain via [`std::error::Error::source`],
-    /// use [`ProtocolError::XdrEncodeFailed`] or a similar typed variant
-    /// instead.  This variant is the generic bucket for manual construction.
     #[error("XDR codec operation failed: {detail}")]
     XdrCodecFailed {
         /// A non-secret diagnostic string describing the XDR codec failure.
         detail: String,
-    },
-
-    /// Context-rule-ID XDR encoding failed; preserves the underlying
-    /// [`EncodeContextRuleIdsError`] source chain.
-    ///
-    /// Produced automatically when a [`EncodeContextRuleIdsError`] is
-    /// converted via [`From`].  Callers walking the error chain with
-    /// [`std::error::Error::source`] recover the original typed error.
-    #[error("context-rule-ID XDR encoding failed")]
-    XdrEncodeFailed {
-        /// The underlying encode error.  Accessible via
-        /// [`std::error::Error::source`].
-        #[from]
-        source: EncodeContextRuleIdsError,
     },
 }
 
@@ -1383,10 +1201,7 @@ impl ProtocolError {
     #[must_use]
     pub fn code(&self) -> &'static str {
         match self {
-            Self::UnsupportedProtocol { .. } => "protocol.unsupported_protocol",
-            Self::UnsupportedOperation { .. } => "protocol.unsupported_operation",
             Self::XdrCodecFailed { .. } => "protocol.xdr_codec_failed",
-            Self::XdrEncodeFailed { .. } => "protocol.xdr_encode_failed",
         }
     }
 }
@@ -1767,23 +1582,6 @@ pub enum InternalError {
         detail: String,
     },
 
-    /// Observability subscriber initialisation failed at process startup.
-    ///
-    /// Preserves the underlying [`InitError`] via the error source chain —
-    /// callers walking [`std::error::Error::source`] recover the original
-    /// typed error.  Produced automatically when a [`InitError`] is
-    /// converted via [`From`].
-    ///
-    /// Operational response differs from `UnexpectedState`: operator
-    /// should check configuration / environment rather than file a bug.
-    #[error("observability initialisation failed")]
-    ObservabilityInitFailed {
-        /// The underlying subscriber-init error.  Accessible via
-        /// [`std::error::Error::source`].
-        #[from]
-        source: InitError,
-    },
-
     /// Serialisation of an envelope or other typed output via `serde_json`
     /// failed.
     ///
@@ -1808,58 +1606,8 @@ impl InternalError {
         match self {
             Self::InvariantViolated { .. } => "internal.invariant_violated",
             Self::UnexpectedState { .. } => "internal.unexpected_state",
-            Self::ObservabilityInitFailed { .. } => "internal.observability_init_failed",
             Self::SerialisationFailed { .. } => "internal.serialisation_failed",
         }
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// From impls for existing error types
-// ──────────────────────────────────────────────────────────────────────────────
-
-// These transitive shims preserve the underlying typed source error chain
-// so that `std::error::Error::source()` walks back to the original error:
-//
-//   InitError
-//     -> InternalError::ObservabilityInitFailed { #[from] source: InitError }
-//     -> WalletError::Internal
-//
-//   EncodeContextRuleIdsError
-//     -> ProtocolError::XdrEncodeFailed { #[from] source: EncodeContextRuleIdsError }
-//     -> WalletError::Protocol
-//
-//   ParseContextRuleIdError
-//     -> ValidationError::RuleIdParseFailed { #[from] source: ParseContextRuleIdError }
-//     -> WalletError::Validation
-
-impl From<InitError> for WalletError {
-    /// Converts a subscriber-initialisation error into
-    /// [`WalletError::Internal`] with subcode
-    /// `"internal.observability_init_failed"`, preserving the original
-    /// [`InitError`] as an [`std::error::Error::source`].
-    fn from(e: InitError) -> Self {
-        Self::Internal(InternalError::from(e))
-    }
-}
-
-impl From<EncodeContextRuleIdsError> for WalletError {
-    /// Converts a context-rule-ID XDR encoding error into
-    /// [`WalletError::Protocol`] with subcode
-    /// `"protocol.xdr_encode_failed"`, preserving the original
-    /// [`EncodeContextRuleIdsError`] as an [`std::error::Error::source`].
-    fn from(e: EncodeContextRuleIdsError) -> Self {
-        Self::Protocol(ProtocolError::from(e))
-    }
-}
-
-impl From<ParseContextRuleIdError> for WalletError {
-    /// Converts a context-rule-ID parse error into
-    /// [`WalletError::Validation`] with subcode
-    /// `"validation.rule_id_parse_failed"`, preserving the original
-    /// [`ParseContextRuleIdError`] as an [`std::error::Error::source`].
-    fn from(e: ParseContextRuleIdError) -> Self {
-        Self::Validation(ValidationError::from(e))
     }
 }
 
@@ -1954,12 +1702,6 @@ mod tests {
                     name: "default".to_owned(),
                 },
                 "validation.profile_not_found",
-            ),
-            (
-                ValidationError::RuleIdInvalid {
-                    input: "not-a-number".to_owned(),
-                },
-                "validation.rule_id_invalid",
             ),
             (
                 ValidationError::AmountMalformed {
@@ -2088,18 +1830,6 @@ mod tests {
                 },
                 ValidationError::ProfileNotFound { name } => {
                     ValidationError::ProfileNotFound { name: name.clone() }
-                }
-                ValidationError::RuleIdInvalid { input } => ValidationError::RuleIdInvalid {
-                    input: input.clone(),
-                },
-                ValidationError::RuleIdParseFailed { .. } => {
-                    // This variant carries a non-`Clone` `ParseContextRuleIdError`
-                    // source and is tested separately via the source-chain
-                    // preservation test; it never appears in this cases table.
-                    panic!(
-                        "RuleIdParseFailed unexpected in cases table; tested via \
-                         from_parse_context_rule_id_error_preserves_source"
-                    )
                 }
                 ValidationError::AmountMalformed { input } => ValidationError::AmountMalformed {
                     input: input.clone(),
@@ -2235,33 +1965,6 @@ mod tests {
         assert_eq!(wallet_err.category(), ErrorCategory::Network);
     }
 
-    // ── Policy errors ────────────────────────────────────────────────────────
-
-    #[test]
-    fn policy_code_round_trip() {
-        let cases: &[(PolicyError, &'static str)] = &[
-            (PolicyError::EngineRequired, "policy.engine_required"),
-            (
-                PolicyError::RuleDenied {
-                    rule_id: "rule-42".to_owned(),
-                },
-                "policy.rule_denied",
-            ),
-            (
-                PolicyError::CapExceeded {
-                    cap: "daily_xlm_limit".to_owned(),
-                    value: "1500 XLM".to_owned(),
-                },
-                "policy.cap_exceeded",
-            ),
-        ];
-
-        assert_code_round_trips!(cases);
-
-        let wallet_err = WalletError::Policy(PolicyError::EngineRequired);
-        assert_eq!(wallet_err.category(), ErrorCategory::Policy);
-    }
-
     // ── Auth errors ──────────────────────────────────────────────────────────
 
     #[test]
@@ -2277,10 +1980,6 @@ mod tests {
                     name: "main".to_owned(),
                 },
                 "auth.keyring_not_found",
-            ),
-            (
-                AuthError::SignatureVerificationFailed,
-                "auth.signature_verification_failed",
             ),
             (AuthError::HardwareUserRefused, "auth.hardware_user_refused"),
             (
@@ -2373,31 +2072,18 @@ mod tests {
 
     #[test]
     fn protocol_code_round_trip() {
-        let cases: &[(ProtocolError, &'static str)] = &[
-            (
-                ProtocolError::UnsupportedProtocol { version: 99 },
-                "protocol.unsupported_protocol",
-            ),
-            (
-                ProtocolError::UnsupportedOperation {
-                    op: "PathPaymentStrictSend".to_owned(),
-                },
-                "protocol.unsupported_operation",
-            ),
-            (
-                ProtocolError::XdrCodecFailed {
-                    detail: "unexpected discriminant".to_owned(),
-                },
-                "protocol.xdr_codec_failed",
-            ),
-            // XdrEncodeFailed is covered by `from_encode_context_rule_ids_error_preserves_source`
-            // below — it requires a real EncodeContextRuleIdsError value which
-            // cannot be constructed directly in a table like this.
-        ];
+        let cases: &[(ProtocolError, &'static str)] = &[(
+            ProtocolError::XdrCodecFailed {
+                detail: "unexpected discriminant".to_owned(),
+            },
+            "protocol.xdr_codec_failed",
+        )];
 
         assert_code_round_trips!(cases);
 
-        let wallet_err = WalletError::Protocol(ProtocolError::UnsupportedProtocol { version: 1 });
+        let wallet_err = WalletError::Protocol(ProtocolError::XdrCodecFailed {
+            detail: "unexpected discriminant".to_owned(),
+        });
         assert_eq!(wallet_err.category(), ErrorCategory::Protocol);
     }
 
@@ -2687,9 +2373,6 @@ mod tests {
             WalletError::Validation(ValidationError::ProfileNotFound {
                 name: "my-profile".to_owned(),
             }),
-            WalletError::Validation(ValidationError::RuleIdInvalid {
-                input: "bad-id".to_owned(),
-            }),
             WalletError::Validation(ValidationError::InvalidPluginName {
                 reason: "invalid character".to_owned(),
             }),
@@ -2738,20 +2421,11 @@ mod tests {
         let full_hash =
             "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_owned();
         let cases = [
-            WalletError::Policy(PolicyError::EngineRequired),
-            WalletError::Policy(PolicyError::RuleDenied {
-                rule_id: "r1".to_owned(),
-            }),
-            WalletError::Policy(PolicyError::CapExceeded {
-                cap: "daily_limit".to_owned(),
-                value: "1500 XLM".to_owned(),
-            }),
             WalletError::Auth(AuthError::KeyringLocked),
             WalletError::Auth(AuthError::KeyringPlatformError),
             WalletError::Auth(AuthError::KeyringNotFound {
                 name: "main".to_owned(),
             }),
-            WalletError::Auth(AuthError::SignatureVerificationFailed),
             WalletError::Auth(AuthError::HardwareUserRefused),
             WalletError::Auth(AuthError::SignerKindMismatch {
                 signer_kind: "software",
@@ -2765,10 +2439,6 @@ mod tests {
             }),
             WalletError::WalletState(WalletStateError::KeyringCorrupted {
                 detail: "bad checksum".to_owned(),
-            }),
-            WalletError::Protocol(ProtocolError::UnsupportedProtocol { version: 99 }),
-            WalletError::Protocol(ProtocolError::UnsupportedOperation {
-                op: "Merge".to_owned(),
             }),
             WalletError::Protocol(ProtocolError::XdrCodecFailed {
                 detail: "bad bytes".to_owned(),
@@ -2843,10 +2513,6 @@ mod tests {
                 ErrorCategory::Network,
             ),
             (
-                WalletError::Policy(PolicyError::EngineRequired),
-                ErrorCategory::Policy,
-            ),
-            (
                 WalletError::Auth(AuthError::KeyringLocked),
                 ErrorCategory::Auth,
             ),
@@ -2855,7 +2521,9 @@ mod tests {
                 ErrorCategory::WalletState,
             ),
             (
-                WalletError::Protocol(ProtocolError::UnsupportedProtocol { version: 1 }),
+                WalletError::Protocol(ProtocolError::XdrCodecFailed {
+                    detail: "bad bytes".to_owned(),
+                }),
                 ErrorCategory::Protocol,
             ),
             (
@@ -2920,104 +2588,6 @@ mod tests {
             assert_eq!(err.category(), ErrorCategory::Io);
             assert!(err.message().contains(source.label()));
         }
-    }
-
-    // ── From impls round-trip ─────────────────────────────────────────────────
-
-    #[test]
-    #[allow(
-        clippy::expect_used,
-        clippy::panic,
-        reason = "test-only: a missing source or panic indicates the source-chain contract is broken"
-    )]
-    fn from_parse_context_rule_id_error_preserves_source() {
-        use crate::smart_account::rule_id::ContextRuleId;
-        use std::error::Error as _;
-        use std::str::FromStr;
-
-        // "not-a-number" is guaranteed to fail parsing. The let-else binds
-        // without ever touching a panic-producing method, so the production
-        // unwrap_used lint is satisfied without a function-wide allow.
-        let Err(parse_err) = ContextRuleId::from_str("not-a-number") else {
-            panic!("ContextRuleId::from_str('not-a-number') unexpectedly parsed");
-        };
-
-        let wallet_err = WalletError::from(parse_err);
-        assert_eq!(wallet_err.category(), ErrorCategory::Validation);
-        assert_eq!(wallet_err.code(), "validation.rule_id_parse_failed");
-
-        // The underlying ParseContextRuleIdError must be walkable via
-        // Error::source().
-        let inner = wallet_err
-            .source()
-            .expect("inner WalletError source present");
-        let inner2 = inner.source().expect(
-            "ParseContextRuleIdError source (the typed cause) present on the inner variant",
-        );
-        // Sanity: the typed cause renders as its own Display, not as
-        // the outer WalletError's message.
-        assert!(
-            !inner2.to_string().contains("WalletError"),
-            "source chain should expose the typed ParseContextRuleIdError, not the outer"
-        );
-    }
-
-    #[test]
-    fn from_encode_context_rule_ids_error_is_protocol() {
-        // EncodeContextRuleIdsError only fires for pathological inputs
-        // (list len > u32::MAX), which we cannot trigger in tests.
-        // We verify the taxonomy wiring by asserting that the
-        // category / code pair for the XdrEncodeFailed variant matches
-        // the stable contract; actual source-chain traversal on a real
-        // instance is blocked by the un-constructable upstream error.
-        //
-        // A zero-cost type-level check that the `From` impl exists:
-        let _: fn(EncodeContextRuleIdsError) -> WalletError = WalletError::from;
-
-        // And a direct construction to cover the .code() / .category() paths.
-        // We construct XdrCodecFailed (the public-diagnostic variant) because
-        // XdrEncodeFailed requires a real EncodeContextRuleIdsError.
-        let err = WalletError::Protocol(ProtocolError::XdrCodecFailed {
-            detail: "encode_context_rule_ids: test".to_owned(),
-        });
-        assert_eq!(err.category(), ErrorCategory::Protocol);
-        assert_eq!(err.code(), "protocol.xdr_codec_failed");
-    }
-
-    #[test]
-    #[allow(
-        clippy::expect_used,
-        clippy::panic,
-        reason = "test-only: a missing source or panic indicates the source-chain contract is broken"
-    )]
-    fn from_init_error_preserves_source_and_uses_specific_subcode() {
-        use crate::observability::InitError;
-        use std::error::Error as _;
-
-        // Construct a real InitError. `InitError::Filter(_)` wraps a
-        // `FromEnvError`, which itself wraps an EnvFilter `ParseError`.
-        let parse_err = match tracing_subscriber::EnvFilter::builder().parse("=INFO") {
-            Err(e) => e,
-            Ok(_) => panic!("'=INFO' is an unambiguous syntax error but parsed cleanly"),
-        };
-        let init_err = InitError::Filter(tracing_subscriber::filter::FromEnvError::from(parse_err));
-
-        let wallet_err = WalletError::from(init_err);
-        assert_eq!(wallet_err.category(), ErrorCategory::Internal);
-        // The specific subcode lands, not a generic fallback.
-        assert_eq!(wallet_err.code(), "internal.observability_init_failed");
-
-        // The underlying InitError must be walkable via Error::source().
-        let inner = wallet_err
-            .source()
-            .expect("inner InternalError source present");
-        let inner2 = inner
-            .source()
-            .expect("InitError source (the typed cause) present on the inner variant");
-        assert!(
-            !inner2.to_string().contains("WalletError"),
-            "source chain should expose the typed InitError, not the outer"
-        );
     }
 
     // ── message() delegates to Display ───────────────────────────────────────

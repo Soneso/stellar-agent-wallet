@@ -292,8 +292,8 @@ pub trait Signer: Send + Sync {
 /// Wallet-side mirror of the OZ on-chain `WebAuthnSigData`.
 ///
 /// Returned by [`Signer::sign_webauthn_assertion`] and consumed by the
-/// External-arm encoders in `stellar_agent_smart_account::webauthn::sig_data`
-/// (`encode_webauthn_sig_data_scval` / `encode_webauthn_signature_value_bytes`).
+/// External-arm encoder in `stellar_agent_smart_account::webauthn::sig_data`
+/// (`encode_webauthn_sig_data_scval`).
 ///
 /// # Placement rationale
 ///

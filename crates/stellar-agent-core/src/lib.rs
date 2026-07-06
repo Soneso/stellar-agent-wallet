@@ -168,7 +168,7 @@ pub use counterparty::is_valid_ldh_home_domain;
 pub use envelope::{Envelope, EnvelopeError, OutputFormat};
 pub use error::{
     AuthError, AuthMismatchReason, ErrorCategory, InternalError, LedgerError, NetworkError,
-    PolicyError, ProtocolError, SubmissionError, ValidationError, WalletError, WalletStateError,
+    ProtocolError, SubmissionError, ValidationError, WalletError, WalletStateError,
 };
 pub use observability::{
     FormatChoice, InitError, RedactingJsonFormatter, SubscriberConfig, init_subscriber,
@@ -186,8 +186,7 @@ pub use policy::{
     ToolDescriptor,
 };
 pub use protocol_consts::{BASE_RESERVE_STROOPS, DEFAULT_CLASSIC_FEE_STROOPS, STROOPS_PER_XLM};
-// policy::PolicyError is intentionally excluded from this flat re-export to
-// avoid shadowing `error::PolicyError` (the umbrella nine-category variant).
+// policy::PolicyError is intentionally excluded from this flat re-export.
 // Callers that need the policy-layer error import `stellar_agent_core::policy::PolicyError`
 // directly.  See the layer-placement note in `policy::PolicyError`.
 pub use envelope_decode::{EnvelopeDecodeError, decode_authoritative_args, stroops_to_human};
