@@ -44,5 +44,5 @@ mod bip39_english;
 
 #[cfg(feature = "wiremock-helpers")]
 pub use echo_id_responder::EchoIdResponder;
-pub use log_capture::{CaptureWriter, RedactionStrictSubscriber};
+pub use log_capture::{CaptureWriter, RedactionStrictSubscriber, with_captured_logs};
 pub use secret_patterns::assert_no_secret_bytes;

@@ -208,7 +208,7 @@ impl AuditWriterHealthHandle {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, reason = "test-only")]
+    #![allow(clippy::unwrap_used, clippy::panic, reason = "test-only")]
 
     use super::*;
 
@@ -267,5 +267,47 @@ mod tests {
     fn default_is_non_degraded() {
         let health = AuditWriterHealth::default();
         assert!(!health.is_degraded());
+    }
+
+    /// Pins the operator-facing session-degraded warning text emitted by the
+    /// first [`AuditWriterHealth::mark_degraded`] call on an instance.
+    ///
+    /// Capture uses a bounded retry over FRESH instances: `tracing` caches
+    /// per-callsite interest in a process-global table, and under a parallel
+    /// test harness a callsite shared with concurrently-running tests can
+    /// transiently read a stale "never interested" state, dropping an event
+    /// a scoped subscriber would accept. The retry bounds that third-party
+    /// nondeterminism; the invariant asserted is unchanged — every fresh
+    /// instance emits the warning on its first transition, exactly once.
+    #[test]
+    fn mark_degraded_first_transition_warns_with_the_session_message() {
+        const ATTEMPTS: usize = 20;
+        let mut last_logs = String::new();
+        for _ in 0..ATTEMPTS {
+            let health = AuditWriterHealth::new();
+            let logs = stellar_agent_test_support::with_captured_logs(|| {
+                health.mark_degraded();
+                health.mark_degraded();
+            });
+            if !logs.is_empty() {
+                assert_eq!(
+                    logs.matches("audit-log structurally degraded during this session")
+                        .count(),
+                    1,
+                    "the session-degraded warning must be emitted exactly once \
+                     per instance: {logs}"
+                );
+                assert!(
+                    logs.contains("audit rows"),
+                    "warning must explain that rows were dropped: {logs}"
+                );
+                return;
+            }
+            last_logs = logs;
+        }
+        panic!(
+            "no capture attempt observed the session-degraded warning after \
+             {ATTEMPTS} fresh instances; last capture: {last_logs:?}"
+        );
     }
 }

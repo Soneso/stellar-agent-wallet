@@ -5400,7 +5400,6 @@ mod tests {
     use stellar_agent_core::audit_log::signer_set::SignerPubkey;
     use stellar_agent_core::audit_log::writer::AuditWriter;
     use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
-    use stellar_agent_test_support::CaptureWriter;
 
     use super::*;
 
@@ -5519,13 +5518,7 @@ mod tests {
             signer_ids: vec![0],
             signer_pubkeys: vec![SignerPubkey::Ed25519 { pubkey: [0x11; 32] }],
         };
-        let capture = CaptureWriter::new();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish();
-
-        tracing::subscriber::with_default(subscriber, || {
+        let logs = stellar_agent_test_support::with_captured_logs(|| {
             manager.emit_baseline(
                 &observed,
                 7,
@@ -5534,16 +5527,16 @@ mod tests {
                 "req-poison",
             );
         });
-
-        let logs = capture.captured_str();
         assert!(
             logs.contains("audit-writer mutex poisoned; SaSignerSetBaselined row dropped"),
             "missing poison warning: {logs}"
         );
-        assert!(
-            logs.contains("audit-log structurally degraded during this session"),
-            "missing degraded-session warning: {logs}"
-        );
+        // The session-degraded warning TEXT is pinned next to its emitter
+        // (core audit_log::health tests); its callsite is shared with other
+        // tests in this binary, and tracing's process-global interest cache
+        // makes cross-test capture of shared callsites nondeterministic
+        // under the parallel harness. This test asserts the state transition
+        // via `audit_writer_degraded()` below instead.
         assert!(logs.contains("rule_id=7"), "missing rule_id: {logs}");
         assert!(
             logs.contains("request_id=req-poison"),
@@ -5620,13 +5613,7 @@ mod tests {
             signer_pubkeys: vec![SignerPubkey::Ed25519 { pubkey: [0x22; 32] }],
         };
 
-        let capture = CaptureWriter::new();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish();
-
-        tracing::subscriber::with_default(subscriber, || {
+        let logs = stellar_agent_test_support::with_captured_logs(|| {
             manager.emit_signer_set_diverged(
                 3,
                 "CDABC...12345",
@@ -5635,16 +5622,13 @@ mod tests {
                 "req-diverge-poison",
             );
         });
-
-        let logs = capture.captured_str();
         assert!(
             logs.contains("audit-writer mutex poisoned; SaSignerSetDiverged row dropped"),
             "missing poison warning: {logs}"
         );
-        assert!(
-            logs.contains("audit-log structurally degraded during this session"),
-            "missing degraded-session warning: {logs}"
-        );
+        // Session-degraded warning text: pinned in core audit_log::health
+        // (see the sibling baseline test's comment); the state transition is
+        // asserted via `audit_writer_degraded()` below.
         assert!(logs.contains("rule_id=3"), "missing rule_id: {logs}");
         assert!(
             logs.contains("request_id=req-diverge-poison"),

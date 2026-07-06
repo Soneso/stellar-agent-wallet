@@ -48,6 +48,36 @@ pub struct CaptureWriter {
     buf: Arc<Mutex<Vec<u8>>>,
 }
 
+/// Runs `f` under a scoped fmt subscriber writing into a fresh
+/// [`CaptureWriter`] and returns everything it captured, as a string.
+///
+/// Installs the subscriber with `tracing::subscriber::with_default` and then
+/// calls [`tracing::callsite::rebuild_interest_cache`] BEFORE running `f`.
+/// The rebuild is what makes the capture deterministic under a parallel test
+/// harness: `tracing` caches per-callsite interest globally, and a cache
+/// state computed while a different (or no) subscriber was active on another
+/// thread can transiently suppress an event that this thread's scoped
+/// subscriber would accept. `#[serial]` does not close that window — it only
+/// serializes against other `#[serial]` tests, not against the non-serial
+/// neighbors that repopulate the cache.
+///
+/// Prefer this over hand-rolling the `CaptureWriter` + `with_default` pair
+/// whenever a test asserts on captured log CONTENT; the hand-rolled form is
+/// only needed when the test must also drive the subscriber or writer
+/// directly.
+pub fn with_captured_logs<F: FnOnce()>(f: F) -> String {
+    let capture = CaptureWriter::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(capture.clone())
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        f();
+    });
+    capture.captured_str()
+}
+
 impl CaptureWriter {
     /// Creates a new `CaptureWriter` with an empty buffer.
     #[must_use]
