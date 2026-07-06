@@ -72,6 +72,24 @@ mod tests {
     }
 
     #[test]
+    fn enroll_js_extracts_sign_count_via_get_authenticator_data() {
+        let body = std::str::from_utf8(ENROLL_JS).unwrap();
+        assert!(body.contains("getAuthenticatorData"));
+    }
+
+    #[test]
+    fn enroll_js_never_reads_attestation_object_bytes_directly() {
+        let body = std::str::from_utf8(ENROLL_JS).unwrap();
+        assert!(!body.contains("response.attestationObject"));
+    }
+
+    #[test]
+    fn enroll_js_copy_paste_command_includes_sign_count_flag() {
+        let body = std::str::from_utf8(ENROLL_JS).unwrap();
+        assert!(body.contains("--sign-count"));
+    }
+
+    #[test]
     fn app_js_wires_ceremony_endpoints_and_csrf_header() {
         let body = std::str::from_utf8(APP_JS).unwrap();
         assert!(body.contains("x-stellar-remote-approval-csrf"));

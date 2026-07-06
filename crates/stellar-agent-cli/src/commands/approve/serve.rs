@@ -207,7 +207,10 @@ pub async fn run(args: ServeArgs) -> i32 {
 
     // Open the browser only on a host with a display, and only when the URL is
     // not being handed to another process for a headless/tunnelled session.
-    if !args.no_open && display_available() && webbrowser::open(&bootstrap_url).is_err() {
+    if !args.no_open
+        && crate::common::display_available()
+        && webbrowser::open(&bootstrap_url).is_err()
+    {
         tracing::debug!("approve serve: browser open failed; use the printed URL");
     }
 
@@ -381,22 +384,6 @@ fn start_error_to_wallet_error(e: &ServeStartError) -> WalletError {
         _ => format!("approve.serve_start: {e}"),
     };
     WalletError::Internal(InternalError::UnexpectedState { detail })
-}
-
-/// Returns `true` when a graphical display is available for a browser launch.
-///
-/// On Linux, requires `DISPLAY` or `WAYLAND_DISPLAY`; a headless host must not
-/// spawn a browser (which would also leak the bootstrap token into another
-/// process's argv). Other platforms are assumed to have a display.
-fn display_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        true
-    }
 }
 
 /// Prints the bootstrap URL plus at most two lines of startup guidance.

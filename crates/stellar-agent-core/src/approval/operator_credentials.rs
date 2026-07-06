@@ -109,6 +109,45 @@ pub struct OperatorApprovalCredential {
     /// of `0` means the authenticator does not support counters and is never
     /// stored here as a comparison baseline — see
     /// [`OperatorApprovalCredentialStore::update_sign_count`].
+    ///
+    /// # Registration-time seeding is advisory, never authorization-bearing
+    ///
+    /// A caller may seed this field at enrollment time with a counter value
+    /// read client-side from the registration ceremony (e.g. the interactive
+    /// loopback enrollment server extracts it from
+    /// `AuthenticatorAttestationResponse.getAuthenticatorData()`). That value
+    /// is client-supplied and, unlike an assertion-time counter, is never
+    /// checked against a signature — nothing stops a caller from reporting
+    /// any number here. This is acceptable because the field feeds only the
+    /// clone-detection regression check in
+    /// [`OperatorApprovalCredentialStore::update_sign_count`]: lying about
+    /// the seed weakens that one credential's own clone-detection baseline
+    /// and nothing else. Authorization is decided solely by the profile's
+    /// `allowed_credentials` allowlist, which this field never influences.
+    ///
+    /// # Seeded verbatim, never clamped
+    ///
+    /// The registration-time value is stored as-is because it is the
+    /// authenticator's own registration counter — the correct WebAuthn
+    /// baseline against which the first subsequent assertion's
+    /// strictly-greater check is meant to run. Imposing a fixed upper bound
+    /// here would be an arbitrary threshold with no basis in the WebAuthn
+    /// spec, and would wrongly reject a legitimate roaming authenticator
+    /// whose counter is already high from use with other relying parties. A
+    /// client that seeds an implausibly high value only weakens
+    /// clone-detection for that one credential going forward; it can never
+    /// grant that credential — or any other — authorization, which the
+    /// `allowed_credentials` allowlist alone decides.
+    ///
+    /// # Seeding is best-effort
+    ///
+    /// An authenticator that reports the same counter value at registration
+    /// and at its first subsequent assertion — rather than a strictly
+    /// greater one — trips the regression check on that first assertion.
+    /// Most platform authenticators report `0` at every ceremony, which is
+    /// exempt from the check under the zero-counter rule above, so this
+    /// edge is rare in practice; when it does occur the assertion is
+    /// refused (never silently accepted), and the operator re-enrolls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sign_count: Option<u32>,
 }

@@ -575,21 +575,32 @@ stellar-agent approve serve --remote --confirm-remote-exposure --profile default
 
 ### `approve operator enroll`
 
-Enrolls a WebAuthn passkey credential for the remote-approval surface. Runs entirely locally — it never touches the network. Enrollment alone does not authorize the credential; its id must also be added to the profile's `[remote_approval] allowed_credentials` list.
+Enrolls a WebAuthn passkey credential for the remote-approval surface. Runs entirely locally in both modes below — neither touches the network. Enrollment alone never authorizes the credential; its id must also be added to the profile's `[remote_approval] allowed_credentials` list.
+
+A WebAuthn credential is bound to its `rp.id` at creation time, and a loopback origin can only claim `"localhost"` as an effective domain — that binding decides which mode applies:
+
+- **`--interactive`** — for a loopback or SSH-tunnelled `approve serve --remote` listener. Starts a one-shot local server, prints (and by default opens) an enrollment page, and persists the credential automatically once the ceremony completes. The printed URL carries a single-use bootstrap token exchanged for an HttpOnly session cookie on first visit; serving the page and the credential-persisting POST both require that cookie, and the server binds `127.0.0.1` only. Always produces `rp_id: "localhost"`.
+- **`--credential-id` / `--public-key` / `--rp-id` / `--label`** (all four together) — for a domain-configured remote listener. Imports the id and public key from a WebAuthn ceremony run elsewhere, normally the remote listener's own `GET /enroll` page (which has to be served from `https://<rp_id>` for the credential to bind to that domain, and displays a ready-to-run copy of this command).
 
 | Flag | Meaning |
 |---|---|
 | `--profile <NAME>` | Profile whose operator-credential store to write |
-| `--credential-id <B64URL>` (required) | Base64url WebAuthn credential id (16-64 raw bytes) |
-| `--public-key <B64URL>` (required) | Base64url-encoded 65-byte uncompressed SEC1 P-256 public key (`0x04 \|\| X \|\| Y`) |
-| `--rp-id <HOSTNAME>` (required) | Must match the profile's `[remote_approval] rp_id` exactly |
-| `--label <LABEL>` (required) | Operator-chosen name for the credential (e.g. `"laptop"`) |
-
-The credential id and public key normally come from the remote-approval listener's own `GET /enroll` helper page, which displays a ready-to-run copy of this command.
+| `--interactive` | Start the loopback ceremony (mutually exclusive with the three credential-import flags `--credential-id`/`--public-key`/`--rp-id`; `--label` still applies, as a page pre-fill) |
+| `--no-open` | Print the enrollment URL instead of opening a browser (interactive mode only) |
+| `--timeout-seconds <SECS>` | Interactive-ceremony timeout (default: 300) |
+| `--credential-id <B64URL>` | Base64url WebAuthn credential id (16-64 raw bytes); import mode, requires the other three below |
+| `--public-key <B64URL>` | Base64url-encoded 65-byte uncompressed SEC1 P-256 public key (`0x04 \|\| X \|\| Y`); import mode only |
+| `--rp-id <HOSTNAME>` | Must match the profile's `[remote_approval] rp_id` exactly; import mode only |
+| `--label <LABEL>` | Operator-chosen name for the credential (e.g. `"laptop"`); required in import mode, optional page pre-fill in interactive mode |
+| `--sign-count <U32>` | Best-effort sign-counter seed read at enrollment time; import mode only (interactive mode extracts it automatically). Advisory only — never affects authorization |
 
 ```bash
+# Local or SSH-tunnelled listener
+stellar-agent approve operator enroll --interactive --label laptop
+
+# Domain-configured remote listener: import a credential enrolled via its own /enroll page
 stellar-agent approve operator enroll --credential-id <B64URL> \
-  --public-key <B64URL> --rp-id wallet.example.internal --label laptop
+  --public-key <B64URL> --rp-id wallet.example.internal --label laptop --sign-count <N>
 ```
 
 ---

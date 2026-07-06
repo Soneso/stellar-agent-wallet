@@ -50,7 +50,10 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 directories = { workspace = true }
 tempfile = { workspace = true }
-p256 = { workspace = true, optional = true }
+# `pkcs8` decodes the ECDSA P-256 PKCS#8 DER private key CDP's
+# `WebAuthn.getCredentials` returns, for the operator-enroll browser
+# acceptance suite's stored-vs-derived public-key cross-check.
+p256 = { workspace = true, optional = true, features = ["pkcs8"] }
 
 [features]
 # Exposes the software-authenticator test helper (p256 keypair signing
@@ -65,6 +68,15 @@ test-helpers = ["dep:p256"]
 #     --test remote_approval_browser_testnet_acceptance -- --ignored
 # CI/dev-only; MUST NOT be enabled in any release-artefact feature set.
 testnet-acceptance = ["test-helpers", "stellar-agent-mcp/test-helpers"]
+# Gate the interactive operator-enrollment browser acceptance suite: a
+# headless Chromium driving the real loopback `operator_enroll` server. No
+# testnet/RPC dependency (unlike `testnet-acceptance` above) — only
+# `test-helpers` (the p256 pkcs8 cross-check) and Chromium. NOT run under
+# default `cargo test`; invoke with:
+#   cargo test -p stellar-agent-approval-remote --features operator-enroll-browser-acceptance \
+#     --test operator_enroll_browser_acceptance -- --ignored
+# CI/dev-only; MUST NOT be enabled in any release-artefact feature set.
+operator-enroll-browser-acceptance = ["test-helpers"]
 
 [dev-dependencies]
 stellar-agent-test-support = { workspace = true }

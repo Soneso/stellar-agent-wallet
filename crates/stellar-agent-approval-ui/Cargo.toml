@@ -53,6 +53,14 @@ sha2 = { workspace = true }
 # crate only needs the `serde_json` value/serialiser surface.
 serde_json = { workspace = true }
 
+# Deserialises the operator-enroll POST /enroll/credential wire payload.
+serde = { workspace = true, features = ["derive"] }
+
+# Decodes the base64url credential id / SEC1 public key on the
+# operator-enroll POST path, and (in tests) verifies the surfaced
+# attestation blob on the decision path.
+base64 = { workspace = true }
+
 # Structured logging facade for library code.
 tracing = { workspace = true }
 
@@ -76,9 +84,6 @@ stellar-agent-test-support = { workspace = true }
 
 # Seed the attestation key into the mock keyring in decision tests.
 keyring-core = { workspace = true }
-
-# Decode/verify the surfaced attestation blob in decision tests.
-base64 = { workspace = true }
 
 # Build a spending-limit policy install-param ScVal fixture in the
 # RuleProposalSimulated renderer tests.

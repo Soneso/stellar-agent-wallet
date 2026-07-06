@@ -50,6 +50,7 @@ use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 
 pub mod decision;
 pub mod error;
+pub mod operator_enroll;
 
 mod auth;
 mod routes;

@@ -286,18 +286,53 @@ walkthrough.
 
 ### `approve operator enroll`
 
+Writes a WebAuthn credential to the profile's dedicated operator-approval
+credential store, for use with `approve serve --remote`. Enrollment alone
+never authorizes anything — the credential still has to be added to the
+profile's `[remote_approval] allowed_credentials` list, a separate,
+operator-controlled step. Runs entirely locally in both modes below; neither
+touches the network.
+
+A WebAuthn credential is bound to its `rp.id` at creation time, and that
+binding is what decides which of the two modes applies:
+
+- **`--interactive`** — for a loopback or SSH-tunnelled `approve serve
+  --remote` listener. Starts a one-shot local server, prints (and by default
+  opens) an enrollment page, and persists the credential automatically once
+  your authenticator completes the ceremony. The printed URL contains a
+  single-use bootstrap token: the first visit exchanges it for an HttpOnly
+  session cookie and the token dies, and both serving the page and the POST
+  that persists the credential require that cookie, so a local non-browser
+  process cannot drive the ceremony. The server binds `127.0.0.1` only and
+  refuses non-loopback hosts and origins. Always produces a credential bound
+  to `rp_id: "localhost"` — the only effective domain a loopback origin can
+  claim.
+- **`--credential-id` / `--public-key` / `--rp-id` / `--label`** (all four
+  together) — for a domain-configured remote listener. Imports the id and
+  public key from a WebAuthn ceremony run elsewhere: normally the remote
+  listener's own `GET /enroll` page, which has to be served from
+  `https://<rp_id>` for the resulting credential to bind to that domain. See
+  [Remote approval](../remote-approval.md) for that page's walkthrough.
+
 ```bash
+# Local or SSH-tunnelled listener
+stellar-agent approve operator enroll --interactive --label laptop
+
+# Domain-configured remote listener: import a credential enrolled via its
+# own /enroll page
 stellar-agent approve operator enroll \
-  --credential-id <B64URL> --public-key <B64URL> --rp-id <HOSTNAME> --label laptop
+  --credential-id <B64URL> --public-key <B64URL> --rp-id <HOSTNAME> \
+  --label laptop --sign-count <N>
 ```
 
-Validates and writes a WebAuthn credential id and SEC1 public key to the
-profile's dedicated operator-approval credential store, for use with
-`approve serve --remote`. Runs entirely locally — it never touches the
-network — and does not by itself authorize the credential; add its id to the
-profile's `[remote_approval] allowed_credentials` list separately. See
-[Remote approval](../remote-approval.md) for where the credential id and
-public key come from.
+- `--no-open` — print the enrollment URL instead of opening a browser
+  (interactive mode only).
+- `--timeout-seconds <SECS>` — interactive-ceremony timeout (default: 300).
+- `--sign-count <U32>` — seeds the clone-detection baseline from a counter
+  read at enrollment time (argument mode only; interactive mode extracts
+  this automatically). Advisory only — a caller reporting a false value only
+  weakens that credential's own clone-detection baseline and never affects
+  authorization, which is decided solely by `allowed_credentials`.
 
 ## `audit`
 

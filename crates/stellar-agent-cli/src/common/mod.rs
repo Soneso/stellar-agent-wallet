@@ -10,6 +10,8 @@
 //!
 //! # Free helpers
 //!
+//! - [`display_available`] — whether a graphical display is available for a
+//!   browser auto-launch, shared by every subcommand that offers one.
 //! - [`resolve_profile_name`] — resolve the effective profile name from an
 //!   explicit CLI arg, `STELLAR_AGENT_PROFILE` env var, or `"default"`.
 //! - [`validate_path_component_ascii_safe`] — validates that a string is safe
@@ -17,6 +19,27 @@
 
 pub mod network;
 pub mod render;
+
+/// Returns `true` when a graphical display is available for a browser launch.
+///
+/// On Linux, requires `DISPLAY` or `WAYLAND_DISPLAY`; a headless host must not
+/// spawn a browser (which could also leak a URL-embedded one-time token into
+/// another process's argv). Other platforms are assumed to have a display.
+///
+/// Shared by every subcommand that offers to auto-launch a browser
+/// (`approve serve`, `approve operator enroll --interactive`) so the
+/// headless-detection rule cannot drift between them.
+#[must_use]
+pub fn display_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
 
 /// Resolves the effective profile name from the CLI arg or
 /// `STELLAR_AGENT_PROFILE` environment variable, falling back to `"default"`.

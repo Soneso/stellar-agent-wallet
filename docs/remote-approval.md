@@ -119,30 +119,45 @@ before you point a browser at it.
 
 ## Enrolling a passkey credential
 
-A WebAuthn credential is bound to the origin that created it: the browser
-requires the page's domain to match the credential's Relying Party ID at
-creation time. This means the credential has to be created by a page served
-from `https://<rp_id>` itself — a page opened from a local file, or from any
-other origin, cannot produce a credential usable against this listener.
+`approve operator enroll` has two modes, and which one applies here comes
+down to one fact: a WebAuthn credential is bound to the origin that created
+it — the browser requires the page's domain to match the credential's
+Relying Party ID at creation time.
 
-The wallet serves exactly such a page. On the approving device, after
-verifying the certificate fingerprint above:
+- This listener's `rp_id` is a real domain (`wallet.example.internal` in the
+  examples above), so the credential has to be created by a page served from
+  `https://<rp_id>` itself. That page can only be the remote listener's own
+  `/enroll` page — a local file, or any other origin, cannot produce a
+  credential usable against this listener. This section covers that path:
+  **argument-import mode**.
+- If you instead want to approve from the wallet host itself, or through an
+  SSH tunnel (no `[remote_approval]` domain involved at all), use
+  `approve operator enroll --interactive` on the wallet host directly — see
+  [CLI reference: `approve operator enroll`](cli-reference/profile-and-governance.md#approve-operator-enroll).
+  That mode only ever produces `rp_id: "localhost"` credentials, which is why
+  it cannot be used for this listener's domain-bound `rp_id`.
+
+### Argument-import mode: enrolling via this listener's `/enroll` page
+
+The wallet serves exactly the page this mode needs. On the approving device,
+after verifying the certificate fingerprint above:
 
 1. Open `https://<rp_id>:<port>/enroll`.
 2. Click "Create passkey" and complete your platform's passkey prompt.
-3. The page displays the new credential's id and public key, and a ready-to-run
-   command:
+3. The page displays the new credential's id, public key, and a best-effort
+   seeded sign count, plus a ready-to-run command:
 
    ```bash
    stellar-agent approve operator enroll \
      --credential-id <B64URL> \
      --public-key <B64URL> \
      --rp-id wallet.example.internal \
-     --label "my-laptop"
+     --label "my-laptop" \
+     --sign-count <N>
    ```
 
 4. Run that command on the **wallet host** (not the approving device).
-   `approve operator enroll` validates the two values and writes them to the
+   `approve operator enroll` validates the values and writes them to the
    profile's dedicated operator-approval credential store — this step never
    touches the network; it is a local write on the machine running the
    wallet.
@@ -165,13 +180,17 @@ CLI command over a channel you already trust.
 - `--label` — a name you choose, so `credentials list`-style tooling can show
   which device a credential belongs to (e.g. `"laptop"`, `"phone"`) — replace
   the placeholder in the displayed command before running it.
+- `--sign-count` — the counter the page read at enrollment time, prefilled.
+  It seeds the clone-detection baseline that assertion-time verification
+  checks against; it never affects authorization by itself.
 
 Finally, add the enrolled credential's id to the profile's
 `[remote_approval] allowed_credentials` list (see
 [Prerequisites](#the-remote_approval-profile-block)) — enrollment and
-authorization are two separate, both-required steps. `allowed_credentials` is
-read once when the listener starts, so restart `approve serve --remote` after
-editing it — the newly enrolled credential is not recognized until you do.
+authorization are two separate, both-required steps, in EITHER mode.
+`allowed_credentials` is read once when the listener starts, so restart
+`approve serve --remote` after editing it — the newly enrolled credential is
+not recognized until you do.
 
 ## Logging in and approving
 
