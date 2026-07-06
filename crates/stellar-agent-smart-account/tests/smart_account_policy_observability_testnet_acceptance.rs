@@ -1116,26 +1116,25 @@ async fn policy_observability_full_flow_testnet_acceptance() {
         Some(true),
         "stellar_rules_get must not be an error result: {get_json}"
     );
-    // i128 budget fields ride the wire as JSON numbers — the established
-    // MCP i128 shape (blend_lend `qty`, dex_trade `qty_in`, vault
-    // `amounts_desired`) and the CLI envelope's shape alike. The test
-    // constants fit i64, so `as_i64` is lossless here.
+    // i128 budget fields ride the wire as DECIMAL STRINGS — the MCP i128
+    // convention (blend_lend `qty`, dex_trade `qty_in`, vault
+    // `amounts_desired`) and the CLI envelope's shape alike: a raw JSON
+    // number above 2^53 cannot be represented exactly by an f64-backed
+    // parser.
+    let budget_i128 =
+        |v: &serde_json::Value| -> Option<i128> { v.as_str().and_then(|s| s.parse::<i128>().ok()) };
     assert_eq!(
-        get_json["data"]["spending_limit"]["spending_limit"]
-            .as_i64()
-            .map(i128::from),
+        budget_i128(&get_json["data"]["spending_limit"]["spending_limit"]),
         Some(LIMIT_L3),
         "MCP get budget block spending_limit must match step-5 state: {get_json}"
     );
     assert_eq!(
-        get_json["data"]["spending_limit"]["in_window_spent"]
-            .as_i64()
-            .map(i128::from),
+        budget_i128(&get_json["data"]["spending_limit"]["in_window_spent"]),
         Some(TRANSFER_A),
         "MCP get budget block in_window_spent must match step-5 state: {get_json}"
     );
     assert_eq!(
-        get_json["data"]["spending_limit"]["remaining_budget"].as_i64(),
+        budget_i128(&get_json["data"]["spending_limit"]["remaining_budget"]),
         Some(0),
         "MCP get budget block remaining_budget must be 0 after the squeeze: {get_json}"
     );
@@ -1215,9 +1214,7 @@ async fn policy_observability_full_flow_testnet_acceptance() {
         "toolset-routed stellar_rules_get must not error: {toolset_json}"
     );
     assert_eq!(
-        toolset_json["data"]["spending_limit"]["spending_limit"]
-            .as_i64()
-            .map(i128::from),
+        budget_i128(&toolset_json["data"]["spending_limit"]["spending_limit"]),
         Some(LIMIT_L3),
         "toolset-routed dispatch must reach the same state: {toolset_json}"
     );
