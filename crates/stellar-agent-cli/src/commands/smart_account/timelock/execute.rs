@@ -55,6 +55,7 @@ use crate::commands::smart_account::common::{
 use crate::common::network::TargetNetwork;
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
+use crate::common::signer_ceremony::record_mlock_degradation;
 
 const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
 
@@ -223,14 +224,15 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
         }
     };
 
-    let signer = match resolve_signer(&args.signer_source, Some(&profile_name)).await {
-        Ok(s) => s,
-        Err(e) => {
-            let envelope: Envelope<()> = Envelope::err(&e);
-            render_json(&envelope);
-            return 1;
-        }
-    };
+    let (signer, mlock_degradation) =
+        match resolve_signer(&args.signer_source, Some(&profile_name)).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                let envelope: Envelope<()> = Envelope::err(&e);
+                render_json(&envelope);
+                return 1;
+            }
+        };
 
     let (audit_writer, _audit_log_path) = match open_audit_writer(&profile_name) {
         Ok(pair) => pair,
@@ -240,6 +242,12 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
             return 1;
         }
     };
+    record_mlock_degradation(
+        &audit_writer,
+        mlock_degradation.as_ref(),
+        &profile_name,
+        &request_id,
+    );
 
     let secondary_rpc_url = args
         .secondary_rpc_url

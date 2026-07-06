@@ -49,7 +49,11 @@ use zeroize::Zeroizing;
 
 use crate::timefmt::{Clock, default_clock};
 
-use super::{config::MlockRequired, error::WalletLifecycleError, mlock::LockedSeed};
+use super::{
+    config::MlockRequired,
+    error::WalletLifecycleError,
+    mlock::{LockedSeed, MlockDegradation},
+};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -144,6 +148,13 @@ pub struct Wallet {
     disposed: AtomicBool,
     /// Wall-clock source for TTL checks.
     clock: Arc<dyn Clock>,
+    /// Snapshot of [`LockedSeed::mlock_degradation`] taken at construction
+    /// time.
+    ///
+    /// Copied out (rather than read through `locked_seed`) so it remains
+    /// queryable after [`Wallet::dispose`] clears `locked_seed`, matching
+    /// `profile_name()` / `expires_at_unix_ms()`'s post-dispose availability.
+    mlock_degradation: Option<MlockDegradation>,
 }
 
 impl Wallet {
@@ -238,6 +249,7 @@ impl Wallet {
 
         // ── Construct the locked seed ────────────────────────────────────────
         let locked_seed = LockedSeed::new(seed, mlock_required, &profile_name)?;
+        let mlock_degradation = locked_seed.mlock_degradation().cloned();
 
         // ── Compute expiry ───────────────────────────────────────────────────
         let now_ms = clock.now_unix_ms()?;
@@ -283,6 +295,7 @@ impl Wallet {
             cancel,
             disposed,
             clock,
+            mlock_degradation,
         })
     }
 
@@ -355,6 +368,22 @@ impl Wallet {
     /// Return the profile name this wallet is bound to.
     pub fn profile_name(&self) -> &str {
         &self.profile_name
+    }
+
+    /// Returns the `mlock` degradation details when `mlock` was attempted
+    /// and failed under `MlockRequired::Warn` — this wallet's unlock window
+    /// proceeded with unprotected (unpinned) memory.
+    ///
+    /// Returns `None` both when `mlock` succeeded and when
+    /// `MlockRequired::False` meant locking was never attempted. Remains
+    /// accurate after [`Wallet::dispose`]: the value is snapshotted at
+    /// construction time, independent of the disposed `locked_seed`.
+    ///
+    /// Callers that need to record a `WalletMlockFailed` audit-log entry
+    /// check this accessor before (or after) disposing the wallet.
+    #[must_use]
+    pub fn mlock_degradation(&self) -> Option<&MlockDegradation> {
+        self.mlock_degradation.as_ref()
     }
 
     /// Return the Unix epoch milliseconds at which the TTL expires.

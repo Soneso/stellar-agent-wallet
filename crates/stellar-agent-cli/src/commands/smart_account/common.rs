@@ -18,6 +18,7 @@ use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{AuthError, IoSource, ValidationError, WalletError};
 use stellar_agent_core::observability::redact_path_in_message;
 use stellar_agent_core::profile::loader as profile_loader;
+use stellar_agent_core::wallet::MlockDegradation;
 use stellar_agent_network::Signer;
 use stellar_agent_smart_account::SaError;
 use stellar_agent_smart_account::managers::rules::{
@@ -25,11 +26,14 @@ use stellar_agent_smart_account::managers::rules::{
     parse_c_strkey_to_smart_account,
 };
 use stellar_agent_smart_account::managers::signers::{SignersManager, SignersManagerConfig};
+use uuid::Uuid;
 
 use crate::common::network::TargetNetwork;
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
-use crate::common::signer_ceremony::resolve_software_signer_from_env;
+use crate::common::signer_ceremony::{
+    SignerCeremonyOutcome, record_mlock_degradation, resolve_software_signer_from_env,
+};
 
 /// Mutually-exclusive signer source flags shared by wallet write/read handlers.
 #[derive(Debug, Args)]
@@ -109,7 +113,8 @@ impl CommonHandlerContext {
     /// audit-log opening, or path setup fails.
     pub async fn new(args: &impl CommonArgsView) -> Result<Self, WalletError> {
         let profile_name = resolve_profile_name(args.profile());
-        let signer = resolve_signer(args.signer_source(), Some(&profile_name)).await?;
+        let (signer, mlock_degradation) =
+            resolve_signer(args.signer_source(), Some(&profile_name)).await?;
         let smart_account = parse_c_strkey_to_smart_account(args.account()).map_err(|e| {
             WalletError::Validation(ValidationError::AddressInvalid {
                 input: format!("--account: {e}"),
@@ -125,6 +130,12 @@ impl CommonHandlerContext {
         let chain_id = network_to_chain_id(args.network()).to_owned();
 
         let (audit_writer, audit_log_path) = open_audit_writer(&profile_name)?;
+        record_mlock_degradation(
+            &audit_writer,
+            mlock_degradation.as_ref(),
+            &profile_name,
+            &Uuid::new_v4().to_string(),
+        );
 
         Ok(Self {
             signer,
@@ -223,6 +234,10 @@ impl CommonHandlerContext {
 /// `--signer-secret-env` path via [`resolve_software_signer_from_env`]; pass
 /// `None` when no profile is available at the call site.
 ///
+/// Returns any `mlock` degradation the secret-env ceremony reported
+/// alongside the signer (`None` for the Ledger path); the caller records it
+/// via [`record_mlock_degradation`] once its audit writer is open.
+///
 /// # Errors
 ///
 /// Returns a [`WalletError`] when no signer-source flag is supplied, the
@@ -230,7 +245,7 @@ impl CommonHandlerContext {
 pub(crate) async fn resolve_signer(
     signer_source: &SignerSourceFlags,
     profile_name: Option<&str>,
-) -> Result<Box<dyn Signer + Send + Sync>, WalletError> {
+) -> Result<(Box<dyn Signer + Send + Sync>, Option<MlockDegradation>), WalletError> {
     if signer_source.sign_with_ledger {
         use stellar_agent_network::signing::hardware::HardwareSigningKey;
         let hw_key = HardwareSigningKey::native()
@@ -240,7 +255,7 @@ pub(crate) async fn resolve_signer(
                 })
             })?
             .with_account_index(signer_source.account_index_or_default());
-        return Ok(Box::new(hw_key));
+        return Ok((Box::new(hw_key), None));
     }
 
     let var_name = signer_source.signer_secret_env.as_deref().ok_or_else(|| {
@@ -251,9 +266,11 @@ pub(crate) async fn resolve_signer(
                 .to_owned(),
         })
     })?;
-    let signer =
-        resolve_software_signer_from_env(var_name, "smart-account-write", profile_name).await?;
-    Ok(Box::new(signer))
+    let SignerCeremonyOutcome {
+        signer,
+        mlock_degradation,
+    } = resolve_software_signer_from_env(var_name, "smart-account-write", profile_name).await?;
+    Ok((Box::new(signer), mlock_degradation))
 }
 
 /// Maps a [`TargetNetwork`] to its CAIP-2 chain-ID string.
@@ -451,9 +468,13 @@ mod tests {
             sign_with_ledger: false,
             account_index: None,
         };
-        let signer = resolve_signer(&flags, None)
+        let (signer, mlock_degradation) = resolve_signer(&flags, None)
             .await
             .expect("resolve must succeed");
+        assert!(
+            mlock_degradation.is_none(),
+            "a real mlock success/opt-out must not report degradation"
+        );
         let derived = signer.public_key().await.expect("public key must derive");
         assert_eq!(derived.to_string().to_string(), expected_g);
         unsafe {

@@ -52,11 +52,11 @@
 //! # Audit-log integration
 //!
 //! This layer emits `tracing::warn!` with structured fields (`profile`,
-//! `reason`, `errno`) when `mlock` fails under `MlockRequired::Warn`.
-//! `EventKind::WalletMlockFailed` is a reserved audit-log event kind
-//! (recognised by `audit verify`) not currently emitted by any call site.
-//! This module is deliberately ignorant of the audit-log writer; the tracing
-//! span is the handover point for any future caller that wires the entry.
+//! `reason`, `errno`) when `mlock` fails under `MlockRequired::Warn`, and
+//! exposes the same details via [`Wallet::mlock_degradation`]. This module
+//! is deliberately ignorant of the audit-log writer; the caller that has one
+//! (the CLI secret-env signer ceremony) records the `WalletMlockFailed`
+//! entry.
 
 pub mod config;
 pub mod error;
@@ -66,4 +66,4 @@ pub mod mlock;
 pub use config::MlockRequired;
 pub use error::WalletLifecycleError;
 pub use lifecycle::{DEFAULT_TTL_SECONDS, MAX_TTL_SECONDS, Wallet};
-pub use mlock::LockedSeed;
+pub use mlock::{LockedSeed, MlockDegradation};

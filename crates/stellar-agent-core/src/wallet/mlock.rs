@@ -81,6 +81,28 @@ pub struct LockedSeed {
     guard: Option<region::LockGuard>,
     /// Whether this seed has been explicitly disposed.
     disposed: bool,
+    /// `Some` when `mlock` was attempted and failed under
+    /// `MlockRequired::Warn` (the process proceeded with unprotected memory).
+    ///
+    /// `None` both when `mlock` succeeded and when `MlockRequired::False`
+    /// meant locking was never attempted — this field distinguishes
+    /// "degraded" from "opted out", which `guard.is_none()` alone cannot.
+    mlock_degradation: Option<MlockDegradation>,
+}
+
+/// Details of an `mlock` failure tolerated under `MlockRequired::Warn`.
+///
+/// Carries the same fields [`WalletLifecycleError::MlockUnavailable`] would
+/// carry had `MlockRequired::True` been in effect, so a caller recording a
+/// `WalletMlockFailed` audit-log entry has the OS-level reason and errno
+/// available rather than only a boolean.
+#[derive(Debug, Clone)]
+pub struct MlockDegradation {
+    /// Human-readable reason string from the OS error.
+    pub reason: String,
+    /// `errno` value from the failed `mlock` / `VirtualLock` syscall, when
+    /// the underlying OS error exposed one.
+    pub errno: Option<i32>,
 }
 
 impl LockedSeed {
@@ -100,10 +122,9 @@ impl LockedSeed {
     ///   [`WalletLifecycleError::MlockUnavailable`]; the seed is zeroed and
     ///   this function does not return `Ok`.
     /// - [`MlockRequired::Warn`] — returns `Ok` with `guard: None`; emits a
-    ///   structured `tracing::warn!`.  `EventKind::WalletMlockFailed` is a
-    ///   reserved audit-log event kind (recognised by `audit verify`) not
-    ///   currently emitted by any call site; this function's responsibility
-    ///   ends at the tracing span.
+    ///   structured `tracing::warn!` and records the failure in
+    ///   [`Self::mlock_degradation`] for the caller to surface as a
+    ///   `WalletMlockFailed` audit-log entry.
     /// - [`MlockRequired::False`] — `mlock` is not attempted; always returns
     ///   `Ok` with `guard: None`.
     ///
@@ -117,6 +138,7 @@ impl LockedSeed {
         required: MlockRequired,
         profile_name: &str,
     ) -> Result<Self, WalletLifecycleError> {
+        let mut mlock_degradation: Option<MlockDegradation> = None;
         let guard = match required {
             MlockRequired::False => None,
             MlockRequired::True | MlockRequired::Warn => {
@@ -155,6 +177,14 @@ impl LockedSeed {
                                     "wallet.mlock_failed: mlock unavailable; \
                                      proceeding with unprotected memory (warn mode)."
                                 );
+                                mlock_degradation = Some(MlockDegradation {
+                                    reason,
+                                    // `extract_os_errno` returns `0` when the
+                                    // underlying `region::Error` carried no OS
+                                    // errno (e.g. `InvalidParameter`); map that
+                                    // sentinel to `None` for the audit-log field.
+                                    errno: if errno == 0 { None } else { Some(errno) },
+                                });
                                 None
                             }
                             // MlockRequired::False is handled in the outer
@@ -170,7 +200,18 @@ impl LockedSeed {
             seed: Some(zeroizing_seed),
             guard,
             disposed: false,
+            mlock_degradation,
         })
+    }
+
+    /// Returns the `mlock` degradation details when `mlock` was attempted
+    /// and failed under `MlockRequired::Warn`.
+    ///
+    /// Returns `None` both when `mlock` succeeded and when
+    /// `MlockRequired::False` meant locking was never attempted.
+    #[must_use]
+    pub(crate) fn mlock_degradation(&self) -> Option<&MlockDegradation> {
+        self.mlock_degradation.as_ref()
     }
 
     /// Borrow the seed bytes.

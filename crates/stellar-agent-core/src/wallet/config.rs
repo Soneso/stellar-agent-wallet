@@ -77,10 +77,10 @@ pub enum MlockRequired {
     ///
     /// The wallet proceeds with the unlock window even if memory pinning
     /// fails, but emits a `tracing::warn!` with the structured fields
-    /// `profile`, `reason`, and `errno`.  `EventKind::WalletMlockFailed` is a
-    /// reserved audit-log event kind (recognised by `audit verify`) not
-    /// currently emitted by any call site; this layer's responsibility ends
-    /// at the `tracing::warn!` emission.
+    /// `profile`, `reason`, and `errno`, and exposes the same details via
+    /// [`crate::wallet::Wallet::mlock_degradation`].  The CLI secret-env
+    /// signer ceremony records this as a `WalletMlockFailed` audit-log entry
+    /// when an audit writer is available at the call site.
     Warn,
 
     /// `mlock` is not attempted at all (operator opt-out).

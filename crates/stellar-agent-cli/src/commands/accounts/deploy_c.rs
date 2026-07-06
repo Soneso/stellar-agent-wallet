@@ -49,6 +49,7 @@ use stellar_agent_core::error::{
     AuthError, InternalError, NetworkError, ValidationError, WalletError,
 };
 use stellar_agent_core::profile::{loader, schema::Profile};
+use stellar_agent_core::wallet::MlockDegradation;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 use stellar_agent_network::{
     StellarRpcClient, parse_classic_fee_choice, resolve_classic_fee_selection,
@@ -61,11 +62,14 @@ use stellar_agent_smart_account::managers::rules::parse_c_strkey_to_smart_accoun
 use stellar_agent_smart_account::managers::signers::build_external_signer_scval;
 use stellar_agent_smart_account::verifiers::VerifierRegistry;
 use tracing::info;
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::common::network::TargetNetwork;
 use crate::common::render::{render_json, sanitize_for_table};
-use crate::common::signer_ceremony::resolve_software_signer_from_env;
+use crate::common::signer_ceremony::{
+    SignerCeremonyOutcome, record_mlock_degradation, resolve_software_signer_from_env,
+};
 use crate::common::{resolve_profile_name, validate_path_component_ascii_safe};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -365,7 +369,7 @@ where
     };
 
     // Resolve the deployer keypair.
-    let deployer = match resolve_deployer(args).await {
+    let (deployer, deployer_mlock_degradation) = match resolve_deployer(args).await {
         Ok(d) => d,
         Err(e) => {
             let envelope = Envelope::<()>::err(&e);
@@ -439,6 +443,18 @@ where
                 return 1;
             }
         };
+
+    // Record any `mlock` degradation from the deployer ceremony now, before
+    // `guard` below takes an exclusive lock on the same writer (recording
+    // after that point would deadlock on the non-reentrant Mutex).
+    if let Some(writer) = &audit_writer_arc {
+        record_mlock_degradation(
+            writer,
+            deployer_mlock_degradation.as_ref(),
+            &resolve_profile_name(args.profile.as_deref()),
+            &Uuid::new_v4().to_string(),
+        );
+    }
 
     // Lock the Arc<Mutex<AuditWriter>> for the duration of the deployment call
     // so we can pass `Option<&mut AuditWriter>` to `deploy_smart_account`.
@@ -868,12 +884,18 @@ fn decode_hex32(hex: &str) -> Result<[u8; 32], ()> {
 
 /// Resolves the deployer keypair from the CLI flags.
 ///
+/// Returns the keypair alongside any `mlock` degradation the secret-env
+/// ceremony reported (`None` for the Ledger path, which never touches
+/// `Wallet::unlock`); the caller records it once its audit writer is open.
+///
 /// # Errors
 ///
 /// - [`WalletError::Auth`] — env var not set, S-strkey invalid, or Ledger not connected.
 /// - [`WalletError::Auth`] wrapping [`stellar_agent_core::error::AuthError::SignerKeyMismatch`]
 ///   for Ledger public-key mismatch.
-async fn resolve_deployer(args: &DeployCArgs) -> Result<DeployerKeypair, WalletError> {
+async fn resolve_deployer(
+    args: &DeployCArgs,
+) -> Result<(DeployerKeypair, Option<MlockDegradation>), WalletError> {
     if args.sign_with_ledger {
         // Ledger mode: we don't yet know the expected G-strkey before fetching it from
         // the device. The `signer_from_ledger` key-match check requires the expected
@@ -893,10 +915,13 @@ async fn resolve_deployer(args: &DeployCArgs) -> Result<DeployerKeypair, WalletE
             .with_account_index(args.account_index);
 
         let signer: Box<dyn stellar_agent_network::Signer + Send + Sync> = Box::new(hw_key);
-        return Ok(DeployerKeypair::Ledger {
-            account_index: args.account_index,
-            signer,
-        });
+        return Ok((
+            DeployerKeypair::Ledger {
+                account_index: args.account_index,
+                signer,
+            },
+            None,
+        ));
     }
 
     // SecretEnv mode.
@@ -913,14 +938,19 @@ async fn resolve_deployer(args: &DeployCArgs) -> Result<DeployerKeypair, WalletE
     // the deployer G-strkey from the secret. We construct the signer first without
     // the mismatch check, then wrap in DeployerKeypair::SecretEnv.
     let profile_name = resolve_profile_name(args.profile.as_deref());
-    let signer =
-        resolve_software_signer_from_env(var_name, "deploy-c", Some(&profile_name)).await?;
+    let SignerCeremonyOutcome {
+        signer,
+        mlock_degradation,
+    } = resolve_software_signer_from_env(var_name, "deploy-c", Some(&profile_name)).await?;
     let signer: Box<dyn stellar_agent_network::Signer + Send + Sync> = Box::new(signer);
 
-    Ok(DeployerKeypair::SecretEnv {
-        var_name: var_name.to_owned(),
-        signer,
-    })
+    Ok((
+        DeployerKeypair::SecretEnv {
+            var_name: var_name.to_owned(),
+            signer,
+        },
+        mlock_degradation,
+    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

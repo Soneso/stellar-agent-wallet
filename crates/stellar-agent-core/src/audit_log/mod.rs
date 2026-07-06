@@ -93,10 +93,12 @@
 //!
 //! # Reserved event kinds
 //!
-//! `PluginInvoked`, `WalletMlockFailed`, and `AuditRotationHandoff` are
-//! declared in [`EventKind`]; `PluginInvoked` and `WalletMlockFailed`
-//! are not currently emitted by this crate but are recognised by `audit verify`
-//! so future additions require no retroactive schema change.
+//! `PluginInvoked` and `AuditRotationHandoff` are declared in [`EventKind`]
+//! but not currently emitted by this crate; they are recognised by
+//! `audit verify` so future additions require no retroactive schema change.
+//! `WalletMlockFailed` is emitted by the CLI's secret-env signer ceremony
+//! (`stellar-agent-cli::common::signer_ceremony`) when `Wallet::unlock`
+//! degrades under `MlockRequired::Warn`.
 
 pub mod chain;
 pub mod entry;

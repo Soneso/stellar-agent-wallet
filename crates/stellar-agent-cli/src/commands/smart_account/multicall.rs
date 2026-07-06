@@ -54,6 +54,7 @@ use serde::{Deserialize, Serialize};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{AuthError, IoSource, ValidationError, WalletError};
 use stellar_agent_core::policy::v1::PolicyEngineV1;
+use stellar_agent_core::wallet::MlockDegradation;
 use stellar_agent_network::{ClassicFeeChoice, parse_classic_fee_choice};
 use stellar_agent_smart_account::ResolvedFeePerOp;
 use stellar_agent_smart_account::multicall::{
@@ -70,7 +71,9 @@ use crate::commands::smart_account::common::{
 use crate::common::network::TargetNetwork;
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
-use crate::common::signer_ceremony::resolve_software_signer_from_env;
+use crate::common::signer_ceremony::{
+    SignerCeremonyOutcome, record_mlock_degradation, resolve_software_signer_from_env,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -249,14 +252,14 @@ pub async fn run(args: &MulticallArgs) -> i32 {
     let profile_name = resolve_profile_name(args.profile.as_deref());
 
     // Resolve signer.
-    let signer = {
+    let (signer, mlock_degradation) = {
         let signer_flags = SignerSourceFlags {
             signer_secret_env: args.signer_secret_env.clone(),
             sign_with_ledger: args.sign_with_ledger,
             account_index: Some(args.account_index),
         };
         match resolve_signer(&signer_flags, Some(&profile_name)).await {
-            Ok(s) => s,
+            Ok(pair) => pair,
             Err(e) => {
                 render_json(&Envelope::<()>::err(&e));
                 return 1;
@@ -359,6 +362,15 @@ pub async fn run(args: &MulticallArgs) -> i32 {
     let profile = build_minimal_profile(args.network, secondary_rpc_url.clone());
 
     let request_id = Uuid::new_v4().to_string();
+
+    if let Some(writer) = &audit_writer {
+        record_mlock_degradation(
+            writer,
+            mlock_degradation.as_ref(),
+            &profile_name,
+            &request_id,
+        );
+    }
 
     let submit_args = MulticallSubmitArgs {
         smart_account: &args.smart_account,
@@ -570,11 +582,19 @@ fn build_minimal_profile(
 /// The `--signer-secret-env` path routes through the shared mlock-protected
 /// [`resolve_software_signer_from_env`] ceremony, applying `profile_name`'s
 /// `[wallet]` posture and TTL exactly like every other secret-env signer
-/// resolution in the CLI.
+/// resolution in the CLI. Returns any `mlock` degradation alongside the
+/// signer (`None` for the Ledger path); the caller records it via
+/// [`record_mlock_degradation`] once its audit writer is open.
 async fn resolve_signer(
     flags: &SignerSourceFlags,
     profile_name: Option<&str>,
-) -> Result<Box<dyn stellar_agent_network::Signer + Send + Sync>, WalletError> {
+) -> Result<
+    (
+        Box<dyn stellar_agent_network::Signer + Send + Sync>,
+        Option<MlockDegradation>,
+    ),
+    WalletError,
+> {
     if flags.sign_with_ledger {
         use stellar_agent_network::signing::hardware::HardwareSigningKey;
         let hw_key = HardwareSigningKey::native()
@@ -584,7 +604,7 @@ async fn resolve_signer(
                 })
             })?
             .with_account_index(flags.account_index.unwrap_or(0));
-        return Ok(Box::new(hw_key));
+        return Ok((Box::new(hw_key), None));
     }
 
     let var_name = flags.signer_secret_env.as_deref().ok_or_else(|| {
@@ -594,8 +614,11 @@ async fn resolve_signer(
                 .to_owned(),
         })
     })?;
-    let signer = resolve_software_signer_from_env(var_name, "multicall-cli", profile_name).await?;
-    Ok(Box::new(signer))
+    let SignerCeremonyOutcome {
+        signer,
+        mlock_degradation,
+    } = resolve_software_signer_from_env(var_name, "multicall-cli", profile_name).await?;
+    Ok((Box::new(signer), mlock_degradation))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

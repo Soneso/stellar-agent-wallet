@@ -75,7 +75,9 @@ use crate::commands::smart_account::common::{
 use crate::common::network::TargetNetwork;
 use crate::common::render::{render_json, sanitize_for_table};
 use crate::common::resolve_profile_name;
-use crate::common::signer_ceremony::resolve_software_signer_from_env;
+use crate::common::signer_ceremony::{
+    SignerCeremonyOutcome, record_mlock_degradation, resolve_software_signer_from_env,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -380,14 +382,17 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     // ── Rule-signer key ceremony (shared mlock ceremony) ─────────────────────
     // Funded-source verification is SKIPPED: a rule key has no on-chain
     // account.
-    let rule_signer = match resolve_software_signer_from_env(
+    let SignerCeremonyOutcome {
+        signer: rule_signer,
+        mlock_degradation: rule_signer_mlock_degradation,
+    } = match resolve_software_signer_from_env(
         &args.rule_signer_ed25519_secret_env,
         "smart-account-execute",
         Some(&profile_name),
     )
     .await
     {
-        Ok(s) => s,
+        Ok(o) => o,
         Err(e) => return emit_error(&e, args.output, &request_id),
     };
 
@@ -420,13 +425,14 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     }
 
     // ── Fee-payer signer ────────────────────────────────────────────────────
-    let fee_payer_signer = match resolve_signer(&args.signer_source, Some(&profile_name)).await {
-        Ok(s) => s,
-        Err(e) => {
-            drop(rule_signer);
-            return emit_error(&e, args.output, &request_id);
-        }
-    };
+    let (fee_payer_signer, fee_payer_mlock_degradation) =
+        match resolve_signer(&args.signer_source, Some(&profile_name)).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                drop(rule_signer);
+                return emit_error(&e, args.output, &request_id);
+            }
+        };
 
     let chain_id = network_to_chain_id(args.network);
     let auth_rule_ids_display: Vec<u32> = args.auth_rule_id.clone();
@@ -468,6 +474,21 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     let audit_writer = open_audit_writer(&profile_name)
         .map(|(writer, _path)| writer)
         .ok();
+
+    if let Some(writer) = &audit_writer {
+        record_mlock_degradation(
+            writer,
+            rule_signer_mlock_degradation.as_ref(),
+            &profile_name,
+            &request_id,
+        );
+        record_mlock_degradation(
+            writer,
+            fee_payer_mlock_degradation.as_ref(),
+            &profile_name,
+            &request_id,
+        );
+    }
 
     match submit_result {
         Ok(result) => {

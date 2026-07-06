@@ -53,7 +53,7 @@ use tracing::info;
 
 use crate::common::network::TargetNetwork;
 use crate::common::render::{render_json, sanitize_for_table};
-use crate::common::signer_ceremony::resolve_software_signer_from_env;
+use crate::common::signer_ceremony::{SignerCeremonyOutcome, resolve_software_signer_from_env};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -311,8 +311,13 @@ async fn resolve_deployer(
     // Shared mlock-protected secret-env ceremony: no `--profile` flag exists
     // on this verb, so the `[wallet]` posture falls back to
     // `MlockRequired::Warn` and the default unlock TTL.
-    let signer =
-        resolve_software_signer_from_env(var_name, "deploy-webauthn-verifier", None).await?;
+    // `--profile` has no effect on the `[wallet]` posture here: no
+    // audit-writer infrastructure exists on this verb, so a degraded
+    // unlock is surfaced only via `Wallet::unlock`'s own `tracing::warn!`.
+    let SignerCeremonyOutcome {
+        signer,
+        mlock_degradation: _,
+    } = resolve_software_signer_from_env(var_name, "deploy-webauthn-verifier", None).await?;
     let signer: Box<dyn stellar_agent_network::Signer + Send + Sync> = Box::new(signer);
 
     Ok(DeployerKeypair::SecretEnv {

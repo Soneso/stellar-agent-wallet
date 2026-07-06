@@ -18,10 +18,24 @@
 //! ceremony. Every CLI verb that resolves a signer from an env var routes
 //! through it, so the `[wallet]` profile controls and the zeroization
 //! discipline cannot drift between call sites.
+//!
+//! # `WalletMlockFailed` audit recording
+//!
+//! When `Wallet::unlock` degrades under `MlockRequired::Warn` (mlock
+//! unavailable), [`resolve_software_signer_from_env`] returns the details in
+//! [`SignerCeremonyOutcome::mlock_degradation`]. [`record_mlock_degradation`]
+//! writes the corresponding `WalletMlockFailed` audit-log entry at call
+//! sites that have an audit writer open; call sites with no audit-writer
+//! infrastructure rely on the `tracing::warn!` `Wallet::unlock` already
+//! emits (see each call site's own comment for which case applies).
 
+use std::sync::{Arc, Mutex};
+
+use stellar_agent_core::audit_log::entry::AuditEntry;
+use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::error::{AuthError, WalletError};
 use stellar_agent_core::profile::loader as profile_loader;
-use stellar_agent_core::wallet::{DEFAULT_TTL_SECONDS, MlockRequired, Wallet};
+use stellar_agent_core::wallet::{DEFAULT_TTL_SECONDS, MlockDegradation, MlockRequired, Wallet};
 use stellar_agent_network::SoftwareSigningKey;
 use stellar_agent_network::signing::wallet::signer_from_wallet;
 use zeroize::Zeroizing;
@@ -55,6 +69,20 @@ fn resolve_wallet_unlock_controls(profile_name: Option<&str>) -> (MlockRequired,
     }
 }
 
+/// Outcome of [`resolve_software_signer_from_env`]: the derived signer plus
+/// whether the mlock-protected unlock window degraded to unprotected memory.
+///
+/// `#[must_use]`: a call site that derives a signer without inspecting
+/// `mlock_degradation` silently drops the information needed to record a
+/// `WalletMlockFailed` audit-log entry via [`record_mlock_degradation`].
+#[must_use]
+pub(crate) struct SignerCeremonyOutcome {
+    /// The derived signing key.
+    pub(crate) signer: SoftwareSigningKey,
+    /// `Some` when `Wallet::unlock` degraded under `MlockRequired::Warn`.
+    pub(crate) mlock_degradation: Option<MlockDegradation>,
+}
+
 /// Derives a `SoftwareSigningKey` from the S-strkey stored in the
 /// environment variable named `var_name`, through the mlock-protected
 /// unlock ceremony described at module level.
@@ -80,7 +108,7 @@ pub(crate) async fn resolve_software_signer_from_env(
     var_name: &str,
     wallet_label: &str,
     profile_name: Option<&str>,
-) -> Result<SoftwareSigningKey, WalletError> {
+) -> Result<SignerCeremonyOutcome, WalletError> {
     let (mlock_required, ttl_seconds) = resolve_wallet_unlock_controls(profile_name);
 
     let s_strkey: Zeroizing<String> = Zeroizing::new(std::env::var(var_name).map_err(|_| {
@@ -106,6 +134,7 @@ pub(crate) async fn resolve_software_signer_from_env(
                 name: format!("Wallet::unlock failed: {e}"),
             })
         })?;
+    let mlock_degradation = wallet.mlock_degradation().cloned();
 
     let signer = match signer_from_wallet(&wallet) {
         Ok(s) => s,
@@ -115,7 +144,38 @@ pub(crate) async fn resolve_software_signer_from_env(
         }
     };
     wallet.dispose();
-    Ok(signer)
+    Ok(SignerCeremonyOutcome {
+        signer,
+        mlock_degradation,
+    })
+}
+
+/// Records a `WalletMlockFailed` audit-log entry when `degradation` is
+/// `Some`, using the caller's already-open audit writer.
+///
+/// No-op when `degradation` is `None`. Best-effort: an audit-writer lock
+/// failure is swallowed rather than failing the signing operation over an
+/// audit-log write, matching the `write_success_audit_rows` /
+/// `write_failure_audit_row` convention used elsewhere in the CLI.
+pub(crate) fn record_mlock_degradation(
+    audit_writer: &Arc<Mutex<AuditWriter>>,
+    degradation: Option<&MlockDegradation>,
+    profile_name: &str,
+    request_id: &str,
+) {
+    let Some(degradation) = degradation else {
+        return;
+    };
+    let Ok(mut writer) = audit_writer.lock() else {
+        return;
+    };
+    let entry = AuditEntry::new_mlock_failed(
+        profile_name.to_owned(),
+        degradation.reason.clone(),
+        degradation.errno,
+        request_id.to_owned(),
+    );
+    let _ = writer.write_entry(entry);
 }
 
 #[cfg(test)]
@@ -156,10 +216,18 @@ mod tests {
         unsafe {
             std::env::set_var(&var, &s_strkey);
         }
-        let signer = resolve_software_signer_from_env(&var, "unit-test", None)
+        let outcome = resolve_software_signer_from_env(&var, "unit-test", None)
             .await
             .expect("resolve must succeed");
-        let derived = signer.public_key().await.expect("public key must derive");
+        assert!(
+            outcome.mlock_degradation.is_none(),
+            "a real mlock success/opt-out must not report degradation"
+        );
+        let derived = outcome
+            .signer
+            .public_key()
+            .await
+            .expect("public key must derive");
         assert_eq!(derived.to_string().to_string(), expected_g);
         unsafe {
             std::env::remove_var(&var);
@@ -307,5 +375,97 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "TTL above MAX_TTL_SECONDS must be refused");
+    }
+
+    // ── mlock-degradation detection ─────────────────────────────────────────
+    //
+    // There is no test-only hook to force `region::lock` to fail
+    // deterministically (mlock.rs's own tests probe real mlock behaviour and
+    // accept either outcome, e.g. `warn_mode_succeeds_or_falls_back`).
+    // These tests instead pin the detection accessor's behaviour on the
+    // paths that ARE deterministic (opt-out via `MlockRequired::False`), and
+    // exercise `record_mlock_degradation` directly against a constructed
+    // `MlockDegradation` value for the recording half.
+
+    /// `Wallet::mlock_degradation` returns `None` under `MlockRequired::False`
+    /// (locking never attempted, not a degradation).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mlock_degradation_is_none_when_locking_is_opted_out() {
+        let seed_bytes = Zeroizing::new([0x44u8; 32]);
+        let mut wallet = Wallet::unlock(
+            "unit-test-mlock-false".to_owned(),
+            seed_bytes,
+            DEFAULT_TTL_SECONDS,
+            MlockRequired::False,
+        )
+        .await
+        .expect("unlock under MlockRequired::False must always succeed");
+        assert!(
+            wallet.mlock_degradation().is_none(),
+            "MlockRequired::False must never report degradation"
+        );
+        wallet.dispose();
+        // The accessor is a snapshot taken at construction time: it remains
+        // queryable (and still None) after dispose.
+        assert!(wallet.mlock_degradation().is_none());
+    }
+
+    /// `record_mlock_degradation` writes a `WalletMlockFailed` audit-log
+    /// entry carrying the supplied reason and errno when `degradation` is
+    /// `Some`.
+    #[test]
+    fn record_mlock_degradation_writes_the_expected_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit").join("test.jsonl");
+        let writer = AuditWriter::open(path.clone(), None).expect("open audit writer");
+        let audit_writer = Arc::new(Mutex::new(writer));
+
+        let degradation = MlockDegradation {
+            reason: "ENOMEM".to_owned(),
+            errno: Some(12),
+        };
+        record_mlock_degradation(
+            &audit_writer,
+            Some(&degradation),
+            "test-profile",
+            "req-mlock-degraded",
+        );
+
+        let contents = std::fs::read_to_string(&path).expect("read audit log");
+        assert_eq!(
+            contents.lines().count(),
+            1,
+            "exactly one audit row must be written; got: {contents}"
+        );
+        assert!(
+            contents.contains("\"wallet_mlock_failed\""),
+            "row must carry the WalletMlockFailed event-kind tag; got: {contents}"
+        );
+        assert!(
+            contents.contains("ENOMEM") && contents.contains("test-profile"),
+            "row must carry the reason and profile fields; got: {contents}"
+        );
+        assert!(
+            contents.contains("req-mlock-degraded"),
+            "row must carry the request_id; got: {contents}"
+        );
+    }
+
+    /// `record_mlock_degradation` is a no-op when `degradation` is `None` —
+    /// the common case (no mlock failure to report).
+    #[test]
+    fn record_mlock_degradation_is_a_noop_when_not_degraded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit").join("test.jsonl");
+        let writer = AuditWriter::open(path.clone(), None).expect("open audit writer");
+        let audit_writer = Arc::new(Mutex::new(writer));
+
+        record_mlock_degradation(&audit_writer, None, "test-profile", "req-not-degraded");
+
+        let contents = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            contents.is_empty(),
+            "no row must be written when degradation is None; got: {contents}"
+        );
     }
 }

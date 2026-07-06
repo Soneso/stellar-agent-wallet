@@ -64,7 +64,7 @@ use stellar_agent_network::{
 
 use crate::common::network::TargetNetwork;
 use crate::common::render::{render_json, sanitize_for_table};
-use crate::common::signer_ceremony::resolve_software_signer_from_env;
+use crate::common::signer_ceremony::{SignerCeremonyOutcome, resolve_software_signer_from_env};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -464,8 +464,12 @@ async fn sign_envelope(args: &ClaimArgs, unsigned_xdr: &str) -> Result<String, W
 
     if let Some(ref var_name) = args.secret_env {
         // mlock-protected signing window (shared ceremony, identical
-        // discipline to `pay`).
-        let signer = resolve_software_signer_from_env(var_name, "claim-commit", None).await?;
+        // discipline to `pay`). `claim` has no audit-writer infrastructure
+        // either; see `pay::sign_envelope` for the same rationale.
+        let SignerCeremonyOutcome {
+            signer,
+            mlock_degradation: _,
+        } = resolve_software_signer_from_env(var_name, "claim-commit", None).await?;
 
         // Public-key verification before signing.
         let signer_pk = signer.public_key().await?;
