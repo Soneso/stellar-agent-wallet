@@ -474,12 +474,36 @@ pub struct CreateArgs {
           num_args = 1.., action = clap::ArgAction::Append)]
     pub signer_webauthn: Vec<String>,
 
-    /// Acknowledge that this rule has no delegated (ed25519) fallback signer
-    /// and the passkey authenticator device is the sole signing authority.
+    /// One or more 64-hex-character raw Ed25519 public keys (one per
+    /// `--signer-ed25519`; flag is repeatable). Each decodes to exactly 32
+    /// bytes and encodes as OZ `Signer::External(verifier, key_data)` — the
+    /// same on-chain shape `smart-account signers add --signer-ed25519` uses.
     ///
-    /// Required when `--signer-webauthn` entries are provided and no
-    /// `--signer-delegated` entries are present (passkey-only refusal). If
-    /// omitted, the command is refused with
+    /// The verifier contract address resolves from `--verifier` when
+    /// supplied, else from the `VerifierRegistry`'s registered Ed25519
+    /// verifier for the target network (deploy one via `smart-account
+    /// deploy-ed25519-verifier`).
+    #[arg(long = "signer-ed25519", value_name = "HEX_PUBKEY_64",
+          num_args = 1.., action = clap::ArgAction::Append)]
+    pub signer_ed25519: Vec<String>,
+
+    /// Ed25519-verifier contract C-strkey override for `--signer-ed25519`.
+    ///
+    /// Only meaningful with `--signer-ed25519`.
+    #[arg(
+        long = "verifier",
+        value_name = "C_STRKEY",
+        requires = "signer_ed25519"
+    )]
+    pub verifier: Option<String>,
+
+    /// Acknowledge that this rule has no delegated (ed25519 G-key) fallback
+    /// signer and an External-shaped signer (passkey or first-class Ed25519)
+    /// is the sole signing authority.
+    ///
+    /// Required when `--signer-webauthn` and/or `--signer-ed25519` entries
+    /// are provided and no `--signer-delegated` entries are present
+    /// (External-only refusal). If omitted, the command is refused with
     /// `validation.passkey_only_rule_no_delegated_fallback`.
     #[arg(long)]
     pub accept_no_delegated_fallback: bool,
@@ -551,12 +575,14 @@ pub struct CreateResult {
     pub rule_id: u32,
     /// Operator-facing rule name.
     pub name: String,
-    /// Total number of signers attached (delegated + external/WebAuthn combined).
+    /// Total number of signers attached (delegated + WebAuthn + Ed25519 combined).
     pub signers_count: u32,
-    /// Number of delegated (ed25519) signers attached.
+    /// Number of delegated (ed25519 G-key) signers attached.
     pub signer_delegated_count: u32,
     /// Number of WebAuthn passkey (External) signers attached.
     pub signer_webauthn_count: u32,
+    /// Number of first-class Ed25519 (External) signers attached.
+    pub signer_ed25519_count: u32,
     /// Optional ledger expiry, `null` for permanent rules.
     pub valid_until: Option<u32>,
     /// First-8-hex of each pinned verifier wasm hash (one per distinct
@@ -587,10 +613,14 @@ async fn create_run(args: &CreateArgs) -> i32 {
     }
 
     // Require at least one signer of any kind.
-    if args.signer_delegated.is_empty() && args.signer_webauthn.is_empty() {
+    if args.signer_delegated.is_empty()
+        && args.signer_webauthn.is_empty()
+        && args.signer_ed25519.is_empty()
+    {
         return emit_error(
             &WalletError::Validation(ValidationError::AddressInvalid {
-                input: "at least one of --signer-delegated or --signer-webauthn is required"
+                input: "at least one of --signer-delegated, --signer-webauthn, or \
+                        --signer-ed25519 is required"
                     .to_owned(),
             }),
             args.common.output,
@@ -598,12 +628,14 @@ async fn create_run(args: &CreateArgs) -> i32 {
         );
     }
 
-    // Refuse a passkey-only rule without explicit acknowledgement: if ALL
-    // signers are WebAuthn (no delegated fallback), the operator must pass
-    // --accept-no-delegated-fallback to acknowledge that a lost authenticator
-    // device leaves the rule permanently inaccessible.
+    // Refuse an External-only rule without explicit acknowledgement: if ALL
+    // signers are WebAuthn and/or first-class Ed25519 (no delegated
+    // fallback), the operator must pass --accept-no-delegated-fallback to
+    // acknowledge that a lost authenticator device or rule seed leaves the
+    // rule permanently inaccessible.
+    let external_signer_count = args.signer_webauthn.len() + args.signer_ed25519.len();
     if args.signer_delegated.is_empty()
-        && !args.signer_webauthn.is_empty()
+        && external_signer_count > 0
         && !args.accept_no_delegated_fallback
     {
         // Print a stderr warning banner before the JSON refusal.
@@ -614,10 +646,12 @@ async fn create_run(args: &CreateArgs) -> i32 {
         {
             eprintln!();
             eprintln!(
-                "WARNING: passkey-only context rule — no delegated (ed25519) fallback signer."
+                "WARNING: External-only context rule — no delegated (ed25519 G-key) fallback \
+                 signer."
             );
             eprintln!(
-                "  If the authenticator device is lost, this rule will be permanently inaccessible."
+                "  If the authenticator device or rule seed is lost, this rule will be \
+                 permanently inaccessible."
             );
             eprintln!(
                 "  To acknowledge this risk and proceed, add: --accept-no-delegated-fallback"
@@ -626,7 +660,7 @@ async fn create_run(args: &CreateArgs) -> i32 {
         }
         return emit_error(
             &WalletError::Validation(ValidationError::PasskeyOnlyRuleNoDelegatedFallback {
-                credential_count: args.signer_webauthn.len(),
+                credential_count: external_signer_count,
             }),
             args.common.output,
             &request_id,
@@ -634,12 +668,13 @@ async fn create_run(args: &CreateArgs) -> i32 {
     }
 
     // Pre-simulate signer-cap check: count the combined total of delegated +
-    // webauthn signers BEFORE any network call and refuse fail-CLOSED when the
-    // total exceeds OZ_MAX_SIGNERS. The on-chain enforcement
-    // (`TooManySigners = 3010`) is the authoritative last-line defence; this
-    // check gives the operator an actionable error with the rule-rotation
-    // alternative before the simulate/submit cycle is reached.
-    let signer_total = args.signer_delegated.len() + args.signer_webauthn.len();
+    // webauthn + ed25519 signers BEFORE any network call and refuse
+    // fail-CLOSED when the total exceeds OZ_MAX_SIGNERS. The on-chain
+    // enforcement (`TooManySigners = 3010`) is the authoritative last-line
+    // defence; this check gives the operator an actionable error with the
+    // rule-rotation alternative before the simulate/submit cycle is reached.
+    let signer_total =
+        args.signer_delegated.len() + args.signer_webauthn.len() + args.signer_ed25519.len();
     if let Err(e) = enforce_signer_cap(signer_total) {
         return emit_error(&WalletError::Validation(e), args.common.output, &request_id);
     }
@@ -839,6 +874,84 @@ async fn create_run(args: &CreateArgs) -> i32 {
         }
     }
 
+    // Resolve first-class Ed25519 signers -> External entries.
+    //
+    // Encoded the same on-chain shape as `smart-account signers add
+    // --signer-ed25519`: OZ `Signer::External(verifier, key_data)` where
+    // `key_data` is the raw 32-byte public key.
+    let ed25519_count = args.signer_ed25519.len() as u32;
+    if !args.signer_ed25519.is_empty() {
+        let ed25519_verifier_c_strkey = if let Some(explicit) = &args.verifier {
+            explicit.clone()
+        } else {
+            let verifier_registry = match VerifierRegistry::open() {
+                Ok(r) => r,
+                Err(e) => {
+                    return emit_error(
+                        &WalletError::Validation(ValidationError::AddressInvalid {
+                            input: format!("could not open verifier registry: {e}"),
+                        }),
+                        args.common.output,
+                        &request_id,
+                    );
+                }
+            };
+            let network_passphrase = args.common.network.passphrase();
+            match verifier_registry.ed25519_verifier_for(network_passphrase) {
+                Some(entry) => entry.address.clone(),
+                None => {
+                    return emit_error(
+                        &WalletError::Validation(ValidationError::AddressInvalid {
+                            input: format!(
+                                "no Ed25519 verifier registered for network \
+                                 '{network_passphrase}'; run: \
+                                 smart-account deploy-ed25519-verifier (or pass --verifier)"
+                            ),
+                        }),
+                        args.common.output,
+                        &request_id,
+                    );
+                }
+            }
+        };
+        let ed25519_verifier_sc_addr = match parse_c_strkey(&ed25519_verifier_c_strkey) {
+            Ok(addr) => addr,
+            Err(e) => return emit_error(&e, args.common.output, &request_id),
+        };
+
+        for hex_pubkey in &args.signer_ed25519 {
+            let key_data = match hex::decode(hex_pubkey) {
+                Ok(b) => b,
+                Err(e) => {
+                    return emit_error(
+                        &WalletError::Validation(ValidationError::AddressInvalid {
+                            input: format!("--signer-ed25519 is not valid hex: {e}"),
+                        }),
+                        args.common.output,
+                        &request_id,
+                    );
+                }
+            };
+            if key_data.len() != 32 {
+                return emit_error(
+                    &WalletError::Validation(ValidationError::AddressInvalid {
+                        input: format!(
+                            "--signer-ed25519 must decode to exactly 32 bytes (a raw Ed25519 \
+                             public key), got {} bytes",
+                            key_data.len()
+                        ),
+                    }),
+                    args.common.output,
+                    &request_id,
+                );
+            }
+            signers.push(ContextRuleSignerInput::External {
+                verifier: ed25519_verifier_sc_addr.clone(),
+                pubkey_data: key_data,
+            });
+        }
+    }
+
     let valid_until = match parse_valid_until(&args.valid_until) {
         Ok(v) => v,
         Err(e) => return emit_error(&e, args.common.output, &request_id),
@@ -905,6 +1018,7 @@ async fn create_run(args: &CreateArgs) -> i32 {
                 signers_count,
                 signer_delegated_count = delegated_count,
                 signer_webauthn_count = webauthn_count,
+                signer_ed25519_count = ed25519_count,
                 mutable_override = pin_result.mutable_override,
                 unknown_override = pin_result.unknown_override,
                 "smart-account rules create: installed",
@@ -916,6 +1030,7 @@ async fn create_run(args: &CreateArgs) -> i32 {
                 signers_count,
                 signer_delegated_count: delegated_count,
                 signer_webauthn_count: webauthn_count,
+                signer_ed25519_count: ed25519_count,
                 valid_until,
                 pinned_verifier_wasm_hashes_first8,
                 pinned_policy_wasm_hashes_first8,
@@ -3272,9 +3387,10 @@ mod tests {
             smart_account: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
             rule_id: 7,
             name: "mixed-signers".to_owned(),
-            signers_count: 2,
+            signers_count: 3,
             signer_delegated_count: 1,
             signer_webauthn_count: 1,
+            signer_ed25519_count: 1,
             valid_until: None,
             pinned_verifier_wasm_hashes_first8: vec![],
             pinned_policy_wasm_hashes_first8: vec![],
@@ -3287,7 +3403,9 @@ mod tests {
 
         assert_eq!(
             round_trip.signers_count,
-            round_trip.signer_delegated_count + round_trip.signer_webauthn_count
+            round_trip.signer_delegated_count
+                + round_trip.signer_webauthn_count
+                + round_trip.signer_ed25519_count
         );
     }
 
@@ -3373,6 +3491,58 @@ mod tests {
         assert_eq!(total, 16);
         enforce_signer_cap(total)
             .expect_err("enforce_signer_cap must return Err for 16 webauthn signers");
+    }
+
+    /// `--signer-ed25519` is repeatable and order-preserving; `--verifier`
+    /// pairs with it as an optional override.
+    #[test]
+    fn create_args_signer_ed25519_repeatable_parses() {
+        let pk_a = "11".repeat(32);
+        let pk_b = "22".repeat(32);
+        let parsed = CreateArgsHarness::parse_from([
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--name",
+            "ed25519-signers",
+            "--signer-ed25519",
+            &pk_a,
+            "--signer-ed25519",
+            &pk_b,
+            "--verifier",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--accept-no-delegated-fallback",
+            "--signer-secret-env",
+            "__STELLAR_AGENT_RULES_TEST_DUMMY_VAR",
+        ]);
+        assert_eq!(parsed.args.signer_ed25519, vec![pk_a, pk_b]);
+        assert!(parsed.args.verifier.is_some());
+    }
+
+    /// 16 `--signer-ed25519` args exceed OZ_MAX_SIGNERS.
+    #[test]
+    fn create_16_ed25519_signers_exceeds_cap() {
+        let mut argv = vec![
+            "test".to_owned(),
+            "--account".to_owned(),
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+            "--name".to_owned(),
+            "capped-rule-ed25519".to_owned(),
+            "--accept-no-delegated-fallback".to_owned(),
+            "--signer-secret-env".to_owned(),
+            "__STELLAR_AGENT_RULES_TEST_DUMMY_VAR".to_owned(),
+        ];
+        for i in 0..16_u32 {
+            argv.push("--signer-ed25519".to_owned());
+            argv.push(format!("{i:02x}").repeat(32));
+        }
+        let parsed = CreateArgsHarness::parse_from(argv);
+        let total = parsed.args.signer_delegated.len()
+            + parsed.args.signer_webauthn.len()
+            + parsed.args.signer_ed25519.len();
+        assert_eq!(total, 16);
+        enforce_signer_cap(total)
+            .expect_err("enforce_signer_cap must return Err for 16 ed25519 signers");
     }
 
     /// Mixed 8 delegated + 8 webauthn = 16 total exceeds cap.

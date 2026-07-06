@@ -43,6 +43,9 @@
 //!   the multicall router registry entry for a network.
 //! - [`timelock`] — `smart-account timelock` subcommand group: schedule,
 //!   cancel, execute, and list-pending OZ upgrade-timelock operations.
+//! - [`execute`] — `smart-account execute` — submit one `CallContract`
+//!   invocation against an external contract, authorized by a named context
+//!   rule and signed by an External-Ed25519 rule signer.
 //!
 //! # Dispatch
 //!
@@ -59,6 +62,7 @@ pub mod deploy_ed25519_verifier;
 pub mod deploy_policy;
 pub mod deploy_spending_limit_policy;
 pub mod deploy_webauthn_verifier;
+pub mod execute;
 pub mod list_rules;
 pub mod list_verifiers;
 pub mod migrate_verifier;
@@ -317,6 +321,23 @@ pub enum SmartAccountSubcommand {
     /// or EXECUTOR) for write operations. `list-pending` is read-only.
     #[command(name = "timelock")]
     Timelock(Box<timelock::TimelockArgs>),
+
+    /// Submit one `CallContract` invocation against an external contract,
+    /// authorised by a named context rule and signed by an
+    /// External-Ed25519 rule signer.
+    ///
+    /// Two distinct signers participate: `--rule-signer-ed25519-secret-env`
+    /// (the agent's rule key, which authorises the call) and
+    /// `--signer-secret-env` / `--sign-with-ledger` (the funded fee-payer
+    /// that pays the transaction fee and signs the envelope).
+    ///
+    /// `--auth-rule-id` has NO default and is required — the delegation use
+    /// case always names a non-zero `CallContract` rule.
+    ///
+    /// Mainnet is structurally refused. Empty function name, malformed
+    /// `--arg` XDR, and an unresolvable Ed25519 verifier all refuse
+    /// client-side before any RPC call or key-material access.
+    Execute(Box<execute::ExecuteArgs>),
 }
 
 /// Runs the `smart-account` subcommand group.
@@ -355,5 +376,6 @@ pub async fn run(args: &SmartAccountArgs) -> i32 {
         SmartAccountSubcommand::RegisterMulticall(args) => register_multicall::run(args).await,
         SmartAccountSubcommand::UnregisterMulticall(args) => unregister_multicall::run(args).await,
         SmartAccountSubcommand::Timelock(args) => timelock::run(args).await,
+        SmartAccountSubcommand::Execute(args) => execute::run(args).await,
     }
 }

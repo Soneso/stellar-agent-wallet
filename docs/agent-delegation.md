@@ -146,11 +146,68 @@ rule's context type is not `call-contract` — a spending limit is only
 meaningful against a scoped contract, and the OpenZeppelin policy contract
 itself rejects both conditions the same way.
 
+## Submitting an agent-signed call
+
+Everything above sets the delegation UP; `smart-account execute` is how the
+agent's key actually SUBMITS a call under it. The agent process holds only
+its own ed25519 seed — it never touches the operator's wallet key — and
+`execute` is the one CLI verb built for that shape: it signs the smart-account
+auth digest with the agent's External-Ed25519 key while a separate,
+funded key pays the transaction fee and signs the envelope.
+
+```bash
+stellar-agent smart-account execute \
+  --account CABC...WXYZ \
+  --contract CTOK...WXYZ \
+  --function transfer \
+  --arg <base64-xdr-ScVal:Address(smart_account)> \
+  --arg <base64-xdr-ScVal:Address(recipient)> \
+  --arg <base64-xdr-ScVal:I128(amount)> \
+  --auth-rule-id <RULE_ID> \
+  --rule-signer-ed25519-secret-env AGENT_SK \
+  --signer-secret-env FEE_PAYER_SK
+```
+
+- `--account` is the smart account whose rule authorizes the call;
+  `--contract` is the external contract being invoked (here, the SEP-41
+  token from step 3) — for most delegated calls these are different
+  addresses.
+- `--arg` takes one standard-base64 XDR `ScVal` per contract argument,
+  repeated in order. Encode each argument with the `stellar-xdr` MCP tools
+  or `stellar-xdr encode`; the wallet validates well-formedness client-side
+  but never re-encodes the value.
+- `--auth-rule-id` has NO default on this verb — unlike every other
+  smart-account write command, it must always be given explicitly. A
+  delegated agent call always names a specific scoped rule; defaulting to
+  the account-wide bootstrap rule would either succeed against the wrong
+  authority or fail on-chain in a way that hides the real mistake.
+- `--rule-signer-ed25519-secret-env` names the environment variable holding
+  the agent's S-strkey seed — never the operator's wallet key. Add
+  `--expect-rule-signer <64_HEX>` to fail closed, before any signing, if the
+  environment variable ever resolves to the wrong key.
+- `--verifier` is optional, resolving from the registered Ed25519 verifier
+  (step 1) when omitted, the same as `signers add --signer-ed25519`.
+- `--signer-secret-env` / `--sign-with-ledger` is the ordinary fee-payer
+  signer group used by every other smart-account write verb: a funded
+  source account that pays the transaction fee and signs the envelope. It
+  is deliberately a different key from the rule signer — the agent's key
+  never needs its own funded classic account.
+
+A call that clears the rule's scope and the spending cap returns
+`status: "submitted"` with the confirmed `tx_hash`. A call that does not —
+over budget, wrong contract, expired rule — surfaces the same typed
+on-chain error every other smart-account write verb renders (see below).
+
+There is currently no MCP tool for this verb; see
+[MCP: why there is no agent-facing execute tool](mcp.md#why-there-is-no-agent-facing-execute-tool)
+for the reasoning and what would change it.
+
 ## What the agent can and cannot do
 
 With the rule and policy in place, the agent — holding only its own ed25519
-seed — can authorize `transfer(smart_account, recipient, amount)` calls on
-the one contract the rule names, up to the spending cap, and nothing else:
+seed, submitting via `smart-account execute` as shown above — can authorize
+`transfer(smart_account, recipient, amount)` calls on the one contract the
+rule names, up to the spending cap, and nothing else:
 
 - **A call to the scoped contract, under budget** succeeds on-chain, the
   same as any other smart-account operation.

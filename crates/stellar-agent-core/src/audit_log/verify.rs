@@ -690,6 +690,10 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
                 // No rotation-handoff tracking needed; the hash-chain is
                 // maintained by the surrounding hash check.
             }
+            EventKind::SaExternalExecuteSubmitted { .. } => {
+                // No rotation-handoff tracking needed; the hash-chain is
+                // maintained by the surrounding hash check.
+            }
             EventKind::ChannelPoolInitialised { .. }
             | EventKind::ChannelAcquired { .. }
             | EventKind::ChannelReleased { .. } => {
@@ -1227,6 +1231,7 @@ mod tests {
             EventKind::SaTimelockDivergencePostSubmit { .. } => {
                 "sa_timelock_divergence_post_submit"
             }
+            EventKind::SaExternalExecuteSubmitted { .. } => "sa_external_execute_submitted",
             EventKind::SaContextRuleNameUpdated { .. } => "sa_context_rule_name_updated",
             EventKind::SaContextRuleValidUntilUpdated { .. } => {
                 "sa_context_rule_valid_until_updated"
@@ -1545,6 +1550,16 @@ mod tests {
                 secondary_present: false,
                 audit_request_id: "00000000-0000-0000-0000-000000000004".to_owned(),
             },
+            EventKind::SaExternalExecuteSubmitted {
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CDABC...12345"),
+                target_contract: "CTOKE...ZZZZZ".to_owned(),
+                function: "transfer".to_owned(),
+                arg_count: 3,
+                auth_rule_ids: vec![1],
+                rule_signer_pubkey_first8: "aabb1122".to_owned(),
+                verifier_address: "CVERI...WWWWW".to_owned(),
+                transaction_hash_redacted: "aabb1122...ccdd3344".to_owned(),
+            },
             EventKind::SubmissionAuthMismatch {
                 smart_account: "CDABC...12345".to_owned(),
                 expected_count: 2,
@@ -1813,6 +1828,7 @@ mod tests {
                 "sa_timelock_cancelled",
                 "sa_timelock_executed",
                 "sa_timelock_divergence_post_submit",
+                "sa_external_execute_submitted",
                 "submission_auth_mismatch",
                 "sa_context_rule_name_updated",
                 "sa_context_rule_valid_until_updated",

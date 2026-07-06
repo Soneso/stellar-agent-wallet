@@ -43,7 +43,7 @@ A context rule has a `rule_id` (`u32`), a name (OZ cap: 20 bytes), an optional e
 
 | Verb | Purpose | Key flags | Notes |
 |------|---------|-----------|-------|
-| `create` | Install a rule (OZ `add_context_rule`); returns new `rule_id` | `--account` (req), `--name` (req), `--context <SPEC>` (default `default`), `--signer-delegated <G>` (repeatable), `--signer-webauthn <CRED>` (repeatable), `--accept-no-delegated-fallback`, `--accept-mutable-verifier`, `--accept-unknown-verifier`, `--auth-rule-id` (repeatable, default `[0]`), `--valid-until <LEDGER\|none>` (default `none`) | Testnet only. At least one `--signer-delegated` or `--signer-webauthn` required. `--context` scopes the rule: `default` matches any invocation, `call-contract:<C>` scopes it to one contract, `create-contract:<64_HEX_WASM_HASH>` scopes it to deploying one wasm hash. Malformed specs refuse before any network call. |
+| `create` | Install a rule (OZ `add_context_rule`); returns new `rule_id` | `--account` (req), `--name` (req), `--context <SPEC>` (default `default`), `--signer-delegated <G>` (repeatable), `--signer-webauthn <CRED>` (repeatable), `--signer-ed25519 <HEX_PUBKEY_64>` (repeatable, opt `--verifier <C>` override), `--accept-no-delegated-fallback`, `--accept-mutable-verifier`, `--accept-unknown-verifier`, `--auth-rule-id` (repeatable, default `[0]`), `--valid-until <LEDGER\|none>` (default `none`) | Testnet only. At least one `--signer-delegated`, `--signer-webauthn`, or `--signer-ed25519` required. `--context` scopes the rule: `default` matches any invocation, `call-contract:<C>` scopes it to one contract, `create-contract:<64_HEX_WASM_HASH>` scopes it to deploying one wasm hash. Malformed specs refuse before any network call. |
 | `get` | Read one rule (OZ `get_context_rule`) | `--account` (req), `--rule-id` (req), `--source-account <G>` (req) | Read-only, mainnet OK. Source account is for simulation only, not debited. Envelope: `present: true\|false`. |
 | `set-name` | Rename (OZ `update_context_rule_name`) | `--account`, `--rule-id`, `--name` (all req), `--auth-rule-id` (opt, default `--rule-id`) | Testnet only. 20-byte name cap. |
 | `set-valid-until` | Change expiry (OZ `update_context_rule_valid_until`) | `--account`, `--rule-id`, `--valid-until <LEDGER\|none>` (all req), `--auth-rule-id` (opt) | Testnet only. `none` clears expiry (permanent rule). |
@@ -240,6 +240,36 @@ stellar-agent smart-account timelock cancel \
   --timelock CTLCK...WXYZ \
   --operation-id abcdef01...89abcdef \
   --signer-secret-env CANCELLER_SK
+```
+
+## Agent-signed execute
+
+`smart-account execute` submits one `CallContract` invocation against an external contract, authorized by a named context rule and signed by an External-Ed25519 rule signer — the CLI surface for the agent-delegation flow (see `agent-delegation.md`). Testnet only; structurally refuses `mainnet` before any RPC call or key-material access. No MCP tool equivalent exists (see `mcp.md`'s "why there is no agent-facing execute tool" — the typed-tool consent model has no meaningful preview for an arbitrary-invocation verb).
+
+Two distinct signers: `--rule-signer-ed25519-secret-env <VAR>` (req) is the agent's own key that authorizes the call (full mlock ceremony; no funded account needed); the ordinary signer-source group (`--signer-secret-env` / `--sign-with-ledger`) is the fee-payer that pays the transaction fee and signs the envelope.
+
+| Flag | Required | Notes |
+|------|----------|-------|
+| `--account <C>` | yes | Smart account whose rule authorizes the call (`auth_address`). |
+| `--contract <C>` | yes | External target contract (`target_contract`); usually different from `--account`. |
+| `--function <NAME>` | yes | Contract function to invoke. |
+| `--arg <SCVAL_BASE64>` | no, repeatable | One standard-base64 XDR `ScVal` per argument, in order. Bounded-decoded to validate only; never re-encoded. A malformed value names the failing index. |
+| `--auth-rule-id <U32>` | yes, repeatable | NO default (deviation from every other write verb) — the delegation use case always names a specific scoped rule. |
+| `--rule-signer-ed25519-secret-env <VAR>` | yes | The agent's S-strkey seed env var. |
+| `--expect-rule-signer <64_HEX>` | no | Fail closed before signing if the derived pubkey differs. |
+| `--verifier <C>` | no | Ed25519-verifier override; else resolves from the registry (`smart-account deploy-ed25519-verifier`). |
+
+Success envelope: `status: "submitted"`, `contract`, `function`, `arg_count`, `auth_rule_ids`, `rule_signer_pubkey_first8`, `verifier_address`, `tx_hash`. On-chain refusals render the same typed `SaError` wire codes and OZ annotations (`[OZ:SpendingLimitExceeded]`, `[OZ:UnvalidatedContext]`, etc.) every other smart-account write verb uses.
+
+```bash
+stellar-agent smart-account execute \
+  --account CABC...WXYZ \
+  --contract CTOK...WXYZ \
+  --function transfer \
+  --arg AAAAEgAAAAA... --arg AAAAEgAAAAA... --arg AAAACgAAAAA... \
+  --auth-rule-id 3 \
+  --rule-signer-ed25519-secret-env AGENT_SK \
+  --signer-secret-env WALLET_SK
 ```
 
 ## External-contract submit convention

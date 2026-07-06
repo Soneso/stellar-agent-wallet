@@ -1799,6 +1799,56 @@ impl AuditEntry {
         }
     }
 
+    /// Constructs a `SaExternalExecuteSubmitted` audit entry.
+    ///
+    /// Emitted by `smart-account execute` after a successful
+    /// `submit_signed_invoke` call whose signing path used an
+    /// External-Ed25519 rule signer. Callers pre-redact
+    /// `smart_account_redacted` (first-5-last-5) and
+    /// `transaction_hash_redacted` (first-8-last-8) before calling this
+    /// constructor.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the field set of the domain event"
+    )]
+    pub fn new_sa_external_execute_submitted(
+        smart_account_redacted: impl Into<RedactedStrkey>,
+        target_contract: impl Into<String>,
+        function: impl Into<String>,
+        arg_count: u32,
+        auth_rule_ids: Vec<u32>,
+        rule_signer_pubkey_first8: impl Into<String>,
+        verifier_address: impl Into<String>,
+        transaction_hash_redacted: impl Into<String>,
+        chain_id: impl IntoOptionalChainId,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "sa.external_execute_submitted".to_owned(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::SaExternalExecuteSubmitted {
+                smart_account_redacted: smart_account_redacted.into(),
+                target_contract: target_contract.into(),
+                function: function.into(),
+                arg_count,
+                auth_rule_ids,
+                rule_signer_pubkey_first8: rule_signer_pubkey_first8.into(),
+                verifier_address: verifier_address.into(),
+                transaction_hash_redacted: transaction_hash_redacted.into(),
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
     /// Constructs a `SaMulticallInnerExecuted` audit entry.
     ///
     /// Emitted once per inner invocation, immediately after

@@ -278,7 +278,7 @@ Each rule has a `rule_id` (u32), a name (OZ cap 20 bytes), an optional expiry le
 
 | Verb | Purpose | Key flags (plus `--account <C_STRKEY>` required everywhere, signer source on write verbs) |
 |---|---|---|
-| `create` | Install a new rule (`add_context_rule`); returns minted `rule_id` | `--name <STRING>` (required); `--context <SPEC>` (default `default`; `call-contract:<C_STRKEY>` or `create-contract:<64_HEX_WASM_HASH>` scope the rule); `--signer-delegated <G_STRKEY>` (repeatable); `--signer-webauthn <CRED_NAME>` (repeatable); `--accept-no-delegated-fallback`; `--accept-mutable-verifier`; `--accept-unknown-verifier`; `--auth-rule-id <U32>`; `--valid-until <LEDGER\|none>` (default `none`). At least one signer required. |
+| `create` | Install a new rule (`add_context_rule`); returns minted `rule_id` | `--name <STRING>` (required); `--context <SPEC>` (default `default`; `call-contract:<C_STRKEY>` or `create-contract:<64_HEX_WASM_HASH>` scope the rule); `--signer-delegated <G_STRKEY>` (repeatable); `--signer-webauthn <CRED_NAME>` (repeatable); `--signer-ed25519 <HEX_PUBKEY_64>` (repeatable, optional `--verifier <C_STRKEY>` override); `--accept-no-delegated-fallback`; `--accept-mutable-verifier`; `--accept-unknown-verifier`; `--auth-rule-id <U32>`; `--valid-until <LEDGER\|none>` (default `none`). At least one signer required. |
 | `get` | Read one rule (`get_context_rule`); read-only, `mainnet` ok | `--rule-id <U32>` (required); `--source-account <G_STRKEY>` (required, simulation only, not debited/signed) |
 | `set-name` | Rename a rule (`update_context_rule_name`) | `--rule-id <U32>`; `--name <STRING>`; `--auth-rule-id` (optional) |
 | `set-valid-until` | Change expiry (`update_context_rule_valid_until`) | `--rule-id <U32>`; `--valid-until <LEDGER\|none>` (required) |
@@ -313,6 +313,31 @@ All verbs take `--account <C_STRKEY>` and `--rule-id <U32>` (both required), the
 ```bash
 stellar-agent smart-account signers set-threshold --account CABC...WXYZ \
   --rule-id 0 --new-threshold 2 --signer-secret-env WALLET_SK
+```
+
+### `smart-account execute`
+
+Submits one `CallContract` invocation against an external contract, authorized by a named context rule and signed by an External-Ed25519 rule signer — the delegation-submission verb (see `agent-delegation.md`). Testnet only; refuses `mainnet` before any RPC call or key access. No MCP equivalent (arbitrary-invocation tools have no meaningful consent preview).
+
+Two signers: `--rule-signer-ed25519-secret-env <VAR>` (required) is the agent's own key that authorizes the call; the ordinary signer source (`--signer-secret-env` / `--sign-with-ledger`) is the fee-payer.
+
+| Flag | Meaning |
+|---|---|
+| `--account <C_STRKEY>` (required) | Smart account whose rule authorizes the call (`auth_address`) |
+| `--contract <C_STRKEY>` (required) | External target contract (`target_contract`) |
+| `--function <NAME>` (required) | Contract function to invoke |
+| `--arg <SCVAL_BASE64>` (repeatable) | One standard-base64 XDR `ScVal` per argument, in order; bounded-decoded to validate only, never re-encoded |
+| `--auth-rule-id <U32>` (required, repeatable) | NO default — deviates from every other write verb; the delegation use case always names a specific scoped rule |
+| `--rule-signer-ed25519-secret-env <VAR>` (required) | Agent's S-strkey seed env var |
+| `--expect-rule-signer <64_HEX>` | Fail closed before signing if the derived pubkey differs |
+| `--verifier <C_STRKEY>` | Ed25519-verifier override; else resolves from the registry |
+
+Success envelope: `status: "submitted"`, `contract`, `function`, `arg_count`, `auth_rule_ids`, `rule_signer_pubkey_first8`, `verifier_address`, `tx_hash`.
+
+```bash
+stellar-agent smart-account execute --account CABC...WXYZ --contract CTOK...WXYZ \
+  --function transfer --arg AAAAEgAAAAA... --arg AAAAEgAAAAA... --arg AAAACgAAAAA... \
+  --auth-rule-id 3 --rule-signer-ed25519-secret-env AGENT_SK --signer-secret-env WALLET_SK
 ```
 
 ### `smart-account multicall`

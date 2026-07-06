@@ -1746,6 +1746,57 @@ pub enum EventKind {
         audit_request_id: String,
     },
 
+    /// An External-Ed25519-signed `CallContract` invocation was submitted via
+    /// `smart-account execute`.
+    ///
+    /// Emitted after a successful `submit_signed_invoke` call whose signing
+    /// path used an External-Ed25519 rule signer (
+    /// `stellar_agent_smart_account::submit::Ed25519RuleSigner`) rather than
+    /// the wallet-key `Signer::Delegated` path used by the admin-mutator
+    /// verbs. Distinct from [`EventKind::SaRawInvocation`] (the generic
+    /// invocation-boundary row emitted alongside this one): this variant
+    /// carries the execute-specific call shape for forensic replay.
+    ///
+    /// # Field redaction
+    ///
+    /// - `smart_account_redacted` — the authorising smart-account C-strkey,
+    ///   first-5-last-5.
+    /// - `rule_signer_pubkey_first8` — first 8 hex characters of the rule
+    ///   signer's raw Ed25519 public key. Never the full key or the seed.
+    /// - `transaction_hash_redacted` — first-8-last-8 of the confirmed
+    ///   Stellar transaction hash.
+    ///
+    /// `target_contract`, `function`, `arg_count`, `auth_rule_ids`, and
+    /// `verifier_address` are non-sensitive on-chain identifiers already
+    /// visible in the CLI's own success envelope.
+    ///
+    /// Per-invocation request correlation ID is carried by the top-level
+    /// [`AuditEntry::request_id`](super::entry::AuditEntry::request_id)
+    /// field. This variant intentionally has NO field named `request_id`
+    /// (see the serde-flatten collision documented on the module).
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    SaExternalExecuteSubmitted {
+        /// Authorising smart-account C-strkey, redacted first-5-last-5.
+        smart_account_redacted: RedactedStrkey,
+        /// External target contract C-strkey (non-sensitive on-chain identifier).
+        target_contract: String,
+        /// Contract function invoked.
+        function: String,
+        /// Number of `ScVal` arguments passed to the invocation.
+        arg_count: u32,
+        /// Context rule IDs that authorised the call.
+        auth_rule_ids: Vec<u32>,
+        /// First 8 hex characters of the rule signer's raw Ed25519 public key.
+        rule_signer_pubkey_first8: String,
+        /// Ed25519-verifier contract C-strkey used to authenticate the signer.
+        verifier_address: String,
+        /// Confirmed Stellar transaction hash, redacted first-8-last-8.
+        transaction_hash_redacted: String,
+    },
+
     /// Channel-account pool was initialised on-chain.
     ///
     /// Emitted by `stellar_agent_pool::init::init_pool` after the CAP-33
@@ -3234,6 +3285,70 @@ mod tests {
         assert!(
             result.is_err(),
             "missing-field deserialisation must fail for SaWeightedThresholdChanged"
+        );
+    }
+
+    /// Asserts `SaExternalExecuteSubmitted` serialises with the correct wire
+    /// discriminant and all required fields, and round-trips cleanly.
+    #[test]
+    fn event_kind_sa_external_execute_submitted_round_trip() {
+        let ev = EventKind::SaExternalExecuteSubmitted {
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...BBBBB"),
+            target_contract: "CTOKE...ZZZZZ".to_owned(),
+            function: "transfer".to_owned(),
+            arg_count: 3,
+            auth_rule_ids: vec![1],
+            rule_signer_pubkey_first8: "aabb1122".to_owned(),
+            verifier_address: "CVERI...WWWWW".to_owned(),
+            transaction_hash_redacted: "aabb1122...ccdd3344".to_owned(),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: EventKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(
+            ev, back,
+            "SaExternalExecuteSubmitted must round-trip cleanly"
+        );
+        assert!(
+            s.contains("\"sa_external_execute_submitted\""),
+            "wire discriminant must be 'sa_external_execute_submitted': {s}"
+        );
+        assert!(
+            s.contains("\"smart_account_redacted\""),
+            "smart_account_redacted field: {s}"
+        );
+        assert!(
+            s.contains("\"target_contract\""),
+            "target_contract field: {s}"
+        );
+        assert!(s.contains("\"function\""), "function field: {s}");
+        assert!(s.contains("\"arg_count\""), "arg_count field: {s}");
+        assert!(s.contains("\"auth_rule_ids\""), "auth_rule_ids field: {s}");
+        assert!(
+            s.contains("\"rule_signer_pubkey_first8\""),
+            "rule_signer_pubkey_first8 field: {s}"
+        );
+        assert!(
+            s.contains("\"verifier_address\""),
+            "verifier_address field: {s}"
+        );
+        assert!(
+            s.contains("\"transaction_hash_redacted\""),
+            "transaction_hash_redacted field: {s}"
+        );
+        assert!(
+            !s.contains("\"request_id\""),
+            "SaExternalExecuteSubmitted must not carry a request_id field: {s}"
+        );
+    }
+
+    /// `SaExternalExecuteSubmitted` with missing fields MUST fail to deserialise.
+    #[test]
+    fn event_kind_sa_external_execute_submitted_missing_fields_fail() {
+        let json = r#"{"kind":"sa_external_execute_submitted"}"#;
+        let result: Result<EventKind, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "missing-field deserialisation must fail for SaExternalExecuteSubmitted"
         );
     }
 

@@ -265,6 +265,29 @@ write can still fail with `SpendingLimitExceeded`.
 Both tools are grantable to a toolset via the `read-rules` capability token,
 separately from `read-balance`. See [Toolsets](./toolsets.md).
 
+#### Why there is no agent-facing execute tool
+
+The CLI has `smart-account execute` (see [Agent delegation](./agent-delegation.md)
+and [CLI reference: smart-account](./cli-reference/smart-account.md#smart-account-execute)):
+an operator-run verb that submits one `CallContract` invocation signed by an
+agent's External-Ed25519 rule key. There is deliberately no MCP equivalent.
+
+Every signing-capable MCP tool in this catalog is a TYPED verb whose rendered
+preview is what the operator consents to — `stellar_pay_commit` renders a
+payment, `stellar_rule_create_commit` renders a full rule definition, and so
+on. An arbitrary-invocation `execute` tool on the agent surface would have no
+such preview: it would sign whatever contract, function, and `ScVal` arguments
+the agent supplied, with nothing meaningful to show the operator before
+consenting. That contradicts the typed-tool consent model this catalog is
+built on. The CLI verb has no such conflict, because the CLI itself is
+operator authority — there is no separate consent step to bypass.
+
+This is a scope decision, not a permanent gap: a concrete agent use case that
+needs a typed, previewable, approval-spine-backed shape (for example, a
+narrowly-typed "agent-signed SEP-41 transfer" tool with a rendered preview,
+rather than an arbitrary-invocation tool) would be evaluated on its own
+terms.
+
 ### DeFi
 
 | Tool | Purpose | Gating |

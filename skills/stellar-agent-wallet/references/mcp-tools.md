@@ -343,6 +343,14 @@ Unlike the payment/claim commit tools, a policy engine `Allow` verdict can
 never let `stellar_rule_create_commit` skip the operator attestation step —
 this pair only operates on testnet.
 
+If you hold an External-Ed25519 rule key installed on a scoped
+`CallContract` rule (see `smart-accounts.md`'s "Agent-signed execute"),
+there is no MCP tool for submitting a call under it — that surface is the
+CLI verb `smart-account execute`, run by the operator or an out-of-process
+agent runtime, not by you through this MCP connection. An arbitrary-invocation
+tool would have no meaningful preview for the operator to consent to, which
+is why this catalog does not expose one.
+
 ### stellar_rule_create arguments
 
 | Field | Type | Required | Notes |

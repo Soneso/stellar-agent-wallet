@@ -2,7 +2,7 @@
 
 The `smart-account` command group (also available under the shorter alias `sa`) governs an on-chain OpenZeppelin smart-account: its context rules, its signer sets and thresholds, the policy contracts attached to each rule, and the supporting infrastructure (verifier registry, multicall router registry, upgrade timelock). It also submits multicall bundles through the registered router.
 
-Most on-chain signing verbs that mutate context-rule, signer, or timelock state structurally refuse `mainnet` before any RPC call or signing key access, surfacing the wire code `network.mainnet_write_forbidden`: the `smart-account rules` write verbs, all `smart-account signers` verbs (including `list` and `refresh`, which emit audit rows), the timelock write verbs (`schedule`, `cancel`, `execute`), and the deploy verbs (`smart-account deploy-webauthn-verifier`, `smart-account deploy-ed25519-verifier`, `smart-account deploy-spending-limit-policy`). The exceptions:
+Most on-chain signing verbs that mutate context-rule, signer, or timelock state structurally refuse `mainnet` before any RPC call or signing key access, surfacing the wire code `network.mainnet_write_forbidden`: the `smart-account rules` write verbs, all `smart-account signers` verbs (including `list` and `refresh`, which emit audit rows), `smart-account execute`, the timelock write verbs (`schedule`, `cancel`, `execute`), and the deploy verbs (`smart-account deploy-webauthn-verifier`, `smart-account deploy-ed25519-verifier`, `smart-account deploy-spending-limit-policy`). The exceptions:
 
 - `smart-account migrate-verifier` allows a mainnet dry-run and permits a mainnet submit only when `--confirm-mainnet-migrate` is supplied; it never returns `network.mainnet_write_forbidden`.
 - `smart-account multicall` accepts `mainnet` at the flag level but requires a multicall router registered for mainnet.
@@ -40,14 +40,16 @@ Flags:
 - `--context <SPEC>` — the rule's context type. `default` (also the default when the flag is omitted) authorizes any invocation; `call-contract:<C_STRKEY>` scopes the rule to invocations of one target contract; `create-contract:<64_HEX_WASM_HASH>` scopes it to creating a contract with that wasm hash. A malformed spec is refused before any network call, naming the accepted grammar. See [Agent delegation](../agent-delegation.md) for the `call-contract` shape used to scope an autonomous agent to one token contract.
 - `--signer-delegated <G_STRKEY>` — a delegated ed25519 signer. Repeatable.
 - `--signer-webauthn <CREDENTIAL_NAME>` — a passkey signer, resolved from the profile's passkey registry (see [`credentials add-passkey`](profile-and-governance.md)). Repeatable. The verifier contract address is read from the verifier registry, which is populated by `smart-account deploy-webauthn-verifier`.
-- `--accept-no-delegated-fallback` — acknowledge a passkey-only rule (no ed25519 fallback). Required when only `--signer-webauthn` signers are given; without it the command refuses with `validation.passkey_only_rule_no_delegated_fallback` after printing a stderr warning.
+- `--signer-ed25519 <HEX_PUBKEY_64>` — a first-class External-Ed25519 signer (a raw 32-byte ed25519 public key). Repeatable. The recommended shape for an autonomous agent's own key (see [Agent delegation](../agent-delegation.md)) — no funded classic account is required. Encodes the same on-chain shape as [`signers add --signer-ed25519`](#smart-account-signers-add).
+- `--verifier <C_STRKEY>` — Ed25519-verifier contract override for `--signer-ed25519`. Omitted, it resolves from the verifier registry (populated by `smart-account deploy-ed25519-verifier`), failing closed if none is registered.
+- `--accept-no-delegated-fallback` — acknowledge an External-only rule (no delegated ed25519-G-key fallback). Required when only `--signer-webauthn` and/or `--signer-ed25519` signers are given; without it the command refuses with `validation.passkey_only_rule_no_delegated_fallback` after printing a stderr warning.
 - `--accept-mutable-verifier` — proceed even if a referenced verifier or policy contract has a mutable admin/owner key. The envelope reports `mutable_override: true`.
 - `--accept-unknown-verifier` — proceed even if a referenced verifier or policy WASM hash is not in the allowlist. The envelope reports `unknown_override: true`.
 - `--auth-rule-id <U32>` — authorizing rule id(s). Repeatable. Default `[0]` (the bootstrap rule installed at deploy time).
 - `--valid-until <LEDGER>` — expiry ledger sequence, or `none` for a permanent rule. Default `none`.
 - Shared: `--profile`, signer-source group, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
 
-At least one `--signer-delegated` or `--signer-webauthn` is required.
+At least one `--signer-delegated`, `--signer-webauthn`, or `--signer-ed25519` is required.
 
 ```bash
 stellar-agent smart-account rules create \
@@ -446,6 +448,46 @@ stellar-agent smart-account signers batch-add \
   --signer-webauthn my-passkey \
   --signer-secret-env WALLET_SK
 ```
+
+---
+
+## `smart-account execute`
+
+Submits one `CallContract` invocation against an external contract, authorized by a named context rule and signed by an External-Ed25519 rule signer, with a separate fee-paying envelope signer. This is the delegation surface: an agent holding only its own ed25519 seed submits a call through its scoped rule — see [Agent delegation](../agent-delegation.md) for the full walkthrough. Signs and submits. Testnet only; structurally refuses `mainnet` before any RPC call or key-material access.
+
+Two distinct signers participate — neither is the other:
+
+- The **rule signer** (`--rule-signer-ed25519-secret-env`) authorizes the smart-account call. It is the agent's own key; it never needs a funded classic account.
+- The **fee-payer signer** (`--signer-secret-env` / `--sign-with-ledger`, the standard [signer source](index.md#signer-source) group) pays the transaction fee and signs the envelope.
+
+Flags:
+
+- `--account <C_STRKEY>` (required) — the smart account whose rule authorizes the call (`auth_address`).
+- `--contract <C_STRKEY>` (required) — the external target contract (`target_contract`). For most delegated calls this differs from `--account`.
+- `--function <NAME>` (required) — the contract function to invoke.
+- `--arg <SCVAL_BASE64>` — one standard-base64 XDR `ScVal` argument, in call order. Repeatable. Decoded client-side only to validate well-formedness (bounded XDR decode) — never re-encoded; a malformed value is refused with the failing argument's index named.
+- `--auth-rule-id <U32>` (required) — the authorizing rule id(s). Repeatable. Unlike every other smart-account write verb, this flag has NO default: the delegation use case always names a specific scoped rule, and a defaulted bootstrap rule (`[0]`) would either authorize against the wrong rule or fail on-chain in a way that hides the caller's mistake.
+- `--rule-signer-ed25519-secret-env <VAR>` (required) — environment variable holding the rule signer's S-strkey seed.
+- `--expect-rule-signer <64_HEX>` — fail closed, before any signing, if the seed-derived public key differs from this value. Surfaces a misconfigured environment variable client-side instead of as an on-chain refusal.
+- `--verifier <C_STRKEY>` — Ed25519-verifier contract override. Omitted, it resolves from the verifier registry (populated by `smart-account deploy-ed25519-verifier`), failing closed if none is registered.
+- Shared: `--profile`, fee-payer signer-source group, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
+
+On success the envelope carries `status: "submitted"`, `contract`, `function`, `arg_count`, `auth_rule_ids`, `rule_signer_pubkey_first8` (never the full key or seed), `verifier_address`, and `tx_hash`. On-chain refusals (spending-limit cap, scope mismatch, expired rule) surface through the same typed `SaError` wire codes and message annotations (e.g. `[OZ:SpendingLimitExceeded]`, `[OZ:UnvalidatedContext]`) every other smart-account write verb renders.
+
+```bash
+stellar-agent smart-account execute \
+  --account CABC...WXYZ \
+  --contract CTOK...WXYZ \
+  --function transfer \
+  --arg AAAAEgAAAAA... \
+  --arg AAAAEgAAAAA... \
+  --arg AAAACgAAAAA... \
+  --auth-rule-id 3 \
+  --rule-signer-ed25519-secret-env AGENT_SK \
+  --signer-secret-env WALLET_SK
+```
+
+There is currently no MCP tool for this verb; see [MCP: why there is no agent-facing execute tool](../mcp.md#why-there-is-no-agent-facing-execute-tool).
 
 ---
 
