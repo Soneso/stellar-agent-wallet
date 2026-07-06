@@ -2596,16 +2596,20 @@ pub struct GetSpendingLimitResult {
     /// Spending-limit-policy contract C-strkey (unredacted; on-chain public
     /// identifier).
     pub policy_address: String,
-    /// The configured spending limit, in stroops.
-    pub spending_limit: i128,
+    /// The configured spending limit, in stroops, as a decimal string. A raw
+    /// JSON number is not used here — `serde_json::from_value` backs numbers
+    /// with `f64`, which cannot represent an i128 exactly above `2^53` — the
+    /// same convention as the MCP `stellar_rules_get` budget snapshot.
+    pub spending_limit: String,
     /// The rolling-window period, in ledgers.
     pub period_ledgers: u32,
     /// Sum of spend-history entries within the rolling window as of
-    /// `as_of_ledger`. See the point-in-time caveat above.
-    pub in_window_spent: i128,
-    /// `max(0, spending_limit - in_window_spent)`. See the point-in-time
-    /// caveat above.
-    pub remaining_budget: i128,
+    /// `as_of_ledger`, as a decimal string (see `spending_limit`). See the
+    /// point-in-time caveat above.
+    pub in_window_spent: String,
+    /// `max(0, spending_limit - in_window_spent)`, as a decimal string (see
+    /// `spending_limit`). See the point-in-time caveat above.
+    pub remaining_budget: String,
     /// Ledger sequence the simulation observed; the "as of" ledger for
     /// `in_window_spent` / `remaining_budget`.
     pub as_of_ledger: u32,
@@ -2615,11 +2619,12 @@ pub struct GetSpendingLimitResult {
     /// Number of entries in the on-chain spend history (bounded by the OZ
     /// `MAX_HISTORY_ENTRIES = 1000` cap; not all necessarily in-window).
     pub history_entries: u32,
-    /// The on-chain cached total, verbatim, for transparency. NOT used to
-    /// compute `in_window_spent` — `get_spending_limit_data` performs no
-    /// eviction on read, so this total can include entries that have since
-    /// fallen outside the rolling window.
-    pub cached_total_spent: i128,
+    /// The on-chain cached total, verbatim, for transparency, as a decimal
+    /// string (see `spending_limit`). NOT used to compute `in_window_spent`
+    /// — `get_spending_limit_data` performs no eviction on read, so this
+    /// total can include entries that have since fallen outside the rolling
+    /// window.
+    pub cached_total_spent: String,
 }
 
 async fn get_spending_limit_run(args: &GetSpendingLimitArgs) -> i32 {
@@ -2716,14 +2721,14 @@ async fn get_spending_limit_run(args: &GetSpendingLimitArgs) -> i32 {
         smart_account: args.common.account.clone(),
         rule_id: args.rule_id,
         policy_address,
-        spending_limit: data.spending_limit,
+        spending_limit: data.spending_limit.to_string(),
         period_ledgers: data.period_ledgers,
-        in_window_spent: window.in_window_spent,
-        remaining_budget: window.remaining,
+        in_window_spent: window.in_window_spent.to_string(),
+        remaining_budget: window.remaining.to_string(),
         as_of_ledger,
         window_cutoff_ledger: window.window_cutoff_ledger,
         history_entries,
-        cached_total_spent: data.cached_total_spent,
+        cached_total_spent: data.cached_total_spent.to_string(),
     };
     emit_success(&result, args.common.output, &request_id, 0)
 }
@@ -2829,8 +2834,11 @@ pub struct SetSpendingLimitResult {
     pub smart_account: String,
     /// Context rule ID whose spending-limit policy was retuned.
     pub rule_id: u32,
-    /// The new spending limit that was applied, in stroops.
-    pub new_limit: i128,
+    /// The new spending limit that was applied, in stroops, as a decimal
+    /// string. A raw JSON number is not used here — `serde_json::from_value`
+    /// backs numbers with `f64`, which cannot represent an i128 exactly
+    /// above `2^53` — the same convention as `GetSpendingLimitResult`.
+    pub new_limit: String,
 }
 
 async fn set_spending_limit_run(args: &SetSpendingLimitArgs) -> i32 {
@@ -2898,7 +2906,7 @@ async fn set_spending_limit_run(args: &SetSpendingLimitArgs) -> i32 {
             let result = SetSpendingLimitResult {
                 smart_account: args.account.clone(),
                 rule_id: args.rule_id,
-                new_limit: args.limit,
+                new_limit: args.limit.to_string(),
             };
             emit_success(&result, args.output, &request_id, 0)
         }

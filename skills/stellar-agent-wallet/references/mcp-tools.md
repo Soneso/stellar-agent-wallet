@@ -105,10 +105,16 @@ A mismatch is refused before any network call.
 - Asset descriptors: `"native"` or `"XLM"` (case-insensitive) for XLM, or
   `"CODE:GISSUER"` for non-native assets.
 - Raw on-chain integer fields use distinct names and carry NO unit label:
-  `amount_in_stroops` (u64), `limit_stroops` (i64), `qty_in` / `qty_out_min` /
-  `qty` (i128), `amounts_desired` / `amounts_min` / `min_amounts_out` (i128
-  arrays), `withdraw_shares` (i128). Anchor-facing amounts (`deposit_hint`) are
-  plain decimal strings without XLM-stroop semantics.
+  `amount_in_stroops` (u64), `limit_stroops` (i64) are JSON numbers; they are
+  exact only up to `2^53` (about 900 million XLM in stroops) — an `f64`-backed
+  JSON parser silently rounds larger values. `qty_in` / `qty_out_min` / `qty`
+  (i128),
+  `amounts_desired` / `amounts_min` / `min_amounts_out` (i128 arrays), and
+  `withdraw_shares` (i128) are DECIMAL STRINGS, not JSON numbers — a raw JSON
+  number above `2^53` cannot be represented exactly by an `f64`-backed parser,
+  so these fields are String-typed and a raw number is rejected. Anchor-facing
+  amounts (`deposit_hint`) are plain decimal strings without XLM-stroop
+  semantics.
 - Classic fee selector (`fee` field): `<stroops>`, `auto`, or `auto:pNN`.
 
 ## Payments and accounts
@@ -310,7 +316,9 @@ Returns the list fields for that one rule, plus `expires_in_ledgers`
 degrades to `"unknown"` rather than failing the call), and, when exactly one
 policy identifies as `spending-limit`, a `spending_limit` block:
 `{ spending_limit, period_ledgers, in_window_spent, remaining_budget,
-as_of_ledger }`.
+as_of_ledger }`. `spending_limit`, `in_window_spent`, and `remaining_budget`
+are decimal strings (i128, stroops); `period_ledgers` and `as_of_ledger` are
+integers (u32).
 
 `in_window_spent` and `remaining_budget` are exact only as of
 `as_of_ledger`: forward ledger movement only grows headroom (older spend
@@ -389,13 +397,14 @@ the policy verdict.
 | `chain_id` | string | yes | |
 | `pool_address` | string | yes | Blend pool contract C-strkey. |
 | `from_address` | string | yes | Wallet smart-account address (C-strkey). |
-| `requests` | array | yes | Each `{ "request_type": <u32>, "address": "<C-strkey>", "qty": <i128> }`. |
+| `requests` | array | yes | Each `{ "request_type": <u32>, "address": "<C-strkey>", "qty": "<decimal i128 string>" }`. |
 | `override_oracle_staleness` | bool | no | Default `false`; overridable staleness only — pin-verify and oracle-allowlist refusals are non-overridable. |
 | `secondary_rpc_url` | string | no | Second RPC for the two-RPC WASM-hash cross-check. |
 | `max_staleness_secs` | integer (u64) | no | Default 600. |
 
 `request_type`: 0 Supply, 1 Withdraw, 2 SupplyCollateral, 3 WithdrawCollateral,
-4 Borrow, 5 Repay. `qty` is a raw 7-decimal i128, no unit label.
+4 Borrow, 5 Repay. `qty` is a raw 7-decimal i128 as a decimal string (e.g.
+`"250000000"`), no unit label; a raw JSON number is rejected.
 
 ### stellar_defindex_vault_deposit arguments
 
@@ -404,8 +413,8 @@ the policy verdict.
 | `chain_id` | string | yes | |
 | `vault_address` | string | yes | DeFindex vault C-strkey. |
 | `from_address` | string | yes | Wallet smart-account address (C-strkey). |
-| `amounts_desired` | array (i128) | yes | One per vault asset, in declaration order. |
-| `amounts_min` | array (i128) | yes | Same length; zero = no slippage protection (not defaulted). |
+| `amounts_desired` | array (i128 decimal strings) | yes | One per vault asset, in declaration order. A raw JSON number is rejected. |
+| `amounts_min` | array (i128 decimal strings) | yes | Same length; zero = no slippage protection (not defaulted). A raw JSON number is rejected. |
 | `invest` | bool | no | Auto-invest after deposit; default `false`. |
 | `override_upgradable` | bool | no | Proceed on an upgradable vault; WASM-pin refusal stays non-overridable. |
 | `secondary_rpc_url` | string | no | Two-RPC WASM-hash cross-check. |
@@ -417,8 +426,8 @@ the policy verdict.
 | `chain_id` | string | yes | |
 | `vault_address` | string | yes | DeFindex vault C-strkey. |
 | `from_address` | string | yes | Wallet smart-account address (C-strkey). |
-| `withdraw_shares` | i128 | yes | Vault shares to redeem. |
-| `min_amounts_out` | array (i128) | yes | One per asset in `total_managed_funds` order; zero = no slippage protection (not defaulted). |
+| `withdraw_shares` | i128 decimal string | yes | Vault shares to redeem. A raw JSON number is rejected. |
+| `min_amounts_out` | array (i128 decimal strings) | yes | One per asset in `total_managed_funds` order; zero = no slippage protection (not defaulted). A raw JSON number is rejected. |
 | `override_upgradable` | bool | no | |
 | `secondary_rpc_url` | string | no | |
 
@@ -428,16 +437,19 @@ the policy verdict.
 | --- | --- | --- | --- |
 | `chain_id` | string | yes | |
 | `from_address` | string | yes | Wallet smart-account address (C-strkey). |
-| `qty_in` | i128 | yes | Exact input amount, native base units (7-decimal). |
-| `qty_out_min` | i128 | yes | Absolute minimum output (non-negative integer, not a percent). |
+| `qty_in` | i128 decimal string | yes | Exact input amount, native base units (7-decimal). A raw JSON number is rejected. |
+| `qty_out_min` | i128 decimal string | yes | Absolute minimum output (non-negative integer, not a percent). A raw JSON number is rejected. |
 | `path` | array (string) | yes | First element input token, last output token; each a C-strkey, `"native"`, or `"CODE:ISSUER"`. |
 | `deadline` | integer (u64) | no | Unix seconds; defaults to `now + 300s`. |
 | `secondary_rpc_url` | string | no | Two-RPC WASM-hash cross-check. |
 
 ### stellar_dex_quote arguments
 
-`chain_id`, `qty_in` (i128 input amount), `path` (same format as
-`stellar_dex_trade.path`).
+`chain_id`, `qty_in` (i128 input amount, decimal string; a raw JSON number is
+rejected), `path` (same format as `stellar_dex_trade.path`).
+
+Response fields `qty_in`, `expected_out`, and each element of `amounts` are
+decimal strings, not JSON numbers.
 
 ## SEP-43 (wallet interface)
 

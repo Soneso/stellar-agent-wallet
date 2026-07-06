@@ -87,15 +87,18 @@ pub struct VaultDepositMcpArgs {
     pub vault_address: String,
     /// The wallet smart-account address submitting the deposit (C-strkey).
     pub from_address: String,
-    /// Desired deposit amounts per asset (i128), in declaration order.
+    /// Desired deposit amounts per asset (i128), in declaration order, each
+    /// as a decimal string (e.g. `"250000000"`). A raw JSON number is
+    /// rejected — `serde_json::from_value` backs numbers with `f64`, which
+    /// cannot represent an i128 exactly above `2^53`.
     ///
     /// Length must match the number of assets in the vault (`get_assets().len()`).
     /// Absence is a structural pre-sign refuse.
-    pub amounts_desired: Vec<i128>,
+    pub amounts_desired: Vec<String>,
     /// Minimum accepted deposit amounts per asset (i128), same length as
-    /// `amounts_desired`. Zero floor = no slippage protection; the wallet
-    /// does NOT default this to zero.
-    pub amounts_min: Vec<i128>,
+    /// `amounts_desired`, each as a decimal string. Zero floor = no slippage
+    /// protection; the wallet does NOT default this to zero.
+    pub amounts_min: Vec<String>,
     /// Whether to auto-invest immediately after deposit (`invest` arg in ABI).
     #[serde(default)]
     pub invest: bool,
@@ -127,15 +130,18 @@ pub struct VaultWithdrawMcpArgs {
     pub vault_address: String,
     /// The wallet smart-account address submitting the withdrawal (C-strkey).
     pub from_address: String,
-    /// Number of vault shares to redeem (i128 raw on-chain value).
+    /// Number of vault shares to redeem (i128 raw on-chain value), as a
+    /// decimal string. A raw JSON number is rejected (see
+    /// `VaultDepositMcpArgs.amounts_desired`).
     ///
     /// This is the `df_amount` / `withdraw_shares` first arg of the vault
     /// `withdraw` function.
-    pub withdraw_shares: i128,
+    pub withdraw_shares: String,
     /// Minimum amounts to receive per asset (i128), in `total_managed_funds`
-    /// order.  Absence is a structural pre-sign refuse.
-    /// Zero floor = no slippage protection; the wallet does NOT default to zero.
-    pub min_amounts_out: Vec<i128>,
+    /// order, each as a decimal string. Absence is a structural pre-sign
+    /// refuse. Zero floor = no slippage protection; the wallet does NOT
+    /// default to zero.
+    pub min_amounts_out: Vec<String>,
     /// Override the upgradable-vault refusal.
     #[serde(default)]
     pub override_upgradable: bool,
@@ -222,11 +228,19 @@ impl WalletServer {
             return Err(crate::tools::common::single_shot_require_approval_error());
         }
 
+        // ── Parse decimal-string amount fields ────────────────────────────────
+        let amounts_desired = crate::tools::amount_wire::parse_i128_vec_field(
+            "amounts_desired",
+            &args.amounts_desired,
+        )?;
+        let amounts_min =
+            crate::tools::amount_wire::parse_i128_vec_field("amounts_min", &args.amounts_min)?;
+
         // ── Structural validation ────────────────────────────────────────────
         let vault_args = VaultDepositArgs {
             vault_address: args.vault_address.clone(),
-            amounts_desired: args.amounts_desired.clone(),
-            amounts_min: args.amounts_min.clone(),
+            amounts_desired,
+            amounts_min,
             from_address: args.from_address.clone(),
             invest: args.invest,
             override_upgradable: args.override_upgradable,
@@ -571,11 +585,19 @@ impl WalletServer {
             return Err(crate::tools::common::single_shot_require_approval_error());
         }
 
+        // ── Parse decimal-string amount fields ────────────────────────────────
+        let withdraw_shares =
+            crate::tools::amount_wire::parse_i128_field("withdraw_shares", &args.withdraw_shares)?;
+        let min_amounts_out = crate::tools::amount_wire::parse_i128_vec_field(
+            "min_amounts_out",
+            &args.min_amounts_out,
+        )?;
+
         // ── Structural validation ────────────────────────────────────────────
         let vault_args = VaultWithdrawArgs {
             vault_address: args.vault_address.clone(),
-            withdraw_shares: args.withdraw_shares,
-            min_amounts_out: args.min_amounts_out.clone(),
+            withdraw_shares,
+            min_amounts_out,
             from_address: args.from_address.clone(),
             override_upgradable: args.override_upgradable,
         };
@@ -904,6 +926,120 @@ mod tests {
         clippy::panic,
         reason = "test-only fixture construction"
     )]
+    use super::{VaultDepositMcpArgs, VaultWithdrawMcpArgs};
+
+    // ── VaultDepositMcpArgs: decimal-string wire ──────────────────────────────
+
+    #[test]
+    fn vault_deposit_args_deserialises_string_amounts_above_2_pow_53() {
+        let json = serde_json::json!({
+            "chain_id": "stellar:testnet",
+            "vault_address": "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN",
+            "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD",
+            "amounts_desired": ["9007199254740993"],
+            "amounts_min": ["1"],
+        });
+        let args: VaultDepositMcpArgs = serde_json::from_value(json).expect("deserialise");
+        assert_eq!(
+            args.amounts_desired[0].parse::<i128>().expect("parse"),
+            9_007_199_254_740_993_i128
+        );
+    }
+
+    #[test]
+    fn vault_deposit_args_rejects_raw_json_number_in_amounts_desired() {
+        let json = serde_json::json!({
+            "chain_id": "stellar:testnet",
+            "vault_address": "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN",
+            "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD",
+            "amounts_desired": [1_000_000_000],
+            "amounts_min": ["1"],
+        });
+        let result: Result<VaultDepositMcpArgs, _> = serde_json::from_value(json);
+        assert!(
+            result.is_err(),
+            "a raw JSON number inside amounts_desired must be rejected (String-typed field)"
+        );
+    }
+
+    #[test]
+    fn vault_deposit_args_round_trips_through_serde_json_from_value() {
+        let value = serde_json::json!({
+            "chain_id": "stellar:testnet",
+            "vault_address": "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN",
+            "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD",
+            "amounts_desired": ["170141183460469231731687303715884105727"],
+            "amounts_min": ["0"],
+        });
+        let args: VaultDepositMcpArgs =
+            serde_json::from_value(value).expect("from_value must succeed");
+        assert_eq!(
+            args.amounts_desired[0].parse::<i128>().expect("parse"),
+            i128::MAX
+        );
+    }
+
+    #[test]
+    fn vault_deposit_amounts_vec_index_error_names_the_failing_entry() {
+        let v = vec!["1".to_owned(), "not-a-number".to_owned()];
+        let err = crate::tools::amount_wire::parse_i128_vec_field("amounts_min", &v).unwrap_err();
+        let msg = err.message.to_string();
+        assert!(
+            msg.contains("amounts_min[1]"),
+            "error must name the failing index: {msg}"
+        );
+    }
+
+    // ── VaultWithdrawMcpArgs: decimal-string wire ─────────────────────────────
+
+    #[test]
+    fn vault_withdraw_args_deserialises_string_shares_above_2_pow_53() {
+        let json = serde_json::json!({
+            "chain_id": "stellar:testnet",
+            "vault_address": "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN",
+            "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD",
+            "withdraw_shares": "9007199254740993",
+            "min_amounts_out": ["1"],
+        });
+        let args: VaultWithdrawMcpArgs = serde_json::from_value(json).expect("deserialise");
+        assert_eq!(
+            args.withdraw_shares.parse::<i128>().expect("parse"),
+            9_007_199_254_740_993_i128
+        );
+    }
+
+    #[test]
+    fn vault_withdraw_args_rejects_raw_json_number_for_withdraw_shares() {
+        let json = serde_json::json!({
+            "chain_id": "stellar:testnet",
+            "vault_address": "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN",
+            "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD",
+            "withdraw_shares": 5_000_000,
+            "min_amounts_out": ["1"],
+        });
+        let result: Result<VaultWithdrawMcpArgs, _> = serde_json::from_value(json);
+        assert!(
+            result.is_err(),
+            "a raw JSON number for withdraw_shares must be rejected (String-typed field)"
+        );
+    }
+
+    #[test]
+    fn vault_withdraw_args_round_trips_through_serde_json_from_value() {
+        let value = serde_json::json!({
+            "chain_id": "stellar:testnet",
+            "vault_address": "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN",
+            "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD",
+            "withdraw_shares": "170141183460469231731687303715884105727",
+            "min_amounts_out": ["0"],
+        });
+        let args: VaultWithdrawMcpArgs =
+            serde_json::from_value(value).expect("from_value must succeed");
+        assert_eq!(
+            args.withdraw_shares.parse::<i128>().expect("parse"),
+            i128::MAX
+        );
+    }
 
     #[test]
     fn redact_strkey_format() {

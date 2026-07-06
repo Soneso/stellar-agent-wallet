@@ -253,11 +253,14 @@ supplied.
 | `stellar_rule_create` | Testnet-only. Resolve and simulate an agent-proposed `add_context_rule` installation: signers (delegated, raw external, or WebAuthn passkey by credential name — resolved to bytes at propose time), policies (raw or typed spending-limit), context, name, expiry, and `auth_rule_ids`. Mints a domain-separated digest over the resolved arguments and parks the full definition as a pending approval. | No signing; no submission. Mints the pending-approval nonce the commit step consumes. |
 | `stellar_rule_create_commit` | Testnet-only. ALWAYS requires operator attestation, unconditionally — the policy engine's verdict for this call can never bypass it. Verify the operator's attestation over the resolved definition (a dedicated gate, distinct from the payment/claim attestation gate), recompute the digest from the stored snapshot, and install the rule. | Signs and submits. Two-phase verb; approval spine. |
 
-`in_window_spent` and `remaining_budget` are exact only as of `as_of_ledger`:
-forward ledger movement past that point only grows headroom (older spend
-entries fall out of the rolling window), but an intervening spend shrinks it.
-The numbers are a point-in-time estimate, not a guarantee for a future
-submission — a later write can still fail with `SpendingLimitExceeded`.
+`spending_limit`, `in_window_spent`, and `remaining_budget` are decimal
+strings (i128, stroops), not JSON numbers — a raw JSON number above `2^53`
+cannot be represented exactly by an `f64`-backed parser. `in_window_spent`
+and `remaining_budget` are exact only as of `as_of_ledger`: forward ledger
+movement past that point only grows headroom (older spend entries fall out
+of the rolling window), but an intervening spend shrinks it. The numbers are
+a point-in-time estimate, not a guarantee for a future submission — a later
+write can still fail with `SpendingLimitExceeded`.
 
 Both tools are grantable to a toolset via the `read-rules` capability token,
 separately from `read-balance`. See [Toolsets](./toolsets.md).

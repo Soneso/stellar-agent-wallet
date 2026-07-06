@@ -76,6 +76,7 @@ SUITES=(
   "stellar-agent-mcp testnet-acceptance x402_authenticated_payment_testnet_acceptance"
   "stellar-agent-mcp testnet-acceptance claim_commit_testnet_acceptance"
   "stellar-agent-mcp testnet-acceptance approve_serve_testnet_acceptance"
+  "stellar-agent-mcp testnet-acceptance dex_quote_wire_testnet_acceptance"
   "stellar-agent-cli testnet-acceptance claim_testnet_acceptance"
   "stellar-agent-smart-account testnet-integration deploy_c_testnet_acceptance"
   "stellar-agent-smart-account testnet-integration quorum_authorization_info_testnet_acceptance"

@@ -100,13 +100,16 @@ pub struct BlendLendRequest {
     pub request_type: u32,
     /// Asset contract address (C-strkey) or liquidatee address for liquidation ops.
     pub address: String,
-    /// Raw token quantity in the asset's native base unit (7-decimal i128).
+    /// Raw token quantity in the asset's native base unit (7-decimal i128),
+    /// as a decimal string (e.g. `"250000000"`). A raw JSON number is
+    /// rejected — `serde_json::from_value` backs numbers with `f64`, which
+    /// cannot represent an i128 exactly above `2^53`.
     ///
     /// This is the direct `Request.amount` field sent to the Blend `submit`
     /// function on-chain. It carries no unit label (not "N XLM" format).
     /// Named `qty` so the dual-unit trigger tokens `amount/fee/balance/charge`
     /// do not apply to this raw on-chain integer.
-    pub qty: i128,
+    pub qty: String,
 }
 
 /// Arguments for the `stellar_blend_lend` MCP tool.
@@ -227,7 +230,7 @@ impl WalletServer {
 
         // ── Parse and validate requests ───────────────────────────────────────
         let mut blend_requests: Vec<BlendRequest> = Vec::with_capacity(args.requests.len());
-        for req in &args.requests {
+        for (idx, req) in args.requests.iter().enumerate() {
             let rt = RequestType::try_from_u32(req.request_type).map_err(|e| {
                 rmcp::ErrorData::invalid_params(format!("blend.invalid_request_type: {e}"), None)
             })?;
@@ -240,7 +243,11 @@ impl WalletServer {
                     None,
                 )
             })?;
-            blend_requests.push(BlendRequest::new(rt, req.address.clone(), req.qty));
+            let qty = crate::tools::amount_wire::parse_i128_field(
+                &format!("requests[{idx}].qty"),
+                &req.qty,
+            )?;
+            blend_requests.push(BlendRequest::new(rt, req.address.clone(), qty));
         }
         if blend_requests.is_empty() {
             return Err(rmcp::ErrorData::invalid_params(
@@ -516,12 +523,28 @@ impl WalletServer {
 
         match submit_result {
             Ok(()) => {
+                // blend_preview.requests carries BlendRequestEntry.amount as a
+                // core i128; the field is projected to a decimal string AT
+                // THIS MCP BOUNDARY (the stellar-agent-blend core type itself
+                // stays i128).
+                let requests_wire: Vec<serde_json::Value> = blend_preview
+                    .requests
+                    .iter()
+                    .map(|r| {
+                        json!({
+                            "verb": r.verb,
+                            "address_redacted": r.address_redacted,
+                            "address_label": r.address_label,
+                            "amount": r.amount.to_string(),
+                        })
+                    })
+                    .collect();
                 let resp = json!({
                     "status": "submitted",
                     "preview": {
                         "pool_address_redacted": blend_preview.pool_address_redacted,
                         "from_address_redacted": blend_preview.from_address_redacted,
-                        "requests": blend_preview.requests,
+                        "requests": requests_wire,
                         "health_factor": "simulate_authoritative",
                         "oracle_staleness_secs": oracle_staleness_secs,
                     },
@@ -558,6 +581,7 @@ mod tests {
         clippy::panic,
         reason = "test-only fixture construction"
     )]
+    use super::{BlendLendArgs, BlendLendRequest};
 
     #[test]
     fn redact_strkey_format() {
@@ -566,5 +590,114 @@ mod tests {
         assert!(redacted.starts_with("CCEBV"), "must start with first 5");
         assert!(redacted.contains("4HGF"), "must contain last chars");
         assert!(!redacted.contains(addr), "full addr must not appear");
+    }
+
+    // ── BlendLendRequest.qty: decimal-string wire ─────────────────────────────
+
+    #[test]
+    fn blend_lend_request_deserialises_string_qty_above_2_pow_53() {
+        let json = serde_json::json!({
+            "request_type": 0,
+            "address": "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU",
+            "qty": "9007199254740993",
+        });
+        let req: BlendLendRequest = serde_json::from_value(json).expect("deserialise");
+        assert_eq!(req.qty, "9007199254740993");
+        assert_eq!(
+            req.qty.parse::<i128>().expect("parse"),
+            9_007_199_254_740_993_i128
+        );
+    }
+
+    #[test]
+    fn blend_lend_request_rejects_raw_json_number_for_qty() {
+        let json = serde_json::json!({
+            "request_type": 0,
+            "address": "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU",
+            "qty": 500_000_000,
+        });
+        let result: Result<BlendLendRequest, _> = serde_json::from_value(json);
+        assert!(
+            result.is_err(),
+            "a raw JSON number for qty must be rejected (String-typed field)"
+        );
+    }
+
+    /// Pins toolset-dispatch eligibility for the enclosing `BlendLendArgs`
+    /// (the toolset matrix dispatcher deserialises via
+    /// `serde_json::from_value`, which cannot decode an i128 field).
+    #[test]
+    fn blend_lend_args_round_trips_through_serde_json_from_value() {
+        let value = serde_json::json!({
+            "chain_id": "stellar:testnet",
+            "pool_address": "CCEBVDYM32YNYCVNRXQKDFFPISJJCV557CDZEIRBEE4NCV4KHPQ44HGF",
+            "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD",
+            "requests": [
+                {
+                    "request_type": 0,
+                    "address": "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU",
+                    "qty": "170141183460469231731687303715884105727",
+                }
+            ],
+        });
+        let args: BlendLendArgs = serde_json::from_value(value).expect("from_value must succeed");
+        assert_eq!(
+            args.requests[0].qty.parse::<i128>().expect("parse"),
+            i128::MAX
+        );
+    }
+
+    /// Mirrors the exact `requests_wire` projection built in
+    /// `stellar_blend_lend`'s success response, proving `BlendRequestEntry.amount`
+    /// (a core i128) stringifies exactly above `2^53` and serialises as a JSON
+    /// string at the MCP boundary — the core `stellar-agent-blend` type
+    /// remains i128.
+    #[test]
+    fn blend_lend_output_requests_amount_stringifies_exactly_above_2_pow_53() {
+        use stellar_agent_blend::abi::{BlendRequest, RequestType};
+        use stellar_agent_blend::preview::{HfStatus, build_blend_lend_preview};
+
+        const POOL: &str = "CCEBVDYM32YNYCVNRXQKDFFPISJJCV557CDZEIRBEE4NCV4KHPQ44HGF";
+        const FROM: &str = "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD";
+        const ASSET: &str = "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU";
+
+        let request = BlendRequest::new(RequestType::Supply, ASSET, 9_007_199_254_740_993_i128);
+        let preview = build_blend_lend_preview(POOL, FROM, &[request], HfStatus::NotArmed, None);
+
+        let requests_wire: Vec<serde_json::Value> = preview
+            .requests
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "verb": r.verb,
+                    "address_redacted": r.address_redacted,
+                    "address_label": r.address_label,
+                    "amount": r.amount.to_string(),
+                })
+            })
+            .collect();
+
+        assert!(
+            requests_wire[0]["amount"].is_string(),
+            "amount must serialise as a JSON string: {:?}",
+            requests_wire[0]
+        );
+        assert_eq!(
+            requests_wire[0]["amount"].as_str().expect("string"),
+            "9007199254740993"
+        );
+    }
+
+    #[test]
+    fn blend_lend_request_vec_index_error_names_the_failing_entry() {
+        // Exercises parse_i128_field's per-request naming convention as used
+        // by the handler's `requests[{idx}].qty` error format.
+        let err = crate::tools::amount_wire::parse_i128_field("requests[2].qty", "not-a-number")
+            .unwrap_err();
+        let msg = err.message.to_string();
+        assert!(
+            msg.contains("requests[2].qty"),
+            "error must name the failing request index: {msg}"
+        );
     }
 }

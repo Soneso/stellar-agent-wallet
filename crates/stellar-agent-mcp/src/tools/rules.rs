@@ -356,15 +356,17 @@ pub struct PolicyEntry {
 /// — see the module-level rustdoc for the full caveat.
 #[derive(Debug, Clone, ::serde::Serialize)]
 pub struct SpendingLimitBudget {
-    /// The configured spending limit, in stroops.
-    pub spending_limit: i128,
+    /// The configured spending limit, in stroops, as a decimal string. A raw
+    /// JSON number would lose precision above `2^53`.
+    pub spending_limit: String,
     /// The rolling-window period, in ledgers.
     pub period_ledgers: u32,
     /// Sum of spend-history entries within the rolling window as of
-    /// `as_of_ledger`.
-    pub in_window_spent: i128,
-    /// `max(0, spending_limit - in_window_spent)`.
-    pub remaining_budget: i128,
+    /// `as_of_ledger`, as a decimal string (see `spending_limit`).
+    pub in_window_spent: String,
+    /// `max(0, spending_limit - in_window_spent)`, as a decimal string (see
+    /// `spending_limit`).
+    pub remaining_budget: String,
     /// Ledger sequence the simulation observed.
     pub as_of_ledger: u32,
 }
@@ -577,10 +579,10 @@ impl WalletServer {
                 Ok((data, budget_as_of_ledger)) => {
                     let window = compute_spending_window(&data, budget_as_of_ledger);
                     Some(SpendingLimitBudget {
-                        spending_limit: data.spending_limit,
+                        spending_limit: data.spending_limit.to_string(),
                         period_ledgers: data.period_ledgers,
-                        in_window_spent: window.in_window_spent,
-                        remaining_budget: window.remaining,
+                        in_window_spent: window.in_window_spent.to_string(),
+                        remaining_budget: window.remaining.to_string(),
                         as_of_ledger: budget_as_of_ledger,
                     })
                 }
@@ -827,10 +829,10 @@ mod tests {
                 identified_kind: "spending-limit".to_owned(),
             }],
             spending_limit: Some(SpendingLimitBudget {
-                spending_limit: 10_000_000,
+                spending_limit: "10000000".to_owned(),
                 period_ledgers: 17_280,
-                in_window_spent: 2_000_000,
-                remaining_budget: 8_000_000,
+                in_window_spent: "2000000".to_owned(),
+                remaining_budget: "8000000".to_owned(),
                 as_of_ledger: 1_500,
             }),
             as_of_ledger: 1_500,
@@ -847,5 +849,36 @@ mod tests {
                 "JSON must contain '{key}' key; got: {json}"
             );
         }
+    }
+
+    /// Asserts the budget fields are JSON strings, not JSON numbers —
+    /// values above `2^53` must survive an `f64`-backed JSON parser
+    /// exactly.
+    #[test]
+    fn spending_limit_budget_amount_fields_serialise_as_json_strings() {
+        let budget = SpendingLimitBudget {
+            spending_limit: "170141183460469231731687303715884105727".to_owned(),
+            period_ledgers: 17_280,
+            in_window_spent: "9007199254740993".to_owned(),
+            remaining_budget: "0".to_owned(),
+            as_of_ledger: 1_500,
+        };
+        let value = serde_json::to_value(&budget).expect("serialise");
+        assert!(
+            value["spending_limit"].is_string(),
+            "spending_limit must serialise as a JSON string: {value}"
+        );
+        assert!(
+            value["in_window_spent"].is_string(),
+            "in_window_spent must serialise as a JSON string: {value}"
+        );
+        assert!(
+            value["remaining_budget"].is_string(),
+            "remaining_budget must serialise as a JSON string: {value}"
+        );
+        assert_eq!(
+            value["spending_limit"].as_str().expect("string"),
+            "170141183460469231731687303715884105727"
+        );
     }
 }

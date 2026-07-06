@@ -74,18 +74,22 @@ pub struct DexTradeArgs {
     pub chain_id: String,
     /// Wallet smart-account address submitting the swap (C-strkey).
     pub from_address: String,
-    /// Exact input token amount in native base units (7-decimal i128).
+    /// Exact input token amount in native base units (7-decimal i128), as a
+    /// decimal string (e.g. `"250000000"`). A raw JSON number is rejected —
+    /// `serde_json::from_value` backs numbers with `f64`, which cannot
+    /// represent an i128 exactly above `2^53`.
     ///
     /// Named `qty_in` so raw on-chain integer fields use `qty_*` rather than
     /// `amount_*`, avoiding conflation with the `McpAmountArgument` dual-unit
     /// schema.
-    pub qty_in: i128,
-    /// Minimum output token amount (absolute floor, required).
+    pub qty_in: String,
+    /// Minimum output token amount (absolute floor, required), as a decimal
+    /// string. A raw JSON number is rejected (see `qty_in`).
     ///
     /// MUST be a non-negative integer (not a percent string).
     /// Named `qty_out_min` for the same naming reason as `qty_in`. The
     /// slippage floor is explicit and absolute.
-    pub qty_out_min: i128,
+    pub qty_out_min: String,
     /// Swap path: first element is the input token, last is the output token.
     ///
     /// Each element is a C-strkey, `"native"`, or `"CODE:ISSUER"` classic asset.
@@ -113,11 +117,13 @@ pub struct DexTradeArgs {
 pub struct DexQuoteArgs {
     /// CAIP-2 chain identifier: `stellar:testnet` or `stellar:mainnet`.
     pub chain_id: String,
-    /// Exact input token amount in native base units.
+    /// Exact input token amount in native base units, as a decimal string
+    /// (e.g. `"250000000"`). A raw JSON number is rejected (see
+    /// `DexTradeArgs.qty_in`).
     ///
     /// Named `qty_in` so raw on-chain integer fields use `qty_*`, avoiding
     /// conflation with the `McpAmountArgument` dual-unit schema.
-    pub qty_in: i128,
+    pub qty_in: String,
     /// Swap path (same format as `stellar_dex_trade.path`).
     pub path: Vec<String>,
 }
@@ -175,6 +181,10 @@ impl WalletServer {
         Parameters(args): Parameters<DexTradeArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         // ── Policy gate ───────────────────────────────────────────────────────
+        // qty_in rides through the policy gate as a decimal STRING
+        // (wire-faithful — deliberate). No criterion reads a decimal-string
+        // amount field numerically; a future amount criterion must parse this
+        // value string-tolerantly rather than assuming a JSON number.
         let args_value = json!({
             "chain_id": args.chain_id,
             "from_address": args.from_address,
@@ -188,6 +198,11 @@ impl WalletServer {
         if matches!(dispatch_outcome, DispatchOutcome::RequireApproval(_)) {
             return Err(crate::tools::common::single_shot_require_approval_error());
         }
+
+        // ── Parse the decimal-string amount fields ────────────────────────────
+        let qty_in = crate::tools::amount_wire::parse_i128_field("qty_in", &args.qty_in)?;
+        let qty_out_min =
+            crate::tools::amount_wire::parse_i128_field("qty_out_min", &args.qty_out_min)?;
 
         // ── Resolve network settings ──────────────────────────────────────────
         let network_passphrase = self.profile.network_passphrase.as_str();
@@ -226,8 +241,8 @@ impl WalletServer {
         // ── Build TradeArgs for the adapter ──────────────────────────────────
         let trade_args = TradeArgs {
             from_address: args.from_address.clone(),
-            amount_in: args.qty_in,
-            amount_out_min: args.qty_out_min,
+            amount_in: qty_in,
+            amount_out_min: qty_out_min,
             path: canonical_path.clone(),
             deadline: args.deadline,
         };
@@ -261,8 +276,8 @@ impl WalletServer {
             verb = "trade",
             router_redacted = %router_redacted,
             from_redacted = %from_redacted,
-            qty_in = args.qty_in,
-            qty_out_min = args.qty_out_min,
+            qty_in,
+            qty_out_min,
             request_id = witness.request_id(),
             "Soroswap trade: policy gate passed, submitting via adapter"
         );
@@ -374,8 +389,9 @@ impl WalletServer {
         &self,
         Parameters(args): Parameters<DexQuoteArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        // ── Validate basic input ──────────────────────────────────────────────
-        if args.qty_in <= 0 {
+        // ── Parse and validate basic input ────────────────────────────────────
+        let qty_in = crate::tools::amount_wire::parse_i128_field("qty_in", &args.qty_in)?;
+        if qty_in <= 0 {
             return Err(rmcp::ErrorData::invalid_params(
                 "dex.quote.invalid_qty_in: qty_in must be positive",
                 None,
@@ -405,7 +421,7 @@ impl WalletServer {
         // ── Fetch on-chain quote ──────────────────────────────────────────────
         let quote = fetch_quote(
             router_address,
-            args.qty_in,
+            qty_in,
             &canonical_path,
             rpc_url,
             network_passphrase,
@@ -415,7 +431,11 @@ impl WalletServer {
             rmcp::ErrorData::internal_error(format!("dex.quote.fetch_failed: {e}"), None)
         })?;
 
+        // expected_out and amounts are core i128 values returned by the dex
+        // crate; they are stringified AT THIS MCP BOUNDARY (the core
+        // QuoteResult type itself stays i128).
         let expected_out = quote.expected_out().unwrap_or(0);
+        let amounts_wire: Vec<String> = quote.amounts.iter().map(ToString::to_string).collect();
         let path_redacted: Vec<String> = canonical_path
             .iter()
             .map(|a| redact_strkey_first5_last5(a))
@@ -424,13 +444,41 @@ impl WalletServer {
         let resp = json!({
             "status": "ok",
             "qty_in": args.qty_in,
-            "expected_out": expected_out,
-            "amounts": quote.amounts,
+            "expected_out": expected_out.to_string(),
+            "amounts": amounts_wire,
             "path_redacted": path_redacted,
             "router_redacted": redact_strkey_first5_last5(router_address),
         });
         let json_str = serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
         Ok(CallToolResult::success(vec![Content::text(json_str)]))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl WalletServer {
+    /// Calls `stellar_dex_quote` with the given args, bypassing the rmcp
+    /// transport.
+    ///
+    /// Integration-test entry point for handler-level checks, including the
+    /// MCP-tool-layer decimal-string wire acceptance test.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    ///
+    /// # Feature gate
+    ///
+    /// Gated on the `test-helpers` feature or `#[cfg(test)]`.
+    #[doc(hidden)]
+    pub async fn call_stellar_dex_quote(
+        &self,
+        args: DexQuoteArgs,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.stellar_dex_quote(Parameters(args)).await
     }
 }
 
@@ -446,6 +494,7 @@ mod tests {
         clippy::panic,
         reason = "test-only fixture construction"
     )]
+    use super::{DexQuoteArgs, DexTradeArgs};
 
     #[test]
     fn router_redaction_format() {
@@ -454,5 +503,144 @@ mod tests {
         assert!(redacted.starts_with("CCJUD"), "must start with first 5");
         assert!(redacted.contains("7BRD"), "must contain last chars");
         assert!(!redacted.contains(addr), "full addr must not appear");
+    }
+
+    // ── DexTradeArgs: decimal-string wire ─────────────────────────────────────
+
+    #[test]
+    fn dex_trade_args_deserialises_string_amounts_above_2_pow_53() {
+        let json = serde_json::json!({
+            "chain_id": "stellar:testnet",
+            "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD",
+            "qty_in": "9007199254740993",
+            "qty_out_min": "1",
+            "path": ["native", "native"],
+        });
+        let args: DexTradeArgs = serde_json::from_value(json).expect("deserialise");
+        assert_eq!(args.qty_in, "9007199254740993");
+        let parsed: i128 = args.qty_in.parse().expect("parse");
+        assert_eq!(parsed, 9_007_199_254_740_993_i128);
+    }
+
+    #[test]
+    fn dex_trade_args_rejects_raw_json_number_for_qty_in() {
+        let json = serde_json::json!({
+            "chain_id": "stellar:testnet",
+            "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD",
+            "qty_in": 250_000_000,
+            "qty_out_min": "1",
+            "path": ["native", "native"],
+        });
+        let result: Result<DexTradeArgs, _> = serde_json::from_value(json);
+        assert!(
+            result.is_err(),
+            "a raw JSON number for qty_in must be rejected (String-typed field)"
+        );
+    }
+
+    #[test]
+    fn dex_trade_args_rejects_raw_json_number_for_qty_out_min() {
+        let json = serde_json::json!({
+            "chain_id": "stellar:testnet",
+            "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD",
+            "qty_in": "250000000",
+            "qty_out_min": 1,
+            "path": ["native", "native"],
+        });
+        let result: Result<DexTradeArgs, _> = serde_json::from_value(json);
+        assert!(
+            result.is_err(),
+            "a raw JSON number for qty_out_min must be rejected (String-typed field)"
+        );
+    }
+
+    /// Pins toolset-dispatch eligibility: the args struct must round-trip
+    /// through `serde_json::from_value`, the mechanism the toolset matrix
+    /// dispatcher uses. String-typed amount fields round-trip
+    /// unconditionally; a raw i128 field fails for values beyond the range
+    /// `serde_json::Number` can hold.
+    #[test]
+    fn dex_trade_args_round_trips_through_serde_json_from_value() {
+        let value = serde_json::json!({
+            "chain_id": "stellar:testnet",
+            "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD",
+            "qty_in": "170141183460469231731687303715884105727",
+            "qty_out_min": "0",
+            "path": ["native", "native"],
+        });
+        let args: DexTradeArgs = serde_json::from_value(value).expect("from_value must succeed");
+        assert_eq!(args.qty_in.parse::<i128>().expect("parse"), i128::MAX);
+    }
+
+    // ── DexQuoteArgs: decimal-string wire ─────────────────────────────────────
+
+    #[test]
+    fn dex_quote_args_deserialises_string_qty_in() {
+        let json = serde_json::json!({
+            "chain_id": "stellar:testnet",
+            "qty_in": "9007199254740993",
+            "path": ["native", "native"],
+        });
+        let args: DexQuoteArgs = serde_json::from_value(json).expect("deserialise");
+        assert_eq!(args.qty_in, "9007199254740993");
+    }
+
+    #[test]
+    fn dex_quote_args_rejects_raw_json_number() {
+        let json = serde_json::json!({
+            "chain_id": "stellar:testnet",
+            "qty_in": 250_000_000,
+            "path": ["native", "native"],
+        });
+        let result: Result<DexQuoteArgs, _> = serde_json::from_value(json);
+        assert!(
+            result.is_err(),
+            "a raw JSON number for qty_in must be rejected (String-typed field)"
+        );
+    }
+
+    #[test]
+    fn dex_quote_args_round_trips_through_serde_json_from_value() {
+        let value = serde_json::json!({
+            "chain_id": "stellar:testnet",
+            "qty_in": "170141183460469231731687303715884105727",
+            "path": ["native", "native"],
+        });
+        let args: DexQuoteArgs = serde_json::from_value(value).expect("from_value must succeed");
+        assert_eq!(args.qty_in.parse::<i128>().expect("parse"), i128::MAX);
+    }
+
+    // ── Output-shape: expected_out / amounts stringify exactly at the boundary ─
+
+    /// Mirrors the exact `expected_out.to_string()` / `amounts.iter().map(...)`
+    /// projection used in `stellar_dex_quote`'s success response, proving the
+    /// values above `2^53` round-trip byte-for-byte and serialise as JSON
+    /// strings rather than JSON numbers.
+    #[test]
+    fn dex_quote_output_amounts_stringify_exactly_above_2_pow_53() {
+        let expected_out: i128 = 9_007_199_254_740_993_i128;
+        let amounts: Vec<i128> = vec![250_000_000_i128, expected_out, i128::MAX];
+        let amounts_wire: Vec<String> = amounts.iter().map(ToString::to_string).collect();
+
+        assert_eq!(amounts_wire[1], "9007199254740993");
+        assert_eq!(amounts_wire[2], i128::MAX.to_string());
+
+        let expected_out_wire = expected_out.to_string();
+        let value = serde_json::json!({
+            "expected_out": expected_out_wire,
+            "amounts": amounts_wire,
+        });
+        assert!(
+            value["expected_out"].is_string(),
+            "expected_out must serialise as a JSON string: {value}"
+        );
+        assert!(
+            value["amounts"][1].is_string(),
+            "each amounts element must serialise as a JSON string: {value}"
+        );
+        assert_eq!(
+            value["expected_out"].as_str().expect("string"),
+            "9007199254740993"
+        );
     }
 }

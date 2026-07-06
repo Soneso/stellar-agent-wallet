@@ -252,7 +252,7 @@ Flags:
 - `--source-account <G_STRKEY>` (required) — source account for the simulation envelope. Any funded account on the target network works (read-only path; no signing).
 - Shared: `--network`, `--rpc-url`, `--timeout-seconds`, `--output`.
 
-Envelope: `{ smart_account, rule_id, policy_address, spending_limit, period_ledgers, in_window_spent, remaining_budget, as_of_ledger, window_cutoff_ledger, history_entries, cached_total_spent }`. `cached_total_spent` is the on-chain cached total verbatim, for transparency — it is NOT used to compute `in_window_spent` (the on-chain cache is not evicted on read, so it can include entries already outside the rolling window).
+Envelope: `{ smart_account, rule_id, policy_address, spending_limit, period_ledgers, in_window_spent, remaining_budget, as_of_ledger, window_cutoff_ledger, history_entries, cached_total_spent }`. `spending_limit`, `in_window_spent`, `remaining_budget`, and `cached_total_spent` are decimal strings (i128, stroops), not JSON numbers — a raw JSON number above `2^53` cannot be represented exactly by an `f64`-backed parser. `cached_total_spent` is the on-chain cached total verbatim, for transparency — it is NOT used to compute `in_window_spent` (the on-chain cache is not evicted on read, so it can include entries already outside the rolling window).
 
 ```bash
 stellar-agent smart-account rules get-spending-limit \

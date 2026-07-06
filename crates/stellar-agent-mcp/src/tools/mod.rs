@@ -35,6 +35,9 @@
 //! - `dex_trade` — `stellar_dex_trade` + `stellar_dex_quote` tools (Soroswap swap adapter).
 //! - `trustline` — `stellar_trustline` + `stellar_trustline_commit` tools (stablecoin trustline verb).
 
+// Shared decimal-string <-> i128 parse helpers for the DeFi tool args (dex,
+// blend, vault) and other i128-carrying wire fields.
+pub(crate) mod amount_wire;
 pub(crate) mod balances;
 pub(crate) mod common;
 pub(crate) mod create_account;

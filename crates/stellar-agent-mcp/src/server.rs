@@ -273,6 +273,9 @@ pub use crate::tools::claim::{StellarClaimArgs, StellarClaimCommitArgs};
 pub use crate::tools::common::check_duplicate_registrations;
 /// Re-exported for back-compat: argument types for `stellar_create_account`.
 pub use crate::tools::create_account::{StellarCreateAccountArgs, StellarCreateAccountCommitArgs};
+/// Re-exported for the MCP-tool-layer decimal-string wire acceptance test:
+/// argument type for `stellar_dex_quote`.
+pub use crate::tools::dex_trade::DexQuoteArgs;
 /// Re-exported for back-compat: argument type for `stellar_fee_stats`.
 pub use crate::tools::fee_stats::StellarFeeStatsArgs;
 /// Re-exported for back-compat: argument type for `stellar_friendbot`.
