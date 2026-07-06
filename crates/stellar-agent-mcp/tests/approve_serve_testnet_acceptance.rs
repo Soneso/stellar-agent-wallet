@@ -380,7 +380,11 @@ async fn t1_serve_approve_then_commit_on_testnet() {
         .unwrap_or_else(|| panic!("parked nonce must be listed in pending.json: {pending_json}"));
     assert_eq!(parked["summary"]["kind"], "payment");
     assert_eq!(parked["summary"]["to"], dest_g);
-    assert_eq!(parked["summary"]["amount_stroops"], PAYMENT_STROOPS);
+    assert_eq!(
+        parked["summary"]["amount_stroops"],
+        PAYMENT_STROOPS.to_string(),
+        "the served pending.json carries amounts as decimal strings"
+    );
 
     // ── 5. Detail page → extract the per-nonce CSRF token ────────────────────
     let detail_resp = client
