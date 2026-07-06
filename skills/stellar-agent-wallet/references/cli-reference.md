@@ -97,7 +97,7 @@ Argument groups: deployer (exactly one) `--deployer-secret-env` xor `--sign-with
 |---|---|---|
 | `--initial-signer <G_STRKEY>` | Delegated (native) genesis signer | — |
 | `--signer-webauthn <CRED_NAME>` | Genesis signer = an already-registered passkey, resolved from the local passkeys registry; needs a WebAuthn verifier already deployed (`deploy-webauthn-verifier`) | — |
-| `--signer-ed25519 <HEX_PUBKEY_64>` | Genesis signer = raw 32-byte ed25519 pubkey, verified via `--signer-external`'s verifier | — |
+| `--signer-ed25519 <HEX_PUBKEY_64>` (optional `--verifier <C_STRKEY>` override) | Genesis signer = raw 32-byte ed25519 pubkey, verified by the Ed25519 verifier resolved from `--verifier` when supplied, else the verifier registry | — |
 | `--signer-external <C_STRKEY>` + `--signer-key-data <HEX>` | Genesis signer = verified by this verifier contract with this key data | — |
 | `--accept-no-delegated-fallback` | Required with any non-`--initial-signer` genesis source: acknowledges NO G-key fallback exists at genesis (`validation.passkey_only_rule_no_delegated_fallback` otherwise) | `false` |
 | `--deployer-secret-env <VAR>` | Env-var name holding deployer S-strkey | — |
@@ -268,190 +268,60 @@ stellar-agent counterparty refresh circle.com --profile default
 
 ## smart-account
 
-Invoke as `stellar-agent smart-account <verb>` or via the shorter `sa` alias. Administration of an on-chain OpenZeppelin smart-account: context rules, signer sets and thresholds, policy contracts, supporting infrastructure (verifier registry, multicall router registry, upgrade timelock), and multicall submission. All write verbs sign through the smart-account auth-entry digest path. Most on-chain signing verbs structurally refuse `mainnet`.
+Invoke as `stellar-agent smart-account <verb>` or via the shorter `sa` alias. Administration of an on-chain OpenZeppelin smart-account: context rules, signer sets and thresholds, policy contracts, supporting infrastructure (verifier registry, multicall router registry, upgrade timelock), and multicall submission. All write verbs sign through the smart-account auth-entry digest path and take a signer source (exactly one of `--signer-secret-env <VAR>` or `--sign-with-ledger`, plus `--account-index <INDEX>`, default `0`). Most on-chain signing verbs structurally refuse `mainnet`. The `smart-account signers` verbs do not accept `--output`; the other verbs take the shared `--output` (`json` default, `table` where offered).
 
-Signer source for write verbs: exactly one of `--signer-secret-env <VAR>` or `--sign-with-ledger`, plus `--account-index <INDEX>` (default `0`).
+Every verb's exact flags, the mainnet-refusal matrix, signer-kind discriminators, WASM-hash pinning and override flags, and worked examples live in [`smart-accounts.md`](smart-accounts.md). Per-verb index:
 
-### `smart-account rules` — context-rule lifecycle
-
-Each rule has a `rule_id` (u32), a name (OZ cap 20 bytes), an optional expiry ledger, a signer set (OZ cap 15), and up to 5 policy contracts. `--auth-rule-id <U32>` names the authorizing rule (repeatable on create/add-policy/remove-policy; default `[0]`, the bootstrap rule); where optional it defaults to `--rule-id`.
-
-| Verb | Purpose | Key flags (plus `--account <C_STRKEY>` required everywhere, signer source on write verbs) |
-|---|---|---|
-| `create` | Install a new rule (`add_context_rule`); returns minted `rule_id` | `--name <STRING>` (required); `--context <SPEC>` (default `default`; `call-contract:<C_STRKEY>` or `create-contract:<64_HEX_WASM_HASH>` scope the rule); `--signer-delegated <G_STRKEY>` (repeatable); `--signer-webauthn <CRED_NAME>` (repeatable); `--signer-ed25519 <HEX_PUBKEY_64>` (repeatable, optional `--verifier <C_STRKEY>` override); `--accept-no-delegated-fallback`; `--accept-mutable-verifier`; `--accept-unknown-verifier`; `--auth-rule-id <U32>`; `--valid-until <LEDGER\|none>` (default `none`). At least one signer required. |
-| `get` | Read one rule (`get_context_rule`); read-only, `mainnet` ok | `--rule-id <U32>` (required); `--source-account <G_STRKEY>` (required, simulation only, not debited/signed) |
-| `set-name` | Rename a rule (`update_context_rule_name`) | `--rule-id <U32>`; `--name <STRING>`; `--auth-rule-id` (optional) |
-| `set-valid-until` | Change expiry (`update_context_rule_valid_until`) | `--rule-id <U32>`; `--valid-until <LEDGER\|none>` (required) |
-| `delete` | Remove a rule (`remove_context_rule`) | `--rule-id <U32>`; `--auth-rule-id` (optional) |
-| `verify-pins` | Verify pinned verifier/policy WASM hashes vs on-chain (drift); read-only, `mainnet` ok; exit `1` on `drift` | `--rule-id <U32>`. Each `*_pin_status` is `match`/`drift`/`unavailable`/`no_pin`/`no_contracts`. |
-| `add-policy` | Add a policy (`add_policy`); cap 5; returns `policy_id` | `--rule-id <U32>`; `--kind <raw\|spending-limit\|simple-threshold\|weighted-threshold>` (default `raw`); raw: `--policy-address <C_STRKEY>`, `--install-param <SCVAL_BASE64>` (standard base64 XDR `ScVal`, raw passthrough); spending-limit: `--limit <STROOPS>`, `--period <LEDGERS>`, optional `--policy <C_STRKEY>` override; simple-threshold: `--threshold <U32>`; weighted-threshold: `--threshold <U32>` plus one or more `--weighted-signer-delegated <G_STRKEY=WEIGHT>` / `--weighted-signer-webauthn <CRED_NAME=WEIGHT>`; `--auth-rule-id` |
-| `remove-policy` | Remove a policy by id (`remove_policy`) | `--rule-id <U32>`; `--policy-id <U32>`; `--auth-rule-id` |
-| `list` | Enumerate active rules by on-chain scan; read-only, `mainnet` ok; alias of `smart-account list-rules` | see `smart-account list-rules` |
-| `get-spending-limit` | Read an installed spending-limit policy's budget state; read-only, `mainnet` ok | `--rule-id <U32>`; `--source-account <G_STRKEY>` (required, simulation only). Returns `spending_limit`, `period_ledgers`, `in_window_spent`, `remaining_budget`, `as_of_ledger`, `window_cutoff_ledger`, `history_entries`, `cached_total_spent`. `in_window_spent`/`remaining_budget` are exact only as of `as_of_ledger`. |
-| `set-spending-limit` | Retune the limit (`set_spending_limit`) without resetting spend history | `--rule-id <U32>`; `--auth-rule-id <U32>` (default 0: the CallContract rule being retuned can never authorize its own retune — an admin-capable rule must); `--limit <STROOPS>` (required, must be positive). Mutates ONLY the limit; the period is immutable post-install (changing it needs `remove-policy` + `add-policy`, which resets history). |
-
-```bash
-stellar-agent smart-account rules create --account CABC...WXYZ --name agent-ops \
-  --signer-delegated GABC...WXYZ --signer-secret-env WALLET_SK
-```
-
-### `smart-account signers` — signer-set lifecycle
-
-All verbs take `--account <C_STRKEY>` and `--rule-id <U32>` (both required), the signer source, and shared network flags. None accept `--output`. All refuse `mainnet`, including `list`/`refresh` (which require a signer source to assemble the read envelope and write audit rows).
-
-| Verb | Purpose | Extra flags |
-|---|---|---|
-| `list` | Read on-chain signer set; baselines `SaSignerSetBaselined` if no prior baseline. Reports `signer_count`, `threshold`, `signer_ids`, `signer_kinds` | — |
-| `refresh` | Unconditionally re-anchor the signer-set baseline | — |
-| `add` | Add one signer (`add_signer`); cap 15; returns `new_signer_id` | exactly one of `--signer-delegated <G_STRKEY>` (alias `--new-signer`) / `--signer-ed25519 <HEX_PUBKEY_64>` (optional `--verifier <C_STRKEY>` override, else registry) / `--signer-external <C_STRKEY>` (requires `--signer-key-data <HEX>`) / `--signer-webauthn <CRED_NAME>`. `--signer-ed25519` is the recommended shape for an agent's own key — no funded account, HSM/keyring-holdable. |
-| `remove` | Remove a signer (`remove_signer`); refuses if it would drop count below threshold | `--signer-id <U32>` (required) |
-| `set-threshold` | Change threshold via threshold-policy `set_threshold` | `--new-threshold <U32>` (required); no `--auth-rule-id` override |
-| `set-weighted-threshold` | Change a weighted-threshold policy's threshold (`set_threshold` on the weighted-threshold policy) | `--new-threshold <U32>` (required); `--auth-rule-id` (default `--rule-id`; use an admin rule if `--rule-id` is scoped) |
-| `set-signer-weight` | Change one signer's weight in a weighted-threshold policy (`set_signer_weight`) | `--new-weight <U32>` (required); target signer: one of `--signer-delegated <G_STRKEY>` / `--signer-ed25519 <HEX_PUBKEY_64>` (optional `--verifier`) / `--signer-external <C_STRKEY>` (requires `--signer-key-data`) / `--signer-webauthn <CRED_NAME>`; `--auth-rule-id` (same default as `set-weighted-threshold`) |
-| `batch-add` | Add MULTIPLE signers in ONE transaction (`batch_add_signer`); cap 15; returns `new_signer_ids` | one or more, any combination, repeatable: `--signer-delegated <G_STRKEY>` / `--signer-webauthn <CRED_NAME>` / `--signer-ed25519 <HEX_PUBKEY_64>` (optional `--verifier` override for all `--signer-ed25519` entries). Refuses an empty batch. Post-op result-fetch needs a SIMPLE-threshold policy on the target rule — attach one first if the rule only has a weighted-threshold policy. |
-
-```bash
-stellar-agent smart-account signers set-threshold --account CABC...WXYZ \
-  --rule-id 0 --new-threshold 2 --signer-secret-env WALLET_SK
-```
-
-### `smart-account execute`
-
-Submits one `CallContract` invocation against an external contract, authorized by a named context rule and signed by an External-Ed25519 rule signer — the delegation-submission verb (see `agent-delegation.md`). Testnet only; refuses `mainnet` before any RPC call or key access. No MCP equivalent (arbitrary-invocation tools have no meaningful consent preview).
-
-Two signers: `--rule-signer-ed25519-secret-env <VAR>` (required) is the agent's own key that authorizes the call; the ordinary signer source (`--signer-secret-env` / `--sign-with-ledger`) is the fee-payer.
-
-| Flag | Meaning |
+| Verb | Purpose |
 |---|---|
-| `--account <C_STRKEY>` (required) | Smart account whose rule authorizes the call (`auth_address`) |
-| `--contract <C_STRKEY>` (required) | External target contract (`target_contract`) |
-| `--function <NAME>` (required) | Contract function to invoke |
-| `--arg <SCVAL_BASE64>` (repeatable) | One standard-base64 XDR `ScVal` per argument, in order; bounded-decoded to validate only, never re-encoded |
-| `--auth-rule-id <U32>` (required, repeatable) | NO default — deviates from every other write verb; the delegation use case always names a specific scoped rule |
-| `--rule-signer-ed25519-secret-env <VAR>` (required) | Agent's S-strkey seed env var |
-| `--expect-rule-signer <64_HEX>` | Fail closed before signing if the derived pubkey differs |
-| `--verifier <C_STRKEY>` | Ed25519-verifier override; else resolves from the registry |
+| `rules create` | Install a context rule; returns the minted `rule_id`. At least one signer required |
+| `rules get` | Read one rule (read-only, mainnet OK) |
+| `rules set-name` | Rename a rule |
+| `rules set-valid-until` | Change a rule's expiry ledger |
+| `rules delete` | Remove a rule |
+| `rules verify-pins` | Verify pinned verifier/policy WASM hashes vs on-chain (drift; read-only, exit `1` on drift) |
+| `rules add-policy` | Attach a policy (`--kind raw`/`spending-limit`/`simple-threshold`/`weighted-threshold`); cap 5 |
+| `rules remove-policy` | Detach a policy by id |
+| `rules list` / `list-rules` | Enumerate active rules by on-chain scan (read-only, mainnet OK) |
+| `rules get-spending-limit` | Read an installed spending-limit policy's rolling-window budget (read-only; amounts are decimal strings) |
+| `rules set-spending-limit` | Retune a spending-limit cap without resetting history. `--auth-rule-id` default 0: the retuned CallContract rule cannot authorize its own retune — name an admin-capable rule. Period is immutable |
+| `signers list` | Read the on-chain signer set; baselines if none |
+| `signers refresh` | Re-anchor the signer-set baseline |
+| `signers add` | Add one signer (cap 15). `--signer-ed25519` is the recommended agent-key shape |
+| `signers remove` | Remove a signer; refuses if it would drop below threshold |
+| `signers set-threshold` | Change a simple-threshold policy's threshold (authorizer is `--rule-id`) |
+| `signers set-weighted-threshold` | Change a weighted-threshold policy's threshold (use an admin `--auth-rule-id` when `--rule-id` is scoped) |
+| `signers set-signer-weight` | Change one signer's weight in a weighted-threshold policy |
+| `signers batch-add` | Add multiple signers in one transaction (cap 15). Result-fetch needs a simple-threshold policy on the rule |
+| `execute` | Submit one `CallContract` invocation authorized by a rule and signed by an External-Ed25519 rule signer — the delegation verb; `--auth-rule-id` has NO default; no MCP equivalent |
+| `multicall` | Submit an atomic 1–50-invocation bundle through the registered router; requires `--secondary-rpc-url` (flag or profile, else a typed error) |
+| `deploy-webauthn-verifier` | Deploy the OZ WebAuthn-verifier WASM; idempotent; testnet only |
+| `deploy-ed25519-verifier` | Deploy the OZ Ed25519-verifier WASM (backs `--signer-ed25519`); testnet only |
+| `deploy-spending-limit-policy` | Deploy the OZ spending-limit-policy WASM (per-network singleton); testnet only |
+| `deploy-policy` | Deploy any of the three OZ policy contracts via one `--kind`; recommended; testnet only |
+| `migrate-verifier` | Move all External signers from one verifier to another across rules; mainnet submit needs `--confirm-mainnet-migrate` |
+| `list-verifiers` | Enumerate the compile-time verifier allowlist and audit-status taxonomy (read-only, no network) |
+| `register-multicall` / `unregister-multicall` | Edit the local multicall-router registry |
+| `timelock schedule` / `cancel` / `execute` / `list-pending` | OpenZeppelin upgrade-timelock lifecycle; write verbs refuse `mainnet`, `list-pending` is read-only |
 
-Success envelope: `status: "submitted"`, `contract`, `function`, `arg_count`, `auth_rule_ids`, `rule_signer_pubkey_first8`, `verifier_address`, `tx_hash`.
-
-```bash
-stellar-agent smart-account execute --account CABC...WXYZ --contract CTOK...WXYZ \
-  --function transfer --arg AAAAEgAAAAA... --arg AAAAEgAAAAA... --arg AAAACgAAAAA... \
-  --auth-rule-id 3 --rule-signer-ed25519-secret-env AGENT_SK --signer-secret-env WALLET_SK
-```
-
-### `smart-account multicall`
-
-Submits an atomic multicall bundle (1–50 invocations) through the registered router. Signs and submits. Router resolved from the local registry (`~/.config/stellar-agent/networks.toml`); `mainnet` requires a mainnet-registered router. Requires a signer source and `--secondary-rpc-url` (flag or `profile.secondary_rpc_url`, else a typed error).
-
-| Flag | Meaning |
-|---|---|
-| `--smart-account <C_STRKEY>` (required) | Smart-account executing the bundle |
-| `--rule-id <U32>` (required) | Authorizing context rule |
-| `--invocation <TARGET:FN:JSON_ARGS>` (required, repeatable, 1–50) | `<target C-strkey>:<fn>:<json array of XDR-encoded args>` |
-| `--secondary-rpc-url <URL>` | Cross-verification RPC (required) |
-| `--fee <STROOPS>` | Integer only; `auto` rejected | 
-
-```bash
-stellar-agent smart-account multicall --smart-account CABC...WXYZ --rule-id 0 \
-  --invocation 'CTOK...WXYZ:transfer:["GABC...WXYZ","GWXY...WXYZ","1000000"]' \
-  --secondary-rpc-url https://rpc2.example --signer-secret-env WALLET_SK
-```
-
-### Infrastructure and timelock verbs
-
-| Verb | Purpose | Key flags |
-|---|---|---|
-| `deploy-webauthn-verifier` | Deploy OZ WebAuthn-verifier WASM, record in registry; idempotent (`status:"already_deployed"`); testnet only | `--deployer-secret-env <VAR>` xor `--sign-with-ledger`; `--account-index`; `--network`; `--rpc-url`; `--fee`; `--timeout-seconds`; `--output`; `--dry-run` (`status:"dry_run"`) |
-| `deploy-ed25519-verifier` | Deploy OZ Ed25519-verifier WASM, record in registry; same flags/idempotency as above; backs `--signer-ed25519`; testnet only | same as `deploy-webauthn-verifier` |
-| `deploy-spending-limit-policy` | Deploy OZ spending-limit-policy WASM (per-network singleton), record in registry; same flags/idempotency as above; backs `rules add-policy --kind spending-limit`; testnet only | same as `deploy-webauthn-verifier` |
-| `deploy-policy` | Deploy any of the three OZ policy contracts through one verb; same flags/idempotency as above; recommended over `deploy-spending-limit-policy`; testnet only | `--kind <simple-threshold\|spending-limit\|weighted-threshold>` (required) plus same as `deploy-webauthn-verifier` |
-| `migrate-verifier` | Move all `External` signers from one verifier to another across rules; dry-run renders plan; mainnet submit needs `--confirm-mainnet-migrate` | `--account <C_STRKEY>`; `--from <HASH_HEX>` (64-char SHA-256 of source WASM); `--to <C_STRKEY>`; `--dry-run`; `--confirm-mainnet-migrate`; signer source (submit) |
-| `list-verifiers` | Enumerate compile-time verifier allowlist + audit-status taxonomy; read-only, no network | `--output` |
-| `list-rules` | Enumerate active rules by scanning `[0, max_scan_id)`; read-only, `mainnet` ok; backs `smart-account rules list` | `--account <C_STRKEY>`; `--source-account <G_STRKEY>` (sim source); `--rpc-url`; `--secondary-rpc-url`; `--network`; `--profile`; `--max-scan-id <1..=10000>` (else profile, else 50); `--timeout-seconds`; `--output` (table deferred) |
-| `register-multicall` | Register router address + WASM hash in local registry; idempotent; refuses if `--wasm-sha256` ≠ compiled-in hash | `--network`; `--address <C_STRKEY>`; `--wasm-sha256 <HEX>` (64-char lowercase); `--profile` |
-| `unregister-multicall` | Remove router registry entry | `--network`; `--force` (corruption recovery, needs TTY `[y/N]` or `--yes-i-have-verified-the-prior-values`); `--profile` |
-
-```bash
-stellar-agent smart-account deploy-webauthn-verifier --deployer-secret-env DEPLOYER_SK
-```
-
-### `smart-account timelock` — OpenZeppelin upgrade timelock
-
-Schedule, cancel, execute, and list pending operations. All share `--timelock <C_STRKEY>` (required), `--rpc-url`, `--secondary-rpc-url` (defaults to `--rpc-url`), `--network`, `--profile`; write verbs add the signer source. Write verbs refuse `mainnet`; `list-pending` is read-only and accepts `mainnet`.
-
-| Verb | Purpose | Extra flags |
-|---|---|---|
-| `schedule` | Schedule (PROPOSER role); returns `salt` (64-char hex) and `operation_id_full_hex` — record `salt`, required by `execute`/`cancel`, not recomputable | `--target <C_STRKEY>`; `--function <NAME>`; `--delay-ledgers <N>` |
-| `cancel` | Cancel pending op (CANCELLER role); cross-confirms event | `--operation-id <HEX>` (64-char from schedule) |
-| `execute` | Execute a ready op (EXECUTOR role / open mode); dual-RPC ready-check fails closed | `--target <C_STRKEY>`; `--function <NAME>`; `--operation-id <HEX>`; `--salt <HEX>` (must match schedule) |
-| `list-pending` | List pending ops via audit log + dual-RPC `get_operation_state`; read-only | (shared only) |
-
-```bash
-stellar-agent smart-account timelock schedule --timelock CTLCK...WXYZ \
-  --target CTGT...WXYZ --function upgrade --delay-ledgers 100 \
-  --signer-secret-env PROPOSER_SK
-# Save the "salt" field from the JSON output.
-```
+Flags for every verb: see [`smart-accounts.md`](smart-accounts.md).
 
 ---
 
 ## DeFi: lend, vault, trade
 
-`lend`, `vault deposit`, `vault withdraw`, and `trade` are signing commands. Before signing each loads the profile, pins the target contract by WASM hash (two-RPC cross-check when `--secondary-rpc-url` is set), evaluates the operator policy engine, then signs and submits. A `Deny` decision refuses `policy.deny.<code>`; a `RequireApproval` decision refuses `policy.approval_required` (use the MCP server for two-phase approval — the CLI has no interactive approval path for these verbs); an unbuildable engine refuses `policy.engine_unavailable` (fail-closed). These commands do not accept `--output`; they always emit JSON. No command-level mainnet refusal — constrained by per-network contract pins. DeFi amounts are raw integer base units (no decimal/unit string).
+`lend`, `vault deposit`, `vault withdraw`, and `trade` are signing commands. Before signing each loads the profile, pins the target contract by WASM hash (two-RPC cross-check when `--secondary-rpc-url` is set), evaluates the operator policy engine, then signs and submits. A `Deny` refuses `policy.deny.<code>`; a `RequireApproval` refuses `policy.approval_required` (use the MCP server for two-phase approval — the CLI has no interactive approval path for these verbs); an unbuildable engine refuses `policy.engine_unavailable` (fail-closed). These commands do not accept `--output`; they always emit JSON. There is no command-level mainnet refusal — they are constrained by per-network contract pins. DeFi amounts are raw integer base units (no decimal/unit string).
 
-### `lend` (Blend)
+Every venue's flags, trust gate, refusal codes, and examples live in [`defi.md`](defi.md). Per-verb index:
 
-Supply/borrow/repay/withdraw against a Blend pool. Trust gate: verify pool WASM hash, require oracle in Reflector allowlist (else `blend.oracle_not_allowlisted`), check oracle staleness (else `oracle.staleness_exceeded`). Liquidation is not exposed.
-
-| Flag | Meaning | Default |
+| Verb | Venue | Purpose |
 |---|---|---|
-| `--profile <NAME>` | Profile | `default` |
-| `--pool <C-strkey>` (required) | Blend pool address | — |
-| `--from <C-strkey>` (required) | Wallet smart-account submitting | — |
-| `--op <OP>` (required) | `supply`, `withdraw`, `supply-collateral`, `withdraw-collateral`, `borrow`, `repay` | — |
-| `--asset <C-strkey>` (required) | Asset contract address | — |
-| `--amount <i128>` (required) | Amount in base unit (integer) | — |
-| `--override-oracle-staleness` | Bypass staleness block | `false` |
-| `--max-staleness-secs <SECS>` | Max accepted staleness; `0` forces a block | `600` |
-| `--secondary-rpc-url <URL>` | Two-RPC WASM-hash cross-check | none |
+| `lend` | Blend | Supply/borrow/repay/withdraw against a Blend pool; oracle-allowlist and staleness gates |
+| `vault deposit` | DeFindex | Deposit into a DeFindex vault; `--amounts-min` required; upgradable-vault refusal |
+| `vault withdraw` | DeFindex | Redeem shares from a DeFindex vault; `--min-amounts-out` required |
+| `trade` | Soroswap | Swap via the Soroswap router; price discovery is inside `trade` (no separate `quote`) |
 
-```bash
-stellar-agent lend --pool CABC...WXYZ --from CABC...WXYZ \
-  --op supply --asset CABC...WXYZ --amount 500000000 --profile default
-```
-
-### `vault deposit` / `vault withdraw` (DeFindex)
-
-Deposit/withdraw via a DeFindex vault. Five-step trust gate (verify WASM hash; read upgradable flag; read role addresses and management mode; read on-chain assets and validate amount-vector length against pinned asset count, else `vault.asset_count_mismatch`; evaluate upgradable in light of mode). An `upgradable:true` vault is refused (`vault.upgradable_refused`) unless `--override-upgradable` (emits `vault.upgradable_override`). The min-amount vectors are required — omitting is a structural pre-sign refusal; `0` per asset means no slippage protection on that asset (opt-in).
-
-`deposit` flags: `--vault <C-strkey>` (required), `--from <C-strkey>` (required), `--amounts-desired <i128>...` (required, per asset in order), `--amounts-min <i128>...` (required, same length), `--invest` (auto-invest after deposit), `--override-upgradable`, `--secondary-rpc-url`, `--profile`.
-
-`withdraw` flags: `--vault <C-strkey>` (required), `--from <C-strkey>` (required), `--shares <i128>` (required, shares to redeem), `--min-amounts-out <i128>...` (required), `--override-upgradable`, `--secondary-rpc-url`, `--profile`.
-
-```bash
-stellar-agent vault deposit --vault CABC...WXYZ --from CABC...WXYZ \
-  --amounts-desired 1000000000 --amounts-min 900000000 --profile default
-```
-
-### `trade` (Soroswap)
-
-Swap tokens via the Soroswap router (`swap_exact_tokens_for_tokens`). Router resolved per-network; an unpinned network refuses `dex.unrecognised_network`. Trust gate: venue allowlist, two-RPC router WASM-hash pin, on-chain `router_get_amounts_out` slippage re-check before signing. There is no separate `quote` subcommand — price discovery happens inside `trade` at signing time. `--amount-out-min` is an absolute output floor in base units, not a percentage.
-
-| Flag | Meaning | Default |
-|---|---|---|
-| `--profile <NAME>` | Profile | `default` |
-| `--from <C-strkey>` (required) | Wallet smart-account | — |
-| `--amount-in <i128>` (required) | Exact input amount in base units | — |
-| `--amount-out-min <i128>` (required) | Absolute minimum output floor | — |
-| `--path <ASSET>` (required, repeatable) | One path element; first = input, last = output (≥2 total). Each is a C-strkey, `native`, or `CODE:ISSUER` | — |
-| `--deadline <UNIX_SECS>` | Swap deadline | `now + 300s` |
-| `--secondary-rpc-url <URL>` | Two-RPC router WASM-hash cross-check | none |
-
-```bash
-stellar-agent trade --from CABC...WXYZ --amount-in 10000000 \
-  --amount-out-min 9800000 --path CABC...WXYZ --path CDEF...WXYZ --profile default
-```
+Flags for every verb: see [`defi.md`](defi.md).
 
 ---
 

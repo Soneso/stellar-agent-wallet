@@ -147,6 +147,12 @@ The `[policy] engine` value is `noop` or `v1`:
   attestation, audit), so enable it only after running the key-rotation
   subcommands under `stellar-agent profile`.
 
+A version-2 profile must declare a `[policy]` block explicitly; there is no
+silent default, and a v2 file without one is refused at load. The example above
+chooses `noop` for a permissive testnet start. When the wallet mints a profile
+for you it writes `engine = "v1"`, and a profile migrated from an older schema
+is set to `noop`.
+
 The CLI reads and manages existing profiles:
 
 ```bash
@@ -163,10 +169,23 @@ stellar-agent profile migrate default
 For the full profile schema, every field, and the key-rotation ceremony, see
 [Profiles](profiles.md).
 
-## Fund a testnet account with Friendbot
+## Create and fund a testnet account
 
-Friendbot funds a new testnet account. Mainnet is structurally refused
-(`network.friendbot_mainnet_forbidden`) before any HTTP call.
+If you do not already hold an account, generate one and fund it in a single
+step. `--generate` mints a fresh ed25519 keypair in-process and returns both the
+G-strkey and the secret in the JSON envelope (the secret in `data.secret_key`,
+never in `--output table` and never logged); `--fund-with-friendbot` funds it
+from Friendbot (testnet only). Capture the printed keys and export the secret so
+the signing commands below can read it:
+
+```bash
+stellar-agent accounts create --generate --fund-with-friendbot
+export WALLET_SK=S...printed-secret...
+```
+
+To fund an account you already hold, call Friendbot directly. Mainnet is
+structurally refused (`network.friendbot_mainnet_forbidden`) before any HTTP
+call.
 
 ```bash
 stellar-agent friendbot --account GABC...WXYZ --network testnet
@@ -250,11 +269,14 @@ Other common flags:
 
 For the `--secret-env` path, the 32-byte signing seed is loaded into the unlock
 window: a short TTL-bounded period during which the seed is resident in pinned,
-zeroize-on-drop memory (mlock). The default TTL is 30 seconds with a hard cap of
-600 seconds, configurable downward via the profile's `[wallet] unlock_ttl_seconds`.
-The window is active only for the duration of a single signing call; the seed is
-zeroized and the lock released on every exit path. The `--sign-with-ledger` path
-holds no seed in memory.
+zeroize-on-drop memory (mlock). The TTL is the profile's `[wallet]
+unlock_ttl_seconds` (default 30 seconds); it must be in the range 1 to 600
+seconds, and a value of 0 or above 600 is refused when the window is constructed
+— never clamped. The profile's `[wallet] mlock_required` governs what happens
+if the seed cannot be pinned in RAM: `true` (the default on Linux/macOS) fails
+the signing call closed. The window is active only for the duration of a single
+signing call; the seed is zeroized and the lock released on every exit path. The
+`--sign-with-ledger` path holds no seed in memory.
 
 ### Staged pipeline
 

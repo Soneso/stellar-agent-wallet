@@ -47,6 +47,13 @@ each tagged release. If no release is listed there yet, build from source.
 - Signed agent toolsets with capability isolation: toolsets are installed only
   after publisher-signature and hash verification, and a structural boundary keeps
   a toolset from reaching a signing tool it was not granted.
+- Bounded agent delegation: scoped context rules (`CallContract` /
+  `CreateContract`), rolling-window spending limits, and a first-class
+  External-Ed25519 signer let an agent hold its own key and submit smart-account
+  `execute` calls within limits the contract enforces on-chain.
+- Interactive passkey enrollment for the operator approval surfaces: register a
+  WebAuthn credential for the loopback or remote approval inbox with a local
+  one-shot browser ceremony.
 
 See [docs/concepts.md](docs/concepts.md) for the policy engine, approval spine,
 audit log, and toolset model in detail.
@@ -54,17 +61,24 @@ audit log, and toolset model in detail.
 ## Install
 
 Every workspace crate sets `publish = false`, so nothing is on crates.io.
+Publication to crates.io is planned; until then, install from the tagged GitHub
+releases or build from source.
 
-### cargo binstall (once a release is tagged)
+### cargo binstall (from the GitHub releases)
+
+Point `cargo binstall` at this repository with `--git`; it resolves the release
+archive for your target from the tagged release assets:
 
 ```bash
-cargo binstall stellar-agent-cli
-cargo binstall stellar-agent-mcp
+cargo binstall --git https://github.com/Soneso/stellar-agent-wallet stellar-agent-cli
+cargo binstall --git https://github.com/Soneso/stellar-agent-wallet stellar-agent-mcp
 ```
 
 The CLI and MCP binaries ship in one release archive
 (`stellar-agent-{version}-{target}.tar.xz`, or `.zip` on Windows), so both
-commands draw from the same download.
+commands draw from the same download. You can also download the archive directly
+from the [releases page](https://github.com/Soneso/stellar-agent-wallet/releases)
+and extract the two binaries onto your `PATH`.
 
 ### Build from source
 
@@ -118,18 +132,21 @@ slsa-verifier verify-artifact stellar-agent-<version>-<target>.tar.xz \
 
 ## 60-second quickstart
 
-Fund an account via Friendbot, check its balances, and send a payment. These
+Generate and fund an account, check its balances, and send a payment. These
 commands take an explicit account on the flags and need no profile.
 
 ```bash
-# Fund the account from Friendbot (testnet/futurenet only).
-stellar-agent friendbot --account GABC...WXYZ --network testnet
+# Generate a fresh testnet keypair and fund it from Friendbot in one step.
+# The JSON output carries the new G-strkey and its secret (data.secret_key).
+stellar-agent accounts create --generate --fund-with-friendbot
 
-# Read its native and trustline balances.
+# Export the printed secret so the signing command below can read it.
+export WALLET_SK=S...printed-secret...
+
+# Read the new account's native and trustline balances.
 stellar-agent balances --account GABC...WXYZ
 
 # Send a payment (asset is positional and defaults to native).
-export WALLET_SK=S...your-testnet-secret...
 stellar-agent pay GDEST...WXYZ "10 XLM" --source GABC...WXYZ --secret-env WALLET_SK
 ```
 

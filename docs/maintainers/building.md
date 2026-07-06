@@ -224,6 +224,7 @@ See [../../CONTRIBUTING.md](../../CONTRIBUTING.md) for the contribution workflow
 exception allows `LGPL-3.0-or-later` for `nacl`, a wasm32-only transitive of
 `stellar-baselib` that is never compiled into the native binaries this project
 builds. The advisories section denies yanked crates and active security
-advisories, with two unmaintained-class advisories ignored on deep transitive
-build-time proc-macro crates that have no fixed release. Unknown registries and
+advisories, with one unmaintained-class advisory ignored (RUSTSEC-2024-0436, on
+the `paste` macro helper pulled deep through the OpenZeppelin Stellar contract
+crates), which has no fixed release. Unknown registries and
 unknown git sources are denied.

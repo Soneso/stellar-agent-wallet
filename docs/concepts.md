@@ -11,6 +11,8 @@ An AI agent calls wallet tools on its own initiative. The model does not assume 
 - A **hash-chained audit log** records every invocation so tampering is detectable after the fact.
 - **Key custody** keeps the signing seed out of the agent's reach: it lives in the platform keyring and is only briefly resident in pinned memory.
 
+A fifth control addresses a different risk — not what the agent decides, but which tool definitions it may load. **Toolsets** package third-party or untrusted tool definitions behind capability isolation: a toolset installs only after publisher-signature and hash verification, and a structural boundary keeps it from reaching a signing tool it was not granted. Where the four controls above constrain each action, toolsets constrain the surface an agent can act through. See [Toolsets](toolsets.md).
+
 Two structural rules apply across all surfaces in this alpha. The default network is `stellar:testnet`. Every write or signing command structurally refuses `stellar:mainnet` (wire code `network.mainnet_write_forbidden`) before any RPC call or signing, while `stellar:mainnet` remains accepted for read-only commands.
 
 ## Two account models
@@ -19,7 +21,7 @@ The wallet operates against two different kinds of Stellar account, and each com
 
 **Classic account operations** work with a keyring-held ed25519 key on its own. There is no contract to deploy: the source account is a standard Stellar account and the signing key is the account's secret. These commands are `pay`, `balances`, `trustline`, `claim`, and `pool`. The read-only helpers `friendbot` (testnet funding) and `fees` (network fee stats) sit in the same bucket, as does `accounts create`, which creates a plain classic account. If you hold a funded classic key, you can run any of these directly.
 
-**Smart-account operations** center on a deployed OpenZeppelin smart-account contract. The contract holds the context rules, signer sets, thresholds, and policy attachments; the keyring key signs as a delegated signer rather than as the account itself. The commands that operate against an existing contract — `trade`, `lend`, the `vault` write verbs, and `smart-account rules`, `signers`, `list-rules`, `migrate-verifier`, `timelock`, plus `multicall` (which names its target via `--smart-account`) — cannot run until that contract address exists. Seven verbs in the `smart-account` group (alias `sa`) need no deployed smart-account contract: `list-verifiers` reads the compile-time verifier allowlist, `register-multicall` and `unregister-multicall` edit the local per-network router registry, and the four deploy verbs — `deploy-webauthn-verifier`, `deploy-ed25519-verifier`, `deploy-spending-limit-policy`, and `deploy-policy` — deploy verifier or policy contracts from a classic deployer key.
+**Smart-account operations** center on a deployed OpenZeppelin smart-account contract. The contract holds the context rules — on-chain authorization rules, each identified by a `u32` rule id, that govern which signers may authorize which actions (defined fully under [Smart-account context rules](#smart-account-context-rules)) — plus signer sets, thresholds, and policy attachments; the keyring key signs as a delegated signer rather than as the account itself. The commands that operate against an existing contract — `trade`, `lend`, the `vault` write verbs, and `smart-account rules`, `signers`, `list-rules`, `migrate-verifier`, `timelock`, plus `multicall` (which names its target via `--smart-account`) — cannot run until that contract address exists. Seven verbs in the `smart-account` group (alias `sa`) need no deployed smart-account contract: `list-verifiers` reads the compile-time verifier allowlist, `register-multicall` and `unregister-multicall` edit the local per-network router registry, and the four deploy verbs — `deploy-webauthn-verifier`, `deploy-ed25519-verifier`, `deploy-spending-limit-policy`, and `deploy-policy` — deploy verifier or policy contracts from a classic deployer key.
 
 **Bootstrapping** bridges the two. `accounts deploy-c` is itself a classic operation — the deployer signs the deployment with a keyring key — but its *output* is a new smart-account contract address. That address is the prerequisite the second bucket needs. So the usual path is: fund a classic key (`friendbot` on testnet), deploy the contract (`accounts deploy-c`), then install rules and signers (`smart-account rules`, `smart-account signers`) before the agent can trade, lend, or run vault writes through it.
 
@@ -38,12 +40,12 @@ A handful of commands need neither model directly. `profile`, `credentials`, `ap
 
 ## Key custody and the unlock window
 
-Secrets are never stored in configuration. A Profile is a per-environment TOML file (schema version 2) that binds a CAIP-2 chain id, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. It holds no secret material; each `*_key_id` field is a Keyring entry reference (a `service` + `account` pair) that names a platform-keyring secret. The signer seed, the nonce key, and every HMAC key live in the platform keyring (macOS Keychain, Linux Secret Service, Windows Credential Manager). The profile TOML is therefore safe to back up. The profile's `Debug` output additionally redacts `rpc_url` and `secondary_rpc_url`, since those may embed RPC credentials.
+Secrets are never stored in configuration. A profile is a per-environment TOML file (schema version 2) that binds a CAIP-2 chain id, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. It holds no secret material; each `*_key_id` field is a Keyring entry reference (a `service` + `account` pair) that names a platform-keyring secret. The signer seed, the nonce key, and every HMAC key live in the platform keyring (macOS Keychain, Linux Secret Service, Windows Credential Manager). The profile TOML is therefore safe to back up. The profile's `Debug` output additionally redacts `rpc_url` and `secondary_rpc_url`, since those may embed RPC credentials.
 
 When a tool needs to sign, the 32-byte signing seed is loaded into a short Unlock window:
 
 - The seed is moved into a zeroize-on-drop buffer, and its backing page is pinned in physical RAM via `mlock` (Linux/macOS) or `VirtualLock` (Windows). Pinning the page keeps the seed out of swap.
-- The window is TTL-bounded. The default is 30 seconds; the value is downward-only configurable per profile and the hard cap is 600 seconds. A background timer fires at the TTL and marks the wallet disposed.
+- The window is TTL-bounded. The default is 30 seconds; the configured value (profile `[wallet] unlock_ttl_seconds`) must be in the range 1 to 600 seconds, and a value of 0 or above 600 is refused when the window is constructed rather than clamped. A background timer fires at the TTL and marks the wallet disposed.
 - On every exit path, including normal return, error propagation, and panic-unwind, the seed is zeroized and the lock released.
 
 The `mlock_required` posture in `[wallet]` controls what happens when pinning fails. The value `true` (default on Linux/macOS) fails closed and aborts the unlock; `"warn"` (default on Windows) proceeds with unprotected memory and emits a warning; `false` proceeds silently, with the operator accepting the swap-disclosure risk. No path logs the seed.
@@ -51,7 +53,7 @@ The `mlock_required` posture in `[wallet]` controls what happens when pinning fa
 ```toml
 [wallet]
 mlock_required = true       # default on Linux/macOS
-unlock_ttl_seconds = 30     # default; downward-only
+unlock_ttl_seconds = 30     # default; must be in the range 1–600
 ```
 
 ## The policy engine
@@ -96,7 +98,7 @@ The tool registry is also fail-closed at startup: a duplicate tool registration,
 
 ## The approval spine
 
-When the policy engine returns RequireApproval, the action does not proceed on the agent's say-so. It is held in the Approval spine until the operator approves it out-of-band — interactively with `approve --id`, or through the loopback approval inbox started by `approve serve`, which lists pending entries (`approve list` does the same in the terminal), notifies the operator, and drives the identical attestation path. The spine is a per-profile pending-approval store plus a cryptographic Attestation minted at approve time. Both approval surfaces record an audit event; an inbox rejection replaces the entry with a short-lived rejection marker so the agent's commit is refused with `policy.approval_rejected` rather than the generic pending code.
+When the policy engine returns RequireApproval, the action does not proceed on the agent's say-so. It is held in the approval spine until the operator approves it out-of-band — interactively with `approve --id`, or through the loopback approval inbox started by `approve serve`, which lists pending entries (`approve list` does the same in the terminal), notifies the operator, and drives the identical attestation path. The spine is a per-profile pending-approval store plus a cryptographic attestation minted at approve time. Both approval surfaces record an audit event; an inbox rejection replaces the entry with a short-lived rejection marker so the agent's commit is refused with `policy.approval_rejected` rather than the generic pending code.
 
 ### The pending-approval store
 
@@ -114,7 +116,7 @@ Entries are kinded. The kinds are `PaymentSimulated`, `ClaimSimulated`, `SignWit
 
 ### The attestation
 
-The Attestation is an HMAC-SHA256 tag, keyed by the profile's attestation key (which lives only in the keyring), over a length-prefixed canonical input. The input binds three things:
+The attestation is an HMAC-SHA256 tag, keyed by the profile's attestation key (which lives only in the keyring), over a length-prefixed canonical input. The input binds three things:
 
 ```text
 HMAC-SHA256(attestation_key,

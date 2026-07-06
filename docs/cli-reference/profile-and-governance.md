@@ -82,7 +82,7 @@ Each returns the profile name and a `rotated` flag. The owner-key (ed25519), att
 {"ok":true,"data":{"profile":"default","rotated":true,"key_kind":"ed25519_seed"},"request_id":"..."}
 ```
 
-A fifth rotation subcommand, `profile rotate-counterparty-key <NAME>`, rotates the `stellar.toml` cache-integrity HMAC key (`counterparty_cache_key_id`); it invalidates every cached counterparty binding, which the wallet re-fetches on the next counterparty-allowlist check. Its data object adds `"key_kind": "hmac_32_bytes"` and `"cache_invalidated": true` to the `profile` and `rotated` fields.
+A fifth rotation subcommand, `profile rotate-counterparty-key <NAME>`, rotates the `stellar.toml` cache-integrity HMAC key (`counterparty_cache_key_id`); it invalidates every cached counterparty binding, which the wallet re-fetches on the next counterparty-allowlist check. Its data object adds `"key_kind": "hmac_32_bytes"` and `"cache_invalidated": true` to the `profile` and `rotated` fields. This rotates the same keyring entry as `stellar-agent counterparty rotate-hmac-key` (see [core operations](stellar-ops.md)); the two verbs are interchangeable.
 
 Each rotation exits `1` with `ProfileNotFound` if the profile does not exist, or with a keyring error if the platform keyring is unavailable.
 

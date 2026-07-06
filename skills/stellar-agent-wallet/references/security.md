@@ -216,8 +216,9 @@ denial-of-service nuisance) but cannot forge an attestation, because the HMAC ke
 is in the keyring, not in the file. Rotating the attestation key invalidates all
 outstanding pending approvals; the operator must re-approve.
 
-Pending entries are kinded: `PaymentSimulated`, `SignWithPasskey`,
-`RegisterPasskey`, `ToolsetFirstInvokeGate`, and `TrustlineClawbackOptIn`. The store
+Pending entries are kinded: `PaymentSimulated`, `ClaimSimulated`,
+`SignWithPasskey`, `RegisterPasskey`, `ToolsetFirstInvokeGate`,
+`TrustlineClawbackOptIn`, and `RuleProposalSimulated`. The store
 holds a single exclusive lock, writes atomically with owner-only permissions, caps
 the number of pending entries, and applies a default entry TTL of 24 hours.
 

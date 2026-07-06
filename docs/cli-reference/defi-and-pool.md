@@ -25,7 +25,7 @@ The default network is testnet (`stellar:testnet`). These DeFi commands and the 
 
 Supply, withdraw, borrow, or repay against a Blend lending pool through the wallet smart-account. Venue: Blend.
 
-Before submitting, `lend` runs an ordered trust gate: (1) verify the pool WASM hash against the per-network Blend pool WASM set; (2) read the pool's oracle address and require it to be in the Reflector allowlist (else `blend.oracle_not_allowlisted`); (3) check oracle price staleness against the threshold (else `oracle.staleness_exceeded`). Only then does the operator-policy evaluation and submit proceed.
+Before submitting, `lend` runs an ordered trust gate: (1) verify the pool WASM hash against the per-network Blend pool WASM set; (2) read the pool's oracle address and require it to be in the Reflector allowlist (else `blend.oracle_not_allowlisted`); (3) check oracle price staleness against the threshold (else `oracle.staleness_exceeded`). Only then does the operator-policy evaluation and submit proceed. Passing `--override-oracle-staleness` bypasses the staleness block and unconditionally emits an `oracle.staleness_overridden` audit event, parallel to the vault upgradable override.
 
 Only the six supply/borrow/repay/withdraw operations below are accepted by `--op`. Blend liquidation operations are not exposed by this command.
 
@@ -58,6 +58,8 @@ stellar-agent lend \
 Deposit assets into a DeFindex vault through the wallet smart-account. Venue: DeFindex.
 
 The ordered trust gate is: (1) verify the vault WASM hash; (2) read the upgradable flag; (3) read the four vault role addresses and compute self-managed vs delegated management mode; (4) read the on-chain assets, validate the `--amounts-min` length against the pinned asset count (else `vault.asset_count_mismatch`), and detect Blend-backed strategies; (5) evaluate the upgradable flag in light of the management mode. By default a vault whose upgradable flag is `true` is refused with `vault.upgradable_refused`. Pass `--override-upgradable` to proceed; doing so emits a `vault.upgradable_override` audit event.
+
+A self-managed vault — one where the depositor holds every fund-affecting role (Manager, with no separate third-party emergency or rebalance manager) — is exempt from the upgradable refusal. The refusal guards against a third-party manager swapping the vault implementation under the depositor; when the depositor holds those roles, an upgrade requires their own key, so the guard does not apply. For a self-managed vault the refusal never fires and `--override-upgradable` is ignored. All other management modes are subject to the refusal and its override and audit path.
 
 `--amounts-min` is required. Omitting it is a structural pre-sign refusal — there is no implicit "no minimum". A value of `0` per asset means no slippage protection on that asset, which you opt into explicitly.
 
@@ -124,8 +126,8 @@ The router address and WASM hash are resolved per-network; a network with no pin
 | `--from <C-strkey>` | Wallet smart-account address submitting the swap | Required | — |
 | `--amount-in <i128>` | Exact input token amount in base units | Required | — |
 | `--amount-out-min <i128>` | Minimum output amount, as an absolute floor (not a percent) | Required | — |
-| `--path <ASSET>` | One swap-path element; repeat the flag to build the path. First element is the input token, last is the output token. The path is validated to have at least two elements (input + output token) before signing. Each value is a C-strkey, `native`, or `CODE:ISSUER` | Required | — |
-| `--deadline <UNIX_SECS>` | Swap deadline as a Unix timestamp in seconds | Optional | `now + 300s` |
+| `--path <ASSET>` | One swap-path element; repeat the flag to build the path. First element is the input token, last is the output token. The path is validated to have at least two and at most five elements before signing. Each value is a C-strkey, `native`, or `CODE:ISSUER` | Required | — |
+| `--deadline <UNIX_SECS>` | Swap deadline as a Unix timestamp in seconds; refused when more than 3600 seconds (1 hour) in the future | Optional | `now + 300s` |
 | `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC router WASM-hash cross-check | Optional | none |
 
 Example:
@@ -150,7 +152,7 @@ The channel pool is a set of channel accounts derived from a single pool master 
 
 Fund `N` channel accounts on-chain via a single CAP-33 sponsored-reserve sandwich transaction. Signing command: the funder signer is loaded from the keyring. The pool master seed is generated in memory and written to the OS keyring only after the on-chain transaction confirms; the public `PoolConfig` bookkeeping is then persisted to the profile TOML. A failure before confirmation leaves no keyring entry and no config, so a clean retry needs no `--force`.
 
-`--size` must be in the range `1..=19`. The bound exists because the funder plus each channel must sign the sandwich envelope, and `N+1` signatures must fit the 20-signature cap. A size outside this range is rejected before any network call. Pool refusals surface on the envelope as `error.code` `internal.unexpected_state` with the specific pool reason (such as `pool.size_out_of_range:` or `pool.already_initialised:`) in `error.message`, not as a distinct top-level code.
+`--size` must be in the range `1..=19`. The bound exists because the funder plus each channel must sign the sandwich envelope, and `N+1` signatures must fit the 20-signature cap. A size outside this range is rejected before any network call. Pool refusals surface on the envelope as `error.code` `internal.unexpected_state`; the `error.message` carries the fixed prefix `unexpected internal state:` followed by the specific pool reason (such as `pool.size_out_of_range:` or `pool.already_initialised:`), rather than a distinct top-level code.
 
 If a pool master key already exists for the profile, `pool init` refuses (message `pool.already_initialised:`) unless `--force` is given. The existence probe fails closed: an ambiguous keyring backend error (as opposed to a definite "absent") also refuses, even without `--force`, rather than risk overwriting a key that may exist but is temporarily unreadable. Using `--force` to overwrite the master orphans all previously funded channels.
 

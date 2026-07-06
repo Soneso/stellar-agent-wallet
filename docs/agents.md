@@ -159,14 +159,16 @@ tools drive them:
 ```
 
 No signing, key, or policy tool is reachable through any capability, so an
-`action` naming one returns `toolset.unknown_action`. The one signing-adjacent
-capability, `sign-payment`, routes to `stellar_pay_commit` through a gated path:
-the first payment to a new destination/asset/amount returns
-`toolset.first_invoke_approval_required` with a nonce for the operator to approve,
-and an unconditional per-action approval fires on every toolset-routed payment
-regardless of policy. To drive a payment, invoke `action: "stellar_pay"` to build
-the envelope, then `action: "stellar_pay_commit"` with `args` carrying the
-`envelope_xdr` (and `nonce`, `expires_at_unix_ms`) returned by that build. See
+`action` naming one returns `toolset.unknown_action`. Two signing-adjacent
+capabilities route through the gated path: `sign-payment` reaches
+`stellar_pay_commit`, and `sign-rule-create` reaches `stellar_rule_create_commit`
+(agent-proposed context rules). Each is guarded by a first-invoke gate — the
+first use with no matching grant returns `toolset.first_invoke_approval_required`
+with a nonce for the operator to approve — and for `sign-payment` an
+unconditional per-action approval additionally fires on every toolset-routed
+payment regardless of policy. To drive a payment, invoke `action: "stellar_pay"`
+to build the envelope, then `action: "stellar_pay_commit"` with `args` carrying
+the `envelope_xdr` (and `nonce`, `expires_at_unix_ms`) returned by that build. See
 [toolsets.md](toolsets.md) and the runnable [examples](../examples/toolsets/).
 
 ## Agent-payments (x402)

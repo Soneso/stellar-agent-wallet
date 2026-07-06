@@ -2,7 +2,7 @@
 
 This document describes the cryptographic primitives behind the Stellar Agent Wallet guardrail spine: the approval attestation, the hash-chained audit log, the wallet unlock window, the nonce scheme, the V1 policy evaluator, and the smart-account auth digest. It is written for a maintainer or security reviewer who needs the byte-level detail, not the operator-facing model. For the model itself see [Concepts](../concepts.md); for how the crates fit together see [Architecture](architecture.md).
 
-Both surfaces — the `stellar-agent` CLI and the `stellar-agent-mcp` server — share these primitives. testnet (`stellar:testnet`) is the default; every write or signing command structurally refuses mainnet (`stellar:mainnet`) before any RPC call or signing (wire code `network.mainnet_write_forbidden`).
+Both surfaces — the `stellar-agent` CLI and the `stellar-agent-mcp` server — share the attestation, audit hash-chain, nonce, policy-evaluator, and auth-digest primitives below. The wallet unlock window (mlock plus TTL) is the exception: it protects the CLI's `--secret-env` signing path, where the seed is loaded into pinned memory. The MCP server does not call `Wallet::unlock`; its signing goes through keyring signer handles, so the [Wallet unlock lifecycle](#wallet-unlock-lifecycle) section below applies to the CLI surface only. testnet (`stellar:testnet`) is the default; every write or signing command structurally refuses mainnet (`stellar:mainnet`) before any RPC call or signing (wire code `network.mainnet_write_forbidden`).
 
 ## Attestation primitive
 
@@ -92,7 +92,7 @@ The non-regular-file check rejects directories and symlinks before open, closing
 
 ## Wallet unlock lifecycle
 
-The unlock window holds a 32-byte signing seed in pinned, zeroize-on-drop memory for a bounded TTL. The lifecycle manager is `Wallet` in `crates/stellar-agent-core/src/wallet/lifecycle.rs`; the locked seed holder is `LockedSeed` in `wallet/mlock.rs`.
+The unlock window holds a 32-byte signing seed in pinned, zeroize-on-drop memory for a bounded TTL. It is entered by the CLI secret-env signing path; the MCP server signs through keyring signer handles and never enters it. The lifecycle manager is `Wallet` in `crates/stellar-agent-core/src/wallet/lifecycle.rs`; the locked seed holder is `LockedSeed` in `wallet/mlock.rs`.
 
 ### Zeroizing seed and eager pin
 
@@ -108,11 +108,11 @@ The unlock window holds a 32-byte signing seed in pinned, zeroize-on-drop memory
 | `"warn"` (default Windows) | Proceed with unprotected memory; emit `tracing::warn!`. |
 | `false` | No lock attempted; no warning (operator accepts swap-disclosure risk). |
 
-On `mlock` failure the module emits a structured `tracing::warn!` carrying `profile`, `reason`, and `errno` — never the seed. The `EventKind::WalletMlockFailed` audit emission is wired at the MCP layer; this module's handover point is the tracing span.
+On `mlock` failure the module emits a structured `tracing::warn!` carrying `profile`, `reason`, and `errno` — never the seed. The `EventKind::WalletMlockFailed` audit emission is wired at the calling CLI surface; this module's handover point is the tracing span.
 
 ### TTL cap and RAII dispose
 
-The default TTL is `DEFAULT_TTL_SECONDS` (30); the hard cap is `MAX_TTL_SECONDS` (600). `unlock` rejects `ttl_seconds == 0` or `ttl_seconds > 600` with `WalletLifecycleError::TtlInvalid`. The profile field `wallet.unlock_ttl_seconds` is downward-only: values above 30 are clamped to 30 at handle-construction time with a structured warning, so a profile cannot widen the default window.
+The default TTL is `DEFAULT_TTL_SECONDS` (30); the hard cap is `MAX_TTL_SECONDS` (600). `unlock` rejects `ttl_seconds == 0` or `ttl_seconds > 600` with `WalletLifecycleError::TtlInvalid`. The profile field `wallet.unlock_ttl_seconds` is validated against that range when the window is constructed: a value of 0 or above 600 is refused, never clamped.
 
 A background `tokio` task sleeps for the TTL and then marks the wallet disposed. A shared `AtomicBool` cancel flag lets an early `dispose()` short-circuit the timer. On every drop path — normal return, `?` propagation, or panic-unwind — `Drop` calls `dispose()` unconditionally, zeroizing the seed and releasing the lock. `Wallet` is intentionally **not** `Send + Sync`; callers needing shared access wrap it in `Arc<Mutex<Wallet>>` or use the MCP server's per-request ownership model.
 

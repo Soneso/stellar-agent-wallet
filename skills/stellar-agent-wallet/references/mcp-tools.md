@@ -71,7 +71,8 @@ first-match default-deny).
 How `RequireApproval` is satisfied depends on tool shape:
 
 - Two-phase signing verbs (`stellar_pay`, `stellar_create_account`,
-  `stellar_trustline`, each paired with a `*_commit`) split into a simulate step
+  `stellar_trustline`, `stellar_claim`, `stellar_rule_create`, each paired with a
+  `*_commit`) split into a simulate step
   and a commit step. The simulate step builds an envelope and mints a single-use
   nonce; if approval is required it records the pending approval. The commit step
   re-checks the nonce, byte-compares the envelope against a fresh rebuild,

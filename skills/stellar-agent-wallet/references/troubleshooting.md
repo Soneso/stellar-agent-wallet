@@ -51,7 +51,7 @@ engine is first-match, default-deny over signed, typed criteria.
 |---|---|---|
 | `policy.deny.<reason>` | A V1 criterion denied the call (`<reason>` is the typed reason: `per_tx_cap_exceeded`, `per_period_cap_exceeded`, `rate_limit_exceeded`, `counterparty_denied`, `minimum_reserve_breached`, `no_matching_rule`). The payload carries the redacted reason. | Do not retry as-is; the policy forbids this operation. Report the reason to the operator. Only the operator can change policy. |
 | `policy.approval_required` | A two-phase signing verb reached its commit step without a valid operator approval, or the attestation was absent, invalid, or expired. This single code intentionally covers every approval-path failure mode (missing, expired, wrong-kind, hash mismatch, HMAC mismatch) so callers cannot probe which. | Ask the operator to run `stellar-agent approve --id <nonce>`, then re-submit the commit with the returned `approval_nonce` and `approval_attestation`. The nonce came from the simulate step. |
-| `policy.approval_required_unsupported` | The policy returned RequireApproval for a single-shot sign tool (no simulate/commit split: SEP-43 sign verbs, `stellar_sep43_sign_and_submit_transaction`, SEP-53 `sign_message`, x402 `create_payment` / `authenticated_payment`). The wallet refuses fail-closed rather than sign without approval. | Cannot proceed via the agent. Ask the operator to either adjust policy so this operation does not require approval, or perform it through a two-phase tool (`stellar_pay`, `stellar_create_account`, `stellar_trustline` and their `*_commit`). |
+| `policy.approval_required_unsupported` | The policy returned RequireApproval for a single-shot sign tool (no simulate/commit split: SEP-43 sign verbs, `stellar_sep43_sign_and_submit_transaction`, SEP-53 `sign_message`, x402 `create_payment` / `authenticated_payment`). The wallet refuses fail-closed rather than sign without approval. | Cannot proceed via the agent. Ask the operator to either adjust policy so this operation does not require approval, or perform it through a two-phase tool (`stellar_pay`, `stellar_create_account`, `stellar_trustline`, `stellar_claim`, `stellar_rule_create` and their `*_commit`). |
 | `policy.engine_required` | The active engine cannot decide the call. Fires for the Noop engine on a destructive tool on `stellar:mainnet`, and for V1 engine errors such as a missing or unverifiable policy document. | Do not retry on mainnet (writes are structurally refused in this alpha; use `stellar:testnet`). Otherwise the profile needs a valid V1 policy installed by the operator. |
 | `policy.unexpected_decision` | Forward-compatibility catch-all for an engine decision the gate does not recognize. Fail-closed. | Treat as a hard refusal. Report to the operator; do not retry. |
 
@@ -62,8 +62,9 @@ this alpha.
 
 ## Nonce codes (two-phase signing verbs)
 
-A simulate step (`stellar_pay`, `stellar_create_account`, `stellar_trustline`)
-mints a single-use nonce bound to the exact envelope, tool, and chain. The
+A simulate step (`stellar_pay`, `stellar_create_account`, `stellar_trustline`,
+`stellar_claim`, `stellar_rule_create`) mints a single-use nonce bound to the
+exact envelope, tool, and chain. The
 commit step (`*_commit`) verifies it. Nonces are single-use and TTL-bounded, and
 the replay window is wiped on process restart.
 

@@ -7,8 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Remote operator approval: `approve serve --remote` binds a TLS-protected,
+  passkey-authenticated listener so an operator can approve or reject pending
+  wallet actions from another device, with per-entry WebAuthn assertions on
+  every decision.
+- Bounded agent delegation: context rules can be scoped to a single contract
+  (`--context call-contract:<C>`) or wasm hash, first-class External-Ed25519
+  signers attach to rules via a registered verifier, and a spending-limit
+  policy enforces a per-rule rolling-window budget on-chain.
+- Spending-limit observability and retuning: `smart-account rules
+  get-spending-limit` reads an installed policy's live budget state,
+  `set-spending-limit` retunes the limit without resetting spend history, and
+  the read-only MCP tools `stellar_rules_list` / `stellar_rules_get` expose
+  rule and budget state to agents.
+- Agent-proposed context rules: the two-phase `stellar_rule_create` /
+  `stellar_rule_create_commit` MCP pair routes rule installation through the
+  operator-approval spine, with the fully resolved rule rendered on every
+  approval surface before consent and the proposal digest bound into the
+  attestation.
+- Smart-account ergonomics: typed simple-threshold and weighted-threshold
+  policy builders, a unified `deploy-policy --kind` verb, weighted-threshold
+  mutators (`set-weighted-threshold`, `set-signer-weight`), batch signer
+  addition, passkey/Ed25519/external genesis signers on `accounts deploy-c`,
+  and new rule/signer read APIs.
+- Interactive WebAuthn operator enrollment: `approve operator enroll
+  --interactive` runs the passkey registration ceremony in the browser against
+  a one-shot loopback server (bootstrap-token gated) and persists the
+  credential without it passing through the shell; the argument mode remains
+  the import path for credentials created on a remote listener's domain.
+- `smart-account execute`: submit a CallContract invocation against an
+  external contract, authorized by named context rules and signed by an
+  External-Ed25519 rule key, with a separate fee-paying envelope signer.
+  `rules create` gains `--signer-ed25519` / `--verifier` so an Ed25519-only
+  rule can be installed entirely from the CLI.
+- A provisional audit status in the verifier allowlist taxonomy: the vendored
+  OpenZeppelin verifier entries now report `provisional` (named-party internal
+  review) rather than overstating an external audit; `list-verifiers` carries
+  the attestor and date as additive fields.
+
 ### Changed
 
+- Value-denominated fields on the machine-readable JSON wire are decimal
+  strings, never JSON numbers: all i128 token quantities (dex, blend, vault,
+  spending-limit budgets) and the residual i64/u64 stroop and fee fields
+  (payment, account-creation, claim, trustline amounts and limits, fee-stats
+  percentiles, served approval summaries). Raw JSON numbers on the migrated
+  input fields are rejected. This is a breaking wire change; JSON numbers are
+  exact only up to 2^53 in f64-backed parsers, and trustline limits routinely
+  carry i64::MAX. The policy cap and reserve criteria now read the resolved
+  stroop amounts on every dispatch shape, and pay's simulate gate arguments
+  include the asset, so cap and reserve policies evaluate calls they
+  previously refused or under-counted.
+- Every CLI secret-env signing path handles the seed through an
+  mlock-protected unlock window with explicit residue zeroization.
 - Renamed the `wallet` CLI command group to `smart-account` (with `sa` as a
   shorter alias), and flattened the former nested `sa` admin subgroup so its
   verbs (`deploy-webauthn-verifier`, `migrate-verifier`, `list-verifiers`,

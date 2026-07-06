@@ -137,8 +137,8 @@ and other AI coding agents discover tools. A first session looks like this:
    you it needs approval. In another terminal, `stellar-agent approve serve`
    opens your approval inbox in the browser; you review what the wallet
    decoded — recipient, amount, asset — and click Approve or Reject. On
-   approval you hand the agent a short attestation code and it completes the
-   payment; on rejection it is told no, definitively.
+   approval you hand the agent a base64 HMAC attestation string and it completes
+   the payment; on rejection it is told no, definitively.
 
 The same MCP server works with any MCP-capable agent runtime, and the skill
 format is an open standard supported beyond Claude Code. For an engineer's

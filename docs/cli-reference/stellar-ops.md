@@ -91,7 +91,8 @@ Argument groups (enforced by the parser):
 |---|---|---|---|
 | `--initial-signer <G_STRKEY>` | Delegated (native) genesis signer | one of the genesis-signer group | — |
 | `--signer-webauthn <CREDENTIAL_NAME>` | Genesis signer is an already-registered WebAuthn passkey, looked up by name in the local passkeys registry; requires a WebAuthn verifier already deployed for the target network (`smart-account deploy-webauthn-verifier`) | one of the genesis-signer group | — |
-| `--signer-ed25519 <HEX_PUBKEY_64>` | Genesis signer is a raw 32-byte ed25519 public key (64 hex chars), verified against `--signer-external`'s verifier | one of the genesis-signer group | — |
+| `--signer-ed25519 <HEX_PUBKEY_64>` | Genesis signer is a raw 32-byte ed25519 public key (64 hex chars), verified by the Ed25519 verifier resolved from `--verifier` when supplied, else from the verifier registry | one of the genesis-signer group | — |
+| `--verifier <C_STRKEY>` | Ed25519-verifier contract override for `--signer-ed25519`. Omitted, it resolves from the verifier registry (populated by `smart-account deploy-ed25519-verifier`), failing closed if none is registered | with `--signer-ed25519` | registry lookup |
 | `--signer-external <C_STRKEY>` | Genesis signer is verified by this verifier contract; requires `--signer-key-data` | one of the genesis-signer group | — |
 | `--signer-key-data <HEX>` | Verifier-specific key material for `--signer-external` | required with `--signer-external` | — |
 | `--accept-no-delegated-fallback` | Acknowledges that `--signer-webauthn` / `--signer-ed25519` / `--signer-external` leaves the account with NO Delegated (G-key) fallback signer at genesis; refused without this flag (`validation.passkey_only_rule_no_delegated_fallback`) | required with a non-Delegated genesis source | `false` |
@@ -388,7 +389,7 @@ stellar-agent counterparty warm-up --profile default
 
 ### `stellar-agent counterparty rotate-hmac-key [flags]`
 
-Rotates the per-profile counterparty cache HMAC key. After rotation, existing cache files fail verification and must be refreshed. Rotates a keyring secret; signs no transaction.
+Rotates the per-profile counterparty cache HMAC key. After rotation, existing cache files fail verification and must be refreshed. Rotates a keyring secret; signs no transaction. This is the same keyring entry (`counterparty_cache_key_id`) that `stellar-agent profile rotate-counterparty-key <NAME>` rotates (see [profile and governance](profile-and-governance.md)); the two verbs are interchangeable entry points to the same rotation.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|

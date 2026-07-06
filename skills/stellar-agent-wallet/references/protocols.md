@@ -26,7 +26,7 @@ Write and signing paths are testnet-only in this alpha. Every signing tool struc
 | SEP-10 | 3.4.1 | Client Web Auth (fetch, 13-point validate, submit) → JWT; ephemeral-key flow | used by anchor + x402 flows | — |
 | SEP-6 | 0006 | Discovery only — `GET /info` capability set | `stellar_sep6_deposit_info` | yes |
 | SEP-24 | 0024 | Interactive deposit/withdraw URL via `POST .../interactive`; returned for browser hand-off | `stellar_sep24_interactive_url` | no (uses JWT) |
-| SEP-43 | 1.2.1 | Wallet signing: address/network/sign tx/sign auth entry/sign message/sign+submit | five + one tools (below) | mixed |
+| SEP-43 | 1.2.1 | Wallet signing: address/network/sign tx/sign auth entry/sign message/sign+submit | six tools (below) | mixed |
 | SEP-45 | 0.1.1 | Client Web Auth for contract (C-) accounts (steps 1–12); ephemeral + persistent-signer | used by anchor flows | — |
 | SEP-47 | 0047 | Discover SEPs a contract claims via `contractmetav0` `sep` meta | `stellar_sep47_discover` | yes |
 | SEP-48 | 0048 | Typed-argument preview of an `InvokeHostFunction` (display only) | `stellar_sep48_preview_invocation` | yes |
