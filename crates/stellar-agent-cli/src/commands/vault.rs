@@ -42,8 +42,10 @@
 use clap::{Args, Subcommand};
 use serde_json::json;
 use stellar_agent_core::envelope::Envelope;
+use stellar_agent_core::error::WalletError;
 use stellar_agent_core::policy::{Decision, McpToolRegistration, ToolDescriptor};
 use stellar_agent_core::profile::loader as profile_loader;
+use stellar_agent_core::profile::schema::Profile;
 
 use crate::commands::policy_engine::build_v1_policy_engine;
 
@@ -60,7 +62,8 @@ use stellar_agent_defindex::{
     storage::{read_vault_assets, read_vault_upgradable_flag},
 };
 use stellar_agent_network::{
-    StellarRpcClient, WasmHashFetch, fetch_contract_wasm_hash, signer_from_keyring,
+    StellarRpcClient, WasmHashFetch, fetch_contract_wasm_hash, init_platform_keyring_store,
+    signer_from_keyring,
 };
 
 use crate::common::render::render_json;
@@ -202,8 +205,32 @@ pub async fn run(args: &VaultArgs) -> i32 {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn run_deposit(args: &VaultDepositCliArgs) -> i32 {
+    run_deposit_with_dependencies(
+        args,
+        |name| profile_loader::load(name, None),
+        init_platform_keyring_store,
+    )
+    .await
+}
+
+/// Testable core of [`run_deposit`] with the profile loader and the
+/// platform-keyring initialiser injected.
+///
+/// Production callers use [`run_deposit`], which supplies the real profile
+/// loader and [`init_platform_keyring_store`]. Tests substitute an in-memory
+/// profile and a spy initialiser to assert the keyring store is registered
+/// before signer resolution without touching the OS keychain.
+async fn run_deposit_with_dependencies<LoadProfile, InitKeyring>(
+    args: &VaultDepositCliArgs,
+    load_profile: LoadProfile,
+    init_keyring: InitKeyring,
+) -> i32
+where
+    LoadProfile: Fn(&str) -> Result<Profile, profile_loader::ProfileLoadError>,
+    InitKeyring: Fn() -> Result<(), WalletError>,
+{
     // ── Load profile ──────────────────────────────────────────────────────────
-    let profile = match profile_loader::load(&args.profile, None) {
+    let profile = match load_profile(&args.profile) {
         Ok(p) => p,
         Err(e) => {
             render_json(&Envelope::<()>::err_raw(
@@ -213,6 +240,15 @@ async fn run_deposit(args: &VaultDepositCliArgs) -> i32 {
             return 1;
         }
     };
+
+    // ── Initialise platform keyring store ─────────────────────────────────────
+    // The keyring signer loaded before signing requires the process-global
+    // default store.  Ordered after the profile load so a missing profile never
+    // triggers the store registration.
+    if let Err(e) = init_keyring() {
+        render_json(&Envelope::<()>::err(&e));
+        return 1;
+    }
 
     let rpc_url = profile.rpc_url.as_str();
     let network_passphrase = profile.network_passphrase.as_str();
@@ -507,8 +543,32 @@ async fn run_deposit(args: &VaultDepositCliArgs) -> i32 {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn run_withdraw(args: &VaultWithdrawCliArgs) -> i32 {
+    run_withdraw_with_dependencies(
+        args,
+        |name| profile_loader::load(name, None),
+        init_platform_keyring_store,
+    )
+    .await
+}
+
+/// Testable core of [`run_withdraw`] with the profile loader and the
+/// platform-keyring initialiser injected.
+///
+/// Production callers use [`run_withdraw`], which supplies the real profile
+/// loader and [`init_platform_keyring_store`]. Tests substitute an in-memory
+/// profile and a spy initialiser to assert the keyring store is registered
+/// before signer resolution without touching the OS keychain.
+async fn run_withdraw_with_dependencies<LoadProfile, InitKeyring>(
+    args: &VaultWithdrawCliArgs,
+    load_profile: LoadProfile,
+    init_keyring: InitKeyring,
+) -> i32
+where
+    LoadProfile: Fn(&str) -> Result<Profile, profile_loader::ProfileLoadError>,
+    InitKeyring: Fn() -> Result<(), WalletError>,
+{
     // ── Load profile ──────────────────────────────────────────────────────────
-    let profile = match profile_loader::load(&args.profile, None) {
+    let profile = match load_profile(&args.profile) {
         Ok(p) => p,
         Err(e) => {
             render_json(&Envelope::<()>::err_raw(
@@ -518,6 +578,15 @@ async fn run_withdraw(args: &VaultWithdrawCliArgs) -> i32 {
             return 1;
         }
     };
+
+    // ── Initialise platform keyring store ─────────────────────────────────────
+    // The keyring signer loaded before signing requires the process-global
+    // default store.  Ordered after the profile load so a missing profile never
+    // triggers the store registration.
+    if let Err(e) = init_keyring() {
+        render_json(&Envelope::<()>::err(&e));
+        return 1;
+    }
 
     let rpc_url = profile.rpc_url.as_str();
     let network_passphrase = profile.network_passphrase.as_str();
@@ -802,5 +871,145 @@ async fn run_withdraw(args: &VaultWithdrawCliArgs) -> i32 {
             ));
             1
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test-only assertions"
+    )]
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use stellar_agent_core::error::AuthError;
+
+    use super::*;
+
+    fn test_profile() -> Profile {
+        Profile::builder_testnet_named(
+            "keyring-order-test",
+            "stellar-agent-signer",
+            "keyring-order-test",
+            "stellar-agent-nonce",
+            "keyring-order-test",
+        )
+        .build()
+    }
+
+    // ── keyring store initialisation ordering (deposit) ───────────────────────
+
+    #[tokio::test]
+    async fn run_deposit_initialises_keyring_store_before_signer_resolution() {
+        // The keyring initialiser must be invoked on the deposit path, after
+        // the profile load and before the signer is resolved from the keyring.
+        // Both dependencies are injected, so no OS keychain or on-disk profile
+        // is touched and no process-global keyring store is registered — hence
+        // this test needs no `#[serial]`.  The injected initialiser returns an
+        // error so the run bails at that step, which proves the store
+        // initialisation gates the path ahead of signer resolution.
+        let profile_loaded = Arc::new(AtomicBool::new(false));
+        let init_invoked = Arc::new(AtomicBool::new(false));
+
+        let loaded_writer = Arc::clone(&profile_loaded);
+        let loaded_reader = Arc::clone(&profile_loaded);
+        let init_writer = Arc::clone(&init_invoked);
+
+        let args = VaultDepositCliArgs {
+            profile: "keyring-order-test".to_owned(),
+            vault: String::new(),
+            from: String::new(),
+            amounts_desired: Vec::new(),
+            amounts_min: Vec::new(),
+            invest: false,
+            override_upgradable: false,
+            secondary_rpc_url: None,
+        };
+
+        let code = run_deposit_with_dependencies(
+            &args,
+            move |_name| {
+                loaded_writer.store(true, Ordering::SeqCst);
+                Ok(test_profile())
+            },
+            move || {
+                assert!(
+                    loaded_reader.load(Ordering::SeqCst),
+                    "profile must be loaded before the keyring store is initialised"
+                );
+                init_writer.store(true, Ordering::SeqCst);
+                Err(WalletError::Auth(AuthError::KeyringNotFound {
+                    name: "keyring-order-test-sentinel".to_owned(),
+                }))
+            },
+        )
+        .await;
+
+        assert!(
+            init_invoked.load(Ordering::SeqCst),
+            "deposit must initialise the keyring store before resolving the signer"
+        );
+        assert_eq!(
+            code, 1,
+            "deposit must surface the keyring init failure instead of reaching signer resolution"
+        );
+    }
+
+    // ── keyring store initialisation ordering (withdraw) ──────────────────────
+
+    #[tokio::test]
+    async fn run_withdraw_initialises_keyring_store_before_signer_resolution() {
+        let profile_loaded = Arc::new(AtomicBool::new(false));
+        let init_invoked = Arc::new(AtomicBool::new(false));
+
+        let loaded_writer = Arc::clone(&profile_loaded);
+        let loaded_reader = Arc::clone(&profile_loaded);
+        let init_writer = Arc::clone(&init_invoked);
+
+        let args = VaultWithdrawCliArgs {
+            profile: "keyring-order-test".to_owned(),
+            vault: String::new(),
+            from: String::new(),
+            shares: 0,
+            min_amounts_out: Vec::new(),
+            override_upgradable: false,
+            secondary_rpc_url: None,
+        };
+
+        let code = run_withdraw_with_dependencies(
+            &args,
+            move |_name| {
+                loaded_writer.store(true, Ordering::SeqCst);
+                Ok(test_profile())
+            },
+            move || {
+                assert!(
+                    loaded_reader.load(Ordering::SeqCst),
+                    "profile must be loaded before the keyring store is initialised"
+                );
+                init_writer.store(true, Ordering::SeqCst);
+                Err(WalletError::Auth(AuthError::KeyringNotFound {
+                    name: "keyring-order-test-sentinel".to_owned(),
+                }))
+            },
+        )
+        .await;
+
+        assert!(
+            init_invoked.load(Ordering::SeqCst),
+            "withdraw must initialise the keyring store before resolving the signer"
+        );
+        assert_eq!(
+            code, 1,
+            "withdraw must surface the keyring init failure instead of reaching signer resolution"
+        );
     }
 }

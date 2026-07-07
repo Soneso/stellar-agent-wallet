@@ -32,8 +32,10 @@
 use clap::{Args, ValueEnum};
 use serde_json::json;
 use stellar_agent_core::envelope::Envelope;
+use stellar_agent_core::error::WalletError;
 use stellar_agent_core::policy::{Decision, McpToolRegistration, ToolDescriptor};
 use stellar_agent_core::profile::loader as profile_loader;
+use stellar_agent_core::profile::schema::Profile;
 
 use crate::commands::policy_engine::build_v1_policy_engine;
 
@@ -53,7 +55,7 @@ use stellar_agent_blend::{
 use stellar_agent_defi::adapter::{DefiAdapter, DefiAdapterCtx};
 use stellar_agent_defi::dispatch::{GateOutcome, dispatch_gate, require_approval_error};
 use stellar_agent_defi::pins::DefiContractPin;
-use stellar_agent_network::{StellarRpcClient, signer_from_keyring};
+use stellar_agent_network::{StellarRpcClient, init_platform_keyring_store, signer_from_keyring};
 
 use crate::common::render::render_json;
 
@@ -171,8 +173,32 @@ pub struct LendArgs {
 ///
 /// Returns `0` on success, `1` on error.
 pub async fn run(args: &LendArgs) -> i32 {
+    run_with_dependencies(
+        args,
+        |name| profile_loader::load(name, None),
+        init_platform_keyring_store,
+    )
+    .await
+}
+
+/// Testable core of [`run`] with the profile loader and the platform-keyring
+/// initialiser injected.
+///
+/// Production callers use [`run`], which supplies the real profile loader and
+/// [`init_platform_keyring_store`]. Tests substitute an in-memory profile and a
+/// spy initialiser to assert the keyring store is registered before signer
+/// resolution without touching the OS keychain.
+async fn run_with_dependencies<LoadProfile, InitKeyring>(
+    args: &LendArgs,
+    load_profile: LoadProfile,
+    init_keyring: InitKeyring,
+) -> i32
+where
+    LoadProfile: Fn(&str) -> Result<Profile, profile_loader::ProfileLoadError>,
+    InitKeyring: Fn() -> Result<(), WalletError>,
+{
     // ── Load profile ──────────────────────────────────────────────────────────
-    let profile = match profile_loader::load(&args.profile, None) {
+    let profile = match load_profile(&args.profile) {
         Ok(p) => p,
         Err(e) => {
             render_json(&Envelope::<()>::err_raw(
@@ -182,6 +208,15 @@ pub async fn run(args: &LendArgs) -> i32 {
             return 1;
         }
     };
+
+    // ── Initialise platform keyring store ─────────────────────────────────────
+    // The keyring signer loaded before signing requires the process-global
+    // default store.  Ordered after the profile load so a missing profile never
+    // triggers the store registration.
+    if let Err(e) = init_keyring() {
+        render_json(&Envelope::<()>::err(&e));
+        return 1;
+    }
 
     // ── Resolve network settings ──────────────────────────────────────────────
     let rpc_url = profile.rpc_url.as_str();
@@ -477,5 +512,92 @@ pub async fn run(args: &LendArgs) -> i32 {
             ));
             1
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test-only assertions"
+    )]
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use stellar_agent_core::error::AuthError;
+
+    use super::*;
+
+    // ── keyring store initialisation ordering ─────────────────────────────────
+
+    #[tokio::test]
+    async fn run_initialises_keyring_store_before_signer_resolution() {
+        // The keyring initialiser must be invoked on the run() path, after the
+        // profile load and before the signer is resolved from the keyring.
+        // Both dependencies are injected, so no OS keychain or on-disk profile
+        // is touched and no process-global keyring store is registered — hence
+        // this test needs no `#[serial]`.  The injected initialiser returns an
+        // error so the run bails at that step, which proves the store
+        // initialisation gates the path ahead of signer resolution.
+        let profile_loaded = Arc::new(AtomicBool::new(false));
+        let init_invoked = Arc::new(AtomicBool::new(false));
+
+        let loaded_writer = Arc::clone(&profile_loaded);
+        let loaded_reader = Arc::clone(&profile_loaded);
+        let init_writer = Arc::clone(&init_invoked);
+
+        let args = LendArgs {
+            profile: "keyring-order-test".to_owned(),
+            pool: String::new(),
+            from: String::new(),
+            op: LendOp::Supply,
+            asset: String::new(),
+            amount: 0,
+            override_oracle_staleness: false,
+            secondary_rpc_url: None,
+            max_staleness_secs: None,
+        };
+
+        let code = run_with_dependencies(
+            &args,
+            move |_name| {
+                loaded_writer.store(true, Ordering::SeqCst);
+                Ok(Profile::builder_testnet_named(
+                    "keyring-order-test",
+                    "stellar-agent-signer",
+                    "keyring-order-test",
+                    "stellar-agent-nonce",
+                    "keyring-order-test",
+                )
+                .build())
+            },
+            move || {
+                assert!(
+                    loaded_reader.load(Ordering::SeqCst),
+                    "profile must be loaded before the keyring store is initialised"
+                );
+                init_writer.store(true, Ordering::SeqCst);
+                Err(WalletError::Auth(AuthError::KeyringNotFound {
+                    name: "keyring-order-test-sentinel".to_owned(),
+                }))
+            },
+        )
+        .await;
+
+        assert!(
+            init_invoked.load(Ordering::SeqCst),
+            "run must initialise the keyring store before resolving the signer"
+        );
+        assert_eq!(
+            code, 1,
+            "run must surface the keyring init failure instead of reaching signer resolution"
+        );
     }
 }

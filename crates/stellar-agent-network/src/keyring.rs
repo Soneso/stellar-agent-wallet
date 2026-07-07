@@ -685,7 +685,7 @@ fn map_keyring_error(e: &keyring_core::Error, service: &str) -> WalletError {
         }),
         keyring_core::Error::NoDefaultStore => WalletError::Auth(AuthError::KeyringNotFound {
             name: format!(
-                "{service} (platform keyring store not initialised — call init_platform_keyring_store at startup)"
+                "{service} (no OS credential store is available for this session; ensure the platform keychain — macOS Keychain, GNOME Keyring / KWallet, or Windows Credential Manager — is running and unlocked)"
             ),
         }),
         keyring_core::Error::PlatformFailure(_) | keyring_core::Error::NoStorageAccess(_) => {
@@ -1015,9 +1015,14 @@ mod tests {
         let err = map_keyring_error(&keyring_core::Error::NoDefaultStore, "my-svc");
         assert_eq!(err.category(), ErrorCategory::Auth);
         assert_eq!(err.code(), "auth.keyring_not_found");
-        // The error message must NOT expose the password / account; it should
-        // mention the service name (non-secret) and the "not initialised" hint.
+        // The message mentions the service name (non-secret) and stays
+        // operator-actionable: it must not expose the password / account and
+        // must not leak the internal `init_platform_keyring_store` API name.
         assert!(err.message().contains("my-svc"), "service name in message");
+        assert!(
+            !err.message().contains("init_platform_keyring_store"),
+            "operator-facing message must not name the internal init API"
+        );
     }
 
     #[test]
