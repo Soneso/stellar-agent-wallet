@@ -625,6 +625,90 @@ pub(crate) fn single_shot_require_approval_error() -> ErrorData {
     )
 }
 
+/// Returns the shared refusal `detail` string for the structural mainnet-signing
+/// guard, carrying the canonical `network.mainnet_write_forbidden` wire code.
+///
+/// Single-sourced so every sign-only surface (SEP-43 and x402) embeds the
+/// identical canonical code, keeping cross-surface audit correlation exact.
+fn mainnet_signing_refusal_detail() -> String {
+    format!(
+        "signing is structurally refused on mainnet ({})",
+        stellar_agent_core::error::NetworkError::MainnetWriteForbidden.code()
+    )
+}
+
+/// Returns the structural mainnet-signing refusal for sign-only SEP-43 tools.
+///
+/// Sign-only tools (`signTransaction`, `signAuthEntry`) return a signature the
+/// caller can broadcast externally, so the submit-layer mainnet gate never
+/// fires. On a mainnet profile these tools MUST refuse structurally, before any
+/// key access, so no valid mainnet signature is ever produced. The refusal is
+/// surfaced as a SEP-43 error object (`is_error = true`) carrying the canonical
+/// `network.mainnet_write_forbidden` wire code so it correlates with the CLI and
+/// submit-layer guards.
+///
+/// # Security
+///
+/// This is the sign-only counterpart to the submit-layer
+/// [`stellar_agent_core::error::NetworkError::MainnetWriteForbidden`] guard.
+/// Without it a mainnet-configured profile would emit valid mainnet signatures
+/// over arbitrary caller-supplied XDR — the exact defect this refusal closes.
+/// The `NoopPolicyEngine` mainnet write gate keys on `destructive_hint`, which
+/// is `false` for these sign-only tools, so the policy engine alone does not
+/// stop them.
+pub(crate) fn mainnet_signing_forbidden_result() -> rmcp::model::CallToolResult {
+    let resp = stellar_agent_sep43::Sep43Error::MainnetSigningForbidden {
+        detail: mainnet_signing_refusal_detail(),
+    }
+    .to_sep43_response();
+    let json_str = serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
+    let mut result =
+        rmcp::model::CallToolResult::success(vec![rmcp::model::Content::text(json_str)]);
+    result.is_error = Some(true);
+    result
+}
+
+/// Returns the structural mainnet-signing refusal for the sign-only x402 tools.
+///
+/// The x402 payment tools (`create_payment`, `authenticated_payment`) sign a
+/// payment authorization the MCP host broadcasts externally, so the submit-layer
+/// mainnet gate never fires. On a mainnet profile they MUST refuse structurally,
+/// before any key access, so no valid mainnet payment signature is ever
+/// produced. Surfaced as an [`stellar_agent_x402::X402Error::MainnetSigningForbidden`]
+/// tool result (`is_error = true`) carrying the canonical
+/// `network.mainnet_write_forbidden` wire code, matching the sign-only SEP-43
+/// refusal in [`mainnet_signing_forbidden_result`].
+pub(crate) fn x402_mainnet_signing_forbidden_result() -> rmcp::model::CallToolResult {
+    x402_error_to_tool_result(&stellar_agent_x402::X402Error::MainnetSigningForbidden {
+        detail: mainnet_signing_refusal_detail(),
+    })
+}
+
+/// Returns the structural mainnet-signing refusal for the SEP-53 message-signing
+/// tool.
+///
+/// `stellar_sep53_sign_message` returns a signature the caller can use
+/// externally; on a mainnet profile it MUST refuse structurally, before any key
+/// access, so no signature is produced. Surfaced in the `{ "error", "detail" }`
+/// envelope that tool uses for its other error results (`is_error = true`), with
+/// the [`stellar_agent_sep53::Sep53Error::MainnetSigningForbidden`] Display —
+/// which carries the canonical `network.mainnet_write_forbidden` wire code — as
+/// the `detail`.
+pub(crate) fn sep53_mainnet_signing_forbidden_result() -> rmcp::model::CallToolResult {
+    let err = stellar_agent_sep53::Sep53Error::MainnetSigningForbidden {
+        detail: mainnet_signing_refusal_detail(),
+    };
+    let resp = serde_json::json!({
+        "error": "mainnet_signing_forbidden",
+        "detail": err.to_string(),
+    });
+    let json_str = serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
+    let mut result =
+        rmcp::model::CallToolResult::success(vec![rmcp::model::Content::text(json_str)]);
+    result.is_error = Some(true);
+    result
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // load_attestation_key — load HMAC key from keyring
 // ─────────────────────────────────────────────────────────────────────────────

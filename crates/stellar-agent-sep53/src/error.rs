@@ -140,6 +140,31 @@ pub enum Sep53Error {
         /// Maximum allowed message length in bytes ([`super::MAX_MESSAGE_BYTES`]).
         max: usize,
     },
+
+    /// A message-signing request targeted a mainnet profile.
+    ///
+    /// The SEP-53 message-signing MCP tool returns a signature the caller can use
+    /// externally; on a mainnet profile it is refused structurally before any key
+    /// access, so no signature is produced. This is a client-invalid request: the
+    /// operation is not serviceable on the active network.
+    ///
+    /// # Errors
+    ///
+    /// Constructed by the MCP consumer layer at tool entry; not returned by the
+    /// crate's own sign/verify functions.
+    ///
+    /// # Redaction invariant
+    ///
+    /// `detail` MUST NOT contain raw key/seed/signature bytes; it is surfaced
+    /// verbatim at Display sites. It carries the canonical
+    /// `network.mainnet_write_forbidden` wire code so this refusal correlates with
+    /// the CLI, submit-layer, SEP-43, and x402 signing guards.
+    #[error("mainnet signing forbidden: {detail}")]
+    MainnetSigningForbidden {
+        /// Non-secret description of the refusal, carrying the canonical
+        /// `network.mainnet_write_forbidden` wire code.
+        detail: String,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -204,6 +229,23 @@ mod tests {
         assert!(
             s.contains("point decompression failed"),
             "display must contain detail: {s}"
+        );
+    }
+
+    #[test]
+    fn mainnet_signing_forbidden_display_carries_canonical_wire_code() {
+        let err = Sep53Error::MainnetSigningForbidden {
+            detail: "signing is structurally refused on mainnet (network.mainnet_write_forbidden)"
+                .to_owned(),
+        };
+        let s = err.to_string();
+        assert!(
+            s.contains("mainnet signing forbidden"),
+            "display must name the refusal: {s}"
+        );
+        assert!(
+            s.contains("network.mainnet_write_forbidden"),
+            "display must carry the canonical wire code: {s}"
         );
     }
 }

@@ -72,6 +72,22 @@ pub enum X402Error {
         profile_passphrase: String,
     },
 
+    /// A payment-signing request targeted a mainnet profile.
+    ///
+    /// The x402 payment tools return a signed payment authorization the MCP host
+    /// broadcasts externally; the submit-layer mainnet gate never fires because
+    /// the wallet does not submit. Signing is therefore refused structurally on a
+    /// mainnet profile before any key access, so no valid mainnet payment
+    /// signature is ever produced. The `detail` carries the canonical
+    /// `network.mainnet_write_forbidden` wire code so this refusal correlates
+    /// with the CLI, submit-layer, and SEP-43 signing guards.
+    #[error("mainnet signing forbidden: {detail}")]
+    MainnetSigningForbidden {
+        /// Non-secret description of the refusal, carrying the canonical
+        /// `network.mainnet_write_forbidden` wire code.
+        detail: String,
+    },
+
     /// The `asset` field is not a valid C-strkey SAC contract address.
     #[error("invalid SAC asset address: {detail}")]
     InvalidAssetAddress {
@@ -270,6 +286,20 @@ mod tests {
             detail: "overflow".to_owned(),
         };
         assert!(err.to_string().contains("overflow"));
+    }
+
+    #[test]
+    fn display_mainnet_signing_forbidden_carries_canonical_wire_code() {
+        let err = X402Error::MainnetSigningForbidden {
+            detail: "signing is structurally refused on mainnet (network.mainnet_write_forbidden)"
+                .to_owned(),
+        };
+        let d = err.to_string();
+        assert!(d.contains("mainnet signing forbidden"));
+        assert!(
+            d.contains("network.mainnet_write_forbidden"),
+            "message must carry the canonical wire code: {d}"
+        );
     }
 
     #[test]

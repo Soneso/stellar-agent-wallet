@@ -28,7 +28,7 @@ use serde_json::json;
 /// - **Code -2 (external service error):** `HorizonError`, `RpcError`
 /// - **Code -3 (client-invalid request):** `InvalidXdr`, `InvalidAddress`,
 ///   `InvalidNetworkPassphrase`, `MissingAddress`, `MalformedAuthEntry`,
-///   `InvalidMessage`
+///   `InvalidMessage`, `MainnetSigningForbidden`
 /// - **Code -4 (user rejected):** `UserRejected`
 ///
 /// # Wire format
@@ -243,6 +243,27 @@ pub enum Sep43Error {
         detail: String,
     },
 
+    /// A signing request targeted a mainnet profile.
+    ///
+    /// Sign-only SEP-43 methods (`signTransaction`, `signAuthEntry`) return a
+    /// signature the caller can broadcast externally; the submit-layer mainnet
+    /// gate never fires because the wallet does not submit. Signing is therefore
+    /// refused structurally on a mainnet profile before any key access, so no
+    /// valid mainnet signature is ever produced. The `detail` carries the
+    /// canonical `network.mainnet_write_forbidden` wire code so this refusal
+    /// correlates with the CLI and submit-layer guards.
+    ///
+    /// Maps to SEP-43 error code `-3`.
+    #[error("mainnet signing forbidden: {detail}")]
+    MainnetSigningForbidden {
+        /// Non-secret description of the refusal.
+        ///
+        /// Callers MUST NOT place secret material (private keys, seed bytes,
+        /// signature bytes, raw keyring entries) in this field. The value is
+        /// surfaced verbatim at Display sites including audit-log emission.
+        detail: String,
+    },
+
     // ── Code -4: user rejected ────────────────────────────────────────────────
     /// The user explicitly rejected the signing request.
     ///
@@ -326,6 +347,7 @@ impl Sep43Error {
             Self::MissingAddress => "sep43.missing_address",
             Self::MalformedAuthEntry { .. } => "sep43.malformed_auth_entry",
             Self::InvalidMessage { .. } => "sep43.invalid_message",
+            Self::MainnetSigningForbidden { .. } => "sep43.mainnet_signing_forbidden",
             Self::UserRejected { .. } => "sep43.user_rejected",
             _ => "sep43.unknown_error",
         }
@@ -375,7 +397,8 @@ impl Sep43Error {
             | Self::InvalidNetworkPassphrase { .. }
             | Self::MissingAddress
             | Self::MalformedAuthEntry { .. }
-            | Self::InvalidMessage { .. } => -3,
+            | Self::InvalidMessage { .. }
+            | Self::MainnetSigningForbidden { .. } => -3,
             // Code -4: user rejected
             Self::UserRejected { .. } => -4,
             // Forward-compat: new variants default to -1 (internal error)
@@ -560,6 +583,17 @@ mod tests {
     }
 
     #[test]
+    fn wire_code_mainnet_signing_forbidden() {
+        assert_eq!(
+            Sep43Error::MainnetSigningForbidden {
+                detail: "network.mainnet_write_forbidden".to_owned(),
+            }
+            .wire_code(),
+            "sep43.mainnet_signing_forbidden"
+        );
+    }
+
+    #[test]
     fn wire_code_user_rejected() {
         assert_eq!(
             Sep43Error::UserRejected {
@@ -628,10 +662,29 @@ mod tests {
             Sep43Error::InvalidMessage {
                 detail: String::new(),
             },
+            Sep43Error::MainnetSigningForbidden {
+                detail: String::new(),
+            },
         ];
         for err in cases {
             assert_eq!(err.sep43_code(), -3, "expected -3 for {:?}", err);
         }
+    }
+
+    #[test]
+    fn mainnet_signing_forbidden_response_carries_canonical_wire_code() {
+        // The refusal must surface the documented cross-surface wire code so
+        // operators correlate it with the CLI and submit-layer guards.
+        let resp = Sep43Error::MainnetSigningForbidden {
+            detail: "signing is refused on mainnet (network.mainnet_write_forbidden)".to_owned(),
+        }
+        .to_sep43_response();
+        assert_eq!(resp["code"], -3_i32);
+        let msg = resp["message"].as_str().unwrap();
+        assert!(
+            msg.contains("network.mainnet_write_forbidden"),
+            "message must carry the canonical wire code: {msg}"
+        );
     }
 
     #[test]

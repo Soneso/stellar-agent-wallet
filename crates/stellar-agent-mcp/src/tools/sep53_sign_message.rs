@@ -5,12 +5,17 @@
 //!
 //! Per `sep-0053.md` lines :55-104.
 //!
-//! # Distinction from SEP-43 signMessage
+//! # Relationship to SEP-43 signMessage
 //!
-//! `stellar_sep43_sign_message` computes `sha256(message_bytes)` with NO prefix
-//! (SEP-43 `signMessage` semantics). This tool uses the SEP-53 24-byte prefix
-//! scheme and produces an incompatible, non-interchangeable signature. The two
-//! tools serve different SEPs and MUST NOT be confused.
+//! `stellar_sep43_sign_message` signs with the SAME SEP-53 prefixed digest:
+//! `stellar_agent_sep43::signing::sign_message_bytes` computes
+//! `stellar_agent_sep53::message_digest` = `SHA-256("Stellar Signed Message:\n" ‖ message)`.
+//! Both tools therefore produce the identical 64-byte ed25519 signature over the
+//! identical bytes, each encoded as standard base64. They differ only in the JSON
+//! response shape: this tool returns `{ signature, signer_public_key,
+//! message_encoding }` and additionally accepts base64 binary input via
+//! `message_encoding`, whereas the SEP-43 tool returns `{ signedMessage,
+//! signerAddress }` for a UTF-8 string message.
 
 use base64::Engine as _;
 use rmcp::{
@@ -87,11 +92,14 @@ pub struct Sep53SignMessageArgs {
 ///
 /// `sep-0053.md` lines :55-104.
 ///
-/// # Distinction from SEP-43
+/// # Relationship to SEP-43
 ///
-/// Uses `stellar_agent_sep53::sign_message`, NOT `stellar_agent_sep43::signing::sign_message_bytes`.
-/// The sep43 path computes `sha256(message_bytes)` with NO prefix and is
-/// incompatible with the SEP-53 scheme.
+/// Uses `stellar_agent_sep53::sign_message`;
+/// `stellar_agent_sep43::signing::sign_message_bytes` signs with the same SEP-53
+/// prefixed digest, so both yield the identical signature bytes. The tools differ
+/// only in response field naming (`signature`/`signer_public_key` here vs
+/// `signedMessage`/`signerAddress`) and in that this tool also accepts base64
+/// binary input.
 ///
 /// # Errors
 ///
@@ -121,13 +129,21 @@ impl WalletServer {
                        message_encoding: 'utf8' (default) or 'base64' for binary messages. \
                        Returns { signature: string (base64), signer_public_key: string (G-strkey), message_encoding: string }. \
                        read_only_hint=false; destructive_hint=false. \
-                       NOT compatible with stellar_sep43_sign_message (different prefix scheme).",
+                       Produces the same SEP-53 signature bytes as stellar_sep43_sign_message; differs only in response field naming (signature/signer_public_key vs signedMessage/signerAddress) and accepts base64 binary input.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn stellar_sep53_sign_message(
         &self,
         Parameters(args): Parameters<Sep53SignMessageArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        // Mainnet structural refusal — before any key access or signing.
+        // This tool returns a signature the caller can use externally; refuse on
+        // a mainnet profile so no mainnet signature is ever produced. Wire code:
+        // network.mainnet_write_forbidden.
+        if self.profile.chain_id.is_mainnet() {
+            return Ok(crate::tools::common::sep53_mainnet_signing_forbidden_result());
+        }
+
         let args_value = json!({
             "chain_id": &args.chain_id,
             "message_len": args.message.len(),
@@ -335,6 +351,64 @@ mod tests {
         .expect("WalletServer::new must not fail in tests");
         server.policy_engine = Arc::new(RequireApprovalEngine);
         server
+    }
+
+    fn make_mainnet_server() -> crate::server::WalletServer {
+        crate::server::WalletServer::new(
+            Profile::builder_mainnet("svc", "acct", "n-svc", "n-acct")
+                .with_noop_engine()
+                .build(),
+        )
+        .expect("WalletServer::new must not fail in tests")
+    }
+
+    /// A mainnet profile MUST refuse `stellar_sep53_sign_message` structurally
+    /// before any key access: the result is an `is_error` envelope whose `detail`
+    /// carries the canonical `network.mainnet_write_forbidden` wire code, and it
+    /// MUST NOT contain a `signature`.
+    ///
+    /// The keyring mock is intentionally NOT installed, and the detail asserts
+    /// the refusal did not reach the keyring (no `keyring`/`unlock` string), so a
+    /// regressed guard that let signing proceed via a leaked key path fails here.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn mainnet_profile_refuses_before_signing_no_signature_produced() {
+        let server = make_mainnet_server();
+        let args = Sep53SignMessageArgs {
+            chain_id: "stellar:mainnet".to_owned(),
+            message: "hello stellar".to_owned(),
+            message_encoding: None,
+        };
+        let result = server
+            .call_stellar_sep53_sign_message(args)
+            .await
+            .expect("structural mainnet refusal is surfaced as Ok(is_error), not Err");
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "mainnet refusal must set is_error = true"
+        );
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .expect("refusal result must carry a text content block");
+        let value: serde_json::Value =
+            serde_json::from_str(text).expect("refusal content must be a JSON object");
+        let detail = value["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("network.mainnet_write_forbidden"),
+            "detail must carry the canonical wire code; got: {value}"
+        );
+        assert!(
+            !detail.contains("keyring") && !detail.contains("unlock"),
+            "refusal must fire before key access — detail must not mention keyring/unlock: {value}"
+        );
+        assert!(
+            value.get("signature").is_none(),
+            "no signature must be produced on mainnet; got: {value}"
+        );
     }
 
     /// A `RequireApproval` policy verdict on `stellar_sep53_sign_message` must

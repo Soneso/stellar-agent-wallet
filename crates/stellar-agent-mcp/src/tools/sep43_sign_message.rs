@@ -1,7 +1,7 @@
 //! `stellar_sep43_sign_message` MCP tool — SEP-43 `signMessage`.
 //!
 //! Signs an arbitrary UTF-8 message string and returns the signature as
-//! lowercase hex with the signer's address.
+//! standard base64 with the signer's address.
 //!
 //! Per `sep-0043.md` lines :90-100.
 
@@ -35,8 +35,8 @@ pub struct Sep43SignMessageArgs {
 
     /// UTF-8 message string to sign.
     ///
-    /// Must be non-empty. The message is hashed via `sha256(message.as_bytes())`
-    /// before signing.
+    /// Must be non-empty. Signed with the SEP-53 prefixed digest
+    /// `SHA-256("Stellar Signed Message:\n" ‖ message)`.
     pub message: String,
 
     /// Optional network passphrase; if provided, must match the active profile.
@@ -59,10 +59,13 @@ pub struct Sep43SignMessageArgs {
 
 /// Signs an arbitrary message string (SEP-43 `signMessage`).
 ///
-/// Hashes the message via `sha256(message.as_bytes())` and signs with the
-/// active signer.
+/// Signs the SEP-53 prefixed digest `SHA-256("Stellar Signed Message:\n" ‖ message)`
+/// with the active signer. Produces the same signature bytes as
+/// `stellar_sep53_sign_message`; the tools differ only in response field naming
+/// and in that the SEP-53 tool additionally accepts base64 binary input (this
+/// tool signs the UTF-8 message string only).
 ///
-/// Returns `{ "signedMessage": "<hex>", "signerAddress": "G..." }` on success.
+/// Returns `{ "signedMessage": "<base64>", "signerAddress": "G..." }` on success.
 ///
 /// # Tool annotations
 ///
@@ -97,8 +100,8 @@ impl WalletServer {
     #[tool(
         name = "stellar_sep43_sign_message",
         description = "Sign an arbitrary UTF-8 message (SEP-43 signMessage). \
-                       Hashes message via sha256 before signing. \
-                       Returns { signedMessage: string (hex), signerAddress: string }. \
+                       Signs the SEP-53 prefixed digest SHA-256('Stellar Signed Message:\\n' + message). \
+                       Returns { signedMessage: string (base64), signerAddress: string }. \
                        read_only_hint=false; destructive_hint=false.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
@@ -106,6 +109,14 @@ impl WalletServer {
         &self,
         Parameters(args): Parameters<Sep43SignMessageArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        // Mainnet structural refusal — before any key access or signing.
+        // This tool returns a signature the caller can use externally; refuse on
+        // a mainnet profile so no mainnet signature is ever produced. Wire code:
+        // network.mainnet_write_forbidden.
+        if self.profile.chain_id.is_mainnet() {
+            return Ok(crate::tools::common::mainnet_signing_forbidden_result());
+        }
+
         let args_value = json!({
             "chain_id": &args.chain_id,
             "message_len": args.message.len(),
@@ -263,6 +274,66 @@ mod tests {
         .expect("WalletServer::new must not fail in tests");
         server.policy_engine = Arc::new(RequireApprovalEngine);
         server
+    }
+
+    fn make_mainnet_server() -> crate::server::WalletServer {
+        crate::server::WalletServer::new(
+            Profile::builder_mainnet("svc", "acct", "n-svc", "n-acct")
+                .with_noop_engine()
+                .build(),
+        )
+        .expect("WalletServer::new must not fail in tests")
+    }
+
+    /// A mainnet profile MUST refuse `stellar_sep43_sign_message` structurally
+    /// before any key access: the result is an `is_error` SEP-43 object carrying
+    /// the canonical `network.mainnet_write_forbidden` wire code (SEP-43 code -3),
+    /// and it MUST NOT contain a `signedMessage`.
+    ///
+    /// The keyring mock is intentionally NOT installed, and the message asserts
+    /// the refusal did not reach the keyring (no `keyring`/`unlock` string), so a
+    /// regressed guard that let signing proceed via a leaked key path fails here.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn mainnet_profile_refuses_before_signing_no_signature_produced() {
+        let server = make_mainnet_server();
+        let args = Sep43SignMessageArgs {
+            chain_id: "stellar:mainnet".to_owned(),
+            message: "hello stellar".to_owned(),
+            network_passphrase: None,
+            address: None,
+        };
+        let result = server
+            .call_stellar_sep43_sign_message(args)
+            .await
+            .expect("structural mainnet refusal is surfaced as Ok(is_error), not Err");
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "mainnet refusal must set is_error = true"
+        );
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .expect("refusal result must carry a text content block");
+        let value: serde_json::Value =
+            serde_json::from_str(text).expect("refusal content must be a SEP-43 JSON object");
+        assert_eq!(value["code"], -3_i32, "mainnet refusal is SEP-43 code -3");
+        let message = value["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("network.mainnet_write_forbidden"),
+            "message must carry the canonical wire code; got: {value}"
+        );
+        assert!(
+            !message.contains("keyring") && !message.contains("unlock"),
+            "refusal must fire before key access — message must not mention keyring/unlock: {value}"
+        );
+        assert!(
+            value.get("signedMessage").is_none(),
+            "no signature must be produced on mainnet; got: {value}"
+        );
     }
 
     /// A `RequireApproval` policy verdict on `stellar_sep43_sign_message` must

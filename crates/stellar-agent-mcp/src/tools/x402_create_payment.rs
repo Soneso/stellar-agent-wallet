@@ -180,6 +180,16 @@ impl WalletServer {
         use stellar_agent_x402::exact::create_payment;
         use stellar_agent_x402::wire::encode_payment_signature;
 
+        // Mainnet structural refusal — before any key access or signing.
+        // This tool returns a payment authorization the MCP host broadcasts
+        // externally; the submit-layer mainnet gate never fires because the
+        // wallet does not submit. Refuse on a mainnet profile so no valid
+        // mainnet payment signature is ever produced. Wire code:
+        // network.mainnet_write_forbidden.
+        if self.profile.chain_id.is_mainnet() {
+            return Ok(crate::tools::common::x402_mainnet_signing_forbidden_result());
+        }
+
         // ── Telemetry preamble (redaction) ───────────────────────────────────
         let args_value = json!({
             "chain_id": &args.chain_id,
@@ -304,6 +314,7 @@ fn classify_x402_error(err: &stellar_agent_x402::X402Error) -> &'static str {
         X402Error::UnsupportedScheme { .. } => "unsupported_scheme",
         X402Error::UnsupportedNetwork { .. } => "unsupported_network",
         X402Error::NetworkPassphraseMismatch { .. } => "network_passphrase_mismatch",
+        X402Error::MainnetSigningForbidden { .. } => "mainnet_signing_forbidden",
         X402Error::InvalidAssetAddress { .. } => "invalid_asset_address",
         X402Error::FeesNotSponsored => "fees_not_sponsored",
         X402Error::AmountConversion { .. } => "amount_conversion",
@@ -433,6 +444,9 @@ mod tests {
                 expected_passphrase: "b",
                 profile_passphrase: "c".to_owned(),
             },
+            X402Error::MainnetSigningForbidden {
+                detail: "network.mainnet_write_forbidden".to_owned(),
+            },
             X402Error::InvalidAssetAddress {
                 detail: "d".to_owned(),
             },
@@ -504,6 +518,64 @@ mod tests {
         .expect("WalletServer::new must not fail in tests");
         server.policy_engine = Arc::new(RequireApprovalEngine);
         server
+    }
+
+    fn make_mainnet_server() -> crate::server::WalletServer {
+        crate::server::WalletServer::new(
+            Profile::builder_mainnet("svc", "acct", "n-svc", "n-acct")
+                .with_noop_engine()
+                .build(),
+        )
+        .expect("WalletServer::new must not fail in tests")
+    }
+
+    /// A mainnet profile MUST refuse `stellar_x402_create_payment` structurally
+    /// before any key access: the result is an `is_error` x402 envelope carrying
+    /// the canonical `network.mainnet_write_forbidden` wire code, and it MUST NOT
+    /// contain a `paymentSignature`.
+    ///
+    /// The keyring mock is intentionally NOT installed: reaching the keyring
+    /// would surface a `keyring load failed` message instead, so this test also
+    /// proves the refusal fires before key access.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn mainnet_profile_refuses_before_signing_no_signature_produced() {
+        let server = make_mainnet_server();
+        let args = X402CreatePaymentArgs {
+            chain_id: "stellar:mainnet".to_owned(),
+            payment_required: sample_requirements_json(),
+            address: None,
+        };
+        let result = server
+            .call_stellar_x402_create_payment(args)
+            .await
+            .expect("structural mainnet refusal is surfaced as Ok(is_error), not Err");
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "mainnet refusal must set is_error = true"
+        );
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .expect("refusal result must carry a text content block");
+        let value: serde_json::Value =
+            serde_json::from_str(text).expect("refusal content must be a JSON object");
+        let message = value["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("network.mainnet_write_forbidden"),
+            "message must carry the canonical wire code; got: {value}"
+        );
+        assert!(
+            !message.contains("keyring") && !message.contains("unlock"),
+            "refusal must fire before key access — message must not mention keyring/unlock: {value}"
+        );
+        assert!(
+            value.get("paymentSignature").is_none(),
+            "no payment signature must be produced on mainnet; got: {value}"
+        );
     }
 
     /// Security regression: a `RequireApproval` policy verdict on
