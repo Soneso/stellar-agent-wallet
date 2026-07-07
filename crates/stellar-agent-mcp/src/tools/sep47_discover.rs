@@ -103,9 +103,12 @@ impl WalletServer {
         // Validate chain_id via dispatch_gate.
         let args_value = json!({ "chain_id": args.chain_id });
         // Read-only tool: RequireApproval produces no signing material; proceed.
-        let _ = self
+        if let Err(e) = self
             .dispatch_gate("stellar_sep47_discover", &args_value, &args.chain_id)
-            .await?;
+            .await
+        {
+            return e.into_result();
+        }
 
         // Resolve the RPC URL from the active profile.
         let rpc_url = self.profile.rpc_url.as_str();
@@ -117,14 +120,10 @@ impl WalletServer {
                     serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
                 Ok(CallToolResult::success(vec![Content::text(json_str)]))
             }
-            Err(e) => {
-                let resp = json!({ "error": e.to_string(), "code": "discovery_failed" });
-                let json_str =
-                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-                let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                result.is_error = Some(true);
-                Ok(result)
-            }
+            Err(e) => Ok(crate::tools::common::business_error_result(
+                "sep47.discovery_failed",
+                e.to_string(),
+            )),
         }
     }
 }

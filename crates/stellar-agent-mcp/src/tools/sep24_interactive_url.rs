@@ -175,9 +175,12 @@ impl WalletServer {
             "has_transfer_server_sep0024": args.transfer_server_sep0024.is_some(),
         });
         // Non-signing tool: RequireApproval produces no signing material; proceed.
-        let _ = self
+        if let Err(e) = self
             .dispatch_gate("stellar_sep24_interactive_url", &args_value, &args.chain_id)
-            .await?;
+            .await
+        {
+            return e.into_result();
+        }
 
         // Parse operation.
         let operation = match args.operation.as_str() {

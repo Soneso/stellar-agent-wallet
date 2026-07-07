@@ -548,22 +548,20 @@ async fn grant_present_creates_per_action_queue_entry() {
         }),
     };
 
-    let result = server.call_stellar_toolset_invoke(args).await;
-    assert!(
-        result.is_err(),
-        "must fail: per-action approval required (forced unconditionally)"
-    );
-    let err = result.unwrap_err();
-    let msg = error_message(&err);
+    let result = server
+        .call_stellar_toolset_invoke(args)
+        .await
+        .expect("per-action approval required must return Ok(is_error) envelope");
+    let (code, message, _text) = common::assert_business_envelope(&result);
 
     // Must be policy.approval_required (forced per-action approval), not first-invoke gate.
-    assert!(
-        msg.contains("approval_required") || msg.contains("policy.approval_required"),
-        "expected policy.approval_required (forced per-action); got: {msg}"
+    assert_eq!(
+        code, "policy.approval_required",
+        "expected policy.approval_required (forced per-action); got: {code}"
     );
     assert!(
-        !msg.contains("first_invoke_approval_required"),
-        "must NOT re-trigger first-invoke gate when grant exists; got: {msg}"
+        !message.contains("first_invoke_approval_required"),
+        "must NOT re-trigger first-invoke gate when grant exists; got: {message}"
     );
 
     // A PaymentSimulated pending approval was queued (not ToolsetFirstInvokeGate).
@@ -639,21 +637,16 @@ async fn permissive_policy_forces_per_action_approval() {
         }),
     };
 
-    let result = server.call_stellar_toolset_invoke(args).await;
-    // MUST be an error — invented attestation must not bypass the gate.
-    assert!(
-        result.is_err(),
-        "invented attestation under permissive policy MUST be refused; \
-         this assertion failing means an attestation bypass is active"
+    let result = server.call_stellar_toolset_invoke(args).await.expect(
+        "invented attestation under permissive policy MUST be refused via an Ok(is_error) \
+             envelope; this assertion failing means an attestation bypass is active",
     );
-
-    let err = result.unwrap_err();
-    let msg = error_message(&err);
+    let (code, _message, _text) = common::assert_business_envelope(&result);
 
     // Must be policy.approval_required (forged attestation rejected).
-    assert!(
-        msg.contains("approval_required") || msg.contains("policy.approval_required"),
-        "must return policy.approval_required for forged attestation; got: {msg}"
+    assert_eq!(
+        code, "policy.approval_required",
+        "must return policy.approval_required for forged attestation; got: {code}"
     );
 }
 
@@ -717,10 +710,8 @@ async fn forged_grant_still_forces_per_action_approval() {
         }),
     };
 
-    let result = server.call_stellar_toolset_invoke(args).await;
-    assert!(
-        result.is_err(),
-        "forged grant must not allow commit; commit must be refused"
+    let result = server.call_stellar_toolset_invoke(args).await.expect(
+        "forged grant must not allow commit; commit must be refused via an Ok(is_error) envelope",
     );
     // The forged grant passes find_matching (field-only; HMAC is not checked on the
     // read path by design — see toolset_grant.rs rustdoc on `matches` and
@@ -728,11 +719,10 @@ async fn forged_grant_still_forces_per_action_approval() {
     // approval_nonce is not in the store → `policy.approval_required`.
     // This must NOT be `first_invoke_approval_required` because the grant fields
     // matched; only the per-action attestation failed.
-    let err = result.unwrap_err();
-    let msg = error_message(&err);
-    assert!(
-        msg.contains("policy.approval_required"),
-        "forged grant must trigger per-action approval_required (not first_invoke gate); got: {msg}"
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "policy.approval_required",
+        "forged grant must trigger per-action approval_required (not first_invoke gate); got: {code}"
     );
 }
 

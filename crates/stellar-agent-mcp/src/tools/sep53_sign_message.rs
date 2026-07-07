@@ -151,13 +151,17 @@ impl WalletServer {
         });
         // Single-shot sign tool: a RequireApproval verdict is fail-closed.
         // The two-phase approval flow is not supported on this path.
-        match self
+        let dispatch_outcome = match self
             .dispatch_gate("stellar_sep53_sign_message", &args_value, &args.chain_id)
-            .await?
+            .await
         {
+            Ok(o) => o,
+            Err(e) => return e.into_result(),
+        };
+        match dispatch_outcome {
             crate::tools::common::DispatchOutcome::Allow => {}
             crate::tools::common::DispatchOutcome::RequireApproval(_) => {
-                return Err(crate::tools::common::single_shot_require_approval_error());
+                return Ok(crate::tools::common::single_shot_require_approval_error());
             }
         }
 
@@ -191,14 +195,10 @@ impl WalletServer {
             match signer_from_keyring(&self.profile.mcp_signer_default, account).await {
                 Ok(h) => h,
                 Err(err) => {
-                    let json_str = serde_json::to_string_pretty(&json!({
-                        "error": "keyring_load_failed",
-                        "detail": format!("keyring load failed: {err}")
-                    }))
-                    .unwrap_or_else(|_| "{}".to_owned());
-                    let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                    result.is_error = Some(true);
-                    return Ok(result);
+                    return Ok(crate::tools::common::business_error_result(
+                        "sep53.keyring_load_failed",
+                        format!("keyring load failed: {err}"),
+                    ));
                 }
             };
 
@@ -253,16 +253,10 @@ impl WalletServer {
                 .unwrap_or_else(|_| "{}".to_owned());
                 Ok(CallToolResult::success(vec![Content::text(json_str)]))
             }
-            Err(err) => {
-                let json_str = serde_json::to_string_pretty(&json!({
-                    "error": "sep53_sign_failed",
-                    "detail": err.to_string(),
-                }))
-                .unwrap_or_else(|_| "{}".to_owned());
-                let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                result.is_error = Some(true);
-                Ok(result)
-            }
+            Err(err) => Ok(crate::tools::common::business_error_result(
+                "sep53.sign_failed",
+                err.to_string(),
+            )),
         }
     }
 }
@@ -363,11 +357,11 @@ mod tests {
     }
 
     /// A mainnet profile MUST refuse `stellar_sep53_sign_message` structurally
-    /// before any key access: the result is an `is_error` envelope whose `detail`
-    /// carries the canonical `network.mainnet_write_forbidden` wire code, and it
-    /// MUST NOT contain a `signature`.
+    /// before any key access: the result is the normalised business-error
+    /// envelope carrying the canonical `network.mainnet_write_forbidden` wire
+    /// code, and it MUST NOT contain a `signature`.
     ///
-    /// The keyring mock is intentionally NOT installed, and the detail asserts
+    /// The keyring mock is intentionally NOT installed, and the envelope asserts
     /// the refusal did not reach the keyring (no `keyring`/`unlock` string), so a
     /// regressed guard that let signing proceed via a leaked key path fails here.
     #[tokio::test]
@@ -383,31 +377,22 @@ mod tests {
             .call_stellar_sep53_sign_message(args)
             .await
             .expect("structural mainnet refusal is surfaced as Ok(is_error), not Err");
+        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
         assert_eq!(
-            result.is_error,
-            Some(true),
-            "mainnet refusal must set is_error = true"
-        );
-        let text = result
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.as_str())
-            .expect("refusal result must carry a text content block");
-        let value: serde_json::Value =
-            serde_json::from_str(text).expect("refusal content must be a JSON object");
-        let detail = value["detail"].as_str().unwrap_or_default();
-        assert!(
-            detail.contains("network.mainnet_write_forbidden"),
-            "detail must carry the canonical wire code; got: {value}"
+            code, "network.mainnet_write_forbidden",
+            "mainnet refusal must carry the canonical wire code"
         );
         assert!(
-            !detail.contains("keyring") && !detail.contains("unlock"),
-            "refusal must fire before key access — detail must not mention keyring/unlock: {value}"
+            message.contains("network.mainnet_write_forbidden"),
+            "message must carry the canonical wire code; got: {message}"
         );
         assert!(
-            value.get("signature").is_none(),
-            "no signature must be produced on mainnet; got: {value}"
+            !text.contains("keyring") && !text.contains("unlock"),
+            "refusal must fire before key access — envelope must not mention keyring/unlock: {text}"
+        );
+        assert!(
+            !text.contains("\"signature\""),
+            "no signature must be produced on mainnet; got: {text}"
         );
     }
 
@@ -424,19 +409,21 @@ mod tests {
             message: "hello stellar".to_owned(),
             message_encoding: None,
         };
-        let result = server.call_stellar_sep53_sign_message(args).await;
-        let err = result.expect_err(
-            "RequireApproval must return Err(ErrorData), not Ok (which would mean signing proceeded)",
+        let result = server.call_stellar_sep53_sign_message(args).await.expect(
+            "RequireApproval must return Ok(is_error) envelope, not a protocol error or a signature",
+        );
+        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(
+            code, "policy.approval_required_unsupported",
+            "wire code must be policy.approval_required_unsupported"
         );
         assert!(
-            err.message.contains("policy.approval_required_unsupported"),
-            "wire code must be policy.approval_required_unsupported; got: {}",
-            err.message
+            message.contains("single-shot"),
+            "error message must mention single-shot; got: {message}"
         );
         assert!(
-            err.message.contains("single-shot"),
-            "error message must mention single-shot; got: {}",
-            err.message
+            !text.contains("\"signature\""),
+            "fail-closed approval refusal must not produce a signature; got: {text}"
         );
     }
 }

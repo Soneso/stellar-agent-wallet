@@ -519,18 +519,22 @@ async fn simulate_create_account_fee_explicit_above_profile_cap_fails() {
         starting_balance: serde_json::from_str(r#""1 XLM""#).unwrap(),
         classic_base: Some("500".to_owned()),
     };
-    let err = server
+    let result = server
         .call_stellar_create_account(args)
         .await
-        .expect_err("fee above cap must fail");
-    assert!(
-        err.to_string().contains("fees.percentile_exceeds_cap"),
-        "expected fees.percentile_exceeds_cap, got: {err}"
+        .expect("fee above cap must return Ok(is_error) envelope");
+    let (code, message, _text) = common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "fees.percentile_exceeds_cap",
+        "expected fees.percentile_exceeds_cap, got: {code}"
     );
-    let data = err.data.as_ref().expect("cap error has structured data");
-    assert_eq!(data["selected_fee_per_op_stroops"], "500");
-    assert_eq!(data["classic_max_fee_per_op_stroops"], "100");
-    assert_eq!(data["selected_fee_percentile"], "explicit");
+    assert_eq!(
+        message,
+        "auto-selected per-operation fee 500 stroops (percentile explicit) \
+         exceeds the profile cap of 100 stroops; raise classic_max_fee_per_op_stroops \
+         or accept a lower fee percentile",
+        "cap-exceeded detail must carry the selected fee, percentile, and cap; got: {message}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -568,12 +572,14 @@ async fn policy_noop_engine_refuses_mainnet_destructive() {
         approval_nonce: None,
         approval_attestation: None,
     };
-    let result = server.call_stellar_create_account_commit(args).await;
-    assert!(result.is_err(), "mainnet commit must return Err");
-    let err = result.unwrap_err();
-    assert!(
-        err.to_string().contains("policy.engine_required"),
-        "error must be policy.engine_required, got: {err}"
+    let result = server
+        .call_stellar_create_account_commit(args)
+        .await
+        .expect("mainnet commit must return Ok(is_error) envelope");
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "policy.engine_required",
+        "error must be policy.engine_required, got: {code}"
     );
 }
 
@@ -602,16 +608,18 @@ async fn policy_v1_engine_allow_rule_passes_gate() {
         approval_nonce: None,
         approval_attestation: None,
     };
-    let result = server.call_stellar_create_account_commit(args).await;
-    let err = result.expect_err("commit must fail at the nonce gate after passing the policy gate");
-    let msg = err.to_string();
-    assert!(
-        !msg.contains("policy.engine_required"),
-        "V1 Allow path must NOT emit policy.engine_required; got: {msg}"
+    let result = server
+        .call_stellar_create_account_commit(args)
+        .await
+        .expect("commit reaches the nonce gate, surfaced as Ok(is_error) envelope");
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    assert_ne!(
+        code, "policy.engine_required",
+        "V1 Allow path must NOT emit policy.engine_required"
     );
-    assert!(
-        msg.contains("nonce.expired"),
-        "V1 Allow path must reach the nonce gate (proof of gate-pass); got: {msg}"
+    assert_eq!(
+        code, "nonce.expired",
+        "V1 Allow path must reach the nonce gate (proof of gate-pass)"
     );
 }
 
@@ -634,18 +642,15 @@ async fn policy_v1_engine_no_matching_rule_emits_wire_code() {
         approval_nonce: None,
         approval_attestation: None,
     };
-    let result = server.call_stellar_create_account_commit(args).await;
-    assert!(
-        result.is_err(),
-        "V1 engine with NoMatchingRule must return Err"
-    );
-    let err = result.unwrap_err();
-    assert!(
-        err.to_string().contains(&format!(
-            "policy.deny.{}",
-            DenyReason::NoMatchingRule.code()
-        )),
-        "V1 engine NoMatchingRule must emit policy.deny.no_matching_rule; got: {err}"
+    let result = server
+        .call_stellar_create_account_commit(args)
+        .await
+        .expect("V1 engine with NoMatchingRule must return Ok(is_error) envelope");
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    let expected_wire_code = format!("policy.deny.{}", DenyReason::NoMatchingRule.code());
+    assert_eq!(
+        code, expected_wire_code,
+        "V1 engine NoMatchingRule must emit policy.deny.no_matching_rule; got: {code}"
     );
 }
 
@@ -668,18 +673,15 @@ async fn policy_v1_engine_explicit_deny_emits_wire_code() {
         approval_nonce: None,
         approval_attestation: None,
     };
-    let result = server.call_stellar_create_account_commit(args).await;
-    assert!(
-        result.is_err(),
-        "V1 engine with ExplicitRuleDeny must return Err"
-    );
-    let err = result.unwrap_err();
-    assert!(
-        err.to_string().contains(&format!(
-            "policy.deny.{}",
-            DenyReason::ExplicitRuleDeny.code()
-        )),
-        "V1 engine ExplicitRuleDeny must emit policy.deny.explicit_rule_deny; got: {err}"
+    let result = server
+        .call_stellar_create_account_commit(args)
+        .await
+        .expect("V1 engine with ExplicitRuleDeny must return Ok(is_error) envelope");
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    let expected_wire_code = format!("policy.deny.{}", DenyReason::ExplicitRuleDeny.code());
+    assert_eq!(
+        code, expected_wire_code,
+        "V1 engine ExplicitRuleDeny must emit policy.deny.explicit_rule_deny; got: {code}"
     );
 }
 
@@ -709,12 +711,14 @@ async fn commit_returns_nonce_expired_on_bad_nonce() {
         approval_nonce: None,
         approval_attestation: None,
     };
-    let result = server.call_stellar_create_account_commit(args).await;
-    assert!(result.is_err(), "bad nonce must return Err");
-    let err = result.unwrap_err();
-    assert!(
-        err.to_string().contains("nonce.expired"),
-        "error must be nonce.expired, got: {err}"
+    let result = server
+        .call_stellar_create_account_commit(args)
+        .await
+        .expect("bad nonce is surfaced as Ok(is_error) envelope");
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "nonce.expired",
+        "bad nonce must carry wire code nonce.expired"
     );
 }
 
@@ -744,12 +748,14 @@ async fn commit_returns_nonce_expired_on_wrong_length_nonce() {
         approval_nonce: None,
         approval_attestation: None,
     };
-    let result = server.call_stellar_create_account_commit(args).await;
-    assert!(result.is_err(), "wrong-length nonce must return Err");
-    let err = result.unwrap_err();
-    assert!(
-        err.to_string().contains("nonce.expired"),
-        "error must be nonce.expired, got: {err}"
+    let result = server
+        .call_stellar_create_account_commit(args)
+        .await
+        .expect("wrong-length nonce is surfaced as Ok(is_error) envelope");
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "nonce.expired",
+        "wrong-length nonce must carry wire code nonce.expired"
     );
 }
 
@@ -1154,8 +1160,8 @@ async fn commit_indistinguishability_expired_vs_hmac_mismatch() {
     let result_a = server
         .call_stellar_create_account_commit(args_a)
         .await
-        .expect_err("Expired path must return Err");
-    let message_a = result_a.message.clone();
+        .expect("Expired path must return Ok(is_error) envelope");
+    let (code_a, message_a, _text_a) = common::assert_business_envelope(&result_a);
 
     // ── Path B: HmacMismatch ──────────────────────────────────────────────────
     // Mint a nonce with valid far-future expiry; corrupt one HMAC byte so the
@@ -1203,14 +1209,53 @@ async fn commit_indistinguishability_expired_vs_hmac_mismatch() {
     let result_b = server
         .call_stellar_create_account_commit(args_b)
         .await
-        .expect_err("HmacMismatch path must return Err");
-    let message_b = result_b.message.clone();
+        .expect("HmacMismatch path must return Ok(is_error) envelope");
+    let (code_b, message_b, _text_b) = common::assert_business_envelope(&result_b);
+
+    // ── Path C: malformed nonce (parse failure) ───────────────────────────────
+    // A nonce string that fails `Nonce::from_base64` reaches the commit handler's
+    // parse arm, which collapses to the same Expired envelope. Valid envelope +
+    // testnet Allow so the call reaches the nonce-parse gate before any verify.
+    let args_c = StellarCreateAccountCommitArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        source: SOURCE_G.to_owned(),
+        destination: DEST_G.to_owned(),
+        starting_balance: serde_json::from_str(r#""1 XLM""#).unwrap(),
+        nonce: "!!! not a valid nonce !!!".to_owned(),
+        expires_at_unix_ms: expiry_b, // valid; parse fails before expiry is read
+        envelope_xdr: envelope_a.clone(),
+        approval_nonce: None,
+        approval_attestation: None,
+    };
+    let result_c = server
+        .call_stellar_create_account_commit(args_c)
+        .await
+        .expect("parse-failure path must return Ok(is_error) envelope");
+    let (code_c, message_c, _text_c) = common::assert_business_envelope(&result_c);
 
     // ── Indistinguishability assertion ────────────────────────────────────────
+    for (label, code) in [
+        ("Expired", &code_a),
+        ("HmacMismatch", &code_b),
+        ("ParseFailure", &code_c),
+    ] {
+        assert_eq!(
+            code, "nonce.expired",
+            "{label} path must carry wire code nonce.expired; got: {code}"
+        );
+    }
+    let pair_a = (code_a, message_a);
+    let pair_b = (code_b, message_b);
+    let pair_c = (code_c, message_c);
     assert_eq!(
-        message_a, message_b,
+        pair_a, pair_b,
         "indistinguishability violated: Expired and HmacMismatch must produce \
-         byte-identical agent-visible error messages.\n  Expired:      {message_a:?}\n  HmacMismatch: {message_b:?}"
+         byte-identical agent-visible (code, message) pairs.\n  a: {pair_a:?}\n  b: {pair_b:?}"
+    );
+    assert_eq!(
+        pair_a, pair_c,
+        "indistinguishability violated: a malformed-nonce parse failure must produce \
+         the same (code, message) as Expired.\n  a: {pair_a:?}\n  c: {pair_c:?}"
     );
 }
 
@@ -1464,14 +1509,14 @@ async fn create_account_commit_high_value_cross_check_fails_on_mismatch() {
         approval_attestation: None,
     };
 
-    let err = server
+    let result = server
         .call_stellar_create_account_commit(args)
         .await
-        .expect_err("oracle divergence must return Err");
-
-    assert!(
-        err.to_string().contains("simulation.divergence"),
-        "oracle mismatch must produce simulation.divergence, got: {err}"
+        .expect("oracle divergence must return Ok(is_error) envelope");
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "simulation.divergence",
+        "oracle mismatch must produce simulation.divergence, got: {code}"
     );
 }
 

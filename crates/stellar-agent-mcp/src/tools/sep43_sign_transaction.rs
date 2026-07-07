@@ -132,17 +132,21 @@ impl WalletServer {
         });
         // Single-shot sign tool: a RequireApproval verdict is fail-closed.
         // The two-phase approval flow is not supported on this path.
-        match self
+        let dispatch_outcome = match self
             .dispatch_gate(
                 "stellar_sep43_sign_transaction",
                 &args_value,
                 &args.chain_id,
             )
-            .await?
+            .await
         {
+            Ok(o) => o,
+            Err(e) => return e.into_result(),
+        };
+        match dispatch_outcome {
             crate::tools::common::DispatchOutcome::Allow => {}
             crate::tools::common::DispatchOutcome::RequireApproval(_) => {
-                return Err(crate::tools::common::single_shot_require_approval_error());
+                return Ok(crate::tools::common::single_shot_require_approval_error());
             }
         }
 
@@ -361,18 +365,21 @@ mod tests {
             address: None,
         };
         let result = server.call_stellar_sep43_sign_transaction(args).await;
-        let err = result.expect_err(
-            "RequireApproval must return Err(ErrorData), not Ok (which would mean signing proceeded)",
+        let result = result.expect(
+            "RequireApproval must return Ok(is_error) envelope, not a protocol error or a signature",
+        );
+        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(
+            code, "policy.approval_required_unsupported",
+            "wire code must be policy.approval_required_unsupported"
         );
         assert!(
-            err.message.contains("policy.approval_required_unsupported"),
-            "wire code must be policy.approval_required_unsupported; got: {}",
-            err.message
+            message.contains("single-shot"),
+            "error message must mention single-shot; got: {message}"
         );
         assert!(
-            err.message.contains("single-shot"),
-            "error message must mention single-shot; got: {}",
-            err.message
+            !text.contains("\"signature\""),
+            "fail-closed approval refusal must not produce a signature; got: {text}"
         );
     }
 }

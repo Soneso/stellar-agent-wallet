@@ -50,9 +50,12 @@ impl WalletServer {
             "rpc_url_override": args.rpc_url.is_some(),
         });
         // Read-only tool: RequireApproval produces no signing material; proceed.
-        let _ = self
+        if let Err(e) = self
             .dispatch_gate("stellar_fee_stats", &args_value, &args.chain_id)
-            .await?;
+            .await
+        {
+            return e.into_result();
+        }
 
         let rpc_url = match args.rpc_url.as_deref() {
             Some(url) => {

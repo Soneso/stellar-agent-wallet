@@ -113,9 +113,12 @@ impl WalletServer {
             "has_transfer_server": args.transfer_server.is_some(),
         });
         // Non-signing tool: RequireApproval produces no signing material; proceed.
-        let _ = self
+        if let Err(e) = self
             .dispatch_gate("stellar_sep6_deposit_info", &args_value, &args.chain_id)
-            .await?;
+            .await
+        {
+            return e.into_result();
+        }
 
         // Resolve transfer_server URL.
         let (transfer_server, anchor_domain_str) = resolve_transfer_server(

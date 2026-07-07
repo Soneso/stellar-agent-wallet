@@ -136,9 +136,12 @@ impl WalletServer {
             "account_id": &args.account_id,
         });
         // Non-signing tool: RequireApproval produces no signing material; proceed.
-        let _ = self
+        if let Err(e) = self
             .dispatch_gate("stellar_friendbot", &args_value, &args.chain_id)
-            .await?;
+            .await
+        {
+            return e.into_result();
+        }
 
         // ── Validate G-strkey (strict G-only ed25519 public key) ────────────
         // Uses ed25519::PublicKey::from_string (not the permissive Strkey::from_string

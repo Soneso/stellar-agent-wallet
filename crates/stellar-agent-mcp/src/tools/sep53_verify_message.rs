@@ -133,9 +133,12 @@ impl WalletServer {
             "public_key_len": args.public_key.len(),
         });
         // Read-only tool: RequireApproval produces no signing material; proceed.
-        let _ = self
+        if let Err(e) = self
             .dispatch_gate("stellar_sep53_verify_message", &args_value, &args.chain_id)
-            .await?;
+            .await
+        {
+            return e.into_result();
+        }
 
         // Decode the message bytes (same logic as sign tool).
         let encoding = args.message_encoding.as_deref().unwrap_or("utf8");
@@ -193,16 +196,10 @@ impl WalletServer {
                     .unwrap_or_else(|_| r#"{"valid":true}"#.to_owned());
                 Ok(CallToolResult::success(vec![Content::text(json_str)]))
             }
-            Err(err) => {
-                let json_str = serde_json::to_string_pretty(&json!({
-                    "error": "sep53_verify_failed",
-                    "detail": err.to_string(),
-                }))
-                .unwrap_or_else(|_| "{}".to_owned());
-                let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                result.is_error = Some(true);
-                Ok(result)
-            }
+            Err(err) => Ok(crate::tools::common::business_error_result(
+                "sep53.verify_failed",
+                err.to_string(),
+            )),
         }
     }
 }

@@ -115,8 +115,10 @@ pub struct X402CreatePaymentArgs {
 /// signed payload.
 ///
 /// Returns `{ paymentSignature, payer, asset, amount, payTo, network }` on
-/// success.  Errors return `{ "code": "x402.error", "message": "..." }` with
-/// `isError = true`.
+/// success.  Errors return the standard business-error envelope
+/// `{ ok: false, error: { code, message }, request_id }` with `isError = true`;
+/// `error.code` is the per-variant `x402.<reason>` wire code (the mainnet
+/// refusal uses `network.mainnet_write_forbidden`).
 ///
 /// # Tool annotations
 ///
@@ -130,7 +132,8 @@ pub struct X402CreatePaymentArgs {
 ///
 /// # Errors
 ///
-/// Returns `isError = true` with `{ "code": "x402.error", "message": "..." }` when:
+/// Returns `isError = true` with the business-error envelope (per-variant
+/// `x402.<reason>` `error.code`) when:
 /// - `chain_id` does not match the active profile.
 /// - `payment_required` is not valid base64+JSON or raw JSON `PaymentRequirements`.
 /// - The `scheme` field is not `"exact"`.
@@ -199,13 +202,17 @@ impl WalletServer {
         // ── dispatch_gate: registry lookup + policy evaluation + chain_id ────
         // Single-shot sign tool: RequireApproval is fail-closed. The two-phase
         // approval flow is not supported on this surface.
-        match self
+        let dispatch_outcome = match self
             .dispatch_gate("stellar_x402_create_payment", &args_value, &args.chain_id)
-            .await?
+            .await
         {
+            Ok(o) => o,
+            Err(e) => return e.into_result(),
+        };
+        match dispatch_outcome {
             crate::tools::common::DispatchOutcome::Allow => {}
             crate::tools::common::DispatchOutcome::RequireApproval(_) => {
-                return Err(crate::tools::common::single_shot_require_approval_error());
+                return Ok(crate::tools::common::single_shot_require_approval_error());
             }
         }
 
@@ -239,8 +246,11 @@ impl WalletServer {
             match signer_from_keyring(&self.profile.mcp_signer_default, account).await {
                 Ok(h) => h,
                 Err(err) => {
-                    let x402_err = stellar_agent_x402::X402Error::InvalidPaymentRequired {
-                        detail: format!("keyring load failed: {err}"),
+                    // Static detail, matching the signer-load refusal wording on
+                    // the other signing tools; the keyring error is traced only.
+                    tracing::debug!(error = %err, "x402 create-payment: signer load failed");
+                    let x402_err = stellar_agent_x402::X402Error::KeyringLoadFailed {
+                        detail: "could not load signer from keyring".to_owned(),
                     };
                     return Ok(x402_error_to_tool_result(&x402_err));
                 }
@@ -550,31 +560,22 @@ mod tests {
             .call_stellar_x402_create_payment(args)
             .await
             .expect("structural mainnet refusal is surfaced as Ok(is_error), not Err");
+        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
         assert_eq!(
-            result.is_error,
-            Some(true),
-            "mainnet refusal must set is_error = true"
+            code, "network.mainnet_write_forbidden",
+            "mainnet refusal must carry the canonical wire code"
         );
-        let text = result
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.as_str())
-            .expect("refusal result must carry a text content block");
-        let value: serde_json::Value =
-            serde_json::from_str(text).expect("refusal content must be a JSON object");
-        let message = value["message"].as_str().unwrap_or_default();
         assert!(
             message.contains("network.mainnet_write_forbidden"),
-            "message must carry the canonical wire code; got: {value}"
+            "message must carry the canonical wire code; got: {message}"
         );
         assert!(
-            !message.contains("keyring") && !message.contains("unlock"),
-            "refusal must fire before key access — message must not mention keyring/unlock: {value}"
+            !text.contains("keyring") && !text.contains("unlock"),
+            "refusal must fire before key access — envelope must not mention keyring/unlock: {text}"
         );
         assert!(
-            value.get("paymentSignature").is_none(),
-            "no payment signature must be produced on mainnet; got: {value}"
+            !text.contains("\"paymentSignature\""),
+            "no payment signature must be produced on mainnet; got: {text}"
         );
     }
 
@@ -593,18 +594,21 @@ mod tests {
             address: None,
         };
         let result = server.call_stellar_x402_create_payment(args).await;
-        let err = result.expect_err(
-            "RequireApproval must return Err(ErrorData), not Ok (which would mean signing proceeded)",
+        let result = result.expect(
+            "RequireApproval must return Ok(is_error) envelope, not a protocol error or a signature",
+        );
+        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(
+            code, "policy.approval_required_unsupported",
+            "wire code must be policy.approval_required_unsupported"
         );
         assert!(
-            err.message.contains("policy.approval_required_unsupported"),
-            "wire code must be policy.approval_required_unsupported; got: {}",
-            err.message
+            message.contains("single-shot"),
+            "error message must mention single-shot; got: {message}"
         );
         assert!(
-            err.message.contains("single-shot"),
-            "error message must mention single-shot; got: {}",
-            err.message
+            !text.contains("\"paymentSignature\"") && !text.contains("\"signature\""),
+            "fail-closed approval refusal must not produce a signature; got: {text}"
         );
     }
 }

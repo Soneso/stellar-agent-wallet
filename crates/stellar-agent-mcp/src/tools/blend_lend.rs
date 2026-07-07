@@ -218,14 +218,18 @@ impl WalletServer {
             "pool_address": args.pool_address,
             "from_address": args.from_address,
         });
-        let dispatch_outcome = self
+        let dispatch_outcome = match self
             .dispatch_gate("stellar_blend_lend", &args_value, &args.chain_id)
-            .await?;
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return e.into_result(),
+        };
 
         // Single-shot DeFi tool: RequireApproval is not supported (no two-phase
         // split). Return fail-closed error rather than silently proceeding.
         if matches!(dispatch_outcome, DispatchOutcome::RequireApproval(_)) {
-            return Err(crate::tools::common::single_shot_require_approval_error());
+            return Ok(crate::tools::common::single_shot_require_approval_error());
         }
 
         // ── Parse and validate requests ───────────────────────────────────────
@@ -237,12 +241,12 @@ impl WalletServer {
             // The `lend` verb permits only lending operations (0-5).
             // Liquidation discriminants 6-9 require the dedicated `liquidate`
             // verb.
-            rt.assert_lend_verb_allowed().map_err(|e| {
-                rmcp::ErrorData::invalid_params(
-                    format!("blend.liquidation_not_permitted_on_lend_verb: {e}"),
-                    None,
-                )
-            })?;
+            if let Err(e) = rt.assert_lend_verb_allowed() {
+                return Ok(crate::tools::common::business_error_result(
+                    "blend.liquidation_not_permitted_on_lend_verb",
+                    e.to_string(),
+                ));
+            }
             let qty = crate::tools::amount_wire::parse_i128_field(
                 &format!("requests[{idx}].qty"),
                 &req.qty,
@@ -287,14 +291,14 @@ impl WalletServer {
             blend_pool_wasm_set_pubnet()
         };
 
-        verify_blend_pool_wasm(
+        if let Err(e) = verify_blend_pool_wasm(
             &args.pool_address,
             &wasm_set,
             &primary_rpc,
             secondary_rpc.as_ref(),
         )
         .await
-        .map_err(|e| {
+        {
             tracing::warn!(
                 event = "blend.pool_wasm_pin_failed",
                 pool_redacted = stellar_agent_core::observability::redact_strkey_first5_last5(
@@ -302,16 +306,17 @@ impl WalletServer {
                 ),
                 error = %e,
             );
-            rmcp::ErrorData::internal_error(
-                "blend.pool_wasm_pin_failed: pool WASM hash mismatch",
-                None,
-            )
-        })?;
+            return Ok(crate::tools::common::business_error_result(
+                "blend.pool_wasm_pin_failed",
+                "pool WASM hash mismatch",
+            ));
+        }
 
         // Step 2: read pool oracle, check allowlist.
-        let oracle_address = read_pool_oracle_address(&args.pool_address, &primary_rpc)
-            .await
-            .map_err(|e| {
+        let oracle_address = match read_pool_oracle_address(&args.pool_address, &primary_rpc).await
+        {
+            Ok(addr) => addr,
+            Err(e) => {
                 tracing::warn!(
                     event = "blend.oracle_fetch_failed",
                     pool_redacted = stellar_agent_core::observability::redact_strkey_first5_last5(
@@ -319,11 +324,12 @@ impl WalletServer {
                     ),
                     error = %e,
                 );
-                rmcp::ErrorData::internal_error(
-                    "blend.oracle_fetch_failed: could not read pool oracle address",
-                    None,
-                )
-            })?;
+                return Ok(crate::tools::common::business_error_result(
+                    "blend.oracle_fetch_failed",
+                    "could not read pool oracle address",
+                ));
+            }
+        };
 
         let network_label = if is_testnet { "testnet" } else { "pubnet" };
         if !is_oracle_in_allowlist(&oracle_address, network_label) {
@@ -335,9 +341,9 @@ impl WalletServer {
                     &args.pool_address
                 ),
             );
-            return Err(rmcp::ErrorData::internal_error(
-                "blend.oracle_not_allowlisted: pool oracle is not in the Reflector allowlist",
-                None,
+            return Ok(crate::tools::common::business_error_result(
+                "blend.oracle_not_allowlisted",
+                "pool oracle is not in the Reflector allowlist",
             ));
         }
 
@@ -394,23 +400,10 @@ impl WalletServer {
                 event = "oracle.staleness_exceeded",
                 reason = %staleness_reason,
             );
-            // Use a static fallback that preserves the oracle.staleness_exceeded
-            // code on the (unreachable) serialise-failure path, rather than
-            // swallowing the code with a bare "{}".
-            let reason_str = staleness_reason.to_string();
-            let resp = json!({
-                "code": "oracle.staleness_exceeded",
-                "reason": reason_str,
-            });
-            let json_str = serde_json::to_string_pretty(&resp).unwrap_or_else(|_| {
-                // Serialisation of a Value with only string fields cannot fail;
-                // this branch is statically unreachable but we preserve the
-                // oracle.staleness_exceeded code rather than emitting "{}".
-                format!(r#"{{"code":"oracle.staleness_exceeded","reason":{reason_str:?}}}"#)
-            });
-            let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-            result.is_error = Some(true);
-            return Ok(result);
+            return Ok(crate::tools::common::business_error_result(
+                "oracle.staleness_exceeded",
+                staleness_reason.to_string(),
+            ));
         }
 
         // ── DeFi dispatch gate ────────────────────────────────────────────────
@@ -420,9 +413,9 @@ impl WalletServer {
         let witness = match gate_result {
             Ok(GateOutcome::Allow(w)) => w,
             Ok(GateOutcome::RequireApproval) => {
-                return Err(rmcp::ErrorData::internal_error(
+                return Ok(crate::tools::common::business_error_result(
+                    "policy.approval_required",
                     require_approval_error(),
-                    None,
                 ));
             }
             Err(e) => {
@@ -467,14 +460,15 @@ impl WalletServer {
         // profile selection is out of scope for this tool.
         let signer_entry_ref = &self.profile.mcp_signer_default;
         let expected_g_strkey = signer_entry_ref.account.as_str();
-        let signer_handle = signer_from_keyring(signer_entry_ref, expected_g_strkey)
-            .await
-            .map_err(|_| {
-                rmcp::ErrorData::internal_error(
-                    "blend.signer_load_failed: could not load signer from keyring",
-                    None,
-                )
-            })?;
+        let signer_handle = match signer_from_keyring(signer_entry_ref, expected_g_strkey).await {
+            Ok(h) => h,
+            Err(_) => {
+                return Ok(crate::tools::common::business_error_result(
+                    "blend.signer_load_failed",
+                    "could not load signer from keyring",
+                ));
+            }
+        };
 
         let timeout = crate::tools::common::submit_timeout(&self.profile);
 
@@ -554,17 +548,10 @@ impl WalletServer {
                     serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
                 Ok(CallToolResult::success(vec![Content::text(json_str)]))
             }
-            Err(e) => {
-                let resp = json!({
-                    "code": "blend.submit_failed",
-                    "message": e.to_string(),
-                });
-                let json_str =
-                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-                let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                result.is_error = Some(true);
-                Ok(result)
-            }
+            Err(e) => Ok(crate::tools::common::business_error_result(
+                "blend.submit_failed",
+                e.to_string(),
+            )),
         }
     }
 }

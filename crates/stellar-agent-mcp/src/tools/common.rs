@@ -62,6 +62,50 @@ pub(crate) enum DispatchOutcome {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ToolError — split error channel (business envelope vs protocol fault)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Failure from a shared tool-substrate helper that can fail in two ways which
+/// surface differently on the wire.
+///
+/// - **Business** — a domain refusal or policy/nonce/approval outcome the agent
+///   is expected to branch on (`policy.deny.<reason>`, `policy.engine_required`,
+///   `nonce.*`, …). These surface through the documented result envelope
+///   (`is_error = true`, `ok: false`, `error.code`) like every other business
+///   error, carried here as a ready-to-return [`CallToolResult`].
+/// - **Protocol** — a genuine protocol fault or internal invariant (malformed
+///   arguments via the dangerous-key guard, `tool.registry_missing`,
+///   `chain_id mismatch`, a `spawn_blocking` join failure). These stay JSON-RPC
+///   [`ErrorData`] because they indicate a protocol-contract violation or an
+///   internal fault rather than a domain refusal.
+///
+/// Returned by [`WalletServer::dispatch_gate`] and
+/// [`commit_envelope_and_verify_nonce`]. A tool handler folds it back into its
+/// `Result<CallToolResult, ErrorData>` return type with
+/// [`ToolError::into_result`].
+#[must_use]
+#[derive(Debug)]
+pub(crate) enum ToolError {
+    /// A refusal to surface as a business-error result envelope.
+    Business(rmcp::model::CallToolResult),
+    /// A protocol fault or internal invariant to surface as a JSON-RPC error.
+    Protocol(ErrorData),
+}
+
+impl ToolError {
+    /// Folds the split channel back into a tool handler's
+    /// `Result<CallToolResult, ErrorData>` return type: a `Business` failure
+    /// becomes `Ok(result)` (an `is_error` envelope) and a `Protocol` failure
+    /// becomes `Err(error_data)`.
+    pub(crate) fn into_result(self) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        match self {
+            ToolError::Business(result) => Ok(result),
+            ToolError::Protocol(err) => Err(err),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Default nonce TTL (30 s–5 min window; 120 s chosen)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -217,21 +261,29 @@ pub(crate) fn total_classic_fee_stroops(
 }
 
 /// Enforces the optional profile classic per-operation fee cap.
+///
+/// # Errors
+///
+/// Returns the `fees.percentile_exceeds_cap` business-error envelope (as an
+/// `Err(CallToolResult)`) when the auto-selected per-operation fee exceeds the
+/// profile's configured cap. The selected fee, the cap, and the selected
+/// percentile are carried in the message (an agent branches on the code and
+/// can raise the cap or accept a lower percentile).
 pub(crate) fn enforce_classic_fee_cap(
     per_op_stroops: u32,
     selected_percentile: &str,
     profile: &Profile,
-) -> Result<(), ErrorData> {
+) -> Result<(), rmcp::model::CallToolResult> {
     if let Some(cap) = profile.classic_max_fee_per_op_stroops
         && per_op_stroops > cap
     {
-        return Err(ErrorData::invalid_params(
+        return Err(business_error_result(
             "fees.percentile_exceeds_cap",
-            Some(serde_json::json!({
-                "selected_fee_per_op_stroops": per_op_stroops.to_string(),
-                "classic_max_fee_per_op_stroops": cap.to_string(),
-                "selected_fee_percentile": selected_percentile,
-            })),
+            format!(
+                "auto-selected per-operation fee {per_op_stroops} stroops \
+                 (percentile {selected_percentile}) exceeds the profile cap of {cap} stroops; \
+                 raise classic_max_fee_per_op_stroops or accept a lower fee percentile"
+            ),
         ));
     }
     Ok(())
@@ -261,6 +313,95 @@ pub(crate) fn ledger_err_result(
     let mut result = CallToolResult::success(vec![Content::text(json)]);
     result.is_error = Some(true);
     result
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// business_error_result — documented business-error envelope
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Builds the documented result envelope `{ ok: false, error: { code, message },
+/// request_id }` for a **business error** and returns a `CallToolResult` with
+/// `is_error = Some(true)`.
+///
+/// A business error is any domain refusal, precondition failure, policy/approval
+/// outcome, keyring/signing failure, submit failure, pin mismatch, quote failure,
+/// or gate refusal — anything the agent should branch on via the documented
+/// `ok`/`error.code` contract (see `SKILL.md` §1).  These are tool-execution
+/// failures and belong in the tool result, not in a JSON-RPC transport error:
+/// this matches the MCP guidance that execution failures are surfaced via
+/// `is_error` in the result while JSON-RPC errors are reserved for protocol
+/// faults (malformed arguments, internal invariant breakage).
+///
+/// Every business error routed through this helper gains a `request_id`
+/// correlating the wire response with the audit log — a correlation the bare
+/// `{code,message}` and JSON-RPC error shapes lacked.
+///
+/// `code` is the stable wire code (e.g. `"policy.approval_required"`,
+/// `"nonce.expired"`, `"blend.pool_wasm_pin_failed"`); `message` is the
+/// human-readable, redaction-clean detail.  Callers that move public identifiers
+/// into `message` MUST redact them first (the envelope applies no redaction).
+///
+/// # Panics
+///
+/// Never panics.
+pub(crate) fn business_error_result(
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> rmcp::model::CallToolResult {
+    use rmcp::model::{CallToolResult, Content};
+    let envelope = stellar_agent_core::Envelope::<()>::err_raw(code, message);
+    let json = envelope
+        .to_json_pretty()
+        .unwrap_or_else(|_| String::from("{}"));
+    let mut result = CallToolResult::success(vec![Content::text(json)]);
+    result.is_error = Some(true);
+    result
+}
+
+/// Test-only: asserts the shared business-error envelope invariants
+/// (`is_error == true`, `ok == false`, non-empty `request_id`) and returns the
+/// `(code, message, full_text)` triple for further per-tool assertions.
+///
+/// Used by tool-module unit tests to assert the normalised
+/// `{ ok:false, error:{code,message}, request_id }` wire contract without
+/// duplicating the JSON extraction at every call site.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test-only assertion helper"
+)]
+pub(crate) fn assert_business_envelope(
+    result: &rmcp::model::CallToolResult,
+) -> (String, String, String) {
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "business-error result must set is_error = true"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("business-error result must carry a text content block");
+    let v: serde_json::Value =
+        serde_json::from_str(&text).expect("business-error content must be JSON");
+    assert_eq!(
+        v["ok"],
+        serde_json::json!(false),
+        "business-error envelope must have ok:false: {v}"
+    );
+    assert!(
+        v["request_id"].as_str().is_some_and(|s| !s.is_empty()),
+        "business-error envelope must carry a non-empty request_id: {v}"
+    );
+    let code = v["error"]["code"].as_str().unwrap_or_default().to_owned();
+    let message = v["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    (code, message, text)
 }
 
 /// Wraps a [`stellar_agent_core::WalletError`] in an envelope after applying
@@ -363,12 +504,17 @@ pub(crate) fn decode_payment_required_input(
 // x402_error_to_tool_result — shared x402 error-envelope helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Wraps an [`stellar_agent_x402::X402Error`] in the x402 error envelope and
-/// returns a `CallToolResult` with `is_error = Some(true)`.
+/// Wraps an [`stellar_agent_x402::X402Error`] in the documented business-error
+/// envelope and returns a `CallToolResult` with `is_error = Some(true)`.
 ///
-/// The envelope shape `{ "code": "x402.error", "message": "..." }` is the
-/// single-sourced wire contract for x402 tool error responses; the `"x402.error"`
-/// code string is defined here only, not in any individual tool file.
+/// The x402 tools have no spec-mandated error wire object (SEP-43 defines one;
+/// x402 defines only `PaymentRequirements`), so their errors surface through the
+/// documented envelope `{ ok: false, error: { code, message }, request_id }` like
+/// every other business error. The `error.code` is derived per-variant via
+/// [`stellar_agent_x402::X402Error::wire_code`] (the `x402.<snake_variant>`
+/// taxonomy, with `MainnetSigningForbidden` mapping to the canonical
+/// `network.mainnet_write_forbidden`), so an agent can branch on the specific
+/// failure instead of a single collapsed code.
 ///
 /// Used by `x402_create_payment.rs`, `x402_authenticated_payment.rs`, and
 /// `x402_parse_receipt.rs`.
@@ -383,15 +529,7 @@ pub(crate) fn decode_payment_required_input(
 pub(crate) fn x402_error_to_tool_result(
     err: &stellar_agent_x402::X402Error,
 ) -> rmcp::model::CallToolResult {
-    use rmcp::model::{CallToolResult, Content};
-    let resp = serde_json::json!({
-        "code": "x402.error",
-        "message": err.to_string(),
-    });
-    let json_str = serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-    let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-    result.is_error = Some(true);
-    result
+    business_error_result(err.wire_code(), err.to_string())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -570,12 +708,11 @@ pub(crate) fn redact_rpc_error_detail(prefix: &str, err: &impl std::fmt::Display
 ///
 /// Internal `tracing::debug!` calls in each failure arm MAY distinguish for
 /// operator forensics; the wire payload is uniform.
-pub(crate) fn approval_required_indistinguishable() -> ErrorData {
-    ErrorData::internal_error(
-        "policy.approval_required: \
-         approval attestation absent, invalid, or expired; \
+pub(crate) fn approval_required_indistinguishable() -> rmcp::model::CallToolResult {
+    business_error_result(
+        "policy.approval_required",
+        "approval attestation absent, invalid, or expired; \
          run `stellar-agent approve --id <nonce>` then re-submit with attestation",
-        None,
     )
 }
 
@@ -588,12 +725,11 @@ pub(crate) fn approval_required_indistinguishable() -> ErrorData {
 /// already turned down. An expired (but not yet GC'd) tombstone is treated
 /// as absent by the expiry check upstream of this function and still
 /// produces the generic `policy.approval_required`.
-pub(crate) fn approval_rejected_error() -> ErrorData {
-    ErrorData::internal_error(
-        "policy.approval_rejected: \
-         the operator explicitly rejected this pending approval; \
+pub(crate) fn approval_rejected_error() -> rmcp::model::CallToolResult {
+    business_error_result(
+        "policy.approval_rejected",
+        "the operator explicitly rejected this pending approval; \
          re-simulate to obtain a fresh approval request if this action is still desired",
-        None,
     )
 }
 
@@ -614,14 +750,13 @@ pub(crate) fn approval_rejected_error() -> ErrorData {
 /// configured a criterion that requires approval before signing, and the wallet
 /// MUST NOT sign without it.  Silently discarding `RequireApproval` would be a
 /// security defect.
-pub(crate) fn single_shot_require_approval_error() -> ErrorData {
-    ErrorData::internal_error(
-        "policy.approval_required_unsupported: \
-         this tool requires approval before signing; \
+pub(crate) fn single_shot_require_approval_error() -> rmcp::model::CallToolResult {
+    business_error_result(
+        "policy.approval_required_unsupported",
+        "this tool requires approval before signing; \
          single-shot sign tools do not support the two-phase approval flow; \
          configure a policy that allows this operation without \
          approval, or use a two-phase tool that supports the approval flow",
-        None,
     )
 }
 
@@ -630,7 +765,7 @@ pub(crate) fn single_shot_require_approval_error() -> ErrorData {
 ///
 /// Single-sourced so every sign-only surface (SEP-43 and x402) embeds the
 /// identical canonical code, keeping cross-surface audit correlation exact.
-fn mainnet_signing_refusal_detail() -> String {
+pub(crate) fn mainnet_signing_refusal_detail() -> String {
     format!(
         "signing is structurally refused on mainnet ({})",
         stellar_agent_core::error::NetworkError::MainnetWriteForbidden.code()
@@ -689,24 +824,21 @@ pub(crate) fn x402_mainnet_signing_forbidden_result() -> rmcp::model::CallToolRe
 ///
 /// `stellar_sep53_sign_message` returns a signature the caller can use
 /// externally; on a mainnet profile it MUST refuse structurally, before any key
-/// access, so no signature is produced. Surfaced in the `{ "error", "detail" }`
-/// envelope that tool uses for its other error results (`is_error = true`), with
-/// the [`stellar_agent_sep53::Sep53Error::MainnetSigningForbidden`] Display —
-/// which carries the canonical `network.mainnet_write_forbidden` wire code — as
-/// the `detail`.
+/// access, so no signature is produced. SEP-53 defines a signing payload, not a
+/// wallet error wire object, so the refusal surfaces through the documented
+/// business-error envelope (`is_error = true`) with the canonical
+/// `network.mainnet_write_forbidden` code, correlating with the CLI, submit-layer,
+/// and SEP-43/x402 signing guards; the
+/// [`stellar_agent_sep53::Sep53Error::MainnetSigningForbidden`] Display — which
+/// also embeds that canonical code — is the `error.message`.
 pub(crate) fn sep53_mainnet_signing_forbidden_result() -> rmcp::model::CallToolResult {
     let err = stellar_agent_sep53::Sep53Error::MainnetSigningForbidden {
         detail: mainnet_signing_refusal_detail(),
     };
-    let resp = serde_json::json!({
-        "error": "mainnet_signing_forbidden",
-        "detail": err.to_string(),
-    });
-    let json_str = serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-    let mut result =
-        rmcp::model::CallToolResult::success(vec![rmcp::model::Content::text(json_str)]);
-    result.is_error = Some(true);
-    result
+    business_error_result(
+        stellar_agent_core::error::NetworkError::MainnetWriteForbidden.code(),
+        err.to_string(),
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -733,7 +865,7 @@ pub(crate) fn sep53_mainnet_signing_forbidden_result() -> rmcp::model::CallToolR
 /// wraps immediately.
 pub(crate) fn load_attestation_key(
     profile: &stellar_agent_core::profile::schema::Profile,
-) -> Result<[u8; 32], ErrorData> {
+) -> Result<[u8; 32], rmcp::model::CallToolResult> {
     use base64::Engine as _;
     use keyring_core::Entry as KeyringEntry;
 
@@ -782,27 +914,34 @@ impl WalletServer {
     ///    the args, the profile, the optional account/identity views, and a
     ///    counterparty-cache snapshot.
     ///    - `Decision::Allow` → `Ok(DispatchOutcome::Allow)`.
-    ///    - `Decision::Deny(reason)` → `Err(internal_error)` with wire code
-    ///      `policy.deny.<reason.code()>` and the redacted `DenyReason` as
-    ///      structured payload (first-5-last-5 on account IDs).
+    ///    - `Decision::Deny(reason)` → `Err(ToolError::Business)` — a business
+    ///      refusal surfaced as the documented result envelope with wire code
+    ///      `policy.deny.<reason.code()>` and the redacted `DenyReason`
+    ///      (first-5-last-5 on account IDs) carried in the message.
     ///    - `Decision::RequireApproval(req)` → `Ok(DispatchOutcome::RequireApproval(req))`.
     ///      The simulate handler persists a `PendingApproval` and embeds the
     ///      nonce in the response; commit handlers verify the attestation.
-    ///    - Any future `Decision` variant not listed above → `Err(internal_error)`
-    ///      with wire code `policy.unexpected_decision` (forward-compat catch-all).
-    ///    - `Err` → `Err(internal_error)` with wire code `policy.engine_required: <err>`.
+    ///    - Any future `Decision` variant not listed above →
+    ///      `Err(ToolError::Business)` with wire code
+    ///      `policy.unexpected_decision` (forward-compat catch-all).
+    ///    - `Err` → `Err(ToolError::Business)` with wire code
+    ///      `policy.engine_required`.
     /// 3. Call `validate_chain_id_matches_profile(chain_id, &self.profile)`.
-    ///    Mismatch → `Err(invalid_params("chain_id mismatch: <err>"))`.
+    ///    Mismatch → `Err(ToolError::Protocol(invalid_params("chain_id mismatch: <err>")))`.
     ///
     /// # Errors
     ///
-    /// Returns `Err(ErrorData)` for all failure modes listed in step 2 and step 3.
+    /// Returns `Err(ToolError)` for all failure modes listed in step 2 and
+    /// step 3: policy refusals as [`ToolError::Business`] (result envelope),
+    /// malformed-argument / registry / chain-id faults as
+    /// [`ToolError::Protocol`] (JSON-RPC error). Fold back into a handler's
+    /// return type with [`ToolError::into_result`].
     pub(crate) async fn dispatch_gate(
         &self,
         tool_name: &'static str,
         args_value: &Value,
         chain_id: &str,
-    ) -> Result<DispatchOutcome, ErrorData> {
+    ) -> Result<DispatchOutcome, ToolError> {
         self.dispatch_gate_with_views(tool_name, args_value, chain_id, None, None)
             .await
     }
@@ -824,7 +963,7 @@ impl WalletServer {
         chain_id: &str,
         account_view: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
         identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
-    ) -> Result<DispatchOutcome, ErrorData> {
+    ) -> Result<DispatchOutcome, ToolError> {
         // Pre-step: dangerous-key guard.
         //
         // Reuse the same guard that toolset dispatch applies (validate_toolset_tool_args).
@@ -836,17 +975,21 @@ impl WalletServer {
         // Note: toolset dispatch sites apply this guard before calling dispatch_gate,
         // so toolset-routed calls get a second (idempotent) application here — that
         // is correct and adds defence-in-depth at the chokepoint.
-        stellar_agent_toolsets::validate_toolset_tool_args(args_value)
-            .map_err(|e| ErrorData::invalid_params(format!("args.validation: {e}"), None))?;
+        stellar_agent_toolsets::validate_toolset_tool_args(args_value).map_err(|e| {
+            ToolError::Protocol(ErrorData::invalid_params(
+                format!("args.validation: {e}"),
+                None,
+            ))
+        })?;
 
         // Step 1 — registry lookup.
         let descriptor = match self.tool_registry.get(tool_name) {
             Some(d) => d,
             None => {
-                return Err(ErrorData::internal_error(
+                return Err(ToolError::Protocol(ErrorData::internal_error(
                     format!("tool.registry_missing: {tool_name} not found in registry"),
                     None,
-                ));
+                )));
             }
         };
 
@@ -884,11 +1027,20 @@ impl WalletServer {
 
             Ok(Decision::Deny(reason)) => {
                 // Redact account IDs in CounterpartyDenied before serialising
-                // into the wire envelope.
+                // into the wire message. A policy denial is a business refusal the
+                // agent branches on, so it surfaces as the documented result
+                // envelope with wire code `policy.deny.<reason.code()>`. The
+                // redacted `DenyReason` (first-5-last-5 on account IDs) is carried
+                // in the message so no structured detail is lost in the move from
+                // the JSON-RPC `data` field.
                 let redacted = redact_deny_reason(&reason);
                 let wire_code = format!("policy.deny.{}", reason.code());
-                let payload = serde_json::to_value(&redacted).ok();
-                return Err(ErrorData::internal_error(wire_code, payload));
+                let detail =
+                    serde_json::to_string(&redacted).unwrap_or_else(|_| reason.code().to_owned());
+                return Err(ToolError::Business(business_error_result(
+                    wire_code,
+                    format!("policy denied this operation: {detail}"),
+                )));
             }
 
             Ok(Decision::RequireApproval(req)) => {
@@ -903,20 +1055,21 @@ impl WalletServer {
             // Forward-compat catch-all: Decision is #[non_exhaustive]; any future
             // variant not handled above falls here so the gate stays fail-closed.
             Ok(_) => {
-                return Err(ErrorData::internal_error(
+                return Err(ToolError::Business(business_error_result(
                     "policy.unexpected_decision",
-                    None,
-                ));
+                    "the policy engine returned a decision this build does not \
+                     recognise; the operation is refused fail-closed",
+                )));
             }
 
             Err(err) => {
                 // Engine error → fail closed as `policy.engine_required`
                 // (fires for `Noop` and for `V1` engine errors such as a
                 // missing policy document).
-                return Err(ErrorData::internal_error(
-                    format!("policy.engine_required: {err}"),
-                    None,
-                ));
+                return Err(ToolError::Business(business_error_result(
+                    "policy.engine_required",
+                    format!("policy engine evaluation failed: {err}"),
+                )));
             }
         };
 
@@ -929,10 +1082,10 @@ impl WalletServer {
         if descriptor.chain_id_required
             && let Err(err) = validate_chain_id_matches_profile(chain_id, &self.profile)
         {
-            return Err(ErrorData::invalid_params(
+            return Err(ToolError::Protocol(ErrorData::invalid_params(
                 format!("chain_id mismatch: {err}"),
                 None,
-            ));
+            )));
         }
 
         Ok(outcome)
@@ -1000,7 +1153,7 @@ pub(crate) async fn commit_envelope_and_verify_nonce(
     chain_id: &str,
     tool_name: &'static str,
     now_ms: u64,
-) -> Result<(), ErrorData> {
+) -> Result<(), ToolError> {
     // Phase 1 — HMAC + expiry + chain check inside spawn_blocking (keyring sync I/O;
     // must not block the Tokio executor).
     let nonce_mint_clone = Arc::clone(nonce_mint);
@@ -1021,15 +1174,15 @@ pub(crate) async fn commit_envelope_and_verify_nonce(
     })
     .await
     .map_err(|e| {
-        ErrorData::internal_error(
+        ToolError::Protocol(ErrorData::internal_error(
             format!("internal_error: spawn_blocking join error: {e}"),
             None,
-        )
+        ))
     })?;
 
     if let Err(err) = hmac_result {
         tracing::debug!(error = %err, "nonce HMAC/expiry verification failed");
-        return Err(nonce_verification_error_data(&err));
+        return Err(ToolError::Business(nonce_verification_error_result(&err)));
     }
 
     // Phase 2: replay window lock is held only for evict_expired + record_verified_nonce
@@ -1041,26 +1194,28 @@ pub(crate) async fn commit_envelope_and_verify_nonce(
         nonce_mint.record_verified_nonce(&mut replay_window_guard, nonce, expires_at_unix_ms)
     {
         tracing::debug!(error = %replay_err, "nonce replay check failed");
-        return Err(nonce_replayed_error_data());
+        return Err(ToolError::Business(nonce_replayed_error_result()));
     }
 
     Ok(())
 }
 
-/// Collapses Expired and HmacMismatch to identical wire output;
-/// non-collapsed variants must not double-prefix the wire-code.
-fn nonce_verification_error_data(err: &NonceError) -> ErrorData {
-    let detail = match err {
+/// Builds the nonce-verification business-error envelope.
+///
+/// Collapses `Expired` and `HmacMismatch` to a byte-identical envelope (code
+/// `nonce.expired`, same message) so the wire cannot distinguish the two; the
+/// detailed reason is operator-visible via `tracing::debug!` only. Every other
+/// typed variant carries its own `wire_code()` and Display message.
+fn nonce_verification_error_result(err: &NonceError) -> rmcp::model::CallToolResult {
+    match err {
         // Indistinguishability: collapse Expired and HmacMismatch to the
-        // same generic message.  Agent recovery is identical (re-simulate);
-        // the detailed reason is operator-visible via tracing::debug! only.
-        NonceError::Expired | NonceError::HmacMismatch => {
-            "nonce expired or invalid; re-simulate to obtain a fresh nonce".to_owned()
-        }
-        other => other.to_string(),
-    };
-    let code = err.wire_code();
-    ErrorData::internal_error(format!("{code}: {detail}"), None)
+        // same generic envelope.  Agent recovery is identical (re-simulate).
+        NonceError::Expired | NonceError::HmacMismatch => business_error_result(
+            "nonce.expired",
+            "nonce expired or invalid; re-simulate to obtain a fresh nonce",
+        ),
+        other => business_error_result(other.wire_code(), other.to_string()),
+    }
 }
 
 /// Collapses commit-path memo, envelope-build, and oracle-build failures to the
@@ -1070,13 +1225,13 @@ fn nonce_verification_error_data(err: &NonceError) -> ErrorData {
 /// tracing only; callers must not expose memo parse, payment-builder,
 /// envelope-builder, or oracle-builder distinctions on the wire.
 ///
-/// Delegates to `nonce_verification_error_data(&NonceError::Expired)` so the
+/// Delegates to `nonce_verification_error_result(&NonceError::Expired)` so the
 /// wire-byte equality with the nonce-expiry path is structurally guaranteed
 /// rather than enforced only by test. A future edit to the collapsed message
-/// in `nonce_verification_error_data` propagates here automatically.
-pub(crate) fn commit_path_error_data(err: impl std::fmt::Display) -> ErrorData {
+/// in `nonce_verification_error_result` propagates here automatically.
+pub(crate) fn commit_path_error_result(err: impl std::fmt::Display) -> rmcp::model::CallToolResult {
     tracing::debug!(error = %err, "stellar_pay_commit commit-path error collapsed");
-    nonce_verification_error_data(&NonceError::Expired)
+    nonce_verification_error_result(&NonceError::Expired)
 }
 
 fn rpc_urls_equivalent_for_cross_check(left: &str, right: &str) -> bool {
@@ -1102,10 +1257,10 @@ fn rpc_urls_equivalent_for_cross_check(left: &str, right: &str) -> bool {
     }
 }
 
-fn nonce_replayed_error_data() -> ErrorData {
-    ErrorData::internal_error(
-        "nonce.replayed: this nonce has already been used; re-simulate to obtain a fresh nonce",
-        None,
+fn nonce_replayed_error_result() -> rmcp::model::CallToolResult {
+    business_error_result(
+        "nonce.replayed",
+        "this nonce has already been used; re-simulate to obtain a fresh nonce",
     )
 }
 
@@ -1156,7 +1311,7 @@ pub(crate) async fn verify_attestation_gate(
     approval_nonce: Option<&str>,
     approval_attestation: Option<&str>,
     tool_name: &'static str,
-) -> Result<(), ErrorData> {
+) -> Result<(), rmcp::model::CallToolResult> {
     use base64::Engine as _;
     use stellar_agent_core::approval::{
         DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, envelope_sha256, open_with_retry,
@@ -1367,11 +1522,11 @@ pub(crate) enum CrossCheckOutcome {
 ///
 /// # Errors
 ///
-/// Returns `Err(ErrorData)` with wire code `simulation.divergence` when the
-/// independent-RPC envelope does not match `primary_rebuilt_xdr`.  Oracle RPC
-/// errors and envelope-build failures also map to `simulation.divergence` —
-/// a non-responsive oracle is treated as divergence because the wallet cannot
-/// confirm the envelope is safe to commit.
+/// Returns `Err(CallToolResult)` — a business-error result envelope with wire
+/// code `simulation.divergence` — when the independent-RPC envelope does not
+/// match `primary_rebuilt_xdr`.  Oracle RPC errors and envelope-build failures
+/// also map to `simulation.divergence` — a non-responsive oracle is treated as
+/// divergence because the wallet cannot confirm the envelope is safe to commit.
 ///
 /// Returns `Ok(CrossCheckOutcome::Skipped)` for all skip conditions.
 /// Returns `Ok(CrossCheckOutcome::Passed)` when the check ran and envelopes
@@ -1401,7 +1556,7 @@ pub(crate) async fn high_value_cross_check<F, Fut>(
     value_stroops: i64,
     oracle_rebuild_fn: F,
     tool_name: &'static str,
-) -> Result<CrossCheckOutcome, ErrorData>
+) -> Result<CrossCheckOutcome, rmcp::model::CallToolResult>
 where
     F: FnOnce(stellar_agent_network::StellarRpcClient) -> Fut,
     Fut: std::future::Future<Output = Result<String, ErrorData>>,
@@ -1452,20 +1607,20 @@ where
     // byte-mismatch arm below emits a more actionable operator diagnostic
     // because the wallet has both rebuilt envelopes and can compare sequence
     // numbers.
-    const CROSS_CHECK_DIVERGENCE_WIRE_BODY: &str = "simulation.divergence: independent-RPC cross-check failed; \
-         re-simulate to obtain a fresh envelope";
+    const CROSS_CHECK_DIVERGENCE_DETAIL: &str =
+        "independent-RPC cross-check failed; re-simulate to obtain a fresh envelope";
 
     // Build a client for the oracle/independent RPC URL.
     let oracle_client = StellarRpcClient::new(oracle_provider_url.as_str()).map_err(|e| {
         // Full error detail retained in debug logs for operator forensics only.
-        // The wire response is the canonical CROSS_CHECK_DIVERGENCE_WIRE_BODY;
+        // The wire response is the canonical CROSS_CHECK_DIVERGENCE_DETAIL;
         // indistinguishability discipline prohibits non-uniform wire bodies.
         tracing::debug!(
             tool = tool_name,
             error = %e,
             "oracle RPC client construction failed; treating as divergence"
         );
-        ErrorData::internal_error(CROSS_CHECK_DIVERGENCE_WIRE_BODY, None)
+        business_error_result("simulation.divergence", CROSS_CHECK_DIVERGENCE_DETAIL)
     })?;
 
     tracing::info!(
@@ -1488,9 +1643,9 @@ where
                     tool = tool_name,
                     "oracle RPC rebuild failed; treating as divergence"
                 );
-                return Err(ErrorData::internal_error(
-                    CROSS_CHECK_DIVERGENCE_WIRE_BODY,
-                    None,
+                return Err(business_error_result(
+                    "simulation.divergence",
+                    CROSS_CHECK_DIVERGENCE_DETAIL,
                 ));
             }
             Err(_elapsed) => {
@@ -1499,9 +1654,9 @@ where
                     timeout_secs = ORACLE_RPC_TIMEOUT.as_secs(),
                     "oracle RPC timeout; treating as divergence"
                 );
-                return Err(ErrorData::internal_error(
-                    CROSS_CHECK_DIVERGENCE_WIRE_BODY,
-                    None,
+                return Err(business_error_result(
+                    "simulation.divergence",
+                    CROSS_CHECK_DIVERGENCE_DETAIL,
                 ));
             }
         };
@@ -1516,9 +1671,9 @@ where
             sequence_delta = %sequence_delta,
             "high-value cross-check: oracle envelope diverges from primary rebuild"
         );
-        return Err(ErrorData::internal_error(
-            cross_check_divergence_wire_body(&sequence_delta),
-            None,
+        return Err(business_error_result(
+            "simulation.divergence",
+            cross_check_divergence_detail(&sequence_delta),
         ));
     }
 
@@ -1529,9 +1684,9 @@ where
     Ok(CrossCheckOutcome::Passed)
 }
 
-fn cross_check_divergence_wire_body(sequence_delta: &str) -> String {
+fn cross_check_divergence_detail(sequence_delta: &str) -> String {
     format!(
-        "simulation.divergence: oracle RPC returned a different sequence number than primary RPC. \
+        "oracle RPC returned a different sequence number than primary RPC. \
          Possible causes: (a) ledger-lag, where one RPC is behind the other (transient; retry will likely succeed); \
          (b) active manipulation, where primary or oracle returns a forged sequence (security event; investigate). \
          Current sequence delta: {sequence_delta}."
@@ -1750,51 +1905,100 @@ mod tests {
 
     // ── nonce error formatting: indistinguishability ─────────────────────────
 
-    #[test]
-    fn nonce_expired_and_hmac_mismatch_have_identical_wire_message() {
-        let expired = nonce_verification_error_data(&NonceError::Expired);
-        let hmac_mismatch = nonce_verification_error_data(&NonceError::HmacMismatch);
-        let expected =
-            "nonce.expired: nonce expired or invalid; re-simulate to obtain a fresh nonce";
-
-        assert_eq!(expired.message.to_string(), expected);
-        assert_eq!(hmac_mismatch.message.to_string(), expected);
-        assert_eq!(expired.message, hmac_mismatch.message);
+    /// Extracts `(is_error, code, message)` from a business-error result envelope
+    /// (`{ ok:false, error:{code,message}, request_id }`) for test assertions.
+    /// Also asserts the envelope invariants (`ok == false`, `request_id` present).
+    fn error_envelope_parts(result: &rmcp::model::CallToolResult) -> (bool, String, String) {
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("result must carry a text content block");
+        let v: serde_json::Value = serde_json::from_str(&text).expect("content must be JSON");
         assert_eq!(
-            expired.data, hmac_mismatch.data,
-            "indistinguishability: .data must also be identical across the two arms"
+            v["ok"],
+            serde_json::json!(false),
+            "business-error envelope must have ok:false"
         );
         assert!(
-            expired.data.is_none(),
-            "indistinguishability: .data must currently be None; if this fails, the indistinguishability invariant has drifted and the message-only assertion above is no longer load-bearing"
+            v["request_id"].as_str().is_some_and(|s| !s.is_empty()),
+            "business-error envelope must carry a non-empty request_id: {v}"
+        );
+        let code = v["error"]["code"].as_str().unwrap_or_default().to_owned();
+        let message = v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        (result.is_error == Some(true), code, message)
+    }
+
+    /// Unwraps a [`ToolError::Business`] to its result envelope for assertions;
+    /// panics if the error is a protocol fault.
+    fn business_tool_error(err: ToolError) -> rmcp::model::CallToolResult {
+        match err {
+            ToolError::Business(result) => result,
+            ToolError::Protocol(data) => {
+                panic!("expected ToolError::Business, got Protocol: {data:?}")
+            }
+        }
+    }
+
+    /// Full text payload (the serialised envelope) of a business `CallToolResult`.
+    fn result_text(result: &rmcp::model::CallToolResult) -> String {
+        result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("result must carry a text content block")
+    }
+
+    #[test]
+    fn nonce_expired_and_hmac_mismatch_have_identical_wire_message() {
+        let expired = nonce_verification_error_result(&NonceError::Expired);
+        let hmac_mismatch = nonce_verification_error_result(&NonceError::HmacMismatch);
+        let expected_message = "nonce expired or invalid; re-simulate to obtain a fresh nonce";
+
+        let (e_is_err, e_code, e_msg) = error_envelope_parts(&expired);
+        let (h_is_err, h_code, h_msg) = error_envelope_parts(&hmac_mismatch);
+        assert!(e_is_err && h_is_err, "both must set is_error = true");
+        assert_eq!(e_code, "nonce.expired");
+        assert_eq!(e_msg, expected_message);
+        assert_eq!(
+            (e_code, e_msg),
+            (h_code, h_msg),
+            "indistinguishability: Expired and HmacMismatch must produce byte-identical code+message"
         );
     }
 
     #[test]
     fn memo_commit_errors_match_nonce_expired_wire_message() {
-        let nonce_expired = nonce_verification_error_data(&NonceError::Expired);
-        let memo_invalid = commit_path_error_data("validation.memo_invalid_type");
-
-        assert_eq!(memo_invalid.message, nonce_expired.message);
-        assert_eq!(memo_invalid.data, nonce_expired.data);
+        let nonce_expired =
+            error_envelope_parts(&nonce_verification_error_result(&NonceError::Expired));
+        let memo_invalid =
+            error_envelope_parts(&commit_path_error_result("validation.memo_invalid_type"));
+        assert_eq!(memo_invalid, nonce_expired);
     }
 
     #[test]
     fn commit_envelope_build_failure_matches_nonce_hmac_wire_response() {
-        let nonce_expired = nonce_verification_error_data(&NonceError::Expired);
-        let envelope_build = commit_path_error_data("envelope_build_error: synthetic failure");
-
-        assert_eq!(envelope_build.message, nonce_expired.message);
-        assert_eq!(envelope_build.data, nonce_expired.data);
+        let nonce_expired =
+            error_envelope_parts(&nonce_verification_error_result(&NonceError::Expired));
+        let envelope_build = error_envelope_parts(&commit_path_error_result(
+            "envelope_build_error: synthetic failure",
+        ));
+        assert_eq!(envelope_build, nonce_expired);
     }
 
     #[test]
     fn commit_oracle_build_failure_matches_nonce_hmac_wire_response() {
-        let nonce_expired = nonce_verification_error_data(&NonceError::Expired);
-        let oracle_build = commit_path_error_data("oracle_build_error: synthetic failure");
-
-        assert_eq!(oracle_build.message, nonce_expired.message);
-        assert_eq!(oracle_build.data, nonce_expired.data);
+        let nonce_expired =
+            error_envelope_parts(&nonce_verification_error_result(&NonceError::Expired));
+        let oracle_build = error_envelope_parts(&commit_path_error_result(
+            "oracle_build_error: synthetic failure",
+        ));
+        assert_eq!(oracle_build, nonce_expired);
     }
 
     #[test]
@@ -1838,8 +2042,17 @@ mod tests {
                 "Display must not include the wire-code prefix: {display}"
             );
 
-            let data = nonce_verification_error_data(&err);
-            assert_eq!(data.message.to_string(), format!("{code}: {display}"));
+            let (is_err, env_code, env_message) =
+                error_envelope_parts(&nonce_verification_error_result(&err));
+            assert!(is_err, "non-collapsed nonce error must set is_error = true");
+            assert_eq!(
+                env_code, code,
+                "envelope code must equal the nonce wire_code"
+            );
+            assert_eq!(
+                env_message, display,
+                "envelope message must equal Display with no wire-code prefix"
+            );
         }
     }
 
@@ -1853,10 +2066,12 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(replay_err, NonceError::Replayed));
-        let data = nonce_replayed_error_data();
+        let (is_err, code, message) = error_envelope_parts(&nonce_replayed_error_result());
+        assert!(is_err, "replay error must set is_error = true");
+        assert_eq!(code, "nonce.replayed");
         assert_eq!(
-            data.message.to_string(),
-            "nonce.replayed: this nonce has already been used; re-simulate to obtain a fresh nonce"
+            message,
+            "this nonce has already been used; re-simulate to obtain a fresh nonce"
         );
     }
 
@@ -1930,11 +2145,12 @@ mod tests {
         let result = server
             .dispatch_gate("stellar_balances", &star_tool_value(), "stellar:testnet")
             .await;
-        let err = result.expect_err("Deny must produce Err(ErrorData)");
-        assert!(
-            err.message.contains("policy.deny.per_tx_cap_exceeded"),
-            "wire code must contain policy.deny.per_tx_cap_exceeded, got: {}",
-            err.message
+        let err = business_tool_error(result.expect_err("Deny must produce Err(ToolError)"));
+        let (is_err, code, _message) = error_envelope_parts(&err);
+        assert!(is_err, "Deny envelope must set is_error = true");
+        assert_eq!(
+            code, "policy.deny.per_tx_cap_exceeded",
+            "wire code must be policy.deny.per_tx_cap_exceeded"
         );
     }
 
@@ -1954,10 +2170,12 @@ mod tests {
         let result = server
             .dispatch_gate("stellar_balances", &star_tool_value(), "stellar:testnet")
             .await;
-        let err = result.expect_err("Deny must produce Err(ErrorData)");
+        let err = business_tool_error(result.expect_err("Deny must produce Err(ToolError)"));
+        let (is_err, code, _message) = error_envelope_parts(&err);
+        assert!(is_err, "Deny envelope must set is_error = true");
 
-        // The payload must NOT contain the full 56-char strkey.
-        let payload_str = format!("{:?}", err.data);
+        // The full serialised envelope must NOT contain the full 56-char strkey.
+        let payload_str = result_text(&err);
         assert!(
             !payload_str.contains(full_strkey),
             "full G-strkey must NOT appear in wire payload; got: {payload_str}"
@@ -1968,10 +2186,9 @@ mod tests {
             "first-5 of G-strkey must appear in redacted form; got: {payload_str}"
         );
         // Wire code must be correct.
-        assert!(
-            err.message.contains("policy.deny.counterparty_denied"),
-            "wire code must be policy.deny.counterparty_denied; got: {}",
-            err.message
+        assert_eq!(
+            code, "policy.deny.counterparty_denied",
+            "wire code must be policy.deny.counterparty_denied"
         );
     }
 
@@ -2005,17 +2222,19 @@ mod tests {
 
     #[test]
     fn approval_required_indistinguishable_has_expected_wire_code() {
-        let err = approval_required_indistinguishable();
-        assert!(
-            err.message.contains("policy.approval_required"),
-            "indistinguishable error must contain policy.approval_required; got: {}",
-            err.message
+        let result = approval_required_indistinguishable();
+        let (is_err, code, _message) = error_envelope_parts(&result);
+        assert!(is_err, "indistinguishable error must set is_error = true");
+        assert_eq!(
+            code, "policy.approval_required",
+            "indistinguishable error must carry wire code policy.approval_required"
         );
-        // Payload must be None — no forensic detail leaked to wire.
+        // The envelope error object exposes only `code` and `message` — no
+        // structured `data` field exists to leak forensic approval detail.
+        let v: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
         assert!(
-            err.data.is_none(),
-            "indistinguishable error must have no data payload; got: {:?}",
-            err.data
+            v["error"].get("data").is_none(),
+            "envelope error object must expose no data field; got: {v}"
         );
     }
 
@@ -2100,10 +2319,11 @@ mod tests {
         .await
         .expect_err("mismatched oracle XDR must fail");
 
-        let message = err.message.as_ref();
-        assert!(
-            message.contains("simulation.divergence"),
-            "wire message must retain simulation.divergence code: {message}"
+        let (is_err, code, message) = error_envelope_parts(&err);
+        assert!(is_err, "divergence envelope must set is_error = true");
+        assert_eq!(
+            code, "simulation.divergence",
+            "envelope code must be simulation.divergence"
         );
         assert!(
             message.contains("Possible causes: (a) ledger-lag"),
@@ -2281,10 +2501,11 @@ mod tests {
         .await;
 
         let err = result.expect_err("clock failure must map to approval_required");
-        assert!(
-            err.message.contains("policy.approval_required"),
-            "clock error must use indistinguishable approval-required wire code, got: {}",
-            err.message
+        let (is_err, code, _message) = error_envelope_parts(&err);
+        assert!(is_err, "clock-error envelope must set is_error = true");
+        assert_eq!(
+            code, "policy.approval_required",
+            "clock error must use indistinguishable approval-required wire code"
         );
     }
 
@@ -2375,11 +2596,15 @@ mod tests {
         let err = result.expect_err(
             "verify_attestation_gate must refuse a RuleProposalSimulated entry, not accept it",
         );
+        let (is_err, code, _message) = error_envelope_parts(&err);
         assert!(
-            err.message.contains("policy.approval_required"),
+            is_err,
+            "wrong-kind refusal envelope must set is_error = true"
+        );
+        assert_eq!(
+            code, "policy.approval_required",
             "RuleProposalSimulated must be refused with the same indistinguishable \
-             approval-required wire code as any other wrong-kind entry, got: {}",
-            err.message
+             approval-required wire code as any other wrong-kind entry"
         );
     }
 
@@ -2516,11 +2741,13 @@ mod tests {
         let result = server
             .dispatch_gate("stellar_balances", &star_tool_value(), "stellar:testnet")
             .await;
-        let err = result.expect_err("Err from engine must produce Err(ErrorData)");
-        assert!(
-            err.message.contains("policy.engine_required"),
-            "engine Err must map to policy.engine_required; got: {}",
-            err.message
+        let err =
+            business_tool_error(result.expect_err("Err from engine must produce Err(ToolError)"));
+        let (is_err, code, _message) = error_envelope_parts(&err);
+        assert!(is_err, "engine-required envelope must set is_error = true");
+        assert_eq!(
+            code, "policy.engine_required",
+            "engine Err must map to policy.engine_required"
         );
     }
 

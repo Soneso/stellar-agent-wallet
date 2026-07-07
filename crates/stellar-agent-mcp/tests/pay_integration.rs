@@ -989,13 +989,14 @@ async fn simulate_fee_explicit_above_profile_cap_fails() {
         memo_return_hex: None,
         classic_base: Some("500".to_owned()),
     };
-    let err = server
+    let result = server
         .call_stellar_pay(args)
         .await
-        .expect_err("fee above cap must fail");
-    assert!(
-        err.to_string().contains("fees.percentile_exceeds_cap"),
-        "expected fees.percentile_exceeds_cap, got: {err}"
+        .expect("fee above cap must return Ok(is_error) envelope");
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "fees.percentile_exceeds_cap",
+        "expected fees.percentile_exceeds_cap, got: {code}"
     );
 }
 
@@ -1040,12 +1041,14 @@ async fn policy_noop_engine_refuses_mainnet_destructive() {
         approval_nonce: None,
         approval_attestation: None,
     };
-    let result = server.call_stellar_pay_commit(args).await;
-    assert!(result.is_err(), "mainnet commit must return Err");
-    let err = result.unwrap_err();
-    assert!(
-        err.to_string().contains("policy.engine_required"),
-        "error must be policy.engine_required, got: {err}"
+    let result = server
+        .call_stellar_pay_commit(args)
+        .await
+        .expect("mainnet commit must return Ok(is_error) envelope");
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "policy.engine_required",
+        "error must be policy.engine_required, got: {code}"
     );
 }
 
@@ -1080,16 +1083,18 @@ async fn policy_v1_engine_allow_rule_passes_gate() {
         approval_nonce: None,
         approval_attestation: None,
     };
-    let result = server.call_stellar_pay_commit(args).await;
-    let err = result.expect_err("commit must fail at the nonce gate after passing the policy gate");
-    let msg = err.to_string();
-    assert!(
-        !msg.contains("policy.engine_required"),
-        "V1 Allow path must NOT emit policy.engine_required; got: {msg}"
+    let result = server
+        .call_stellar_pay_commit(args)
+        .await
+        .expect("commit reaches the nonce gate, surfaced as Ok(is_error) envelope");
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    assert_ne!(
+        code, "policy.engine_required",
+        "V1 Allow path must NOT emit policy.engine_required"
     );
-    assert!(
-        msg.contains("nonce.expired"),
-        "V1 Allow path must reach the nonce gate (proof of gate-pass); got: {msg}"
+    assert_eq!(
+        code, "nonce.expired",
+        "V1 Allow path must reach the nonce gate (proof of gate-pass)"
     );
 }
 
@@ -1118,18 +1123,15 @@ async fn policy_v1_engine_no_matching_rule_emits_wire_code() {
         approval_nonce: None,
         approval_attestation: None,
     };
-    let result = server.call_stellar_pay_commit(args).await;
-    assert!(
-        result.is_err(),
-        "V1 engine with NoMatchingRule must return Err"
-    );
-    let err = result.unwrap_err();
-    assert!(
-        err.to_string().contains(&format!(
-            "policy.deny.{}",
-            DenyReason::NoMatchingRule.code()
-        )),
-        "V1 engine NoMatchingRule must emit policy.deny.no_matching_rule; got: {err}"
+    let result = server
+        .call_stellar_pay_commit(args)
+        .await
+        .expect("V1 engine with NoMatchingRule must return Ok(is_error) envelope");
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    let expected_wire_code = format!("policy.deny.{}", DenyReason::NoMatchingRule.code());
+    assert_eq!(
+        code, expected_wire_code,
+        "V1 engine NoMatchingRule must emit policy.deny.no_matching_rule; got: {code}"
     );
 }
 
@@ -1158,18 +1160,15 @@ async fn policy_v1_engine_explicit_deny_emits_wire_code() {
         approval_nonce: None,
         approval_attestation: None,
     };
-    let result = server.call_stellar_pay_commit(args).await;
-    assert!(
-        result.is_err(),
-        "V1 engine with ExplicitRuleDeny must return Err"
-    );
-    let err = result.unwrap_err();
-    assert!(
-        err.to_string().contains(&format!(
-            "policy.deny.{}",
-            DenyReason::ExplicitRuleDeny.code()
-        )),
-        "V1 engine ExplicitRuleDeny must emit policy.deny.explicit_rule_deny; got: {err}"
+    let result = server
+        .call_stellar_pay_commit(args)
+        .await
+        .expect("V1 engine with ExplicitRuleDeny must return Ok(is_error) envelope");
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    let expected_wire_code = format!("policy.deny.{}", DenyReason::ExplicitRuleDeny.code());
+    assert_eq!(
+        code, expected_wire_code,
+        "V1 engine ExplicitRuleDeny must emit policy.deny.explicit_rule_deny; got: {code}"
     );
 }
 
@@ -1204,12 +1203,14 @@ async fn commit_returns_nonce_expired_on_bad_nonce() {
         approval_nonce: None,
         approval_attestation: None,
     };
-    let result = server.call_stellar_pay_commit(args).await;
-    assert!(result.is_err(), "bad nonce must return Err");
-    let err = result.unwrap_err();
-    assert!(
-        err.to_string().contains("nonce.expired"),
-        "error must be nonce.expired, got: {err}"
+    let result = server
+        .call_stellar_pay_commit(args)
+        .await
+        .expect("bad nonce is surfaced as Ok(is_error) envelope");
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "nonce.expired",
+        "bad nonce must carry wire code nonce.expired"
     );
 }
 
@@ -1243,12 +1244,14 @@ async fn commit_returns_nonce_expired_on_wrong_length_nonce() {
         approval_nonce: None,
         approval_attestation: None,
     };
-    let result = server.call_stellar_pay_commit(args).await;
-    assert!(result.is_err(), "wrong-length nonce must return Err");
-    let err = result.unwrap_err();
-    assert!(
-        err.to_string().contains("nonce.expired"),
-        "error must be nonce.expired, got: {err}"
+    let result = server
+        .call_stellar_pay_commit(args)
+        .await
+        .expect("wrong-length nonce is surfaced as Ok(is_error) envelope");
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "nonce.expired",
+        "wrong-length nonce must carry wire code nonce.expired"
     );
 }
 
@@ -1399,28 +1402,25 @@ async fn indistinguishability_expired_and_parse_fail_produce_same_wire_code() {
         ..args_bad_b64.clone()
     };
 
-    let err_a = server
+    let result_a = server
         .call_stellar_pay_commit(args_bad_b64)
         .await
-        .expect_err("must error");
-    let err_b = server
+        .expect("path A surfaced as Ok(is_error) envelope");
+    let result_b = server
         .call_stellar_pay_commit(args_short)
         .await
-        .expect_err("must error");
+        .expect("path B surfaced as Ok(is_error) envelope");
+    let (code_a, message_a, _a) = common::assert_business_envelope(&result_a);
+    let (code_b, message_b, _b) = common::assert_business_envelope(&result_b);
 
-    // Both must contain exactly "nonce.expired" as the wire code.
-    assert!(
-        err_a.to_string().contains("nonce.expired"),
-        "path A must contain nonce.expired, got: {err_a}"
-    );
-    assert!(
-        err_b.to_string().contains("nonce.expired"),
-        "path B must contain nonce.expired, got: {err_b}"
-    );
-    // The two error messages must be byte-identical (indistinguishability).
+    // Both must carry exactly "nonce.expired" as the wire code.
+    assert_eq!(code_a, "nonce.expired", "path A must carry nonce.expired");
+    assert_eq!(code_b, "nonce.expired", "path B must carry nonce.expired");
+    // The (code, message) pairs must be byte-identical (indistinguishability);
+    // request_id is minted per call and intentionally excluded.
     assert_eq!(
-        err_a.to_string(),
-        err_b.to_string(),
+        (code_a, message_a),
+        (code_b, message_b),
         "Expired and parse-fail responses must be byte-identical"
     );
 }
@@ -1466,26 +1466,33 @@ async fn commit_invalid_memo_parse_matches_nonce_hmac_wire_response() {
         approval_attestation: None,
     };
 
-    let nonce_err = server
+    let nonce_result = server
         .call_stellar_pay_commit(base_args.clone())
         .await
-        .expect_err("zero nonce must fail HMAC verification");
-    let memo_err = server
+        .expect("zero nonce must return Ok(is_error) envelope for HMAC failure");
+    let (nonce_code, nonce_message, _nonce_text) = common::assert_business_envelope(&nonce_result);
+
+    let memo_result = server
         .call_stellar_pay_commit(StellarPayCommitArgs {
             memo_hash_hex: Some("not-hex-memo-content".to_owned()),
             ..base_args
         })
         .await
-        .expect_err("invalid memo hash must collapse to an Err");
+        .expect("invalid memo hash must collapse to an Ok(is_error) envelope");
+    let (memo_code, memo_message, _memo_text) = common::assert_business_envelope(&memo_result);
 
     assert_eq!(
-        memo_err.to_string(),
-        nonce_err.to_string(),
+        nonce_code, "nonce.expired",
+        "zero nonce HMAC failure must carry wire code nonce.expired; got: {nonce_code}"
+    );
+    assert_eq!(
+        (memo_code.clone(), memo_message.clone()),
+        (nonce_code, nonce_message),
         "commit memo parse failures must be byte-identical to nonce HMAC/expiry failures"
     );
     assert!(
-        !memo_err.to_string().contains("memo"),
-        "collapsed memo error must not expose memo-specific details: {memo_err}"
+        !memo_message.contains("memo"),
+        "collapsed memo error must not expose memo-specific details: {memo_message}"
     );
 }
 
@@ -2020,14 +2027,14 @@ async fn pay_commit_high_value_cross_check_fails_on_mismatch() {
         approval_attestation: None,
     };
 
-    let err = server
+    let result = server
         .call_stellar_pay_commit(args)
         .await
-        .expect_err("oracle divergence must return Err");
-
-    assert!(
-        err.to_string().contains("simulation.divergence"),
-        "oracle mismatch must produce simulation.divergence, got: {err}"
+        .expect("oracle divergence must return Ok(is_error) envelope");
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "simulation.divergence",
+        "oracle mismatch must produce simulation.divergence, got: {code}"
     );
 }
 

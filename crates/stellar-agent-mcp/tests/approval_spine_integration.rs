@@ -268,6 +268,22 @@ async fn stellar_pay_commit_require_approval_no_attestation_is_blocked() {
 
     let result = server.call_stellar_pay_commit(commit_args).await;
     match result {
+        Ok(tool_result) => {
+            // The attestation gate fires before nonce parse for
+            // `stellar_pay_commit`, so `policy.approval_required` (an
+            // Ok(is_error) business envelope) is the expected outcome here.
+            // `nonce.expired`/`nonce.replayed` (also business envelopes) are
+            // accepted as well, in case the gate ordering ever changes.
+            let (code, _message, _text) = common::assert_business_envelope(&tool_result);
+            let blocked = code == "nonce.expired"
+                || code == "nonce.replayed"
+                || code == "policy.approval_required";
+            assert!(
+                blocked,
+                "commit must be blocked at nonce or attestation gate; \
+                 expected nonce.expired, nonce.replayed, or policy.approval_required, got: {code}"
+            );
+        }
         Err(e) => {
             // nonce.expired (from nonce parse) or policy.approval_required
             // (from attestation gate if nonce parse were to succeed) are
@@ -282,9 +298,6 @@ async fn stellar_pay_commit_require_approval_no_attestation_is_blocked() {
                 e.message
             );
         }
-        Ok(_) => panic!(
-            "stellar_pay_commit with RequireApproval and no attestation must return an error"
-        ),
     }
 }
 
@@ -317,23 +330,21 @@ async fn stellar_create_account_commit_require_approval_no_attestation_is_blocke
         approval_attestation: None,
     };
 
-    let result = server.call_stellar_create_account_commit(commit_args).await;
-    match result {
-        Err(e) => {
-            let blocked = e.message.contains("nonce.expired")
-                || e.message.contains("nonce.replayed")
-                || e.message.contains("policy.approval_required");
-            assert!(
-                blocked,
-                "commit must be blocked at nonce or attestation gate; \
-                 expected nonce.expired or policy.approval_required, got: {}",
-                e.message
-            );
-        }
-        Ok(_) => panic!(
-            "stellar_create_account_commit with RequireApproval and no attestation must error"
-        ),
-    }
+    let result = server
+        .call_stellar_create_account_commit(commit_args)
+        .await
+        .expect(
+            "commit blocked at the nonce/attestation gate is surfaced as an Ok(is_error) envelope, \
+             not a protocol error or a signed submission",
+        );
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    let blocked =
+        code == "nonce.expired" || code == "nonce.replayed" || code == "policy.approval_required";
+    assert!(
+        blocked,
+        "commit must be blocked at nonce or attestation gate; \
+         expected nonce.expired / nonce.replayed / policy.approval_required, got: {code}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -373,6 +384,26 @@ async fn stellar_pay_commit_allow_engine_no_attestation_gate() {
 
     let result = server.call_stellar_pay_commit(commit_args).await;
     match result {
+        Ok(tool_result) => {
+            // The stub envelope_xdr ("AAAAAA==") fails re-derivation before the
+            // dispatch/attestation gates are even reached, so the expected
+            // outcome here is the `simulation.divergence` business envelope.
+            let (code, message, _text) = common::assert_business_envelope(&tool_result);
+            assert_ne!(
+                code, "policy.approval_required",
+                "Allow engine must NOT trigger policy.approval_required; got: {code}"
+            );
+            let blocked = code == "nonce.expired"
+                || code == "nonce.replayed"
+                || code.starts_with("nonce.")
+                || code == "simulation.divergence"
+                || message.contains("chain_id mismatch");
+            assert!(
+                blocked,
+                "Allow engine should fail at nonce gate or divergence check, not policy gate; \
+                 got: {code} / {message}"
+            );
+        }
         Err(e) => {
             // Must NOT be policy.approval_required (attestation gate bypassed
             // for Allow flows).
@@ -391,11 +422,6 @@ async fn stellar_pay_commit_allow_engine_no_attestation_gate() {
                 "Allow engine should fail at nonce gate, not policy gate; got: {}",
                 e.message
             );
-        }
-        Ok(_) => {
-            // An unparseable nonce should never succeed; if it does something
-            // changed upstream.
-            panic!("commit with unparseable nonce must return an error");
         }
     }
 }
@@ -636,28 +662,23 @@ async fn commit_with_valid_nonce_but_no_attestation_returns_indistinguishable_ap
         approval_attestation: None,
     };
 
-    let result = server.call_stellar_pay_commit(commit_args).await;
+    let result = server
+        .call_stellar_pay_commit(commit_args)
+        .await
+        .expect("stellar_pay_commit with RequireApproval and no attestation must return Ok(is_error) envelope");
 
     // ── Assert: SPECIFICALLY policy.approval_required ─────────────────────────
     // Correct order: attestation gate fires first → policy.approval_required.
     // Regression (nonce before attestation): nonce.expired (HMAC mismatch).
-    match result {
-        Err(e) => {
-            assert!(
-                e.message.contains("policy.approval_required"),
-                "ordering invariant: attestation gate must fire before nonce HMAC verify; \
-                 expected policy.approval_required, got: {}",
-                e.message
-            );
-            assert!(
-                !e.message.contains("nonce.expired"),
-                "nonce.expired indicates wrong gate order (nonce HMAC verified before attestation); \
-                 got: {}",
-                e.message
-            );
-        }
-        Ok(_) => {
-            panic!("stellar_pay_commit with RequireApproval and no attestation must return Err")
-        }
-    }
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "policy.approval_required",
+        "ordering invariant: attestation gate must fire before nonce HMAC verify; \
+         expected policy.approval_required, got: {code}"
+    );
+    assert_ne!(
+        code, "nonce.expired",
+        "nonce.expired indicates wrong gate order (nonce HMAC verified before attestation); \
+         got: {code}"
+    );
 }

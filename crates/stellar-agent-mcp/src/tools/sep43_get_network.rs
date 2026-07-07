@@ -102,9 +102,12 @@ impl WalletServer {
         let effective_chain: &str = args.chain_id.as_deref().unwrap_or(profile_chain);
         let args_value = json!({ "chain_id": effective_chain });
         // Read-only tool: RequireApproval produces no signing material; proceed.
-        let _ = self
+        if let Err(e) = self
             .dispatch_gate("stellar_sep43_get_network", &args_value, effective_chain)
-            .await?;
+            .await
+        {
+            return e.into_result();
+        }
 
         use std::sync::Arc;
         use stellar_agent_sep43::StellarAgentModule;

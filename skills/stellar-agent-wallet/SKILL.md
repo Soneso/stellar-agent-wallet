@@ -70,7 +70,19 @@ Every tool returns the same JSON envelope:
 On failure, `ok` is `false` and `error` carries a stable wire `code` (such as
 `policy.deny.<reason>`, `policy.approval_required`, or `policy.engine_required`)
 instead of `data`. Branch on `ok`; use `code` for control flow, never the human
-message. `request_id` correlates the call with the audit log.
+message. `request_id` correlates the call with the audit log. Every business
+error uses this envelope — domain refusals, policy and approval outcomes,
+keyring and signing failures, submit failures, and the SEP-53, x402, and DeFi
+verbs alike; codes follow a `<family>.<reason>` convention (for example
+`x402.insufficient_funds`, `sep53.sign_failed`, `nonce.mint_failed`).
+
+The six `stellar_sep43_*` tools are the one exception: to preserve SEP-43
+v1.2.1 wire compatibility, their signing results and protocol errors — including
+the structural mainnet-signing refusal and keyring-unlock failures — use the
+SEP-43 `{ code, message }` object with SEP-43 numeric codes, not this envelope,
+on both success and failure. The single case where a SEP-43 tool falls back to
+the standard envelope is a policy `RequireApproval` verdict, refused as
+`policy.approval_required_unsupported`.
 
 ### chain_id
 

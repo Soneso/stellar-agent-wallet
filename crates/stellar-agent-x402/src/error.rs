@@ -88,6 +88,19 @@ pub enum X402Error {
         detail: String,
     },
 
+    /// The signer could not be loaded from the platform keyring.
+    ///
+    /// An infrastructure fault distinct from a malformed payment request: the
+    /// keyring entry for the profile's `mcp_signer_default` is missing, locked,
+    /// or otherwise unreadable, so no signer is available. Kept separate from
+    /// [`X402Error::InvalidPaymentRequired`] so the wire code reflects an
+    /// infrastructure/keyring failure rather than a client-supplied input error.
+    #[error("keyring load failed: {detail}")]
+    KeyringLoadFailed {
+        /// Non-secret description of the keyring failure.
+        detail: String,
+    },
+
     /// The `asset` field is not a valid C-strkey SAC contract address.
     #[error("invalid SAC asset address: {detail}")]
     InvalidAssetAddress {
@@ -176,6 +189,40 @@ pub enum X402Error {
         /// Human-readable description of the violation.
         detail: String,
     },
+}
+
+impl X402Error {
+    /// Returns the stable wire code for this error.
+    ///
+    /// The x402 tools surface errors through the documented result envelope
+    /// (`{ ok: false, error: { code, message }, request_id }`); this method
+    /// supplies the `error.code`. Codes follow the `x402.<snake_variant>`
+    /// taxonomy so an agent can branch on the specific failure, with one
+    /// deliberate exception: [`X402Error::MainnetSigningForbidden`] returns the
+    /// canonical `network.mainnet_write_forbidden` code so the refusal correlates
+    /// with the CLI, submit-layer, and SEP-43/SEP-53 signing guards across every
+    /// surface.
+    #[must_use]
+    pub fn wire_code(&self) -> &'static str {
+        match self {
+            X402Error::InvalidPaymentRequired { .. } => "x402.invalid_payment_required",
+            X402Error::UnsupportedScheme { .. } => "x402.unsupported_scheme",
+            X402Error::UnsupportedNetwork { .. } => "x402.unsupported_network",
+            X402Error::NetworkPassphraseMismatch { .. } => "x402.network_passphrase_mismatch",
+            X402Error::MainnetSigningForbidden { .. } => "network.mainnet_write_forbidden",
+            X402Error::InvalidAssetAddress { .. } => "x402.invalid_asset_address",
+            X402Error::InvalidRecipientAddress { .. } => "x402.invalid_recipient_address",
+            X402Error::InvalidPayerAddress { .. } => "x402.invalid_payer_address",
+            X402Error::FeesNotSponsored => "x402.fees_not_sponsored",
+            X402Error::AmountConversion { .. } => "x402.amount_conversion",
+            X402Error::AuthEntrySignFailed { .. } => "x402.auth_entry_sign_failed",
+            X402Error::RpcSimulateFailed { .. } => "x402.rpc_simulate_failed",
+            X402Error::ReceiptParseFailed { .. } => "x402.receipt_parse_failed",
+            X402Error::TransactionBuildFailed { .. } => "x402.transaction_build_failed",
+            X402Error::UnexpectedAuthEntries { .. } => "x402.unexpected_auth_entries",
+            X402Error::KeyringLoadFailed { .. } => "x402.keyring_load_failed",
+        }
+    }
 }
 
 /// Test-only constructors for [`X402Error`] variants that tests need to

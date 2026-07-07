@@ -190,13 +190,17 @@ impl WalletServer {
             "from_address": args.from_address,
             "qty_in": args.qty_in,
         });
-        let dispatch_outcome = self
+        let dispatch_outcome = match self
             .dispatch_gate("stellar_dex_trade", &args_value, &args.chain_id)
-            .await?;
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return e.into_result(),
+        };
 
         // Single-shot DeFi tool: RequireApproval is not supported (no two-phase split).
         if matches!(dispatch_outcome, DispatchOutcome::RequireApproval(_)) {
-            return Err(crate::tools::common::single_shot_require_approval_error());
+            return Ok(crate::tools::common::single_shot_require_approval_error());
         }
 
         // ── Parse the decimal-string amount fields ────────────────────────────
@@ -259,9 +263,9 @@ impl WalletServer {
         let witness = match gate_result {
             Ok(GateOutcome::Allow(w)) => w,
             Ok(GateOutcome::RequireApproval) => {
-                return Err(rmcp::ErrorData::internal_error(
+                return Ok(crate::tools::common::business_error_result(
+                    "policy.approval_required",
                     require_approval_error(),
-                    None,
                 ));
             }
             Err(e) => {
@@ -285,14 +289,15 @@ impl WalletServer {
         // ── Load signer from keyring ──────────────────────────────────────────
         let signer_entry_ref = &self.profile.mcp_signer_default;
         let expected_g_strkey = signer_entry_ref.account.as_str();
-        let signer_handle = signer_from_keyring(signer_entry_ref, expected_g_strkey)
-            .await
-            .map_err(|_| {
-                rmcp::ErrorData::internal_error(
-                    "dex.signer_load_failed: could not load signer from keyring",
-                    None,
-                )
-            })?;
+        let signer_handle = match signer_from_keyring(signer_entry_ref, expected_g_strkey).await {
+            Ok(h) => h,
+            Err(_) => {
+                return Ok(crate::tools::common::business_error_result(
+                    "dex.signer_load_failed",
+                    "could not load signer from keyring",
+                ));
+            }
+        };
 
         let timeout = crate::tools::common::submit_timeout(&self.profile);
 
@@ -358,17 +363,10 @@ impl WalletServer {
                     serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
                 Ok(CallToolResult::success(vec![Content::text(json_str)]))
             }
-            Err(e) => {
-                let resp = json!({
-                    "code": "dex.submit_failed",
-                    "message": e.to_string(),
-                });
-                let json_str =
-                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-                let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                result.is_error = Some(true);
-                Ok(result)
-            }
+            Err(e) => Ok(crate::tools::common::business_error_result(
+                "dex.submit_failed",
+                e.to_string(),
+            )),
         }
     }
 
@@ -419,7 +417,7 @@ impl WalletServer {
         })?;
 
         // ── Fetch on-chain quote ──────────────────────────────────────────────
-        let quote = fetch_quote(
+        let quote = match fetch_quote(
             router_address,
             qty_in,
             &canonical_path,
@@ -427,9 +425,15 @@ impl WalletServer {
             network_passphrase,
         )
         .await
-        .map_err(|e| {
-            rmcp::ErrorData::internal_error(format!("dex.quote.fetch_failed: {e}"), None)
-        })?;
+        {
+            Ok(q) => q,
+            Err(e) => {
+                return Ok(crate::tools::common::business_error_result(
+                    "dex.quote.fetch_failed",
+                    e.to_string(),
+                ));
+            }
+        };
 
         // expected_out and amounts are core i128 values returned by the dex
         // crate; they are stringified AT THIS MCP BOUNDARY (the core

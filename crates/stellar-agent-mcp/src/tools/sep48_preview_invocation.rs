@@ -126,13 +126,16 @@ impl WalletServer {
         // Validate chain_id via dispatch_gate.
         let args_value = json!({ "chain_id": args.chain_id });
         // Read-only tool: RequireApproval produces no signing material; proceed.
-        let _ = self
+        if let Err(e) = self
             .dispatch_gate(
                 "stellar_sep48_preview_invocation",
                 &args_value,
                 &args.chain_id,
             )
-            .await?;
+            .await
+        {
+            return e.into_result();
+        }
 
         // Resolve the RPC URL from the active profile.
         let rpc_url = self.profile.rpc_url.as_str();
@@ -142,27 +145,20 @@ impl WalletServer {
             match decode_invoke_host_function(xdr) {
                 Ok(decoded) => (decoded.contract_strkey, decoded.function_name, decoded.args),
                 Err(e) => {
-                    let resp = json!({ "error": e.to_string(), "code": "invoke_decode_failed" });
-                    let json_str =
-                        serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-                    let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                    result.is_error = Some(true);
-                    return Ok(result);
+                    return Ok(crate::tools::common::business_error_result(
+                        "sep48.invoke_decode_failed",
+                        e.to_string(),
+                    ));
                 }
             }
         } else {
             match (&args.contract_id, &args.function) {
                 (Some(cid), Some(func)) => (cid.clone(), func.clone(), vec![]),
                 _ => {
-                    let resp = json!({
-                        "error": "either transaction_xdr or (contract_id + function) must be provided",
-                        "code": "missing_required_args"
-                    });
-                    let json_str =
-                        serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-                    let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                    result.is_error = Some(true);
-                    return Ok(result);
+                    return Ok(crate::tools::common::business_error_result(
+                        "sep48.missing_required_args",
+                        "either transaction_xdr or (contract_id + function) must be provided",
+                    ));
                 }
             }
         };
@@ -171,12 +167,10 @@ impl WalletServer {
         let entries = match fetch_contract_spec(rpc_url, &contract_strkey).await {
             Ok(e) => e,
             Err(e) => {
-                let resp = json!({ "error": e.to_string(), "code": "spec_fetch_failed" });
-                let json_str =
-                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-                let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                result.is_error = Some(true);
-                return Ok(result);
+                return Ok(crate::tools::common::business_error_result(
+                    "sep48.spec_fetch_failed",
+                    e.to_string(),
+                ));
             }
         };
 
@@ -187,14 +181,10 @@ impl WalletServer {
                     serde_json::to_string_pretty(&preview).unwrap_or_else(|_| "{}".to_owned());
                 Ok(CallToolResult::success(vec![Content::text(json_str)]))
             }
-            Err(e) => {
-                let resp = json!({ "error": e.to_string(), "code": "render_failed" });
-                let json_str =
-                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-                let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                result.is_error = Some(true);
-                Ok(result)
-            }
+            Err(e) => Ok(crate::tools::common::business_error_result(
+                "sep48.render_failed",
+                e.to_string(),
+            )),
         }
     }
 }
@@ -217,5 +207,72 @@ impl WalletServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         self.stellar_sep48_preview_invocation(Parameters(args))
             .await
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "test-only; panics acceptable in unit tests"
+    )]
+
+    use super::*;
+    use stellar_agent_core::profile::schema::Profile;
+
+    fn make_testnet_server() -> crate::server::WalletServer {
+        crate::server::WalletServer::new(
+            Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+                .with_noop_engine()
+                .build(),
+        )
+        .expect("WalletServer::new must not fail in tests")
+    }
+
+    /// Neither `transaction_xdr` nor `contract_id` + `function` supplied: the
+    /// tool refuses through the normalised business-error envelope carrying wire
+    /// code `sep48.missing_required_args` (never the legacy `{error, code}`
+    /// top-level shape).
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn missing_required_args_returns_business_envelope() {
+        let server = make_testnet_server();
+        let args = Sep48PreviewInvocationArgs {
+            transaction_xdr: None,
+            contract_id: None,
+            function: None,
+            chain_id: "stellar:testnet".to_owned(),
+        };
+        let result = server
+            .invoke_stellar_sep48_preview_invocation(args)
+            .await
+            .expect("missing-args refusal is surfaced as Ok(is_error) envelope");
+        let (code, _message, _text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "sep48.missing_required_args");
+    }
+
+    /// A malformed `transaction_xdr` fails invocation decode before any RPC call:
+    /// business-error envelope with wire code `sep48.invoke_decode_failed`.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn malformed_transaction_xdr_returns_invoke_decode_failed() {
+        let server = make_testnet_server();
+        let args = Sep48PreviewInvocationArgs {
+            transaction_xdr: Some("!!! not valid xdr !!!".to_owned()),
+            contract_id: None,
+            function: None,
+            chain_id: "stellar:testnet".to_owned(),
+        };
+        let result = server
+            .invoke_stellar_sep48_preview_invocation(args)
+            .await
+            .expect("decode failure is surfaced as Ok(is_error) envelope");
+        let (code, _message, _text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "sep48.invoke_decode_failed");
     }
 }

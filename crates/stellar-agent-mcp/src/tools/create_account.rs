@@ -14,10 +14,10 @@ use stellar_agent_mcp_macros::mcp_tool_router;
 use crate::server::WalletServer;
 use crate::tools::common::{
     APPROVAL_TTL_MS, CLASSIC_SINGLE_OPERATION_COUNT, DEFAULT_NONCE_TTL_MS, DispatchOutcome,
-    commit_envelope_and_verify_nonce, enforce_classic_fee_cap, high_value_cross_check,
-    ledger_err_result, nonce_id_prefix, redact_rpc_error_detail, redacted_wallet_error_envelope,
-    resolve_classic_fee_per_op_stroops, submit_timeout, total_classic_fee_stroops,
-    validate_g_strkey, verify_attestation_gate,
+    commit_envelope_and_verify_nonce, commit_path_error_result, enforce_classic_fee_cap,
+    high_value_cross_check, ledger_err_result, nonce_id_prefix, redact_rpc_error_detail,
+    redacted_wallet_error_envelope, resolve_classic_fee_per_op_stroops, submit_timeout,
+    total_classic_fee_stroops, validate_g_strkey, verify_attestation_gate,
 };
 use stellar_agent_core::amount::McpAmountArgument;
 use stellar_agent_core::approval::retry::{
@@ -386,7 +386,7 @@ impl WalletServer {
         // configured for this tool fails closed, which is correct — a not-yet-
         // existent account has no home_domain to resolve).
         let source_adapter = crate::policy_adapter::AccountViewAdapter::new(&account_view);
-        let dispatch_outcome = self
+        let dispatch_outcome = match self
             .dispatch_gate_with_views(
                 "stellar_create_account",
                 &args_value,
@@ -394,7 +394,11 @@ impl WalletServer {
                 Some(&source_adapter),
                 None,
             )
-            .await?;
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return e.into_result(),
+        };
 
         let source_sequence = account_view.sequence_number;
         // Use the canonical decimal-to-stroops parser to avoid f64 precision
@@ -440,11 +444,13 @@ impl WalletServer {
                 ));
             }
         };
-        enforce_classic_fee_cap(
+        if let Err(r) = enforce_classic_fee_cap(
             fee_selection.per_op_stroops,
             &fee_selection.selected_fee_percentile,
             &self.profile,
-        )?;
+        ) {
+            return Ok(r);
+        }
         let fee_per_op_stroops = fee_selection.per_op_stroops;
         let total_fee_stroops =
             total_classic_fee_stroops(fee_per_op_stroops, CLASSIC_SINGLE_OPERATION_COUNT)?;
@@ -521,9 +527,9 @@ impl WalletServer {
         ) {
             Ok(n) => n,
             Err(err) => {
-                return Err(rmcp::ErrorData::internal_error(
-                    format!("nonce.mint_failed: {err}"),
-                    None,
+                return Ok(crate::tools::common::business_error_result(
+                    "nonce.mint_failed",
+                    err.to_string(),
                 ));
             }
         };
@@ -738,18 +744,20 @@ impl WalletServer {
         // - XDR decode failure → `simulation.divergence`.
         // - Operation kind mismatch (non-CreateAccount op) → `simulation.divergence`.
         let mut authoritative_args =
-            decode_authoritative_args(&args.envelope_xdr, "stellar_create_account_commit")
-                .map_err(|e| {
+            match decode_authoritative_args(&args.envelope_xdr, "stellar_create_account_commit") {
+                Ok(a) => a,
+                Err(e) => {
                     tracing::debug!(
                         error = %e,
                         tool = "stellar_create_account_commit",
                         "envelope_xdr re-derivation failed; returning simulation.divergence"
                     );
-                    rmcp::ErrorData::internal_error(
-                        format!("simulation.divergence: envelope_xdr re-derivation failed: {e}"),
-                        None,
-                    )
-                })?;
+                    return Ok(crate::tools::common::business_error_result(
+                        "simulation.divergence",
+                        format!("envelope_xdr re-derivation failed: {e}"),
+                    ));
+                }
+            };
         // Inject chain_id (not XDR-encoded; validated by CAIP-2 check in
         // dispatch_gate step 3).
         authoritative_args["chain_id"] = serde_json::Value::String(args.chain_id.clone());
@@ -757,13 +765,17 @@ impl WalletServer {
         // ── dispatch gate (uses authoritative args, not caller args) ─────────
         // destructive_hint = true → engine evaluates per profile.policy.engine;
         // Noop refuses on mainnet, V1 evaluates typed criteria.
-        let dispatch_outcome = self
+        let dispatch_outcome = match self
             .dispatch_gate(
                 "stellar_create_account_commit",
                 &authoritative_args,
                 &args.chain_id,
             )
-            .await?;
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return e.into_result(),
+        };
 
         // ── Validate G-strkeys ────────────────────────────────────────────────
         validate_g_strkey(&args.source, "source")?;
@@ -772,12 +784,7 @@ impl WalletServer {
         // ── Decode nonce — map parse error to nonce.expired ──────────────────
         let nonce = match stellar_agent_nonce::Nonce::from_base64(&args.nonce) {
             Ok(n) => n,
-            Err(_) => {
-                return Err(rmcp::ErrorData::internal_error(
-                    "nonce.expired: nonce parse failed (re-simulate to obtain a fresh nonce)",
-                    None,
-                ));
-            }
+            Err(_) => return Ok(commit_path_error_result("nonce parse failed")),
         };
 
         // ── Re-fetch source account state and re-build envelope ───────────────
@@ -811,16 +818,19 @@ impl WalletServer {
         // `Account::increment_sequence_number`; an explicit +1 here produces
         // CURRENT+2 → TxBadSeq.
 
-        let total_fee_from_envelope = authoritative_args
+        let total_fee_from_envelope = match authoritative_args
             .get("total_fee_stroops")
             .and_then(serde_json::Value::as_u64)
             .and_then(|fee| u32::try_from(fee).ok())
-            .ok_or_else(|| {
-                rmcp::ErrorData::internal_error(
-                    "simulation.divergence: envelope_xdr did not contain a valid fee",
-                    None,
-                )
-            })?;
+        {
+            Some(f) => f,
+            None => {
+                return Ok(crate::tools::common::business_error_result(
+                    "simulation.divergence",
+                    "envelope_xdr did not contain a valid fee",
+                ));
+            }
+        };
         let fee_per_op_stroops = total_fee_from_envelope
             .checked_div(CLASSIC_SINGLE_OPERATION_COUNT)
             .ok_or_else(|| {
@@ -839,23 +849,19 @@ impl WalletServer {
             &self.profile.network_passphrase,
             fee_per_op_stroops,
         );
+        // Commit-path builder failures collapse to the same `nonce.expired`
+        // envelope as memo/rebuild failures in pay/trustline commits, so the wire
+        // does not distinguish a builder fault from an expired nonce on the commit
+        // path (indistinguishability parity across the two-phase classic tools).
         if let Err(err) = builder.create_account(
             &args.destination,
             args.starting_balance.into_stellar_amount(),
         ) {
-            return Err(rmcp::ErrorData::internal_error(
-                format!("envelope_build_error: {err}"),
-                None,
-            ));
+            return Ok(commit_path_error_result(err));
         }
         let rebuilt_envelope_xdr = match builder.build() {
             Ok(xdr) => xdr,
-            Err(err) => {
-                return Err(rmcp::ErrorData::internal_error(
-                    format!("envelope_build_error: {err}"),
-                    None,
-                ));
-            }
+            Err(err) => return Ok(commit_path_error_result(err)),
         };
 
         // ── Envelope divergence check ────────────────────────────────────────
@@ -867,10 +873,10 @@ impl WalletServer {
         // the rebuild (UX freshness) and the HMAC (integrity gate) are complementary
         // and MUST NOT be removed as "redundant".
         if rebuilt_envelope_xdr != args.envelope_xdr {
-            return Err(rmcp::ErrorData::internal_error(
-                "simulation.divergence: re-built envelope does not match presented envelope_xdr; \
+            return Ok(crate::tools::common::business_error_result(
+                "simulation.divergence",
+                "re-built envelope does not match presented envelope_xdr; \
                  re-simulate to obtain a fresh envelope",
-                None,
             ));
         }
 
@@ -884,16 +890,18 @@ impl WalletServer {
         // Skip conditions: value below threshold, or `oracle_provider_url` unset
         // (fail-open with tracing::warn!).
         {
-            let starting_balance_stroops: i64 = authoritative_args
+            let starting_balance_stroops: i64 = match authoritative_args
                 .get("starting_balance_stroops")
                 .and_then(crate::tools::amount_wire::value_as_stroops_i64)
-                .ok_or_else(|| {
-                    rmcp::ErrorData::internal_error(
-                        "simulation.divergence: authoritative_args missing required \
-                         `starting_balance_stroops` field",
-                        None,
-                    )
-                })?;
+            {
+                Some(v) => v,
+                None => {
+                    return Ok(crate::tools::common::business_error_result(
+                        "simulation.divergence",
+                        "authoritative_args missing required `starting_balance_stroops` field",
+                    ));
+                }
+            };
             // CreateAccount always transfers native XLM.
             let asset_is_native = true;
             // Capture builder inputs needed for the oracle rebuild.
@@ -902,7 +910,7 @@ impl WalletServer {
             let oracle_network_passphrase = self.profile.network_passphrase.clone();
             let oracle_starting_balance = starting_balance_for_oracle;
 
-            high_value_cross_check(
+            if let Err(result) = high_value_cross_check(
                 &self.profile,
                 &rebuilt_envelope_xdr,
                 &args.source,
@@ -942,7 +950,10 @@ impl WalletServer {
                 },
                 "stellar_create_account_commit",
             )
-            .await?;
+            .await
+            {
+                return Ok(result);
+            }
         }
 
         // ── Attestation verification gate ────────────────────────────────────
@@ -961,7 +972,7 @@ impl WalletServer {
         // HMAC+replay.
         //
         // This is a no-op when `dispatch_outcome` is `Allow`.
-        verify_attestation_gate(
+        if let Err(result) = verify_attestation_gate(
             self,
             &dispatch_outcome,
             &args.envelope_xdr,
@@ -969,7 +980,10 @@ impl WalletServer {
             args.approval_attestation.as_deref(),
             "stellar_create_account_commit",
         )
-        .await?;
+        .await
+        {
+            return Ok(result);
+        }
 
         // ── Nonce verification + replay window ────────────────────────────────
         //
@@ -986,7 +1000,7 @@ impl WalletServer {
         // pattern shared by every *_commit tool.  All wire codes, error-code
         // indistinguishability, and tracing::debug! calls are preserved
         // byte-identical inside the helper.
-        commit_envelope_and_verify_nonce(
+        if let Err(e) = commit_envelope_and_verify_nonce(
             &self.nonce_mint,
             &self.replay_window,
             &nonce,
@@ -996,7 +1010,10 @@ impl WalletServer {
             "stellar_create_account_commit",
             now_ms,
         )
-        .await?;
+        .await
+        {
+            return e.into_result();
+        }
 
         // ── Wallet unlock deferred ───────────────────────────────────────────
         // See stellar_pay_commit for the identical rationale (signer-from-wallet

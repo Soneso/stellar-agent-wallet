@@ -141,14 +141,7 @@ fn build_signers_manager(
 /// mirroring the `redacted_wallet_error_envelope` pattern used by the other
 /// read-only tools in this crate.
 fn sa_error_result(err: &SaError) -> CallToolResult {
-    let envelope = ::serde_json::json!({
-        "code": err.wire_code(),
-        "message": err.to_string(),
-    });
-    let json_str = ::serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| "{}".to_owned());
-    let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-    result.is_error = Some(true);
-    result
+    crate::tools::common::business_error_result(err.wire_code(), err.to_string())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -241,9 +234,12 @@ impl WalletServer {
             "chain_id": &args.chain_id,
             "smart_account": &args.smart_account,
         });
-        let _ = self
+        if let Err(e) = self
             .dispatch_gate("stellar_rules_list", &args_value, &args.chain_id)
-            .await?;
+            .await
+        {
+            return e.into_result();
+        }
 
         let smart_account = match parse_c_strkey_to_smart_account(&args.smart_account) {
             Ok(a) => a,
@@ -439,9 +435,12 @@ impl WalletServer {
             "smart_account": &args.smart_account,
             "rule_id": args.rule_id,
         });
-        let _ = self
+        if let Err(e) = self
             .dispatch_gate("stellar_rules_get", &args_value, &args.chain_id)
-            .await?;
+            .await
+        {
+            return e.into_result();
+        }
 
         let smart_account = match parse_c_strkey_to_smart_account(&args.smart_account) {
             Ok(a) => a,

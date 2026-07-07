@@ -43,6 +43,8 @@ use stellar_xdr::{
     TransactionV1Envelope, Uint256, VecM, WriteXdr,
 };
 
+mod common;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixture constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -183,12 +185,14 @@ async fn pay_commit_with_create_account_xdr_returns_simulation_divergence() {
         approval_attestation: None,
     };
 
-    let result = server.call_stellar_pay_commit(args).await;
-    assert!(result.is_err(), "CreateAccount XDR must cause an Err");
-    let err = result.unwrap_err();
-    assert!(
-        err.to_string().contains("simulation.divergence"),
-        "error must be simulation.divergence (op-kind mismatch); got: {err}"
+    let result = server
+        .call_stellar_pay_commit(args)
+        .await
+        .expect("CreateAccount XDR must return Ok(is_error) envelope");
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "simulation.divergence",
+        "error must be simulation.divergence (op-kind mismatch); got: {code}"
     );
 }
 
@@ -318,12 +322,14 @@ async fn pay_commit_hash_memo_xdr_reaches_nonce_check() {
     // The Hash memo does not fail at decode.  The call proceeds past decode and
     // dispatch_gate, then fails at nonce-parse (nonce.expired) because "dGVzdA"
     // is not a valid Nonce wire format.
-    let result = server.call_stellar_pay_commit(args).await;
-    assert!(result.is_err(), "call must still return an error");
-    let err = result.unwrap_err();
+    let result = server
+        .call_stellar_pay_commit(args)
+        .await
+        .expect("hash-memo XDR reaches the nonce gate, surfaced as Ok(is_error) envelope");
+    let (code, _msg, _text) = common::assert_business_envelope(&result);
     // The nonce-parse gate fires before the envelope-rebuild divergence check.
-    assert!(
-        err.to_string().contains("nonce.expired"),
-        "Hash memo XDR reaches nonce-parse gate; expected nonce.expired; got: {err}"
+    assert_eq!(
+        code, "nonce.expired",
+        "Hash memo XDR reaches nonce-parse gate; expected nonce.expired"
     );
 }

@@ -93,8 +93,9 @@ fn decode_payment_response_input(
 /// response, it does not sign or submit anything.
 ///
 /// Returns `{ success, transaction, payer, network, errorReason }` on success.
-/// Errors return `{ "code": "x402.error", "message": "..." }` with
-/// `isError = true`.
+/// Errors return the standard business-error envelope
+/// `{ ok: false, error: { code, message }, request_id }` with `isError = true`;
+/// `error.code` is the per-variant `x402.<reason>` wire code.
 ///
 /// # Tool annotations
 ///
@@ -103,7 +104,8 @@ fn decode_payment_response_input(
 ///
 /// # Errors
 ///
-/// Returns `isError = true` with `{ "code": "x402.error", "message": "..." }` when:
+/// Returns `isError = true` with the business-error envelope (per-variant
+/// `x402.<reason>` `error.code`) when:
 /// - `payment_response` is not valid base64+JSON or raw JSON `SettleResponse`.
 ///
 /// # Examples

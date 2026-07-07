@@ -145,9 +145,12 @@ impl WalletServer {
             "verify_origin": args.verify_origin,
         });
         // Read-only tool: RequireApproval produces no signing material; proceed.
-        let _ = self
+        if let Err(e) = self
             .dispatch_gate("stellar_sep7_parse_uri", &args_value, &args.chain_id)
-            .await?;
+            .await
+        {
+            return e.into_result();
+        }
 
         // Parse the URI and determine signature status.
         let (request, status) = if args.verify_origin {

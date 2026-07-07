@@ -46,6 +46,8 @@ use stellar_agent_core::profile::schema::{PolicyConfig, PolicyEngineKind, Profil
 use stellar_agent_mcp::server::{StellarBalancesArgs, WalletServer};
 use tempfile::TempDir;
 
+mod common;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -396,16 +398,16 @@ decision = "deny"
     let engine = PolicyEngineV1::new(document, "default".into());
     let server = make_server_with_v1_engine(engine);
 
-    let err = server
+    let result = server
         .call_stellar_balances(balances_args())
         .await
-        .expect_err("Decision::Deny must propagate as Err");
+        .expect("Decision::Deny must return Ok(is_error) envelope");
 
+    let (code, _message, _text) = common::assert_business_envelope(&result);
     let expected_wire_code = format!("policy.deny.{}", DenyReason::ExplicitRuleDeny.code());
-    assert!(
-        err.message.contains(&expected_wire_code),
-        "wire code must contain {expected_wire_code}; got: {}",
-        err.message
+    assert_eq!(
+        code, expected_wire_code,
+        "wire code must be {expected_wire_code}; got: {code}"
     );
 }
 

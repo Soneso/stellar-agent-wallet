@@ -147,9 +147,12 @@ impl WalletServer {
         let args_value = json!({});
         // dispatch_gate with empty chain_id (chain_id_required = false).
         // Non-signing tool: RequireApproval produces no signing material; proceed.
-        let _ = self
+        if let Err(e) = self
             .dispatch_gate("stellar_toolset_list", &args_value, "")
-            .await?;
+            .await
+        {
+            return e.into_result();
+        }
 
         let toolsets_root =
             stellar_agent_core::profile::schema::default_toolsets_dir().map_err(|e| {
@@ -237,9 +240,12 @@ impl WalletServer {
         // dispatch_gate with empty chain_id (chain_id_required = false for the
         // outer toolset_invoke tool — the routed tool handles its own chain_id check).
         // Non-signing tool: RequireApproval produces no signing material; proceed.
-        let _ = self
+        if let Err(e) = self
             .dispatch_gate("stellar_toolset_invoke", &args_value, "")
-            .await?;
+            .await
+        {
+            return e.into_result();
+        }
 
         let toolsets_root = {
             #[cfg(any(test, feature = "test-helpers"))]

@@ -311,6 +311,17 @@ terms.
 | `stellar_sep43_sign_message` | Sign an arbitrary UTF-8 message via `sha256(message)` then ed25519; return `signedMessage` (hex) and `signerAddress`. | Signs; does not submit. |
 | `stellar_sep43_sign_and_submit_transaction` | Sign a `TransactionEnvelope` XDR, submit it, and poll until confirmed; return `signedTxXdr`, `txHash`, and `status`. | Signs and submits; policy gate. |
 
+These six tools preserve SEP-43 v1.2.1 wire compatibility: their results and
+protocol errors are the SEP-43 `{ code, message }` object with SEP-43 numeric
+codes, not the standard `{ ok, error, request_id }` result envelope, on both
+success and failure. The structural mainnet refusal is SEP-43 code `-3`
+(`MainnetSigningForbidden`) and a missing signer keyring entry surfaces as a
+SEP-43 wallet-unlock error. The one exception is a policy `RequireApproval`
+verdict, which every single-shot sign tool — SEP-43 included — refuses through
+the standard envelope as `policy.approval_required_unsupported`. SEP-53 and x402
+have no spec-defined error object and use the standard envelope for every
+business error.
+
 ### SEP-45, SEP-47, SEP-48, SEP-53
 
 | Tool | Purpose | Gating |

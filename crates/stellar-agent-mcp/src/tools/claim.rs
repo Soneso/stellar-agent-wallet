@@ -18,9 +18,10 @@ use stellar_agent_mcp_macros::mcp_tool_router;
 use crate::server::WalletServer;
 use crate::tools::common::{
     APPROVAL_TTL_MS, CLASSIC_SINGLE_OPERATION_COUNT, DEFAULT_NONCE_TTL_MS, DispatchOutcome,
-    commit_envelope_and_verify_nonce, enforce_classic_fee_cap, ledger_err_result, nonce_id_prefix,
-    redact_rpc_error_detail, redacted_wallet_error_envelope, resolve_classic_fee_per_op_stroops,
-    submit_timeout, total_classic_fee_stroops, verify_attestation_gate,
+    commit_envelope_and_verify_nonce, commit_path_error_result, enforce_classic_fee_cap,
+    ledger_err_result, nonce_id_prefix, redact_rpc_error_detail, redacted_wallet_error_envelope,
+    resolve_classic_fee_per_op_stroops, submit_timeout, total_classic_fee_stroops,
+    verify_attestation_gate,
 };
 use stellar_agent_claimable::entry::{fetch_claimable_balance_entry, fetch_trustline_state};
 use stellar_agent_claimable::error::ClaimError;
@@ -352,7 +353,7 @@ impl WalletServer {
             "source": &source,
         });
         let source_adapter = crate::policy_adapter::AccountViewAdapter::new(&account_view);
-        let dispatch_outcome = self
+        let dispatch_outcome = match self
             .dispatch_gate_with_views(
                 "stellar_claim",
                 &args_value,
@@ -360,7 +361,11 @@ impl WalletServer {
                 Some(&source_adapter),
                 None,
             )
-            .await?;
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return e.into_result(),
+        };
 
         // ── Build the preview + run the guards ────────────────────────────────
         let now_ms = now_unix_ms()
@@ -416,11 +421,13 @@ impl WalletServer {
                 ));
             }
         };
-        enforce_classic_fee_cap(
+        if let Err(r) = enforce_classic_fee_cap(
             fee_selection.per_op_stroops,
             &fee_selection.selected_fee_percentile,
             &self.profile,
-        )?;
+        ) {
+            return Ok(r);
+        }
         let fee_per_op_stroops = fee_selection.per_op_stroops;
         let total_fee_stroops =
             total_classic_fee_stroops(fee_per_op_stroops, CLASSIC_SINGLE_OPERATION_COUNT)?;
@@ -485,9 +492,9 @@ impl WalletServer {
         ) {
             Ok(n) => n,
             Err(err) => {
-                return Err(rmcp::ErrorData::internal_error(
-                    format!("nonce.mint_failed: {err}"),
-                    None,
+                return Ok(crate::tools::common::business_error_result(
+                    "nonce.mint_failed",
+                    err.to_string(),
                 ));
             }
         };
@@ -622,37 +629,46 @@ impl WalletServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         // ── Re-derive authoritative args from the HMAC-bound envelope_xdr ─────
         let mut authoritative_args =
-            decode_authoritative_args(&args.envelope_xdr, "stellar_claim_commit").map_err(|e| {
-                tracing::debug!(
-                    error = %e,
-                    tool = "stellar_claim_commit",
-                    "envelope_xdr re-derivation failed; returning simulation.divergence"
-                );
-                rmcp::ErrorData::internal_error(
-                    format!("simulation.divergence: envelope_xdr re-derivation failed: {e}"),
-                    None,
-                )
-            })?;
+            match decode_authoritative_args(&args.envelope_xdr, "stellar_claim_commit") {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        tool = "stellar_claim_commit",
+                        "envelope_xdr re-derivation failed; returning simulation.divergence"
+                    );
+                    return Ok(crate::tools::common::business_error_result(
+                        "simulation.divergence",
+                        format!("envelope_xdr re-derivation failed: {e}"),
+                    ));
+                }
+            };
         authoritative_args["chain_id"] = serde_json::Value::String(args.chain_id.clone());
 
         // ── Dispatch gate (uses authoritative args) ──────────────────────────
-        let dispatch_outcome = self
+        let dispatch_outcome = match self
             .dispatch_gate("stellar_claim_commit", &authoritative_args, &args.chain_id)
-            .await?;
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return e.into_result(),
+        };
 
         // ── Resolve the authoritative source (from the signed envelope) ──────
         // The source used for RPC fetch, signing, and submission MUST come from
         // the HMAC-bound envelope decode, never from caller-supplied args.
-        let source = authoritative_args
+        let source = match authoritative_args
             .get("source")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                rmcp::ErrorData::internal_error(
-                    "simulation.divergence: envelope_xdr did not decode a source account",
-                    None,
-                )
-            })?
-            .to_owned();
+        {
+            Some(s) => s.to_owned(),
+            None => {
+                return Ok(crate::tools::common::business_error_result(
+                    "simulation.divergence",
+                    "envelope_xdr did not decode a source account",
+                ));
+            }
+        };
         if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(&source) {
             return Err(rmcp::ErrorData::invalid_params(
                 format!("invalid source (expected G-strkey): {err}"),
@@ -661,7 +677,7 @@ impl WalletServer {
         }
 
         // ── Attestation verification gate ────────────────────────────────────
-        verify_attestation_gate(
+        if let Err(result) = verify_attestation_gate(
             self,
             &dispatch_outcome,
             &args.envelope_xdr,
@@ -669,29 +685,30 @@ impl WalletServer {
             args.approval_attestation.as_deref(),
             "stellar_claim_commit",
         )
-        .await?;
+        .await
+        {
+            return Ok(result);
+        }
 
         // ── Decode nonce ─────────────────────────────────────────────────────
         let nonce = match stellar_agent_nonce::Nonce::from_base64(&args.nonce) {
             Ok(n) => n,
-            Err(_) => {
-                return Err(rmcp::ErrorData::internal_error(
-                    "nonce.expired: nonce parse failed (re-simulate to obtain a fresh nonce)",
-                    None,
-                ));
-            }
+            Err(_) => return Ok(commit_path_error_result("nonce parse failed")),
         };
 
         // ── Parse the authoritative balance id ───────────────────────────────
-        let balance_id_hex72 = authoritative_args
+        let balance_id_hex72 = match authoritative_args
             .get("balance_id_hex72")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                rmcp::ErrorData::internal_error(
-                    "simulation.divergence: envelope_xdr did not decode a balance id",
-                    None,
-                )
-            })?;
+        {
+            Some(s) => s,
+            None => {
+                return Ok(crate::tools::common::business_error_result(
+                    "simulation.divergence",
+                    "envelope_xdr did not decode a balance id",
+                ));
+            }
+        };
         let id = match BalanceId::parse(balance_id_hex72) {
             Ok(id) => id,
             Err(err) => return Ok(claim_error_result(&err)),
@@ -746,16 +763,19 @@ impl WalletServer {
         };
         let source_sequence = account_view.sequence_number;
 
-        let total_fee_from_envelope = authoritative_args
+        let total_fee_from_envelope = match authoritative_args
             .get("total_fee_stroops")
             .and_then(serde_json::Value::as_u64)
             .and_then(|fee| u32::try_from(fee).ok())
-            .ok_or_else(|| {
-                rmcp::ErrorData::internal_error(
-                    "simulation.divergence: envelope_xdr did not contain a valid fee",
-                    None,
-                )
-            })?;
+        {
+            Some(f) => f,
+            None => {
+                return Ok(crate::tools::common::business_error_result(
+                    "simulation.divergence",
+                    "envelope_xdr did not contain a valid fee",
+                ));
+            }
+        };
         let fee_per_op_stroops = total_fee_from_envelope
             .checked_div(CLASSIC_SINGLE_OPERATION_COUNT)
             .ok_or_else(|| {
@@ -786,18 +806,20 @@ impl WalletServer {
 
         // ── Envelope divergence check ────────────────────────────────────────
         if rebuilt_envelope_xdr != args.envelope_xdr {
-            return Err(rmcp::ErrorData::internal_error(
-                "simulation.divergence: re-built envelope does not match presented envelope_xdr; \
+            return Ok(crate::tools::common::business_error_result(
+                "simulation.divergence",
+                "re-built envelope does not match presented envelope_xdr; \
                  re-simulate to obtain a fresh envelope",
-                None,
             ));
         }
 
         // ── Fee cap ──────────────────────────────────────────────────────────
-        enforce_classic_fee_cap(fee_per_op_stroops, "envelope", &self.profile)?;
+        if let Err(r) = enforce_classic_fee_cap(fee_per_op_stroops, "envelope", &self.profile) {
+            return Ok(r);
+        }
 
         // ── Nonce verification + replay window ───────────────────────────────
-        commit_envelope_and_verify_nonce(
+        if let Err(e) = commit_envelope_and_verify_nonce(
             &self.nonce_mint,
             &self.replay_window,
             &nonce,
@@ -807,7 +829,10 @@ impl WalletServer {
             "stellar_claim_commit",
             now_ms,
         )
-        .await?;
+        .await
+        {
+            return e.into_result();
+        }
 
         // ── Load signer handle from keyring ──────────────────────────────────
         let handle = match signer_from_keyring(&self.profile.mcp_signer_default, &source).await {

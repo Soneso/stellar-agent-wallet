@@ -216,16 +216,20 @@ impl WalletServer {
             "vault_address": args.vault_address,
             "from_address": args.from_address,
         });
-        let dispatch_outcome = self
+        let dispatch_outcome = match self
             .dispatch_gate(
                 "stellar_defindex_vault_deposit",
                 &args_value,
                 &args.chain_id,
             )
-            .await?;
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return e.into_result(),
+        };
 
         if matches!(dispatch_outcome, DispatchOutcome::RequireApproval(_)) {
-            return Err(crate::tools::common::single_shot_require_approval_error());
+            return Ok(crate::tools::common::single_shot_require_approval_error());
         }
 
         // ── Parse decimal-string amount fields ────────────────────────────────
@@ -439,9 +443,9 @@ impl WalletServer {
         let witness = match gate_result {
             Ok(GateOutcome::Allow(w)) => w,
             Ok(GateOutcome::RequireApproval) => {
-                return Err(rmcp::ErrorData::internal_error(
+                return Ok(crate::tools::common::business_error_result(
+                    "policy.approval_required",
                     require_approval_error(),
-                    None,
                 ));
             }
             Err(e) => {
@@ -455,14 +459,15 @@ impl WalletServer {
         // ── Load signer ───────────────────────────────────────────────────────
         let signer_entry_ref = &self.profile.mcp_signer_default;
         let expected_g_strkey = signer_entry_ref.account.as_str();
-        let signer_handle = signer_from_keyring(signer_entry_ref, expected_g_strkey)
-            .await
-            .map_err(|_| {
-                rmcp::ErrorData::internal_error(
-                    "vault.signer_load_failed: could not load signer from keyring",
-                    None,
-                )
-            })?;
+        let signer_handle = match signer_from_keyring(signer_entry_ref, expected_g_strkey).await {
+            Ok(h) => h,
+            Err(_) => {
+                return Ok(crate::tools::common::business_error_result(
+                    "vault.signer_load_failed",
+                    "could not load signer from keyring",
+                ));
+            }
+        };
 
         let timeout = crate::tools::common::submit_timeout(&self.profile);
         let network = self.profile.network_passphrase.as_str();
@@ -533,17 +538,10 @@ impl WalletServer {
                     serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
                 Ok(CallToolResult::success(vec![Content::text(json_str)]))
             }
-            Err(e) => {
-                let resp = json!({
-                    "code": "vault.submit_failed",
-                    "message": e.to_string(),
-                });
-                let json_str =
-                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-                let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                result.is_error = Some(true);
-                Ok(result)
-            }
+            Err(e) => Ok(crate::tools::common::business_error_result(
+                "vault.submit_failed",
+                e.to_string(),
+            )),
         }
     }
 
@@ -573,16 +571,20 @@ impl WalletServer {
             "vault_address": args.vault_address,
             "from_address": args.from_address,
         });
-        let dispatch_outcome = self
+        let dispatch_outcome = match self
             .dispatch_gate(
                 "stellar_defindex_vault_withdraw",
                 &args_value,
                 &args.chain_id,
             )
-            .await?;
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return e.into_result(),
+        };
 
         if matches!(dispatch_outcome, DispatchOutcome::RequireApproval(_)) {
-            return Err(crate::tools::common::single_shot_require_approval_error());
+            return Ok(crate::tools::common::single_shot_require_approval_error());
         }
 
         // ── Parse decimal-string amount fields ────────────────────────────────
@@ -793,9 +795,9 @@ impl WalletServer {
         let witness = match gate_result {
             Ok(GateOutcome::Allow(w)) => w,
             Ok(GateOutcome::RequireApproval) => {
-                return Err(rmcp::ErrorData::internal_error(
+                return Ok(crate::tools::common::business_error_result(
+                    "policy.approval_required",
                     require_approval_error(),
-                    None,
                 ));
             }
             Err(e) => {
@@ -809,14 +811,15 @@ impl WalletServer {
         // ── Load signer ───────────────────────────────────────────────────────
         let signer_entry_ref = &self.profile.mcp_signer_default;
         let expected_g_strkey = signer_entry_ref.account.as_str();
-        let signer_handle = signer_from_keyring(signer_entry_ref, expected_g_strkey)
-            .await
-            .map_err(|_| {
-                rmcp::ErrorData::internal_error(
-                    "vault.signer_load_failed: could not load signer from keyring",
-                    None,
-                )
-            })?;
+        let signer_handle = match signer_from_keyring(signer_entry_ref, expected_g_strkey).await {
+            Ok(h) => h,
+            Err(_) => {
+                return Ok(crate::tools::common::business_error_result(
+                    "vault.signer_load_failed",
+                    "could not load signer from keyring",
+                ));
+            }
+        };
 
         let timeout = crate::tools::common::submit_timeout(&self.profile);
         let network = self.profile.network_passphrase.as_str();
@@ -886,17 +889,10 @@ impl WalletServer {
                     serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
                 Ok(CallToolResult::success(vec![Content::text(json_str)]))
             }
-            Err(e) => {
-                let resp = json!({
-                    "code": "vault.submit_failed",
-                    "message": e.to_string(),
-                });
-                let json_str =
-                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-                let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                result.is_error = Some(true);
-                Ok(result)
-            }
+            Err(e) => Ok(crate::tools::common::business_error_result(
+                "vault.submit_failed",
+                e.to_string(),
+            )),
         }
     }
 }
@@ -905,13 +901,11 @@ impl WalletServer {
 // Helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Builds a `CallToolResult` with `is_error = true` from a code + message.
+/// Builds the documented business-error result envelope (`is_error = true`,
+/// `ok: false`, `error.code`) from a code + message. The `code` string is
+/// preserved verbatim as `error.code`.
 fn tool_error_result(code: &str, message: &str) -> CallToolResult {
-    let resp = json!({ "code": code, "message": message });
-    let json_str = serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-    let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-    result.is_error = Some(true);
-    result
+    crate::tools::common::business_error_result(code.to_owned(), message.to_owned())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

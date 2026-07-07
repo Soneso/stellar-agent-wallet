@@ -745,14 +745,7 @@ fn build_write_context_rule_manager(server: &WalletServer) -> Result<ContextRule
 }
 
 fn sa_error_result(err: &SaError) -> CallToolResult {
-    let envelope = json!({
-        "code": err.wire_code(),
-        "message": err.to_string(),
-    });
-    let json_str = serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| "{}".to_owned());
-    let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-    result.is_error = Some(true);
-    result
+    crate::tools::common::business_error_result(err.wire_code(), err.to_string())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -928,9 +921,13 @@ impl WalletServer {
             "smart_account": &args.smart_account,
             "name": &args.name,
         });
-        let dispatch_outcome = self
+        let dispatch_outcome = match self
             .dispatch_gate("stellar_rule_create", &args_value, &args.chain_id)
-            .await?;
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return e.into_result(),
+        };
 
         // ── Simulate (runs the SAME pin check install_rule runs) ─────────────
         let manager = match build_write_context_rule_manager(self) {
@@ -1163,47 +1160,62 @@ impl WalletServer {
             "approval_nonce": &args.approval_nonce,
         });
         let dispatch_outcome = match forced_dispatch_outcome {
-            Some(forced) => match self
-                .dispatch_gate("stellar_rule_create_commit", &args_value, &args.chain_id)
-                .await?
-            {
-                DispatchOutcome::Allow => {
-                    tracing::debug!(
-                        tool = "stellar_rule_create_commit",
-                        "toolset_gated: overriding DispatchOutcome::Allow → forced RequireApproval"
-                    );
-                    forced
+            Some(forced) => {
+                let gate_outcome = match self
+                    .dispatch_gate("stellar_rule_create_commit", &args_value, &args.chain_id)
+                    .await
+                {
+                    Ok(o) => o,
+                    Err(e) => return e.into_result(),
+                };
+                match gate_outcome {
+                    DispatchOutcome::Allow => {
+                        tracing::debug!(
+                            tool = "stellar_rule_create_commit",
+                            "toolset_gated: overriding DispatchOutcome::Allow → forced RequireApproval"
+                        );
+                        forced
+                    }
+                    other => other,
                 }
-                other => other,
-            },
-            None => {
-                self.dispatch_gate("stellar_rule_create_commit", &args_value, &args.chain_id)
-                    .await?
             }
+            None => match self
+                .dispatch_gate("stellar_rule_create_commit", &args_value, &args.chain_id)
+                .await
+            {
+                Ok(o) => o,
+                Err(e) => return e.into_result(),
+            },
         };
 
         // ── Load the pending entry (the SOLE source of the definition) ───────
-        let approvals_dir = self.resolve_approval_dir().map_err(|_| {
-            tracing::debug!(
-                tool = "stellar_rule_create_commit",
-                "approval dir resolution failed"
-            );
-            approval_required_indistinguishable()
-        })?;
-        let store_path = approvals_dir.join(format!("{}.toml", self.profile_name_for_approval()));
-        let mut store = open_with_retry(&store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
-            .map_err(|_| {
+        let approvals_dir = match self.resolve_approval_dir() {
+            Ok(dir) => dir,
+            Err(_) => {
                 tracing::debug!(
                     tool = "stellar_rule_create_commit",
-                    "approval store open failed"
+                    "approval dir resolution failed"
                 );
-                approval_required_indistinguishable()
-            })?;
+                return Ok(approval_required_indistinguishable());
+            }
+        };
+        let store_path = approvals_dir.join(format!("{}.toml", self.profile_name_for_approval()));
+        let mut store =
+            match open_with_retry(&store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF) {
+                Ok(s) => s,
+                Err(_) => {
+                    tracing::debug!(
+                        tool = "stellar_rule_create_commit",
+                        "approval store open failed"
+                    );
+                    return Ok(approval_required_indistinguishable());
+                }
+            };
 
-        let entry = store
-            .get(&args.approval_nonce)
-            .cloned()
-            .ok_or_else(approval_required_indistinguishable)?;
+        let entry = match store.get(&args.approval_nonce).cloned() {
+            Some(e) => e,
+            None => return Ok(approval_required_indistinguishable()),
+        };
 
         let now_ms = now_unix_ms()
             .map_err(|e| rmcp::ErrorData::internal_error(format!("clock_error: {e}"), None))?;
@@ -1212,13 +1224,13 @@ impl WalletServer {
                 tool = "stellar_rule_create_commit",
                 "approval entry expired"
             );
-            return Err(approval_required_indistinguishable());
+            return Ok(approval_required_indistinguishable());
         }
 
         let (smart_account_str, entry_chain_id, definition_snapshot, stored_proposal_sha256) =
             match &entry.kind {
                 stellar_agent_core::approval::ApprovalKind::Rejected { .. } => {
-                    return Err(approval_rejected_error());
+                    return Ok(approval_rejected_error());
                 }
                 stellar_agent_core::approval::ApprovalKind::RuleProposalSimulated {
                     smart_account,
@@ -1232,7 +1244,7 @@ impl WalletServer {
                     definition.clone(),
                     *proposal_sha256,
                 ),
-                _ => return Err(approval_required_indistinguishable()),
+                _ => return Ok(approval_required_indistinguishable()),
             };
 
         if entry_chain_id != args.chain_id {
@@ -1294,33 +1306,38 @@ impl WalletServer {
                         tool = "stellar_rule_create_commit",
                         "approval_attestation absent"
                     );
-                    return Err(approval_required_indistinguishable());
+                    return Ok(approval_required_indistinguishable());
                 }
             };
-            let attestation_bytes: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            let attestation_bytes: [u8; 32] = match base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(attestation_b64)
                 .ok()
                 .and_then(|v| v.try_into().ok())
-                .ok_or_else(|| {
+            {
+                Some(bytes) => bytes,
+                None => {
                     tracing::debug!(
                         tool = "stellar_rule_create_commit",
                         "attestation base64 decode failed"
                     );
-                    approval_required_indistinguishable()
-                })?;
+                    return Ok(approval_required_indistinguishable());
+                }
+            };
 
-            let attestation_key_bytes = load_attestation_key(&self.profile)?;
+            let attestation_key_bytes = match load_attestation_key(&self.profile) {
+                Ok(k) => k,
+                Err(result) => return Ok(result),
+            };
             let attestation_key = zeroize::Zeroizing::new(attestation_key_bytes);
 
-            store
-                .verify_rule_proposal_gate(
-                    nonce_str,
-                    &recomputed_digest,
-                    &attestation_key,
-                    &attestation_bytes,
-                    now_ms,
-                )
-                .map_err(|e| match e {
+            if let Err(e) = store.verify_rule_proposal_gate(
+                nonce_str,
+                &recomputed_digest,
+                &attestation_key,
+                &attestation_bytes,
+                now_ms,
+            ) {
+                return Ok(match e {
                     RuleProposalGateError::Rejected => approval_rejected_error(),
                     // `RuleProposalGateError` is `#[non_exhaustive]`; a future
                     // variant collapses to the same indistinguishable refusal
@@ -1332,7 +1349,8 @@ impl WalletServer {
                         );
                         approval_required_indistinguishable()
                     }
-                })?;
+                });
+            }
         }
 
         // ── Load signer + build the write-capable manager ─────────────────────
@@ -1993,8 +2011,9 @@ mod tests {
                 "unknown-nonce".to_owned(),
             ))
             .await;
-        let err = result.expect_err("unknown nonce must be Err");
-        assert!(err.message.contains("policy.approval_required"));
+        let result = result.expect("unknown nonce must be Err");
+        let (code, _message, _text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "policy.approval_required");
     }
 
     #[tokio::test]
@@ -2007,8 +2026,9 @@ mod tests {
         let result = server
             .call_stellar_rule_create_commit(commit_args("stellar:testnet", nonce))
             .await;
-        let err = result.expect_err("expired entry must be Err");
-        assert!(err.message.contains("policy.approval_required"));
+        let result = result.expect("expired entry must be Err");
+        let (code, _message, _text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "policy.approval_required");
     }
 
     #[tokio::test]
@@ -2030,11 +2050,11 @@ mod tests {
         let result = server
             .call_stellar_rule_create_commit(commit_args("stellar:testnet", nonce))
             .await;
-        let err = result.expect_err("rejected tombstone must be Err");
-        assert!(
-            err.message.contains("policy.approval_rejected"),
-            "a live Rejected tombstone must be distinguishable, got: {}",
-            err.message
+        let result = result.expect("rejected tombstone must be surfaced as Ok(is_error) envelope");
+        let (code, _message, _text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(
+            code, "policy.approval_rejected",
+            "a live Rejected tombstone must be distinguishable"
         );
     }
 
@@ -2058,15 +2078,12 @@ mod tests {
         let result = server
             .call_stellar_rule_create_commit(commit_args("stellar:testnet", nonce))
             .await;
-        let err = result.expect_err(
+        let result = result.expect(
             "an Allow-engine profile must still refuse an unattested commit through the public \
-             handler",
+             handler, surfaced as an Ok(is_error) envelope",
         );
-        assert!(
-            err.message.contains("policy.approval_required"),
-            "got: {}",
-            err.message
-        );
+        let (code, _message, _text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "policy.approval_required");
     }
 
     #[tokio::test]
@@ -2101,8 +2118,9 @@ mod tests {
         let result = server
             .call_stellar_rule_create_commit(commit_args("stellar:testnet", nonce))
             .await;
-        let err = result.expect_err("wrong-kind entry must be Err");
-        assert!(err.message.contains("policy.approval_required"));
+        let result = result.expect("wrong-kind entry must be Err");
+        let (code, _message, _text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "policy.approval_required");
     }
 
     #[tokio::test]
@@ -2163,8 +2181,9 @@ mod tests {
         let result = server
             .stellar_rule_create_commit_impl(commit_args("stellar:testnet", nonce), Some(forced))
             .await;
-        let err = result.expect_err("missing attestation under RequireApproval must be Err");
-        assert!(err.message.contains("policy.approval_required"));
+        let result = result.expect("missing attestation under RequireApproval must be Err");
+        let (code, _message, _text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "policy.approval_required");
     }
 
     #[tokio::test]
@@ -2182,8 +2201,9 @@ mod tests {
         let result = server
             .stellar_rule_create_commit_impl(args, Some(forced))
             .await;
-        let err = result.expect_err("malformed attestation base64 must be Err");
-        assert!(err.message.contains("policy.approval_required"));
+        let result = result.expect("malformed attestation base64 must be Err");
+        let (code, _message, _text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "policy.approval_required");
     }
 
     #[tokio::test]
@@ -2209,8 +2229,9 @@ mod tests {
         let result = server
             .stellar_rule_create_commit_impl(args, Some(forced))
             .await;
-        let err = result.expect_err("wrong attestation must be Err");
-        assert!(err.message.contains("policy.approval_required"));
+        let result = result.expect("wrong attestation must be Err");
+        let (code, _message, _text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "policy.approval_required");
     }
 
     // ── Mainnet write defence ─────────────────────────────────────────────────

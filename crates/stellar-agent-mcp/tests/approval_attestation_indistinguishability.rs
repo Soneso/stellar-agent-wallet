@@ -76,6 +76,8 @@ use tracing::instrument::WithSubscriber as _;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+mod common;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -83,13 +85,17 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 const SOURCE: &str = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
 const DEST: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
 
-/// The canonical indistinguishable wire message emitted by
-/// `approval_required_indistinguishable()` for all attestation-gate failure modes.
+/// The canonical wire code emitted by `approval_required_indistinguishable()`
+/// for all attestation-gate failure modes.
+const POLICY_APPROVAL_REQUIRED_CODE: &str = "policy.approval_required";
+
+/// The canonical indistinguishable `error.message` detail emitted by
+/// `approval_required_indistinguishable()` for all attestation-gate failure
+/// modes.
 ///
 /// Using `assert_eq!` against this constant (rather than `assert!(contains(...))`)
 /// pins the exact wire body and catches any drift in the message text.
-const POLICY_APPROVAL_REQUIRED_MSG: &str = "policy.approval_required: \
-     approval attestation absent, invalid, or expired; \
+const POLICY_APPROVAL_REQUIRED_MSG: &str = "approval attestation absent, invalid, or expired; \
      run `stellar-agent approve --id <nonce>` then re-submit with attestation";
 
 fn capture_subscriber(writer: CaptureWriter) -> impl tracing::Subscriber + Send + Sync {
@@ -283,7 +289,7 @@ async fn property4_all_failure_modes_produce_byte_identical_wire_error() {
 
     let (server_a, envelope_a, nonce_a, expiry_a) =
         build_scaffold(profile_a, temp_a.path().to_path_buf()).await;
-    let err_a = server_a
+    let result_a = server_a
         .call_stellar_pay_commit(StellarPayCommitArgs {
             chain_id: "stellar:testnet".to_owned(),
             source: SOURCE.to_owned(),
@@ -303,7 +309,8 @@ async fn property4_all_failure_modes_produce_byte_identical_wire_error() {
             approval_attestation: None,
         })
         .await
-        .expect_err("case a: absent attestation must return Err");
+        .expect("case a: absent attestation must return Ok(is_error) envelope");
+    let (code_a, message_a, _text_a) = common::assert_business_envelope(&result_a);
 
     // ── Case b: forged attestation (nonce not in store) ──────────────────────
     let temp_b = TempDir::new().expect("TempDir::new for case b");
@@ -316,7 +323,7 @@ async fn property4_all_failure_modes_produce_byte_identical_wire_error() {
 
     let (server_b, envelope_b, nonce_b, expiry_b) =
         build_scaffold(profile_b, temp_b.path().to_path_buf()).await;
-    let err_b = server_b
+    let result_b = server_b
         .call_stellar_pay_commit(StellarPayCommitArgs {
             chain_id: "stellar:testnet".to_owned(),
             source: SOURCE.to_owned(),
@@ -338,7 +345,8 @@ async fn property4_all_failure_modes_produce_byte_identical_wire_error() {
             ),
         })
         .await
-        .expect_err("case b: forged attestation must return Err");
+        .expect("case b: forged attestation must return Ok(is_error) envelope");
+    let (code_b, message_b, _text_b) = common::assert_business_envelope(&result_b);
 
     // ── Case c: expired approval entry ───────────────────────────────────────
     let temp_c = TempDir::new().expect("TempDir::new for case c");
@@ -386,7 +394,7 @@ async fn property4_all_failure_modes_produce_byte_identical_wire_error() {
     // Provide a plausible attestation blob (32 bytes); expiry fires before HMAC.
     let fake_attestation = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xABu8; 32]);
 
-    let err_c = server_c
+    let result_c = server_c
         .call_stellar_pay_commit(StellarPayCommitArgs {
             chain_id: "stellar:testnet".to_owned(),
             source: SOURCE.to_owned(),
@@ -406,36 +414,43 @@ async fn property4_all_failure_modes_produce_byte_identical_wire_error() {
             approval_attestation: Some(fake_attestation),
         })
         .await
-        .expect_err("case c: expired entry must return Err");
+        .expect("case c: expired entry must return Ok(is_error) envelope");
+    let (code_c, message_c, _text_c) = common::assert_business_envelope(&result_c);
 
     // Temp dirs dropped at end of test: temp_a, temp_b, temp_c.
 
     // ── Byte-identity assertion ───────────────────────────────────────────────
-    for (label, err) in [
-        ("a (absent)", &err_a),
-        ("b (forged)", &err_b),
-        ("c (expired)", &err_c),
+    for (label, code, message) in [
+        ("a (absent)", &code_a, &message_a),
+        ("b (forged)", &code_b, &message_b),
+        ("c (expired)", &code_c, &message_c),
     ] {
         assert_eq!(
-            err.message, POLICY_APPROVAL_REQUIRED_MSG,
-            "Property 4 case {label}: must produce canonical wire message; got: {}",
-            err.message
+            code, POLICY_APPROVAL_REQUIRED_CODE,
+            "Property 4 case {label}: must produce canonical wire code; got: {code}"
+        );
+        assert_eq!(
+            message, POLICY_APPROVAL_REQUIRED_MSG,
+            "Property 4 case {label}: must produce canonical wire message; got: {message}"
         );
     }
 
-    let wire_a = serde_json::to_string(&err_a).expect("serialize err_a");
-    let wire_b = serde_json::to_string(&err_b).expect("serialize err_b");
-    let wire_c = serde_json::to_string(&err_c).expect("serialize err_c");
+    // Compare the (code, message) tuples for equality — never the full JSON
+    // text or request_id, which are freshly minted per call and therefore
+    // legitimately differ between cases.
+    let pair_a = (code_a, message_a);
+    let pair_b = (code_b, message_b);
+    let pair_c = (code_c, message_c);
 
     assert_eq!(
-        wire_a, wire_b,
-        "Property 4: case a (absent) and case b (forged) wire envelopes must be \
-         byte-identical.\n  a: {wire_a}\n  b: {wire_b}"
+        pair_a, pair_b,
+        "Property 4: case a (absent) and case b (forged) (code, message) pairs must be \
+         byte-identical.\n  a: {pair_a:?}\n  b: {pair_b:?}"
     );
     assert_eq!(
-        wire_a, wire_c,
-        "Property 4: case a (absent) and case c (expired) wire envelopes must be \
-         byte-identical.\n  a: {wire_a}\n  c: {wire_c}"
+        pair_a, pair_c,
+        "Property 4: case a (absent) and case c (expired) (code, message) pairs must be \
+         byte-identical.\n  a: {pair_a:?}\n  c: {pair_c:?}"
     );
 }
 
@@ -475,7 +490,7 @@ async fn property4a_absent_attestation_returns_approval_required() {
 
     let logs = CaptureWriter::new();
     let subscriber = capture_subscriber(logs.clone());
-    let err = server
+    let result = server
         .call_stellar_pay_commit(StellarPayCommitArgs {
             chain_id: "stellar:testnet".to_owned(),
             source: SOURCE.to_owned(),
@@ -495,12 +510,16 @@ async fn property4a_absent_attestation_returns_approval_required() {
         })
         .with_subscriber(subscriber)
         .await
-        .expect_err("absent attestation must return Err");
+        .expect("absent attestation must return Ok(is_error) envelope");
+    let (code, message, _text) = common::assert_business_envelope(&result);
 
     assert_eq!(
-        err.message, POLICY_APPROVAL_REQUIRED_MSG,
-        "Property 4a: absent attestation must produce canonical wire message; got: {}",
-        err.message
+        code, POLICY_APPROVAL_REQUIRED_CODE,
+        "Property 4a: absent attestation must produce canonical wire code; got: {code}"
+    );
+    assert_eq!(
+        message, POLICY_APPROVAL_REQUIRED_MSG,
+        "Property 4a: absent attestation must produce canonical wire message; got: {message}"
     );
     let captured = logs.captured_str();
     assert!(
@@ -545,7 +564,7 @@ async fn property4b_forged_attestation_returns_approval_required() {
 
     let logs = CaptureWriter::new();
     let subscriber = capture_subscriber(logs.clone());
-    let err = server
+    let result = server
         .call_stellar_pay_commit(StellarPayCommitArgs {
             chain_id: "stellar:testnet".to_owned(),
             source: SOURCE.to_owned(),
@@ -568,12 +587,16 @@ async fn property4b_forged_attestation_returns_approval_required() {
         })
         .with_subscriber(subscriber)
         .await
-        .expect_err("forged attestation must return Err");
+        .expect("forged attestation must return Ok(is_error) envelope");
+    let (code, message, _text) = common::assert_business_envelope(&result);
 
     assert_eq!(
-        err.message, POLICY_APPROVAL_REQUIRED_MSG,
-        "Property 4b: forged attestation must produce canonical wire message; got: {}",
-        err.message
+        code, POLICY_APPROVAL_REQUIRED_CODE,
+        "Property 4b: forged attestation must produce canonical wire code; got: {code}"
+    );
+    assert_eq!(
+        message, POLICY_APPROVAL_REQUIRED_MSG,
+        "Property 4b: forged attestation must produce canonical wire message; got: {message}"
     );
     let captured = logs.captured_str();
     assert!(
@@ -647,7 +670,7 @@ async fn property4c_expired_approval_entry_returns_approval_required() {
 
     let logs = CaptureWriter::new();
     let subscriber = capture_subscriber(logs.clone());
-    let err = server
+    let result = server
         .call_stellar_pay_commit(StellarPayCommitArgs {
             chain_id: "stellar:testnet".to_owned(),
             source: SOURCE.to_owned(),
@@ -667,12 +690,16 @@ async fn property4c_expired_approval_entry_returns_approval_required() {
         })
         .with_subscriber(subscriber)
         .await
-        .expect_err("expired entry must return Err");
+        .expect("expired entry must return Ok(is_error) envelope");
+    let (code, message, _text) = common::assert_business_envelope(&result);
 
     assert_eq!(
-        err.message, POLICY_APPROVAL_REQUIRED_MSG,
-        "Property 4c: expired entry must produce canonical wire message; got: {}",
-        err.message
+        code, POLICY_APPROVAL_REQUIRED_CODE,
+        "Property 4c: expired entry must produce canonical wire code; got: {code}"
+    );
+    assert_eq!(
+        message, POLICY_APPROVAL_REQUIRED_MSG,
+        "Property 4c: expired entry must produce canonical wire message; got: {message}"
     );
     let captured = logs.captured_str();
     assert!(

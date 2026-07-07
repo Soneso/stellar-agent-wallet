@@ -704,11 +704,12 @@ async fn commit_replayed_nonce_returns_replayed() {
     // Second commit with the SAME nonce: the replay window already contains it.
     let second = server
         .call_stellar_claim_commit(commit_args(nonce, expires, envelope))
-        .await;
-    let err = second.expect_err("replayed nonce must return Err");
-    assert!(
-        err.to_string().contains("nonce.replayed"),
-        "second commit must return nonce.replayed, got: {err}"
+        .await
+        .expect("replayed nonce must return Ok(is_error) envelope");
+    let (code, _message, _text) = common::assert_business_envelope(&second);
+    assert_eq!(
+        code, "nonce.replayed",
+        "second commit must return nonce.replayed, got: {code}"
     );
 }
 
@@ -775,11 +776,12 @@ async fn commit_envelope_divergence_on_account_sequence_mismatch() {
             3_000_000_000_000, // far future so expiry is not the failing gate
             presented_envelope,
         ))
-        .await;
-    let err = result.expect_err("account-sequence mismatch must return Err");
-    assert!(
-        err.to_string().contains("simulation.divergence"),
-        "sequence mismatch must produce simulation.divergence, got: {err}"
+        .await
+        .expect("account-sequence mismatch must return Ok(is_error) envelope");
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "simulation.divergence",
+        "sequence mismatch must produce simulation.divergence, got: {code}"
     );
 }
 

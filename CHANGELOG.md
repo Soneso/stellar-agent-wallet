@@ -20,6 +20,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Breaking (MCP wire): tool business errors now use one uniform result envelope
+  `{ ok: false, error: { code, message }, request_id }` with `is_error` set, in
+  place of the previous mix of JSON-RPC `ErrorData`, bare `{ error, detail }`
+  (SEP-53), and `{ code: "x402.error" }` shapes. Branch on `error.code`. x402
+  errors carry per-variant codes (`x402.<reason>`); SEP-53 failures use
+  `sep53.keyring_load_failed` / `sep53.sign_failed` / `sep53.verify_failed`; a
+  keyring-unavailable nonce mint at simulate time returns `nonce.mint_failed`;
+  and a trustline to a clawback-enabled issuer returns the
+  `trustline.clawback_opt_in_required` business error instead of an `ok` result.
+  Genuine protocol faults (malformed arguments, internal invariants) remain
+  JSON-RPC errors. The six `stellar_sep43_*` tools keep the SEP-43 v1.2.1
+  `{ code, message }` object (numeric codes) for signing results and their
+  protocol, mainnet, and keyring-unlock errors to preserve wire compatibility;
+  the one case those tools use the standard envelope is a policy
+  `RequireApproval` verdict, refused as `policy.approval_required_unsupported`.
+  The SEP-43 sign-and-submit submit-layer mainnet backstop now reports the
+  unified `MainnetSigningForbidden` (SEP-43 code -3) instead of the generic
+  rpc-error code (-2). (#35)
 - Breaking: removed `profile rotate-owner-key`. The policy owner keyring entry
   now holds the owner PUBLIC key that the always-online engine verifies
   against, not the private seed. Enrol the public key with

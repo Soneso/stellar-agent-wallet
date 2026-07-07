@@ -15,7 +15,7 @@ use stellar_xdr::Memo;
 use crate::server::WalletServer;
 use crate::tools::common::{
     APPROVAL_TTL_MS, CLASSIC_SINGLE_OPERATION_COUNT, DEFAULT_NONCE_TTL_MS, DispatchOutcome,
-    commit_envelope_and_verify_nonce, commit_path_error_data, enforce_classic_fee_cap,
+    commit_envelope_and_verify_nonce, commit_path_error_result, enforce_classic_fee_cap,
     hash_to_lower_hex, high_value_cross_check, ledger_err_result, nonce_id_prefix,
     redact_rpc_error_detail, redacted_wallet_error_envelope, resolve_classic_fee_per_op_stroops,
     submit_timeout, total_classic_fee_stroops, validate_g_strkey, verify_attestation_gate,
@@ -654,7 +654,7 @@ impl WalletServer {
         let dest_adapter = dest_view
             .as_ref()
             .map(crate::policy_adapter::AccountViewAdapter::new);
-        let dispatch_outcome = self
+        let dispatch_outcome = match self
             .dispatch_gate_with_views(
                 "stellar_pay",
                 &args_value,
@@ -664,7 +664,11 @@ impl WalletServer {
                     .as_ref()
                     .map(|a| a as &dyn stellar_agent_core::policy::v1::AccountIdentityView),
             )
-            .await?;
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return e.into_result(),
+        };
 
         let source_sequence = account_view.sequence_number;
         let native_balance_stroops = account_view
@@ -700,11 +704,13 @@ impl WalletServer {
                 ));
             }
         };
-        enforce_classic_fee_cap(
+        if let Err(r) = enforce_classic_fee_cap(
             fee_selection.per_op_stroops,
             &fee_selection.selected_fee_percentile,
             &self.profile,
-        )?;
+        ) {
+            return Ok(r);
+        }
         let fee_per_op_stroops = fee_selection.per_op_stroops;
         let total_fee_stroops =
             total_classic_fee_stroops(fee_per_op_stroops, CLASSIC_SINGLE_OPERATION_COUNT)?;
@@ -885,9 +891,9 @@ impl WalletServer {
         ) {
             Ok(n) => n,
             Err(err) => {
-                return Err(rmcp::ErrorData::internal_error(
-                    format!("nonce.mint_failed: {err}"),
-                    None,
+                return Ok(crate::tools::common::business_error_result(
+                    "nonce.mint_failed",
+                    err.to_string(),
                 ));
             }
         };
@@ -1161,17 +1167,20 @@ impl WalletServer {
         // `args.chain_id` after the decode.  The CAIP-2 check in dispatch_gate
         // validates it against the profile.
         let mut authoritative_args =
-            decode_authoritative_args(&args.envelope_xdr, "stellar_pay_commit").map_err(|e| {
-                tracing::debug!(
-                    error = %e,
-                    tool = "stellar_pay_commit",
-                    "envelope_xdr re-derivation failed; returning simulation.divergence"
-                );
-                rmcp::ErrorData::internal_error(
-                    format!("simulation.divergence: envelope_xdr re-derivation failed: {e}"),
-                    None,
-                )
-            })?;
+            match decode_authoritative_args(&args.envelope_xdr, "stellar_pay_commit") {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        tool = "stellar_pay_commit",
+                        "envelope_xdr re-derivation failed; returning simulation.divergence"
+                    );
+                    return Ok(crate::tools::common::business_error_result(
+                        "simulation.divergence",
+                        format!("envelope_xdr re-derivation failed: {e}"),
+                    ));
+                }
+            };
         // Inject chain_id (not XDR-encoded; validated by CAIP-2 check in
         // dispatch_gate step 3).
         authoritative_args["chain_id"] = serde_json::Value::String(args.chain_id.clone());
@@ -1190,10 +1199,14 @@ impl WalletServer {
             Some(forced) => {
                 // Still run dispatch_gate for chain_id validation + Deny check;
                 // override Allow with the forced outcome if the gate does not deny.
-                match self
+                let gate_outcome = match self
                     .dispatch_gate("stellar_pay_commit", &authoritative_args, &args.chain_id)
-                    .await?
+                    .await
                 {
+                    Ok(o) => o,
+                    Err(e) => return e.into_result(),
+                };
+                match gate_outcome {
                     super::common::DispatchOutcome::Allow => {
                         // Override: policy said Allow but toolset-gated path forces RequireApproval.
                         tracing::debug!(
@@ -1208,8 +1221,13 @@ impl WalletServer {
             }
             None => {
                 // Normal path: use the policy-engine outcome directly.
-                self.dispatch_gate("stellar_pay_commit", &authoritative_args, &args.chain_id)
-                    .await?
+                match self
+                    .dispatch_gate("stellar_pay_commit", &authoritative_args, &args.chain_id)
+                    .await
+                {
+                    Ok(o) => o,
+                    Err(e) => return e.into_result(),
+                }
             }
         };
 
@@ -1237,7 +1255,7 @@ impl WalletServer {
         // This is a no-op when `dispatch_outcome` is `DispatchOutcome::Allow`.
         // For the toolset-gated path, `forced_dispatch_outcome = Some(RequireApproval)`
         // makes it ALWAYS active.
-        verify_attestation_gate(
+        if let Err(result) = verify_attestation_gate(
             self,
             &dispatch_outcome,
             &args.envelope_xdr,
@@ -1245,17 +1263,15 @@ impl WalletServer {
             args.approval_attestation.as_deref(),
             "stellar_pay_commit",
         )
-        .await?;
+        .await
+        {
+            return Ok(result);
+        }
 
         // ── Decode nonce — map parse error to nonce.expired (indistinguishability) ──
         let nonce = match stellar_agent_nonce::Nonce::from_base64(&args.nonce) {
             Ok(n) => n,
-            Err(_) => {
-                return Err(rmcp::ErrorData::internal_error(
-                    "nonce.expired: nonce parse failed (re-simulate to obtain a fresh nonce)",
-                    None,
-                ));
-            }
+            Err(_) => return Ok(commit_path_error_result("nonce parse failed")),
         };
 
         // ── Parse asset ───────────────────────────────────────────────────────
@@ -1278,7 +1294,7 @@ impl WalletServer {
             args.memo_return_hex.as_deref(),
         ) {
             Ok(m) => m,
-            Err(err) => return Err(commit_path_error_data(err)),
+            Err(err) => return Ok(commit_path_error_result(err)),
         };
 
         // ── Re-fetch source account state and re-build envelope ───────────────
@@ -1312,16 +1328,19 @@ impl WalletServer {
         // `Account::increment_sequence_number`; an explicit +1 produces
         // CURRENT+2 → TxBadSeq.
 
-        let total_fee_from_envelope = authoritative_args
+        let total_fee_from_envelope = match authoritative_args
             .get("total_fee_stroops")
             .and_then(serde_json::Value::as_u64)
             .and_then(|fee| u32::try_from(fee).ok())
-            .ok_or_else(|| {
-                rmcp::ErrorData::internal_error(
-                    "simulation.divergence: envelope_xdr did not contain a valid fee",
-                    None,
-                )
-            })?;
+        {
+            Some(f) => f,
+            None => {
+                return Ok(crate::tools::common::business_error_result(
+                    "simulation.divergence",
+                    "envelope_xdr did not contain a valid fee",
+                ));
+            }
+        };
         let fee_per_op_stroops = total_fee_from_envelope
             .checked_div(CLASSIC_SINGLE_OPERATION_COUNT)
             .ok_or_else(|| {
@@ -1341,22 +1360,22 @@ impl WalletServer {
             fee_per_op_stroops,
         );
         if let Err(err) = builder.payment(&args.destination, payment_amount, &asset) {
-            return Err(commit_path_error_data(err));
+            return Ok(commit_path_error_result(err));
         }
         if let Err(err) = builder.memo(&memo) {
-            return Err(commit_path_error_data(err));
+            return Ok(commit_path_error_result(err));
         }
         let rebuilt_envelope_xdr = match builder.build() {
             Ok(xdr) => xdr,
-            Err(err) => return Err(commit_path_error_data(err)),
+            Err(err) => return Ok(commit_path_error_result(err)),
         };
 
         // ── Envelope divergence check ────────────────────────────────────────
         if rebuilt_envelope_xdr != args.envelope_xdr {
-            return Err(rmcp::ErrorData::internal_error(
-                "simulation.divergence: re-built envelope does not match presented envelope_xdr; \
+            return Ok(crate::tools::common::business_error_result(
+                "simulation.divergence",
+                "re-built envelope does not match presented envelope_xdr; \
                  re-simulate to obtain a fresh envelope",
-                None,
             ));
         }
 
@@ -1370,16 +1389,18 @@ impl WalletServer {
         // Skip conditions: non-native asset, value below threshold, or
         // `oracle_provider_url` unset (fail-open with tracing::warn!).
         {
-            let amount_stroops: i64 = authoritative_args
+            let amount_stroops: i64 = match authoritative_args
                 .get("amount_stroops")
                 .and_then(crate::tools::amount_wire::value_as_stroops_i64)
-                .ok_or_else(|| {
-                    rmcp::ErrorData::internal_error(
-                        "simulation.divergence: authoritative_args missing required \
-                         `amount_stroops` field",
-                        None,
-                    )
-                })?;
+            {
+                Some(v) => v,
+                None => {
+                    return Ok(crate::tools::common::business_error_result(
+                        "simulation.divergence",
+                        "authoritative_args missing required `amount_stroops` field",
+                    ));
+                }
+            };
             let asset_is_native = matches!(asset, Asset::Native);
             // Capture all builder inputs for the oracle re-build closure.
             let oracle_source = args.source.clone();
@@ -1390,7 +1411,7 @@ impl WalletServer {
             // Use the pre-captured payment amount (cloned before primary rebuild consumed it).
             let oracle_payment_amount = payment_amount_for_oracle;
 
-            high_value_cross_check(
+            if let Err(result) = high_value_cross_check(
                 &self.profile,
                 &rebuilt_envelope_xdr,
                 &args.source,
@@ -1415,15 +1436,25 @@ impl WalletServer {
                     );
                     oracle_builder
                         .payment(&oracle_destination, oracle_payment_amount, &oracle_asset)
-                        .map_err(commit_path_error_data)?;
-                    oracle_builder
-                        .memo(&oracle_memo)
-                        .map_err(commit_path_error_data)?;
-                    oracle_builder.build().map_err(commit_path_error_data)
+                        .map_err(|e| {
+                            rmcp::ErrorData::internal_error(
+                                format!("oracle rebuild failed: {e}"),
+                                None,
+                            )
+                        })?;
+                    oracle_builder.memo(&oracle_memo).map_err(|e| {
+                        rmcp::ErrorData::internal_error(format!("oracle rebuild failed: {e}"), None)
+                    })?;
+                    oracle_builder.build().map_err(|e| {
+                        rmcp::ErrorData::internal_error(format!("oracle rebuild failed: {e}"), None)
+                    })
                 },
                 "stellar_pay_commit",
             )
-            .await?;
+            .await
+            {
+                return Ok(result);
+            }
         }
 
         // ── Nonce verification + replay window ────────────────────────────────
@@ -1443,7 +1474,7 @@ impl WalletServer {
         // Same split-phase pattern as stellar_create_account_commit; all wire
         // codes and indistinguishability invariants are preserved inside the
         // shared helper.
-        commit_envelope_and_verify_nonce(
+        if let Err(e) = commit_envelope_and_verify_nonce(
             &self.nonce_mint,
             &self.replay_window,
             &nonce,
@@ -1453,7 +1484,10 @@ impl WalletServer {
             "stellar_pay_commit",
             now_ms,
         )
-        .await?;
+        .await
+        {
+            return e.into_result();
+        }
 
         // ── Load signer handle from keyring ───────────────────────────────────
         let handle = match signer_from_keyring(&self.profile.mcp_signer_default, &args.source).await
@@ -1683,13 +1717,16 @@ impl WalletServer {
             // Force per-action approval unconditionally.
             // Synthesise a PaymentSimulated pending approval from the authoritative
             // envelope params.
-            let authoritative = decode_authoritative_args(&args.envelope_xdr, "stellar_pay_commit")
-                .map_err(|e| {
-                    rmcp::ErrorData::internal_error(
-                        format!("simulation.divergence: toolset_gated envelope_xdr decode: {e}"),
-                        None,
-                    )
-                })?;
+            let authoritative =
+                match decode_authoritative_args(&args.envelope_xdr, "stellar_pay_commit") {
+                    Ok(a) => a,
+                    Err(e) => {
+                        return Ok(crate::tools::common::business_error_result(
+                            "simulation.divergence",
+                            format!("toolset_gated envelope_xdr decode: {e}"),
+                        ));
+                    }
+                };
 
             let summary_to = authoritative
                 .get("destination")
@@ -1708,15 +1745,18 @@ impl WalletServer {
 
             // Decode envelope XDR bytes for SHA-256.
             use base64::Engine as _;
-            let envelope_xdr_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            let envelope_xdr_bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(&args.envelope_xdr)
                 .or_else(|_| base64::engine::general_purpose::STANDARD.decode(&args.envelope_xdr))
-                .map_err(|e| {
-                    rmcp::ErrorData::internal_error(
-                        format!("simulation.divergence: base64 decode: {e}"),
-                        None,
-                    )
-                })?;
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    return Ok(crate::tools::common::business_error_result(
+                        "simulation.divergence",
+                        format!("base64 decode: {e}"),
+                    ));
+                }
+            };
 
             let uid = process_uid_for_attestation().map_err(|e| {
                 rmcp::ErrorData::internal_error(format!("approval.uid_unavailable: {e}"), None)
@@ -1791,7 +1831,7 @@ impl WalletServer {
 
             // Return indistinguishable approval_required (the nonce is in the
             // tracing log for operator forensics; not in the wire error).
-            return Err(approval_required_indistinguishable());
+            return Ok(approval_required_indistinguishable());
         }
 
         // Approval fields present → delegate to the commit path with FORCED

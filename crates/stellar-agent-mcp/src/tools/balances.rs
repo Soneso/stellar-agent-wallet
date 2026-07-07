@@ -202,9 +202,12 @@ impl WalletServer {
         });
         // Read-only tool: RequireApproval produces no signing material; proceed
         // regardless of verdict (only Deny and engine errors are fail-closed via ?).
-        let _ = self
+        if let Err(e) = self
             .dispatch_gate("stellar_balances", &args_value, &args.chain_id)
-            .await?;
+            .await
+        {
+            return e.into_result();
+        }
 
         // ── Validate G-strkey (strict G-only ed25519 public key) ────────────
         // Uses ed25519::PublicKey::from_string (not the permissive Strkey::from_string
