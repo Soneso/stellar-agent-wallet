@@ -47,7 +47,8 @@ use stellar_agent_core::policy::v1::bundle::InnerOpDescriptor;
 
 use crate::SaError;
 use crate::managers::auth_entry::{
-    AuthorizationSimulation, PartialSorobanAuthorizationEntry, build_authorization_entry,
+    AuthorizationSimulation, PartialSorobanAuthorizationEntry, PreSubmitBudget,
+    bound_pre_submit_stage, build_authorization_entry,
     build_authorization_entry_with_sub_invocations, complete_authorization_entry,
 };
 use crate::managers::authorization::collect_quorum_signatures;
@@ -327,7 +328,16 @@ pub struct SubmitInvokeArgs<'a> {
     /// (e.g. `"stellar:testnet"`).
     pub chain_id: &'a str,
 
-    /// Submission polling timeout.
+    /// RPC budget, spent as two independent per-phase budgets. All pre-submit
+    /// RPC stages (initial fetch, initial simulate, re-fetch, re-simulate)
+    /// share ONE collective deadline of this duration, armed once at the first
+    /// pre-submit call; the submit-and-confirm poll then spends its own
+    /// separate budget of this same duration, so the base rule-install path
+    /// worst case is ~2x this value of wall clock. The optional intervening
+    /// checks (rule-expiry, multicall cross-RPC verification) run outside the
+    /// collective pre-submit deadline but consume wall clock after it is armed;
+    /// they carry their own separate budgets, so the ~2x figure describes the
+    /// base path only.
     pub timeout: std::time::Duration,
 
     /// Per-operation fee (stroops). [`ResolvedFeePerOp::default()`] applies
@@ -482,7 +492,8 @@ pub struct SubmitInvokeArgs<'a> {
 /// - [`SaError::RuleExpired`] — `valid_until < latest_ledger` for the expiry
 ///   check rule_id.
 /// - [`SaError::AuthEntryConstructionFailed`] — pubkey fetch, XDR encoding,
-///   simulate, or auth-entry construction failure.
+///   simulate, or auth-entry construction failure, or a pre-submit RPC stage
+///   exceeding the collective pre-submit deadline (`args.timeout`).
 /// - [`SaError::DeploymentFailed`] — simulate error, envelope build, or
 ///   submission failure.
 /// - [`SaError::RuleIdMismatch`] / [`SaError::SimulationDivergence`] — from
@@ -587,9 +598,30 @@ pub async fn submit_signed_invoke(
     let primary_rpc_client = StellarRpcClient::new(args.primary_rpc_url)
         .map_err(|e| auth_payload_err(format!("StellarRpcClient construction failed: {e}")))?;
 
-    let source_view = fetch_account(&primary_rpc_client, &source_pubkey_strkey, &[])
-        .await
-        .map_err(|e| auth_payload_err(format!("source-account fetch failed: {e}")))?;
+    // Pre-submit deadline: a single absolute instant, armed once here, binds
+    // the collective wall-clock budget of the FOUR unconditional pre-submit
+    // RPC stages this path always runs — the initial account fetch, the
+    // initial simulate, and the re-fetch + re-simulate inside
+    // `resimulate_with_signed_auth` (see `PreSubmitBudget` /
+    // `bound_pre_submit_stage`). Those four share this SAME deadline rather
+    // than each re-arming a fresh `args.timeout` window. The optional
+    // intervening checks (the rule-expiry check and the multicall cross-RPC
+    // verification, including its secondary-RPC simulate) are NOT bounded by
+    // this deadline — they run after it is armed and carry their own budgets.
+    // The final submit+poll stage (`submit_transaction_and_wait`) likewise
+    // keeps its own, separate `args.timeout` budget.
+    let pre_submit_budget = PreSubmitBudget {
+        deadline: tokio::time::Instant::now() + args.timeout,
+        total: args.timeout,
+    };
+
+    let source_view = bound_pre_submit_stage(
+        pre_submit_budget,
+        "fetch_account_initial",
+        fetch_account(&primary_rpc_client, &source_pubkey_strkey, &[]),
+    )
+    .await?
+    .map_err(|e| auth_payload_err(format!("source-account fetch failed: {e}")))?;
 
     let mut source_account = BaselibAccount::new(
         &source_pubkey_strkey,
@@ -610,10 +642,13 @@ pub async fn submit_signed_invoke(
     let sim_envelope = tx_for_simulate
         .to_envelope()
         .map_err(|e| auth_payload_err(format!("to_envelope failed: {e:?}")))?;
-    let sim_response = server
-        .simulate_transaction_envelope(&sim_envelope, None)
-        .await
-        .map_err(|e| auth_payload_err(format!("simulate_transaction_envelope failed: {e}")))?;
+    let sim_response = bound_pre_submit_stage(
+        pre_submit_budget,
+        "simulate_initial",
+        server.simulate_transaction_envelope(&sim_envelope, None),
+    )
+    .await?
+    .map_err(|e| auth_payload_err(format!("simulate_transaction_envelope failed: {e}")))?;
 
     // ── Step 3 continued: Option<*Check> dispatch ─────────────────────────────
     //
@@ -1147,6 +1182,12 @@ pub async fn submit_signed_invoke(
     // Re-simulate with signed auth entries to obtain a footprint that includes
     // __check_auth storage reads. Without this, submission traps with
     // "trying to access contract data key outside of the footprint".
+    //
+    // `pre_submit_budget` carries the same collective deadline armed at the
+    // top of this function, so the re-fetch and re-simulate inside
+    // `resimulate_with_signed_auth` share that budget with the stages already
+    // run above (initial fetch, initial simulate, and the off-chain signing
+    // step just completed).
     let resim_response = resimulate_with_signed_auth(
         &server,
         &primary_rpc_client,
@@ -1156,6 +1197,7 @@ pub async fn submit_signed_invoke(
         auth_entries.clone(),
         &source_pubkey_strkey,
         args.network_passphrase,
+        pre_submit_budget,
     )
     .await?;
 
@@ -1242,6 +1284,7 @@ pub async fn submit_signed_invoke(
         );
     }
 
+    let sa_submit_timing_t_submit = std::time::Instant::now();
     let submission = submit_transaction_and_wait(
         &primary_rpc_client,
         &final_signed_xdr,
@@ -1254,6 +1297,13 @@ pub async fn submit_signed_invoke(
         phase: "submit",
         redacted_reason: format!("{} submission failed: {e}", args.op_label),
     })?;
+    tracing::debug!(
+        target: "sa_submit_timing",
+        stage = "submit_and_wait",
+        elapsed_ms = u64::try_from(sa_submit_timing_t_submit.elapsed().as_millis())
+            .unwrap_or(u64::MAX),
+        "sa_submit_timing: submit+poll stage elapsed (separate args.timeout budget)"
+    );
 
     if args.emit_observability_logs {
         let op = args.op_label;

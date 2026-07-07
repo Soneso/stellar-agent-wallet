@@ -1128,6 +1128,64 @@ pub(crate) async fn build_and_sign_delegated_g_key_entry(
     })
 }
 
+/// The collective pre-submit deadline shared across every pre-submit RPC
+/// stage of a single `submit_signed_invoke` call.
+///
+/// `deadline` is the absolute instant (`Instant::now() + args.timeout`)
+/// computed once at the top of `submit_signed_invoke`; `total` is the
+/// `args.timeout` value it was derived from, carried only for the budget
+/// figure in the timeout error message. `Copy`, so it threads through the
+/// pre-submit call sites — including [`resimulate_with_signed_auth`] — as one
+/// argument.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreSubmitBudget {
+    /// Absolute instant past which a pre-submit stage is refused.
+    pub deadline: tokio::time::Instant,
+    /// The `args.timeout` value `deadline` was derived from.
+    pub total: std::time::Duration,
+}
+
+/// Bounds one pre-submit RPC stage against the collective [`PreSubmitBudget`]
+/// and records its wall-clock duration on the `sa_submit_timing` debug span.
+///
+/// Every pre-submit stage on the submit path — the initial fetch, the initial
+/// simulate, the re-fetch, and the re-simulate — shares ONE `budget.deadline`
+/// rather than each re-arming a fresh `args.timeout` window, so time spent in
+/// an earlier stage (including the off-chain auth-entry signing step between
+/// simulate and re-simulate) shrinks the budget left for a later one. A stage
+/// can therefore elapse because earlier stages consumed the collective budget,
+/// not because that stage itself ran long — the timeout message says
+/// "collective" for that reason.
+///
+/// On elapse, returns [`SaError::AuthEntryConstructionFailed`] with
+/// `stage: "auth_payload"` — the same stage tag the non-timeout
+/// transport-error mapping at each call site already uses, so a timed-out
+/// pre-submit stage and a transport failure at that stage surface through the
+/// identical error variant.
+pub(crate) async fn bound_pre_submit_stage<T>(
+    budget: PreSubmitBudget,
+    stage: &'static str,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T, SaError> {
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout_at(budget.deadline, fut)
+        .await
+        .map_err(|_elapsed| SaError::AuthEntryConstructionFailed {
+            stage: "auth_payload",
+            redacted_reason: format!(
+                "{stage} exceeded collective pre-submit budget of {}s",
+                budget.total.as_secs()
+            ),
+        });
+    tracing::debug!(
+        target: "sa_submit_timing",
+        stage,
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "sa_submit_timing: pre-submit stage elapsed"
+    );
+    outcome
+}
+
 /// Re-simulates the InvokeHostFunction op with the signed smart-account
 /// auth entry attached, returning the new simulation response. The new
 /// response's `transaction_data` carries the proper footprint (including
@@ -1142,11 +1200,17 @@ pub(crate) async fn build_and_sign_delegated_g_key_entry(
 /// traps with `OpInner(InvokeHostFunction(Trapped))` and the on-chain
 /// diagnostic reports "trying to access contract data key outside of
 /// the footprint".
+///
+/// `budget` carries the collective pre-submit deadline `submit_signed_invoke`
+/// computes once at function entry (see [`PreSubmitBudget`]) — the re-fetch
+/// and re-simulate below are bounded against that same deadline, not a fresh
+/// per-call timeout.
 #[allow(
     clippy::too_many_arguments,
-    reason = "irreducible RPC + smart-account + auth-entry-list + source-account context required \
-              for the off-chain re-simulate-with-signed-auth flow; collapsing into a struct would \
-              hide the per-call lifetime contracts of `&Server` and `&StellarRpcClient`"
+    reason = "irreducible RPC + smart-account + auth-entry-list + source-account + \
+              pre-submit-budget context required for the off-chain re-simulate-with-signed-auth \
+              flow; collapsing the borrows into a struct would hide the per-call lifetime \
+              contracts of `&Server` and `&StellarRpcClient`"
 )]
 pub(crate) async fn resimulate_with_signed_auth(
     server: &Client,
@@ -1157,6 +1221,7 @@ pub(crate) async fn resimulate_with_signed_auth(
     signed_auth_entries: Vec<SorobanAuthorizationEntry>,
     source_account_strkey: &str,
     network_passphrase: &str,
+    budget: PreSubmitBudget,
 ) -> Result<stellar_rpc_client::SimulateTransactionResponse, SaError> {
     let auth_payload_err = |reason: String| SaError::AuthEntryConstructionFailed {
         stage: "auth_payload",
@@ -1185,9 +1250,13 @@ pub(crate) async fn resimulate_with_signed_auth(
     // its sequence stable but build_for_simulation reads `current+1`, and
     // we want a fresh BaselibAccount snapshot that mirrors the final
     // submitted tx's source-account state.
-    let source_view = fetch_account(rpc_client, source_account_strkey, &[])
-        .await
-        .map_err(|e| auth_payload_err(format!("re-simulate: source-account fetch failed: {e}")))?;
+    let source_view = bound_pre_submit_stage(
+        budget,
+        "fetch_account_resimulate",
+        fetch_account(rpc_client, source_account_strkey, &[]),
+    )
+    .await?
+    .map_err(|e| auth_payload_err(format!("re-simulate: source-account fetch failed: {e}")))?;
     let mut source_account = BaselibAccount::new(
         source_account_strkey,
         &source_view.sequence_number.to_string(),
@@ -1202,14 +1271,17 @@ pub(crate) async fn resimulate_with_signed_auth(
     let resim_envelope = resim_tx
         .to_envelope()
         .map_err(|e| auth_payload_err(format!("re-simulate: to_envelope failed: {e:?}")))?;
-    let resim_response = server
-        .simulate_transaction_envelope(&resim_envelope, None)
-        .await
-        .map_err(|e| {
-            auth_payload_err(format!(
-                "re-simulate: simulate_transaction_envelope failed: {e}"
-            ))
-        })?;
+    let resim_response = bound_pre_submit_stage(
+        budget,
+        "simulate_resimulate",
+        server.simulate_transaction_envelope(&resim_envelope, None),
+    )
+    .await?
+    .map_err(|e| {
+        auth_payload_err(format!(
+            "re-simulate: simulate_transaction_envelope failed: {e}"
+        ))
+    })?;
 
     if let Some(sim_error) = &resim_response.error {
         return Err(SaError::DeploymentFailed {
@@ -2447,6 +2519,81 @@ mod tests {
                     "sub-entries must be Delegated G-key (Account) entries"
                 );
             }
+        }
+    }
+
+    // ── bound_pre_submit_stage ────────────────────────────────────────────────
+
+    /// A future that resolves well within the deadline passes its `Ok` value
+    /// through unchanged.
+    #[tokio::test]
+    async fn bound_pre_submit_stage_passes_through_ok_before_deadline() {
+        let budget = PreSubmitBudget {
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            total: std::time::Duration::from_secs(30),
+        };
+        let outcome: Result<Result<u32, &str>, SaError> =
+            bound_pre_submit_stage(budget, "unit_test_stage", async { Ok::<u32, &str>(7) }).await;
+
+        let inner = outcome.expect("the outer timeout must not fire before the deadline");
+        assert_eq!(inner, Ok(7));
+    }
+
+    /// A future that resolves well within the deadline surfaces its `Err`
+    /// value unchanged (the timeout wrapper is transparent to the inner
+    /// `Result`).
+    #[tokio::test]
+    async fn bound_pre_submit_stage_passes_through_inner_err_before_deadline() {
+        let budget = PreSubmitBudget {
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            total: std::time::Duration::from_secs(30),
+        };
+        let outcome = bound_pre_submit_stage(budget, "unit_test_stage", async {
+            Err::<u32, &str>("inner transport failure")
+        })
+        .await
+        .expect("the outer timeout must not fire before the deadline");
+
+        assert_eq!(outcome.unwrap_err(), "inner transport failure");
+    }
+
+    /// A deadline that has already elapsed before the future is polled
+    /// surfaces `SaError::AuthEntryConstructionFailed { stage: "auth_payload" }`
+    /// with the stage description and configured budget in the message —
+    /// never the inner future's own `Ok`/`Err` outcome.
+    #[tokio::test]
+    async fn bound_pre_submit_stage_times_out_when_deadline_already_elapsed() {
+        // A deadline in the past: `Instant::now() - a small duration`.
+        let budget = PreSubmitBudget {
+            deadline: tokio::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .expect("test host clock must be well past 1 second of monotonic time"),
+            total: std::time::Duration::from_secs(45),
+        };
+        // The inner future sleeps past any reasonable poll granularity so a
+        // same-poll fast-path resolution cannot mask the timeout.
+        let result: Result<Result<u32, &str>, SaError> =
+            bound_pre_submit_stage(budget, "unit_test_elapsed_stage", async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                Ok::<u32, &str>(1)
+            })
+            .await;
+
+        let err = result.expect_err("an already-elapsed deadline must surface a timeout error");
+        match err {
+            SaError::AuthEntryConstructionFailed {
+                stage,
+                redacted_reason,
+            } => {
+                assert_eq!(stage, "auth_payload");
+                assert!(
+                    redacted_reason.contains("unit_test_elapsed_stage")
+                        && redacted_reason.contains("exceeded collective pre-submit budget of 45s"),
+                    "redacted_reason must name the stage and the configured budget: \
+                     {redacted_reason}"
+                );
+            }
+            other => panic!("expected AuthEntryConstructionFailed; got {other:?}"),
         }
     }
 }
