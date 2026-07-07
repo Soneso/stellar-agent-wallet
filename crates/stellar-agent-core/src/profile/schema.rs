@@ -663,7 +663,7 @@ pub struct Profile {
     ///
     /// A per-profile reference to the OS keyring entry that holds the BIP-39
     /// mnemonic (or equivalent 64-byte seed) used to deterministically derive
-    /// channel account keypairs via `stellar-agent-derive`
+    /// channel account keypairs via `stellar-agent-sep5`
     /// (`Sep5Wallet::from_bip39_seed`, path `m/44'/148'/<index>'`).
     ///
     /// Channel private keys are never persisted individually; they are
@@ -749,7 +749,7 @@ impl PoolChannelRecord {
 /// # Secret discipline
 ///
 /// No secrets here.  Channel private keys are re-derived on demand from the
-/// keyring master at `m/44'/148'/<index>'` via `stellar-agent-derive`.
+/// keyring master at `m/44'/148'/<index>'` via `stellar-agent-sep5`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct PoolConfig {

@@ -56,7 +56,6 @@ mod live {
     use rand_core::OsRng;
     use stellar_agent_core::StellarAmount;
     use stellar_agent_core::observability::redact_strkey_first5_last5;
-    use stellar_agent_derive::Sep5Wallet;
     use stellar_agent_network::builder::Asset;
     use stellar_agent_network::{
         ClassicOpBuilder, SoftwareSigningKey, StellarRpcClient, fetch_account, fund_with_friendbot,
@@ -65,6 +64,7 @@ mod live {
     use stellar_agent_pool::pool::ChannelPool;
     use stellar_agent_pool::submit::submit_pooled;
     use stellar_agent_pool::{ChannelRecord, PoolError};
+    use stellar_agent_sep5::Sep5Wallet;
     use stellar_strkey::ed25519::PublicKey as StrPublicKey;
     use tokio::task::JoinSet;
     use zeroize::Zeroizing;

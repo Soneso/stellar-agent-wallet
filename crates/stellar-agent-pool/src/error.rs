@@ -91,9 +91,9 @@ pub enum PoolError {
 
     /// Channel key derivation failed.
     ///
-    /// Wraps [`stellar_agent_derive::DeriveError`].
+    /// Wraps [`stellar_agent_sep5::DeriveError`].
     #[error("pool.derive_failed: {0}")]
-    DeriveFailed(#[from] stellar_agent_derive::DeriveError),
+    DeriveFailed(#[from] stellar_agent_sep5::DeriveError),
 
     /// An underlying wallet error propagated from network / signing / core.
     #[error("pool.wallet_error: {0}")]

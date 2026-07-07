@@ -40,11 +40,11 @@ Crates form a directed acyclic graph from foundational substrate up to the two b
 
 ### Layer 0 — substrate
 
-`stellar-agent-core`, `stellar-agent-network` (depends on `core`), `stellar-agent-derive`, `stellar-agent-xdr-limits`, and `stellar-agent-nonce`. These carry the typed errors, amounts, envelopes, RPC transport, key derivation, untrusted-XDR bounds, and replay-nonce primitives that every higher layer builds on. `xdr-limits`, `derive`, and `nonce` are independent leaves; `network` depends on `core`.
+`stellar-agent-core`, `stellar-agent-network` (depends on `core`), `stellar-agent-sep5`, `stellar-agent-xdr-limits`, and `stellar-agent-nonce`. These carry the typed errors, amounts, envelopes, RPC transport, key derivation, untrusted-XDR bounds, and replay-nonce primitives that every higher layer builds on. `xdr-limits`, `sep5`, and `nonce` are independent leaves; `network` depends on `core`.
 
 ### Layer 1 — orchestration and platform
 
-`stellar-agent-smart-account` (off-chain orchestration over OpenZeppelin `stellar-accounts`), `stellar-agent-webauthn-bridge` (loopback HTTP listener into the core approval store), `stellar-agent-loopback-http` (shared loopback-HTTP middleware behind the browser-facing listeners), `stellar-agent-approval-ui` and `stellar-agent-approval-remote` (the loopback and TLS-plus-passkey operator approval surfaces), `stellar-agent-claimable` (claimable-balance domain logic over `core`/`network`), `stellar-agent-pool` (channel-account pool over `core`/`network`/`derive`), and `stellar-agent-windows-identity` (platform leaf).
+`stellar-agent-smart-account` (off-chain orchestration over OpenZeppelin `stellar-accounts`), `stellar-agent-webauthn-bridge` (loopback HTTP listener into the core approval store), `stellar-agent-loopback-http` (shared loopback-HTTP middleware behind the browser-facing listeners), `stellar-agent-approval-ui` and `stellar-agent-approval-remote` (the loopback and TLS-plus-passkey operator approval surfaces), `stellar-agent-claimable` (claimable-balance domain logic over `core`/`network`), `stellar-agent-pool` (channel-account pool over `core`/`network`/`sep5`), and `stellar-agent-windows-identity` (platform leaf).
 
 ### Layer 2 — protocol and SEP crates
 
@@ -76,7 +76,7 @@ Both binaries share a single release archive. The `[package.metadata.binstall]` 
 | `stellar-agent-core` | Synchronous, runtime-free substrate: typed amounts, nine-category `WalletError`, JSON `Envelope`, profiles, observability, smart-account auth-digest helpers, the policy-engine trait and Noop/V1 implementations, the approval spine, and the audit log. |
 | `stellar-agent-network` | Async Stellar RPC client, account-view projection, transaction assembly, SEP-29 memo enforcement, hardware-signer preparation, Friendbot funding, and the idempotent submit primitive. |
 | `stellar-agent-claimable` | Claimable-balance domain logic: balance-id normalization, predicate evaluation, entry and trustline fetch, and claim preview; drives the `claim` verb. |
-| `stellar-agent-derive` | SEP-5 / BIP-44 HD ed25519 key derivation (`m/44'/148'/index'`, SLIP-0010 hardened) from a BIP-39 mnemonic or seed; no I/O or RNG. |
+| `stellar-agent-sep5` | SEP-5 / BIP-44 HD ed25519 key derivation (`m/44'/148'/index'`, SLIP-0010 hardened) from a BIP-39 mnemonic or seed; no I/O or RNG. |
 | `stellar-agent-xdr-limits` | Leaf crate supplying recursion-depth and length bounds for decoding untrusted XDR. |
 | `stellar-agent-nonce` | HMAC-SHA256 wallet-issued nonce, in-memory TTL replay window, `ToolCatalogue` trait, and nonce-key rotation. |
 | `stellar-agent-smart-account` | Off-chain orchestration over OpenZeppelin `stellar-accounts`: deployment, context-rule install, WebAuthn passkey signer, threshold updates, wasm-hash pinning, verifier migration, multicall, upgrade timelock. |
@@ -111,7 +111,7 @@ Both binaries share a single release archive. The `[package.metadata.binstall]` 
 ## Crate classification
 
 - **Binaries (2):** `stellar-agent-cli` (binary `stellar-agent`) and `stellar-agent-mcp` (binary `stellar-agent-mcp`, plus a library re-export for integration tests).
-- **Plain libraries:** `core`, `network`, `claimable`, `derive`, `xdr-limits`, `nonce`, `smart-account`, `webauthn-bridge`, `loopback-http`, `approval-ui`, `approval-remote`, `pool`, `sep7`, `sep10`, `sep43`, `sep45`, `sep48`, `sep53`, `anchor`, `toolsets`, `toolsets-install`, `toolsets-runtime`, `defi`, `blend`, `defindex`, `dex`, `stablecoin`, `x402`, `x402-identity`.
+- **Plain libraries:** `core`, `network`, `claimable`, `sep5`, `xdr-limits`, `nonce`, `smart-account`, `webauthn-bridge`, `loopback-http`, `approval-ui`, `approval-remote`, `pool`, `sep7`, `sep10`, `sep43`, `sep45`, `sep48`, `sep53`, `anchor`, `toolsets`, `toolsets-install`, `toolsets-runtime`, `defi`, `blend`, `defindex`, `dex`, `stablecoin`, `x402`, `x402-identity`.
 - **Proc-macro library:** `mcp-macros`, the compiler-plugin companion to the `inventory` runtime in `mcp`.
 - **Platform-gated:** `windows-identity`, target-gated to `cfg(target_os = "windows")`. It uses `unsafe` for Win32 FFI as its core capability and is absent off Windows. (The CLI also carries a narrowly-scoped `#[allow(unsafe_code)]` for a POSIX `geteuid` FFI declaration in the audit-verify owner check.)
 - **Dev-only:** `test-support`, consumed strictly as a `[dev-dependencies]` entry behind gated test-harness features and never as a runtime dependency.

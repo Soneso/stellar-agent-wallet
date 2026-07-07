@@ -45,7 +45,7 @@ stellar-agent-claimable = { workspace = true }
 # Channel-account pool subcommands (pool init / list / status).
 stellar-agent-pool = { workspace = true }
 # SEP-5 HD-path derivation for pool channel keypairs.
-stellar-agent-derive = { workspace = true }
+stellar-agent-sep5 = { workspace = true }
 # Toolset install/uninstall with cryptographic provenance.
 stellar-agent-toolsets-install = { workspace = true }
 # Capability-to-tool matrix + enforcement for toolsets.

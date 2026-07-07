@@ -21,15 +21,15 @@
 //! over a BIP-39 seed.  Channel indices start at 1; index 0 is reserved for
 //! the wallet's primary account.
 //!
-//! Cited from `stellar-agent-derive` which cites SLIP-0010 §"Hardened child
+//! Cited from `stellar-agent-sep5` which cites SLIP-0010 §"Hardened child
 //! key derivation" + SEP-5 §"Multi-Account Hierarchy for Deterministic Wallets".
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use keyring_core::Entry as KeyringEntry;
 use secrecy::ExposeSecret;
-use stellar_agent_derive::Sep5Wallet;
 use stellar_agent_network::SoftwareSigningKey;
+use stellar_agent_sep5::Sep5Wallet;
 use zeroize::Zeroizing;
 
 use crate::error::PoolError;

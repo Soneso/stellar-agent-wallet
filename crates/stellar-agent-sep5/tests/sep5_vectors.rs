@@ -20,7 +20,7 @@
     reason = "test-only; panics and unwraps are acceptable in integration tests"
 )]
 
-use stellar_agent_derive::{DeriveError, Sep5Wallet};
+use stellar_agent_sep5::{DeriveError, Sep5Wallet};
 use zeroize::Zeroizing;
 
 // ─── helpers ─────────────────────────────────────────────────────────────────

@@ -47,7 +47,7 @@ mod live {
     use stellar_strkey::ed25519::PublicKey as StrPublicKey;
     use zeroize::Zeroizing;
 
-    use stellar_agent_derive::Sep5Wallet;
+    use stellar_agent_sep5::Sep5Wallet;
 
     const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
     const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";

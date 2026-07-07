@@ -4727,11 +4727,11 @@ dependencies = [
  "stellar-agent-core",
  "stellar-agent-defi",
  "stellar-agent-defindex",
- "stellar-agent-derive",
  "stellar-agent-dex",
  "stellar-agent-network",
  "stellar-agent-nonce",
  "stellar-agent-pool",
+ "stellar-agent-sep5",
  "stellar-agent-smart-account",
  "stellar-agent-stablecoin",
  "stellar-agent-test-support",
@@ -4834,21 +4834,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "zeroize",
-]
-
-[[package]]
-name = "stellar-agent-derive"
-version = "0.1.0-alpha.2"
-dependencies = [
- "bip39",
- "ed25519-dalek",
- "hex",
- "hmac 0.13.0",
- "secrecy",
- "sha2 0.11.0",
- "stellar-strkey 0.0.18",
- "thiserror 2.0.18",
  "zeroize",
 ]
 
@@ -5031,8 +5016,8 @@ dependencies = [
  "serde_json",
  "serial_test",
  "stellar-agent-core",
- "stellar-agent-derive",
  "stellar-agent-network",
+ "stellar-agent-sep5",
  "stellar-agent-test-support",
  "stellar-strkey 0.0.18",
  "stellar-xdr 27.0.0",
@@ -5125,6 +5110,21 @@ dependencies = [
  "tracing",
  "wasmparser 0.116.1",
  "wiremock",
+]
+
+[[package]]
+name = "stellar-agent-sep5"
+version = "0.1.0-alpha.2"
+dependencies = [
+ "bip39",
+ "ed25519-dalek",
+ "hex",
+ "hmac 0.13.0",
+ "secrecy",
+ "sha2 0.11.0",
+ "stellar-strkey 0.0.18",
+ "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]

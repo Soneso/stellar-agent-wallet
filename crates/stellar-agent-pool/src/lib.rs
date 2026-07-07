@@ -5,7 +5,7 @@
 //! Provides a set of pre-funded Stellar accounts (`channels`) whose sequence
 //! numbers are managed in-pool to allow concurrent transaction submission
 //! without `tx_bad_seq` errors.  The pool is SEP-5-derived
-//! (`m/44'/148'/<index>'` via `stellar-agent-derive`) from a pool master seed
+//! (`m/44'/148'/<index>'` via `stellar-agent-sep5`) from a pool master seed
 //! held in the OS keyring.
 //!
 //! Key operations:
@@ -30,7 +30,7 @@
 //!
 //! - Does not submit transactions; submission is `stellar-agent-network`'s
 //!   responsibility.
-//! - Does not generate mnemonics; derivation is `stellar-agent-derive`'s
+//! - Does not generate mnemonics; derivation is `stellar-agent-sep5`'s
 //!   responsibility.
 //! - Does not hold channel secrets persistently; secrets are re-derived on
 //!   demand from the pool master in the OS keyring.
@@ -38,7 +38,7 @@
 //! ## Sibling crates
 //!
 //! - `stellar-agent-network` — RPC transport, submission, account fetch.
-//! - `stellar-agent-derive` — SEP-5 HD-path derivation.
+//! - `stellar-agent-sep5` — SEP-5 HD-path derivation.
 //! - `stellar-agent-core` — profile, audit log, error taxonomy.
 
 #![deny(unsafe_code)]

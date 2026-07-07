@@ -63,7 +63,7 @@ impl Sep5Wallet {
     /// # Examples
     ///
     /// ```rust
-    /// # use stellar_agent_derive::Sep5Wallet;
+    /// # use stellar_agent_sep5::Sep5Wallet;
     /// let wallet = Sep5Wallet::from_mnemonic(
     ///     "illness spike retreat truth genius clock brain pass fit cave bargain toe",
     ///     "",
@@ -103,7 +103,7 @@ impl Sep5Wallet {
     /// # Examples
     ///
     /// ```rust
-    /// # use stellar_agent_derive::Sep5Wallet;
+    /// # use stellar_agent_sep5::Sep5Wallet;
     /// # use zeroize::Zeroizing;
     /// // The Zeroizing wrapper is consumed; no bare-array temporary forms.
     /// let seed = Zeroizing::new([0u8; 64]);
@@ -133,7 +133,7 @@ impl Sep5Wallet {
     /// # Examples
     ///
     /// ```rust
-    /// # use stellar_agent_derive::Sep5Wallet;
+    /// # use stellar_agent_sep5::Sep5Wallet;
     /// let wallet = Sep5Wallet::from_mnemonic(
     ///     "illness spike retreat truth genius clock brain pass fit cave bargain toe",
     ///     "",

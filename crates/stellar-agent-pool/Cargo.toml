@@ -36,7 +36,7 @@ keyring-core          = { workspace = true }
 # Stellar agent workspace crates
 stellar-agent-core    = { workspace = true }
 stellar-agent-network = { workspace = true }
-stellar-agent-derive  = { workspace = true }
+stellar-agent-sep5  = { workspace = true }
 
 [dev-dependencies]
 tokio                      = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

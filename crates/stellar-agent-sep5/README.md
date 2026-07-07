@@ -1,4 +1,4 @@
-# stellar-agent-derive
+# stellar-agent-sep5
 
 SEP-5 / BIP-44 HD-path ed25519 key derivation for Stellar.
 

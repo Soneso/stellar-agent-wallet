@@ -35,7 +35,7 @@ use stellar_agent_pool::pool::{ChannelPool, TerminalOutcome};
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
 /// Known-valid G-strkeys verified against stellar-agent-network builder.rs +
-/// stellar-agent-derive SEP-5 test vectors.
+/// stellar-agent-sep5 SEP-5 test vectors.
 const TEST_KEYS: &[&str] = &[
     "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY", // seed=[1u8;32]
     "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL", // seed=[2u8;32]

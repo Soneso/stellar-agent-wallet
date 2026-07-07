@@ -33,7 +33,7 @@ FLOORS = {
     "stellar-agent-core": 91,
     "stellar-agent-defi": 88,
     "stellar-agent-defindex": 60,
-    "stellar-agent-derive": 97,
+    "stellar-agent-sep5": 97,
     "stellar-agent-dex": 74,
     "stellar-agent-loopback-http": 95,
     "stellar-agent-mcp": 46,

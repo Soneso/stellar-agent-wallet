@@ -13,7 +13,7 @@
 //! - The pool master 64-byte seed lives ONLY in the OS keyring (URL-safe
 //!   base64, no padding — same encoding as `profile/key_ops.rs` rotate helpers).
 //! - Channel private keys are NEVER persisted; re-derived on demand from the
-//!   keyring master at `m/44'/148'/<index>'` via `stellar-agent-derive`.
+//!   keyring master at `m/44'/148'/<index>'` via `stellar-agent-sep5`.
 //! - The init result JSON contains: funder (redacted), channel G-strkeys
 //!   (public), channel_count, tx_hash (redacted), ledger.  NO seed bytes.
 //!
@@ -60,13 +60,13 @@ use stellar_agent_core::error::{AuthError, InternalError, ValidationError, Walle
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_core::profile::loader::{self, ProfileLoadError};
 use stellar_agent_core::profile::schema::{KeyringEntryRef, PoolChannelRecord, PoolConfig};
-use stellar_agent_derive::Sep5Wallet;
 use stellar_agent_network::{
     SoftwareSigningKey, StellarRpcClient, fetch_account, keyring::signer_from_keyring,
 };
 use stellar_agent_pool::PoolError;
 use stellar_agent_pool::derive::derive_channel_signer;
 use stellar_agent_pool::init::{InitParams, init_pool};
+use stellar_agent_sep5::Sep5Wallet;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -284,7 +284,7 @@ pub async fn run(args: &PoolInitArgs) -> i32 {
     let mut channel_indices: Vec<u32> = Vec::with_capacity(n);
 
     for idx in 1..=(n as u32) {
-        let derived: stellar_agent_derive::DerivedAccount = match wallet.derive_account(idx) {
+        let derived: stellar_agent_sep5::DerivedAccount = match wallet.derive_account(idx) {
             Ok(d) => d,
             Err(e) => {
                 let err = pool_err_to_wallet_err(&PoolError::from(e));
