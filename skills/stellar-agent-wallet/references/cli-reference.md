@@ -63,7 +63,7 @@ Account-management group. Subcommands: `create`, `deploy-c`.
 
 ### `accounts create [NEW_G_STRKEY] [flags]`
 
-Creates a new account in one of two mutually exclusive modes: sponsored `CreateAccount`, or Friendbot funding. Sponsored mode signs with the sponsor key; Friendbot mode signs nothing. Only `testnet` is accepted.
+Creates a new account in one of two mutually exclusive modes: sponsored `CreateAccount`, or Friendbot funding. Sponsored mode signs with the sponsor key; Friendbot mode signs nothing. `mainnet` parses but is structurally refused (sponsored: `network.mainnet_write_forbidden`; Friendbot: `network.friendbot_mainnet_forbidden`).
 
 Argument groups (parser-enforced): mode (exactly one) `--sponsor` xor `--fund-with-friendbot`; account (exactly one) positional `<NEW_G_STRKEY>` xor `--generate`; signer (sponsored) `--secret-env` xor `--sign-with-ledger`.
 
@@ -89,7 +89,7 @@ stellar-agent accounts create --generate --sponsor GABC...WXYZ \
 
 ### `accounts deploy-c [flags]`
 
-Deploys a new OpenZeppelin smart-account (C-account) contract via `CreateContractV2`; the genesis signer is installed through the contract `__constructor`. Signs source-account credentials with the deployer key (except `--dry-run`, which derives the C-strkey deterministically with no signing or RPC). Only `testnet` accepted.
+Deploys a new OpenZeppelin smart-account (C-account) contract via `CreateContractV2`; the genesis signer is installed through the contract `__constructor`. Signs source-account credentials with the deployer key (except `--dry-run`, which derives the C-strkey deterministically with no signing or RPC). `mainnet` parses but is structurally refused for writes.
 
 Argument groups: deployer (exactly one) `--deployer-secret-env` xor `--sign-with-ledger`; salt (at most one) `--salt-hex` xor `--salt-random` (random when neither given); genesis signer source (exactly one) `--initial-signer` xor `--signer-webauthn` xor `--signer-ed25519` xor `--signer-external` (with `--signer-key-data`). `__constructor` takes a single-element signer vec, so exactly one genesis signer is ever installed.
 
@@ -120,7 +120,7 @@ stellar-agent accounts deploy-c --initial-signer GABC...WXYZ \
 
 ## pay
 
-`pay <DESTINATION> <AMOUNT> [ASSET] [flags]` — sends a classic payment, enforcing SEP-29 memo-required before signing. By default builds, signs, and submits atomically. Only `testnet` accepted. `--use-oz-relayer` is not implemented and declines.
+`pay <DESTINATION> <AMOUNT> [ASSET] [flags]` — sends a classic payment, enforcing SEP-29 memo-required before signing. By default builds, signs, and submits atomically. `mainnet` parses but is structurally refused for writes. `--use-oz-relayer` is not implemented and declines.
 
 Staged pipeline (mutually exclusive): `--build-only` emits unsigned envelope XDR and exits; `--sign-only <XDR>` signs a prebuilt envelope and emits signed XDR; `--submit-only <XDR>` submits a pre-signed envelope.
 
@@ -186,7 +186,7 @@ stellar-agent trustline --from GABC...WXYZ --asset USDC --profile default
 
 ## claim
 
-`claim <BALANCE_ID> [flags]` — claims a Stellar `ClaimClaimableBalance` operation for a balance the agent already holds the id of. Enforces the claim guards (claimant membership, predicate satisfaction, non-native trustline state, native-XLM fee affordability) before signing. Only `testnet` accepted. Same three-stage pipeline as `pay`: `--build-only` emits unsigned envelope XDR and exits; `--sign-only <XDR>` signs a prebuilt envelope; `--submit-only <XDR>` submits a pre-signed envelope; the default runs all three atomically.
+`claim <BALANCE_ID> [flags]` — claims a Stellar `ClaimClaimableBalance` operation for a balance the agent already holds the id of. Enforces the claim guards (claimant membership, predicate satisfaction, non-native trustline state, native-XLM fee affordability) before signing. `mainnet` parses but is structurally refused for writes. Same three-stage pipeline as `pay`: `--build-only` emits unsigned envelope XDR and exits; `--sign-only <XDR>` signs a prebuilt envelope; `--submit-only <XDR>` submits a pre-signed envelope; the default runs all three atomically.
 
 | Flag / arg | Meaning | Default |
 |---|---|---|
@@ -196,7 +196,7 @@ stellar-agent trustline --from GABC...WXYZ --asset USDC --profile default
 | `--secret-env <VAR>` | Env-var name holding source S-strkey | — |
 | `--sign-with-ledger` / `--account-index <INDEX>` | Ledger signer / BIP index | `false` / `0` |
 | `--build-only` / `--sign-only <XDR>` / `--submit-only <XDR>` | Stage selection (at most one) | — |
-| `--network` | Only `testnet` accepted | `testnet` |
+| `--network` | `testnet` or `mainnet` (`mainnet` structurally refused for writes) | `testnet` |
 | `--timeout-seconds` / `--rpc-url` / `--output` | shared | as above |
 
 The build stage prints a typed preview (balance id, asset, amount, claimants, `is_claimant`, predicate verdict) to stdout before the guards run, so the operator sees the balance disclosure even when a guard subsequently refuses.

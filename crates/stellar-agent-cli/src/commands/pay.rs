@@ -235,7 +235,8 @@ pub struct PayArgs {
     #[arg(long, value_name = "BASE64_XDR", group = "stage")]
     pub submit_only: Option<String>,
 
-    /// Network to target. Only `testnet` is accepted.
+    /// Network to target. `mainnet` parses but is structurally refused before
+    /// any RPC call or signing (wire code `network.mainnet_write_forbidden`).
     #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
     pub network: TargetNetwork,
 

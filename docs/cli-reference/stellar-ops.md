@@ -31,7 +31,7 @@ Account-management group. Subcommands: `create`, `deploy-c`.
 Creates a new Stellar account in one of two mutually exclusive modes: a sponsored `CreateAccount` operation, or Friendbot funding.
 
 - **Signing.** Sponsored mode signs the `CreateAccount` operation with the sponsor's key. Friendbot mode performs no signing and touches no key.
-- **Network.** `--network` accepts only `testnet`; `mainnet` is structurally refused before any RPC, HTTP, or key access. Sponsored mode returns `network.mainnet_write_forbidden`; Friendbot mode returns `network.friendbot_mainnet_forbidden`. Friendbot funding is testnet-only.
+- **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` is structurally refused before any RPC, HTTP, or key access. Sponsored mode returns `network.mainnet_write_forbidden`; Friendbot mode returns `network.friendbot_mainnet_forbidden`. Friendbot funding is testnet-only.
 - **Account identity.** Provide the new account's G-strkey as the positional argument, or pass `--generate` to mint a fresh ed25519 keypair in-process. Exactly one is required.
 - **Secret-key discipline.** `--generate` returns the new S-strkey in the JSON envelope's `data.secret_key` field. It is never emitted in `--output table` and never logged. Capture it from the JSON output and store it securely; for example, redirect with a restrictive umask: `umask 077 && stellar-agent accounts create --generate ... > secret.json`.
 
@@ -52,7 +52,7 @@ Argument groups (enforced by the parser):
 | `--account-index <INDEX>` | Ledger BIP-32 account index | optional | `0` |
 | `--fund-with-friendbot` | Fund the account via Friendbot (testnet only) | one of the mode group | `false` |
 | `--friendbot-url <URL>` | Friendbot endpoint URL (Friendbot mode) | optional | `https://friendbot.stellar.org` |
-| `--network <NETWORK>` | Target network; only `testnet` accepted | optional | `testnet` |
+| `--network <NETWORK>` | Target network; `testnet` or `mainnet` (`mainnet` parses but is structurally refused for writes) | optional | `testnet` |
 | `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee (sponsored mode) | optional | profile default (100) |
 | `--timeout-seconds <SECONDS>` | Submission timeout (sponsored mode) | optional | `60` |
 | `--rpc-url <URL>` | Soroban RPC endpoint (sponsored mode) | optional | `https://soroban-testnet.stellar.org` |
@@ -76,7 +76,7 @@ stellar-agent accounts create \
 Deploys a new OpenZeppelin smart-account (C-account) contract instance on Soroban via `CreateContractV2`. The genesis signer is installed through the contract's `__constructor`.
 
 - **Signing.** Signs the transaction's source-account credentials with the deployer key. The exception is `--dry-run`, which derives the resulting C-strkey deterministically with no signing and no RPC traffic.
-- **Network.** `--network` accepts only `testnet`; `mainnet` is structurally refused (`network.mainnet_write_forbidden`) before any RPC or key access, with a passphrase-layer refusal at submit as defence in depth.
+- **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` is structurally refused (`network.mainnet_write_forbidden`) before any RPC or key access, with a passphrase-layer refusal at submit as defence in depth.
 - **Salt.** The salt determines the deployed C-strkey. By default a fresh random 32-byte salt is generated. Pass `--salt-hex` to re-derive a known address (for example, recovery or interop verification); the same deployer plus the same salt always recovers the same C-strkey.
 - **Audit.** Pass `--profile` to route deployment entries to that profile's audit-log writer. When omitted, the handler emits no `deploy-c` audit entries.
 - **Genesis signer source.** Exactly one signer is installed at genesis — `__constructor` takes a single-element `Vec<Signer>`. Four mutually exclusive sources cover this: a Delegated (native) G-key, an already-registered WebAuthn passkey by name, a raw External-Ed25519 public key, or a generic External signer against any registered verifier contract. Only the Delegated source is fail-open by default; the other three require an explicit acknowledgement flag because the resulting account has no built-in G-key fallback until a second signer is added post-deploy.
@@ -102,7 +102,7 @@ Argument groups (enforced by the parser):
 | `--salt-hex <HEX64>` | 32-byte salt as 64-char lowercase hex (re-deploy at a known C-strkey) | one of the salt group | — |
 | `--salt-random` | Generate a fresh random 32-byte salt | one of the salt group | random when `--salt-hex` absent |
 | `--profile <NAME>` | Profile whose audit writer receives deploy entries | optional | none |
-| `--network <NETWORK>` | Target network; only `testnet` accepted | optional | `testnet` |
+| `--network <NETWORK>` | Target network; `testnet` or `mainnet` (`mainnet` parses but is structurally refused for writes) | optional | `testnet` |
 | `--rpc-url <URL>` | Soroban RPC endpoint | optional | `https://soroban-testnet.stellar.org` |
 | `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee; see [Shared flags](#shared-flags) | optional | profile default (100) |
 | `--timeout-seconds <SECONDS>` | Submission timeout | optional | `60` |
@@ -139,7 +139,7 @@ stellar-agent accounts deploy-c \
 Sends a payment from a source account to a destination, enforcing SEP-29 memo-required before signing (see [protocols](../protocols.md)).
 
 - **Signing.** By default the command builds, signs, and submits atomically. Three staged flags split the pipeline: `--build-only` emits the unsigned envelope XDR and exits (no signing); `--sign-only <XDR>` signs a prebuilt envelope and emits signed XDR; `--submit-only <XDR>` submits a pre-signed envelope. The stage flags are mutually exclusive.
-- **Network.** `--network` accepts only `testnet`; `mainnet` returns `network.mainnet_write_forbidden` before any RPC call, with a submit-layer URL rejection as defence in depth.
+- **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` returns `network.mainnet_write_forbidden` before any RPC call, with a submit-layer URL rejection as defence in depth.
 - **Relayer.** `--use-oz-relayer` is not implemented in this build. Passing it emits an AGPL-3.0 disclosure to stderr and declines the operation rather than submitting.
 
 Argument groups (enforced by the parser):
@@ -165,7 +165,7 @@ Argument groups (enforced by the parser):
 | `--sign-only <BASE64_XDR>` | Sign the given XDR, emit signed XDR | stage group | — |
 | `--submit-only <BASE64_XDR>` | Submit the given signed XDR | stage group | — |
 | `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee | optional | profile default (100) |
-| `--network <NETWORK>` | Target network; only `testnet` accepted | optional | `testnet` |
+| `--network <NETWORK>` | Target network; `testnet` or `mainnet` (`mainnet` parses but is structurally refused for writes) | optional | `testnet` |
 | `--timeout-seconds <SECONDS>` | Submission timeout | optional | `60` |
 | `--rpc-url <URL>` | Soroban RPC endpoint | optional | `https://soroban-testnet.stellar.org` |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
@@ -201,7 +201,7 @@ asset — an authorized trustline with enough limit headroom exists
   response, or the creating transaction's result).
 - **Signing.** Same staged pipeline as `pay`: atomic by default;
   `--build-only` / `--sign-only <XDR>` / `--submit-only <XDR>` split it.
-- **Network.** `--network` accepts only `testnet`; `mainnet` returns
+- **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` returns
   `network.mainnet_write_forbidden` before any RPC call.
 - **Timing.** The predicate is evaluated against the local clock; on-chain
   validation uses the apply-ledger close time, so a claim previewed near a
@@ -218,7 +218,7 @@ asset — an authorized trustline with enough limit headroom exists
 | `--sign-only <BASE64_XDR>` | Sign the given XDR, emit signed XDR | stage group | — |
 | `--submit-only <BASE64_XDR>` | Submit the given signed XDR | stage group | — |
 | `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee | optional | profile default (100) |
-| `--network <NETWORK>` | Target network; only `testnet` accepted | optional | `testnet` |
+| `--network <NETWORK>` | Target network; `testnet` or `mainnet` (`mainnet` parses but is structurally refused for writes) | optional | `testnet` |
 | `--timeout-seconds <SECONDS>` | Submission timeout | optional | `60` |
 | `--rpc-url <URL>` | Soroban RPC endpoint | optional | `https://soroban-testnet.stellar.org` |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |

@@ -291,7 +291,9 @@ pub struct CreateArgs {
     #[arg(long, group = "mode_group")]
     pub fund_with_friendbot: bool,
 
-    /// Network to target. Only `testnet` is accepted.
+    /// Network to target. `mainnet` parses but is structurally refused before
+    /// any RPC call or signing (sponsored mode: `network.mainnet_write_forbidden`;
+    /// Friendbot mode: `network.friendbot_mainnet_forbidden`).
     #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
     pub network: TargetNetwork,
 

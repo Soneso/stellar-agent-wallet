@@ -44,9 +44,9 @@ Some commands take the profile as a positional argument instead of a flag (the `
 
 ### Network
 
-`--network <NETWORK>` accepts `testnet` (the default) or `mainnet`, case-insensitive; no other value is accepted. The CAIP-2 chain id (`stellar:testnet` or `stellar:mainnet`) drives passphrase resolution and the mainnet-write gate.
+`--network <NETWORK>` accepts `testnet` (the default) or `mainnet`, case-insensitive; no other value is accepted. The CAIP-2 chain id (`stellar:testnet` or `stellar:mainnet`) drives passphrase resolution and the mainnet-write gate. Not every command exposes `--network`: the read-only `balances` command selects its network through `--rpc-url` instead.
 
-`testnet` is the default everywhere. `mainnet` is accepted for read-only commands. Every write or signing command structurally refuses `mainnet` in this alpha — see [Mainnet-write refusal](#mainnet-write-refusal).
+`testnet` is the default everywhere. `mainnet` is accepted for read-only commands, selected via `--network` where the command exposes it or via `--rpc-url` for `balances`. Every write or signing command structurally refuses `mainnet` in this alpha — see [Mainnet-write refusal](#mainnet-write-refusal).
 
 A few commands derive their network from the loaded profile rather than from a `--network` flag (for example `trustline`, which takes `--chain-id <CAIP2>`). This is noted on the relevant page.
 

@@ -17,9 +17,11 @@ first session with Claude Code looks.
 Public alpha, under active development.
 
 - testnet (`stellar:testnet`) is the default network.
-- mainnet (`stellar:mainnet`) is accepted for read-only commands. Every
-  write or signing command structurally refuses mainnet in this alpha, before
-  any RPC call or signing (wire code `network.mainnet_write_forbidden`).
+- mainnet (`stellar:mainnet`) is accepted for read-only commands, selected
+  via `--network` where the command exposes it or via `--rpc-url` for
+  `balances` (which has no `--network` flag). Every write or signing command
+  structurally refuses mainnet in this alpha, before any RPC call or signing
+  (wire code `network.mainnet_write_forbidden`).
 - Friendbot funding is testnet/futurenet only; mainnet is structurally refused.
 
 Release archives and `cargo binstall` assets are published on the

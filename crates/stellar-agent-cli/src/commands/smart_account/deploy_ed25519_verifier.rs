@@ -118,8 +118,8 @@ pub struct DeployEd25519VerifierArgs {
 
     /// Network to target.
     ///
-    /// Only `testnet` is accepted for deployment. Mainnet is structurally
-    /// refused. Default: `testnet`.
+    /// `mainnet` parses but deployment structurally refuses it
+    /// (`network.mainnet_write_forbidden`). Default: `testnet`.
     #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
     pub network: TargetNetwork,
 

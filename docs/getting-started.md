@@ -17,8 +17,10 @@ reads secret keys from a named environment variable, not from the command line.
 ## Network and safety defaults
 
 - `stellar:testnet` is the default network. Friendbot funding is testnet-only.
-- `stellar:mainnet` is accepted for read-only commands, but every write or
-  signing command structurally refuses mainnet (see [Mainnet is refused for
+- `stellar:mainnet` is accepted for read-only commands — selected via
+  `--network` where the command exposes it, or via `--rpc-url` for `balances`
+  (which has no `--network` flag) — but every write or signing command
+  structurally refuses mainnet (see [Mainnet is refused for
   writes](#mainnet-is-refused-for-writes)).
 - CLI commands print a JSON envelope on stdout by default. Exit code is `0` on
   success and `1` on any error; the envelope's `error.code` carries the
