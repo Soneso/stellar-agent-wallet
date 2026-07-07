@@ -148,6 +148,8 @@ enum Commands {
     /// - `profile show <name>` — print a profile's resolved configuration.
     /// - `profile migrate <name>` — migrate a profile schema to the current
     ///   version.
+    /// - `profile enroll-signer` — import the MCP signer seed into the
+    ///   profile's keyring entry.
     /// - `profile rotate-nonce-key <name>` — rotate the HMAC nonce key.
     /// - `profile rotate-owner-key <name>` — rotate the policy-file owner
     ///   ed25519 key.

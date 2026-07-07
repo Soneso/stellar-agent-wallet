@@ -6,6 +6,8 @@
 //! - [`show`] — print a profile's resolved configuration (excluding keyring
 //!   secrets, which are never stored in the TOML).
 //! - [`migrate`] — invoke the schema migration for a named profile.
+//! - [`enroll_signer`] — import an operator-held ed25519 seed into the
+//!   profile's MCP signer keyring entry.
 //! - [`rotate_nonce_key`] — rotate the HMAC nonce key for a profile.
 //! - [`rotate_owner_key`] — rotate the policy-file owner ed25519 key.
 //! - [`rotate_attestation_key`] — rotate the approval-spine attestation HMAC
@@ -21,6 +23,7 @@
 //! enum.  The top-level [`crate::main`] function routes `Commands::Profile(args)`
 //! to [`run`], which delegates to the appropriate subcommand handler.
 
+pub mod enroll_signer;
 pub mod key_ops;
 pub mod list;
 pub mod migrate;
@@ -61,6 +64,15 @@ pub enum ProfileSubcommand {
     /// Reads the named profile, applies any pending migrations atomically
     /// (temp-file + rename), and prints the outcome.
     Migrate(migrate::MigrateArgs),
+    /// Enroll the MCP signer seed for a profile.
+    ///
+    /// Reads an `S...` ed25519 secret-key strkey from the environment variable
+    /// named by `--secret-env`, derives its public address, and stores it at the
+    /// profile's `mcp_signer_default` keyring coordinate so MCP tools and the
+    /// keyring-signing CLI verbs can resolve a working signer.  The seed is never
+    /// printed; only the derived public address and keyring coordinate are
+    /// reported.
+    EnrollSigner(enroll_signer::EnrollSignerArgs),
     /// Rotate the HMAC nonce key for a profile.
     ///
     /// Generates 32 bytes from `OsRng` and stores them in the platform
@@ -117,6 +129,7 @@ pub async fn run(args: &ProfileArgs) -> i32 {
         ProfileSubcommand::List(a) => list::run(a).await,
         ProfileSubcommand::Show(a) => show::run(a).await,
         ProfileSubcommand::Migrate(a) => migrate::run(a).await,
+        ProfileSubcommand::EnrollSigner(a) => enroll_signer::run(a).await,
         ProfileSubcommand::RotateNonceKey(a) => rotate_nonce_key::run(a).await,
         ProfileSubcommand::RotateOwnerKey(a) => rotate_owner_key::run(a).await,
         ProfileSubcommand::RotateAttestationKey(a) => rotate_attestation_key::run(a).await,

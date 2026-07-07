@@ -113,7 +113,7 @@ rpc_url = "https://soroban-testnet.stellar.org"
 
 [mcp_signer_default]
 service = "stellar-agent-signer-default"
-account = "default"
+account = "GABC...WXYZ"
 
 [mcp_nonce_key_alias]
 service = "stellar-agent-nonce-default"
@@ -138,6 +138,14 @@ account = "default"
 [policy]
 engine = "noop"
 ```
+
+In `[mcp_signer_default]`, `account` is the signer's identity: it must be the
+G-strkey (public address) that the enrolled signer seed derives to. The MCP tools
+and the keyring-signing CLI verbs verify the loaded seed against this value, so a
+placeholder such as `"default"` never signs. Replace `GABC...WXYZ` with your
+signer's public address and enroll the matching seed with
+[`profile enroll-signer`](#enroll-the-mcp-signer). The `account` field on the
+other entries is only a keyring coordinate label and may stay `"default"`.
 
 The `[policy] engine` value is `noop` or `v1`:
 
@@ -200,6 +208,37 @@ Flags:
 - `--friendbot-url <URL>` — override the Friendbot endpoint; the URL is validated
   against an allow-list unless `--friendbot-url-unchecked` is set.
 - `--output <FORMAT>` — `json` (default) or `table`.
+
+## Enroll the MCP signer
+
+The MCP fund-movement tools and the keyring-signing CLI verbs (`trustline`,
+`lend`, `trade`, `vault`) resolve their signer from the profile's
+`mcp_signer_default` keyring entry. On a fresh install that entry is empty, so
+those paths fail with `auth.keyring_not_found` until you enroll a seed. Enrollment
+reads the `S...` secret from a named environment variable, derives its public
+address, and stores it in the platform keyring — the secret is never printed.
+
+Set `[mcp_signer_default] account` in the profile to the signer's public address
+first (enrollment refuses if it does not match the seed), then enroll:
+
+```bash
+export WALLET_SK=S...your-testnet-secret...
+stellar-agent profile enroll-signer --profile default --secret-env WALLET_SK
+```
+
+Flags:
+
+- `--secret-env <VAR>` — name of the environment variable holding the signer's
+  S-strkey. The flag takes the variable name, never the secret.
+- `--profile <NAME>` — profile whose `mcp_signer_default` entry is written
+  (default `default`).
+- `--expected-address <G_STRKEY>` — optional guard; enrollment refuses unless the
+  seed derives to this address.
+- `--force` — replace an already-enrolled entry.
+
+The JSON envelope reports the derived `public_address` and the keyring coordinate
+written. If the profile's `account` does not match the derived address, the
+command refuses and prints the address to set `account` to.
 
 ## Check a balance
 

@@ -56,6 +56,28 @@ On a no-op it reports `status` `no_op` and the current version; on a migration i
 {"ok":true,"data":{"status":"migrated","from_version":1,"to_version":2,"path":"..."},"request_id":"..."}
 ```
 
+### `profile enroll-signer`
+
+```bash
+export WALLET_SK=S...signer-secret...
+stellar-agent profile enroll-signer --profile default --secret-env WALLET_SK
+```
+
+Imports an operator-held ed25519 seed into the profile's `mcp_signer_default` keyring entry — the signer every MCP fund-movement tool and every keyring-signing CLI verb (`trustline`, `lend`, `trade`, `vault`) resolves. On a clean install that entry is absent and those paths fail with `auth.keyring_not_found`; this command is the way to populate it. State-changing (keyring), no network. The seed is read from a named environment variable through the shared mlock-protected ceremony and stored verbatim; it is never printed, logged, or returned.
+
+- `--secret-env <VAR>` (required) — name of the environment variable holding the signer's `S...` strkey. The flag takes the variable name, never the secret.
+- `--profile <NAME>` — profile whose `mcp_signer_default` entry is written (default `default`).
+- `--expected-address <G_STRKEY>` — refuse unless the seed derives to this address.
+- `--force` — replace an already-enrolled entry (refused without it when one exists).
+
+The coordinate's `account` field is the signer identity: `signer_from_keyring` verifies the loaded seed derives to it, so `account` must equal the seed's public address (not a placeholder like `"default"`). Enrollment refuses on a mismatch and prints the address to set `account` to; it never rewrites the profile TOML. On success the data object reports the derived `public_address`, the `keyring_service`/`keyring_account` written, and `replaced` (with `previous_address` when an entry was replaced):
+
+```json
+{"ok":true,"data":{"profile":"default","enrolled":true,"public_address":"G...","keyring_service":"stellar-agent-signer-default","keyring_account":"G...","replaced":false},"request_id":"..."}
+```
+
+Exits `1` with `ProfileNotFound` if the profile does not exist, `enroll_signer.account_identity_mismatch` if the seed does not match the profile's signer account, `enroll_signer.expected_address_mismatch` if `--expected-address` does not match, `enroll_signer.entry_exists` if an entry exists without `--force`, or a keyring error if the platform keyring is unavailable.
+
 ### Key-rotation subcommands
 
 Each rotation subcommand generates a fresh 32-byte secret from the OS CSPRNG, encodes it as URL-safe base64 (no padding), and atomically replaces one keyring entry the profile names. The raw bytes never leave the keyring, are never logged, and are never returned. All four take the profile as a positional `<NAME>` argument, change keyring state (no network), and are not reversible. Rotate deliberately, because each one invalidates material minted under the old key.

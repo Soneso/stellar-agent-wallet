@@ -85,8 +85,8 @@ secret.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `[mcp_signer_default]` | keyring ref | yes | — | Keyring entry for the default MCP signer seed. |
-| `[mcp_nonce_key_alias]` | keyring ref | yes | — | Keyring entry for the HMAC nonce key. |
+| `[mcp_signer_default]` | keyring ref | yes | — | Keyring entry for the default MCP signer seed. Its `account` is the signer identity: `signer_from_keyring` verifies the loaded seed derives to it, so `account` must be the signer's G-strkey (public address), not a placeholder. Populate the entry with [`profile enroll-signer`](cli-reference/profile-and-governance.md#profile-enroll-signer). |
+| `[mcp_nonce_key_alias]` | keyring ref | yes | — | Keyring entry for the HMAC nonce key. Here `account` is only a coordinate label. |
 
 ### Thresholds and fees
 
@@ -199,6 +199,24 @@ on error.
 | `stellar-agent profile rotate-counterparty-key <name>` | `counterparty_cache_key_id` | Fresh 32-byte HMAC key. All cached `stellar.toml` entries are invalidated and re-fetched on next use. |
 | `stellar-agent profile rotate-nonce-key <name>` | `mcp_nonce_key_alias` | Fresh 32-byte HMAC key. Outstanding nonces minted with the old key are invalidated. |
 
+### Enroll the MCP signer
+
+The signer seed is imported, not minted: it is the operator's own account key.
+Set `[mcp_signer_default] account` to that account's G-strkey (public address),
+then import the matching `S...` secret from a named environment variable:
+
+```bash
+export WALLET_SK=S...signer-secret...
+stellar-agent profile enroll-signer --profile <name> --secret-env WALLET_SK
+```
+
+Enrollment derives the seed's public address, refuses if it does not equal the
+profile's `account` (printing the address to set `account` to), and stores the
+seed in the keyring. Without it, the MCP tools and the keyring-signing CLI verbs
+(`trustline`, `lend`, `trade`, `vault`) fail with `auth.keyring_not_found`. See
+[cli-reference/profile-and-governance.md](cli-reference/profile-and-governance.md#profile-enroll-signer)
+for flags and the envelope shape.
+
 ### Opt in to V1
 
 After rotating the owner, attestation, and audit keys, set the engine to V1 in
@@ -227,7 +245,7 @@ mcp_disabled = false
 
 [mcp_signer_default]
 service = "stellar-agent-signer-my-profile"
-account = "default"
+account = "GABC...WXYZ"
 
 [mcp_nonce_key_alias]
 service = "stellar-agent-nonce-my-profile"
