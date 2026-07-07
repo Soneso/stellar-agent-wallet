@@ -18,6 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `stellar_agent_core::policy::v1::signature::sign`, the owner-signature
   primitive that is the exact inverse of `verify`. (#30)
 
+### Fixed
+
+- `approve --id` writes the human-readable approval summary and the y/n prompt
+  to stderr; stdout carries exactly one JSON envelope, so
+  `approve --id <ID> --yes > out.json` yields parseable JSON with the
+  `approval_attestation`, as the output contract documents. Summary field
+  lines are consistently indented. (#32)
+- `audit verify` no longer doubles the wire-code prefix in error details, and
+  a missing primary log file is classified as the actionable
+  `audit.log_not_found` validation error instead of an internal error. (#29)
+
 ### Changed
 
 - Breaking (MCP wire): tool business errors now use one uniform result envelope

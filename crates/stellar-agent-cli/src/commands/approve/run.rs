@@ -1,7 +1,8 @@
 //! `stellar-agent approve --id <nonce>` — interactive y/n for a pending approval.
 //!
 //! Fetches the pending approval entry from the on-disk store, renders a
-//! wallet-controlled summary to stdout (NOT the agent's rendering), reads
+//! wallet-controlled summary to stderr (NOT the agent's rendering, and NOT
+//! stdout — stdout is reserved for the single terminal JSON envelope), reads
 //! y/n from stdin, and on approval:
 //!
 //! - For `PaymentSimulated`: computes the HMAC-SHA256 attestation blob and
@@ -55,7 +56,7 @@
 //!
 //! This is the `approve --id` CLI path of the wallet-owned approval spine.
 
-use std::io::{BufRead as _, Write as _};
+use std::io::{BufRead as _, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
@@ -109,8 +110,9 @@ pub struct RunArgs {
     /// # Security implication
     ///
     /// With `--yes`, the command immediately approves without reading from
-    /// stdin.  The wallet-controlled summary is still printed to stdout so
-    /// there is a visible record, but no human confirmation is required.
+    /// stdin.  The wallet-controlled summary is still printed to stderr so
+    /// there is a visible record (stdout stays reserved for the JSON envelope),
+    /// but no human confirmation is required.
     /// This mode is intended for integration tests and CI pipelines operating
     /// in a controlled, trusted environment.
     #[arg(long = "yes")]
@@ -375,10 +377,10 @@ fn render_rule_proposal_definition(definition: &ContextRuleProposalSnapshot) -> 
     match &definition.context_type {
         RuleProposalContextType::Default => {
             lines.push(
-                "  Context:           Default\n\
-                   WARNING: Default context grants ACCOUNT-WIDE AUTHORITY — \
-                   this rule authorizes ANY contract invocation, not a scoped \
-                   subset."
+                "  Context:           Default\n  \
+                 WARNING: Default context grants ACCOUNT-WIDE AUTHORITY — \
+                 this rule authorizes ANY contract invocation, not a scoped \
+                 subset."
                     .to_owned(),
             );
         }
@@ -493,15 +495,17 @@ fn render_rule_proposal_definition(definition: &ContextRuleProposalSnapshot) -> 
     lines.join("\n")
 }
 
-/// Renders the wallet-controlled approval summary to stdout.
+/// Writes the wallet-controlled approval summary to `out`.
 ///
-/// Prints the pending approval details in a human-readable block format.
-/// Always called regardless of `--yes` so there is a visible record.
+/// Formats the pending approval details in a human-readable block. Production
+/// wires `out` to stderr (see [`render_summary`]) so stdout carries only the
+/// single terminal JSON envelope; factored out so the block formatting is
+/// unit-testable against an in-memory sink.
 ///
 /// For `PaymentSimulated` entries, displays payment-summary fields.
 /// For `SignWithPasskey` entries, displays the smart-account redacted address
 /// and rule IDs (no amount — this is a passkey signing request, not a payment).
-fn render_summary(entry: &PendingApproval) {
+fn write_summary(entry: &PendingApproval, out: &mut dyn Write) -> std::io::Result<()> {
     let created = unix_ms_to_rfc3339(entry.created_at_unix_ms);
     let expires = unix_ms_to_rfc3339(entry.expires_at_unix_ms);
 
@@ -529,12 +533,12 @@ fn render_summary(entry: &PendingApproval) {
                 format!("{} stroops", summary_amount_stroops)
             };
             format!(
-                "  To:                {to}\n\
-                   Amount:            {amount}\n\
-                   Asset:             {asset}\n\
-                 {memo}\n\
-                   Simulated fee:     {fee} stroops\n\
-                   Simulated seq num: {seq}",
+                "  To:                {to}\n  \
+                 Amount:            {amount}\n  \
+                 Asset:             {asset}\n\
+                 {memo}\n  \
+                 Simulated fee:     {fee} stroops\n  \
+                 Simulated seq num: {seq}",
                 to = summary_to,
                 amount = amount_xlm,
                 asset = summary_asset,
@@ -549,9 +553,9 @@ fn render_summary(entry: &PendingApproval) {
             ..
         } => {
             format!(
-                "  Kind:              SignWithPasskey\n\
-                   Smart account:     {smart_account_redacted}\n\
-                   Rule IDs:          {rule_ids:?}"
+                "  Kind:              SignWithPasskey\n  \
+                 Smart account:     {smart_account_redacted}\n  \
+                 Rule IDs:          {rule_ids:?}"
             )
         }
         ApprovalKind::ToolsetFirstInvokeGate {
@@ -583,13 +587,13 @@ fn render_summary(entry: &PendingApproval) {
                 format!("{amount_max_stroops} stroops")
             };
             format!(
-                "  Kind:              ToolsetFirstInvokeGate\n\
-                   Toolset:             {toolset_name}\n\
-                   Capability:        {capability}\n\
-                   Destination:       {dest_redacted}\n\
-                   Asset:             {asset}\n\
-                   Amount max:        {amount_max_xlm}\n\
-                   Amount min:        {amount_min_stroops} stroops"
+                "  Kind:              ToolsetFirstInvokeGate\n  \
+                 Toolset:           {toolset_name}\n  \
+                 Capability:        {capability}\n  \
+                 Destination:       {dest_redacted}\n  \
+                 Asset:             {asset}\n  \
+                 Amount max:        {amount_max_xlm}\n  \
+                 Amount min:        {amount_min_stroops} stroops"
             )
         }
         ApprovalKind::TrustlineClawbackOptIn {
@@ -604,12 +608,12 @@ fn render_summary(entry: &PendingApproval) {
                 "<redacted>".to_owned()
             };
             format!(
-                "  Kind:              TrustlineClawbackOptIn\n\
-                   Network:           {network}\n\
-                   Asset code:        {code}\n\
-                   Issuer:            {issuer_redacted}\n\
-                   WARNING: This issuer has AUTH_CLAWBACK_ENABLED set.\n\
-                            The issuer may reclaim tokens from this trustline."
+                "  Kind:              TrustlineClawbackOptIn\n  \
+                 Network:           {network}\n  \
+                 Asset code:        {code}\n  \
+                 Issuer:            {issuer_redacted}\n  \
+                 WARNING: This issuer has AUTH_CLAWBACK_ENABLED set.\n    \
+                 The issuer may reclaim tokens from this trustline."
             )
         }
         ApprovalKind::ClaimSimulated {
@@ -635,14 +639,14 @@ fn render_summary(entry: &PendingApproval) {
                 format!("{summary_amount_stroops} stroops")
             };
             format!(
-                "  Kind:              ClaimSimulated\n\
-                   Balance ID:        {summary_balance_id_strkey}\n\
-                   Balance ID (hex):  {summary_balance_id_hex72}\n\
-                   Asset:             {summary_asset}\n\
-                   Amount:            {amount}\n\
-                   Source:            {summary_source}\n\
-                   Simulated fee:     {summary_simulated_fee_stroops} stroops\n\
-                   Simulated seq num: {summary_simulated_seq_num}"
+                "  Kind:              ClaimSimulated\n  \
+                 Balance ID:        {summary_balance_id_strkey}\n  \
+                 Balance ID (hex):  {summary_balance_id_hex72}\n  \
+                 Asset:             {summary_asset}\n  \
+                 Amount:            {amount}\n  \
+                 Source:            {summary_source}\n  \
+                 Simulated fee:     {summary_simulated_fee_stroops} stroops\n  \
+                 Simulated seq num: {summary_simulated_seq_num}"
             )
         }
         ApprovalKind::RuleProposalSimulated {
@@ -654,11 +658,11 @@ fn render_summary(entry: &PendingApproval) {
         } => {
             let digest_hex: String = proposal_sha256.iter().map(|b| format!("{b:02x}")).collect();
             format!(
-                "  Kind:              RuleProposalSimulated\n\
-                   Smart account:     {smart_account_redacted}\n\
-                   Chain ID:          {chain_id}\n\
-                 {body}\n\
-                   Proposal digest:   {digest_hex}",
+                "  Kind:              RuleProposalSimulated\n  \
+                 Smart account:     {smart_account_redacted}\n  \
+                 Chain ID:          {chain_id}\n\
+                 {body}\n  \
+                 Proposal digest:   {digest_hex}",
                 body = render_rule_proposal_definition(definition),
             )
         }
@@ -685,32 +689,40 @@ fn render_summary(entry: &PendingApproval) {
         expires = expires,
     );
 
-    // `#[allow]` is required by the clippy restriction for print_stdout in a
-    // binary crate — intentional user output.
-    #[allow(
-        clippy::print_stdout,
-        reason = "CLI binary intentional user output — approval summary"
-    )]
-    {
-        print!("{summary}");
-    }
+    write!(out, "{summary}")
 }
 
-/// Prompts `Approve? [y/N]: ` on stdout and reads a line from stdin.
+/// Renders the wallet-controlled approval summary to stderr.
+///
+/// Thin production wrapper over [`write_summary`]: routes the human-readable
+/// block to STDERR so STDOUT carries only the single terminal JSON envelope
+/// (the documented programmatic contract — `approve ... > out.json` must yield
+/// exactly one parseable envelope). Always called regardless of `--yes` so
+/// there is a visible record.
+fn render_summary(entry: &PendingApproval) {
+    let mut err = std::io::stderr();
+    // The summary is advisory; the JSON envelope on stdout is the authoritative
+    // result, so a stderr write failure must not abort the approval.
+    let _ = write_summary(entry, &mut err);
+    // Flush stderr so the summary is visible before the prompt blocks on read.
+    let _ = err.flush();
+}
+
+/// Prompts `Approve? [y/N]: ` on stderr and reads a line from stdin.
 ///
 /// Accepts `y`, `Y`, or `yes` (case-insensitive prefix of `"yes"`).
 /// Everything else (including empty input, `n`, `N`, EOF) is treated as denial.
 /// No external prompt crate; uses `std::io::stdin().lock().read_line`.
 fn prompt_yn() -> bool {
     #[allow(
-        clippy::print_stdout,
-        reason = "CLI binary intentional user output — y/n prompt"
+        clippy::print_stderr,
+        reason = "CLI binary intentional user output — y/n prompt on stderr"
     )]
     {
-        print!("Approve? [y/N]: ");
+        eprint!("Approve? [y/N]: ");
     }
-    // Flush stdout so the prompt appears before blocking on read.
-    let _ = std::io::stdout().flush();
+    // Flush stderr so the prompt appears before blocking on read.
+    let _ = std::io::stderr().flush();
 
     let mut line = String::new();
     match std::io::stdin().lock().read_line(&mut line) {
@@ -1157,6 +1169,115 @@ mod tests {
 
     const RULE_TEST_G_ADDR: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     const RULE_TEST_C_ADDR: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    // ── #32: summary stream routing + block indentation ──────────────────────
+
+    /// The human-readable summary is written to the injected sink — the
+    /// production wrapper wires this to stderr so stdout carries only the JSON
+    /// envelope. Guards the sink seam and the block formatting; the stderr
+    /// wiring itself lives in `render_summary` and is verified structurally
+    /// (`render_json` is the sole stdout writer in `run()`).
+    #[test]
+    fn write_summary_payment_writes_block_to_sink() {
+        let entry = make_entry(DEFAULT_TTL_MS);
+        let mut sink: Vec<u8> = Vec::new();
+        write_summary(&entry, &mut sink).expect("write to in-memory sink");
+        let s = String::from_utf8(sink).expect("summary is utf-8");
+        assert!(
+            s.contains("Pending approval"),
+            "must render the header: {s}"
+        );
+        assert!(
+            s.contains(&format!("Approval nonce:    {}", entry.approval_nonce)),
+            "must render the approval nonce: {s}"
+        );
+        // Every payment field keeps its 2-space indent through the multi-line
+        // `format!` continuation (the `\n\` must not strip it).
+        for field in [
+            "\n  To:",
+            "\n  Amount:",
+            "\n  Asset:",
+            "\n  Memo:",
+            "\n  Simulated fee:",
+            "\n  Simulated seq num:",
+        ] {
+            assert!(
+                s.contains(field),
+                "payment field {field:?} must keep its 2-space indent: {s}"
+            );
+        }
+    }
+
+    /// The Default-context WARNING line must keep its 2-space indent: the
+    /// `\n\` line-continuation strips the next source line's leading spaces, so
+    /// the indent must be embedded explicitly after the `\n`.
+    #[test]
+    fn render_rule_proposal_default_context_warning_is_indented() {
+        let definition = ContextRuleProposalSnapshot::new(
+            RuleProposalContextType::Default,
+            "spend-daily".to_owned(),
+            None,
+            vec![RuleProposalSigner::delegated(
+                RULE_TEST_G_ADDR.to_owned(),
+                true,
+            )],
+            vec![],
+            vec![0],
+            false,
+            false,
+        );
+        let rendered = render_rule_proposal_definition(&definition);
+        assert!(
+            rendered.contains("\n  WARNING: Default context grants ACCOUNT-WIDE AUTHORITY"),
+            "the Default-context WARNING line must keep its 2-space indent: {rendered:?}"
+        );
+    }
+
+    /// `RuleProposalSimulated` header fields (Smart account / Chain ID / Proposal
+    /// digest) must each keep their 2-space indent through the multi-line
+    /// `format!` continuation.
+    #[test]
+    fn write_summary_rule_proposal_fields_are_indented() {
+        let definition = ContextRuleProposalSnapshot::new(
+            RuleProposalContextType::CallContract {
+                contract: RULE_TEST_C_ADDR.to_owned(),
+            },
+            "spend-daily".to_owned(),
+            None,
+            vec![RuleProposalSigner::delegated(
+                RULE_TEST_G_ADDR.to_owned(),
+                true,
+            )],
+            vec![],
+            vec![0],
+            false,
+            false,
+        );
+        let entry = PendingApproval::new_rule_proposal_pending(
+            RULE_TEST_C_ADDR.to_owned(),
+            "Test SDF Network ; September 2015".to_owned(),
+            "stellar:testnet".to_owned(),
+            definition,
+            [0x99u8; 32],
+            "CallContract rule \"spend-daily\"".to_owned(),
+            process_uid_for_attestation().expect("UID available on test host"),
+            DEFAULT_TTL_MS,
+        )
+        .expect("build RuleProposalSimulated pending entry");
+        let mut sink: Vec<u8> = Vec::new();
+        write_summary(&entry, &mut sink).expect("write to in-memory sink");
+        let s = String::from_utf8(sink).expect("summary is utf-8");
+        for field in [
+            "\n  Smart account:",
+            "\n  Chain ID:",
+            "\n  Proposal digest:",
+        ] {
+            assert!(
+                s.contains(field),
+                "RuleProposalSimulated field {field:?} must keep its 2-space indent: {s}"
+            );
+        }
+    }
 
     #[test]
     fn render_rule_proposal_default_context_shows_account_wide_authority_callout() {
