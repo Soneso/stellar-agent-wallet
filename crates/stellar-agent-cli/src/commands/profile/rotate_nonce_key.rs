@@ -116,7 +116,7 @@ mod tests {
 
     use super::*;
 
-    // Defensive #[serial] — see rotate_owner_key.rs for full rationale; the
+    // Defensive #[serial] — see enroll_signer.rs for full rationale; the
     // test binary observes a flaky race during parallel execution that
     // clobbers sibling #[serial] keyring tests' mock store.
     #[tokio::test]

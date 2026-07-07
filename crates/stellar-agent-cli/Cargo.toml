@@ -97,6 +97,9 @@ serde_json = { workspace = true }
 # URL host extraction for the timelock degraded-defence INFO log (logs host
 # only at INFO; full URL at DEBUG).
 url = { workspace = true }
+# Atomic temp-file + fsync + rename when writing the signed policy file
+# (profile/sign_policy.rs); also used by profile/{show,migrate}.rs tests.
+tempfile = { workspace = true }
 
 [dev-dependencies]
 # Build signed toolset .tar.gz fixtures in the install tests.
@@ -126,8 +129,6 @@ stellar-agent-smart-account = { path = "../stellar-agent-smart-account", feature
 wiremock = { workspace = true }
 # wiremock::Respond impls in command-module unit tests.
 async-trait = { workspace = true }
-# profile/show.rs + profile/migrate.rs tests.
-tempfile = { workspace = true }
 # process-global keyring store serialisation (key_ops.rs tests).
 serial_test = { workspace = true }
 # keyring_mock::install for the mock store setup (key_ops.rs tests).

@@ -288,7 +288,7 @@ fn apply_migrations(name: &str, path: &Path, from_version: u32) -> Result<Profil
 /// | New field | Default value | Key minted by |
 /// |-----------|---------------|---------------|
 /// | `audit_log_hash_chain_key_id` | `stellar-agent-audit-<name>/default` | `rotate-audit-key` |
-/// | `policy_owner_key_id` | `stellar-agent-owner-<name>/default` | `rotate-owner-key` |
+/// | `policy_owner_key_id` | `stellar-agent-owner-<name>/default` | `enroll-owner-key` |
 /// | `attestation_key_id` | `stellar-agent-attestation-<name>/default` | `rotate-attestation-key` |
 /// | `counterparty_cache_key_id` | `stellar-agent-counterparty-<name>/default` | `rotate-counterparty-key` |
 /// | `oracle_provider_url` | `None` | operator action |

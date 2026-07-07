@@ -373,9 +373,10 @@ leave the keyring, are never logged, and are never returned. Rotation is not
 reversible; each one invalidates material minted under the old key. All take the
 profile as a positional `<NAME>`.
 
+The policy-file owner key is not rotated here — it is enrolled with `profile enroll-owner-key` (public key stored) and used by `profile sign-policy`. The rotation subcommands below mint 32-byte HMAC keys.
+
 | Subcommand | Key kind | Effect on outstanding material |
 |---|---|---|
-| `profile rotate-owner-key <NAME>` | ed25519 seed | Policy files signed by the old owner key are rejected on next load; re-sign every policy file. |
 | `profile rotate-attestation-key <NAME>` | 32-byte HMAC | All pending approvals invalidated; re-run the simulate-and-approve round trip. |
 | `profile rotate-audit-key <NAME>` | 32-byte HMAC | New log files use the new key for their chain-root signature; existing files keep the key active when they were opened. |
 | `profile rotate-nonce-key <NAME>` | 32-byte HMAC | All outstanding nonces minted with the old key are invalidated. |

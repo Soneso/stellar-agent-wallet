@@ -352,14 +352,17 @@ Lists, shows, and migrates profiles, and rotates the keyring-backed keys a profi
 | `list` | `profile list` | Read-only. Returns known profile names sorted as a JSON array. No flags. |
 | `show <NAME>` | `profile show default` | Read-only. Resolved config; keyring refs appear as opaque `{service, account}`, secrets never read. Exits `1` with `ProfileNotFound` or an unsupported-version error. |
 | `migrate <NAME>` | `profile migrate default` | State-changing (atomic temp+rename). No-op if already current (`status:"no_op"`); else `status:"migrated"` with `from_version`/`to_version`/`path`. |
+| `enroll-owner-key` | `profile enroll-owner-key --profile default --secret-env WALLET_OWNER_SK` | State-changing (keyring). Derives the owner ed25519 PUBLIC key from an operator `S...` seed and stores it at `policy_owner_key_id` (the key the V1 engine verifies against). The seed is never stored. `--expected-address`, `--force`. |
+| `sign-policy` | `profile sign-policy --profile default --secret-env WALLET_OWNER_SK` | State-changing (writes the policy file, atomic). Signs `<state_dir>/policies/<profile>.toml` (or `--file`) with the owner seed and writes the `[signature]` table. Refuses if the seed does not match the enrolled owner key. |
 
 ### Key-rotation subcommands
 
 Each generates a fresh 32-byte CSPRNG secret, atomically replaces one named keyring entry, and is not reversible. Each takes the profile as positional `<NAME>` and returns `profile` + `rotated`; some add `key_kind`.
 
+The policy-file owner key is NOT rotated here — it is an ed25519 key enrolled with `enroll-owner-key` (public key stored) and used by `sign-policy` (seed supplied at sign time). All rotation subcommands below mint 32-byte HMAC keys.
+
 | Subcommand | Keyring entry | Effect |
 |---|---|---|
-| `rotate-owner-key` | policy-file owner ed25519 (`policy_owner_key_id`) | Policy files signed by the old key are rejected on next load; re-sign all policy files. `key_kind:"ed25519_seed"`. |
 | `rotate-attestation-key` | approval-spine attestation HMAC (`attestation_key_id`) | Invalidates all pending approvals; the simulate-and-approve round trip must be re-run. `key_kind:"hmac_32_bytes"`. |
 | `rotate-audit-key` | audit-log chain-root HMAC (`audit_log_hash_chain_key_id`) | New log files use the new chain-root key; open files keep their key. `key_kind:"hmac_32_bytes"`. |
 | `rotate-nonce-key` | HMAC nonce key (`mcp_nonce_key_alias`) | Invalidates outstanding nonces. Returns only `profile` + `rotated`. |

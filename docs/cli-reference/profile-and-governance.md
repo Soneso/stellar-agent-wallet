@@ -78,33 +78,74 @@ The coordinate's `account` field is the signer identity: `signer_from_keyring` v
 
 Exits `1` with `ProfileNotFound` if the profile does not exist, `enroll_signer.account_identity_mismatch` if the seed does not match the profile's signer account, `enroll_signer.expected_address_mismatch` if `--expected-address` does not match, `enroll_signer.entry_exists` if an entry exists without `--force`, or a keyring error if the platform keyring is unavailable.
 
+### `profile enroll-owner-key`
+
+```bash
+export WALLET_OWNER_SK=S...owner-secret...
+stellar-agent profile enroll-owner-key --profile default --secret-env WALLET_OWNER_SK
+```
+
+Enrolls the policy-file owner PUBLIC key into the profile's `policy_owner_key_id` keyring entry — the key the V1 policy engine verifies every policy file against. The owner key is the root of trust for policy: whoever can sign a policy file can authorise any action the policy permits. The always-online agent therefore holds only the public key; the operator keeps the seed offline and signs policy files with `sign-policy`. State-changing (keyring), no network. The owner `S...` seed is read from a named environment variable through the shared mlock-protected ceremony; only the derived public key is stored, and the seed is never printed, logged, or returned.
+
+- `--secret-env <VAR>` (required) — name of the environment variable holding the owner `S...` strkey. The flag takes the variable name, never the secret.
+- `--profile <NAME>` — profile whose owner coordinate is written (default `default`).
+- `--expected-address <G_STRKEY>` — refuse unless the seed derives to this address.
+- `--force` — replace an already-enrolled owner key (refused without it when one exists; replacing invalidates every policy file signed by the previous owner key).
+
+The owner coordinate's `account` is the literal `"default"` (the value the engine reads); the stored value is the URL-safe base64 (no padding) encoding of the 32-byte public key. On success the data object reports the derived `owner_address`, the `keyring_service`/`keyring_account` written, and `replaced`. The prior key's stored value is never decoded or reported: the legacy `rotate-owner-key` wrote the owner seed at this coordinate in the same encoding, so rendering it could print a private key; `replaced: true` conveys that a prior entry existed.
+
+```json
+{"ok":true,"data":{"profile":"default","enrolled":true,"owner_address":"G...","keyring_service":"stellar-agent-owner-default","keyring_account":"default","replaced":false},"request_id":"..."}
+```
+
+Exits `1` with `ProfileNotFound` if the profile does not exist, `enroll_owner_key.expected_address_mismatch` if `--expected-address` does not match, `enroll_owner_key.entry_exists` if an owner key is already enrolled without `--force`, or a keyring error if the platform keyring is unavailable.
+
+### `profile sign-policy`
+
+```bash
+export WALLET_OWNER_SK=S...owner-secret...
+stellar-agent profile sign-policy --profile default --secret-env WALLET_OWNER_SK
+```
+
+Signs a V1 policy file so the engine accepts it. The engine loads `<state_dir>/policies/<profile>.toml`, recomputes the canonical form (the `[signature]` table excluded), and verifies the signature against the enrolled owner public key. This command produces that `[signature]` table: it computes the same canonical BLAKE3 digest the loader computes, signs it with the owner seed, and writes `owner_id` (the owner G-strkey) and `sig` (hex) back into the file. State-changing (writes the policy file), no network. The owner seed is read from a named environment variable and held only in zeroizing memory; it is never printed, logged, or written to disk.
+
+- `--secret-env <VAR>` (required) — name of the environment variable holding the owner `S...` strkey.
+- `--profile <NAME>` — profile whose policy file is signed (default `default`).
+- `--file <PATH>` — sign a policy file at a non-default path (default `<state_dir>/policies/<profile>.toml`, the only location the engine loads).
+
+Before writing, the seed's derived public key is cross-checked against the enrolled owner key; a seed that does not match is refused (`sign_policy.owner_key_mismatch`) so a file the engine would reject is never produced. Re-signing an already-signed file replaces the `[signature]` table in place and reports `replaced: true` with the previous `owner_id`. On success the data object reports the `owner_address`, the `policy_path`, the `digest` (hex), and the `signature` (hex):
+
+```json
+{"ok":true,"data":{"profile":"default","signed":true,"owner_address":"G...","policy_path":".../policies/default.toml","digest":"<hex>","signature":"<hex>","replaced":false},"request_id":"..."}
+```
+
+Exits `1` with `ProfileNotFound` if the profile does not exist, `sign_policy.owner_key_unavailable` if no owner key is enrolled (run `enroll-owner-key` first), `sign_policy.owner_key_mismatch` if the seed does not match the enrolled owner key, `sign_policy.policy_file_unreadable` if the policy file is missing, `sign_policy.canonicalization_failed` if it is malformed, or a keyring error if the platform keyring is unavailable.
+
 ### Key-rotation subcommands
 
-Each rotation subcommand generates a fresh 32-byte secret from the OS CSPRNG, encodes it as URL-safe base64 (no padding), and atomically replaces one keyring entry the profile names. The raw bytes never leave the keyring, are never logged, and are never returned. All four take the profile as a positional `<NAME>` argument, change keyring state (no network), and are not reversible. Rotate deliberately, because each one invalidates material minted under the old key.
+Each rotation subcommand generates a fresh 32-byte secret from the OS CSPRNG, encodes it as URL-safe base64 (no padding), and atomically replaces one keyring entry the profile names. The raw bytes never leave the keyring, are never logged, and are never returned. All three take the profile as a positional `<NAME>` argument, change keyring state (no network), and are not reversible. Rotate deliberately, because each one invalidates material minted under the old key. (The policy-file owner ed25519 key is not rotated here; it is enrolled with `enroll-owner-key`.)
 
 | Subcommand | Keyring entry rotated | Key kind | Effect on outstanding material |
 |---|---|---|---|
-| `rotate-owner-key` | policy-file owner ed25519 key (`policy_owner_key_id`) | ed25519 seed | Policy files signed by the old owner key are rejected on next load; re-sign every policy file with the new key. |
 | `rotate-attestation-key` | approval-spine attestation HMAC key (`attestation_key_id`) | 32-byte HMAC | All pending approvals are invalidated; the simulate-and-approve round trip must be re-run. |
 | `rotate-audit-key` | audit-log chain-root HMAC key (`audit_log_hash_chain_key_id`) | 32-byte HMAC | New log files use the new key for their chain-root signature; existing files keep the key active when they were opened. |
 | `rotate-nonce-key` | HMAC nonce key (`mcp_nonce_key_alias`) | 32-byte HMAC | All outstanding nonces minted with the old key are invalidated. |
 
-`rotate-owner-key` mints an ed25519 signing-key seed that the policy engine reconstructs the signing key from; the other three mint raw HMAC keys.
+All three mint raw 32-byte HMAC keys.
 
 ```bash
-stellar-agent profile rotate-owner-key default
 stellar-agent profile rotate-attestation-key default
 stellar-agent profile rotate-audit-key default
 stellar-agent profile rotate-nonce-key default
 ```
 
-Each returns the profile name and a `rotated` flag. The owner-key (ed25519), attestation-key, and audit-key paths additionally report a `key_kind` (`ed25519_seed` or `hmac_32_bytes`); `rotate-nonce-key` returns only `profile` and `rotated`:
+Each returns the profile name and a `rotated` flag. The attestation-key and audit-key paths additionally report a `key_kind` (`hmac_32_bytes`); `rotate-nonce-key` returns only `profile` and `rotated`:
 
 ```json
-{"ok":true,"data":{"profile":"default","rotated":true,"key_kind":"ed25519_seed"},"request_id":"..."}
+{"ok":true,"data":{"profile":"default","rotated":true,"key_kind":"hmac_32_bytes"},"request_id":"..."}
 ```
 
-A fifth rotation subcommand, `profile rotate-counterparty-key <NAME>`, rotates the `stellar.toml` cache-integrity HMAC key (`counterparty_cache_key_id`); it invalidates every cached counterparty binding, which the wallet re-fetches on the next counterparty-allowlist check. Its data object adds `"key_kind": "hmac_32_bytes"` and `"cache_invalidated": true` to the `profile` and `rotated` fields. This rotates the same keyring entry as `stellar-agent counterparty rotate-hmac-key` (see [core operations](stellar-ops.md)); the two verbs are interchangeable.
+A fourth rotation subcommand, `profile rotate-counterparty-key <NAME>`, rotates the `stellar.toml` cache-integrity HMAC key (`counterparty_cache_key_id`); it invalidates every cached counterparty binding, which the wallet re-fetches on the next counterparty-allowlist check. Its data object adds `"key_kind": "hmac_32_bytes"` and `"cache_invalidated": true` to the `profile` and `rotated` fields. This rotates the same keyring entry as `stellar-agent counterparty rotate-hmac-key` (see [core operations](stellar-ops.md)); the two verbs are interchangeable.
 
 Each rotation exits `1` with `ProfileNotFound` if the profile does not exist, or with a keyring error if the platform keyring is unavailable.
 

@@ -1,119 +1,28 @@
-//! Shared keyring rotation helpers for profile rotate-key commands.
+//! Shared keyring rotation helper for profile rotate-key commands.
 //!
-//! This module provides two mint paths:
-//!
-//! - [`rotate_ed25519_seed`] — generates a fresh ed25519 signing-key seed for
-//!   the policy-file owner key.  The stored 32 bytes are a valid RFC 8032
-//!   ed25519 seed; the policy engine reads them via
-//!   `ed25519_dalek::SigningKey::from_bytes`.
-//!
-//! - [`rotate_hmac_like_key`] — generates 32 CSPRNG bytes for HMAC-keyed
-//!   operations (attestation, audit-log chain root, counterparty cache).  The
-//!   bytes are not an ed25519 seed; they are consumed as `HMAC-SHA256(key, …)`.
-//!
-//! Both paths store URL-safe base64 (no padding) encoded 32-byte values. The
-//! HMAC-key path delegates to
+//! [`rotate_hmac_like_key`] generates 32 CSPRNG bytes for HMAC-keyed
+//! operations (attestation, audit-log chain root, counterparty cache).  The
+//! bytes are consumed as `HMAC-SHA256(key, …)`.  The stored value is URL-safe
+//! base64 (no padding) encoded; the path delegates to
 //! [`stellar_agent_network::keyring::rotate_keyring_secret_32`], the same
 //! primitive used by `stellar-agent-nonce::rotate_nonce_key`.
 //!
 //! # Self-custodial conformance
 //!
-//! Neither helper returns, logs, or stores the raw key bytes outside the
-//! keyring.  For the ed25519 owner-key path, raw bytes live in a
-//! `Zeroizing<[u8; 32]>` on the stack and are erased on drop.  The encoded form
-//! is a `Zeroizing<String>` that is passed directly to `set_password` and then
-//! erased.  The HMAC-key path inherits the same zeroization discipline from the
-//! shared network helper.
+//! The helper never returns, logs, or stores the raw key bytes outside the
+//! keyring; the zeroization discipline is inherited from the shared network
+//! helper.
 //!
 //! # Key kind naming
 //!
 //! `caller_tag` is used only in `tracing::debug!` messages for operator
 //! forensics; it never appears in the keyring entry itself.
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ed25519_dalek::SigningKey;
-use keyring_core::Entry as KeyringEntry;
-use rand_core::OsRng;
-use zeroize::Zeroizing;
-
 use stellar_agent_core::{
     error::{AuthError, WalletError},
     profile::schema::KeyringEntryRef,
 };
 use stellar_agent_network::keyring::rotate_keyring_secret_32;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Owner-key path (ed25519 seed)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Generates a fresh ed25519 signing key and atomically stores its 32-byte
-/// seed in the keyring entry identified by `entry_ref`.
-///
-/// The owner key is an **ed25519 seed** (RFC 8032 §5.1.5).  The policy engine
-/// reads the stored bytes via `ed25519_dalek::SigningKey::from_bytes(&seed)`.
-/// The seed is URL-safe base64 (no padding) encoded before storage so the wire
-/// encoding is consistent with the HMAC-key entries.
-///
-/// # Key shape
-///
-/// The stored value is the 32-byte seed extracted from
-/// `ed25519_dalek::SigningKey::generate(&mut OsRng)` via `.to_bytes()`.
-/// Consumers MUST reconstruct the signing key as:
-///
-/// ```rust,ignore
-/// let seed: [u8; 32] = base64_url_safe_no_pad_decode(stored_base64)?;
-/// let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
-/// ```
-///
-/// This is NOT a raw HMAC key; using it as raw `HMAC-SHA256(key, …)` input
-/// is cryptographically incorrect.
-///
-/// # Errors
-///
-/// - [`WalletError::Auth`] wrapping [`AuthError::KeyringNotFound`] if the
-///   platform keyring is unavailable or the `set_password` call fails.
-///
-/// # Panics
-///
-/// Never panics.
-pub(super) fn rotate_ed25519_seed(
-    entry_ref: &KeyringEntryRef,
-    caller_tag: &str,
-) -> Result<(), WalletError> {
-    // Generate a fresh ed25519 SigningKey (RFC 8032 §5.1.5).
-    let signing_key = SigningKey::generate(&mut OsRng);
-    // Extract the 32-byte seed; Zeroizing ensures it is erased on drop.
-    let seed: Zeroizing<[u8; 32]> = Zeroizing::new(signing_key.to_bytes());
-
-    // Base64-encode into a Zeroizing<String>; never leaves the stack.
-    let encoded: Zeroizing<String> = Zeroizing::new(URL_SAFE_NO_PAD.encode(seed.as_ref()));
-
-    let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).map_err(|e| {
-        tracing::debug!(
-            error = %e,
-            caller = caller_tag,
-            "keyring entry construction failed (ed25519 seed)"
-        );
-        WalletError::Auth(AuthError::KeyringNotFound {
-            name: format!("{}:{}", entry_ref.service, entry_ref.account),
-        })
-    })?;
-
-    entry.set_password(&encoded).map_err(|e| {
-        tracing::debug!(
-            error = %e,
-            caller = caller_tag,
-            "set_password failed (ed25519 seed)"
-        );
-        WalletError::Auth(AuthError::KeyringNotFound {
-            name: format!("{}:{}", entry_ref.service, entry_ref.account),
-        })
-    })?;
-
-    // seed and encoded are Zeroizing; they zero on drop here.
-    Ok(())
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HMAC-key path (3 rotators: attestation, audit, counterparty)
@@ -128,8 +37,9 @@ pub(super) fn rotate_ed25519_seed(
 /// exists (first-run) succeeds by creating the entry.  Calling it when an entry
 /// exists replaces the value atomically via `set_password`.
 ///
-/// **This helper is for HMAC keys only.**  Do NOT use for the owner key (which
-/// is an ed25519 seed); use [`rotate_ed25519_seed`] instead.
+/// **This helper is for HMAC keys only.**  The policy-file owner key is an
+/// ed25519 key enrolled via `stellar-agent profile enroll-owner-key`, not an
+/// HMAC key.
 ///
 /// `caller_tag` appears only in `tracing::debug!` messages; it is never
 /// written to the keyring.
@@ -167,12 +77,12 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
+        clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
 
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use ed25519_dalek::SigningKey;
     use keyring_core::Entry as KeyringEntry;
     use serial_test::serial;
     use stellar_agent_test_support::keyring_mock;
@@ -186,16 +96,6 @@ mod tests {
         let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).unwrap();
         entry.get_password().expect("key stored")
     }
-
-    /// Rotates the ed25519 seed for the given entry ref and returns the stored
-    /// base64 string.  Private to this module.
-    fn rotate_ed25519_and_read(entry_ref: &KeyringEntryRef) -> String {
-        rotate_ed25519_seed(entry_ref, "test").expect("rotation ok");
-        let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).unwrap();
-        entry.get_password().expect("seed stored")
-    }
-
-    // ── HMAC-key tests ────────────────────────────────────────────────────────
 
     #[test]
     #[serial]
@@ -231,66 +131,5 @@ mod tests {
             .decode(stored.as_bytes())
             .expect("valid URL-safe base64");
         assert_eq!(bytes.len(), 32);
-    }
-
-    // ── ed25519-seed tests ────────────────────────────────────────────────────
-
-    /// Verifies that the stored base64 decodes to a valid ed25519 seed and that
-    /// a `SigningKey` constructed from it can sign a message that verifies
-    /// successfully.  This is the binding evidence that the owner-key shape is
-    /// a valid ed25519 seed.
-    #[test]
-    #[serial]
-    fn rotate_owner_key_produces_valid_ed25519_seed() {
-        use ed25519_dalek::Signer as _;
-        use ed25519_dalek::Verifier as _;
-
-        keyring_mock::install().expect("mock store");
-        let entry_ref = KeyringEntryRef::new("stellar-agent-owner-key-ops-test", "default");
-
-        let stored = rotate_ed25519_and_read(&entry_ref);
-
-        // Decode the stored base64 to raw seed bytes.
-        let seed_bytes = URL_SAFE_NO_PAD
-            .decode(stored.as_bytes())
-            .expect("valid URL-safe base64");
-        assert_eq!(seed_bytes.len(), 32, "seed must be exactly 32 bytes");
-
-        // Reconstruct the signing key from the seed (the consumer contract).
-        let seed_arr: [u8; 32] = seed_bytes.try_into().expect("32 bytes");
-        let signing_key = SigningKey::from_bytes(&seed_arr);
-
-        // Sign a sample message and verify — proves the bytes ARE a valid ed25519 seed.
-        let msg = b"stellar-agent-owner-key-validity-check";
-        let sig = signing_key.sign(msg);
-        signing_key
-            .verifying_key()
-            .verify(msg, &sig)
-            .expect("signature must verify with the reconstructed key");
-    }
-
-    #[test]
-    #[serial]
-    fn rotate_ed25519_seed_produces_valid_base64() {
-        keyring_mock::install().expect("mock store");
-        let entry_ref = KeyringEntryRef::new("stellar-agent-owner-b64-test", "default");
-
-        let stored = rotate_ed25519_and_read(&entry_ref);
-        let bytes = URL_SAFE_NO_PAD
-            .decode(stored.as_bytes())
-            .expect("valid URL-safe base64");
-        assert_eq!(bytes.len(), 32);
-    }
-
-    #[test]
-    #[serial]
-    fn rotate_ed25519_seed_overwrites_existing() {
-        keyring_mock::install().expect("mock store");
-        let entry_ref = KeyringEntryRef::new("stellar-agent-owner-overwrite-test", "default");
-
-        let first = rotate_ed25519_and_read(&entry_ref);
-        let second = rotate_ed25519_and_read(&entry_ref);
-
-        assert_ne!(first, second, "each rotation must produce a different seed");
     }
 }

@@ -197,9 +197,14 @@ Each command generates fresh key material from the OS CSPRNG and stores it in th
 named keyring entry. The CLI prints a JSON envelope and exits `0` on success, `1`
 on error.
 
+The policy-file owner key is not rotated here. It is an ed25519 key whose PUBLIC
+half is enrolled with `stellar-agent profile enroll-owner-key` (from an operator
+`S...` seed; only the public key is stored) and whose seed signs policy files via
+`stellar-agent profile sign-policy`. Re-enrolling a different owner key
+invalidates policy files signed by the previous one.
+
 | Command | Mints into | Notes |
 |---------|------------|-------|
-| `stellar-agent profile rotate-owner-key <name>` | `policy_owner_key_id` | Fresh ed25519 key. Policy files signed by the previous owner key are rejected on next load; re-sign every policy file with the new key. |
 | `stellar-agent profile rotate-attestation-key <name>` | `attestation_key_id` | Fresh 32-byte HMAC key. All pending approvals are invalidated. |
 | `stellar-agent profile rotate-audit-key <name>` | `audit_log_hash_chain_key_id` | Fresh 32-byte HMAC key. New audit-log files opened after rotation use the new key for their chain-root signature. |
 | `stellar-agent profile rotate-counterparty-key <name>` | `counterparty_cache_key_id` | Fresh 32-byte HMAC key. All cached `stellar.toml` entries are invalidated and re-fetched on next use. |
@@ -207,8 +212,9 @@ on error.
 
 ### Opt in to V1
 
-After rotating the owner, attestation, and audit keys, set the engine to V1 in
-the profile TOML:
+After enrolling the owner key (`profile enroll-owner-key`), signing the policy
+file (`profile sign-policy`), and rotating the attestation and audit keys, set
+the engine to V1 in the profile TOML:
 
 ```toml
 [policy]

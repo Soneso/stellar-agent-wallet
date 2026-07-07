@@ -150,9 +150,10 @@ enum Commands {
     ///   version.
     /// - `profile enroll-signer` — import the MCP signer seed into the
     ///   profile's keyring entry.
+    /// - `profile enroll-owner-key` — enroll the policy-file owner ed25519
+    ///   PUBLIC key into the profile's keyring entry.
+    /// - `profile sign-policy` — sign a V1 policy file with the owner key.
     /// - `profile rotate-nonce-key <name>` — rotate the HMAC nonce key.
-    /// - `profile rotate-owner-key <name>` — rotate the policy-file owner
-    ///   ed25519 key.
     /// - `profile rotate-attestation-key <name>` — rotate the approval-spine
     ///   attestation HMAC key.
     /// - `profile rotate-audit-key <name>` — rotate the hash-chain audit-log

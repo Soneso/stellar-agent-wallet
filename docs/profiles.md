@@ -107,7 +107,7 @@ actual keys (see [Migration and key rotation](#migration-and-key-rotation)).
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `[audit_log_hash_chain_key_id]` | keyring ref | yes | HMAC key signing the audit log's chain root. |
-| `[policy_owner_key_id]` | keyring ref | yes | ed25519 key whose signature every V1 policy file must carry. |
+| `[policy_owner_key_id]` | keyring ref | yes | ed25519 owner PUBLIC key whose signature every V1 policy file must carry (enrolled with `profile enroll-owner-key`). |
 | `[attestation_key_id]` | keyring ref | yes | HMAC key minting approval attestations at `approve` time. |
 | `[counterparty_cache_key_id]` | keyring ref | yes | HMAC key protecting the local `stellar.toml` cache integrity. |
 
@@ -193,7 +193,7 @@ on error.
 
 | Command | Mints into | Notes |
 |---------|------------|-------|
-| `stellar-agent profile rotate-owner-key <name>` | `policy_owner_key_id` | Fresh ed25519 key. Policy files signed by the previous owner key are rejected on next load; re-sign every policy file with the new key. |
+| `stellar-agent profile enroll-owner-key` | `policy_owner_key_id` | Enrols the owner ed25519 PUBLIC key from an operator seed. Sign policy files with `profile sign-policy`; re-enrolling a different key invalidates policy files signed by the previous one. |
 | `stellar-agent profile rotate-attestation-key <name>` | `attestation_key_id` | Fresh 32-byte HMAC key. All pending approvals are invalidated. |
 | `stellar-agent profile rotate-audit-key <name>` | `audit_log_hash_chain_key_id` | Fresh 32-byte HMAC key. New audit-log files opened after rotation use the new key for their chain-root signature. |
 | `stellar-agent profile rotate-counterparty-key <name>` | `counterparty_cache_key_id` | Fresh 32-byte HMAC key. All cached `stellar.toml` entries are invalidated and re-fetched on next use. |

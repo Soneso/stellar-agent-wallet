@@ -235,7 +235,7 @@ impl KeyringEntryRef {
 /// Newly-minted profiles default to `V1` (the typed-criteria engine).
 /// Profiles migrated from schema version 1 have `engine = "noop"` set
 /// explicitly by `migrate_v1_to_v2` so that existing wallets retain the
-/// mainnet gate until the operator completes the `rotate-owner-key`,
+/// mainnet gate until the operator completes the `enroll-owner-key`,
 /// `rotate-attestation-key`, and `rotate-audit-key` sequence.  The asymmetry
 /// is intentional: new profiles are minted with the policy-engine
 /// infrastructure already in place; migrated profiles require an explicit
@@ -261,7 +261,7 @@ pub enum PolicyEngineKind {
     /// destructive tool on mainnet.
     ///
     /// Operators set `[policy]\nengine = "v1"` explicitly in migrated profiles
-    /// after completing the `rotate-owner-key`, `rotate-attestation-key`, and
+    /// after completing the `enroll-owner-key`, `rotate-attestation-key`, and
     /// `rotate-audit-key` runbook steps.
     #[default]
     V1,
@@ -536,9 +536,9 @@ pub struct Profile {
     /// and private-key signer.  Policy files signed by a previous owner key
     /// (after rotation) are rejected on load.
     ///
-    /// Lazy-mint semantics: the field is populated at migration time with
-    /// `stellar-agent-owner-<profile>`; the actual keypair is minted by
-    /// `rotate-owner-key`.
+    /// Lazy-enrol semantics: the field is populated at migration time with
+    /// `stellar-agent-owner-<profile>`; the owner PUBLIC key is enrolled into
+    /// that entry by `enroll-owner-key`.
     pub policy_owner_key_id: KeyringEntryRef,
 
     /// Keyring entry for the wallet-owned approval spine attestation key.
@@ -583,7 +583,7 @@ pub struct Profile {
     /// Policy-engine selection and configuration.
     ///
     /// Newly-minted profiles default to `V1`.  Migrated profiles retain `Noop`
-    /// until the operator completes the `rotate-owner-key`,
+    /// until the operator completes the `enroll-owner-key`,
     /// `rotate-attestation-key`, and `rotate-audit-key` runbook.
     #[serde(default)]
     pub policy: PolicyConfig,
@@ -1232,7 +1232,7 @@ impl ProfileBuilder {
     ///
     /// - (a) An operator explicitly chooses the `Noop` engine for a
     ///   freshly-built profile that has not yet completed the
-    ///   `rotate-owner-key`, `rotate-attestation-key`, and `rotate-audit-key`
+    ///   `enroll-owner-key`, `rotate-attestation-key`, and `rotate-audit-key`
     ///   ceremony.
     /// - (b) The loader fallback synthesises a first-run testnet profile that
     ///   must run without an owner-key keyring entry.  Since

@@ -80,7 +80,7 @@ A destructive tool on a mainnet profile cannot pass the Noop engine. Newly minte
 
 ### V1 engine
 
-The V1 engine evaluates a signed policy document against typed Criteria. The document carries an ed25519 owner signature over its canonical form; an invalid signature, or a signature from a key that was rotated after signing, is rejected.
+The V1 engine evaluates a signed policy document against typed Criteria. The document carries an ed25519 owner signature over its canonical form, produced with `profile sign-policy` and verified against the owner public key enrolled with `profile enroll-owner-key`; an invalid signature, or a signature from a key that was re-enrolled after signing, is rejected. The online agent holds only the owner public key — the seed stays with the operator and is supplied to `sign-policy` at sign time.
 
 Evaluation is **first-match, default-deny**:
 

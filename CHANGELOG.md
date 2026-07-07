@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `profile enroll-owner-key` enrols the policy-file owner ed25519 PUBLIC key
+  from an operator-held seed, and `profile sign-policy` signs a V1 policy file
+  with that seed so the engine accepts it. Together they make
+  `policy.engine = "v1"` usable end to end: no shipped command previously
+  produced the `[signature]` table the engine requires, so selecting `v1`
+  failed closed. (#30)
+- `stellar_agent_core::policy::v1::signature::sign`, the owner-signature
+  primitive that is the exact inverse of `verify`. (#30)
+
+### Changed
+
+- Breaking: removed `profile rotate-owner-key`. The policy owner keyring entry
+  now holds the owner PUBLIC key that the always-online engine verifies
+  against, not the private seed. Enrol the public key with
+  `profile enroll-owner-key` and sign policy files with `profile sign-policy`,
+  keeping the owner seed offline. Profiles that relied on `rotate-owner-key`
+  must re-enrol the owner public key and re-sign their policy files. (#30)
+
 ## [0.1.0-alpha.2] - 2026-07-07
 
 ### Added

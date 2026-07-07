@@ -585,8 +585,12 @@ mod tests {
 
     // Real `run()`: a nonexistent profile bails at the profile-load arm (mapped
     // to `ProfileNotFound`, matching the sibling rotate commands) before any
-    // keyring or environment access. Defensive `#[serial]` — see
-    // rotate_owner_key.rs for the shared-mock-store race rationale.
+    // keyring or environment access. Defensive `#[serial]`: even though `run()`
+    // early-exits before `init_platform_keyring_store()`, the test binary
+    // observes a flaky race (~1 in 30 runs) where an `Arc<CredentialStore>` swap
+    // during parallel execution clobbers a sibling `#[serial]` test's mock
+    // store, surfacing as `Auth(KeyringNotFound)` for the sibling. Serialising
+    // defensively eliminates the cross-test interference at trivial cost.
     #[tokio::test]
     #[serial]
     async fn enroll_nonexistent_profile_returns_exit_1() {

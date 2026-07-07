@@ -1,15 +1,17 @@
 //! BLAKE3 digest and ed25519 signature verification for policy documents.
 //!
-//! Two primitives:
+//! Three primitives:
 //!
 //! 1. [`crate::policy::v1::signature::digest`] — computes a BLAKE3 hash of the canonical policy bytes.
-//! 2. [`crate::policy::v1::signature::verify`] — verifies an ed25519 signature over the digest using the
+//! 2. [`crate::policy::v1::signature::sign`] — produces an ed25519 signature over the digest using the
+//!    owner signing key.  It is the exact inverse of [`crate::policy::v1::signature::verify`].
+//! 3. [`crate::policy::v1::signature::verify`] — verifies an ed25519 signature over the digest using the
 //!    owner public key.
 //!
 //! ## Dependencies
 //!
-//! - `ed25519-dalek` is used for signature verification.  No hand-rolled
-//!   ed25519.
+//! - `ed25519-dalek` is used for signature production and verification.  No
+//!   hand-rolled ed25519.
 //! - `blake3` is used for hashing.  `subtle::ConstantTimeEq` is NOT needed
 //!   here: `ed25519_dalek::VerifyingKey::verify_strict` is already
 //!   internally constant-time on the signature comparison step.
@@ -32,7 +34,7 @@
 //! supplied profile name on failure.  The split avoids coupling `signature.rs`
 //! to the loader's profile-name plumbing while preserving the typed error.
 
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 
 use crate::policy::PolicyError;
 
@@ -126,6 +128,50 @@ pub fn verify(
         .map_err(|_| PolicyError::OwnerSignatureInvalid {
             profile: profile.to_owned(),
         })
+}
+
+/// Produces an ed25519 signature over `digest` using `signing_key`.
+///
+/// This is the exact inverse of [`verify`]: for any `digest` and `signing_key`,
+///
+/// ```text
+/// verify(digest, &sign(digest, signing_key), &signing_key.verifying_key().to_bytes(), p)
+/// ```
+///
+/// returns `Ok(())` for every profile name `p`.
+///
+/// The `digest` MUST be the output of [`digest`] over the
+/// [`super::canonical::canonical_bytes`] of the policy document (the
+/// `[signature]` table excluded).  Signing any other pre-image produces a
+/// signature the loader will reject.
+///
+/// The returned bytes are the raw 64-byte ed25519 signature.  Callers writing
+/// the on-disk `[signature]` table hex-encode them; the loader hex-decodes and
+/// passes them straight to [`verify`].
+///
+/// # Examples
+///
+/// ```
+/// use ed25519_dalek::SigningKey;
+/// use rand_core::OsRng;
+/// use stellar_agent_core::policy::v1::signature::{digest, sign, verify};
+///
+/// let signing_key = SigningKey::generate(&mut OsRng);
+/// let pubkey = signing_key.verifying_key().to_bytes();
+///
+/// let d = digest(b"version = 1\nscope = \"profile:default\"\n");
+/// let sig = sign(&d, &signing_key);
+///
+/// verify(&d, &sig, &pubkey, "alice").unwrap();
+/// ```
+#[must_use]
+pub fn sign(digest: &[u8; 32], signing_key: &SigningKey) -> [u8; 64] {
+    // `ed25519_dalek::SigningKey::sign` is deterministic (RFC 8032 §5.1.6):
+    // the nonce is derived from the key and message, so signing the same
+    // digest with the same key always yields the same 64 bytes.  This matches
+    // `verify_strict` on the read side — no domain separation or pre-hashing
+    // is applied here because none is applied there.
+    signing_key.sign(digest).to_bytes()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -250,6 +296,55 @@ mod tests {
         assert!(
             matches!(err, PolicyError::OwnerSignatureInvalid { .. }),
             "wrong digest must produce OwnerSignatureInvalid, got: {err:?}"
+        );
+    }
+
+    // ── sign is the exact inverse of verify ───────────────────────────────────
+
+    #[test]
+    fn sign_then_verify_round_trip() {
+        let (sk, pk) = make_keypair();
+        let d = digest(CANONICAL);
+        let sig = sign(&d, &sk);
+        verify(&d, &sig, &pk, "alice").expect("sign output must verify under the matching key");
+    }
+
+    #[test]
+    fn sign_matches_dalek_signer_trait() {
+        // The free `sign` must produce byte-identical output to the trait method
+        // the loader's read side implicitly relies on via `verify_strict`.
+        let (sk, _pk) = make_keypair();
+        let d = digest(CANONICAL);
+        let via_fn = sign(&d, &sk);
+        let via_trait: [u8; 64] = sk.sign(&d).to_bytes();
+        assert_eq!(
+            via_fn, via_trait,
+            "sign must equal the raw ed25519 signature over the digest"
+        );
+    }
+
+    #[test]
+    fn sign_is_deterministic() {
+        // RFC 8032 ed25519 is deterministic: same key + same digest → same sig.
+        let (sk, _pk) = make_keypair();
+        let d = digest(CANONICAL);
+        assert_eq!(
+            sign(&d, &sk),
+            sign(&d, &sk),
+            "signing the same digest with the same key must be deterministic"
+        );
+    }
+
+    #[test]
+    fn sign_wrong_key_is_rejected_by_verify() {
+        let (sk, _pk) = make_keypair();
+        let (_sk2, pk2) = make_keypair();
+        let d = digest(CANONICAL);
+        let sig = sign(&d, &sk);
+        let err = verify(&d, &sig, &pk2, "alice").unwrap_err();
+        assert!(
+            matches!(err, PolicyError::OwnerSignatureInvalid { .. }),
+            "a signature must not verify under a different owner key, got: {err:?}"
         );
     }
 }

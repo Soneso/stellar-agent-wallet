@@ -831,7 +831,7 @@ pub fn load_default_or_testnet_fallback() -> Result<Profile, ProfileLoadError> {
 /// The asymmetry between this fallback and a newly-minted profile is
 /// intentional: newly-minted profiles default to `V1`, but the synthesised
 /// first-run fallback retains `Noop` because no owner-key has been minted yet.
-/// The operator opts in to `V1` via the `rotate-owner-key` +
+/// The operator opts in to `V1` via the `enroll-owner-key` +
 /// `rotate-attestation-key` + `rotate-audit-key` ceremony.
 ///
 /// # Design note

@@ -8,8 +8,9 @@
 //! - [`migrate`] — invoke the schema migration for a named profile.
 //! - [`enroll_signer`] — import an operator-held ed25519 seed into the
 //!   profile's MCP signer keyring entry.
+//! - [`enroll_owner_key`] — enroll the policy-file owner ed25519 PUBLIC key.
+//! - [`sign_policy`] — sign a V1 policy file with the owner key.
 //! - [`rotate_nonce_key`] — rotate the HMAC nonce key for a profile.
-//! - [`rotate_owner_key`] — rotate the policy-file owner ed25519 key.
 //! - [`rotate_attestation_key`] — rotate the approval-spine attestation HMAC
 //!   key.
 //! - [`rotate_audit_key`] — rotate the hash-chain audit-log root-signature
@@ -23,6 +24,7 @@
 //! enum.  The top-level [`crate::main`] function routes `Commands::Profile(args)`
 //! to [`run`], which delegates to the appropriate subcommand handler.
 
+pub mod enroll_owner_key;
 pub mod enroll_signer;
 pub mod key_ops;
 pub mod list;
@@ -31,8 +33,8 @@ pub mod rotate_attestation_key;
 pub mod rotate_audit_key;
 pub mod rotate_counterparty_key;
 pub mod rotate_nonce_key;
-pub mod rotate_owner_key;
 pub mod show;
+pub mod sign_policy;
 
 use clap::{Args, Subcommand};
 
@@ -73,19 +75,27 @@ pub enum ProfileSubcommand {
     /// printed; only the derived public address and keyring coordinate are
     /// reported.
     EnrollSigner(enroll_signer::EnrollSignerArgs),
+    /// Enroll the policy-file owner PUBLIC key for a profile.
+    ///
+    /// Derives the owner ed25519 public key from an operator-held `S...` seed
+    /// (read from a named environment variable through the mlock-protected
+    /// ceremony) and stores the PUBLIC key in the platform keyring entry the V1
+    /// policy engine verifies against.  The seed is never stored; the operator
+    /// keeps it offline and signs policy files with `sign-policy`.
+    EnrollOwnerKey(enroll_owner_key::EnrollOwnerKeyArgs),
+    /// Sign a V1 policy file with the owner key.
+    ///
+    /// Computes the canonical digest the engine verifies, signs it with the
+    /// owner seed (read from a named environment variable), and writes the
+    /// `[signature]` table into the policy file.  Refuses when the seed does
+    /// not match the enrolled owner key.
+    SignPolicy(sign_policy::SignPolicyArgs),
     /// Rotate the HMAC nonce key for a profile.
     ///
     /// Generates 32 bytes from `OsRng` and stores them in the platform
     /// keyring entry for the profile's `mcp_nonce_key_alias`.  All
     /// outstanding nonces minted with the old key are invalidated.
     RotateNonceKey(rotate_nonce_key::RotateNonceKeyArgs),
-    /// Rotate the policy-file owner ed25519 key for a profile.
-    ///
-    /// Generates a fresh ed25519 keypair from `OsRng` and stores the signing
-    /// key in the platform keyring entry for `policy_owner_key_id`.  Policy
-    /// files signed by the old owner key are rejected on next load.  The
-    /// operator must re-sign all policy files with the new key.
-    RotateOwnerKey(rotate_owner_key::RotateOwnerKeyArgs),
     /// Rotate the approval-spine attestation HMAC key for a profile.
     ///
     /// Generates 32 bytes from `OsRng` and stores them in the platform
@@ -130,8 +140,9 @@ pub async fn run(args: &ProfileArgs) -> i32 {
         ProfileSubcommand::Show(a) => show::run(a).await,
         ProfileSubcommand::Migrate(a) => migrate::run(a).await,
         ProfileSubcommand::EnrollSigner(a) => enroll_signer::run(a).await,
+        ProfileSubcommand::EnrollOwnerKey(a) => enroll_owner_key::run(a).await,
+        ProfileSubcommand::SignPolicy(a) => sign_policy::run(a).await,
         ProfileSubcommand::RotateNonceKey(a) => rotate_nonce_key::run(a).await,
-        ProfileSubcommand::RotateOwnerKey(a) => rotate_owner_key::run(a).await,
         ProfileSubcommand::RotateAttestationKey(a) => rotate_attestation_key::run(a).await,
         ProfileSubcommand::RotateAuditKey(a) => rotate_audit_key::run(a).await,
         ProfileSubcommand::RotateCounterpartyKey(a) => rotate_counterparty_key::run(a).await,
