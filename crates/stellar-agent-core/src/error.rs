@@ -759,6 +759,26 @@ pub enum ValidationError {
         /// OZ canonical maximum byte length (`MAX_NAME_SIZE = 20`).
         max: usize,
     },
+
+    /// The audit log file to verify does not exist at the supplied path.
+    ///
+    /// A user-actionable condition, not an integrity violation: either nothing
+    /// has been written to the audit log yet, or the `--log-path` is wrong.
+    /// Carries the `audit.log_not_found` wire code (audit taxonomy) while being
+    /// a validation-class error so callers can distinguish "no log yet" from a
+    /// tamper-evidence failure.
+    ///
+    /// # Wire code
+    ///
+    /// `"audit.log_not_found"`.
+    #[error(
+        "audit log not found at {path}; nothing has been written to the audit \
+         log yet, or the --log-path is incorrect"
+    )]
+    AuditLogNotFound {
+        /// Display path of the missing primary audit-log file.
+        path: String,
+    },
 }
 
 impl ValidationError {
@@ -794,6 +814,9 @@ impl ValidationError {
             Self::ValidUntilInvalid { .. } => "validation.valid_until_invalid",
             Self::ConfigInvalid { .. } => "validation.config_invalid",
             Self::RuleNameTooLong { .. } => "validation.rule_name_too_long",
+            // Audit taxonomy code on a validation-class variant: the code names
+            // the subsystem (audit.*) while the category stays Validation.
+            Self::AuditLogNotFound { .. } => "audit.log_not_found",
         }
     }
 }
@@ -1804,6 +1827,12 @@ mod tests {
                 },
                 "validation.rule_name_too_long",
             ),
+            (
+                ValidationError::AuditLogNotFound {
+                    path: "/tmp/audit.jsonl".to_owned(),
+                },
+                "audit.log_not_found",
+            ),
         ];
 
         for (variant, expected_code) in cases {
@@ -1905,6 +1934,9 @@ mod tests {
                         name_len: *name_len,
                         max: *max,
                     }
+                }
+                ValidationError::AuditLogNotFound { path } => {
+                    ValidationError::AuditLogNotFound { path: path.clone() }
                 }
             });
             assert_eq!(

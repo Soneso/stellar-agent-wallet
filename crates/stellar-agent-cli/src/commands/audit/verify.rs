@@ -337,29 +337,42 @@ fn check_parent_owner(path: &std::path::Path) -> Result<(), String> {
 /// `PathContract` and `Io` map to `Internal(UnexpectedState)` because the log
 /// path must satisfy the verifier contract and the log file should be readable
 /// when the path is correct.
+///
+/// `LogNotFound` maps to `Validation(AuditLogNotFound)` — a missing primary log
+/// is a user-actionable condition (nothing logged yet, or a wrong path), not an
+/// integrity violation, and surfaces the `audit.log_not_found` wire code with
+/// an actionable message.
+///
+/// The `detail` is the `VerifyError` Display string alone: every variant's
+/// Display already begins with its own wire code (e.g. `"audit.io_error: ..."`),
+/// so prefixing `wire_code()` again would double it.
 fn map_verify_error(err: &VerifyError) -> stellar_agent_core::WalletError {
-    use stellar_agent_core::error::InternalError;
+    use stellar_agent_core::error::{InternalError, ValidationError};
 
-    let code = err.wire_code();
     let msg = err.to_string();
 
     match err {
+        VerifyError::LogNotFound { path } => {
+            stellar_agent_core::WalletError::Validation(ValidationError::AuditLogNotFound {
+                path: path.clone(),
+            })
+        }
         VerifyError::ChainBroken { .. }
         | VerifyError::RotationGap { .. }
         | VerifyError::HmacMismatch { .. }
         | VerifyError::HmacSidecarMissing { .. }
         | VerifyError::ParseError { .. } => {
             stellar_agent_core::WalletError::Internal(InternalError::InvariantViolated {
-                detail: format!("{code}: {msg}"),
+                detail: msg,
             })
         }
         VerifyError::PathContract { .. } | VerifyError::Io(_) => {
             stellar_agent_core::WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("{code}: {msg}"),
+                detail: msg,
             })
         }
         _ => stellar_agent_core::WalletError::Internal(InternalError::UnexpectedState {
-            detail: format!("{code}: {msg}"),
+            detail: msg,
         }),
     }
 }
@@ -696,6 +709,67 @@ mod tests {
                 )
             ),
             "expected UnexpectedState, got {we:?}"
+        );
+    }
+
+    /// The envelope message must carry each variant's wire code exactly once —
+    /// `VerifyError` Display already begins with the code, so `map_verify_error`
+    /// must not prepend it again. Covers two variants across both `Internal`
+    /// arms.
+    #[test]
+    fn map_verify_error_message_has_single_code_prefix() {
+        for (err, code) in [
+            (
+                VerifyError::ChainBroken {
+                    line: 5,
+                    file: "f.jsonl".to_owned(),
+                    reason: "previous_entry_hash_mismatch",
+                },
+                "audit.chain_broken",
+            ),
+            (
+                VerifyError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                )),
+                "audit.io_error",
+            ),
+        ] {
+            let message = map_verify_error(&err).message();
+            assert_eq!(
+                message.matches(&format!("{code}:")).count(),
+                1,
+                "message must contain the wire code prefix exactly once (not doubled), \
+                 got: {message}"
+            );
+        }
+    }
+
+    /// A missing primary log classifies as validation-class with the
+    /// `audit.log_not_found` code and an actionable, single-prefix message.
+    #[test]
+    fn map_verify_error_log_not_found_is_validation_class() {
+        let err = VerifyError::LogNotFound {
+            path: "/tmp/audit.jsonl".to_owned(),
+        };
+        let we = map_verify_error(&err);
+        assert!(
+            matches!(we, stellar_agent_core::WalletError::Validation(_)),
+            "missing primary log must be validation-class, got {we:?}"
+        );
+        assert_eq!(
+            we.code(),
+            "audit.log_not_found",
+            "envelope code must be audit.log_not_found"
+        );
+        let message = we.message();
+        assert!(
+            message.contains("/tmp/audit.jsonl"),
+            "message must name the missing path: {message}"
+        );
+        assert!(
+            !message.contains("audit.log_not_found:"),
+            "the code is the envelope code field, not a message prefix: {message}"
         );
     }
 

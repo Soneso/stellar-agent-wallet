@@ -176,11 +176,13 @@ pub fn verify_log(log_path: &Path, hmac_key: Option<&[u8; 32]>) -> Result<Verify
     for (file_idx, path) in file_chain.iter().enumerate() {
         if !path.exists() {
             if file_idx == 0 {
-                // The primary (oldest / only) file must exist.
-                return Err(VerifyError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("log file not found: {}", path.display()),
-                )));
+                // The primary (oldest / only) file must exist. A missing primary
+                // log is a user-actionable condition (nothing logged yet, or a
+                // wrong path), not an ambient I/O failure — surface it via the
+                // dedicated `LogNotFound` variant so it classifies distinctly.
+                return Err(VerifyError::LogNotFound {
+                    path: path.display().to_string(),
+                });
             }
             // A rotated file referenced by the chain does not exist.
             let basename = path
@@ -1081,6 +1083,21 @@ pub enum VerifyError {
         detail: String,
     },
 
+    /// The primary (oldest / only) audit-log file does not exist.
+    ///
+    /// Distinct from [`VerifyError::Io`]: a missing primary log is not an
+    /// ambient I/O failure but a user-actionable condition — either nothing has
+    /// been written to the audit log yet, or the supplied path is wrong. The
+    /// dedicated variant lets callers classify it as validation-class rather
+    /// than an internal invariant violation.
+    ///
+    /// Wire code: `audit.log_not_found`.
+    #[error("audit.log_not_found: audit log not found at {path}")]
+    LogNotFound {
+        /// Display path of the missing primary audit-log file.
+        path: String,
+    },
+
     /// An I/O error occurred while reading the log.
     ///
     /// Wire code: `audit.io_error`.
@@ -1159,6 +1176,7 @@ impl VerifyError {
             Self::NonRegularFileLogPath { .. } => "audit.non_regular_file_log_path",
             Self::ParseError { .. } => "audit.parse_error",
             Self::PathContract { .. } => "audit.path_contract",
+            Self::LogNotFound { .. } => "audit.log_not_found",
             Self::Io(_) => "audit.io_error",
             Self::SignerSetCanonicalBody(_) => "audit.signer_set_canonical_body",
             Self::PartialRotation { .. } => "audit.partial_rotation",
@@ -3208,18 +3226,23 @@ mod tests {
         assert_eq!(*drift_ms, 60_001);
     }
 
-    // ── verify_log: missing active log file returns Io error ──────────────────
+    // ── verify_log: missing primary log file returns LogNotFound ──────────────
 
     #[test]
-    fn verify_log_missing_active_file_returns_io_error() {
+    fn verify_log_missing_primary_file_returns_log_not_found() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("nonexistent.jsonl");
-        // No file created — the active log is absent.
+        // No file created — the primary (only) log is absent.
 
         let result = verify_log(&path, None);
         assert!(
-            matches!(result, Err(VerifyError::Io(_))),
-            "missing active log file must return Io error, got {result:?}"
+            matches!(result, Err(VerifyError::LogNotFound { .. })),
+            "missing primary log file must return LogNotFound, got {result:?}"
+        );
+        assert_eq!(
+            result.unwrap_err().wire_code(),
+            "audit.log_not_found",
+            "missing primary log must carry the audit.log_not_found wire code"
         );
     }
 

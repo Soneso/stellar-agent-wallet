@@ -1945,6 +1945,7 @@ mod tests {
                 }
                 AuditLogIntegrityError::ParseError { .. } => "audit.parse_error",
                 AuditLogIntegrityError::PathContract { .. } => "audit.path_contract",
+                AuditLogIntegrityError::LogNotFound { .. } => "audit.log_not_found",
                 AuditLogIntegrityError::Io(_) => "audit.io_error",
                 AuditLogIntegrityError::SignerSetCanonicalBody(_) => {
                     "audit.signer_set_canonical_body"
@@ -1978,6 +1979,9 @@ mod tests {
             },
             AuditLogIntegrityError::PathContract {
                 detail: "no parent".to_owned(),
+            },
+            AuditLogIntegrityError::LogNotFound {
+                path: "/tmp/audit.jsonl".to_owned(),
             },
             AuditLogIntegrityError::Io(std::io::Error::other("ambient")),
             AuditLogIntegrityError::SignerSetCanonicalBody(
