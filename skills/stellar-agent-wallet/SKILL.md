@@ -2,7 +2,7 @@
 name: stellar-agent-wallet
 description: Operate the Stellar Agent Wallet — a self-custodial Stellar wallet built for AI agents — through its stellar-agent CLI and stellar-agent-mcp MCP server. Use when an agent needs to read Stellar account state, send XLM or asset payments, create accounts, manage trustlines, claim claimable balances, run OpenZeppelin smart-account governance, lend/trade/deposit on DeFi, or handle SEP and x402 flows, all under a local policy engine, an operator-approval gate (satisfiable via the CLI, a local web inbox, or a TLS-protected remote-approval surface), and a tamper-evident audit log. Covers the two-phase build-then-commit signing pattern, the simulate-approve-commit handshake, chain_id and the JSON result envelope, and the mainnet write gate. Reach for it when the user mentions the stellar-agent wallet, an AI-agent wallet on Stellar, MCP-driven Stellar payments, or autonomous-agent key custody.
 license: Apache-2.0
-compatibility: Requires the stellar-agent CLI and stellar-agent-mcp server (v0.1.0-alpha.2 public alpha; install from crates.io with cargo install/binstall stellar-agent-cli and stellar-agent-mcp, or build from source). Targets Stellar testnet (default) and mainnet.
+compatibility: Requires the stellar-agent CLI and stellar-agent-mcp server (v0.1.0-alpha.2 public alpha; install with cargo binstall/install --git from the GitHub repository, or build from source). Targets Stellar testnet (default) and mainnet.
 metadata:
   version: "0.1.1"
   wallet_version: "0.1.0-alpha.2"

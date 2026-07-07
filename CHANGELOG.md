@@ -48,10 +48,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   OpenZeppelin verifier entries now report `provisional` (named-party internal
   review) rather than overstating an external audit; `list-verifiers` carries
   the attestor and date as additive fields.
-- All 34 workspace crates are published to crates.io, so the binaries install
-  with `cargo install stellar-agent-cli` / `cargo install stellar-agent-mcp`
-  (or `cargo binstall` without a `--git` URL) and the library crates resolve
-  as normal registry dependencies.
 
 ### Changed
 

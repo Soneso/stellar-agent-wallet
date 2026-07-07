@@ -45,13 +45,13 @@ from GitHub release archives. A single release archive carries both binaries:
 - Binaries inside: `stellar-agent` and `stellar-agent-mcp`.
 
 ```bash
-cargo binstall stellar-agent-cli
-cargo binstall stellar-agent-mcp
+cargo binstall --git https://github.com/Soneso/stellar-agent-wallet stellar-agent-cli
+cargo binstall --git https://github.com/Soneso/stellar-agent-wallet stellar-agent-mcp
 ```
 
-The release archives and `binstall` assets these commands fetch are published
-with each tagged release on the repository's releases page. If none is listed
-yet, build from source as shown below.
+The release archives these commands fetch are published with each tagged
+release on the repository's releases page. If none is listed yet, build from
+source as shown below. crates.io publication is planned for a future release.
 
 ### Build from source
 
@@ -68,9 +68,9 @@ The two binaries are produced at:
 - `target/release/stellar-agent`
 - `target/release/stellar-agent-mcp`
 
-`cargo install stellar-agent-cli` and `cargo install stellar-agent-mcp` (or
-`cargo binstall` for prebuilt binaries) also work to place the binaries on your
-`PATH`; `stellar-agent-cli` installs the binary named `stellar-agent`.
+`cargo install --git https://github.com/Soneso/stellar-agent-wallet` also works
+to place the binaries on your `PATH`; the `stellar-agent-cli` crate installs the
+binary named `stellar-agent`.
 
 When `stellar-agent` is on your `PATH`, the incumbent `stellar-cli` discovers it
 as an external subcommand: `stellar agent ...` and `stellar-agent ...` invoke the

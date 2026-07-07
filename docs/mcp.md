@@ -37,11 +37,12 @@ This alpha does not offer an HTTP or SSE transport. stdio is the only transport.
 
 ### Availability
 
-This is a public alpha. Install with `cargo binstall stellar-agent-mcp`
-(prebuilt binary from the tagged GitHub release) or
-`cargo install stellar-agent-mcp` (build from crates.io), or build from
-source. See [the CLI reference](./cli-reference/) and the repository README
-for build instructions; the build that produces `stellar-agent` produces
+This is a public alpha. Install with
+`cargo binstall --git https://github.com/Soneso/stellar-agent-wallet stellar-agent-mcp`
+(prebuilt binary from the tagged GitHub release), or build from source.
+crates.io publication is planned for a future release. See
+[the CLI reference](./cli-reference/) and the repository README for build
+instructions; the build that produces `stellar-agent` produces
 `stellar-agent-mcp` alongside it.
 
 ## Launching the server

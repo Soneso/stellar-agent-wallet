@@ -60,16 +60,18 @@ audit log, and toolset model in detail.
 
 ## Install
 
-All workspace crates are published on crates.io as pre-release versions.
+Prebuilt binaries are published on the
+[releases page](https://github.com/Soneso/stellar-agent-wallet/releases) for each
+tagged release. crates.io publication is planned for a future release.
 
-### cargo binstall (prebuilt binaries)
+### cargo binstall (from the GitHub releases)
 
-`cargo binstall` downloads the prebuilt release archive for your target from
-the tagged GitHub release assets:
+Point `cargo binstall` at this repository with `--git`; it resolves the release
+archive for your target from the tagged release assets:
 
 ```bash
-cargo binstall stellar-agent-cli
-cargo binstall stellar-agent-mcp
+cargo binstall --git https://github.com/Soneso/stellar-agent-wallet stellar-agent-cli
+cargo binstall --git https://github.com/Soneso/stellar-agent-wallet stellar-agent-mcp
 ```
 
 The CLI and MCP binaries ship in one release archive
@@ -77,15 +79,6 @@ The CLI and MCP binaries ship in one release archive
 commands draw from the same download. You can also download the archive directly
 from the [releases page](https://github.com/Soneso/stellar-agent-wallet/releases)
 and extract the two binaries onto your `PATH`.
-
-### cargo install (build from crates.io)
-
-```bash
-cargo install stellar-agent-cli
-cargo install stellar-agent-mcp
-```
-
-`stellar-agent-cli` installs the binary named `stellar-agent`.
 
 ### Build from source
 
@@ -96,8 +89,8 @@ cargo build --release
 ```
 
 The binaries land at `target/release/stellar-agent` and
-`target/release/stellar-agent-mcp`. Building requires the stable Rust
-toolchain (edition 2024).
+`target/release/stellar-agent-mcp`. `cargo install --git https://github.com/Soneso/stellar-agent-wallet`
+also works. Building requires the stable Rust toolchain (edition 2024).
 
 The CLI is also discoverable as `stellar agent ...` through the `stellar-cli`
 external-binary plugin convention when `stellar-agent` is on your `PATH`.
