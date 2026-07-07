@@ -79,6 +79,7 @@ the replay window is wiped on process restart.
 | `nonce.key_too_short` | The keyring nonce key has fewer than 32 bytes. | Operator must repair the keyring nonce key. Not agent-recoverable. |
 | `nonce.input_too_long` | A length-prefixed field (`tool_name` or `chain_id`) exceeds the encoding bound. | Use a valid registered tool name and a valid CAIP-2 `chain_id`. |
 | `nonce.serialise_failed` | Base64 encode/decode of the nonce failed. | Pass the nonce string exactly as returned by simulate. |
+| `nonce.mint_failed` | The simulate step could not mint the single-use nonce — almost always because the profile's keyring nonce key is missing or unreadable. This fires at simulate time, before any commit, so an unpopulated keyring blocks the flow at the first write step, not at commit. | Not agent-recoverable: the operator must populate the profile's keyring nonce key. Report to the operator. |
 | `tool.unknown` | The `tool_name` carried by the nonce is not in the registered catalog. | Use a registered tool name; do not hand-build nonces. |
 | `nonce.unknown_error` | Forward-compatibility fallback for an unrecognized nonce error variant. | Treat as a hard failure; re-simulate. Report to the operator if it persists. |
 
@@ -126,7 +127,7 @@ agent-recoverable at runtime.
 
 | Code | Meaning | Agent action |
 |---|---|---|
-| `keyring.error` | A platform keyring read failed while loading the nonce key or an HMAC key on a two-phase verb. | Often the active profile names a keyring entry that holds no secret yet (the first-run testnet fallback profile uses placeholder coordinates). Read-only tools and the simulate step still work; the commit step does not until the operator populates the keyring entry. Report to the operator. |
+| `keyring.error` | A platform keyring read failed while loading the nonce key or an HMAC key on a two-phase verb. | Often the active profile names a keyring entry that holds no secret yet (the first-run testnet fallback profile uses placeholder coordinates). Only read-only tools that never touch the keyring still work: the simulate step already fails at nonce mint (`nonce.mint_failed`) when the nonce key is missing, so the flow stops there, before any commit. The operator must populate the keyring entry. Report to the operator. |
 
 A missing or empty **signer** keyring entry on a single-shot SEP-43 sign tool
 surfaces as a SEP-43 error envelope (a wallet-unlock failure), not a `keyring.*`
