@@ -271,6 +271,7 @@ mod tests {
             destructive_hint: true,
             read_only_hint: false,
             chain_id_required: true,
+            value_kind: crate::policy::ToolValueKind::ReadOnly,
         });
         let args = serde_json::Value::Null;
         let profile = Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build();
@@ -362,6 +363,7 @@ mod tests {
             destructive_hint: true,
             read_only_hint: false,
             chain_id_required: true,
+            value_kind: crate::policy::ToolValueKind::ReadOnly,
         });
         let args = serde_json::Value::Null;
         let profile = Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build();

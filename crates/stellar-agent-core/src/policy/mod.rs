@@ -237,6 +237,44 @@ pub enum BuildRegistryError {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ToolValueKind
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The static value shape a tool declares at registration.
+///
+/// Every tool declares one of these via `#[mcp_tool_item(value_kind = "…")]`
+/// so a new tool cannot be added without a conscious classification. The field
+/// defaults to [`ToolValueKind::ReadOnly`] when the annotation omits it
+/// (back-compatible), which is the correct classification for the large
+/// majority of tools (reads, quotes, status, `get_*`, message sign/verify).
+///
+/// This is a compile-time-declared shape distinct from the per-call
+/// [`crate::policy::v1::value::ValueClass`] the dispatch gate derives: a
+/// `MovesValue` tool resolves a concrete `ValueClass::Value` at dispatch, an
+/// `OpaqueSign` tool resolves `ValueClass::Opaque`, and a `ReadOnly` tool
+/// resolves `ValueClass::ReadOnly`.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::policy::ToolValueKind;
+///
+/// assert_eq!(ToolValueKind::default(), ToolValueKind::ReadOnly);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolValueKind {
+    /// The tool moves no on-chain value. Default classification.
+    #[default]
+    ReadOnly,
+    /// The tool moves value; the dispatch site resolves the concrete effect(s).
+    MovesValue,
+    /// The tool signs caller-supplied / opaque material whose value effect the
+    /// dispatch site cannot resolve (the SEP-43 transaction / auth-entry sign
+    /// tools).
+    OpaqueSign,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ToolDescriptor
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -264,6 +302,7 @@ pub enum BuildRegistryError {
 ///     destructive_hint: false,
 ///     read_only_hint: true,
 ///     chain_id_required: true,
+///     value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
 /// };
 /// let d = ToolDescriptor::from_registration(&reg);
 /// assert_eq!(d.name, "stellar_balances");
@@ -299,6 +338,10 @@ pub struct ToolDescriptor {
     /// [`ToolDescriptor::from_registration`] — `NoopPolicyEngine` does not use
     /// this field; `PolicyEngineV1` requires it to be set.
     pub chain_id: String,
+    /// The tool's declared static value shape, sourced from the
+    /// `#[mcp_tool_item(value_kind = "…")]` annotation via
+    /// [`McpToolRegistration::value_kind`].
+    pub value_kind: ToolValueKind,
 }
 
 /// A single MCP tool registration record, collected by `inventory` at link time.
@@ -346,6 +389,12 @@ pub struct McpToolRegistration {
     /// `stellar_friendbot` handlers in `stellar-agent-mcp::server`).
     /// The `NoopPolicyEngine` does not consult this field.
     pub chain_id_required: bool,
+    /// The tool's declared static value shape.
+    ///
+    /// Emitted by the `#[mcp_tool_item]` macro from the optional
+    /// `value_kind = "read_only" | "moves_value" | "opaque_sign"` argument;
+    /// the annotation defaults to [`ToolValueKind::ReadOnly`] when omitted.
+    pub value_kind: ToolValueKind,
 }
 
 // Register McpToolRegistration as an inventory-collectable type.
@@ -376,6 +425,7 @@ impl ToolDescriptor {
     ///     destructive_hint: false,
     ///     read_only_hint: true,
     ///     chain_id_required: true,
+    ///     value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
     /// };
     /// let d = ToolDescriptor::from_registration(&reg);
     /// assert_eq!(d.name, "stellar_balances");
@@ -392,6 +442,7 @@ impl ToolDescriptor {
             read_only_hint: reg.read_only_hint,
             chain_id_required: reg.chain_id_required,
             chain_id: String::new(),
+            value_kind: reg.value_kind,
         }
     }
 }
@@ -1129,6 +1180,7 @@ pub trait PolicyEngine: Send + Sync {
 ///     .build();
 /// let tool = ToolDescriptor::from_registration(&McpToolRegistration {
 ///     name: "stellar_pay", destructive_hint: true, read_only_hint: false, chain_id_required: true,
+///     value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
 /// });
 /// assert_eq!(engine.evaluate(&tool, &args, &profile, None, None, None, None, None).unwrap(), Decision::Allow);
 ///
@@ -1138,12 +1190,14 @@ pub trait PolicyEngine: Send + Sync {
 ///     .build();
 /// let read_tool = ToolDescriptor::from_registration(&McpToolRegistration {
 ///     name: "stellar_balances", destructive_hint: false, read_only_hint: true, chain_id_required: true,
+///     value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
 /// });
 /// assert_eq!(engine.evaluate(&read_tool, &args, &profile_mainnet, None, None, None, None, None).unwrap(), Decision::Allow);
 ///
 /// // Mainnet: destructive tool is NOT implemented yet.
 /// let write_tool = ToolDescriptor::from_registration(&McpToolRegistration {
 ///     name: "stellar_pay", destructive_hint: true, read_only_hint: false, chain_id_required: true,
+///     value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
 /// });
 /// assert!(engine.evaluate(&write_tool, &args, &profile_mainnet, None, None, None, None, None).is_err());
 /// ```
@@ -1210,6 +1264,7 @@ mod tests {
             destructive_hint: true,
             read_only_hint: false,
             chain_id_required: false,
+            value_kind: crate::policy::ToolValueKind::ReadOnly,
         })
     }
 
@@ -1219,6 +1274,7 @@ mod tests {
             destructive_hint: false,
             read_only_hint: false,
             chain_id_required: false,
+            value_kind: crate::policy::ToolValueKind::ReadOnly,
         })
     }
 

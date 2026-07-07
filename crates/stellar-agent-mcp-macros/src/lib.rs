@@ -258,7 +258,33 @@ fn expand_mcp_tool_router(impl_block: &mut ItemImpl) -> syn::Result<TokenStream2
                     destructive_hint,
                     read_only_hint,
                     chain_id_required,
+                    value_kind,
                 } = args;
+
+                // Map the optional value_kind string to the runtime enum path.
+                // Omitted → ReadOnly (back-compatible default); an unrecognised
+                // value is a compile error so a typo cannot silently downgrade
+                // a value-moving tool to ReadOnly.
+                let value_kind_tokens = match value_kind.as_deref() {
+                    None | Some("read_only") => {
+                        quote! { ::stellar_agent_core::policy::ToolValueKind::ReadOnly }
+                    }
+                    Some("moves_value") => {
+                        quote! { ::stellar_agent_core::policy::ToolValueKind::MovesValue }
+                    }
+                    Some("opaque_sign") => {
+                        quote! { ::stellar_agent_core::policy::ToolValueKind::OpaqueSign }
+                    }
+                    Some(other) => {
+                        return Err(syn::Error::new_spanned(
+                            &fn_item.sig.ident,
+                            format!(
+                                "#[mcp_tool_item] value_kind = \"{other}\" is not recognised; \
+                                 expected one of \"read_only\", \"moves_value\", \"opaque_sign\""
+                            ),
+                        ));
+                    }
+                };
 
                 submit_items.push(quote! {
                     ::inventory::submit! {
@@ -267,6 +293,7 @@ fn expand_mcp_tool_router(impl_block: &mut ItemImpl) -> syn::Result<TokenStream2
                             destructive_hint: #destructive_hint,
                             read_only_hint: #read_only_hint,
                             chain_id_required: #chain_id_required,
+                            value_kind: #value_kind_tokens,
                         }
                     }
                 });
@@ -538,6 +565,79 @@ mod tests {
         assert!(
             ts_str.contains("McpToolRegistration"),
             "emitted TokenStream must reference McpToolRegistration"
+        );
+    }
+
+    /// (g2) An omitted `value_kind` emits the back-compatible `ReadOnly`
+    /// default, and an explicit `value_kind = "moves_value"` emits `MovesValue`.
+    #[test]
+    fn value_kind_defaults_to_read_only_and_honours_explicit_value() {
+        let mut omitted: ItemImpl = parse_quote! {
+            impl Dummy {
+                #[mcp_tool_item(
+                    name = "stellar_balances",
+                    destructive_hint = false,
+                    read_only_hint = true,
+                    chain_id_required = true
+                )]
+                #[tool(name = "stellar_balances")]
+                fn stellar_balances(&self) {}
+            }
+        };
+        let expanded = expand_mcp_tool_router(&mut omitted).expect("ok");
+        assert!(
+            expanded.to_string().contains(
+                "value_kind : :: stellar_agent_core :: policy :: ToolValueKind :: ReadOnly"
+            ),
+            "omitted value_kind must emit the ReadOnly default: {}",
+            expanded
+        );
+
+        let mut explicit: ItemImpl = parse_quote! {
+            impl Dummy {
+                #[mcp_tool_item(
+                    name = "stellar_pay",
+                    destructive_hint = true,
+                    read_only_hint = false,
+                    chain_id_required = true,
+                    value_kind = "moves_value"
+                )]
+                #[tool(name = "stellar_pay")]
+                fn stellar_pay(&self) {}
+            }
+        };
+        let expanded = expand_mcp_tool_router(&mut explicit).expect("ok");
+        assert!(
+            expanded.to_string().contains(
+                "value_kind : :: stellar_agent_core :: policy :: ToolValueKind :: MovesValue"
+            ),
+            "explicit value_kind must emit MovesValue: {}",
+            expanded
+        );
+    }
+
+    /// (g3) An unrecognised `value_kind` string is a compile error so a typo
+    /// cannot silently downgrade a value-moving tool to `ReadOnly`.
+    #[test]
+    fn unrecognised_value_kind_is_a_compile_error() {
+        let mut impl_block: ItemImpl = parse_quote! {
+            impl Dummy {
+                #[mcp_tool_item(
+                    name = "stellar_pay",
+                    destructive_hint = true,
+                    read_only_hint = false,
+                    chain_id_required = true,
+                    value_kind = "moves-value"
+                )]
+                #[tool(name = "stellar_pay")]
+                fn stellar_pay(&self) {}
+            }
+        };
+        let err = expand_mcp_tool_router(&mut impl_block).unwrap_err();
+        assert!(
+            err.to_string().contains("value_kind"),
+            "error must mention value_kind: {}",
+            err
         );
     }
 

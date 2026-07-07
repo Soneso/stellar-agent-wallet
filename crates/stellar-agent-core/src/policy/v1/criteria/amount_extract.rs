@@ -42,7 +42,27 @@ pub(crate) fn extract_pay_or_create_account_stroops(
     ctx: &EvalContext<'_>,
     caller: &'static str,
 ) -> Result<Option<i64>, PolicyError> {
-    let tool_name = ctx.tool.name.as_str();
+    resolve_pay_or_create_account_stroops(ctx.tool.name.as_str(), ctx.args, caller)
+}
+
+/// Resolves the debit amount in stroops for `stellar_pay(_commit)` /
+/// `stellar_create_account(_commit)` directly from `(tool_name, args)`.
+///
+/// This is the [`EvalContext`]-free core of
+/// [`extract_pay_or_create_account_stroops`]; the descriptor derivation
+/// ([`crate::policy::v1::value::derive_value_class`]) calls it before an
+/// `EvalContext` exists, and the criterion wrapper delegates to it, so both
+/// paths resolve the amount identically.
+///
+/// # Errors
+///
+/// Returns [`PolicyError::CriterionEvaluationFailed`] when a present key does
+/// not parse as a valid amount.
+pub(crate) fn resolve_pay_or_create_account_stroops(
+    tool_name: &str,
+    args: &serde_json::Value,
+    caller: &str,
+) -> Result<Option<i64>, PolicyError> {
     let (resolved_key, legacy_key) = match tool_name {
         "stellar_pay" | "stellar_pay_commit" => ("amount_stroops", "amount"),
         "stellar_create_account" | "stellar_create_account_commit" => {
@@ -51,7 +71,7 @@ pub(crate) fn extract_pay_or_create_account_stroops(
         _ => return Ok(None),
     };
 
-    if let Some(v) = ctx.args.get(resolved_key) {
+    if let Some(v) = args.get(resolved_key) {
         return value_as_stroops_i64(v).map(Some).ok_or_else(|| {
             PolicyError::CriterionEvaluationFailed {
                 detail: format!(
@@ -62,7 +82,7 @@ pub(crate) fn extract_pay_or_create_account_stroops(
         });
     }
 
-    if let Some(v) = ctx.args.get(legacy_key).and_then(|v| v.as_str()) {
+    if let Some(v) = args.get(legacy_key).and_then(|v| v.as_str()) {
         let stroops = StellarAmount::parse_with_unit(v)
             .or_else(|_| StellarAmount::parse_stroops(v))
             .map(|a| a.as_stroops())
@@ -103,6 +123,7 @@ mod tests {
             destructive_hint: true,
             read_only_hint: false,
             chain_id_required: true,
+            value_kind: crate::policy::ToolValueKind::ReadOnly,
         };
         ToolDescriptor::from_registration(&reg)
     }

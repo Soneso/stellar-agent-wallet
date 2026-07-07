@@ -160,7 +160,8 @@ impl WalletServer {
         name = "stellar_x402_create_payment",
         destructive_hint = false,
         read_only_hint = false,
-        chain_id_required = true
+        chain_id_required = true,
+        value_kind = "moves_value"
     )]
     #[tool(
         name = "stellar_x402_create_payment",

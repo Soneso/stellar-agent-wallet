@@ -86,6 +86,7 @@ fn balances_descriptor() -> ToolDescriptor {
         destructive_hint: false,
         read_only_hint: true,
         chain_id_required: true,
+        value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
     });
     td.chain_id = "stellar:testnet".to_owned();
     td

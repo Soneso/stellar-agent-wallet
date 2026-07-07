@@ -241,6 +241,7 @@ fn tool_descriptor_from_meta(meta: &ToolMeta) -> ToolDescriptor {
         destructive_hint: meta.destructive_hint,
         read_only_hint: meta.read_only_hint,
         chain_id_required: meta.chain_id_required,
+        value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
     };
     let mut td = ToolDescriptor::from_registration(&reg);
     td.chain_id = meta.chain_id.clone();

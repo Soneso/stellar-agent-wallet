@@ -153,6 +153,7 @@ fn noopengine_rejects_stellar_friendbot_on_mainnet() {
         destructive_hint: true,
         read_only_hint: false,
         chain_id_required: true,
+        value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
     });
     let args = json!({
         "chain_id": "stellar:mainnet",
@@ -178,6 +179,7 @@ fn noopengine_allows_stellar_friendbot_on_testnet() {
         destructive_hint: true,
         read_only_hint: false,
         chain_id_required: true,
+        value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
     });
     let args = json!({
         "chain_id": "stellar:testnet",

@@ -395,6 +395,9 @@ where
         destructive_hint: true,
         read_only_hint: false,
         chain_id_required: true,
+        // Mirrors the authoritative #[mcp_tool_item(value_kind = "moves_value")]
+        // on stellar_defindex_vault_deposit in stellar-agent-mcp; keep in sync.
+        value_kind: stellar_agent_core::policy::ToolValueKind::MovesValue,
     };
     let mut tool_descriptor = ToolDescriptor::from_registration(&vault_deposit_reg);
     tool_descriptor.chain_id = chain_id.to_owned();
@@ -731,6 +734,9 @@ where
         destructive_hint: true,
         read_only_hint: false,
         chain_id_required: true,
+        // Mirrors the authoritative #[mcp_tool_item(value_kind = "moves_value")]
+        // on stellar_defindex_vault_withdraw in stellar-agent-mcp; keep in sync.
+        value_kind: stellar_agent_core::policy::ToolValueKind::MovesValue,
     };
     let mut tool_descriptor = ToolDescriptor::from_registration(&vault_withdraw_reg);
     tool_descriptor.chain_id = chain_id.to_owned();

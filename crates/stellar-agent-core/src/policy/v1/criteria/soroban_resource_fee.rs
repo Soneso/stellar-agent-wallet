@@ -190,6 +190,7 @@ mod tests {
             destructive_hint: true,
             read_only_hint: false,
             chain_id_required: true,
+            value_kind: crate::policy::ToolValueKind::ReadOnly,
         };
         ToolDescriptor::from_registration(&reg)
     }
@@ -209,6 +210,7 @@ mod tests {
             args,
             profile_name: "alice",
             profile,
+            value: crate::policy::v1::value::ValueClass::ReadOnly,
             account_view: None,
             identity_view: None,
             quorum: None,
@@ -232,6 +234,7 @@ mod tests {
                 destructive_hint: false,
                 read_only_hint: false,
                 chain_id_required: false,
+                value_kind: crate::policy::ToolValueKind::ReadOnly,
             };
             let tool = ToolDescriptor::from_registration(&tool_reg);
             let profile = Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build();
@@ -240,6 +243,7 @@ mod tests {
                 args: &args,
                 profile_name: "alice",
                 profile: &profile,
+                value: crate::policy::v1::value::ValueClass::ReadOnly,
                 account_view: None,
                 identity_view: None,
                 quorum: None,

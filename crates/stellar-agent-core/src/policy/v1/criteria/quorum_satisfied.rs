@@ -168,6 +168,7 @@ mod tests {
             destructive_hint: true,
             read_only_hint: false,
             chain_id_required: true,
+            value_kind: crate::policy::ToolValueKind::ReadOnly,
         })
     }
 

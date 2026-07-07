@@ -293,6 +293,7 @@ impl PolicyRule {
     ///     destructive_hint: true,
     ///     read_only_hint: false,
     ///     chain_id_required: true,
+    ///     value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
     /// });
     /// assert!(rule.matches_tool(&tool));
     /// ```
@@ -322,6 +323,7 @@ impl PolicyRule {
 ///     destructive_hint: true,
 ///     read_only_hint: false,
 ///     chain_id_required: true,
+///     value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
 /// });
 /// assert!(m.matches(&tool));
 /// ```
@@ -348,6 +350,7 @@ impl RuleMatch {
     ///     destructive_hint: true,
     ///     read_only_hint: false,
     ///     chain_id_required: true,
+    ///     value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
     /// });
     /// // chain_id on ToolDescriptor is populated from the tool call arg at dispatch;
     /// // for the match test the chain_id field of ToolDescriptor is not yet set.
@@ -1359,6 +1362,7 @@ mod tests {
             destructive_hint: true,
             read_only_hint: false,
             chain_id_required: true,
+            value_kind: crate::policy::ToolValueKind::ReadOnly,
         })
     }
 
@@ -1379,6 +1383,11 @@ mod tests {
             args,
             profile_name: "alice",
             profile: &profile,
+            // This helper emulates the dispatch gate for criterion tests, so it
+            // derives the value descriptor exactly as the gate does. Non-value
+            // criteria (rate limits, session guards) and tools this derivation
+            // does not recognise resolve to ReadOnly and are unaffected.
+            value: crate::policy::v1::value::derive_value_class(tool.name.as_str(), args),
             account_view,
             identity_view: None,
             quorum: None,
@@ -1661,6 +1670,7 @@ decision = "allow"
                 destructive_hint: true,
                 read_only_hint: false,
                 chain_id_required: true,
+                value_kind: crate::policy::ToolValueKind::ReadOnly,
             });
         td.chain_id = "stellar:testnet".into();
         assert!(m.matches(&td));
@@ -1678,6 +1688,7 @@ decision = "allow"
                 destructive_hint: true,
                 read_only_hint: false,
                 chain_id_required: true,
+                value_kind: crate::policy::ToolValueKind::ReadOnly,
             });
         td.chain_id = "stellar:mainnet".into();
         assert!(m.matches(&td));
@@ -1695,6 +1706,7 @@ decision = "allow"
                 destructive_hint: false,
                 read_only_hint: true,
                 chain_id_required: true,
+                value_kind: crate::policy::ToolValueKind::ReadOnly,
             });
         assert!(!m.matches(&td));
     }
@@ -1715,6 +1727,7 @@ decision = "allow"
                 destructive_hint: true,
                 read_only_hint: false,
                 chain_id_required: true,
+                value_kind: crate::policy::ToolValueKind::ReadOnly,
             });
 
         assert!(
@@ -1739,6 +1752,7 @@ decision = "allow"
                 destructive_hint: true,
                 read_only_hint: false,
                 chain_id_required: true,
+                value_kind: crate::policy::ToolValueKind::ReadOnly,
             });
 
         assert!(

@@ -487,12 +487,14 @@ fn duplicate_registration_fails_closed() {
             destructive_hint: false,
             read_only_hint: true,
             chain_id_required: true,
+            value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
         },
         McpToolRegistration {
             name: "stellar_pay",
             destructive_hint: true,
             read_only_hint: false,
             chain_id_required: true,
+            value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
         },
     ];
     assert!(
@@ -509,12 +511,14 @@ fn duplicate_registration_fails_closed() {
             destructive_hint: true,
             read_only_hint: false,
             chain_id_required: true,
+            value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
         },
         McpToolRegistration {
             name: "stellar_pay",     // same name — attacker variant
             destructive_hint: false, // would shadow the legitimate destructive=true entry
             read_only_hint: false,
             chain_id_required: false,
+            value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
         },
     ];
     let result = check_duplicate_registrations(&duplicate);
@@ -1449,5 +1453,84 @@ fn wire_drift_guard_input_schemas_have_no_raw_numeric_amount_fields() {
          Either retype the field as a decimal string on the wire, or — if it is \
          genuinely a count/id/budget rather than a stroop amount — add its exact \
          field name to ALLOWED_NUMERIC_FIELD_NAMES with a one-line justification."
+    );
+}
+
+/// Every registered tool declares a `value_kind`, and the classification map is
+/// exactly the design's: the named `MovesValue` set moves value, ONLY the three
+/// SEP-43 transaction/auth-entry sign tools are `OpaqueSign`, and every other
+/// tool (reads, quotes, status, `get_*`, message sign/verify) is `ReadOnly`.
+///
+/// This locks the per-tool classification (design §2.3 MAJOR-4): a new
+/// value-moving tool added without a `value_kind = "moves_value"` annotation
+/// lands in the ReadOnly bucket and fails this test; the `OpaqueSign` set cannot
+/// silently grow beyond the three audited sign tools.
+#[test]
+fn value_kind_classification_matches_design() {
+    use stellar_agent_core::policy::ToolValueKind;
+
+    let moves_value: HashSet<&str> = [
+        "stellar_pay",
+        "stellar_pay_commit",
+        "stellar_create_account",
+        "stellar_create_account_commit",
+        "stellar_claim",
+        "stellar_claim_commit",
+        "stellar_trustline",
+        "stellar_trustline_commit",
+        "stellar_blend_lend",
+        "stellar_dex_trade",
+        "stellar_defindex_vault_deposit",
+        "stellar_defindex_vault_withdraw",
+        "stellar_x402_authenticated_payment",
+        "stellar_x402_create_payment",
+    ]
+    .into_iter()
+    .collect();
+
+    let opaque_sign: HashSet<&str> = [
+        "stellar_sep43_sign_transaction",
+        "stellar_sep43_sign_and_submit_transaction",
+        "stellar_sep43_sign_auth_entry",
+    ]
+    .into_iter()
+    .collect();
+
+    // Every registration is classified exactly as the design prescribes.
+    for reg in inventory::iter::<McpToolRegistration>() {
+        let expected = if moves_value.contains(reg.name) {
+            ToolValueKind::MovesValue
+        } else if opaque_sign.contains(reg.name) {
+            ToolValueKind::OpaqueSign
+        } else {
+            ToolValueKind::ReadOnly
+        };
+        assert_eq!(
+            reg.value_kind, expected,
+            "tool '{}' has value_kind {:?} but the design classifies it as {:?}",
+            reg.name, reg.value_kind, expected
+        );
+    }
+
+    // Every named MovesValue / OpaqueSign tool is actually registered (guards a
+    // rename that would otherwise silently drop a value-moving tool to ReadOnly
+    // via the wildcard arm above).
+    let registered = collect_registry_names();
+    for name in moves_value.iter().chain(opaque_sign.iter()) {
+        assert!(
+            registered.contains(name),
+            "expected value-classified tool '{name}' is not registered; \
+             a rename must update this classification map"
+        );
+    }
+
+    // No OpaqueSign tool exists outside the three audited sign tools.
+    let opaque_registered: HashSet<&str> = inventory::iter::<McpToolRegistration>()
+        .filter(|reg| reg.value_kind == ToolValueKind::OpaqueSign)
+        .map(|reg| reg.name)
+        .collect();
+    assert_eq!(
+        opaque_registered, opaque_sign,
+        "the OpaqueSign set must be exactly the three SEP-43 sign tools"
     );
 }

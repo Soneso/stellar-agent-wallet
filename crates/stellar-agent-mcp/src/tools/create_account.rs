@@ -329,7 +329,8 @@ impl WalletServer {
         name = "stellar_create_account",
         destructive_hint = false,
         read_only_hint = false,
-        chain_id_required = true
+        chain_id_required = true,
+        value_kind = "moves_value"
     )]
     #[tool(
         name = "stellar_create_account",
@@ -718,7 +719,8 @@ impl WalletServer {
         name = "stellar_create_account_commit",
         destructive_hint = true,
         read_only_hint = false,
-        chain_id_required = true
+        chain_id_required = true,
+        value_kind = "moves_value"
     )]
     #[tool(
         name = "stellar_create_account_commit",

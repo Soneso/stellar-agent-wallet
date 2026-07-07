@@ -245,6 +245,7 @@ where
         destructive_hint: true,
         read_only_hint: false,
         chain_id_required: true,
+        value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
     };
     let mut tool_descriptor = ToolDescriptor::from_registration(&trustline_reg);
     tool_descriptor.chain_id = chain_id.to_owned();

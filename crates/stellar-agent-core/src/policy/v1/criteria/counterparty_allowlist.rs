@@ -244,7 +244,7 @@ impl CounterpartyAllowlistCriterion {
     }
 
     fn check_g_account(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
-        let destination = extract_string_field(ctx, "destination")?;
+        let destination = resolve_destination(ctx)?;
 
         // Validate that it is a well-formed G-strkey.
         PublicKey::from_string(&destination).map_err(|e| {
@@ -268,7 +268,7 @@ impl CounterpartyAllowlistCriterion {
     }
 
     fn check_c_account(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
-        let destination = extract_string_field(ctx, "destination")?;
+        let destination = resolve_destination(ctx)?;
 
         // Validate that it is a well-formed C-strkey.
         Contract::from_string(&destination).map_err(|e| {
@@ -292,9 +292,9 @@ impl CounterpartyAllowlistCriterion {
     }
 
     fn check_known_issuer(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
-        let asset_str = match ctx.args.get("asset").and_then(|v| v.as_str()) {
+        let asset_str = match resolve_asset(ctx) {
             None => return Ok(None), // no asset field; criterion does not apply
-            Some(s) => s.to_owned(),
+            Some(s) => s,
         };
 
         // Native asset has no issuer to check.
@@ -391,6 +391,63 @@ impl CounterpartyAllowlistCriterion {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Returns `true` for the pay/create tool family whose value fields are now
+/// sourced from the derived value leg rather than raw args.
+fn is_pay_or_create(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "stellar_pay"
+            | "stellar_pay_commit"
+            | "stellar_create_account"
+            | "stellar_create_account_commit"
+    )
+}
+
+/// Resolves the counterparty destination for the current call.
+///
+/// For the pay/create family reads `ctx.value`'s sole leg `destination`
+/// (behaviour-neutral: the leg's destination is the same `args["destination"]`
+/// string the gate derived); an unresolvable destination is refused exactly as
+/// a missing/non-string `args` field was. Other tools keep the raw-args path.
+///
+/// # Errors
+///
+/// Returns [`PolicyError::CriterionEvaluationFailed`] when the destination is
+/// unresolvable.
+fn resolve_destination(ctx: &EvalContext<'_>) -> Result<String, PolicyError> {
+    if is_pay_or_create(ctx.tool.name.as_str()) {
+        ctx.value
+            .sole_value_leg()
+            .and_then(|leg| leg.destination.clone())
+            .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+                detail: format!(
+                    "counterparty_allowlist: missing or non-string field 'destination' \
+                     in value descriptor for tool '{}'",
+                    ctx.tool.name
+                ),
+            })
+    } else {
+        extract_string_field(ctx, "destination")
+    }
+}
+
+/// Resolves the asset for the KNOWN_ISSUER check.
+///
+/// For the pay/create family reads `ctx.value`'s sole leg `asset` (the
+/// canonical asset id derived from `args["asset"]`); `None` means the criterion
+/// does not apply, matching an absent `args["asset"]`. Other tools keep the
+/// raw-args path.
+fn resolve_asset(ctx: &EvalContext<'_>) -> Option<String> {
+    if is_pay_or_create(ctx.tool.name.as_str()) {
+        ctx.value.sole_value_leg().and_then(|leg| leg.asset.clone())
+    } else {
+        ctx.args
+            .get("asset")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    }
+}
+
 fn extract_string_field(ctx: &EvalContext<'_>, field: &str) -> Result<String, PolicyError> {
     ctx.args
         .get(field)
@@ -473,6 +530,7 @@ mod tests {
             destructive_hint: true,
             read_only_hint: false,
             chain_id_required: true,
+            value_kind: crate::policy::ToolValueKind::ReadOnly,
         };
         ToolDescriptor::from_registration(&reg)
     }
@@ -496,6 +554,9 @@ mod tests {
             args,
             profile_name: "alice",
             profile,
+            // Mirror the dispatch gate: derive the value descriptor the
+            // counterparty checks now read through ctx.value for pay/create.
+            value: crate::policy::v1::value::derive_value_class(tool.name.as_str(), args),
             account_view: None,
             identity_view: None,
             quorum: None,
@@ -722,6 +783,7 @@ mod tests {
             args,
             profile_name: "alice",
             profile,
+            value: crate::policy::v1::value::derive_value_class(tool.name.as_str(), args),
             account_view: None,
             identity_view: Some(view),
             quorum: None,

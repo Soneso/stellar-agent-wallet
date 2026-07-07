@@ -80,6 +80,11 @@ pub mod bundle;
 /// Per-criterion evaluators.
 pub mod criteria;
 
+/// Typed value descriptor (`ValueClass` / `ValueEffects` / `ValueLeg` /
+/// `ActionKind`) consumed by the value-policy criteria and derived at the
+/// dispatch gate.
+pub mod value;
+
 /// Owner-signed policy file loader.
 pub mod loader;
 
@@ -109,6 +114,7 @@ mod proptest_properties;
 pub use criteria::Criterion;
 pub use criteria::PolicyStateStore;
 pub use loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
+pub use value::{ActionKind, OpaqueReason, ValueClass, ValueEffects, ValueLeg};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AccountIdentityView — local trait to avoid circular dep with
@@ -440,6 +446,17 @@ pub struct EvalContext<'a> {
     pub profile_name: &'a str,
     /// The active profile for this call.
     pub profile: &'a Profile,
+    /// Typed value descriptor for this call, DERIVED at the dispatch gate from
+    /// the same authoritative source the tool signs from.
+    ///
+    /// Value criteria (`per_tx_cap`, `per_period_cap`, `minimum_reserve`,
+    /// `counterparty_allowlist`) read the typed [`value::ValueLeg`]s out of
+    /// this field instead of pattern-matching tool names against `args`.
+    /// Defaults to [`value::ValueClass::ReadOnly`] when constructed via
+    /// [`EvalContext::new`]; [`PolicyEngineV1::evaluate`] derives the concrete
+    /// class from `(tool, args)` before running the criteria, and the bundle
+    /// path populates it per inner descriptor.
+    pub value: value::ValueClass,
     /// Account reserve view, populated when the minimum-reserve criterion
     /// is configured.  `None` when the criterion is not active or when the
     /// dispatch site does not have account state available.
@@ -574,6 +591,7 @@ impl<'a> EvalContext<'a> {
     ///     destructive_hint: true,
     ///     read_only_hint: false,
     ///     chain_id_required: true,
+    ///     value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
     /// });
     /// let profile = Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build();
     /// let args = serde_json::Value::Null;
@@ -599,6 +617,7 @@ impl<'a> EvalContext<'a> {
             args,
             profile_name,
             profile,
+            value: value::ValueClass::ReadOnly,
             account_view: None,
             identity_view: None,
             quorum: None,
@@ -608,6 +627,17 @@ impl<'a> EvalContext<'a> {
             state_store,
             bundle: None,
         }
+    }
+
+    /// Returns `self` with the `value` field set.
+    ///
+    /// Builder-style; consumes and returns `self`. Supply the derived
+    /// [`value::ValueClass`] when evaluating a call whose value effect has been
+    /// resolved at the dispatch gate.
+    #[must_use]
+    pub fn with_value(mut self, value: value::ValueClass) -> Self {
+        self.value = value;
+        self
     }
 
     /// Returns `self` with the `account_view` field set.
@@ -654,6 +684,7 @@ impl<'a> EvalContext<'a> {
     ///     destructive_hint: true,
     ///     read_only_hint: false,
     ///     chain_id_required: true,
+    ///     value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
     /// });
     /// let profile = Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build();
     /// let args = serde_json::Value::Null;
@@ -697,6 +728,7 @@ impl<'a> EvalContext<'a> {
     ///     destructive_hint: true,
     ///     read_only_hint: false,
     ///     chain_id_required: true,
+    ///     value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
     /// });
     /// let profile = Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build();
     /// let args = serde_json::Value::Null;
@@ -736,6 +768,7 @@ impl<'a> EvalContext<'a> {
     ///     destructive_hint: true,
     ///     read_only_hint: false,
     ///     chain_id_required: true,
+    ///     value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
     /// });
     /// let profile = Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build();
     /// let args = serde_json::Value::Null;
@@ -775,6 +808,7 @@ impl<'a> EvalContext<'a> {
     ///     destructive_hint: true,
     ///     read_only_hint: false,
     ///     chain_id_required: true,
+    ///     value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
     /// });
     /// let profile = Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build();
     /// let args = serde_json::Value::Null;
@@ -1057,11 +1091,18 @@ impl PolicyEngine for PolicyEngineV1 {
                 continue;
             }
 
+            // Derive the typed value descriptor from the same (tool, args) the
+            // criteria gate on. On the commit path `args` is the HMAC-bound
+            // authoritative_args, so the descriptor is transitively bound to the
+            // signed envelope. Non-pay/create tools derive ReadOnly in this step.
+            let value = value::derive_value_class(&tool.name, args);
+
             let ctx = EvalContext {
                 tool,
                 args,
                 profile_name: &self.profile_name,
                 profile,
+                value,
                 account_view,
                 identity_view,
                 // Quorum view is None on the standard single-tx path.
@@ -1197,11 +1238,16 @@ impl PolicyEngineV1 {
                     inners: bundle.inners,
                     overlay: &overlay,
                 };
+                // Populate the value axis from this inner's typed descriptor so
+                // value criteria read ctx.value uniformly. Generic inners map to
+                // ReadOnly (they contribute nothing to value caps).
+                let value = value::value_class_for_inner(inner);
                 let ctx = EvalContext {
                     tool,
                     args,
                     profile_name: &self.profile_name,
                     profile,
+                    value,
                     account_view: None,
                     identity_view: None,
                     quorum: None,
@@ -1249,6 +1295,9 @@ impl PolicyEngineV1 {
                     args,
                     profile_name: &self.profile_name,
                     profile,
+                    // Accumulation derives state keys only from profile_name;
+                    // the value axis is unused here.
+                    value: value::ValueClass::ReadOnly,
                     account_view: None,
                     identity_view: None,
                     quorum: None,
@@ -1281,6 +1330,9 @@ impl PolicyEngineV1 {
             args,
             profile_name: &self.profile_name,
             profile,
+            // Bundle-level criteria inspect the full inners slice, not the value
+            // axis; ReadOnly is the correct placeholder here.
+            value: value::ValueClass::ReadOnly,
             account_view: None,
             identity_view: None,
             quorum: None,
@@ -1349,6 +1401,7 @@ mod tests {
             destructive_hint: false,
             read_only_hint: false,
             chain_id_required: false,
+            value_kind: crate::policy::ToolValueKind::ReadOnly,
         });
         td.chain_id = chain.to_owned();
         td

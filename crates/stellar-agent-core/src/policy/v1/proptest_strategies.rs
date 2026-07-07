@@ -313,6 +313,7 @@ pub fn arb_tool_descriptor() -> impl Strategy<Value = ToolDescriptor> {
             destructive_hint: true,
             read_only_hint: false,
             chain_id_required: true,
+            value_kind: crate::policy::ToolValueKind::ReadOnly,
         });
         td.chain_id = chain_id;
         td
@@ -332,6 +333,7 @@ pub fn arb_tool_descriptor_for_payment_tools() -> impl Strategy<Value = ToolDesc
             destructive_hint: true,
             read_only_hint: false,
             chain_id_required: true,
+            value_kind: crate::policy::ToolValueKind::ReadOnly,
         });
         td.chain_id = "stellar:testnet".to_owned();
         td

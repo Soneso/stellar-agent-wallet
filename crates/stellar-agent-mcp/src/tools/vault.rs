@@ -194,7 +194,8 @@ impl WalletServer {
         name = "stellar_defindex_vault_deposit",
         destructive_hint = true,
         read_only_hint = false,
-        chain_id_required = true
+        chain_id_required = true,
+        value_kind = "moves_value"
     )]
     #[tool(
         name = "stellar_defindex_vault_deposit",
@@ -549,7 +550,8 @@ impl WalletServer {
         name = "stellar_defindex_vault_withdraw",
         destructive_hint = true,
         read_only_hint = false,
-        chain_id_required = true
+        chain_id_required = true,
+        value_kind = "moves_value"
     )]
     #[tool(
         name = "stellar_defindex_vault_withdraw",

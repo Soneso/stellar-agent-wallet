@@ -93,7 +93,8 @@ impl WalletServer {
         name = "stellar_sep43_sign_auth_entry",
         destructive_hint = false,
         read_only_hint = false,
-        chain_id_required = true
+        chain_id_required = true,
+        value_kind = "opaque_sign"
     )]
     #[tool(
         name = "stellar_sep43_sign_auth_entry",

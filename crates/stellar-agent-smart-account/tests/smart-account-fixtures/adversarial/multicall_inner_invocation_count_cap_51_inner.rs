@@ -59,6 +59,7 @@ fn make_tool() -> ToolDescriptor {
         destructive_hint: true,
         read_only_hint: false,
         chain_id_required: true,
+        value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
     })
 }
 

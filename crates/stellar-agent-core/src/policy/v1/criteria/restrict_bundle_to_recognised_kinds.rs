@@ -125,6 +125,7 @@ mod tests {
             destructive_hint: true,
             read_only_hint: false,
             chain_id_required: true,
+            value_kind: crate::policy::ToolValueKind::ReadOnly,
         })
     }
 
@@ -160,6 +161,7 @@ mod tests {
             args,
             profile_name: "alice",
             profile,
+            value: crate::policy::v1::value::ValueClass::ReadOnly,
             account_view: None,
             identity_view: None,
             quorum: None,

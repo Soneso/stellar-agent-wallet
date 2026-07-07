@@ -1304,6 +1304,12 @@ pub async fn submit_multicall_bundle(
         destructive_hint: true,
         read_only_hint: false,
         chain_id_required: true,
+        // wallet_multicall dispatches a bundle of value-moving inner operations;
+        // its value effect is realised per-inner via the bundle path
+        // (value_class_for_inner), so it is classified MovesValue. It has no
+        // #[mcp_tool_item] twin (smart-account-internal), so this classification
+        // stands on its own value-moving nature.
+        value_kind: stellar_agent_core::policy::ToolValueKind::MovesValue,
     };
     let tool = ToolDescriptor::from_registration(&tool_reg);
     let eval_args = serde_json::json!({

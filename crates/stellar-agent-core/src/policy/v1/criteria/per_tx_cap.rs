@@ -37,7 +37,6 @@
 
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::criteria::Criterion;
-use crate::policy::v1::criteria::amount_extract::extract_pay_or_create_account_stroops;
 use crate::policy::{DenyReason, PolicyError};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -123,25 +122,46 @@ impl Criterion for PerTxCapCriterion {
 
         // Extract (attempted_stroops, tool_asset) per tool type.
         let (attempted_stroops, tool_asset) = match tool_name {
-            "stellar_pay" | "stellar_pay_commit" => {
-                let asset_str = extract_string_field(ctx, "asset")?;
-                let stroops = extract_pay_or_create_account_stroops(ctx, "per_tx_cap")?
-                    .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+            "stellar_pay"
+            | "stellar_pay_commit"
+            | "stellar_create_account"
+            | "stellar_create_account_commit" => {
+                // Read the resolved value leg the gate derived from the same
+                // authoritative args (amount / asset / destination), rather than
+                // re-parsing args here. Behaviour-neutral: the leg's amount and
+                // asset come from the identical resolved-key logic and the same
+                // asset normalisation this criterion applied before.
+                let leg = ctx.value.sole_value_leg().ok_or_else(|| {
+                    PolicyError::CriterionEvaluationFailed {
                         detail: format!(
-                            "per_tx_cap: missing amount_stroops/amount field for tool '{tool_name}'"
+                            "per_tx_cap: value descriptor not populated for tool '{tool_name}'"
+                        ),
+                    }
+                })?;
+                let amount = leg
+                    .amount
+                    .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+                        detail: format!("per_tx_cap: unresolvable amount for tool '{tool_name}'"),
+                    })?;
+                // i128 widening of the cap compare path is a later step; the
+                // derived amount originates from an i64 resolved key, so this
+                // conversion cannot lose data in this step.
+                let stroops =
+                    i64::try_from(amount).map_err(|_| PolicyError::CriterionEvaluationFailed {
+                        detail: format!(
+                            "per_tx_cap: amount {amount} exceeds i64 range for tool '{tool_name}'"
                         ),
                     })?;
-                (stroops, asset_normalise(asset_str))
-            }
-            "stellar_create_account" | "stellar_create_account_commit" => {
-                let stroops = extract_pay_or_create_account_stroops(ctx, "per_tx_cap")?
-                    .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
-                        detail: format!(
-                            "per_tx_cap: missing starting_balance_stroops/starting_balance \
-                             field for tool '{tool_name}'"
-                        ),
-                    })?;
-                (stroops, "native".to_owned())
+                let asset =
+                    leg.asset
+                        .clone()
+                        .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+                            detail: format!(
+                                "per_tx_cap: unresolvable asset for tool '{tool_name}'"
+                            ),
+                        })?;
+                // leg.asset is already the canonical policy asset id.
+                (stroops, asset)
             }
             "stellar_axelar_bridge" => {
                 // `qty` is an on-chain i128 integer (not a unit-bearing string).
@@ -246,6 +266,7 @@ mod tests {
             destructive_hint: true,
             read_only_hint: false,
             chain_id_required: true,
+            value_kind: crate::policy::ToolValueKind::ReadOnly,
         };
         ToolDescriptor::from_registration(&reg)
     }
@@ -269,6 +290,9 @@ mod tests {
             args,
             profile_name: "alice",
             profile,
+            // Mirror the dispatch gate: derive the value descriptor from the
+            // same args the criterion now reads through ctx.value.
+            value: crate::policy::v1::value::derive_value_class(tool.name.as_str(), args),
             account_view: None,
             identity_view: None,
             quorum: None,

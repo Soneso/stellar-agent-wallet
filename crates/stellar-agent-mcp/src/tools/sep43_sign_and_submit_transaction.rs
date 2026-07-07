@@ -172,7 +172,8 @@ impl WalletServer {
         name = "stellar_sep43_sign_and_submit_transaction",
         destructive_hint = true,
         read_only_hint = false,
-        chain_id_required = true
+        chain_id_required = true,
+        value_kind = "opaque_sign"
     )]
     #[tool(
         name = "stellar_sep43_sign_and_submit_transaction",

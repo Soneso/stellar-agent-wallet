@@ -41,4 +41,12 @@ pub(crate) struct McpToolItemArgs {
     pub read_only_hint: bool,
     /// Whether the tool requires a CAIP-2 `chain_id` argument.
     pub chain_id_required: bool,
+    /// The tool's declared static value shape.
+    ///
+    /// Optional and back-compatible: when omitted, the tool is classified as
+    /// `read_only` (the runtime `ToolValueKind::ReadOnly` default). Accepted
+    /// values are `"read_only"`, `"moves_value"`, and `"opaque_sign"`; any
+    /// other value is a compile-time error raised by `expand_mcp_tool_router`.
+    #[darling(default)]
+    pub value_kind: Option<String>,
 }

@@ -221,7 +221,45 @@ impl Criterion for MinimumReserveCriterion {
 /// Returns [`PolicyError::CriterionEvaluationFailed`] when a present resolved
 /// or legacy amount field fails to parse.
 fn extract_amount_stroops(ctx: &EvalContext<'_>) -> Result<i64, PolicyError> {
-    Ok(extract_pay_or_create_account_stroops(ctx, "minimum_reserve")?.unwrap_or(0))
+    match ctx.tool.name.as_str() {
+        "stellar_pay"
+        | "stellar_pay_commit"
+        | "stellar_create_account"
+        | "stellar_create_account_commit" => {
+            // Read the resolved debit from the value leg the gate derived. A
+            // pay/create leg with an unresolvable (`None`) amount is refused
+            // (fail-closed None-is-deny): an unresolvable server-derived amount
+            // must not be sized as a zero debit that would silently bypass the
+            // reserve guard. The leg's asset is not consulted: the reserve debit
+            // is asset-agnostic — every leg amount counts against the native
+            // reserve.
+            let leg = ctx.value.sole_value_leg().ok_or_else(|| {
+                PolicyError::CriterionEvaluationFailed {
+                    detail: format!(
+                        "minimum_reserve: value descriptor not populated for tool '{}'",
+                        ctx.tool.name
+                    ),
+                }
+            })?;
+            let amount = leg
+                .amount
+                .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+                    detail: format!(
+                        "minimum_reserve: unresolvable amount for tool '{}'",
+                        ctx.tool.name
+                    ),
+                })?;
+            i64::try_from(amount).map_err(|_| PolicyError::CriterionEvaluationFailed {
+                detail: format!(
+                    "minimum_reserve: amount {amount} exceeds i64 range for tool '{}'",
+                    ctx.tool.name
+                ),
+            })
+        }
+        // Other tools keep the current args path: a genuinely amount-less tool
+        // resolves to a 0 debit (the reserve check still fires on the fee).
+        _ => Ok(extract_pay_or_create_account_stroops(ctx, "minimum_reserve")?.unwrap_or(0)),
+    }
 }
 
 /// Extracts the transaction fee in stroops from args.
@@ -280,6 +318,7 @@ mod tests {
             destructive_hint: true,
             read_only_hint: false,
             chain_id_required: true,
+            value_kind: crate::policy::ToolValueKind::ReadOnly,
         };
         ToolDescriptor::from_registration(&reg)
     }
@@ -300,6 +339,9 @@ mod tests {
             args,
             profile_name: "alice",
             profile,
+            // Mirror the dispatch gate: derive the value descriptor the
+            // criterion now reads through ctx.value for pay/create.
+            value: crate::policy::v1::value::derive_value_class(tool.name.as_str(), args),
             account_view,
             identity_view: None,
             quorum: None,

@@ -368,6 +368,7 @@ fn policy_engine_allows_stellar_balances_read_only() {
         destructive_hint: false,
         read_only_hint: true,
         chain_id_required: true,
+        value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
     });
     let args = serde_json::Value::Null;
 

@@ -166,7 +166,8 @@ impl WalletServer {
         name = "stellar_dex_trade",
         destructive_hint = true,
         read_only_hint = false,
-        chain_id_required = true
+        chain_id_required = true,
+        value_kind = "moves_value"
     )]
     #[tool(
         name = "stellar_dex_trade",
