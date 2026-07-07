@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-publish = false
 description = "Windows account-SID lookup used to bind approval attestations to the current OS user. Safe wrapper isolating the Win32 FFI from the unsafe-free core crate."
+readme = "README.md"
+keywords = ["stellar", "windows", "sid", "identity", "wallet"]
+categories = ["os::windows-apis", "authentication"]
 
 [lib]
 name = "stellar_agent_windows_identity"

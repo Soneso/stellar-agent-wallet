@@ -67,11 +67,11 @@
 ///
 // Path is relative to THIS FILE (`src/signers/verifier_identification.rs`),
 // per Rust `include_bytes!` semantics — NOT the crate root or workspace root.
-// Resolves to `<repo-root>/vendor/oz-webauthn-verifier/
+// Resolves to `<crate-root>/vendor/oz-webauthn-verifier/
 // v0.7.2/multisig_webauthn_verifier_example.wasm`.
 #[cfg(any(test, feature = "deploy-cli"))]
 pub const VERIFIER_WASM_FIXTURE: &[u8] = include_bytes!(
-    "../../../../vendor/oz-webauthn-verifier/v0.7.2/multisig_webauthn_verifier_example.wasm"
+    "../../vendor/oz-webauthn-verifier/v0.7.2/multisig_webauthn_verifier_example.wasm"
 );
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

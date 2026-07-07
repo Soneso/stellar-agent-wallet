@@ -6,7 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Capability-to-tool matrix and enforcement layer for installed toolsets in the Stellar agent wallet."
-publish = false
+readme = "README.md"
+keywords = ["stellar", "toolset", "capability", "wallet", "ai-agent"]
+categories = ["cryptography::cryptocurrencies"]
 
 [dependencies]
 stellar-agent-toolsets         = { workspace = true }
@@ -18,11 +20,11 @@ serde     = { workspace = true }
 
 [dev-dependencies]
 tempfile                   = { workspace = true }
-stellar-agent-test-support = { workspace = true }
-stellar-agent-toolsets       = { workspace = true, features = ["test-helpers"] }
-stellar-agent-core         = { workspace = true }
+stellar-agent-test-support = { path = "../stellar-agent-test-support" }
+stellar-agent-toolsets = { path = "../stellar-agent-toolsets", features = ["test-helpers"] }
+stellar-agent-core = { path = "../stellar-agent-core" }
 serde_json                 = { workspace = true }
-stellar-agent-toolsets-install = { workspace = true, features = ["test-helpers"] }
+stellar-agent-toolsets-install = { path = "../stellar-agent-toolsets-install", features = ["test-helpers"] }
 
 [features]
 # Exposes test helpers for integration tests in sibling crates.

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.2] - 2026-07-07
+
 ### Added
 
 - Remote operator approval: `approve serve --remote` binds a TLS-protected,
@@ -46,6 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   OpenZeppelin verifier entries now report `provisional` (named-party internal
   review) rather than overstating an external audit; `list-verifiers` carries
   the attestor and date as additive fields.
+- All 34 workspace crates are published to crates.io, so the binaries install
+  with `cargo install stellar-agent-cli` / `cargo install stellar-agent-mcp`
+  (or `cargo binstall` without a `--git` URL) and the library crates resolve
+  as normal registry dependencies.
 
 ### Changed
 
@@ -61,7 +67,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   include the asset, so cap and reserve policies evaluate calls they
   previously refused or under-counted.
 - Every CLI secret-env signing path handles the seed through an
-  mlock-protected unlock window with explicit residue zeroization.
+  mlock-protected unlock window with explicit residue zeroization; when mlock
+  is unavailable and the profile policy allows degraded operation, the
+  degradation is recorded in the audit log as a `wallet_mlock_failed` event.
 - Renamed the `wallet` CLI command group to `smart-account` (with `sa` as a
   shorter alias), and flattened the former nested `sa` admin subgroup so its
   verbs (`deploy-webauthn-verifier`, `migrate-verifier`, `list-verifiers`,
@@ -138,5 +146,6 @@ policy engine, operator-approval spine, and tamper-evident audit log.
 - An agent integration guide (`docs/agents.md`) and capability-isolation example
   toolsets under `examples/toolsets/`.
 
-[Unreleased]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.1...HEAD
+[Unreleased]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.2...HEAD
+[0.1.0-alpha.2]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.1...v0.1.0-alpha.2
 [0.1.0-alpha.1]: https://github.com/Soneso/stellar-agent-wallet/releases/tag/v0.1.0-alpha.1

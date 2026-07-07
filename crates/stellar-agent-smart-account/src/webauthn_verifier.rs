@@ -110,9 +110,8 @@ pub const WEBAUTHN_VERIFIER_WASM_SHA256: &str =
 /// Also ensures the SHA-256 check in
 /// `tests::webauthn_verifier_wasm_sha256_matches_provenance` can verify the
 /// artefact at `cargo test` time.
-pub const WEBAUTHN_VERIFIER_WASM: &[u8] = include_bytes!(
-    "../../../vendor/oz-webauthn-verifier/v0.7.2/multisig_webauthn_verifier_example.wasm"
-);
+pub const WEBAUTHN_VERIFIER_WASM: &[u8] =
+    include_bytes!("../vendor/oz-webauthn-verifier/v0.7.2/multisig_webauthn_verifier_example.wasm");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests

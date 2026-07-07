@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-publish = false
 description = "SEP-7 web+stellar URI inbound parsing and anti-phishing signature verification for the Stellar agent wallet."
+readme = "README.md"
+keywords = ["stellar", "sep-7", "uri", "anti-phishing", "wallet"]
+categories = ["cryptography::cryptocurrencies"]
 
 [lib]
 name = "stellar_agent_sep7"
@@ -41,7 +43,7 @@ test-helpers = []
 testnet-acceptance = []
 
 [dev-dependencies]
-stellar-agent-test-support = { workspace = true, features = ["test-helpers"] }
+stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # OS CSPRNG for generating ed25519 test keys in the adversarial suite.
 rand_core = { workspace = true }

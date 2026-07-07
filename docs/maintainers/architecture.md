@@ -6,7 +6,7 @@ For concept-level background read [../concepts.md](../concepts.md). For build an
 
 ## Workspace overview
 
-The repository is a single Cargo workspace (`resolver = "2"`) with 34 member crates under `crates/`, all named `stellar-agent-*`. Shared package metadata is inherited from `[workspace.package]`: version `0.1.0-alpha.1`, Rust edition `2024`, license `Apache-2.0`, repository `https://github.com/Soneso/stellar-agent-wallet`, author `Soneso`. Every member crate sets `publish = false`; nothing is published to crates.io.
+The repository is a single Cargo workspace (`resolver = "2"`) with 34 member crates under `crates/`, all named `stellar-agent-*`. Shared package metadata is inherited from `[workspace.package]`: version `0.1.0-alpha.2`, Rust edition `2024`, license `Apache-2.0`, repository `https://github.com/Soneso/stellar-agent-wallet`, author `Soneso`. Every member crate is published to crates.io; releases publish the whole workspace at one shared version via `cargo publish --workspace` from the tagged commit.
 
 Shared dependency pins live in `[workspace.dependencies]` in the root `Cargo.toml` and are added when a crate first needs them, so the workspace only carries dependencies it actually uses.
 
@@ -67,7 +67,7 @@ The wallet ships two surfaces from two binary crates.
 
 The two binaries are siblings, not a dependency pair. `stellar-agent-cli` does not depend on `stellar-agent-mcp`. The CLI carries none of the SEP, anchor, or x402 protocol crates; the MCP binary adds that protocol surface plus the `mcp-macros` proc-macro with the `inventory` runtime. The per-crate table below carries the detail.
 
-Both binaries share a single release archive. The `[package.metadata.binstall]` blocks in both crates point at the same `stellar-agent-{version}-{target}.tar.xz` (`.zip` on Windows), and `{ bin }` resolves to each crate's own binary name. Those archives and the `cargo binstall` assets they reference are published with each tagged release. Building from source with `cargo build --release` (or `cargo install --git`) always works. See [building.md](building.md) for the build flow.
+Both binaries share a single release archive. The `[package.metadata.binstall]` blocks in both crates point at the same `stellar-agent-{version}-{target}.tar.xz` (`.zip` on Windows), and `{ bin }` resolves to each crate's own binary name. Those archives and the `cargo binstall` assets they reference are published with each tagged release. Building from source with `cargo build --release` (or `cargo install stellar-agent-cli` / `cargo install stellar-agent-mcp` from crates.io) always works. See [building.md](building.md) for the build flow.
 
 ## Per-crate responsibility
 

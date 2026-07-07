@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-publish = false
 description = "Toolset install/uninstall with cryptographic provenance (SHA-256 + ed25519 publisher signatures) for the Stellar agent wallet."
+readme = "README.md"
+keywords = ["stellar", "toolset", "provenance", "ed25519", "wallet"]
+categories = ["cryptography::cryptocurrencies", "cryptography"]
 
 [dependencies]
 thiserror = { workspace = true }
@@ -29,7 +31,7 @@ tar = { workspace = true }
 semver = { workspace = true }
 
 [dev-dependencies]
-stellar-agent-test-support = { workspace = true }
+stellar-agent-test-support = { path = "../stellar-agent-test-support" }
 tempfile = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }
@@ -41,7 +43,7 @@ stellar-strkey = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
 # For parse_capability_value_pub in pin tests.
-stellar-agent-toolsets = { workspace = true, features = ["test-helpers"] }
+stellar-agent-toolsets = { path = "../stellar-agent-toolsets", features = ["test-helpers"] }
 
 [features]
 # Exposes `ToolsetPinRecord::build_for_test` for sibling-crate tests.

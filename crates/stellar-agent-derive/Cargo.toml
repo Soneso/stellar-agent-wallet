@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-publish = false
 description = "SEP-5 / BIP-44 HD-path ed25519 key derivation for Stellar."
+readme = "README.md"
+keywords = ["stellar", "sep-5", "bip-44", "ed25519", "hd-wallet"]
+categories = ["cryptography::cryptocurrencies", "cryptography"]
 
 [dependencies]
 hmac = { workspace = true }

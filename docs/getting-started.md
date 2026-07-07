@@ -68,8 +68,9 @@ The two binaries are produced at:
 - `target/release/stellar-agent`
 - `target/release/stellar-agent-mcp`
 
-`cargo install --git https://github.com/Soneso/stellar-agent-wallet` also works
-to place the binaries on your `PATH`.
+`cargo install stellar-agent-cli` and `cargo install stellar-agent-mcp` (or
+`cargo binstall` for prebuilt binaries) also work to place the binaries on your
+`PATH`; `stellar-agent-cli` installs the binary named `stellar-agent`.
 
 When `stellar-agent` is on your `PATH`, the incumbent `stellar-cli` discovers it
 as an external subcommand: `stellar agent ...` and `stellar-agent ...` invoke the

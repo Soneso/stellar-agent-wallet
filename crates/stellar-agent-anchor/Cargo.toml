@@ -6,7 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "SEP-24 interactive hand-off and SEP-6 discovery-only anchor client. Calls GET /info only for SEP-6; returns the interactive URL for SEP-24 without opening or following it."
-publish = false
+readme = "README.md"
+keywords = ["stellar", "sep-24", "sep-6", "anchor", "wallet"]
+categories = ["cryptography::cryptocurrencies", "api-bindings"]
 
 [lib]
 name = "stellar_agent_anchor"
@@ -40,8 +42,8 @@ stellar-agent-network = { workspace = true }
 
 [dev-dependencies]
 tokio               = { workspace = true, features = ["rt-multi-thread", "macros"] }
-stellar-agent-sep10 = { workspace = true }
-stellar-agent-network = { workspace = true }
+stellar-agent-sep10 = { path = "../stellar-agent-sep10" }
+stellar-agent-network = { path = "../stellar-agent-network" }
 serde_json          = { workspace = true }
 serde               = { workspace = true }
 reqwest             = { workspace = true }

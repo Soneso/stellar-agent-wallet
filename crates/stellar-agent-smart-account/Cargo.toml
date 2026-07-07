@@ -6,7 +6,13 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Smart-account orchestration layer for the Stellar agent wallet (OZ stellar-accounts v0.7.2 consumer)."
-publish = false
+readme = "README.md"
+keywords = ["stellar", "soroban", "smart-account", "passkey", "wallet"]
+categories = ["cryptography::cryptocurrencies", "authentication"]
+# The v0.7.1 vendored WASM binaries and build scripts are unused by the build
+# (only their PROVENANCE.md SHA-256 anchors are cited from code); they stay in
+# the repository for auditability but are not shipped in the package.
+exclude = ["vendor/*/v0.7.1/*.wasm", "vendor/*/v0.7.1/build.sh"]
 
 [lib]
 name = "stellar_agent_smart_account"
@@ -172,9 +178,9 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 static_assertions = { workspace = true }
-stellar-agent-test-support = { workspace = true, features = ["verifier-registry", "wiremock-helpers", "test-helpers"] }
+stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["verifier-registry", "wiremock-helpers", "test-helpers"] }
 tracing-subscriber = { workspace = true }
-stellar-agent-core = { workspace = true }
+stellar-agent-core = { path = "../stellar-agent-core" }
 # soroban-sdk with testutils for the auth_digest_parity byte-parity gate.
 soroban-sdk = { workspace = true, features = ["testutils"] }
 sha2 = { workspace = true }
@@ -195,13 +201,13 @@ chromiumoxide = { workspace = true }
 futures = { workspace = true }
 # stellar-agent-webauthn-bridge: the bridge listener driven by the WebAuthn
 # acceptance test.
-stellar-agent-webauthn-bridge = { workspace = true }
+stellar-agent-webauthn-bridge = { path = "../stellar-agent-webauthn-bridge" }
 # stellar-agent-mcp: real WalletServer dispatch (registry/matrix/toolsets) for
 # the MCP-dispatch leg of smart_account_policy_observability_testnet_acceptance.rs.
 # test-helpers exposes the call_stellar_*/set_*_for_test cross-crate test hooks;
 # this dev-only back-edge (mcp depends on smart-account normally) is supported
 # by cargo because dev-dependencies are not part of the library build graph.
-stellar-agent-mcp = { workspace = true, features = ["test-helpers"] }
+stellar-agent-mcp = { path = "../stellar-agent-mcp", features = ["test-helpers"] }
 # keyring-core: seeds the mock in-memory keyring store for WalletServer::new.
 keyring-core = { workspace = true }
 # rmcp: inspects CallToolResult from the MCP-dispatch leg.

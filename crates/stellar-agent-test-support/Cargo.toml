@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-publish = false
 description = "Test harness: log-capture, secret-leakage assertions, and Stellar test fixtures."
+readme = "README.md"
+keywords = ["stellar", "testing", "fixtures", "wallet"]
+categories = ["development-tools::testing"]
 
 [lib]
 name = "stellar_agent_test_support"

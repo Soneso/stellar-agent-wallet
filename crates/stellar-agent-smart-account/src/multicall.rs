@@ -56,7 +56,7 @@ use crate::submit::{MulticallCheck, ResolvedFeePerOp, SubmitInvokeArgs, submit_s
 ///
 /// SHA-256 provenance: `vendor/multicall/v0.1.0/REFERENCE.md`.
 /// Runtime defence-in-depth: `multicall_wasm_sha256_matches_provenance` test.
-pub const MULTICALL_WASM: &[u8] = include_bytes!("../../../vendor/multicall/v0.1.0/multicall.wasm");
+pub const MULTICALL_WASM: &[u8] = include_bytes!("../vendor/multicall/v0.1.0/multicall.wasm");
 
 /// Expected SHA-256 of [`MULTICALL_WASM`], as 64-char lowercase hex.
 ///

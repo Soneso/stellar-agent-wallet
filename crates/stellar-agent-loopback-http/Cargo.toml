@@ -6,7 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Shared tower/axum defence-in-depth middleware for the Stellar agent wallet's loopback-only HTTP listeners (Host allowlist, Origin allowlist, hardened security headers)."
-publish = false
+readme = "README.md"
+keywords = ["stellar", "http", "middleware", "tower", "axum"]
+categories = ["web-programming::http-server", "network-programming"]
 
 [lib]
 name = "stellar_agent_loopback_http"

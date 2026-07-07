@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-publish = false
 description = "Signed-toolset (TOOLSET.md) format parsing and capability-manifest validation."
+readme = "README.md"
+keywords = ["stellar", "toolset", "manifest", "capability", "wallet"]
+categories = ["cryptography::cryptocurrencies"]
 
 [dependencies]
 thiserror = { workspace = true }

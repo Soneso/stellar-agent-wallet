@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-publish = false
 description = "HMAC-SHA256 wallet-issued nonce with a replay window and key rotation for the Stellar agent wallet."
+readme = "README.md"
+keywords = ["stellar", "nonce", "hmac", "replay", "wallet"]
+categories = ["cryptography::cryptocurrencies", "cryptography"]
 
 [lib]
 name = "stellar_agent_nonce"
@@ -35,10 +37,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-stellar-agent-test-support = { workspace = true }
+stellar-agent-test-support = { path = "../stellar-agent-test-support" }
 serial_test = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }
-stellar-agent-nonce = { workspace = true, features = ["test-helpers", "test-hooks"] }
+stellar-agent-nonce = { path = ".", features = ["test-helpers", "test-hooks"] }
 
 [lints]
 workspace = true

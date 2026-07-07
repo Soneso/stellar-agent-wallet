@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-publish = false
 description = "SEP-10 Stellar Web Authentication client: challenge validation, ephemeral-key signing, and JWT session handling."
+readme = "README.md"
+keywords = ["stellar", "sep-10", "authentication", "jwt", "wallet"]
+categories = ["cryptography::cryptocurrencies", "authentication"]
 
 [dependencies]
 stellar-xdr = { workspace = true }

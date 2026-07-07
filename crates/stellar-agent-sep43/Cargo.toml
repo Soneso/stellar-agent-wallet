@@ -6,7 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "SEP-43 v1.2.1 Wallet Protocol: five-method ModuleInterface dispatch (signTransaction, signAuthEntry, signMessage, getNetwork, getAddress) for the Stellar agent wallet."
-publish = false
+readme = "README.md"
+keywords = ["stellar", "sep-43", "wallet", "protocol", "signing"]
+categories = ["cryptography::cryptocurrencies"]
 
 [lib]
 name = "stellar_agent_sep43"
@@ -50,7 +52,7 @@ stellar-agent-network = { workspace = true }
 stellar-agent-sep53 = { workspace = true }
 
 [dev-dependencies]
-stellar-agent-test-support = { workspace = true, features = ["test-helpers"] }
+stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # Independent ed25519 verification of produced signatures in tests.
 ed25519-dalek = { workspace = true }

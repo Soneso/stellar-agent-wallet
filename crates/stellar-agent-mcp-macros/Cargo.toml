@@ -6,7 +6,9 @@ license = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
 description = "Proc-macro crate exporting #[mcp_tool_router] and #[mcp_tool_item] for the Stellar agent wallet MCP registry."
-publish = false
+readme = "README.md"
+keywords = ["stellar", "mcp", "proc-macro", "wallet"]
+categories = ["development-tools::procedural-macro-helpers", "cryptography::cryptocurrencies"]
 
 [lib]
 proc-macro = true

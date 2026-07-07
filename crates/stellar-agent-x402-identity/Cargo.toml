@@ -6,7 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "SEP-10 counterparty-identity pre-payment gate for x402 Exact Stellar payments (payer side)."
-publish = false
+readme = "README.md"
+keywords = ["stellar", "x402", "sep-10", "payments", "identity"]
+categories = ["cryptography::cryptocurrencies", "authentication"]
 
 [lib]
 name = "stellar_agent_x402_identity"
@@ -40,12 +42,12 @@ wiremock   = { workspace = true }
 serde_json = { workspace = true }
 # SEP-10 test helpers: generate_ephemeral_seed + signing_key_from_seed.
 # Required for constructing wire-correct SEP-10 challenges in the offline gate tests.
-stellar-agent-sep10 = { workspace = true, features = ["test-helpers"] }
+stellar-agent-sep10 = { path = "../stellar-agent-sep10", features = ["test-helpers"] }
 ed25519-dalek  = { workspace = true }
 rand_core      = { workspace = true }
 stellar-xdr    = { workspace = true }
 stellar-strkey = { workspace = true }
-stellar-agent-network = { workspace = true }
+stellar-agent-network = { path = "../stellar-agent-network" }
 sha2   = { workspace = true }
 base64 = { workspace = true }
 reqwest = { workspace = true }

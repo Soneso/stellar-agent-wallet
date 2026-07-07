@@ -75,7 +75,7 @@ pub const SPENDING_LIMIT_POLICY_WASM_SHA256: &str =
 /// upload the WASM via `UploadContractWasm` without re-fetching from disk at
 /// runtime; the bytes are passed by reference to the deployment substrate.
 pub const SPENDING_LIMIT_POLICY_WASM: &[u8] = include_bytes!(
-    "../../../vendor/oz-spending-limit-policy/v0.7.2/multisig_spending_limit_policy_example.wasm"
+    "../vendor/oz-spending-limit-policy/v0.7.2/multisig_spending_limit_policy_example.wasm"
 );
 
 use stellar_xdr::{Int128Parts, ScMap, ScMapEntry, ScSymbol, ScVal, VecM};

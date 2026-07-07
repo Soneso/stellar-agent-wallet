@@ -6,7 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Recursion-depth and length bounds for decoding untrusted XDR in the Stellar agent wallet."
-publish = false
+readme = "README.md"
+keywords = ["stellar", "xdr", "limits", "wallet", "decoding"]
+categories = ["cryptography::cryptocurrencies", "encoding"]
 
 [lib]
 name = "stellar_agent_xdr_limits"

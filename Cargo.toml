@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/stellar-agent-derive", "crates/stellar-agent-toolsets", "crates/stellar-agent-sep10", "crates/stellar-agent-sep45", "crates/stellar-agent-test-support", "crates/stellar-agent-windows-identity", "crates/stellar-agent-core", "crates/stellar-agent-network", "crates/stellar-agent-sep53", "crates/stellar-agent-nonce", "crates/stellar-agent-sep7", "crates/stellar-agent-sep43", "crates/stellar-agent-stablecoin", "crates/stellar-agent-pool", "crates/stellar-agent-xdr-limits", "crates/stellar-agent-sep48", "crates/stellar-agent-defi", "crates/stellar-agent-anchor", "crates/stellar-agent-toolsets-install", "crates/stellar-agent-mcp-macros", "crates/stellar-agent-toolsets-runtime", "crates/stellar-agent-smart-account", "crates/stellar-agent-webauthn-bridge", "crates/stellar-agent-approval-ui", "crates/stellar-agent-loopback-http", "crates/stellar-agent-blend", "crates/stellar-agent-dex", "crates/stellar-agent-defindex", "crates/stellar-agent-x402", "crates/stellar-agent-x402-identity", "crates/stellar-agent-mcp", "crates/stellar-agent-cli", "crates/stellar-agent-claimable", "crates/stellar-agent-approval-remote"]
 
 [workspace.package]
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/Soneso/stellar-agent-wallet"
@@ -52,19 +52,19 @@ toml_edit = { version = "0.25.12", default-features = true }
 blake3 = { version = "1.8.5", default-features = false, features = ["std", "pure"] }
 region = "=3.0.2"
 proptest = "1.11.0"
-stellar-agent-test-support = { path = "crates/stellar-agent-test-support" }
-stellar-agent-windows-identity = { path = "crates/stellar-agent-windows-identity" }
-stellar-agent-core = { path = "crates/stellar-agent-core" }
-stellar-agent-network = { path = "crates/stellar-agent-network" }
-stellar-agent-derive = { path = "crates/stellar-agent-derive" }
-stellar-agent-toolsets = { path = "crates/stellar-agent-toolsets" }
-stellar-agent-toolsets-install = { path = "crates/stellar-agent-toolsets-install" }
-stellar-agent-toolsets-runtime = { path = "crates/stellar-agent-toolsets-runtime" }
-stellar-agent-nonce = { path = "crates/stellar-agent-nonce" }
-stellar-agent-sep10 = { path = "crates/stellar-agent-sep10" }
-stellar-agent-sep53 = { path = "crates/stellar-agent-sep53" }
-stellar-agent-sep43 = { path = "crates/stellar-agent-sep43" }
-stellar-agent-xdr-limits = { path = "crates/stellar-agent-xdr-limits" }
+stellar-agent-test-support = { path = "crates/stellar-agent-test-support", version = "0.1.0-alpha.2" }
+stellar-agent-windows-identity = { path = "crates/stellar-agent-windows-identity", version = "0.1.0-alpha.2" }
+stellar-agent-core = { path = "crates/stellar-agent-core", version = "0.1.0-alpha.2" }
+stellar-agent-network = { path = "crates/stellar-agent-network", version = "0.1.0-alpha.2" }
+stellar-agent-derive = { path = "crates/stellar-agent-derive", version = "0.1.0-alpha.2" }
+stellar-agent-toolsets = { path = "crates/stellar-agent-toolsets", version = "0.1.0-alpha.2" }
+stellar-agent-toolsets-install = { path = "crates/stellar-agent-toolsets-install", version = "0.1.0-alpha.2" }
+stellar-agent-toolsets-runtime = { path = "crates/stellar-agent-toolsets-runtime", version = "0.1.0-alpha.2" }
+stellar-agent-nonce = { path = "crates/stellar-agent-nonce", version = "0.1.0-alpha.2" }
+stellar-agent-sep10 = { path = "crates/stellar-agent-sep10", version = "0.1.0-alpha.2" }
+stellar-agent-sep53 = { path = "crates/stellar-agent-sep53", version = "0.1.0-alpha.2" }
+stellar-agent-sep43 = { path = "crates/stellar-agent-sep43", version = "0.1.0-alpha.2" }
+stellar-agent-xdr-limits = { path = "crates/stellar-agent-xdr-limits", version = "0.1.0-alpha.2" }
 soroban-spec-tools = { version = "=27.0.0", default-features = false }
 wasmparser = { version = "=0.116.1", default-features = false }
 stellar-rpc-client = "=27.0.0"
@@ -95,14 +95,14 @@ openssl = { version = "=0.10.81", features = ["vendored"] }
 p256 = { version = "=0.13.2", features = ["ecdsa"] }
 soroban-sdk = { version = "=26.1.0", default-features = false }
 static_assertions = "=1.1.0"
-stellar-agent-smart-account = { path = "crates/stellar-agent-smart-account" }
+stellar-agent-smart-account = { path = "crates/stellar-agent-smart-account", version = "0.1.0-alpha.2" }
 # stellar-agent-webauthn-bridge deps.
 axum = { version = "=0.8.9", default-features = false, features = ["tokio", "http1", "json"] }
 tower = { version = "=0.5.3", default-features = false, features = ["util"] }
 tower-http = { version = "=0.7.0", default-features = false, features = ["limit", "trace"] }
-stellar-agent-webauthn-bridge = { path = "crates/stellar-agent-webauthn-bridge" }
-stellar-agent-approval-ui = { path = "crates/stellar-agent-approval-ui" }
-stellar-agent-loopback-http = { path = "crates/stellar-agent-loopback-http" }
+stellar-agent-webauthn-bridge = { path = "crates/stellar-agent-webauthn-bridge", version = "0.1.0-alpha.2" }
+stellar-agent-approval-ui = { path = "crates/stellar-agent-approval-ui", version = "0.1.0-alpha.2" }
+stellar-agent-loopback-http = { path = "crates/stellar-agent-loopback-http", version = "0.1.0-alpha.2" }
 # stellar-agent-approval-remote deps. rustls / tokio-rustls / rcgen are
 # pinned to the ring crypto provider (see that crate's Cargo.toml) so the
 # dependency graph stays single-backend alongside reqwest's existing
@@ -113,13 +113,13 @@ rustls = { version = "=0.23.41", default-features = false }
 tokio-rustls = { version = "=0.26.4", default-features = false }
 rustls-pki-types = { version = "=1.15.0" }
 rcgen = { version = "=0.14.8", default-features = false }
-stellar-agent-approval-remote = { path = "crates/stellar-agent-approval-remote" }
-stellar-agent-blend = { path = "crates/stellar-agent-blend" }
-stellar-agent-defi = { path = "crates/stellar-agent-defi" }
-stellar-agent-dex = { path = "crates/stellar-agent-dex" }
-stellar-agent-defindex = { path = "crates/stellar-agent-defindex" }
-stellar-agent-x402 = { path = "crates/stellar-agent-x402" }
-stellar-agent-x402-identity = { path = "crates/stellar-agent-x402-identity" }
+stellar-agent-approval-remote = { path = "crates/stellar-agent-approval-remote", version = "0.1.0-alpha.2" }
+stellar-agent-blend = { path = "crates/stellar-agent-blend", version = "0.1.0-alpha.2" }
+stellar-agent-defi = { path = "crates/stellar-agent-defi", version = "0.1.0-alpha.2" }
+stellar-agent-dex = { path = "crates/stellar-agent-dex", version = "0.1.0-alpha.2" }
+stellar-agent-defindex = { path = "crates/stellar-agent-defindex", version = "0.1.0-alpha.2" }
+stellar-agent-x402 = { path = "crates/stellar-agent-x402", version = "0.1.0-alpha.2" }
+stellar-agent-x402-identity = { path = "crates/stellar-agent-x402-identity", version = "0.1.0-alpha.2" }
 # chromiumoxide: CDP virtual-authenticator client driving the headless-Chrome
 # WebAuthn ceremony in the smart-account testnet acceptance test (dev-only).
 chromiumoxide = { version = "=0.9.1", default-features = false }
@@ -135,19 +135,19 @@ tokio-util = { version = "=0.7.18", default-features = false, features = ["codec
 # libc: raw prctl(2) on Linux for process isolation; #[cfg(target_os = "linux")]
 # only, a zero-dep no-op on macOS/Windows.
 libc = { version = "=0.2.186", default-features = false }
-stellar-agent-stablecoin = { path = "crates/stellar-agent-stablecoin" }
-stellar-agent-sep48 = { path = "crates/stellar-agent-sep48" }
-stellar-agent-sep7 = { path = "crates/stellar-agent-sep7" }
-stellar-agent-anchor = { path = "crates/stellar-agent-anchor" }
-stellar-agent-mcp-macros = { path = "crates/stellar-agent-mcp-macros" }
-stellar-agent-mcp = { path = "crates/stellar-agent-mcp" }
+stellar-agent-stablecoin = { path = "crates/stellar-agent-stablecoin", version = "0.1.0-alpha.2" }
+stellar-agent-sep48 = { path = "crates/stellar-agent-sep48", version = "0.1.0-alpha.2" }
+stellar-agent-sep7 = { path = "crates/stellar-agent-sep7", version = "0.1.0-alpha.2" }
+stellar-agent-anchor = { path = "crates/stellar-agent-anchor", version = "0.1.0-alpha.2" }
+stellar-agent-mcp-macros = { path = "crates/stellar-agent-mcp-macros", version = "0.1.0-alpha.2" }
+stellar-agent-mcp = { path = "crates/stellar-agent-mcp", version = "0.1.0-alpha.2" }
 # CLI binary (stellar-agent) deps.
 clap = { version = "=4.6.1", default-features = false, features = ["std", "derive", "help", "usage"] }
 # webbrowser: launches the system browser for the passkey-registration handoff.
 webbrowser = { version = "=1.2.1", default-features = false }
-stellar-agent-pool = { path = "crates/stellar-agent-pool" }
-stellar-agent-cli = { path = "crates/stellar-agent-cli" }
-stellar-agent-claimable = { path = "crates/stellar-agent-claimable" }
+stellar-agent-pool = { path = "crates/stellar-agent-pool", version = "0.1.0-alpha.2" }
+stellar-agent-cli = { path = "crates/stellar-agent-cli", version = "0.1.0-alpha.2" }
+stellar-agent-claimable = { path = "crates/stellar-agent-claimable", version = "0.1.0-alpha.2" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

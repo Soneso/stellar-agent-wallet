@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-publish = false
 description = "Core library for the Stellar agent wallet: signing, policy engine, smart accounts, and a hash-chained audit log. Embeddable; the primary public API of the workspace."
+readme = "README.md"
+keywords = ["stellar", "wallet", "ai-agent", "policy", "signing"]
+categories = ["cryptography::cryptocurrencies", "authentication"]
 
 [lib]
 name = "stellar_agent_core"
@@ -61,7 +63,7 @@ test-helpers = ["dep:proptest", "dep:stellar-agent-test-support"]
 
 [dev-dependencies]
 proptest = { workspace = true }
-stellar-agent-test-support = { workspace = true }
+stellar-agent-test-support = { path = "../stellar-agent-test-support" }
 serial_test = { workspace = true }
 rand_core = { workspace = true }
 

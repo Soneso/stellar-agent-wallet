@@ -6,7 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "CLI binary for the Stellar agent wallet. Integrates with stellar-cli via the external-binary plugin convention (discovered as `stellar agent`)."
-publish = false
+readme = "README.md"
+keywords = ["stellar", "wallet", "ai-agent", "cli", "soroban"]
+categories = ["command-line-utilities", "cryptography::cryptocurrencies"]
 
 [[bin]]
 name = "stellar-agent"
@@ -111,15 +113,15 @@ reqwest = { workspace = true }
 # production [dependencies] entry only enables rt-multi-thread).
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # parse_capability_value_pub + CapabilitySet in tests.
-stellar-agent-toolsets = { workspace = true, features = ["test-helpers"] }
+stellar-agent-toolsets = { path = "../stellar-agent-toolsets", features = ["test-helpers"] }
 # build_attestation_preimage in the install tests.
-stellar-agent-toolsets-install = { workspace = true }
+stellar-agent-toolsets-install = { path = "../stellar-agent-toolsets-install" }
 # test-helpers enables the STELLAR_AGENT_HOME override on default_passkeys_dir()
 # in test builds.
-stellar-agent-core = { workspace = true, features = ["test-helpers"] }
+stellar-agent-core = { path = "../stellar-agent-core", features = ["test-helpers"] }
 # test-helpers enables VerifierAllowlistEntry::new_for_test in advisory tests;
 # the production [dependencies] entry uses deploy-cli only.
-stellar-agent-smart-account = { workspace = true, features = ["deploy-cli", "test-helpers"] }
+stellar-agent-smart-account = { path = "../stellar-agent-smart-account", features = ["deploy-cli", "test-helpers"] }
 # Deterministic mocked RPC responses in pay.rs / accounts/create.rs tests.
 wiremock = { workspace = true }
 # wiremock::Respond impls in command-module unit tests.
@@ -129,7 +131,7 @@ tempfile = { workspace = true }
 # process-global keyring store serialisation (key_ops.rs tests).
 serial_test = { workspace = true }
 # keyring_mock::install for the mock store setup (key_ops.rs tests).
-stellar-agent-test-support = { workspace = true }
+stellar-agent-test-support = { path = "../stellar-agent-test-support" }
 # request_id generation in audit/verify.rs tests.
 uuid = { workspace = true }
 # Assert on structured tracing events captured via CaptureWriter.

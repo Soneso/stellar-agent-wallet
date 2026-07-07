@@ -6,7 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "MCP stdio server for the Stellar agent wallet. Tools are registered at link time via the #[mcp_tool_router]/#[mcp_tool_item] macro pair (stellar-agent-mcp-macros) with inventory-based discovery."
-publish = false
+readme = "README.md"
+keywords = ["stellar", "mcp", "ai-agent", "wallet", "soroban"]
+categories = ["cryptography::cryptocurrencies", "command-line-utilities"]
 
 [lib]
 name = "stellar_agent_mcp"
@@ -151,24 +153,25 @@ reqwest = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-stellar-agent-toolsets-runtime = { workspace = true, features = ["test-helpers"] }
-# Self-ref uses workspace = true so the workspace-deps gate resolves the entry.
-stellar-agent-mcp          = { workspace = true, features = ["test-helpers"] }
-stellar-agent-test-support = { workspace = true, features = ["test-helpers"] }
-stellar-agent-network      = { workspace = true, features = ["test-loopback"] }
-stellar-agent-nonce        = { workspace = true, features = ["test-helpers"] }
+stellar-agent-toolsets-runtime = { path = "../stellar-agent-toolsets-runtime", features = ["test-helpers"] }
+# Path-only self-reference: enables this crate's own test features for its tests
+# and is stripped from the published manifest like every internal dev-dependency.
+stellar-agent-mcp = { path = ".", features = ["test-helpers"] }
+stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
+stellar-agent-network = { path = "../stellar-agent-network", features = ["test-loopback"] }
+stellar-agent-nonce = { path = "../stellar-agent-nonce", features = ["test-helpers"] }
 tempfile                   = { workspace = true }
 tokio                      = { workspace = true, features = ["rt-multi-thread", "process", "io-util", "time", "sync"] }
 regex-lite                 = { workspace = true }
 # The loopback approval-inbox server, driven over real HTTP in the
 # approve-serve testnet acceptance test (gated behind testnet-acceptance).
-stellar-agent-approval-ui  = { workspace = true }
+stellar-agent-approval-ui = { path = "../stellar-agent-approval-ui" }
 serde_json                 = { workspace = true }
 # registry_walk.rs iterates McpToolRegistration records and cross-checks the
 # rmcp ToolRouter.
 inventory                  = { workspace = true }
-stellar-agent-core         = { workspace = true }
-stellar-agent-mcp-macros   = { workspace = true }
+stellar-agent-core = { path = "../stellar-agent-core" }
+stellar-agent-mcp-macros = { path = "../stellar-agent-mcp-macros" }
 # Wiremock for the friendbot + balances handler tests.
 wiremock                   = { workspace = true }
 url                        = { workspace = true }
@@ -189,7 +192,7 @@ reqwest                    = { workspace = true }
 ed25519-dalek              = { workspace = true }
 zeroize                    = { workspace = true }
 # x402 wire types + XDR decode in the testnet acceptance tests.
-stellar-agent-x402         = { workspace = true }
+stellar-agent-x402 = { path = "../stellar-agent-x402" }
 stellar-strkey             = { workspace = true }
 stellar-xdr                = { workspace = true }
 # SHA-256 for HashIdPreimage construction in the x402 / claim testnet

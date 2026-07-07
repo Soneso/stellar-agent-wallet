@@ -20,10 +20,11 @@ Run `stellar-agent --help` for the live subcommand list, or `stellar-agent <comm
 
 ### Availability
 
-The wallet is a public alpha. Every workspace crate sets `publish = false`, so nothing is on crates.io. The two ways to install are:
+The wallet is a public alpha; all workspace crates are published on crates.io as pre-release versions. The ways to install are:
 
-- `cargo binstall` from the GitHub release archives (`stellar-agent-<version>-<target>.tar.xz`, or `.zip` on Windows; the `stellar-agent` CLI and the `stellar-agent-mcp` server ship in one archive). Available once the first `v0.1.0-alpha.1` release is tagged; until then build from source.
-- Building from source with `cargo build --release`, or `cargo install --git https://github.com/Soneso/stellar-agent-wallet`.
+- `cargo binstall stellar-agent-cli` — downloads the prebuilt GitHub release archive for your target (`stellar-agent-<version>-<target>.tar.xz`, or `.zip` on Windows; the `stellar-agent` CLI and the `stellar-agent-mcp` server ship in one archive).
+- `cargo install stellar-agent-cli` — builds from crates.io; the installed binary is named `stellar-agent`.
+- Building from source with `cargo build --release`.
 
 ## Global conventions
 

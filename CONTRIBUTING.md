@@ -94,7 +94,7 @@ For a bug, include:
 
 - What you did and what you expected.
 - The output you got, with secrets removed.
-- The version (`0.1.0-alpha.1`) or the commit you built from, and your platform and target.
+- The version (`stellar-agent --version`) or the commit you built from, and your platform and target.
 - A minimal reproduction where possible.
 
 For a feature request, describe the use case and the behavior you want.

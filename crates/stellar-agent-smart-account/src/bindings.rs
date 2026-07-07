@@ -63,7 +63,7 @@ pub const WASM_SHA256: &str = "b0ac8ad7156957757de89ea3dc00ed4d7d0148d273c12af52
 /// Embedded to ensure the sha256 check in `wasm_sha256_matches_provenance`
 /// can verify the artefact on disk at `cargo test` time.
 pub const WASM: &[u8] =
-    include_bytes!("../../../vendor/oz-stellar-accounts/v0.7.2/stellar_accounts.wasm");
+    include_bytes!("../vendor/oz-stellar-accounts/v0.7.2/stellar_accounts.wasm");
 
 // Re-export the OZ stellar-accounts types that the off-chain orchestration
 // layer uses for auth-entry construction. These types are re-exported

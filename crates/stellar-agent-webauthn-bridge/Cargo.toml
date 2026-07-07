@@ -6,7 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Localhost HTTP listener that ferries WebAuthn ceremony bytes from the operator's browser into the wallet-owned approval spine."
-publish = false
+readme = "README.md"
+keywords = ["stellar", "webauthn", "passkey", "wallet", "approval"]
+categories = ["authentication", "cryptography::cryptocurrencies"]
 
 [lib]
 name = "stellar_agent_webauthn_bridge"

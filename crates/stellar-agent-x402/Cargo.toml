@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-publish = false
 description = "Rust-native x402 Exact Stellar payment scheme (payer side)"
+readme = "README.md"
+keywords = ["stellar", "x402", "payments", "wallet", "soroban"]
+categories = ["cryptography::cryptocurrencies", "finance"]
 
 [features]
 # Exposes constructors used by integration tests across crate boundaries.
@@ -30,7 +32,7 @@ stellar-agent-network = { workspace = true }
 stellar-agent-sep43 = { workspace = true }
 
 [dev-dependencies]
-stellar-agent-test-support = { workspace = true }
+stellar-agent-test-support = { path = "../stellar-agent-test-support" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 rand_core = { workspace = true }
 ed25519-dalek = { workspace = true }

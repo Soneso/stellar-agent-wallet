@@ -22,7 +22,7 @@ approval attestations) see `./approvals-and-audit.md` and `./security.md`.
   SSE transport.
 - Protocol version `2024-11-05`. Declared capabilities: `tools` and `resources`.
 - Server identity at `initialize`: name `stellar-agent-mcp`, version matching
-  the crate's package version (`0.1.0-alpha.1` as of this release).
+  the crate's package version (`0.1.0-alpha.2` as of this release).
 - The server refuses to start if the active profile sets `mcp_disabled = true`,
   exiting non-zero with `mcp.disabled_per_profile`.
 

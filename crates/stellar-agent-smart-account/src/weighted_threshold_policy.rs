@@ -75,7 +75,7 @@ pub const WEIGHTED_THRESHOLD_POLICY_WASM_SHA256: &str =
 /// re-fetching from disk at runtime; the bytes are passed by reference to the
 /// deployment substrate.
 pub const WEIGHTED_THRESHOLD_POLICY_WASM: &[u8] = include_bytes!(
-    "../../../vendor/oz-weighted-threshold-policy/v0.7.2/multisig_weighted_threshold_policy_example.wasm"
+    "../vendor/oz-weighted-threshold-policy/v0.7.2/multisig_weighted_threshold_policy_example.wasm"
 );
 
 /// SHA-256 allowlist for audited weighted-threshold-policy WASM deployments.

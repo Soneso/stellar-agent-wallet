@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-publish = false
 description = "Stellar RPC network client, account query, transaction assembly, and hardware-signing adapter for the Stellar agent wallet."
+readme = "README.md"
+keywords = ["stellar", "soroban", "rpc", "transaction", "wallet"]
+categories = ["cryptography::cryptocurrencies", "api-bindings"]
 
 [lib]
 name = "stellar_agent_network"
@@ -87,7 +89,7 @@ dbus-secret-service-keyring-store = { workspace = true, features = ["crypto-rust
 windows-native-keyring-store = { workspace = true }
 
 [dev-dependencies]
-stellar-agent-test-support = { workspace = true, features = ["wiremock-helpers", "test-helpers"] }
+stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["wiremock-helpers", "test-helpers"] }
 wiremock = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "test-util"] }
 # jsonrpsee-core builds Error::JsonRpc fixtures in retry.rs unit tests. The pin

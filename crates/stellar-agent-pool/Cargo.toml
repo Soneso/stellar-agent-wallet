@@ -6,7 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Channel-account pool with sponsored-reserve funded initialisation and exhaustion-typed errors for concurrent transaction submission in the Stellar agent wallet."
-publish = false
+readme = "README.md"
+keywords = ["stellar", "channel-account", "pool", "wallet", "soroban"]
+categories = ["cryptography::cryptocurrencies"]
 
 [lib]
 name = "stellar_agent_pool"
@@ -38,9 +40,9 @@ stellar-agent-derive  = { workspace = true }
 
 [dev-dependencies]
 tokio                      = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
-stellar-agent-test-support = { workspace = true, features = ["test-helpers"] }
+stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
 stellar-xdr                = { workspace = true }
-stellar-agent-network      = { workspace = true }
+stellar-agent-network = { path = "../stellar-agent-network" }
 wiremock                   = { workspace = true }
 tempfile                   = { workspace = true }
 serial_test                = { workspace = true }

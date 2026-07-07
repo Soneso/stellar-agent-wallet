@@ -1,7 +1,9 @@
 [package]
 name = "stellar-agent-dex"
 description = "Soroswap swap adapter for the Stellar agent wallet"
-publish = false
+readme = "README.md"
+keywords = ["stellar", "soroban", "soroswap", "swap", "dex"]
+categories = ["cryptography::cryptocurrencies", "api-bindings"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -34,8 +36,8 @@ test-helpers = []
 testnet-acceptance = ["test-helpers", "stellar-agent-test-support/testnet-helpers"]
 
 [dev-dependencies]
-stellar-agent-test-support = { workspace = true }
-stellar-agent-defi = { workspace = true, features = ["test-helpers"] }
+stellar-agent-test-support = { path = "../stellar-agent-test-support" }
+stellar-agent-defi = { path = "../stellar-agent-defi", features = ["test-helpers"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 zeroize = { workspace = true }

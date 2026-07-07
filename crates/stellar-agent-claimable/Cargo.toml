@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-publish = false
 description = "Claimable-balance domain logic for the Stellar agent wallet — balance-id normalization, predicate evaluation, entry/trustline fetch, and claim preview"
+readme = "README.md"
+keywords = ["stellar", "claimable-balance", "wallet", "soroban"]
+categories = ["cryptography::cryptocurrencies"]
 
 [features]
 # Exposes test-helper constructors for cross-crate tests.
@@ -24,7 +26,7 @@ serde                    = { workspace = true }
 
 [dev-dependencies]
 serde_json                 = { workspace = true }
-stellar-agent-test-support = { workspace = true, features = ["wiremock-helpers", "test-helpers"] }
+stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["wiremock-helpers", "test-helpers"] }
 wiremock                    = { workspace = true }
 tokio                       = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 

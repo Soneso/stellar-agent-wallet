@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-publish = false
 description = "SEP-45 Web Authentication for Contract Accounts: challenge validation, ephemeral-key signing, and JWT session handling."
+readme = "README.md"
+keywords = ["stellar", "sep-45", "authentication", "soroban", "jwt"]
+categories = ["cryptography::cryptocurrencies", "authentication"]
 
 [dependencies]
 stellar-xdr = { workspace = true }

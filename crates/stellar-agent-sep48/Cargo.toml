@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-publish = false
 description = "SEP-48 contract-interface typed-preview + SEP-47 Contract Interface Discovery for the Stellar agent wallet"
+readme = "README.md"
+keywords = ["stellar", "sep-48", "sep-47", "soroban", "contract"]
+categories = ["cryptography::cryptocurrencies", "api-bindings"]
 
 [features]
 # Exposes test-only constructors used by cross-crate tests. Never enable in
@@ -28,7 +30,7 @@ stellar-agent-xdr-limits = { workspace = true }
 tracing               = { workspace = true }
 
 [dev-dependencies]
-stellar-agent-test-support = { workspace = true, features = ["wiremock-helpers"] }
+stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["wiremock-helpers"] }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros"] }
 serial_test        = { workspace = true }
 soroban-spec-tools = { workspace = true }

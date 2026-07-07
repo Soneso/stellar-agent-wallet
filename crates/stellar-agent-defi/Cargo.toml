@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-publish = false
 description = "DeFi adapter substrate — contract-pin framework, typed-preview surface, and dispatch-verb seam for the Stellar agent wallet"
+readme = "README.md"
+keywords = ["stellar", "soroban", "defi", "wallet"]
+categories = ["cryptography::cryptocurrencies", "api-bindings"]
 
 [features]
 # Exposes test helper constructors and the mock adapter used by cross-crate tests.
@@ -26,7 +28,7 @@ stellar-rpc-client      = { workspace = true }
 stellar-strkey          = { workspace = true }
 
 [dev-dependencies]
-stellar-agent-test-support = { workspace = true, features = ["test-helpers"] }
+stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
 tokio                      = { workspace = true, features = ["rt-multi-thread", "macros"] }
 wiremock                   = { workspace = true }
 serde_json                 = { workspace = true }

@@ -6,7 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "TLS-protected, passkey-authenticated remote approval HTTP surface for the Stellar agent wallet: lets an operator approve or reject pending agent actions from a device other than the wallet host."
-publish = false
+readme = "README.md"
+keywords = ["stellar", "approval", "passkey", "webauthn", "wallet"]
+categories = ["cryptography::cryptocurrencies", "authentication"]
 
 [lib]
 name = "stellar_agent_approval_remote"
@@ -79,20 +81,20 @@ testnet-acceptance = ["test-helpers", "stellar-agent-mcp/test-helpers"]
 operator-enroll-browser-acceptance = ["test-helpers"]
 
 [dev-dependencies]
-stellar-agent-test-support = { workspace = true }
+stellar-agent-test-support = { path = "../stellar-agent-test-support" }
 serial_test = { workspace = true }
 keyring-core = { workspace = true }
 # Testnet-acceptance-only: WalletServer (simulate/commit spine), the network
 # client, a headless-Chromium CDP client for the shipped browser frontend, and
 # the WebAuthn-ceremony-adjacent signing/encoding helpers the acceptance test
 # needs to seed a virtual authenticator with a known keypair.
-stellar-agent-mcp = { workspace = true }
-stellar-agent-network = { workspace = true }
+stellar-agent-mcp = { path = "../stellar-agent-mcp" }
+stellar-agent-network = { path = "../stellar-agent-network" }
 # The rule-proposal acceptance suite registers a co-signer WebAuthn credential
 # via the local bridge (the rules_webauthn precedent) and exercises the
 # toolset-gated sign-rule-create first-invoke-grant path.
-stellar-agent-webauthn-bridge = { workspace = true }
-stellar-agent-toolsets-runtime = { workspace = true }
+stellar-agent-webauthn-bridge = { path = "../stellar-agent-webauthn-bridge" }
+stellar-agent-toolsets-runtime = { path = "../stellar-agent-toolsets-runtime" }
 chromiumoxide = { workspace = true }
 futures = { workspace = true }
 url = { workspace = true }

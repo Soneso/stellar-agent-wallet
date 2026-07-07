@@ -4573,7 +4573,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-anchor"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "reqwest 0.12.28",
  "serde",
@@ -4589,7 +4589,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-approval-remote"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "axum",
  "axum-server",
@@ -4637,7 +4637,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-approval-ui"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -4666,7 +4666,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-blend"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "async-trait",
  "serde",
@@ -4687,7 +4687,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-claimable"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -4704,7 +4704,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-cli"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4759,7 +4759,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-core"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "base64 0.22.1",
  "bip39",
@@ -4799,7 +4799,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-defi"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "async-trait",
  "serde",
@@ -4819,7 +4819,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-defindex"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "async-trait",
  "serde",
@@ -4839,7 +4839,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-derive"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "bip39",
  "ed25519-dalek",
@@ -4854,7 +4854,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-dex"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "async-trait",
  "serde",
@@ -4876,7 +4876,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-loopback-http"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "axum",
  "serde_json",
@@ -4887,7 +4887,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-mcp"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4946,7 +4946,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-mcp-macros"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -4957,7 +4957,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-network"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "apple-native-keyring-store",
  "async-trait",
@@ -4998,7 +4998,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-nonce"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "base64 0.22.1",
  "hmac 0.13.0",
@@ -5019,7 +5019,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-pool"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -5046,7 +5046,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-sep10"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -5067,7 +5067,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-sep43"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5087,7 +5087,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-sep45"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -5108,7 +5108,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-sep48"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -5129,7 +5129,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-sep53"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -5143,7 +5143,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-sep7"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -5162,7 +5162,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-smart-account"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5212,7 +5212,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-stablecoin"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "ed25519-dalek",
  "rand_core 0.6.4",
@@ -5232,7 +5232,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-test-support"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "async-trait",
  "ed25519-dalek",
@@ -5258,7 +5258,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-toolsets"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -5269,7 +5269,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-toolsets-install"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "ed25519-dalek",
  "flate2",
@@ -5292,7 +5292,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-toolsets-runtime"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -5307,7 +5307,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-webauthn-bridge"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -5331,7 +5331,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-windows-identity"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "thiserror 2.0.18",
  "windows-sys 0.61.2",
@@ -5339,7 +5339,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-x402"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -5364,7 +5364,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-x402-identity"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -5385,7 +5385,7 @@ dependencies = [
 
 [[package]]
 name = "stellar-agent-xdr-limits"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "stellar-xdr 27.0.0",
 ]

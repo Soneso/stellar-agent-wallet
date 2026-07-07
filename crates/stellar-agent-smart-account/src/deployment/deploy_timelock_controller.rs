@@ -73,9 +73,8 @@ use crate::managers::rules::parse_c_strkey_to_smart_account;
 /// Built from SHA `a9c4216` via `vendor/oz-timelock-controller/v0.7.2/build.sh`.
 /// New timelock deployments use these v0.7.2 bytes; the ABI is unchanged from
 /// v0.7.1.
-pub const TIMELOCK_CONTROLLER_WASM: &[u8] = include_bytes!(
-    "../../../../vendor/oz-timelock-controller/v0.7.2/timelock_controller_example.wasm"
-);
+pub const TIMELOCK_CONTROLLER_WASM: &[u8] =
+    include_bytes!("../../vendor/oz-timelock-controller/v0.7.2/timelock_controller_example.wasm");
 
 /// SHA-256 of [`TIMELOCK_CONTROLLER_WASM`], 64-char lowercase hex.
 ///

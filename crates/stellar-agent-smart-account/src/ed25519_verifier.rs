@@ -80,9 +80,8 @@ pub const ED25519_VERIFIER_WASM_SHA256: &str =
 /// Embedded so the deploy CLI (`smart-account deploy-ed25519-verifier`) can
 /// upload the WASM via `UploadContractWasm` without re-fetching from disk at
 /// runtime; the bytes are passed by reference to the deployment substrate.
-pub const ED25519_VERIFIER_WASM: &[u8] = include_bytes!(
-    "../../../vendor/oz-ed25519-verifier/v0.7.2/multisig_ed25519_verifier_example.wasm"
-);
+pub const ED25519_VERIFIER_WASM: &[u8] =
+    include_bytes!("../vendor/oz-ed25519-verifier/v0.7.2/multisig_ed25519_verifier_example.wasm");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests

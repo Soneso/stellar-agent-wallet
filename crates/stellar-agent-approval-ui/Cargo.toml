@@ -6,7 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Localhost approval-inbox web UI for the Stellar agent wallet: a loopback HTTP server that surfaces the pending-approval queue for browser approve/reject."
-publish = false
+readme = "README.md"
+keywords = ["stellar", "approval", "wallet", "ai-agent"]
+categories = ["cryptography::cryptocurrencies", "web-programming::http-server"]
 
 [lib]
 name = "stellar_agent_approval_ui"
@@ -80,7 +82,7 @@ tempfile = { workspace = true }
 serial_test = { workspace = true }
 
 # In-memory mock keyring store for the attest-key tests.
-stellar-agent-test-support = { workspace = true }
+stellar-agent-test-support = { path = "../stellar-agent-test-support" }
 
 # Seed the attestation key into the mock keyring in decision tests.
 keyring-core = { workspace = true }

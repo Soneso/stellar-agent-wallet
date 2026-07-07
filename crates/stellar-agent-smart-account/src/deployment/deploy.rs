@@ -66,9 +66,8 @@ use crate::deployment::address::derive_interop_deployer_seed;
 ///
 /// New smart-account deployments use these v0.7.2 bytes. Accounts already deployed
 /// on-chain from the v0.7.1 bytes remain valid and recognised (the ABI is unchanged).
-pub const MULTISIG_ACCOUNT_WASM: &[u8] = include_bytes!(
-    "../../../../vendor/oz-smart-account-multisig/v0.7.2/multisig_account_example.wasm"
-);
+pub const MULTISIG_ACCOUNT_WASM: &[u8] =
+    include_bytes!("../../vendor/oz-smart-account-multisig/v0.7.2/multisig_account_example.wasm");
 
 /// SHA-256 of [`MULTISIG_ACCOUNT_WASM`], pinned at build time.
 ///

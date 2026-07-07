@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-publish = false
 description = "DeFindex vault adapter for the Stellar agent wallet — ABI binding, typed preview, role disclosure, upgradable-flag guard, Blend-strategy detection"
+readme = "README.md"
+keywords = ["stellar", "soroban", "defindex", "vault", "defi"]
+categories = ["cryptography::cryptocurrencies", "api-bindings"]
 
 [features]
 # Exposes test helper constructors for cross-crate tests.
@@ -30,7 +32,7 @@ async-trait           = { workspace = true }
 tokio                 = { workspace = true, features = ["rt", "time"] }
 
 [dev-dependencies]
-stellar-agent-test-support  = { workspace = true }
+stellar-agent-test-support = { path = "../stellar-agent-test-support" }
 tokio                       = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 zeroize                     = { workspace = true }
 

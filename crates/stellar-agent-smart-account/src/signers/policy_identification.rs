@@ -120,7 +120,7 @@ pub const THRESHOLD_POLICY_WASM_HASHES: &[[u8; 32]] = &[
 ///
 // Path is relative to THIS FILE (`src/signers/policy_identification.rs`),
 // per Rust `include_bytes!` semantics — NOT the crate root or workspace root.
-// Resolves to `<repo-root>/vendor/oz-threshold-policy/
+// Resolves to `<crate-root>/vendor/oz-threshold-policy/
 // v0.7.2/multisig_threshold_policy_example.wasm`.
 //
 // Unconditionally embedded (no feature gate), matching every other
@@ -129,7 +129,7 @@ pub const THRESHOLD_POLICY_WASM_HASHES: &[[u8; 32]] = &[
 // `smart-account deploy-policy --kind simple-threshold` verb consumes this
 // constant in production, not only under `deploy-cli`/`testnet-integration`.
 pub const THRESHOLD_POLICY_WASM: &[u8] = include_bytes!(
-    "../../../../vendor/oz-threshold-policy/v0.7.2/multisig_threshold_policy_example.wasm"
+    "../../vendor/oz-threshold-policy/v0.7.2/multisig_threshold_policy_example.wasm"
 );
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
