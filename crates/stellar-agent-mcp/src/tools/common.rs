@@ -3187,3 +3187,422 @@ mod tests {
         assert!(wire.contains("ledger.destination_invalid"));
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// value_descriptor_enumeration — family (a) / family (b) coverage cross-check
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Cross-checks the two derivation families of the typed value descriptor
+/// ([`stellar_agent_core::policy::v1::value::ValueClass`]) against each other
+/// and against the registered MCP tool inventory.
+///
+/// A tool's value effect is derived one of two ways:
+///
+/// - **Family (a) — args-path.** [`stellar_agent_core::policy::v1::value::derive_value_class`]
+///   maps `(tool_name, args)` straight to a `ValueClass` for the two-phase
+///   classic tools (`stellar_pay`, `stellar_create_account`, `stellar_claim`,
+///   `stellar_trustline`, and their `_commit` twins) and the three SEP-43
+///   opaque-sign tools. This module is placed inside `stellar-agent-mcp` (not
+///   `stellar-agent-core`) specifically so it can also reach family (b).
+/// - **Family (b) — handler-supplied.** Single-shot DeFi/DEX/x402 handlers
+///   decode their operation once and build [`stellar_agent_core::policy::v1::ValueLeg`]s
+///   directly via a shared per-domain builder (`blend_value_legs`,
+///   `dex_trade_value_leg`, `vault_deposit_value_legs`,
+///   `vault_withdraw_value_leg`, [`x402_value_leg`]), then wrap them in
+///   `ValueClass::Value(ValueEffects::new(legs))` for
+///   [`WalletServer::dispatch_gate_with_value`]. The dispatch gate does not
+///   derive anything for these tools; the gate's fail-closed
+///   `classify_value` default (a `MovesValue` tool that resolves no effects
+///   denies rather than passing as read-only) and the `debug_assert!` inside
+///   `ValueEffects::new` (non-empty legs) are what would surface a forgotten
+///   family-(b) wiring at runtime — this module verifies the wiring itself is
+///   present and correctly shaped, ahead of that runtime backstop.
+///
+/// # 2a vs 2b
+///
+/// `registry_cross_check_every_moves_value_tool_resolves_through_a_family`
+/// enforces that every `MovesValue` tool the `inventory` registry actually
+/// contains resolves through one of the two families (no unreachable tool).
+/// `family_a_derives_expected_action_kind_and_debit_per_tool` and
+/// `family_b_builders_produce_expected_action_kind_and_debit` exercise every
+/// family-(a) arm and every family-(b) builder individually with
+/// representative parsed inputs and assert the produced leg(s) carry the
+/// documented `ActionKind` and debit classification.
+#[cfg(test)]
+mod value_descriptor_enumeration {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test-only fixture construction"
+    )]
+
+    use std::collections::HashSet;
+
+    use serde_json::json;
+    use stellar_agent_blend::abi::{BlendRequest, RequestType};
+    use stellar_agent_blend::value::blend_value_legs;
+    use stellar_agent_core::policy::v1::value::derive_value_class;
+    use stellar_agent_core::policy::v1::{ActionKind, ValueClass};
+    use stellar_agent_core::policy::{McpToolRegistration, ToolValueKind};
+    use stellar_agent_defindex::value::{vault_deposit_value_legs, vault_withdraw_value_leg};
+    use stellar_agent_dex::value::dex_trade_value_leg;
+
+    use super::{decode_payment_required_input, x402_value_leg};
+
+    // Representative fixtures shared by both tests below. Valid-shaped
+    // G-/C-strkeys so `derive_value_class` / the builders exercise their real
+    // parse paths rather than short-circuiting on malformed input.
+    const DESTINATION: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
+    const USDC_ASSET: &str = "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+    const POOL: &str = "CCEBVDYM32YNYCVNRXQKDFFPISJJCV557CDZEIRBEE4NCV4KHPQ44HGF";
+    const RESERVE_ASSET_A: &str = "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU";
+    const RESERVE_ASSET_B: &str = "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD";
+    const ROUTER: &str = "CCJUD55AG6W5HAI5LRVNKAE5WDP5XGZBUDS5WNTIVDU7O264UZZE7BRD";
+    const VAULT: &str = "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN";
+
+    /// Family-(a) tool names: `derive_value_class` recognises these directly
+    /// from `(tool_name, args)`. Mirrors the match arms in
+    /// `stellar_agent_core::policy::v1::value::derive_value_class`.
+    const FAMILY_A_TOOLS: &[&str] = &[
+        "stellar_pay",
+        "stellar_pay_commit",
+        "stellar_create_account",
+        "stellar_create_account_commit",
+        "stellar_claim",
+        "stellar_claim_commit",
+        "stellar_trustline",
+        "stellar_trustline_commit",
+    ];
+
+    /// Family-(b) tool names: the handler decodes once and builds legs via a
+    /// shared builder before calling `dispatch_gate_with_value`. Mirrors the
+    /// `value_kind = "moves_value"` handlers in `blend_lend.rs`, `dex_trade.rs`,
+    /// `vault.rs`, `x402_create_payment.rs`, `x402_authenticated_payment.rs`.
+    const FAMILY_B_TOOLS: &[&str] = &[
+        "stellar_blend_lend",
+        "stellar_dex_trade",
+        "stellar_defindex_vault_deposit",
+        "stellar_defindex_vault_withdraw",
+        "stellar_x402_create_payment",
+        "stellar_x402_authenticated_payment",
+    ];
+
+    fn sample_x402_requirements() -> stellar_agent_x402::wire::PaymentRequirements {
+        let json = json!({
+            "scheme": "exact",
+            "network": "stellar:testnet",
+            "asset": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+            "amount": "2500000",
+            "payTo": DESTINATION,
+            "maxTimeoutSeconds": 300,
+            "extra": { "areFeesSponsored": true }
+        })
+        .to_string();
+        decode_payment_required_input(&json).expect("sample x402 requirements must decode")
+    }
+
+    /// Builds the non-empty leg vector a family-(b) tool would pass to
+    /// `dispatch_gate_with_value` for `tool_name`, using representative
+    /// parsed inputs. Panics (test-only) for any name outside
+    /// [`FAMILY_B_TOOLS`] — every call site below only ever passes a name from
+    /// that set.
+    fn family_b_legs_for(tool_name: &str) -> Vec<stellar_agent_core::policy::v1::ValueLeg> {
+        match tool_name {
+            "stellar_blend_lend" => {
+                let reqs = vec![
+                    BlendRequest::new(RequestType::Supply, RESERVE_ASSET_A, 500_000_000_i128),
+                    BlendRequest::new(RequestType::FillUserLiquidationAuction, DESTINATION, 25),
+                ];
+                blend_value_legs(&reqs, POOL)
+            }
+            "stellar_dex_trade" => {
+                let canonical_path = vec![RESERVE_ASSET_A.to_owned(), RESERVE_ASSET_B.to_owned()];
+                vec![dex_trade_value_leg(
+                    1_000_000_000_i128,
+                    &canonical_path,
+                    ROUTER,
+                )]
+            }
+            "stellar_defindex_vault_deposit" => {
+                let amounts_desired = vec![250_000_000_i128, 100_000_000_i128];
+                let asset_addresses = vec![RESERVE_ASSET_A.to_owned(), RESERVE_ASSET_B.to_owned()];
+                vault_deposit_value_legs(&amounts_desired, &asset_addresses, VAULT)
+            }
+            "stellar_defindex_vault_withdraw" => {
+                vec![vault_withdraw_value_leg(75_000_000_i128, VAULT)]
+            }
+            "stellar_x402_create_payment" | "stellar_x402_authenticated_payment" => {
+                let requirements = sample_x402_requirements();
+                vec![x402_value_leg(&requirements).expect("valid requirements must build a leg")]
+            }
+            other => panic!("family_b_legs_for: unrecognised family-(b) tool name '{other}'"),
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // TEST 2a — registry / no-dead-reference cross-check
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Enforces that every `ToolValueKind::MovesValue` tool the `inventory`
+    /// registry actually contains resolves through EITHER derivation family.
+    ///
+    /// # Invariant enforced
+    ///
+    /// A derivation keyed to a tool name that no registered tool carries can
+    /// never gate a real call — it silently no-ops. So every `MovesValue` tool
+    /// the registry contains MUST resolve its value effect through family (a)
+    /// (`derive_value_class` on `(tool_name, args)`) or family (b) (a shared
+    /// per-domain leg builder); otherwise its effect cannot be sized and the
+    /// policy gate cannot constrain it.
+    ///
+    /// This test enumerates the CURRENT registry (not a name literal copied
+    /// from source) and asserts every `MovesValue` entry is in
+    /// [`FAMILY_A_TOOLS`] or [`FAMILY_B_TOOLS`]: it FAILS if a future
+    /// `MovesValue` tool is registered without adding a `derive_value_class`
+    /// arm or a family-(b) builder call, because such a tool falls through
+    /// `derive_value_class`'s wildcard `_ => ValueClass::ReadOnly` arm and
+    /// does not appear in either family set here.
+    ///
+    /// The reverse direction is checked too: every name in [`FAMILY_A_TOOLS`]
+    /// and [`FAMILY_B_TOOLS`] must itself be a real, currently-registered
+    /// `MovesValue` tool — guarding against a derivation path keyed to a tool
+    /// name absent from the registry.
+    #[test]
+    fn registry_cross_check_every_moves_value_tool_resolves_through_a_family() {
+        let family_a: HashSet<&str> = FAMILY_A_TOOLS.iter().copied().collect();
+        let family_b: HashSet<&str> = FAMILY_B_TOOLS.iter().copied().collect();
+        assert!(
+            family_a.is_disjoint(&family_b),
+            "a tool name must not appear in both derivation families"
+        );
+
+        let registered: HashSet<&'static str> = inventory::iter::<McpToolRegistration>()
+            .map(|reg| reg.name)
+            .collect();
+        let registered_moves_value: HashSet<&'static str> =
+            inventory::iter::<McpToolRegistration>()
+                .filter(|reg| reg.value_kind == ToolValueKind::MovesValue)
+                .map(|reg| reg.name)
+                .collect();
+        assert!(
+            !registered_moves_value.is_empty(),
+            "the registry must contain at least one MovesValue tool for this \
+             cross-check to be non-vacuous"
+        );
+
+        // Forward direction: every registered MovesValue tool is covered.
+        for name in registered_moves_value.iter().copied() {
+            assert!(
+                family_a.contains(name) || family_b.contains(name),
+                "registered MovesValue tool '{name}' is not covered by either \
+                 derivation family; its value effect cannot be sized by the \
+                 policy gate, so no value rule could constrain it"
+            );
+
+            // The family-(a) coverage claim must be a REAL claim: calling
+            // derive_value_class with representative args must actually
+            // produce a populated, non-empty Value (not silently fall through
+            // to the wildcard ReadOnly arm because the tool name was typo'd
+            // in FAMILY_A_TOOLS).
+            if family_a.contains(name) {
+                let args = representative_family_a_args(name);
+                let vc = derive_value_class(name, &args);
+                assert!(
+                    matches!(&vc, ValueClass::Value(effects) if !effects.legs().is_empty()),
+                    "FAMILY_A_TOOLS claims '{name}' is derived by derive_value_class, \
+                     but derive_value_class returned {vc:?} for representative args"
+                );
+            }
+
+            // Same real-claim check for family (b): the builder must actually
+            // produce a non-empty leg vector for this tool.
+            if family_b.contains(name) {
+                let legs = family_b_legs_for(name);
+                assert!(
+                    !legs.is_empty(),
+                    "FAMILY_B_TOOLS claims '{name}' is covered by a shared builder, \
+                     but the builder produced no legs"
+                );
+            }
+        }
+
+        // Reverse direction: neither family set references a tool name absent
+        // from the registry.
+        for name in family_a.iter().copied().chain(family_b.iter().copied()) {
+            assert!(
+                registered.contains(name),
+                "derivation family references tool '{name}', which is not a \
+                 registered MCP tool; a derivation keyed to an unregistered \
+                 tool name would never gate a real call"
+            );
+            assert!(
+                registered_moves_value.contains(name),
+                "derivation family references tool '{name}', which is registered \
+                 but not classified ToolValueKind::MovesValue"
+            );
+        }
+    }
+
+    /// Representative pre-decode `args` for a [`FAMILY_A_TOOLS`] entry,
+    /// shaped so `derive_value_class` resolves a populated leg (mirrors the
+    /// fixtures in `derive_pay_builds_payment_leg_from_authoritative_args` /
+    /// `derive_create_account_builds_native_account_creation_leg` /
+    /// `derive_claim_builds_non_debit_claim_leg` /
+    /// `derive_trustline_builds_non_debit_trustline_leg_with_asset` in
+    /// `stellar_agent_core::policy::v1::value`).
+    fn representative_family_a_args(tool_name: &str) -> serde_json::Value {
+        match tool_name {
+            "stellar_pay" | "stellar_pay_commit" => json!({
+                "amount_stroops": "1500000000",
+                "asset": "native",
+                "destination": DESTINATION,
+            }),
+            "stellar_create_account" | "stellar_create_account_commit" => json!({
+                "starting_balance_stroops": "50000000",
+                "destination": DESTINATION,
+            }),
+            "stellar_claim" | "stellar_claim_commit" => json!({
+                "balance_id": "00000000abcdef",
+            }),
+            "stellar_trustline" | "stellar_trustline_commit" => json!({
+                "asset": USDC_ASSET,
+            }),
+            other => panic!("representative_family_a_args: unrecognised family-(a) tool '{other}'"),
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // TEST 2b — two-family enumeration
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Exercises every family-(a) arm (pay/create/claim/trustline and their
+    /// `_commit` twins) with representative parsed args and asserts the
+    /// derived leg carries the documented [`ActionKind`] and debit
+    /// classification.
+    #[test]
+    fn family_a_derives_expected_action_kind_and_debit_per_tool() {
+        let cases: &[(&str, ActionKind, bool)] = &[
+            ("stellar_pay", ActionKind::Payment, true),
+            ("stellar_pay_commit", ActionKind::Payment, true),
+            ("stellar_create_account", ActionKind::AccountCreation, true),
+            (
+                "stellar_create_account_commit",
+                ActionKind::AccountCreation,
+                true,
+            ),
+            ("stellar_claim", ActionKind::Claim, false),
+            ("stellar_claim_commit", ActionKind::Claim, false),
+            ("stellar_trustline", ActionKind::Trustline, false),
+            ("stellar_trustline_commit", ActionKind::Trustline, false),
+        ];
+
+        for (tool_name, expected_kind, expect_debit) in cases.iter().copied() {
+            let args = representative_family_a_args(tool_name);
+            let vc = derive_value_class(tool_name, &args);
+            let ValueClass::Value(effects) = vc else {
+                panic!("expected ValueClass::Value for '{tool_name}', got {vc:?}");
+            };
+            assert!(
+                !effects.legs().is_empty(),
+                "'{tool_name}' must derive at least one leg"
+            );
+            for leg in effects.legs() {
+                assert_eq!(
+                    leg.kind, expected_kind,
+                    "'{tool_name}' leg kind must be {expected_kind:?}"
+                );
+                assert_eq!(
+                    leg.kind.carries_debit(),
+                    expect_debit,
+                    "'{tool_name}' leg carries_debit must be {expect_debit}"
+                );
+            }
+        }
+    }
+
+    /// Exercises every family-(b) shared builder with representative parsed
+    /// inputs and asserts the produced leg(s) carry the documented
+    /// [`ActionKind`], debit classification, and (for DEX/vault-withdraw)
+    /// the documented asset/destination shape.
+    #[test]
+    fn family_b_builders_produce_expected_action_kind_and_debit() {
+        // Blend: Supply-side outflow leg (debit) …
+        let blend_legs = family_b_legs_for("stellar_blend_lend");
+        assert_eq!(blend_legs.len(), 2);
+        assert_eq!(blend_legs[0].kind, ActionKind::Lend);
+        assert!(
+            blend_legs[0].kind.carries_debit(),
+            "Blend Supply must be a debit"
+        );
+        assert_eq!(blend_legs[0].amount, Some(500_000_000_i128));
+        assert_eq!(blend_legs[0].asset.as_deref(), Some(RESERVE_ASSET_A));
+        // … and an auction leg (non-debit; amount collapses to None, not the
+        // fill-percentage `req.amount`, per `blend_value_legs`'s documented
+        // mapping for the four liquidation discriminants).
+        assert_eq!(blend_legs[1].kind, ActionKind::LendWithdraw);
+        assert!(
+            !blend_legs[1].kind.carries_debit(),
+            "a Blend auction-fill leg must not be a spendable-balance debit"
+        );
+        assert_eq!(blend_legs[1].amount, None);
+        assert_eq!(
+            blend_legs[1].asset, None,
+            "an auction's `address` field is a liquidatee, not a reserve asset"
+        );
+
+        // DEX: single send-side debit leg.
+        let dex_legs = family_b_legs_for("stellar_dex_trade");
+        assert_eq!(dex_legs.len(), 1);
+        assert_eq!(dex_legs[0].kind, ActionKind::DexTrade);
+        assert!(dex_legs[0].kind.carries_debit(), "a DEX trade is a debit");
+        assert_eq!(dex_legs[0].amount, Some(1_000_000_000_i128));
+        assert_eq!(dex_legs[0].asset.as_deref(), Some(RESERVE_ASSET_A));
+        assert_eq!(dex_legs[0].destination.as_deref(), Some(ROUTER));
+
+        // Vault deposit: one debit leg per asset.
+        let deposit_legs = family_b_legs_for("stellar_defindex_vault_deposit");
+        assert_eq!(deposit_legs.len(), 2);
+        for leg in &deposit_legs {
+            assert_eq!(leg.kind, ActionKind::VaultDeposit);
+            assert!(leg.kind.carries_debit(), "a vault deposit is a debit");
+            assert_eq!(leg.destination.as_deref(), Some(VAULT));
+        }
+        assert_eq!(deposit_legs[0].amount, Some(250_000_000_i128));
+        assert_eq!(deposit_legs[0].asset.as_deref(), Some(RESERVE_ASSET_A));
+        assert_eq!(deposit_legs[1].amount, Some(100_000_000_i128));
+        assert_eq!(deposit_legs[1].asset.as_deref(), Some(RESERVE_ASSET_B));
+
+        // Vault withdraw: single non-debit leg; amount is the share count.
+        let withdraw_legs = family_b_legs_for("stellar_defindex_vault_withdraw");
+        assert_eq!(withdraw_legs.len(), 1);
+        assert_eq!(withdraw_legs[0].kind, ActionKind::VaultWithdraw);
+        assert!(
+            !withdraw_legs[0].kind.carries_debit(),
+            "a vault withdrawal returns funds; not a spendable-balance debit"
+        );
+        assert_eq!(withdraw_legs[0].amount, Some(75_000_000_i128));
+        assert_eq!(withdraw_legs[0].asset, None);
+        assert_eq!(withdraw_legs[0].destination.as_deref(), Some(VAULT));
+
+        // x402: single debit leg from the decoded PaymentRequirements.
+        for tool_name in [
+            "stellar_x402_create_payment",
+            "stellar_x402_authenticated_payment",
+        ] {
+            let x402_legs = family_b_legs_for(tool_name);
+            assert_eq!(x402_legs.len(), 1);
+            assert_eq!(x402_legs[0].kind, ActionKind::X402Payment);
+            assert!(
+                x402_legs[0].kind.carries_debit(),
+                "an x402 payment is a debit"
+            );
+            assert_eq!(x402_legs[0].amount, Some(2_500_000_i128));
+            assert_eq!(
+                x402_legs[0].destination.as_deref(),
+                Some(DESTINATION),
+                "x402 leg destination must be requirements.pay_to verbatim"
+            );
+        }
+    }
+}

@@ -20,10 +20,13 @@
 //! The CLI loads the operator-signed `PolicyEngineV1` from the profile (if
 //! `policy.engine = "v1"`) or falls back to `NoopPolicyEngine` (if `"noop"`).
 //! A `ToolDescriptor` for `stellar_blend_lend` (destructive, not read-only) is
-//! evaluated BEFORE submit, honouring Deny / RequireApproval exactly as the MCP
-//! tool does via `WalletServer::dispatch_gate`.  The verb-registry
-//! `dispatch_gate` call remains (capability-witness seam); the policy evaluation
-//! runs alongside it.  Both paths enforce the operator policy document.
+//! evaluated BEFORE submit, value-carrying via `evaluate_with_value` — honouring
+//! Deny / RequireApproval exactly as the MCP tool does via
+//! `WalletServer::dispatch_gate_with_value`.  The legs are built from the SAME
+//! `blend_requests` vector later placed into `BlendLendArgs` (single-decode
+//! invariant).  The verb-registry `dispatch_gate` call remains
+//! (capability-witness seam); the policy evaluation runs alongside it.  Both
+//! paths enforce the operator policy document.
 //!
 //! # Output
 //!
@@ -33,11 +36,13 @@ use clap::{Args, ValueEnum};
 use serde_json::json;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::WalletError;
-use stellar_agent_core::policy::{Decision, McpToolRegistration, ToolDescriptor};
+use stellar_agent_core::policy::v1::{ValueClass, ValueEffects};
 use stellar_agent_core::profile::loader as profile_loader;
 use stellar_agent_core::profile::schema::Profile;
 
-use crate::commands::policy_engine::build_v1_policy_engine;
+use crate::commands::policy_engine::{
+    build_v1_policy_engine, evaluate_value_moving_policy_with_value,
+};
 
 use stellar_agent_blend::{
     abi::{BlendRequest, LendArgs as BlendLendArgs, RequestType},
@@ -51,6 +56,7 @@ use stellar_agent_blend::{
         BlendPoolWasmSet, blend_pool_wasm_set_pubnet, blend_pool_wasm_set_testnet,
         is_oracle_in_allowlist, verify_blend_pool_wasm,
     },
+    value::blend_value_legs,
 };
 use stellar_agent_defi::adapter::{DefiAdapter, DefiAdapterCtx};
 use stellar_agent_defi::dispatch::{GateOutcome, dispatch_gate, require_approval_error};
@@ -342,13 +348,12 @@ where
         return 1;
     }
 
-    // ── Operator policy evaluation (mirrors MCP dispatch_gate) ───────────────
+    // ── Operator policy evaluation (value-carrying; mirrors the MCP
+    // `stellar_blend_lend` twin's `dispatch_gate_with_value` mechanism) ─────
     // Load the operator-signed PolicyEngineV1 (if profile.policy.engine == V1)
     // or a permissive NoopPolicyEngine (if Noop), then evaluate before submit.
-    // This mirrors WalletServer::dispatch_gate.
-    //
-    // The ToolDescriptor matches the `stellar_blend_lend` MCP tool registration:
-    // destructive_hint=true, read_only_hint=false, chain_id_required=true.
+    // The legs are built from the SAME `blend_requests` vector later placed
+    // into `BlendLendArgs` (single-decode invariant).
     let policy_engine = match build_v1_policy_engine("lend", &profile.policy.engine, &profile) {
         Ok(pe) => pe,
         Err(msg) => {
@@ -358,65 +363,22 @@ where
             return 1;
         }
     };
-    // Construct the ToolDescriptor from its static registration record (the
-    // preferred constructor per ToolDescriptor::from_registration rustdoc).
-    // chain_id is set after construction as it is resolved at dispatch time.
-    let blend_lend_reg = McpToolRegistration {
-        name: "stellar_blend_lend",
-        destructive_hint: true,
-        read_only_hint: false,
-        chain_id_required: true,
-        // Mirrors the authoritative #[mcp_tool_item(value_kind = "moves_value")]
-        // on stellar_blend_lend in stellar-agent-mcp; keep the two in sync.
-        value_kind: stellar_agent_core::policy::ToolValueKind::MovesValue,
-    };
-    let mut tool_descriptor = ToolDescriptor::from_registration(&blend_lend_reg);
-    tool_descriptor.chain_id = chain_id.to_owned();
+    let value_legs = blend_value_legs(&blend_requests, &args.pool);
     let policy_args = json!({
-        "chain_id": chain_id,
         "pool_address": args.pool,
         "from_address": args.from,
     });
-    match policy_engine.evaluate(
-        &tool_descriptor,
-        &policy_args,
+    if let Err(envelope) = evaluate_value_moving_policy_with_value(
+        policy_engine.as_ref(),
         &profile,
-        None,
-        None,
-        None,
-        None,
-        None,
+        "stellar_blend_lend",
+        chain_id,
+        &policy_args,
+        ValueClass::Value(ValueEffects::new(value_legs)),
+        "lend",
     ) {
-        Ok(Decision::Allow) => {}
-        Ok(Decision::Deny(reason)) => {
-            render_json(&Envelope::<()>::err_raw(
-                format!("policy.deny.{}", reason.code()),
-                "lend operation denied by operator policy".to_owned(),
-            ));
-            return 1;
-        }
-        Ok(Decision::RequireApproval(_)) => {
-            render_json(&Envelope::<()>::err_raw(
-                "policy.approval_required",
-                "lend operation requires approval; use the MCP server for two-phase approval"
-                    .to_owned(),
-            ));
-            return 1;
-        }
-        Ok(_) => {
-            render_json(&Envelope::<()>::err_raw(
-                "policy.unexpected_decision",
-                "unexpected policy decision — operation refused (fail-closed)".to_owned(),
-            ));
-            return 1;
-        }
-        Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                "policy.engine_required",
-                format!("{e}"),
-            ));
-            return 1;
-        }
+        render_json(&envelope);
+        return 1;
     }
 
     // ── DeFi dispatch gate (capability-witness seam) ──────────────────────────

@@ -22,7 +22,12 @@
 //! # Policy engine
 //!
 //! Uses the shared `commands::policy_engine::build_v1_policy_engine` builder,
-//! same as `lend.rs` / `vault.rs` / `trade.rs`.
+//! same as `lend.rs` / `vault.rs` / `trade.rs`, and gates via the shared
+//! `evaluate_value_moving_policy` args-path helper (the `Trustline` leg is
+//! derived from `policy_args` by `derive_value_class` — no typed leg builder
+//! is needed for this verb).  `policy_args` is built by
+//! `commands::policy_engine::trustline_policy_args`, matching the MCP
+//! `stellar_trustline` twin's `{from, asset}` dispatch fields.
 //!
 //! # Output
 //!
@@ -47,11 +52,12 @@ use stellar_agent_core::approval::{
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::WalletError;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
-use stellar_agent_core::policy::{Decision, McpToolRegistration, ToolDescriptor};
 use stellar_agent_core::profile::loader as profile_loader;
 use stellar_agent_core::profile::schema::{Profile, default_approval_dir};
 
-use crate::commands::policy_engine::build_v1_policy_engine;
+use crate::commands::policy_engine::{
+    build_v1_policy_engine, evaluate_value_moving_policy, trustline_policy_args,
+};
 
 use stellar_agent_network::{
     Asset, ClassicOpBuilder, StellarRpcClient, SubmissionSignerKind, fetch_account,
@@ -228,7 +234,9 @@ where
         return 1;
     }
 
-    // ── GATE 1: Operator policy evaluation ───────────────────────────────────
+    // ── GATE 1: Operator policy evaluation (args-path; mirrors the MCP
+    // `stellar_trustline` twin, which derives its `Trustline` leg from the
+    // dispatch args via `derive_value_class` rather than a typed builder) ────
     let policy_engine = match build_v1_policy_engine("trustline", &profile.policy.engine, &profile)
     {
         Ok(pe) => pe,
@@ -240,59 +248,18 @@ where
             return 1;
         }
     };
-    let trustline_reg = McpToolRegistration {
-        name: "stellar_trustline",
-        destructive_hint: true,
-        read_only_hint: false,
-        chain_id_required: true,
-        value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
-    };
-    let mut tool_descriptor = ToolDescriptor::from_registration(&trustline_reg);
-    tool_descriptor.chain_id = chain_id.to_owned();
-    let policy_args = json!({
-        "chain_id": chain_id,
-        "from": &args.from,
-        "asset": &args.asset,
-    });
-    match policy_engine.evaluate(
-        &tool_descriptor,
-        &policy_args,
+    let policy_args = trustline_policy_args(&args.from, &args.asset);
+    if let Err(envelope) = evaluate_value_moving_policy(
+        policy_engine.as_ref(),
         &profile,
-        None,
-        None,
-        None,
-        None,
-        None,
+        "stellar_trustline",
+        stellar_agent_core::policy::ToolValueKind::MovesValue,
+        chain_id,
+        &policy_args,
+        "trustline",
     ) {
-        Ok(Decision::Allow) => {}
-        Ok(Decision::Deny(reason)) => {
-            render_json(&Envelope::<()>::err_raw(
-                format!("trustline.policy_denied.{}", reason.code()),
-                "trustline operation denied by operator policy",
-            ));
-            return 1;
-        }
-        Ok(Decision::RequireApproval(_)) => {
-            render_json(&Envelope::<()>::err_raw(
-                "trustline.policy_approval_required",
-                "trustline operation requires approval; use the MCP server for two-phase approval",
-            ));
-            return 1;
-        }
-        Ok(_) => {
-            render_json(&Envelope::<()>::err_raw(
-                "trustline.policy_unexpected_decision",
-                "unexpected policy decision — operation refused (fail-closed)",
-            ));
-            return 1;
-        }
-        Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                "trustline.policy_engine_error",
-                e.to_string(),
-            ));
-            return 1;
-        }
+        render_json(&envelope);
+        return 1;
     }
 
     // ── GATE 2: resolve_denomination (D3 ordered refusal) ────────────────────

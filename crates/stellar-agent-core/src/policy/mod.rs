@@ -526,9 +526,16 @@ pub enum DenyReason {
         /// `"USDC:GA5ZSE…"`).
         asset: String,
         /// The configured maximum in stroops.
-        max_stroops: i64,
+        ///
+        /// `i128` because a token quantity (e.g. a Soroban SAC transfer) can
+        /// exceed `i64::MAX`; serialized as a decimal string at the wire
+        /// boundary (`#[serde(with = "crate::wire_stroops::i128")]`) since a
+        /// JSON number cannot carry this precision losslessly.
+        #[serde(with = "crate::wire_stroops::i128")]
+        max_stroops: i128,
         /// The attempted transfer amount in stroops.
-        attempted_stroops: i64,
+        #[serde(with = "crate::wire_stroops::i128")]
+        attempted_stroops: i128,
     },
     /// The per-period aggregate cap was exceeded.
     PerPeriodCapExceeded {
@@ -537,11 +544,17 @@ pub enum DenyReason {
         /// Human-readable window description (e.g. `"rolling_24h"`).
         window: String,
         /// The configured maximum for the period in stroops.
-        max_stroops: i64,
+        ///
+        /// `i128` for the same reason as [`DenyReason::PerTxCapExceeded`]'s
+        /// `max_stroops`; serialized as a decimal string at the wire boundary.
+        #[serde(with = "crate::wire_stroops::i128")]
+        max_stroops: i128,
         /// The attempted transfer amount in stroops.
-        attempted_stroops: i64,
+        #[serde(with = "crate::wire_stroops::i128")]
+        attempted_stroops: i128,
         /// Accumulated spend in the current window in stroops.
-        period_used_stroops: i64,
+        #[serde(with = "crate::wire_stroops::i128")]
+        period_used_stroops: i128,
     },
     /// The rate-limit (calls per window) was exceeded.
     RateLimitExceeded {
@@ -566,9 +579,16 @@ pub enum DenyReason {
     /// The operation would leave the account below the Stellar minimum reserve.
     MinimumReserveBreached {
         /// Required reserve in stroops (2 + subentry_count) × base_reserve.
-        reserve_required_stroops: i64,
+        ///
+        /// `i128` because the debit that produced this figure may include an
+        /// i128 token quantity; serialized as a decimal string at the wire
+        /// boundary since a JSON number cannot carry this precision
+        /// losslessly.
+        #[serde(with = "crate::wire_stroops::i128")]
+        reserve_required_stroops: i128,
         /// Current account balance in stroops.
-        balance_stroops: i64,
+        #[serde(with = "crate::wire_stroops::i128")]
+        balance_stroops: i128,
     },
     /// The owner signature is stale; the key was rotated after the policy
     /// was signed.
@@ -1568,6 +1588,116 @@ mod tests {
             balance_stroops: 4_000_000,
         };
         assert_eq!(r.code(), "minimum_reserve_breached");
+    }
+
+    // ── i128 stroop-field wire encoding (decimal string, no clamp) ───────────
+
+    /// `PerTxCapExceeded`'s stroop fields carry a value strictly greater than
+    /// `i64::MAX` (an i128 token quantity) and must serialize as decimal
+    /// STRINGS, not JSON numbers — a JSON number cannot carry this precision
+    /// losslessly across a JS/TS MCP client. Asserts the exact full i128
+    /// decimal, not merely "is a string".
+    #[test]
+    fn deny_reason_per_tx_cap_exceeded_i128_beyond_i64_max_serializes_as_decimal_string() {
+        let max_stroops: i128 = i128::from(i64::MAX) + 1;
+        let attempted_stroops: i128 = i128::from(i64::MAX) + 2;
+        let r = DenyReason::PerTxCapExceeded {
+            asset: "native".into(),
+            max_stroops,
+            attempted_stroops,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            json["PerTxCapExceeded"]["max_stroops"],
+            max_stroops.to_string(),
+            "max_stroops beyond i64::MAX must serialize as its full i128 decimal string"
+        );
+        assert_eq!(
+            json["PerTxCapExceeded"]["attempted_stroops"],
+            attempted_stroops.to_string(),
+            "attempted_stroops beyond i64::MAX must serialize as its full i128 decimal string"
+        );
+        assert!(
+            json["PerTxCapExceeded"]["max_stroops"].is_string()
+                && json["PerTxCapExceeded"]["attempted_stroops"].is_string(),
+            "both stroop fields must be JSON strings, not numbers: {json}"
+        );
+    }
+
+    /// Same assertion for `PerPeriodCapExceeded`'s three stroop fields.
+    #[test]
+    fn deny_reason_per_period_cap_exceeded_i128_beyond_i64_max_serializes_as_decimal_string() {
+        let max_stroops: i128 = i128::from(i64::MAX) + 1;
+        let attempted_stroops: i128 = i128::from(i64::MAX) + 2;
+        let period_used_stroops: i128 = i128::from(i64::MAX) + 3;
+        let r = DenyReason::PerPeriodCapExceeded {
+            asset: "native".into(),
+            window: "1d".into(),
+            max_stroops,
+            attempted_stroops,
+            period_used_stroops,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        let payload = &json["PerPeriodCapExceeded"];
+        assert_eq!(payload["max_stroops"], max_stroops.to_string());
+        assert_eq!(payload["attempted_stroops"], attempted_stroops.to_string());
+        assert_eq!(
+            payload["period_used_stroops"],
+            period_used_stroops.to_string()
+        );
+        assert!(
+            payload["max_stroops"].is_string()
+                && payload["attempted_stroops"].is_string()
+                && payload["period_used_stroops"].is_string(),
+            "all three stroop fields must be JSON strings, not numbers: {json}"
+        );
+    }
+
+    /// Same assertion for `MinimumReserveBreached`'s two stroop fields.
+    #[test]
+    fn deny_reason_minimum_reserve_breached_i128_beyond_i64_max_serializes_as_decimal_string() {
+        let reserve_required_stroops: i128 = i128::from(i64::MAX) + 1;
+        let balance_stroops: i128 = i128::from(i64::MAX) + 2;
+        let r = DenyReason::MinimumReserveBreached {
+            reserve_required_stroops,
+            balance_stroops,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        let payload = &json["MinimumReserveBreached"];
+        assert_eq!(
+            payload["reserve_required_stroops"],
+            reserve_required_stroops.to_string()
+        );
+        assert_eq!(payload["balance_stroops"], balance_stroops.to_string());
+        assert!(
+            payload["reserve_required_stroops"].is_string()
+                && payload["balance_stroops"].is_string(),
+            "both stroop fields must be JSON strings, not numbers: {json}"
+        );
+    }
+
+    /// `#[serde(with = "crate::wire_stroops::i128")]` round-trips exactly (no
+    /// clamp) through the underlying encoder used by every widened
+    /// `DenyReason` stroop field — proven directly against the encoder
+    /// (`DenyReason` itself is `Serialize`-only; the encoder's own
+    /// `Deserialize` half is exercised here, matching the exact `with =`
+    /// path each field above uses).
+    #[test]
+    fn wire_stroops_i128_round_trips_value_beyond_i64_max_with_no_clamp() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Wrapper {
+            #[serde(with = "crate::wire_stroops::i128")]
+            v: i128,
+        }
+        let v: i128 = i128::from(i64::MAX) + 12_345;
+        let w = Wrapper { v };
+        let json = serde_json::to_value(&w).unwrap();
+        assert_eq!(json["v"], v.to_string());
+        let round_tripped: Wrapper = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            round_tripped.v, v,
+            "an i128 value beyond i64::MAX must round-trip exactly, with no saturating clamp"
+        );
     }
 
     #[test]

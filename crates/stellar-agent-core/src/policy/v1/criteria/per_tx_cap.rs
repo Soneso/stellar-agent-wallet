@@ -27,12 +27,10 @@
 //! legacy `args["starting_balance"]`) and treats the asset as implicitly
 //! native.
 //!
-//! For `stellar_axelar_bridge`: reads `args["qty"]` (a raw i128 on-chain
-//! integer) and `args["token_address"]` (the resolved C-strkey from the
-//! token-egress pin, injected at dispatch time).  The raw integer is compared
-//! directly against `max_stroops` without decimal parsing.
-//!
-//! For other tools: the criterion returns `Ok(None)` (does not apply).
+//! For other tools: the criterion is driven entirely by the typed value
+//! descriptor ([`crate::policy::v1::value::classify_value`]); it applies to
+//! any `MovesValue` tool whose descriptor resolves debit legs in the
+//! configured asset (see [`crate::policy::v1::value`]).
 //!
 
 use crate::policy::v1::EvalContext;
@@ -65,7 +63,10 @@ pub struct PerTxCapCriterion {
     /// for non-native assets.
     asset: String,
     /// The maximum allowed amount in stroops for a single transaction.
-    max_stroops: i64,
+    ///
+    /// `i128` because a single leg's token quantity (e.g. a Soroban SAC
+    /// transfer) can exceed `i64::MAX`.
+    max_stroops: i128,
 }
 
 impl PerTxCapCriterion {
@@ -85,13 +86,13 @@ impl PerTxCapCriterion {
     /// assert_eq!(cap.max_stroops(), 5_000_0000000);
     /// ```
     #[must_use]
-    pub fn new(asset: String, max_stroops: i64) -> Self {
+    pub fn new(asset: String, max_stroops: i128) -> Self {
         Self { asset, max_stroops }
     }
 
     /// Returns the configured maximum in stroops.
     #[must_use]
-    pub fn max_stroops(&self) -> i64 {
+    pub fn max_stroops(&self) -> i128 {
         self.max_stroops
     }
 
@@ -122,34 +123,6 @@ impl Criterion for PerTxCapCriterion {
         let tool_name = ctx.tool.name.as_str();
 
         let criterion_asset = asset_normalise(&self.asset);
-
-        // Legacy args-based arm for the not-yet-migrated `stellar_axelar_bridge`
-        // (an unregistered dead arm removed in #22). Reached only for that name;
-        // every classified tool is sized through the value descriptor below.
-        if tool_name == "stellar_axelar_bridge" {
-            let qty_val = ctx
-                .args
-                .get("qty")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
-                    detail: format!(
-                        "per_tx_cap: missing or non-integer field 'qty' in args for tool \
-                         '{tool_name}'"
-                    ),
-                })?;
-            let token_address = extract_string_field(ctx, "token_address")?;
-            if criterion_asset != token_address {
-                return Ok(None);
-            }
-            if qty_val > self.max_stroops {
-                return Ok(Some(DenyReason::PerTxCapExceeded {
-                    asset: self.asset.clone(),
-                    max_stroops: self.max_stroops,
-                    attempted_stroops: qty_val,
-                }));
-            }
-            return Ok(None);
-        }
 
         // Descriptor-driven path with the fail-closed default: an unsizable
         // effect (MovesValue tool that resolved no effects, or an opaque-sign
@@ -197,40 +170,16 @@ impl Criterion for PerTxCapCriterion {
             return Ok(None);
         }
 
-        if sum > i128::from(self.max_stroops) {
+        if sum > self.max_stroops {
             return Ok(Some(DenyReason::PerTxCapExceeded {
                 asset: self.asset.clone(),
                 max_stroops: self.max_stroops,
-                // The decision is made in i128; only the reported figure on the
-                // deny path saturates to i64. Widening the DenyReason payload to
-                // i128 is a later step.
-                attempted_stroops: i64::try_from(sum).unwrap_or(i64::MAX),
+                attempted_stroops: sum,
             }));
         }
 
         Ok(None)
     }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Extracts a string field from `ctx.args`.
-///
-/// Returns `PolicyError::CriterionEvaluationFailed` when the field is missing
-/// or is not a JSON string.
-fn extract_string_field(ctx: &EvalContext<'_>, field: &str) -> Result<String, PolicyError> {
-    ctx.args
-        .get(field)
-        .and_then(|v| v.as_str())
-        .map(str::to_owned)
-        .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
-            detail: format!(
-                "per_tx_cap: missing or non-string field '{}' in args for tool '{}'",
-                field, ctx.tool.name
-            ),
-        })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -448,97 +397,6 @@ mod tests {
         assert!(
             matches!(result, Err(PolicyError::CriterionEvaluationFailed { .. })),
             "missing amount field should return CriterionEvaluationFailed"
-        );
-    }
-
-    // ── stellar_axelar_bridge path ────────────────────────────────────────────
-
-    const USDC_TOKEN_ADDRESS: &str = "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA";
-
-    #[test]
-    fn bridge_qty_within_cap_returns_none() {
-        let tool = make_tool("stellar_axelar_bridge");
-        let profile = make_profile();
-        let store = PolicyStateStore::new();
-        // Cap: 1000 USDC (7 decimals) = 10_000_000_000 base units.
-        let criterion = PerTxCapCriterion::new(USDC_TOKEN_ADDRESS.to_owned(), 10_000_000_000);
-        let args = json!({
-            "qty": 5_000_000_000i64, // 500 USDC
-            "token_address": USDC_TOKEN_ADDRESS,
-        });
-        let ctx = make_ctx(&tool, &profile, &args, &store);
-        let result = criterion.evaluate(&ctx).unwrap();
-        assert!(result.is_none(), "qty within cap must pass: {result:?}");
-    }
-
-    #[test]
-    fn bridge_qty_over_cap_returns_deny() {
-        let tool = make_tool("stellar_axelar_bridge");
-        let profile = make_profile();
-        let store = PolicyStateStore::new();
-        let criterion = PerTxCapCriterion::new(USDC_TOKEN_ADDRESS.to_owned(), 10_000_000_000);
-        let args = json!({
-            "qty": 10_010_000_000i64, // 1001 USDC — just over cap
-            "token_address": USDC_TOKEN_ADDRESS,
-        });
-        let ctx = make_ctx(&tool, &profile, &args, &store);
-        let result = criterion.evaluate(&ctx).unwrap();
-        assert!(
-            matches!(result, Some(DenyReason::PerTxCapExceeded { .. })),
-            "qty over cap must deny: {result:?}"
-        );
-    }
-
-    #[test]
-    fn bridge_token_address_mismatch_criterion_does_not_apply() {
-        let tool = make_tool("stellar_axelar_bridge");
-        let profile = make_profile();
-        let store = PolicyStateStore::new();
-        // Cap configured for USDC, but bridge uses a different token.
-        let criterion = PerTxCapCriterion::new(USDC_TOKEN_ADDRESS.to_owned(), 10_000_000_000);
-        let args = json!({
-            "qty": 99_990_000_000i64,
-            "token_address": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
-        });
-        let ctx = make_ctx(&tool, &profile, &args, &store);
-        let result = criterion.evaluate(&ctx).unwrap();
-        assert!(
-            result.is_none(),
-            "token address mismatch must not trigger criterion: {result:?}"
-        );
-    }
-
-    #[test]
-    fn bridge_missing_qty_returns_evaluation_failed() {
-        let tool = make_tool("stellar_axelar_bridge");
-        let profile = make_profile();
-        let store = PolicyStateStore::new();
-        let criterion = PerTxCapCriterion::new(USDC_TOKEN_ADDRESS.to_owned(), 10_000_000_000);
-        // No "qty" field.
-        let args = json!({ "token_address": USDC_TOKEN_ADDRESS });
-        let ctx = make_ctx(&tool, &profile, &args, &store);
-        let result = criterion.evaluate(&ctx);
-        assert!(
-            matches!(result, Err(PolicyError::CriterionEvaluationFailed { .. })),
-            "missing qty must return CriterionEvaluationFailed: {result:?}"
-        );
-    }
-
-    #[test]
-    fn bridge_qty_at_cap_limit_passes() {
-        let tool = make_tool("stellar_axelar_bridge");
-        let profile = make_profile();
-        let store = PolicyStateStore::new();
-        let criterion = PerTxCapCriterion::new(USDC_TOKEN_ADDRESS.to_owned(), 10_000_000_000);
-        let args = json!({
-            "qty": 10_000_000_000i64, // exactly at cap
-            "token_address": USDC_TOKEN_ADDRESS,
-        });
-        let ctx = make_ctx(&tool, &profile, &args, &store);
-        let result = criterion.evaluate(&ctx).unwrap();
-        assert!(
-            result.is_none(),
-            "qty == cap must pass (inclusive bound): {result:?}"
         );
     }
 
@@ -879,6 +737,38 @@ mod tests {
             matches!(result, Some(DenyReason::PerTxCapExceeded { attempted_stroops, .. })
                 if attempted_stroops == 1_200_000_000),
             "two 60 XLM legs must aggregate to 120 XLM and deny a 100 XLM cap, got {result:?}"
+        );
+    }
+
+    /// A single debit leg carrying an i128 token quantity strictly greater
+    /// than `i64::MAX` must be compared and reported without a lossy clamp:
+    /// the criterion denies and `attempted_stroops` carries the exact
+    /// beyond-i64 value, not a saturated `i64::MAX`.
+    #[test]
+    fn debit_leg_amount_beyond_i64_max_denies_without_clamp() {
+        use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
+
+        let tool = make_tool("stellar_multicall");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let beyond_i64_max: i128 = i128::from(i64::MAX) + 1_000;
+        let cap: i128 = i128::from(i64::MAX);
+        let criterion = PerTxCapCriterion::new("native".into(), cap);
+        let args = json!({});
+        let leg = ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(beyond_i64_max),
+            asset: Some("native".to_owned()),
+            destination: Some("GAAA".to_owned()),
+        };
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+            .with_value(ValueClass::Value(ValueEffects::single(leg)));
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::PerTxCapExceeded { attempted_stroops, max_stroops, .. })
+                if attempted_stroops == beyond_i64_max && max_stroops == cap),
+            "a debit beyond i64::MAX must deny with the exact i128 value, not a clamped \
+             i64::MAX, got {result:?}"
         );
     }
 

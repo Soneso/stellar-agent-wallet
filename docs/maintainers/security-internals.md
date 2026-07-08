@@ -175,7 +175,6 @@ Each criterion is a `Box<dyn Criterion>` (`Send + Sync`) with a snake_case kind 
 | `rate_limit` | Sliding-window call-rate limit |
 | `counterparty_allowlist` | Destination allowlist (`ADDRESS` / `HOME_DOMAIN` / `SEP10_IDENTITY` / `ONE_TIME_ADDRESS`) |
 | `minimum_reserve` | Minimum-reserve guard |
-| `soroban_resource_fee_cap` | Soroban resource-fee cap |
 | `inner_invocation_count_cap` | Multicall inner-count cap |
 | `bundle_aggregate_cap` | Multicall aggregate-value cap |
 | `restrict_bundle_to_recognised_kinds` | Reject generic / unrecognised inner kinds |

@@ -498,13 +498,10 @@ async fn h2_per_period_cap_deny_at_inner_3() {
     let cap_usdc: i128 = 1_000_000_000; // 100 USDC in SAC units
 
     let window = Window::parse("1h").expect("Window::parse('1h') must succeed");
-    // BundlePerPeriodCapCriterion::new takes `max_stroops: i64`; cap_usdc fits in i64.
-    #[allow(clippy::cast_possible_truncation)]
-    let cap_usdc_i64 = cap_usdc as i64;
     let bundle_per_period_cap = BundlePerPeriodCapCriterion::new(
         DUMMY_C_STRKEY.to_owned(), // asset = fake USDC SAC address (dummy C-strkey)
         window,
-        cap_usdc_i64,
+        cap_usdc,
     );
 
     let policy_engine = policy_engine_with_criteria(vec![Box::new(bundle_per_period_cap)]);

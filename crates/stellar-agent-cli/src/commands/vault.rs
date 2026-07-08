@@ -30,10 +30,13 @@
 //!
 //! # Operator policy evaluation
 //!
-//! Mirrors the MCP `dispatch_gate` policy path: loads the operator-signed
-//! `PolicyEngineV1` (if `policy.engine = "v1"`) or `NoopPolicyEngine` (if
-//! `"noop"`).  Fail-closed: a configured-but-unbuildable policy refuses the
-//! value-moving vault op.
+//! Mirrors the MCP `dispatch_gate_with_value` policy path: loads the
+//! operator-signed `PolicyEngineV1` (if `policy.engine = "v1"`) or
+//! `NoopPolicyEngine` (if `"noop"`), then evaluates value-carrying via
+//! `evaluate_with_value` with legs built from the relocated
+//! `vault_deposit_value_legs` / `vault_withdraw_value_leg` builders (the SAME
+//! ones the MCP twins use).  Fail-closed: a configured-but-unbuildable policy
+//! refuses the value-moving vault op.
 //!
 //! # Output
 //!
@@ -43,11 +46,13 @@ use clap::{Args, Subcommand};
 use serde_json::json;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::WalletError;
-use stellar_agent_core::policy::{Decision, McpToolRegistration, ToolDescriptor};
+use stellar_agent_core::policy::v1::{ValueClass, ValueEffects};
 use stellar_agent_core::profile::loader as profile_loader;
 use stellar_agent_core::profile::schema::Profile;
 
-use crate::commands::policy_engine::build_v1_policy_engine;
+use crate::commands::policy_engine::{
+    build_v1_policy_engine, evaluate_value_moving_policy_with_value,
+};
 
 use stellar_agent_defi::adapter::{DefiAdapter, DefiAdapterCtx};
 use stellar_agent_defi::dispatch::{GateOutcome, dispatch_gate, require_approval_error};
@@ -60,6 +65,7 @@ use stellar_agent_defindex::{
     preview::VaultOperationPreview,
     roles::read_vault_roles,
     storage::{read_vault_assets, read_vault_upgradable_flag},
+    value::{vault_deposit_value_legs, vault_withdraw_value_leg},
 };
 use stellar_agent_network::{
     StellarRpcClient, WasmHashFetch, fetch_contract_wasm_hash, init_platform_keyring_store,
@@ -382,7 +388,13 @@ where
         return 1;
     }
 
-    // ── Operator policy evaluation (mirrors MCP dispatch_gate) ───────────────
+    // ── Operator policy evaluation (value-carrying; mirrors the MCP
+    // `stellar_defindex_vault_deposit` twin's `dispatch_gate_with_value`
+    // mechanism) ──────────────────────────────────────────────────────────
+    // `asset_addresses` is derived from the SAME PIN-VERIFIED `assets` result
+    // used to validate the amounts length above, and zips 1:1 against the
+    // SAME `vault_args.amounts_desired` vector later placed into
+    // `VaultDepositArgs` (single-decode invariant).
     let policy_engine = match build_v1_policy_engine("vault", &profile.policy.engine, &profile) {
         Ok(pe) => pe,
         Err(msg) => {
@@ -390,62 +402,24 @@ where
             return 1;
         }
     };
-    let vault_deposit_reg = McpToolRegistration {
-        name: "stellar_defindex_vault_deposit",
-        destructive_hint: true,
-        read_only_hint: false,
-        chain_id_required: true,
-        // Mirrors the authoritative #[mcp_tool_item(value_kind = "moves_value")]
-        // on stellar_defindex_vault_deposit in stellar-agent-mcp; keep in sync.
-        value_kind: stellar_agent_core::policy::ToolValueKind::MovesValue,
-    };
-    let mut tool_descriptor = ToolDescriptor::from_registration(&vault_deposit_reg);
-    tool_descriptor.chain_id = chain_id.to_owned();
+    let asset_addresses: Vec<String> = assets.iter().map(|a| a.address.clone()).collect();
+    let value_legs =
+        vault_deposit_value_legs(&vault_args.amounts_desired, &asset_addresses, &args.vault);
     let policy_args = json!({
-        "chain_id": chain_id,
         "vault_address": args.vault,
         "from_address": args.from,
     });
-    match policy_engine.evaluate(
-        &tool_descriptor,
-        &policy_args,
+    if let Err(envelope) = evaluate_value_moving_policy_with_value(
+        policy_engine.as_ref(),
         &profile,
-        None,
-        None,
-        None,
-        None,
-        None,
+        "stellar_defindex_vault_deposit",
+        chain_id,
+        &policy_args,
+        ValueClass::Value(ValueEffects::new(value_legs)),
+        "vault_deposit",
     ) {
-        Ok(Decision::Allow) => {}
-        Ok(Decision::Deny(reason)) => {
-            render_json(&Envelope::<()>::err_raw(
-                format!("policy.deny.{}", reason.code()),
-                "vault deposit denied by operator policy".to_owned(),
-            ));
-            return 1;
-        }
-        Ok(Decision::RequireApproval(_)) => {
-            render_json(&Envelope::<()>::err_raw(
-                "policy.approval_required",
-                "vault deposit requires approval; use the MCP server for two-phase approval"
-                    .to_owned(),
-            ));
-            return 1;
-        }
-        Ok(_) => {
-            render_json(&Envelope::<()>::err_raw(
-                "policy.unexpected_decision",
-                "unexpected policy decision — operation refused (fail-closed)".to_owned(),
-            ));
-            return 1;
-        }
-        Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                "policy.engine_required",
-                format!("{e}"),
-            ));
-            return 1;
-        }
+        render_json(&envelope);
+        return 1;
     }
 
     // ── DeFi dispatch gate (capability-witness seam) ──────────────────────────
@@ -721,7 +695,9 @@ where
         return 1;
     }
 
-    // ── Operator policy evaluation ────────────────────────────────────────────
+    // ── Operator policy evaluation (value-carrying; mirrors the MCP
+    // `stellar_defindex_vault_withdraw` twin's `dispatch_gate_with_value`
+    // mechanism) ──────────────────────────────────────────────────────────
     let policy_engine = match build_v1_policy_engine("vault", &profile.policy.engine, &profile) {
         Ok(pe) => pe,
         Err(msg) => {
@@ -729,62 +705,22 @@ where
             return 1;
         }
     };
-    let vault_withdraw_reg = McpToolRegistration {
-        name: "stellar_defindex_vault_withdraw",
-        destructive_hint: true,
-        read_only_hint: false,
-        chain_id_required: true,
-        // Mirrors the authoritative #[mcp_tool_item(value_kind = "moves_value")]
-        // on stellar_defindex_vault_withdraw in stellar-agent-mcp; keep in sync.
-        value_kind: stellar_agent_core::policy::ToolValueKind::MovesValue,
-    };
-    let mut tool_descriptor = ToolDescriptor::from_registration(&vault_withdraw_reg);
-    tool_descriptor.chain_id = chain_id.to_owned();
+    let value_leg = vault_withdraw_value_leg(vault_args.withdraw_shares, &args.vault);
     let policy_args = json!({
-        "chain_id": chain_id,
         "vault_address": args.vault,
         "from_address": args.from,
     });
-    match policy_engine.evaluate(
-        &tool_descriptor,
-        &policy_args,
+    if let Err(envelope) = evaluate_value_moving_policy_with_value(
+        policy_engine.as_ref(),
         &profile,
-        None,
-        None,
-        None,
-        None,
-        None,
+        "stellar_defindex_vault_withdraw",
+        chain_id,
+        &policy_args,
+        ValueClass::Value(ValueEffects::new(vec![value_leg])),
+        "vault_withdraw",
     ) {
-        Ok(Decision::Allow) => {}
-        Ok(Decision::Deny(reason)) => {
-            render_json(&Envelope::<()>::err_raw(
-                format!("policy.deny.{}", reason.code()),
-                "vault withdraw denied by operator policy".to_owned(),
-            ));
-            return 1;
-        }
-        Ok(Decision::RequireApproval(_)) => {
-            render_json(&Envelope::<()>::err_raw(
-                "policy.approval_required",
-                "vault withdraw requires approval; use the MCP server for two-phase approval"
-                    .to_owned(),
-            ));
-            return 1;
-        }
-        Ok(_) => {
-            render_json(&Envelope::<()>::err_raw(
-                "policy.unexpected_decision",
-                "unexpected policy decision — operation refused (fail-closed)".to_owned(),
-            ));
-            return 1;
-        }
-        Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                "policy.engine_required",
-                format!("{e}"),
-            ));
-            return 1;
-        }
+        render_json(&envelope);
+        return 1;
     }
 
     // ── DeFi dispatch gate ────────────────────────────────────────────────────

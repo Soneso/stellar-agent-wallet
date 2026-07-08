@@ -7,7 +7,7 @@
 //! - [`crate::policy::v1::bundle::BundleView`] — a read-only view of the full bundle passed into each
 //!   [`crate::policy::v1::EvalContext`] during
 //!   [`crate::policy::v1::PolicyEngineV1::evaluate_bundle`].
-//! - `BundleStateOverlay` — a per-`StateKey` `i64` accumulator that lets
+//! - `BundleStateOverlay` — a per-`StateKey` `i128` accumulator that lets
 //!   stateful criteria (`per_period_cap`, `rate_limit`) account for inners
 //!   evaluated earlier in the same bundle without committing to the persistent
 //!   [`crate::policy::v1::criteria::state_store::PolicyStateStore`].
@@ -115,7 +115,7 @@ pub enum InnerOpDescriptor {
 // BundleStateOverlay
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Per-`StateKey` `i64` accumulator for in-flight bundle evaluation.
+/// Per-`StateKey` `i128` accumulator for in-flight bundle evaluation.
 ///
 /// Stateful criteria (`per_period_cap`, `rate_limit`) read from both the
 /// persistent [`crate::policy::v1::criteria::state_store::PolicyStateStore`]
@@ -124,10 +124,11 @@ pub enum InnerOpDescriptor {
 ///
 /// # Overflow discipline
 ///
-/// Individual amounts are cast from `i128` via saturating cast to `i64`
-/// (`i64::try_from(amount).unwrap_or(i64::MAX)`) at the accumulation call site.
-/// Over-saturation is treated as a worst-case `i64::MAX` — the per-period cap
-/// will fire but the operation will not panic or silently wrap.
+/// Accumulation uses `i128` end-to-end (no clamp): each `TokenTransfer`
+/// inner's amount is already `i128` at the descriptor layer, so it is
+/// accumulated directly.  [`i128::saturating_add`] guards only against the
+/// running total itself overflowing `i128::MAX`, not against narrowing to a
+/// smaller integer type.
 ///
 /// # Single-tx path
 ///
@@ -147,7 +148,7 @@ pub enum InnerOpDescriptor {
 /// ```
 #[derive(Debug, Default)]
 pub struct BundleStateOverlay {
-    per_key_accumulated_stroops: HashMap<StateKey, i64>,
+    per_key_accumulated_stroops: HashMap<StateKey, i128>,
 }
 
 impl BundleStateOverlay {
@@ -159,7 +160,7 @@ impl BundleStateOverlay {
     /// legitimate read use case; reading without understanding the key-shape
     /// convention would yield misleading results.
     #[must_use]
-    pub(crate) fn get(&self, state_key: &StateKey) -> i64 {
+    pub(crate) fn get(&self, state_key: &StateKey) -> i128 {
         self.per_key_accumulated_stroops
             .get(state_key)
             .copied()
@@ -168,14 +169,14 @@ impl BundleStateOverlay {
 
     /// Adds `attempted_stroops` to the running total for `state_key`.
     ///
-    /// Uses [`i64::saturating_add`] to prevent overflow.  When the accumulated
-    /// total saturates at `i64::MAX`, subsequent `get` calls return `i64::MAX`,
+    /// Uses [`i128::saturating_add`] to prevent overflow.  When the accumulated
+    /// total saturates at `i128::MAX`, subsequent `get` calls return `i128::MAX`,
     /// which will cause the per-period cap to deny (over-deny rather than
     /// under-deny — a safe-fail posture).
     ///
     /// This is a `pub(crate)` method; only [`crate::policy::v1::PolicyEngineV1::evaluate_bundle`]
     /// calls it.
-    pub(crate) fn accumulate(&mut self, state_key: StateKey, attempted_stroops: i64) {
+    pub(crate) fn accumulate(&mut self, state_key: StateKey, attempted_stroops: i128) {
         let entry = self
             .per_key_accumulated_stroops
             .entry(state_key)
@@ -547,12 +548,28 @@ mod tests {
     }
 
     #[test]
-    fn overlay_accumulate_saturates_at_i64_max() {
+    fn overlay_accumulate_saturates_at_i128_max() {
         let mut overlay = BundleStateOverlay::default();
         let key = StateKey::new("alice", 1, "native", 3_600);
-        overlay.accumulate(key.clone(), i64::MAX);
+        overlay.accumulate(key.clone(), i128::MAX);
         overlay.accumulate(key.clone(), 1);
-        assert_eq!(overlay.get(&key), i64::MAX, "must saturate, not overflow");
+        assert_eq!(overlay.get(&key), i128::MAX, "must saturate, not overflow");
+    }
+
+    /// A value strictly greater than `i64::MAX` must accumulate exactly, with
+    /// no narrowing clamp to `i64::MAX` — the overlay stores an on-chain
+    /// `i128` token quantity directly.
+    #[test]
+    fn overlay_accumulate_and_get_round_trips_value_beyond_i64_max() {
+        let mut overlay = BundleStateOverlay::default();
+        let key = StateKey::new("alice", 1, "native", 3_600);
+        let beyond_i64_max = i128::from(i64::MAX) + 1_000;
+        overlay.accumulate(key.clone(), beyond_i64_max);
+        assert_eq!(
+            overlay.get(&key),
+            beyond_i64_max,
+            "amounts beyond i64::MAX must accumulate exactly, not clamp"
+        );
     }
 
     #[test]

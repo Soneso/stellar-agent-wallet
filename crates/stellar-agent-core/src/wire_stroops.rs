@@ -95,6 +95,51 @@ pub mod i64_opt {
     }
 }
 
+/// Boundary encoder for an `i128` stroop field.
+///
+/// Used for fields that must represent a token quantity or an aggregated
+/// stroop total that can exceed `i64::MAX` (e.g. an i128 on-chain token
+/// amount, or a per-period sum across many legs).  A JSON number cannot carry
+/// this precision losslessly (see the module-level note); the decimal-string
+/// convention applies identically to the `i64` encoder above.
+pub mod i128 {
+    use super::{Deserialize, Deserializer, Serializer, StrOrNum};
+
+    /// Serializes `value` as a decimal string.
+    ///
+    /// # Errors
+    ///
+    /// Never fails; infallible for any `i128` value.
+    pub fn serialize<S>(value: &i128, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(value)
+    }
+
+    /// Deserializes an `i128` from either a decimal string or a JSON number.
+    ///
+    /// # Errors
+    ///
+    /// Returns a deserialization error when the value is neither a
+    /// well-formed decimal `i128` string nor an in-range JSON number.
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<i128, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // A legacy JSON number always originated from the pre-widening `i64`
+        // field, so it is representable as `i64` and widened here. New `i128`
+        // values only ever cross the wire as decimal strings (the serializer
+        // emits `collect_str`). Deserializing the numeric branch as `i128`
+        // directly is not possible: serde's untagged `Content` buffer does not
+        // forward `i128`, so a JSON number fails to match `StrOrNum::<i128>`.
+        match StrOrNum::<i64>::deserialize(deserializer)? {
+            StrOrNum::Str(s) => s.parse::<i128>().map_err(serde::de::Error::custom),
+            StrOrNum::Num(n) => Ok(i128::from(n)),
+        }
+    }
+}
+
 /// Boundary encoder for a `u32` stroop field (e.g. classic per-operation
 /// fees).
 pub mod u32 {
@@ -247,6 +292,12 @@ mod tests {
     }
 
     #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+    struct I128Wrapper {
+        #[serde(with = "crate::wire_stroops::i128")]
+        v: i128,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
     struct U32Wrapper {
         #[serde(with = "crate::wire_stroops::u32")]
         v: u32,
@@ -324,6 +375,74 @@ mod tests {
         let json = serde_json::json!({ "v": null });
         let w: I64OptWrapper = serde_json::from_value(json).unwrap();
         assert_eq!(w.v, None);
+    }
+
+    #[test]
+    fn i128_serializes_as_decimal_string_beyond_i64_max() {
+        // A value strictly greater than i64::MAX: this is exactly the case a
+        // JSON number cannot carry losslessly through a JS/TS client.
+        let v: i128 = i128::from(i64::MAX) + 1;
+        let w = I128Wrapper { v };
+        let json = serde_json::to_value(&w).unwrap();
+        assert_eq!(json["v"], v.to_string());
+        assert!(
+            json["v"].is_string(),
+            "an i128 stroop field must serialize as a JSON string, not a number"
+        );
+    }
+
+    #[test]
+    fn i128_deserializes_from_decimal_string() {
+        let v: i128 = i128::from(i64::MAX) + 1;
+        let json = serde_json::json!({ "v": v.to_string() });
+        let w: I128Wrapper = serde_json::from_value(json).unwrap();
+        assert_eq!(w.v, v);
+    }
+
+    #[test]
+    fn i128_deserializes_from_legacy_number() {
+        let json = serde_json::json!({ "v": 42 });
+        let w: I128Wrapper = serde_json::from_value(json).unwrap();
+        assert_eq!(w.v, 42);
+    }
+
+    #[test]
+    fn i128_rejects_bare_json_number_beyond_i64_range() {
+        // The wire convention encodes an `i128` stroop value beyond `i64::MAX`
+        // as a decimal STRING (JSON-number-unsafe past 2^53). A bare JSON
+        // number that overflows `i64` is therefore non-conforming and is
+        // rejected fail-closed rather than truncated: the numeric branch
+        // deserializes as `i64` (legacy values never exceeded it), so a value
+        // above the range matches no variant. The same magnitude presented as
+        // a decimal string is the conforming representation and succeeds.
+        let beyond = u64::try_from(i64::MAX).expect("i64::MAX is non-negative") + 1;
+        let numeric = serde_json::json!({ "v": beyond });
+        assert!(
+            serde_json::from_value::<I128Wrapper>(numeric).is_err(),
+            "a bare JSON number above i64::MAX must be rejected, not truncated"
+        );
+
+        let same_magnitude = i128::from(i64::MAX) + 1;
+        let string_form = serde_json::json!({ "v": same_magnitude.to_string() });
+        let w: I128Wrapper =
+            serde_json::from_value(string_form).expect("decimal string above i64::MAX must parse");
+        assert_eq!(w.v, same_magnitude);
+    }
+
+    #[test]
+    fn i128_round_trips_i128_min_and_max() {
+        for v in [i128::MIN, i128::MAX, 0] {
+            let w = I128Wrapper { v };
+            let json = serde_json::to_value(&w).unwrap();
+            let round_tripped: I128Wrapper = serde_json::from_value(json).unwrap();
+            assert_eq!(round_tripped.v, v);
+        }
+    }
+
+    #[test]
+    fn i128_rejects_malformed_string() {
+        let json = serde_json::json!({ "v": "not-a-number" });
+        assert!(serde_json::from_value::<I128Wrapper>(json).is_err());
     }
 
     #[test]

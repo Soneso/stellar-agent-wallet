@@ -48,6 +48,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolves to a
   persisted profile with `policy.engine = "v1"`. `accounts create` Friendbot
   mode is not gated (it debits no wallet funds). (#19)
+- CLI `trade`, `lend`, and `vault` now size their policy gate with the same
+  value descriptor their `stellar_dex_trade` / `stellar_blend_lend` /
+  `stellar_defindex_vault_deposit` / `stellar_defindex_vault_withdraw` MCP
+  twins use: each verb builds its value legs from the same parsed inputs it
+  submits and evaluates them through `PolicyEngine::evaluate_with_value`, so
+  `per_tx_cap` / `per_period_cap` / `minimum_reserve` constrain CLI DeFi debits
+  exactly as they constrain the MCP calls. Previously these verbs gated on the
+  tool name alone — with `trade` classified read-only — leaving the traded,
+  lent, and deposited amounts unconstrained. CLI `trustline` gates through the
+  shared args-path descriptor builder; its refusals now carry the shared
+  `policy.deny.<code>` / `policy.approval_required` / `policy.unexpected_decision`
+  / `policy.engine_required` wire codes instead of the previous
+  `trustline.policy_denied.<code>` / `trustline.policy_*` codes (a
+  wire-observable parity change). Operators with `policy.engine = "v1"` value
+  rules should expect CLI DeFi debits to be gated. (#20)
+- Value caps (`per_tx_cap`, `per_period_cap`, `minimum_reserve`, and their
+  `bundle_*` variants) and the amount fields of their deny reasons
+  (`max_stroops`, `attempted_stroops`, `period_used_stroops`,
+  `reserve_required_stroops`, `balance_stroops`) are `i128`: the comparison
+  path and the emitted deny-reason amounts are exact across the full `i128`
+  range and are no longer clamped to `i64::MAX`, so a cap or an attempted
+  single-transaction debit above `i64::MAX` is represented exactly instead of
+  saturating. These amounts cross the MCP wire as decimal strings
+  (JSON-number-unsafe beyond 2^53); consumers must parse them as `i128` /
+  decimal strings rather than `i64`. The persisted per-period window
+  accumulator remains `i64`-width: cumulative recorded spend within a rolling
+  window is tracked exactly up to `i64::MAX` stroops per asset per window, and a
+  per-period rule refuses fail-closed rather than silently saturating when a
+  call's resulting window total would exceed that bound; single-transaction
+  sizing is unaffected. (#20)
+
+### Removed
+
+- Breaking (policy file): the `soroban_resource_fee_cap` criterion. It gated on
+  a `stellar_invoke*` tool-name prefix that no registered tool matches, so it
+  never constrained a real call. A policy file that references
+  `soroban_resource_fee_cap` now fails to load with the unknown-criterion
+  error. A future contract-invocation tool should reintroduce a
+  descriptor-based resource criterion sized against `ContractInvoke` value
+  legs. (#22)
+- The remaining hard-coded per-tool arms inside the value criteria. A criterion
+  now sizes a call solely from its typed value legs, never from the tool name.
+  (#22)
 
 ### Fixed
 

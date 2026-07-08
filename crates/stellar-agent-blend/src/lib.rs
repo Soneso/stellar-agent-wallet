@@ -84,3 +84,4 @@ pub mod oracle_fetch;
 pub mod pins;
 pub mod preview;
 pub mod scval;
+pub mod value;

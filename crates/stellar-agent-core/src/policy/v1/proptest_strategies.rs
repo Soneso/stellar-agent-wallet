@@ -2,25 +2,24 @@
 //!
 //! # Scope
 //!
-//! These generators cover the **four state-independent criteria**:
+//! These generators cover the **three state-independent criteria**:
 //!
 //! | Criterion           | Strategy function               |
 //! |---------------------|---------------------------------|
 //! | `per_tx_cap`        | `arb_per_tx_cap_rule`         |
 //! | `counterparty_allowlist` | `arb_counterparty_allowlist_rule` |
 //! | `minimum_reserve`   | `arb_minimum_reserve_rule`    |
-//! | `soroban_resource_fee_cap` | `arb_soroban_resource_fee_rule` |
 //!
 //! # Why `per_period_cap` and `rate_limit` are excluded
 //!
 //! Both criteria depend on `SystemTime::now()` and mutate
 //! `PolicyStateStore`.  Including them in proptest
-//! would make all four properties wall-clock-sensitive and create
+//! would make all three properties wall-clock-sensitive and create
 //! flaky tests whose outcome depends on scheduler timing.
 //!
 //! # Coverage
 //!
-//! The four generators cover every criterion the engine can evaluate without
+//! The three generators cover every criterion the engine can evaluate without
 //! external clock state.  `minimum_reserve` requires an `account_view`; the
 //! property tests inject a synthetic view that always returns a fixed balance
 //! so the criterion's result is deterministic.
@@ -51,7 +50,7 @@ use stellar_agent_test_support::testnet_strkeys::{VERSION_PUBLIC_KEY, strkey_fro
 
 use crate::policy::v1::criteria::{
     CounterpartyAllowlistCriterion, MinimumReserveCriterion, PerTxCapCriterion,
-    SorobanResourceFeeCriterion, counterparty_allowlist::CounterpartyKind,
+    counterparty_allowlist::CounterpartyKind,
 };
 use crate::policy::v1::loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
 use crate::policy::{Decision, McpToolRegistration, ToolDescriptor};
@@ -126,8 +125,9 @@ pub fn arb_per_tx_cap_rule() -> impl Strategy<Value = PolicyRule> {
     let max_stroops_strategy = 1_i64..=100_000_000_000_i64;
 
     (tool_names, max_stroops_strategy).prop_map(|(tool_name, max_stroops)| {
-        let criterion: Box<dyn crate::policy::v1::criteria::Criterion> =
-            Box::new(PerTxCapCriterion::new("native".to_owned(), max_stroops));
+        let criterion: Box<dyn crate::policy::v1::criteria::Criterion> = Box::new(
+            PerTxCapCriterion::new("native".to_owned(), i128::from(max_stroops)),
+        );
         PolicyRule {
             r#match: RuleMatch {
                 tool: tool_name,
@@ -213,45 +213,6 @@ pub fn arb_minimum_reserve_rule() -> impl Strategy<Value = PolicyRule> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Strategy: arb_soroban_resource_fee_rule
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Generates a [`PolicyRule`] whose single criterion is a random
-/// `soroban_resource_fee_cap`.
-///
-/// - `max_resource_fee_stroops` is drawn from `1..=1_000_000_000_i64`.
-/// - `max_footprint_entries` is drawn from `1_u32..=1000_u32`.
-/// - `tool` is `"*"` (wildcard).
-/// - `chain` is `"*"`.
-/// - `decision` is `Decision::Allow`.
-///
-/// Note: non-Soroban tools cause this criterion to return `Ok(None)` (does not
-/// apply).  The property test for this rule verifies determinism by confirming
-/// two evaluations of the same non-Soroban tool produce identical
-/// `Ok(Decision::Allow)` results.
-pub fn arb_soroban_resource_fee_rule() -> impl Strategy<Value = PolicyRule> {
-    let max_fee_strategy = 1_i64..=1_000_000_000_i64;
-    let max_footprint_strategy = 1_u32..=1000_u32;
-
-    (max_fee_strategy, max_footprint_strategy).prop_map(
-        |(max_resource_fee_stroops, max_footprint_entries)| {
-            let criterion: Box<dyn crate::policy::v1::criteria::Criterion> = Box::new(
-                SorobanResourceFeeCriterion::new(max_resource_fee_stroops, max_footprint_entries),
-            );
-            PolicyRule {
-                r#match: RuleMatch {
-                    tool: "*".to_owned(),
-                    chain: "*".to_owned(),
-                },
-                criteria: vec![criterion],
-                decision: Decision::Allow,
-                allow_opaque_signing: false,
-            }
-        },
-    )
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Strategy: arb_strict_deny_per_tx_rule
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -285,7 +246,7 @@ pub fn arb_strict_deny_per_tx_rule() -> impl Strategy<Value = PolicyRule> {
         },
         criteria: vec![Box::new(PerTxCapCriterion::new(
             "native".to_owned(),
-            1_i64, // 1 stroop cap — denies payments > 1 stroop via criterion failure
+            1, // 1 stroop cap — denies payments > 1 stroop via criterion failure
         ))],
         decision: Decision::Allow,
         allow_opaque_signing: false,

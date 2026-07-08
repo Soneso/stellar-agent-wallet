@@ -489,6 +489,25 @@ mod tests {
     }
 
     #[test]
+    fn canonicalise_path_is_idempotent_for_native_and_code_issuer() {
+        // Re-canonicalising an already-canonical path returns it unchanged for
+        // both a native and a CODE:ISSUER input. This pins the single-decode
+        // invariant the CLI DeFi value-sizing relies on: the value leg is built
+        // from the same canonical path the adapter re-canonicalises before
+        // signing, so pre-canonicalising the path in the CLI cannot alter the
+        // signed transaction — `canonicalise(canonicalise(x)) == canonicalise(x)`.
+        let path = vec!["native".to_owned(), format!("USDC:{VALID_ISSUER}")];
+        let once = canonicalise_path(&path, TESTNET_PASSPHRASE)
+            .expect("native and CODE:ISSUER inputs must canonicalise");
+        let twice = canonicalise_path(&once, TESTNET_PASSPHRASE)
+            .expect("re-canonicalising already-canonical C-strkeys must succeed");
+        assert_eq!(
+            once, twice,
+            "canonicalise_path must be idempotent on already-canonical SAC C-strkeys"
+        );
+    }
+
+    #[test]
     fn canonicalise_path_fails_on_first_error() {
         let tokens = vec![
             "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC".to_owned(),

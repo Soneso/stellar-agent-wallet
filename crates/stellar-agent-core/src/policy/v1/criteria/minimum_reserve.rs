@@ -170,15 +170,21 @@ impl Criterion for MinimumReserveCriterion {
         };
         let fee_stroops = extract_fee_stroops(ctx);
 
-        // Compute post-balance using saturating arithmetic to avoid wrapping on
-        // underflow (e.g. if amount exceeds balance — the reserve check will
-        // catch this case correctly since post_balance will be 0 or very small).
-        let debit = amount_stroops.saturating_add(fee_stroops);
+        // The reserve compare and the DenyReason payload are i128 end-to-end
+        // (no clamp): `amount_stroops` may already carry an i128 token
+        // quantity, so `pre_balance`, `fee_stroops`, and
+        // `reserve_required_stroops` (each still `i64` at their own source —
+        // the account-view trait and the configured margin are unaffected by
+        // this widening) are promoted here rather than narrowing the debit.
+        let pre_balance = i128::from(pre_balance);
+        let debit = amount_stroops.saturating_add(i128::from(fee_stroops));
         let post_balance = pre_balance.saturating_sub(debit);
 
-        let reserve_required_stroops = account_view
-            .reserves_stroops(BASE_RESERVE_STROOPS)
-            .saturating_add(self.margin_stroops);
+        let reserve_required_stroops = i128::from(
+            account_view
+                .reserves_stroops(BASE_RESERVE_STROOPS)
+                .saturating_add(self.margin_stroops),
+        );
 
         if post_balance < reserve_required_stroops {
             return Ok(Some(DenyReason::MinimumReserveBreached {
@@ -200,7 +206,9 @@ impl Criterion for MinimumReserveCriterion {
 enum AmountOutcome {
     /// The resolved native-XLM debit in stroops (0 for a genuinely value-less
     /// call; the reserve check still fires on the fee alone).
-    Debit(i64),
+    ///
+    /// `i128` because a native debit leg's amount can exceed `i64::MAX`.
+    Debit(i128),
     /// The call's value effect cannot be sized; refuse fail-closed with this
     /// reason instead of computing a debit.
     Deny(DenyReason),
@@ -228,8 +236,7 @@ enum AmountOutcome {
 /// # Errors
 ///
 /// Returns [`PolicyError::CriterionEvaluationFailed`] when a native debit leg
-/// carries no resolvable amount, or when the aggregate exceeds the `i64`
-/// range.
+/// carries no resolvable amount.
 fn extract_amount_stroops(ctx: &EvalContext<'_>) -> Result<AmountOutcome, PolicyError> {
     let effects = match classify_value(ctx) {
         ValueGate::NotApplicable => return Ok(AmountOutcome::Debit(0)),
@@ -255,13 +262,7 @@ fn extract_amount_stroops(ctx: &EvalContext<'_>) -> Result<AmountOutcome, Policy
         sum = sum.saturating_add(amount);
     }
 
-    let stroops = i64::try_from(sum).map_err(|_| PolicyError::CriterionEvaluationFailed {
-        detail: format!(
-            "minimum_reserve: aggregate native debit {sum} exceeds i64 range for tool '{}'",
-            ctx.tool.name
-        ),
-    })?;
-    Ok(AmountOutcome::Debit(stroops))
+    Ok(AmountOutcome::Debit(sum))
 }
 
 /// Extracts the transaction fee in stroops from args.

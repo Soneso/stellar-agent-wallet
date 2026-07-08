@@ -60,7 +60,10 @@ pub struct BundlePerTxCapCriterion {
     /// Asset identifier: `"native"` or `"CODE:G…ISSUER"`.
     asset: String,
     /// Maximum stroops per single inner transfer.
-    max_stroops: i64,
+    ///
+    /// `i128` because a single inner's token quantity (e.g. a Soroban SAC
+    /// transfer) can exceed `i64::MAX`.
+    max_stroops: i128,
 }
 
 impl BundlePerTxCapCriterion {
@@ -75,13 +78,13 @@ impl BundlePerTxCapCriterion {
     /// assert_eq!(c.max_stroops(), 5_000_000_000);
     /// ```
     #[must_use]
-    pub fn new(asset: String, max_stroops: i64) -> Self {
+    pub fn new(asset: String, max_stroops: i128) -> Self {
         Self { asset, max_stroops }
     }
 
     /// Returns the configured maximum stroops per inner transfer.
     #[must_use]
-    pub fn max_stroops(&self) -> i64 {
+    pub fn max_stroops(&self) -> i128 {
         self.max_stroops
     }
 }
@@ -126,8 +129,7 @@ impl Criterion for BundlePerTxCapCriterion {
                 continue;
             }
 
-            // Saturating cast: over-deny on i128 > i64::MAX is the correct posture.
-            let inner_stroops = i64::try_from(*amount).unwrap_or(i64::MAX);
+            let inner_stroops = *amount;
 
             if inner_stroops > self.max_stroops {
                 return Ok(Some(DenyReason::BundleDenied {

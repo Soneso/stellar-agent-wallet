@@ -204,8 +204,10 @@ fn per_tx_cap_document(rules: Vec<(&str, i64, bool)>) -> PolicyDocument {
     let rules = rules
         .into_iter()
         .map(|(tool, max_stroops, allow_opaque_signing)| {
-            let criterion: Box<dyn Criterion> =
-                Box::new(PerTxCapCriterion::new("native".to_owned(), max_stroops));
+            let criterion: Box<dyn Criterion> = Box::new(PerTxCapCriterion::new(
+                "native".to_owned(),
+                i128::from(max_stroops),
+            ));
             PolicyRule {
                 r#match: RuleMatch {
                     tool: tool.to_owned(),

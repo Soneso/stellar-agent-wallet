@@ -63,7 +63,6 @@ use crate::policy::v1::criteria::{
     BundleRateLimitCriterion, CounterpartyAllowlistCriterion, Criterion,
     InnerInvocationCountCapCriterion, MinimumReserveCriterion, PerPeriodCapCriterion,
     PerTxCapCriterion, RateLimitCriterion, RestrictBundleToRecognisedKindsCriterion,
-    SorobanResourceFeeCriterion,
 };
 use crate::policy::v1::signature::{digest, verify};
 use crate::policy::{Decision, DenyReason, PolicyError};
@@ -781,7 +780,6 @@ fn parse_criteria(
 /// | `"rate_limit"`             | [`RateLimitCriterion`]               |
 /// | `"counterparty_allowlist"` | [`CounterpartyAllowlistCriterion`]   |
 /// | `"minimum_reserve"`        | [`MinimumReserveCriterion`]          |
-/// | `"soroban_resource_fee_cap"` | [`SorobanResourceFeeCriterion`]    |
 /// | `"bundle_per_period_cap"`  | [`BundlePerPeriodCapCriterion`]      |
 /// | `"bundle_per_tx_cap"`      | [`BundlePerTxCapCriterion`]          |
 /// | `"bundle_rate_limit"`      | [`BundleRateLimitCriterion`]         |
@@ -832,7 +830,7 @@ fn parse_criterion(
     match kind {
         "per_tx_cap" => {
             let asset = require_str(table, "asset", &loc)?;
-            let max_stroops = require_i64(table, "max_stroops", &loc)?;
+            let max_stroops = require_i128(table, "max_stroops", &loc)?;
             if max_stroops < 0 {
                 return Err(PolicyError::PolicyFileParseFailed {
                     detail: format!("{loc}: `max_stroops` must be non-negative, got {max_stroops}"),
@@ -850,7 +848,7 @@ fn parse_criterion(
                      valid values: 1m, 5m, 1h, 1d, 1w"
                     ),
                 })?;
-            let max_stroops = require_i64(table, "max_stroops", &loc)?;
+            let max_stroops = require_i128(table, "max_stroops", &loc)?;
             if max_stroops < 0 {
                 return Err(PolicyError::PolicyFileParseFailed {
                     detail: format!("{loc}: `max_stroops` must be non-negative, got {max_stroops}"),
@@ -939,30 +937,8 @@ fn parse_criterion(
             }
             Ok(Box::new(MinimumReserveCriterion::new(margin_stroops)))
         }
-        "soroban_resource_fee_cap" => {
-            let max_resource_fee_stroops = require_i64(table, "max_resource_fee_stroops", &loc)?;
-            if max_resource_fee_stroops < 0 {
-                return Err(PolicyError::PolicyFileParseFailed {
-                    detail: format!(
-                        "{loc}: `max_resource_fee_stroops` must be non-negative, \
-                         got {max_resource_fee_stroops}"
-                    ),
-                });
-            }
-            let max_footprint_raw = require_i64(table, "max_footprint_entries", &loc)?;
-            let max_footprint_entries = u32::try_from(max_footprint_raw).map_err(|_| {
-                PolicyError::PolicyFileParseFailed {
-                    detail: format!(
-                        "{loc}: `max_footprint_entries` value {max_footprint_raw} is \
-                         out of range for u32"
-                    ),
-                }
-            })?;
-            Ok(Box::new(SorobanResourceFeeCriterion::new(
-                max_resource_fee_stroops,
-                max_footprint_entries,
-            )))
-        }
+        // A future contract-invoke tool should get a descriptor-based resource
+        // criterion designed against `ContractInvoke` value legs.
         "inner_invocation_count_cap" => {
             let max_count_raw = require_i64(table, "max_count", &loc)?;
             let max_count =
@@ -1014,7 +990,7 @@ fn parse_criterion(
                          valid values: 1m, 5m, 1h, 1d, 1w"
                     ),
                 })?;
-            let max_stroops = require_i64(table, "max_stroops", &loc)?;
+            let max_stroops = require_i128(table, "max_stroops", &loc)?;
             if max_stroops < 0 {
                 return Err(PolicyError::PolicyFileParseFailed {
                     detail: format!("{loc}: `max_stroops` must be non-negative, got {max_stroops}"),
@@ -1028,7 +1004,7 @@ fn parse_criterion(
         }
         "bundle_per_tx_cap" => {
             let asset = require_str(table, "asset", &loc)?;
-            let max_stroops = require_i64(table, "max_stroops", &loc)?;
+            let max_stroops = require_i128(table, "max_stroops", &loc)?;
             if max_stroops < 0 {
                 return Err(PolicyError::PolicyFileParseFailed {
                     detail: format!("{loc}: `max_stroops` must be non-negative, got {max_stroops}"),
@@ -1070,7 +1046,7 @@ fn parse_criterion(
             detail: format!(
                 "{loc}: unknown criterion kind `{other}`; accepted kinds: \
                  per_tx_cap, per_period_cap, rate_limit, counterparty_allowlist, \
-                 minimum_reserve, soroban_resource_fee_cap, inner_invocation_count_cap, \
+                 minimum_reserve, inner_invocation_count_cap, \
                  bundle_aggregate_cap, restrict_bundle_to_recognised_kinds, \
                  bundle_per_period_cap, bundle_per_tx_cap, bundle_rate_limit, \
                  quorum_satisfied, home_domain_resolved, sep10_session_active, \
@@ -1117,6 +1093,41 @@ fn require_i64(table: &toml_edit::InlineTable, key: &str, loc: &str) -> Result<i
         .ok_or_else(|| PolicyError::PolicyFileParseFailed {
             detail: format!("{loc}: missing or non-integer required field `{key}`"),
         })
+}
+
+/// Extracts a required integer field (as `i128`) from a criterion inline
+/// table.
+///
+/// Accepts either TOML's native integer type (bounded to `i64`, widened
+/// losslessly) or a decimal string, so a cap that must exceed `i64::MAX`
+/// (e.g. an i128 token quantity) can still be expressed — TOML has no native
+/// i128 integer literal.  This mirrors the `bundle_aggregate_cap` /
+/// `max_amount` convention already used for i128 fields in this loader.
+///
+/// # Errors
+///
+/// Returns [`PolicyError::PolicyFileParseFailed`] when the field is absent,
+/// is neither an integer nor a string, or a string value does not parse as a
+/// valid i128 decimal.
+fn require_i128(table: &toml_edit::InlineTable, key: &str, loc: &str) -> Result<i128, PolicyError> {
+    let Some(value) = table.get(key) else {
+        return Err(PolicyError::PolicyFileParseFailed {
+            detail: format!("{loc}: missing or non-integer required field `{key}`"),
+        });
+    };
+    if let Some(n) = value.as_integer() {
+        return Ok(i128::from(n));
+    }
+    if let Some(s) = value.as_str() {
+        return s
+            .parse::<i128>()
+            .map_err(|_| PolicyError::PolicyFileParseFailed {
+                detail: format!("{loc}: `{key}` value `{s}` is not a valid i128 decimal"),
+            });
+    }
+    Err(PolicyError::PolicyFileParseFailed {
+        detail: format!("{loc}: missing or non-integer required field `{key}`"),
+    })
 }
 
 /// Extracts a required boolean field from a criterion inline table.
@@ -1902,6 +1913,50 @@ criteria = []
         );
     }
 
+    /// `per_tx_cap`'s `max_stroops` must accept a decimal-string value beyond
+    /// `i64::MAX` — TOML has no native i128 integer literal, so a cap that
+    /// must exceed `i64::MAX` (e.g. an i128 token quantity) is expressed as a
+    /// decimal string, mirroring `bundle_aggregate_cap`'s `max_amount`
+    /// convention.
+    #[test]
+    fn criterion_per_tx_cap_max_stroops_accepts_decimal_string_beyond_i64_max() {
+        let (sk, pk) = make_keypair();
+        let dir = TempDir::new().unwrap();
+        let beyond_i64_max: i128 = i128::from(i64::MAX) + 1;
+        let body = body_with_criterion(&format!(
+            r#"{{ kind = "per_tx_cap", asset = "native", max_stroops = "{beyond_i64_max}" }}"#
+        ));
+        let toml = make_signed_toml(&body, &sk, "GABCDE");
+        let path = write_policy(&dir, "alice.toml", &toml);
+
+        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        assert_eq!(doc.rules[0].criteria[0].kind(), "per_tx_cap");
+    }
+
+    /// The `require_i128` loader helper accepts a native TOML integer,
+    /// widening it losslessly, and a decimal string beyond `i64::MAX`; it
+    /// rejects a non-numeric string.
+    #[test]
+    fn require_i128_accepts_native_integer_and_decimal_string_rejects_garbage() {
+        let toml_str = r#"
+[t]
+native_int = 42
+big_string = "170141183460469231731687303715884105727"
+garbage = "not-a-number"
+"#;
+        let doc: toml_edit::DocumentMut = toml_str.parse().unwrap();
+        let table = doc["t"].as_table().unwrap();
+        let inline = table.clone().into_inline_table();
+
+        assert_eq!(require_i128(&inline, "native_int", "loc").unwrap(), 42_i128);
+        assert_eq!(
+            require_i128(&inline, "big_string", "loc").unwrap(),
+            i128::MAX
+        );
+        assert!(require_i128(&inline, "garbage", "loc").is_err());
+        assert!(require_i128(&inline, "missing_key", "loc").is_err());
+    }
+
     #[test]
     fn criterion_per_period_cap_loads_correctly() {
         let (sk, pk) = make_keypair();
@@ -2008,44 +2063,6 @@ criteria = []
         );
     }
 
-    #[test]
-    fn criterion_soroban_resource_fee_cap_loads_correctly() {
-        let (sk, pk) = make_keypair();
-        let dir = TempDir::new().unwrap();
-        let body = body_with_criterion(
-            r#"{ kind = "soroban_resource_fee_cap", max_resource_fee_stroops = 100000000, max_footprint_entries = 50 }"#,
-        );
-        let toml = make_signed_toml(&body, &sk, "GABCDE");
-        let path = write_policy(&dir, "alice.toml", &toml);
-
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
-        assert_eq!(doc.rules[0].criteria.len(), 1);
-        assert_eq!(doc.rules[0].criteria[0].kind(), "soroban_resource_fee_cap");
-    }
-
-    #[test]
-    fn criterion_soroban_resource_fee_cap_allows_zero_resource_fee() {
-        let (sk, pk) = make_keypair();
-        let dir = TempDir::new().unwrap();
-        let body = body_with_criterion(
-            r#"{ kind = "soroban_resource_fee_cap", max_resource_fee_stroops = 0, max_footprint_entries = 50 }"#,
-        );
-        let toml = make_signed_toml(&body, &sk, "GABCDE");
-        let path = write_policy(&dir, "alice.toml", &toml);
-
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
-        assert_eq!(doc.rules[0].criteria[0].kind(), "soroban_resource_fee_cap");
-
-        let tool = test_tool("stellar_invoke_contract");
-        let args = json!({ "resource_fee_stroops": 1, "footprint_entries": 1 });
-        let store = PolicyStateStore::new();
-        let deny = eval_first_criterion(&doc, &tool, &args, &store, None);
-        assert!(
-            matches!(deny, Some(DenyReason::EvaluationError { .. })),
-            "zero soroban resource-fee cap must deny any positive resource fee"
-        );
-    }
-
     /// Standard-table `match` syntax is intentionally accepted as an alternate to inline tables.
     #[test]
     fn extract_str_field_from_standard_table_match_item() {
@@ -2127,6 +2144,27 @@ chain = "*"
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("made_up_thing")),
             "unknown criterion kind should produce PolicyFileParseFailed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn soroban_resource_fee_cap_kind_is_rejected_as_unknown_criterion() {
+        let (sk, pk) = make_keypair();
+        let dir = TempDir::new().unwrap();
+        // `soroban_resource_fee_cap` is not a registered criterion kind, so a
+        // policy file that references it must fail to load with the
+        // unknown-criterion error rather than silently ignoring the rule.
+        let body = body_with_criterion(
+            r#"{ kind = "soroban_resource_fee_cap", max_resource_fee_stroops = 100000000, max_footprint_entries = 50 }"#,
+        );
+        let toml = make_signed_toml(&body, &sk, "GABCDE");
+        let path = write_policy(&dir, "alice.toml", &toml);
+
+        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        assert!(
+            matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("soroban_resource_fee_cap")),
+            "a policy referencing soroban_resource_fee_cap must be rejected as an \
+             unknown criterion, got {err:?}"
         );
     }
 

@@ -15,8 +15,12 @@
 //! # Operator policy evaluation
 //!
 //! Loads the operator-signed `PolicyEngineV1` (if `profile.policy.engine == V1`)
-//! or a permissive `NoopPolicyEngine` (if `Noop`) and evaluates before submit.
-//! Mirrors the MCP `dispatch_gate` pattern.  Fail-closed on build failures.
+//! or a permissive `NoopPolicyEngine` (if `Noop`) and evaluates before submit,
+//! value-carrying via `evaluate_with_value` — mirroring the MCP
+//! `stellar_dex_trade` twin's `dispatch_gate_with_value` mechanism. The debit
+//! leg is built from the SAME `amount_in` / canonicalised path later placed
+//! into `DexTradeArgs` (the single-decode invariant). Fail-closed on build
+//! failures.
 //!
 //! # Output
 //!
@@ -26,17 +30,20 @@ use clap::Args;
 use serde_json::json;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::WalletError;
-use stellar_agent_core::policy::{Decision, McpToolRegistration, ToolDescriptor};
+use stellar_agent_core::policy::v1::{ValueClass, ValueEffects};
 use stellar_agent_core::profile::loader as profile_loader;
 use stellar_agent_core::profile::schema::Profile;
 
-use crate::commands::policy_engine::build_v1_policy_engine;
+use crate::commands::policy_engine::{
+    build_v1_policy_engine, evaluate_value_moving_policy_with_value,
+};
 
 use stellar_agent_defi::adapter::{DefiAdapter, DefiAdapterCtx};
 use stellar_agent_defi::dispatch::{GateOutcome, dispatch_gate, require_approval_error};
 use stellar_agent_defi::pins::DefiContractPin;
 use stellar_agent_dex::{
     abi::TradeArgs as DexTradeArgs, adapter::DexSwapAdapter, pins::pinned_router_for_network,
+    sac::canonicalise_path, value::dex_trade_value_leg,
 };
 use stellar_agent_network::{StellarRpcClient, init_platform_keyring_store, signer_from_keyring};
 
@@ -198,7 +205,24 @@ where
         }
     };
 
-    // ── Operator policy evaluation ────────────────────────────────────────────
+    // ── Canonicalise path (single decode; feeds BOTH the value-carrying
+    // policy gate below and `DexTradeArgs` handed to the adapter further
+    // down) ────────────────────────────────────────────────────────────────
+    let canonical_path = match canonicalise_path(&args.path, network_passphrase) {
+        Ok(p) => p,
+        Err(e) => {
+            render_json(&Envelope::<()>::err_raw(
+                "dex.canonicalisation_failed",
+                format!("{e}"),
+            ));
+            return 1;
+        }
+    };
+
+    // ── Operator policy evaluation (value-carrying; mirrors the MCP
+    // `stellar_dex_trade` twin's `dispatch_gate_with_value` mechanism) ───────
+    // The debit leg is built from the SAME `amount_in` / `canonical_path`
+    // used to construct `trade_args` below (single-decode invariant).
     let policy_engine = match build_v1_policy_engine("trade", &profile.policy.engine, &profile) {
         Ok(pe) => pe,
         Err(msg) => {
@@ -206,60 +230,22 @@ where
             return 1;
         }
     };
-    let dex_trade_reg = McpToolRegistration {
-        name: "stellar_dex_trade",
-        destructive_hint: true,
-        read_only_hint: false,
-        chain_id_required: true,
-        value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
-    };
-    let mut tool_descriptor = ToolDescriptor::from_registration(&dex_trade_reg);
-    tool_descriptor.chain_id = chain_id.to_owned();
+    let value_leg = dex_trade_value_leg(args.amount_in, &canonical_path, router_address);
     let policy_args = json!({
-        "chain_id": chain_id,
         "from_address": args.from,
-        "amount_in": args.amount_in,
+        "amount_in": args.amount_in.to_string(),
     });
-    match policy_engine.evaluate(
-        &tool_descriptor,
-        &policy_args,
+    if let Err(envelope) = evaluate_value_moving_policy_with_value(
+        policy_engine.as_ref(),
         &profile,
-        None,
-        None,
-        None,
-        None,
-        None,
+        "stellar_dex_trade",
+        chain_id,
+        &policy_args,
+        ValueClass::Value(ValueEffects::new(vec![value_leg])),
+        "trade",
     ) {
-        Ok(Decision::Allow) => {}
-        Ok(Decision::Deny(reason)) => {
-            render_json(&Envelope::<()>::err_raw(
-                format!("policy.deny.{}", reason.code()),
-                "trade operation denied by operator policy".to_owned(),
-            ));
-            return 1;
-        }
-        Ok(Decision::RequireApproval(_)) => {
-            render_json(&Envelope::<()>::err_raw(
-                "policy.approval_required",
-                "trade operation requires approval; use the MCP server for two-phase approval"
-                    .to_owned(),
-            ));
-            return 1;
-        }
-        Ok(_) => {
-            render_json(&Envelope::<()>::err_raw(
-                "policy.unexpected_decision",
-                "unexpected policy decision — operation refused (fail-closed)".to_owned(),
-            ));
-            return 1;
-        }
-        Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                "policy.engine_required",
-                format!("{e}"),
-            ));
-            return 1;
-        }
+        render_json(&envelope);
+        return 1;
     }
 
     // ── DeFi dispatch gate (capability-witness seam) ──────────────────────────
@@ -279,11 +265,13 @@ where
     };
 
     // ── Build DexTradeArgs for the adapter ───────────────────────────────────
+    // `path` is the SAME `canonical_path` used to build `value_leg` above
+    // (single-decode invariant).
     let trade_args = DexTradeArgs {
         from_address: args.from.clone(),
         amount_in: args.amount_in,
         amount_out_min: args.amount_out_min,
-        path: args.path.clone(),
+        path: canonical_path.clone(),
         deadline: args.deadline,
     };
 

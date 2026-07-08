@@ -86,7 +86,10 @@ pub struct BundlePerPeriodCapCriterion {
     /// Rolling window duration.
     window: Window,
     /// Maximum aggregate stroops within the window (per-period + bundle total).
-    max_stroops: i64,
+    ///
+    /// `i128` because a token quantity aggregated over many legs (e.g.
+    /// Soroban SAC transfers) can exceed `i64::MAX`.
+    max_stroops: i128,
 }
 
 impl BundlePerPeriodCapCriterion {
@@ -103,7 +106,7 @@ impl BundlePerPeriodCapCriterion {
     /// assert_eq!(c.max_stroops(), 5_000_000_000);
     /// ```
     #[must_use]
-    pub fn new(asset: String, window: Window, max_stroops: i64) -> Self {
+    pub fn new(asset: String, window: Window, max_stroops: i128) -> Self {
         Self {
             asset,
             window,
@@ -113,7 +116,7 @@ impl BundlePerPeriodCapCriterion {
 
     /// Returns the configured maximum stroops per window.
     #[must_use]
-    pub fn max_stroops(&self) -> i64 {
+    pub fn max_stroops(&self) -> i128 {
         self.max_stroops
     }
 }
@@ -189,7 +192,10 @@ impl Criterion for BundlePerPeriodCapCriterion {
 
         // Accumulate inner amounts against the period cap, tracking which inner
         // tips the sum.  Only `TokenTransfer` inners whose asset matches fire.
-        let mut running_sum: i64 = 0_i64;
+        // `i128` end-to-end (no clamp): `period_used_recorded` is widened from
+        // the state store's own storage type once, up front.
+        let period_used_recorded: i128 = i128::from(period_used_recorded);
+        let mut running_sum: i128 = 0;
 
         for (idx, inner) in view.inners.iter().enumerate() {
             let InnerOpDescriptor::TokenTransfer { asset, amount, .. } = inner else {
@@ -203,9 +209,7 @@ impl Criterion for BundlePerPeriodCapCriterion {
                 continue;
             }
 
-            // Saturating cast: over-deny on i128 > i64::MAX is the correct
-            // security posture.
-            let inner_stroops = i64::try_from(*amount).unwrap_or(i64::MAX);
+            let inner_stroops = *amount;
 
             // Check cap: period_used_recorded + running_sum + inner_stroops > max?
             let would_use = period_used_recorded

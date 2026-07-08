@@ -13,7 +13,6 @@
 //! | `rate_limit` | `RateLimitCriterion` | `"rate_limit"` |
 //! | `counterparty_allowlist` | `CounterpartyAllowlistCriterion` | `"counterparty_allowlist"` |
 //! | `minimum_reserve` | `MinimumReserveCriterion` | `"minimum_reserve"` |
-//! | `soroban_resource_fee` | `SorobanResourceFeeCriterion` | `"soroban_resource_fee_cap"` |
 //! | `inner_invocation_count_cap` | `InnerInvocationCountCapCriterion` | `"inner_invocation_count_cap"` |
 //! | `bundle_aggregate_cap` | `BundleAggregateCapCriterion` | `"bundle_aggregate_cap"` |
 //! | `restrict_bundle_to_recognised_kinds` | `RestrictBundleToRecognisedKindsCriterion` | `"restrict_bundle_to_recognised_kinds"` |
@@ -45,7 +44,6 @@ pub mod rate_limit;
 pub mod restrict_bundle_to_recognised_kinds;
 pub mod sep10_session_active;
 pub mod sep45_session_active;
-pub mod soroban_resource_fee;
 pub mod state_store;
 
 pub use bundle_aggregate_cap::BundleAggregateCapCriterion;
@@ -63,7 +61,6 @@ pub use rate_limit::RateLimitCriterion;
 pub use restrict_bundle_to_recognised_kinds::RestrictBundleToRecognisedKindsCriterion;
 pub use sep10_session_active::Sep10SessionActiveCriterion;
 pub use sep45_session_active::Sep45SessionActiveCriterion;
-pub use soroban_resource_fee::SorobanResourceFeeCriterion;
 pub use state_store::PolicyStateStore;
 
 /// A single policy criterion evaluated against an [`EvalContext`].

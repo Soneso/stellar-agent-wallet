@@ -328,6 +328,20 @@ pub(crate) fn claim_policy_args(balance_id: &str) -> serde_json::Value {
     serde_json::json!({ "balance_id": balance_id })
 }
 
+/// Builds the `stellar_trustline` / `stellar_trustline_commit` policy args.
+///
+/// `derive_value_class` reads only the `asset` field for the trustline arm
+/// (a `Trustline` leg carries no debit); `from` is carried for audit parity
+/// with the MCP `stellar_trustline` twin's dispatch args, which supplies
+/// `{chain_id, from, asset}` (`chain_id` is applied separately via
+/// [`ToolDescriptor::chain_id`](stellar_agent_core::policy::ToolDescriptor),
+/// so it is not duplicated here). Shared by the `trustline` CLI verb call
+/// site and its parity tests.
+#[must_use]
+pub(crate) fn trustline_policy_args(from: &str, asset: &str) -> serde_json::Value {
+    serde_json::json!({ "from": from, "asset": asset })
+}
+
 /// Evaluates operator policy for a value-moving classic verb (`pay`, `claim`,
 /// `accounts create`) through the same [`PolicyEngine::evaluate`] path the
 /// DeFi verbs (`trade`, `lend`, `vault`, `trustline`) already use.
@@ -370,6 +384,83 @@ pub(crate) fn evaluate_value_moving_policy(
         &tool_descriptor,
         policy_args,
         profile,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ) {
+        Ok(Decision::Allow) => Ok(()),
+        Ok(Decision::Deny(reason)) => Err(Envelope::<()>::err_raw(
+            format!("policy.deny.{}", reason.code()),
+            format!("{verb} operation denied by operator policy"),
+        )),
+        Ok(Decision::RequireApproval(_)) => Err(Envelope::<()>::err_raw(
+            "policy.approval_required",
+            format!(
+                "{verb} operation requires approval; use the MCP server for two-phase approval"
+            ),
+        )),
+        Ok(_) => Err(Envelope::<()>::err_raw(
+            "policy.unexpected_decision",
+            "unexpected policy decision — operation refused (fail-closed)".to_owned(),
+        )),
+        Err(e) => Err(Envelope::<()>::err_raw(
+            "policy.engine_required",
+            format!("{e}"),
+        )),
+    }
+}
+
+/// Evaluates operator policy for a value-moving DeFi verb (`trade`, `lend`,
+/// `vault`) whose effect cannot be derived from pre-decode args alone —
+/// mirroring the MCP DeFi tools' `WalletServer::dispatch_gate_with_value`
+/// mechanism.
+///
+/// Constructs the same [`ToolDescriptor`] shape as
+/// [`evaluate_value_moving_policy`] (`McpToolRegistration` with
+/// `value_kind: ToolValueKind::MovesValue`, `ToolDescriptor::from_registration`,
+/// `chain_id` set), but evaluates via
+/// [`PolicyEngine::evaluate_with_value`] with the caller-supplied
+/// `value_class` — the same value descriptor the CLI verb builds from the
+/// SAME parsed requirements it signs (single-decode invariant) — instead of
+/// [`PolicyEngine::evaluate`]'s args-derived descriptor. Returns `Ok(())` on
+/// [`Decision::Allow`]; returns `Err(envelope)` for every other outcome,
+/// mirroring the `evaluate_value_moving_policy` refusal-message shapes
+/// verbatim so a V1-engine deny produces the identical wire code the MCP
+/// twin returns for the same rule.
+///
+/// Callers render the envelope with their own `print_error` (JSON vs table)
+/// and exit `1`.
+///
+/// # Errors
+///
+/// Returns `Err(envelope)` on `Decision::Deny`, `Decision::RequireApproval`,
+/// an unexpected `Decision` variant, or a policy-engine evaluation error.
+pub(crate) fn evaluate_value_moving_policy_with_value(
+    policy_engine: &dyn PolicyEngine,
+    profile: &Profile,
+    tool_name: &'static str,
+    chain_id: &str,
+    policy_args: &serde_json::Value,
+    value_class: stellar_agent_core::policy::v1::ValueClass,
+    verb: &str,
+) -> Result<(), Envelope<()>> {
+    let reg = McpToolRegistration {
+        name: tool_name,
+        destructive_hint: true,
+        read_only_hint: false,
+        chain_id_required: true,
+        value_kind: ToolValueKind::MovesValue,
+    };
+    let mut tool_descriptor = ToolDescriptor::from_registration(&reg);
+    tool_descriptor.chain_id = chain_id.to_owned();
+
+    match policy_engine.evaluate_with_value(
+        &tool_descriptor,
+        policy_args,
+        profile,
+        value_class,
         None,
         None,
         None,
@@ -600,7 +691,7 @@ mod tests {
             },
             criteria: vec![Box::new(PerTxCapCriterion::new(
                 "native".to_owned(),
-                max_stroops,
+                i128::from(max_stroops),
             ))],
             decision: Decision::Allow,
             allow_opaque_signing: false,
@@ -775,6 +866,77 @@ mod tests {
             envelope_code(&result),
             "policy.deny.rate_limit_exceeded",
             "an explicit deny rule matching stellar_claim must refuse with its wire code"
+        );
+    }
+
+    // ── evaluate_value_moving_policy_with_value: single-shot DeFi verb parity ──
+    //
+    // These tests drive `evaluate_value_moving_policy_with_value` against a
+    // synthetic `stellar_dex_trade`-shaped rule, mirroring the pattern above
+    // but through the `evaluate_with_value` path (typed `ValueClass` supplied
+    // directly rather than derived from `args`), the mechanism the `trade` /
+    // `lend` / `vault` CLI verbs now share with their MCP twins.
+
+    use stellar_agent_core::policy::v1::{ActionKind, ValueClass, ValueLeg};
+
+    fn dex_trade_leg(amount: i128) -> ValueClass {
+        ValueClass::single(ValueLeg {
+            kind: ActionKind::DexTrade,
+            amount: Some(amount),
+            asset: Some("native".to_owned()),
+            destination: Some(PARITY_DEST_G.to_owned()),
+        })
+    }
+
+    #[test]
+    fn with_value_gate_under_cap_allows() {
+        let engine = per_tx_cap_engine("stellar_dex_trade", 1_000_000_000); // 100 XLM cap
+        let profile = parity_profile();
+        let policy_args = serde_json::json!({ "from_address": PARITY_DEST_G });
+        let result = evaluate_value_moving_policy_with_value(
+            &engine,
+            &profile,
+            "stellar_dex_trade",
+            "stellar:testnet",
+            &policy_args,
+            dex_trade_leg(500_000_000),
+            "trade",
+        );
+        assert!(result.is_ok(), "50 XLM under a 100 XLM cap must allow");
+    }
+
+    #[test]
+    fn with_value_gate_over_cap_denies_with_mcp_wire_code() {
+        let engine = per_tx_cap_engine("stellar_dex_trade", 1_000_000_000); // 100 XLM cap
+        let profile = parity_profile();
+        let policy_args = serde_json::json!({ "from_address": PARITY_DEST_G });
+        let result = evaluate_value_moving_policy_with_value(
+            &engine,
+            &profile,
+            "stellar_dex_trade",
+            "stellar:testnet",
+            &policy_args,
+            dex_trade_leg(1_500_000_000),
+            "trade",
+        );
+        assert_eq!(
+            envelope_code(&result),
+            "policy.deny.per_tx_cap_exceeded",
+            "150 XLM over a 100 XLM cap must deny with the same wire code the MCP \
+             `stellar_dex_trade` twin returns for the identical rule"
+        );
+    }
+
+    // ── trustline_policy_args: field-shape parity with the MCP twin ──────────
+
+    #[test]
+    fn trustline_policy_args_carries_from_and_asset_only() {
+        let value = trustline_policy_args(PARITY_DEST_G, "USDC");
+        assert_eq!(value["from"], PARITY_DEST_G);
+        assert_eq!(value["asset"], "USDC");
+        assert!(
+            value.get("chain_id").is_none(),
+            "chain_id is applied via ToolDescriptor::chain_id, not duplicated in policy_args"
         );
     }
 

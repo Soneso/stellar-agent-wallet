@@ -49,10 +49,10 @@
 //! legacy `args["starting_balance"]`) and treats the asset as implicitly
 //! native.
 //!
-//! For `stellar_axelar_bridge`: reads `args["qty"]` (a raw i128 on-chain
-//! integer) and `args["token_address"]` (the resolved C-strkey from the
-//! token-egress pin, injected at dispatch time).  The raw integer is compared
-//! directly against the period total without decimal parsing.
+//! For other tools: the criterion is driven entirely by the typed value
+//! descriptor ([`crate::policy::v1::value::classify_value`]); it applies to
+//! any `MovesValue` tool whose descriptor resolves debit legs in the
+//! configured asset (see [`crate::policy::v1::value`]).
 //!
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -190,7 +190,10 @@ pub struct PerPeriodCapCriterion {
     /// Rolling window duration.
     window: Window,
     /// Maximum aggregate stroops within the window.
-    max_stroops: i64,
+    ///
+    /// `i128` because a token quantity aggregated over many legs (e.g.
+    /// Soroban SAC transfers) can exceed `i64::MAX`.
+    max_stroops: i128,
 }
 
 impl PerPeriodCapCriterion {
@@ -206,7 +209,7 @@ impl PerPeriodCapCriterion {
     /// assert_eq!(cap.max_stroops(), 1_000_000_000);
     /// ```
     #[must_use]
-    pub fn new(asset: String, window: Window, max_stroops: i64) -> Self {
+    pub fn new(asset: String, window: Window, max_stroops: i128) -> Self {
         Self {
             asset,
             window,
@@ -216,7 +219,7 @@ impl PerPeriodCapCriterion {
 
     /// Returns the configured maximum stroops per window.
     #[must_use]
-    pub fn max_stroops(&self) -> i64 {
+    pub fn max_stroops(&self) -> i128 {
         self.max_stroops
     }
 }
@@ -238,34 +241,13 @@ impl Criterion for PerPeriodCapCriterion {
     /// - The required amount field is missing or unparseable.
     /// - [`SystemTime`] is before UNIX epoch (should not occur in practice).
     /// - The state store detects clock skew exceeding 30 seconds.
+    /// - The resulting cumulative window total would exceed the `i64`
+    ///   accounting bound (interim fail-closed guard until the store carries
+    ///   `i128`).
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
         let tool_name = ctx.tool.name.as_str();
 
         let criterion_asset = asset_normalise(&self.asset);
-
-        // Legacy args-based arm for the not-yet-migrated `stellar_axelar_bridge`
-        // (an unregistered dead arm removed in #22). Reached only for that name;
-        // every classified tool is sized through the value descriptor below.
-        if tool_name == "stellar_axelar_bridge" {
-            // `qty` is an on-chain i128 integer (not a unit-bearing string).
-            // `token_address` is the resolved C-strkey from the token-egress
-            // pin, injected by the dispatch site alongside qty.
-            let qty_val = ctx
-                .args
-                .get("qty")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
-                    detail: format!(
-                        "per_period_cap: missing or non-integer field 'qty' \
-                             in args for tool '{tool_name}'"
-                    ),
-                })?;
-            let token_address = extract_string_field(ctx, "token_address")?;
-            if criterion_asset != token_address {
-                return Ok(None);
-            }
-            return self.check_window(ctx, &criterion_asset, qty_val);
-        }
 
         // Descriptor-driven path with the fail-closed default: an unsizable
         // effect (MovesValue tool that resolved no effects, or an opaque-sign
@@ -313,8 +295,7 @@ impl Criterion for PerPeriodCapCriterion {
             return Ok(None);
         }
 
-        let attempted_stroops = i64::try_from(sum).unwrap_or(i64::MAX);
-        self.check_window(ctx, &criterion_asset, attempted_stroops)
+        self.check_window(ctx, &criterion_asset, sum)
     }
 
     /// Accumulates this inner's amount into the overlay using the SAME
@@ -329,8 +310,8 @@ impl Criterion for PerPeriodCapCriterion {
     /// asset matches `self.asset` (after normalisation).  `Generic` inners and
     /// asset-mismatched inners contribute 0.
     ///
-    /// Amount is cast `i128 → i64` via saturating cast (over-deny direction on
-    /// overflow).
+    /// The amount is accumulated as `i128` (no clamp): both the overlay and
+    /// the on-chain token quantity it accounts for are `i128`.
     fn accumulate_overlay(
         &self,
         ctx: &EvalContext<'_>,
@@ -351,9 +332,7 @@ impl Criterion for PerPeriodCapCriterion {
 
         // Derive the SAME state key as evaluate() uses — guarantees read-key equality.
         let state_key = StateKey::new(ctx.profile_name, 1, &criterion_asset, self.window.as_secs());
-        // Saturating cast: over-deny on i128 > i64::MAX is the correct security posture.
-        let attempted_stroops = i64::try_from(*amount).unwrap_or(i64::MAX);
-        overlay.accumulate(state_key, attempted_stroops);
+        overlay.accumulate(state_key, *amount);
     }
 }
 
@@ -362,21 +341,26 @@ impl PerPeriodCapCriterion {
     /// `criterion_asset`, combining the state-store-recorded total with any
     /// bundle overlay contribution.
     ///
-    /// Shared by both the legacy `stellar_axelar_bridge` args arm and the
-    /// descriptor-driven path in `evaluate` — both resolve an
-    /// `(asset, attempted_stroops)` pair upstream and then check it against
-    /// the identical window/overlay logic.
+    /// Called by the descriptor-driven path in `evaluate` after it resolves
+    /// an `(asset, attempted_stroops)` pair.
+    ///
+    /// The decision arithmetic is `i128` end-to-end (no clamp): the
+    /// state-store-recorded total and the bundle overlay contribution are
+    /// each widened from their own storage type before being combined with
+    /// `attempted_stroops` and compared against `self.max_stroops`.
     ///
     /// # Errors
     ///
     /// Returns [`PolicyError::CriterionEvaluationFailed`] when [`SystemTime`]
-    /// is before UNIX epoch, or the state store detects clock skew exceeding
-    /// 30 seconds.
+    /// is before UNIX epoch, the state store detects clock skew exceeding
+    /// 30 seconds, or the resulting cumulative window total would exceed the
+    /// `i64` accounting bound (interim fail-closed guard until the store
+    /// carries `i128`).
     fn check_window(
         &self,
         ctx: &EvalContext<'_>,
         criterion_asset: &str,
-        attempted_stroops: i64,
+        attempted_stroops: i128,
     ) -> Result<Option<DenyReason>, PolicyError> {
         let now_ms = system_time_to_ms()?;
 
@@ -400,13 +384,13 @@ impl PerPeriodCapCriterion {
         // Add any overlay amount accumulated from earlier inners in the same
         // multicall bundle.  On the single-tx path (bundle = None) the overlay
         // contributes 0.
-        let bundle_accumulated_stroops: i64 = ctx
+        let bundle_accumulated_stroops: i128 = ctx
             .bundle
             .map(|view| view.overlay.get(&state_key))
             .unwrap_or(0);
 
         let period_used_stroops =
-            period_used_stroops_recorded.saturating_add(bundle_accumulated_stroops);
+            i128::from(period_used_stroops_recorded).saturating_add(bundle_accumulated_stroops);
 
         // Would-exceed check: period_used + attempted > max?
         let would_use = period_used_stroops.saturating_add(attempted_stroops);
@@ -420,6 +404,29 @@ impl PerPeriodCapCriterion {
             }));
         }
 
+        // Interim fail-closed guard at the i128→i64 state-store boundary. The
+        // rolling-window accumulator persists as `i64`. A call the cap would
+        // otherwise allow, but whose resulting cumulative window total
+        // (`would_use`) exceeds `i64::MAX`, cannot be recorded faithfully: the
+        // dispatch site's post-commit `append` would saturate, silently
+        // under-counting the window and raising the effective cap on later
+        // calls. Refuse such a call so the under-count surfaces as a visible
+        // refusal. `would_use >= attempted_stroops >= any single appended debit`,
+        // so this one bound covers both the amount about to be recorded and the
+        // aggregate window total; it holds the store's cumulative at or below
+        // `i64::MAX` by construction, keeping the recorded read faithful.
+        if would_use > i128::from(i64::MAX) {
+            return Err(PolicyError::CriterionEvaluationFailed {
+                detail: format!(
+                    "per_period_cap: rolling-window total for asset '{}' would exceed the \
+                     i64 accounting bound (attempted={attempted_stroops}, \
+                     period_used={period_used_stroops}); refused fail-closed to avoid \
+                     silently under-counting the window",
+                    self.asset
+                ),
+            });
+        }
+
         Ok(None)
     }
 }
@@ -427,19 +434,6 @@ impl PerPeriodCapCriterion {
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
-
-fn extract_string_field(ctx: &EvalContext<'_>, field: &str) -> Result<String, PolicyError> {
-    ctx.args
-        .get(field)
-        .and_then(|v| v.as_str())
-        .map(str::to_owned)
-        .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
-            detail: format!(
-                "per_period_cap: missing or non-string field '{}' in args for tool '{}'",
-                field, ctx.tool.name
-            ),
-        })
-}
 
 /// Returns the current time as unix-milliseconds.
 ///
@@ -794,96 +788,6 @@ mod tests {
         );
     }
 
-    // ── stellar_axelar_bridge path ────────────────────────────────────────────
-
-    const USDC_TOKEN_ADDRESS: &str = "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA";
-
-    #[test]
-    #[serial]
-    fn bridge_empty_window_allows() {
-        let tool = make_tool("stellar_axelar_bridge");
-        let profile = make_profile();
-        let store = PolicyStateStore::new();
-        let w = Window::parse("1d").unwrap();
-        // Cap: 1000 USDC (7 decimals) = 10_000_000_000 base units.
-        let criterion =
-            PerPeriodCapCriterion::new(USDC_TOKEN_ADDRESS.to_owned(), w, 10_000_000_000);
-        let args = json!({
-            "qty": 1_000_000_000i64, // 100 USDC
-            "token_address": USDC_TOKEN_ADDRESS,
-        });
-        let ctx = make_ctx(&tool, &profile, &args, &store);
-        let result = criterion.evaluate(&ctx).unwrap();
-        assert!(result.is_none(), "empty window must allow: {result:?}");
-    }
-
-    #[test]
-    #[serial]
-    fn bridge_qty_over_period_cap_denies() {
-        let tool = make_tool("stellar_axelar_bridge");
-        let profile = make_profile();
-        let store = PolicyStateStore::new();
-        let w = Window::parse("1d").unwrap();
-        let criterion =
-            PerPeriodCapCriterion::new(USDC_TOKEN_ADDRESS.to_owned(), w, 10_000_000_000);
-
-        let key = StateKey::new("alice", 1, USDC_TOKEN_ADDRESS, 86_400);
-        let now = system_time_to_ms().unwrap();
-        store.append(&key, now - 1_000, 9_000_000_000).unwrap(); // 900 USDC already spent
-
-        // Try 200 USDC (2_000_000_000) → total 1100 USDC > 1000 USDC cap.
-        let args = json!({
-            "qty": 2_000_000_000i64,
-            "token_address": USDC_TOKEN_ADDRESS,
-        });
-        let ctx = make_ctx(&tool, &profile, &args, &store);
-        let result = criterion.evaluate(&ctx).unwrap();
-        assert!(
-            matches!(result, Some(DenyReason::PerPeriodCapExceeded { .. })),
-            "900+200=1100 USDC must be denied by 1000 USDC period cap: {result:?}"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn bridge_token_address_mismatch_criterion_does_not_apply() {
-        let tool = make_tool("stellar_axelar_bridge");
-        let profile = make_profile();
-        let store = PolicyStateStore::new();
-        let w = Window::parse("1d").unwrap();
-        let criterion =
-            PerPeriodCapCriterion::new(USDC_TOKEN_ADDRESS.to_owned(), w, 10_000_000_000);
-        // Different token address.
-        let args = json!({
-            "qty": 99_990_000_000i64,
-            "token_address": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
-        });
-        let ctx = make_ctx(&tool, &profile, &args, &store);
-        let result = criterion.evaluate(&ctx).unwrap();
-        assert!(
-            result.is_none(),
-            "token address mismatch must not trigger period criterion: {result:?}"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn bridge_missing_qty_returns_evaluation_failed() {
-        let tool = make_tool("stellar_axelar_bridge");
-        let profile = make_profile();
-        let store = PolicyStateStore::new();
-        let w = Window::parse("1d").unwrap();
-        let criterion =
-            PerPeriodCapCriterion::new(USDC_TOKEN_ADDRESS.to_owned(), w, 10_000_000_000);
-        let args = json!({ "token_address": USDC_TOKEN_ADDRESS });
-        let ctx = make_ctx(&tool, &profile, &args, &store);
-        let result = criterion.evaluate(&ctx);
-        assert!(
-            matches!(result, Err(PolicyError::CriterionEvaluationFailed { .. })),
-            "missing qty must return CriterionEvaluationFailed: {result:?}"
-        );
-    }
-
     // ── Real production args shapes (resolved-key re-point) ────────────────
 
     /// Simulate-time `stellar_pay` args_value shape when the caller used
@@ -1121,6 +1025,42 @@ mod tests {
         );
     }
 
+    /// A single debit leg carrying an i128 token quantity strictly greater
+    /// than `i64::MAX` must be compared and reported without a lossy clamp,
+    /// through the full `check_window` decision path (state-store total +
+    /// overlay + attempted, all `i128`): the criterion denies and
+    /// `attempted_stroops` carries the exact beyond-i64 value.
+    #[test]
+    #[serial]
+    fn debit_leg_amount_beyond_i64_max_denies_without_clamp() {
+        use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
+
+        let tool = make_tool("stellar_multicall");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let w = Window::parse("1d").unwrap();
+        let beyond_i64_max: i128 = i128::from(i64::MAX) + 1_000;
+        let cap: i128 = i128::from(i64::MAX);
+        let criterion = PerPeriodCapCriterion::new("native".into(), w, cap);
+        let args = json!({});
+        let leg = ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(beyond_i64_max),
+            asset: Some("native".to_owned()),
+            destination: Some("GAAA".to_owned()),
+        };
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+            .with_value(ValueClass::Value(ValueEffects::single(leg)));
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::PerPeriodCapExceeded {
+                attempted_stroops, max_stroops, period_used_stroops: 0, ..
+            }) if attempted_stroops == beyond_i64_max && max_stroops == cap),
+            "a debit beyond i64::MAX must deny with the exact i128 value, not a clamped \
+             i64::MAX, got {result:?}"
+        );
+    }
+
     /// The period cap aggregates ONLY debit (outflow) legs; an inflow leg
     /// (`LendWithdraw`) is present in the descriptor but never summed into the
     /// window.
@@ -1157,6 +1097,55 @@ mod tests {
             result.is_none(),
             "the period cap must sum only the 60 XLM outflow leg, so a 100 XLM cap \
              allows the call, got {result:?}"
+        );
+    }
+
+    /// Interim fail-closed guard at the i128→i64 state-store boundary: a call
+    /// the i128 cap would otherwise ALLOW (cap set above `i64::MAX`), but whose
+    /// resulting cumulative window total exceeds `i64::MAX`, is refused
+    /// fail-closed rather than silently under-counted by the `i64` accumulator.
+    /// Distinct from `debit_leg_amount_beyond_i64_max_denies_without_clamp`,
+    /// where the cap itself denies first; here the cap passes and only the
+    /// store-boundary guard refuses. Nothing is recorded.
+    #[test]
+    #[serial]
+    fn window_total_beyond_i64_store_bound_denies_fail_closed_nothing_recorded() {
+        use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
+
+        let tool = make_tool("stellar_multicall");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let w = Window::parse("1d").unwrap();
+        // Cap ABOVE i64::MAX so the i128 cap comparison ALLOWS the call; the
+        // store-boundary guard is what must refuse it.
+        let cap: i128 = i128::from(i64::MAX) * 4;
+        let attempted: i128 = i128::from(i64::MAX) + 1_000;
+        let criterion = PerPeriodCapCriterion::new("native".into(), w, cap);
+        let args = json!({});
+        let leg = ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(attempted),
+            asset: Some("native".to_owned()),
+            destination: Some("GAAA".to_owned()),
+        };
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+            .with_value(ValueClass::Value(ValueEffects::single(leg)));
+
+        let result = criterion.evaluate(&ctx);
+        assert!(
+            matches!(result, Err(PolicyError::CriterionEvaluationFailed { .. })),
+            "a debit whose cumulative window total exceeds the i64 store bound must be \
+             refused fail-closed even when the i128 cap would allow it, got {result:?}"
+        );
+
+        // Nothing recorded: evaluation is read-only; the window remains empty,
+        // so the refusal cannot have narrowed or written state.
+        let key = StateKey::new("alice", 1, "native", w.as_secs());
+        let now_ms = system_time_to_ms().unwrap();
+        let (recorded, _) = store.query_window(&key, now_ms).unwrap();
+        assert_eq!(
+            recorded, 0,
+            "a fail-closed refusal must not record anything into the window"
         );
     }
 }

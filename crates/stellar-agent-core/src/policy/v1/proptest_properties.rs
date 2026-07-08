@@ -13,8 +13,8 @@
 //! global state) would cause non-determinism across runs.  This property
 //! guards against those regressions.
 //!
-//! Scope: the four state-independent criteria (`per_tx_cap`,
-//! `counterparty_allowlist`, `minimum_reserve`, `soroban_resource_fee_cap`).
+//! Scope: the three state-independent criteria (`per_tx_cap`,
+//! `counterparty_allowlist`, `minimum_reserve`).
 //! `per_period_cap` and `rate_limit` are excluded because they depend on
 //! `SystemTime::now()` and mutate `PolicyStateStore`; including them would
 //! make this property inherently flaky.
@@ -68,9 +68,9 @@ use proptest::prelude::*;
 use crate::policy::v1::PolicyEngineV1;
 use crate::policy::v1::proptest_strategies::{
     arb_counterparty_allowlist_rule, arb_minimum_reserve_rule, arb_native_payment_args,
-    arb_payment_args, arb_per_tx_cap_rule, arb_profile, arb_soroban_resource_fee_rule,
-    arb_strict_deny_per_tx_rule, arb_tool_descriptor, arb_tool_descriptor_for_payment_tools,
-    single_rule_document, two_rule_document,
+    arb_payment_args, arb_per_tx_cap_rule, arb_profile, arb_strict_deny_per_tx_rule,
+    arb_tool_descriptor, arb_tool_descriptor_for_payment_tools, single_rule_document,
+    two_rule_document,
 };
 use crate::policy::{Decision, DenyReason, PolicyEngine};
 
@@ -190,27 +190,6 @@ proptest! {
         );
     }
 
-    /// Property 1d — Determinism for `soroban_resource_fee_cap`.
-    ///
-    /// Same-engine re-evaluation must return the same `Decision`.  Non-Soroban
-    /// tools cause the criterion to return `Ok(None)` (does not apply) and the
-    /// rule's `Allow` decision is returned.
-    #[test]
-    fn prop_soroban_resource_fee_evaluate_is_deterministic(
-        rule in arb_soroban_resource_fee_rule(),
-        tool in arb_tool_descriptor(),
-        args in arb_payment_args(),
-        (profile, profile_name) in arb_profile(),
-    ) {
-        let doc = single_rule_document(rule);
-        let engine = PolicyEngineV1::new(doc, profile_name);
-        let r1 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None);
-        let r2 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None);
-        prop_assert!(
-            decisions_equiv(&r1, &r2),
-            "soroban_resource_fee determinism failed: first={r1:?} second={r2:?}"
-        );
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -263,7 +242,7 @@ proptest! {
                 },
                 criteria: vec![Box::new(PerTxCapCriterion::new(
                     "native".to_owned(),
-                    100_000_000_000_000_i64, // 10 000 000 XLM — always passes
+                    100_000_000_000_000, // 10 000 000 XLM — always passes
                 ))],
                 decision: Decision::Allow,
                 allow_opaque_signing: false,
@@ -489,8 +468,8 @@ proptest! {
     #[test]
     fn prop_deny_reason_per_tx_cap_code_is_payload_independent(
         asset in "[a-z]{3,8}",
-        max_stroops in 0_i64..=100_000_000_000_i64,
-        attempted_stroops in 0_i64..=200_000_000_000_i64,
+        max_stroops in 0_i128..=(i128::from(i64::MAX) * 2),
+        attempted_stroops in 0_i128..=(i128::from(i64::MAX) * 4),
     ) {
         let reason = DenyReason::PerTxCapExceeded {
             asset,
@@ -505,9 +484,9 @@ proptest! {
     fn prop_deny_reason_per_period_cap_code_is_payload_independent(
         asset in "[a-z]{3,8}",
         window in "[a-z0-9_]{3,16}",
-        max_stroops in 0_i64..=100_000_000_000_i64,
-        attempted_stroops in 0_i64..=200_000_000_000_i64,
-        period_used_stroops in 0_i64..=200_000_000_000_i64,
+        max_stroops in 0_i128..=(i128::from(i64::MAX) * 2),
+        attempted_stroops in 0_i128..=(i128::from(i64::MAX) * 4),
+        period_used_stroops in 0_i128..=(i128::from(i64::MAX) * 4),
     ) {
         let reason = DenyReason::PerPeriodCapExceeded {
             asset,
@@ -550,8 +529,8 @@ proptest! {
     /// Property 3f — The `MinimumReserveBreached` wire code is payload-independent.
     #[test]
     fn prop_deny_reason_minimum_reserve_code_is_payload_independent(
-        reserve_required_stroops in 0_i64..=1_000_000_000_i64,
-        balance_stroops in 0_i64..=1_000_000_000_i64,
+        reserve_required_stroops in 0_i128..=(i128::from(i64::MAX) * 2),
+        balance_stroops in 0_i128..=(i128::from(i64::MAX) * 2),
     ) {
         let reason = DenyReason::MinimumReserveBreached {
             reserve_required_stroops,

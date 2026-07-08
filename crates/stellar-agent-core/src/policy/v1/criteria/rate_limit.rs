@@ -131,18 +131,18 @@ impl Criterion for RateLimitCriterion {
         // state_key derivation ("rate_limit" bucket) so each inner in a bundle
         // contributes +1 call via the overlay.  On the single-tx path
         // (bundle = None) the overlay contributes 0.
-        let bundle_accumulated_calls: i64 = ctx
+        let bundle_accumulated_calls: i128 = ctx
             .bundle
             .map(|view| view.overlay.get(&state_key))
             .unwrap_or(0);
 
         // `.max(0)` is defence-in-depth: `BundleStateOverlay::accumulate` uses
-        // `i64::saturating_add` with positive addends (call counts), so the
+        // `i128::saturating_add` with positive addends (call counts), so the
         // overlay value should never be negative.  The clamp protects against
         // future criterion implementations that might accumulate negative amounts
         // via `accumulate_overlay`, preventing a negative overlay from
         // under-counting the window total and silently raising the effective cap.
-        // The subsequent saturating cast to u32 handles any `i64` value that
+        // The subsequent saturating cast to u32 handles any `i128` value that
         // would overflow u32.
         let calls_in_window = calls_in_window_recorded
             .saturating_add(u32::try_from(bundle_accumulated_calls.max(0)).unwrap_or(u32::MAX));
@@ -409,7 +409,7 @@ mod tests {
 
         // Overlay simulates 2 calls already approved in earlier bundle inners.
         let mut overlay = BundleStateOverlay::default();
-        // The overlay uses rate_limit key with i64 count.
+        // The overlay uses rate_limit key with i128 count.
         overlay.accumulate(rate_key.clone(), 2);
         let inners: Vec<crate::policy::v1::bundle::InnerOpDescriptor> = vec![];
         let view = BundleView {
