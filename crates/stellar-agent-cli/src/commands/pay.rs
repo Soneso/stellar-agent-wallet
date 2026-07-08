@@ -48,14 +48,16 @@
 //!
 //! # Operator policy evaluation
 //!
-//! After the envelope is built (and before signing, in both the full pipeline
-//! and `--build-only`), the resolved amount/asset/destination are evaluated
-//! against the operator-signed `PolicyEngineV1` (when `--profile` resolves to
-//! a persisted profile with `policy.engine = "v1"`) or the permissive
-//! `NoopPolicyEngine` otherwise, mirroring the `stellar_pay` MCP tool's
-//! dispatch gate. When `--profile` names no persisted `<name>.toml` file, an
-//! in-memory `Noop`-engine testnet profile is synthesized so the command keeps
-//! working without an authored profile file.
+//! The profile is resolved (and, when it carries `policy.engine = "v1"`, the
+//! platform keyring store is initialised) before any network build, in both
+//! the full pipeline and `--build-only`. After the envelope is built and
+//! before signing, the resolved amount/asset/destination are evaluated
+//! against the operator-signed `PolicyEngineV1` (V1 profiles) or the
+//! permissive `NoopPolicyEngine` (`Noop` profiles), mirroring the
+//! `stellar_pay` MCP tool's dispatch gate. When `--profile` names no
+//! persisted `<name>.toml` file, an in-memory `Noop`-engine testnet profile is
+//! synthesized so the command keeps working without an authored profile file
+//! — and without ever touching the OS keyring.
 //!
 //! # Behavior
 //!
@@ -72,14 +74,15 @@ use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{AuthError, NetworkError, ValidationError, WalletError};
 use stellar_xdr::Memo;
 
+use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile};
 use stellar_agent_network::builder::{Asset, ClassicOpBuilder};
 use stellar_agent_network::signing::Signer;
 use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::signing::source::signer_from_ledger;
 use stellar_agent_network::{
     ClassicFeeSelection, StellarRpcClient, SubmissionResult, SubmissionSignerKind,
-    parse_classic_fee_choice, parse_memo_fields, resolve_classic_fee_selection,
-    submit_transaction_and_wait,
+    init_platform_keyring_store, parse_classic_fee_choice, parse_memo_fields,
+    resolve_classic_fee_selection, submit_transaction_and_wait,
 };
 
 use crate::commands::policy_engine::{
@@ -317,6 +320,32 @@ pub struct PayArgs {
 ///
 /// Never panics.
 pub async fn run(args: &PayArgs) -> i32 {
+    run_with_dependencies(
+        args,
+        load_profile_or_synthesize_testnet,
+        init_platform_keyring_store,
+    )
+    .await
+}
+
+/// Testable core of [`run`] with the profile loader and the platform-keyring
+/// initialiser injected.
+///
+/// Production callers use [`run`], which supplies
+/// [`load_profile_or_synthesize_testnet`] and [`init_platform_keyring_store`].
+/// Tests substitute an in-memory profile and a spy initialiser to assert the
+/// keyring store is registered before the V1 policy gate's owner-key read
+/// (see `run_build_only` / `run_full_pipeline`) without touching the OS
+/// keychain.
+async fn run_with_dependencies<LoadProfile, InitKeyring>(
+    args: &PayArgs,
+    load_profile: LoadProfile,
+    init_keyring: InitKeyring,
+) -> i32
+where
+    LoadProfile: Fn(&str) -> Result<Profile, String>,
+    InitKeyring: Fn() -> Result<(), WalletError>,
+{
     // ── Mainnet structural rejection (first layer) ────────────────────────────
     if args.network == TargetNetwork::Mainnet {
         let err = WalletError::Network(NetworkError::MainnetWriteForbidden);
@@ -335,15 +364,18 @@ pub async fn run(args: &PayArgs) -> i32 {
         return 1;
     }
 
-    // Determine execution stage.
+    // Determine execution stage. Only the gated stages (`--build-only` and
+    // the full pipeline) read the owner key from the keyring via
+    // `build_v1_policy_engine`, so only they receive the injected
+    // profile-loader/keyring-initialiser pair.
     if args.build_only {
-        run_build_only(args).await
+        run_build_only(args, load_profile, init_keyring).await
     } else if let Some(ref xdr) = args.sign_only {
         run_sign_only(args, xdr).await
     } else if let Some(ref xdr) = args.submit_only {
         run_submit_only(args, xdr).await
     } else {
-        run_full_pipeline(args).await
+        run_full_pipeline(args, load_profile, init_keyring).await
     }
 }
 
@@ -351,11 +383,48 @@ pub async fn run(args: &PayArgs) -> i32 {
 // Stage implementations
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn run_build_only(args: &PayArgs) -> i32 {
+async fn run_build_only<LoadProfile, InitKeyring>(
+    args: &PayArgs,
+    load_profile: LoadProfile,
+    init_keyring: InitKeyring,
+) -> i32
+where
+    LoadProfile: Fn(&str) -> Result<Profile, String>,
+    InitKeyring: Fn() -> Result<(), WalletError>,
+{
+    // ── Resolve profile & conditionally initialise the platform keyring ──────
+    // Must happen before any network build: `build_v1_policy_engine` (invoked
+    // from `evaluate_pay_policy` below) reads the owner PUBLIC key from the
+    // OS keyring only when `profile.policy.engine == V1`, so the platform
+    // keyring store is registered here — and only then — ahead of that read.
+    // The Noop-engine (zero-config) path never touches the keyring.
+    let profile = match load_profile(&args.profile) {
+        Ok(p) => p,
+        Err(msg) => {
+            print_error(
+                &Envelope::<()>::err_raw("profile.load_failed", msg),
+                args.output,
+            );
+            return 1;
+        }
+    };
+    // `PolicyEngineKind` is `#[non_exhaustive]` (a foreign-crate enum), so this
+    // cannot be a wildcard-free exhaustive match. `Noop` is the only engine that
+    // reads no owner key; every other engine — `V1` and any future variant —
+    // needs the keyring store registered before the gate's owner-key read.
+    // Default to initialising (fail toward registering the store) so a
+    // newly-added engine is never silently left without it.
+    if !matches!(profile.policy.engine, PolicyEngineKind::Noop)
+        && let Err(e) = init_keyring()
+    {
+        print_error(&Envelope::<()>::err(&e), args.output);
+        return 1;
+    }
+
     match build_unsigned_envelope(args).await {
         Ok(built) => {
             let chain_id = caip2_chain_id_for_network(args.network);
-            if let Some(code) = evaluate_pay_policy(args, &built, chain_id) {
+            if let Some(code) = evaluate_pay_policy(args, &built, chain_id, &profile) {
                 return code;
             }
             let result = PayResult {
@@ -424,7 +493,15 @@ async fn run_submit_only(args: &PayArgs, signed_xdr: &str) -> i32 {
     }
 }
 
-async fn run_full_pipeline(args: &PayArgs) -> i32 {
+async fn run_full_pipeline<LoadProfile, InitKeyring>(
+    args: &PayArgs,
+    load_profile: LoadProfile,
+    init_keyring: InitKeyring,
+) -> i32
+where
+    LoadProfile: Fn(&str) -> Result<Profile, String>,
+    InitKeyring: Fn() -> Result<(), WalletError>,
+{
     // Require both source and a signer for the full pipeline.
     if args.source.is_none() {
         let err =
@@ -433,6 +510,32 @@ async fn run_full_pipeline(args: &PayArgs) -> i32 {
             });
         let envelope = Envelope::<()>::err(&err);
         print_error(&envelope, args.output);
+        return 1;
+    }
+
+    // ── Resolve profile & conditionally initialise the platform keyring ──────
+    // Same rationale as `run_build_only`: registered before any network
+    // build, and only when the resolved profile's engine is V1.
+    let profile = match load_profile(&args.profile) {
+        Ok(p) => p,
+        Err(msg) => {
+            print_error(
+                &Envelope::<()>::err_raw("profile.load_failed", msg),
+                args.output,
+            );
+            return 1;
+        }
+    };
+    // `PolicyEngineKind` is `#[non_exhaustive]` (a foreign-crate enum), so this
+    // cannot be a wildcard-free exhaustive match. `Noop` is the only engine that
+    // reads no owner key; every other engine — `V1` and any future variant —
+    // needs the keyring store registered before the gate's owner-key read.
+    // Default to initialising (fail toward registering the store) so a
+    // newly-added engine is never silently left without it.
+    if !matches!(profile.policy.engine, PolicyEngineKind::Noop)
+        && let Err(e) = init_keyring()
+    {
+        print_error(&Envelope::<()>::err(&e), args.output);
         return 1;
     }
 
@@ -449,7 +552,7 @@ async fn run_full_pipeline(args: &PayArgs) -> i32 {
     // Runs while `built` is still owned so its fields can be moved out (not
     // cloned) once the gate allows.
     let chain_id = caip2_chain_id_for_network(args.network);
-    if let Some(code) = evaluate_pay_policy(args, &built, chain_id) {
+    if let Some(code) = evaluate_pay_policy(args, &built, chain_id, &profile) {
         return code;
     }
 
@@ -578,22 +681,19 @@ async fn build_unsigned_envelope(args: &PayArgs) -> Result<BuiltPaymentEnvelope,
 /// Returns `None` when the operation is allowed (the caller proceeds to
 /// signing); returns `Some(exit_code)` — with the refusal envelope already
 /// rendered — when the operation must be refused.
+///
+/// `profile` is the already-resolved profile from the caller's top-of-gated-
+/// path load (see `run_build_only` / `run_full_pipeline`); this function does
+/// not re-resolve it, so the platform keyring store the caller conditionally
+/// initialised for a V1 engine remains registered for the `build_v1_policy_engine`
+/// owner-key read below.
 fn evaluate_pay_policy(
     args: &PayArgs,
     built: &BuiltPaymentEnvelope,
     chain_id: &str,
+    profile: &Profile,
 ) -> Option<i32> {
-    let profile = match load_profile_or_synthesize_testnet(&args.profile) {
-        Ok(p) => p,
-        Err(msg) => {
-            print_error(
-                &Envelope::<()>::err_raw("profile.load_failed", msg),
-                args.output,
-            );
-            return Some(1);
-        }
-    };
-    let policy_engine = match build_v1_policy_engine("pay", &profile.policy.engine, &profile) {
+    let policy_engine = match build_v1_policy_engine("pay", &profile.policy.engine, profile) {
         Ok(pe) => pe,
         Err(msg) => {
             print_error(
@@ -608,7 +708,7 @@ fn evaluate_pay_policy(
     let policy_args = pay_policy_args(built.amount_stroops, &built.asset_raw, &built.destination);
     match evaluate_value_moving_policy(
         policy_engine.as_ref(),
-        &profile,
+        profile,
         "stellar_pay",
         stellar_agent_core::policy::ToolValueKind::MovesValue,
         chain_id,
@@ -1487,6 +1587,119 @@ mod tests {
         assert!(
             RELAYER_AGPL_DISCLOSURE.contains("not implemented in this build"),
             "disclosure must state relayer is not implemented in this build"
+        );
+    }
+
+    // ── keyring store initialisation ordering (issue #41) ────────────────────
+
+    /// The platform keyring store must be initialised before the V1 policy
+    /// gate's owner-key read (`build_v1_policy_engine`), on both gated
+    /// stages (`--build-only` here). Both dependencies are injected, so no
+    /// OS keychain or on-disk profile is touched and no process-global
+    /// keyring store is registered — hence this test needs no `#[serial]`.
+    /// The injected initialiser returns an error so the run bails at that
+    /// step, before `build_unsigned_envelope` ever runs, proving the
+    /// initialisation happens ahead of any network build.
+    #[tokio::test]
+    async fn run_initialises_keyring_store_before_policy_gate() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let profile_loaded = Arc::new(AtomicBool::new(false));
+        let init_invoked = Arc::new(AtomicBool::new(false));
+
+        let loaded_writer = Arc::clone(&profile_loaded);
+        let loaded_reader = Arc::clone(&profile_loaded);
+        let init_writer = Arc::clone(&init_invoked);
+
+        // `--build-only`: reaches `run_build_only`, which resolves the
+        // profile and conditionally initialises the keyring store BEFORE
+        // `build_unsigned_envelope` is called (`--source` is not consulted
+        // until then), so the injected initialiser's error bails the run
+        // before any network build.
+        let mut args = minimal_args();
+        args.build_only = true;
+
+        let code = run_with_dependencies(
+            &args,
+            move |_name| {
+                loaded_writer.store(true, Ordering::SeqCst);
+                Ok(Profile::builder_testnet_named(
+                    "keyring-order-test",
+                    "stellar-agent-signer",
+                    "keyring-order-test",
+                    "stellar-agent-nonce",
+                    "keyring-order-test",
+                )
+                .policy_engine(PolicyEngineKind::V1)
+                .build())
+            },
+            move || {
+                assert!(
+                    loaded_reader.load(Ordering::SeqCst),
+                    "profile must be loaded before the keyring store is initialised"
+                );
+                init_writer.store(true, Ordering::SeqCst);
+                Err(WalletError::Auth(AuthError::KeyringNotFound {
+                    name: "keyring-order-test-sentinel".to_owned(),
+                }))
+            },
+        )
+        .await;
+
+        assert!(
+            init_invoked.load(Ordering::SeqCst),
+            "run must initialise the keyring store before the V1 policy gate's owner-key read"
+        );
+        assert_eq!(
+            code, 1,
+            "run must surface the keyring init failure instead of reaching the network build"
+        );
+    }
+
+    /// When the resolved profile's engine is `Noop` (the zero-config
+    /// default), the keyring initialiser must NOT be invoked — the
+    /// `Noop` engine never reads the owner key from the keyring.
+    #[tokio::test]
+    async fn run_does_not_initialise_keyring_when_engine_is_noop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let init_invoked = Arc::new(AtomicBool::new(false));
+        let init_writer = Arc::clone(&init_invoked);
+
+        // `--build-only` with no `--source`: the profile loads (Noop engine)
+        // and the keyring gate is skipped, then `build_unsigned_envelope`
+        // refuses immediately on the missing `--source` — before any RPC
+        // client construction — so this stays network-free.
+        let mut args = minimal_args();
+        args.build_only = true;
+
+        let code = run_with_dependencies(
+            &args,
+            |_name| {
+                Ok(Profile::builder_testnet_named(
+                    "keyring-order-test-noop",
+                    "stellar-agent-signer",
+                    "keyring-order-test-noop",
+                    "stellar-agent-nonce",
+                    "keyring-order-test-noop",
+                )
+                .policy_engine(PolicyEngineKind::Noop)
+                .build())
+            },
+            move || {
+                init_writer.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(
+            !init_invoked.load(Ordering::SeqCst),
+            "the Noop engine must never trigger the keyring store initialisation"
+        );
+        assert_eq!(
+            code, 1,
+            "missing --source must still refuse (unrelated to the keyring gate)"
         );
     }
 }

@@ -50,17 +50,18 @@
 //!
 //! # Operator policy evaluation (sponsored mode only)
 //!
-//! After `--starting-balance` and the new account's public key are resolved
-//! and before `sponsored_create` signs and submits, the sponsored
-//! `CreateAccount` is evaluated against the operator-signed `PolicyEngineV1`
-//! (when `--profile` resolves to a persisted profile with
-//! `policy.engine = "v1"`) or the permissive `NoopPolicyEngine` otherwise,
-//! mirroring the `stellar_create_account` MCP tool's dispatch gate. When
-//! `--profile` names no persisted `<name>.toml` file, an in-memory
-//! `Noop`-engine testnet profile is synthesized so sponsored mode keeps
-//! working without an authored profile file. Friendbot mode is not gated: it
-//! funds the new account from the external Friendbot faucet and debits no
-//! wallet-held funds.
+//! After `--starting-balance` and the new account's public key are resolved,
+//! the profile is resolved (and, when it carries `policy.engine = "v1"`, the
+//! platform keyring store is initialised) before `sponsored_create` builds
+//! any network request, signs, or submits. The sponsored `CreateAccount` is
+//! then evaluated against the operator-signed `PolicyEngineV1` (V1 profiles)
+//! or the permissive `NoopPolicyEngine` (`Noop` profiles), mirroring the
+//! `stellar_create_account` MCP tool's dispatch gate. When `--profile` names
+//! no persisted `<name>.toml` file, an in-memory `Noop`-engine testnet
+//! profile is synthesized so sponsored mode keeps working without an
+//! authored profile file — and without ever touching the OS keyring.
+//! Friendbot mode is not gated: it funds the new account from the external
+//! Friendbot faucet and debits no wallet-held funds, and touches no keyring.
 //!
 //! # Behavior
 //!
@@ -76,6 +77,7 @@ use rand_core::OsRng;
 use stellar_agent_core::StellarAmount;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{AuthError, NetworkError, ValidationError, WalletError};
+use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile};
 use zeroize::Zeroizing;
 
 use stellar_agent_network::builder::ClassicOpBuilder;
@@ -84,7 +86,8 @@ use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::signing::source::signer_from_ledger;
 use stellar_agent_network::{
     ClassicFeeSelection, StellarRpcClient, SubmissionResult, SubmissionSignerKind,
-    parse_classic_fee_choice, resolve_classic_fee_selection, submit_transaction_and_wait,
+    init_platform_keyring_store, parse_classic_fee_choice, resolve_classic_fee_selection,
+    submit_transaction_and_wait,
 };
 use stellar_agent_network::{FriendbotResult, fund_with_friendbot};
 
@@ -372,10 +375,37 @@ pub struct CreateArgs {
 ///
 /// Never panics.
 pub async fn run(args: &CreateArgs) -> i32 {
+    run_with_dependencies(
+        args,
+        load_profile_or_synthesize_testnet,
+        init_platform_keyring_store,
+    )
+    .await
+}
+
+/// Testable core of [`run`] with the profile loader and the platform-keyring
+/// initialiser injected.
+///
+/// Production callers use [`run`], which supplies
+/// [`load_profile_or_synthesize_testnet`] and [`init_platform_keyring_store`].
+/// Tests substitute an in-memory profile and a spy initialiser to assert the
+/// keyring store is registered before the V1 policy gate's owner-key read
+/// (see `run_sponsored`) without touching the OS keychain. Only the sponsored
+/// path receives the injected pair — Friendbot mode is not gated (see the
+/// module-level doc comment) and touches no keyring.
+async fn run_with_dependencies<LoadProfile, InitKeyring>(
+    args: &CreateArgs,
+    load_profile: LoadProfile,
+    init_keyring: InitKeyring,
+) -> i32
+where
+    LoadProfile: Fn(&str) -> Result<Profile, String>,
+    InitKeyring: Fn() -> Result<(), WalletError>,
+{
     if args.fund_with_friendbot {
         run_friendbot(args).await
     } else {
-        run_sponsored(args).await
+        run_sponsored(args, load_profile, init_keyring).await
     }
 }
 
@@ -530,24 +560,21 @@ fn build_friendbot_result(new_account: &NewAccount, fb: &FriendbotResult) -> Cre
 /// Returns `None` when the operation is allowed (the caller proceeds to
 /// signing); returns `Some(exit_code)` — with the refusal envelope already
 /// rendered — when the operation must be refused.
+///
+/// `profile` is the already-resolved profile from `run_sponsored`'s
+/// top-of-gated-path load; this function does not re-resolve it, so the
+/// platform keyring store `run_sponsored` conditionally initialised for a V1
+/// engine remains registered for the `build_v1_policy_engine` owner-key read
+/// below.
 fn evaluate_create_policy(
     args: &CreateArgs,
+    profile: &Profile,
     starting_balance_stroops: i64,
     new_account_g_strkey: &str,
     chain_id: &str,
 ) -> Option<i32> {
-    let profile = match load_profile_or_synthesize_testnet(&args.profile) {
-        Ok(p) => p,
-        Err(msg) => {
-            print_error(
-                &Envelope::<()>::err_raw("profile.load_failed", msg),
-                args.output,
-            );
-            return Some(1);
-        }
-    };
     let policy_engine =
-        match build_v1_policy_engine("accounts create", &profile.policy.engine, &profile) {
+        match build_v1_policy_engine("accounts create", &profile.policy.engine, profile) {
             Ok(pe) => pe,
             Err(msg) => {
                 print_error(
@@ -562,7 +589,7 @@ fn evaluate_create_policy(
     let policy_args = create_policy_args(starting_balance_stroops, new_account_g_strkey);
     match evaluate_value_moving_policy(
         policy_engine.as_ref(),
-        &profile,
+        profile,
         "stellar_create_account",
         stellar_agent_core::policy::ToolValueKind::MovesValue,
         chain_id,
@@ -581,7 +608,15 @@ fn evaluate_create_policy(
 // Sponsored mode
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn run_sponsored(args: &CreateArgs) -> i32 {
+async fn run_sponsored<LoadProfile, InitKeyring>(
+    args: &CreateArgs,
+    load_profile: LoadProfile,
+    init_keyring: InitKeyring,
+) -> i32
+where
+    LoadProfile: Fn(&str) -> Result<Profile, String>,
+    InitKeyring: Fn() -> Result<(), WalletError>,
+{
     // Sponsored mode — mainnet write forbidden.
     if args.network == TargetNetwork::Mainnet {
         let err = WalletError::Network(NetworkError::MainnetWriteForbidden);
@@ -640,11 +675,42 @@ async fn run_sponsored(args: &CreateArgs) -> i32 {
         }
     };
 
+    // ── Resolve profile & conditionally initialise the platform keyring ──────
+    // Must happen before `sponsored_create`'s network build:
+    // `build_v1_policy_engine` (invoked from `evaluate_create_policy` below)
+    // reads the owner PUBLIC key from the OS keyring only when
+    // `profile.policy.engine == V1`, so the platform keyring store is
+    // registered here — and only then — ahead of that read. The Noop-engine
+    // (zero-config) path never touches the keyring.
+    let profile = match load_profile(&args.profile) {
+        Ok(p) => p,
+        Err(msg) => {
+            print_error(
+                &Envelope::<()>::err_raw("profile.load_failed", msg),
+                args.output,
+            );
+            return 1;
+        }
+    };
+    // `PolicyEngineKind` is `#[non_exhaustive]` (a foreign-crate enum), so this
+    // cannot be a wildcard-free exhaustive match. `Noop` is the only engine that
+    // reads no owner key; every other engine — `V1` and any future variant —
+    // needs the keyring store registered before the gate's owner-key read.
+    // Default to initialising (fail toward registering the store) so a
+    // newly-added engine is never silently left without it.
+    if !matches!(profile.policy.engine, PolicyEngineKind::Noop)
+        && let Err(e) = init_keyring()
+    {
+        print_error(&Envelope::<()>::err(&e), args.output);
+        return 1;
+    }
+
     // ── Operator policy evaluation (before signing/submission) ───────────────
     let chain_id = caip2_chain_id_for_network(args.network);
     let starting_balance_stroops = starting_balance.as_stroops();
     if let Some(code) = evaluate_create_policy(
         args,
+        &profile,
         starting_balance_stroops,
         &new_account.g_strkey,
         chain_id,
@@ -1556,5 +1622,117 @@ mod tests {
             rpc_url: TESTNET_RPC_URL.to_owned(),
             fee: None,
         }
+    }
+
+    // ── keyring store initialisation ordering (issue #41) ────────────────────
+
+    /// The platform keyring store must be initialised before the V1 policy
+    /// gate's owner-key read (`build_v1_policy_engine`), on the sponsored
+    /// path (`run_sponsored`). Both dependencies are injected, so no OS
+    /// keychain or on-disk profile is touched and no process-global keyring
+    /// store is registered — hence this test needs no `#[serial]`. The
+    /// injected initialiser returns an error so the run bails at that step,
+    /// before `sponsored_create` (and its RPC calls) ever runs, proving the
+    /// initialisation happens ahead of any network build.
+    #[tokio::test]
+    async fn run_initialises_keyring_store_before_policy_gate() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let profile_loaded = Arc::new(AtomicBool::new(false));
+        let init_invoked = Arc::new(AtomicBool::new(false));
+
+        let loaded_writer = Arc::clone(&profile_loaded);
+        let loaded_reader = Arc::clone(&profile_loaded);
+        let init_writer = Arc::clone(&init_invoked);
+
+        let args = minimal_sponsored_args();
+
+        let code = run_with_dependencies(
+            &args,
+            move |_name| {
+                loaded_writer.store(true, Ordering::SeqCst);
+                Ok(Profile::builder_testnet_named(
+                    "keyring-order-test",
+                    "stellar-agent-signer",
+                    "keyring-order-test",
+                    "stellar-agent-nonce",
+                    "keyring-order-test",
+                )
+                .policy_engine(PolicyEngineKind::V1)
+                .build())
+            },
+            move || {
+                assert!(
+                    loaded_reader.load(Ordering::SeqCst),
+                    "profile must be loaded before the keyring store is initialised"
+                );
+                init_writer.store(true, Ordering::SeqCst);
+                Err(WalletError::Auth(AuthError::KeyringNotFound {
+                    name: "keyring-order-test-sentinel".to_owned(),
+                }))
+            },
+        )
+        .await;
+
+        assert!(
+            init_invoked.load(Ordering::SeqCst),
+            "run must initialise the keyring store before the V1 policy gate's owner-key read"
+        );
+        assert_eq!(
+            code, 1,
+            "run must surface the keyring init failure instead of reaching the network build"
+        );
+    }
+
+    /// When the resolved profile's engine is `Noop` (the zero-config
+    /// default), the keyring initialiser must NOT be invoked — the `Noop`
+    /// engine never reads the owner key from the keyring.
+    #[tokio::test]
+    async fn run_does_not_initialise_keyring_when_engine_is_noop() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let init_invoked = Arc::new(AtomicBool::new(false));
+        let init_writer = Arc::clone(&init_invoked);
+
+        // All arg resolution (sponsor, starting balance, new-account
+        // strkey) succeeds with no network touched, so `load_profile` is
+        // genuinely reached and the Noop branch is exercised. The
+        // non-routable `rpc_url` ensures that if `sponsored_create`'s
+        // subsequent RPC call were reached, it fails immediately with a
+        // connection error rather than making a real network round trip.
+        let mut args = minimal_sponsored_args();
+        args.rpc_url = "http://127.0.0.1:1".to_owned();
+
+        let code = run_with_dependencies(
+            &args,
+            |_name| {
+                Ok(Profile::builder_testnet_named(
+                    "keyring-order-test-noop",
+                    "stellar-agent-signer",
+                    "keyring-order-test-noop",
+                    "stellar-agent-nonce",
+                    "keyring-order-test-noop",
+                )
+                .policy_engine(PolicyEngineKind::Noop)
+                .build())
+            },
+            move || {
+                init_writer.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(
+            !init_invoked.load(Ordering::SeqCst),
+            "the Noop engine must never trigger the keyring store initialisation"
+        );
+        assert_eq!(
+            code, 1,
+            "the non-routable RPC endpoint must still fail the operation \
+             (unrelated to the keyring gate)"
+        );
     }
 }

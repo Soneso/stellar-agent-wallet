@@ -49,6 +49,18 @@
 //! Both invocations reuse the same source/destination pair (the over-cap
 //! refusal happens before signing, so it does not consume a sequence number).
 //!
+//! # Coverage note: the OS keyring is not exercised here
+//!
+//! The owner PUBLIC key is supplied via the `STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE`
+//! file source described above, which bypasses the OS keyring entirely. This
+//! acceptance test therefore does NOT cover
+//! `stellar_agent_network::init_platform_keyring_store` — the call
+//! `commands::pay::run_full_pipeline` / `run_build_only` make (conditioned on
+//! `profile.policy.engine == V1`) before `build_v1_policy_engine`'s owner-key
+//! read. That coverage lives in `commands::pay`'s
+//! `run_initialises_keyring_store_before_policy_gate` spy test (and the
+//! equivalent spy tests in `commands::claim` and `commands::accounts::create`).
+//!
 //! Gated behind `testnet-acceptance`:
 //!
 //! ```text

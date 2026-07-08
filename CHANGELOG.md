@@ -59,6 +59,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `audit verify` no longer doubles the wire-code prefix in error details, and
   a missing primary log file is classified as the actionable
   `audit.log_not_found` validation error instead of an internal error. (#29)
+- CLI `pay`, `claim`, and `accounts create` now initialize the platform
+  keyring store before reading the owner key on the `policy.engine = "v1"`
+  path, so v1 policy evaluation works on a real install (previously failed
+  `policy.engine_unavailable` with `NoDefaultStore`). (#41)
 
 ### Changed
 
