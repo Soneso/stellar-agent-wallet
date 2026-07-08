@@ -345,20 +345,36 @@ async fn gated_toolset_first_invoke_and_forced_per_action_testnet() {
         }),
     };
 
-    let result2 = server.call_stellar_toolset_invoke(args2).await;
-    assert!(
-        result2.is_err(),
-        "re-invoke with grant but no per-action approval must fail"
+    // The forced per-action approval surfaces as the documented business-error
+    // envelope (is_error = true; the wire code nests at error.code), not a
+    // protocol Err. is_error = true guards against the call silently succeeding.
+    let call2 = server.call_stellar_toolset_invoke(args2).await.expect(
+        "forced per-action refusal surfaces as a business-error result, not a protocol error",
     );
-    let err2 = result2.unwrap_err();
-    assert!(
-        err2.message.contains("approval_required"),
-        "expected policy.approval_required (forced per-action approval); got: {}",
-        err2.message
+    assert_eq!(
+        call2.is_error,
+        Some(true),
+        "re-invoke with grant but no per-action approval must be refused (is_error = true)"
+    );
+    let text2 = call2
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.as_str())
+        .expect("refusal result must carry text content");
+    let json2: serde_json::Value =
+        serde_json::from_str(text2).expect("refusal result text must be valid JSON");
+    let code2 = json2["error"]["code"]
+        .as_str()
+        .expect("error.code must be present and a string");
+    assert_eq!(
+        code2, "policy.approval_required",
+        "re-invoke with grant but no per-action approval must carry policy.approval_required \
+         (forced per-action); got: {json2}"
     );
     assert!(
-        !err2.message.contains("first_invoke_approval_required"),
-        "must NOT re-trigger first-invoke gate when grant is current"
+        !code2.contains("first_invoke"),
+        "must NOT re-trigger the first-invoke gate when the grant is current; got: {code2}"
     );
 
     // A PaymentSimulated pending approval was queued.

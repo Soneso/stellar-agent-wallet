@@ -261,13 +261,13 @@ async fn a6f_neg1_unreachable_domain_aborts_before_payment() {
         serde_json::from_str(&text).expect("error result must be valid JSON");
 
     // Error code must be the identity gate abort code — NOT an x402 error.
-    let error_code = value
-        .get("error")
-        .and_then(|v| v.as_str())
-        .expect("error field must be present and a string");
+    // The business-error envelope nests the code at `error.code`.
+    let error_code = value["error"]["code"]
+        .as_str()
+        .expect("error.code must be present and a string");
     assert_eq!(
         error_code, "identity.home_domain_unresolvable",
-        "unreachable domain must abort with identity.home_domain_unresolvable; got: {error_code}"
+        "unreachable domain must abort with identity.home_domain_unresolvable; got: {value}"
     );
 
     // Abort-before-payment — no paymentSignature or authorization.
@@ -327,13 +327,13 @@ async fn a6f_neg2_invalid_home_domain_aborts_before_payment() {
         serde_json::from_str(&text).expect("error result must be valid JSON");
 
     // Error code must be the DISTINCT input-validation abort code.
-    let error_code = value
-        .get("error")
-        .and_then(|v| v.as_str())
-        .expect("error field must be present and a string");
+    // The business-error envelope nests the code at `error.code`.
+    let error_code = value["error"]["code"]
+        .as_str()
+        .expect("error.code must be present and a string");
     assert_eq!(
         error_code, "identity.home_domain_invalid",
-        "invalid home_domain must abort with identity.home_domain_invalid (distinct from unresolvable); got: {error_code}"
+        "invalid home_domain must abort with identity.home_domain_invalid (distinct from unresolvable); got: {value}"
     );
 
     // Abort-before-payment — no paymentSignature or authorization.

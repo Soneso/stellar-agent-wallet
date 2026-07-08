@@ -626,7 +626,7 @@ async fn t2_serve_reject_then_commit_refused() {
     //    attestation gate before any hash/HMAC check runs, so any well-formed
     //    32-byte attestation blob reaches (and is refused by) that check.
     let bogus_attestation_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 32]);
-    let commit_err = server
+    let commit_result = server
         .call_stellar_pay_commit(StellarPayCommitArgs {
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             source: payer_g.clone(),
@@ -645,12 +645,19 @@ async fn t2_serve_reject_then_commit_refused() {
             approval_attestation: Some(bogus_attestation_b64),
         })
         .await
-        .expect_err("commit must be refused after an HTTP reject");
-    assert!(
-        commit_err.message.contains("policy.approval_rejected"),
+        .expect("a refused commit surfaces as a business-error result, not a protocol error");
+    // A refusal is the documented business-error envelope (is_error = true;
+    // the wire code nests at error.code), not a protocol Err.
+    assert_eq!(
+        commit_result.is_error,
+        Some(true),
+        "a commit refused after an HTTP reject must set is_error = true"
+    );
+    let commit_json = result_json(&commit_result);
+    assert_eq!(
+        commit_json["error"]["code"], "policy.approval_rejected",
         "commit refusal after reject must carry the distinct policy.approval_rejected wire \
-         code, not the generic policy.approval_required: {}",
-        commit_err.message
+         code, not the generic policy.approval_required: {commit_json}"
     );
 
     // ── 4. No on-chain effect: the destination balance is unchanged ─────────
