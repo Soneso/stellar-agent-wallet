@@ -37,6 +37,17 @@
 //! `resolve_software_signer_from_env`) or `--sign-with-ledger` (hardware
 //! signer; no seed ever in process memory). The public key derived from the
 //! signer is compared against `--source` before any signing.
+//!
+//! # Operator policy evaluation
+//!
+//! After the build stage (guards, preview, envelope construction) and before
+//! signing, in both the full pipeline and `--build-only`, the claim is
+//! evaluated against the operator-signed `PolicyEngineV1` (when `--profile`
+//! resolves to a persisted profile with `policy.engine = "v1"`) or the
+//! permissive `NoopPolicyEngine` otherwise, mirroring the `stellar_claim` MCP
+//! tool's dispatch gate. When `--profile` names no persisted `<name>.toml`
+//! file, an in-memory `Noop`-engine testnet profile is synthesized so the
+//! command keeps working without an authored profile file.
 
 use std::time::Duration;
 
@@ -62,6 +73,10 @@ use stellar_agent_network::{
     submit_transaction_and_wait,
 };
 
+use crate::commands::policy_engine::{
+    build_v1_policy_engine, caip2_chain_id_for_network, claim_policy_args,
+    evaluate_value_moving_policy, load_profile_or_synthesize_testnet,
+};
 use crate::common::network::TargetNetwork;
 use crate::common::render::{render_json, sanitize_for_table};
 use crate::common::signer_ceremony::{SignerCeremonyOutcome, resolve_software_signer_from_env};
@@ -134,6 +149,14 @@ struct BuiltClaimEnvelope {
     group(ArgGroup::new("signer_group").args(["secret_env", "sign_with_ledger"]).required(false)),
 )]
 pub struct ClaimArgs {
+    /// Profile name to evaluate operator policy against (default: "default").
+    ///
+    /// When no `<name>.toml` profile file exists, an in-memory `Noop`-engine
+    /// testnet profile is synthesized so the command keeps working without an
+    /// authored profile file; see [`crate::commands::policy_engine::load_profile_or_synthesize_testnet`].
+    #[arg(long, default_value = "default")]
+    pub profile: String,
+
     /// Claimable-balance id: a `B...` strkey, canonical 72-hex id, or bare
     /// 64-hex hash.
     #[arg(value_name = "BALANCE_ID")]
@@ -234,6 +257,10 @@ pub async fn run(args: &ClaimArgs) -> i32 {
 async fn run_build_only(args: &ClaimArgs) -> i32 {
     match build_unsigned_envelope(args).await {
         Ok(built) => {
+            let chain_id = caip2_chain_id_for_network(args.network);
+            if let Some(code) = evaluate_claim_policy(args, &built, chain_id) {
+                return code;
+            }
             let result = ClaimResult {
                 envelope_xdr: built.envelope_xdr,
                 tx_hash: None,
@@ -301,6 +328,12 @@ async fn run_full_pipeline(args: &ClaimArgs) -> i32 {
         }
     };
     let unsigned_xdr = built.envelope_xdr.clone();
+
+    // ── Operator policy evaluation (before signing) ───────────────────────────
+    let chain_id = caip2_chain_id_for_network(args.network);
+    if let Some(code) = evaluate_claim_policy(args, &built, chain_id) {
+        return code;
+    }
 
     // 2. Sign.
     let signed_xdr = match sign_envelope(args, &unsigned_xdr).await {
@@ -426,6 +459,64 @@ async fn build_unsigned_envelope(args: &ClaimArgs) -> Result<BuiltClaimEnvelope,
         balance_id_hex72: id.to_hex72(),
         fee_selection,
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Operator policy gate
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Evaluates operator policy for the built claim, using the same engine path
+/// (and `stellar_claim` value descriptor contract) the `stellar_claim` MCP
+/// tool's dispatch gate uses.
+///
+/// Returns `None` when the operation is allowed (the caller proceeds to
+/// signing); returns `Some(exit_code)` — with the refusal envelope already
+/// rendered — when the operation must be refused.
+fn evaluate_claim_policy(
+    args: &ClaimArgs,
+    built: &BuiltClaimEnvelope,
+    chain_id: &str,
+) -> Option<i32> {
+    let profile = match load_profile_or_synthesize_testnet(&args.profile) {
+        Ok(p) => p,
+        Err(msg) => {
+            print_error(
+                &Envelope::<()>::err_raw("profile.load_failed", msg),
+                args.output,
+            );
+            return Some(1);
+        }
+    };
+    let policy_engine = match build_v1_policy_engine("claim", &profile.policy.engine, &profile) {
+        Ok(pe) => pe,
+        Err(msg) => {
+            print_error(
+                &Envelope::<()>::err_raw("policy.engine_unavailable", msg),
+                args.output,
+            );
+            return Some(1);
+        }
+    };
+    // `derive_value_class` ignores args for `stellar_claim` (a non-debit
+    // Claim leg is always emitted); `balance_id` is carried for audit parity
+    // with the MCP tool's dispatch args and for any future criterion that
+    // reads it.
+    let policy_args = claim_policy_args(&built.balance_id_hex72);
+    match evaluate_value_moving_policy(
+        policy_engine.as_ref(),
+        &profile,
+        "stellar_claim",
+        stellar_agent_core::policy::ToolValueKind::MovesValue,
+        chain_id,
+        &policy_args,
+        "claim",
+    ) {
+        Ok(()) => None,
+        Err(envelope) => {
+            print_error(&envelope, args.output);
+            Some(1)
+        }
+    }
 }
 
 /// Returns the current Unix time in seconds for predicate evaluation.
@@ -640,6 +731,7 @@ mod tests {
 
     fn minimal_args() -> ClaimArgs {
         ClaimArgs {
+            profile: "default".to_owned(),
             balance_id: HEX64.to_owned(),
             source: SOURCE_G.to_owned(),
             fee: None,

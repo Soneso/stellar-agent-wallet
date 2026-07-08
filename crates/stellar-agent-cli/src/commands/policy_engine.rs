@@ -4,7 +4,15 @@
 //!
 //! Provides [`build_v1_policy_engine`]: a single fail-closed builder for
 //! `PolicyEngineV1` (or `NoopPolicyEngine`) shared by the `lend`, `vault`,
-//! `trade`, `bridge`, and `trustline` CLI subcommands.
+//! `trade`, `bridge`, and `trustline` CLI subcommands, as well as `pay`,
+//! `claim`, and `accounts create` (sponsored mode).
+//!
+//! Also provides [`load_profile_or_synthesize_testnet`] (the zero-config
+//! profile resolution `pay`/`claim`/`accounts create` use instead of a hard
+//! `--profile` requirement), [`caip2_chain_id_for_network`] (chain-id
+//! derivation for verbs that select their network via `--network` rather than
+//! a profile's `chain_id`), and [`evaluate_value_moving_policy`] (the shared
+//! `PolicyEngine::evaluate` call plus refusal-envelope construction).
 //!
 //! # Fail-closed invariant
 //!
@@ -22,10 +30,26 @@
 //! - Unknown engine kinds → `Err` (fail-closed), matching the MCP server.
 //! - The `verb` argument appears verbatim in every `Err` message so callers
 //!   can attribute the failure to the right operation.
+//!
+//! # Owner PUBLIC key source (production vs. test)
+//!
+//! [`build_v1_policy_engine`] resolves the owner **PUBLIC** key through
+//! [`owner_pubkey_b64`], which reads it from the OS keyring in production. A
+//! test-only file source, gated behind `#[cfg(any(test, feature =
+//! "test-helpers"))]` and armed only when `STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE`
+//! is set, exists solely so a subprocess testnet-acceptance test can supply the
+//! owner public key without touching the OS keyring. There is no file-based
+//! owner **seed**/secret-key source anywhere in this codebase.
 
+use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::policy::v1::PolicyEngineV1;
-use stellar_agent_core::policy::{NoopPolicyEngine, PolicyEngine};
-use stellar_agent_core::profile::schema::{PolicyEngineKind, default_policy_dir};
+use stellar_agent_core::policy::{
+    Decision, McpToolRegistration, NoopPolicyEngine, PolicyEngine, ToolDescriptor, ToolValueKind,
+};
+use stellar_agent_core::profile::loader as profile_loader;
+use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile, default_policy_dir};
+
+use crate::common::network::TargetNetwork;
 
 /// The service-name prefix used by
 /// [`stellar_agent_core::profile::schema::KeyringEntryRef::default_owner_key`].
@@ -62,7 +86,6 @@ pub(crate) fn build_v1_policy_engine(
 ) -> Result<Box<dyn PolicyEngine>, String> {
     use base64::Engine as _;
     use ed25519_dalek::PUBLIC_KEY_LENGTH;
-    use keyring_core::Entry as KeyringEntry;
     use stellar_agent_core::policy::v1::loader::load_signed_policy;
 
     match kind {
@@ -82,21 +105,9 @@ pub(crate) fn build_v1_policy_engine(
                 }
             };
 
-            // Fetch the owner public key from the OS keyring.
-            let entry_ref = stellar_agent_core::profile::schema::KeyringEntryRef::default_owner_key(
-                &profile_name,
-            );
-            let raw_key = match KeyringEntry::new(&entry_ref.service, &entry_ref.account)
-                .and_then(|e| e.get_password())
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    return Err(format!(
-                        "policy.engine is 'v1' but the owner key for profile '{profile_name}' \
-                         could not be read from the keyring ({e}); {verb} refuses (fail-closed)"
-                    ));
-                }
-            };
+            // Resolve the owner PUBLIC key (base64 URL-safe-no-pad), either from the
+            // OS keyring (production) or from a gated test-only file source.
+            let raw_key = owner_pubkey_b64(&profile_name, verb)?;
 
             let key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(raw_key.trim());
             let key_bytes = match key_bytes {
@@ -147,6 +158,242 @@ pub(crate) fn build_v1_policy_engine(
         }
         _ => Err(format!(
             "unsupported policy engine kind {kind:?}; {verb} refuses (fail-closed)"
+        )),
+    }
+}
+
+/// Resolves the operator's owner **PUBLIC** key (base64 URL-safe-no-pad,
+/// untrimmed) for `profile_name`, for `PolicyEngineV1`'s owner-signature
+/// verification step only.
+///
+/// This function supplies a PUBLIC key exclusively. It is used solely to
+/// verify the operator's ed25519 signature over the policy document; there is
+/// no file-based owner **seed**/secret-key source anywhere in this codebase,
+/// and there must never be one — owner seeds are only ever read from the OS
+/// keyring (`enroll-owner-key`) or a `--secret-env` variable at signing time
+/// (`profile sign-policy`), never from a caller-supplied file path at
+/// verification time.
+///
+/// # Test-only file override
+///
+/// When the environment variable `STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE` is
+/// set, the owner public key is read from the file at that path instead of
+/// the OS keyring. This branch is gated behind
+/// `#[cfg(any(test, feature = "test-helpers"))]`: production release builds
+/// never compile this branch, so `STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE` has no
+/// effect in a released binary — this closes the env-injection
+/// owner-key-swap surface for the policy-signature verification path. Absent
+/// the env var (or outside a test/`test-helpers` build), this function reads
+/// the owner public key from the OS keyring exactly as production always has.
+///
+/// # Errors
+///
+/// Returns `Err(human-readable message)` — naming `verb` and carrying no
+/// secret material — when the file (test-only path) or keyring (production
+/// path) cannot be read.
+fn owner_pubkey_b64(profile_name: &str, verb: &str) -> Result<String, String> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    if let Some(path) = std::env::var_os("STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE") {
+        let path = std::path::PathBuf::from(path);
+        return std::fs::read_to_string(&path)
+            .map(|s| s.trim().to_owned())
+            .map_err(|e| {
+                format!(
+                    "policy.engine is 'v1' but the test-only owner_pubkey file at {} could not \
+                     be read ({e}); {verb} refuses (fail-closed)",
+                    path.display()
+                )
+            });
+    }
+
+    use keyring_core::Entry as KeyringEntry;
+
+    let entry_ref =
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_owner_key(profile_name);
+    KeyringEntry::new(&entry_ref.service, &entry_ref.account)
+        .and_then(|e| e.get_password())
+        .map_err(|e| {
+            format!(
+                "policy.engine is 'v1' but the owner key for profile '{profile_name}' could not \
+                 be read from the keyring ({e}); {verb} refuses (fail-closed)"
+            )
+        })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Zero-config profile resolution for the value-moving classic verbs
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Loads the named profile, falling back to an in-memory `Noop`-engine
+/// testnet profile when no `<name>.toml` file exists.
+///
+/// `pay`, `claim`, and `accounts create` operate against testnet without
+/// requiring an authored profile file (see the "Set up a profile" section of
+/// the getting-started guide). This preserves that zero-config invariant: the
+/// permissive fallback fires ONLY on [`profile_loader::ProfileLoadError::NotFound`],
+/// and is forced to [`PolicyEngineKind::Noop`] regardless of
+/// [`Profile::builder_testnet`]'s own default (`V1`), so an unauthored profile
+/// never triggers an owner-key/policy-file requirement the operator never
+/// opted into. Once an operator persists a real profile — `V1` or `Noop` — that
+/// file's configured engine governs instead.
+///
+/// # Errors
+///
+/// Returns `Err(message)` for any profile-load failure OTHER than `NotFound`
+/// (a malformed TOML file, an unsupported schema version, etc.) — those are
+/// genuine configuration errors the synthesis fallback must not mask.
+pub(crate) fn load_profile_or_synthesize_testnet(name: &str) -> Result<Profile, String> {
+    match profile_loader::load(name, None) {
+        Ok(p) => Ok(p),
+        Err(profile_loader::ProfileLoadError::NotFound { .. }) => {
+            Ok(Profile::builder_testnet_named(
+                name,
+                "stellar-agent-signer",
+                name,
+                "stellar-agent-nonce",
+                name,
+            )
+            .policy_engine(PolicyEngineKind::Noop)
+            .build())
+        }
+        Err(e) => Err(format!("profile '{name}' failed to load: {e}")),
+    }
+}
+
+/// Maps a CLI [`TargetNetwork`] selector to its CAIP-2 chain-id string.
+///
+/// `pay`, `claim`, and `accounts create` select their target network via
+/// `--network` rather than a loaded profile's `chain_id` (unlike `trade` /
+/// `lend` / `vault` / `trustline`, which trust `profile.chain_id`
+/// exclusively). The policy gate's `ToolDescriptor::chain_id` must reflect the
+/// network the transaction actually targets, so it is derived here instead of
+/// from the (possibly synthesized, possibly mismatched) profile object.
+#[must_use]
+pub(crate) fn caip2_chain_id_for_network(network: TargetNetwork) -> &'static str {
+    // Binding: these are the CAIP-2 chain identifiers and MUST stay
+    // byte-identical to `Caip2::caip2_str` (profile/caip2.rs:108), the
+    // authoritative source `profile.chain_id` resolves through. A drift here
+    // would silently stop chain-scoped policy rules from matching the value the
+    // MCP twin evaluates against.
+    match network {
+        TargetNetwork::Testnet => "stellar:testnet",
+        TargetNetwork::Mainnet => "stellar:mainnet",
+    }
+}
+
+/// Builds the `stellar_pay` policy args the dispatch gate derives the value
+/// descriptor from.
+///
+/// Single source of truth shared by the `pay` verb call site and its parity
+/// tests, byte-identical to the `stellar_pay` MCP twin's dispatch args: the
+/// resolved amount as a decimal stroop string, the raw (unreformatted)
+/// caller-supplied asset string (`derive_value_class` normalises it), and the
+/// destination.
+#[must_use]
+pub(crate) fn pay_policy_args(
+    amount_stroops: i64,
+    asset_raw: &str,
+    destination: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "amount_stroops": amount_stroops.to_string(),
+        "asset": asset_raw,
+        "destination": destination,
+    })
+}
+
+/// Builds the `stellar_create_account` policy args for sponsored `create`.
+///
+/// `derive_value_class` forces the asset to native for account creation, so
+/// only the resolved starting balance (decimal stroop string) and the
+/// destination are supplied. Shared by the verb call site and its parity tests.
+#[must_use]
+pub(crate) fn create_policy_args(
+    starting_balance_stroops: i64,
+    destination: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "starting_balance_stroops": starting_balance_stroops.to_string(),
+        "destination": destination,
+    })
+}
+
+/// Builds the `stellar_claim` policy args.
+///
+/// `derive_value_class` ignores the args for `stellar_claim` (a claim is always
+/// a non-debit `Claim` leg); the balance id is carried for audit parity with
+/// the MCP twin. Shared by the verb call site and its parity tests.
+#[must_use]
+pub(crate) fn claim_policy_args(balance_id: &str) -> serde_json::Value {
+    serde_json::json!({ "balance_id": balance_id })
+}
+
+/// Evaluates operator policy for a value-moving classic verb (`pay`, `claim`,
+/// `accounts create`) through the same [`PolicyEngine::evaluate`] path the
+/// DeFi verbs (`trade`, `lend`, `vault`, `trustline`) already use.
+///
+/// Constructs the [`ToolDescriptor`] from `tool_name` / `value_kind` /
+/// `chain_id`, then evaluates `policy_args` against `profile`. Returns
+/// `Ok(())` on [`Decision::Allow`]; returns `Err(envelope)` — a fully-rendered
+/// refusal envelope — for every other outcome, mirroring the `trade` /
+/// `lend` / `vault` / `trustline` refusal-message shapes verbatim so a
+/// V1-engine deny produces the identical wire code the MCP twin returns for
+/// the same rule.
+///
+/// Callers render the envelope with their own `print_error` (JSON vs table)
+/// and exit `1`.
+///
+/// # Errors
+///
+/// Returns `Err(envelope)` on `Decision::Deny`, `Decision::RequireApproval`,
+/// an unexpected `Decision` variant, or a policy-engine evaluation error.
+pub(crate) fn evaluate_value_moving_policy(
+    policy_engine: &dyn PolicyEngine,
+    profile: &Profile,
+    tool_name: &'static str,
+    value_kind: ToolValueKind,
+    chain_id: &str,
+    policy_args: &serde_json::Value,
+    verb: &str,
+) -> Result<(), Envelope<()>> {
+    let reg = McpToolRegistration {
+        name: tool_name,
+        destructive_hint: true,
+        read_only_hint: false,
+        chain_id_required: true,
+        value_kind,
+    };
+    let mut tool_descriptor = ToolDescriptor::from_registration(&reg);
+    tool_descriptor.chain_id = chain_id.to_owned();
+
+    match policy_engine.evaluate(
+        &tool_descriptor,
+        policy_args,
+        profile,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ) {
+        Ok(Decision::Allow) => Ok(()),
+        Ok(Decision::Deny(reason)) => Err(Envelope::<()>::err_raw(
+            format!("policy.deny.{}", reason.code()),
+            format!("{verb} operation denied by operator policy"),
+        )),
+        Ok(Decision::RequireApproval(_)) => Err(Envelope::<()>::err_raw(
+            "policy.approval_required",
+            format!(
+                "{verb} operation requires approval; use the MCP server for two-phase approval"
+            ),
+        )),
+        Ok(_) => Err(Envelope::<()>::err_raw(
+            "policy.unexpected_decision",
+            "unexpected policy decision — operation refused (fail-closed)".to_owned(),
+        )),
+        Err(e) => Err(Envelope::<()>::err_raw(
+            "policy.engine_required",
+            format!("{e}"),
         )),
     }
 }
@@ -246,7 +493,12 @@ mod tests {
 
     /// When the service prefix is correct but the OS keyring has no entry, the
     /// builder returns `Err` containing the verb name and "fail-closed".
+    ///
+    /// `#[serial]`: `build_v1_policy_engine` -> `owner_pubkey_b64` reads the
+    /// process-global `STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE` env var when set;
+    /// serialising avoids a race against the hazard tests below that set it.
     #[test]
+    #[serial_test::serial]
     fn v1_missing_keyring_returns_err_naming_verb() {
         // Use a random profile name so the test is independent of any real
         // keyring state on the test machine.
@@ -304,6 +556,390 @@ mod tests {
             msg.len() < 512,
             "error message unexpectedly long ({} chars): {msg}",
             msg.len()
+        );
+    }
+
+    // ── CLI-verb / MCP-twin parity (issue #19) ───────────────────────────────
+    //
+    // These tests drive `evaluate_value_moving_policy` directly against a
+    // `PolicyEngineV1` built from a literal `PolicyDocument` (the same
+    // construction convention as
+    // `stellar-agent-core/tests/policy_descriptor_equivalence.rs`'s
+    // `engine_derives_descriptor_and_denies_over_cap_pay`), rather than through
+    // `build_v1_policy_engine`'s keyring/file-backed loader. The `policy_args`
+    // literals below MUST stay byte-for-byte in sync with the shapes built by
+    // `crate::commands::pay::evaluate_pay_policy`,
+    // `crate::commands::claim::evaluate_claim_policy`, and
+    // `crate::commands::accounts::create::evaluate_create_policy` — that
+    // identity is exactly what proves the CLI verb gates like its MCP twin.
+
+    use stellar_agent_core::policy::DenyReason;
+    use stellar_agent_core::policy::v1::criteria::per_tx_cap::PerTxCapCriterion;
+    use stellar_agent_core::policy::v1::loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
+
+    const PARITY_DEST_G: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
+
+    fn parity_profile() -> stellar_agent_core::profile::schema::Profile {
+        // The engine's scope resolution uses the `profile_name` bound at
+        // `PolicyEngineV1::new` construction, not any field read off this
+        // `Profile` value — any structurally-valid profile works here.
+        Profile::builder_testnet(
+            "stellar-agent-signer",
+            "alice",
+            "stellar-agent-nonce",
+            "alice",
+        )
+        .build()
+    }
+
+    fn per_tx_cap_engine(tool: &str, max_stroops: i64) -> PolicyEngineV1 {
+        let rule = PolicyRule {
+            r#match: RuleMatch {
+                tool: tool.to_owned(),
+                chain: "*".to_owned(),
+            },
+            criteria: vec![Box::new(PerTxCapCriterion::new(
+                "native".to_owned(),
+                max_stroops,
+            ))],
+            decision: Decision::Allow,
+            allow_opaque_signing: false,
+        };
+        let doc = PolicyDocument {
+            version: 1,
+            scope: ScopeId::AllProfiles,
+            rules: vec![rule],
+            signature: None,
+        };
+        PolicyEngineV1::new(doc, "alice".to_owned())
+    }
+
+    fn envelope_code(result: &Result<(), Envelope<()>>) -> &str {
+        result
+            .as_ref()
+            .expect_err("expected a refusal envelope")
+            .error
+            .as_ref()
+            .expect("refusal envelope must carry an error block")
+            .code
+            .as_str()
+    }
+
+    #[test]
+    fn pay_gate_under_cap_allows() {
+        let engine = per_tx_cap_engine("stellar_pay", 1_000_000_000); // 100 XLM cap
+        let profile = parity_profile();
+        // Mirrors `crate::commands::pay::evaluate_pay_policy`'s policy_args shape.
+        let policy_args = pay_policy_args(500_000_000, "native", PARITY_DEST_G);
+        let result = evaluate_value_moving_policy(
+            &engine,
+            &profile,
+            "stellar_pay",
+            ToolValueKind::MovesValue,
+            "stellar:testnet",
+            &policy_args,
+            "pay",
+        );
+        assert!(result.is_ok(), "50 XLM under a 100 XLM cap must allow");
+    }
+
+    #[test]
+    fn pay_gate_over_cap_denies_with_mcp_wire_code() {
+        let engine = per_tx_cap_engine("stellar_pay", 1_000_000_000); // 100 XLM cap
+        let profile = parity_profile();
+        let policy_args = pay_policy_args(1_500_000_000, "native", PARITY_DEST_G);
+        let result = evaluate_value_moving_policy(
+            &engine,
+            &profile,
+            "stellar_pay",
+            ToolValueKind::MovesValue,
+            "stellar:testnet",
+            &policy_args,
+            "pay",
+        );
+        assert_eq!(
+            envelope_code(&result),
+            "policy.deny.per_tx_cap_exceeded",
+            "150 XLM over a 100 XLM cap must deny with the same wire code the MCP \
+             `stellar_pay` twin returns for the identical rule"
+        );
+    }
+
+    #[test]
+    fn create_gate_under_cap_allows() {
+        let engine = per_tx_cap_engine("stellar_create_account", 1_000_000_000); // 100 XLM cap
+        let profile = parity_profile();
+        // Mirrors `crate::commands::accounts::create::evaluate_create_policy`'s
+        // policy_args shape.
+        let policy_args = create_policy_args(500_000_000, PARITY_DEST_G);
+        let result = evaluate_value_moving_policy(
+            &engine,
+            &profile,
+            "stellar_create_account",
+            ToolValueKind::MovesValue,
+            "stellar:testnet",
+            &policy_args,
+            "accounts_create",
+        );
+        assert!(
+            result.is_ok(),
+            "50 XLM starting balance under a 100 XLM cap must allow"
+        );
+    }
+
+    #[test]
+    fn create_gate_over_cap_denies_with_mcp_wire_code() {
+        let engine = per_tx_cap_engine("stellar_create_account", 1_000_000_000); // 100 XLM cap
+        let profile = parity_profile();
+        let policy_args = create_policy_args(1_500_000_000, PARITY_DEST_G);
+        let result = evaluate_value_moving_policy(
+            &engine,
+            &profile,
+            "stellar_create_account",
+            ToolValueKind::MovesValue,
+            "stellar:testnet",
+            &policy_args,
+            "accounts_create",
+        );
+        assert_eq!(
+            envelope_code(&result),
+            "policy.deny.per_tx_cap_exceeded",
+            "150 XLM starting balance over a 100 XLM cap must deny with the same wire \
+             code the MCP `stellar_create_account` twin returns for the identical rule"
+        );
+    }
+
+    #[test]
+    fn claim_gate_per_tx_cap_not_applicable_allows() {
+        // stellar_claim derives a non-debit Claim leg (`derive_value_class`), so
+        // a per_tx_cap rule never matches it — parity with the MCP twin, which
+        // is equally not-applicable for the same reason.
+        let engine = per_tx_cap_engine("stellar_claim", 1_000_000_000);
+        let profile = parity_profile();
+        // Mirrors `crate::commands::claim::evaluate_claim_policy`'s policy_args
+        // shape.
+        let policy_args = claim_policy_args(&"0".repeat(72));
+        let result = evaluate_value_moving_policy(
+            &engine,
+            &profile,
+            "stellar_claim",
+            ToolValueKind::MovesValue,
+            "stellar:testnet",
+            &policy_args,
+            "claim",
+        );
+        assert!(
+            result.is_ok(),
+            "a per_tx_cap rule must not apply to a non-debit claim leg"
+        );
+    }
+
+    #[test]
+    fn claim_gate_explicit_deny_rule_denies_with_wire_code() {
+        // Proves the claim verb is genuinely wired to the engine: an explicit
+        // deny-decision rule matching `stellar_claim` (no criteria — an
+        // unconditional deny) must refuse the CLI call with that rule's wire
+        // code, exactly as it would refuse the MCP `stellar_claim` twin.
+        let rule = PolicyRule {
+            r#match: RuleMatch {
+                tool: "stellar_claim".to_owned(),
+                chain: "*".to_owned(),
+            },
+            criteria: vec![],
+            decision: Decision::Deny(DenyReason::RateLimitExceeded {
+                window: "rolling_1h".to_owned(),
+                max_calls: 0,
+                calls_in_window: 1,
+            }),
+            allow_opaque_signing: false,
+        };
+        let doc = PolicyDocument {
+            version: 1,
+            scope: ScopeId::AllProfiles,
+            rules: vec![rule],
+            signature: None,
+        };
+        let engine = PolicyEngineV1::new(doc, "alice".to_owned());
+        let profile = parity_profile();
+        let policy_args = claim_policy_args(&"0".repeat(72));
+        let result = evaluate_value_moving_policy(
+            &engine,
+            &profile,
+            "stellar_claim",
+            ToolValueKind::MovesValue,
+            "stellar:testnet",
+            &policy_args,
+            "claim",
+        );
+        assert_eq!(
+            envelope_code(&result),
+            "policy.deny.rate_limit_exceeded",
+            "an explicit deny rule matching stellar_claim must refuse with its wire code"
+        );
+    }
+
+    // ── Decision-1 hazard: fail-closed on corruption ─────────────────────────
+    //
+    // `load_profile_or_synthesize_testnet` must synthesize the permissive
+    // `Noop` engine ONLY on `ProfileLoadError::NotFound`. A malformed profile
+    // file, or a policy file with a forged/corrupted signature, must refuse
+    // (`Err`) rather than silently falling through to an allow-everything
+    // engine. These tests use the `STELLAR_AGENT_HOME` env-var override
+    // (`stellar-agent-core`'s `default_profile_dir` / `default_policy_dir`,
+    // active here via that crate's `test-helpers` dev-dependency feature) to
+    // isolate `default_profile_dir` / `default_policy_dir` in a tempdir, and
+    // the `STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE` override on
+    // `owner_pubkey_b64` (active here via this crate's own `#[cfg(test)]`) to
+    // supply the owner public key without touching the OS keyring.
+
+    /// RAII guard for an arbitrary env var, mirroring
+    /// `crate::commands::profile::sign_policy`'s test-only `EnvGuard`.
+    struct TestEnvVarGuard {
+        var: &'static str,
+    }
+    impl TestEnvVarGuard {
+        fn set(var: &'static str, value: &std::ffi::OsStr) -> Self {
+            #[allow(
+                unsafe_code,
+                reason = "test-only env mutation; serialised by #[serial]"
+            )]
+            // SAFETY: serialised by the caller's `#[serial]`; restored on Drop.
+            unsafe {
+                std::env::set_var(var, value);
+            }
+            Self { var }
+        }
+    }
+    impl Drop for TestEnvVarGuard {
+        fn drop(&mut self) {
+            #[allow(unsafe_code, reason = "test-only env cleanup")]
+            // SAFETY: same as `set`; serialised by the caller's `#[serial]`.
+            unsafe {
+                std::env::remove_var(self.var);
+            }
+        }
+    }
+
+    /// Writes a minimal, valid v2 profile TOML for `name` with
+    /// `policy.engine = "v1"` into `<home>/profiles/<name>.toml`.
+    fn write_v1_profile_toml(home: &std::path::Path, name: &str) {
+        let dir = home.join("profiles");
+        std::fs::create_dir_all(&dir).expect("create profiles dir");
+        let toml = format!(
+            "version = 2\n\
+             chain_id = \"stellar:testnet\"\n\n\
+             [mcp_signer_default]\n\
+             service = \"stellar-agent-signer\"\n\
+             account = \"default\"\n\n\
+             [mcp_nonce_key_alias]\n\
+             service = \"stellar-agent-nonce\"\n\
+             account = \"default\"\n\n\
+             [audit_log_hash_chain_key_id]\n\
+             service = \"stellar-agent-audit-{name}\"\n\
+             account = \"default\"\n\n\
+             [policy_owner_key_id]\n\
+             service = \"{OWNER_KEY_SERVICE_PREFIX}{name}\"\n\
+             account = \"default\"\n\n\
+             [attestation_key_id]\n\
+             service = \"stellar-agent-attestation-{name}\"\n\
+             account = \"default\"\n\n\
+             [counterparty_cache_key_id]\n\
+             service = \"stellar-agent-counterparty-{name}\"\n\
+             account = \"default\"\n\n\
+             [policy]\n\
+             engine = \"v1\"\n"
+        );
+        std::fs::write(dir.join(format!("{name}.toml")), toml).expect("write profile toml");
+    }
+
+    /// A malformed profile TOML file must return `Err` from
+    /// `load_profile_or_synthesize_testnet` — NOT the permissive `Noop`
+    /// synthesis, which is reserved for the file-absent case only.
+    #[test]
+    #[serial_test::serial]
+    fn malformed_profile_toml_returns_err_not_noop_synthesis() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let profiles_dir = home.path().join("profiles");
+        std::fs::create_dir_all(&profiles_dir).expect("create profiles dir");
+        std::fs::write(
+            profiles_dir.join("malformed-hazard.toml"),
+            "this is not { valid toml [[[",
+        )
+        .expect("write malformed profile");
+
+        let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+
+        let result = load_profile_or_synthesize_testnet("malformed-hazard");
+        assert!(
+            result.is_err(),
+            "a malformed profile TOML must return Err, not synthesize Noop"
+        );
+    }
+
+    /// A v1 profile whose policy file carries a signature that does not
+    /// verify under the enrolled owner key (forged/corrupted) must refuse via
+    /// `Err` from `build_v1_policy_engine` — the engine must not silently
+    /// disable enforcement on a corrupted root-of-trust document.
+    #[test]
+    #[serial_test::serial]
+    fn build_v1_policy_engine_forged_signature_fails_closed() {
+        use base64::Engine as _;
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let name = "forged-hazard";
+        write_v1_profile_toml(home.path(), name);
+
+        // The enrolled (correct) owner keypair — its PUBLIC key is what
+        // `build_v1_policy_engine` verifies against via the gated
+        // owner_pubkey file source below.
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_pk = owner_sk.verifying_key().to_bytes();
+
+        // A DIFFERENT keypair, used only to forge a signature that must NOT
+        // verify under `owner_pk`.
+        let attacker_sk = SigningKey::generate(&mut OsRng);
+
+        let policy_body = format!(
+            "version = 1\nscope = \"profile:{name}\"\n\n[[rules]]\nmatch = {{ tool = \"stellar_pay\", chain = \"*\" }}\ncriteria = []\ndecision = \"allow\"\n"
+        );
+        let canon = stellar_agent_core::policy::v1::canonical::canonical_bytes(&policy_body)
+            .expect("canonical_bytes");
+        let policy_digest = stellar_agent_core::policy::v1::signature::digest(&canon);
+        let forged_sig =
+            stellar_agent_core::policy::v1::signature::sign(&policy_digest, &attacker_sk);
+        let sig_hex: String = forged_sig.iter().map(|b| format!("{b:02x}")).collect();
+        let owner_g = stellar_strkey::ed25519::PublicKey(owner_pk)
+            .to_string()
+            .to_string();
+        let signed_policy =
+            format!("{policy_body}\n[signature]\nowner_id = \"{owner_g}\"\nsig = \"{sig_hex}\"\n");
+
+        let policies_dir = home.path().join("policies");
+        std::fs::create_dir_all(&policies_dir).expect("create policies dir");
+        std::fs::write(policies_dir.join(format!("{name}.toml")), signed_policy)
+            .expect("write policy toml");
+
+        let pubkey_file = home.path().join("owner_pubkey.txt");
+        std::fs::write(
+            &pubkey_file,
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(owner_pk),
+        )
+        .expect("write owner pubkey file");
+
+        let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let _pubkey_guard = TestEnvVarGuard::set(
+            "STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE",
+            pubkey_file.as_os_str(),
+        );
+
+        let profile = load_profile_or_synthesize_testnet(name).expect("v1 profile file must load");
+        let result = build_v1_policy_engine("pay", &profile.policy.engine, &profile);
+        assert!(
+            result.is_err(),
+            "a forged/corrupted policy signature must fail closed, not silently disable \
+             enforcement"
         );
     }
 }

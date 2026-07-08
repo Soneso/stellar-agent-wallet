@@ -48,6 +48,20 @@
 //! `attach_signature` → drop. The `--sign-with-ledger` path uses
 //! `signer_from_ledger` (hardware signer; no seed ever held in process memory).
 //!
+//! # Operator policy evaluation (sponsored mode only)
+//!
+//! After `--starting-balance` and the new account's public key are resolved
+//! and before `sponsored_create` signs and submits, the sponsored
+//! `CreateAccount` is evaluated against the operator-signed `PolicyEngineV1`
+//! (when `--profile` resolves to a persisted profile with
+//! `policy.engine = "v1"`) or the permissive `NoopPolicyEngine` otherwise,
+//! mirroring the `stellar_create_account` MCP tool's dispatch gate. When
+//! `--profile` names no persisted `<name>.toml` file, an in-memory
+//! `Noop`-engine testnet profile is synthesized so sponsored mode keeps
+//! working without an authored profile file. Friendbot mode is not gated: it
+//! funds the new account from the external Friendbot faucet and debits no
+//! wallet-held funds.
+//!
 //! # Behavior
 //!
 //! - All RPC calls go through Stellar RPC.
@@ -74,6 +88,10 @@ use stellar_agent_network::{
 };
 use stellar_agent_network::{FriendbotResult, fund_with_friendbot};
 
+use crate::commands::policy_engine::{
+    build_v1_policy_engine, caip2_chain_id_for_network, create_policy_args,
+    evaluate_value_moving_policy, load_profile_or_synthesize_testnet,
+};
 use crate::common::network::TargetNetwork;
 use crate::common::render::{render_json, sanitize_for_table};
 use crate::common::signer_ceremony::{SignerCeremonyOutcome, resolve_software_signer_from_env};
@@ -245,6 +263,15 @@ struct SponsoredCreateResult {
     ),
 )]
 pub struct CreateArgs {
+    /// Profile name to evaluate operator policy against in sponsored mode
+    /// (default: "default"). Ignored in Friendbot mode.
+    ///
+    /// When no `<name>.toml` profile file exists, an in-memory `Noop`-engine
+    /// testnet profile is synthesized so sponsored mode keeps working without
+    /// an authored profile file; see [`crate::commands::policy_engine::load_profile_or_synthesize_testnet`].
+    #[arg(long, default_value = "default")]
+    pub profile: String,
+
     /// New account G-strkey. Mutually exclusive with `--generate`.
     #[arg(value_name = "NEW_G_STRKEY", group = "account_group")]
     pub new_account: Option<String>,
@@ -435,6 +462,9 @@ fn resolve_new_account(args: &CreateArgs) -> Result<NewAccount, WalletError> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn run_friendbot(args: &CreateArgs) -> i32 {
+    // No operator-policy gate here: Friendbot mode funds the new account from
+    // the external testnet faucet and debits no wallet-held funds, so there is
+    // no value-moving leg for the policy engine to evaluate.
     // First layer: structural mainnet rejection.
     if args.network == TargetNetwork::Mainnet {
         let err = WalletError::Network(NetworkError::FriendbotMainnetForbidden);
@@ -486,6 +516,64 @@ fn build_friendbot_result(new_account: &NewAccount, fb: &FriendbotResult) -> Cre
         friendbot_url_used: Some(fb.friendbot_url_used.clone()),
         selected_fee_per_op_stroops: None,
         selected_fee_percentile: None,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Operator policy gate (sponsored mode only)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Evaluates operator policy for the resolved sponsored `CreateAccount`,
+/// using the same engine path (and `stellar_create_account` value descriptor
+/// contract) the `stellar_create_account` MCP tool's dispatch gate uses.
+///
+/// Returns `None` when the operation is allowed (the caller proceeds to
+/// signing); returns `Some(exit_code)` — with the refusal envelope already
+/// rendered — when the operation must be refused.
+fn evaluate_create_policy(
+    args: &CreateArgs,
+    starting_balance_stroops: i64,
+    new_account_g_strkey: &str,
+    chain_id: &str,
+) -> Option<i32> {
+    let profile = match load_profile_or_synthesize_testnet(&args.profile) {
+        Ok(p) => p,
+        Err(msg) => {
+            print_error(
+                &Envelope::<()>::err_raw("profile.load_failed", msg),
+                args.output,
+            );
+            return Some(1);
+        }
+    };
+    let policy_engine =
+        match build_v1_policy_engine("accounts create", &profile.policy.engine, &profile) {
+            Ok(pe) => pe,
+            Err(msg) => {
+                print_error(
+                    &Envelope::<()>::err_raw("policy.engine_unavailable", msg),
+                    args.output,
+                );
+                return Some(1);
+            }
+        };
+    // `derive_value_class` forces the asset to native for `stellar_create_account`
+    // — no "asset" key is needed here.
+    let policy_args = create_policy_args(starting_balance_stroops, new_account_g_strkey);
+    match evaluate_value_moving_policy(
+        policy_engine.as_ref(),
+        &profile,
+        "stellar_create_account",
+        stellar_agent_core::policy::ToolValueKind::MovesValue,
+        chain_id,
+        &policy_args,
+        "accounts create",
+    ) {
+        Ok(()) => None,
+        Err(envelope) => {
+            print_error(&envelope, args.output);
+            Some(1)
+        }
     }
 }
 
@@ -551,6 +639,18 @@ async fn run_sponsored(args: &CreateArgs) -> i32 {
             return 1;
         }
     };
+
+    // ── Operator policy evaluation (before signing/submission) ───────────────
+    let chain_id = caip2_chain_id_for_network(args.network);
+    let starting_balance_stroops = starting_balance.as_stroops();
+    if let Some(code) = evaluate_create_policy(
+        args,
+        starting_balance_stroops,
+        &new_account.g_strkey,
+        chain_id,
+    ) {
+        return code;
+    }
 
     // Sign and submit.
     match sponsored_create(args, &sponsor, &new_account.g_strkey, starting_balance).await {
@@ -1082,6 +1182,7 @@ mod tests {
     #[tokio::test]
     async fn friendbot_mainnet_rejected_before_http_call() {
         let args = CreateArgs {
+            profile: "default".to_owned(),
             new_account: Some(
                 "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL".to_owned(),
             ),
@@ -1108,6 +1209,7 @@ mod tests {
     #[tokio::test]
     async fn sponsored_mainnet_rejected_before_rpc_call() {
         let args = CreateArgs {
+            profile: "default".to_owned(),
             new_account: Some(
                 "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL".to_owned(),
             ),
@@ -1256,6 +1358,7 @@ mod tests {
     #[test]
     fn resolve_new_account_generate_produces_valid_strkeys() {
         let args = CreateArgs {
+            profile: "default".to_owned(),
             new_account: None,
             generate: true,
             starting_balance: None,
@@ -1298,6 +1401,7 @@ mod tests {
     #[test]
     fn resolve_new_account_positional_invalid_returns_error() {
         let args = CreateArgs {
+            profile: "default".to_owned(),
             new_account: Some("NOTASTRKEY".to_owned()),
             generate: false,
             starting_balance: None,
@@ -1330,6 +1434,7 @@ mod tests {
     #[test]
     fn secret_key_absent_when_not_generating() {
         let args = CreateArgs {
+            profile: "default".to_owned(),
             new_account: Some(
                 "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL".to_owned(),
             ),
@@ -1362,6 +1467,7 @@ mod tests {
     #[test]
     fn secret_key_present_when_generating() {
         let args = CreateArgs {
+            profile: "default".to_owned(),
             new_account: None,
             generate: true,
             starting_balance: None,
@@ -1434,6 +1540,7 @@ mod tests {
 
     fn minimal_sponsored_args() -> CreateArgs {
         CreateArgs {
+            profile: "default".to_owned(),
             new_account: Some(DEST_G.to_owned()),
             generate: false,
             starting_balance: Some("1 XLM".to_owned()),

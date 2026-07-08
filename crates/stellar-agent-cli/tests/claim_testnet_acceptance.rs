@@ -22,8 +22,12 @@
 //!    claimant's native balance increased and the balance entry is gone.
 //!
 //! `claim` reads its secret straight from the named environment variable
-//! (`std::env::var`) and does not touch the wallet profile/keyring system, so
-//! no profile setup or keyring seeding is needed here.
+//! (`std::env::var`) and never touches the wallet keyring system, so no
+//! keyring seeding is needed here. The `--profile` flag defaults to
+//! `"default"`; with no `default.toml` file present, the command synthesizes
+//! an in-memory `Noop`-engine testnet profile for its policy gate (see
+//! `crate::commands::policy_engine::load_profile_or_synthesize_testnet`), so
+//! no profile setup is needed either — the gate is a permissive no-op here.
 //!
 //! Gated behind the `testnet-acceptance` feature flag:
 //!

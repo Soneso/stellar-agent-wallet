@@ -35,6 +35,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no longer reduces the native reserve. Operators with existing value rules
   should expect previously-unconstrained value tools to be gated. (#18, #19,
   #20)
+- CLI `pay`, `claim`, and `accounts create` (sponsored mode) now evaluate
+  operator policy before signing, through the same `PolicyEngine::evaluate`
+  path the `trade`/`lend`/`vault`/`trustline` CLI verbs already use and with
+  value descriptors identical to their `stellar_pay` / `stellar_claim` /
+  `stellar_create_account` MCP twins. Previously these three verbs signed and
+  submitted unconditionally, bypassing the engine entirely. All three verbs
+  gain a `--profile` flag (default `"default"`). With no persisted profile
+  file, an in-memory `Noop`-engine testnet profile is synthesized, so the verbs
+  keep working without an authored profile and `policy.engine = "noop"`
+  behavior on testnet is unchanged. The gate only bites when `--profile`
+  resolves to a
+  persisted profile with `policy.engine = "v1"`. `accounts create` Friendbot
+  mode is not gated (it debits no wallet funds). (#19)
 
 ### Fixed
 

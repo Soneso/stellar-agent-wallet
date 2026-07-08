@@ -31,6 +31,7 @@ Account-management group. Subcommands: `create`, `deploy-c`.
 Creates a new Stellar account in one of two mutually exclusive modes: a sponsored `CreateAccount` operation, or Friendbot funding.
 
 - **Signing.** Sponsored mode signs the `CreateAccount` operation with the sponsor's key. Friendbot mode performs no signing and touches no key.
+- **Policy (sponsored mode only).** After `--starting-balance` and the new account's public key are resolved and before signing, the sponsored `CreateAccount` is evaluated against `--profile`'s policy engine — the same evaluation the `stellar_create_account` MCP tool runs. With no persisted `<name>.toml` profile, an in-memory `Noop`-engine testnet profile is synthesized, so sponsored mode works without an authored profile file until an operator opts into `policy.engine = "v1"`. Friendbot mode is not gated: it debits no wallet-held funds.
 - **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` is structurally refused before any RPC, HTTP, or key access. Sponsored mode returns `network.mainnet_write_forbidden`; Friendbot mode returns `network.friendbot_mainnet_forbidden`. Friendbot funding is testnet-only.
 - **Account identity.** Provide the new account's G-strkey as the positional argument, or pass `--generate` to mint a fresh ed25519 keypair in-process. Exactly one is required.
 - **Secret-key discipline.** `--generate` returns the new S-strkey in the JSON envelope's `data.secret_key` field. It is never emitted in `--output table` and never logged. Capture it from the JSON output and store it securely; for example, redirect with a restrictive umask: `umask 077 && stellar-agent accounts create --generate ... > secret.json`.
@@ -45,6 +46,7 @@ Argument groups (enforced by the parser):
 |---|---|---|---|
 | `<NEW_G_STRKEY>` (positional) | G-strkey of the account to create | one of the account group | — |
 | `--generate` | Generate a fresh ed25519 keypair in-process; returns the G- and S-strkey in JSON | one of the account group | `false` |
+| `--profile <NAME>` | Profile to evaluate operator policy against (sponsored mode only) | optional | `default` |
 | `--sponsor <G_STRKEY>` | Sponsor/source account for the `CreateAccount` op | one of the mode group | — |
 | `--starting-balance <AMOUNT>` | Starting balance with explicit units, e.g. `"5 XLM"` (bare numbers rejected) | sponsored mode | — |
 | `--secret-env <VAR>` | Env-var name holding the sponsor S-strkey | signer group (sponsored) | — |
@@ -139,6 +141,7 @@ stellar-agent accounts deploy-c \
 Sends a payment from a source account to a destination, enforcing SEP-29 memo-required before signing (see [protocols](../protocols.md)).
 
 - **Signing.** By default the command builds, signs, and submits atomically. Three staged flags split the pipeline: `--build-only` emits the unsigned envelope XDR and exits (no signing); `--sign-only <XDR>` signs a prebuilt envelope and emits signed XDR; `--submit-only <XDR>` submits a pre-signed envelope. The stage flags are mutually exclusive.
+- **Policy.** After the envelope is built and before signing (in both the full pipeline and `--build-only`), the amount/asset/destination are evaluated against `--profile`'s policy engine — the same evaluation the `stellar_pay` MCP tool runs. With no persisted `<name>.toml` profile, an in-memory `Noop`-engine testnet profile is synthesized, so the command works without an authored profile file until an operator opts into `policy.engine = "v1"`. The staged `--sign-only` and `--submit-only` flows are not policy-sized under `v1`: they operate on an opaque prebuilt envelope, so an operator using the split staged pipeline is responsible for sizing at the `--build-only` step, which is gated.
 - **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` returns `network.mainnet_write_forbidden` before any RPC call, with a submit-layer URL rejection as defence in depth.
 - **Relayer.** `--use-oz-relayer` is not implemented in this build. Passing it emits an AGPL-3.0 disclosure to stderr and declines the operation rather than submitting.
 
@@ -153,6 +156,7 @@ Argument groups (enforced by the parser):
 | `<DESTINATION>` (positional) | Destination account G-strkey | yes | — |
 | `<AMOUNT>` (positional) | Amount with explicit units, e.g. `"10 XLM"`, `"10.5 USDC"` (raw stroop strings rejected) | yes | — |
 | `[ASSET]` (positional) | `native`, `XLM`, or `CODE:ISSUER_GSTRKEY` | optional | `native` |
+| `--profile <NAME>` | Profile to evaluate operator policy against | optional | `default` |
 | `--source <G_STRKEY>` | Source account; required for signing | conditional | — |
 | `--memo-text <STRING>` | Memo text (UTF-8, up to 28 bytes) | one of the memo group | — |
 | `--memo-id <U64>` | Memo ID (u64 decimal) | one of the memo group | — |
@@ -201,6 +205,16 @@ asset — an authorized trustline with enough limit headroom exists
   response, or the creating transaction's result).
 - **Signing.** Same staged pipeline as `pay`: atomic by default;
   `--build-only` / `--sign-only <XDR>` / `--submit-only <XDR>` split it.
+- **Policy.** After the build stage (guards, preview, envelope construction)
+  and before signing (in both the full pipeline and `--build-only`), the claim
+  is evaluated against `--profile`'s policy engine — the same evaluation the
+  `stellar_claim` MCP tool runs. With no persisted `<name>.toml` profile, an
+  in-memory `Noop`-engine testnet profile is synthesized, so the command works
+  without an authored profile file until an operator opts into
+  `policy.engine = "v1"`. The staged `--sign-only` and `--submit-only` flows are
+  not policy-sized under `v1`: they operate on an opaque prebuilt envelope, so an
+  operator using the split staged pipeline is responsible for sizing at the
+  `--build-only` step, which is gated.
 - **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` returns
   `network.mainnet_write_forbidden` before any RPC call.
 - **Timing.** The predicate is evaluated against the local clock; on-chain
@@ -210,6 +224,7 @@ asset — an authorized trustline with enough limit headroom exists
 | Flag / arg | Meaning | Required | Default |
 |---|---|---|---|
 | `<BALANCE_ID>` (positional) | Claimable balance ID (72-hex, 64-hex, or `B...` strkey) | yes | — |
+| `--profile <NAME>` | Profile to evaluate operator policy against | optional | `default` |
 | `--source <G_STRKEY>` | Claiming account; must be a claimant | yes | — |
 | `--secret-env <VAR>` | Env-var name holding the source S-strkey | signer group | — |
 | `--sign-with-ledger` | Sign with a connected Ledger | signer group | `false` |

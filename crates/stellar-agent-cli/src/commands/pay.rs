@@ -46,6 +46,17 @@
 //! `attach_signature` → drop. The `--sign-with-ledger` path uses
 //! `signer_from_ledger` (hardware signer; no seed ever in memory).
 //!
+//! # Operator policy evaluation
+//!
+//! After the envelope is built (and before signing, in both the full pipeline
+//! and `--build-only`), the resolved amount/asset/destination are evaluated
+//! against the operator-signed `PolicyEngineV1` (when `--profile` resolves to
+//! a persisted profile with `policy.engine = "v1"`) or the permissive
+//! `NoopPolicyEngine` otherwise, mirroring the `stellar_pay` MCP tool's
+//! dispatch gate. When `--profile` names no persisted `<name>.toml` file, an
+//! in-memory `Noop`-engine testnet profile is synthesized so the command keeps
+//! working without an authored profile file.
+//!
 //! # Behavior
 //!
 //! All network calls go through Stellar RPC. SEP-29 on-chain data-entry
@@ -71,6 +82,10 @@ use stellar_agent_network::{
     submit_transaction_and_wait,
 };
 
+use crate::commands::policy_engine::{
+    build_v1_policy_engine, caip2_chain_id_for_network, evaluate_value_moving_policy,
+    load_profile_or_synthesize_testnet, pay_policy_args,
+};
 use crate::common::network::TargetNetwork;
 use crate::common::render::{render_json, sanitize_for_table};
 use crate::common::signer_ceremony::{SignerCeremonyOutcome, resolve_software_signer_from_env};
@@ -152,6 +167,18 @@ pub struct PayResult {
 struct BuiltPaymentEnvelope {
     envelope_xdr: String,
     fee_selection: ClassicFeeSelection,
+    /// Resolved payment amount in stroops. Feeds the policy gate's
+    /// `amount_stroops` field — identical key and value the `stellar_pay` MCP
+    /// tool's dispatch args carry.
+    amount_stroops: i64,
+    /// The asset string exactly as supplied on the CLI (`args.asset`,
+    /// unreformatted). The `stellar_pay` MCP tool's dispatch args also carry
+    /// the raw caller-supplied asset string — `asset_normalise` performs the
+    /// only normalisation either side applies, so passing the raw string here
+    /// keeps both sides identical.
+    asset_raw: String,
+    /// The destination G-strkey exactly as supplied on the CLI.
+    destination: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -171,6 +198,14 @@ struct BuiltPaymentEnvelope {
     group(ArgGroup::new("signer_group").args(["secret_env", "sign_with_ledger"]).required(false)),
 )]
 pub struct PayArgs {
+    /// Profile name to evaluate operator policy against (default: "default").
+    ///
+    /// When no `<name>.toml` profile file exists, an in-memory `Noop`-engine
+    /// testnet profile is synthesized so the command keeps working without an
+    /// authored profile file; see [`crate::commands::policy_engine::load_profile_or_synthesize_testnet`].
+    #[arg(long, default_value = "default")]
+    pub profile: String,
+
     /// Destination account G-strkey.
     #[arg(value_name = "DESTINATION")]
     pub destination: String,
@@ -319,6 +354,10 @@ pub async fn run(args: &PayArgs) -> i32 {
 async fn run_build_only(args: &PayArgs) -> i32 {
     match build_unsigned_envelope(args).await {
         Ok(built) => {
+            let chain_id = caip2_chain_id_for_network(args.network);
+            if let Some(code) = evaluate_pay_policy(args, &built, chain_id) {
+                return code;
+            }
             let result = PayResult {
                 envelope_xdr: built.envelope_xdr,
                 tx_hash: None,
@@ -406,7 +445,15 @@ async fn run_full_pipeline(args: &PayArgs) -> i32 {
             return 1;
         }
     };
-    let unsigned_xdr = built.envelope_xdr.clone();
+    // ── Operator policy evaluation (before signing) ───────────────────────────
+    // Runs while `built` is still owned so its fields can be moved out (not
+    // cloned) once the gate allows.
+    let chain_id = caip2_chain_id_for_network(args.network);
+    if let Some(code) = evaluate_pay_policy(args, &built, chain_id) {
+        return code;
+    }
+
+    let unsigned_xdr = built.envelope_xdr;
     let fee_selection = built.fee_selection;
 
     // 2. Sign.
@@ -514,7 +561,66 @@ async fn build_unsigned_envelope(args: &PayArgs) -> Result<BuiltPaymentEnvelope,
     Ok(BuiltPaymentEnvelope {
         envelope_xdr,
         fee_selection,
+        amount_stroops: amount.as_stroops(),
+        asset_raw: args.asset.clone(),
+        destination: args.destination.clone(),
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Operator policy gate
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Evaluates operator policy for the built payment leg, using the same
+/// engine path (and `stellar_pay` value descriptor contract) the
+/// `stellar_pay` MCP tool's dispatch gate uses.
+///
+/// Returns `None` when the operation is allowed (the caller proceeds to
+/// signing); returns `Some(exit_code)` — with the refusal envelope already
+/// rendered — when the operation must be refused.
+fn evaluate_pay_policy(
+    args: &PayArgs,
+    built: &BuiltPaymentEnvelope,
+    chain_id: &str,
+) -> Option<i32> {
+    let profile = match load_profile_or_synthesize_testnet(&args.profile) {
+        Ok(p) => p,
+        Err(msg) => {
+            print_error(
+                &Envelope::<()>::err_raw("profile.load_failed", msg),
+                args.output,
+            );
+            return Some(1);
+        }
+    };
+    let policy_engine = match build_v1_policy_engine("pay", &profile.policy.engine, &profile) {
+        Ok(pe) => pe,
+        Err(msg) => {
+            print_error(
+                &Envelope::<()>::err_raw("policy.engine_unavailable", msg),
+                args.output,
+            );
+            return Some(1);
+        }
+    };
+    // Mirrors the `stellar_pay` MCP tool's dispatch args exactly: resolved
+    // stroops, the raw (unreformatted) asset string, and the destination.
+    let policy_args = pay_policy_args(built.amount_stroops, &built.asset_raw, &built.destination);
+    match evaluate_value_moving_policy(
+        policy_engine.as_ref(),
+        &profile,
+        "stellar_pay",
+        stellar_agent_core::policy::ToolValueKind::MovesValue,
+        chain_id,
+        &policy_args,
+        "pay",
+    ) {
+        Ok(()) => None,
+        Err(envelope) => {
+            print_error(&envelope, args.output);
+            Some(1)
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1089,6 +1195,7 @@ mod tests {
     #[tokio::test]
     async fn mainnet_rejected_at_run_boundary() {
         let args = PayArgs {
+            profile: "default".to_owned(),
             destination: "GABC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGH".to_owned(),
             amount: "10 XLM".to_owned(),
             asset: "native".to_owned(),
@@ -1243,6 +1350,7 @@ mod tests {
     /// Constructs a minimal `PayArgs` with default values for fields not under test.
     fn minimal_args() -> PayArgs {
         PayArgs {
+            profile: "default".to_owned(),
             destination: "GABC".to_owned(),
             amount: "10 XLM".to_owned(),
             asset: "native".to_owned(),

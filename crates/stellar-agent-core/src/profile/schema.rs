@@ -1511,11 +1511,29 @@ fn is_windows_reserved_file_stem(stem: &str) -> bool {
 /// - macOS: `~/Library/Application Support/stellar-agent/profiles/`
 /// - Windows: `%LOCALAPPDATA%\stellar-agent\profiles\`
 ///
+/// Tests may set `STELLAR_AGENT_HOME` to redirect this directory to
+/// `$STELLAR_AGENT_HOME/profiles`. The env-var read is **gated behind
+/// `#[cfg(any(test, feature = "test-helpers"))]`** so production release builds
+/// never honour it — this closes the env-injection profile-store-swap attack
+/// surface. A profile file governs which policy engine and owner-key
+/// coordinate a value-moving command trusts, so an unauthenticated override of
+/// this path in a production binary would let an attacker substitute a
+/// permissive profile.
+///
 /// # Errors
 ///
 /// Returns [`StateDirError`] when the platform directories library cannot
 /// determine the user's state directory.
 pub fn default_profile_dir() -> Result<PathBuf, StateDirError> {
+    // Gated env-var override: only honoured in test builds OR when the crate is
+    // compiled with `--features test-helpers`. Production release builds never
+    // read this variable, eliminating the env-injection profile-store-swap
+    // surface.
+    #[cfg(any(test, feature = "test-helpers"))]
+    if let Some(home) = std::env::var_os("STELLAR_AGENT_HOME") {
+        return Ok(PathBuf::from(home).join("profiles"));
+    }
+
     let dirs =
         directories::ProjectDirs::from("", "Soneso", "stellar-agent").ok_or(StateDirError)?;
     Ok(dirs.data_local_dir().join("profiles"))
@@ -1530,11 +1548,29 @@ pub fn default_profile_dir() -> Result<PathBuf, StateDirError> {
 /// - macOS: `~/Library/Application Support/stellar-agent/policies/`
 /// - Windows: `%LOCALAPPDATA%\stellar-agent\policies\`
 ///
+/// Tests may set `STELLAR_AGENT_HOME` to redirect this directory to
+/// `$STELLAR_AGENT_HOME/policies`. The env-var read is **gated behind
+/// `#[cfg(any(test, feature = "test-helpers"))]`** so production release builds
+/// never honour it — this closes the env-injection policy-store-swap attack
+/// surface. The policy directory holds the operator-signed root-of-trust
+/// document `PolicyEngineV1` enforces; an unauthenticated override of this
+/// path in a production binary would let an attacker substitute a forged or
+/// permissive policy file.
+///
 /// # Errors
 ///
 /// Returns [`StateDirError`] when the platform directories library cannot
 /// determine the user's state directory.
 pub fn default_policy_dir() -> Result<PathBuf, StateDirError> {
+    // Gated env-var override: only honoured in test builds OR when the crate is
+    // compiled with `--features test-helpers`. Production release builds never
+    // read this variable, eliminating the env-injection policy-store-swap
+    // surface.
+    #[cfg(any(test, feature = "test-helpers"))]
+    if let Some(home) = std::env::var_os("STELLAR_AGENT_HOME") {
+        return Ok(PathBuf::from(home).join("policies"));
+    }
+
     let dirs =
         directories::ProjectDirs::from("", "Soneso", "stellar-agent").ok_or(StateDirError)?;
     Ok(dirs.data_local_dir().join("policies"))
@@ -2188,9 +2224,35 @@ mod tests {
         assert_eq!(counter.service, "stellar-agent-counterparty-prof");
     }
 
+    /// With `STELLAR_AGENT_HOME` set, `default_profile_dir` and
+    /// `default_policy_dir` redirect to `$STELLAR_AGENT_HOME/profiles` and
+    /// `$STELLAR_AGENT_HOME/policies` respectively, mirroring the
+    /// `default_passkeys_dir` / `default_toolsets_dir` override contract.
+    ///
+    /// `#[serial]` because `STELLAR_AGENT_HOME` is a process-global env var;
+    /// a concurrently-running sibling test that reads or sets it would race.
+    #[test]
+    #[serial_test::serial]
+    fn stellar_agent_home_override_redirects_profile_and_policy_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _guard = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+
+        let profile_dir = default_profile_dir().expect("default_profile_dir must succeed");
+        assert_eq!(profile_dir, dir.path().join("profiles"));
+
+        let policy_dir = default_policy_dir().expect("default_policy_dir must succeed");
+        assert_eq!(policy_dir, dir.path().join("policies"));
+    }
+
     /// `default_passkeys_dir` returns a path ending with the `passkeys`
     /// component and uses the OS-conventional project-dirs base.
+    ///
+    /// `#[serial]`: `default_passkeys_dir` honours the process-global
+    /// `STELLAR_AGENT_HOME` override; serialising avoids a race against
+    /// `stellar_agent_home_override_redirects_profile_and_policy_dirs` and the
+    /// other `STELLAR_AGENT_HOME`-sensitive tests in this module.
     #[test]
+    #[serial_test::serial]
     fn default_passkeys_dir_ends_with_passkeys_component() {
         let dir = default_passkeys_dir().expect("default_passkeys_dir must succeed on CI");
         assert!(
@@ -2222,7 +2284,11 @@ mod tests {
     /// `default_operator_approval_credentials_dir` returns a path ending with
     /// the `operator-approval-credentials` component, distinct from
     /// `default_passkeys_dir`.
+    ///
+    /// `#[serial]`: both dir functions honour the `STELLAR_AGENT_HOME`
+    /// override; see `default_passkeys_dir_ends_with_passkeys_component`.
     #[test]
+    #[serial_test::serial]
     fn default_operator_approval_credentials_dir_ends_with_expected_component() {
         let dir = default_operator_approval_credentials_dir()
             .expect("default_operator_approval_credentials_dir must succeed on CI");
@@ -2671,7 +2737,9 @@ mod tests {
         );
     }
 
+    /// `#[serial]`: see `default_passkeys_dir_ends_with_passkeys_component`.
     #[test]
+    #[serial_test::serial]
     fn default_profile_dir_ends_with_profiles() {
         let dir = default_profile_dir().expect("default_profile_dir must succeed on CI");
         assert_eq!(
@@ -2685,7 +2753,9 @@ mod tests {
         );
     }
 
+    /// `#[serial]`: see `default_passkeys_dir_ends_with_passkeys_component`.
     #[test]
+    #[serial_test::serial]
     fn default_policy_dir_ends_with_policies() {
         let dir = default_policy_dir().expect("default_policy_dir must succeed on CI");
         assert_eq!(
@@ -2713,7 +2783,9 @@ mod tests {
         );
     }
 
+    /// `#[serial]`: see `default_passkeys_dir_ends_with_passkeys_component`.
     #[test]
+    #[serial_test::serial]
     fn default_toolsets_dir_ends_with_toolsets() {
         let dir = default_toolsets_dir().expect("default_toolsets_dir must succeed on CI");
         assert_eq!(

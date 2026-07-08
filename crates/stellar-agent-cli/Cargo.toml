@@ -155,7 +155,22 @@ test-helpers = []
 #     --test claim_testnet_acceptance
 # This feature is CI/dev-only and MUST NOT be enabled in any release-artefact
 # feature set.
-testnet-acceptance = ["stellar-agent-test-support/testnet-helpers"]
+#
+# Forwards `test-helpers` (this crate's own gate on
+# `commands::policy_engine::owner_pubkey_b64`'s file-based owner-PUBLIC-key
+# override) and `stellar-agent-core/test-helpers` (core's
+# `STELLAR_AGENT_HOME` override on `default_profile_dir` / `default_policy_dir`)
+# so the acceptance tests' spawned `stellar-agent` binary — built with
+# `#[cfg(test)]` inactive — still has both overrides compiled in. Because both
+# overrides additionally require the matching env var to be set, this feature
+# never widens what a plain `--features testnet-acceptance` release build would
+# accept unless that env var is also present; no release-artefact build ever
+# enables this feature.
+testnet-acceptance = [
+    "test-helpers",
+    "stellar-agent-core/test-helpers",
+    "stellar-agent-test-support/testnet-helpers",
+]
 
 [lints]
 workspace = true
