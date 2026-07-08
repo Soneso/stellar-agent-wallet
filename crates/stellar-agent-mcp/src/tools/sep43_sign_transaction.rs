@@ -145,7 +145,7 @@ impl WalletServer {
             Err(e) => return e.into_result(),
         };
         match dispatch_outcome {
-            crate::tools::common::DispatchOutcome::Allow => {}
+            crate::tools::common::DispatchOutcome::Allow(_) => {}
             crate::tools::common::DispatchOutcome::RequireApproval(_) => {
                 return Ok(crate::tools::common::single_shot_require_approval_error());
             }

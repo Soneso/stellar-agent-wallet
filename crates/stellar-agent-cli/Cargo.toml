@@ -133,6 +133,8 @@ async-trait = { workspace = true }
 serial_test = { workspace = true }
 # keyring_mock::install for the mock store setup (key_ops.rs tests).
 stellar-agent-test-support = { path = "../stellar-agent-test-support" }
+# Temp audit-log path in the value-audit end-to-end emission test.
+tempfile = { workspace = true }
 # request_id generation in audit/verify.rs tests.
 uuid = { workspace = true }
 # Assert on structured tracing events captured via CaptureWriter.

@@ -229,6 +229,11 @@ impl WalletServer {
         // `None`: the `minimum_reserve` / `home_domain` criteria fail closed on
         // this tool pending account-view wiring, acceptable for this step.
         let value_leg = dex_trade_value_leg(qty_in, &canonical_path, router_address);
+        // Capture the gate-derived leg as an audit record before the descriptor
+        // moves into the gate (single-derivation invariant).
+        let audit_legs = vec![stellar_agent_core::audit_log::ValueLegRecord::from(
+            &value_leg,
+        )];
         let args_value = json!({
             "chain_id": args.chain_id,
             "from_address": args.from_address,
@@ -336,7 +341,7 @@ impl WalletServer {
             "soroswap-core",  // abi_source_provenance
         );
 
-        let ctx = DefiAdapterCtx::new_with_submit_ctx(
+        let mut ctx = DefiAdapterCtx::new_with_submit_ctx(
             "default",
             &router_pin,
             &primary_rpc,
@@ -346,6 +351,15 @@ impl WalletServer {
             secondary_rpc.as_ref(),
             Some(timeout),
         );
+        // Thread the audit writer + gate-derived leg so the adapter emits the
+        // ValueActionSubmitted row after a confirmed submit (non-fatal).
+        let audit_profile_name = self.profile_name_for_approval();
+        ctx.audit_writer = crate::tools::value_audit::acquire_value_audit_writer(
+            &self.profile,
+            &audit_profile_name,
+        );
+        ctx.audit_legs = Some(&audit_legs);
+        ctx.audit_tool = Some("stellar_dex_trade");
 
         // ── Delegate to DexSwapAdapter::submit (witness consumed inside) ──────
         // NO inline HostFunction build or submit_signed_invoke call here. All

@@ -1197,6 +1197,11 @@ impl WalletServer {
         // preserve the chain_id validation and Deny arm — but if
         // forced_dispatch_outcome overrides Allow, the allow no-op in
         // verify_attestation_gate is bypassed.
+        // Effects sized by the gate, retained even when the toolset-gated path
+        // overrides Allow with a forced RequireApproval: the post-submit audit
+        // row must carry the legs the gate sized (single-derivation invariant).
+        let mut overridden_gate_effects: Option<stellar_agent_core::policy::v1::ValueEffects> =
+            None;
         let dispatch_outcome = match forced_dispatch_outcome {
             Some(forced) => {
                 // Still run dispatch_gate for chain_id validation + Deny check;
@@ -1209,8 +1214,9 @@ impl WalletServer {
                     Err(e) => return e.into_result(),
                 };
                 match gate_outcome {
-                    super::common::DispatchOutcome::Allow => {
+                    super::common::DispatchOutcome::Allow(effects) => {
                         // Override: policy said Allow but toolset-gated path forces RequireApproval.
+                        overridden_gate_effects = effects;
                         tracing::debug!(
                             tool = "stellar_pay_commit",
                             "toolset_gated: overriding DispatchOutcome::Allow → forced RequireApproval"
@@ -1269,6 +1275,22 @@ impl WalletServer {
         {
             return Ok(result);
         }
+
+        // Extract the gate-sized legs for the post-submit audit row: the SAME
+        // ValueEffects the policy gate evaluated (single-derivation invariant),
+        // threaded from the dispatch outcome — or, on the toolset-gated forced
+        // path, from the Allow the override displaced. Empty when the engine
+        // sized no value (the row then records an unsized allow).
+        let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> = match &dispatch_outcome
+        {
+            super::common::DispatchOutcome::Allow(Some(effects)) => {
+                effects.legs().iter().map(Into::into).collect()
+            }
+            _ => overridden_gate_effects
+                .as_ref()
+                .map(|effects| effects.legs().iter().map(Into::into).collect())
+                .unwrap_or_default(),
+        };
 
         // ── Decode nonce — map parse error to nonce.expired (indistinguishability) ──
         let nonce = match stellar_agent_nonce::Nonce::from_base64(&args.nonce) {
@@ -1580,6 +1602,27 @@ impl WalletServer {
                     nonce_id = %nonce_id_prefix,
                     decision = "committed",
                     "stellar_pay_commit: tx submitted"
+                );
+
+                // Non-fatal allow-path audit row carrying the gate-sized legs.
+                let audit_request_id = uuid::Uuid::new_v4().to_string();
+                let audit_tx_redacted = stellar_agent_network::submit::redact_tx_hash(&tx_hash);
+                let audit_entry =
+                    stellar_agent_core::audit_log::AuditEntry::new_value_action_submitted(
+                        "stellar_pay_commit",
+                        args.chain_id.as_str(),
+                        audit_legs,
+                        audit_tx_redacted.as_str(),
+                        ledger,
+                        stellar_agent_core::audit_log::PolicyDecision::Allow,
+                        None,
+                        Some(nonce_id_prefix.to_string()),
+                        &audit_request_id,
+                    );
+                crate::tools::value_audit::emit_value_audit_row(
+                    &self.profile,
+                    &self.profile_name_for_approval(),
+                    audit_entry,
                 );
 
                 // Remove the consumed approval entry from the store so it

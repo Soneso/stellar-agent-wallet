@@ -848,7 +848,7 @@ async fn acceptance_submit_and_confirm() {
     let primary_rpc = testnet_rpc();
 
     // Build DefiAdapterCtx with full submit context.
-    let ctx = DefiAdapterCtx::new_with_submit_ctx(
+    let mut ctx = DefiAdapterCtx::new_with_submit_ctx(
         "default",
         &pin,
         &primary_rpc,
@@ -868,6 +868,31 @@ async fn acceptance_submit_and_confirm() {
         deadline: None, // adapter defaults to now + 300s
     };
 
+    // Wire audit emission exactly as the MCP `stellar_dex_trade` handler does,
+    // so the confirmed swap records its value_action_submitted row.  The leg is
+    // built from the SAME amount/path/router the trade uses (single-derivation
+    // invariant); the writer uses a fixed test key.
+    let audit_dir = std::env::temp_dir().join(format!("dex-audit-{}", now_secs()));
+    std::fs::create_dir_all(&audit_dir).expect("create audit dir");
+    let audit_log_path = audit_dir.join("audit.jsonl");
+    let audit_writer = std::sync::Arc::new(std::sync::Mutex::new(
+        stellar_agent_core::audit_log::AuditWriter::open(
+            audit_log_path.clone(),
+            Some(Zeroizing::new([0x11u8; 32])),
+        )
+        .expect("open audit writer"),
+    ));
+    let audit_legs = vec![stellar_agent_core::audit_log::ValueLegRecord::from(
+        &stellar_agent_dex::value::dex_trade_value_leg(
+            trade_args.amount_in,
+            &trade_args.path,
+            SOROSWAP_ROUTER_ADDRESS_TESTNET,
+        ),
+    )];
+    ctx.audit_writer = Some(std::sync::Arc::clone(&audit_writer));
+    ctx.audit_legs = Some(&audit_legs);
+    ctx.audit_tool = Some("stellar_dex_trade");
+
     // Execute the swap.
     // NOTE: `witness` is consumed (moved) by `submit`; cannot retry.
     // submit includes its own internal retry for transient RPC issues.
@@ -886,6 +911,20 @@ async fn acceptance_submit_and_confirm() {
     eprintln!(
         "Acceptance PASS — real on-chain swap SUCCEEDED for wallet {}",
         redact_strkey(&wallet_c)
+    );
+
+    // #21 — the confirmed on-chain swap must have recorded a
+    // value_action_submitted row for stellar_dex_trade.
+    let audit_rows: Vec<serde_json::Value> = std::io::BufRead::lines(std::io::BufReader::new(
+        std::fs::File::open(&audit_log_path).expect("audit log after submit"),
+    ))
+    .map(|line| serde_json::from_str(&line.expect("audit line")).expect("audit JSON row"))
+    .collect();
+    assert!(
+        audit_rows.iter().any(|row| {
+            row["kind"] == "value_action_submitted" && row["tool"] == "stellar_dex_trade"
+        }),
+        "confirmed DEX swap must record a value_action_submitted row: {audit_rows:?}"
     );
 
     // ── Step 6: Assert the multi-auth-entry guard observed count == 1 ─

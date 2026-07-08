@@ -1140,6 +1140,13 @@ impl PolicyError {
 pub trait PolicyEngine: Send + Sync {
     /// Evaluates whether the given tool call is permitted under the active profile.
     ///
+    /// Returns the [`Decision`] ONLY and discards any value descriptor the engine
+    /// sizes while deciding. A value-moving dispatch path MUST call
+    /// [`Self::evaluate_full`] instead: the value-verb audit row records exactly
+    /// the effects the gate sized, and a dispatch that gates through this view
+    /// silently loses them. This decision-only view is for callers that record no
+    /// value row — read-only gates, criteria-internal checks, and tests.
+    ///
     /// # Arguments
     ///
     /// - `tool` — the tool descriptor for the tool being invoked.
@@ -1197,6 +1204,11 @@ pub trait PolicyEngine: Send + Sync {
     /// ([`crate::policy::v1::PolicyEngineV1`]) override it to gate on the supplied
     /// descriptor.
     ///
+    /// Returns the [`Decision`] ONLY and discards the sized descriptor. A
+    /// value-moving dispatch path MUST call [`Self::evaluate_with_value_full`]
+    /// instead so the effects reach the audit row; this decision-only view is for
+    /// callers that record no value row.
+    ///
     /// # Errors
     ///
     /// Same as [`Self::evaluate`].
@@ -1224,6 +1236,105 @@ pub trait PolicyEngine: Send + Sync {
             sep45_sessions,
         )
     }
+
+    /// Evaluates a tool call and additionally surfaces the value descriptor the
+    /// engine sized, for callers (e.g. the audit emission path) that must record
+    /// exactly what the gate evaluated.
+    ///
+    /// The default returns the [`Self::evaluate`] decision with
+    /// `value_effects = None`, correct for engines that do not size value
+    /// ([`NoopPolicyEngine`]). [`crate::policy::v1::PolicyEngineV1`] overrides
+    /// this to surface the exact [`ValueEffects`](crate::policy::v1::ValueEffects)
+    /// its value criteria sized (single-derivation invariant).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::evaluate`].
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_full(
+        &self,
+        tool: &ToolDescriptor,
+        args: &serde_json::Value,
+        profile: &Profile,
+        account_view: Option<&dyn crate::policy::v1::AccountReservesView>,
+        identity_view: Option<&dyn crate::policy::v1::AccountIdentityView>,
+        counterparty_cache: Option<&dyn crate::policy::v1::CounterpartyCacheView>,
+        sep10_sessions: Option<&dyn crate::policy::v1::Sep10SessionView>,
+        sep45_sessions: Option<&dyn crate::policy::v1::Sep45SessionView>,
+    ) -> Result<Evaluation, PolicyError> {
+        let decision = self.evaluate(
+            tool,
+            args,
+            profile,
+            account_view,
+            identity_view,
+            counterparty_cache,
+            sep10_sessions,
+            sep45_sessions,
+        )?;
+        Ok(Evaluation {
+            decision,
+            value_effects: None,
+        })
+    }
+
+    /// Value-carrying counterpart of [`Self::evaluate_full`].
+    ///
+    /// The default returns the [`Self::evaluate_with_value`] decision with
+    /// `value_effects = None`; value-sizing engines override it to echo the
+    /// supplied descriptor's effects back on the allow path.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::evaluate_with_value`].
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_with_value_full(
+        &self,
+        tool: &ToolDescriptor,
+        args: &serde_json::Value,
+        profile: &Profile,
+        value: crate::policy::v1::ValueClass,
+        account_view: Option<&dyn crate::policy::v1::AccountReservesView>,
+        identity_view: Option<&dyn crate::policy::v1::AccountIdentityView>,
+        counterparty_cache: Option<&dyn crate::policy::v1::CounterpartyCacheView>,
+        sep10_sessions: Option<&dyn crate::policy::v1::Sep10SessionView>,
+        sep45_sessions: Option<&dyn crate::policy::v1::Sep45SessionView>,
+    ) -> Result<Evaluation, PolicyError> {
+        let decision = self.evaluate_with_value(
+            tool,
+            args,
+            profile,
+            value,
+            account_view,
+            identity_view,
+            counterparty_cache,
+            sep10_sessions,
+            sep45_sessions,
+        )?;
+        Ok(Evaluation {
+            decision,
+            value_effects: None,
+        })
+    }
+}
+
+/// Outcome of a policy evaluation: the [`Decision`] plus the value descriptor
+/// the engine sized on the allow path, when the engine sizes value.
+///
+/// `value_effects` is `Some` only for a [`Decision::Allow`] from an engine that
+/// sizes value ([`crate::policy::v1::PolicyEngineV1`]); it is `None` for
+/// read-only/opaque tools, for denials, and for engines that do not size value.
+/// It carries the SAME [`ValueEffects`](crate::policy::v1::ValueEffects) the
+/// value criteria evaluated, so a caller records exactly what the gate sized
+/// (single-derivation invariant) without re-deriving. Not `Serialize`: it
+/// crosses only in-process.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Evaluation {
+    /// The policy decision.
+    pub decision: Decision,
+    /// The value descriptor the engine sized on the allow path, or `None`.
+    pub value_effects: Option<crate::policy::v1::ValueEffects>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

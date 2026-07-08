@@ -348,11 +348,14 @@ pub(crate) fn trustline_policy_args(from: &str, asset: &str) -> serde_json::Valu
 ///
 /// Constructs the [`ToolDescriptor`] from `tool_name` / `value_kind` /
 /// `chain_id`, then evaluates `policy_args` against `profile`. Returns
-/// `Ok(())` on [`Decision::Allow`]; returns `Err(envelope)` — a fully-rendered
-/// refusal envelope — for every other outcome, mirroring the `trade` /
-/// `lend` / `vault` / `trustline` refusal-message shapes verbatim so a
-/// V1-engine deny produces the identical wire code the MCP twin returns for
-/// the same rule.
+/// `Ok(value_effects)` on [`Decision::Allow`] — the value descriptor the gate
+/// sized while deriving it from `policy_args` (`Some` for a value-moving allow,
+/// `None` for a read-only allow or the no-op engine) — so the caller records
+/// exactly the legs the gate evaluated (single-derivation invariant) without
+/// re-deriving. Returns `Err(envelope)` — a fully-rendered refusal envelope —
+/// for every other outcome, mirroring the `trade` / `lend` / `vault` /
+/// `trustline` refusal-message shapes verbatim so a V1-engine deny produces the
+/// identical wire code the MCP twin returns for the same rule.
 ///
 /// Callers render the envelope with their own `print_error` (JSON vs table)
 /// and exit `1`.
@@ -369,7 +372,7 @@ pub(crate) fn evaluate_value_moving_policy(
     chain_id: &str,
     policy_args: &serde_json::Value,
     verb: &str,
-) -> Result<(), Envelope<()>> {
+) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, Envelope<()>> {
     let reg = McpToolRegistration {
         name: tool_name,
         destructive_hint: true,
@@ -380,7 +383,7 @@ pub(crate) fn evaluate_value_moving_policy(
     let mut tool_descriptor = ToolDescriptor::from_registration(&reg);
     tool_descriptor.chain_id = chain_id.to_owned();
 
-    match policy_engine.evaluate(
+    match policy_engine.evaluate_full(
         &tool_descriptor,
         policy_args,
         profile,
@@ -390,21 +393,23 @@ pub(crate) fn evaluate_value_moving_policy(
         None,
         None,
     ) {
-        Ok(Decision::Allow) => Ok(()),
-        Ok(Decision::Deny(reason)) => Err(Envelope::<()>::err_raw(
-            format!("policy.deny.{}", reason.code()),
-            format!("{verb} operation denied by operator policy"),
-        )),
-        Ok(Decision::RequireApproval(_)) => Err(Envelope::<()>::err_raw(
-            "policy.approval_required",
-            format!(
-                "{verb} operation requires approval; use the MCP server for two-phase approval"
-            ),
-        )),
-        Ok(_) => Err(Envelope::<()>::err_raw(
-            "policy.unexpected_decision",
-            "unexpected policy decision — operation refused (fail-closed)".to_owned(),
-        )),
+        Ok(evaluation) => match evaluation.decision {
+            Decision::Allow => Ok(evaluation.value_effects),
+            Decision::Deny(reason) => Err(Envelope::<()>::err_raw(
+                format!("policy.deny.{}", reason.code()),
+                format!("{verb} operation denied by operator policy"),
+            )),
+            Decision::RequireApproval(_) => Err(Envelope::<()>::err_raw(
+                "policy.approval_required",
+                format!(
+                    "{verb} operation requires approval; use the MCP server for two-phase approval"
+                ),
+            )),
+            _ => Err(Envelope::<()>::err_raw(
+                "policy.unexpected_decision",
+                "unexpected policy decision — operation refused (fail-closed)".to_owned(),
+            )),
+        },
         Err(e) => Err(Envelope::<()>::err_raw(
             "policy.engine_required",
             format!("{e}"),
@@ -456,7 +461,11 @@ pub(crate) fn evaluate_value_moving_policy_with_value(
     let mut tool_descriptor = ToolDescriptor::from_registration(&reg);
     tool_descriptor.chain_id = chain_id.to_owned();
 
-    match policy_engine.evaluate_with_value(
+    // Dispatch through the value-surfacing method so no production dispatch path
+    // calls the decision-only `evaluate_with_value` view. The caller supplies the
+    // value descriptor and retains it for its own audit row (single-decode
+    // invariant), so the effects the engine echoes here are not re-read.
+    match policy_engine.evaluate_with_value_full(
         &tool_descriptor,
         policy_args,
         profile,
@@ -467,21 +476,23 @@ pub(crate) fn evaluate_value_moving_policy_with_value(
         None,
         None,
     ) {
-        Ok(Decision::Allow) => Ok(()),
-        Ok(Decision::Deny(reason)) => Err(Envelope::<()>::err_raw(
-            format!("policy.deny.{}", reason.code()),
-            format!("{verb} operation denied by operator policy"),
-        )),
-        Ok(Decision::RequireApproval(_)) => Err(Envelope::<()>::err_raw(
-            "policy.approval_required",
-            format!(
-                "{verb} operation requires approval; use the MCP server for two-phase approval"
-            ),
-        )),
-        Ok(_) => Err(Envelope::<()>::err_raw(
-            "policy.unexpected_decision",
-            "unexpected policy decision — operation refused (fail-closed)".to_owned(),
-        )),
+        Ok(evaluation) => match evaluation.decision {
+            Decision::Allow => Ok(()),
+            Decision::Deny(reason) => Err(Envelope::<()>::err_raw(
+                format!("policy.deny.{}", reason.code()),
+                format!("{verb} operation denied by operator policy"),
+            )),
+            Decision::RequireApproval(_) => Err(Envelope::<()>::err_raw(
+                "policy.approval_required",
+                format!(
+                    "{verb} operation requires approval; use the MCP server for two-phase approval"
+                ),
+            )),
+            _ => Err(Envelope::<()>::err_raw(
+                "policy.unexpected_decision",
+                "unexpected policy decision — operation refused (fail-closed)".to_owned(),
+            )),
+        },
         Err(e) => Err(Envelope::<()>::err_raw(
             "policy.engine_required",
             format!("{e}"),
@@ -705,7 +716,7 @@ mod tests {
         PolicyEngineV1::new(doc, "alice".to_owned())
     }
 
-    fn envelope_code(result: &Result<(), Envelope<()>>) -> &str {
+    fn envelope_code<T: std::fmt::Debug>(result: &Result<T, Envelope<()>>) -> &str {
         result
             .as_ref()
             .expect_err("expected a refusal envelope")
@@ -731,7 +742,19 @@ mod tests {
             &policy_args,
             "pay",
         );
-        assert!(result.is_ok(), "50 XLM under a 100 XLM cap must allow");
+        // The allow path must surface EXACTLY the effects `derive_value_class`
+        // sizes for the same (tool, args) — the single-derivation invariant the
+        // post-submit audit row relies on (the legs it records are these).
+        let stellar_agent_core::policy::v1::ValueClass::Value(expected) =
+            stellar_agent_core::policy::v1::value::derive_value_class("stellar_pay", &policy_args)
+        else {
+            panic!("stellar_pay must derive a value-moving descriptor");
+        };
+        assert_eq!(
+            result.expect("50 XLM under a 100 XLM cap must allow"),
+            Some(expected),
+            "the gate must return the SAME ValueEffects derive_value_class produces"
+        );
     }
 
     #[test]
@@ -772,9 +795,21 @@ mod tests {
             &policy_args,
             "accounts_create",
         );
-        assert!(
-            result.is_ok(),
-            "50 XLM starting balance under a 100 XLM cap must allow"
+        // Single-derivation invariant: the allow path returns EXACTLY the effects
+        // `derive_value_class` sizes for the same (tool, args) — the create leg
+        // the post-submit audit row records.
+        let stellar_agent_core::policy::v1::ValueClass::Value(expected) =
+            stellar_agent_core::policy::v1::value::derive_value_class(
+                "stellar_create_account",
+                &policy_args,
+            )
+        else {
+            panic!("stellar_create_account must derive a value-moving descriptor");
+        };
+        assert_eq!(
+            result.expect("50 XLM starting balance under a 100 XLM cap must allow"),
+            Some(expected),
+            "the gate must return the SAME ValueEffects derive_value_class produces"
         );
     }
 
@@ -819,9 +854,45 @@ mod tests {
             &policy_args,
             "claim",
         );
-        assert!(
-            result.is_ok(),
-            "a per_tx_cap rule must not apply to a non-debit claim leg"
+        // Single-derivation invariant: the allow path returns EXACTLY the
+        // non-debit Claim leg `derive_value_class` sizes — the leg the
+        // post-submit audit row records.
+        let stellar_agent_core::policy::v1::ValueClass::Value(expected) =
+            stellar_agent_core::policy::v1::value::derive_value_class(
+                "stellar_claim",
+                &policy_args,
+            )
+        else {
+            panic!("stellar_claim must derive a value-moving descriptor");
+        };
+        assert_eq!(
+            result.expect("a per_tx_cap rule must not apply to a non-debit claim leg"),
+            Some(expected),
+            "the gate must return the SAME ValueEffects derive_value_class produces"
+        );
+    }
+
+    #[test]
+    fn noop_engine_allow_surfaces_no_gate_sized_effects() {
+        // The no-op engine allows every call but sizes no value, so the gate
+        // returns `Ok(None)`; the value-verb handlers then record an audit row
+        // with no legs rather than re-deriving them from args.
+        let engine = stellar_agent_core::policy::NoopPolicyEngine;
+        let profile = parity_profile();
+        let policy_args = pay_policy_args(500_000_000, "native", PARITY_DEST_G);
+        let result = evaluate_value_moving_policy(
+            &engine,
+            &profile,
+            "stellar_pay",
+            ToolValueKind::MovesValue,
+            "stellar:testnet",
+            &policy_args,
+            "pay",
+        );
+        assert_eq!(
+            result.expect("the no-op engine allows"),
+            None,
+            "the no-op engine allows but surfaces no gate-sized effects"
         );
     }
 

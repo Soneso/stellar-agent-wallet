@@ -209,6 +209,21 @@ pub struct DefiAdapterCtx<'a> {
     ///
     /// `None` delegates the default count decision to the concrete adapter.
     pub auth_rule_ids: Option<&'a [ContextRuleId]>,
+    /// Audit writer for the value-action row emitted after a confirmed submit.
+    ///
+    /// `None` for preview-only calls and any caller that does not record value
+    /// rows. When `Some`, the adapter emits a `ValueActionSubmitted` row in the
+    /// submit Ok arm; the writer MUST have been opened with the profile's audit
+    /// chain-root HMAC key so `audit verify` covers the row.
+    pub audit_writer:
+        Option<std::sync::Arc<std::sync::Mutex<stellar_agent_core::audit_log::AuditWriter>>>,
+    /// Gate-derived value legs recorded in the value-action row — the same
+    /// descriptor the policy gate sized (single-derivation invariant). Emission
+    /// is skipped when `None`.
+    pub audit_legs: Option<&'a [stellar_agent_core::audit_log::ValueLegRecord]>,
+    /// MCP/CLI tool identity for the audit row's outer `tool` field (e.g.
+    /// `"stellar_blend_lend"`). Emission is skipped when `None`.
+    pub audit_tool: Option<&'a str>,
 }
 
 impl<'a> DefiAdapterCtx<'a> {
@@ -251,6 +266,9 @@ impl<'a> DefiAdapterCtx<'a> {
             secondary_rpc: None,
             timeout: None,
             auth_rule_ids: None,
+            audit_writer: None,
+            audit_legs: None,
+            audit_tool: None,
         }
     }
 
@@ -301,6 +319,59 @@ impl<'a> DefiAdapterCtx<'a> {
             secondary_rpc,
             timeout,
             auth_rule_ids: None,
+            audit_writer: None,
+            audit_legs: None,
+            audit_tool: None,
+        }
+    }
+
+    /// Emits a `ValueActionSubmitted` audit row for a confirmed DeFi submit.
+    ///
+    /// No-op unless an audit writer, gate-derived legs, tool identity, and
+    /// chain id were all threaded into this context. Non-fatal: the submit has
+    /// already confirmed, so a row-write failure logs a warning and does not
+    /// affect the caller. `tx_hash_redacted` MUST already be redacted.
+    pub fn emit_value_action_submitted(
+        &self,
+        tx_hash_redacted: &str,
+        ledger: u32,
+        request_id: &str,
+    ) {
+        let (Some(writer), Some(legs), Some(tool), Some(chain_id)) = (
+            self.audit_writer.as_ref(),
+            self.audit_legs,
+            self.audit_tool,
+            self.chain_id,
+        ) else {
+            return;
+        };
+
+        let entry = stellar_agent_core::audit_log::AuditEntry::new_value_action_submitted(
+            tool,
+            chain_id,
+            legs.to_vec(),
+            tx_hash_redacted,
+            ledger,
+            stellar_agent_core::audit_log::PolicyDecision::Allow,
+            None,
+            None,
+            request_id,
+        );
+
+        match writer.lock() {
+            Ok(mut guard) => {
+                if let Err(e) = guard.write_entry(entry) {
+                    tracing::warn!(
+                        error = %e,
+                        "defi value audit: write_entry failed; ValueActionSubmitted NOT emitted"
+                    );
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "defi value audit: writer mutex poisoned; ValueActionSubmitted NOT emitted"
+                );
+            }
         }
     }
 }

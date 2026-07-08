@@ -282,6 +282,21 @@ pub enum OpaqueReason {
     RawAuthEntrySignature,
 }
 
+impl OpaqueReason {
+    /// Stable snake_case wire label, for audit rows and telemetry.
+    ///
+    /// Matches the `#[serde(rename_all = "snake_case")]` convention of the
+    /// audit-log event schema. The match is exhaustive within the defining
+    /// crate so a new variant forces a label here rather than defaulting.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RawTransactionSignature => "raw_transaction_signature",
+            Self::RawAuthEntrySignature => "raw_auth_entry_signature",
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // asset_normalise
 // ─────────────────────────────────────────────────────────────────────────────

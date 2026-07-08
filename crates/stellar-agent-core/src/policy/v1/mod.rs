@@ -1085,14 +1085,38 @@ impl PolicyEngine for PolicyEngineV1 {
         sep10_sessions: Option<&dyn Sep10SessionView>,
         sep45_sessions: Option<&dyn Sep45SessionView>,
     ) -> Result<Decision, PolicyError> {
+        self.evaluate_full(
+            tool,
+            args,
+            profile,
+            account_view,
+            identity_view,
+            counterparty_cache,
+            sep10_sessions,
+            sep45_sessions,
+        )
+        .map(|e| e.decision)
+    }
+
+    fn evaluate_full(
+        &self,
+        tool: &ToolDescriptor,
+        args: &Value,
+        profile: &Profile,
+        account_view: Option<&dyn AccountReservesView>,
+        identity_view: Option<&dyn AccountIdentityView>,
+        counterparty_cache: Option<&dyn CounterpartyCacheView>,
+        sep10_sessions: Option<&dyn Sep10SessionView>,
+        sep45_sessions: Option<&dyn Sep45SessionView>,
+    ) -> Result<crate::policy::Evaluation, PolicyError> {
         // Derive the typed value descriptor from the same (tool, args) the
         // criteria gate on. Two-phase classic tools carry the resolved keys in
         // `args` (authoritative_args on the commit path); OpaqueSign tools derive
         // Opaque; everything else derives ReadOnly. Single-shot Soroban tools
-        // supply their resolved effects via `evaluate_with_value` instead.
+        // supply their resolved effects via `evaluate_with_value_full` instead.
         let value = value::derive_value_class(&tool.name, args);
         self.assert_value_kind_populated(tool, &value);
-        self.evaluate_inner(
+        let decision = self.evaluate_inner(
             tool,
             args,
             profile,
@@ -1102,7 +1126,11 @@ impl PolicyEngine for PolicyEngineV1 {
             counterparty_cache,
             sep10_sessions,
             sep45_sessions,
-        )
+        )?;
+        Ok(crate::policy::Evaluation {
+            value_effects: value_effects_on_allow(&decision, &value),
+            decision,
+        })
     }
 
     fn evaluate_with_value(
@@ -1117,10 +1145,37 @@ impl PolicyEngine for PolicyEngineV1 {
         sep10_sessions: Option<&dyn Sep10SessionView>,
         sep45_sessions: Option<&dyn Sep45SessionView>,
     ) -> Result<Decision, PolicyError> {
+        self.evaluate_with_value_full(
+            tool,
+            args,
+            profile,
+            value,
+            account_view,
+            identity_view,
+            counterparty_cache,
+            sep10_sessions,
+            sep45_sessions,
+        )
+        .map(|e| e.decision)
+    }
+
+    fn evaluate_with_value_full(
+        &self,
+        tool: &ToolDescriptor,
+        args: &Value,
+        profile: &Profile,
+        value: value::ValueClass,
+        account_view: Option<&dyn AccountReservesView>,
+        identity_view: Option<&dyn AccountIdentityView>,
+        counterparty_cache: Option<&dyn CounterpartyCacheView>,
+        sep10_sessions: Option<&dyn Sep10SessionView>,
+        sep45_sessions: Option<&dyn Sep45SessionView>,
+    ) -> Result<crate::policy::Evaluation, PolicyError> {
         // The dispatch site resolved the value from the SAME decoded requirements
-        // it signs (§2.1 single-decode invariant); use it as-is.
+        // it signs (the single-decode invariant); use it as-is and echo it back
+        // on the allow path so the caller records exactly what the gate sized.
         self.assert_value_kind_populated(tool, &value);
-        self.evaluate_inner(
+        let decision = self.evaluate_inner(
             tool,
             args,
             profile,
@@ -1130,7 +1185,24 @@ impl PolicyEngine for PolicyEngineV1 {
             counterparty_cache,
             sep10_sessions,
             sep45_sessions,
-        )
+        )?;
+        Ok(crate::policy::Evaluation {
+            value_effects: value_effects_on_allow(&decision, &value),
+            decision,
+        })
+    }
+}
+
+/// Extracts the sized [`value::ValueEffects`] from a resolved descriptor, but
+/// only on the allow path — `value_effects` is surfaced for a permitted
+/// value-moving call, never for a denial, an opaque sign, or a read-only tool.
+fn value_effects_on_allow(
+    decision: &Decision,
+    value: &value::ValueClass,
+) -> Option<value::ValueEffects> {
+    match (decision, value) {
+        (Decision::Allow, value::ValueClass::Value(effects)) => Some(effects.clone()),
+        _ => None,
     }
 }
 

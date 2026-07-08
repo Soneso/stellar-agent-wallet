@@ -48,6 +48,41 @@ mod i128_decimal_str {
     }
 }
 
+/// Serializes/deserializes `Option<i128>` as an optional decimal string.
+///
+/// The `Option`-aware sibling of [`i128_decimal_str`]: `None` serializes as
+/// JSON `null` (and is skipped entirely under `skip_serializing_if`), `Some(v)`
+/// as the decimal-string form. The same `Content`-buffering limitation that
+/// forbids a bare `i128` on an internally-tagged variant (see
+/// [`i128_decimal_str`]) applies to `Option<i128>`; routing through a string
+/// sidesteps it and preserves precision beyond ±2^53.
+mod i128_decimal_str_opt {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S>(value: &Option<i128>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(v) => serializer.serialize_some(&v.to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<i128>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match Option::<String>::deserialize(deserializer)? {
+            Some(s) => s
+                .parse::<i128>()
+                .map(Some)
+                .map_err(|e| serde::de::Error::custom(format!("invalid decimal i128 '{s}': {e}"))),
+            None => Ok(None),
+        }
+    }
+}
+
 // ── PolicyDecision ────────────────────────────────────────────────────────────
 
 /// The outcome of a policy-engine evaluation, serialised into each audit entry.
@@ -201,6 +236,171 @@ pub enum SaInvocationResult {
     ///
     /// Wire form: `"post_submit_verification_failed"`.
     PostSubmitVerificationFailed,
+}
+
+// ── Value-action audit records ───────────────────────────────────────────────
+
+/// Audit-wire mirror of [`crate::policy::v1::value::ActionKind`].
+///
+/// Policy types stay wire-free (they derive no `Serialize`); this closed mirror
+/// is what crosses the hash-chained log. The [`From`] conversion from
+/// `ActionKind` is an EXHAUSTIVE match with no wildcard, so a future
+/// `ActionKind` variant is a compile error here rather than a silently
+/// mis-recorded leg — the same posture as
+/// [`ActionKind::carries_debit`](crate::policy::v1::value::ActionKind::carries_debit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ValueActionKind {
+    /// See [`ActionKind::Payment`](crate::policy::v1::value::ActionKind::Payment).
+    Payment,
+    /// See [`ActionKind::AccountCreation`](crate::policy::v1::value::ActionKind::AccountCreation).
+    AccountCreation,
+    /// See [`ActionKind::Claim`](crate::policy::v1::value::ActionKind::Claim).
+    Claim,
+    /// See [`ActionKind::Trustline`](crate::policy::v1::value::ActionKind::Trustline).
+    Trustline,
+    /// See [`ActionKind::DexTrade`](crate::policy::v1::value::ActionKind::DexTrade).
+    DexTrade,
+    /// See [`ActionKind::Lend`](crate::policy::v1::value::ActionKind::Lend).
+    Lend,
+    /// See [`ActionKind::LendWithdraw`](crate::policy::v1::value::ActionKind::LendWithdraw).
+    LendWithdraw,
+    /// See [`ActionKind::VaultDeposit`](crate::policy::v1::value::ActionKind::VaultDeposit).
+    VaultDeposit,
+    /// See [`ActionKind::VaultWithdraw`](crate::policy::v1::value::ActionKind::VaultWithdraw).
+    VaultWithdraw,
+    /// See [`ActionKind::X402Payment`](crate::policy::v1::value::ActionKind::X402Payment).
+    X402Payment,
+    /// See [`ActionKind::MppCharge`](crate::policy::v1::value::ActionKind::MppCharge).
+    MppCharge,
+    /// See [`ActionKind::ContractInvoke`](crate::policy::v1::value::ActionKind::ContractInvoke).
+    ContractInvoke,
+}
+
+impl From<crate::policy::v1::value::ActionKind> for ValueActionKind {
+    fn from(kind: crate::policy::v1::value::ActionKind) -> Self {
+        use crate::policy::v1::value::ActionKind;
+        // EXHAUSTIVE — no wildcard. A new `ActionKind` variant must break this
+        // match so its audit-wire name is chosen deliberately, never defaulted.
+        match kind {
+            ActionKind::Payment => Self::Payment,
+            ActionKind::AccountCreation => Self::AccountCreation,
+            ActionKind::Claim => Self::Claim,
+            ActionKind::Trustline => Self::Trustline,
+            ActionKind::DexTrade => Self::DexTrade,
+            ActionKind::Lend => Self::Lend,
+            ActionKind::LendWithdraw => Self::LendWithdraw,
+            ActionKind::VaultDeposit => Self::VaultDeposit,
+            ActionKind::VaultWithdraw => Self::VaultWithdraw,
+            ActionKind::X402Payment => Self::X402Payment,
+            ActionKind::MppCharge => Self::MppCharge,
+            ActionKind::ContractInvoke => Self::ContractInvoke,
+        }
+    }
+}
+
+/// Maximum recorded length for free-form identifier strings that may
+/// originate outside the wallet (x402 facilitator-supplied `network`/`scheme`,
+/// leg `asset`). Legitimate values are short (an asset is at most
+/// `CODE:ISSUER` ≈ 70 chars; x402 network/scheme names are single tokens);
+/// the bound stops a hostile counterparty from inflating hash-chained rows
+/// with multi-megabyte strings. Truncation cannot break JSONL framing
+/// (serde_json escapes) — this is a size bound only.
+pub const RECORDED_STR_MAX: usize = 128;
+
+/// Truncates `s` to [`RECORDED_STR_MAX`] characters (char-boundary safe) for
+/// recording in an audit row.
+pub(super) fn bound_recorded_str(s: &str) -> String {
+    if s.chars().count() <= RECORDED_STR_MAX {
+        s.to_string()
+    } else {
+        s.chars().take(RECORDED_STR_MAX).collect()
+    }
+}
+
+/// One leg of a value-moving action, in audit-wire form.
+///
+/// Built at emission time from the SAME `ValueEffects` the policy gate sized
+/// (the single-derivation invariant — never a second derivation). The
+/// destination strkey is redacted first-5-last-5 at construction via
+/// [`redact_strkey_first5_last5`](crate::observability::redact_strkey_first5_last5)
+/// so a raw account/contract address never reaches the log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValueLegRecord {
+    /// The kind of action this leg performs.
+    pub action: ValueActionKind,
+    /// Stroop amount; `None` when the leg carries no resolvable amount.
+    /// Wire-encoded as an optional decimal string (`i128_decimal_str_opt`) —
+    /// a bare `i128` cannot appear on an internally-tagged variant (see
+    /// [`i128_decimal_str`]).
+    #[serde(
+        with = "i128_decimal_str_opt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub amount: Option<i128>,
+    /// Asset identifier (`"native"` or `"CODE:ISSUER"`); `None` when the leg
+    /// carries no asset (e.g. a share-denominated vault withdrawal). Bounded
+    /// to [`RECORDED_STR_MAX`] characters at construction — the source may be
+    /// counterparty-supplied (x402 requirements).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset: Option<String>,
+    /// Destination account/contract, redacted first-5-last-5; `None` when the
+    /// leg has no destination. Never a full strkey.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_redacted: Option<String>,
+}
+
+impl From<&crate::policy::v1::value::ValueLeg> for ValueLegRecord {
+    fn from(leg: &crate::policy::v1::value::ValueLeg) -> Self {
+        Self {
+            action: leg.kind.into(),
+            amount: leg.amount,
+            asset: leg.asset.as_deref().map(bound_recorded_str),
+            destination_redacted: leg
+                .destination
+                .as_deref()
+                .map(crate::observability::redact_strkey_first5_last5),
+        }
+    }
+}
+
+/// The category of long-lived key material a profile command wrote to the
+/// platform keyring, recorded in [`EventKind::KeyringKeyWritten`].
+///
+/// Carries only WHICH key slot was written — never any key value. Closed set;
+/// `#[non_exhaustive]` for additive evolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum KeyPurpose {
+    /// The MCP signer ed25519 seed (`profile enroll-signer`).
+    McpSignerSeed,
+    /// The policy-owner ed25519 public key (`profile enroll-owner-key`).
+    OwnerPublicKey,
+    /// The nonce HMAC key (`profile rotate-nonce-key`).
+    NonceHmac,
+    /// The attestation HMAC key (`profile rotate-attestation-key`).
+    AttestationHmac,
+    /// The audit-log hash-chain HMAC key (`profile rotate-audit-key`).
+    AuditHashChainHmac,
+    /// The counterparty-cache HMAC key (`profile rotate-counterparty-key`).
+    CounterpartyCacheHmac,
+}
+
+impl std::fmt::Display for KeyPurpose {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::McpSignerSeed => "mcp_signer_seed",
+            Self::OwnerPublicKey => "owner_public_key",
+            Self::NonceHmac => "nonce_hmac",
+            Self::AttestationHmac => "attestation_hmac",
+            Self::AuditHashChainHmac => "audit_hash_chain_hmac",
+            Self::CounterpartyCacheHmac => "counterparty_cache_hmac",
+        };
+        f.write_str(s)
+    }
 }
 
 // ── EventKind ────────────────────────────────────────────────────────────────
@@ -2041,6 +2241,123 @@ pub enum EventKind {
         /// and non-reversibility properties.
         operator_credential_id_redacted: String,
     },
+
+    /// A value-moving action was CONFIRMED on-chain.
+    ///
+    /// Emitted after a successful submit-and-confirm on an allow-path value
+    /// verb (classic pay / create-account / claim / trustline, and the DeFi
+    /// trade / lend / vault adapters). The `legs` are the SAME descriptor the
+    /// policy gate sized — the single-derivation invariant, never a second
+    /// derivation. The verb identity, chain id, policy decision, and request id
+    /// ride on the OUTER [`AuditEntry`](super::entry::AuditEntry) fields, as
+    /// with every other row.
+    ///
+    /// # Sized vs opaque submits
+    ///
+    /// A sized submit (classic pay/create/claim/trustline, DeFi trade/lend/vault
+    /// under a value-sizing policy engine) carries non-empty `legs` and
+    /// `opaque_reason: None`. An opaque submit — a raw sign-and-submit the
+    /// policy could not size (e.g. `stellar_sep43_sign_and_submit_transaction`)
+    /// — carries empty `legs` and `opaque_reason: Some(reason)`; the outer
+    /// entry's `envelope_hash` identifies what was submitted. Empty `legs` with
+    /// `opaque_reason: None` records an allow from an engine that sizes no
+    /// value (the no-op engine returns no descriptor). Non-empty `legs` is
+    /// valid ONLY with `opaque_reason: None`: legs are never fabricated for an
+    /// envelope the policy could not size.
+    ///
+    /// # Field redaction
+    ///
+    /// - `legs[].destination_redacted` — first-5-last-5 (see [`ValueLegRecord`]).
+    /// - `transaction_hash_redacted` — first-8-last-8 of the confirmed hash,
+    ///   the same convention as
+    ///   [`Self::SaExternalExecuteSubmitted::transaction_hash_redacted`].
+    ///
+    /// This variant intentionally has NO field named `request_id` or `tool`
+    /// (the outer [`AuditEntry`](super::entry::AuditEntry) owns those; see the
+    /// serde-flatten collision documented on the module).
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    ValueActionSubmitted {
+        /// The value legs the policy gate sized for this action. Empty for an
+        /// opaque submit (`opaque_reason` is `Some`) or for an allow from an
+        /// engine that sizes no value (`opaque_reason` is `None`).
+        legs: Vec<ValueLegRecord>,
+        /// Present for an opaque (unsizable) submit; the policy opaque-reason's
+        /// stable string form. Absent (`None`) for a sized submit. Mutually
+        /// exclusive with non-empty `legs`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        opaque_reason: Option<String>,
+        /// Confirmed Stellar transaction hash, redacted first-8-last-8.
+        transaction_hash_redacted: String,
+        /// Ledger sequence the transaction confirmed in.
+        ledger: u32,
+    },
+
+    /// An x402 payment authorization was signed.
+    ///
+    /// Emitted at the point the authorization signature is produced and about
+    /// to be returned; there is no on-chain submit point — the host settles
+    /// externally. The `legs` are the SAME descriptor the policy gate sized.
+    /// Only non-secret settle identifiers are recorded — never the signature,
+    /// token, or any secret.
+    ///
+    /// This variant intentionally has NO field named `request_id` or `tool`
+    /// (the outer [`AuditEntry`](super::entry::AuditEntry) owns those).
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    X402PaymentAuthorized {
+        /// The value legs the policy gate sized for this authorization. Each
+        /// leg's `destination_redacted` identifies the redacted `pay_to`
+        /// recipient; the leg `asset` is the SAC token contract (a non-secret
+        /// on-chain identifier).
+        legs: Vec<ValueLegRecord>,
+        /// x402 CAIP-2 network the authorization settles on (e.g.
+        /// `"stellar:testnet"`). A non-secret settle identifier,
+        /// facilitator-supplied and bounded to [`RECORDED_STR_MAX`] characters
+        /// at construction.
+        network: String,
+        /// x402 payment scheme (e.g. `"exact"`). A non-secret protocol
+        /// constant identifying how the host settles, facilitator-supplied and
+        /// bounded to [`RECORDED_STR_MAX`] characters at construction.
+        scheme: String,
+    },
+
+    /// Long-lived key material was written to the platform keyring.
+    ///
+    /// Emitted after a successful keyring write by a key-writing profile
+    /// command (`enroll-signer`, `enroll-owner-key`, and the
+    /// `rotate-{nonce,attestation,audit,counterparty}-key` commands). Records
+    /// only WHICH key slot was written and its keyring coordinates — NEVER any
+    /// key value, seed, base64 key material, or derived secret. This no-secret
+    /// property is load-bearing.
+    ///
+    /// # Field redaction
+    ///
+    /// - `public_address` — present only for the two enroll commands: the
+    ///   redacted first-5-last-5 account strkey, the same [`RedactedStrkey`]
+    ///   convention as
+    ///   [`Self::SaExternalExecuteSubmitted::smart_account_redacted`]. Absent
+    ///   for HMAC keys, which have no public address.
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    KeyringKeyWritten {
+        /// Which key slot was written.
+        key_purpose: KeyPurpose,
+        /// Keyring service name the key was written under.
+        keyring_service: String,
+        /// Keyring entry name the key was written under.
+        keyring_entry: String,
+        /// Redacted first-5-last-5 public account strkey, for the two enroll
+        /// commands; absent for HMAC keys.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        public_address: Option<RedactedStrkey>,
+    },
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -3731,5 +4048,359 @@ mod tests {
         );
         let back: AuditEntry = serde_json::from_str(&s).unwrap();
         assert_eq!(back.request_id, rejected.request_id);
+    }
+
+    // ── #21 / #34 audit records ──────────────────────────────────────────────
+
+    #[test]
+    fn event_kind_value_action_submitted_round_trip() {
+        let ev = EventKind::ValueActionSubmitted {
+            legs: vec![ValueLegRecord {
+                action: ValueActionKind::Payment,
+                amount: Some(1_500_000_000),
+                asset: Some("native".to_owned()),
+                destination_redacted: Some("GAAAA...ZZZZZ".to_owned()),
+            }],
+            opaque_reason: None,
+            transaction_hash_redacted: "aabb1122...ccdd3344".to_owned(),
+            ledger: 12_345,
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: EventKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(ev, back, "ValueActionSubmitted must round-trip cleanly");
+        assert!(
+            s.contains("\"value_action_submitted\""),
+            "wire discriminant: {s}"
+        );
+        assert!(s.contains("\"legs\""), "legs field: {s}");
+        assert!(
+            s.contains("\"transaction_hash_redacted\""),
+            "tx-hash field: {s}"
+        );
+        assert!(s.contains("\"ledger\""), "ledger field: {s}");
+        assert!(
+            s.contains("\"1500000000\""),
+            "amount must be a decimal string, not a JSON number: {s}"
+        );
+        // A sized submit skips opaque_reason entirely.
+        assert!(
+            !s.contains("opaque_reason"),
+            "opaque_reason must be skipped for a sized submit: {s}"
+        );
+        // Flatten-collision guard: the outer AuditEntry owns request_id and tool.
+        assert!(
+            !s.contains("request_id"),
+            "request_id must NOT appear as a variant field: {s}"
+        );
+        assert!(
+            !s.contains("\"tool\""),
+            "tool must NOT appear as a variant field: {s}"
+        );
+    }
+
+    #[test]
+    fn event_kind_value_action_submitted_opaque_round_trip() {
+        // The opaque shape: empty legs, opaque_reason Some — a raw submit the
+        // policy could not size (e.g. sep43 sign-and-submit).
+        let ev = EventKind::ValueActionSubmitted {
+            legs: vec![],
+            opaque_reason: Some("opaque_sign".to_owned()),
+            transaction_hash_redacted: "aabb1122...ccdd3344".to_owned(),
+            ledger: 777,
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: EventKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(ev, back, "opaque ValueActionSubmitted must round-trip");
+        assert!(
+            s.contains("\"opaque_reason\":\"opaque_sign\""),
+            "opaque_reason present for an opaque submit: {s}"
+        );
+    }
+
+    #[test]
+    fn event_kind_value_action_submitted_missing_fields_fail() {
+        // opaque_reason absent MUST still deserialize (the sized shape): only
+        // the always-required fields (transaction_hash_redacted, ledger) drive
+        // rejection here.
+        let json = r#"{"kind":"value_action_submitted"}"#;
+        let result: Result<EventKind, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "missing-field deserialisation must fail for ValueActionSubmitted"
+        );
+        // The sized shape (legs present, opaque_reason absent) deserializes.
+        let sized = r#"{"kind":"value_action_submitted","legs":[],"transaction_hash_redacted":"aa..bb","ledger":1}"#;
+        assert!(
+            serde_json::from_str::<EventKind>(sized).is_ok(),
+            "opaque_reason absent must still deserialize for the sized shape"
+        );
+    }
+
+    #[test]
+    fn event_kind_x402_payment_authorized_round_trip() {
+        let ev = EventKind::X402PaymentAuthorized {
+            legs: vec![ValueLegRecord {
+                action: ValueActionKind::X402Payment,
+                amount: Some(2_500_000),
+                asset: Some("CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA".to_owned()),
+                destination_redacted: Some("GBPXX...MWIVL".to_owned()),
+            }],
+            network: "stellar:testnet".to_owned(),
+            scheme: "exact".to_owned(),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: EventKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(ev, back, "X402PaymentAuthorized must round-trip cleanly");
+        assert!(
+            s.contains("\"x402_payment_authorized\""),
+            "wire discriminant: {s}"
+        );
+        assert!(s.contains("\"network\""), "network field: {s}");
+        assert!(s.contains("\"scheme\""), "scheme field: {s}");
+        assert!(
+            !s.contains("request_id"),
+            "request_id must NOT appear as a variant field: {s}"
+        );
+        assert!(
+            !s.contains("\"tool\""),
+            "tool must NOT appear as a variant field: {s}"
+        );
+    }
+
+    #[test]
+    fn event_kind_x402_payment_authorized_missing_fields_fail() {
+        let json = r#"{"kind":"x402_payment_authorized"}"#;
+        let result: Result<EventKind, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "missing-field deserialisation must fail for X402PaymentAuthorized"
+        );
+    }
+
+    #[test]
+    fn event_kind_keyring_key_written_round_trip() {
+        let ev = EventKind::KeyringKeyWritten {
+            key_purpose: KeyPurpose::McpSignerSeed,
+            keyring_service: "stellar-agent-signer".to_owned(),
+            keyring_entry: "default".to_owned(),
+            public_address: Some(RedactedStrkey::from_already_redacted("GAAAA...ZZZZZ")),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: EventKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(ev, back, "KeyringKeyWritten must round-trip cleanly");
+        assert!(
+            s.contains("\"keyring_key_written\""),
+            "wire discriminant: {s}"
+        );
+        assert!(s.contains("\"key_purpose\""), "key_purpose field: {s}");
+        assert!(
+            s.contains("\"mcp_signer_seed\""),
+            "key_purpose snake_case wire: {s}"
+        );
+        assert!(
+            s.contains("\"keyring_service\""),
+            "keyring_service field: {s}"
+        );
+        assert!(s.contains("\"keyring_entry\""), "keyring_entry field: {s}");
+        assert!(
+            !s.contains("request_id"),
+            "request_id must NOT appear as a variant field: {s}"
+        );
+        assert!(
+            !s.contains("\"tool\""),
+            "tool must NOT appear as a variant field: {s}"
+        );
+    }
+
+    #[test]
+    fn event_kind_keyring_key_written_missing_fields_fail() {
+        let json = r#"{"kind":"keyring_key_written"}"#;
+        let result: Result<EventKind, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "missing-field deserialisation must fail for KeyringKeyWritten"
+        );
+    }
+
+    #[test]
+    fn key_purpose_serialization_forms() {
+        let cases = [
+            (KeyPurpose::McpSignerSeed, "mcp_signer_seed"),
+            (KeyPurpose::OwnerPublicKey, "owner_public_key"),
+            (KeyPurpose::NonceHmac, "nonce_hmac"),
+            (KeyPurpose::AttestationHmac, "attestation_hmac"),
+            (KeyPurpose::AuditHashChainHmac, "audit_hash_chain_hmac"),
+            (KeyPurpose::CounterpartyCacheHmac, "counterparty_cache_hmac"),
+        ];
+        for (purpose, wire) in cases {
+            let s = serde_json::to_string(&purpose).unwrap();
+            assert_eq!(s, format!("\"{wire}\""), "KeyPurpose wire form");
+            assert_eq!(
+                purpose.to_string(),
+                wire,
+                "KeyPurpose Display must match the wire form"
+            );
+            let back: KeyPurpose = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, purpose, "KeyPurpose round-trip");
+        }
+    }
+
+    #[test]
+    fn value_action_kind_serialization_forms() {
+        let cases = [
+            (ValueActionKind::Payment, "payment"),
+            (ValueActionKind::AccountCreation, "account_creation"),
+            (ValueActionKind::Claim, "claim"),
+            (ValueActionKind::Trustline, "trustline"),
+            (ValueActionKind::DexTrade, "dex_trade"),
+            (ValueActionKind::Lend, "lend"),
+            (ValueActionKind::LendWithdraw, "lend_withdraw"),
+            (ValueActionKind::VaultDeposit, "vault_deposit"),
+            (ValueActionKind::VaultWithdraw, "vault_withdraw"),
+            (ValueActionKind::X402Payment, "x402_payment"),
+            (ValueActionKind::MppCharge, "mpp_charge"),
+            (ValueActionKind::ContractInvoke, "contract_invoke"),
+        ];
+        for (kind, wire) in cases {
+            let s = serde_json::to_string(&kind).unwrap();
+            assert_eq!(s, format!("\"{wire}\""), "ValueActionKind wire form");
+            let back: ValueActionKind = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, kind, "ValueActionKind round-trip");
+        }
+    }
+
+    #[test]
+    fn value_action_kind_from_action_kind_exhaustive_mapping() {
+        use crate::policy::v1::value::ActionKind;
+        // Every current ActionKind maps to its audit-wire mirror with the
+        // pinned snake_case name. The From impl is exhaustive; if a new
+        // ActionKind variant is added, this array (and the impl) must grow.
+        let cases = [
+            (ActionKind::Payment, ValueActionKind::Payment, "payment"),
+            (
+                ActionKind::AccountCreation,
+                ValueActionKind::AccountCreation,
+                "account_creation",
+            ),
+            (ActionKind::Claim, ValueActionKind::Claim, "claim"),
+            (
+                ActionKind::Trustline,
+                ValueActionKind::Trustline,
+                "trustline",
+            ),
+            (ActionKind::DexTrade, ValueActionKind::DexTrade, "dex_trade"),
+            (ActionKind::Lend, ValueActionKind::Lend, "lend"),
+            (
+                ActionKind::LendWithdraw,
+                ValueActionKind::LendWithdraw,
+                "lend_withdraw",
+            ),
+            (
+                ActionKind::VaultDeposit,
+                ValueActionKind::VaultDeposit,
+                "vault_deposit",
+            ),
+            (
+                ActionKind::VaultWithdraw,
+                ValueActionKind::VaultWithdraw,
+                "vault_withdraw",
+            ),
+            (
+                ActionKind::X402Payment,
+                ValueActionKind::X402Payment,
+                "x402_payment",
+            ),
+            (
+                ActionKind::MppCharge,
+                ValueActionKind::MppCharge,
+                "mpp_charge",
+            ),
+            (
+                ActionKind::ContractInvoke,
+                ValueActionKind::ContractInvoke,
+                "contract_invoke",
+            ),
+        ];
+        for (src, expected, wire) in cases {
+            let got = ValueActionKind::from(src);
+            assert_eq!(got, expected, "ActionKind {src:?} must map to {expected:?}");
+            assert_eq!(
+                serde_json::to_string(&got).unwrap(),
+                format!("\"{wire}\""),
+                "pinned wire name for {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn value_leg_record_from_value_leg_redacts_destination_and_strings_amount() {
+        use crate::policy::v1::value::{ActionKind, ValueLeg};
+        let full_dest = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
+        let leg = ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(9_223_372_036_854_775_808), // i64::MAX + 1
+            asset: Some("native".to_owned()),
+            destination: Some(full_dest.to_owned()),
+        };
+        let record = ValueLegRecord::from(&leg);
+        assert_eq!(record.action, ValueActionKind::Payment);
+        assert_eq!(record.amount, Some(9_223_372_036_854_775_808));
+        let dest = record.destination_redacted.as_deref().unwrap();
+        assert!(
+            dest.starts_with("GBPXX") && dest.ends_with("MWIVL") && dest.contains("..."),
+            "destination must be first-5-last-5 redacted: {dest}"
+        );
+        assert!(
+            !record
+                .destination_redacted
+                .as_deref()
+                .unwrap()
+                .contains(full_dest),
+            "the full destination strkey must never appear in the record"
+        );
+        let s = serde_json::to_string(&record).unwrap();
+        assert!(
+            !s.contains(full_dest),
+            "serialized leg must not contain the full destination strkey: {s}"
+        );
+        assert!(
+            s.contains("\"9223372036854775808\""),
+            "amount must serialize as a decimal string beyond i64 range: {s}"
+        );
+    }
+
+    #[test]
+    fn counterparty_supplied_strings_are_bounded_in_records() {
+        use crate::policy::v1::value::{ActionKind, ValueLeg};
+        let oversized = "A".repeat(RECORDED_STR_MAX * 64);
+        let leg = ValueLeg {
+            kind: ActionKind::X402Payment,
+            amount: Some(1),
+            asset: Some(oversized.clone()),
+            destination: None,
+        };
+        let record = ValueLegRecord::from(&leg);
+        assert_eq!(
+            record.asset.as_deref().map(|a| a.chars().count()),
+            Some(RECORDED_STR_MAX),
+            "a counterparty-supplied asset string must be bounded at conversion"
+        );
+        // A within-bound asset passes through unchanged.
+        let short_leg = ValueLeg {
+            kind: ActionKind::X402Payment,
+            amount: Some(1),
+            asset: Some("native".to_owned()),
+            destination: None,
+        };
+        assert_eq!(
+            ValueLegRecord::from(&short_leg).asset.as_deref(),
+            Some("native")
+        );
+        // Truncation is char-boundary safe for multi-byte input.
+        let multibyte = "\u{00e9}".repeat(RECORDED_STR_MAX + 7);
+        assert_eq!(
+            bound_recorded_str(&multibyte).chars().count(),
+            RECORDED_STR_MAX
+        );
     }
 }

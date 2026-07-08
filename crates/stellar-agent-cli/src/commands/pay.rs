@@ -424,7 +424,9 @@ where
     match build_unsigned_envelope(args).await {
         Ok(built) => {
             let chain_id = caip2_chain_id_for_network(args.network);
-            if let Some(code) = evaluate_pay_policy(args, &built, chain_id, &profile) {
+            // Build-only: gate but do not submit, so the gate-sized effects are
+            // not recorded (no confirmed on-chain action to attest).
+            if let Err(code) = evaluate_pay_policy(args, &built, chain_id, &profile) {
                 return code;
             }
             let result = PayResult {
@@ -552,9 +554,10 @@ where
     // Runs while `built` is still owned so its fields can be moved out (not
     // cloned) once the gate allows.
     let chain_id = caip2_chain_id_for_network(args.network);
-    if let Some(code) = evaluate_pay_policy(args, &built, chain_id, &profile) {
-        return code;
-    }
+    let pay_effects = match evaluate_pay_policy(args, &built, chain_id, &profile) {
+        Ok(effects) => effects,
+        Err(code) => return code,
+    };
 
     let unsigned_xdr = built.envelope_xdr;
     let fee_selection = built.fee_selection;
@@ -572,6 +575,32 @@ where
     // 3. Submit.
     match submit_envelope(args, &signed_xdr).await {
         Ok((xdr, sub_result)) => {
+            // Non-fatal allow-path audit row carrying the SAME legs the gate
+            // sized (single-derivation invariant), recorded on confirmed submit.
+            let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> = pay_effects
+                .as_ref()
+                .map(|e| e.legs().iter().map(Into::into).collect())
+                .unwrap_or_default();
+            let audit_request_id = uuid::Uuid::new_v4().to_string();
+            let audit_tx_redacted =
+                stellar_agent_network::submit::redact_tx_hash(&sub_result.tx_hash);
+            let audit_entry = stellar_agent_core::audit_log::AuditEntry::new_value_action_submitted(
+                "stellar_pay",
+                chain_id,
+                audit_legs,
+                audit_tx_redacted.as_str(),
+                sub_result.ledger,
+                stellar_agent_core::audit_log::PolicyDecision::Allow,
+                None,
+                None,
+                &audit_request_id,
+            );
+            crate::commands::value_audit::emit_value_audit_row(
+                &profile,
+                &args.profile,
+                audit_entry,
+            );
+
             let result = PayResult {
                 envelope_xdr: xdr,
                 tx_hash: Some(sub_result.tx_hash.clone()),
@@ -692,7 +721,7 @@ fn evaluate_pay_policy(
     built: &BuiltPaymentEnvelope,
     chain_id: &str,
     profile: &Profile,
-) -> Option<i32> {
+) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, i32> {
     let policy_engine = match build_v1_policy_engine("pay", &profile.policy.engine, profile) {
         Ok(pe) => pe,
         Err(msg) => {
@@ -700,7 +729,7 @@ fn evaluate_pay_policy(
                 &Envelope::<()>::err_raw("policy.engine_unavailable", msg),
                 args.output,
             );
-            return Some(1);
+            return Err(1);
         }
     };
     // Mirrors the `stellar_pay` MCP tool's dispatch args exactly: resolved
@@ -715,10 +744,10 @@ fn evaluate_pay_policy(
         &policy_args,
         "pay",
     ) {
-        Ok(()) => None,
+        Ok(effects) => Ok(effects),
         Err(envelope) => {
             print_error(&envelope, args.output);
-            Some(1)
+            Err(1)
         }
     }
 }

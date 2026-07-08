@@ -23,6 +23,8 @@ pub mod toolsets;
 pub mod vault;
 // Soroswap DEX swap adapter — trade verb.
 pub mod trade;
+// Shared value-action audit emission for value-moving CLI verbs.
+pub(crate) mod value_audit;
 // Stablecoin substrate — trustline verb.
 pub mod trustline;
 // Claimable-balance substrate — claim verb.

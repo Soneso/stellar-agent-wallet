@@ -249,7 +249,7 @@ where
         }
     };
     let policy_args = trustline_policy_args(&args.from, &args.asset);
-    if let Err(envelope) = evaluate_value_moving_policy(
+    let trustline_effects = match evaluate_value_moving_policy(
         policy_engine.as_ref(),
         &profile,
         "stellar_trustline",
@@ -258,9 +258,12 @@ where
         &policy_args,
         "trustline",
     ) {
-        render_json(&envelope);
-        return 1;
-    }
+        Ok(effects) => effects,
+        Err(envelope) => {
+            render_json(&envelope);
+            return 1;
+        }
+    };
 
     // ── GATE 2: resolve_denomination (D3 ordered refusal) ────────────────────
     let input = parse_denomination_input(&args.asset);
@@ -668,6 +671,31 @@ where
                 ledger = ?ledger,
                 "ChangeTrust tx submitted"
             );
+
+            // Non-fatal allow-path audit row carrying the SAME legs the gate
+            // sized (single-derivation invariant), recorded on confirmed submit.
+            let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> = trustline_effects
+                .as_ref()
+                .map(|e| e.legs().iter().map(Into::into).collect())
+                .unwrap_or_default();
+            let audit_request_id = uuid::Uuid::new_v4().to_string();
+            let audit_entry = stellar_agent_core::audit_log::AuditEntry::new_value_action_submitted(
+                "stellar_trustline",
+                chain_id,
+                audit_legs,
+                tx_hash_redacted.as_str(),
+                ledger,
+                stellar_agent_core::audit_log::PolicyDecision::Allow,
+                None,
+                None,
+                &audit_request_id,
+            );
+            crate::commands::value_audit::emit_value_audit_row(
+                &profile,
+                &args.profile,
+                audit_entry,
+            );
+
             render_json(&Envelope::ok(json!({
                 "status": "submitted",
                 "action": "change_trust",

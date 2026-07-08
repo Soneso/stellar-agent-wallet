@@ -114,7 +114,8 @@ pub mod writer;
 pub use entry::{AuditEntry, NewToolInvocation};
 pub use health::{AuditWriterHealth, AuditWriterHealthHandle};
 pub use reader::{AuditLogIntegrityError, AuditReader, PinnedHashesRecord};
-pub use schema::{EventKind, PolicyDecision};
+pub use rotation::{SidecarResignError, resign_chain_root_sidecars};
+pub use schema::{EventKind, KeyPurpose, PolicyDecision, ValueActionKind, ValueLegRecord};
 pub use signer_set::{
     BaselineReason, DOMAIN_SA_SIGNER_SET_V1, ObservedSignerSet, SignerPubkey,
     SignerSetStatePayload, compute_signer_set_digest, format_digest_first8_last8,

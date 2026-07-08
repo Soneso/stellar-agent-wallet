@@ -45,7 +45,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::schema::{ContractKind, EventKind, PolicyDecision, VerifierAdvisoryKind};
+use super::schema::{
+    ContractKind, EventKind, KeyPurpose, PolicyDecision, ValueLegRecord, VerifierAdvisoryKind,
+};
 use crate::error::ValidationError;
 use crate::observability::RedactedStrkey;
 use crate::redact_first5_last5;
@@ -1844,6 +1846,181 @@ impl AuditEntry {
                 rule_signer_pubkey_first8: rule_signer_pubkey_first8.into(),
                 verifier_address: verifier_address.into(),
                 transaction_hash_redacted: transaction_hash_redacted.into(),
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
+    /// Constructs a `ValueActionSubmitted` audit entry.
+    ///
+    /// Emitted after a value-moving verb's on-chain submit confirms. `legs`
+    /// MUST be built from the SAME `ValueEffects` the policy gate sized — the
+    /// single-derivation invariant. `transaction_hash_redacted` MUST be
+    /// pre-redacted to first-8-last-8 at the call site; `legs` destinations are
+    /// redacted by [`ValueLegRecord`] construction. `policy_decision` carries
+    /// the gate's actual decision (`Allow` on this path).
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "flat audit-field constructor, mirrors new_sa_external_execute_submitted"
+    )]
+    pub fn new_value_action_submitted(
+        tool: impl Into<String>,
+        chain_id: impl IntoOptionalChainId,
+        legs: Vec<ValueLegRecord>,
+        transaction_hash_redacted: impl Into<String>,
+        ledger: u32,
+        policy_decision: PolicyDecision,
+        envelope_hash: Option<String>,
+        nonce_id: Option<String>,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.into(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash,
+            nonce_id,
+            policy_decision,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::ValueActionSubmitted {
+                legs,
+                opaque_reason: None,
+                transaction_hash_redacted: transaction_hash_redacted.into(),
+                ledger,
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
+    /// Constructs an opaque `ValueActionSubmitted` audit entry.
+    ///
+    /// Emitted after a raw sign-and-submit that the policy could not size (an
+    /// opaque-sign surface such as `stellar_sep43_sign_and_submit_transaction`).
+    /// `legs` is empty and `opaque_reason` carries the policy opaque-reason's
+    /// stable string form — legs are never fabricated for an envelope the policy
+    /// could not size. The outer entry's `envelope_hash` identifies what was
+    /// submitted. `transaction_hash_redacted` MUST be pre-redacted to
+    /// first-8-last-8 at the call site.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "flat audit-field constructor, mirrors new_value_action_submitted"
+    )]
+    pub fn new_opaque_action_submitted(
+        tool: impl Into<String>,
+        chain_id: impl IntoOptionalChainId,
+        opaque_reason: impl Into<String>,
+        transaction_hash_redacted: impl Into<String>,
+        ledger: u32,
+        policy_decision: PolicyDecision,
+        envelope_hash: Option<String>,
+        nonce_id: Option<String>,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.into(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash,
+            nonce_id,
+            policy_decision,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::ValueActionSubmitted {
+                legs: vec![],
+                opaque_reason: Some(opaque_reason.into()),
+                transaction_hash_redacted: transaction_hash_redacted.into(),
+                ledger,
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
+    /// Constructs an `X402PaymentAuthorized` audit entry.
+    ///
+    /// Emitted at the point an x402 payment authorization signature is
+    /// produced. `legs` MUST be the SAME descriptor the policy gate sized.
+    /// `network` and `scheme` are non-secret settle identifiers; no signature,
+    /// token, or secret is recorded. `policy_decision` carries the gate's
+    /// actual decision (`Allow` on this path).
+    #[must_use]
+    pub fn new_x402_payment_authorized(
+        tool: impl Into<String>,
+        chain_id: impl IntoOptionalChainId,
+        legs: Vec<ValueLegRecord>,
+        network: impl Into<String>,
+        scheme: impl Into<String>,
+        policy_decision: PolicyDecision,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.into(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision,
+            decision_reason: None,
+            request_id: request_id.into(),
+            // network and scheme originate in the facilitator-supplied 402
+            // challenge; bound so a hostile counterparty cannot inflate
+            // hash-chained rows.
+            event_kind: EventKind::X402PaymentAuthorized {
+                legs,
+                network: super::schema::bound_recorded_str(&network.into()),
+                scheme: super::schema::bound_recorded_str(&scheme.into()),
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
+    /// Constructs a `KeyringKeyWritten` audit entry.
+    ///
+    /// Emitted after a key-writing profile command successfully writes
+    /// long-lived key material to the platform keyring. Records only WHICH key
+    /// slot was written (`key_purpose`), its keyring coordinates, and — for the
+    /// two enroll commands — the redacted public address; NEVER any key value.
+    /// Key writes are not policy-gated, so `policy_decision` is `Allow` (the
+    /// operation was permitted and executed), matching the crate's
+    /// administrative-row convention. `chain_id` is absent — key writes are
+    /// chain-independent.
+    #[must_use]
+    pub fn new_keyring_key_written(
+        tool: impl Into<String>,
+        key_purpose: KeyPurpose,
+        keyring_service: impl Into<String>,
+        keyring_entry: impl Into<String>,
+        public_address: Option<RedactedStrkey>,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.into(),
+            chain_id: None,
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::KeyringKeyWritten {
+                key_purpose,
+                keyring_service: keyring_service.into(),
+                keyring_entry: keyring_entry.into(),
+                public_address,
             },
             previous_entry_hash: String::new(),
         }
@@ -6059,5 +6236,28 @@ mod tests {
             Some(""),
             "canonical body must always set previous_entry_hash to empty string"
         );
+    }
+
+    #[test]
+    fn x402_constructor_bounds_facilitator_supplied_network_and_scheme() {
+        use crate::audit_log::schema::RECORDED_STR_MAX;
+        let oversized = "n".repeat(RECORDED_STR_MAX * 8);
+        let entry = AuditEntry::new_x402_payment_authorized(
+            "stellar_x402_create_payment",
+            Some("stellar:testnet"),
+            vec![],
+            oversized.clone(),
+            oversized,
+            crate::audit_log::schema::PolicyDecision::Allow,
+            "req-1",
+        );
+        let EventKind::X402PaymentAuthorized {
+            network, scheme, ..
+        } = &entry.event_kind
+        else {
+            panic!("wrong event kind");
+        };
+        assert_eq!(network.chars().count(), RECORDED_STR_MAX);
+        assert_eq!(scheme.chars().count(), RECORDED_STR_MAX);
     }
 }

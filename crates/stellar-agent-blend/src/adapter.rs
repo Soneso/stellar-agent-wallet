@@ -344,17 +344,40 @@ impl DefiAdapter for BlendLendAdapter {
 
         match submit_result {
             Ok(result) => {
+                let tx_hash_redacted = stellar_agent_network::redact_tx_hash(&result.tx_hash);
                 tracing::info!(
                     verb = self.verb(),
                     request_id = %request_id,
-                    tx_hash_redacted = stellar_agent_network::redact_tx_hash(&result.tx_hash),
+                    tx_hash_redacted = %tx_hash_redacted,
                     "Blend lend: submit succeeded"
                 );
+                // Non-fatal allow-path value-audit row (no-op unless the caller
+                // threaded a writer + gate-derived legs into the context).
+                ctx.emit_value_action_submitted(&tx_hash_redacted, result.ledger, &request_id);
                 Ok(())
             }
-            Err(e) => Err(DefiAdapterError::Network {
-                reason: format!("submit_signed_invoke failed: {e}"),
-            }),
+            Err(e) => {
+                // Caller-side Err-arm discipline: record the failure as a
+                // SaRawInvocation row (non-fatal, no-op unless a writer was
+                // threaded in) so failed value operations are not audit-silent.
+                if let Some(writer) = ctx.audit_writer.as_ref() {
+                    let smart_account_redacted =
+                        stellar_agent_core::observability::redact_strkey_first5_last5(
+                            &lend_args.from_address,
+                        );
+                    stellar_agent_smart_account::submit::emit_sa_raw_invocation_failure(
+                        writer,
+                        &smart_account_redacted,
+                        &e,
+                        ctx.auth_rule_ids.map_or(1, |ids| ids.len() as u32),
+                        ctx.chain_id,
+                        &request_id,
+                    );
+                }
+                Err(DefiAdapterError::Network {
+                    reason: format!("submit_signed_invoke failed: {e}"),
+                })
+            }
         }
     }
 }

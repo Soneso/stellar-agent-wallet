@@ -373,7 +373,7 @@ struct VerifySingleFileContext<'a> {
 /// operators see one error class for "the supplied path is structurally
 /// unusable", rather than conflating it into `audit.io_error`
 /// (which covers permission-denied, ENOSPC, etc.).
-fn collect_file_chain(log_path: &Path) -> Result<Vec<PathBuf>, VerifyError> {
+pub(super) fn collect_file_chain(log_path: &Path) -> Result<Vec<PathBuf>, VerifyError> {
     let dir = log_path.parent().ok_or_else(|| VerifyError::PathContract {
         detail: "audit log path must have a parent directory component \
                  (e.g. /path/to/audit/default.jsonl, not a bare filename)"
@@ -715,6 +715,13 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
                 // Approval lifecycle events. No rotation-handoff tracking
                 // needed; the hash-chain is maintained by the surrounding
                 // hash check.
+            }
+            EventKind::ValueActionSubmitted { .. }
+            | EventKind::X402PaymentAuthorized { .. }
+            | EventKind::KeyringKeyWritten { .. } => {
+                // Value-action and key-write forensic rows. No rotation-handoff
+                // tracking needed; the hash-chain is maintained by the
+                // surrounding hash check.
             }
             EventKind::AuditRotationHandoff { next_file_name } => {
                 if ctx.is_last_file {
@@ -1197,7 +1204,10 @@ mod tests {
     use super::*;
     use crate::audit_log::{
         entry::{AuditEntry, IntoOptionalChainId, NewToolInvocation},
-        schema::{ContractKind, PolicyDecision, VerifierAdvisoryKind},
+        schema::{
+            ContractKind, KeyPurpose, PolicyDecision, ValueActionKind, ValueLegRecord,
+            VerifierAdvisoryKind,
+        },
         writer::{AuditWriter, ROTATION_THRESHOLD_BYTES},
     };
     use crate::observability::RedactedStrkey;
@@ -1262,6 +1272,9 @@ mod tests {
             EventKind::ApprovalRejected { .. } => "approval_rejected",
             EventKind::ApprovalAttestedRemote { .. } => "approval_attested_remote",
             EventKind::ApprovalRejectedRemote { .. } => "approval_rejected_remote",
+            EventKind::ValueActionSubmitted { .. } => "value_action_submitted",
+            EventKind::X402PaymentAuthorized { .. } => "x402_payment_authorized",
+            EventKind::KeyringKeyWritten { .. } => "keyring_key_written",
         }
     }
 
@@ -1620,6 +1633,35 @@ mod tests {
                 nonce_prefix: "DDDDDDDD".to_owned(),
                 operator_credential_id_redacted: "cafebabe".to_owned(),
             },
+            EventKind::ValueActionSubmitted {
+                legs: vec![ValueLegRecord {
+                    action: ValueActionKind::Payment,
+                    amount: Some(1_000_000),
+                    asset: Some("native".to_owned()),
+                    destination_redacted: Some("GAAAA...ZZZZZ".to_owned()),
+                }],
+                opaque_reason: None,
+                transaction_hash_redacted: "abcd1234...5678efgh".to_owned(),
+                ledger: 42,
+            },
+            EventKind::X402PaymentAuthorized {
+                legs: vec![ValueLegRecord {
+                    action: ValueActionKind::X402Payment,
+                    amount: Some(2_500_000),
+                    asset: Some(
+                        "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA".to_owned(),
+                    ),
+                    destination_redacted: Some("GBPXX...WIVL".to_owned()),
+                }],
+                network: "stellar:testnet".to_owned(),
+                scheme: "exact".to_owned(),
+            },
+            EventKind::KeyringKeyWritten {
+                key_purpose: KeyPurpose::AuditHashChainHmac,
+                keyring_service: "stellar-agent-audit".to_owned(),
+                keyring_entry: "default".to_owned(),
+                public_address: None,
+            },
         ]
     }
 
@@ -1854,6 +1896,9 @@ mod tests {
                 "approval_rejected",
                 "approval_attested_remote",
                 "approval_rejected_remote",
+                "value_action_submitted",
+                "x402_payment_authorized",
+                "keyring_key_written",
             ]
         );
     }

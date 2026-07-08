@@ -429,7 +429,7 @@ async fn blend_supply_submit_and_confirm() {
     let primary_rpc = testnet_rpc();
 
     // Build DefiAdapterCtx with full submit context.
-    let ctx = DefiAdapterCtx::new_with_submit_ctx(
+    let mut ctx = DefiAdapterCtx::new_with_submit_ctx(
         "default",
         &pin,
         &primary_rpc,
@@ -452,6 +452,30 @@ async fn blend_supply_submit_and_confirm() {
         override_oracle_staleness: false,
     };
 
+    // Wire audit emission exactly as the MCP `stellar_blend_lend` handler does,
+    // so the confirmed submit records its value_action_submitted row.  The legs
+    // are built from the SAME requests placed into `lend_args` (single-derivation
+    // invariant).  The writer uses a fixed test key; a real deployment supplies
+    // the profile's audit chain-root key.
+    let audit_dir = std::env::temp_dir().join(format!("blend-audit-{}", now_secs()));
+    std::fs::create_dir_all(&audit_dir).expect("create audit dir");
+    let audit_log_path = audit_dir.join("audit.jsonl");
+    let audit_writer = std::sync::Arc::new(std::sync::Mutex::new(
+        stellar_agent_core::audit_log::AuditWriter::open(
+            audit_log_path.clone(),
+            Some(Zeroizing::new([0x11u8; 32])),
+        )
+        .expect("open audit writer"),
+    ));
+    let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> =
+        stellar_agent_blend::value::blend_value_legs(&lend_args.requests, &lend_args.pool_address)
+            .iter()
+            .map(Into::into)
+            .collect();
+    ctx.audit_writer = Some(std::sync::Arc::clone(&audit_writer));
+    ctx.audit_legs = Some(&audit_legs);
+    ctx.audit_tool = Some("stellar_blend_lend");
+
     // Execute the supply.
     // NOTE: `witness` is consumed (moved) by `submit`; cannot retry.
     // submit includes its own internal retry for transient RPC issues.
@@ -468,6 +492,22 @@ async fn blend_supply_submit_and_confirm() {
                 redact_strkey(&wallet_c),
                 redact_strkey(&supply_asset),
                 SUPPLY_AMOUNT,
+            );
+
+            // #21 — the confirmed on-chain supply must have recorded a
+            // value_action_submitted row for stellar_blend_lend.
+            let audit_rows: Vec<serde_json::Value> = std::io::BufRead::lines(
+                std::io::BufReader::new(
+                    std::fs::File::open(&audit_log_path).expect("audit log after submit"),
+                ),
+            )
+            .map(|line| serde_json::from_str(&line.expect("audit line")).expect("audit JSON row"))
+            .collect();
+            assert!(
+                audit_rows.iter().any(|row| {
+                    row["kind"] == "value_action_submitted" && row["tool"] == "stellar_blend_lend"
+                }),
+                "confirmed Blend supply must record a value_action_submitted row: {audit_rows:?}"
             );
         }
         Err(e) => {

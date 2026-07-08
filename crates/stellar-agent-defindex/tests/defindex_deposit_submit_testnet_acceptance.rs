@@ -442,7 +442,7 @@ async fn defindex_deposit_submit_and_confirm() {
     );
 
     let primary_rpc_for_deposit = testnet_rpc();
-    let deposit_ctx = DefiAdapterCtx::new_with_submit_ctx(
+    let mut deposit_ctx = DefiAdapterCtx::new_with_submit_ctx(
         "default",
         &vault_pin,
         &primary_rpc_for_deposit,
@@ -462,6 +462,33 @@ async fn defindex_deposit_submit_and_confirm() {
         override_upgradable: true,
     };
 
+    // Wire audit emission exactly as the MCP `stellar_defindex_vault_deposit`
+    // handler does, so the confirmed deposit records its value_action_submitted
+    // row.  Legs are built from the SAME amounts/asset/vault the deposit uses
+    // (single-derivation invariant); the writer uses a fixed test key.
+    let audit_dir = std::env::temp_dir().join(format!("defindex-deposit-audit-{}", now_secs()));
+    std::fs::create_dir_all(&audit_dir).expect("create audit dir");
+    let audit_log_path = audit_dir.join("audit.jsonl");
+    let audit_writer = std::sync::Arc::new(std::sync::Mutex::new(
+        stellar_agent_core::audit_log::AuditWriter::open(
+            audit_log_path.clone(),
+            Some(Zeroizing::new([0x11u8; 32])),
+        )
+        .expect("open audit writer"),
+    ));
+    let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> =
+        stellar_agent_defindex::value::vault_deposit_value_legs(
+            &deposit_args.amounts_desired,
+            &[XLM_SAC_TESTNET.to_owned()],
+            &deposit_args.vault_address,
+        )
+        .iter()
+        .map(Into::into)
+        .collect();
+    deposit_ctx.audit_writer = Some(std::sync::Arc::clone(&audit_writer));
+    deposit_ctx.audit_legs = Some(&audit_legs);
+    deposit_ctx.audit_tool = Some("stellar_defindex_vault_deposit");
+
     let defindex_adapter = DefindexVaultAdapter::new();
     let deposit_result = defindex_adapter
         .submit(&deposit_args, &deposit_ctx, deposit_witness)
@@ -476,6 +503,23 @@ async fn defindex_deposit_submit_and_confirm() {
                  The auth-entry sub-invocation fix is confirmed correct.",
                 redact_strkey(&wallet_c),
                 redact_strkey(DEFINDEX_TESTNET_VAULT),
+            );
+
+            // #21 — the confirmed on-chain deposit must have recorded a
+            // value_action_submitted row for stellar_defindex_vault_deposit.
+            let audit_rows: Vec<serde_json::Value> = std::io::BufRead::lines(
+                std::io::BufReader::new(
+                    std::fs::File::open(&audit_log_path).expect("audit log after submit"),
+                ),
+            )
+            .map(|line| serde_json::from_str(&line.expect("audit line")).expect("audit JSON row"))
+            .collect();
+            assert!(
+                audit_rows.iter().any(|row| {
+                    row["kind"] == "value_action_submitted"
+                        && row["tool"] == "stellar_defindex_vault_deposit"
+                }),
+                "confirmed DeFindex deposit must record a value_action_submitted row: {audit_rows:?}"
             );
         }
         Err(e) => {
@@ -777,7 +821,7 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
     };
 
     let primary_rpc_for_withdraw = testnet_rpc();
-    let withdraw_ctx = DefiAdapterCtx::new_with_submit_ctx(
+    let mut withdraw_ctx = DefiAdapterCtx::new_with_submit_ctx(
         "default",
         &vault_pin,
         &primary_rpc_for_withdraw,
@@ -796,6 +840,30 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
         override_upgradable: true,
     };
 
+    // Wire audit emission exactly as the MCP `stellar_defindex_vault_withdraw`
+    // handler does, so the confirmed withdraw records its value_action_submitted
+    // row.  The leg is built from the SAME shares/vault the withdraw uses.
+    let withdraw_audit_dir =
+        std::env::temp_dir().join(format!("defindex-withdraw-audit-{}", now_secs()));
+    std::fs::create_dir_all(&withdraw_audit_dir).expect("create audit dir");
+    let withdraw_audit_log_path = withdraw_audit_dir.join("audit.jsonl");
+    let withdraw_audit_writer = std::sync::Arc::new(std::sync::Mutex::new(
+        stellar_agent_core::audit_log::AuditWriter::open(
+            withdraw_audit_log_path.clone(),
+            Some(Zeroizing::new([0x11u8; 32])),
+        )
+        .expect("open audit writer"),
+    ));
+    let withdraw_audit_legs = vec![stellar_agent_core::audit_log::ValueLegRecord::from(
+        &stellar_agent_defindex::value::vault_withdraw_value_leg(
+            withdraw_args.withdraw_shares,
+            &withdraw_args.vault_address,
+        ),
+    )];
+    withdraw_ctx.audit_writer = Some(std::sync::Arc::clone(&withdraw_audit_writer));
+    withdraw_ctx.audit_legs = Some(&withdraw_audit_legs);
+    withdraw_ctx.audit_tool = Some("stellar_defindex_vault_withdraw");
+
     let withdraw_result = defindex_adapter
         .submit(&withdraw_args, &withdraw_ctx, withdraw_witness)
         .await;
@@ -811,6 +879,23 @@ async fn defindex_deposit_then_withdraw_submit_and_confirm() {
                 redact_strkey(&wallet_c),
                 redact_strkey(DEFINDEX_TESTNET_VAULT),
                 share_balance,
+            );
+
+            // #21 — the confirmed on-chain withdraw must have recorded a
+            // value_action_submitted row for stellar_defindex_vault_withdraw.
+            let audit_rows: Vec<serde_json::Value> = std::io::BufRead::lines(
+                std::io::BufReader::new(
+                    std::fs::File::open(&withdraw_audit_log_path).expect("audit log after submit"),
+                ),
+            )
+            .map(|line| serde_json::from_str(&line.expect("audit line")).expect("audit JSON row"))
+            .collect();
+            assert!(
+                audit_rows.iter().any(|row| {
+                    row["kind"] == "value_action_submitted"
+                        && row["tool"] == "stellar_defindex_vault_withdraw"
+                }),
+                "confirmed DeFindex withdraw must record a value_action_submitted row: {audit_rows:?}"
             );
         }
         Err(e) => {

@@ -53,15 +53,20 @@ use keyring_core::Entry as KeyringEntry;
 use serde::Serialize;
 use zeroize::Zeroizing;
 
+use stellar_agent_core::audit_log::KeyPurpose;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{AuthError, InternalError, ValidationError, WalletError};
+use stellar_agent_core::observability::RedactedStrkey;
 use stellar_agent_core::profile::loader;
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_network::Signer as _;
 use stellar_agent_network::keyring::{init_platform_keyring_store, signer_from_keyring};
+use uuid::Uuid;
 
 use crate::common::render;
 use crate::common::signer_ceremony::resolve_software_signer_from_env;
+
+use super::audit_emit::emit_keyring_key_written;
 
 /// Arguments for `stellar-agent profile enroll-signer`.
 #[derive(Debug, Args)]
@@ -320,6 +325,17 @@ where
         return 1;
     }
     drop(s_strkey);
+
+    let request_id = Uuid::new_v4().to_string();
+    emit_keyring_key_written(
+        &profile,
+        &args.profile,
+        "profile_enroll_signer",
+        KeyPurpose::McpSignerSeed,
+        entry_ref,
+        Some(RedactedStrkey::from_full(&derived_g)),
+        &request_id,
+    );
 
     // Info-level log omits the address and coordinate to avoid leaking operator
     // topology; the JSON envelope carries the full detail.

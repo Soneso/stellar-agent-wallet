@@ -4598,7 +4598,7 @@ fn emit_metadata_update_audit(
 
 /// Maps an [`SaError`] outcome to the corresponding
 /// [`stellar_agent_core::audit_log::schema::SaInvocationResult`] variant.
-fn sa_error_to_invocation_result(
+pub(crate) fn sa_error_to_invocation_result(
     err: &SaError,
 ) -> stellar_agent_core::audit_log::schema::SaInvocationResult {
     use stellar_agent_core::audit_log::schema::SaInvocationResult;

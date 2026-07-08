@@ -167,6 +167,16 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>, attestation_key: 
         .expect("attestation keyring entry")
         .set_password(&attest_key_b64)
         .expect("set attestation key");
+
+    // Audit-log chain-root HMAC key, so the commit's post-submit
+    // `value_action_submitted` row is signed and lands (the loader reads this
+    // coordinate; without it the emission is a non-fatal no-op).
+    let audit_ref = &profile.audit_log_hash_chain_key_id;
+    let audit_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x33u8; 32]);
+    keyring_core::Entry::new(&audit_ref.service, &audit_ref.account)
+        .expect("audit keyring entry")
+        .set_password(&audit_key_b64)
+        .expect("set audit key");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -193,6 +203,8 @@ async fn pay_with_approval_commits_and_submits_on_testnet() {
             .with_noop_engine()
             .build();
     profile.rpc_url = TESTNET_RPC_URL.to_owned();
+    // Redirect the audit log to the test temp dir so the row can be read back.
+    profile.audit_log_path = approval_dir.path().join("audit.jsonl");
     seed_keyring(&profile, &seed, &attestation_key);
 
     let mut server = WalletServer::new(profile).expect("WalletServer::new");
@@ -297,5 +309,21 @@ async fn pay_with_approval_commits_and_submits_on_testnet() {
     assert!(
         commit_json["data"]["ledger"].as_u64().unwrap_or(0) > 0,
         "commit must report the ledger it was included in: {commit_json}"
+    );
+
+    // #21 — the confirmed commit must have recorded a `value_action_submitted`
+    // row for `stellar_pay_commit`, signed under the profile's audit chain-root
+    // key (verifiable by `audit verify`).
+    let audit_path = approval_dir.path().join("audit.jsonl");
+    let audit_rows: Vec<serde_json::Value> = std::io::BufRead::lines(std::io::BufReader::new(
+        std::fs::File::open(&audit_path).expect("audit log exists after commit"),
+    ))
+    .map(|line| serde_json::from_str(&line.expect("audit line")).expect("audit JSON row"))
+    .collect();
+    assert!(
+        audit_rows.iter().any(|row| {
+            row["kind"] == "value_action_submitted" && row["tool"] == "stellar_pay_commit"
+        }),
+        "commit must record a value_action_submitted row: {audit_rows:?}"
     );
 }

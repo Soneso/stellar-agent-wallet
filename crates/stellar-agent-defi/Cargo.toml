@@ -32,6 +32,7 @@ stellar-agent-test-support = { path = "../stellar-agent-test-support", features 
 tokio                      = { workspace = true, features = ["rt-multi-thread", "macros"] }
 wiremock                   = { workspace = true }
 serde_json                 = { workspace = true }
+tempfile                   = { workspace = true }
 
 [lints]
 workspace = true

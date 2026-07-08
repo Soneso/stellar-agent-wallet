@@ -24,6 +24,7 @@
 //! enum.  The top-level [`crate::main`] function routes `Commands::Profile(args)`
 //! to [`run`], which delegates to the appropriate subcommand handler.
 
+pub mod audit_emit;
 pub mod enroll_owner_key;
 pub mod enroll_signer;
 pub mod key_ops;

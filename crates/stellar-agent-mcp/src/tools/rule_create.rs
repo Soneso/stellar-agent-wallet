@@ -1169,7 +1169,7 @@ impl WalletServer {
                     Err(e) => return e.into_result(),
                 };
                 match gate_outcome {
-                    DispatchOutcome::Allow => {
+                    DispatchOutcome::Allow(_) => {
                         tracing::debug!(
                             tool = "stellar_rule_create_commit",
                             "toolset_gated: overriding DispatchOutcome::Allow → forced RequireApproval"

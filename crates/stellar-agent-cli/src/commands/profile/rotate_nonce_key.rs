@@ -23,12 +23,16 @@
 
 use clap::Args;
 use serde::Serialize;
+use stellar_agent_core::audit_log::KeyPurpose;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
 use stellar_agent_core::profile::loader;
 use stellar_agent_network::keyring::init_platform_keyring_store;
+use uuid::Uuid;
 
 use crate::common::render;
+
+use super::audit_emit::emit_keyring_key_written;
 
 /// Arguments for `stellar-agent profile rotate-nonce-key`.
 #[derive(Debug, Args)]
@@ -87,6 +91,16 @@ pub async fn run(args: &RotateNonceKeyArgs) -> i32 {
     // Rotate the nonce key.
     match stellar_agent_nonce::rotate_nonce_key(&profile) {
         Ok(()) => {
+            let request_id = Uuid::new_v4().to_string();
+            emit_keyring_key_written(
+                &profile,
+                &args.name,
+                "profile_rotate_nonce_key",
+                KeyPurpose::NonceHmac,
+                &profile.mcp_nonce_key_alias,
+                None,
+                &request_id,
+            );
             render::render_json(&Envelope::ok(RotateNonceKeyData {
                 profile: args.name.clone(),
                 rotated: true,

@@ -86,7 +86,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use keyring_core::Entry as KeyringEntry;
 use rand_core::{OsRng, RngCore};
 use stellar_agent_core::{
-    error::{AuthError, WalletError},
+    error::{AuthError, InternalError, WalletError},
     observability::redact_strkey_first5_last5,
     profile::schema::KeyringEntryRef,
 };
@@ -214,6 +214,62 @@ pub fn rotate_keyring_secret_32(service: &str, entry_name: &str) -> Result<(), W
         .map_err(|e| map_keyring_error(&e, service))?;
 
     Ok(())
+}
+
+/// Loads a 32-byte HMAC-like secret from the keyring entry `entry_ref`,
+/// base64-URL-safe-no-pad decoding it and validating the 32-byte length.
+///
+/// The READ counterpart of [`rotate_keyring_secret_32`]: chain-root HMAC keys
+/// (audit log, nonce, attestation, counterparty cache) are stored as
+/// `URL_SAFE_NO_PAD`-encoded 32-byte secrets. The decoded key is returned inside
+/// a [`Zeroizing`] wrapper so it is wiped on drop; the residency discipline is
+/// the caller's from there. This is the single source for chain-root HMAC key
+/// loading — the MCP tools and CLI commands adapt it with a profile-field
+/// lookup rather than re-implementing the keyring read.
+///
+/// Do NOT use this for ed25519 owner seeds: those are stored as S-strkeys and
+/// loaded through [`signer_from_keyring`], which applies the full parse-verify
+/// zeroise sequence and host-swap defence.
+///
+/// # Errors
+///
+/// - [`WalletError::Auth`] wrapping [`AuthError::KeyringNotFound`] if the entry
+///   is unavailable, following the same secret-safe keyring error discipline as
+///   [`signer_from_keyring`] (the service name is the only coordinate echoed).
+/// - [`WalletError::Internal`] if the stored value is not valid base64 or does
+///   not decode to exactly 32 bytes.
+///
+/// # Panics
+///
+/// Never panics.
+pub fn load_hmac_key_32(entry_ref: &KeyringEntryRef) -> Result<Zeroizing<[u8; 32]>, WalletError> {
+    let entry = open_entry(entry_ref)?;
+    let secret_b64 = Zeroizing::new(
+        entry
+            .get_password()
+            .map_err(|e| map_keyring_error(&e, &entry_ref.service))?,
+    );
+
+    let decoded = Zeroizing::new(URL_SAFE_NO_PAD.decode(secret_b64.as_bytes()).map_err(|e| {
+        // Upstream Display strings are not forwarded to typed errors; debug only.
+        tracing::debug!(error = %e, "chain-root HMAC key base64 decode failed");
+        WalletError::Internal(InternalError::UnexpectedState {
+            detail: "audit.key_decode_failed: keyring HMAC key is not valid base64".to_owned(),
+        })
+    })?);
+
+    if decoded.len() != 32 {
+        return Err(WalletError::Internal(InternalError::UnexpectedState {
+            detail: format!(
+                "audit.key_length_error: keyring HMAC key must be 32 bytes, got {}",
+                decoded.len()
+            ),
+        }));
+    }
+
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(decoded.as_slice());
+    Ok(key)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -901,6 +957,40 @@ mod tests {
         assert_eq!(decoded.len(), 32);
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn load_hmac_key_32_round_trips_rotate_keyring_secret_32() {
+        keyring_mock::install().expect("mock store");
+        let service = "stellar-agent-network-load-hmac-test";
+        let entry_name = "default";
+
+        rotate_keyring_secret_32(service, entry_name).expect("rotation ok");
+
+        let entry_ref = KeyringEntryRef::new(service, entry_name);
+        let loaded = load_hmac_key_32(&entry_ref).expect("load ok");
+        assert_eq!(loaded.len(), 32, "loaded key must be exactly 32 bytes");
+        // Loading the same entry twice yields the identical key. Compared with a
+        // bare `assert!` (not `assert_eq!`) so a failure never prints the key.
+        let reloaded = load_hmac_key_32(&entry_ref).expect("reload ok");
+        assert!(*loaded == *reloaded, "same entry must load the same key");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_hmac_key_32_rejects_non_32_byte_secret() {
+        keyring_mock::install().expect("mock store");
+        let entry_ref = KeyringEntryRef::new("stellar-agent-network-load-hmac-bad-len", "default");
+        // A base64 secret that decodes to 16 bytes must be rejected as an
+        // internal invariant violation, not silently truncated or padded.
+        let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).unwrap();
+        entry
+            .set_password(&URL_SAFE_NO_PAD.encode([0u8; 16]))
+            .unwrap();
+
+        let err = load_hmac_key_32(&entry_ref).unwrap_err();
+        assert_eq!(err.category(), ErrorCategory::Internal);
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn signer_from_keyring_emits_handle_construction_event() {
@@ -1084,7 +1174,13 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn open_entry_without_store_returns_keyring_not_found() {
+        // `#[serial]` alongside the store-installing tests: this test unsets the
+        // process-global keyring store and then asserts a lookup fails, so a
+        // sibling test re-installing the default store between those two steps
+        // would race it. Serialising against the store mutators removes the race
+        // without weakening the assertion.
         // Explicitly unset the store so the test is not order-dependent.
         keyring_core::unset_default_store();
 

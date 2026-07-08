@@ -557,8 +557,10 @@ fn build_friendbot_result(new_account: &NewAccount, fb: &FriendbotResult) -> Cre
 /// using the same engine path (and `stellar_create_account` value descriptor
 /// contract) the `stellar_create_account` MCP tool's dispatch gate uses.
 ///
-/// Returns `None` when the operation is allowed (the caller proceeds to
-/// signing); returns `Some(exit_code)` — with the refusal envelope already
+/// Returns `Ok(value_effects)` when the operation is allowed (the caller
+/// proceeds to signing) — the gate-sized effects the caller records on
+/// confirmed submit (`Some` for the value-moving allow, `None` for the no-op
+/// engine); returns `Err(exit_code)` — with the refusal envelope already
 /// rendered — when the operation must be refused.
 ///
 /// `profile` is the already-resolved profile from `run_sponsored`'s
@@ -572,7 +574,7 @@ fn evaluate_create_policy(
     starting_balance_stroops: i64,
     new_account_g_strkey: &str,
     chain_id: &str,
-) -> Option<i32> {
+) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, i32> {
     let policy_engine =
         match build_v1_policy_engine("accounts create", &profile.policy.engine, profile) {
             Ok(pe) => pe,
@@ -581,7 +583,7 @@ fn evaluate_create_policy(
                     &Envelope::<()>::err_raw("policy.engine_unavailable", msg),
                     args.output,
                 );
-                return Some(1);
+                return Err(1);
             }
         };
     // `derive_value_class` forces the asset to native for `stellar_create_account`
@@ -596,10 +598,10 @@ fn evaluate_create_policy(
         &policy_args,
         "accounts create",
     ) {
-        Ok(()) => None,
+        Ok(effects) => Ok(effects),
         Err(envelope) => {
             print_error(&envelope, args.output);
-            Some(1)
+            Err(1)
         }
     }
 }
@@ -708,21 +710,49 @@ where
     // ── Operator policy evaluation (before signing/submission) ───────────────
     let chain_id = caip2_chain_id_for_network(args.network);
     let starting_balance_stroops = starting_balance.as_stroops();
-    if let Some(code) = evaluate_create_policy(
+    let create_effects = match evaluate_create_policy(
         args,
         &profile,
         starting_balance_stroops,
         &new_account.g_strkey,
         chain_id,
     ) {
-        return code;
-    }
+        Ok(effects) => effects,
+        Err(code) => return code,
+    };
 
     // Sign and submit.
     match sponsored_create(args, &sponsor, &new_account.g_strkey, starting_balance).await {
         Ok(sponsored_result) => {
             let secret_key = new_account.secret.as_ref().map(|s| s.as_str().to_owned());
             let sub_result = sponsored_result.submission;
+
+            // Non-fatal allow-path audit row carrying the SAME legs the gate
+            // sized (single-derivation invariant), recorded on confirmed submit.
+            // Sponsored mode only: the Friendbot path is not policy-gated.
+            let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> = create_effects
+                .as_ref()
+                .map(|e| e.legs().iter().map(Into::into).collect())
+                .unwrap_or_default();
+            let audit_request_id = uuid::Uuid::new_v4().to_string();
+            let audit_tx_redacted =
+                stellar_agent_network::submit::redact_tx_hash(&sub_result.tx_hash);
+            let audit_entry = stellar_agent_core::audit_log::AuditEntry::new_value_action_submitted(
+                "stellar_create_account",
+                chain_id,
+                audit_legs,
+                audit_tx_redacted.as_str(),
+                sub_result.ledger,
+                stellar_agent_core::audit_log::PolicyDecision::Allow,
+                None,
+                None,
+                &audit_request_id,
+            );
+            crate::commands::value_audit::emit_value_audit_row(
+                &profile,
+                &args.profile,
+                audit_entry,
+            );
 
             let result = CreateAccountResult {
                 account_id: new_account.g_strkey.clone(),

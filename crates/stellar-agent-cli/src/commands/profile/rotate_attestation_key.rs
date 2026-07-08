@@ -37,13 +37,16 @@
 
 use clap::Args;
 use serde::Serialize;
+use stellar_agent_core::audit_log::KeyPurpose;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{ValidationError, WalletError};
 use stellar_agent_core::profile::loader;
 use stellar_agent_network::keyring::init_platform_keyring_store;
+use uuid::Uuid;
 
 use crate::common::render;
 
+use super::audit_emit::emit_keyring_key_written;
 use super::key_ops::rotate_hmac_like_key;
 
 /// Arguments for `stellar-agent profile rotate-attestation-key`.
@@ -107,6 +110,16 @@ pub async fn run(args: &RotateAttestationKeyArgs) -> i32 {
     let entry_ref = &profile.attestation_key_id;
     match rotate_hmac_like_key(entry_ref, "rotate_attestation_key") {
         Ok(()) => {
+            let request_id = Uuid::new_v4().to_string();
+            emit_keyring_key_written(
+                &profile,
+                &args.name,
+                "profile_rotate_attestation_key",
+                KeyPurpose::AttestationHmac,
+                entry_ref,
+                None,
+                &request_id,
+            );
             // Info-level log omits the keyring service name to avoid leaking it.
             tracing::info!("attestation key rotated; pending approvals are now invalid");
             render::render_json(&Envelope::ok(RotateAttestationKeyData {

@@ -92,6 +92,35 @@ A missing primary log surfaces `audit.log_not_found` and is classified validatio
 
 The non-regular-file check rejects directories and symlinks before open, closing a symlink-redirect surface. A detected mid-rotation crash state (`PartialRotation`) is surfaced as an error and requires operator intervention; it is never auto-recovered, because silent recovery could mask a tamper attempt that manufactured the same directory state.
 
+### Value-action emission sites
+
+Every verb that moves value writes a `value_action_submitted` row after — and only after — the on-chain action confirms, carrying the SAME value legs the policy gate sized (single-derivation invariant: the legs are the `ValueEffects` the gate evaluated, never re-derived at the emission site). The redacted transaction hash (first-8-last-8) and confirmed ledger are recorded; the row never carries key material. Emission is non-fatal: a row-write failure after a confirmed submit logs a warning and never changes the result. A DeFi adapter that instead FAILS at submit records a `sa_raw_invocation` row (with the mapped `SaInvocationResult`) in its error arm.
+
+| Surface | Verb / tool | Row |
+| --- | --- | --- |
+| MCP | `stellar_pay_commit`, `stellar_create_account_commit`, `stellar_claim_commit`, `stellar_trustline_commit` | `value_action_submitted` (sized legs) |
+| MCP | `stellar_blend_lend`, `stellar_dex_trade`, `stellar_defindex_vault_deposit`, `stellar_defindex_vault_withdraw` | `value_action_submitted` on success; `sa_raw_invocation` on submit failure |
+| MCP | `stellar_x402_create_payment`, `stellar_x402_authenticated_payment` | `value_action_submitted` (authorization legs) |
+| MCP | `stellar_sep43_sign_and_submit_transaction` | `value_action_submitted` (opaque: empty legs + `opaque_reason`) |
+| CLI | `pay`, `claim`, `accounts create` (sponsored mode only), `trustline`, `trade` | `value_action_submitted` (sized legs) |
+
+The value descriptor reaches the emission site through the policy engine's `evaluate_full` / `evaluate_with_value_full`, which surface the sized `ValueEffects` on the allow path; the decision-only `evaluate` / `evaluate_with_value` views discard it and must never gate a value-moving dispatch (see the rustdoc on those methods). Rows are written under the profile's `audit_log_hash_chain_key_id`, loaded through the single `stellar_agent_network::keyring::load_hmac_key_32` source, so `audit verify` covers them.
+
+### Key-write emission sites
+
+Each profile command that writes long-lived key material to the keyring records a `keyring_key_written` row after the write succeeds, naming the key slot (`key_purpose`) and the keyring coordinates. The two enroll commands additionally record a redacted (first-5-last-5) public address; HMAC-key rotations record none. The row NEVER carries a key value, seed, base64 material, or any derived secret.
+
+| Command | `key_purpose` | Public address |
+| --- | --- | --- |
+| `profile enroll-signer` | `mcp_signer_seed` | redacted derived address |
+| `profile enroll-owner-key` | `owner_public_key` | redacted owner address |
+| `profile rotate-nonce-key` | `nonce_hmac` | none |
+| `profile rotate-attestation-key` | `attestation_hmac` | none |
+| `profile rotate-counterparty-key` | `counterparty_cache_hmac` | none |
+| `profile rotate-audit-key` | `audit_hash_chain_hmac` | none |
+
+`rotate-audit-key` is ordered persist-before-resign: it (1) writes the new key, (2) re-signs every per-file chain-root sidecar with the new key so `audit verify` stays green across the rotation, then (3) emits the `keyring_key_written` row under the new key. Emitting the row before the re-sign would append a row the freshly rotated key cannot verify.
+
 ## Wallet unlock lifecycle
 
 The unlock window holds a 32-byte signing seed in pinned, zeroize-on-drop memory for a bounded TTL. It is entered by the CLI secret-env signing path; the MCP server signs through keyring signer handles and never enters it. The lifecycle manager is `Wallet` in `crates/stellar-agent-core/src/wallet/lifecycle.rs`; the locked seed holder is `LockedSeed` in `wallet/mlock.rs`.

@@ -231,6 +231,11 @@ where
         }
     };
     let value_leg = dex_trade_value_leg(args.amount_in, &canonical_path, router_address);
+    // Capture the gate-derived leg as an audit record before the descriptor
+    // moves into the gate (single-derivation invariant).
+    let audit_legs = vec![stellar_agent_core::audit_log::ValueLegRecord::from(
+        &value_leg,
+    )];
     let policy_args = json!({
         "from_address": args.from,
         "amount_in": args.amount_in.to_string(),
@@ -301,7 +306,7 @@ where
     );
 
     let timeout = std::time::Duration::from_secs(60);
-    let ctx = DefiAdapterCtx::new_with_submit_ctx(
+    let mut ctx = DefiAdapterCtx::new_with_submit_ctx(
         "default",
         &router_pin,
         &primary_rpc,
@@ -311,6 +316,12 @@ where
         secondary_rpc.as_ref(),
         Some(timeout),
     );
+    // Thread the audit writer + gate-derived leg so the adapter emits the
+    // ValueActionSubmitted row after a confirmed submit (non-fatal).
+    ctx.audit_writer =
+        crate::commands::value_audit::acquire_value_audit_writer(&profile, &args.profile);
+    ctx.audit_legs = Some(&audit_legs);
+    ctx.audit_tool = Some("stellar_dex_trade");
 
     // ── Delegate to DexSwapAdapter::submit (witness consumed inside) ──────────
     // NO inline HostFunction build or submit_signed_invoke here. All execution

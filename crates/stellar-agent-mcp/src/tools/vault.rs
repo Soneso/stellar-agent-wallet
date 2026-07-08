@@ -427,6 +427,10 @@ impl WalletServer {
             &asset_addresses,
             &args.vault_address,
         );
+        // Capture the gate-derived legs as audit records before the descriptor
+        // moves into the gate (single-derivation invariant).
+        let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> =
+            value_legs.iter().map(Into::into).collect();
         let args_value = json!({
             "chain_id": args.chain_id,
             "vault_address": args.vault_address,
@@ -523,7 +527,7 @@ impl WalletServer {
             "defindex-vault", // abi_source_provenance
         );
 
-        let ctx = DefiAdapterCtx::new_with_submit_ctx(
+        let mut ctx = DefiAdapterCtx::new_with_submit_ctx(
             "default",
             &vault_pin,
             &primary_rpc,
@@ -533,6 +537,15 @@ impl WalletServer {
             secondary_rpc.as_ref(),
             Some(timeout),
         );
+        // Thread the audit writer + gate-derived legs so the adapter emits the
+        // ValueActionSubmitted row after a confirmed submit (non-fatal).
+        let audit_profile_name = self.profile_name_for_approval();
+        ctx.audit_writer = crate::tools::value_audit::acquire_value_audit_writer(
+            &self.profile,
+            &audit_profile_name,
+        );
+        ctx.audit_legs = Some(&audit_legs);
+        ctx.audit_tool = Some("stellar_defindex_vault_deposit");
 
         tracing::info!(
             verb = "vault",
@@ -640,6 +653,11 @@ impl WalletServer {
         // criteria fail closed on this tool pending account-view wiring,
         // acceptable for this step.
         let value_leg = vault_withdraw_value_leg(vault_args.withdraw_shares, &args.vault_address);
+        // Capture the gate-derived leg as an audit record before the descriptor
+        // moves into the gate (single-derivation invariant).
+        let audit_legs = vec![stellar_agent_core::audit_log::ValueLegRecord::from(
+            &value_leg,
+        )];
         let args_value = json!({
             "chain_id": args.chain_id,
             "vault_address": args.vault_address,
@@ -892,7 +910,7 @@ impl WalletServer {
             "defindex-vault", // abi_source_provenance
         );
 
-        let ctx = DefiAdapterCtx::new_with_submit_ctx(
+        let mut ctx = DefiAdapterCtx::new_with_submit_ctx(
             "default",
             &vault_pin,
             &primary_rpc,
@@ -902,6 +920,15 @@ impl WalletServer {
             secondary_rpc.as_ref(),
             Some(timeout),
         );
+        // Thread the audit writer + gate-derived leg so the adapter emits the
+        // ValueActionSubmitted row after a confirmed submit (non-fatal).
+        let audit_profile_name = self.profile_name_for_approval();
+        ctx.audit_writer = crate::tools::value_audit::acquire_value_audit_writer(
+            &self.profile,
+            &audit_profile_name,
+        );
+        ctx.audit_legs = Some(&audit_legs);
+        ctx.audit_tool = Some("stellar_defindex_vault_withdraw");
 
         tracing::info!(
             verb = "vault",

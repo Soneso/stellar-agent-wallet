@@ -190,11 +190,15 @@ impl WalletServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         use std::sync::Arc;
 
+        use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
+        use stellar_agent_core::policy::v1::OpaqueReason;
         use stellar_agent_network::StellarRpcClient;
         use stellar_agent_network::keyring::signer_from_keyring;
         use stellar_agent_network::submit::submit_transaction_and_wait;
         use stellar_agent_sep43::StellarAgentModule;
         use stellar_agent_sep43::module::ModuleAdapter;
+
+        use crate::tools::value_audit::emit_value_audit_row;
 
         // ── Telemetry preamble ────────────────────────────────────────────────
         // Redact account IDs to first-5-last-5; tx XDR length only (no content).
@@ -218,7 +222,7 @@ impl WalletServer {
             Err(e) => return e.into_result(),
         };
         match dispatch_outcome {
-            crate::tools::common::DispatchOutcome::Allow => {}
+            crate::tools::common::DispatchOutcome::Allow(_) => {}
             crate::tools::common::DispatchOutcome::RequireApproval(_) => {
                 return Ok(crate::tools::common::single_shot_require_approval_error());
             }
@@ -343,6 +347,30 @@ impl WalletServer {
                     ledger = result.ledger,
                     "sep43_sign_and_submit: transaction confirmed",
                 );
+
+                // Non-fatal allow-path audit row. This is an opaque submit: the
+                // wallet did not decode the caller-supplied envelope's value, so
+                // legs are empty and the opaque reason is the tool's fixed
+                // classification (name-derived, not argument-derived). The on-chain
+                // tx is identified by the redacted hash.
+                let request_id = uuid::Uuid::new_v4().to_string();
+                let audit_entry = AuditEntry::new_opaque_action_submitted(
+                    "stellar_sep43_sign_and_submit_transaction",
+                    args.chain_id.as_str(),
+                    OpaqueReason::RawTransactionSignature.as_str(),
+                    redacted.as_str(),
+                    result.ledger,
+                    PolicyDecision::Allow,
+                    None,
+                    None,
+                    &request_id,
+                );
+                emit_value_audit_row(
+                    &self.profile,
+                    &self.profile_name_for_approval(),
+                    audit_entry,
+                );
+
                 let response = json!({
                     "signedTxXdr": signed_xdr,
                     "txHash": result.tx_hash,

@@ -17,6 +17,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failed closed. (#30)
 - `stellar_agent_core::policy::v1::signature::sign`, the owner-signature
   primitive that is the exact inverse of `verify`. (#30)
+- Value-moving verbs now write a hash-chained, HMAC-signed
+  `value_action_submitted` audit row after a confirmed on-chain submit,
+  recording the SAME value legs the policy gate sized (single-derivation
+  invariant), the redacted transaction hash, and the ledger. This covers the MCP
+  `stellar_pay` / `stellar_create_account` / `stellar_claim` / `stellar_trustline`
+  commit tools, the Blend / DEX / DeFindex adapters, the x402 payment
+  authorizers, the opaque `stellar_sep43_sign_and_submit_transaction` path, and
+  the CLI `pay` / `claim` / `accounts create` (sponsored) / `trustline` verbs. A
+  DeFi adapter that fails on submit records a `sa_raw_invocation` row instead.
+  Emission is non-fatal post-submit: a row-write failure logs a warning and
+  never changes the result. (#21)
+- `PolicyEngine` gains `evaluate_full` / `evaluate_with_value_full`, which return
+  an `Evaluation { decision, value_effects }` surfacing the value descriptor the
+  gate sized on the allow path; the decision-only `evaluate` /
+  `evaluate_with_value` remain as thin views. Value-verb dispatch uses the
+  `_full` methods so the post-submit audit row records exactly the legs the gate
+  evaluated rather than re-deriving them. (#21)
+- The six key-writing profile commands — `enroll-signer`, `enroll-owner-key`,
+  `rotate-nonce-key`, `rotate-attestation-key`, `rotate-counterparty-key`, and
+  `rotate-audit-key` — now write a `keyring_key_written` audit row recording the
+  key purpose and, where applicable, the redacted public address. (#34)
+- `profile rotate-audit-key` rotates the audit chain-root HMAC key and re-signs
+  every per-file chain-root sidecar with the new key so `audit verify` stays
+  green across the rotation; the new key is persisted before any sidecar is
+  re-signed. (#34)
 
 ### Changed
 

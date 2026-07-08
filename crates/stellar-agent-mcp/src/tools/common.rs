@@ -53,7 +53,12 @@ use crate::server::WalletServer;
 #[derive(Debug)]
 pub(crate) enum DispatchOutcome {
     /// Policy engine returned `Decision::Allow`; proceed with the tool logic.
-    Allow,
+    ///
+    /// Carries the value descriptor the gate sized on the allow path
+    /// (`Some` only for a permitted value-moving call; `None` for read-only /
+    /// opaque tools and the no-op engine), so the value-verb handlers record
+    /// exactly what the gate evaluated without re-deriving.
+    Allow(Option<stellar_agent_core::policy::v1::ValueEffects>),
     /// Policy engine returned `Decision::RequireApproval`; the simulate handler
     /// must persist a `PendingApproval` entry and embed `approval_nonce` in the
     /// response.  The commit handler must verify the attestation blob before
@@ -966,10 +971,11 @@ impl WalletServer {
     ///
     /// 1. Look up `tool_name` in `self.tool_registry`. Missing → fail-closed
     ///    `internal_error("tool.registry_missing: <name> not found in registry")`.
-    /// 2. Call `self.policy_engine.evaluate(...)` with the registry descriptor,
-    ///    the args, the profile, the optional account/identity views, and a
-    ///    counterparty-cache snapshot.
-    ///    - `Decision::Allow` → `Ok(DispatchOutcome::Allow)`.
+    /// 2. Call `self.policy_engine.evaluate_full(...)` with the registry
+    ///    descriptor, the args, the profile, the optional account/identity views,
+    ///    and a counterparty-cache snapshot.
+    ///    - `Decision::Allow` → `Ok(DispatchOutcome::Allow(value_effects))`, the
+    ///      gate-sized effects (`Some` for a value-moving allow).
     ///    - `Decision::Deny(reason)` → `Err(ToolError::Business)` — a business
     ///      refusal surfaced as the documented result envelope with wire code
     ///      `policy.deny.<reason.code()>` and the redacted `DenyReason`
@@ -1132,8 +1138,11 @@ impl WalletServer {
         let counterparty_view = counterparty_cache
             .as_ref()
             .map(|snapshot| snapshot as &dyn stellar_agent_core::policy::v1::CounterpartyCacheView);
-        let decision = match value {
-            Some(value) => self.policy_engine.evaluate_with_value(
+        // The `_full` evaluation additionally surfaces the value descriptor the
+        // gate sized on the allow path, threaded into `DispatchOutcome::Allow` so
+        // the value-verb handlers record exactly what the gate evaluated.
+        let evaluation = match value {
+            Some(value) => self.policy_engine.evaluate_with_value_full(
                 descriptor,
                 args_value,
                 &self.profile,
@@ -1144,7 +1153,7 @@ impl WalletServer {
                 None,
                 None,
             ),
-            None => self.policy_engine.evaluate(
+            None => self.policy_engine.evaluate_full(
                 descriptor,
                 args_value,
                 &self.profile,
@@ -1155,10 +1164,23 @@ impl WalletServer {
                 None, // sep45_sessions: wired at dispatch site when sep45_session_active criterion active
             ),
         };
-        let outcome = match decision {
-            Ok(Decision::Allow) => DispatchOutcome::Allow,
+        let evaluation = match evaluation {
+            Ok(evaluation) => evaluation,
+            Err(err) => {
+                // Engine error → fail closed as `policy.engine_required`
+                // (fires for `Noop` and for `V1` engine errors such as a
+                // missing policy document).
+                return Err(ToolError::Business(business_error_result(
+                    "policy.engine_required",
+                    format!("policy engine evaluation failed: {err}"),
+                )));
+            }
+        };
+        let value_effects = evaluation.value_effects;
+        let outcome = match evaluation.decision {
+            Decision::Allow => DispatchOutcome::Allow(value_effects),
 
-            Ok(Decision::Deny(reason)) => {
+            Decision::Deny(reason) => {
                 // Redact account IDs in CounterpartyDenied before serialising
                 // into the wire message. A policy denial is a business refusal the
                 // agent branches on, so it surfaces as the documented result
@@ -1176,7 +1198,7 @@ impl WalletServer {
                 )));
             }
 
-            Ok(Decision::RequireApproval(req)) => {
+            Decision::RequireApproval(req) => {
                 // Return the ApprovalRequest to the caller; simulate handlers
                 // persist a PendingApproval entry; commit handlers verify
                 // the attestation before proceeding.  Do NOT produce a wire
@@ -1187,21 +1209,11 @@ impl WalletServer {
 
             // Forward-compat catch-all: Decision is #[non_exhaustive]; any future
             // variant not handled above falls here so the gate stays fail-closed.
-            Ok(_) => {
+            _ => {
                 return Err(ToolError::Business(business_error_result(
                     "policy.unexpected_decision",
                     "the policy engine returned a decision this build does not \
                      recognise; the operation is refused fail-closed",
-                )));
-            }
-
-            Err(err) => {
-                // Engine error → fail closed as `policy.engine_required`
-                // (fires for `Noop` and for `V1` engine errors such as a
-                // missing policy document).
-                return Err(ToolError::Business(business_error_result(
-                    "policy.engine_required",
-                    format!("policy engine evaluation failed: {err}"),
                 )));
             }
         };
@@ -2325,7 +2337,7 @@ mod tests {
             .dispatch_gate("stellar_balances", &args, "stellar:testnet")
             .await;
         assert!(
-            matches!(result, Ok(DispatchOutcome::Allow)),
+            matches!(result, Ok(DispatchOutcome::Allow(_))),
             "Decision::Allow must produce DispatchOutcome::Allow; got {result:?}"
         );
     }
@@ -2346,7 +2358,7 @@ mod tests {
             .await;
 
         assert!(
-            matches!(result, Ok(DispatchOutcome::Allow)),
+            matches!(result, Ok(DispatchOutcome::Allow(_))),
             "cache-backed policy engine must allow when snapshot contains circle.com; got {result:?}"
         );
         assert!(

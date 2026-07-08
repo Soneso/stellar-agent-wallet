@@ -327,7 +327,9 @@ where
     match build_unsigned_envelope(args).await {
         Ok(built) => {
             let chain_id = caip2_chain_id_for_network(args.network);
-            if let Some(code) = evaluate_claim_policy(args, &built, chain_id, &profile) {
+            // Build-only: gate but do not submit, so the gate-sized effects are
+            // not recorded (no confirmed on-chain action to attest).
+            if let Err(code) = evaluate_claim_policy(args, &built, chain_id, &profile) {
                 return code;
             }
             let result = ClaimResult {
@@ -434,9 +436,10 @@ where
 
     // ── Operator policy evaluation (before signing) ───────────────────────────
     let chain_id = caip2_chain_id_for_network(args.network);
-    if let Some(code) = evaluate_claim_policy(args, &built, chain_id, &profile) {
-        return code;
-    }
+    let claim_effects = match evaluate_claim_policy(args, &built, chain_id, &profile) {
+        Ok(effects) => effects,
+        Err(code) => return code,
+    };
 
     // 2. Sign.
     let signed_xdr = match sign_envelope(args, &unsigned_xdr).await {
@@ -450,6 +453,32 @@ where
     // 3. Submit.
     match submit_envelope(args, &signed_xdr).await {
         Ok((xdr, sub_result)) => {
+            // Non-fatal allow-path audit row carrying the SAME legs the gate
+            // sized (single-derivation invariant), recorded on confirmed submit.
+            let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> = claim_effects
+                .as_ref()
+                .map(|e| e.legs().iter().map(Into::into).collect())
+                .unwrap_or_default();
+            let audit_request_id = uuid::Uuid::new_v4().to_string();
+            let audit_tx_redacted =
+                stellar_agent_network::submit::redact_tx_hash(&sub_result.tx_hash);
+            let audit_entry = stellar_agent_core::audit_log::AuditEntry::new_value_action_submitted(
+                "stellar_claim",
+                chain_id,
+                audit_legs,
+                audit_tx_redacted.as_str(),
+                sub_result.ledger,
+                stellar_agent_core::audit_log::PolicyDecision::Allow,
+                None,
+                None,
+                &audit_request_id,
+            );
+            crate::commands::value_audit::emit_value_audit_row(
+                &profile,
+                &args.profile,
+                audit_entry,
+            );
+
             let result = ClaimResult {
                 envelope_xdr: xdr,
                 tx_hash: Some(sub_result.tx_hash.clone()),
@@ -586,7 +615,7 @@ fn evaluate_claim_policy(
     built: &BuiltClaimEnvelope,
     chain_id: &str,
     profile: &Profile,
-) -> Option<i32> {
+) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, i32> {
     let policy_engine = match build_v1_policy_engine("claim", &profile.policy.engine, profile) {
         Ok(pe) => pe,
         Err(msg) => {
@@ -594,7 +623,7 @@ fn evaluate_claim_policy(
                 &Envelope::<()>::err_raw("policy.engine_unavailable", msg),
                 args.output,
             );
-            return Some(1);
+            return Err(1);
         }
     };
     // `derive_value_class` ignores args for `stellar_claim` (a non-debit
@@ -611,10 +640,10 @@ fn evaluate_claim_policy(
         &policy_args,
         "claim",
     ) {
-        Ok(()) => None,
+        Ok(effects) => Ok(effects),
         Err(envelope) => {
             print_error(&envelope, args.output);
-            Some(1)
+            Err(1)
         }
     }
 }

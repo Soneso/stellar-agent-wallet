@@ -218,6 +218,15 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>, attestation_key: 
         .expect("attestation keyring entry")
         .set_password(&attest_key_b64)
         .expect("set attestation key");
+
+    // Audit-log chain-root HMAC key, so the commit's post-submit
+    // `value_action_submitted` row is signed and lands.
+    let audit_ref = &profile.audit_log_hash_chain_key_id;
+    let audit_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x33u8; 32]);
+    keyring_core::Entry::new(&audit_ref.service, &audit_ref.account)
+        .expect("audit keyring entry")
+        .set_password(&audit_key_b64)
+        .expect("set audit key");
 }
 
 /// Fetches `account_id`'s current sequence number over `client`.
@@ -318,6 +327,9 @@ async fn t1_claim_two_phase_happy_path() {
     .with_noop_engine()
     .build();
     profile.rpc_url = TESTNET_RPC_URL.to_owned();
+    // Redirect the audit log to a test temp dir so the row can be read back.
+    let audit_dir = tempfile::tempdir().expect("audit temp dir");
+    profile.audit_log_path = audit_dir.path().join("audit.jsonl");
     seed_keyring(&profile, &claimant_seed, &attestation_key);
 
     let mut server = WalletServer::new(profile).expect("WalletServer::new");
@@ -418,6 +430,20 @@ async fn t1_claim_two_phase_happy_path() {
     assert!(
         commit_json["data"]["ledger"].as_u64().unwrap_or(0) > 0,
         "commit must report the ledger it was included in: {commit_json}"
+    );
+
+    // #21 — the confirmed claim commit must have recorded a
+    // `value_action_submitted` row for `stellar_claim_commit`.
+    let audit_rows: Vec<serde_json::Value> = std::io::BufRead::lines(std::io::BufReader::new(
+        std::fs::File::open(audit_dir.path().join("audit.jsonl")).expect("audit log after commit"),
+    ))
+    .map(|line| serde_json::from_str(&line.expect("audit line")).expect("audit JSON row"))
+    .collect();
+    assert!(
+        audit_rows.iter().any(|row| {
+            row["kind"] == "value_action_submitted" && row["tool"] == "stellar_claim_commit"
+        }),
+        "claim commit must record a value_action_submitted row: {audit_rows:?}"
     );
 
     // ── 4. On-chain effects: claimant credited, entry gone ─────────────────────

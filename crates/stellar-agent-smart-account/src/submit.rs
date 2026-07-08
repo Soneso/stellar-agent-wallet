@@ -1402,6 +1402,53 @@ fn check_required(
     Ok(())
 }
 
+/// Emits the caller-side `SaRawInvocation` failure row for a
+/// [`submit_signed_invoke`] call that returned `Err`.
+///
+/// Implements the audit discipline documented at the top of this module: the
+/// caller's `Err` arm records the domain-specific failure row (mapping the
+/// [`SaError`] to a [`stellar_agent_core::audit_log::schema::SaInvocationResult`]
+/// and the stable wire code) so failed value operations are not audit-silent.
+///
+/// Non-fatal: a write failure logs a `tracing::warn!` and does not change the
+/// caller's error. `smart_account_redacted` MUST already be first-5-last-5
+/// redacted. `context_rule_ids_count` is the number of context-rule ids passed
+/// to the submit.
+pub fn emit_sa_raw_invocation_failure(
+    writer: &std::sync::Arc<std::sync::Mutex<stellar_agent_core::audit_log::AuditWriter>>,
+    smart_account_redacted: &str,
+    err: &SaError,
+    context_rule_ids_count: u32,
+    chain_id: Option<&str>,
+    request_id: &str,
+) {
+    let result = crate::managers::rules::sa_error_to_invocation_result(err);
+    let raw = stellar_agent_core::audit_log::AuditEntry::new_sa_raw_invocation(
+        smart_account_redacted,
+        err.wire_code(),
+        None,
+        context_rule_ids_count,
+        result,
+        chain_id,
+        request_id,
+    );
+    match writer.lock() {
+        Ok(mut guard) => {
+            if let Err(e) = guard.write_entry(raw) {
+                tracing::warn!(
+                    error = %e,
+                    "defi submit failure audit: write_entry failed; SaRawInvocation NOT emitted"
+                );
+            }
+        }
+        Err(_) => {
+            tracing::warn!(
+                "defi submit failure audit: writer mutex poisoned; SaRawInvocation NOT emitted"
+            );
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1466,6 +1513,56 @@ mod tests {
             constructor_args: VecM::default(),
         });
         assert_eq!(host_function_kind_str(&hf), "CreateContractV2");
+    }
+
+    /// `emit_sa_raw_invocation_failure` writes exactly one `sa_raw_invocation`
+    /// row carrying the error's wire code and the mapped invocation result.
+    ///
+    /// This is the offline (push-CI) guard for the DeFi adapters' Err-arm
+    /// emission plumbing: a `submit`-phase `SaError` maps to `on_chain_rejected`
+    /// and the row records the redacted smart account, the wire code, and the
+    /// context-rule count. The adapter call sites (which invoke this helper in
+    /// their submit Err arm) are additionally covered by the DeFi testnet
+    /// acceptance tests.
+    #[test]
+    fn emit_sa_raw_invocation_failure_writes_a_raw_invocation_row() {
+        use std::io::BufRead as _;
+        use std::sync::{Arc, Mutex};
+        use stellar_agent_core::audit_log::AuditWriter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let writer = Arc::new(Mutex::new(AuditWriter::open(path.clone(), None).unwrap()));
+
+        let err = SaError::DeploymentFailed {
+            phase: "submit",
+            redacted_reason: "on-chain rejected: GBPXX...MWIVL".to_owned(),
+        };
+        emit_sa_raw_invocation_failure(
+            &writer,
+            "CAAAA…D2KM",
+            &err,
+            1,
+            Some("stellar:testnet"),
+            "req-sa-1",
+        );
+
+        let file = std::fs::File::open(&path).unwrap();
+        let rows: Vec<serde_json::Value> = std::io::BufReader::new(file)
+            .lines()
+            .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
+            .collect();
+
+        assert_eq!(rows.len(), 1, "exactly one row must be written");
+        let row = &rows[0];
+        assert_eq!(row["kind"], "sa_raw_invocation", "row kind");
+        assert_eq!(row["wire_code"], "sa.deployment_failed", "error wire code");
+        assert_eq!(
+            row["result"], "on_chain_rejected",
+            "a submit-phase failure maps to on_chain_rejected"
+        );
+        assert_eq!(row["context_rule_ids_count"], 1, "context-rule count");
+        assert_eq!(row["chain_id"], "stellar:testnet", "chain id");
     }
 
     /// `host_function_kind_str` returns `"UploadContractWasm"` for the

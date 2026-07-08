@@ -1150,6 +1150,17 @@ impl WalletServer {
 
         let nonce_id_prefix = nonce_id_prefix(&nonce);
 
+        // Extract the gate-sized legs for the post-submit audit row: the SAME
+        // ValueEffects the gate evaluated (single-derivation invariant). Empty on
+        // any non-value allow path.
+        let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> = match &dispatch_outcome
+        {
+            DispatchOutcome::Allow(Some(effects)) => {
+                effects.legs().iter().map(Into::into).collect()
+            }
+            _ => Vec::new(),
+        };
+
         // ── Submit ────────────────────────────────────────────────────────────
         match submit_transaction_and_wait(
             &client,
@@ -1182,6 +1193,26 @@ impl WalletServer {
                     tx_hash = %tx_hash_redacted,
                     decision = "committed",
                     "ChangeTrust tx submitted"
+                );
+
+                // Non-fatal allow-path audit row carrying the gate-sized legs.
+                let audit_request_id = uuid::Uuid::new_v4().to_string();
+                let audit_entry =
+                    stellar_agent_core::audit_log::AuditEntry::new_value_action_submitted(
+                        "stellar_trustline_commit",
+                        args.chain_id.as_str(),
+                        audit_legs,
+                        tx_hash_redacted.as_str(),
+                        ledger,
+                        stellar_agent_core::audit_log::PolicyDecision::Allow,
+                        None,
+                        Some(nonce_id_prefix.to_string()),
+                        &audit_request_id,
+                    );
+                crate::tools::value_audit::emit_value_audit_row(
+                    &self.profile,
+                    &self.profile_name_for_approval(),
+                    audit_entry,
                 );
 
                 // Best-effort: remove the consumed approval entry.

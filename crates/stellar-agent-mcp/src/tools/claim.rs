@@ -820,6 +820,17 @@ impl WalletServer {
             return Ok(r);
         }
 
+        // Extract the gate-sized legs for the post-submit audit row: the SAME
+        // ValueEffects the gate evaluated (single-derivation invariant). Empty on
+        // any non-value allow path.
+        let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> = match &dispatch_outcome
+        {
+            DispatchOutcome::Allow(Some(effects)) => {
+                effects.legs().iter().map(Into::into).collect()
+            }
+            _ => Vec::new(),
+        };
+
         // ── Nonce verification + replay window ───────────────────────────────
         if let Err(e) = commit_envelope_and_verify_nonce(
             &self.nonce_mint,
@@ -891,6 +902,27 @@ impl WalletServer {
                     nonce_id = %nonce_id_prefix,
                     decision = "committed",
                     "stellar_claim_commit: tx submitted"
+                );
+
+                // Non-fatal allow-path audit row carrying the gate-sized legs.
+                let audit_request_id = uuid::Uuid::new_v4().to_string();
+                let audit_tx_redacted = stellar_agent_network::submit::redact_tx_hash(&tx_hash);
+                let audit_entry =
+                    stellar_agent_core::audit_log::AuditEntry::new_value_action_submitted(
+                        "stellar_claim_commit",
+                        args.chain_id.as_str(),
+                        audit_legs,
+                        audit_tx_redacted.as_str(),
+                        ledger,
+                        stellar_agent_core::audit_log::PolicyDecision::Allow,
+                        None,
+                        Some(nonce_id_prefix.to_string()),
+                        &audit_request_id,
+                    );
+                crate::tools::value_audit::emit_value_audit_row(
+                    &self.profile,
+                    &self.profile_name_for_approval(),
+                    audit_entry,
                 );
 
                 // Best-effort removal of the consumed approval entry so it

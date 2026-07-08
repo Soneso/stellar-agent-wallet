@@ -4811,6 +4811,7 @@ dependencies = [
  "stellar-rpc-client",
  "stellar-strkey 0.0.18",
  "stellar-xdr 27.0.0",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -4823,6 +4824,7 @@ version = "0.1.0-alpha.2"
 dependencies = [
  "async-trait",
  "serde",
+ "serde_json",
  "stellar-agent-core",
  "stellar-agent-defi",
  "stellar-agent-network",

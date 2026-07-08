@@ -257,6 +257,11 @@ impl WalletServer {
         // is acceptable for this step (Blend legs are token debits, not native
         // reserve debits, in the common case).
         let value_legs = blend_value_legs(&blend_requests, &args.pool_address);
+        // Capture the gate-derived legs as audit records before the descriptor
+        // moves into the gate, so the emitted row carries exactly what the gate
+        // sized (single-derivation invariant).
+        let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> =
+            value_legs.iter().map(Into::into).collect();
         let args_value = json!({
             "chain_id": args.chain_id,
             "pool_address": args.pool_address,
@@ -509,7 +514,7 @@ impl WalletServer {
             "blend-contracts", // abi_source_provenance
         );
 
-        let ctx = DefiAdapterCtx::new_with_submit_ctx(
+        let mut ctx = DefiAdapterCtx::new_with_submit_ctx(
             "default",
             &pool_pin,
             &primary_rpc,
@@ -519,6 +524,16 @@ impl WalletServer {
             secondary_rpc.as_ref(),
             Some(timeout),
         );
+        // Thread the audit writer + gate-derived legs so the adapter emits the
+        // ValueActionSubmitted row after a confirmed submit. Non-fatal: a failed
+        // writer acquisition leaves the fields unset and the adapter skips the row.
+        let audit_profile_name = self.profile_name_for_approval();
+        ctx.audit_writer = crate::tools::value_audit::acquire_value_audit_writer(
+            &self.profile,
+            &audit_profile_name,
+        );
+        ctx.audit_legs = Some(&audit_legs);
+        ctx.audit_tool = Some("stellar_blend_lend");
 
         // ── Build LendArgs for the adapter ────────────────────────────────────
         let lend_args = LendArgs {

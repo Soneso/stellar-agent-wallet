@@ -51,6 +51,7 @@ use rmcp::{
     schemars, serde, tool, tool_router,
 };
 use serde_json::json;
+use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision, ValueLegRecord};
 use stellar_agent_core::policy::v1::ValueClass;
 use stellar_agent_mcp_macros::mcp_tool_router;
 
@@ -58,6 +59,7 @@ use crate::server::WalletServer;
 use crate::tools::common::{
     decode_payment_required_input, x402_error_to_tool_result, x402_value_leg,
 };
+use crate::tools::value_audit::emit_value_audit_row;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Argument type
@@ -218,6 +220,10 @@ impl WalletServer {
             Err(ref err) => return Ok(x402_error_to_tool_result(err)),
         };
 
+        // Capture the gate-derived leg as an audit record before it moves into
+        // the value descriptor, so the row carries exactly what the gate sized.
+        let audit_leg = ValueLegRecord::from(&value_leg);
+
         // ── Telemetry preamble (redaction) ───────────────────────────────────
         let args_value = json!({
             "chain_id": &args.chain_id,
@@ -245,7 +251,7 @@ impl WalletServer {
             Err(e) => return e.into_result(),
         };
         match dispatch_outcome {
-            crate::tools::common::DispatchOutcome::Allow => {}
+            crate::tools::common::DispatchOutcome::Allow(_) => {}
             crate::tools::common::DispatchOutcome::RequireApproval(_) => {
                 return Ok(crate::tools::common::single_shot_require_approval_error());
             }
@@ -323,6 +329,25 @@ impl WalletServer {
             payer = %redacted_payer,
             network = %requirements.network,
             "x402_create_payment: payment payload constructed",
+        );
+
+        // Non-fatal audit row at signature production. The wallet is the payer;
+        // the host settles externally, so there is no on-chain submit — the row
+        // records the authorized value, not a confirmed transaction.
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let audit_entry = AuditEntry::new_x402_payment_authorized(
+            "stellar_x402_create_payment",
+            args.chain_id.as_str(),
+            vec![audit_leg],
+            requirements.network.as_str(),
+            requirements.scheme.as_str(),
+            PolicyDecision::Allow,
+            &request_id,
+        );
+        emit_value_audit_row(
+            &self.profile,
+            &self.profile_name_for_approval(),
+            audit_entry,
         );
 
         // ── Build response ────────────────────────────────────────────────────
