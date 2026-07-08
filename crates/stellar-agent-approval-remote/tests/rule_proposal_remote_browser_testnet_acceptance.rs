@@ -1257,11 +1257,17 @@ async fn commit_without_attestation_is_approval_required() {
             approval_attestation: None,
         })
         .await;
-    let err = result.expect_err("commit without attestation must be Err");
-    assert!(
-        err.message.contains("policy.approval_required"),
-        "got: {}",
-        err.message
+    let result = result.expect("commit call must return a tool result");
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "commit without attestation must be a business error"
+    );
+    let json = result_json(&result);
+    assert_eq!(
+        json["error"]["code"].as_str(),
+        Some("policy.approval_required"),
+        "got: {json}"
     );
 }
 
@@ -1358,11 +1364,17 @@ async fn operator_reject_then_commit_is_rejected() {
             approval_attestation: None,
         })
         .await;
-    let err = result.expect_err("rejected tombstone must be Err");
-    assert!(
-        err.message.contains("policy.approval_rejected"),
-        "a live Rejected tombstone must be distinguishable, got: {}",
-        err.message
+    let result = result.expect("commit call must return a tool result");
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a rejected tombstone must produce a business error"
+    );
+    let json = result_json(&result);
+    assert_eq!(
+        json["error"]["code"].as_str(),
+        Some("policy.approval_rejected"),
+        "a live Rejected tombstone must be distinguishable, got: {json}"
     );
 }
 
@@ -1467,6 +1479,16 @@ async fn toolset_gated_first_invoke_entry_is_consumed() {
             approval_attestation: None,
         })
         .await;
-    let err = result.expect_err("commit without attestation must still be Err");
-    assert!(err.message.contains("policy.approval_required"));
+    let result = result.expect("commit call must return a tool result");
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "commit without attestation must still be a business error"
+    );
+    let json = result_json(&result);
+    assert_eq!(
+        json["error"]["code"].as_str(),
+        Some("policy.approval_required"),
+        "got: {json}"
+    );
 }
