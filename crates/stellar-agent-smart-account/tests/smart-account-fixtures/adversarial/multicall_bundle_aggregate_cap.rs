@@ -94,6 +94,7 @@ fn build_engine_with_aggregate_cap(asset: &str, max_amount: i128) -> PolicyEngin
                 max_amount,
             })],
             decision: Decision::Allow,
+            allow_opaque_signing: false,
         }],
         signature: None,
     };

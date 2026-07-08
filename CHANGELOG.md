@@ -18,6 +18,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `stellar_agent_core::policy::v1::signature::sign`, the owner-signature
   primitive that is the exact inverse of `verify`. (#30)
 
+### Changed
+
+- Value criteria (`per_tx_cap`, `per_period_cap`, `minimum_reserve`,
+  `counterparty_allowlist`) now size a call through a typed value descriptor
+  derived at the dispatch gate, instead of matching hard-coded tool names. A
+  rule that matches a value-moving tool constrains every debit leg it carries
+  (classic pay/create, Blend supply/repay, DEX trades, vault deposits, x402
+  payments), and per-asset caps aggregate across the legs of a multi-leg call.
+  A value rule that matches a call whose value cannot be sized — a tool that
+  reached the gate without resolved effects, or a raw signing tool
+  (`stellar_sep43_*`) — now denies fail-closed with
+  `policy.deny.unsizable_value_effect` rather than passing silently. A rule may
+  opt a signing tool back in with `allow_opaque_signing = true`.
+  `minimum_reserve` now counts only native-XLM outflow legs; a token-only move
+  no longer reduces the native reserve. Operators with existing value rules
+  should expect previously-unconstrained value tools to be gated. (#18, #19,
+  #20)
+
 ### Fixed
 
 - `approve --id` writes the human-readable approval summary and the y/n prompt

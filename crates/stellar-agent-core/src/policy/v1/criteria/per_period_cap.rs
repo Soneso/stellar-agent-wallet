@@ -61,6 +61,7 @@ use crate::policy::v1::EvalContext;
 use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
 use crate::policy::v1::criteria::Criterion;
 use crate::policy::v1::criteria::state_store::StateKey;
+use crate::policy::v1::value::{ValueGate, asset_normalise, classify_value};
 use crate::policy::{DenyReason, PolicyError};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -240,70 +241,143 @@ impl Criterion for PerPeriodCapCriterion {
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
         let tool_name = ctx.tool.name.as_str();
 
-        let (attempted_stroops, tool_asset) = match tool_name {
-            "stellar_pay"
-            | "stellar_pay_commit"
-            | "stellar_create_account"
-            | "stellar_create_account_commit" => {
-                // Read the resolved value leg the gate derived (behaviour-neutral:
-                // same resolved-key amount and same asset normalisation as the
-                // prior args-read path).
-                let leg = ctx.value.sole_value_leg().ok_or_else(|| {
-                    PolicyError::CriterionEvaluationFailed {
-                        detail: format!(
-                            "per_period_cap: value descriptor not populated for tool '{tool_name}'"
-                        ),
-                    }
+        let criterion_asset = asset_normalise(&self.asset);
+
+        // Legacy args-based arm for the not-yet-migrated `stellar_axelar_bridge`
+        // (an unregistered dead arm removed in #22). Reached only for that name;
+        // every classified tool is sized through the value descriptor below.
+        if tool_name == "stellar_axelar_bridge" {
+            // `qty` is an on-chain i128 integer (not a unit-bearing string).
+            // `token_address` is the resolved C-strkey from the token-egress
+            // pin, injected by the dispatch site alongside qty.
+            let qty_val = ctx
+                .args
+                .get("qty")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+                    detail: format!(
+                        "per_period_cap: missing or non-integer field 'qty' \
+                             in args for tool '{tool_name}'"
+                    ),
                 })?;
-                let amount = leg
-                    .amount
-                    .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
-                        detail: format!(
-                            "per_period_cap: unresolvable amount for tool '{tool_name}'"
-                        ),
-                    })?;
-                let stroops = i64::try_from(amount).map_err(|_| {
-                    PolicyError::CriterionEvaluationFailed {
-                        detail: format!(
-                            "per_period_cap: amount {amount} exceeds i64 range for tool '{tool_name}'"
-                        ),
-                    }
-                })?;
-                let asset =
-                    leg.asset
-                        .clone()
-                        .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
-                            detail: format!(
-                                "per_period_cap: unresolvable asset for tool '{tool_name}'"
-                            ),
-                        })?;
-                (stroops, asset)
+            let token_address = extract_string_field(ctx, "token_address")?;
+            if criterion_asset != token_address {
+                return Ok(None);
             }
-            "stellar_axelar_bridge" => {
-                // `qty` is an on-chain i128 integer (not a unit-bearing string).
-                // `token_address` is the resolved C-strkey from the token-egress
-                // pin, injected by the dispatch site alongside qty.
-                let qty_val = ctx
-                    .args
-                    .get("qty")
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
-                        detail: format!(
-                            "per_period_cap: missing or non-integer field 'qty' \
-                                 in args for tool '{}'",
-                            ctx.tool.name
-                        ),
-                    })?;
-                let token_address = extract_string_field(ctx, "token_address")?;
-                (qty_val, token_address)
-            }
-            _ => return Ok(None),
+            return self.check_window(ctx, &criterion_asset, qty_val);
+        }
+
+        // Descriptor-driven path with the fail-closed default: an unsizable
+        // effect (MovesValue tool that resolved no effects, or an opaque-sign
+        // call) denies here rather than passing silently.
+        let effects = match classify_value(ctx) {
+            ValueGate::NotApplicable => return Ok(None),
+            ValueGate::Deny(reason) => return Ok(Some(reason)),
+            ValueGate::Effects(effects) => effects,
         };
 
-        let criterion_asset = asset_normalise(self.asset.clone());
-        if criterion_asset != tool_asset {
+        // Aggregate the debit legs matching the configured asset (per-asset
+        // aggregation across the N legs of a multi-leg call). A non-debit leg
+        // (Claim/Trustline) contributes nothing; a debit leg with an
+        // unresolvable amount or asset is refused fail-closed.
+        let mut matched = false;
+        let mut sum: i128 = 0;
+        for leg in effects.legs() {
+            if !leg.kind.carries_debit() {
+                continue;
+            }
+            let leg_asset =
+                leg.asset
+                    .as_deref()
+                    .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+                        detail: format!(
+                            "per_period_cap: debit leg of tool '{tool_name}' carries no asset"
+                        ),
+                    })?;
+            if asset_normalise(leg_asset) != criterion_asset {
+                continue;
+            }
+            let amount = leg
+                .amount
+                .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+                    detail: format!(
+                        "per_period_cap: unresolvable amount for a debit leg of tool '{tool_name}'"
+                    ),
+                })?;
+            matched = true;
+            sum = sum.saturating_add(amount);
+        }
+
+        // The configured asset is not moved by this call — criterion not applicable.
+        if !matched {
             return Ok(None);
         }
+
+        let attempted_stroops = i64::try_from(sum).unwrap_or(i64::MAX);
+        self.check_window(ctx, &criterion_asset, attempted_stroops)
+    }
+
+    /// Accumulates this inner's amount into the overlay using the SAME
+    /// `StateKey` as `evaluate`.
+    ///
+    /// Derives `StateKey::new(ctx.profile_name, 1, criterion_asset, window_secs)` —
+    /// matching the key constructed in `evaluate` — so that the overlay write
+    /// is guaranteed to be read back correctly on the next inner's `evaluate`
+    /// call.
+    ///
+    /// Only accumulates for `InnerOpDescriptor::TokenTransfer` inners whose
+    /// asset matches `self.asset` (after normalisation).  `Generic` inners and
+    /// asset-mismatched inners contribute 0.
+    ///
+    /// Amount is cast `i128 → i64` via saturating cast (over-deny direction on
+    /// overflow).
+    fn accumulate_overlay(
+        &self,
+        ctx: &EvalContext<'_>,
+        inner: &InnerOpDescriptor,
+        overlay: &mut BundleStateOverlay,
+    ) {
+        let InnerOpDescriptor::TokenTransfer { asset, amount, .. } = inner else {
+            // Generic inners contribute 0.
+            return;
+        };
+
+        let criterion_asset = asset_normalise(&self.asset);
+        let inner_asset = asset_normalise(asset);
+        if criterion_asset != inner_asset {
+            // Asset mismatch: this inner does not count toward this criterion.
+            return;
+        }
+
+        // Derive the SAME state key as evaluate() uses — guarantees read-key equality.
+        let state_key = StateKey::new(ctx.profile_name, 1, &criterion_asset, self.window.as_secs());
+        // Saturating cast: over-deny on i128 > i64::MAX is the correct security posture.
+        let attempted_stroops = i64::try_from(*amount).unwrap_or(i64::MAX);
+        overlay.accumulate(state_key, attempted_stroops);
+    }
+}
+
+impl PerPeriodCapCriterion {
+    /// Checks `attempted_stroops` against the rolling window for
+    /// `criterion_asset`, combining the state-store-recorded total with any
+    /// bundle overlay contribution.
+    ///
+    /// Shared by both the legacy `stellar_axelar_bridge` args arm and the
+    /// descriptor-driven path in `evaluate` — both resolve an
+    /// `(asset, attempted_stroops)` pair upstream and then check it against
+    /// the identical window/overlay logic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] when [`SystemTime`]
+    /// is before UNIX epoch, or the state store detects clock skew exceeding
+    /// 30 seconds.
+    fn check_window(
+        &self,
+        ctx: &EvalContext<'_>,
+        criterion_asset: &str,
+        attempted_stroops: i64,
+    ) -> Result<Option<DenyReason>, PolicyError> {
         let now_ms = system_time_to_ms()?;
 
         let state_key = StateKey::new(
@@ -312,7 +386,7 @@ impl Criterion for PerPeriodCapCriterion {
             // site can supply a narrower resolved specificity via EvalContext.
             // Defaulting to 1 avoids silently sharing state across scopes.
             1,
-            &criterion_asset,
+            criterion_asset,
             self.window.as_secs(),
         );
 
@@ -348,45 +422,6 @@ impl Criterion for PerPeriodCapCriterion {
 
         Ok(None)
     }
-
-    /// Accumulates this inner's amount into the overlay using the SAME
-    /// `StateKey` as `evaluate`.
-    ///
-    /// Derives `StateKey::new(ctx.profile_name, 1, criterion_asset, window_secs)` —
-    /// matching the key constructed in `evaluate` — so that the overlay write
-    /// is guaranteed to be read back correctly on the next inner's `evaluate`
-    /// call.
-    ///
-    /// Only accumulates for `InnerOpDescriptor::TokenTransfer` inners whose
-    /// asset matches `self.asset` (after normalisation).  `Generic` inners and
-    /// asset-mismatched inners contribute 0.
-    ///
-    /// Amount is cast `i128 → i64` via saturating cast (over-deny direction on
-    /// overflow).
-    fn accumulate_overlay(
-        &self,
-        ctx: &EvalContext<'_>,
-        inner: &InnerOpDescriptor,
-        overlay: &mut BundleStateOverlay,
-    ) {
-        let InnerOpDescriptor::TokenTransfer { asset, amount, .. } = inner else {
-            // Generic inners contribute 0.
-            return;
-        };
-
-        let criterion_asset = asset_normalise(self.asset.clone());
-        let inner_asset = asset_normalise(asset.clone());
-        if criterion_asset != inner_asset {
-            // Asset mismatch: this inner does not count toward this criterion.
-            return;
-        }
-
-        // Derive the SAME state key as evaluate() uses — guarantees read-key equality.
-        let state_key = StateKey::new(ctx.profile_name, 1, &criterion_asset, self.window.as_secs());
-        // Saturating cast: over-deny on i128 > i64::MAX is the correct security posture.
-        let attempted_stroops = i64::try_from(*amount).unwrap_or(i64::MAX);
-        overlay.accumulate(state_key, attempted_stroops);
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -404,14 +439,6 @@ fn extract_string_field(ctx: &EvalContext<'_>, field: &str) -> Result<String, Po
                 field, ctx.tool.name
             ),
         })
-}
-
-fn asset_normalise(asset: String) -> String {
-    if asset.eq_ignore_ascii_case("native") || asset.eq_ignore_ascii_case("xlm") {
-        "native".to_owned()
-    } else {
-        asset
-    }
 }
 
 /// Returns the current time as unix-milliseconds.
@@ -905,9 +932,8 @@ mod tests {
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
             matches!(result, Some(DenyReason::PerPeriodCapExceeded { .. })),
-            "150 XLM commit should be denied by a 100 XLM period cap; this is the \
-             pre-existing fail-closed bug this re-point fixes (authoritative_args never \
-             carried 'amount', only 'amount_stroops'): {result:?}"
+            "a 150 XLM commit must be denied by a 100 XLM period cap; the debit is sized \
+             from 'amount_stroops', the only amount key authoritative_args carries: {result:?}"
         );
     }
 
@@ -994,6 +1020,143 @@ mod tests {
         assert!(
             matches!(result, Some(DenyReason::PerPeriodCapExceeded { .. })),
             "numeric amount_stroops must still be denied by the period cap"
+        );
+    }
+
+    // ── Fail-closed value-descriptor matrix ─────────────────────────────────
+
+    /// Constructs a `ToolDescriptor` with an explicit `value_kind` (rather
+    /// than the fixed `ReadOnly` of [`make_tool`]).
+    fn make_tool_with_kind(
+        tool_name: &'static str,
+        value_kind: crate::policy::ToolValueKind,
+    ) -> ToolDescriptor {
+        let reg = McpToolRegistration {
+            name: tool_name,
+            destructive_hint: true,
+            read_only_hint: false,
+            chain_id_required: true,
+            value_kind,
+        };
+        ToolDescriptor::from_registration(&reg)
+    }
+
+    /// A `MovesValue` tool the descriptor derivation has not classified
+    /// (`derive_value_class` falls through to `ReadOnly` for any name outside
+    /// its match arms) must deny fail-closed rather than passing silently.
+    #[test]
+    #[serial]
+    fn moves_value_tool_with_unpopulated_effects_denies_unsizable() {
+        let tool = make_tool_with_kind(
+            "stellar_blend_lend",
+            crate::policy::ToolValueKind::MovesValue,
+        );
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let w = Window::parse("1d").unwrap();
+        let criterion = PerPeriodCapCriterion::new("native".into(), w, 1_000_000_000);
+        let args = json!({});
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx);
+        assert!(
+            matches!(result, Ok(Some(DenyReason::UnsizableValueEffect { .. }))),
+            "a MovesValue tool with no resolved effects must deny fail-closed, got {result:?}"
+        );
+    }
+
+    /// An opaque-signing call on the single-tx path must deny fail-closed.
+    #[test]
+    #[serial]
+    fn opaque_sign_call_denies_unsizable_on_single_tx() {
+        let tool = make_tool("stellar_sep43_sign_transaction");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let w = Window::parse("1d").unwrap();
+        let criterion = PerPeriodCapCriterion::new("native".into(), w, 1_000_000_000);
+        let args = json!({});
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx);
+        assert!(
+            matches!(result, Ok(Some(DenyReason::UnsizableValueEffect { .. }))),
+            "an opaque-signing call must deny fail-closed on the single-tx path, got {result:?}"
+        );
+    }
+
+    /// A multi-leg native-asset value effect is aggregated per-asset: two
+    /// legs individually under the cap must still deny when their sum exceeds
+    /// it, with a fresh (empty) period window.
+    #[test]
+    #[serial]
+    fn two_leg_native_value_aggregates_over_cap_denies() {
+        use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
+
+        let tool = make_tool("stellar_multicall");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let w = Window::parse("1d").unwrap();
+        // Cap: 100 XLM. Each leg is 60 XLM (under cap individually); the
+        // aggregate of 120 XLM must deny against an empty period window.
+        let criterion = PerPeriodCapCriterion::new("native".into(), w, 1_000_000_000);
+        let args = json!({});
+        let leg_a = ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(600_000_000),
+            asset: Some("native".to_owned()),
+            destination: Some("GAAA".to_owned()),
+        };
+        let leg_b = ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(600_000_000),
+            asset: Some("native".to_owned()),
+            destination: Some("GBBB".to_owned()),
+        };
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+            .with_value(ValueClass::Value(ValueEffects::new(vec![leg_a, leg_b])));
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::PerPeriodCapExceeded { attempted_stroops, .. })
+                if attempted_stroops == 1_200_000_000),
+            "two 60 XLM legs must aggregate to 120 XLM and deny a 100 XLM period cap, \
+             got {result:?}"
+        );
+    }
+
+    /// The period cap aggregates ONLY debit (outflow) legs; an inflow leg
+    /// (`LendWithdraw`) is present in the descriptor but never summed into the
+    /// window.
+    #[test]
+    #[serial]
+    fn cap_aggregates_only_debit_legs_not_inflow_legs() {
+        use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
+
+        let tool = make_tool("stellar_blend_lend");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let w = Window::parse("1d").unwrap();
+        // Cap 100 XLM, empty window. 60 XLM outflow (Lend) + 60 XLM inflow
+        // (LendWithdraw). Summing both would deny; summing only the outflow is
+        // 60 XLM and allows.
+        let criterion = PerPeriodCapCriterion::new("native".into(), w, 1_000_000_000);
+        let args = json!({});
+        let outflow = ValueLeg {
+            kind: ActionKind::Lend,
+            amount: Some(600_000_000),
+            asset: Some("native".to_owned()),
+            destination: Some("CAAA".to_owned()),
+        };
+        let inflow = ValueLeg {
+            kind: ActionKind::LendWithdraw,
+            amount: Some(600_000_000),
+            asset: Some("native".to_owned()),
+            destination: Some("CAAA".to_owned()),
+        };
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+            .with_value(ValueClass::Value(ValueEffects::new(vec![outflow, inflow])));
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            result.is_none(),
+            "the period cap must sum only the 60 XLM outflow leg, so a 100 XLM cap \
+             allows the call, got {result:?}"
         );
     }
 }

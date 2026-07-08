@@ -609,6 +609,24 @@ pub enum DenyReason {
         detail: String,
     },
 
+    /// A value criterion in the matched rule cannot size this call's value
+    /// effect, so the call is denied fail-closed.
+    ///
+    /// Produced when a `MovesValue` tool reached a value criterion without the
+    /// dispatch site resolving concrete `ValueClass::Value(effects)` (a
+    /// forgotten population is denied, never waved through), or when an
+    /// `OpaqueSign` tool (`ValueClass::Opaque`) is matched by a broad value
+    /// rule that has not opted it out via `allow_opaque_signing`.
+    ///
+    /// Wire code: `policy.deny.unsizable_value_effect`.
+    ///
+    /// `detail` is a non-secret diagnostic (tool name and the unsizable reason);
+    /// it never carries key material or user-supplied secret input.
+    UnsizableValueEffect {
+        /// Non-secret diagnostic detail (tool name + reason).
+        detail: String,
+    },
+
     // ── Bundle-level criteria ──────────────────────────────────────────────
     /// The number of inner invocations in a multicall bundle exceeded the cap.
     ///
@@ -777,6 +795,7 @@ impl DenyReason {
             Self::NoMatchingRule => "no_matching_rule",
             Self::CounterpartyKindUnsupported { .. } => "counterparty_kind_unsupported",
             Self::EvaluationError { .. } => "evaluation_error",
+            Self::UnsizableValueEffect { .. } => "unsizable_value_effect",
             Self::ExplicitRuleDeny => "explicit_rule_deny",
             Self::InnerInvocationCountCapExceeded { .. } => "inner_invocation_count_cap_exceeded",
             Self::BundleAggregateCapExceeded { .. } => "bundle_aggregate_cap_exceeded",
@@ -1143,6 +1162,48 @@ pub trait PolicyEngine: Send + Sync {
         sep10_sessions: Option<&dyn crate::policy::v1::Sep10SessionView>,
         sep45_sessions: Option<&dyn crate::policy::v1::Sep45SessionView>,
     ) -> Result<Decision, PolicyError>;
+
+    /// Evaluates a tool call with the value descriptor supplied explicitly by
+    /// the dispatch site.
+    ///
+    /// For single-shot Soroban tools (DeFi, x402, MPP charge) whose value cannot
+    /// appear in the pre-decode `args`, the handler resolves the effects and the
+    /// signed operation from ONE decoded value (§2.1 single-decode invariant) and
+    /// passes the resolved [`crate::policy::v1::ValueClass`] here.
+    ///
+    /// The default implementation ignores `value` and delegates to
+    /// [`Self::evaluate`], which is correct for engines that do not size value
+    /// (e.g. [`NoopPolicyEngine`]). Engines that size value
+    /// ([`crate::policy::v1::PolicyEngineV1`]) override it to gate on the supplied
+    /// descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::evaluate`].
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_with_value(
+        &self,
+        tool: &ToolDescriptor,
+        args: &serde_json::Value,
+        profile: &Profile,
+        _value: crate::policy::v1::ValueClass,
+        account_view: Option<&dyn crate::policy::v1::AccountReservesView>,
+        identity_view: Option<&dyn crate::policy::v1::AccountIdentityView>,
+        counterparty_cache: Option<&dyn crate::policy::v1::CounterpartyCacheView>,
+        sep10_sessions: Option<&dyn crate::policy::v1::Sep10SessionView>,
+        sep45_sessions: Option<&dyn crate::policy::v1::Sep45SessionView>,
+    ) -> Result<Decision, PolicyError> {
+        self.evaluate(
+            tool,
+            args,
+            profile,
+            account_view,
+            identity_view,
+            counterparty_cache,
+            sep10_sessions,
+            sep45_sessions,
+        )
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

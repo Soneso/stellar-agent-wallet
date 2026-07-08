@@ -20,8 +20,10 @@
 
 use serde_json::Value;
 
+use crate::policy::v1::EvalContext;
 use crate::policy::v1::bundle::InnerOpDescriptor;
 use crate::policy::v1::criteria::amount_extract::resolve_pay_or_create_account_stroops;
+use crate::policy::{DenyReason, ToolValueKind};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ValueClass
@@ -180,13 +182,35 @@ pub enum ActionKind {
     Claim,
     /// A change-trust (trustline) operation.
     Trustline,
-    /// A DEX path-payment / manage-offer trade.
+    /// A DEX path-payment / manage-offer trade. The debit leg carries the
+    /// send asset (the value leaving the wallet).
     DexTrade,
-    /// A Blend lending deposit / borrow.
+    /// A Blend supply / repay — value leaving the wallet into the pool
+    /// (Blend `Supply`, `SupplyCollateral`, `Repay`).
     Lend,
-    /// A vault deposit.
+    /// A Blend withdrawal or borrow — inbound funds returning to (or advanced
+    /// to) the wallet (Blend `Withdraw`, `WithdrawCollateral`, `Borrow`).
+    ///
+    /// Not a spendable-balance debit ([`ActionKind::carries_debit`] is `false`),
+    /// so value caps and `minimum_reserve` do not size it. The leg is still
+    /// emitted so the descriptor faithfully records every leg of the call.
+    ///
+    /// # The `Borrow` decision (deliberate)
+    ///
+    /// Value caps bound spendable-balance OUTFLOWS. Borrow proceeds are an
+    /// inflow: they raise the wallet's balance, and they become cap-constrained
+    /// at the moment they are SPENT (that spend is a `Payment`/`DexTrade`/`Lend`
+    /// outflow leg the caps size then). The debt / leverage exposure a borrow
+    /// creates — a liability rather than a balance movement — is a distinct
+    /// criterion class that value caps do not model; the rule-level budget
+    /// (on-chain spending-limit policy) is where that exposure is bounded. The
+    /// invariant is therefore: a borrow is never summed into a value cap at the
+    /// point of borrowing, only when the borrowed value later leaves the wallet.
+    LendWithdraw,
+    /// A vault deposit — value leaving the wallet into the vault.
     VaultDeposit,
-    /// A vault withdrawal.
+    /// A vault withdrawal — inbound funds returning to the wallet. Not a
+    /// spendable-balance debit (see [`ActionKind::LendWithdraw`]).
     VaultWithdraw,
     /// An x402 payment.
     X402Payment,
@@ -194,6 +218,49 @@ pub enum ActionKind {
     MppCharge,
     /// A generic Soroban contract invocation that moves value.
     ContractInvoke,
+}
+
+impl ActionKind {
+    /// Whether a leg of this kind reduces the wallet's spendable balance — an
+    /// outflow that value caps and `minimum_reserve` should size.
+    ///
+    /// `false` for inbound / no-value kinds: [`ActionKind::Claim`] (inbound
+    /// claimable balance), [`ActionKind::Trustline`] (a trust-line change moves
+    /// no value), [`ActionKind::LendWithdraw`] (Blend withdrawal/borrow returns
+    /// funds), and [`ActionKind::VaultWithdraw`] (vault redemption returns
+    /// funds). A debit-carrying leg with a `None` amount is unresolvable and a
+    /// value criterion refuses it; a non-debit leg with a `None` amount is
+    /// legitimately skipped.
+    #[must_use]
+    pub fn carries_debit(self) -> bool {
+        match self {
+            Self::Payment
+            | Self::AccountCreation
+            | Self::DexTrade
+            | Self::Lend
+            | Self::VaultDeposit
+            | Self::X402Payment
+            | Self::MppCharge
+            | Self::ContractInvoke => true,
+            Self::Claim | Self::Trustline | Self::LendWithdraw | Self::VaultWithdraw => false,
+        }
+    }
+}
+
+impl ValueLeg {
+    /// Whether this leg is a native-XLM debit — a debit-carrying leg
+    /// ([`ActionKind::carries_debit`]) whose asset is the canonical `"native"`.
+    ///
+    /// The minimum-reserve criterion counts only these legs: a token-only move
+    /// does not reduce the native reserve.
+    #[must_use]
+    pub fn is_native_debit(&self) -> bool {
+        self.kind.carries_debit()
+            && self
+                .asset
+                .as_deref()
+                .is_some_and(|a| asset_normalise(a) == "native")
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -242,23 +309,28 @@ pub fn asset_normalise(asset: &str) -> String {
 
 /// Derives a [`ValueClass`] for a tool call from `(tool_name, args)`.
 ///
-/// This is the single derivation point for the two already-covered tools
-/// (`stellar_pay` / `stellar_create_account`, and their two-phase `_commit`
-/// twins). The amount is resolved from the SAME resolved-key logic the value
-/// criteria already use ([`resolve_pay_or_create_account_stroops`]); when the
-/// engine is called on the commit path, `args` is the HMAC-bound
-/// `authoritative_args`, so the derived leg is transitively bound to the signed
-/// envelope.
+/// This is the single derivation point for the classic tools whose value is
+/// fully described by their args: `stellar_pay` / `stellar_create_account`
+/// (debit legs), `stellar_claim` / `stellar_trustline` (non-debit legs), and
+/// their two-phase `_commit` twins. The pay/create amount is resolved from the
+/// SAME resolved-key logic the value criteria use
+/// ([`resolve_pay_or_create_account_stroops`]); on the commit path `args` is
+/// the HMAC-bound `authoritative_args`, so the derived leg is transitively bound
+/// to the signed envelope.
 ///
-/// A present-but-unparseable amount is resolved to `None` here (rather than a
-/// hard error) so the derivation stays infallible and does not fire an error
-/// for rules that carry no value criterion. The value criteria treat a
-/// pay/create leg with `amount == None` as unresolvable and deny/error exactly
-/// as the args-read path does today.
+/// A present-but-unparseable pay/create amount is resolved to `None` here
+/// (rather than a hard error) so the derivation stays infallible and does not
+/// fire an error for rules that carry no value criterion. The value criteria
+/// treat a pay/create leg with `amount == None` as unresolvable and deny/error
+/// exactly as the args-read path does.
 ///
-/// Every other tool derives [`ValueClass::ReadOnly`] in this step; the
-/// per-tool `MovesValue` / `OpaqueSign` classification of the remaining tools
-/// is wired in a later migration step.
+/// The OpaqueSign tools (`stellar_sep43_*`) derive [`ValueClass::Opaque`] so a
+/// broad value rule denies them fail-closed. Single-shot Soroban tools (DeFi,
+/// x402, MPP charge) cannot be derived from pre-decode args; they resolve their
+/// effects in the handler and gate via
+/// [`PolicyEngine::evaluate_with_value`](crate::policy::PolicyEngine::evaluate_with_value)
+/// instead of this function. Every remaining tool is genuinely read-only and
+/// derives [`ValueClass::ReadOnly`].
 #[must_use]
 pub fn derive_value_class(tool_name: &str, args: &Value) -> ValueClass {
     match tool_name {
@@ -298,7 +370,107 @@ pub fn derive_value_class(tool_name: &str, args: &Value) -> ValueClass {
                 destination,
             })
         }
+        // Two-phase classic tools whose leg carries no spendable-balance debit.
+        // `stellar_claim` receives an inbound claimable balance; `stellar_trustline`
+        // changes a trust line. Both are `MovesValue`, so the descriptor must be a
+        // populated `Value` (non-empty) to satisfy the population guard, but the leg
+        // is non-debit (`carries_debit` false), so caps and counterparty checks skip
+        // it. On the commit path `args` is the HMAC-bound authoritative_args.
+        "stellar_claim" | "stellar_claim_commit" => ValueClass::single(ValueLeg {
+            kind: ActionKind::Claim,
+            amount: None,
+            asset: None,
+            destination: None,
+        }),
+        "stellar_trustline" | "stellar_trustline_commit" => {
+            let asset = args
+                .get("asset")
+                .and_then(Value::as_str)
+                .map(asset_normalise);
+            ValueClass::single(ValueLeg {
+                kind: ActionKind::Trustline,
+                amount: None,
+                asset,
+                destination: None,
+            })
+        }
+        // OpaqueSign tools: the wallet signs caller-supplied material whose value
+        // effect it does not decode. Deriving Opaque here (rather than ReadOnly)
+        // makes a broad value rule deny them fail-closed unless the rule opts in
+        // via allow_opaque_signing.
+        "stellar_sep43_sign_transaction" | "stellar_sep43_sign_and_submit_transaction" => {
+            ValueClass::Opaque(OpaqueReason::RawTransactionSignature)
+        }
+        "stellar_sep43_sign_auth_entry" => ValueClass::Opaque(OpaqueReason::RawAuthEntrySignature),
         _ => ValueClass::ReadOnly,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// classify_value — the fail-closed gate shared by every value criterion
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The value-axis verdict a value criterion should act on for a call.
+///
+/// Produced by [`classify_value`], which centralises the fail-closed default so
+/// every value criterion (`per_tx_cap`, `per_period_cap`, `minimum_reserve`,
+/// `counterparty_allowlist`) shares one implementation of the ReadOnly /
+/// Value / Opaque decision.
+pub enum ValueGate<'a> {
+    /// The value criterion does not apply (a genuinely read-only call).
+    NotApplicable,
+    /// Size the call against these resolved effects.
+    Effects(&'a ValueEffects),
+    /// Deny fail-closed: the effect cannot be sized.
+    Deny(DenyReason),
+}
+
+/// Classifies a call's value axis for a value criterion, applying the
+/// fail-closed default (design §2.2).
+///
+/// - `ValueClass::Value(effects)` → [`ValueGate::Effects`]; the criterion sizes
+///   the legs.
+/// - `ValueClass::Opaque(_)` → [`ValueGate::Deny`] under a matched value rule,
+///   UNLESS `ctx.bundle.is_some()` (bundle inners are typed by
+///   `decompose_bundle` and never opaque, so the opaque-deny is suppressed on
+///   the per-inner axis).
+/// - `ValueClass::ReadOnly` → [`ValueGate::NotApplicable`], EXCEPT a
+///   `MovesValue` tool that resolved no effects on the single-tx path: that is
+///   a forgotten/failed population and is denied fail-closed
+///   ([`DenyReason::UnsizableValueEffect`]) rather than waved through. In bundle
+///   mode a ReadOnly inner (a `Generic` inner) is not-applicable — Generic-inner
+///   policing belongs to `restrict_bundle_to_recognised_kinds`, not the value
+///   caps.
+#[must_use]
+pub fn classify_value<'a>(ctx: &'a EvalContext<'_>) -> ValueGate<'a> {
+    match &ctx.value {
+        ValueClass::Value(effects) => ValueGate::Effects(effects),
+        ValueClass::Opaque(_) => {
+            if ctx.bundle.is_some() {
+                ValueGate::NotApplicable
+            } else {
+                ValueGate::Deny(DenyReason::UnsizableValueEffect {
+                    detail: format!(
+                        "tool '{}' signs opaque material whose value effect cannot be \
+                         sized; a value rule matched it without allow_opaque_signing",
+                        ctx.tool.name
+                    ),
+                })
+            }
+        }
+        ValueClass::ReadOnly => {
+            if ctx.tool.value_kind == ToolValueKind::MovesValue && ctx.bundle.is_none() {
+                ValueGate::Deny(DenyReason::UnsizableValueEffect {
+                    detail: format!(
+                        "tool '{}' is classified MovesValue but the dispatch site resolved \
+                         no value effects; refusing rather than sizing it as read-only",
+                        ctx.tool.name
+                    ),
+                })
+            } else {
+                ValueGate::NotApplicable
+            }
+        }
     }
 }
 
@@ -467,6 +639,38 @@ mod tests {
     }
 
     #[test]
+    fn derive_claim_builds_non_debit_claim_leg() {
+        // stellar_claim is MovesValue, so it must derive a populated Value (guard),
+        // but the leg is a non-debit inbound Claim that caps and counterparty skip.
+        let args = json!({ "balance_id": "00000000abcdef" });
+        let ValueClass::Value(effects) = derive_value_class("stellar_claim", &args) else {
+            panic!("stellar_claim must derive a Value to satisfy the population guard");
+        };
+        assert_eq!(effects.legs().len(), 1);
+        let leg = &effects.legs()[0];
+        assert_eq!(leg.kind, ActionKind::Claim);
+        assert!(!leg.kind.carries_debit());
+        assert_eq!(leg.amount, None);
+    }
+
+    #[test]
+    fn derive_trustline_builds_non_debit_trustline_leg_with_asset() {
+        let args =
+            json!({ "asset": "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" });
+        let ValueClass::Value(effects) = derive_value_class("stellar_trustline_commit", &args)
+        else {
+            panic!("stellar_trustline must derive a Value to satisfy the population guard");
+        };
+        let leg = &effects.legs()[0];
+        assert_eq!(leg.kind, ActionKind::Trustline);
+        assert!(!leg.kind.carries_debit());
+        assert_eq!(
+            leg.asset.as_deref(),
+            Some("USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN")
+        );
+    }
+
+    #[test]
     fn inner_token_transfer_maps_to_payment_leg() {
         let inner = InnerOpDescriptor::TokenTransfer {
             asset: "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA".into(),
@@ -488,6 +692,141 @@ mod tests {
             leg.destination.as_deref(),
             Some("GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL")
         );
+    }
+
+    // ── classify_value fail-closed matrix ────────────────────────────────────
+
+    use crate::policy::v1::{EvalContext, PolicyStateStore};
+    use crate::policy::{McpToolRegistration, ToolValueKind};
+    use crate::profile::schema::Profile;
+
+    fn tool_with_kind(name: &'static str, kind: ToolValueKind) -> crate::policy::ToolDescriptor {
+        let mut d = crate::policy::ToolDescriptor::from_registration(&McpToolRegistration {
+            name,
+            destructive_hint: true,
+            read_only_hint: false,
+            chain_id_required: true,
+            value_kind: kind,
+        });
+        d.value_kind = kind;
+        d
+    }
+
+    #[test]
+    fn classify_value_value_effects_are_sized() {
+        let tool = tool_with_kind("stellar_pay", ToolValueKind::MovesValue);
+        let profile = Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build();
+        let args = json!({});
+        let store = PolicyStateStore::new();
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store).with_value(
+            ValueClass::single(ValueLeg {
+                kind: ActionKind::Payment,
+                amount: Some(1),
+                asset: Some("native".into()),
+                destination: None,
+            }),
+        );
+        assert!(matches!(classify_value(&ctx), ValueGate::Effects(_)));
+    }
+
+    #[test]
+    fn classify_value_moves_value_tool_without_effects_denies() {
+        // A MovesValue tool whose dispatch site resolved ReadOnly is a forgotten
+        // population; fail-closed deny rather than a silent pass.
+        let tool = tool_with_kind("stellar_blend_lend", ToolValueKind::MovesValue);
+        let profile = Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build();
+        let args = json!({});
+        let store = PolicyStateStore::new();
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store);
+        assert!(matches!(
+            classify_value(&ctx),
+            ValueGate::Deny(DenyReason::UnsizableValueEffect { .. })
+        ));
+    }
+
+    #[test]
+    fn classify_value_read_only_tool_is_not_applicable() {
+        let tool = tool_with_kind("stellar_balances", ToolValueKind::ReadOnly);
+        let profile = Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build();
+        let args = json!({});
+        let store = PolicyStateStore::new();
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store);
+        assert!(matches!(classify_value(&ctx), ValueGate::NotApplicable));
+    }
+
+    #[test]
+    fn classify_value_opaque_denies_on_single_tx_but_suppressed_in_bundle() {
+        use crate::policy::v1::bundle::{BundleStateOverlay, BundleView, InnerOpDescriptor};
+
+        let tool = tool_with_kind("stellar_sep43_sign_transaction", ToolValueKind::OpaqueSign);
+        let profile = Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build();
+        let args = json!({});
+        let store = PolicyStateStore::new();
+
+        let single = EvalContext::new(&tool, &args, "alice", &profile, &store)
+            .with_value(ValueClass::Opaque(OpaqueReason::RawTransactionSignature));
+        assert!(matches!(
+            classify_value(&single),
+            ValueGate::Deny(DenyReason::UnsizableValueEffect { .. })
+        ));
+
+        let inners: Vec<InnerOpDescriptor> = vec![];
+        let overlay = BundleStateOverlay::default();
+        let view = BundleView {
+            inners: &inners,
+            overlay: &overlay,
+        };
+        let bundled = EvalContext::new(&tool, &args, "alice", &profile, &store)
+            .with_value(ValueClass::Opaque(OpaqueReason::RawTransactionSignature))
+            .with_bundle(&view);
+        assert!(matches!(classify_value(&bundled), ValueGate::NotApplicable));
+    }
+
+    #[test]
+    fn carries_debit_and_native_debit_classification() {
+        assert!(ActionKind::Payment.carries_debit());
+        assert!(ActionKind::VaultDeposit.carries_debit());
+        assert!(
+            ActionKind::Lend.carries_debit(),
+            "Blend supply/repay is an outflow"
+        );
+        assert!(!ActionKind::Claim.carries_debit());
+        assert!(!ActionKind::Trustline.carries_debit());
+        assert!(
+            !ActionKind::VaultWithdraw.carries_debit(),
+            "vault withdrawal returns funds; not a spendable-balance debit"
+        );
+        assert!(
+            !ActionKind::LendWithdraw.carries_debit(),
+            "Blend withdrawal/borrow returns funds; not a spendable-balance debit"
+        );
+
+        let native = ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(1),
+            asset: Some("XLM".into()),
+            destination: None,
+        };
+        assert!(native.is_native_debit(), "XLM normalises to native debit");
+
+        let token = ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(1),
+            asset: Some("USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN".into()),
+            destination: None,
+        };
+        assert!(
+            !token.is_native_debit(),
+            "a token move is not a native debit"
+        );
+
+        let claim = ValueLeg {
+            kind: ActionKind::Claim,
+            amount: None,
+            asset: Some("native".into()),
+            destination: None,
+        };
+        assert!(!claim.is_native_debit(), "an inbound claim is not a debit");
     }
 
     #[test]

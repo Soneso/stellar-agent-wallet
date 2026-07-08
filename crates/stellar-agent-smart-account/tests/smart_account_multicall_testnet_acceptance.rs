@@ -214,6 +214,7 @@ fn policy_engine_with_criteria(
             },
             criteria,
             decision: Decision::Allow,
+            allow_opaque_signing: false,
         }],
         signature: None,
     };

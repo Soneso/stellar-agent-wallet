@@ -1,5 +1,4 @@
-//! Shared amount-extraction helper for criteria that read a transaction's
-//! debit amount from `EvalContext::args`.
+//! Shared amount-extraction helper for the pay/create-account tool family.
 //!
 //! `args` is either the caller-supplied simulate-time `args_value` or the
 //! HMAC-bound commit-time `authoritative_args`
@@ -12,7 +11,6 @@
 
 use crate::amount::StellarAmount;
 use crate::policy::PolicyError;
-use crate::policy::v1::EvalContext;
 /// Reads a stroop amount from a `serde_json::Value`, tolerating both the
 /// decimal-string wire encoding and a legacy JSON number (and rejecting a
 /// negative value — every resolved-key consumer here is a non-negative
@@ -20,7 +18,11 @@ use crate::policy::v1::EvalContext;
 pub(crate) use crate::wire_stroops::value_as_stroops_i64;
 
 /// Resolves the debit amount in stroops for `stellar_pay(_commit)` /
-/// `stellar_create_account(_commit)`.
+/// `stellar_create_account(_commit)` directly from `(tool_name, args)`.
+///
+/// This is the [`crate::policy::v1::EvalContext`]-free core the descriptor
+/// derivation ([`crate::policy::v1::value::derive_value_class`]) calls before
+/// an `EvalContext` exists.
 ///
 /// Tries the resolved key first (`amount_stroops` for pay, or
 /// `starting_balance_stroops` for create_account — string-tolerant, number
@@ -33,26 +35,6 @@ pub(crate) use crate::wire_stroops::value_as_stroops_i64;
 /// to be absent together only for a tool this function does not recognise;
 /// for pay/create_account the resolved key is always present in produced
 /// args).
-///
-/// # Errors
-///
-/// Returns [`PolicyError::CriterionEvaluationFailed`] when a present key does
-/// not parse as a valid amount.
-pub(crate) fn extract_pay_or_create_account_stroops(
-    ctx: &EvalContext<'_>,
-    caller: &'static str,
-) -> Result<Option<i64>, PolicyError> {
-    resolve_pay_or_create_account_stroops(ctx.tool.name.as_str(), ctx.args, caller)
-}
-
-/// Resolves the debit amount in stroops for `stellar_pay(_commit)` /
-/// `stellar_create_account(_commit)` directly from `(tool_name, args)`.
-///
-/// This is the [`EvalContext`]-free core of
-/// [`extract_pay_or_create_account_stroops`]; the descriptor derivation
-/// ([`crate::policy::v1::value::derive_value_class`]) calls it before an
-/// `EvalContext` exists, and the criterion wrapper delegates to it, so both
-/// paths resolve the amount identically.
 ///
 /// # Errors
 ///
@@ -113,31 +95,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::policy::v1::criteria::state_store::PolicyStateStore;
-    use crate::policy::{McpToolRegistration, ToolDescriptor};
-    use crate::profile::schema::Profile;
-
-    fn make_tool(tool_name: &'static str) -> ToolDescriptor {
-        let reg = McpToolRegistration {
-            name: tool_name,
-            destructive_hint: true,
-            read_only_hint: false,
-            chain_id_required: true,
-            value_kind: crate::policy::ToolValueKind::ReadOnly,
-        };
-        ToolDescriptor::from_registration(&reg)
-    }
-
-    fn make_ctx<'a>(tool: &'a ToolDescriptor, args: &'a serde_json::Value) -> EvalContext<'a> {
-        // `profile`/`state_store` are leaked intentionally for the 'static
-        // lifetime this helper needs across many small tests; acceptable in a
-        // unit-test-only helper.
-        let profile: &'a Profile = Box::leak(Box::new(
-            Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build(),
-        ));
-        let store: &'a PolicyStateStore = Box::leak(Box::new(PolicyStateStore::new()));
-        EvalContext::new(tool, args, "alice", profile, store)
-    }
 
     #[test]
     fn value_as_stroops_i64_reads_string() {
@@ -164,19 +121,15 @@ mod tests {
         // `>= 0` guard turns it into "malformed", which this extractor
         // reports as an error rather than silently returning a negative stroop
         // amount.
-        let tool = make_tool("stellar_pay");
         let args = json!({ "amount_stroops": "-100000000" });
-        let ctx = make_ctx(&tool, &args);
-        assert!(extract_pay_or_create_account_stroops(&ctx, "test").is_err());
+        assert!(resolve_pay_or_create_account_stroops("stellar_pay", &args, "test").is_err());
     }
 
     #[test]
     fn pay_resolved_key_present_is_used() {
-        let tool = make_tool("stellar_pay");
         let args = json!({ "amount_stroops": "100000000", "amount": "999 XLM" });
-        let ctx = make_ctx(&tool, &args);
         assert_eq!(
-            extract_pay_or_create_account_stroops(&ctx, "test").unwrap(),
+            resolve_pay_or_create_account_stroops("stellar_pay", &args, "test").unwrap(),
             Some(100_000_000),
             "resolved key must win over the legacy key when both are present"
         );
@@ -186,33 +139,27 @@ mod tests {
     fn pay_commit_resolved_key_only_no_legacy_key() {
         // Matches envelope_decode's authoritative_args shape exactly: no
         // "amount" key at all.
-        let tool = make_tool("stellar_pay_commit");
         let args = json!({ "source": "G...", "destination": "G...", "amount_stroops": "100000000", "asset": "XLM" });
-        let ctx = make_ctx(&tool, &args);
         assert_eq!(
-            extract_pay_or_create_account_stroops(&ctx, "test").unwrap(),
+            resolve_pay_or_create_account_stroops("stellar_pay_commit", &args, "test").unwrap(),
             Some(100_000_000)
         );
     }
 
     #[test]
     fn pay_falls_back_to_legacy_amount_when_resolved_key_absent() {
-        let tool = make_tool("stellar_pay");
         let args = json!({ "amount": "10 XLM", "asset": "native" });
-        let ctx = make_ctx(&tool, &args);
         assert_eq!(
-            extract_pay_or_create_account_stroops(&ctx, "test").unwrap(),
+            resolve_pay_or_create_account_stroops("stellar_pay", &args, "test").unwrap(),
             Some(100_000_000)
         );
     }
 
     #[test]
     fn pay_version_crossing_numeric_amount_stroops_still_parses() {
-        let tool = make_tool("stellar_pay");
         let args = json!({ "amount_stroops": 100_000_000 });
-        let ctx = make_ctx(&tool, &args);
         assert_eq!(
-            extract_pay_or_create_account_stroops(&ctx, "test").unwrap(),
+            resolve_pay_or_create_account_stroops("stellar_pay", &args, "test").unwrap(),
             Some(100_000_000)
         );
     }
@@ -222,55 +169,46 @@ mod tests {
         // Matches both simulate-time args_value AND commit-time
         // authoritative_args: only starting_balance_stroops, never
         // "starting_balance".
-        let tool = make_tool("stellar_create_account");
         let args = json!({ "starting_balance_stroops": "50000000" });
-        let ctx = make_ctx(&tool, &args);
         assert_eq!(
-            extract_pay_or_create_account_stroops(&ctx, "test").unwrap(),
+            resolve_pay_or_create_account_stroops("stellar_create_account", &args, "test").unwrap(),
             Some(50_000_000)
         );
     }
 
     #[test]
     fn create_account_commit_resolved_key_only() {
-        let tool = make_tool("stellar_create_account_commit");
         let args = json!({ "source": "G...", "destination": "G...", "starting_balance_stroops": "50000000" });
-        let ctx = make_ctx(&tool, &args);
         assert_eq!(
-            extract_pay_or_create_account_stroops(&ctx, "test").unwrap(),
+            resolve_pay_or_create_account_stroops("stellar_create_account_commit", &args, "test")
+                .unwrap(),
             Some(50_000_000)
         );
     }
 
     #[test]
     fn create_account_falls_back_to_legacy_starting_balance() {
-        let tool = make_tool("stellar_create_account");
         let args = json!({ "starting_balance": "5 XLM" });
-        let ctx = make_ctx(&tool, &args);
         assert_eq!(
-            extract_pay_or_create_account_stroops(&ctx, "test").unwrap(),
+            resolve_pay_or_create_account_stroops("stellar_create_account", &args, "test").unwrap(),
             Some(50_000_000)
         );
     }
 
     #[test]
     fn unrecognised_tool_returns_ok_none() {
-        let tool = make_tool("stellar_balances");
         let args = json!({});
-        let ctx = make_ctx(&tool, &args);
         assert_eq!(
-            extract_pay_or_create_account_stroops(&ctx, "test").unwrap(),
+            resolve_pay_or_create_account_stroops("stellar_balances", &args, "test").unwrap(),
             None
         );
     }
 
     #[test]
     fn neither_key_present_returns_ok_none() {
-        let tool = make_tool("stellar_pay");
         let args = json!({ "asset": "native" });
-        let ctx = make_ctx(&tool, &args);
         assert_eq!(
-            extract_pay_or_create_account_stroops(&ctx, "test").unwrap(),
+            resolve_pay_or_create_account_stroops("stellar_pay", &args, "test").unwrap(),
             None
         );
     }
@@ -279,17 +217,13 @@ mod tests {
     fn malformed_resolved_key_is_an_error_not_a_silent_fallback() {
         // A malformed resolved-key value must NOT silently fall back to the
         // legacy key (which could mask a genuine wire-shape bug) — it errors.
-        let tool = make_tool("stellar_pay");
         let args = json!({ "amount_stroops": "not-a-number", "amount": "10 XLM" });
-        let ctx = make_ctx(&tool, &args);
-        assert!(extract_pay_or_create_account_stroops(&ctx, "test").is_err());
+        assert!(resolve_pay_or_create_account_stroops("stellar_pay", &args, "test").is_err());
     }
 
     #[test]
     fn malformed_legacy_key_is_an_error() {
-        let tool = make_tool("stellar_pay");
         let args = json!({ "amount": "not-a-number" });
-        let ctx = make_ctx(&tool, &args);
-        assert!(extract_pay_or_create_account_stroops(&ctx, "test").is_err());
+        assert!(resolve_pay_or_create_account_stroops("stellar_pay", &args, "test").is_err());
     }
 }

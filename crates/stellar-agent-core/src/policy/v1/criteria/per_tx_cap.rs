@@ -37,6 +37,7 @@
 
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::criteria::Criterion;
+use crate::policy::v1::value::{ValueGate, asset_normalise, classify_value};
 use crate::policy::{DenyReason, PolicyError};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -120,86 +121,90 @@ impl Criterion for PerTxCapCriterion {
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
         let tool_name = ctx.tool.name.as_str();
 
-        // Extract (attempted_stroops, tool_asset) per tool type.
-        let (attempted_stroops, tool_asset) = match tool_name {
-            "stellar_pay"
-            | "stellar_pay_commit"
-            | "stellar_create_account"
-            | "stellar_create_account_commit" => {
-                // Read the resolved value leg the gate derived from the same
-                // authoritative args (amount / asset / destination), rather than
-                // re-parsing args here. Behaviour-neutral: the leg's amount and
-                // asset come from the identical resolved-key logic and the same
-                // asset normalisation this criterion applied before.
-                let leg = ctx.value.sole_value_leg().ok_or_else(|| {
-                    PolicyError::CriterionEvaluationFailed {
-                        detail: format!(
-                            "per_tx_cap: value descriptor not populated for tool '{tool_name}'"
-                        ),
-                    }
+        let criterion_asset = asset_normalise(&self.asset);
+
+        // Legacy args-based arm for the not-yet-migrated `stellar_axelar_bridge`
+        // (an unregistered dead arm removed in #22). Reached only for that name;
+        // every classified tool is sized through the value descriptor below.
+        if tool_name == "stellar_axelar_bridge" {
+            let qty_val = ctx
+                .args
+                .get("qty")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+                    detail: format!(
+                        "per_tx_cap: missing or non-integer field 'qty' in args for tool \
+                         '{tool_name}'"
+                    ),
                 })?;
-                let amount = leg
-                    .amount
-                    .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
-                        detail: format!("per_tx_cap: unresolvable amount for tool '{tool_name}'"),
-                    })?;
-                // i128 widening of the cap compare path is a later step; the
-                // derived amount originates from an i64 resolved key, so this
-                // conversion cannot lose data in this step.
-                let stroops =
-                    i64::try_from(amount).map_err(|_| PolicyError::CriterionEvaluationFailed {
-                        detail: format!(
-                            "per_tx_cap: amount {amount} exceeds i64 range for tool '{tool_name}'"
-                        ),
-                    })?;
-                let asset =
-                    leg.asset
-                        .clone()
-                        .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
-                            detail: format!(
-                                "per_tx_cap: unresolvable asset for tool '{tool_name}'"
-                            ),
-                        })?;
-                // leg.asset is already the canonical policy asset id.
-                (stroops, asset)
-            }
-            "stellar_axelar_bridge" => {
-                // `qty` is an on-chain i128 integer (not a unit-bearing string).
-                // `token_address` is the resolved C-strkey from the token-egress
-                // pin, injected by the dispatch site alongside qty.
-                let qty_val = ctx
-                    .args
-                    .get("qty")
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
-                        detail: format!(
-                            "per_tx_cap: missing or non-integer field 'qty' \
-                                 in args for tool '{}'",
-                            ctx.tool.name
-                        ),
-                    })?;
-                let token_address = extract_string_field(ctx, "token_address")?;
-                (qty_val, token_address)
-            }
-            _ => {
-                // Criterion does not apply to other tools.
+            let token_address = extract_string_field(ctx, "token_address")?;
+            if criterion_asset != token_address {
                 return Ok(None);
             }
-        };
-
-        // Normalise the configured asset for comparison.
-        let criterion_asset = asset_normalise(self.asset.clone());
-
-        // Asset mismatch — criterion does not apply.
-        if criterion_asset != tool_asset {
+            if qty_val > self.max_stroops {
+                return Ok(Some(DenyReason::PerTxCapExceeded {
+                    asset: self.asset.clone(),
+                    max_stroops: self.max_stroops,
+                    attempted_stroops: qty_val,
+                }));
+            }
             return Ok(None);
         }
 
-        if attempted_stroops > self.max_stroops {
+        // Descriptor-driven path with the fail-closed default: an unsizable
+        // effect (MovesValue tool that resolved no effects, or an opaque-sign
+        // call) denies here rather than passing silently.
+        let effects = match classify_value(ctx) {
+            ValueGate::NotApplicable => return Ok(None),
+            ValueGate::Deny(reason) => return Ok(Some(reason)),
+            ValueGate::Effects(effects) => effects,
+        };
+
+        // Aggregate the debit legs matching the configured asset (per-asset
+        // aggregation across the N legs of a multi-leg call). A non-debit leg
+        // (Claim/Trustline) contributes nothing; a debit leg with an
+        // unresolvable amount or asset is refused fail-closed.
+        let mut matched = false;
+        let mut sum: i128 = 0;
+        for leg in effects.legs() {
+            if !leg.kind.carries_debit() {
+                continue;
+            }
+            let leg_asset =
+                leg.asset
+                    .as_deref()
+                    .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+                        detail: format!(
+                            "per_tx_cap: debit leg of tool '{tool_name}' carries no asset"
+                        ),
+                    })?;
+            if asset_normalise(leg_asset) != criterion_asset {
+                continue;
+            }
+            let amount = leg
+                .amount
+                .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+                    detail: format!(
+                        "per_tx_cap: unresolvable amount for a debit leg of tool '{tool_name}'"
+                    ),
+                })?;
+            matched = true;
+            sum = sum.saturating_add(amount);
+        }
+
+        // The configured asset is not moved by this call — criterion not applicable.
+        if !matched {
+            return Ok(None);
+        }
+
+        if sum > i128::from(self.max_stroops) {
             return Ok(Some(DenyReason::PerTxCapExceeded {
                 asset: self.asset.clone(),
                 max_stroops: self.max_stroops,
-                attempted_stroops,
+                // The decision is made in i128; only the reported figure on the
+                // deny path saturates to i64. Widening the DenyReason payload to
+                // i128 is a later step.
+                attempted_stroops: i64::try_from(sum).unwrap_or(i64::MAX),
             }));
         }
 
@@ -226,17 +231,6 @@ fn extract_string_field(ctx: &EvalContext<'_>, field: &str) -> Result<String, Po
                 field, ctx.tool.name
             ),
         })
-}
-
-/// Normalises an asset identifier to lowercase `"native"` for XLM, or
-/// leaves non-native assets as-is (uppercased `CODE:Gissuer` is
-/// preserved verbatim for allowlist matching).
-fn asset_normalise(asset: String) -> String {
-    if asset.eq_ignore_ascii_case("native") || asset.eq_ignore_ascii_case("xlm") {
-        "native".to_owned()
-    } else {
-        asset
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -692,9 +686,8 @@ mod tests {
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
             matches!(result, Some(DenyReason::PerTxCapExceeded { .. })),
-            "150 XLM commit should be denied by a 100 XLM cap; this is the pre-existing \
-             fail-closed bug this re-point fixes (authoritative_args never carried \
-             'amount', only 'amount_stroops')"
+            "a 150 XLM commit must be denied by a 100 XLM cap; the descriptor sizes the \
+             debit from 'amount_stroops', the only amount key authoritative_args carries"
         );
     }
 
@@ -734,9 +727,8 @@ mod tests {
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
             matches!(result, Some(DenyReason::PerTxCapExceeded { .. })),
-            "150 XLM should be denied by a 100 XLM cap; this is the pre-existing \
-             fail-closed bug this re-point fixes (create_account args_value never \
-             carried 'starting_balance', only 'starting_balance_stroops')"
+            "150 XLM must be denied by a 100 XLM cap; the descriptor sizes the debit from \
+             'starting_balance_stroops', the only amount key create_account args carry"
         );
     }
 
@@ -793,6 +785,135 @@ mod tests {
         assert!(
             matches!(result, Some(DenyReason::PerTxCapExceeded { .. })),
             "numeric amount_stroops must still be denied by the cap"
+        );
+    }
+
+    // ── Fail-closed value-descriptor matrix ─────────────────────────────────
+
+    /// Constructs a `ToolDescriptor` with an explicit `value_kind` (rather
+    /// than the fixed `ReadOnly` of [`make_tool`]).
+    fn make_tool_with_kind(
+        tool_name: &'static str,
+        value_kind: crate::policy::ToolValueKind,
+    ) -> ToolDescriptor {
+        let reg = McpToolRegistration {
+            name: tool_name,
+            destructive_hint: true,
+            read_only_hint: false,
+            chain_id_required: true,
+            value_kind,
+        };
+        ToolDescriptor::from_registration(&reg)
+    }
+
+    /// A `MovesValue` tool the descriptor derivation has not classified
+    /// (`derive_value_class` falls through to `ReadOnly` for any name outside
+    /// its match arms) must deny fail-closed rather than passing silently —
+    /// this is a forgotten/failed population, not a legitimate no-op.
+    #[test]
+    fn moves_value_tool_with_unpopulated_effects_denies_unsizable() {
+        let tool = make_tool_with_kind(
+            "stellar_blend_lend",
+            crate::policy::ToolValueKind::MovesValue,
+        );
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = PerTxCapCriterion::new("native".into(), 1_000_000_000);
+        let args = json!({});
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx);
+        assert!(
+            matches!(result, Ok(Some(DenyReason::UnsizableValueEffect { .. }))),
+            "a MovesValue tool with no resolved effects must deny fail-closed, got {result:?}"
+        );
+    }
+
+    /// An opaque-signing call (raw transaction / auth-entry XDR) on the
+    /// single-tx path must deny fail-closed: the wallet cannot size a value
+    /// cap against material it does not decode.
+    #[test]
+    fn opaque_sign_call_denies_unsizable_on_single_tx() {
+        let tool = make_tool("stellar_sep43_sign_transaction");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = PerTxCapCriterion::new("native".into(), 1_000_000_000);
+        let args = json!({});
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx);
+        assert!(
+            matches!(result, Ok(Some(DenyReason::UnsizableValueEffect { .. }))),
+            "an opaque-signing call must deny fail-closed on the single-tx path, got {result:?}"
+        );
+    }
+
+    /// A multi-leg native-asset value effect is aggregated per-asset: two
+    /// legs individually under the cap must still deny when their sum exceeds
+    /// it.
+    #[test]
+    fn two_leg_native_value_aggregates_over_cap_denies() {
+        use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
+
+        let tool = make_tool("stellar_multicall");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        // Cap: 100 XLM. Each leg is 60 XLM (under cap individually); the
+        // aggregate of 120 XLM must deny.
+        let criterion = PerTxCapCriterion::new("native".into(), 1_000_000_000);
+        let args = json!({});
+        let leg_a = ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(600_000_000),
+            asset: Some("native".to_owned()),
+            destination: Some("GAAA".to_owned()),
+        };
+        let leg_b = ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(600_000_000),
+            asset: Some("native".to_owned()),
+            destination: Some("GBBB".to_owned()),
+        };
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+            .with_value(ValueClass::Value(ValueEffects::new(vec![leg_a, leg_b])));
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::PerTxCapExceeded { attempted_stroops, .. })
+                if attempted_stroops == 1_200_000_000),
+            "two 60 XLM legs must aggregate to 120 XLM and deny a 100 XLM cap, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn cap_aggregates_only_debit_legs_not_inflow_legs() {
+        use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
+
+        let tool = make_tool("stellar_blend_lend");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        // Cap 100 XLM. One 60 XLM outflow (Lend) + one 60 XLM inflow
+        // (LendWithdraw), same asset. Summing both would be 120 XLM and deny;
+        // summing only the debit (outflow) leg is 60 XLM and allows. The cap
+        // must size ONLY the outflow, so the call is allowed.
+        let criterion = PerTxCapCriterion::new("native".into(), 1_000_000_000);
+        let args = json!({});
+        let outflow = ValueLeg {
+            kind: ActionKind::Lend,
+            amount: Some(600_000_000),
+            asset: Some("native".to_owned()),
+            destination: Some("CAAA".to_owned()),
+        };
+        let inflow = ValueLeg {
+            kind: ActionKind::LendWithdraw,
+            amount: Some(600_000_000),
+            asset: Some("native".to_owned()),
+            destination: Some("CAAA".to_owned()),
+        };
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+            .with_value(ValueClass::Value(ValueEffects::new(vec![outflow, inflow])));
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            result.is_none(),
+            "the per-tx cap must sum only the 60 XLM outflow leg (not the 60 XLM \
+             inflow leg), so a 100 XLM cap allows the call, got {result:?}"
         );
     }
 }

@@ -266,6 +266,7 @@ proptest! {
                     100_000_000_000_000_i64, // 10 000 000 XLM — always passes
                 ))],
                 decision: Decision::Allow,
+                allow_opaque_signing: false,
             };
 
             // The strict deny rule (cap = 1 stroop) is placed first.
@@ -317,6 +318,7 @@ fn enumerate_deny_reason_for_test(v: &DenyReason) -> &'static str {
         DenyReason::ExplicitRuleDeny => "explicit_rule_deny",
         DenyReason::CounterpartyKindUnsupported { .. } => "counterparty_kind_unsupported",
         DenyReason::EvaluationError { .. } => "evaluation_error",
+        DenyReason::UnsizableValueEffect { .. } => "unsizable_value_effect",
         DenyReason::InnerInvocationCountCapExceeded { .. } => "inner_invocation_count_cap_exceeded",
         DenyReason::BundleAggregateCapExceeded { .. } => "bundle_aggregate_cap_exceeded",
         DenyReason::BundleContainsGenericKind { .. } => "bundle_contains_generic_kind",
@@ -396,6 +398,9 @@ fn deny_reason_wire_codes_are_unique() {
         DenyReason::EvaluationError {
             detail: "test".into(),
         },
+        DenyReason::UnsizableValueEffect {
+            detail: "test".into(),
+        },
         DenyReason::InnerInvocationCountCapExceeded {
             max: 50,
             attempted: 51,
@@ -454,7 +459,7 @@ fn deny_reason_wire_codes_are_unique() {
     // but forgets the corresponding entry in `variants`, this catches it.
     assert_eq!(
         variants.len(),
-        18,
+        19,
         "variants list count drifted from DenyReason variant count.  \
          Update enumerate_deny_reason_for_test, the variants vec, and this assertion."
     );

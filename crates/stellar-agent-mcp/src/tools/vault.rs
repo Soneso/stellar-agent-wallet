@@ -36,6 +36,19 @@
 //! Length is ALSO validated against the PIN-VERIFIED on-chain asset count from
 //! `read_vault_assets`.
 //!
+//! # Policy evaluation
+//!
+//! Both tools run `WalletServer::dispatch_gate_with_value` before signing,
+//! carrying typed [`stellar_agent_core::policy::v1::ValueLeg`]s
+//! (`vault_deposit_value_legs` / `vault_withdraw_value_leg`).  The withdraw
+//! gate runs immediately after decode (no vault-asset addresses are needed for
+//! its single non-debit leg).  The deposit gate runs AFTER ordered-trust-gate
+//! step 4 (`read_vault_assets`): a `VaultDeposit` leg's `asset` is the
+//! deposited token's on-chain address, which is not present in the wire args
+//! and can only be resolved from that read — the legs still zip 1:1 against
+//! the SAME `amounts_desired` vector later signed inside `VaultDepositArgs`
+//! (single-decode invariant).
+//!
 //! # Behaviour
 //!
 //! - Typed preview plus submit for deposit and withdraw.
@@ -52,6 +65,7 @@ use rmcp::{
 use serde_json::json;
 use stellar_agent_mcp_macros::mcp_tool_router;
 
+use stellar_agent_core::policy::v1::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 use stellar_agent_defi::adapter::{DefiAdapter, DefiAdapterCtx};
 use stellar_agent_defi::dispatch::{GateOutcome, dispatch_gate, require_approval_error};
 use stellar_agent_defi::pins::DefiContractPin;
@@ -211,29 +225,9 @@ impl WalletServer {
         &self,
         Parameters(args): Parameters<VaultDepositMcpArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        // ── Policy gate (MCP server dispatch_gate prerequisite) ───────────────
-        let args_value = json!({
-            "chain_id": args.chain_id,
-            "vault_address": args.vault_address,
-            "from_address": args.from_address,
-        });
-        let dispatch_outcome = match self
-            .dispatch_gate(
-                "stellar_defindex_vault_deposit",
-                &args_value,
-                &args.chain_id,
-            )
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => return e.into_result(),
-        };
-
-        if matches!(dispatch_outcome, DispatchOutcome::RequireApproval(_)) {
-            return Ok(crate::tools::common::single_shot_require_approval_error());
-        }
-
-        // ── Parse decimal-string amount fields ────────────────────────────────
+        // ── Parse decimal-string amount fields (single decode; feeds BOTH the
+        // value-carrying policy gate below and `VaultDepositArgs` handed to
+        // the adapter further down) ───────────────────────────────────────────
         let amounts_desired = crate::tools::amount_wire::parse_i128_vec_field(
             "amounts_desired",
             &args.amounts_desired,
@@ -413,6 +407,49 @@ impl WalletServer {
             }
         }
 
+        // ── Policy gate (value-carrying; MCP server dispatch_gate
+        // prerequisite) ───────────────────────────────────────────────────────
+        // Deferred until AFTER ordered-trust-gate step 4: the per-asset
+        // addresses a `VaultDeposit` leg needs are read on-chain by
+        // `read_vault_assets`, not present in the wire args, so they cannot be
+        // resolved from `args` alone. `asset_addresses` zips 1:1 against
+        // `vault_args.amounts_desired` — the SAME vector `validate_against_asset_count`
+        // just confirmed is equal length, and the SAME vector later placed into
+        // the `VaultDepositArgs` signed by the adapter (single-decode
+        // invariant: no second amounts/asset parse). `account_view` /
+        // `identity_view` are `None`: the `minimum_reserve` / `home_domain`
+        // criteria fail closed on this tool pending account-view wiring,
+        // acceptable for this step.
+        let asset_addresses: Vec<String> = assets.iter().map(|a| a.address.clone()).collect();
+        let value_legs = vault_deposit_value_legs(
+            &vault_args.amounts_desired,
+            &asset_addresses,
+            &args.vault_address,
+        );
+        let args_value = json!({
+            "chain_id": args.chain_id,
+            "vault_address": args.vault_address,
+            "from_address": args.from_address,
+        });
+        let dispatch_outcome = match self
+            .dispatch_gate_with_value(
+                "stellar_defindex_vault_deposit",
+                &args_value,
+                &args.chain_id,
+                ValueClass::Value(ValueEffects::new(value_legs)),
+                None,
+                None,
+            )
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return e.into_result(),
+        };
+
+        if matches!(dispatch_outcome, DispatchOutcome::RequireApproval(_)) {
+            return Ok(crate::tools::common::single_shot_require_approval_error());
+        }
+
         // ── ORDERED TRUST GATE step 5: mode-aware upgradable evaluation ──────
         if let Err(reason) =
             UpgradableEvalExt::evaluate(is_upgradable, args.override_upgradable, &management_mode)
@@ -567,29 +604,9 @@ impl WalletServer {
         &self,
         Parameters(args): Parameters<VaultWithdrawMcpArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        // ── Policy gate ───────────────────────────────────────────────────────
-        let args_value = json!({
-            "chain_id": args.chain_id,
-            "vault_address": args.vault_address,
-            "from_address": args.from_address,
-        });
-        let dispatch_outcome = match self
-            .dispatch_gate(
-                "stellar_defindex_vault_withdraw",
-                &args_value,
-                &args.chain_id,
-            )
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => return e.into_result(),
-        };
-
-        if matches!(dispatch_outcome, DispatchOutcome::RequireApproval(_)) {
-            return Ok(crate::tools::common::single_shot_require_approval_error());
-        }
-
-        // ── Parse decimal-string amount fields ────────────────────────────────
+        // ── Parse decimal-string amount fields (single decode; feeds BOTH the
+        // value-carrying policy gate below and `VaultWithdrawArgs` handed to
+        // the adapter further down) ───────────────────────────────────────────
         let withdraw_shares =
             crate::tools::amount_wire::parse_i128_field("withdraw_shares", &args.withdraw_shares)?;
         let min_amounts_out = crate::tools::amount_wire::parse_i128_vec_field(
@@ -607,6 +624,43 @@ impl WalletServer {
         };
         if let Err(e) = vault_args.validate_structure() {
             return Ok(tool_error_result("vault.invalid_args", &e.to_string()));
+        }
+
+        // ── Policy gate (value-carrying; MCP server dispatch_gate
+        // prerequisite) ───────────────────────────────────────────────────────
+        // A withdrawal redeems shares for a basket of underlying assets
+        // (`min_amounts_out` spans the vault's whole asset set), so no single
+        // token id is the leg's `asset`; the vault-share token id itself is out
+        // of scope for this step, so `asset` is `None` (see
+        // `vault_withdraw_value_leg`). `VaultWithdraw` is a non-debit
+        // `ActionKind` (a redemption returns funds), so leaving `asset` unset
+        // does not affect `minimum_reserve` sizing. `account_view` /
+        // `identity_view` are `None`: the `minimum_reserve` / `home_domain`
+        // criteria fail closed on this tool pending account-view wiring,
+        // acceptable for this step.
+        let value_leg = vault_withdraw_value_leg(vault_args.withdraw_shares, &args.vault_address);
+        let args_value = json!({
+            "chain_id": args.chain_id,
+            "vault_address": args.vault_address,
+            "from_address": args.from_address,
+        });
+        let dispatch_outcome = match self
+            .dispatch_gate_with_value(
+                "stellar_defindex_vault_withdraw",
+                &args_value,
+                &args.chain_id,
+                ValueClass::single(value_leg),
+                None,
+                None,
+            )
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return e.into_result(),
+        };
+
+        if matches!(dispatch_outcome, DispatchOutcome::RequireApproval(_)) {
+            return Ok(crate::tools::common::single_shot_require_approval_error());
         }
 
         // ── Build RPCs ────────────────────────────────────────────────────────
@@ -911,6 +965,79 @@ fn tool_error_result(code: &str, message: &str) -> CallToolResult {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// vault_deposit_value_legs / vault_withdraw_value_leg — pure leg-construction
+// helpers (single-decode invariant)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Builds one debit [`ValueLeg`] per deposited asset for the
+/// `stellar_defindex_vault_deposit` value-carrying policy gate.
+///
+/// `amounts_desired` and `asset_addresses` are zipped 1:1 by index — the
+/// caller MUST have already confirmed (via
+/// [`stellar_agent_defindex::abi::VaultDepositArgs::validate_against_asset_count`])
+/// that both slices carry the vault's on-chain asset count. Any length
+/// mismatch is truncated to the shorter slice by [`Iterator::zip`] rather
+/// than panicking — a defensive fallback only, since the caller-side length
+/// check is the authoritative gate.
+///
+/// Every leg is [`ActionKind::VaultDeposit`] (a debit: value leaving the
+/// wallet into the vault) with `destination = vault_address`.
+///
+/// Called from `stellar_defindex_vault_deposit` with the SAME
+/// `vault_args.amounts_desired` vector later placed into the
+/// `VaultDepositArgs` signed by the adapter, and with `asset_addresses`
+/// derived from the SAME PIN-VERIFIED `read_vault_assets` result used to
+/// validate the amounts length — the single-decode invariant. This is a pure
+/// function so it can be unit-tested directly without exercising the async
+/// handler.
+#[must_use]
+fn vault_deposit_value_legs(
+    amounts_desired: &[i128],
+    asset_addresses: &[String],
+    vault_address: &str,
+) -> Vec<ValueLeg> {
+    amounts_desired
+        .iter()
+        .zip(asset_addresses.iter())
+        .map(|(amount, asset)| ValueLeg {
+            kind: ActionKind::VaultDeposit,
+            amount: Some(*amount),
+            asset: Some(asset.clone()),
+            destination: Some(vault_address.to_owned()),
+        })
+        .collect()
+}
+
+/// Builds the single [`ValueLeg`] for the `stellar_defindex_vault_withdraw`
+/// value-carrying policy gate.
+///
+/// `kind` is [`ActionKind::VaultWithdraw`] — a redemption that returns funds
+/// to the wallet, not a spendable-balance debit
+/// ([`ActionKind::carries_debit`] is `false`). `amount` is honestly the
+/// number of vault shares redeemed (not an underlying-asset amount); value
+/// caps and `minimum_reserve` skip non-debit legs, so this amount is
+/// reported for counterparty/asset visibility only, never used to size a
+/// debit. `asset` is `None`: a withdrawal returns a basket of underlying
+/// assets (`min_amounts_out` spans the vault's whole asset set), so no
+/// single token id represents "the" asset, and the vault-share token id
+/// itself is out of scope for this step.
+///
+/// Called from `stellar_defindex_vault_withdraw` with the SAME
+/// `vault_args.withdraw_shares` value later placed into the
+/// `VaultWithdrawArgs` signed by the adapter — the single-decode invariant.
+/// This is a pure function so it can be unit-tested directly without
+/// exercising the async handler.
+#[must_use]
+fn vault_withdraw_value_leg(withdraw_shares: i128, vault_address: &str) -> ValueLeg {
+    ValueLeg {
+        kind: ActionKind::VaultWithdraw,
+        amount: Some(withdraw_shares),
+        asset: None,
+        destination: Some(vault_address.to_owned()),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1055,5 +1182,63 @@ mod tests {
             !redacted.contains("JK6NTOT2O4"),
             "redacted must not contain middle: {redacted}"
         );
+    }
+
+    // ── vault_deposit_value_legs / vault_withdraw_value_leg: value-carrying
+    // policy-gate leg construction ────────────────────────────────────────────
+
+    #[test]
+    fn vault_deposit_value_legs_one_leg_per_asset_with_matching_amount_and_asset() {
+        use stellar_agent_core::policy::v1::ActionKind;
+
+        const VAULT: &str = "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN";
+        let asset_a = "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU".to_owned();
+        let asset_b = "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD".to_owned();
+        let amounts_desired = vec![250_000_000_i128, 9_007_199_254_740_993_i128];
+        let asset_addresses = vec![asset_a.clone(), asset_b.clone()];
+
+        let legs = super::vault_deposit_value_legs(&amounts_desired, &asset_addresses, VAULT);
+
+        assert_eq!(legs.len(), 2);
+        for (leg, (expected_amount, expected_asset)) in legs
+            .iter()
+            .zip(amounts_desired.iter().zip(asset_addresses.iter()))
+        {
+            assert_eq!(leg.kind, ActionKind::VaultDeposit);
+            assert!(leg.kind.carries_debit(), "a vault deposit is a debit");
+            // Single-decode invariant: the leg amount is exactly the
+            // `amounts_desired` entry later placed into `VaultDepositArgs`.
+            assert_eq!(leg.amount, Some(*expected_amount));
+            assert_eq!(leg.asset.as_deref(), Some(expected_asset.as_str()));
+            assert_eq!(leg.destination.as_deref(), Some(VAULT));
+        }
+    }
+
+    #[test]
+    fn vault_deposit_value_legs_empty_amounts_yields_no_legs() {
+        const VAULT: &str = "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN";
+        let legs = super::vault_deposit_value_legs(&[], &[], VAULT);
+        assert!(legs.is_empty());
+    }
+
+    #[test]
+    fn vault_withdraw_value_leg_carries_shares_as_amount_no_asset_non_debit() {
+        use stellar_agent_core::policy::v1::ActionKind;
+
+        const VAULT: &str = "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN";
+        let withdraw_shares = 9_007_199_254_740_993_i128;
+
+        let leg = super::vault_withdraw_value_leg(withdraw_shares, VAULT);
+
+        assert_eq!(leg.kind, ActionKind::VaultWithdraw);
+        assert!(
+            !leg.kind.carries_debit(),
+            "a vault withdrawal returns funds; it is not a spendable-balance debit"
+        );
+        // Single-decode invariant: the leg amount is exactly `withdraw_shares`,
+        // the same integer placed into `VaultWithdrawArgs.withdraw_shares`.
+        assert_eq!(leg.amount, Some(withdraw_shares));
+        assert_eq!(leg.asset, None);
+        assert_eq!(leg.destination.as_deref(), Some(VAULT));
     }
 }

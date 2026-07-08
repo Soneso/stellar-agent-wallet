@@ -501,6 +501,62 @@ pub(crate) fn decode_payment_required_input(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// x402 value-descriptor helpers — shared by both x402 payment tools
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parses an x402 atomic-unit amount string to a positive `i128`.
+///
+/// Mirrors `stellar_agent_x402::exact::create_payment`'s own parse + `> 0`
+/// check byte-for-byte over the SAME immutable `requirements.amount` string, so
+/// the amount the value gate sizes is deterministically identical to the amount
+/// the SAC transfer carries (the single-decode invariant §2.1 for a value that
+/// the signing crate re-parses from the same string).
+///
+/// # Errors
+///
+/// Returns [`stellar_agent_x402::X402Error::AmountConversion`] — the same
+/// variant and detail shape `create_payment` returns — when `amount_str` is not
+/// a valid positive `i128`.
+pub(crate) fn x402_parse_atomic_amount(
+    amount_str: &str,
+) -> Result<i128, stellar_agent_x402::X402Error> {
+    let amount: i128 = amount_str.parse::<i128>().map_err(|e| {
+        stellar_agent_x402::X402Error::AmountConversion {
+            detail: format!("wire amount {amount_str:?} is not a valid i128: {e}"),
+        }
+    })?;
+    if amount <= 0 {
+        return Err(stellar_agent_x402::X402Error::AmountConversion {
+            detail: format!("wire amount must be a positive integer (> 0), got {amount_str}"),
+        });
+    }
+    Ok(amount)
+}
+
+/// Builds the single x402-payment [`ValueLeg`] from `requirements`.
+///
+/// The leg's `amount` is the atomic i128 the SAC transfer carries (via
+/// [`x402_parse_atomic_amount`]); `asset` is `requirements.asset` verbatim (a
+/// SAC C-strkey; the value criteria normalise it) and `destination` is
+/// `requirements.pay_to` verbatim.
+///
+/// # Errors
+///
+/// Propagates [`stellar_agent_x402::X402Error::AmountConversion`] from
+/// [`x402_parse_atomic_amount`] on a malformed or non-positive amount.
+pub(crate) fn x402_value_leg(
+    requirements: &stellar_agent_x402::wire::PaymentRequirements,
+) -> Result<stellar_agent_core::policy::v1::ValueLeg, stellar_agent_x402::X402Error> {
+    let amount = x402_parse_atomic_amount(&requirements.amount)?;
+    Ok(stellar_agent_core::policy::v1::ValueLeg {
+        kind: stellar_agent_core::policy::v1::ActionKind::X402Payment,
+        amount: Some(amount),
+        asset: Some(requirements.asset.clone()),
+        destination: Some(requirements.pay_to.clone()),
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // x402_error_to_tool_result — shared x402 error-envelope helper
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -942,7 +998,7 @@ impl WalletServer {
         args_value: &Value,
         chain_id: &str,
     ) -> Result<DispatchOutcome, ToolError> {
-        self.dispatch_gate_with_views(tool_name, args_value, chain_id, None, None)
+        self.dispatch_gate_inner(tool_name, args_value, chain_id, None, None, None)
             .await
     }
 
@@ -961,6 +1017,64 @@ impl WalletServer {
         tool_name: &'static str,
         args_value: &Value,
         chain_id: &str,
+        account_view: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
+        identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
+    ) -> Result<DispatchOutcome, ToolError> {
+        self.dispatch_gate_inner(
+            tool_name,
+            args_value,
+            chain_id,
+            None,
+            account_view,
+            identity_view,
+        )
+        .await
+    }
+
+    /// Value-carrying gate for single-shot Soroban tools (DeFi, x402, MPP charge)
+    /// whose value effects cannot appear in the pre-decode `args`.
+    ///
+    /// The handler decodes the operation ONCE, derives the
+    /// [`ValueClass`](stellar_agent_core::policy::v1::ValueClass) from that SAME
+    /// decode (single-decode invariant §2.1), and passes it here. The gate feeds
+    /// it to [`PolicyEngine::evaluate_with_value`](stellar_agent_core::policy::PolicyEngine::evaluate_with_value)
+    /// so the value criteria size the exact effect that will be signed. A
+    /// `MovesValue` tool that reaches this gate MUST supply
+    /// [`ValueClass::Value`]; supplying `ReadOnly`/`Opaque` makes the value
+    /// criteria deny fail-closed (`policy.deny.unsizable_value_effect`).
+    ///
+    /// # Errors
+    ///
+    /// Same failure modes as [`Self::dispatch_gate_with_views`].
+    pub(crate) async fn dispatch_gate_with_value(
+        &self,
+        tool_name: &'static str,
+        args_value: &Value,
+        chain_id: &str,
+        value: stellar_agent_core::policy::v1::ValueClass,
+        account_view: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
+        identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
+    ) -> Result<DispatchOutcome, ToolError> {
+        self.dispatch_gate_inner(
+            tool_name,
+            args_value,
+            chain_id,
+            Some(value),
+            account_view,
+            identity_view,
+        )
+        .await
+    }
+
+    /// Shared gate core. `value` is `Some` for the value-carrying path
+    /// ([`Self::dispatch_gate_with_value`]) and `None` for the args-derived path
+    /// ([`Self::dispatch_gate`] / [`Self::dispatch_gate_with_views`]).
+    async fn dispatch_gate_inner(
+        &self,
+        tool_name: &'static str,
+        args_value: &Value,
+        chain_id: &str,
+        value: Option<stellar_agent_core::policy::v1::ValueClass>,
         account_view: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
         identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
     ) -> Result<DispatchOutcome, ToolError> {
@@ -1011,18 +1125,37 @@ impl WalletServer {
             };
 
         // Step 2 — policy engine evaluation with explicit typed arms.
-        let outcome = match self.policy_engine.evaluate(
-            descriptor,
-            args_value,
-            &self.profile,
-            account_view,
-            identity_view,
-            counterparty_cache.as_ref().map(|snapshot| {
-                snapshot as &dyn stellar_agent_core::policy::v1::CounterpartyCacheView
-            }),
-            None,
-            None, // sep45_sessions: wired at dispatch site when sep45_session_active criterion active
-        ) {
+        //
+        // The value-carrying path (`value = Some`) sizes the exact effect the
+        // handler decoded; the args-derived path (`value = None`) lets the engine
+        // derive the descriptor from `args_value` (pay/create/opaque-sign tools).
+        let counterparty_view = counterparty_cache
+            .as_ref()
+            .map(|snapshot| snapshot as &dyn stellar_agent_core::policy::v1::CounterpartyCacheView);
+        let decision = match value {
+            Some(value) => self.policy_engine.evaluate_with_value(
+                descriptor,
+                args_value,
+                &self.profile,
+                value,
+                account_view,
+                identity_view,
+                counterparty_view,
+                None,
+                None,
+            ),
+            None => self.policy_engine.evaluate(
+                descriptor,
+                args_value,
+                &self.profile,
+                account_view,
+                identity_view,
+                counterparty_view,
+                None,
+                None, // sep45_sessions: wired at dispatch site when sep45_session_active criterion active
+            ),
+        };
+        let outcome = match decision {
             Ok(Decision::Allow) => DispatchOutcome::Allow,
 
             Ok(Decision::Deny(reason)) => {
@@ -1739,6 +1872,99 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
     use stellar_agent_core::AuthError;
+
+    // ── x402 value-descriptor helpers ───────────────────────────────────────────
+
+    fn sample_requirements() -> stellar_agent_x402::wire::PaymentRequirements {
+        let json = serde_json::json!({
+            "scheme": "exact",
+            "network": "stellar:testnet",
+            "asset": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+            "amount": "1000000",
+            "payTo": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "maxTimeoutSeconds": 300,
+            "extra": { "areFeesSponsored": true }
+        })
+        .to_string();
+        decode_payment_required_input(&json).expect("sample requirements must decode")
+    }
+
+    #[test]
+    fn x402_value_leg_builds_x402_payment_leg_from_requirements() {
+        let requirements = sample_requirements();
+        let leg = x402_value_leg(&requirements).expect("valid requirements must build a leg");
+        assert_eq!(
+            leg.kind,
+            stellar_agent_core::policy::v1::ActionKind::X402Payment
+        );
+        assert_eq!(leg.amount, Some(1_000_000_i128));
+        assert_eq!(leg.asset.as_deref(), Some(requirements.asset.as_str()));
+        assert_eq!(
+            leg.destination.as_deref(),
+            Some(requirements.pay_to.as_str())
+        );
+    }
+
+    #[test]
+    fn x402_value_leg_amount_matches_the_atomic_parse_path() {
+        // The leg's amount is the SAME i128 the SAC transfer carries, derived by
+        // the identical atomic parse over the same immutable requirements.amount.
+        let requirements = sample_requirements();
+        let parsed = x402_parse_atomic_amount(&requirements.amount)
+            .expect("sample amount must parse as a positive i128");
+        let leg = x402_value_leg(&requirements).expect("valid requirements must build a leg");
+        assert_eq!(leg.amount, Some(parsed));
+    }
+
+    #[test]
+    fn x402_parse_atomic_amount_malformed_string_surfaces_amount_conversion_error() {
+        let result = x402_parse_atomic_amount("not-a-number");
+        assert!(
+            matches!(
+                result,
+                Err(stellar_agent_x402::X402Error::AmountConversion { .. })
+            ),
+            "malformed amount must surface AmountConversion, not panic; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn x402_parse_atomic_amount_zero_is_rejected() {
+        let result = x402_parse_atomic_amount("0");
+        assert!(
+            matches!(
+                result,
+                Err(stellar_agent_x402::X402Error::AmountConversion { .. })
+            ),
+            "zero amount must be rejected as AmountConversion; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn x402_parse_atomic_amount_negative_is_rejected() {
+        let result = x402_parse_atomic_amount("-5");
+        assert!(
+            matches!(
+                result,
+                Err(stellar_agent_x402::X402Error::AmountConversion { .. })
+            ),
+            "negative amount must be rejected as AmountConversion; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn x402_value_leg_malformed_amount_surfaces_error_not_panic() {
+        let mut requirements = sample_requirements();
+        requirements.amount = "not-a-number".to_owned();
+        let result = x402_value_leg(&requirements);
+        assert!(
+            matches!(
+                result,
+                Err(stellar_agent_x402::X402Error::AmountConversion { .. })
+            ),
+            "malformed amount must surface AmountConversion, not panic; got {result:?}"
+        );
+    }
     use stellar_agent_core::policy::v1::{
         AccountIdentityView, AccountReservesView, CounterpartyCacheView, Sep10SessionView,
         Sep45SessionView,

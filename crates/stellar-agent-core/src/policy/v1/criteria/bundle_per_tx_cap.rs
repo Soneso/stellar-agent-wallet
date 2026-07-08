@@ -27,6 +27,7 @@
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::bundle::InnerOpDescriptor;
 use crate::policy::v1::criteria::Criterion;
+use crate::policy::v1::value::asset_normalise;
 use crate::policy::{DenyReason, PolicyError};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -113,14 +114,14 @@ impl Criterion for BundlePerTxCapCriterion {
             return Ok(None);
         };
 
-        let criterion_asset = asset_normalise(self.asset.clone());
+        let criterion_asset = asset_normalise(&self.asset);
 
         for (idx, inner) in view.inners.iter().enumerate() {
             let InnerOpDescriptor::TokenTransfer { asset, amount, .. } = inner else {
                 continue;
             };
 
-            let inner_asset = asset_normalise(asset.clone());
+            let inner_asset = asset_normalise(asset);
             if inner_asset != criterion_asset {
                 continue;
             }
@@ -141,18 +142,6 @@ impl Criterion for BundlePerTxCapCriterion {
         }
 
         Ok(None)
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn asset_normalise(asset: String) -> String {
-    if asset.eq_ignore_ascii_case("native") || asset.eq_ignore_ascii_case("xlm") {
-        "native".to_owned()
-    } else {
-        asset
     }
 }
 

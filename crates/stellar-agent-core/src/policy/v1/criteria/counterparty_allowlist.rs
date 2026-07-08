@@ -70,6 +70,7 @@ use stellar_strkey::{Contract, ed25519::PublicKey};
 
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::criteria::Criterion;
+use crate::policy::v1::value::{ValueEffects, ValueGate, classify_value};
 use crate::policy::{DenyReason, PolicyError};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -208,15 +209,34 @@ impl Criterion for CounterpartyAllowlistCriterion {
     /// Returns `Ok(None)` when every kind passes (destination on allowlist).
     /// Returns `Ok(Some(DenyReason::CounterpartyDenied))` when a destination
     /// is not on the allowlist.
-    /// Returns `Ok(Some(DenyReason::CounterpartyKindUnsupported))` when an
-    /// unsupported kind (`SEP10_IDENTITY`, `HOME_DOMAIN`, `ONE_TIME_ADDRESS`)
-    /// is listed.
+    /// `HOME_DOMAIN` is evaluated against the account's on-chain home domain via
+    /// the identity view. Returns
+    /// `Ok(Some(DenyReason::CounterpartyKindUnsupported))` when an unsupported
+    /// kind (`SEP10_IDENTITY`, `ONE_TIME_ADDRESS`) is listed.
     ///
     /// # Errors
     ///
     /// Returns [`PolicyError::CriterionEvaluationFailed`] when the destination
     /// field is missing or is not a valid strkey.
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
+        // The shared fail-closed gate: an opaque-sign call under a matched
+        // rule (without `allow_opaque_signing`) or a forgotten `MovesValue`
+        // population denies here. `NotApplicable` (a genuinely read-only call,
+        // or a tool the descriptor derivation has not classified) falls
+        // through to the legacy per-kind path below, unchanged.
+        match classify_value(ctx) {
+            ValueGate::Deny(reason) => return Ok(Some(reason)),
+            ValueGate::Effects(effects) => {
+                for kind in &self.kinds {
+                    if let Some(deny) = self.evaluate_kind_over_effects(kind, ctx, effects)? {
+                        return Ok(Some(deny));
+                    }
+                }
+                return Ok(None);
+            }
+            ValueGate::NotApplicable => {}
+        }
+
         for kind in &self.kinds {
             if let Some(deny) = self.evaluate_kind(kind, ctx)? {
                 return Ok(Some(deny));
@@ -227,6 +247,10 @@ impl Criterion for CounterpartyAllowlistCriterion {
 }
 
 impl CounterpartyAllowlistCriterion {
+    /// Legacy per-kind dispatch reading raw `ctx.args` — reached only when
+    /// [`classify_value`] resolves `NotApplicable` for the current call (a
+    /// genuinely read-only tool, or one the descriptor derivation has not yet
+    /// classified).
     fn evaluate_kind(
         &self,
         kind: &CounterpartyKind,
@@ -241,6 +265,178 @@ impl CounterpartyAllowlistCriterion {
                 kind: unsupported.tag().to_owned(),
             })),
         }
+    }
+
+    /// Descriptor-driven per-kind dispatch over the resolved value legs.
+    ///
+    /// `HOME_DOMAIN` stays on `identity_view` (leg-independent — the
+    /// destination account's home domain, not any per-leg field), unchanged
+    /// from the raw-args path.
+    fn evaluate_kind_over_effects(
+        &self,
+        kind: &CounterpartyKind,
+        ctx: &EvalContext<'_>,
+        effects: &ValueEffects,
+    ) -> Result<Option<DenyReason>, PolicyError> {
+        match kind {
+            CounterpartyKind::GAccount => self.check_g_account_legs(ctx, effects),
+            CounterpartyKind::CAccount => self.check_c_account_legs(ctx, effects),
+            CounterpartyKind::KnownIssuer => self.check_known_issuer_legs(ctx, effects),
+            CounterpartyKind::HomeDomain => self.check_home_domain(ctx),
+            unsupported => Ok(Some(DenyReason::CounterpartyKindUnsupported {
+                kind: unsupported.tag().to_owned(),
+            })),
+        }
+    }
+
+    /// Checks each debit leg's `destination` as a G-strkey against the
+    /// allowlist.
+    ///
+    /// A debit leg with `destination == None` denies
+    /// ([`DenyReason::CounterpartyDenied`]) rather than erroring: a
+    /// counterparty-bearing action with no resolvable counterparty cannot
+    /// satisfy an allowlist. A single-leg pay/create call sees exactly the
+    /// same check as the raw-args path, since its sole leg carries the same
+    /// `args["destination"]` string the gate derived.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] when a present
+    /// destination is not a well-formed G-strkey.
+    fn check_g_account_legs(
+        &self,
+        ctx: &EvalContext<'_>,
+        effects: &ValueEffects,
+    ) -> Result<Option<DenyReason>, PolicyError> {
+        for leg in effects.legs() {
+            if !leg.kind.carries_debit() {
+                continue;
+            }
+            let Some(destination) = leg.destination.as_deref() else {
+                return Ok(Some(DenyReason::CounterpartyDenied {
+                    kind: "G_ACCOUNT".to_owned(),
+                    value: String::new(),
+                }));
+            };
+
+            PublicKey::from_string(destination).map_err(|e| {
+                PolicyError::CriterionEvaluationFailed {
+                    detail: format!(
+                        "counterparty_allowlist: invalid G-strkey in a debit leg's \
+                         destination for tool '{}': {e}",
+                        ctx.tool.name
+                    ),
+                }
+            })?;
+
+            if !self.allowlist.iter().any(|a| a == destination) {
+                return Ok(Some(DenyReason::CounterpartyDenied {
+                    kind: "G_ACCOUNT".to_owned(),
+                    value: destination.to_owned(),
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Checks each debit leg's `destination` as a C-strkey against the
+    /// allowlist. See [`Self::check_g_account_legs`] for the `None`-is-deny
+    /// posture.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] when a present
+    /// destination is not a well-formed C-strkey.
+    fn check_c_account_legs(
+        &self,
+        ctx: &EvalContext<'_>,
+        effects: &ValueEffects,
+    ) -> Result<Option<DenyReason>, PolicyError> {
+        for leg in effects.legs() {
+            if !leg.kind.carries_debit() {
+                continue;
+            }
+            let Some(destination) = leg.destination.as_deref() else {
+                return Ok(Some(DenyReason::CounterpartyDenied {
+                    kind: "C_ACCOUNT".to_owned(),
+                    value: String::new(),
+                }));
+            };
+
+            Contract::from_string(destination).map_err(|e| {
+                PolicyError::CriterionEvaluationFailed {
+                    detail: format!(
+                        "counterparty_allowlist: invalid C-strkey in a debit leg's \
+                         destination for tool '{}': {e}",
+                        ctx.tool.name
+                    ),
+                }
+            })?;
+
+            if !self.allowlist.iter().any(|a| a == destination) {
+                return Ok(Some(DenyReason::CounterpartyDenied {
+                    kind: "C_ACCOUNT".to_owned(),
+                    value: destination.to_owned(),
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Checks each debit leg's `asset` issuer against the allowlist.
+    ///
+    /// A native-asset debit leg has no issuer and is skipped. A debit leg whose
+    /// asset is `None` (unresolved) denies fail-closed
+    /// ([`DenyReason::CounterpartyDenied`], `kind = "KNOWN_ISSUER"`): the
+    /// operator asked to bound issuers and this leg's issuer cannot be
+    /// established, so it is never waved through.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] when a present
+    /// non-native asset is not in `CODE:Gissuer` format, or the issuer is not
+    /// a well-formed G-strkey.
+    fn check_known_issuer_legs(
+        &self,
+        ctx: &EvalContext<'_>,
+        effects: &ValueEffects,
+    ) -> Result<Option<DenyReason>, PolicyError> {
+        for leg in effects.legs() {
+            if !leg.kind.carries_debit() {
+                continue;
+            }
+            // A debit leg whose asset the dispatch site could not resolve cannot
+            // be checked against the issuer allowlist, so it denies fail-closed
+            // (design §2.2) — mirroring the None-destination posture in
+            // `check_g_account_legs`. A `None` here is never a silent pass.
+            let Some(asset_str) = leg.asset.as_deref() else {
+                return Ok(Some(DenyReason::CounterpartyDenied {
+                    kind: "KNOWN_ISSUER".to_owned(),
+                    value: String::new(),
+                }));
+            };
+            if asset_str.eq_ignore_ascii_case("native") || asset_str.eq_ignore_ascii_case("xlm") {
+                continue;
+            }
+
+            let issuer = parse_asset_issuer(asset_str, ctx)?;
+
+            let on_list = self.allowlist.iter().any(|entry| {
+                if let Some(list_issuer) = entry.split_once(':').map(|(_, i)| i) {
+                    list_issuer == issuer
+                } else {
+                    entry == &issuer
+                }
+            });
+
+            if !on_list {
+                return Ok(Some(DenyReason::CounterpartyDenied {
+                    kind: "KNOWN_ISSUER".to_owned(),
+                    value: issuer,
+                }));
+            }
+        }
+        Ok(None)
     }
 
     fn check_g_account(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
@@ -391,61 +587,34 @@ impl CounterpartyAllowlistCriterion {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Returns `true` for the pay/create tool family whose value fields are now
-/// sourced from the derived value leg rather than raw args.
-fn is_pay_or_create(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "stellar_pay"
-            | "stellar_pay_commit"
-            | "stellar_create_account"
-            | "stellar_create_account_commit"
-    )
-}
-
-/// Resolves the counterparty destination for the current call.
+/// Resolves the counterparty destination for the current call from raw
+/// `ctx.args`.
 ///
-/// For the pay/create family reads `ctx.value`'s sole leg `destination`
-/// (behaviour-neutral: the leg's destination is the same `args["destination"]`
-/// string the gate derived); an unresolvable destination is refused exactly as
-/// a missing/non-string `args` field was. Other tools keep the raw-args path.
+/// Reached only via [`CounterpartyAllowlistCriterion::evaluate_kind`], which
+/// runs when [`classify_value`] resolves `NotApplicable` for the current
+/// call — a tool the descriptor derivation has not classified as
+/// value-moving. A value-moving tool (including the pay/create family) is
+/// always routed through [`CounterpartyAllowlistCriterion::evaluate_kind_over_effects`]
+/// instead, which reads the resolved value leg(s) rather than raw args.
 ///
 /// # Errors
 ///
 /// Returns [`PolicyError::CriterionEvaluationFailed`] when the destination is
-/// unresolvable.
+/// missing or not a string.
 fn resolve_destination(ctx: &EvalContext<'_>) -> Result<String, PolicyError> {
-    if is_pay_or_create(ctx.tool.name.as_str()) {
-        ctx.value
-            .sole_value_leg()
-            .and_then(|leg| leg.destination.clone())
-            .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
-                detail: format!(
-                    "counterparty_allowlist: missing or non-string field 'destination' \
-                     in value descriptor for tool '{}'",
-                    ctx.tool.name
-                ),
-            })
-    } else {
-        extract_string_field(ctx, "destination")
-    }
+    extract_string_field(ctx, "destination")
 }
 
-/// Resolves the asset for the KNOWN_ISSUER check.
+/// Resolves the asset for the KNOWN_ISSUER check from raw `ctx.args`.
 ///
-/// For the pay/create family reads `ctx.value`'s sole leg `asset` (the
-/// canonical asset id derived from `args["asset"]`); `None` means the criterion
-/// does not apply, matching an absent `args["asset"]`. Other tools keep the
-/// raw-args path.
+/// `None` means the criterion does not apply, matching an absent
+/// `args["asset"]`. See [`resolve_destination`] for why this path is reached
+/// only for tools not classified as value-moving.
 fn resolve_asset(ctx: &EvalContext<'_>) -> Option<String> {
-    if is_pay_or_create(ctx.tool.name.as_str()) {
-        ctx.value.sole_value_leg().and_then(|leg| leg.asset.clone())
-    } else {
-        ctx.args
-            .get("asset")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-    }
+    ctx.args
+        .get("asset")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
 }
 
 fn extract_string_field(ctx: &EvalContext<'_>, field: &str) -> Result<String, PolicyError> {
@@ -748,6 +917,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn known_issuer_debit_leg_with_no_asset_denies() {
+        use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
+
+        let tool = make_tool("stellar_blend_lend");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = CounterpartyAllowlistCriterion::new(
+            vec![CounterpartyKind::KnownIssuer],
+            vec![format!("USDC:{USDC_ISSUER}")],
+        );
+        // A debit (outflow) leg whose asset the dispatch site could not resolve
+        // must deny fail-closed under a KNOWN_ISSUER rule, not silently pass.
+        let args = json!({});
+        let leg = ValueLeg {
+            kind: ActionKind::Lend,
+            amount: Some(1),
+            asset: None,
+            destination: Some("CAAA".to_owned()),
+        };
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+            .with_value(ValueClass::Value(ValueEffects::single(leg)));
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(&result, Some(DenyReason::CounterpartyDenied { kind, .. }) if kind.as_str() == "KNOWN_ISSUER"),
+            "a debit leg with no resolvable asset must deny under a KNOWN_ISSUER rule, got {result:?}"
+        );
+    }
+
     // ── HOME_DOMAIN tests ─────────────────────────────────────────────────────
 
     /// A minimal [`crate::policy::v1::AccountIdentityView`] implementation for
@@ -1037,6 +1235,120 @@ mod tests {
                 Some(DenyReason::CounterpartyDenied { ref kind, .. }) if kind == "G_ACCOUNT"
             ),
             "G_ACCOUNT denial must short-circuit before HOME_DOMAIN; got {result:?}"
+        );
+    }
+
+    // ── Fail-closed value-descriptor matrix ─────────────────────────────────
+
+    /// Constructs a `ToolDescriptor` with an explicit `value_kind` (rather
+    /// than the fixed `ReadOnly` of [`make_tool`]).
+    fn make_tool_with_kind(
+        tool_name: &'static str,
+        value_kind: crate::policy::ToolValueKind,
+    ) -> ToolDescriptor {
+        let reg = McpToolRegistration {
+            name: tool_name,
+            destructive_hint: true,
+            read_only_hint: false,
+            chain_id_required: true,
+            value_kind,
+        };
+        ToolDescriptor::from_registration(&reg)
+    }
+
+    /// A `MovesValue` tool the descriptor derivation has not classified
+    /// (`derive_value_class` falls through to `ReadOnly` for any name outside
+    /// its match arms) must deny fail-closed rather than passing silently.
+    #[test]
+    fn moves_value_tool_with_unpopulated_effects_denies_unsizable() {
+        let tool = make_tool_with_kind(
+            "stellar_blend_lend",
+            crate::policy::ToolValueKind::MovesValue,
+        );
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = CounterpartyAllowlistCriterion::new(
+            vec![CounterpartyKind::GAccount],
+            vec![G_ALLOWED.to_owned()],
+        );
+        let args = json!({});
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx);
+        assert!(
+            matches!(result, Ok(Some(DenyReason::UnsizableValueEffect { .. }))),
+            "a MovesValue tool with no resolved effects must deny fail-closed, got {result:?}"
+        );
+    }
+
+    /// An opaque-signing call on the single-tx path must deny fail-closed.
+    #[test]
+    fn opaque_sign_call_denies_unsizable_on_single_tx() {
+        let tool = make_tool("stellar_sep43_sign_transaction");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = CounterpartyAllowlistCriterion::new(
+            vec![CounterpartyKind::GAccount],
+            vec![G_ALLOWED.to_owned()],
+        );
+        let args = json!({});
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx);
+        assert!(
+            matches!(result, Ok(Some(DenyReason::UnsizableValueEffect { .. }))),
+            "an opaque-signing call must deny fail-closed on the single-tx path, got {result:?}"
+        );
+    }
+
+    /// A resolved `Value` effect is checked per-leg: the sole leg of a
+    /// single-leg pay/create call is checked identically to the raw-args
+    /// path (byte-identical outcome for the existing pay tests above).
+    #[test]
+    fn g_account_over_effects_single_leg_matches_raw_args_outcome() {
+        let tool = make_tool("stellar_pay");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = CounterpartyAllowlistCriterion::new(
+            vec![CounterpartyKind::GAccount],
+            vec![G_ALLOWED.to_owned()],
+        );
+        let args =
+            json!({ "destination": G_DENIED, "amount_stroops": "100000000", "asset": "native" });
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::CounterpartyDenied { ref kind, .. }) if kind == "G_ACCOUNT"),
+            "a pay call's sole leg must be checked identically to the raw-args path, \
+             got {result:?}"
+        );
+    }
+
+    /// A debit leg with no resolvable destination denies
+    /// (`CounterpartyDenied`) rather than erroring: a counterparty-bearing
+    /// action with no resolvable counterparty cannot satisfy an allowlist.
+    #[test]
+    fn g_account_over_effects_missing_destination_denies() {
+        use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
+
+        let tool = make_tool("stellar_multicall");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = CounterpartyAllowlistCriterion::new(
+            vec![CounterpartyKind::GAccount],
+            vec![G_ALLOWED.to_owned()],
+        );
+        let leg = ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(100),
+            asset: Some("native".to_owned()),
+            destination: None,
+        };
+        let args = json!({});
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+            .with_value(ValueClass::Value(ValueEffects::single(leg)));
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::CounterpartyDenied { ref kind, .. }) if kind == "G_ACCOUNT"),
+            "a debit leg with no destination must deny, not error: {result:?}"
         );
     }
 }

@@ -114,7 +114,9 @@ mod proptest_properties;
 pub use criteria::Criterion;
 pub use criteria::PolicyStateStore;
 pub use loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
-pub use value::{ActionKind, OpaqueReason, ValueClass, ValueEffects, ValueLeg};
+pub use value::{
+    ActionKind, OpaqueReason, ValueClass, ValueEffects, ValueGate, ValueLeg, classify_value,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AccountIdentityView — local trait to avoid circular dep with
@@ -1001,6 +1003,7 @@ impl PolicyEngineV1 {
     ///             r#match: RuleMatch { tool: "*".into(), chain: "*".into() },
     ///             criteria: vec![],
     ///             decision: Decision::Allow,
+    ///             allow_opaque_signing: false,
     ///         },
     ///     ],
     ///     signature: None,
@@ -1082,6 +1085,95 @@ impl PolicyEngine for PolicyEngineV1 {
         sep10_sessions: Option<&dyn Sep10SessionView>,
         sep45_sessions: Option<&dyn Sep45SessionView>,
     ) -> Result<Decision, PolicyError> {
+        // Derive the typed value descriptor from the same (tool, args) the
+        // criteria gate on. Two-phase classic tools carry the resolved keys in
+        // `args` (authoritative_args on the commit path); OpaqueSign tools derive
+        // Opaque; everything else derives ReadOnly. Single-shot Soroban tools
+        // supply their resolved effects via `evaluate_with_value` instead.
+        let value = value::derive_value_class(&tool.name, args);
+        self.assert_value_kind_populated(tool, &value);
+        self.evaluate_inner(
+            tool,
+            args,
+            profile,
+            &value,
+            account_view,
+            identity_view,
+            counterparty_cache,
+            sep10_sessions,
+            sep45_sessions,
+        )
+    }
+
+    fn evaluate_with_value(
+        &self,
+        tool: &ToolDescriptor,
+        args: &Value,
+        profile: &Profile,
+        value: value::ValueClass,
+        account_view: Option<&dyn AccountReservesView>,
+        identity_view: Option<&dyn AccountIdentityView>,
+        counterparty_cache: Option<&dyn CounterpartyCacheView>,
+        sep10_sessions: Option<&dyn Sep10SessionView>,
+        sep45_sessions: Option<&dyn Sep45SessionView>,
+    ) -> Result<Decision, PolicyError> {
+        // The dispatch site resolved the value from the SAME decoded requirements
+        // it signs (§2.1 single-decode invariant); use it as-is.
+        self.assert_value_kind_populated(tool, &value);
+        self.evaluate_inner(
+            tool,
+            args,
+            profile,
+            &value,
+            account_view,
+            identity_view,
+            counterparty_cache,
+            sep10_sessions,
+            sep45_sessions,
+        )
+    }
+}
+
+impl PolicyEngineV1 {
+    /// The pinned population guard (design §2.3): a `MovesValue` tool that
+    /// reaches the gate MUST carry resolved `ValueClass::Value` effects, and an
+    /// `OpaqueSign` tool MUST carry `ValueClass::Opaque`. A violation is a
+    /// forgotten/failed population; in debug builds it panics loudly here, and
+    /// in release builds the value criteria still deny it fail-closed via
+    /// [`value::classify_value`]. This turns a would-be uncapped tool into a
+    /// loud failure rather than a silent bypass.
+    fn assert_value_kind_populated(&self, tool: &ToolDescriptor, value: &value::ValueClass) {
+        debug_assert!(
+            tool.value_kind != crate::policy::ToolValueKind::MovesValue
+                || matches!(value, value::ValueClass::Value(_)),
+            "MovesValue tool '{}' reached the policy gate without resolved value effects",
+            tool.name
+        );
+        debug_assert!(
+            tool.value_kind != crate::policy::ToolValueKind::OpaqueSign
+                || matches!(value, value::ValueClass::Opaque(_)),
+            "OpaqueSign tool '{}' reached the policy gate without an opaque value class",
+            tool.name
+        );
+    }
+
+    /// Shared single-tx evaluation core used by both [`PolicyEngine::evaluate`]
+    /// (which derives `value`) and [`PolicyEngine::evaluate_with_value`] (which
+    /// receives it). Honours the per-rule `allow_opaque_signing` exemption by
+    /// treating an opaque value as read-only for a rule that opted in.
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_inner(
+        &self,
+        tool: &ToolDescriptor,
+        args: &Value,
+        profile: &Profile,
+        value: &value::ValueClass,
+        account_view: Option<&dyn AccountReservesView>,
+        identity_view: Option<&dyn AccountIdentityView>,
+        counterparty_cache: Option<&dyn CounterpartyCacheView>,
+        sep10_sessions: Option<&dyn Sep10SessionView>,
+        sep45_sessions: Option<&dyn Sep45SessionView>,
+    ) -> Result<Decision, PolicyError> {
         // project_id is cached at engine construction time from STELLAR_AGENT_PROJECT.
         let rules = self.matching_rules(&self.profile_name, self.project_id.as_deref());
 
@@ -1091,18 +1183,22 @@ impl PolicyEngine for PolicyEngineV1 {
                 continue;
             }
 
-            // Derive the typed value descriptor from the same (tool, args) the
-            // criteria gate on. On the commit path `args` is the HMAC-bound
-            // authoritative_args, so the descriptor is transitively bound to the
-            // signed envelope. Non-pay/create tools derive ReadOnly in this step.
-            let value = value::derive_value_class(&tool.name, args);
+            // Opaque-signing exemption (design §2.4): a rule that opted in
+            // downgrades an opaque value to read-only so the value criteria treat
+            // it as not-applicable and the rule's own decision governs.
+            let effective_value =
+                if rule.allow_opaque_signing && matches!(value, value::ValueClass::Opaque(_)) {
+                    value::ValueClass::ReadOnly
+                } else {
+                    value.clone()
+                };
 
             let ctx = EvalContext {
                 tool,
                 args,
                 profile_name: &self.profile_name,
                 profile,
-                value,
+                value: effective_value,
                 account_view,
                 identity_view,
                 // Quorum view is None on the standard single-tx path.
@@ -1575,6 +1671,7 @@ mod tests {
                     },
                     criteria: vec![],
                     decision: Decision::Allow,
+                    allow_opaque_signing: false,
                 },
                 PolicyRule {
                     r#match: RuleMatch {
@@ -1583,6 +1680,7 @@ mod tests {
                     },
                     criteria: vec![],
                     decision: Decision::Allow,
+                    allow_opaque_signing: false,
                 },
             ],
             signature: None,
@@ -1609,6 +1707,7 @@ mod tests {
                 },
                 criteria: vec![],
                 decision: Decision::Allow,
+                allow_opaque_signing: false,
             }],
             signature: None,
         };
@@ -1633,6 +1732,7 @@ mod tests {
                 },
                 criteria: vec![],
                 decision: Decision::Allow,
+                allow_opaque_signing: false,
             }],
             signature: None,
         };
@@ -1661,6 +1761,7 @@ mod tests {
                 },
                 criteria: vec![],
                 decision: Decision::Allow,
+                allow_opaque_signing: false,
             }],
             signature: None,
         };
@@ -1712,6 +1813,7 @@ mod tests {
                 },
                 criteria: vec![],
                 decision: Decision::Allow,
+                allow_opaque_signing: false,
             }],
             signature: None,
         };
@@ -1746,6 +1848,7 @@ mod tests {
                 },
                 criteria,
                 decision: Decision::Allow,
+                allow_opaque_signing: false,
             }],
             signature: None,
         }
@@ -1858,6 +1961,7 @@ mod tests {
                 },
                 criteria: vec![],
                 decision: Decision::Allow,
+                allow_opaque_signing: false,
             }],
             signature: None,
         };

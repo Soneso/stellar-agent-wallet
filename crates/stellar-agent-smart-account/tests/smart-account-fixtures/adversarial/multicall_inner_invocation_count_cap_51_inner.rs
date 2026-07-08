@@ -89,6 +89,7 @@ fn build_engine_with_cap(max_count: u32) -> PolicyEngineV1 {
             },
             criteria: vec![Box::new(InnerInvocationCountCapCriterion { max_count })],
             decision: Decision::Allow,
+            allow_opaque_signing: false,
         }],
         signature: None,
     };

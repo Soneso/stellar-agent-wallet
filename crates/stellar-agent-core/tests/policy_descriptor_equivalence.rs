@@ -272,6 +272,7 @@ fn engine_derives_descriptor_and_denies_over_cap_pay() {
             1_000_000_000,
         ))],
         decision: Decision::Allow,
+        allow_opaque_signing: false,
     };
     let doc = PolicyDocument {
         version: 1,

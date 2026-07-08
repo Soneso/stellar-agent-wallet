@@ -135,6 +135,7 @@ pub fn arb_per_tx_cap_rule() -> impl Strategy<Value = PolicyRule> {
             },
             criteria: vec![criterion],
             decision: Decision::Allow,
+            allow_opaque_signing: false,
         }
     })
 }
@@ -172,6 +173,7 @@ pub fn arb_counterparty_allowlist_rule() -> impl Strategy<Value = PolicyRule> {
             },
             criteria: vec![criterion],
             decision: Decision::Allow,
+            allow_opaque_signing: false,
         }
     })
 }
@@ -205,6 +207,7 @@ pub fn arb_minimum_reserve_rule() -> impl Strategy<Value = PolicyRule> {
             },
             criteria: vec![criterion],
             decision: Decision::Allow,
+            allow_opaque_signing: false,
         }
     })
 }
@@ -242,6 +245,7 @@ pub fn arb_soroban_resource_fee_rule() -> impl Strategy<Value = PolicyRule> {
                 },
                 criteria: vec![criterion],
                 decision: Decision::Allow,
+                allow_opaque_signing: false,
             }
         },
     )
@@ -284,6 +288,7 @@ pub fn arb_strict_deny_per_tx_rule() -> impl Strategy<Value = PolicyRule> {
             1_i64, // 1 stroop cap — denies payments > 1 stroop via criterion failure
         ))],
         decision: Decision::Allow,
+        allow_opaque_signing: false,
     })
 }
 

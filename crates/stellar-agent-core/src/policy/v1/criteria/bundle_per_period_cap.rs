@@ -45,6 +45,7 @@ use crate::policy::v1::bundle::InnerOpDescriptor;
 use crate::policy::v1::criteria::Criterion;
 use crate::policy::v1::criteria::per_period_cap::Window;
 use crate::policy::v1::criteria::state_store::StateKey;
+use crate::policy::v1::value::asset_normalise;
 use crate::policy::{DenyReason, PolicyError};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -159,7 +160,7 @@ impl Criterion for BundlePerPeriodCapCriterion {
             return Ok(None);
         };
 
-        let criterion_asset = asset_normalise(self.asset.clone());
+        let criterion_asset = asset_normalise(&self.asset);
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -196,7 +197,7 @@ impl Criterion for BundlePerPeriodCapCriterion {
                 continue;
             };
 
-            let inner_asset = asset_normalise(asset.clone());
+            let inner_asset = asset_normalise(asset);
             if inner_asset != criterion_asset {
                 // Asset mismatch: this inner does not count toward this criterion.
                 continue;
@@ -230,18 +231,6 @@ impl Criterion for BundlePerPeriodCapCriterion {
         }
 
         Ok(None)
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn asset_normalise(asset: String) -> String {
-    if asset.eq_ignore_ascii_case("native") || asset.eq_ignore_ascii_case("xlm") {
-        "native".to_owned()
-    } else {
-        asset
     }
 }
 

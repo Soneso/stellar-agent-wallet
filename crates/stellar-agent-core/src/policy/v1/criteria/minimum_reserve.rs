@@ -12,6 +12,10 @@
 //!
 //! # Logic
 //!
+//! `amount_stroops` is the sum of the call's native-XLM debit (outflow) legs,
+//! read from the typed value descriptor ([`EvalContext::value`]); a token-only
+//! move is not a native debit and does not reduce the native reserve (§7.4).
+//!
 //! ```text
 //! reserve_required = account.reserves_stroops(BASE_RESERVE_STROOPS) + margin_stroops
 //! post_balance     = pre_balance - (amount_stroops + fee_stroops)     [saturating]
@@ -38,7 +42,7 @@
 
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::criteria::Criterion;
-use crate::policy::v1::criteria::amount_extract::extract_pay_or_create_account_stroops;
+use crate::policy::v1::value::{ValueGate, classify_value};
 use crate::policy::{DenyReason, PolicyError};
 use crate::protocol_consts::BASE_RESERVE_STROOPS;
 
@@ -132,10 +136,9 @@ impl Criterion for MinimumReserveCriterion {
     /// - [`PolicyError::CriterionEvaluationFailed`] when
     ///   `account_view.balance_stroops()` returns an error (balance
     ///   unreadable or parse failure).
-    /// - [`PolicyError::CriterionEvaluationFailed`] when a present
-    ///   `amount_stroops` / `starting_balance_stroops` (or legacy `amount` /
-    ///   `starting_balance`) field fails to parse — a malformed
-    ///   server-derived amount refuses rather than passing as a zero debit.
+    /// - [`PolicyError::CriterionEvaluationFailed`] when a native-XLM debit leg
+    ///   of the value descriptor carries no resolvable amount — an unresolvable
+    ///   native debit refuses rather than passing as a zero debit.
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
         // Fail-closed: account_view = None means the dispatch site has not
         // wired up the account state.  Silently passing would allow every
@@ -161,7 +164,10 @@ impl Criterion for MinimumReserveCriterion {
                     ),
                 })?;
 
-        let amount_stroops = extract_amount_stroops(ctx)?;
+        let amount_stroops = match extract_amount_stroops(ctx)? {
+            AmountOutcome::Debit(amount) => amount,
+            AmountOutcome::Deny(reason) => return Ok(Some(reason)),
+        };
         let fee_stroops = extract_fee_stroops(ctx);
 
         // Compute post-balance using saturating arithmetic to avoid wrapping on
@@ -189,77 +195,73 @@ impl Criterion for MinimumReserveCriterion {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Extracts the transaction amount in stroops from args.
+/// The outcome of resolving the transaction's native debit for the reserve
+/// check.
+enum AmountOutcome {
+    /// The resolved native-XLM debit in stroops (0 for a genuinely value-less
+    /// call; the reserve check still fires on the fee alone).
+    Debit(i64),
+    /// The call's value effect cannot be sized; refuse fail-closed with this
+    /// reason instead of computing a debit.
+    Deny(DenyReason),
+}
+
+/// Extracts the transaction's native-XLM debit in stroops.
 ///
-/// For `stellar_pay(_commit)` and `stellar_create_account(_commit)`, resolves
-/// the amount via [`extract_pay_or_create_account_stroops`] (resolved
-/// `amount_stroops` / `starting_balance_stroops` key first, legacy
-/// unit-string key as fallback) — every args shape these tools produce in
-/// production carries the resolved key, so the reserve guard sees the real
-/// debit on every path (simulate AND commit).
+/// Drives off the shared [`classify_value`] gate (design §7.4, native-only):
 ///
-/// # Invariant
-///
-/// [`extract_pay_or_create_account_stroops`] distinguishes `Err` (a
-/// recognised tool's amount field IS present but malformed) from `Ok(None)`
-/// (the tool is not one this criterion knows how to extract a debit for, or
-/// — for pay/create_account — genuinely carries neither key). This function
-/// preserves that distinction rather than collapsing both to a silent 0:
-///
-/// - `Ok(Some(stroops))` → the real debit.
-/// - `Ok(None)` → a genuinely amount-less tool; defaults to 0 (fail-open ONLY
-///   here, matching the pre-existing "fee-only" fallback posture — the
-///   reserve check still fires on the fee alone via `extract_fee_stroops`).
-/// - `Err(_)` → a server-derived amount field is present but malformed; this
-///   is propagated as [`PolicyError::CriterionEvaluationFailed`] (refuse),
-///   the same fail-closed posture `per_tx_cap` / `per_period_cap` apply to
-///   the identical condition. Silently treating a malformed amount as 0 would
-///   let an attacker suppress the reserve debit by corrupting the field.
+/// - [`ValueGate::NotApplicable`] → [`AmountOutcome::Debit(0)`]: a genuinely
+///   value-less call; the reserve check still fires on the fee alone via
+///   [`extract_fee_stroops`].
+/// - [`ValueGate::Deny`] → [`AmountOutcome::Deny`]: the call's value effect
+///   cannot be sized (an unpopulated `MovesValue` tool, or an opaque-sign call
+///   under a matched rule); the criterion returns this reason directly rather
+///   than computing a debit.
+/// - [`ValueGate::Effects`] → sums only the debit legs whose asset is the
+///   canonical `"native"` ([`crate::policy::v1::value::ValueLeg::is_native_debit`]).
+///   A non-native leg (a token-only move) contributes 0 to the reserve debit —
+///   it does not reduce the native reserve. A native debit leg with an
+///   unresolvable (`None`) amount is refused fail-closed: an unresolvable
+///   server-derived amount must not be sized as a zero debit that would
+///   silently bypass the reserve guard.
 ///
 /// # Errors
 ///
-/// Returns [`PolicyError::CriterionEvaluationFailed`] when a present resolved
-/// or legacy amount field fails to parse.
-fn extract_amount_stroops(ctx: &EvalContext<'_>) -> Result<i64, PolicyError> {
-    match ctx.tool.name.as_str() {
-        "stellar_pay"
-        | "stellar_pay_commit"
-        | "stellar_create_account"
-        | "stellar_create_account_commit" => {
-            // Read the resolved debit from the value leg the gate derived. A
-            // pay/create leg with an unresolvable (`None`) amount is refused
-            // (fail-closed None-is-deny): an unresolvable server-derived amount
-            // must not be sized as a zero debit that would silently bypass the
-            // reserve guard. The leg's asset is not consulted: the reserve debit
-            // is asset-agnostic — every leg amount counts against the native
-            // reserve.
-            let leg = ctx.value.sole_value_leg().ok_or_else(|| {
-                PolicyError::CriterionEvaluationFailed {
-                    detail: format!(
-                        "minimum_reserve: value descriptor not populated for tool '{}'",
-                        ctx.tool.name
-                    ),
-                }
-            })?;
-            let amount = leg
-                .amount
-                .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
-                    detail: format!(
-                        "minimum_reserve: unresolvable amount for tool '{}'",
-                        ctx.tool.name
-                    ),
-                })?;
-            i64::try_from(amount).map_err(|_| PolicyError::CriterionEvaluationFailed {
+/// Returns [`PolicyError::CriterionEvaluationFailed`] when a native debit leg
+/// carries no resolvable amount, or when the aggregate exceeds the `i64`
+/// range.
+fn extract_amount_stroops(ctx: &EvalContext<'_>) -> Result<AmountOutcome, PolicyError> {
+    let effects = match classify_value(ctx) {
+        ValueGate::NotApplicable => return Ok(AmountOutcome::Debit(0)),
+        ValueGate::Deny(reason) => return Ok(AmountOutcome::Deny(reason)),
+        ValueGate::Effects(effects) => effects,
+    };
+
+    let mut sum: i128 = 0;
+    for leg in effects.legs() {
+        if !leg.is_native_debit() {
+            // A non-native debit (or a non-debit leg such as Claim/Trustline)
+            // does not reduce the native reserve.
+            continue;
+        }
+        let amount = leg
+            .amount
+            .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
                 detail: format!(
-                    "minimum_reserve: amount {amount} exceeds i64 range for tool '{}'",
+                    "minimum_reserve: unresolvable amount for a native debit leg of tool '{}'",
                     ctx.tool.name
                 ),
-            })
-        }
-        // Other tools keep the current args path: a genuinely amount-less tool
-        // resolves to a 0 debit (the reserve check still fires on the fee).
-        _ => Ok(extract_pay_or_create_account_stroops(ctx, "minimum_reserve")?.unwrap_or(0)),
+            })?;
+        sum = sum.saturating_add(amount);
     }
+
+    let stroops = i64::try_from(sum).map_err(|_| PolicyError::CriterionEvaluationFailed {
+        detail: format!(
+            "minimum_reserve: aggregate native debit {sum} exceeds i64 range for tool '{}'",
+            ctx.tool.name
+        ),
+    })?;
+    Ok(AmountOutcome::Debit(stroops))
 }
 
 /// Extracts the transaction fee in stroops from args.
@@ -545,15 +547,15 @@ mod tests {
         assert_eq!(extract_fee_stroops(&ctx), 12_345);
     }
 
-    // ── Real production args shapes (resolved-key re-point; closes the
-    // pre-existing FAIL-OPEN where the absent legacy key silently counted the
-    // debit as 0) ────────────────────────────────────────────────────────────
+    // ── Real production args shapes ───────────────────────────────────────────
+    // The native-XLM debit is sized from the descriptor's outflow leg (resolved
+    // from `amount_stroops` / `starting_balance_stroops`); a leg whose amount is
+    // unresolvable denies rather than counting a 0 debit.
 
-    /// Commit-time `stellar_pay_commit` authoritative_args shape breaches the
-    /// reserve on the real debit — before this re-point, the absent "amount"
-    /// key silently defaulted to 0 and this call would have passed.
+    /// A commit-time `stellar_pay_commit` authoritative_args shape that breaches
+    /// the reserve on its native debit is denied.
     #[test]
-    fn pay_commit_authoritative_args_shape_breach_is_now_caught() {
+    fn pay_commit_authoritative_args_shape_breach_is_caught() {
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
 
@@ -704,11 +706,9 @@ mod tests {
         );
     }
 
-    /// A present-but-malformed resolved-key amount must be refused, not
-    /// silently treated as a 0 debit. Before this fix, `extract_amount_stroops`
-    /// swallowed `Err` from the shared extractor via `.ok().flatten().unwrap_or(0)`,
-    /// which would have let a corrupted `amount_stroops` field bypass the
-    /// reserve guard entirely.
+    /// A present-but-malformed resolved-key amount is refused, not treated as a
+    /// 0 debit: a native-XLM debit leg whose amount cannot be resolved denies
+    /// fail-closed rather than bypassing the reserve guard.
     #[test]
     fn malformed_resolved_key_amount_is_refused_not_silently_zeroed() {
         let store = PolicyStateStore::new();
@@ -734,6 +734,108 @@ mod tests {
             matches!(result, Err(PolicyError::CriterionEvaluationFailed { .. })),
             "a malformed amount_stroops value must refuse (CriterionEvaluationFailed), \
              not silently pass with a 0 debit: {result:?}"
+        );
+    }
+
+    // ── Fail-closed value-descriptor matrix ─────────────────────────────────
+
+    /// Constructs a `ToolDescriptor` with an explicit `value_kind` (rather
+    /// than the fixed `ReadOnly` of [`make_tool`]).
+    fn make_tool_with_kind(
+        tool_name: &'static str,
+        value_kind: crate::policy::ToolValueKind,
+    ) -> ToolDescriptor {
+        let reg = McpToolRegistration {
+            name: tool_name,
+            destructive_hint: true,
+            read_only_hint: false,
+            chain_id_required: true,
+            value_kind,
+        };
+        ToolDescriptor::from_registration(&reg)
+    }
+
+    /// A `MovesValue` tool the descriptor derivation has not classified
+    /// (`derive_value_class` falls through to `ReadOnly` for any name outside
+    /// its match arms) must deny fail-closed rather than passing silently.
+    #[test]
+    fn moves_value_tool_with_unpopulated_effects_denies_unsizable() {
+        let store = PolicyStateStore::new();
+        let criterion = MinimumReserveCriterion::new(5_000_000);
+        let view = MockAccountView {
+            balance: 120_000_000,
+            subentries: 0,
+        };
+        let args = json!({});
+        let tool = make_tool_with_kind(
+            "stellar_blend_lend",
+            crate::policy::ToolValueKind::MovesValue,
+        );
+        let profile = make_profile();
+        let ctx = make_ctx(&tool, &profile, &args, &store, Some(&view));
+        let result = criterion.evaluate(&ctx);
+        assert!(
+            matches!(result, Ok(Some(DenyReason::UnsizableValueEffect { .. }))),
+            "a MovesValue tool with no resolved effects must deny fail-closed, got {result:?}"
+        );
+    }
+
+    /// An opaque-signing call on the single-tx path must deny fail-closed.
+    #[test]
+    fn opaque_sign_call_denies_unsizable_on_single_tx() {
+        let store = PolicyStateStore::new();
+        let criterion = MinimumReserveCriterion::new(5_000_000);
+        let view = MockAccountView {
+            balance: 120_000_000,
+            subentries: 0,
+        };
+        let args = json!({});
+        let tool = make_tool("stellar_sep43_sign_transaction");
+        let profile = make_profile();
+        let ctx = make_ctx(&tool, &profile, &args, &store, Some(&view));
+        let result = criterion.evaluate(&ctx);
+        assert!(
+            matches!(result, Ok(Some(DenyReason::UnsizableValueEffect { .. }))),
+            "an opaque-signing call must deny fail-closed on the single-tx path, got {result:?}"
+        );
+    }
+
+    /// A token-only (non-native) debit leg must NOT reduce the native
+    /// reserve: the reserve check sees a 0 debit and passes on a balance that
+    /// would otherwise breach if the token amount were (incorrectly) counted
+    /// as a native debit.
+    #[test]
+    fn token_only_non_native_debit_leg_does_not_reduce_native_reserve() {
+        use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
+
+        let store = PolicyStateStore::new();
+        let criterion = MinimumReserveCriterion::new(5_000_000);
+
+        // Balance 12 XLM, 0 subentries. Reserve required: 15_000_000 stroops.
+        // A native debit of this size (110_000_000) would breach
+        // (post = 10_000_000 < 15_000_000); a non-native debit of the same
+        // size must NOT be counted, leaving post = pre_balance (120_000_000)
+        // which passes.
+        let view = MockAccountView {
+            balance: 120_000_000,
+            subentries: 0,
+        };
+        let leg = ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(110_000_000),
+            asset: Some("USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN".to_owned()),
+            destination: Some("GBBB".to_owned()),
+        };
+        let args = json!({});
+        let tool = make_tool("stellar_multicall");
+        let profile = make_profile();
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+            .with_account_view(&view)
+            .with_value(ValueClass::Value(ValueEffects::single(leg)));
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            result.is_none(),
+            "a token-only debit must not reduce the native reserve; got {result:?}"
         );
     }
 }

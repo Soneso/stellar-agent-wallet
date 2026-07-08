@@ -272,6 +272,16 @@ pub struct PolicyRule {
     pub criteria: Vec<Box<dyn Criterion>>,
     /// The decision to return when all criteria pass.
     pub decision: Decision,
+    /// Operator opt-in that this rule may match an `OpaqueSign` tool whose value
+    /// effect cannot be sized.
+    ///
+    /// Value criteria deny an opaque-signing call fail-closed
+    /// ([`crate::policy::DenyReason::UnsizableValueEffect`]) by default. Setting
+    /// `allow_opaque_signing = true` on a rule that matches such a tool is the
+    /// explicit, auditable exemption (design §2.4): the engine treats the
+    /// opaque value as not-applicable for that rule so the rule's own
+    /// `decision` governs. It has no effect on non-opaque calls.
+    pub allow_opaque_signing: bool,
 }
 
 impl PolicyRule {
@@ -287,6 +297,7 @@ impl PolicyRule {
     ///     r#match: RuleMatch { tool: "stellar_pay".into(), chain: "*".into() },
     ///     criteria: vec![],
     ///     decision: Decision::Allow,
+    ///     allow_opaque_signing: false,
     /// };
     /// let tool = ToolDescriptor::from_registration(&McpToolRegistration {
     ///     name: "stellar_pay",
@@ -701,10 +712,22 @@ fn parse_rule(table: &toml_edit::Table, idx: usize) -> Result<PolicyRule, Policy
     let ttl_secs = parse_optional_ttl_secs(table, idx)?;
     let decision = parse_decision(decision_str, idx, reason, ttl_secs)?;
 
+    // Optional opaque-signing exemption (design §2.4). Absent → false; present
+    // but not a boolean → parse error (fail-closed on a malformed exemption).
+    let allow_opaque_signing = match table.get("allow_opaque_signing") {
+        None => false,
+        Some(item) => item
+            .as_bool()
+            .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+                detail: format!("rule[{idx}] `allow_opaque_signing` must be a boolean"),
+            })?,
+    };
+
     Ok(PolicyRule {
         r#match: rule_match,
         criteria,
         decision,
+        allow_opaque_signing,
     })
 }
 
@@ -1720,6 +1743,7 @@ decision = "allow"
             },
             criteria: vec![],
             decision: Decision::Allow,
+            allow_opaque_signing: false,
         };
         let tool =
             crate::policy::ToolDescriptor::from_registration(&crate::policy::McpToolRegistration {
@@ -1745,6 +1769,7 @@ decision = "allow"
             },
             criteria: vec![],
             decision: Decision::Allow,
+            allow_opaque_signing: false,
         };
         let tool =
             crate::policy::ToolDescriptor::from_registration(&crate::policy::McpToolRegistration {

@@ -21,8 +21,11 @@
 //!
 //! # Policy evaluation
 //!
-//! `stellar_dex_trade` runs `WalletServer::dispatch_gate` before signing.
-//! `stellar_dex_quote` is read-only; it does NOT call `dispatch_gate`.
+//! `stellar_dex_trade` runs `WalletServer::dispatch_gate_with_value` before
+//! signing, with a single [`stellar_agent_core::policy::v1::ValueLeg`] sized
+//! from the SAME `qty_in` / canonicalised path later placed into `TradeArgs`
+//! (`dex_trade_value_leg`) — the single-decode invariant.
+//! `stellar_dex_quote` is read-only; it does NOT call `dispatch_gate_with_value`.
 //!
 //! # Behaviour
 //!
@@ -43,6 +46,7 @@ use serde_json::json;
 use stellar_agent_mcp_macros::mcp_tool_router;
 
 use stellar_agent_core::observability::redact_strkey_first5_last5;
+use stellar_agent_core::policy::v1::{ActionKind, ValueClass, ValueLeg};
 use stellar_agent_defi::adapter::{DefiAdapter, DefiAdapterCtx};
 use stellar_agent_defi::dispatch::{GateOutcome, dispatch_gate, require_approval_error};
 use stellar_agent_defi::pins::DefiContractPin;
@@ -181,18 +185,64 @@ impl WalletServer {
         &self,
         Parameters(args): Parameters<DexTradeArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        // ── Policy gate ───────────────────────────────────────────────────────
-        // qty_in rides through the policy gate as a decimal STRING
-        // (wire-faithful — deliberate). No criterion reads a decimal-string
-        // amount field numerically; a future amount criterion must parse this
-        // value string-tolerantly rather than assuming a JSON number.
+        // ── Parse the decimal-string amount fields (single decode; feeds BOTH
+        // the value-carrying policy gate below and `TradeArgs` handed to the
+        // adapter further down) ───────────────────────────────────────────────
+        let qty_in = crate::tools::amount_wire::parse_i128_field("qty_in", &args.qty_in)?;
+        let qty_out_min =
+            crate::tools::amount_wire::parse_i128_field("qty_out_min", &args.qty_out_min)?;
+
+        // ── Resolve network settings ──────────────────────────────────────────
+        let network_passphrase = self.profile.network_passphrase.as_str();
+        let rpc_url = self.profile.rpc_url.as_str();
+
+        // ── Resolve pinned router address and WASM hash for network ──────────
+        // Table lookup only (no RPC); safe to resolve ahead of the policy gate.
+        let (router_address, router_wasm_hash) = pinned_router_for_network(&args.chain_id)
+            .map_err(|e| {
+                rmcp::ErrorData::invalid_params(format!("dex.unrecognised_network: {e}"), None)
+            })?;
+
+        // ── Canonicalise path for display and TradeArgs ───────────────────────
+        // Surface canonicalisation errors (not swallowed): an unresolvable token
+        // address is a structural refusal, not a warning to ignore. Pure
+        // computation (no RPC); safe to resolve ahead of the policy gate.
+        let canonical_path = canonicalise_path(&args.path, network_passphrase).map_err(|e| {
+            rmcp::ErrorData::invalid_params(format!("dex.canonicalisation_failed: {e}"), None)
+        })?;
+
+        // ── Build TradeArgs for the adapter ──────────────────────────────────
+        let trade_args = TradeArgs {
+            from_address: args.from_address.clone(),
+            amount_in: qty_in,
+            amount_out_min: qty_out_min,
+            path: canonical_path.clone(),
+            deadline: args.deadline,
+        };
+
+        // ── Policy gate (value-carrying; dispatch_gate prerequisite) ──────────
+        // The debit leg is built from the SAME `qty_in` / `canonical_path` used
+        // to construct `trade_args` above (single-decode invariant). `qty_in`
+        // still rides through `args_value` as a decimal STRING (wire-faithful —
+        // deliberate; no criterion reads a decimal-string amount field
+        // numerically from `args_value`). `account_view` / `identity_view` are
+        // `None`: the `minimum_reserve` / `home_domain` criteria fail closed on
+        // this tool pending account-view wiring, acceptable for this step.
+        let value_leg = dex_trade_value_leg(qty_in, &canonical_path, router_address);
         let args_value = json!({
             "chain_id": args.chain_id,
             "from_address": args.from_address,
             "qty_in": args.qty_in,
         });
         let dispatch_outcome = match self
-            .dispatch_gate("stellar_dex_trade", &args_value, &args.chain_id)
+            .dispatch_gate_with_value(
+                "stellar_dex_trade",
+                &args_value,
+                &args.chain_id,
+                ValueClass::single(value_leg),
+                None,
+                None,
+            )
             .await
         {
             Ok(o) => o,
@@ -203,15 +253,6 @@ impl WalletServer {
         if matches!(dispatch_outcome, DispatchOutcome::RequireApproval(_)) {
             return Ok(crate::tools::common::single_shot_require_approval_error());
         }
-
-        // ── Parse the decimal-string amount fields ────────────────────────────
-        let qty_in = crate::tools::amount_wire::parse_i128_field("qty_in", &args.qty_in)?;
-        let qty_out_min =
-            crate::tools::amount_wire::parse_i128_field("qty_out_min", &args.qty_out_min)?;
-
-        // ── Resolve network settings ──────────────────────────────────────────
-        let network_passphrase = self.profile.network_passphrase.as_str();
-        let rpc_url = self.profile.rpc_url.as_str();
 
         // ── Build RPCs ────────────────────────────────────────────────────────
         let primary_rpc = StellarRpcClient::new(rpc_url).map_err(|e| {
@@ -229,28 +270,6 @@ impl WalletServer {
                 })
             })
             .transpose()?;
-
-        // ── Resolve pinned router address and WASM hash for network ──────────
-        let (router_address, router_wasm_hash) = pinned_router_for_network(&args.chain_id)
-            .map_err(|e| {
-                rmcp::ErrorData::invalid_params(format!("dex.unrecognised_network: {e}"), None)
-            })?;
-
-        // ── Canonicalise path for display and TradeArgs ───────────────────────
-        // Surface canonicalisation errors (not swallowed): an unresolvable token
-        // address is a structural refusal, not a warning to ignore.
-        let canonical_path = canonicalise_path(&args.path, network_passphrase).map_err(|e| {
-            rmcp::ErrorData::invalid_params(format!("dex.canonicalisation_failed: {e}"), None)
-        })?;
-
-        // ── Build TradeArgs for the adapter ──────────────────────────────────
-        let trade_args = TradeArgs {
-            from_address: args.from_address.clone(),
-            amount_in: qty_in,
-            amount_out_min: qty_out_min,
-            path: canonical_path.clone(),
-            deadline: args.deadline,
-        };
 
         let from_redacted = redact_strkey_first5_last5(&args.from_address);
         let router_redacted = redact_strkey_first5_last5(router_address);
@@ -460,6 +479,39 @@ impl WalletServer {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// dex_trade_value_leg — pure leg-construction helper (single-decode invariant)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Builds the single debit [`ValueLeg`] for the `stellar_dex_trade`
+/// value-carrying policy gate.
+///
+/// The leg carries the SEND side of the swap — the value leaving the wallet
+/// — never the receive side: `amount = Some(qty_in)`, `asset` is the send
+/// asset (`canonical_path`'s first element), and `destination` is the
+/// Soroswap router address (the only on-chain counterparty contract this
+/// call is ever routed through).
+///
+/// `canonical_path` may (structurally) be shorter than 2 elements at this
+/// call site — the `[2, 5]` length bound is enforced later, inside
+/// `DexSwapAdapter::submit` — so `asset` degrades to `None` rather than
+/// panicking when `canonical_path` is empty; the adapter's own length check
+/// still fail-closes the call before any signing occurs.
+///
+/// Called from `stellar_dex_trade` with the SAME `qty_in` / `canonical_path`
+/// used to construct `TradeArgs` — the single-decode invariant. This is a
+/// pure function so it can be unit-tested directly without exercising the
+/// async handler.
+#[must_use]
+fn dex_trade_value_leg(qty_in: i128, canonical_path: &[String], router_address: &str) -> ValueLeg {
+    ValueLeg {
+        kind: ActionKind::DexTrade,
+        amount: Some(qty_in),
+        asset: canonical_path.first().cloned(),
+        destination: Some(router_address.to_owned()),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Test helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -647,5 +699,53 @@ mod tests {
             value["expected_out"].as_str().expect("string"),
             "9007199254740993"
         );
+    }
+
+    // ── dex_trade_value_leg: value-carrying policy-gate leg construction ──────
+
+    #[test]
+    fn dex_trade_value_leg_carries_send_side_amount_asset_and_router_destination() {
+        use stellar_agent_core::policy::v1::ActionKind;
+
+        const ROUTER: &str = "CCJUD55AG6W5HAI5LRVNKAE5WDP5XGZBUDS5WNTIVDU7O264UZZE7BRD";
+        let canonical_path = vec![
+            "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU".to_owned(),
+            "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD".to_owned(),
+        ];
+        let qty_in = 9_007_199_254_740_993_i128;
+
+        let leg = super::dex_trade_value_leg(qty_in, &canonical_path, ROUTER);
+
+        assert_eq!(leg.kind, ActionKind::DexTrade);
+        assert!(leg.kind.carries_debit(), "the send side is a debit");
+        // Single-decode invariant: the leg amount is exactly `qty_in`, the same
+        // integer placed into `TradeArgs.amount_in`.
+        assert_eq!(leg.amount, Some(qty_in));
+        assert_eq!(leg.asset.as_deref(), Some(canonical_path[0].as_str()));
+        assert_eq!(leg.destination.as_deref(), Some(ROUTER));
+    }
+
+    #[test]
+    fn dex_trade_value_leg_does_not_carry_the_receive_side() {
+        const ROUTER: &str = "CCJUD55AG6W5HAI5LRVNKAE5WDP5XGZBUDS5WNTIVDU7O264UZZE7BRD";
+        let canonical_path = vec![
+            "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU".to_owned(),
+            "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD".to_owned(),
+        ];
+        let leg = super::dex_trade_value_leg(1_000_000_i128, &canonical_path, ROUTER);
+        assert_ne!(
+            leg.asset.as_deref(),
+            Some(canonical_path[1].as_str()),
+            "the leg must not carry the receive-side (last) path element"
+        );
+    }
+
+    #[test]
+    fn dex_trade_value_leg_empty_path_degrades_asset_to_none_without_panicking() {
+        const ROUTER: &str = "CCJUD55AG6W5HAI5LRVNKAE5WDP5XGZBUDS5WNTIVDU7O264UZZE7BRD";
+        let leg = super::dex_trade_value_leg(1_000_000_i128, &[], ROUTER);
+        assert_eq!(leg.amount, Some(1_000_000_i128));
+        assert_eq!(leg.asset, None);
+        assert_eq!(leg.destination.as_deref(), Some(ROUTER));
     }
 }

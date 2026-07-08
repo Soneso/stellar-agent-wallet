@@ -51,10 +51,13 @@ use rmcp::{
     schemars, serde, tool, tool_router,
 };
 use serde_json::json;
+use stellar_agent_core::policy::v1::ValueClass;
 use stellar_agent_mcp_macros::mcp_tool_router;
 
 use crate::server::WalletServer;
-use crate::tools::common::{decode_payment_required_input, x402_error_to_tool_result};
+use crate::tools::common::{
+    decode_payment_required_input, x402_error_to_tool_result, x402_value_leg,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Argument type
@@ -194,17 +197,48 @@ impl WalletServer {
             return Ok(crate::tools::common::x402_mainnet_signing_forbidden_result());
         }
 
+        // ── Decode payment_required input FIRST ───────────────────────────────
+        // The dispatch gate needs the value-carrying descriptor, which is
+        // derived from this SAME decode (single-decode invariant §2.1) — the
+        // gate must run before any signing but AFTER the decode it sizes.
+        let requirements = match decode_payment_required_input(&args.payment_required) {
+            Ok(r) => r,
+            Err(ref err) => return Ok(x402_error_to_tool_result(err)),
+        };
+
+        // ── Build the value-carrying leg from the SAME decode ────────────────
+        // `x402_value_leg` parses `requirements.amount` to the atomic i128 via
+        // the identical logic `create_payment` applies to the same field
+        // (mirrored, not shared, because `create_payment` lives in the
+        // `stellar-agent-x402` crate and takes `&PaymentRequirements` rather
+        // than a pre-parsed amount); both parses are deterministic over the
+        // same immutable string and so cannot diverge.
+        let value_leg = match x402_value_leg(&requirements) {
+            Ok(leg) => leg,
+            Err(ref err) => return Ok(x402_error_to_tool_result(err)),
+        };
+
         // ── Telemetry preamble (redaction) ───────────────────────────────────
         let args_value = json!({
             "chain_id": &args.chain_id,
             "payment_required_len": args.payment_required.len(),
         });
 
-        // ── dispatch_gate: registry lookup + policy evaluation + chain_id ────
+        // ── dispatch_gate_with_value: registry lookup + policy evaluation +
+        // chain_id, sizing the value criteria against `value_leg` ────────────
         // Single-shot sign tool: RequireApproval is fail-closed. The two-phase
-        // approval flow is not supported on this surface.
+        // approval flow is not supported on this surface. `account_view` /
+        // `identity_view` are `None`: the `minimum_reserve` / `home_domain`
+        // criteria fail closed on this tool pending account-view wiring.
         let dispatch_outcome = match self
-            .dispatch_gate("stellar_x402_create_payment", &args_value, &args.chain_id)
+            .dispatch_gate_with_value(
+                "stellar_x402_create_payment",
+                &args_value,
+                &args.chain_id,
+                ValueClass::single(value_leg),
+                None,
+                None,
+            )
             .await
         {
             Ok(o) => o,
@@ -222,12 +256,6 @@ impl WalletServer {
             payment_required_len = args.payment_required.len(),
             "x402_create_payment: dispatch gate passed",
         );
-
-        // ── Decode payment_required input ─────────────────────────────────────
-        let requirements = match decode_payment_required_input(&args.payment_required) {
-            Ok(r) => r,
-            Err(ref err) => return Ok(x402_error_to_tool_result(err)),
-        };
 
         // ── Validate optional address arg matches profile signer ──────────────
         let account = self.profile.mcp_signer_default.account.as_str();
