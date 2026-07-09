@@ -356,7 +356,7 @@ where
                 default_approval_dir()
                     .ok()
                     .map(|dir| {
-                        let store_path = dir.join(format!("{}.toml", &args.profile));
+                        let store_path = dir.join(format!("{}.toml", args.profile));
                         open_with_retry(&store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
                             .map(|store| {
                                 store.verify_attested_trustline_clawback_opt_in(
@@ -429,7 +429,7 @@ where
                             "approval dir create_all failed; opt-in entry not minted"
                         );
                     } else {
-                        let store_path = dir.join(format!("{}.toml", &args.profile));
+                        let store_path = dir.join(format!("{}.toml", args.profile));
                         match open_with_retry(
                             &store_path,
                             DEFAULT_RETRY_ATTEMPTS,

@@ -676,7 +676,7 @@ impl WalletServer {
                      clawback opt-in for asset {code} (issuer {issuer}; opt-in expires at \
                      {opt_in_expires} unix ms), then re-invoke stellar_trustline. Review pending \
                      approvals with `stellar-agent approve list`.",
-                    code = &resolved.code,
+                    code = resolved.code,
                     issuer = redact_strkey_first5_last5(&resolved.issuer),
                 );
                 return Ok(crate::tools::common::business_error_result(

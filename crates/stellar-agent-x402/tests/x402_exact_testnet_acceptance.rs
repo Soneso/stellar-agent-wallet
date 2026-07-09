@@ -328,7 +328,7 @@ async fn submit_to_testnet_reaches_ledger() {
     eprintln!(
         "[submit/confirm PASS] re-sourced submit reached ledger {}; tx_hash prefix = {}",
         submission.ledger,
-        &redact_tx_hash(&submission.tx_hash),
+        redact_tx_hash(&submission.tx_hash),
     );
 }
 

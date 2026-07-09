@@ -220,7 +220,7 @@ impl Challenge {
                 detail: format!(
                     "tx source account does not match expected server signing key \
                      (source has hint {:?})",
-                    &tx_source_strkey.get(..5).unwrap_or_default()
+                    tx_source_strkey.get(..5).unwrap_or_default()
                 ),
             });
         }

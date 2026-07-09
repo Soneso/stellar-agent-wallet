@@ -934,7 +934,7 @@ async fn h4_release_binary_acceptance() {
 
     eprintln!(
         "[h4] Step 3 PASS: smart-account multicall 1-transfer bundle confirmed (tx_hash prefix: {})",
-        &multicall_json["result"]["bundle_tx_hash"]
+        multicall_json["result"]["bundle_tx_hash"]
             .as_str()
             .unwrap_or("")
             .get(..8)
