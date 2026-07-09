@@ -20,6 +20,18 @@
 //! { kind = "bundle_per_tx_cap", asset = "native", max_stroops = 1_000_000_000 }
 //! ```
 //!
+//! # Generic-inner coupling
+//!
+//! This criterion inspects only [`InnerOpDescriptor::TokenTransfer`] inners; a
+//! [`InnerOpDescriptor::Generic`] inner is not checked against the cap. A rule
+//! carrying this criterion therefore implicitly enforces
+//! [`crate::policy::v1::criteria::restrict_bundle_to_recognised_kinds::RestrictBundleToRecognisedKindsCriterion`]'s
+//! Generic-rejection check at evaluation time
+//! ([`crate::policy::v1::PolicyEngineV1::evaluate_bundle`]), independent of
+//! whether that criterion is configured on the rule, so a bundle cannot bypass
+//! the cap with an invocation whose ABI shape decodes as `Generic` but whose
+//! on-chain effect is a token transfer.
+//!
 //! # Single-tx path
 //!
 //! When `ctx.bundle` is `None`, the criterion passes unconditionally.

@@ -203,15 +203,15 @@ Each criterion is a `Box<dyn Criterion>` (`Send + Sync`) with a snake_case kind 
 | `per_period_cap` | Sliding-window per-period value cap |
 | `rate_limit` | Sliding-window call-rate limit |
 | `counterparty_allowlist` | Destination allowlist (`ADDRESS` / `HOME_DOMAIN` / `SEP10_IDENTITY` / `ONE_TIME_ADDRESS`) |
-| `minimum_reserve` | Minimum-reserve guard |
+| `minimum_reserve` | Minimum-reserve guard (classic-account tools only — see below) |
 | `inner_invocation_count_cap` | Multicall inner-count cap |
-| `bundle_aggregate_cap` | Multicall aggregate-value cap |
+| `bundle_aggregate_cap` | Multicall aggregate-value cap (implicitly enforces the Generic-rejection check below, on any rule that carries it) |
 | `restrict_bundle_to_recognised_kinds` | Reject generic / unrecognised inner kinds |
-| `bundle_per_period_cap` | Per-period cap across a bundle |
-| `bundle_per_tx_cap` | Per-tx cap applied to each inner |
+| `bundle_per_period_cap` | Per-period cap across a bundle (implicitly enforces the Generic-rejection check above, on any rule that carries it) |
+| `bundle_per_tx_cap` | Per-tx cap applied to each inner (implicitly enforces the Generic-rejection check above, on any rule that carries it) |
 | `bundle_rate_limit` | Rate limit across a bundle |
 | `quorum_satisfied` | Smart-account signer-group quorum |
-| `home_domain_resolved` | Counterparty `stellar.toml` resolved/cached |
+| `home_domain_resolved` | Counterparty `stellar.toml` resolved/cached (contract counterparties only — see below) |
 | `sep10_session_active` | Active SEP-10 session for the account |
 | `sep45_session_active` | Active SEP-45 session for the contract |
 
@@ -220,6 +220,10 @@ Multicall bundles also carry a hard floor independent of policy: `evaluate_bundl
 ### Injected views fail closed when absent
 
 Several criteria need state the core crate cannot fetch itself (account reserves, identity, counterparty cache, SEP-10/SEP-45 sessions, quorum). To avoid a circular dependency on the network and smart-account crates, these arrive as optional trait objects on `EvalContext` — `AccountReservesView`, `AccountIdentityView`, `CounterpartyCacheView`, `Sep10SessionView`, `Sep45SessionView`, `QuorumView` — populated by adapters in `stellar-agent-mcp` at the dispatch site. When a configured criterion's required view is `None`, the criterion returns `Err(PolicyError::CriterionEvaluationFailed)` rather than silently passing: `minimum_reserve` with no `account_view`, `sep10_session_active` with no session view, and `home_domain_resolved` with no counterparty cache all fail closed. `AccountIdentityView` is deliberately a separate trait with no default methods so a missing `home_domain` cannot become a silent allow.
+
+### `minimum_reserve` is inapplicable to smart-account verbs
+
+`account_view` is populated only for classic-account tools (`stellar_pay`, `stellar_create_account`, `stellar_claim`) whose acting account is a plain Stellar account with a classic `AccountEntry`. The smart-account verbs — MCP `stellar_blend_lend` / `stellar_dex_trade` / `stellar_defindex_vault_deposit` / `stellar_defindex_vault_withdraw`, and the corresponding CLI `lend` / `trade` / `vault` commands — act through a deployed smart-account contract (C-strkey); a contract has no classic `AccountEntry`, so there is no reserve state to fetch and `account_view` stays `None` on these tools by design. A rule that configures `minimum_reserve` on one of them fails closed on every call via the criterion's own `CriterionEvaluationFailed` path. The same applies to `identity_view` on these tools: the DeFi counterparty (pool / router / vault) is a contract, so a configured identity-class criterion (`home_domain_resolved`) is equally unanswerable and fails closed. Operators should not configure `minimum_reserve` or identity-class criteria on rules matching the smart-account verbs.
 
 ### Fail-closed registry construction
 

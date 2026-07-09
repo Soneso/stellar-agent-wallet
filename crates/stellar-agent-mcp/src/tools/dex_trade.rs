@@ -226,8 +226,12 @@ impl WalletServer {
         // still rides through `args_value` as a decimal STRING (wire-faithful —
         // deliberate; no criterion reads a decimal-string amount field
         // numerically from `args_value`). `account_view` / `identity_view` are
-        // `None`: the `minimum_reserve` / `home_domain` criteria fail closed on
-        // this tool pending account-view wiring, acceptable for this step.
+        // `None` and stay `None`: `from_address` is a smart-account contract
+        // (C-strkey), which has no classic `AccountEntry` — `minimum_reserve`'s
+        // classic reserve formula is inapplicable to this account model, and
+        // the DeFi counterparty (the router) is a contract, so home-domain
+        // identity is unanswerable. A rule that configures `minimum_reserve` or
+        // an identity-class criterion on this tool fails closed by design.
         let value_leg = dex_trade_value_leg(qty_in, &canonical_path, router_address);
         // Capture the gate-derived leg as an audit record before the descriptor
         // moves into the gate (single-derivation invariant).

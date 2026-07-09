@@ -418,9 +418,13 @@ impl WalletServer {
         // just confirmed is equal length, and the SAME vector later placed into
         // the `VaultDepositArgs` signed by the adapter (single-decode
         // invariant: no second amounts/asset parse). `account_view` /
-        // `identity_view` are `None`: the `minimum_reserve` / `home_domain`
-        // criteria fail closed on this tool pending account-view wiring,
-        // acceptable for this step.
+        // `identity_view` are `None` and stay `None`: `from_address` is a
+        // smart-account contract (C-strkey), which has no classic
+        // `AccountEntry` — `minimum_reserve`'s classic reserve formula is
+        // inapplicable to this account model, and the DeFi counterparty (the
+        // vault) is a contract, so home-domain identity is unanswerable. A
+        // rule that configures `minimum_reserve` or an identity-class
+        // criterion on this tool fails closed by design.
         let asset_addresses: Vec<String> = assets.iter().map(|a| a.address.clone()).collect();
         let value_legs = vault_deposit_value_legs(
             &vault_args.amounts_desired,
@@ -649,9 +653,13 @@ impl WalletServer {
         // `vault_withdraw_value_leg`). `VaultWithdraw` is a non-debit
         // `ActionKind` (a redemption returns funds), so leaving `asset` unset
         // does not affect `minimum_reserve` sizing. `account_view` /
-        // `identity_view` are `None`: the `minimum_reserve` / `home_domain`
-        // criteria fail closed on this tool pending account-view wiring,
-        // acceptable for this step.
+        // `identity_view` are `None` and stay `None`: `from_address` is a
+        // smart-account contract (C-strkey), which has no classic
+        // `AccountEntry` — `minimum_reserve`'s classic reserve formula is
+        // inapplicable to this account model, and the DeFi counterparty (the
+        // vault) is a contract, so home-domain identity is unanswerable. A
+        // rule that configures `minimum_reserve` or an identity-class
+        // criterion on this tool fails closed by design.
         let value_leg = vault_withdraw_value_leg(vault_args.withdraw_shares, &args.vault_address);
         // Capture the gate-derived leg as an audit record before the descriptor
         // moves into the gate (single-derivation invariant).

@@ -2430,6 +2430,96 @@ mod tests {
         );
     }
 
+    // ── dispatch_gate: DeFi-shaped tool + minimum_reserve, no account_view → fails closed ──
+
+    /// Pins the terminal posture: the smart-account-fronted DeFi
+    /// tools (`stellar_blend_lend`, `stellar_dex_trade`,
+    /// `stellar_defindex_vault_deposit`, `stellar_defindex_vault_withdraw`)
+    /// always call `dispatch_gate_with_value` with `account_view = None` —
+    /// `from_address` on these tools is a smart-account contract (C-strkey)
+    /// with no classic `AccountEntry`, so there is no account state to fetch.
+    /// A rule that configures `minimum_reserve` on such a tool therefore fails
+    /// closed on EVERY call by design, via the criterion's own fail-closed
+    /// path (`PolicyError::CriterionEvaluationFailed` when `account_view` is
+    /// `None`), surfaced at the wire as `policy.engine_required` — this is not
+    /// missing wiring; there is no account to wire.
+    ///
+    /// Exercises the REAL `PolicyEngineV1` + `MinimumReserveCriterion`, not a
+    /// `MockPolicyEngine`, so the assertion proves the criterion's own
+    /// fail-closed branch fires, not just that dispatch_gate propagates an
+    /// engine error generically.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn dispatch_gate_defi_tool_minimum_reserve_fails_closed_with_no_account_view() {
+        use stellar_agent_blend::abi::{BlendRequest, RequestType};
+        use stellar_agent_blend::value::blend_value_legs;
+        use stellar_agent_core::policy::v1::criteria::MinimumReserveCriterion;
+        use stellar_agent_core::policy::v1::{ValueClass, ValueEffects};
+        use stellar_agent_core::{PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId};
+
+        stellar_agent_test_support::keyring_mock::install().ok();
+
+        const POOL: &str = "CCEBVDYM32YNYCVNRXQKDFFPISJJCV557CDZEIRBEE4NCV4KHPQ44HGF";
+        const ASSET: &str = "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU";
+        const FROM: &str = "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD";
+
+        let doc = PolicyDocument {
+            version: 1,
+            scope: ScopeId::AllProfiles,
+            rules: vec![PolicyRule {
+                r#match: RuleMatch {
+                    tool: "stellar_blend_lend".into(),
+                    chain: "*".into(),
+                },
+                criteria: vec![Box::new(MinimumReserveCriterion::new(0))],
+                decision: Decision::Allow,
+                allow_opaque_signing: false,
+            }],
+            signature: None,
+        };
+        let engine = PolicyEngineV1::new(doc, "svc".into());
+        let server = make_server_with_engine(engine);
+
+        let reqs = vec![BlendRequest::new(
+            RequestType::Supply,
+            ASSET,
+            500_000_000_i128,
+        )];
+        let legs = blend_value_legs(&reqs, POOL);
+        let args_value = serde_json::json!({
+            "chain_id": "stellar:testnet",
+            "pool_address": POOL,
+            "from_address": FROM,
+        });
+
+        // Mirrors the real dispatch site exactly: account_view and
+        // identity_view are both None (see blend_lend.rs's dispatch call).
+        let result = server
+            .dispatch_gate_with_value(
+                "stellar_blend_lend",
+                &args_value,
+                "stellar:testnet",
+                ValueClass::Value(ValueEffects::new(legs)),
+                None,
+                None,
+            )
+            .await;
+
+        let err = business_tool_error(
+            result.expect_err("minimum_reserve with no account_view must fail closed"),
+        );
+        let (is_err, code, _message) = error_envelope_parts(&err);
+        assert!(
+            is_err,
+            "fail-closed criterion error must set is_error = true"
+        );
+        assert_eq!(
+            code, "policy.engine_required",
+            "a minimum_reserve criterion with no account_view must surface \
+             policy.engine_required, got {code}"
+        );
+    }
+
     // ── dispatch_gate: Decision::RequireApproval → DispatchOutcome::RequireApproval ──
 
     #[tokio::test]

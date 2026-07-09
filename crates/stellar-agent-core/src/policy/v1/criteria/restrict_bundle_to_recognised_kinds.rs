@@ -6,12 +6,19 @@
 //! recognised by [`crate::policy::v1::bundle::decompose_bundle`] (currently:
 //! SAC token transfers) are permitted in a multicall bundle.
 //!
-//! # Relationship to `bundle_aggregate_cap`
+//! # Relationship to the value-summing bundle caps
 //!
-//! Policy authors using `bundle_aggregate_cap` MUST also enable this criterion
-//! OR accept that an adversarial agent can bypass the aggregate cap by crafting
-//! an invocation whose ABI shape looks like a `Generic` (and thus is not summed)
-//! but whose on-chain effect is a token transfer.
+//! A rule carrying any value-summing bundle cap (`bundle_aggregate_cap`,
+//! `bundle_per_tx_cap`, or `bundle_per_period_cap`) implicitly enforces this
+//! criterion's Generic-rejection check at evaluation time
+//! ([`crate::policy::v1::PolicyEngineV1::evaluate_bundle`]), regardless of
+//! whether this criterion is present on the rule or, if present, its `enabled`
+//! value. Those caps sum only `TokenTransfer` inners, so an invocation whose
+//! ABI shape decodes as `Generic` contributes nothing to any of them; the
+//! implicit check closes that bypass without requiring policy authors to
+//! remember the pairing. (`bundle_rate_limit` counts `Generic` inners and is
+//! not coupled.) The criterion remains independently configurable as a
+//! standalone guard (rejecting `Generic` inners with no cap present).
 //!
 //! # TOML shape
 //!

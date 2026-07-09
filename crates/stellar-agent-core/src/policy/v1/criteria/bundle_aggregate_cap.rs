@@ -8,6 +8,18 @@
 //! (`asset = None`).  When cross-asset, all `TokenTransfer` inners contribute
 //! to the sum regardless of their asset.
 //!
+//! # Generic-inner coupling
+//!
+//! This criterion sums only [`InnerOpDescriptor::TokenTransfer`] inners; a
+//! [`InnerOpDescriptor::Generic`] inner contributes zero to the sum. A rule
+//! carrying this criterion therefore implicitly enforces
+//! [`crate::policy::v1::criteria::restrict_bundle_to_recognised_kinds::RestrictBundleToRecognisedKindsCriterion`]'s
+//! Generic-rejection check at evaluation time
+//! ([`crate::policy::v1::PolicyEngineV1::evaluate_bundle`]), independent of
+//! whether that criterion is configured on the rule. This guarantees that a
+//! bundle cannot bypass the cap by crafting an invocation whose ABI shape
+//! decodes as `Generic` but whose on-chain effect is a token transfer.
+//!
 //! # Overflow safety
 //!
 //! The running sum uses `i128::checked_add`.  Overflow returns

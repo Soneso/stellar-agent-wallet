@@ -1342,6 +1342,17 @@ impl PolicyEngineV1 {
     /// with the fully-populated overlay (4 + 1 overlay = 5 ≥ 5) would deny.  The
     /// `is_bundle_level()` dispatch eliminates this over-iteration.
     ///
+    /// # `bundle_aggregate_cap` / `restrict_bundle_to_recognised_kinds` coupling
+    ///
+    /// A rule carrying `bundle_aggregate_cap` implicitly enforces the
+    /// Generic-rejection check of `restrict_bundle_to_recognised_kinds` at
+    /// Phase 2, regardless of whether that criterion is configured on the rule
+    /// or, if configured, its `enabled` value. `bundle_aggregate_cap` sums only
+    /// `TokenTransfer` inners, so a `Generic` inner would otherwise contribute
+    /// zero to the sum and bypass the cap. A policy file's meaning is
+    /// self-contained: this invariant does not depend on config state that
+    /// could drift out of sync with the cap.
+    ///
     /// # Arguments
     ///
     /// - `tool` — the tool descriptor for the multicall invocation.
@@ -1510,6 +1521,35 @@ impl PolicyEngineV1 {
             state_store: &self.state_store,
             bundle: Some(&final_view),
         };
+
+        // Implicit coupling: any value-summing bundle cap on the matched rule
+        // enforces the Generic-rejection check regardless of whether
+        // `restrict_bundle_to_recognised_kinds` is configured on the rule or,
+        // if configured, its `enabled` value. The value-summing caps
+        // (`bundle_aggregate_cap`, `bundle_per_tx_cap`, `bundle_per_period_cap`)
+        // all sum only `TokenTransfer` inners, so a Generic-decoding inner
+        // contributes zero to each — an uncoupled cap is bypassable by an inner
+        // whose ABI shape is unrecognised but whose on-chain effect moves
+        // tokens. (`bundle_rate_limit` counts Generic inners and needs no
+        // coupling.) Runs before the criteria loop so a disabled explicit
+        // guard cannot suppress it.
+        const VALUE_SUMMING_BUNDLE_CAPS: [&str; 3] = [
+            "bundle_aggregate_cap",
+            "bundle_per_tx_cap",
+            "bundle_per_period_cap",
+        ];
+        if rule
+            .criteria
+            .iter()
+            .any(|c| VALUE_SUMMING_BUNDLE_CAPS.contains(&c.kind()))
+        {
+            let implicit_guard =
+                criteria::RestrictBundleToRecognisedKindsCriterion { enabled: true };
+            if let Some(deny) = implicit_guard.evaluate(&final_ctx)? {
+                return Ok(Decision::Deny(deny));
+            }
+        }
+
         for criterion in &rule.criteria {
             // Skip non-bundle-level criteria at Phase 2 — they ran at Phase 1.
             if !criterion.is_bundle_level() {
@@ -1936,6 +1976,14 @@ mod tests {
         }
     }
 
+    /// Generic inner: unrecognised ABI shape, contributes zero to any sum.
+    fn generic_inner() -> InnerOpDescriptor {
+        InnerOpDescriptor::Generic {
+            target: "CSTRKEY".into(),
+            fn_name: "unknown_fn".into(),
+        }
+    }
+
     /// evaluate_bundle: `InnerInvocationCountCapCriterion` is bundle-level (Phase 2).
     ///
     /// With `max_count = 0` and a 2-inner bundle, Phase 1 runs no per-inner
@@ -2121,6 +2169,249 @@ mod tests {
                 Decision::Deny(DenyReason::BundleAggregateCapExceeded { sum: 150, .. })
             ),
             "3×50 > cap=100 must deny via BundleAggregateCapExceeded (bundle-level, not wrapped), got {result:?}"
+        );
+    }
+
+    /// evaluate_bundle: `bundle_aggregate_cap` alone (no `restrict_bundle_to_recognised_kinds`
+    /// on the rule) still denies a bundle containing a `Generic` inner, with the
+    /// restrict criterion's own deny code — the implicit coupling.
+    #[test]
+    fn evaluate_bundle_aggregate_cap_alone_denies_generic_inner() {
+        use crate::policy::v1::criteria::BundleAggregateCapCriterion;
+
+        let doc = allow_all_doc_with_criteria(vec![Box::new(BundleAggregateCapCriterion {
+            asset: None,
+            max_amount: 1_000_000_000_000,
+        })]);
+        let engine = PolicyEngineV1::new(doc, "alice".into());
+        let td = tool("stellar_multicall", "stellar:testnet");
+        let profile = testnet_profile();
+
+        let inners = vec![token_transfer_inner(50), generic_inner()];
+        let overlay = BundleStateOverlay::default();
+        let view = BundleView {
+            inners: &inners,
+            overlay: &overlay,
+        };
+
+        let result = engine
+            .evaluate_bundle(&td, &Value::Null, &profile, &view)
+            .unwrap();
+        assert!(
+            matches!(
+                result,
+                Decision::Deny(DenyReason::BundleContainsGenericKind { inner_index: 1 })
+            ),
+            "cap-only rule must deny a Generic inner via BundleContainsGenericKind, got {result:?}"
+        );
+    }
+
+    /// evaluate_bundle: `bundle_per_tx_cap` alone triggers the implicit
+    /// Generic-rejection guard — the per-tx cap sums only `TokenTransfer`
+    /// inners, so without the coupling a Generic-decoding inner would escape
+    /// it.
+    #[test]
+    fn evaluate_bundle_per_tx_cap_alone_denies_generic_inner() {
+        use crate::policy::v1::criteria::BundlePerTxCapCriterion;
+
+        let doc = allow_all_doc_with_criteria(vec![Box::new(BundlePerTxCapCriterion::new(
+            "native".to_owned(),
+            1_000_000_000_000,
+        ))]);
+        let engine = PolicyEngineV1::new(doc, "alice".into());
+        let td = tool("stellar_multicall", "stellar:testnet");
+        let profile = testnet_profile();
+
+        let inners = vec![token_transfer_inner(50), generic_inner()];
+        let overlay = BundleStateOverlay::default();
+        let view = BundleView {
+            inners: &inners,
+            overlay: &overlay,
+        };
+
+        let result = engine
+            .evaluate_bundle(&td, &Value::Null, &profile, &view)
+            .unwrap();
+        assert!(
+            matches!(
+                result,
+                Decision::Deny(DenyReason::BundleContainsGenericKind { inner_index: 1 })
+            ),
+            "per-tx-cap-only rule must deny a Generic inner, got {result:?}"
+        );
+    }
+
+    /// evaluate_bundle: `bundle_per_period_cap` alone triggers the implicit
+    /// Generic-rejection guard — the per-period cap sums only `TokenTransfer`
+    /// inners, so without the coupling a Generic-decoding inner would escape
+    /// it.
+    #[test]
+    fn evaluate_bundle_per_period_cap_alone_denies_generic_inner() {
+        use crate::policy::v1::criteria::BundlePerPeriodCapCriterion;
+        use crate::policy::v1::criteria::per_period_cap::Window;
+
+        let doc = allow_all_doc_with_criteria(vec![Box::new(BundlePerPeriodCapCriterion::new(
+            "native".to_owned(),
+            Window::parse("1d").unwrap(),
+            1_000_000_000_000,
+        ))]);
+        let engine = PolicyEngineV1::new(doc, "alice".into());
+        let td = tool("stellar_multicall", "stellar:testnet");
+        let profile = testnet_profile();
+
+        let inners = vec![token_transfer_inner(50), generic_inner()];
+        let overlay = BundleStateOverlay::default();
+        let view = BundleView {
+            inners: &inners,
+            overlay: &overlay,
+        };
+
+        let result = engine
+            .evaluate_bundle(&td, &Value::Null, &profile, &view)
+            .unwrap();
+        assert!(
+            matches!(
+                result,
+                Decision::Deny(DenyReason::BundleContainsGenericKind { inner_index: 1 })
+            ),
+            "per-period-cap-only rule must deny a Generic inner, got {result:?}"
+        );
+    }
+
+    /// evaluate_bundle: `bundle_aggregate_cap` alone allows an all-recognised
+    /// bundle within the cap — the implicit coupling does not over-deny.
+    #[test]
+    fn evaluate_bundle_aggregate_cap_alone_allows_recognised_within_cap() {
+        use crate::policy::v1::criteria::BundleAggregateCapCriterion;
+
+        let doc = allow_all_doc_with_criteria(vec![Box::new(BundleAggregateCapCriterion {
+            asset: None,
+            max_amount: 1_000,
+        })]);
+        let engine = PolicyEngineV1::new(doc, "alice".into());
+        let td = tool("stellar_multicall", "stellar:testnet");
+        let profile = testnet_profile();
+
+        let inners = vec![token_transfer_inner(100), token_transfer_inner(200)];
+        let overlay = BundleStateOverlay::default();
+        let view = BundleView {
+            inners: &inners,
+            overlay: &overlay,
+        };
+
+        let result = engine
+            .evaluate_bundle(&td, &Value::Null, &profile, &view)
+            .unwrap();
+        assert_eq!(
+            result,
+            Decision::Allow,
+            "all-recognised bundle within cap must allow, got {result:?}"
+        );
+    }
+
+    /// evaluate_bundle: `bundle_aggregate_cap` + explicitly `enabled = true`
+    /// `restrict_bundle_to_recognised_kinds` yields the same deny reason and
+    /// `inner_index` as the cap-alone case — the implicit check and the
+    /// explicit criterion cannot diverge in the deny shape an operator sees.
+    #[test]
+    fn evaluate_bundle_aggregate_cap_with_explicit_enabled_guard_single_deny() {
+        use crate::policy::v1::criteria::{
+            BundleAggregateCapCriterion, RestrictBundleToRecognisedKindsCriterion,
+        };
+
+        let doc = allow_all_doc_with_criteria(vec![
+            Box::new(BundleAggregateCapCriterion {
+                asset: None,
+                max_amount: 1_000_000_000_000,
+            }),
+            Box::new(RestrictBundleToRecognisedKindsCriterion { enabled: true }),
+        ]);
+        let engine = PolicyEngineV1::new(doc, "alice".into());
+        let td = tool("stellar_multicall", "stellar:testnet");
+        let profile = testnet_profile();
+
+        let inners = vec![generic_inner()];
+        let overlay = BundleStateOverlay::default();
+        let view = BundleView {
+            inners: &inners,
+            overlay: &overlay,
+        };
+
+        let result = engine
+            .evaluate_bundle(&td, &Value::Null, &profile, &view)
+            .unwrap();
+        assert!(
+            matches!(
+                result,
+                Decision::Deny(DenyReason::BundleContainsGenericKind { inner_index: 0 })
+            ),
+            "cap + explicit enabled guard must produce one BundleContainsGenericKind deny, got {result:?}"
+        );
+    }
+
+    /// evaluate_bundle: `bundle_aggregate_cap` + explicitly `enabled = false`
+    /// `restrict_bundle_to_recognised_kinds` still denies — the implicit
+    /// coupling wins over an explicit opt-out.
+    #[test]
+    fn evaluate_bundle_aggregate_cap_with_explicit_disabled_guard_still_denies() {
+        use crate::policy::v1::criteria::{
+            BundleAggregateCapCriterion, RestrictBundleToRecognisedKindsCriterion,
+        };
+
+        let doc = allow_all_doc_with_criteria(vec![
+            Box::new(BundleAggregateCapCriterion {
+                asset: None,
+                max_amount: 1_000_000_000_000,
+            }),
+            Box::new(RestrictBundleToRecognisedKindsCriterion { enabled: false }),
+        ]);
+        let engine = PolicyEngineV1::new(doc, "alice".into());
+        let td = tool("stellar_multicall", "stellar:testnet");
+        let profile = testnet_profile();
+
+        let inners = vec![generic_inner()];
+        let overlay = BundleStateOverlay::default();
+        let view = BundleView {
+            inners: &inners,
+            overlay: &overlay,
+        };
+
+        let result = engine
+            .evaluate_bundle(&td, &Value::Null, &profile, &view)
+            .unwrap();
+        assert!(
+            matches!(
+                result,
+                Decision::Deny(DenyReason::BundleContainsGenericKind { inner_index: 0 })
+            ),
+            "cap present + guard explicitly disabled must still deny (implicit coupling wins), got {result:?}"
+        );
+    }
+
+    /// evaluate_bundle: no `bundle_aggregate_cap`, no
+    /// `restrict_bundle_to_recognised_kinds` on the rule — a Generic inner is
+    /// allowed. Existing behavior is unchanged when the cap is absent.
+    #[test]
+    fn evaluate_bundle_no_cap_no_guard_allows_generic_inner() {
+        let doc = allow_all_doc_with_criteria(vec![]);
+        let engine = PolicyEngineV1::new(doc, "alice".into());
+        let td = tool("stellar_multicall", "stellar:testnet");
+        let profile = testnet_profile();
+
+        let inners = vec![generic_inner()];
+        let overlay = BundleStateOverlay::default();
+        let view = BundleView {
+            inners: &inners,
+            overlay: &overlay,
+        };
+
+        let result = engine
+            .evaluate_bundle(&td, &Value::Null, &profile, &view)
+            .unwrap();
+        assert_eq!(
+            result,
+            Decision::Allow,
+            "no cap, no guard: Generic inner must be allowed, got {result:?}"
         );
     }
 

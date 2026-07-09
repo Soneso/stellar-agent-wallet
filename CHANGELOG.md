@@ -45,6 +45,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Documented that `minimum_reserve` and identity-class criteria
+  (`home_domain_resolved`) are inapplicable to the smart-account verbs
+  (`stellar_blend_lend`, `stellar_dex_trade`, `stellar_defindex_vault_deposit`,
+  `stellar_defindex_vault_withdraw`, and the CLI `lend`/`trade`/`vault`
+  equivalents): the acting account is a smart-account contract with no classic
+  `AccountEntry`, so `account_view` and `identity_view` stay unset permanently
+  on these tools, by design. A rule configuring either criterion on one of
+  these verbs fails closed on every call. (#38)
 - Value criteria (`per_tx_cap`, `per_period_cap`, `minimum_reserve`,
   `counterparty_allowlist`) now size a call through a typed value descriptor
   derived at the dispatch gate, instead of matching hard-coded tool names. A
@@ -131,6 +139,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keyring store before reading the owner key on the `policy.engine = "v1"`
   path, so v1 policy evaluation works on a real install (previously failed
   `policy.engine_unavailable` with `NoDefaultStore`). (#41)
+- A rule carrying any value-summing bundle cap (`bundle_aggregate_cap`,
+  `bundle_per_tx_cap`, or `bundle_per_period_cap`) now implicitly enforces the
+  `restrict_bundle_to_recognised_kinds` Generic-rejection check at evaluation
+  time, regardless of whether that criterion is configured on the rule or its
+  `enabled` value. These caps sum only `TokenTransfer` inners, so a multicall
+  bundle containing a `Generic` inner now denies under a cap-only rule instead
+  of bypassing the cap. (#23)
 
 ### Changed
 
