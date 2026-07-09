@@ -72,6 +72,7 @@ use clap::{ArgGroup, Args};
 use stellar_agent_core::StellarAmount;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{AuthError, NetworkError, ValidationError, WalletError};
+use stellar_agent_core::policy::v1::AccountIdentityView;
 use stellar_xdr::Memo;
 
 use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile};
@@ -182,6 +183,16 @@ struct BuiltPaymentEnvelope {
     asset_raw: String,
     /// The destination G-strkey exactly as supplied on the CLI.
     destination: String,
+    /// The source account's fetched state — reused (not re-fetched) to feed
+    /// the policy gate's `account_view`, mirroring the `stellar_pay` MCP
+    /// twin's `AccountViewAdapter` wiring exactly.
+    source_account_view: stellar_agent_network::AccountView,
+    /// The destination account's fetched state, if the destination exists on
+    /// chain — feeds the policy gate's `identity_view`. `None` when the
+    /// destination fetch fails (not-yet-created account), mirroring the
+    /// `stellar_pay` MCP twin's `fetch_account(...).ok()` exactly (a failed
+    /// destination fetch is non-fatal, unlike a failed SOURCE fetch).
+    dest_account_view: Option<stellar_agent_network::AccountView>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -690,12 +701,25 @@ async fn build_unsigned_envelope(args: &PayArgs) -> Result<BuiltPaymentEnvelope,
 
     let envelope_xdr = builder.build()?;
 
+    // Destination-derived identity view for the policy gate's
+    // `home_domain_resolved` criterion, mirroring the `stellar_pay` MCP
+    // twin's `fetch_account(&client, &args.destination, &[]).await.ok()`
+    // exactly: reuses the SAME client (same RPC timeout budget as the
+    // source fetch above), and a failed destination fetch is non-fatal
+    // (`None`) — a not-yet-created destination legitimately has no on-chain
+    // state to resolve `home_domain` from.
+    let dest_account_view = stellar_agent_network::fetch_account(&client, &args.destination, &[])
+        .await
+        .ok();
+
     Ok(BuiltPaymentEnvelope {
         envelope_xdr,
         fee_selection,
         amount_stroops: amount.as_stroops(),
         asset_raw: args.asset.clone(),
         destination: args.destination.clone(),
+        source_account_view: source_account,
+        dest_account_view,
     })
 }
 
@@ -735,6 +759,17 @@ fn evaluate_pay_policy(
     // Mirrors the `stellar_pay` MCP tool's dispatch args exactly: resolved
     // stroops, the raw (unreformatted) asset string, and the destination.
     let policy_args = pay_policy_args(built.amount_stroops, &built.asset_raw, &built.destination);
+    // `account_view` reuses the source-account state `build_unsigned_envelope`
+    // already fetched (feeds `minimum_reserve`); `identity_view` reuses the
+    // destination-account state the same function fetched (`.ok()`-optional,
+    // `None` when the destination does not yet exist) (feeds
+    // `home_domain_resolved`) — mirroring the `stellar_pay` MCP twin exactly.
+    let source_adapter =
+        stellar_agent_network::policy_view::AccountViewAdapter::new(&built.source_account_view);
+    let dest_adapter = built
+        .dest_account_view
+        .as_ref()
+        .map(stellar_agent_network::policy_view::AccountViewAdapter::new);
     match evaluate_value_moving_policy(
         policy_engine.as_ref(),
         profile,
@@ -743,6 +778,8 @@ fn evaluate_pay_policy(
         chain_id,
         &policy_args,
         "pay",
+        Some(&source_adapter),
+        dest_adapter.as_ref().map(|a| a as &dyn AccountIdentityView),
     ) {
         Ok(effects) => Ok(effects),
         Err(envelope) => {

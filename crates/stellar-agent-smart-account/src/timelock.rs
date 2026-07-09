@@ -52,9 +52,11 @@
 
 use sha2::{Digest as _, Sha256};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use stellar_agent_core::{
     audit_log::{entry::AuditEntry, writer::AuditWriter},
     observability::{RedactedStrkey, redact_strkey_first5_last5},
+    rpc_budget::{SequentialRpcBudget, bound_stage},
 };
 use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::signing::Signer;
@@ -100,6 +102,10 @@ use crate::managers::rules::{
 // packages/governance/src/timelock/mod.rs:352-357 (SHA a9c4216)
 const UNSET_LEDGER: u32 = 0;
 const DONE_LEDGER: u32 = 1;
+
+/// Collective wall-clock budget for [`list_pending`]'s per-candidate
+/// cross-RPC scan.
+const LIST_PENDING_TOTAL_BUDGET: Duration = Duration::from_secs(60);
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -2414,6 +2420,15 @@ pub async fn list_pending(
         })?;
 
     let mut results = Vec::with_capacity(candidates.len());
+    // `candidates` grows with the wallet's own scheduling history (one row per
+    // `schedule` call, uncapped) — the audit log has no expiry or count limit.
+    // Each candidate costs a cross-RPC round-trip (primary + secondary), each
+    // individually bounded at 60s by the transport; without a collective
+    // total, a long-lived wallet's `list_pending` call could cost up to
+    // `candidates.len() x 60s` with no cap. `LIST_PENDING_TOTAL_BUDGET`
+    // matches the transport's own per-call bound, applied once across the
+    // whole scan instead of once per candidate.
+    let list_pending_budget = SequentialRpcBudget::new(LIST_PENDING_TOTAL_BUDGET);
 
     for (op_id_hex, scheduled_request_id, _timelock_redacted) in candidates {
         // Decode full hex operation_id.
@@ -2423,15 +2438,26 @@ pub async fn list_pending(
         })?;
         let operation_id = TimelockOperationId::from_bytes(op_bytes);
 
-        let state = query_operation_state_cross_rpc(
-            &primary_rpc,
-            &secondary_rpc,
-            timelock_contract_strkey,
-            &operation_id,
-            network_passphrase,
-            request_id,
+        let state = bound_stage(
+            list_pending_budget,
+            "query_operation_state_cross_rpc",
+            query_operation_state_cross_rpc(
+                &primary_rpc,
+                &secondary_rpc,
+                timelock_contract_strkey,
+                &operation_id,
+                network_passphrase,
+                request_id,
+            ),
         )
-        .await?;
+        .await
+        .map_err(|elapsed| SaError::TimelockListPendingFailed {
+            redacted_reason: format!(
+                "collective list_pending budget of {}s elapsed during {}; the RPC \
+                 endpoint may be slow or unreachable",
+                elapsed.total_secs, elapsed.stage
+            ),
+        })??;
 
         let enriched_state = enrich_state_view_with_current_ledger(state, current_ledger);
 

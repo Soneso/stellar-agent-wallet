@@ -249,6 +249,11 @@ where
         }
     };
     let policy_args = trustline_policy_args(&args.from, &args.asset);
+    // `account_view` / `identity_view` are `None`: the MCP `stellar_trustline`
+    // twin calls the plain `dispatch_gate` (no views at all, not even a
+    // source-account fetch) — mirrored here exactly. A rule that configures
+    // `minimum_reserve` or an identity-class criterion on `stellar_trustline`
+    // fails closed on both the MCP and CLI paths identically.
     let trustline_effects = match evaluate_value_moving_policy(
         policy_engine.as_ref(),
         &profile,
@@ -257,6 +262,8 @@ where
         chain_id,
         &policy_args,
         "trustline",
+        None,
+        None,
     ) {
         Ok(effects) => effects,
         Err(envelope) => {

@@ -146,6 +146,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `enabled` value. These caps sum only `TokenTransfer` inners, so a multicall
   bundle containing a `Generic` inner now denies under a cap-only rule instead
   of bypassing the cap. (#23)
+- `ContextRuleManager::list_active_context_rules`, Blend's
+  `query_oracle_lastprice_timestamps`, and the timelock `list_pending` scan
+  each now enforce a collective wall-clock budget across their per-item RPC
+  loop, instead of only bounding iteration COUNT. A large scan bound, request
+  batch, or scheduling history against a slow RPC endpoint previously had no
+  total time cap; each of the three now refuses with a "collective ... budget
+  elapsed" message once its budget (the manager's configured `timeout` for
+  the rule scan; a fixed constant for the other two) is exhausted, rather
+  than continuing to probe for up to iteration-count times the transport's
+  60s per-call bound. (#33)
+- `cargo build --workspace --tests` (and any bare `cargo test`/`cargo build
+  --tests` invocation omitting `--features test-helpers`) no longer fails to
+  compile `stellar-agent-approval-remote`: its `test_helpers` module was
+  gated on `cfg(any(test, feature = "test-helpers"))`, which let `cfg(test)`
+  alone compile the module's `p256` imports without the optional `p256`
+  dependency they need (gated solely on the `test-helpers` feature). The
+  module is now gated on the feature alone. (#37)
+- CLI `pay`, `claim`, and `accounts create` (sponsored) now supply the same
+  `account_view` / `identity_view` their MCP twins supply — `pay` a source
+  `account_view` plus a destination-derived `identity_view`; `claim` and
+  `accounts create` a source/sponsor `account_view` only — so a `minimum_reserve`
+  or identity-class criterion configured on these verbs is actually evaluated
+  instead of failing closed on every call. `trustline` is unchanged: its MCP
+  twin supplies no views at all, so the CLI mirrors that exactly. The
+  `AccountReservesView` / `AccountIdentityView` bridge adapter
+  (`AccountViewAdapter`) moved from `stellar-agent-mcp::policy_adapter` to
+  `stellar-agent-network::policy_view` (re-exported from its former path for
+  compatibility) so the CLI can use it without a new dependency on the MCP
+  crate. (#45)
 
 ### Changed
 

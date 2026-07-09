@@ -46,6 +46,7 @@ pub mod friendbot;
 pub mod idempotent_submit;
 pub mod keyring;
 pub mod memo;
+pub mod policy_view;
 pub mod redact;
 pub mod retry;
 pub mod sep29;

@@ -2075,6 +2075,18 @@ impl ContextRuleManager {
         // `gaps_seen` counts LEGITIMATE sparse gaps (`Ok(None)` — deleted
         // rules).  Operator-facing envelope shows `rules_skipped` only;
         // early-exit and planner accounting use the sum.
+        //
+        // `scan_budget` bounds the WALL-CLOCK TOTAL of this loop, independent
+        // of `max_scan_id`: `max_scan_id` bounds the ITERATION COUNT (up to
+        // 10,000 per the profile-load clamp), but each iteration is its own
+        // RPC round-trip individually bounded at 60s by the transport — a
+        // large `max_scan_id` against a slow endpoint would otherwise cost up
+        // to `max_scan_id x 60s` with no total cap. Reuses `self.timeout` (the
+        // manager's configured RPC timeout — the flow's existing
+        // caller-facing budget) rather than a second, independently-tuned
+        // constant, so raising `timeout` in the profile raises the scan
+        // budget too.
+        let scan_budget = stellar_agent_core::rpc_budget::SequentialRpcBudget::new(self.timeout);
         let mut rules: Vec<ContextRuleSummary> = Vec::with_capacity(active_count as usize);
         let mut returned: u32 = 0;
         let mut skipped: usize = 0;
@@ -2083,6 +2095,7 @@ impl ContextRuleManager {
         // regardless of outcome. Exposed as `scanned_id_range_end` in the return
         // value.
         let mut scanned_id_range_end: u32 = 0;
+        let mut budget_elapsed = false;
 
         for rule_id in 0..max_scan_id {
             // Early-exit when all active rules are found.
@@ -2102,12 +2115,22 @@ impl ContextRuleManager {
             // must not abort the whole enumeration.
             // `Ok(None)` = recognised gap (ContextRuleNotFound) — silent skip.
             // `Err(_)` = unrecognised simulate failure — logged + counted.
-            let scval_opt = match self
-                .get_rule(smart_account.clone(), rule_id, source_account_strkey)
-                .await
+            // The collective scan budget wraps the call; a budget timeout
+            // stops the scan immediately (distinct from a per-rule simulate
+            // failure, which only skips that one rule ID).
+            let scval_opt = match stellar_agent_core::rpc_budget::bound_stage(
+                scan_budget,
+                "get_rule",
+                self.get_rule(smart_account.clone(), rule_id, source_account_strkey),
+            )
+            .await
             {
-                Ok(opt) => opt,
-                Err(e) => {
+                Err(_elapsed) => {
+                    budget_elapsed = true;
+                    break;
+                }
+                Ok(Ok(opt)) => opt,
+                Ok(Err(e)) => {
                     warn!(
                         rule_id,
                         error = %e,
@@ -2137,7 +2160,22 @@ impl ContextRuleManager {
         // `phase: "simulate"` — exhaustion is a simulate-phase failure (the
         // per-rule simulate loop did not collect all active rules before the
         // scan bound). "enumerate_rules" is not in the closed 7-value
-        // `SaError::DeploymentFailed` phase set (error.rs:620-642).
+        // `SaError::DeploymentFailed` phase set (error.rs:620-642). The same
+        // phase covers both exhaustion causes (scan-bound reached, or the
+        // collective wall-clock budget elapsed); the message text
+        // distinguishes them for operator diagnosis.
+        if budget_elapsed {
+            let budget_secs = self.timeout.as_secs();
+            return Err(SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: format!(
+                    "list_active_context_rules: collective scan budget of {budget_secs}s \
+                     elapsed before collecting all {active_count} active rules (found \
+                     {returned}, probed up to rule_id {scanned_id_range_end}); the RPC \
+                     endpoint may be slow or unreachable"
+                ),
+            });
+        }
         if returned < active_count {
             return Err(SaError::DeploymentFailed {
                 phase: "simulate",

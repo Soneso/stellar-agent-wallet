@@ -12,6 +12,7 @@
 //! | [`t6_symbolic_not_found_treated_as_gap`] | wiremock | `ContextRuleNotFound` as symbolic name → `Ok(None)` gap path |
 //! | [`t7_non_context_rule_not_found_error_is_skipped_defensively`] | wiremock | Unrecognised simulate error → defensive skip (rules_skipped += 1) |
 //! | [`t2b_valid_until_some_decoded_correctly`] | wiremock | `valid_until = Some(N)` → `ScVal::U32(N)` decoded to `Some(N)`; `Some(valid_until)` decoder regression-lock |
+//! | [`t8_collective_scan_budget_fires_before_max_scan_id_exhaustion`] | wiremock (delayed response) | `active_count=5`, per-rule probes delayed past a short `timeout` → collective scan budget refuses before `max_scan_id` would exhaust (#33) |
 //!
 //! The empty-account and dense-scan tests are regression-locks for the early-exit logic.
 //! The `Some(valid_until)` decoder path requires the canonical
@@ -708,5 +709,121 @@ async fn t7_non_context_rule_not_found_error_is_skipped_defensively() {
         !msg.contains("9999"),
         "error must NOT propagate the #9999 per-rule error; \
          defensive skip must have occurred; got: {msg}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// t8 — collective scan budget fires before max_scan_id would exhaust (#33)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Responder that answers `getLedgerEntries` and the FIRST `simulateTransaction`
+/// call (`get_context_rules_count`) immediately, then delays every subsequent
+/// `simulateTransaction` call (the per-rule `get_rule` probes) by `delay` —
+/// long enough to exceed a short test `timeout`, proving
+/// [`ContextRuleManager::list_active_context_rules`]'s collective scan budget
+/// (derived from `self.timeout`) fires rather than letting the scan run for
+/// `max_scan_id` full per-call windows.
+struct DelayedPerRuleResponder {
+    ledger_entries: serde_json::Value,
+    count_response: serde_json::Value,
+    per_rule_response: serde_json::Value,
+    delay: std::time::Duration,
+    simulate_call: std::sync::atomic::AtomicUsize,
+}
+
+impl wiremock::Respond for DelayedPerRuleResponder {
+    fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        use std::sync::atomic::Ordering;
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).unwrap_or(serde_json::json!({}));
+        let req_id = body.get("id").cloned().unwrap_or(serde_json::json!(1));
+        let method = body
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+
+        match method {
+            "getLedgerEntries" => wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "jsonrpc": "2.0", "id": req_id, "result": self.ledger_entries }),
+            ),
+            "simulateTransaction" => {
+                let call_idx = self.simulate_call.fetch_add(1, Ordering::SeqCst);
+                let result = if call_idx == 0 {
+                    self.count_response.clone()
+                } else {
+                    self.per_rule_response.clone()
+                };
+                let template = wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "jsonrpc": "2.0", "id": req_id, "result": result }),
+                );
+                if call_idx == 0 {
+                    template
+                } else {
+                    template.set_delay(self.delay)
+                }
+            }
+            _ => wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "jsonrpc": "2.0", "id": req_id, "result": {} })),
+        }
+    }
+}
+
+/// The collective scan budget (`self.timeout`) fires before `max_scan_id`
+/// would exhaust: a short `timeout` (100ms) against a mock that delays every
+/// per-rule `get_rule` probe past that budget (300ms) must refuse with the
+/// collective-budget message, NOT continue probing toward `max_scan_id`.
+#[tokio::test]
+async fn t8_collective_scan_budget_fires_before_max_scan_id_exhaustion() {
+    let server = MockServer::start().await;
+    let smart_account = addr(0x08);
+
+    let ledger_resp = build_ledger_entries_account(SOURCE_G);
+    // `active_count = 5` so the scan would otherwise need up to 5 per-rule
+    // probes (well within `max_scan_id`) — the budget must cut it short
+    // long before `max_scan_id` is reached.
+    let count_response = build_simulate_response(&u32_xdr(5));
+    let signers = signer_set_n_of_n(1);
+    let per_rule_response =
+        build_simulate_response(&build_context_rule_scval_xdr(0, &signers, &[]));
+
+    let responder = DelayedPerRuleResponder {
+        ledger_entries: ledger_resp,
+        count_response,
+        per_rule_response,
+        delay: std::time::Duration::from_millis(300),
+        simulate_call: std::sync::atomic::AtomicUsize::new(0),
+    };
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(responder)
+        .mount(&server)
+        .await;
+
+    // A 100ms manager timeout: the collective scan budget derives from this
+    // (`self.timeout`), so the FIRST delayed per-rule probe (300ms) alone
+    // must exceed it.
+    let config = ContextRuleManagerConfig::new(
+        server.uri(),
+        NETWORK_PASSPHRASE.to_owned(),
+        std::time::Duration::from_millis(100),
+        CHAIN_ID.to_owned(),
+    );
+    let manager = ContextRuleManager::new(config).expect("ContextRuleManager::new must succeed");
+
+    let result = manager
+        .list_active_context_rules(smart_account, SOURCE_G, DEFAULT_MAX_SCAN_ID)
+        .await;
+
+    let err = result.expect_err(
+        "a per-rule probe delayed past the collective scan budget must refuse, \
+         not silently continue probing",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("collective scan budget"),
+        "error must be the collective-budget timeout, not scan-bound exhaustion \
+         or a hard-propagated per-rule error; got: {msg}"
     );
 }

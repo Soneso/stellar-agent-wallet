@@ -574,6 +574,7 @@ fn evaluate_create_policy(
     starting_balance_stroops: i64,
     new_account_g_strkey: &str,
     chain_id: &str,
+    sponsor_account_view: &stellar_agent_network::AccountView,
 ) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, i32> {
     let policy_engine =
         match build_v1_policy_engine("accounts create", &profile.policy.engine, profile) {
@@ -589,6 +590,13 @@ fn evaluate_create_policy(
     // `derive_value_class` forces the asset to native for `stellar_create_account`
     // — no "asset" key is needed here.
     let policy_args = create_policy_args(starting_balance_stroops, new_account_g_strkey);
+    // `account_view` feeds `minimum_reserve` on the SPONSOR (the source
+    // account debited for the starting balance), mirroring the
+    // `stellar_create_account` MCP twin. `identity_view` is `None`: the new
+    // account does not yet exist, so it has no on-chain `home_domain` to
+    // resolve — matching the twin exactly.
+    let sponsor_adapter =
+        stellar_agent_network::policy_view::AccountViewAdapter::new(sponsor_account_view);
     match evaluate_value_moving_policy(
         policy_engine.as_ref(),
         profile,
@@ -597,6 +605,8 @@ fn evaluate_create_policy(
         chain_id,
         &policy_args,
         "accounts create",
+        Some(&sponsor_adapter),
+        None,
     ) {
         Ok(effects) => Ok(effects),
         Err(envelope) => {
@@ -707,6 +717,29 @@ where
         return 1;
     }
 
+    // ── Fetch sponsor account state (feeds the policy gate's account_view) ──
+    // This fetch runs BEFORE the gate, mirroring the MCP twin's
+    // fetch-then-dispatch ordering; `build_sponsored_unsigned_envelope` below
+    // re-fetches the same account for its own sequence-number read (the gate
+    // runs strictly before any build/sign/submit work in this command, so
+    // the fetched view cannot be threaded into that later call without
+    // restructuring the build pipeline — a known, accepted extra round-trip).
+    let client = match StellarRpcClient::new(&args.rpc_url) {
+        Ok(c) => c,
+        Err(e) => {
+            print_error(&Envelope::<()>::err(&e), args.output);
+            return 1;
+        }
+    };
+    let sponsor_account_view =
+        match stellar_agent_network::fetch_account(&client, &sponsor, &[]).await {
+            Ok(v) => v,
+            Err(e) => {
+                print_error(&Envelope::<()>::err(&e), args.output);
+                return 1;
+            }
+        };
+
     // ── Operator policy evaluation (before signing/submission) ───────────────
     let chain_id = caip2_chain_id_for_network(args.network);
     let starting_balance_stroops = starting_balance.as_stroops();
@@ -716,6 +749,7 @@ where
         starting_balance_stroops,
         &new_account.g_strkey,
         chain_id,
+        &sponsor_account_view,
     ) {
         Ok(effects) => effects,
         Err(code) => return code,

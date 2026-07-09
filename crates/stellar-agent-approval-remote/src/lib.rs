@@ -65,7 +65,16 @@ mod routes;
 mod templates;
 mod web;
 
-#[cfg(any(test, feature = "test-helpers"))]
+// Gated on the feature alone, not `any(test, feature = "test-helpers")`: the
+// module needs the optional `p256` dependency, which is gated to the SAME
+// feature (`test-helpers = ["dep:p256"]`) — `cfg(test)` alone would compile
+// this module (and its `use p256::...` imports) without the dependency
+// present, an unresolved-import build failure under any bare `cargo test`/
+// `cargo build --tests` invocation that omits `--features test-helpers`. The
+// sole internal consumer (`routes.rs`) is already double-gated
+// `#[cfg(all(test, feature = "test-helpers"))]`, so no caller depends on this
+// module compiling under `cfg(test)` alone.
+#[cfg(feature = "test-helpers")]
 pub mod test_helpers;
 
 pub use config_validate::{RemoteConfigValidationError, validate_remote_config};

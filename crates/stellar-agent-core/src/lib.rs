@@ -88,6 +88,13 @@ pub mod envelope;
 
 pub mod observability;
 
+/// Total wall-clock budget for a sequence of RPC round-trips (a loop, a poll,
+/// or a multi-stage flow), shared by crates that do not depend on
+/// `stellar-agent-smart-account`. See the module documentation for the
+/// single-call-vs-sequence distinction and the relationship to
+/// `stellar-agent-smart-account`'s `PreSubmitBudget`.
+pub mod rpc_budget;
+
 /// Policy engine trait, no-op implementation, and typed decision surface.
 ///
 /// The [`policy::PolicyEngine`] trait is the binding mechanism for the mainnet

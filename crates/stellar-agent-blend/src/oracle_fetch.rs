@@ -29,12 +29,27 @@
 //! - Reflector `lastprice(Asset)` function: SEP-40 oracle interface; verified
 //!   on-chain.
 
+use std::time::Duration;
+
+use stellar_agent_core::rpc_budget::{SequentialRpcBudget, bound_stage};
 use stellar_agent_network::StellarRpcClient;
 use stellar_agent_xdr_limits::untrusted_decode_limits;
 use stellar_xdr::{
     ContractDataDurability, ContractId, Hash, LedgerEntryData, LedgerKey, LedgerKeyContractData,
     ReadXdr, ScAddress, ScSymbol, ScVal,
 };
+
+/// Collective wall-clock budget for [`query_oracle_lastprice_timestamps`]'s
+/// per-asset-address loop.
+///
+/// `asset_addresses` is the set of distinct assets touched by the request
+/// batch — a caller-controlled count with no existing structural cap on this
+/// tool. Each iteration is its own RPC round-trip individually bounded at
+/// 60s by the transport; without a collective total, a large request batch
+/// against a slow endpoint could cost up to `asset_addresses.len() x 60s`.
+/// Matches the transport's own per-call bound, applied once across the whole
+/// loop instead of once per call.
+const ORACLE_FETCH_TOTAL_BUDGET: Duration = Duration::from_secs(60);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PoolOracleFetchError
@@ -368,15 +383,50 @@ pub async fn query_oracle_lastprice_timestamps(
     rpc_url: &str,
     network_passphrase: &str,
 ) -> Result<Vec<u64>, PoolOracleFetchError> {
+    query_oracle_lastprice_timestamps_with_budget(
+        oracle_address,
+        asset_addresses,
+        rpc_url,
+        network_passphrase,
+        ORACLE_FETCH_TOTAL_BUDGET,
+    )
+    .await
+}
+
+/// [`query_oracle_lastprice_timestamps`] with an injectable collective
+/// budget, for deterministic in-crate timeout tests without a multi-second
+/// real-time wait. Production callers use the public wrapper above, which
+/// fixes `total_budget` at [`ORACLE_FETCH_TOTAL_BUDGET`]. Crate-private:
+/// always compiled (the public wrapper delegates to it unconditionally), and
+/// visible to this file's own `#[cfg(test)] mod tests` via `use super::*`.
+async fn query_oracle_lastprice_timestamps_with_budget(
+    oracle_address: &str,
+    asset_addresses: &[String],
+    rpc_url: &str,
+    network_passphrase: &str,
+    total_budget: Duration,
+) -> Result<Vec<u64>, PoolOracleFetchError> {
     if asset_addresses.is_empty() {
         return Ok(vec![]);
     }
 
     let mut timestamps = Vec::with_capacity(asset_addresses.len());
+    let budget = SequentialRpcBudget::new(total_budget);
 
     for asset_addr in asset_addresses {
-        let ts =
-            query_single_lastprice(oracle_address, asset_addr, rpc_url, network_passphrase).await?;
+        let ts = bound_stage(
+            budget,
+            "query_single_lastprice",
+            query_single_lastprice(oracle_address, asset_addr, rpc_url, network_passphrase),
+        )
+        .await
+        .map_err(|elapsed| PoolOracleFetchError::OraclePriceSimulateFailed {
+            reason: format!(
+                "collective oracle-fetch budget of {}s elapsed during {}; \
+                 the oracle RPC endpoint may be slow or unreachable",
+                elapsed.total_secs, elapsed.stage
+            ),
+        })??;
         timestamps.push(ts);
     }
 

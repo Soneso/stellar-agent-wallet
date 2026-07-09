@@ -42,7 +42,7 @@
 //! owner **seed**/secret-key source anywhere in this codebase.
 
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::policy::v1::PolicyEngineV1;
+use stellar_agent_core::policy::v1::{AccountIdentityView, AccountReservesView, PolicyEngineV1};
 use stellar_agent_core::policy::{
     Decision, McpToolRegistration, NoopPolicyEngine, PolicyEngine, ToolDescriptor, ToolValueKind,
 };
@@ -360,10 +360,28 @@ pub(crate) fn trustline_policy_args(from: &str, asset: &str) -> serde_json::Valu
 /// Callers render the envelope with their own `print_error` (JSON vs table)
 /// and exit `1`.
 ///
+/// `account_view` / `identity_view` mirror the MCP twin's
+/// `dispatch_gate_with_views` wiring exactly: `pay`, `claim`, and
+/// `accounts create` (sponsored) fetch the source account and supply it as
+/// `account_view` (feeds `minimum_reserve`); `pay` additionally supplies a
+/// destination-derived `identity_view` (feeds `home_domain_resolved`) where
+/// its MCP twin does; `claim` and `accounts create` pass `None` for
+/// `identity_view` exactly as their MCP twins do. `trustline`'s MCP twin
+/// calls the plain `dispatch_gate` (no views at all), so the `trustline` CLI
+/// caller passes `None` for both, matching that twin.
+///
 /// # Errors
 ///
 /// Returns `Err(envelope)` on `Decision::Deny`, `Decision::RequireApproval`,
 /// an unexpected `Decision` variant, or a policy-engine evaluation error.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors evaluate_full's parameter set (engine, profile, descriptor \
+              inputs, both policy views) plus verb/output-format context every \
+              caller already threads individually; collapsing into a struct would \
+              hide the per-call-site view-population contract this function's \
+              rustdoc documents (which view is Some/None per verb)"
+)]
 pub(crate) fn evaluate_value_moving_policy(
     policy_engine: &dyn PolicyEngine,
     profile: &Profile,
@@ -372,6 +390,8 @@ pub(crate) fn evaluate_value_moving_policy(
     chain_id: &str,
     policy_args: &serde_json::Value,
     verb: &str,
+    account_view: Option<&dyn AccountReservesView>,
+    identity_view: Option<&dyn AccountIdentityView>,
 ) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, Envelope<()>> {
     let reg = McpToolRegistration {
         name: tool_name,
@@ -387,8 +407,8 @@ pub(crate) fn evaluate_value_moving_policy(
         &tool_descriptor,
         policy_args,
         profile,
-        None,
-        None,
+        account_view,
+        identity_view,
         None,
         None,
         None,
@@ -741,6 +761,8 @@ mod tests {
             "stellar:testnet",
             &policy_args,
             "pay",
+            None,
+            None,
         );
         // The allow path must surface EXACTLY the effects `derive_value_class`
         // sizes for the same (tool, args) — the single-derivation invariant the
@@ -770,6 +792,8 @@ mod tests {
             "stellar:testnet",
             &policy_args,
             "pay",
+            None,
+            None,
         );
         assert_eq!(
             envelope_code(&result),
@@ -794,6 +818,8 @@ mod tests {
             "stellar:testnet",
             &policy_args,
             "accounts_create",
+            None,
+            None,
         );
         // Single-derivation invariant: the allow path returns EXACTLY the effects
         // `derive_value_class` sizes for the same (tool, args) — the create leg
@@ -826,6 +852,8 @@ mod tests {
             "stellar:testnet",
             &policy_args,
             "accounts_create",
+            None,
+            None,
         );
         assert_eq!(
             envelope_code(&result),
@@ -853,6 +881,8 @@ mod tests {
             "stellar:testnet",
             &policy_args,
             "claim",
+            None,
+            None,
         );
         // Single-derivation invariant: the allow path returns EXACTLY the
         // non-debit Claim leg `derive_value_class` sizes — the leg the
@@ -888,6 +918,8 @@ mod tests {
             "stellar:testnet",
             &policy_args,
             "pay",
+            None,
+            None,
         );
         assert_eq!(
             result.expect("the no-op engine allows"),
@@ -932,11 +964,301 @@ mod tests {
             "stellar:testnet",
             &policy_args,
             "claim",
+            None,
+            None,
         );
         assert_eq!(
             envelope_code(&result),
             "policy.deny.rate_limit_exceeded",
             "an explicit deny rule matching stellar_claim must refuse with its wire code"
+        );
+    }
+
+    // ── CLI classic-verb account-view parity matrix (#45) ──────────────────────
+    //
+    // Pins that each CLI classic verb populates `account_view` / `identity_view`
+    // exactly as its MCP twin does: `pay` supplies both (source `account_view`,
+    // destination-derived `identity_view`); `claim` and `accounts create` supply
+    // only `account_view`; `trustline` supplies neither (its MCP twin calls the
+    // plain `dispatch_gate`, with no account fetch at all). Exercises the REAL
+    // `MinimumReserveCriterion` / `HomeDomainResolvedCriterion` against a
+    // synthesised `AccountView`, not a mock engine — proving the injected view
+    // actually feeds the criterion, not just that a non-`None` value was passed.
+
+    use stellar_agent_core::policy::v1::criteria::{
+        HomeDomainResolvedCriterion, MinimumReserveCriterion,
+    };
+    use stellar_agent_network::policy_view::AccountViewAdapter;
+    use stellar_agent_network::{AccountView, AssetView, BalanceView, ThresholdsView};
+
+    /// A structurally-valid `AccountView` with the given native balance and
+    /// subentry count; `home_domain` is set when `domain` is `Some`.
+    fn parity_account_view(
+        balance_stroops: i64,
+        subentry_count: u32,
+        domain: Option<&str>,
+    ) -> AccountView {
+        let balance = stellar_agent_core::stroops_to_human(balance_stroops);
+        AccountView::new(
+            "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY".to_owned(),
+            100,
+            subentry_count,
+            vec![BalanceView::new(
+                AssetView::native(),
+                balance,
+                None,
+                "0.0000000".to_owned(),
+                "0.0000000".to_owned(),
+            )],
+            ThresholdsView::new(1, 0, 0, 0),
+            vec![],
+            domain.map(str::to_owned),
+            None,
+        )
+    }
+
+    fn minimum_reserve_engine(tool: &str, margin_stroops: i64) -> PolicyEngineV1 {
+        let rule = PolicyRule {
+            r#match: RuleMatch {
+                tool: tool.to_owned(),
+                chain: "*".to_owned(),
+            },
+            criteria: vec![Box::new(MinimumReserveCriterion::new(margin_stroops))],
+            decision: Decision::Allow,
+            allow_opaque_signing: false,
+        };
+        let doc = PolicyDocument {
+            version: 1,
+            scope: ScopeId::AllProfiles,
+            rules: vec![rule],
+            signature: None,
+        };
+        PolicyEngineV1::new(doc, "alice".to_owned())
+    }
+
+    fn home_domain_engine(tool: &str) -> PolicyEngineV1 {
+        let rule = PolicyRule {
+            r#match: RuleMatch {
+                tool: tool.to_owned(),
+                chain: "*".to_owned(),
+            },
+            criteria: vec![Box::new(HomeDomainResolvedCriterion::new())],
+            decision: Decision::Allow,
+            allow_opaque_signing: false,
+        };
+        let doc = PolicyDocument {
+            version: 1,
+            scope: ScopeId::AllProfiles,
+            rules: vec![rule],
+            signature: None,
+        };
+        PolicyEngineV1::new(doc, "alice".to_owned())
+    }
+
+    /// `pay`: a `minimum_reserve` rule the source account satisfies allows —
+    /// pins that the gate receives a populated `account_view` (without one,
+    /// the criterion returns `CriterionEvaluationFailed` and every call with
+    /// the criterion configured denies).
+    #[test]
+    fn pay_gate_minimum_reserve_satisfied_allows() {
+        let engine = minimum_reserve_engine("stellar_pay", 0);
+        let profile = parity_profile();
+        let policy_args = pay_policy_args(500_000_000, "native", PARITY_DEST_G);
+        // 100 XLM native balance, 0 subentries: reserve floor is
+        // (2+0)*5_000_000 = 10_000_000 stroops — comfortably satisfied.
+        let source_view = parity_account_view(1_000_000_000, 0, None);
+        let source_adapter = AccountViewAdapter::new(&source_view);
+        let result = evaluate_value_moving_policy(
+            &engine,
+            &profile,
+            "stellar_pay",
+            ToolValueKind::MovesValue,
+            "stellar:testnet",
+            &policy_args,
+            "pay",
+            Some(&source_adapter),
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "a satisfied minimum_reserve rule must allow with account_view supplied; \
+             got {result:?}"
+        );
+    }
+
+    /// `pay`: a `minimum_reserve` rule the source account does NOT satisfy
+    /// denies with the criterion's own wire code — proving the view actually
+    /// feeds the criterion, not merely that a non-`None` value was passed.
+    #[test]
+    fn pay_gate_minimum_reserve_violated_denies() {
+        let engine = minimum_reserve_engine("stellar_pay", 0);
+        let profile = parity_profile();
+        let policy_args = pay_policy_args(500_000_000, "native", PARITY_DEST_G);
+        // Zero balance, 0 subentries: reserve floor 10_000_000 stroops is not met.
+        let source_view = parity_account_view(0, 0, None);
+        let source_adapter = AccountViewAdapter::new(&source_view);
+        let result = evaluate_value_moving_policy(
+            &engine,
+            &profile,
+            "stellar_pay",
+            ToolValueKind::MovesValue,
+            "stellar:testnet",
+            &policy_args,
+            "pay",
+            Some(&source_adapter),
+            None,
+        );
+        assert_eq!(
+            envelope_code(&result),
+            "policy.deny.minimum_reserve_breached",
+            "an unsatisfied minimum_reserve rule must deny with the criterion's own wire \
+             code when account_view is supplied"
+        );
+    }
+
+    /// `pay`: a `home_domain_resolved` rule reads the destination-derived
+    /// `identity_view` — the second view `pay`'s MCP twin supplies that
+    /// `claim` / `accounts create` do not.
+    ///
+    /// `home_domain_resolved` also requires `counterparty_cache` (a separate,
+    /// unaddressed view outside #45's scope — only `account_view` /
+    /// `identity_view` are named), so a fully-populated `identity_view` alone
+    /// cannot reach `Allow` here. The proof this test pins is narrower and
+    /// exact: with a populated `identity_view` the failure mode is
+    /// "counterparty_cache was not populated" (an unpopulated `identity_view`
+    /// would fail as "identity_view was not populated" instead) — and the
+    /// message embeds the resolved `"circle.com"` home_domain read FROM
+    /// `identity_view` — showing `identity_view` was genuinely consulted,
+    /// not merely non-`None`.
+    #[test]
+    fn pay_gate_home_domain_resolved_reads_identity_view() {
+        let engine = home_domain_engine("stellar_pay");
+        let profile = parity_profile();
+        let policy_args = pay_policy_args(500_000_000, "native", PARITY_DEST_G);
+        let source_view = parity_account_view(1_000_000_000, 0, None);
+        let dest_view = parity_account_view(1_000_000_000, 0, Some("circle.com"));
+        let source_adapter = AccountViewAdapter::new(&source_view);
+        let dest_adapter = AccountViewAdapter::new(&dest_view);
+        let result = evaluate_value_moving_policy(
+            &engine,
+            &profile,
+            "stellar_pay",
+            ToolValueKind::MovesValue,
+            "stellar:testnet",
+            &policy_args,
+            "pay",
+            Some(&source_adapter),
+            Some(&dest_adapter),
+        );
+        let err = result.expect_err(
+            "home_domain_resolved must still fail closed pending counterparty_cache \
+             (out of #45's scope), not allow",
+        );
+        let message = err
+            .error
+            .as_ref()
+            .expect("refusal envelope must carry an error block")
+            .message
+            .as_str();
+        assert!(
+            message.contains("counterparty_cache was not populated"),
+            "the resolved identity_view must shift the failure to the \
+             counterparty_cache gap, not an identity_view gap; got: {message}"
+        );
+        assert!(
+            message.contains("circle.com"),
+            "the failure message must embed the home_domain read FROM identity_view, \
+             proving it was consulted; got: {message}"
+        );
+    }
+
+    /// `claim`: a `minimum_reserve` rule the source account does NOT satisfy
+    /// denies — `claim` supplies `account_view` (no `identity_view`; claim has
+    /// no destination concept), mirroring its MCP twin.
+    #[test]
+    fn claim_gate_minimum_reserve_violated_denies() {
+        let engine = minimum_reserve_engine("stellar_claim", 0);
+        let profile = parity_profile();
+        let policy_args = claim_policy_args(&"0".repeat(72));
+        let source_view = parity_account_view(0, 0, None);
+        let source_adapter = AccountViewAdapter::new(&source_view);
+        let result = evaluate_value_moving_policy(
+            &engine,
+            &profile,
+            "stellar_claim",
+            ToolValueKind::MovesValue,
+            "stellar:testnet",
+            &policy_args,
+            "claim",
+            Some(&source_adapter),
+            None,
+        );
+        assert_eq!(
+            envelope_code(&result),
+            "policy.deny.minimum_reserve_breached",
+            "claim must deny on an unsatisfied minimum_reserve rule when account_view is \
+             supplied"
+        );
+    }
+
+    /// `accounts create` (sponsored): a `minimum_reserve` rule the sponsor
+    /// account does NOT satisfy denies — `accounts create` supplies
+    /// `account_view` for the SPONSOR (no `identity_view`; the new account
+    /// does not yet exist), mirroring its MCP twin.
+    #[test]
+    fn create_gate_minimum_reserve_violated_denies() {
+        let engine = minimum_reserve_engine("stellar_create_account", 0);
+        let profile = parity_profile();
+        let policy_args = create_policy_args(500_000_000, PARITY_DEST_G);
+        let sponsor_view = parity_account_view(0, 0, None);
+        let sponsor_adapter = AccountViewAdapter::new(&sponsor_view);
+        let result = evaluate_value_moving_policy(
+            &engine,
+            &profile,
+            "stellar_create_account",
+            ToolValueKind::MovesValue,
+            "stellar:testnet",
+            &policy_args,
+            "accounts_create",
+            Some(&sponsor_adapter),
+            None,
+        );
+        assert_eq!(
+            envelope_code(&result),
+            "policy.deny.minimum_reserve_breached",
+            "accounts create must deny on an unsatisfied minimum_reserve rule when \
+             account_view is supplied"
+        );
+    }
+
+    /// `trustline`: a `minimum_reserve` rule configured on `stellar_trustline`
+    /// fails closed (`policy.engine_required`, the criterion's
+    /// `CriterionEvaluationFailed` path) because `trustline`'s MCP twin calls
+    /// the plain `dispatch_gate` — no account fetch, no views at all. The CLI
+    /// mirrors that exactly (`None, None`); this is NOT a CLI-side gap this
+    /// batch fixes — pinning it here documents the shared, un-addressed MCP
+    /// posture rather than silently diverging from it.
+    #[test]
+    fn trustline_gate_minimum_reserve_configured_fails_closed_no_views() {
+        let engine = minimum_reserve_engine("stellar_trustline", 0);
+        let profile = parity_profile();
+        let policy_args = trustline_policy_args(PARITY_DEST_G, "native");
+        let result = evaluate_value_moving_policy(
+            &engine,
+            &profile,
+            "stellar_trustline",
+            ToolValueKind::MovesValue,
+            "stellar:testnet",
+            &policy_args,
+            "trustline",
+            None,
+            None,
+        );
+        assert_eq!(
+            envelope_code(&result),
+            "policy.engine_required",
+            "trustline has no views to supply (matching its MCP twin), so a configured \
+             minimum_reserve rule must fail closed via CriterionEvaluationFailed"
         );
     }
 

@@ -134,6 +134,10 @@ struct BuiltClaimEnvelope {
     balance_id_hex72: String,
     #[allow(dead_code)]
     fee_selection: ClassicFeeSelection,
+    /// The source account's fetched state — reused (not re-fetched) to feed
+    /// the policy gate's `account_view`, mirroring the `stellar_claim` MCP
+    /// twin's `AccountViewAdapter` wiring exactly.
+    account_view: stellar_agent_network::AccountView,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -590,6 +594,7 @@ async fn build_unsigned_envelope(args: &ClaimArgs) -> Result<BuiltClaimEnvelope,
         envelope_xdr,
         balance_id_hex72: id.to_hex72(),
         fee_selection,
+        account_view,
     })
 }
 
@@ -631,6 +636,12 @@ fn evaluate_claim_policy(
     // with the MCP tool's dispatch args and for any future criterion that
     // reads it.
     let policy_args = claim_policy_args(&built.balance_id_hex72);
+    // `account_view` reuses the source-account state `build_unsigned_envelope`
+    // already fetched (feeds `minimum_reserve`) — mirroring the MCP
+    // `stellar_claim` twin exactly. `identity_view` is `None`: `stellar_claim`
+    // has no destination concept, matching the twin.
+    let source_adapter =
+        stellar_agent_network::policy_view::AccountViewAdapter::new(&built.account_view);
     match evaluate_value_moving_policy(
         policy_engine.as_ref(),
         profile,
@@ -639,6 +650,8 @@ fn evaluate_claim_policy(
         chain_id,
         &policy_args,
         "claim",
+        Some(&source_adapter),
+        None,
     ) {
         Ok(effects) => Ok(effects),
         Err(envelope) => {

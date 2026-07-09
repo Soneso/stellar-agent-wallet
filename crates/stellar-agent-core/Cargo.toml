@@ -66,6 +66,10 @@ proptest = { workspace = true }
 stellar-agent-test-support = { path = "../stellar-agent-test-support" }
 serial_test = { workspace = true }
 rand_core = { workspace = true }
+# `test-util` (paused-clock control for `rpc_budget`'s deterministic timeout
+# tests) is dev-only: it is never enabled on the production `tokio` dependency
+# above, so it cannot affect a release build's behavior.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
