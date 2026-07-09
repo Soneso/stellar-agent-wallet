@@ -43,9 +43,12 @@ use stellar_agent_core::approval::store::PendingApproval;
 use stellar_agent_core::approval::{
     PendingApprovalStore, compute_attestation, envelope_sha256, process_uid_for_attestation,
 };
+use stellar_agent_core::observability::redact_strkey_first5_last5;
+use stellar_agent_core::policy::v1::criteria::{Criterion, PerTxCapCriterion};
+use stellar_agent_core::policy::v1::loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
 use stellar_agent_core::policy::v1::{
-    AccountIdentityView, AccountReservesView, CounterpartyCacheView, Sep10SessionView,
-    Sep45SessionView,
+    AccountIdentityView, AccountReservesView, CounterpartyCacheView, PolicyEngineV1,
+    Sep10SessionView, Sep45SessionView,
 };
 use stellar_agent_core::policy::{
     ApprovalRequest, Decision, PolicyEngine, PolicyError, ToolDescriptor,
@@ -311,7 +314,7 @@ async fn pay_with_approval_commits_and_submits_on_testnet() {
         "commit must report the ledger it was included in: {commit_json}"
     );
 
-    // #21 — the confirmed commit must have recorded a `value_action_submitted`
+    // The confirmed commit must have recorded a `value_action_submitted`
     // row for `stellar_pay_commit`, signed under the profile's audit chain-root
     // key (verifiable by `audit verify`).
     let audit_path = approval_dir.path().join("audit.jsonl");
@@ -325,5 +328,183 @@ async fn pay_with_approval_commits_and_submits_on_testnet() {
             row["kind"] == "value_action_submitted" && row["tool"] == "stellar_pay_commit"
         }),
         "commit must record a value_action_submitted row: {audit_rows:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// V1-engine variant: the audit row's leg content matches the submitted values
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Builds an `AllProfiles`-scoped, unsigned [`PolicyDocument`] with one
+/// `Decision::Allow` `per_tx_cap` rule per tool name in `tools`, well above
+/// `PAYMENT_STROOPS`.
+///
+/// `dispatch_gate` is invoked with the literal tool name at each dispatch
+/// point (`"stellar_pay"` at simulate, `"stellar_pay_commit"` at commit), so
+/// both must be covered for the commit step to reach on-chain submission.
+fn per_tx_cap_document(tools: &[&str]) -> PolicyDocument {
+    const CAP_STROOPS: i128 = 100_000_000_000; // 10 000 XLM
+    let rules = tools
+        .iter()
+        .map(|tool| {
+            let criterion: Box<dyn Criterion> =
+                Box::new(PerTxCapCriterion::new("native".to_owned(), CAP_STROOPS));
+            PolicyRule {
+                r#match: RuleMatch {
+                    tool: (*tool).to_owned(),
+                    chain: "*".to_owned(),
+                },
+                criteria: vec![criterion],
+                decision: Decision::Allow,
+                allow_opaque_signing: false,
+            }
+        })
+        .collect();
+    PolicyDocument {
+        version: 1,
+        scope: ScopeId::AllProfiles,
+        rules,
+        signature: None,
+    }
+}
+
+/// A `stellar_pay` self-payment under a `PolicyEngineV1` `per_tx_cap` rule
+/// (rather than the `Noop` engine the happy-path test above uses) commits and
+/// submits on the live testnet ledger, and the confirmed commit's
+/// `value_action_submitted` audit row carries a `legs` entry whose content —
+/// `action`, `amount`, `asset`, and the redacted `destination` — equals
+/// exactly the values submitted on-chain, proving the row is built from the
+/// same `ValueEffects` the V1 engine sized rather than a placeholder or
+/// re-derived value.
+#[tokio::test]
+#[serial]
+async fn pay_v1_engine_commit_records_matching_leg_content_on_testnet() {
+    keyring_mock::install().expect("mock keyring store init");
+
+    let (g_strkey, seed) = fresh_keypair();
+    fund_via_friendbot(&g_strkey).await;
+    wait_until_queryable(&g_strkey).await;
+
+    let attestation_key = [0x61u8; 32];
+    let mut profile =
+        Profile::builder_testnet("stellar-agent", &g_strkey, "stellar-agent-nonce", &g_strkey)
+            .with_noop_engine()
+            .build();
+    profile.rpc_url = TESTNET_RPC_URL.to_owned();
+    let audit_dir = tempfile::tempdir().expect("audit temp dir");
+    profile.audit_log_path = audit_dir.path().join("audit.jsonl");
+    seed_keyring(&profile, &seed, &attestation_key);
+
+    let mut server = WalletServer::new(profile).expect("WalletServer::new");
+    let doc = per_tx_cap_document(&["stellar_pay", "stellar_pay_commit"]);
+    server.set_policy_engine_for_test(Arc::new(PolicyEngineV1::new(doc, g_strkey.clone())));
+
+    // ── Simulate ───────────────────────────────────────────────────────────
+    let sim = server
+        .call_stellar_pay(StellarPayArgs {
+            chain_id: TESTNET_CHAIN_ID.to_owned(),
+            source: g_strkey.clone(),
+            destination: g_strkey.clone(),
+            amount: Some(serde_json::from_str(r#""1 XLM""#).expect("amount")),
+            amount_in_stroops: None,
+            asset: "native".to_owned(),
+            memo_text: None,
+            memo_id: None,
+            memo_hash_hex: None,
+            memo_return_hex: None,
+            classic_base: Some(FEE_STROOPS.to_string()),
+        })
+        .await
+        .expect("simulate must not error");
+    let sim_json = result_json(&sim);
+    assert!(
+        sim_json["ok"].as_bool().unwrap_or(false),
+        "simulate under an allowing V1 per_tx_cap rule must be ok: {sim_json}"
+    );
+    let envelope_xdr = sim_json["data"]["envelope_xdr"]
+        .as_str()
+        .expect("simulate must surface envelope_xdr")
+        .to_owned();
+    let nonce = sim_json["data"]["nonce"]
+        .as_str()
+        .expect("simulate must surface nonce")
+        .to_owned();
+    let expires_at_unix_ms = sim_json["data"]["expires_at_unix_ms"]
+        .as_u64()
+        .expect("simulate must surface expires_at_unix_ms");
+
+    // ── Commit ─────────────────────────────────────────────────────────────
+    let commit = server
+        .call_stellar_pay_commit(StellarPayCommitArgs {
+            chain_id: TESTNET_CHAIN_ID.to_owned(),
+            source: g_strkey.clone(),
+            destination: g_strkey.clone(),
+            amount: Some(serde_json::from_str(r#""1 XLM""#).expect("amount")),
+            amount_in_stroops: None,
+            asset: "native".to_owned(),
+            memo_text: None,
+            memo_id: None,
+            memo_hash_hex: None,
+            memo_return_hex: None,
+            nonce,
+            expires_at_unix_ms,
+            envelope_xdr,
+            approval_nonce: None,
+            approval_attestation: None,
+        })
+        .await
+        .expect("commit must pass the gate and submit on-chain");
+    let commit_json = result_json(&commit);
+    assert!(
+        commit_json["ok"].as_bool().unwrap_or(false),
+        "commit under an allowing V1 per_tx_cap rule must be ok (submitted on-chain): \
+         {commit_json}"
+    );
+    assert!(
+        commit_json["data"]["tx_hash"].as_str().is_some(),
+        "commit must report an on-chain tx_hash: {commit_json}"
+    );
+
+    // ── The value_action_submitted row's leg content matches the submitted
+    // values ─────────────────────────────────────────────────────────────────
+    let audit_rows: Vec<serde_json::Value> = std::io::BufRead::lines(std::io::BufReader::new(
+        std::fs::File::open(audit_dir.path().join("audit.jsonl")).expect("audit log after commit"),
+    ))
+    .map(|line| serde_json::from_str(&line.expect("audit line")).expect("audit JSON row"))
+    .collect();
+    let row = audit_rows
+        .iter()
+        .find(|row| row["kind"] == "value_action_submitted" && row["tool"] == "stellar_pay_commit")
+        .unwrap_or_else(|| {
+            panic!("commit must record a value_action_submitted row: {audit_rows:?}")
+        });
+
+    let legs = row["legs"]
+        .as_array()
+        .expect("value_action_submitted row must carry a legs array");
+    assert_eq!(
+        legs.len(),
+        1,
+        "a single-leg native self-payment must record exactly one leg: {row}"
+    );
+    let leg = &legs[0];
+    assert_eq!(
+        leg["action"], "payment",
+        "the leg action must be the payment kind the V1 engine sized: {leg}"
+    );
+    assert_eq!(
+        leg["amount"].as_str(),
+        Some(PAYMENT_STROOPS.to_string().as_str()),
+        "the leg amount must equal the submitted payment amount: {leg}"
+    );
+    assert_eq!(
+        leg["asset"].as_str(),
+        Some("native"),
+        "the leg asset must equal the submitted native asset: {leg}"
+    );
+    assert_eq!(
+        leg["destination_redacted"].as_str(),
+        Some(redact_strkey_first5_last5(&g_strkey).as_str()),
+        "the leg destination must be the redacted form of the submitted destination: {leg}"
     );
 }

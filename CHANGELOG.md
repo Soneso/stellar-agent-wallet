@@ -42,6 +42,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every per-file chain-root sidecar with the new key so `audit verify` stays
   green across the rotation; the new key is persisted before any sidecar is
   re-signed. (#34)
+- Offline envelope-shape regression coverage for the `nonce.mint_failed`
+  business error on the four two-phase simulate handlers (`stellar_pay`,
+  `stellar_create_account`, `stellar_claim`, `stellar_trustline`) and for the
+  RPC-dependent `sep48.spec_fetch_failed` / `sep48.render_failed` /
+  `sep47.discovery_failed` arms of `stellar_sep48_preview_invocation` /
+  `stellar_sep47_discover`, each asserting the full normalised envelope
+  (`ok:false`, the documented wire code, a non-empty `request_id`,
+  `is_error == Some(true)`). (#36)
+- Testnet acceptance coverage for a sponsored `stellar_create_account` /
+  `stellar_create_account_commit` two-phase call: the destination account
+  exists on-chain afterward with the sponsored starting balance, and the
+  commit recorded a `value_action_submitted` audit row. (#43)
+- Testnet acceptance coverage for a classic `stellar_trustline` /
+  `stellar_trustline_commit` two-phase call against the pinned testnet USDC
+  issuer, run under a `minimum_reserve` policy rule the funded source account
+  satisfies: the simulate and commit steps both reaching `ok:true` (rather
+  than `policy.criterion_evaluation_failed`) is on-chain proof that both
+  dispatch points supply a genuinely populated `account_view` (#47). Asserts
+  the on-chain trustline limit and the commit's `value_action_submitted`
+  audit row. (#43)
+- `profile rotate-audit-key` gained the `run_with_dependencies` seam already
+  used by the other key-writing profile commands, so its unit coverage now
+  drives the actual persist → re-sign → emit sequence rather than a parallel
+  reimplementation of it; reordering the three steps turns the test red. A
+  V1-engine testnet acceptance variant of the `stellar_pay_commit` flow now
+  asserts the confirmed commit's `value_action_submitted` audit row's leg
+  content (`action`, `amount`, `asset`, redacted `destination`) equals exactly
+  the values submitted on-chain, not merely that a row of the right kind
+  exists. (#44)
 
 ### Changed
 
@@ -127,6 +156,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- MCP `stellar_trustline` / `stellar_trustline_commit` and CLI `trustline` now
+  supply the source account as the policy gate's `account_view` (previously
+  `None`), so a `minimum_reserve` criterion configured on `stellar_trustline`
+  is actually evaluated instead of failing closed on every call. The source
+  fetch was already made by the existing ordered gate (for the sequence
+  number); the policy gate now runs after it. `identity_view` stays `None` on
+  this verb: the only counterparty account is the asset issuer, whose on-chain
+  `home_domain` is self-asserted — supplying it to `counterparty_allowlist`
+  HOME_DOMAIN matching would let an issuer alias an allowlisted domain, so
+  identity-class criteria configured on `stellar_trustline` fail closed by
+  design. (#47)
 - `approve --id` writes the human-readable approval summary and the y/n prompt
   to stderr; stdout carries exactly one JSON envelope, so
   `approve --id <ID> --yes > out.json` yields parseable JSON with the

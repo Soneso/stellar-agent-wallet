@@ -51,6 +51,7 @@ use stellar_agent_core::audit_log::{KeyPurpose, SidecarResignError, resign_chain
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
 use stellar_agent_core::profile::loader;
+use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 use uuid::Uuid;
 
@@ -105,9 +106,34 @@ fn resign_failure_error(e: &SidecarResignError) -> WalletError {
 ///
 /// Never panics.
 pub async fn run(args: &RotateAuditKeyArgs) -> i32 {
-    // ── Step 1: load the profile FIRST so a nonexistent profile never reaches
+    run_with_dependencies(
+        args,
+        |name| loader::load(name, None),
+        init_platform_keyring_store,
+    )
+    .await
+}
+
+/// Testable core of [`run`] with the profile loader and the platform-keyring
+/// initialiser injected.
+///
+/// Production callers use [`run`], which supplies the real profile loader and
+/// [`init_platform_keyring_store`]. Tests substitute an in-memory profile
+/// (backed by a temp-dir audit log) and a spy initialiser so the rotate →
+/// re-sign → emit sequence can be exercised against a mock keyring store
+/// without touching the OS keychain or a persisted profile file.
+async fn run_with_dependencies<LoadProfile, InitKeyring>(
+    args: &RotateAuditKeyArgs,
+    load_profile: LoadProfile,
+    init_keyring: InitKeyring,
+) -> i32
+where
+    LoadProfile: Fn(&str) -> Result<Profile, loader::ProfileLoadError>,
+    InitKeyring: Fn() -> Result<(), WalletError>,
+{
+    // ── Setup A: load the profile FIRST so a nonexistent profile never reaches
     // the keyring init.  Eliminates the process-global keyring-store race.
-    let profile = match loader::load(&args.name, None) {
+    let profile = match load_profile(&args.name) {
         Ok(p) => p,
         Err(loader::ProfileLoadError::NotFound { name, .. }) => {
             let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
@@ -124,8 +150,8 @@ pub async fn run(args: &RotateAuditKeyArgs) -> i32 {
         }
     };
 
-    // ── Step 2: initialise the platform keyring store.
-    if let Err(e) = init_platform_keyring_store() {
+    // ── Setup B: initialise the platform keyring store.
+    if let Err(e) = init_keyring() {
         render::render_json(&Envelope::err(&e));
         return 1;
     }
@@ -218,31 +244,35 @@ mod tests {
         assert_eq!(code, 1);
     }
 
-    /// End-to-end coverage of the rotation orchestration `run` performs after
-    /// the profile load and platform-store init (which need on-disk profile
-    /// persistence and the real OS keychain, so are exercised separately): the
-    /// load-bearing Step 1-3 sequence against a mock keyring and real audit-log
-    /// files.
+    /// End-to-end coverage of the rotation orchestration [`run_with_dependencies`]
+    /// performs, driven through the real function itself (not a parallel
+    /// reimplementation of its steps) with an in-memory profile, a spy keyring
+    /// initialiser, a mock keyring store, and real audit-log files.
     ///
-    /// Drives persist-before-resign in order — rotate the key, re-sign the
-    /// sidecars under the freshly loaded new key, emit the `KeyringKeyWritten`
-    /// row — then asserts the whole log (pre-rotation entries AND the new row)
-    /// verifies green under the NEW key, the OLD key no longer verifies, and the
-    /// key-write row is present. Emitting before the re-sign, or re-signing
-    /// before persisting, would break one of these assertions.
-    #[test]
+    /// Seeds an OLD chain-root key and a pre-rotation chain under it, then
+    /// invokes `run_with_dependencies`, and asserts the whole log (pre-rotation
+    /// entries AND the new `KeyringKeyWritten` row) verifies green under the NEW
+    /// key read back from the keyring afterward, and the OLD key no longer
+    /// verifies. Because the test calls the production function directly rather
+    /// than re-executing its persist/re-sign/emit steps inline, reordering
+    /// `run_with_dependencies`'s internal Step 1 (persist) / Step 2 (re-sign) /
+    /// Step 3 (emit) sequence turns this test red: emitting before persisting
+    /// the new key would leave the keyring holding an unresigned old key and
+    /// `load_audit_hmac_key` would read back the stale key, or re-signing before
+    /// persisting would sign sidecars with a key already destroyed.
+    #[tokio::test]
     #[serial]
-    fn rotate_audit_key_resign_keeps_verify_green_under_new_key_and_emits_row() {
+    async fn rotate_audit_key_run_resign_keeps_verify_green_under_new_key_and_emits_row() {
         use std::io::BufRead as _;
 
         use stellar_agent_core::audit_log::{AuditEntry, AuditWriter, PolicyDecision, verify_log};
-        use stellar_agent_core::profile::schema::Profile;
         use stellar_agent_test_support::keyring_mock;
 
         keyring_mock::install().expect("mock keyring store");
 
         let dir = tempfile::tempdir().expect("tmp dir");
-        let mut profile = Profile::builder_testnet("rotate-e2e", "acct", "n-svc", "n-acct").build();
+        let mut profile =
+            Profile::builder_testnet("rotate-run-e2e", "acct", "n-svc", "n-acct").build();
         profile.audit_log_path = dir.path().join("audit.jsonl");
         let entry_ref = profile.audit_log_hash_chain_key_id.clone();
 
@@ -275,28 +305,25 @@ mod tests {
             "pre-rotation log must verify under the old key"
         );
 
-        // Step 1: persist the new key (destroys the old). Step 2: re-sign the
-        // sidecars under the freshly loaded new key. Step 3: emit the row.
-        rotate_hmac_like_key(&entry_ref, "rotate_audit_key").expect("rotate to new key");
-        let new_key = load_audit_hmac_key(&profile).expect("load new key");
-        let resigned = resign_chain_root_sidecars(&profile.audit_log_path, &new_key)
-            .expect("re-sign sidecars");
-        assert!(resigned >= 1, "at least one sidecar must be re-signed");
-        emit_keyring_key_written(
-            &profile,
-            "rotate-e2e",
-            "profile_rotate_audit_key",
-            KeyPurpose::AuditHashChainHmac,
-            &entry_ref,
-            None,
-            "req-rotate",
+        let args = RotateAuditKeyArgs {
+            name: "rotate-run-e2e".to_owned(),
+        };
+        let cloned_profile = profile.clone();
+        let code =
+            run_with_dependencies(&args, move |_name| Ok(cloned_profile.clone()), || Ok(())).await;
+        assert_eq!(code, 0, "run_with_dependencies must succeed");
+
+        let new_key = load_audit_hmac_key(&profile).expect("load new key after rotation");
+        assert_ne!(
+            *new_key, *old_key,
+            "rotation must replace the chain-root key"
         );
 
         assert!(
             verify_log(&profile.audit_log_path, Some(&new_key))
                 .expect("verify new")
                 .hmac_verified,
-            "the whole log must verify under the new key after re-sign + emit"
+            "the whole log must verify under the new key after run_with_dependencies"
         );
         assert!(
             verify_log(&profile.audit_log_path, Some(&old_key)).is_err(),

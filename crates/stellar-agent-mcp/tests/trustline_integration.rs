@@ -27,6 +27,8 @@ use stellar_agent_test_support::xdr_fixtures::{
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+mod common;
+
 /// Pinned testnet USDC issuer (matches
 /// `stellar_agent_stablecoin::resolve`'s testnet pin table).
 const USDC_TESTNET_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
@@ -354,5 +356,177 @@ async fn trustline_simulate_echoes_canonical_limit_stroops_not_raw_caller_string
         sim_data.pointer("/preview/limit_stroops"),
         Some(&serde_json::json!("1000000000")),
         "the preview's limit_stroops must also be canonical: {sim_data}"
+    );
+}
+
+// ── Envelope-shape regression guard: nonce.mint_failed ───────────────────────
+
+/// `stellar_trustline` returns the full documented business-error envelope
+/// (`ok:false`, `error.code == "nonce.mint_failed"`, non-empty `request_id`,
+/// `is_error == Some(true)`) when the nonce-key keyring entry is absent.
+///
+/// Forces the failure the cheapest honest way: a fresh mock keyring store
+/// with NO key written at the profile's nonce coordinate — the source and
+/// issuer account fetches (feeding the policy gate's `account_view`
+/// wiring, and the clawback gate) succeed normally via
+/// `TrustlineSubmitSuccessRpcResponder`, so the only failure is
+/// `NonceMint::mint`'s keyring load inside the handler's own simulate path.
+#[tokio::test]
+#[serial]
+async fn simulate_nonce_mint_failed_envelope_shape() {
+    keyring_mock::install().expect("mock keyring store init");
+    // Deliberately no `install_test_nonce_key(...)` call — the mock store
+    // stays empty at the nonce coordinate.
+
+    let seed = [0x45_u8; 32];
+    let source_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+
+    let source_key_xdr = account_ledger_key_xdr(&source_g);
+    let source_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
+    let issuer_key_xdr = account_ledger_key_xdr(USDC_TESTNET_ISSUER);
+    let issuer_xdr = account_entry_xdr_with_balance(USDC_TESTNET_ISSUER, 100_000_000_000_000);
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(TrustlineSubmitSuccessRpcResponder {
+            source_key_xdr,
+            source_xdr,
+            issuer_key_xdr,
+            issuer_xdr,
+        })
+        .mount(&mock_server)
+        .await;
+
+    let profile = testnet_profile_with_rpc(&mock_server.uri());
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    let simulate_args = StellarTrustlineArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        from: source_g,
+        asset: "USDC".to_owned(),
+        limit_stroops: Some("1000000000".to_owned()),
+        classic_base: None,
+    };
+    let result = server
+        .call_stellar_trustline(simulate_args)
+        .await
+        .expect("handler must return a business-error result, not a protocol error");
+
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "nonce.mint_failed",
+        "an absent nonce-key keyring entry must surface nonce.mint_failed"
+    );
+}
+
+// ── Regression guard: `from` G-strkey validation runs before any RPC call ────
+
+/// `stellar_trustline_commit` rejects a malformed `from` via the dedicated
+/// `invalid_params` protocol error, WITHOUT attempting the source-account
+/// fetch first.
+///
+/// `fetch_account` itself parses its account argument through the same
+/// strkey check, so if the validation ran after the fetch, a malformed
+/// `from` would instead surface as a redacted RPC-error business envelope
+/// (`Ok(is_error: true)`) rather than this dedicated `Err`.
+///
+/// Builds a genuine, well-formed `envelope_xdr` via a real simulate call
+/// (`decode_authoritative_args` must succeed for the flow to reach the `from`
+/// check at all — it runs before the check), then commits with a MISMATCHED,
+/// malformed `from` against a SEPARATE `WalletServer` pointed at an
+/// unroutable RPC URL. `decode_authoritative_args` reads only `envelope_xdr`,
+/// never `args.from`, so the mismatch does not block reaching the check.
+/// Because that server's RPC URL is unroutable, an attempted source/issuer
+/// account fetch would fail loudly (or hang) rather than silently succeed,
+/// making "no RPC call happened before the check" load-bearing.
+#[tokio::test]
+#[serial]
+async fn commit_rejects_invalid_from_strkey_before_any_rpc_call() {
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(212);
+
+    let seed = [0x47_u8; 32];
+    let source_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+
+    let source_key_xdr = account_ledger_key_xdr(&source_g);
+    let source_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
+    let issuer_key_xdr = account_ledger_key_xdr(USDC_TESTNET_ISSUER);
+    let issuer_xdr = account_entry_xdr_with_balance(USDC_TESTNET_ISSUER, 100_000_000_000_000);
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(TrustlineSubmitSuccessRpcResponder {
+            source_key_xdr,
+            source_xdr,
+            issuer_key_xdr,
+            issuer_xdr,
+        })
+        .mount(&mock_server)
+        .await;
+
+    let simulate_profile = testnet_profile_with_rpc(&mock_server.uri());
+    let simulate_server = WalletServer::new(simulate_profile).expect("WalletServer::new");
+
+    let sim_result = simulate_server
+        .call_stellar_trustline(StellarTrustlineArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            from: source_g,
+            asset: "USDC".to_owned(),
+            limit_stroops: Some("1000000000".to_owned()),
+            classic_base: None,
+        })
+        .await
+        .expect("simulate must not error");
+    let sim_json = call_result_json(&sim_result);
+    let sim_data = sim_json.get("data").expect("simulate success carries data");
+    let envelope_xdr = sim_data
+        .get("envelope_xdr")
+        .and_then(serde_json::Value::as_str)
+        .expect("simulate must surface envelope_xdr")
+        .to_owned();
+    let nonce = sim_data
+        .get("nonce")
+        .and_then(serde_json::Value::as_str)
+        .expect("nonce present")
+        .to_owned();
+    let expires_at_unix_ms = sim_data
+        .get("expires_at_unix_ms")
+        .and_then(serde_json::Value::as_u64)
+        .expect("expires_at_unix_ms present");
+
+    // A fresh server with no keyring seeded and an unroutable RPC URL: any
+    // step reaching the network or the keyring would fail loudly, not
+    // silently proceed.
+    let commit_profile = testnet_profile_with_rpc("http://198.51.100.1:1");
+    let commit_server = WalletServer::new(commit_profile).expect("WalletServer::new");
+
+    let commit_args = StellarTrustlineCommitArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        from: "not-a-valid-g-strkey".to_owned(),
+        nonce,
+        expires_at_unix_ms,
+        envelope_xdr,
+        approval_nonce: None,
+        approval_attestation: None,
+    };
+    let result = commit_server
+        .call_stellar_trustline_commit(commit_args)
+        .await;
+
+    let err = result.expect_err(
+        "a malformed `from` must return the dedicated invalid_params protocol error, \
+         not a business-error envelope from a fetch attempt",
+    );
+    assert!(
+        err.message.contains("invalid from"),
+        "error message must name the invalid `from` field: {err:?}"
     );
 }

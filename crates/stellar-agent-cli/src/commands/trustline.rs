@@ -5,19 +5,22 @@
 //! Builds, signs, and submits a Stellar `ChangeTrust` classic transaction.
 //! Enforces the full ordered trust gate before signing:
 //!
-//! 1. Operator policy evaluation — the shared
-//!    [`crate::commands::policy_engine::build_v1_policy_engine`]
-//!    (V1 `NoopPolicyEngine` / `PolicyEngineV1`; fail-closed on build failures).
-//! 2. `resolve_denomination` — USDT hard-refusal + known-lookalike denylist +
+//! 1. `resolve_denomination` — USDT hard-refusal + known-lookalike denylist +
 //!    pinned-issuer-mismatch + unpinned-bare-code.
-//! 3. Live issuer-flag fetch via `fetch_account` → `AccountFlagsView` projection.
-//!    **Fetch failure fail-closes.**
-//! 4. `clawback_gate(flags, opt_in_present)` where `opt_in_present` is derived
+//! 2. Live issuer account fetch via `fetch_account` → `AccountFlagsView`
+//!    (for the clawback gate).
+//! 3. Source account fetch via `fetch_account` (for the policy gate's
+//!    `account_view`; sequence number consumed at envelope-build time).
+//! 4. Operator policy evaluation — the shared
+//!    [`crate::commands::policy_engine::build_v1_policy_engine`]
+//!    (V1 `NoopPolicyEngine` / `PolicyEngineV1`; fail-closed on build failures),
+//!    now that both views from steps 2-3 are populated.
+//! 5. `clawback_gate(flags, opt_in_present)` where `opt_in_present` is derived
 //!    from the wallet-controlled `PendingApprovalStore` (NOT a CLI flag).
-//! 5. `TrustlinePreview::build` — typed JSON preview rendered to stdout.
-//! 6. `RefuseWithWarning` / `Refuse` gate decisions → early return (exit 1).
-//! 7. Build `ChangeTrust` envelope via `ClassicOpBuilder::change_trust`.
-//! 8. Sign via keyring → submit → wait for confirmation.
+//! 6. `TrustlinePreview::build` — typed JSON preview rendered to stdout.
+//! 7. `RefuseWithWarning` / `Refuse` gate decisions → early return (exit 1).
+//! 8. Build `ChangeTrust` envelope via `ClassicOpBuilder::change_trust`.
+//! 9. Sign via keyring → submit → wait for confirmation.
 //!
 //! # Policy engine
 //!
@@ -28,6 +31,10 @@
 //! is needed for this verb).  `policy_args` is built by
 //! `commands::policy_engine::trustline_policy_args`, matching the MCP
 //! `stellar_trustline` twin's `{from, asset}` dispatch fields.
+//! `account_view` is the fetched source account; `identity_view` is `None`
+//! (the issuer's on-chain `home_domain` is self-asserted and must not feed
+//! allowlist matching, so identity-class criteria configured on this verb
+//! fail closed).
 //!
 //! # Output
 //!
@@ -60,9 +67,10 @@ use crate::commands::policy_engine::{
 };
 
 use stellar_agent_network::{
-    Asset, ClassicOpBuilder, StellarRpcClient, SubmissionSignerKind, fetch_account,
-    init_platform_keyring_store, parse_classic_fee_choice, resolve_classic_fee_selection,
-    signer_from_keyring,
+    AccountView, Asset, ClassicOpBuilder, StellarRpcClient, SubmissionSignerKind, fetch_account,
+    init_platform_keyring_store, parse_classic_fee_choice,
+    policy_view::AccountViewAdapter,
+    resolve_classic_fee_selection, signer_from_keyring,
     signing::envelope_signing::attach_signature,
     submit::{SubmissionResult, submit_transaction_and_wait},
 };
@@ -234,45 +242,7 @@ where
         return 1;
     }
 
-    // ── GATE 1: Operator policy evaluation (args-path; mirrors the MCP
-    // `stellar_trustline` twin, which derives its `Trustline` leg from the
-    // dispatch args via `derive_value_class` rather than a typed builder) ────
-    let policy_engine = match build_v1_policy_engine("trustline", &profile.policy.engine, &profile)
-    {
-        Ok(pe) => pe,
-        Err(msg) => {
-            render_json(&Envelope::<()>::err_raw(
-                "trustline.policy_engine_unavailable",
-                msg,
-            ));
-            return 1;
-        }
-    };
-    let policy_args = trustline_policy_args(&args.from, &args.asset);
-    // `account_view` / `identity_view` are `None`: the MCP `stellar_trustline`
-    // twin calls the plain `dispatch_gate` (no views at all, not even a
-    // source-account fetch) — mirrored here exactly. A rule that configures
-    // `minimum_reserve` or an identity-class criterion on `stellar_trustline`
-    // fails closed on both the MCP and CLI paths identically.
-    let trustline_effects = match evaluate_value_moving_policy(
-        policy_engine.as_ref(),
-        &profile,
-        "stellar_trustline",
-        stellar_agent_core::policy::ToolValueKind::MovesValue,
-        chain_id,
-        &policy_args,
-        "trustline",
-        None,
-        None,
-    ) {
-        Ok(effects) => effects,
-        Err(envelope) => {
-            render_json(&envelope);
-            return 1;
-        }
-    };
-
-    // ── GATE 2: resolve_denomination (D3 ordered refusal) ────────────────────
+    // ── GATE 1: resolve_denomination (D3 ordered refusal) ────────────────────
     let input = parse_denomination_input(&args.asset);
     let resolved = match resolve_denomination(input, network_passphrase) {
         Ok(r) => r,
@@ -292,7 +262,7 @@ where
         }
     };
 
-    // ── GATE 3: Live issuer-flag fetch (fail-closed on failure) ───────────────
+    // ── GATE 2: Live issuer account fetch ──────────────────────────────────────
     let rpc_client = match StellarRpcClient::new(rpc_url) {
         Ok(c) => c,
         Err(e) => {
@@ -304,12 +274,17 @@ where
         }
     };
 
-    // Fetch the ISSUER account (not the wallet account) to read its flags.
-    // Flag booleans are third-party public facts; log freely.
-    let issuer_flags: Option<AccountFlagsView> =
+    // Fetch the ISSUER account (not the wallet account) for `issuer_flags`
+    // (the clawback gate, below). The issuer account is deliberately NOT
+    // supplied as the policy gate's `identity_view`: its on-chain
+    // `home_domain` is self-asserted, so feeding it to
+    // `counterparty_allowlist` HOME_DOMAIN matching would let an issuer alias
+    // an allowlisted domain — see the MCP `stellar_trustline` twin. Flag
+    // booleans are third-party public facts; log freely.
+    let issuer_account_view: Option<AccountView> =
         match fetch_account(&rpc_client, &resolved.issuer, &[]).await {
             Ok(account_view) => {
-                let flags_opt = account_view.account_flags;
+                let flags_opt = &account_view.account_flags;
                 tracing::info!(
                     subcommand = "trustline",
                     issuer = %redact_strkey_first5_last5(&resolved.issuer),
@@ -318,7 +293,7 @@ where
                     auth_clawback_enabled = ?flags_opt.as_ref().map(|f| f.auth_clawback_enabled),
                     "issuer flags fetched"
                 );
-                flags_opt
+                Some(account_view)
             }
             Err(e) => {
                 // Fetch failure fail-closes the gate.
@@ -331,8 +306,63 @@ where
                 None
             }
         };
+    let issuer_flags: Option<AccountFlagsView> = issuer_account_view
+        .as_ref()
+        .and_then(|v| v.account_flags.clone());
 
-    // ── GATE 4: Wallet-controlled clawback opt-in lookup (HMAC-verified) ────
+    // ── GATE 3: Fetch source account (feeds the policy gate's account_view;
+    // sequence number also consumed by the envelope build below) ────────────
+    let source_account_view = match fetch_account(&rpc_client, &args.from, &[]).await {
+        Ok(v) => v,
+        Err(e) => {
+            render_json(&Envelope::<()>::err_raw(
+                "trustline.source_account_fetch_failed",
+                e.to_string(),
+            ));
+            return 1;
+        }
+    };
+    let source_sequence = source_account_view.sequence_number;
+
+    // ── GATE 4: Operator policy evaluation (args-path; mirrors the MCP
+    // `stellar_trustline` twin, which derives its `Trustline` leg from the
+    // dispatch args via `derive_value_class` rather than a typed builder) ────
+    let policy_engine = match build_v1_policy_engine("trustline", &profile.policy.engine, &profile)
+    {
+        Ok(pe) => pe,
+        Err(msg) => {
+            render_json(&Envelope::<()>::err_raw(
+                "trustline.policy_engine_unavailable",
+                msg,
+            ));
+            return 1;
+        }
+    };
+    let policy_args = trustline_policy_args(&args.from, &args.asset);
+    // `account_view` is the fetched source account (feeds `minimum_reserve`).
+    // `identity_view` stays `None`, matching the MCP twin: the issuer's
+    // self-asserted `home_domain` must not feed allowlist matching, so
+    // identity-class criteria configured on this verb fail closed.
+    let source_adapter = AccountViewAdapter::new(&source_account_view);
+    let trustline_effects = match evaluate_value_moving_policy(
+        policy_engine.as_ref(),
+        &profile,
+        "stellar_trustline",
+        stellar_agent_core::policy::ToolValueKind::MovesValue,
+        chain_id,
+        &policy_args,
+        "trustline",
+        Some(&source_adapter),
+        None,
+    ) {
+        Ok(effects) => effects,
+        Err(envelope) => {
+            render_json(&envelope);
+            return 1;
+        }
+    };
+
+    // ── GATE 5: Wallet-controlled clawback opt-in lookup (HMAC-verified) ────
     //
     // `opt_in_present` is NOT a CLI flag; it is derived from the wallet-controlled
     // approval store only.
@@ -389,7 +419,7 @@ where
         }
     };
 
-    // ── GATE 5: Build trustline preview (includes clawback gate decision) ─────
+    // ── GATE 6: Build trustline preview (includes clawback gate decision) ─────
     let preview = TrustlinePreview::build(
         resolved.clone(),
         args.limit_stroops,
@@ -397,7 +427,7 @@ where
         opt_in_present,
     );
 
-    // ── GATE 6: Clawback gate decision (fail-closed) ──────────────────────────
+    // ── GATE 7: Clawback gate decision (fail-closed) ──────────────────────────
     //
     // RefuseWithWarning: `auth_clawback_enabled = true` and no VERIFIED opt-in.
     // Mint a `TrustlineClawbackOptIn` pending entry and tell the operator to run
@@ -534,19 +564,6 @@ where
         "gate_decision": &preview.gate_decision,
     }));
     render_json(&preview_envelope);
-
-    // ── Fetch source account for sequence number ──────────────────────────────
-    let account_view = match fetch_account(&rpc_client, &args.from, &[]).await {
-        Ok(v) => v,
-        Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                "trustline.source_account_fetch_failed",
-                e.to_string(),
-            ));
-            return 1;
-        }
-    };
-    let source_sequence = account_view.sequence_number;
 
     // ── Fee resolution ────────────────────────────────────────────────────────
     let fee_choice = match parse_classic_fee_choice(args.classic_base.as_deref()) {

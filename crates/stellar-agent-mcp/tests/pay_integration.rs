@@ -2507,3 +2507,60 @@ async fn pay_commit_full_round_trip_succeeds_with_string_encoded_amounts() {
         "committed response must carry the submitted ledger: {commit_data}"
     );
 }
+
+// ── Envelope-shape regression guard: nonce.mint_failed ───────────────────────
+
+/// `stellar_pay` returns the full documented business-error envelope
+/// (`ok:false`, `error.code == "nonce.mint_failed"`, non-empty `request_id`,
+/// `is_error == Some(true)`) when the nonce-key keyring entry is absent.
+///
+/// Forces the failure the cheapest honest way: a fresh mock keyring store
+/// (via `keyring_mock::install()`) with NO key written at the profile's
+/// nonce coordinate (`"n-svc"/"n-acct"`) — every other RPC call (fee stats,
+/// account fetch) succeeds normally via `PayFeeRpcResponder`, so the ONLY
+/// failure is `NonceMint::mint`'s keyring load, deep inside `stellar_pay`'s
+/// own simulate path — not a hand-built envelope.
+#[tokio::test]
+#[serial]
+async fn simulate_nonce_mint_failed_envelope_shape() {
+    keyring_mock::install().expect("mock keyring store init");
+    // Deliberately no `install_test_nonce_key(...)` call — the mock store
+    // stays empty at the nonce coordinate.
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(PayFeeRpcResponder::new(
+            account_ledger_key_xdr(SOURCE_G),
+            account_entry_xdr_with_balance(SOURCE_G, 100_000_000_000),
+            fee_stats_result("333", "999"),
+        ))
+        .mount(&mock_server)
+        .await;
+
+    let profile = testnet_profile_with_rpc(&mock_server.uri());
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    let args = StellarPayArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        source: SOURCE_G.to_owned(),
+        destination: DEST_G.to_owned(),
+        amount: Some(serde_json::from_str(r#""1 XLM""#).unwrap()),
+        amount_in_stroops: None,
+        asset: "native".to_owned(),
+        memo_text: None,
+        memo_id: None,
+        memo_hash_hex: None,
+        memo_return_hex: None,
+        classic_base: Some("auto".to_owned()),
+    };
+    let result = server
+        .call_stellar_pay(args)
+        .await
+        .expect("handler must return a business-error result, not a protocol error");
+
+    let (code, _message, _full_text) = common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "nonce.mint_failed",
+        "an absent nonce-key keyring entry must surface nonce.mint_failed"
+    );
+}

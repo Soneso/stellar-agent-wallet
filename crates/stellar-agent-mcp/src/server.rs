@@ -292,6 +292,11 @@ pub use crate::tools::rule_create::{
 pub use crate::tools::rules::{StellarRulesGetArgs, StellarRulesListArgs};
 /// Re-exported for testnet acceptance and integration tests.
 pub use crate::tools::sep43_sign_and_submit_transaction::Sep43SignAndSubmitTransactionArgs;
+/// Re-exported for integration tests: argument type for `stellar_sep47_discover`.
+pub use crate::tools::sep47_discover::Sep47DiscoverArgs;
+/// Re-exported for integration tests: argument type for
+/// `stellar_sep48_preview_invocation`.
+pub use crate::tools::sep48_preview_invocation::Sep48PreviewInvocationArgs;
 pub use crate::tools::toolsets::StellarToolsetInvokeArgs;
 /// Re-exported for back-compat: argument types for `stellar_trustline`.
 pub use crate::tools::trustline::{StellarTrustlineArgs, StellarTrustlineCommitArgs};

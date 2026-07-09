@@ -189,6 +189,30 @@ impl WalletServer {
     }
 }
 
+#[cfg(any(test, feature = "test-helpers"))]
+impl WalletServer {
+    /// Calls `stellar_sep48_preview_invocation` with the given args, bypassing
+    /// the rmcp transport.
+    ///
+    /// Integration-test entry point for handler-level checks.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    ///
+    /// # Feature gate
+    ///
+    /// Gated on the `test-helpers` feature or `#[cfg(test)]`.
+    #[doc(hidden)]
+    pub async fn call_stellar_sep48_preview_invocation(
+        &self,
+        args: Sep48PreviewInvocationArgs,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.stellar_sep48_preview_invocation(Parameters(args))
+            .await
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Toolset-dispatch helper
 // ─────────────────────────────────────────────────────────────────────────────

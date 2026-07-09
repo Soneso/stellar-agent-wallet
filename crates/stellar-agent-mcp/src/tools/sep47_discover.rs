@@ -128,6 +128,29 @@ impl WalletServer {
     }
 }
 
+#[cfg(any(test, feature = "test-helpers"))]
+impl WalletServer {
+    /// Calls `stellar_sep47_discover` with the given args, bypassing the rmcp
+    /// transport.
+    ///
+    /// Integration-test entry point for handler-level checks.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    ///
+    /// # Feature gate
+    ///
+    /// Gated on the `test-helpers` feature or `#[cfg(test)]`.
+    #[doc(hidden)]
+    pub async fn call_stellar_sep47_discover(
+        &self,
+        args: Sep47DiscoverArgs,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.stellar_sep47_discover(Parameters(args)).await
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Toolset-dispatch helper
 // ─────────────────────────────────────────────────────────────────────────────

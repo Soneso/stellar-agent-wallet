@@ -12,24 +12,35 @@
 //!
 //! # Gate order on the live path (fail-closed at every step)
 //!
-//! 1. `dispatch_gate` — policy engine evaluation (chain_id, rate limits).
-//! 2. `resolve_denomination` — USDT hard-refusal + lookalike denylist +
+//! 1. `resolve_denomination` — USDT hard-refusal + lookalike denylist +
 //!    pinned-issuer-mismatch + unpinned-bare-code.
-//! 3. Live issuer-flag fetch via `fetch_account` → `AccountFlagsView`.
-//!    **Fetch failure fail-closes** the gate.
-//! 4. `clawback_gate(flags, opt_in_present)` where `opt_in_present` is
+//! 2. Live issuer account fetch via `fetch_account` → `AccountFlagsView`
+//!    (for the clawback gate).
+//! 3. Source account fetch via `fetch_account` (for the policy gate's
+//!    `account_view`; sequence number consumed at envelope-build time).
+//! 4. `dispatch_gate_with_views` — policy engine evaluation (chain_id, rate
+//!    limits, and `minimum_reserve` against the step-3 `account_view`;
+//!    `identity_view` stays `None`, so identity-class criteria fail closed).
+//! 5. `clawback_gate(flags, opt_in_present)` where `opt_in_present` is
 //!    derived from the wallet-controlled approval store ONLY — NOT an
 //!    agent-suppliable bool.
-//! 5. `TrustlinePreview::build` — typed JSON preview for the operator.
-//! 6. `RefuseWithWarning` / `Refuse` gate decisions return early.
-//! 7. Build `ChangeTrust` envelope via `ClassicOpBuilder::change_trust`.
-//! 8. Mint nonce bound to `"stellar_trustline_commit"`.
+//! 6. `TrustlinePreview::build` — typed JSON preview for the operator.
+//! 7. `RefuseWithWarning` / `Refuse` gate decisions return early.
+//! 8. Fee resolution.
+//! 9. Build `ChangeTrust` envelope via `ClassicOpBuilder::change_trust`.
+//! 10. Mint nonce bound to `"stellar_trustline_commit"`.
 //!
 //! # Behavior
 //!
 //! - Denomination resolver + USDT refusal: bare codes resolve via the pin table;
 //!   USDT is refused unconditionally.
 //! - Live issuer-flag fetch + named clawback gate disclosure.
+//! - `identity_view` is `None` on both phases: `ChangeTrust`'s only
+//!   counterparty account is the asset issuer, whose on-chain `home_domain`
+//!   is self-asserted — feeding it to `counterparty_allowlist` HOME_DOMAIN
+//!   matching would let an issuer alias an allowlisted domain. Identity-class
+//!   criteria configured on this verb fail closed. See the Step 2 comment in
+//!   `stellar_trustline`.
 //! - Nonce binding: simulate mints a nonce; commit verifies and consumes it.
 
 use rmcp::{
@@ -50,7 +61,7 @@ use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_core::profile::schema::default_approval_dir;
 use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_network::{
-    Asset, ClassicOpBuilder, StellarRpcClient,
+    AccountView, Asset, ClassicOpBuilder, StellarRpcClient,
     account::AccountFlagsView,
     fetch_account,
     keyring::signer_from_keyring,
@@ -58,6 +69,8 @@ use stellar_agent_network::{
     signing::envelope_signing::attach_signature,
     submit::{SubmissionResult, SubmissionSignerKind, submit_transaction_and_wait},
 };
+
+use crate::policy_adapter::AccountViewAdapter;
 use stellar_agent_stablecoin::{
     preview::{GateDecisionView, TrustlinePreview},
     resolve::{DenominationInput, ResolvedAsset, resolve_denomination},
@@ -381,19 +394,11 @@ impl WalletServer {
         &self,
         Parameters(args): Parameters<StellarTrustlineArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        // ── Dispatch gate ────────────────────────────────────────────────────
         let args_value = json!({
             "chain_id": &args.chain_id,
             "from": &args.from,
             "asset": &args.asset,
         });
-        let dispatch_outcome = match self
-            .dispatch_gate("stellar_trustline", &args_value, &args.chain_id)
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => return e.into_result(),
-        };
 
         // ── Parse limit_stroops (0..=i64::MAX; see the field rustdoc for the
         // client-side lower-bound tightening) ─────────────────────────────
@@ -445,7 +450,7 @@ impl WalletServer {
                 }
             };
 
-        // ── Step 2: Live issuer-flag fetch (fail-closed on failure) ───────────
+        // ── Step 2: Live issuer account fetch ─────────────────────────────────
         let rpc_url = self.profile.rpc_url.as_str();
         let client = match StellarRpcClient::new(rpc_url) {
             Ok(c) => c,
@@ -457,9 +462,16 @@ impl WalletServer {
             }
         };
 
-        // Fetch the ISSUER account (not the wallet account) to get its flags.
-        // Flags are third-party public facts; safe to log.
-        let issuer_flags: Option<AccountFlagsView> = match fetch_account(
+        // Fetch the ISSUER account (not the wallet account) for
+        // `issuer_flags` (the clawback gate, below). The issuer account is
+        // deliberately NOT supplied as the policy gate's `identity_view`:
+        // `AccountEntry.home_domain` is self-asserted (any issuer can set an
+        // arbitrary domain via SetOptions), so feeding it to
+        // `counterparty_allowlist` HOME_DOMAIN matching would let an issuer
+        // alias an allowlisted domain and convert that criterion's
+        // fail-closed deny into an attacker-influenceable allow. Issuer
+        // flags are third-party public facts; safe to log.
+        let issuer_account_view: Option<AccountView> = match fetch_account(
             &client,
             &resolved.issuer,
             &[],
@@ -467,7 +479,7 @@ impl WalletServer {
         .await
         {
             Ok(account_view) => {
-                let flags_opt = account_view.account_flags.clone();
+                let flags_opt = &account_view.account_flags;
                 tracing::info!(
                     tool = "stellar_trustline",
                     issuer = %redact_strkey_first5_last5(&resolved.issuer),
@@ -476,7 +488,7 @@ impl WalletServer {
                     auth_clawback_enabled = ?flags_opt.as_ref().map(|f| f.auth_clawback_enabled),
                     "issuer flags fetched"
                 );
-                flags_opt
+                Some(account_view)
             }
             Err(err) => {
                 // Fetch failure fail-closes the gate.  Log at INFO so the
@@ -491,8 +503,50 @@ impl WalletServer {
                 None
             }
         };
+        let issuer_flags: Option<AccountFlagsView> = issuer_account_view
+            .as_ref()
+            .and_then(|v| v.account_flags.clone());
 
-        // ── Step 3: Wallet-controlled clawback opt-in lookup (HMAC-verified) ────
+        // ── Step 3: Fetch source account (feeds the policy gate's
+        // account_view; sequence number consumed by the envelope build at
+        // Step 8) ──────────────────────────────────────────────────────────
+        let source_account_view = match fetch_account(&client, &args.from, &[]).await {
+            Ok(v) => v,
+            Err(err) => {
+                let envelope = redacted_wallet_error_envelope(&err);
+                let json = envelope
+                    .to_json_pretty()
+                    .unwrap_or_else(|_| String::from("{}"));
+                let mut result = CallToolResult::success(vec![Content::text(json)]);
+                result.is_error = Some(true);
+                return Ok(result);
+            }
+        };
+        let source_sequence = source_account_view.sequence_number;
+
+        // ── Step 4: Dispatch gate (with policy views) ─────────────────────────
+        // `account_view` is the fetched source account, feeding
+        // `minimum_reserve`. `identity_view` stays `None`: the only
+        // counterparty account a `ChangeTrust` has is the asset issuer, and
+        // its self-asserted `home_domain` must not feed allowlist matching
+        // (see the Step 2 comment), so identity-class criteria configured on
+        // this verb fail closed.
+        let source_adapter = AccountViewAdapter::new(&source_account_view);
+        let dispatch_outcome = match self
+            .dispatch_gate_with_views(
+                "stellar_trustline",
+                &args_value,
+                &args.chain_id,
+                Some(&source_adapter),
+                None,
+            )
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return e.into_result(),
+        };
+
+        // ── Step 5: Wallet-controlled clawback opt-in lookup (HMAC-verified) ────
         //
         // `opt_in_present` is NOT an agent-suppliable bool; it is derived from
         // the wallet-controlled approval store.
@@ -557,7 +611,7 @@ impl WalletServer {
             }
         };
 
-        // ── Step 4: Build trustline preview (includes clawback gate decision) ─
+        // ── Step 6: Build trustline preview (includes clawback gate decision) ─
         let preview = TrustlinePreview::build(
             resolved.clone(),
             limit_stroops,
@@ -565,7 +619,7 @@ impl WalletServer {
             opt_in_present,
         );
 
-        // ── Step 5: Gate decision check — fail-closed ─────────────────────────
+        // ── Step 7: Gate decision check — fail-closed ─────────────────────────
         //
         // RefuseWithWarning means `auth_clawback_enabled = true` and no VERIFIED
         // opt-in exists.  This is NOT a terminal refusal —
@@ -706,23 +760,7 @@ impl WalletServer {
             }
         }
 
-        // ── Step 6: Fetch source account for sequence number and fee ─────────
-        let account_view = match fetch_account(&client, &args.from, &[]).await {
-            Ok(v) => v,
-            Err(err) => {
-                let envelope = redacted_wallet_error_envelope(&err);
-                let json = envelope
-                    .to_json_pretty()
-                    .unwrap_or_else(|_| String::from("{}"));
-                let mut result = CallToolResult::success(vec![Content::text(json)]);
-                result.is_error = Some(true);
-                return Ok(result);
-            }
-        };
-
-        let source_sequence = account_view.sequence_number;
-
-        // ── Step 7: Fee resolution ────────────────────────────────────────────
+        // ── Step 8: Fee resolution ────────────────────────────────────────────
         let fee_choice = parse_classic_fee_choice(args.classic_base.as_deref()).map_err(|err| {
             rmcp::ErrorData::invalid_params(format!("invalid fee: {}", err.code()), None)
         })?;
@@ -755,7 +793,7 @@ impl WalletServer {
         let total_fee_stroops =
             total_classic_fee_stroops(fee_per_op_stroops, CLASSIC_SINGLE_OPERATION_COUNT)?;
 
-        // ── Step 8: Build unsigned ChangeTrust envelope ───────────────────────
+        // ── Step 9: Build unsigned ChangeTrust envelope ───────────────────────
         let asset = Asset::from_code_and_issuer(&resolved.code, &resolved.issuer).map_err(|e| {
             rmcp::ErrorData::internal_error(
                 format!("envelope_build_error: asset construction: {e}"),
@@ -785,7 +823,7 @@ impl WalletServer {
             }
         };
 
-        // ── Step 9: Mint nonce ────────────────────────────────────────────────
+        // ── Step 10: Mint nonce ───────────────────────────────────────────────
         let expiry_unix_ms = now_ms.saturating_add(DEFAULT_NONCE_TTL_MS);
 
         let nonce = match self.nonce_mint.mint(
@@ -818,7 +856,7 @@ impl WalletServer {
             "ChangeTrust simulation complete; nonce minted"
         );
 
-        // ── Step 10: Persist pending approval if policy requires it ───────────
+        // ── Step 11: Persist pending approval if policy requires it ──────────
         let approval_block = if let DispatchOutcome::RequireApproval(ref _req) = dispatch_outcome {
             let profile_name = self.profile_name_for_approval();
             match self.persist_trustline_pending_approval(
@@ -950,47 +988,6 @@ impl WalletServer {
             };
         authoritative_args["chain_id"] = serde_json::Value::String(args.chain_id.clone());
 
-        // ── Dispatch gate (uses authoritative args) ───────────────────────────
-        let dispatch_outcome = match self
-            .dispatch_gate(
-                "stellar_trustline_commit",
-                &authoritative_args,
-                &args.chain_id,
-            )
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => return e.into_result(),
-        };
-
-        // ── Validate G-strkey ─────────────────────────────────────────────────
-        if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(&args.from) {
-            return Err(rmcp::ErrorData::invalid_params(
-                format!("invalid from (expected G-strkey): {err}"),
-                None,
-            ));
-        }
-
-        // ── Attestation verification gate ─────────────────────────────────────
-        if let Err(result) = verify_attestation_gate(
-            self,
-            &dispatch_outcome,
-            &args.envelope_xdr,
-            args.approval_nonce.as_deref(),
-            args.approval_attestation.as_deref(),
-            "stellar_trustline_commit",
-        )
-        .await
-        {
-            return Ok(result);
-        }
-
-        // ── Decode nonce ──────────────────────────────────────────────────────
-        let nonce = match stellar_agent_nonce::Nonce::from_base64(&args.nonce) {
-            Ok(n) => n,
-            Err(_) => return Ok(commit_path_error_result("nonce parse failed")),
-        };
-
         // ── Extract authoritative asset fields for rebuild ────────────────────
         let auth_asset_code = match authoritative_args
             .get("asset_code")
@@ -1039,7 +1036,20 @@ impl WalletServer {
                 rmcp::ErrorData::internal_error("internal_error: operation count is zero", None)
             })?;
 
-        // ── Re-fetch source account for rebuild ───────────────────────────────
+        // ── Validate G-strkey ─────────────────────────────────────────────────
+        // Runs BEFORE the source-account fetch below: `fetch_account` itself
+        // parses `args.from` via the same strkey check and would otherwise
+        // surface a malformed `from` as a redacted RPC-error business envelope
+        // instead of this dedicated `invalid_params` protocol error.
+        if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(&args.from) {
+            return Err(rmcp::ErrorData::invalid_params(
+                format!("invalid from (expected G-strkey): {err}"),
+                None,
+            ));
+        }
+
+        // ── Re-fetch source + issuer accounts (feed the policy gate's views;
+        // sequence number also consumed by the rebuild below) ────────────────
         let rpc_url = self.profile.rpc_url.as_str();
         let client = match StellarRpcClient::new(rpc_url) {
             Ok(c) => c,
@@ -1051,7 +1061,7 @@ impl WalletServer {
             }
         };
 
-        let account_view = match fetch_account(&client, &args.from, &[]).await {
+        let source_account_view = match fetch_account(&client, &args.from, &[]).await {
             Ok(v) => v,
             Err(err) => {
                 let envelope = redacted_wallet_error_envelope(&err);
@@ -1063,8 +1073,47 @@ impl WalletServer {
                 return Ok(result);
             }
         };
+        let source_sequence = source_account_view.sequence_number;
 
-        let source_sequence = account_view.sequence_number;
+        // ── Dispatch gate (authoritative args + source account_view) ──────────
+        // `identity_view` stays `None`, matching the simulate tool: the only
+        // counterparty account (the asset issuer) carries a self-asserted
+        // `home_domain`, which must not feed allowlist matching; identity-class
+        // criteria configured on this verb fail closed.
+        let source_adapter = AccountViewAdapter::new(&source_account_view);
+        let dispatch_outcome = match self
+            .dispatch_gate_with_views(
+                "stellar_trustline_commit",
+                &authoritative_args,
+                &args.chain_id,
+                Some(&source_adapter),
+                None,
+            )
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return e.into_result(),
+        };
+
+        // ── Attestation verification gate ─────────────────────────────────────
+        if let Err(result) = verify_attestation_gate(
+            self,
+            &dispatch_outcome,
+            &args.envelope_xdr,
+            args.approval_nonce.as_deref(),
+            args.approval_attestation.as_deref(),
+            "stellar_trustline_commit",
+        )
+        .await
+        {
+            return Ok(result);
+        }
+
+        // ── Decode nonce ──────────────────────────────────────────────────────
+        let nonce = match stellar_agent_nonce::Nonce::from_base64(&args.nonce) {
+            Ok(n) => n,
+            Err(_) => return Ok(commit_path_error_result("nonce parse failed")),
+        };
 
         // ── Re-build envelope (divergence check) ──────────────────────────────
         let asset = match Asset::from_code_and_issuer(&auth_asset_code, &auth_asset_issuer) {

@@ -1860,6 +1860,56 @@ async fn create_account_commit_full_round_trip_succeeds_with_string_encoded_amou
     );
 }
 
+// ── Envelope-shape regression guard: nonce.mint_failed ───────────────────────
+
+/// `stellar_create_account` returns the full documented business-error
+/// envelope (`ok:false`, `error.code == "nonce.mint_failed"`, non-empty
+/// `request_id`, `is_error == Some(true)`) when the nonce-key keyring entry
+/// is absent.
+///
+/// Forces the failure the cheapest honest way: a fresh mock keyring store
+/// with NO key written at the profile's nonce coordinate — every RPC call
+/// (fee stats, account fetch) succeeds normally, so the only failure is
+/// `NonceMint::mint`'s keyring load inside the handler's own simulate path.
+#[tokio::test]
+#[serial]
+async fn simulate_nonce_mint_failed_envelope_shape() {
+    keyring_mock::install().expect("mock keyring store init");
+    // Deliberately no nonce-key seeding call — the mock store stays empty
+    // at the nonce coordinate.
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(CreateAccountFeeRpcResponder::new(
+            account_ledger_key_xdr(SOURCE_G),
+            account_entry_xdr_with_balance(SOURCE_G, 100_000_000_000),
+            fee_stats_result("333", "999"),
+        ))
+        .mount(&mock_server)
+        .await;
+
+    let profile = testnet_profile_with_rpc(&mock_server.uri());
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    let args = StellarCreateAccountArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        source: SOURCE_G.to_owned(),
+        destination: DEST_G.to_owned(),
+        starting_balance: serde_json::from_str(r#""1 XLM""#).unwrap(),
+        classic_base: Some("auto".to_owned()),
+    };
+    let result = server
+        .call_stellar_create_account(args)
+        .await
+        .expect("handler must return a business-error result, not a protocol error");
+
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "nonce.mint_failed",
+        "an absent nonce-key keyring entry must surface nonce.mint_failed"
+    );
+}
+
 mod helpers {
     use base64::Engine;
     use keyring_core::Entry;

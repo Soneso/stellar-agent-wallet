@@ -1022,3 +1022,57 @@ async fn claim_commit_full_round_trip_succeeds_with_string_encoded_amount() {
         "committed response must carry the submitted ledger: {commit_data}"
     );
 }
+
+// ── Envelope-shape regression guard: nonce.mint_failed ───────────────────────
+
+/// `stellar_claim` returns the full documented business-error envelope
+/// (`ok:false`, `error.code == "nonce.mint_failed"`, non-empty `request_id`,
+/// `is_error == Some(true)`) when the nonce-key keyring entry is absent.
+///
+/// Forces the failure the cheapest honest way: a fresh mock keyring store
+/// with NO key written at the profile's nonce coordinate — the claimable
+/// balance fetch and source-account fetch succeed normally via
+/// `ClaimRpcResponder`, so the only failure is `NonceMint::mint`'s keyring
+/// load inside the handler's own simulate path.
+#[tokio::test]
+#[serial]
+async fn simulate_nonce_mint_failed_envelope_shape() {
+    keyring_mock::install().expect("mock keyring store init");
+    // Deliberately no `install_test_nonce_key()` call — the mock store stays
+    // empty at the nonce coordinate.
+
+    let id = test_balance_id();
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ClaimRpcResponder {
+            cb_key_xdr: claim_key_xdr(&id),
+            entry_xdr: Some(claim_entry_xdr(
+                &id,
+                SOURCE_G,
+                stellar_xdr::ClaimPredicate::Unconditional,
+                CLAIM_AMOUNT_STROOPS,
+            )),
+            account_key_xdr: account_ledger_key_xdr(SOURCE_G),
+            account_xdr: account_entry_xdr_with_seq(
+                SOURCE_G,
+                SOURCE_BALANCE_STROOPS,
+                0,
+                SOURCE_SEQ,
+            ),
+        })
+        .mount(&mock_server)
+        .await;
+
+    let server =
+        WalletServer::new(testnet_profile_with_rpc(&mock_server.uri())).expect("WalletServer::new");
+    let result = server
+        .call_stellar_claim(simulate_args())
+        .await
+        .expect("handler must return a business-error result, not a protocol error");
+
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "nonce.mint_failed",
+        "an absent nonce-key keyring entry must surface nonce.mint_failed"
+    );
+}

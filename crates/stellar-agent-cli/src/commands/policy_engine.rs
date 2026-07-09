@@ -974,14 +974,15 @@ mod tests {
         );
     }
 
-    // ── CLI classic-verb account-view parity matrix (#45) ──────────────────────
+    // ── CLI classic-verb account-view parity matrix ─────────────────────────────
     //
     // Pins that each CLI classic verb populates `account_view` / `identity_view`
     // exactly as its MCP twin does: `pay` supplies both (source `account_view`,
     // destination-derived `identity_view`); `claim` and `accounts create` supply
-    // only `account_view`; `trustline` supplies neither (its MCP twin calls the
-    // plain `dispatch_gate`, with no account fetch at all). Exercises the REAL
-    // `MinimumReserveCriterion` / `HomeDomainResolvedCriterion` against a
+    // only `account_view`; `trustline` supplies both (source `account_view`,
+    // asset-issuer-derived `identity_view` — its MCP twin calls
+    // `dispatch_gate_with_views` after fetching both accounts). Exercises the
+    // REAL `MinimumReserveCriterion` / `HomeDomainResolvedCriterion` against a
     // synthesised `AccountView`, not a mock engine — proving the injected view
     // actually feeds the criterion, not just that a non-`None` value was passed.
 
@@ -1121,7 +1122,7 @@ mod tests {
     /// `claim` / `accounts create` do not.
     ///
     /// `home_domain_resolved` also requires `counterparty_cache` (a separate,
-    /// unaddressed view outside #45's scope — only `account_view` /
+    /// separately-scoped view — only `account_view` /
     /// `identity_view` are named), so a fully-populated `identity_view` alone
     /// cannot reach `Allow` here. The proof this test pins is narrower and
     /// exact: with a populated `identity_view` the failure mode is
@@ -1152,7 +1153,7 @@ mod tests {
         );
         let err = result.expect_err(
             "home_domain_resolved must still fail closed pending counterparty_cache \
-             (out of #45's scope), not allow",
+             (a separately-scoped view), not allow",
         );
         let message = err
             .error
@@ -1231,18 +1232,16 @@ mod tests {
         );
     }
 
-    /// `trustline`: a `minimum_reserve` rule configured on `stellar_trustline`
-    /// fails closed (`policy.engine_required`, the criterion's
-    /// `CriterionEvaluationFailed` path) because `trustline`'s MCP twin calls
-    /// the plain `dispatch_gate` — no account fetch, no views at all. The CLI
-    /// mirrors that exactly (`None, None`); this is NOT a CLI-side gap this
-    /// batch fixes — pinning it here documents the shared, un-addressed MCP
-    /// posture rather than silently diverging from it.
+    /// `trustline`: a `minimum_reserve` rule the source account satisfies
+    /// allows — `trustline` supplies `account_view` (the source), matching
+    /// its MCP twin.
     #[test]
-    fn trustline_gate_minimum_reserve_configured_fails_closed_no_views() {
+    fn trustline_gate_minimum_reserve_satisfied_allows() {
         let engine = minimum_reserve_engine("stellar_trustline", 0);
         let profile = parity_profile();
         let policy_args = trustline_policy_args(PARITY_DEST_G, "native");
+        let source_view = parity_account_view(1_000_000_000, 0, None);
+        let source_adapter = AccountViewAdapter::new(&source_view);
         let result = evaluate_value_moving_policy(
             &engine,
             &profile,
@@ -1251,14 +1250,79 @@ mod tests {
             "stellar:testnet",
             &policy_args,
             "trustline",
+            Some(&source_adapter),
             None,
+        );
+        assert!(
+            result.is_ok(),
+            "a satisfied minimum_reserve rule must allow with account_view supplied; \
+             got {result:?}"
+        );
+    }
+
+    /// `trustline`: a `minimum_reserve` rule the source account does NOT
+    /// satisfy denies with the criterion's own wire code — proving the view
+    /// actually feeds the criterion.
+    #[test]
+    fn trustline_gate_minimum_reserve_violated_denies() {
+        let engine = minimum_reserve_engine("stellar_trustline", 0);
+        let profile = parity_profile();
+        let policy_args = trustline_policy_args(PARITY_DEST_G, "native");
+        let source_view = parity_account_view(0, 0, None);
+        let source_adapter = AccountViewAdapter::new(&source_view);
+        let result = evaluate_value_moving_policy(
+            &engine,
+            &profile,
+            "stellar_trustline",
+            ToolValueKind::MovesValue,
+            "stellar:testnet",
+            &policy_args,
+            "trustline",
+            Some(&source_adapter),
             None,
         );
         assert_eq!(
             envelope_code(&result),
-            "policy.engine_required",
-            "trustline has no views to supply (matching its MCP twin), so a configured \
-             minimum_reserve rule must fail closed via CriterionEvaluationFailed"
+            "policy.deny.minimum_reserve_breached",
+            "trustline must deny on an unsatisfied minimum_reserve rule when \
+             account_view is supplied"
+        );
+    }
+
+    /// `trustline`: identity-class criteria fail closed — the verb supplies
+    /// `identity_view: None` by design (the asset issuer's on-chain
+    /// `home_domain` is self-asserted; feeding it to allowlist matching would
+    /// let an issuer alias an allowlisted domain), so a `home_domain_resolved`
+    /// rule configured on this verb denies with the identity_view gap.
+    #[test]
+    fn trustline_gate_identity_class_criterion_fails_closed_without_identity_view() {
+        let engine = home_domain_engine("stellar_trustline");
+        let profile = parity_profile();
+        let policy_args = trustline_policy_args(PARITY_DEST_G, "native");
+        let source_view = parity_account_view(1_000_000_000, 0, None);
+        let source_adapter = AccountViewAdapter::new(&source_view);
+        let result = evaluate_value_moving_policy(
+            &engine,
+            &profile,
+            "stellar_trustline",
+            ToolValueKind::MovesValue,
+            "stellar:testnet",
+            &policy_args,
+            "trustline",
+            Some(&source_adapter),
+            None,
+        );
+        let err = result
+            .expect_err("an identity-class criterion on trustline must fail closed, not allow");
+        let message = err
+            .error
+            .as_ref()
+            .expect("refusal envelope must carry an error block")
+            .message
+            .as_str();
+        assert!(
+            message.contains("identity_view was not populated"),
+            "the deny must name the identity_view gap; got: {message}"
         );
     }
 
