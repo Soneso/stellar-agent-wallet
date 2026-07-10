@@ -2,7 +2,7 @@
   "test_kind": "evaluate",
   "name": "case_insensitive_match_allow",
   "category": "counterparty_lookalike",
-  "description": "HOME_DOMAIN allowlist = ['circle.com']. On-chain AccountEntry.home_domain = 'Circle.com' (mixed case). ASCII-lowercase normalisation (RFC 4343, Security-MAJOR-6) converts it to 'circle.com' before comparison. Expect Allow.",
+  "description": "HOME_DOMAIN allowlist = ['circle.com']. On-chain AccountEntry.home_domain = 'Circle.com' (mixed case). ASCII-lowercase normalisation (RFC 4343, Security-MAJOR-6) converts it to 'circle.com' before comparison, verified via counterparty cache keyed by the lowercased domain (#49). Expect Allow.",
   "tool": {
     "name": "stellar_pay",
     "destructive_hint": true,
@@ -17,6 +17,7 @@
   },
   "profile_name": "default",
   "mock_home_domain": "Circle.com",
+  "mock_resolved_domains": ["circle.com"],
   "expected": {
     "kind": "Allow"
   }

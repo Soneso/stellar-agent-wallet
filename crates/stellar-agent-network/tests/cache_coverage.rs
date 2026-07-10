@@ -417,12 +417,14 @@ fn stellar_toml_binding_new_fields() {
 
     let now = SystemTime::now();
     let later = now + Duration::from_secs(3600);
-    let b = StellarTomlBinding::new("circle.com".to_owned(), now, later, false);
+    let accounts = vec!["GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN".to_owned()];
+    let b = StellarTomlBinding::new("circle.com".to_owned(), now, later, false, accounts.clone());
 
     assert_eq!(b.home_domain, "circle.com");
     assert_eq!(b.fetched_at, now);
     assert_eq!(b.expires_at, later);
     assert!(!b.stale);
+    assert_eq!(b.accounts, accounts);
 }
 
 /// `StellarTomlBinding::new` with `stale = true` preserves the flag.
@@ -431,7 +433,7 @@ fn stellar_toml_binding_new_stale_flag() {
     use stellar_agent_network::StellarTomlBinding;
 
     let now = SystemTime::now();
-    let b = StellarTomlBinding::new("anchor.example".to_owned(), now, now, true);
+    let b = StellarTomlBinding::new("anchor.example".to_owned(), now, now, true, vec![]);
     assert!(b.stale);
 }
 

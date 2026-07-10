@@ -58,6 +58,10 @@ required-features = ["test-helpers"]
 name = "recover_strkey_from_seed_and_deployer"
 required-features = ["test-helpers"]
 
+[[test]]
+name = "deploy_smart_account_collective_budget_mock"
+required-features = ["test-helpers"]
+
 # testnet acceptance tests: each requires the testnet-integration feature.
 [[test]]
 name = "deploy_c_testnet_acceptance"

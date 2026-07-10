@@ -647,18 +647,11 @@ impl WalletServer {
             };
         authoritative_args["chain_id"] = serde_json::Value::String(args.chain_id.clone());
 
-        // ── Dispatch gate (uses authoritative args) ──────────────────────────
-        let dispatch_outcome = match self
-            .dispatch_gate("stellar_claim_commit", &authoritative_args, &args.chain_id)
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => return e.into_result(),
-        };
-
         // ── Resolve the authoritative source (from the signed envelope) ──────
         // The source used for RPC fetch, signing, and submission MUST come from
         // the HMAC-bound envelope decode, never from caller-supplied args.
+        // Moved ahead of the gate: `dispatch_gate_with_views` below needs the
+        // source's on-chain `account_view` for `minimum_reserve`.
         let source = match authoritative_args
             .get("source")
             .and_then(serde_json::Value::as_str)
@@ -671,12 +664,64 @@ impl WalletServer {
                 ));
             }
         };
+        // Runs BEFORE the account fetch below: `fetch_account` itself parses
+        // `source` via the same strkey check and would otherwise surface a
+        // malformed value as a redacted RPC-error business envelope instead of
+        // this dedicated `invalid_params` protocol error.
         if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(&source) {
             return Err(rmcp::ErrorData::invalid_params(
                 format!("invalid source (expected G-strkey): {err}"),
                 None,
             ));
         }
+
+        // ── RPC client ───────────────────────────────────────────────────────
+        let rpc_url = self.profile.rpc_url.as_str();
+        let client = match StellarRpcClient::new(rpc_url) {
+            Ok(c) => c,
+            Err(err) => {
+                return Err(rmcp::ErrorData::internal_error(
+                    redact_rpc_error_detail("rpc_client_error", &err),
+                    None,
+                ));
+            }
+        };
+
+        // ── Re-fetch source account (feeds the policy gate's `account_view`;
+        // sequence number also consumed by the rebuild below) ────────────────
+        // Reused for the whole commit path — no second fetch.
+        let account_view = match fetch_account(&client, &source, &[]).await {
+            Ok(v) => v,
+            Err(err) => {
+                let envelope = redacted_wallet_error_envelope(&err);
+                let json = envelope
+                    .to_json_pretty()
+                    .unwrap_or_else(|_| String::from("{}"));
+                let mut result = CallToolResult::success(vec![Content::text(json)]);
+                result.is_error = Some(true);
+                return Ok(result);
+            }
+        };
+        let source_sequence = account_view.sequence_number;
+
+        // ── Dispatch gate (uses authoritative args + source account_view) ────
+        // `identity_view` stays `None`, matching `stellar_claim`'s simulate
+        // phase: claim has no counterparty identity to feed
+        // `home_domain_resolved`.
+        let source_adapter = crate::policy_adapter::AccountViewAdapter::new(&account_view);
+        let dispatch_outcome = match self
+            .dispatch_gate_with_views(
+                "stellar_claim_commit",
+                &authoritative_args,
+                &args.chain_id,
+                Some(&source_adapter),
+                None,
+            )
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return e.into_result(),
+        };
 
         // ── Attestation verification gate ────────────────────────────────────
         if let Err(result) = verify_attestation_gate(
@@ -716,22 +761,12 @@ impl WalletServer {
             Err(err) => return Ok(claim_error_result(&err)),
         };
 
-        // ── RPC client ───────────────────────────────────────────────────────
-        let rpc_url = self.profile.rpc_url.as_str();
-        let client = match StellarRpcClient::new(rpc_url) {
-            Ok(c) => c,
-            Err(err) => {
-                return Err(rmcp::ErrorData::internal_error(
-                    redact_rpc_error_detail("rpc_client_error", &err),
-                    None,
-                ));
-            }
-        };
-
         // ── Re-fetch the entry and re-check the claim guards ─────────────────
         // Per commit-phase parity with pay: the ENTRY (existence, claimant,
         // predicate) is re-fetched, but the account/trustline are not — a
-        // between-phase trustline change fails cleanly on-chain.
+        // between-phase trustline change fails cleanly on-chain. Reuses the
+        // `client` constructed above (ahead of the policy gate); no second
+        // client construction.
         let entry = match fetch_claimable_balance_entry(&client, &id).await {
             Ok(e) => e,
             Err(err) => return Ok(claim_error_result(&err)),
@@ -750,20 +785,9 @@ impl WalletServer {
             return Ok(claim_error_result(&err));
         }
 
-        // ── Re-fetch source account and re-build the envelope ────────────────
-        let account_view = match fetch_account(&client, &source, &[]).await {
-            Ok(v) => v,
-            Err(err) => {
-                let envelope = redacted_wallet_error_envelope(&err);
-                let json = envelope
-                    .to_json_pretty()
-                    .unwrap_or_else(|_| String::from("{}"));
-                let mut result = CallToolResult::success(vec![Content::text(json)]);
-                result.is_error = Some(true);
-                return Ok(result);
-            }
-        };
-        let source_sequence = account_view.sequence_number;
+        // `account_view`/`source_sequence` were fetched above (ahead of the
+        // policy gate) and are reused here for the envelope rebuild — no
+        // second source-account fetch.
 
         let total_fee_from_envelope = match authoritative_args
             .get("total_fee_stroops")

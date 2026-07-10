@@ -44,27 +44,59 @@
 //! `"CODE:Gissuer"`.  A native-asset payment passes through (no issuer to
 //! check).
 //!
-//! # HOME_DOMAIN logic
+//! # HOME_DOMAIN logic — trust model
 //!
-//! Reads the destination account's `home_domain` via
-//! `AccountReservesView::home_domain`.  When `home_domain`
-//! is `None` (the destination account has no published home domain) the criterion
-//! returns [`DenyReason::CounterpartyDenied`] — an account with no home domain
-//! cannot match an allowlist of trusted operators.
+//! `home_domain` on `AccountEntry` is a **self-asserted** field: any account
+//! can set it to an allowlisted string via `SetOptions` at zero cost. Matching
+//! the self-assertion alone (the behavior for the other kinds) lets an attacker-controlled
+//! account impersonate an allowlisted operator simply by copying that
+//! operator's `home_domain` string onto its own `AccountEntry` — the homoglyph
+//! defence below bounds which BYTES the string may contain, not whether the
+//! assertion is true.
 //!
-//! The comparison is a **strict byte-equality** between the resolved domain and
-//! each allowlist entry.  Both sides MUST be valid ASCII; non-ASCII bytes in the
-//! resolved home domain produce [`DenyReason::CounterpartyDenied`] (not an
-//! error) as the homoglyph defence: a Cyrillic or digit-substituted domain such
-//! as `сircle.com` or `circ1e.com` cannot satisfy an allowlist entry of
-//! `"circle.com"`.  Allowlist entries that contain non-ASCII bytes are rejected
-//! at construction time in the TOML loader (see [`crate::policy::v1::loader`]).
+//! `HOME_DOMAIN` therefore requires a **verified, bidirectional** binding
+//! before the allowlist is even consulted:
 //!
-//! The comparison is case-sensitive.  Operators MUST normalise domain names to
-//! lowercase in their policy files (RFC 4343 DNS case-insensitivity is explicitly
-//! NOT applied here — a follow-up issue tracks whether relaxation is appropriate;
-//! the safe default is strict equality).
+//! 1. The destination account's on-chain `home_domain` resolves via
+//!    [`crate::policy::v1::AccountIdentityView::home_domain`] (self-asserted;
+//!    the same shape as every other kind's deny).
+//! 2. Strict-ASCII homoglyph defence on the resolved value (unchanged).
+//! 3. **Domain verification**: [`EvalContext::counterparty_cache`] must be
+//!    populated AND report the domain as resolved
+//!    ([`crate::policy::v1::CounterpartyCacheView::has_resolved`]) — proof the
+//!    wallet operator has independently fetched a real `stellar.toml` at that
+//!    domain (via `stellar-agent counterparty warm-up` or
+//!    `stellar-agent counterparty refresh <domain>`), not merely that the
+//!    on-chain field contains a plausible-looking string.
+//! 4. **Account-listing verification**: the resolved domain's cached
+//!    `stellar.toml` `ACCOUNTS` list must name THIS account
+//!    ([`crate::policy::v1::CounterpartyCacheView::is_account_listed`]) — the
+//!    bidirectional half of the proof.  Without it, step 3 alone would still
+//!    let any account that copies an ALREADY-cached, legitimate operator's
+//!    `home_domain` string pass, since `has_resolved` is keyed by domain only.
+//! 5. Only once steps 3–4 both pass does the resolved domain get checked
+//!    against the operator's `allowlist` — a verified-but-non-allowlisted
+//!    domain still denies, distinctly from an unverified one (see the `value`
+//!    field on each deny below).
 //!
+//! # Breaking change (behavior tightening)
+//!
+//! Existing `HOME_DOMAIN` rules now require `EvalContext::counterparty_cache`
+//! to carry a resolved entry that lists the counterparty account — operators
+//! MUST populate the cache (`stellar-agent counterparty warm-up` scans the
+//! configured `allowlist` entries out of the policy file and refreshes each;
+//! `stellar-agent counterparty refresh <domain>` refreshes one domain) before
+//! any `HOME_DOMAIN` rule can pass. A rule that previously passed on a
+//! self-asserted match alone will now deny until the operator populates the
+//! cache. This does NOT affect `G_ACCOUNT` / `C_ACCOUNT` / `KNOWN_ISSUER`.
+//!
+//! # Deny detail
+//!
+//! All `HOME_DOMAIN` denials use [`DenyReason::CounterpartyDenied`] with
+//! `kind = "HOME_DOMAIN"`; the `value` field text distinguishes the failure
+//! mode for operator triage: no on-chain domain, non-ASCII homoglyph, cache
+//! not populated, domain not resolved in the cache, account not listed by the
+//! domain's `stellar.toml`, or (only once verified) not on the allowlist.
 
 use stellar_strkey::{Contract, ed25519::PublicKey};
 
@@ -523,60 +555,87 @@ impl CounterpartyAllowlistCriterion {
         Ok(None)
     }
 
-    /// Checks the destination account's `home_domain` against the allowlist.
+    /// Checks the destination account's `home_domain` against the allowlist,
+    /// requiring a VERIFIED (not merely self-asserted) domain-account binding.
     ///
-    /// Reads `home_domain` via [`crate::policy::v1::AccountIdentityView::home_domain`]
-    /// (supplied in [`EvalContext::identity_view`]).  When `identity_view` is
-    /// `None` or `home_domain()` returns `None` (destination has no published home
-    /// domain), returns [`DenyReason::CounterpartyDenied`].
-    ///
-    /// The comparison is case-insensitive ASCII (see the `check_home_domain` body).
-    /// Non-ASCII bytes in the resolved home domain produce
-    /// [`DenyReason::CounterpartyDenied`] — the homoglyph defence.  Allowlist
-    /// entries are guaranteed to be valid ASCII because the TOML loader rejects
-    /// non-ASCII entries at parse time.
+    /// See the module-level `# HOME_DOMAIN logic — trust model` section for
+    /// the full 5-step rationale. Reads `home_domain` via
+    /// [`crate::policy::v1::AccountIdentityView::home_domain`] (supplied in
+    /// [`EvalContext::identity_view`]) and cross-checks it against
+    /// [`EvalContext::counterparty_cache`]. Every failure mode returns
+    /// [`DenyReason::CounterpartyDenied`] with `kind = "HOME_DOMAIN"`; the
+    /// `value` field distinguishes which step failed for operator triage.
     fn check_home_domain(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
-        // Retrieve the home_domain from the identity view.
-        // When identity_view is None or home_domain() returns None, the
-        // destination has no published home domain and cannot match any allowlist
-        // entry.  AccountIdentityView has no default home_domain() implementation,
-        // so forgetting to implement it at the dispatch site is a compile error.
-        let resolved = match ctx.identity_view.and_then(|v| v.home_domain()) {
-            Some(d) => d,
-            None => {
-                return Ok(Some(DenyReason::CounterpartyDenied {
-                    kind: "HOME_DOMAIN".to_owned(),
-                    value: String::new(),
-                }));
-            }
-        };
-
-        // Strict-ASCII enforcement — the homoglyph defence.
-        // If the resolved home_domain contains non-ASCII bytes (e.g. Cyrillic
-        // lookalikes, digit substitutions encoded outside the ASCII range), the
-        // domain cannot satisfy any allowlist entry and is immediately denied.
-        // Non-ASCII bytes are REDACTED from the DenyReason value to avoid
-        // leaking potentially sensitive data in error/audit envelopes.
-        // The ASCII branch still echoes the value (all bytes are printable ASCII).
-        if !resolved.bytes().all(|b| b.is_ascii()) {
-            return Ok(Some(DenyReason::CounterpartyDenied {
+        fn deny(value: impl Into<String>) -> Result<Option<DenyReason>, PolicyError> {
+            Ok(Some(DenyReason::CounterpartyDenied {
                 kind: "HOME_DOMAIN".to_owned(),
-                value: "<non-ascii-redacted>".to_owned(),
-            }));
+                value: value.into(),
+            }))
         }
 
-        // Case-insensitive ASCII comparison per RFC 4343.
-        // Lowercase the resolved home_domain before comparing so that on-chain
-        // entries like "Circle.com" correctly match the allowlist entry "circle.com".
-        // The homoglyph defence is not relaxed: Cyrillic lookalikes have already
-        // been rejected by the non-ASCII check above; only ASCII-lowercase
-        // normalisation is applied here.
+        // Step 1: retrieve the (self-asserted) home_domain from the identity
+        // view. AccountIdentityView has no default home_domain()
+        // implementation, so forgetting to implement it at the dispatch site
+        // is a compile error.
+        let Some(identity) = ctx.identity_view else {
+            return deny(String::new());
+        };
+        let Some(resolved) = identity.home_domain() else {
+            return deny(String::new());
+        };
+
+        // Step 2: strict-ASCII enforcement — the homoglyph defence. If the
+        // resolved home_domain contains non-ASCII bytes (e.g. Cyrillic
+        // lookalikes, digit substitutions encoded outside the ASCII range),
+        // the domain cannot satisfy any allowlist entry and is immediately
+        // denied. Non-ASCII bytes are REDACTED from the value to avoid leaking
+        // potentially sensitive data in error/audit envelopes.
+        if !resolved.bytes().all(|b| b.is_ascii()) {
+            return deny("<non-ascii-redacted>");
+        }
+
+        // Case-insensitive ASCII comparison per RFC 4343. Lowercase the
+        // resolved home_domain so that on-chain entries like "Circle.com"
+        // correctly match a "circle.com" allowlist/cache entry. The homoglyph
+        // defence is not relaxed: Cyrillic lookalikes were already rejected
+        // above; only ASCII-lowercase normalisation is applied here.
         let resolved_lower = resolved.to_ascii_lowercase();
+
+        // Step 3: domain verification. `has_resolved` proves the wallet
+        // operator independently fetched a real stellar.toml at this domain —
+        // it does NOT (by itself) prove this specific account belongs to it,
+        // since the cache is keyed by domain alone.
+        let cache = match ctx.counterparty_cache {
+            Some(c) => c,
+            None => {
+                return deny(format!(
+                    "{resolved_lower}: not verified (counterparty cache not populated)"
+                ));
+            }
+        };
+        if !cache.has_resolved(&resolved_lower) {
+            return deny(format!(
+                "{resolved_lower}: not verified (domain not resolved in counterparty cache; \
+                 run `stellar-agent counterparty refresh {resolved_lower}`)"
+            ));
+        }
+
+        // Step 4: account-listing verification — the bidirectional half of
+        // the proof. Closes the gap step 3 alone would leave open: without
+        // this, any account could self-assert an ALREADY-cached, legitimate
+        // operator's home_domain and pass, since has_resolved does not
+        // distinguish which account a resolved domain belongs to.
+        if !cache.is_account_listed(&resolved_lower, identity.account_id()) {
+            return deny(format!(
+                "{resolved_lower}: not verified (account not listed by domain's stellar.toml)"
+            ));
+        }
+
+        // Step 5: only a VERIFIED domain is checked against the operator's
+        // allowlist. A verified-but-non-allowlisted domain still denies, with
+        // a distinct value text from every unverified-domain deny above.
         if !self.allowlist.iter().any(|entry| entry == &resolved_lower) {
-            return Ok(Some(DenyReason::CounterpartyDenied {
-                kind: "HOME_DOMAIN".to_owned(),
-                value: resolved_lower,
-            }));
+            return deny(resolved_lower);
         }
 
         Ok(None)
@@ -968,7 +1027,8 @@ mod tests {
     }
 
     /// Constructs an [`EvalContext`] with a `MockIdentityView` set on
-    /// `identity_view`.
+    /// `identity_view` and NO `counterparty_cache` (the attacker shape: a
+    /// self-asserted `home_domain` with no independent verification).
     fn make_ctx_with_identity<'a>(
         tool: &'a ToolDescriptor,
         profile: &'a Profile,
@@ -993,8 +1053,66 @@ mod tests {
         }
     }
 
+    /// A minimal [`crate::policy::v1::CounterpartyCacheView`] for HOME_DOMAIN
+    /// verification tests. `resolved` is `Some((domain, listed_account))` when
+    /// exactly one domain is cached as resolved, with exactly one account
+    /// listed in that domain's `ACCOUNTS`. `None` simulates a cache with no
+    /// bindings at all — distinct from `ctx.counterparty_cache` itself being
+    /// `None` (cache not populated vs. cache populated but empty).
+    struct MockCacheView {
+        resolved: Option<(&'static str, &'static str)>,
+    }
+
+    impl crate::policy::v1::CounterpartyCacheView for MockCacheView {
+        fn has_resolved(&self, home_domain: &str) -> bool {
+            self.resolved.is_some_and(|(d, _)| d == home_domain)
+        }
+
+        fn is_account_listed(&self, home_domain: &str, account_id: &str) -> bool {
+            self.resolved
+                .is_some_and(|(d, a)| d == home_domain && a == account_id)
+        }
+    }
+
+    /// Constructs an [`EvalContext`] with a `MockIdentityView` on
+    /// `identity_view` and a `MockCacheView` on `counterparty_cache`.
+    fn make_ctx_with_identity_and_cache<'a>(
+        tool: &'a ToolDescriptor,
+        profile: &'a Profile,
+        args: &'a serde_json::Value,
+        store: &'a PolicyStateStore,
+        identity: &'a dyn crate::policy::v1::AccountIdentityView,
+        cache: &'a dyn crate::policy::v1::CounterpartyCacheView,
+    ) -> EvalContext<'a> {
+        EvalContext {
+            tool,
+            args,
+            profile_name: "alice",
+            profile,
+            value: crate::policy::v1::value::derive_value_class(tool.name.as_str(), args),
+            account_view: None,
+            identity_view: Some(identity),
+            quorum: None,
+            counterparty_cache: Some(cache),
+            sep10_sessions: None,
+            sep45_sessions: None,
+            state_store: store,
+            bundle: None,
+        }
+    }
+
+    /// The account_id `MockIdentityView::account_id()` returns; shared by
+    /// every HOME_DOMAIN verification test so `MockCacheView::resolved`'s
+    /// account half lines up with it.
+    const IDENTITY_ACCOUNT_ID: &str = "GABC123456789012345678901234567890123456789012345678901234";
+
+    /// Self-asserted `home_domain` with NO counterparty cache at all (the
+    /// attacker shape: any account can set `home_domain` via `SetOptions`
+    /// with zero independent verification). Must deny even though the
+    /// asserted domain is on the operator's allowlist — matching the domain
+    /// on-chain proves nothing without cache verification.
     #[test]
-    fn home_domain_in_allowlist_passes() {
+    fn home_domain_self_asserted_only_with_no_cache_denies() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1008,34 +1126,170 @@ mod tests {
         let args = json!({ "destination": G_ALLOWED });
         let ctx = make_ctx_with_identity(&tool, &profile, &args, &store, &view);
         let result = criterion.evaluate(&ctx).unwrap();
-        assert!(
-            result.is_none(),
-            "home_domain on allowlist should pass; got {result:?}"
-        );
+        match result {
+            Some(DenyReason::CounterpartyDenied {
+                ref kind,
+                ref value,
+            }) => {
+                assert_eq!(kind, "HOME_DOMAIN");
+                assert!(
+                    value.contains("not verified") && value.contains("cache not populated"),
+                    "a self-asserted-only domain (no cache) must deny as unverified, \
+                     not as merely off-allowlist; got value: {value}"
+                );
+            }
+            other => panic!("self-asserted home_domain with no cache must deny; got {other:?}"),
+        }
     }
 
+    /// Cache-verified AND allowlisted domain passes: the domain is resolved
+    /// in the counterparty cache, the counterparty account is listed in that
+    /// domain's `ACCOUNTS`, and the domain is on the operator's allowlist.
     #[test]
-    fn home_domain_not_in_allowlist_denies() {
+    fn home_domain_cache_verified_and_allowlisted_passes() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
-        let view = MockIdentityView {
-            home_domain: Some("evil.com"),
+        let identity = MockIdentityView {
+            home_domain: Some("circle.com"),
+        };
+        let cache = MockCacheView {
+            resolved: Some(("circle.com", IDENTITY_ACCOUNT_ID)),
         };
         let criterion = CounterpartyAllowlistCriterion::new(
             vec![CounterpartyKind::HomeDomain],
             vec!["circle.com".to_owned()],
         );
         let args = json!({ "destination": G_ALLOWED });
-        let ctx = make_ctx_with_identity(&tool, &profile, &args, &store, &view);
+        let ctx =
+            make_ctx_with_identity_and_cache(&tool, &profile, &args, &store, &identity, &cache);
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
-            matches!(
-                result,
-                Some(DenyReason::CounterpartyDenied { ref kind, .. }) if kind == "HOME_DOMAIN"
-            ),
-            "home_domain not on allowlist should be denied; got {result:?}"
+            result.is_none(),
+            "cache-verified, allowlisted home_domain should pass; got {result:?}"
         );
+    }
+
+    /// Cache-verified but NOT allowlisted domain denies, with a deny `value`
+    /// distinguishable from an unverified-domain deny (the operator can tell
+    /// "verified but not on our allowlist" from "not verified at all").
+    #[test]
+    fn home_domain_cache_verified_but_not_allowlisted_denies() {
+        let tool = make_tool("stellar_pay");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let identity = MockIdentityView {
+            home_domain: Some("legitimate-but-unlisted.example"),
+        };
+        let cache = MockCacheView {
+            resolved: Some(("legitimate-but-unlisted.example", IDENTITY_ACCOUNT_ID)),
+        };
+        let criterion = CounterpartyAllowlistCriterion::new(
+            vec![CounterpartyKind::HomeDomain],
+            vec!["circle.com".to_owned()], // does NOT include the resolved domain
+        );
+        let args = json!({ "destination": G_ALLOWED });
+        let ctx =
+            make_ctx_with_identity_and_cache(&tool, &profile, &args, &store, &identity, &cache);
+        let result = criterion.evaluate(&ctx).unwrap();
+        match result {
+            Some(DenyReason::CounterpartyDenied {
+                ref kind,
+                ref value,
+            }) => {
+                assert_eq!(kind, "HOME_DOMAIN");
+                assert!(
+                    !value.contains("not verified"),
+                    "a fully-verified-but-unlisted domain must NOT be denied as \
+                     unverified; got value: {value}"
+                );
+                assert_eq!(
+                    value, "legitimate-but-unlisted.example",
+                    "not-allowlisted deny must echo the verified domain, matching the \
+                     pre-existing (non-verification) deny shape"
+                );
+            }
+            other => panic!("verified-but-unlisted domain must deny; got {other:?}"),
+        }
+    }
+
+    /// Cache absent entirely (`ctx.counterparty_cache = None`) denies as
+    /// unverified, distinct from a populated-but-empty/miss cache.
+    #[test]
+    fn home_domain_cache_absent_denies() {
+        let tool = make_tool("stellar_pay");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let view = MockIdentityView {
+            home_domain: Some("circle.com"),
+        };
+        let criterion = CounterpartyAllowlistCriterion::new(
+            vec![CounterpartyKind::HomeDomain],
+            vec!["circle.com".to_owned()],
+        );
+        let args = json!({ "destination": G_ALLOWED });
+        // make_ctx_with_identity sets counterparty_cache = None.
+        let ctx = make_ctx_with_identity(&tool, &profile, &args, &store, &view);
+        let result = criterion.evaluate(&ctx).unwrap();
+        match result {
+            Some(DenyReason::CounterpartyDenied {
+                ref kind,
+                ref value,
+            }) => {
+                assert_eq!(kind, "HOME_DOMAIN");
+                assert!(
+                    value.contains("cache not populated"),
+                    "absent cache must deny with a cache-not-populated detail; got: {value}"
+                );
+            }
+            other => panic!("absent counterparty_cache must deny; got {other:?}"),
+        }
+    }
+
+    /// The domain is genuinely resolved in the cache (a REAL, independently
+    /// fetched stellar.toml exists at that domain) but the counterparty
+    /// account is NOT in that domain's `ACCOUNTS` list. This is the core
+    /// anti-spoofing case #49 closes: an attacker account cannot borrow an
+    /// already-cached, legitimate operator's `home_domain` string.
+    #[test]
+    fn home_domain_resolved_but_account_not_listed_denies() {
+        let tool = make_tool("stellar_pay");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let identity = MockIdentityView {
+            home_domain: Some("circle.com"),
+        };
+        let cache = MockCacheView {
+            // circle.com IS resolved, but its ACCOUNTS list names a DIFFERENT
+            // account than the one this call's identity_view carries.
+            resolved: Some((
+                "circle.com",
+                "GDIFFERENTACCOUNTNOTLISTEDBYTHISDOMAIN1234567890AB",
+            )),
+        };
+        let criterion = CounterpartyAllowlistCriterion::new(
+            vec![CounterpartyKind::HomeDomain],
+            vec!["circle.com".to_owned()],
+        );
+        let args = json!({ "destination": G_ALLOWED });
+        let ctx =
+            make_ctx_with_identity_and_cache(&tool, &profile, &args, &store, &identity, &cache);
+        let result = criterion.evaluate(&ctx).unwrap();
+        match result {
+            Some(DenyReason::CounterpartyDenied {
+                ref kind,
+                ref value,
+            }) => {
+                assert_eq!(kind, "HOME_DOMAIN");
+                assert!(
+                    value.contains("account not listed"),
+                    "a resolved domain whose ACCOUNTS list omits this account must deny \
+                     as account-not-listed, not silently pass on domain-resolution alone; \
+                     got value: {value}"
+                );
+            }
+            other => panic!("resolved domain with unlisted account must deny; got {other:?}"),
+        }
     }
 
     /// Digit-1 substitution homoglyph: `circ1e.com` (ASCII, digit '1' in place
@@ -1048,23 +1302,38 @@ mod tests {
         let profile = make_profile();
         let store = PolicyStateStore::new();
         // Digit '1' in position 4: "circ1e.com" vs allowlist "circle.com".
+        // The cache resolves and lists the lookalike domain, so evaluation
+        // reaches the allowlist byte-equality comparison itself — the deny
+        // must come from byte-inequality, not from an unverified-cache
+        // shortcut, or this test would keep passing if the comparison were
+        // ever loosened to a fuzzy match.
         let view = MockIdentityView {
             home_domain: Some("circ1e.com"),
+        };
+        let cache = MockCacheView {
+            resolved: Some(("circ1e.com", IDENTITY_ACCOUNT_ID)),
         };
         let criterion = CounterpartyAllowlistCriterion::new(
             vec![CounterpartyKind::HomeDomain],
             vec!["circle.com".to_owned()],
         );
         let args = json!({ "destination": G_ALLOWED });
-        let ctx = make_ctx_with_identity(&tool, &profile, &args, &store, &view);
+        let ctx = make_ctx_with_identity_and_cache(&tool, &profile, &args, &store, &view, &cache);
         let result = criterion.evaluate(&ctx).unwrap();
-        assert!(
-            matches!(
-                result,
-                Some(DenyReason::CounterpartyDenied { ref kind, .. }) if kind == "HOME_DOMAIN"
-            ),
-            "digit-1 homoglyph 'circ1e.com' must be denied; got {result:?}"
-        );
+        match result {
+            Some(DenyReason::CounterpartyDenied {
+                ref kind,
+                ref value,
+            }) => {
+                assert_eq!(kind, "HOME_DOMAIN");
+                assert_eq!(
+                    value, "circ1e.com",
+                    "the deny must come from allowlist byte-inequality (bare \
+                     domain value), not a cache-verification shortcut"
+                );
+            }
+            other => panic!("digit-1 homoglyph 'circ1e.com' must be denied; got {other:?}"),
+        }
     }
 
     /// Cyrillic homoglyph: the resolved `home_domain` contains non-ASCII bytes
@@ -1113,15 +1382,21 @@ mod tests {
         let store = PolicyStateStore::new();
         // On-chain AccountEntry.home_domain = "Circle.com" (mixed case).
         // Allowlist entry = "circle.com" (lowercase, as required by loader).
-        let view = MockIdentityView {
+        // The cache is keyed by the LOWERCASED form, matching what the
+        // criterion queries after ASCII-lowercase normalisation.
+        let identity = MockIdentityView {
             home_domain: Some("Circle.com"),
+        };
+        let cache = MockCacheView {
+            resolved: Some(("circle.com", IDENTITY_ACCOUNT_ID)),
         };
         let criterion = CounterpartyAllowlistCriterion::new(
             vec![CounterpartyKind::HomeDomain],
             vec!["circle.com".to_owned()],
         );
         let args = json!({ "destination": G_ALLOWED });
-        let ctx = make_ctx_with_identity(&tool, &profile, &args, &store, &view);
+        let ctx =
+            make_ctx_with_identity_and_cache(&tool, &profile, &args, &store, &identity, &cache);
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
             result.is_none(),

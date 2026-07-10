@@ -2072,6 +2072,7 @@ mod tests {
                 now,
                 now + std::time::Duration::from_secs(3600),
                 false,
+                vec![],
             )])
         }
     }

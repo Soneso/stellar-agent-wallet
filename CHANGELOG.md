@@ -140,6 +140,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-period rule refuses fail-closed rather than silently saturating when a
   call's resulting window total would exceed that bound; single-transaction
   sizing is unaffected. (#20)
+- Breaking (policy file behavior): `counterparty_allowlist`'s `HOME_DOMAIN`
+  kind now requires the destination's on-chain `home_domain` to be
+  independently VERIFIED through the operator's counterparty cache before the
+  allowlist is even consulted — a resolved cache entry for that domain, whose
+  cached `stellar.toml` `ACCOUNTS` list names the counterparty account.
+  Previously a bare self-asserted `home_domain` match sufficed: any account
+  could set `home_domain` to an allowlisted string via `SetOptions` at zero
+  cost and pass. Existing `HOME_DOMAIN` rules now deny until the operator
+  populates the cache for the domains they allowlist — `stellar-agent
+  counterparty warm-up` refreshes every domain already in the policy file's
+  `HOME_DOMAIN` allowlists in one pass; `stellar-agent counterparty refresh
+  <domain>` refreshes one domain. `G_ACCOUNT` / `C_ACCOUNT` / `KNOWN_ISSUER`
+  are unaffected. `CounterpartyCacheView` gains `is_account_listed`
+  (default `false`, fail-closed) and `StellarTomlBinding` gains an `accounts`
+  field carrying the cached `stellar.toml`'s `ACCOUNTS` G-strkeys. (#49)
 
 ### Removed
 
@@ -156,6 +171,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- MCP `stellar_pay_commit`, `stellar_claim_commit`, and
+  `stellar_create_account_commit` now supply the source account (and, for
+  `stellar_pay_commit`, the destination) as the policy gate's
+  `account_view`/`identity_view` — mirroring `stellar_trustline_commit` — so a
+  `minimum_reserve` criterion configured on these verbs is actually evaluated
+  at commit instead of failing closed on every call, even when the same rule
+  passed at simulate. The account fetch each commit path already made for the
+  sequence number is reused; no second fetch. `identity_view` stays `None` for
+  `stellar_claim_commit` / `stellar_create_account_commit`, matching their
+  simulate phases. (#48)
+- `ContextRuleManager::check_divergence_for_auth_rule_ids`,
+  `deploy_smart_account` (and its five sibling deploy flows:
+  `deploy_ed25519_verifier`, `deploy_webauthn_verifier`, `deploy_policy`,
+  `deploy_spending_limit_policy`, `deploy_timelock_controller`), and
+  `retry_with_backoff` each now enforce a collective wall-clock budget across
+  their fixed-count multi-stage RPC sequence, instead of leaving each stage
+  bounded only by the transport's own per-call timeout. A `SignersManager`
+  divergence check across up to 50 `auth_rule_ids`, a deploy flow's
+  fetch/simulate/submit/verify sequence, and a blind-backoff retry loop could
+  previously run for up to (stage count) × (transport timeout) with no total
+  cap; each now refuses with a "collective budget elapsed" error once its
+  budget (the manager's/flow's existing configured timeout) is exhausted.
+  `retry_with_backoff` additionally races each attempt against the shared
+  deadline, so one hung attempt cannot overshoot the deadline by the
+  transport's own bound; a deadline cutoff surfaces as the SAME
+  `TransactionSubmissionTimeout` variant the existing poll-timeout path
+  returns and is never retried. (#46)
 - MCP `stellar_trustline` / `stellar_trustline_commit` and CLI `trustline` now
   supply the source account as the policy gate's `account_view` (previously
   `None`), so a `minimum_reserve` criterion configured on `stellar_trustline`

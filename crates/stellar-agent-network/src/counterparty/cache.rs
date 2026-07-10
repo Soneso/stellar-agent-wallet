@@ -363,6 +363,12 @@ impl CounterpartyResolver for StellarTomlResolver {
     ///
     /// Never panics.
     async fn refresh(&self, home_domain: &str) -> Result<StellarTomlBinding, CounterpartyError> {
+        // Normalise to ASCII lowercase before any use: the policy criteria
+        // query the cache with the lowercased on-chain home_domain, so a
+        // mixed-case refresh argument would key an entry the lookup can never
+        // hit and a legitimate counterparty would deny as unverified.
+        let home_domain = &home_domain.to_ascii_lowercase();
+
         // Validate the domain before touching the filesystem.
         crate::counterparty::fetch::validate_home_domain(home_domain)?;
 
@@ -407,8 +413,9 @@ impl CounterpartyResolver for StellarTomlResolver {
             Err(err) => return Err(err),
         };
 
-        // Structural parse (validates TOML and extracts fields).
-        parse_minimal_sep1(&body)?;
+        // Structural parse (validates TOML and extracts fields, including
+        // ACCOUNTS — carried into the binding below).
+        let sep1 = parse_minimal_sep1(&body)?;
 
         // Load (or mint) the HMAC key.
         let hmac_key = load_or_mint_hmac_key(&self.profile_name)?;
@@ -455,6 +462,7 @@ impl CounterpartyResolver for StellarTomlResolver {
             fetched_at,
             expires_at,
             stale: false,
+            accounts: sep1.accounts,
         })
     }
 
@@ -507,7 +515,24 @@ impl CounterpartyResolver for StellarTomlResolver {
             // (e.g. "sub-domain.com") would round-trip incorrectly if
             // recovered from the filename sanitisation.
             match read_and_verify_cache(&path, hmac_key.as_ref()) {
-                Ok((home_domain, _body, file_meta)) => {
+                Ok((home_domain, body, file_meta)) => {
+                    // Re-parse the cached body to recover ACCOUNTS. A body
+                    // that fails to parse here indicates the cache file was
+                    // written by an incompatible format or corrupted in a way
+                    // the HMAC check does not catch bit-for-bit; skip it like
+                    // the other invalid-entry arms rather than trusting a
+                    // domain-only binding with no ACCOUNTS proof.
+                    let accounts = match parse_minimal_sep1(&String::from_utf8_lossy(&body)) {
+                        Ok(sep1) => sep1.accounts,
+                        Err(err) => {
+                            tracing::debug!(
+                                file = %path.file_name().unwrap_or_default().to_string_lossy(),
+                                err = %err,
+                                "counterparty cache body failed SEP-1 re-parse — skipping"
+                            );
+                            continue;
+                        }
+                    };
                     let fetched_at = file_meta;
                     let expires_at = cache_expires_at(fetched_at, self.ttl);
                     bindings.push(StellarTomlBinding {
@@ -515,6 +540,7 @@ impl CounterpartyResolver for StellarTomlResolver {
                         fetched_at,
                         expires_at,
                         stale: false,
+                        accounts,
                     });
                 }
                 Err(CounterpartyError::HmacMismatch) => {
@@ -581,12 +607,13 @@ impl StellarTomlResolver {
         let body_str = String::from_utf8(body).map_err(|_| CounterpartyError::CacheInvalid {
             detail: "cache body is not valid UTF-8".to_owned(),
         })?;
-        parse_minimal_sep1(&body_str)?;
+        let sep1 = parse_minimal_sep1(&body_str)?;
         Ok(Some(StellarTomlBinding {
             home_domain: cached_home_domain,
             fetched_at,
             expires_at: cache_expires_at(fetched_at, self.ttl),
             stale: true,
+            accounts: sep1.accounts,
         }))
     }
 }
@@ -1210,6 +1237,7 @@ pub fn read_cache_entry(
         fetched_at,
         expires_at,
         stale: false,
+        accounts: parsed.accounts.clone(),
     };
 
     Ok(Some((parsed, binding)))

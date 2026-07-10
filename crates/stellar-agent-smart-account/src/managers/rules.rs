@@ -539,6 +539,9 @@ impl ContextRuleManager {
     /// - [`SaError::SignerSetMissingBaseline`] — no baseline row for the rule.
     /// - [`SaError::NetworkRpcDivergence`] — primary and secondary RPC disagree.
     /// - [`SaError::AuditLog`] — audit-log integrity violation.
+    /// - [`SaError::DeploymentFailed`] (`phase = "simulate"`) — the collective
+    ///   wall-clock budget for the whole loop elapsed before every
+    ///   `auth_rule_id` was checked (see `deploy_budget` below).
     async fn check_divergence_for_auth_rule_ids(
         &self,
         smart_account: ScAddress,
@@ -556,6 +559,16 @@ impl ContextRuleManager {
             return Ok(());
         };
 
+        // `auth_rule_ids` is capped at 50 by the caller, but each entry costs
+        // ~2 RPC round-trips (`identify_threshold_policy` + the parallel
+        // primary/secondary `fetch_signer_set`), each individually bounded at
+        // 60s by the transport — with no shared deadline the whole loop could
+        // cost up to 50 x 2 x 60s. Reuses `self.timeout` (the manager's
+        // configured RPC timeout — the flow's existing caller-facing budget),
+        // mirroring `list_active_context_rules`'s `scan_budget` above.
+        let divergence_budget =
+            stellar_agent_core::rpc_budget::SequentialRpcBudget::new(self.timeout);
+
         for rule_id_obj in auth_rule_ids {
             let rule_id = rule_id_obj.as_u32();
 
@@ -569,13 +582,25 @@ impl ContextRuleManager {
                 continue;
             }
 
-            sm.verify_signer_set_against_chain(
-                smart_account.clone(),
-                rule_id,
-                Some(source_account_strkey),
-                request_id.to_owned(),
+            stellar_agent_core::rpc_budget::bound_stage(
+                divergence_budget,
+                "verify_signer_set_against_chain",
+                sm.verify_signer_set_against_chain(
+                    smart_account.clone(),
+                    rule_id,
+                    Some(source_account_strkey),
+                    request_id.to_owned(),
+                ),
             )
             .await
+            .map_err(|elapsed| SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: format!(
+                    "check_divergence_for_auth_rule_ids: collective budget of {}s \
+                     elapsed during {}; the RPC endpoint may be slow or unreachable",
+                    elapsed.total_secs, elapsed.stage
+                ),
+            })?
             .map(|_frozen| ())?;
         }
 

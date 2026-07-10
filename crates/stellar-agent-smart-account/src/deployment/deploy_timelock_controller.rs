@@ -43,6 +43,7 @@
 use std::time::Duration;
 
 use sha2::{Digest as _, Sha256};
+use stellar_agent_core::rpc_budget::{SequentialRpcBudget, bound_stage};
 use stellar_agent_network::{
     StellarRpcClient, fetch_account, signing::envelope_signing::attach_signature,
     submit_transaction_and_wait,
@@ -64,6 +65,7 @@ use tracing::info;
 use crate::SaError;
 use crate::deployment::address::derive_smart_account_address;
 use crate::deployment::deploy::{ResolvedFeePerOp, decode_hex32, redact_wasm_hash, to_hex};
+use crate::deployment::map_budget_elapsed;
 use crate::managers::rules::parse_c_strkey_to_smart_account;
 
 // ── Embedded WASM ─────────────────────────────────────────────────────────────
@@ -261,6 +263,17 @@ async fn deploy_timelock_controller_body(
             redacted_reason: format!("StellarRpcClient construction failed: {e}"),
         })?;
 
+    // One collective wall-clock budget for every RPC stage below (idempotency
+    // check, account fetch, WASM pre-flight, simulate, submit-and-wait). Each
+    // stage is individually bounded at 60s by the transport; without a shared
+    // deadline the flow's total wall time is the SUM of every stage's
+    // transport bound plus the submit-and-wait poll(s), which can exceed
+    // `args.timeout` by several multiples. Reusing `args.timeout` — the
+    // caller's existing polling budget — as the ONE total makes the whole
+    // flow's wall-clock ceiling match what the caller already configured,
+    // rather than each stage re-arming its own allowance.
+    let deploy_budget = SequentialRpcBudget::new(args.timeout);
+
     // Check if the contract instance already exists at the derived address.
     if let Ok(c_strkey) = ContractStrkey::from_string(&derived_address) {
         let contract_sc_address = ScAddress::Contract(ContractId(Hash(c_strkey.0)));
@@ -269,7 +282,12 @@ async fn deploy_timelock_controller_body(
             key: ScVal::LedgerKeyContractInstance,
             durability: ContractDataDurability::Persistent,
         });
-        if let Ok(resp) = rpc_server.get_ledger_entries(&[instance_key]).await
+        if let Ok(Ok(resp)) = bound_stage(
+            deploy_budget,
+            "idempotency_get_ledger_entries",
+            rpc_server.get_ledger_entries(&[instance_key]),
+        )
+        .await
             && resp.entries.as_ref().is_some_and(|e| !e.is_empty())
         {
             info!(
@@ -290,12 +308,17 @@ async fn deploy_timelock_controller_body(
     }
 
     // ── Step 6: Fetch deployer account sequence ───────────────────────────────
-    let deployer_view = fetch_account(&network_client, &deployer_pubkey, &[])
-        .await
-        .map_err(|e| SaError::DeploymentFailed {
-            phase: "build",
-            redacted_reason: format!("deployer account fetch failed: {e}"),
-        })?;
+    let deployer_view = bound_stage(
+        deploy_budget,
+        "fetch_deployer_account",
+        fetch_account(&network_client, &deployer_pubkey, &[]),
+    )
+    .await
+    .map_err(|elapsed| map_budget_elapsed(elapsed, "build"))?
+    .map_err(|e| SaError::DeploymentFailed {
+        phase: "build",
+        redacted_reason: format!("deployer account fetch failed: {e}"),
+    })?;
 
     let mut deployer_account =
         BaselibAccount::new(&deployer_pubkey, &deployer_view.sequence_number.to_string()).map_err(
@@ -312,13 +335,17 @@ async fn deploy_timelock_controller_body(
         hash: Hash(wasm_hash_bytes),
     });
 
-    let wasm_query_resp = rpc_server
-        .get_ledger_entries(&[wasm_key])
-        .await
-        .map_err(|e| SaError::DeploymentFailed {
-            phase: "build",
-            redacted_reason: format!("getLedgerEntries (wasm pre-flight) failed: {e}"),
-        })?;
+    let wasm_query_resp = bound_stage(
+        deploy_budget,
+        "wasm_preflight_get_ledger_entries",
+        rpc_server.get_ledger_entries(&[wasm_key]),
+    )
+    .await
+    .map_err(|elapsed| map_budget_elapsed(elapsed, "build"))?
+    .map_err(|e| SaError::DeploymentFailed {
+        phase: "build",
+        redacted_reason: format!("getLedgerEntries (wasm pre-flight) failed: {e}"),
+    })?;
 
     let wasm_already_on_chain = wasm_query_resp
         .entries
@@ -359,13 +386,17 @@ async fn deploy_timelock_controller_body(
                 phase: "build",
                 redacted_reason: format!("upload to_envelope (pre-sim) failed: {e}"),
             })?;
-        let upload_sim = rpc_server
-            .simulate_transaction_envelope(&upload_envelope, None)
-            .await
-            .map_err(|e| SaError::DeploymentFailed {
-                phase: "simulate",
-                redacted_reason: format!("upload simulate_transaction_envelope failed: {e}"),
-            })?;
+        let upload_sim = bound_stage(
+            deploy_budget,
+            "upload_simulate",
+            rpc_server.simulate_transaction_envelope(&upload_envelope, None),
+        )
+        .await
+        .map_err(|elapsed| map_budget_elapsed(elapsed, "simulate"))?
+        .map_err(|e| SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason: format!("upload simulate_transaction_envelope failed: {e}"),
+        })?;
 
         if let Some(sim_error) = &upload_sim.error {
             return Err(SaError::DeploymentFailed {
@@ -420,14 +451,19 @@ async fn deploy_timelock_controller_body(
             redacted_reason: format!("upload signing failed: {e}"),
         })?;
 
-        let upload_submission = submit_transaction_and_wait(
-            &network_client,
-            &signed_upload_xdr,
-            args.timeout,
-            &args.network_passphrase,
-            None,
+        let upload_submission = bound_stage(
+            deploy_budget,
+            "upload_submit_and_wait",
+            submit_transaction_and_wait(
+                &network_client,
+                &signed_upload_xdr,
+                args.timeout,
+                &args.network_passphrase,
+                None,
+            ),
         )
         .await
+        .map_err(|elapsed| map_budget_elapsed(elapsed, "upload"))?
         .map_err(|e| SaError::DeploymentFailed {
             phase: "upload",
             redacted_reason: format!("upload submission failed: {e}"),
@@ -440,12 +476,17 @@ async fn deploy_timelock_controller_body(
         );
 
         // Re-fetch deployer sequence after the upload transaction.
-        let deployer_view2 = fetch_account(&network_client, &deployer_pubkey, &[])
-            .await
-            .map_err(|e| SaError::DeploymentFailed {
-                phase: "build",
-                redacted_reason: format!("deployer account re-fetch after upload failed: {e}"),
-            })?;
+        let deployer_view2 = bound_stage(
+            deploy_budget,
+            "fetch_deployer_account_post_upload",
+            fetch_account(&network_client, &deployer_pubkey, &[]),
+        )
+        .await
+        .map_err(|elapsed| map_budget_elapsed(elapsed, "build"))?
+        .map_err(|e| SaError::DeploymentFailed {
+            phase: "build",
+            redacted_reason: format!("deployer account re-fetch after upload failed: {e}"),
+        })?;
         deployer_account = BaselibAccount::new(
             &deployer_pubkey,
             &deployer_view2.sequence_number.to_string(),
@@ -601,13 +642,17 @@ async fn deploy_timelock_controller_body(
         phase: "build",
         redacted_reason: format!("deploy to_envelope (pre-sim) failed: {e}"),
     })?;
-    let sim_response = rpc_server
-        .simulate_transaction_envelope(&deploy_envelope_pre, None)
-        .await
-        .map_err(|e| SaError::DeploymentFailed {
-            phase: "simulate",
-            redacted_reason: format!("deploy simulate_transaction_envelope failed: {e}"),
-        })?;
+    let sim_response = bound_stage(
+        deploy_budget,
+        "deploy_simulate",
+        rpc_server.simulate_transaction_envelope(&deploy_envelope_pre, None),
+    )
+    .await
+    .map_err(|elapsed| map_budget_elapsed(elapsed, "simulate"))?
+    .map_err(|e| SaError::DeploymentFailed {
+        phase: "simulate",
+        redacted_reason: format!("deploy simulate_transaction_envelope failed: {e}"),
+    })?;
 
     if let Some(sim_error) = &sim_response.error {
         return Err(SaError::DeploymentFailed {
@@ -692,14 +737,19 @@ async fn deploy_timelock_controller_body(
         "deploy_timelock_controller: submitting deploy transaction"
     );
 
-    let submission = submit_transaction_and_wait(
-        &network_client,
-        &signed_xdr,
-        args.timeout,
-        &args.network_passphrase,
-        None,
+    let submission = bound_stage(
+        deploy_budget,
+        "deploy_submit_and_wait",
+        submit_transaction_and_wait(
+            &network_client,
+            &signed_xdr,
+            args.timeout,
+            &args.network_passphrase,
+            None,
+        ),
     )
     .await
+    .map_err(|elapsed| map_budget_elapsed(elapsed, "deploy"))?
     .map_err(|e| SaError::DeploymentFailed {
         phase: "deploy",
         redacted_reason: format!("deploy submission failed: {e}"),

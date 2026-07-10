@@ -2,7 +2,7 @@
   "test_kind": "evaluate",
   "name": "legitimate_circle_allow",
   "category": "counterparty_lookalike",
-  "description": "HOME_DOMAIN allowlist = ['circle.com']. Resolved domain = 'circle.com' (exact ASCII match). Expect Allow.",
+  "description": "HOME_DOMAIN allowlist = ['circle.com']. Resolved domain = 'circle.com' (exact ASCII match), verified via counterparty cache (#49). Expect Allow.",
   "tool": {
     "name": "stellar_pay",
     "destructive_hint": true,
@@ -17,6 +17,7 @@
   },
   "profile_name": "default",
   "mock_home_domain": "circle.com",
+  "mock_resolved_domains": ["circle.com"],
   "expected": {
     "kind": "Allow"
   }

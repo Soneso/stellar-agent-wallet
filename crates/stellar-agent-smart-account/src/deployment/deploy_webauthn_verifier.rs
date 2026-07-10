@@ -50,6 +50,7 @@ use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::SaInvocationResult;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::error::{SubmissionError, WalletError};
+use stellar_agent_core::rpc_budget::{SequentialRpcBudget, bound_stage};
 use stellar_agent_network::{
     StellarRpcClient, fetch_account, signing::envelope_signing::attach_signature,
     submit_transaction_and_wait,
@@ -74,6 +75,7 @@ use crate::deployment::deploy::{
     ResolvedFeePerOp, caip2_chain_id_for_passphrase, decode_hex32, redact_wasm_hash, to_hex,
     uuid_v4_hex, verify_post_deploy_wasm_hash,
 };
+use crate::deployment::map_budget_elapsed;
 use crate::verifiers::VerifierRegistry;
 use crate::webauthn_verifier::{WEBAUTHN_VERIFIER_WASM, WEBAUTHN_VERIFIER_WASM_SHA256};
 
@@ -336,12 +338,27 @@ async fn deploy_webauthn_verifier_body(
         })?;
 
     // ── Step 7: Fetch deployer account sequence ───────────────────────────────
-    let deployer_view = fetch_account(&network_client, &deployer_pubkey, &[])
-        .await
-        .map_err(|e| SaError::DeploymentFailed {
-            phase: "build",
-            redacted_reason: format!("deployer account fetch failed: {e}"),
-        })?;
+    // One collective wall-clock budget for every RPC stage below.
+    // Each stage is individually bounded at 60s by the transport; without
+    // a shared deadline the flow's total wall time is the SUM of every
+    // stage's transport bound plus the submit-and-wait poll(s), which can
+    // exceed `args.timeout` by several multiples. Reusing `args.timeout` —
+    // the caller's existing polling budget — as the ONE total makes the
+    // whole flow's wall-clock ceiling match what the caller already
+    // configured, rather than each stage re-arming its own allowance.
+    let deploy_budget = SequentialRpcBudget::new(args.timeout);
+
+    let deployer_view = bound_stage(
+        deploy_budget,
+        "fetch_deployer_account",
+        fetch_account(&network_client, &deployer_pubkey, &[]),
+    )
+    .await
+    .map_err(|elapsed| map_budget_elapsed(elapsed, "build"))?
+    .map_err(|e| SaError::DeploymentFailed {
+        phase: "build",
+        redacted_reason: format!("deployer account fetch failed: {e}"),
+    })?;
 
     let mut deployer_account =
         BaselibAccount::new(&deployer_pubkey, &deployer_view.sequence_number.to_string()).map_err(
@@ -358,13 +375,17 @@ async fn deploy_webauthn_verifier_body(
         hash: Hash(wasm_hash_bytes),
     });
 
-    let wasm_query_resp = rpc_server
-        .get_ledger_entries(&[wasm_key])
-        .await
-        .map_err(|e| SaError::DeploymentFailed {
-            phase: "build",
-            redacted_reason: format!("getLedgerEntries (wasm pre-flight) failed: {e}"),
-        })?;
+    let wasm_query_resp = bound_stage(
+        deploy_budget,
+        "wasm_preflight_get_ledger_entries",
+        rpc_server.get_ledger_entries(&[wasm_key]),
+    )
+    .await
+    .map_err(|elapsed| map_budget_elapsed(elapsed, "build"))?
+    .map_err(|e| SaError::DeploymentFailed {
+        phase: "build",
+        redacted_reason: format!("getLedgerEntries (wasm pre-flight) failed: {e}"),
+    })?;
 
     let wasm_already_on_chain = match wasm_query_resp.entries.as_ref() {
         Some(entries) => !entries.is_empty(),
@@ -412,13 +433,17 @@ async fn deploy_webauthn_verifier_body(
                 phase: "build",
                 redacted_reason: format!("upload to_envelope (pre-sim) failed: {e}"),
             })?;
-        let upload_sim = rpc_server
-            .simulate_transaction_envelope(&upload_envelope, None)
-            .await
-            .map_err(|e| SaError::DeploymentFailed {
-                phase: "simulate",
-                redacted_reason: format!("upload simulate_transaction_envelope failed: {e}"),
-            })?;
+        let upload_sim = bound_stage(
+            deploy_budget,
+            "upload_simulate",
+            rpc_server.simulate_transaction_envelope(&upload_envelope, None),
+        )
+        .await
+        .map_err(|elapsed| map_budget_elapsed(elapsed, "simulate"))?
+        .map_err(|e| SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason: format!("upload simulate_transaction_envelope failed: {e}"),
+        })?;
 
         if let Some(sim_error) = &upload_sim.error {
             return Err(SaError::DeploymentFailed {
@@ -472,14 +497,19 @@ async fn deploy_webauthn_verifier_body(
             redacted_reason: format!("upload signing failed: {e}"),
         })?;
 
-        let upload_submission = submit_transaction_and_wait(
-            &network_client,
-            &signed_upload_xdr,
-            args.timeout,
-            &args.network_passphrase,
-            None,
+        let upload_submission = bound_stage(
+            deploy_budget,
+            "upload_submit_and_wait",
+            submit_transaction_and_wait(
+                &network_client,
+                &signed_upload_xdr,
+                args.timeout,
+                &args.network_passphrase,
+                None,
+            ),
         )
         .await
+        .map_err(|elapsed| map_budget_elapsed(elapsed, "upload"))?
         .map_err(|e| {
             let reason = e.to_string();
             let phase = match &e {
@@ -501,12 +531,17 @@ async fn deploy_webauthn_verifier_body(
         );
 
         // Re-fetch deployer sequence number after the upload transaction.
-        let deployer_view2 = fetch_account(&network_client, &deployer_pubkey, &[])
-            .await
-            .map_err(|e| SaError::DeploymentFailed {
-                phase: "build",
-                redacted_reason: format!("deployer account re-fetch after upload failed: {e}"),
-            })?;
+        let deployer_view2 = bound_stage(
+            deploy_budget,
+            "fetch_deployer_account_post_upload",
+            fetch_account(&network_client, &deployer_pubkey, &[]),
+        )
+        .await
+        .map_err(|elapsed| map_budget_elapsed(elapsed, "build"))?
+        .map_err(|e| SaError::DeploymentFailed {
+            phase: "build",
+            redacted_reason: format!("deployer account re-fetch after upload failed: {e}"),
+        })?;
         deployer_account = BaselibAccount::new(
             &deployer_pubkey,
             &deployer_view2.sequence_number.to_string(),
@@ -569,13 +604,17 @@ async fn deploy_webauthn_verifier_body(
         phase: "build",
         redacted_reason: format!("deploy to_envelope (pre-sim) failed: {e}"),
     })?;
-    let sim_response = rpc_server
-        .simulate_transaction_envelope(&deploy_envelope_pre, None)
-        .await
-        .map_err(|e| SaError::DeploymentFailed {
-            phase: "simulate",
-            redacted_reason: format!("deploy simulate_transaction_envelope failed: {e}"),
-        })?;
+    let sim_response = bound_stage(
+        deploy_budget,
+        "deploy_simulate",
+        rpc_server.simulate_transaction_envelope(&deploy_envelope_pre, None),
+    )
+    .await
+    .map_err(|elapsed| map_budget_elapsed(elapsed, "simulate"))?
+    .map_err(|e| SaError::DeploymentFailed {
+        phase: "simulate",
+        redacted_reason: format!("deploy simulate_transaction_envelope failed: {e}"),
+    })?;
 
     if let Some(sim_error) = &sim_response.error {
         return Err(SaError::DeploymentFailed {
@@ -659,14 +698,19 @@ async fn deploy_webauthn_verifier_body(
         "deploy_webauthn_verifier: submitting deploy transaction"
     );
 
-    let submission = submit_transaction_and_wait(
-        &network_client,
-        &signed_xdr,
-        args.timeout,
-        &args.network_passphrase,
-        None,
+    let submission = bound_stage(
+        deploy_budget,
+        "deploy_submit_and_wait",
+        submit_transaction_and_wait(
+            &network_client,
+            &signed_xdr,
+            args.timeout,
+            &args.network_passphrase,
+            None,
+        ),
     )
     .await
+    .map_err(|elapsed| map_budget_elapsed(elapsed, "deploy"))?
     .map_err(|e| {
         let reason = e.to_string();
         let phase = match &e {
@@ -694,13 +738,17 @@ async fn deploy_webauthn_verifier_body(
         durability: ContractDataDurability::Persistent,
     });
 
-    let post_deploy_resp = rpc_server
-        .get_ledger_entries(&[instance_key])
-        .await
-        .map_err(|e| SaError::DeploymentFailed {
-            phase: "post_deploy_verification",
-            redacted_reason: format!("getLedgerEntries (post-deploy verify) failed: {e}"),
-        })?;
+    let post_deploy_resp = bound_stage(
+        deploy_budget,
+        "post_deploy_get_ledger_entries",
+        rpc_server.get_ledger_entries(&[instance_key]),
+    )
+    .await
+    .map_err(|elapsed| map_budget_elapsed(elapsed, "post_deploy_verification"))?
+    .map_err(|e| SaError::DeploymentFailed {
+        phase: "post_deploy_verification",
+        redacted_reason: format!("getLedgerEntries (post-deploy verify) failed: {e}"),
+    })?;
 
     let entries = post_deploy_resp.entries.unwrap_or_default();
     let entry = entries.first().ok_or_else(|| SaError::DeploymentFailed {

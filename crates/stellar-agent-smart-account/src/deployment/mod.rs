@@ -64,6 +64,35 @@ pub use deploy_webauthn_verifier::{
     WebAuthnVerifierDeployArgs, WebAuthnVerifierDeployResult, deploy_webauthn_verifier,
 };
 
+/// Maps a [`stellar_agent_core::rpc_budget::SequentialRpcBudgetElapsed`] to
+/// `SaError::DeploymentFailed` for the given `phase`.
+///
+/// Every deploy flow (`deploy_smart_account`, `deploy_ed25519_verifier`,
+/// `deploy_webauthn_verifier`, `deploy_policy`, `deploy_spending_limit_policy`,
+/// `deploy_timelock_controller`) shares ONE collective wall-clock budget
+/// across its sequential RPC stages (fetch account, WASM pre-flight,
+/// simulate, submit-and-wait, post-deploy verification); this helper maps
+/// the shared budget's timeout to the SAME `DeploymentFailed { phase }` the
+/// call site already returns for other failures at that stage, so a budget
+/// timeout classifies identically to any other failure there (see
+/// `map_sa_invocation_result`). `phase` MUST be one of `ALL_EMITTED_PHASES`.
+pub(crate) fn map_budget_elapsed(
+    elapsed: stellar_agent_core::rpc_budget::SequentialRpcBudgetElapsed,
+    phase: &'static str,
+) -> crate::SaError {
+    crate::SaError::DeploymentFailed {
+        phase,
+        redacted_reason: format!(
+            "collective deployment budget of {}s elapsed during \"{}\"; \
+             the RPC endpoint may be slow or unreachable. A cutoff during a \
+             submit stage does not undo a transaction that was already \
+             broadcast — check the deployer account's recent operations \
+             before re-running",
+            elapsed.total_secs, elapsed.stage
+        ),
+    }
+}
+
 /// Canonical inventory of every `SaError::DeploymentFailed::phase` literal
 /// emitted from the `deployment/` module substance code.
 ///

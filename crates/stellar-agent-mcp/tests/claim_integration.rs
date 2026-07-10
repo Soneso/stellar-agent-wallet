@@ -151,6 +151,32 @@ fn claim_entry_xdr(
         .expect("claimable-balance entry XDR encode")
 }
 
+/// Builds a `TransactionV1Envelope` from `source_g` and a single `op`,
+/// serialised to base64. Used to hand-build a commit-phase authoritative
+/// envelope without needing a real simulate call.
+fn build_claim_envelope_b64(source_g: &str, op: stellar_xdr::Operation) -> String {
+    use stellar_xdr::{
+        Limits, Memo, MuxedAccount, SequenceNumber, Transaction, TransactionEnvelope,
+        TransactionExt, TransactionV1Envelope, Uint256, VecM, WriteXdr,
+    };
+    let pk = stellar_strkey::ed25519::PublicKey::from_string(source_g).expect("valid G-strkey");
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(pk.0)),
+        fee: 100,
+        seq_num: SequenceNumber(101),
+        cond: stellar_xdr::Preconditions::None,
+        memo: Memo::None,
+        operations: vec![op].try_into().expect("single-op vec"),
+        ext: TransactionExt::V0,
+    };
+    let env = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    env.to_xdr_base64(Limits::none())
+        .expect("XDR encode must succeed")
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Server / profile helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1020,6 +1046,196 @@ async fn claim_commit_full_round_trip_succeeds_with_string_encoded_amount() {
             .and_then(serde_json::Value::as_u64),
         Some(1005),
         "committed response must carry the submitted ledger: {commit_data}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Commit-phase gate view wiring (#48): minimum_reserve under a real V1 engine
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Full simulate → commit round trip succeeds under a `minimum_reserve` rule
+/// covering BOTH `stellar_claim` and `stellar_claim_commit`, evaluated by a
+/// real `PolicyEngineV1` (not `MockPolicyEngine`, which ignores
+/// `account_view`).
+///
+/// `MinimumReserveCriterion::evaluate` fails closed whenever `ctx.account_view`
+/// is `None`; both phases reaching `Ok` (rather than
+/// `policy.criterion_evaluation_failed` at commit) is direct proof that
+/// `stellar_claim_commit`'s dispatch site now supplies the same kind of real
+/// `account_view` its simulate phase always has.
+#[tokio::test]
+#[serial]
+async fn claim_two_phase_round_trip_succeeds_under_satisfied_minimum_reserve_rule() {
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key();
+
+    let seed = [0x46_u8; 32];
+    let claimant_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+
+    let id = test_balance_id();
+    let cb_key_xdr = claim_key_xdr(&id);
+    let entry_xdr = claim_entry_xdr(
+        &id,
+        &claimant_g,
+        stellar_xdr::ClaimPredicate::Unconditional,
+        CLAIM_AMOUNT_STROOPS,
+    );
+    let account_key_xdr = account_ledger_key_xdr(&claimant_g);
+    // Comfortably covers the base reserve, fee, AND the minimum_reserve margin below.
+    let account_xdr = account_entry_xdr_with_seq(&claimant_g, 100_000_000_000_000, 0, SOURCE_SEQ);
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ClaimSubmitSuccessRpcResponder {
+            cb_key_xdr,
+            entry_xdr,
+            account_key_xdr,
+            account_xdr,
+        })
+        .mount(&mock_server)
+        .await;
+
+    let profile = testnet_profile_with_rpc(&mock_server.uri());
+    let mut server = WalletServer::new(profile).expect("WalletServer::new");
+    server.set_policy_engine_for_test(std::sync::Arc::new(
+        common::v1_engine_mock::minimum_reserve_engine(
+            &["stellar_claim", "stellar_claim_commit"],
+            5_0000000, // 5 XLM margin — comfortably satisfied by the funded account.
+        ),
+    ));
+
+    // ── Simulate ───────────────────────────────────────────────────────────
+    let simulate_args = StellarClaimArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        balance_id: "ab".repeat(32),
+        source_account: Some(claimant_g.clone()),
+    };
+    let sim_result = server
+        .call_stellar_claim(simulate_args)
+        .await
+        .expect("simulate must not error");
+    assert_ne!(
+        sim_result.is_error,
+        Some(true),
+        "simulate under a satisfied minimum_reserve rule must succeed: {}",
+        call_result_json(&sim_result)
+    );
+
+    let (nonce, expires_at_unix_ms, envelope_xdr) = extract_commit_triple(&sim_result);
+
+    // ── Commit ─────────────────────────────────────────────────────────────
+    let commit_args = StellarClaimCommitArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        balance_id: "ab".repeat(32),
+        source_account: Some(claimant_g),
+        nonce,
+        expires_at_unix_ms,
+        envelope_xdr,
+        approval_nonce: None,
+        approval_attestation: None,
+    };
+    let commit_result = server
+        .call_stellar_claim_commit(commit_args)
+        .await
+        .expect("commit must not error");
+    let commit_json = call_result_json(&commit_result);
+    assert_ne!(
+        commit_result.is_error,
+        Some(true),
+        "commit under a satisfied minimum_reserve rule must succeed \
+         (account_view must be supplied at the commit dispatch site); got: {commit_json}"
+    );
+    assert!(
+        commit_json
+            .get("data")
+            .and_then(|d| d.get("tx_hash"))
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "committed response must carry tx_hash: {commit_json}"
+    );
+}
+
+/// `stellar_claim_commit` denies under a `minimum_reserve` rule when the
+/// claimant account's real (mocked, low) on-chain balance breaches the
+/// reserve floor — `policy.deny.minimum_reserve_breached`, not
+/// `policy.criterion_evaluation_failed` (which would indicate a missing
+/// `account_view`) and not any RPC-error envelope.
+#[tokio::test]
+#[serial]
+async fn claim_commit_denies_under_unsatisfied_minimum_reserve_rule() {
+    keyring_mock::install().expect("mock keyring store init");
+
+    let id = test_balance_id();
+    let cb_key_xdr = claim_key_xdr(&id);
+    let entry_xdr = claim_entry_xdr(
+        &id,
+        SOURCE_G,
+        stellar_xdr::ClaimPredicate::Unconditional,
+        CLAIM_AMOUNT_STROOPS,
+    );
+    let account_key_xdr = account_ledger_key_xdr(SOURCE_G);
+    // 2 XLM: below the ~1.5 XLM base reserve plus the 5 XLM margin configured
+    // below — the rule must deny, not fail closed on a missing view.
+    let account_xdr = account_entry_xdr_with_seq(SOURCE_G, 20_000_000, 0, SOURCE_SEQ);
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ClaimSubmitSuccessRpcResponder {
+            cb_key_xdr,
+            entry_xdr,
+            account_key_xdr,
+            account_xdr,
+        })
+        .mount(&mock_server)
+        .await;
+
+    let profile = testnet_profile_with_rpc(&mock_server.uri());
+    let mut server = WalletServer::new(profile).expect("WalletServer::new");
+    server.set_policy_engine_for_test(std::sync::Arc::new(
+        common::v1_engine_mock::minimum_reserve_engine(
+            &["stellar_claim", "stellar_claim_commit"],
+            5_0000000, // 5 XLM margin — the mocked 2 XLM balance cannot satisfy it.
+        ),
+    ));
+
+    // Commit is reached directly with a hand-built authoritative envelope: the
+    // gate denies before nonce parsing (see pay.rs's equivalent test), so an
+    // arbitrary nonce is sufficient — nonce verification is never reached.
+    let op = stellar_xdr::Operation {
+        source_account: None,
+        body: stellar_xdr::OperationBody::ClaimClaimableBalance(
+            stellar_xdr::ClaimClaimableBalanceOp {
+                balance_id: stellar_xdr::ClaimableBalanceId::ClaimableBalanceIdTypeV0(
+                    stellar_xdr::Hash(id.hash()),
+                ),
+            },
+        ),
+    };
+    let envelope_xdr = build_claim_envelope_b64(SOURCE_G, op);
+
+    let commit_args = StellarClaimCommitArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        balance_id: "ab".repeat(32),
+        source_account: Some(SOURCE_G.to_owned()),
+        nonce: "dGVzdA".to_owned(),
+        expires_at_unix_ms: u64::MAX,
+        envelope_xdr,
+        approval_nonce: None,
+        approval_attestation: None,
+    };
+    let commit_result = server
+        .call_stellar_claim_commit(commit_args)
+        .await
+        .expect("unsatisfied minimum_reserve rule must return Ok(is_error) envelope");
+    let (code, _message, _text) = common::assert_business_envelope(&commit_result);
+    assert_eq!(
+        code, "policy.deny.minimum_reserve_breached",
+        "commit under an unsatisfied minimum_reserve rule must deny with \
+         minimum_reserve_breached, not fail closed on a missing account_view; got: {code}"
     );
 }
 

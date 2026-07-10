@@ -72,18 +72,30 @@ impl PolicyEngine for MockPolicyEngine {
 
 /// Returns a mainnet `WalletServer` with the given engine injected.
 ///
-/// The server is constructed with `engine = Noop` so `WalletServer::new`
-/// succeeds without a signed policy file on disk; the engine is then swapped
-/// via `set_policy_engine_for_test`.
+/// Returns a mainnet `WalletServer` with the given engine injected AND
+/// `rpc_url` overridden to a caller-supplied endpoint (typically a local
+/// wiremock server).
+///
+/// Commit-phase policy gates now fetch the source `account_view` BEFORE
+/// evaluating policy (feeds `minimum_reserve`), so a test that reaches the
+/// commit gate performs a real RPC round-trip even when the injected
+/// `PolicyEngine` ignores its `account_view` argument entirely (as
+/// `MockPolicyEngine` does). Pointing `rpc_url` at a local mock keeps that
+/// round-trip fast and deterministic instead of depending on the default
+/// mainnet RPC endpoint's live reachability.
 #[allow(
     dead_code,
-    reason = "shared integration-test helper; approval_spine uses its testnet-specific server helper"
+    reason = "shared integration-test helper; not every consumer needs an rpc_url override"
 )]
-pub fn mainnet_server_with_engine(engine: impl PolicyEngine + 'static) -> WalletServer {
+pub fn mainnet_server_with_engine_and_rpc(
+    engine: impl PolicyEngine + 'static,
+    rpc_url: &str,
+) -> WalletServer {
     keyring_mock::install().expect("mock keyring install");
-    let profile = Profile::builder_mainnet("svc", "acct", "n-svc", "n-acct")
+    let mut profile = Profile::builder_mainnet("svc", "acct", "n-svc", "n-acct")
         .with_noop_engine()
         .build();
+    profile.rpc_url = rpc_url.to_owned();
     let mut server = WalletServer::new(profile).expect("WalletServer::new");
     server.set_policy_engine_for_test(Arc::new(engine));
     server

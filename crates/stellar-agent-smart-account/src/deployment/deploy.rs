@@ -25,6 +25,7 @@ use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::SaInvocationResult;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::error::{SubmissionError, WalletError};
+use stellar_agent_core::rpc_budget::{SequentialRpcBudget, bound_stage};
 #[cfg(any(test, feature = "test-helpers"))]
 use stellar_agent_network::SoftwareSigningKey;
 use stellar_agent_network::{
@@ -47,6 +48,7 @@ use tracing::info;
 
 use crate::SaError;
 use crate::deployment::address::derive_smart_account_address;
+use crate::deployment::map_budget_elapsed;
 
 #[cfg(any(test, feature = "test-helpers"))]
 use crate::deployment::address::derive_interop_deployer_seed;
@@ -819,13 +821,30 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
             redacted_reason: format!("StellarRpcClient construction failed: {e}"),
         })?;
 
+    // One collective wall-clock budget for every RPC stage below (account
+    // fetch, WASM pre-flight, simulate, submit-and-wait, post-deploy
+    // verification). Each stage is individually bounded at 60s by the
+    // transport; without a shared deadline the flow's total wall time is the
+    // SUM of every stage's transport bound plus up to two independent
+    // `args.timeout` polls (upload + deploy submissions), which can exceed
+    // `args.timeout` by several multiples. Reusing `args.timeout` — the
+    // caller's existing polling budget — as the ONE total makes the whole
+    // flow's wall-clock ceiling match what the caller already configured,
+    // rather than each stage re-arming its own allowance.
+    let deploy_budget = SequentialRpcBudget::new(args.timeout);
+
     // Step 4: fetch the deployer's account-id sequence via the wallet substrate.
-    let deployer_view = fetch_account(&network_client, &deployer_pubkey, &[])
-        .await
-        .map_err(|e| SaError::DeploymentFailed {
-            phase: "build",
-            redacted_reason: format!("deployer account fetch failed: {e}"),
-        })?;
+    let deployer_view = bound_stage(
+        deploy_budget,
+        "fetch_deployer_account",
+        fetch_account(&network_client, &deployer_pubkey, &[]),
+    )
+    .await
+    .map_err(|elapsed| map_budget_elapsed(elapsed, "build"))?
+    .map_err(|e| SaError::DeploymentFailed {
+        phase: "build",
+        redacted_reason: format!("deployer account fetch failed: {e}"),
+    })?;
 
     // Construct the baselib Account from the returned sequence.
     let mut deployer_account =
@@ -841,13 +860,17 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
         hash: Hash(wasm_hash_bytes),
     });
 
-    let wasm_query_resp = rpc_server
-        .get_ledger_entries(&[wasm_key])
-        .await
-        .map_err(|e| SaError::DeploymentFailed {
-            phase: "build",
-            redacted_reason: format!("getLedgerEntries (wasm pre-flight) failed: {e}"),
-        })?;
+    let wasm_query_resp = bound_stage(
+        deploy_budget,
+        "wasm_preflight_get_ledger_entries",
+        rpc_server.get_ledger_entries(&[wasm_key]),
+    )
+    .await
+    .map_err(|elapsed| map_budget_elapsed(elapsed, "build"))?
+    .map_err(|e| SaError::DeploymentFailed {
+        phase: "build",
+        redacted_reason: format!("getLedgerEntries (wasm pre-flight) failed: {e}"),
+    })?;
 
     // Explicit match: `entries` is `None` when the RPC response contains no `entries` field,
     // which means the WASM is not on-chain (same semantic as an empty vec).
@@ -912,13 +935,17 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
                 phase: "build",
                 redacted_reason: format!("upload to_envelope (pre-sim) failed: {e}"),
             })?;
-        let upload_sim = rpc_server
-            .simulate_transaction_envelope(&upload_envelope, None)
-            .await
-            .map_err(|e| SaError::DeploymentFailed {
-                phase: "simulate",
-                redacted_reason: format!("upload simulate_transaction_envelope failed: {e}"),
-            })?;
+        let upload_sim = bound_stage(
+            deploy_budget,
+            "upload_simulate",
+            rpc_server.simulate_transaction_envelope(&upload_envelope, None),
+        )
+        .await
+        .map_err(|elapsed| map_budget_elapsed(elapsed, "simulate"))?
+        .map_err(|e| SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason: format!("upload simulate_transaction_envelope failed: {e}"),
+        })?;
 
         // Panic-insulation pre-check.
         if let Some(sim_error) = &upload_sim.error {
@@ -978,15 +1005,24 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
             "deploy_smart_account: submitting WASM upload transaction"
         );
 
-        // Submit the upload transaction and wait for confirmation.
-        let upload_submission = submit_transaction_and_wait(
-            &network_client,
-            &signed_upload_xdr,
-            args.timeout,
-            &args.network_passphrase,
-            None,
+        // Submit the upload transaction and wait for confirmation. Wrapped in
+        // the SAME collective budget as every other stage: a shared-budget
+        // timeout here means the tx may already be broadcast, so it
+        // classifies under phase "upload" (see `map_sa_invocation_result`),
+        // matching the other submission-failure arms below.
+        let upload_submission = bound_stage(
+            deploy_budget,
+            "upload_submit_and_wait",
+            submit_transaction_and_wait(
+                &network_client,
+                &signed_upload_xdr,
+                args.timeout,
+                &args.network_passphrase,
+                None,
+            ),
         )
         .await
+        .map_err(|elapsed| map_budget_elapsed(elapsed, "upload"))?
         .map_err(|e| {
             // Map upload-tx envelope rejections to phase "submit". The match is
             // intentionally asymmetric with the deploy-side classifier below: the
@@ -1015,12 +1051,17 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
         // Re-fetch the deployer account sequence number after the upload transaction
         // has been confirmed. The sequence number is consumed by the upload transaction
         // and must be refreshed before building the deploy transaction.
-        let deployer_view_post_upload = fetch_account(&network_client, &deployer_pubkey, &[])
-            .await
-            .map_err(|e| SaError::DeploymentFailed {
-                phase: "build",
-                redacted_reason: format!("deployer account re-fetch after upload failed: {e}"),
-            })?;
+        let deployer_view_post_upload = bound_stage(
+            deploy_budget,
+            "fetch_deployer_account_post_upload",
+            fetch_account(&network_client, &deployer_pubkey, &[]),
+        )
+        .await
+        .map_err(|elapsed| map_budget_elapsed(elapsed, "build"))?
+        .map_err(|e| SaError::DeploymentFailed {
+            phase: "build",
+            redacted_reason: format!("deployer account re-fetch after upload failed: {e}"),
+        })?;
         deployer_account = BaselibAccount::new(
             &deployer_pubkey,
             &deployer_view_post_upload.sequence_number.to_string(),
@@ -1113,13 +1154,17 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
         phase: "build",
         redacted_reason: format!("deploy to_envelope (pre-sim) failed: {e}"),
     })?;
-    let sim_response = rpc_server
-        .simulate_transaction_envelope(&deploy_envelope_pre, None)
-        .await
-        .map_err(|e| SaError::DeploymentFailed {
-            phase: "simulate",
-            redacted_reason: format!("deploy simulate_transaction_envelope failed: {e}"),
-        })?;
+    let sim_response = bound_stage(
+        deploy_budget,
+        "deploy_simulate",
+        rpc_server.simulate_transaction_envelope(&deploy_envelope_pre, None),
+    )
+    .await
+    .map_err(|elapsed| map_budget_elapsed(elapsed, "simulate"))?
+    .map_err(|e| SaError::DeploymentFailed {
+        phase: "simulate",
+        redacted_reason: format!("deploy simulate_transaction_envelope failed: {e}"),
+    })?;
 
     // Panic-insulation pre-check.
     // Check sim_response.error FIRST: when the RPC returns a simulation error (low fee,
@@ -1208,14 +1253,20 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
     );
 
     // Step 9: submit + poll the deploy transaction via the existing primitive.
-    let submission = submit_transaction_and_wait(
-        &network_client,
-        &signed_xdr,
-        args.timeout,
-        &args.network_passphrase,
-        None,
+    // Wrapped in the SAME collective budget as every prior stage.
+    let submission = bound_stage(
+        deploy_budget,
+        "deploy_submit_and_wait",
+        submit_transaction_and_wait(
+            &network_client,
+            &signed_xdr,
+            args.timeout,
+            &args.network_passphrase,
+            None,
+        ),
     )
     .await
+    .map_err(|elapsed| map_budget_elapsed(elapsed, "deploy"))?
     .map_err(|e| {
         // Map RPC envelope-rejection failures to phase "submit". `TxMalformed`
         // wraps the RPC client's `txMalformed`-class responses, including the
@@ -1253,13 +1304,17 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
         durability: ContractDataDurability::Persistent,
     });
 
-    let post_deploy_resp = rpc_server
-        .get_ledger_entries(&[instance_key])
-        .await
-        .map_err(|e| SaError::DeploymentFailed {
-            phase: "post_deploy_verification",
-            redacted_reason: format!("get_ledger_entries (post-deploy) failed: {e}"),
-        })?;
+    let post_deploy_resp = bound_stage(
+        deploy_budget,
+        "post_deploy_get_ledger_entries",
+        rpc_server.get_ledger_entries(&[instance_key]),
+    )
+    .await
+    .map_err(|elapsed| map_budget_elapsed(elapsed, "post_deploy_verification"))?
+    .map_err(|e| SaError::DeploymentFailed {
+        phase: "post_deploy_verification",
+        redacted_reason: format!("get_ledger_entries (post-deploy) failed: {e}"),
+    })?;
 
     // `entries` is `None` when `getLedgerEntries` returns a response with no entries field;
     // the `ok_or_else` below handles the no-entry case with a typed error.

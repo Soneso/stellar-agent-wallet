@@ -156,8 +156,10 @@ pub trait AccountIdentityView: Send + Sync {
 
     /// Returns the account's G-strkey (or C-strkey for contract accounts).
     ///
-    /// Used by audit-log and diagnostic paths; not consumed by the
-    /// HOME_DOMAIN criterion directly.
+    /// Used by audit-log and diagnostic paths, and by the `HOME_DOMAIN`
+    /// counterparty-allowlist check's `is_account_listed` verification: the
+    /// account this call resolved `home_domain` for is the SAME account
+    /// checked against that domain's cached `ACCOUNTS` list.
     fn account_id(&self) -> &str;
 }
 
@@ -252,6 +254,27 @@ pub trait CounterpartyCacheView: Send + Sync {
     /// (same as the counterparty allowlist criterion), which defends against
     /// IDN homoglyph attacks.
     fn has_resolved(&self, home_domain: &str) -> bool;
+
+    /// Returns `true` if `account_id` appears in the resolved `home_domain`'s
+    /// cached `stellar.toml` `ACCOUNTS` list.
+    ///
+    /// This is the bidirectional proof the `HOME_DOMAIN` counterparty-allowlist
+    /// check requires: `has_resolved` alone only proves the domain's
+    /// `stellar.toml` was successfully fetched, NOT that this specific
+    /// counterparty account is the one that domain vouches for. Any account
+    /// could self-assert a resolved, allowlisted `home_domain` on-chain
+    /// (`SetOptions`) without this check.
+    ///
+    /// Defaults to `false` (fail-closed) so implementations predating this
+    /// method — including test mocks that only override `has_resolved` — deny
+    /// rather than silently pass an unverified account-domain binding.
+    /// [`stellar_agent_network::counterparty::CounterpartyCacheSnapshot`]
+    /// (the production implementation) overrides this with a real check
+    /// against the cached `ACCOUNTS` list.
+    fn is_account_listed(&self, home_domain: &str, account_id: &str) -> bool {
+        let _ = (home_domain, account_id);
+        false
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

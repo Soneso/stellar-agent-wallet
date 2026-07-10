@@ -1,4 +1,5 @@
 pub mod policy_mock;
+pub mod v1_engine_mock;
 
 use rmcp::model::CallToolResult;
 

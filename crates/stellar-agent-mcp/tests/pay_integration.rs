@@ -50,7 +50,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use common::policy_mock::{MockPolicyEngine, mainnet_server_with_engine};
+use common::policy_mock::{MockPolicyEngine, mainnet_server_with_engine_and_rpc};
 use serial_test::serial;
 use stellar_agent_core::policy::DenyReason;
 use stellar_agent_core::profile::schema::Profile;
@@ -232,6 +232,20 @@ fn mainnet_profile() -> Profile {
     Profile::builder_mainnet("svc", "acct", "n-svc", "n-acct")
         .with_noop_engine()
         .build()
+}
+
+/// `mainnet_profile` with `rpc_url` overridden to a caller-supplied endpoint.
+///
+/// The commit-phase policy gate now fetches the source `account_view` before
+/// evaluating policy, so Property-A's `NoopPolicyEngine` refusal — which does
+/// not itself depend on account state — still incurs a real RPC round-trip
+/// ahead of it. Pointing `rpc_url` at a local wiremock server keeps that
+/// round-trip fast and independent of the default mainnet endpoint's live
+/// reachability.
+fn mainnet_profile_with_rpc(rpc_url: &str) -> Profile {
+    let mut p = mainnet_profile();
+    p.rpc_url = rpc_url.to_owned();
+    p
 }
 
 /// Builds a minimal but structurally valid `TransactionV1Envelope` base64 string
@@ -1019,7 +1033,16 @@ async fn simulate_fee_explicit_above_profile_cap_fails() {
 #[serial]
 async fn policy_noop_engine_refuses_mainnet_destructive() {
     keyring_mock::install().expect("mock keyring store init");
-    let profile = mainnet_profile();
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(PayFeeRpcResponder::new(
+            account_ledger_key_xdr(SOURCE_G),
+            account_entry_xdr_with_balance(SOURCE_G, 100_000_000_000_000),
+            fee_stats_result("100", "100"),
+        ))
+        .mount(&mock_server)
+        .await;
+    let profile = mainnet_profile_with_rpc(&mock_server.uri());
     let server = WalletServer::new(profile).expect("WalletServer::new");
 
     let args = StellarPayCommitArgs {
@@ -1064,7 +1087,16 @@ async fn policy_noop_engine_refuses_mainnet_destructive() {
 #[tokio::test]
 #[serial]
 async fn policy_v1_engine_allow_rule_passes_gate() {
-    let server = mainnet_server_with_engine(MockPolicyEngine::allow());
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(PayFeeRpcResponder::new(
+            account_ledger_key_xdr(SOURCE_G),
+            account_entry_xdr_with_balance(SOURCE_G, 100_000_000_000_000),
+            fee_stats_result("100", "100"),
+        ))
+        .mount(&mock_server)
+        .await;
+    let server = mainnet_server_with_engine_and_rpc(MockPolicyEngine::allow(), &mock_server.uri());
 
     let args = StellarPayCommitArgs {
         chain_id: "stellar:mainnet".to_owned(),
@@ -1104,7 +1136,19 @@ async fn policy_v1_engine_allow_rule_passes_gate() {
 #[tokio::test]
 #[serial]
 async fn policy_v1_engine_no_matching_rule_emits_wire_code() {
-    let server = mainnet_server_with_engine(MockPolicyEngine::deny_no_matching_rule());
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(PayFeeRpcResponder::new(
+            account_ledger_key_xdr(SOURCE_G),
+            account_entry_xdr_with_balance(SOURCE_G, 100_000_000_000_000),
+            fee_stats_result("100", "100"),
+        ))
+        .mount(&mock_server)
+        .await;
+    let server = mainnet_server_with_engine_and_rpc(
+        MockPolicyEngine::deny_no_matching_rule(),
+        &mock_server.uri(),
+    );
 
     let args = StellarPayCommitArgs {
         chain_id: "stellar:mainnet".to_owned(),
@@ -1141,7 +1185,19 @@ async fn policy_v1_engine_no_matching_rule_emits_wire_code() {
 #[tokio::test]
 #[serial]
 async fn policy_v1_engine_explicit_deny_emits_wire_code() {
-    let server = mainnet_server_with_engine(MockPolicyEngine::deny_explicit_rule());
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(PayFeeRpcResponder::new(
+            account_ledger_key_xdr(SOURCE_G),
+            account_entry_xdr_with_balance(SOURCE_G, 100_000_000_000_000),
+            fee_stats_result("100", "100"),
+        ))
+        .mount(&mock_server)
+        .await;
+    let server = mainnet_server_with_engine_and_rpc(
+        MockPolicyEngine::deny_explicit_rule(),
+        &mock_server.uri(),
+    );
 
     let args = StellarPayCommitArgs {
         chain_id: "stellar:mainnet".to_owned(),
@@ -2505,6 +2561,201 @@ async fn pay_commit_full_round_trip_succeeds_with_string_encoded_amounts() {
             .and_then(serde_json::Value::as_u64),
         Some(1005),
         "committed response must carry the submitted ledger: {commit_data}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Commit-phase gate view wiring (#48): minimum_reserve under a real V1 engine
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Full simulate → commit round trip succeeds under a `minimum_reserve` rule
+/// covering BOTH `stellar_pay` and `stellar_pay_commit`, evaluated by a real
+/// `PolicyEngineV1` (not `MockPolicyEngine`, which ignores `account_view`).
+///
+/// `MinimumReserveCriterion::evaluate` fails closed whenever `ctx.account_view`
+/// is `None`; both phases reaching `Ok` (rather than
+/// `policy.criterion_evaluation_failed` at commit) is direct proof that
+/// `stellar_pay_commit`'s dispatch site now supplies the same kind of real
+/// `account_view` its simulate phase always has (without the view, the
+/// commit-phase gate call carried no view at all).
+#[tokio::test]
+#[serial]
+async fn pay_two_phase_round_trip_succeeds_under_satisfied_minimum_reserve_rule() {
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(201);
+
+    let seed = [0x43_u8; 32];
+    let source_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+
+    let account_key_xdr = account_ledger_key_xdr(&source_g);
+    // 10_000_000 XLM: comfortably covers the 100 XLM payment, base reserve,
+    // fee, AND the minimum_reserve margin below.
+    let account_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(PaySubmitSuccessRpcResponder {
+            account_key_xdr,
+            account_xdr,
+        })
+        .mount(&mock_server)
+        .await;
+
+    let profile = testnet_profile_with_rpc(&mock_server.uri());
+    let mut server = WalletServer::new(profile).expect("WalletServer::new");
+    server.set_policy_engine_for_test(std::sync::Arc::new(
+        common::v1_engine_mock::minimum_reserve_engine(
+            &["stellar_pay", "stellar_pay_commit"],
+            5_0000000, // 5 XLM margin — comfortably satisfied by the funded account.
+        ),
+    ));
+
+    // ── Simulate ───────────────────────────────────────────────────────────
+    let simulate_args = StellarPayArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        source: source_g.clone(),
+        destination: DEST_G.to_owned(),
+        amount: None,
+        amount_in_stroops: Some("1000000000".to_owned()), // 100 XLM
+        asset: "native".to_owned(),
+        memo_text: None,
+        memo_id: None,
+        memo_hash_hex: None,
+        memo_return_hex: None,
+        classic_base: None,
+    };
+    let sim_result = server
+        .call_stellar_pay(simulate_args.clone())
+        .await
+        .expect("simulate must not error");
+    assert_ne!(
+        sim_result.is_error,
+        Some(true),
+        "simulate under a satisfied minimum_reserve rule must succeed: {}",
+        call_result_text(&sim_result)
+    );
+    let sim_json = call_result_json(&sim_result);
+    let sim_data = sim_json.get("data").expect("simulate success carries data");
+    let nonce = sim_data
+        .get("nonce")
+        .and_then(serde_json::Value::as_str)
+        .expect("nonce present")
+        .to_owned();
+    let expires_at_unix_ms = sim_data
+        .get("expires_at_unix_ms")
+        .and_then(serde_json::Value::as_u64)
+        .expect("expires_at_unix_ms present");
+    let envelope_xdr = sim_data
+        .get("envelope_xdr")
+        .and_then(serde_json::Value::as_str)
+        .expect("envelope_xdr present")
+        .to_owned();
+
+    // ── Commit ─────────────────────────────────────────────────────────────
+    let commit_args = StellarPayCommitArgs {
+        chain_id: simulate_args.chain_id.clone(),
+        source: simulate_args.source.clone(),
+        destination: simulate_args.destination.clone(),
+        amount: simulate_args.amount.clone(),
+        amount_in_stroops: simulate_args.amount_in_stroops.clone(),
+        asset: simulate_args.asset.clone(),
+        memo_text: None,
+        memo_id: None,
+        memo_hash_hex: None,
+        memo_return_hex: None,
+        nonce,
+        expires_at_unix_ms,
+        envelope_xdr,
+        approval_nonce: None,
+        approval_attestation: None,
+    };
+    let commit_result = server
+        .call_stellar_pay_commit(commit_args)
+        .await
+        .expect("commit must not error");
+    let commit_json = call_result_json(&commit_result);
+    assert_ne!(
+        commit_result.is_error,
+        Some(true),
+        "commit under a satisfied minimum_reserve rule must succeed \
+         (account_view must be supplied at the commit dispatch site); got: {commit_json}"
+    );
+    assert!(
+        commit_json
+            .get("data")
+            .and_then(|d| d.get("tx_hash"))
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "committed response must carry tx_hash: {commit_json}"
+    );
+}
+
+/// `stellar_pay_commit` denies under a `minimum_reserve` rule when the
+/// source account's real (mocked, low) on-chain balance breaches the reserve
+/// floor — `policy.deny.minimum_reserve_breached`, not
+/// `policy.criterion_evaluation_failed` (which would indicate a missing
+/// `account_view`) and not any RPC-error envelope.
+#[tokio::test]
+#[serial]
+async fn pay_commit_denies_under_unsatisfied_minimum_reserve_rule() {
+    keyring_mock::install().expect("mock keyring store init");
+
+    let account_key_xdr = account_ledger_key_xdr(SOURCE_G);
+    // 2 XLM: below the ~1.5 XLM base reserve plus the 5 XLM margin configured
+    // below — the rule must deny, not fail closed on a missing view.
+    let account_xdr = account_entry_xdr_with_balance(SOURCE_G, 20_000_000);
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(AccountOnlyResponder {
+            account_key_xdr,
+            account_xdr,
+        })
+        .mount(&mock_server)
+        .await;
+
+    let profile = testnet_profile_with_rpc(&mock_server.uri());
+    let mut server = WalletServer::new(profile).expect("WalletServer::new");
+    server.set_policy_engine_for_test(std::sync::Arc::new(
+        common::v1_engine_mock::minimum_reserve_engine(
+            &["stellar_pay", "stellar_pay_commit"],
+            5_0000000, // 5 XLM margin — the mocked 2 XLM balance cannot satisfy it.
+        ),
+    ));
+
+    // Commit is reached directly: the gate denies before nonce parsing, so an
+    // arbitrary nonce/envelope pair (not minted by a prior simulate call) is
+    // sufficient — nonce verification is never reached.
+    let args = StellarPayCommitArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        source: SOURCE_G.to_owned(),
+        destination: DEST_G.to_owned(),
+        amount: Some(serde_json::from_str(r#""10 XLM""#).unwrap()),
+        amount_in_stroops: None,
+        asset: "native".to_owned(),
+        memo_text: None,
+        memo_id: None,
+        memo_hash_hex: None,
+        memo_return_hex: None,
+        nonce: "dGVzdA".to_owned(),
+        expires_at_unix_ms: u64::MAX,
+        envelope_xdr: valid_payment_envelope_b64(),
+        approval_nonce: None,
+        approval_attestation: None,
+    };
+    let result = server
+        .call_stellar_pay_commit(args)
+        .await
+        .expect("unsatisfied minimum_reserve rule must return Ok(is_error) envelope");
+    let (code, _message, _text) = common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "policy.deny.minimum_reserve_breached",
+        "commit under an unsatisfied minimum_reserve rule must deny with \
+         minimum_reserve_breached, not fail closed on a missing account_view; got: {code}"
     );
 }
 

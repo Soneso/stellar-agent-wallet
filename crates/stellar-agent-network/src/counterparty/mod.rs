@@ -207,8 +207,10 @@ pub enum CounterpartyError {
 /// 3. The HMAC is verified on every subsequent cache read.
 ///
 /// The `stellar.toml` body is retained in the cache for forensic correlation
-/// and for the SEP-10 server-key binding step; the binding struct carries only
-/// the metadata fields needed for TTL tracking and cache enumeration.
+/// and for the SEP-10 server-key binding step; the binding struct carries the
+/// metadata fields needed for TTL tracking, cache enumeration, and the
+/// `ACCOUNTS`-listing bidirectional proof the `HOME_DOMAIN` counterparty-
+/// allowlist check requires (see `stellar_agent_core::policy::v1::criteria::counterparty_allowlist`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StellarTomlBinding {
@@ -228,6 +230,15 @@ pub struct StellarTomlBinding {
     /// because an opt-in stale-if-error fallback handled a transient fetch
     /// failure.
     pub stale: bool,
+
+    /// The raw `ACCOUNTS` G-strkeys declared by `home_domain`'s `stellar.toml`,
+    /// re-parsed from the cached body at read time. Empty when the field is
+    /// absent from the TOML. This is the bidirectional-proof list the
+    /// `HOME_DOMAIN` counterparty-allowlist check verifies a counterparty
+    /// account against, so a resolved domain alone cannot be spoofed by an
+    /// unrelated account merely asserting that domain as its own
+    /// `home_domain`.
+    pub accounts: Vec<String>,
 }
 
 impl StellarTomlBinding {
@@ -242,12 +253,14 @@ impl StellarTomlBinding {
         fetched_at: SystemTime,
         expires_at: SystemTime,
         stale: bool,
+        accounts: Vec<String>,
     ) -> Self {
         Self {
             home_domain,
             fetched_at,
             expires_at,
             stale,
+            accounts,
         }
     }
 }
@@ -372,17 +385,18 @@ impl CounterpartyResolver for NoopCounterpartyResolver {
 /// impl entirely to this synchronous snapshot.
 #[derive(Debug, Clone)]
 pub struct CounterpartyCacheSnapshot {
-    resolved: std::collections::HashSet<String>,
+    /// Maps each resolved `home_domain` to the `ACCOUNTS` G-strkeys its
+    /// `stellar.toml` declared at snapshot construction time. Key presence
+    /// alone answers `has_resolved`; the value answers `is_account_listed`.
+    resolved: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl CounterpartyCacheSnapshot {
     /// Builds a snapshot from the current cache state of a
     /// [`CounterpartyResolver`].
     ///
-    /// Calls `resolver.list_cached()` once and collects the `home_domain`
-    /// keys of all returned bindings.  Bindings whose `home_domain` is absent
-    /// are ignored (should never occur given the resolver's validation, but
-    /// defensive-ness is warranted).
+    /// Calls `resolver.list_cached()` once and collects the `home_domain` key
+    /// and `accounts` value of every returned binding.
     ///
     /// # Errors
     ///
@@ -414,8 +428,8 @@ impl CounterpartyCacheSnapshot {
         let bindings = resolver.list_cached().await?;
         let resolved = bindings
             .into_iter()
-            .map(|b| b.home_domain)
-            .collect::<std::collections::HashSet<_>>();
+            .map(|b| (b.home_domain, b.accounts))
+            .collect::<std::collections::HashMap<_, _>>();
         Ok(Self { resolved })
     }
 
@@ -443,7 +457,21 @@ impl CounterpartyCacheSnapshot {
     /// ```
     #[must_use]
     pub fn has_resolved(&self, home_domain: &str) -> bool {
-        self.resolved.contains(home_domain)
+        self.resolved.contains_key(home_domain)
+    }
+
+    /// Returns `true` if `account_id` appears in `home_domain`'s cached
+    /// `ACCOUNTS` list.
+    ///
+    /// Equivalent to `CounterpartyCacheView::is_account_listed` — exposed here
+    /// for callers holding a concrete snapshot reference. Case-sensitive byte
+    /// equality (G-strkeys have exactly one canonical encoding, so this is not
+    /// a homoglyph surface).
+    #[must_use]
+    pub fn is_account_listed(&self, home_domain: &str, account_id: &str) -> bool {
+        self.resolved
+            .get(home_domain)
+            .is_some_and(|accounts| accounts.iter().any(|a| a == account_id))
     }
 }
 
@@ -454,7 +482,16 @@ impl stellar_agent_core::policy::v1::CounterpartyCacheView for CounterpartyCache
     /// Case-sensitive byte equality — same posture as the counterparty
     /// allowlist criterion for IDN homoglyph defence.
     fn has_resolved(&self, home_domain: &str) -> bool {
-        self.resolved.contains(home_domain)
+        self.resolved.contains_key(home_domain)
+    }
+
+    /// Returns `true` if `account_id` appears in `home_domain`'s cached
+    /// `ACCOUNTS` list — the bidirectional proof the `HOME_DOMAIN`
+    /// counterparty-allowlist check requires.
+    fn is_account_listed(&self, home_domain: &str, account_id: &str) -> bool {
+        self.resolved
+            .get(home_domain)
+            .is_some_and(|accounts| accounts.iter().any(|a| a == account_id))
     }
 }
 
@@ -541,6 +578,7 @@ mod tests {
                         fetched_at: now,
                         expires_at: now + Duration::from_secs(3600),
                         stale: false,
+                        accounts: vec![],
                     })
                     .collect())
             }
@@ -585,6 +623,71 @@ mod tests {
         assert!(
             !view.has_resolved("example.com"),
             "trait object delegation must report empty snapshot"
+        );
+    }
+
+    /// `is_account_listed` reports `true` only for an account present in the
+    /// resolved domain's cached `ACCOUNTS` list, and `false` for an unlisted
+    /// account on the SAME resolved domain (`has_resolved` alone is not
+    /// sufficient — the account must be in the domain's own list).
+    #[tokio::test]
+    async fn snapshot_is_account_listed_checks_accounts_not_just_domain_resolution() {
+        use std::time::{Duration, SystemTime};
+
+        use stellar_agent_core::policy::v1::CounterpartyCacheView;
+
+        const LISTED_G: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+        const UNLISTED_G: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+
+        struct StubResolver;
+
+        #[async_trait::async_trait]
+        impl CounterpartyResolver for StubResolver {
+            async fn refresh(
+                &self,
+                _home_domain: &str,
+            ) -> Result<StellarTomlBinding, CounterpartyError> {
+                Err(CounterpartyError::FetchFailed {
+                    detail: "stub".to_owned(),
+                })
+            }
+
+            async fn list_cached(&self) -> Result<Vec<StellarTomlBinding>, CounterpartyError> {
+                let now = SystemTime::now();
+                Ok(vec![StellarTomlBinding {
+                    home_domain: "circle.com".to_owned(),
+                    fetched_at: now,
+                    expires_at: now + Duration::from_secs(3600),
+                    stale: false,
+                    accounts: vec![LISTED_G.to_owned()],
+                }])
+            }
+        }
+
+        let snapshot = CounterpartyCacheSnapshot::from_resolver(&StubResolver)
+            .await
+            .expect("stub resolver must not fail");
+
+        assert!(
+            snapshot.has_resolved("circle.com"),
+            "circle.com must be reported as resolved"
+        );
+        assert!(
+            snapshot.is_account_listed("circle.com", LISTED_G),
+            "an account present in the cached ACCOUNTS list must be reported as listed"
+        );
+        assert!(
+            !snapshot.is_account_listed("circle.com", UNLISTED_G),
+            "an account absent from the cached ACCOUNTS list must NOT be reported as \
+             listed, even though the domain itself is resolved"
+        );
+        assert!(
+            !CounterpartyCacheView::is_account_listed(&snapshot, "circle.com", UNLISTED_G),
+            "trait object delegation must match the inherent method"
+        );
+        assert!(
+            !snapshot.is_account_listed("unresolved.example", LISTED_G),
+            "an unresolved domain must report every account as unlisted"
         );
     }
 }

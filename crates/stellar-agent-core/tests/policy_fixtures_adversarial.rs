@@ -324,16 +324,26 @@ impl stellar_agent_core::policy::v1::AccountIdentityView for MockIdentityView {
 // Mock CounterpartyCacheView for home_domain_resolved tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Minimal `CounterpartyCacheView` for `home_domain_resolved` criterion tests.
+/// Minimal `CounterpartyCacheView` for `home_domain_resolved` AND `HOME_DOMAIN`
+/// (counterparty_allowlist) criterion tests.
 ///
 /// The fixture driver injects this view via the `counterparty_cache` parameter
-/// of `PolicyEngineV1::evaluate`.
+/// of `PolicyEngineV1::evaluate`. Every fixture in this suite uses the SAME
+/// fixed `MockIdentityView::account_id()`, so `is_account_listed` mirrors
+/// `has_resolved` rather than tracking a separate per-domain accounts list —
+/// this suite covers domain-resolution/homoglyph edge cases, not the
+/// account-listing dimension (unit-tested directly in
+/// `counterparty_allowlist.rs`).
 struct MockCounterpartyCacheView {
     resolved: std::collections::HashSet<String>,
 }
 
 impl stellar_agent_core::policy::v1::CounterpartyCacheView for MockCounterpartyCacheView {
     fn has_resolved(&self, home_domain: &str) -> bool {
+        self.resolved.contains(home_domain)
+    }
+
+    fn is_account_listed(&self, home_domain: &str, _account_id: &str) -> bool {
         self.resolved.contains(home_domain)
     }
 }

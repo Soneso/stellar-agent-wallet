@@ -37,11 +37,16 @@ use serial_test::serial;
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_mcp::server::{StellarPayCommitArgs, WalletServer};
 use stellar_agent_test_support::keyring_mock;
+use stellar_agent_test_support::xdr_fixtures::{
+    account_entry_xdr_with_balance, account_ledger_key_xdr,
+};
 use stellar_xdr::{
     AccountId, Asset, Hash, Limits, Memo, MuxedAccount, Operation, OperationBody, PaymentOp,
     Preconditions, PublicKey, SequenceNumber, Transaction, TransactionEnvelope, TransactionExt,
     TransactionV1Envelope, Uint256, VecM, WriteXdr,
 };
+use wiremock::matchers::method;
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 mod common;
 
@@ -148,6 +153,59 @@ fn testnet_profile() -> Profile {
     Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
         .with_noop_engine()
         .build()
+}
+
+/// `testnet_profile` with `rpc_url` overridden to a caller-supplied endpoint.
+///
+/// The commit-phase policy gate now fetches the source `account_view` before
+/// evaluating policy, so a test that reaches the gate performs a real RPC
+/// round-trip regardless of what the policy decision itself depends on.
+/// Pointing `rpc_url` at a local wiremock server keeps that round-trip fast
+/// and independent of live testnet reachability / account existence.
+fn testnet_profile_with_rpc(rpc_url: &str) -> Profile {
+    let mut p = testnet_profile();
+    p.rpc_url = rpc_url.to_owned();
+    p
+}
+
+/// Simple wiremock responder serving `getLedgerEntries` for one account and
+/// an empty result for anything else.
+struct AccountOnlyResponder {
+    account_key_xdr: String,
+    account_xdr: String,
+}
+
+impl Respond for AccountOnlyResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).unwrap_or_else(|_| serde_json::json!({}));
+        let req_id = body.get("id").cloned().unwrap_or(serde_json::json!(1));
+        let method_name = body
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let result = if method_name == "getLedgerEntries"
+            && String::from_utf8_lossy(&request.body).contains(&self.account_key_xdr)
+        {
+            serde_json::json!({
+                "entries": [{
+                    "key": &self.account_key_xdr,
+                    "xdr": &self.account_xdr,
+                    "lastModifiedLedgerSeq": 1000
+                }],
+                "latestLedger": 1001
+            })
+        } else {
+            serde_json::json!({ "entries": [], "latestLedger": 1001 })
+        };
+        ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": result
+            }))
+            .insert_header("content-type", "application/json")
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -295,7 +353,16 @@ async fn pay_commit_policy_engine_sees_xdr_destination_not_caller_destination() 
 #[serial]
 async fn pay_commit_hash_memo_xdr_reaches_nonce_check() {
     keyring_mock::install().expect("mock keyring store init");
-    let server = WalletServer::new(testnet_profile()).expect("WalletServer::new");
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(AccountOnlyResponder {
+            account_key_xdr: account_ledger_key_xdr(SOURCE_G),
+            account_xdr: account_entry_xdr_with_balance(SOURCE_G, 100_000_000_000_000),
+        })
+        .mount(&mock_server)
+        .await;
+    let server =
+        WalletServer::new(testnet_profile_with_rpc(&mock_server.uri())).expect("WalletServer::new");
 
     let envelope_xdr = payment_envelope_b64(G_REAL_DEST, 10_000_000, Memo::Hash(Hash([0u8; 32])));
 

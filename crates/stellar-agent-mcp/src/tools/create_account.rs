@@ -764,32 +764,21 @@ impl WalletServer {
         // dispatch_gate step 3).
         authoritative_args["chain_id"] = serde_json::Value::String(args.chain_id.clone());
 
-        // ── dispatch gate (uses authoritative args, not caller args) ─────────
-        // destructive_hint = true → engine evaluates per profile.policy.engine;
-        // Noop refuses on mainnet, V1 evaluates typed criteria.
-        let dispatch_outcome = match self
-            .dispatch_gate(
-                "stellar_create_account_commit",
-                &authoritative_args,
-                &args.chain_id,
-            )
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => return e.into_result(),
-        };
-
         // ── Validate G-strkeys ────────────────────────────────────────────────
+        // Runs BEFORE the account fetch below: `fetch_account` itself parses
+        // `args.source` via the same strkey check and would otherwise surface a
+        // malformed value as a redacted RPC-error business envelope instead of
+        // this dedicated `invalid_params` protocol error.
         validate_g_strkey(&args.source, "source")?;
         validate_g_strkey(&args.destination, "destination")?;
 
-        // ── Decode nonce — map parse error to nonce.expired ──────────────────
-        let nonce = match stellar_agent_nonce::Nonce::from_base64(&args.nonce) {
-            Ok(n) => n,
-            Err(_) => return Ok(commit_path_error_result("nonce parse failed")),
-        };
-
-        // ── Re-fetch source account state and re-build envelope ───────────────
+        // ── Re-fetch source account state (feeds the policy gate's
+        // `account_view`; sequence number also consumed by the rebuild below) ──
+        // Moved ahead of the gate so `dispatch_gate_with_views` evaluates
+        // `minimum_reserve` against the SAME on-chain source state the commit
+        // path already needs for the sequence number — reused below, no second
+        // fetch. Nothing state-mutating (nonce decode/replay-window, approval
+        // writes, signing) runs before this point.
         let rpc_url = self.profile.rpc_url.as_str();
         let client = match StellarRpcClient::new(rpc_url) {
             Ok(c) => c,
@@ -819,6 +808,34 @@ impl WalletServer {
         // `stellar_baselib::TransactionBuilder::build` auto-increments via
         // `Account::increment_sequence_number`; an explicit +1 here produces
         // CURRENT+2 → TxBadSeq.
+
+        // ── dispatch gate (uses authoritative args + source account_view) ────
+        // destructive_hint = true → engine evaluates per profile.policy.engine;
+        // Noop refuses on mainnet, V1 evaluates typed criteria. `identity_view`
+        // stays `None`, matching `stellar_create_account`'s simulate phase: the
+        // destination has no on-chain state yet (that is the point of this
+        // operation), so there is no counterparty identity to feed
+        // `home_domain_resolved`.
+        let source_adapter = crate::policy_adapter::AccountViewAdapter::new(&account_view);
+        let dispatch_outcome = match self
+            .dispatch_gate_with_views(
+                "stellar_create_account_commit",
+                &authoritative_args,
+                &args.chain_id,
+                Some(&source_adapter),
+                None,
+            )
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return e.into_result(),
+        };
+
+        // ── Decode nonce — map parse error to nonce.expired ──────────────────
+        let nonce = match stellar_agent_nonce::Nonce::from_base64(&args.nonce) {
+            Ok(n) => n,
+            Err(_) => return Ok(commit_path_error_result("nonce parse failed")),
+        };
 
         let total_fee_from_envelope = match authoritative_args
             .get("total_fee_stroops")
@@ -965,13 +982,14 @@ impl WalletServer {
         // live (timing oracle).  All failure modes collapse to
         // `policy.approval_required`.
         //
-        // Ordering note: `stellar_pay_commit_impl` runs this gate BEFORE the
-        // RPC fetch (fail-fast principle + toolset-gated test ergonomics).  Here
-        // the gate runs AFTER the high-value cross-check because
-        // `stellar_create_account_commit` does not have a toolset-gated variant,
-        // so there is no test-bypass motivation to hoist the gate above RPC work.
-        // The ordering invariant is still satisfied: the gate fires before nonce
-        // HMAC+replay.
+        // Ordering note: both `stellar_pay_commit_impl` and this handler
+        // fetch the source (+ pay's destination) account BEFORE the policy
+        // dispatch gate, which consumes that on-chain state as
+        // `account_view`/`identity_view`.  This attestation gate runs AFTER
+        // the high-value cross-check because `stellar_create_account_commit`
+        // has no toolset-gated variant, so there is no test-bypass motivation
+        // to hoist it above that work.  The ordering invariant holds: this
+        // gate fires before nonce HMAC+replay in both tools.
         //
         // This is a no-op when `dispatch_outcome` is `Allow`.
         if let Err(result) = verify_attestation_gate(

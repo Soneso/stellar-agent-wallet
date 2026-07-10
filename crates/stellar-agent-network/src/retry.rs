@@ -481,7 +481,10 @@ fn jitter_delay(attempt: u32, base_delay: Duration, max_delay: Duration) -> Dura
 /// # Bounded wall-time
 ///
 /// Total wall-time ≤ `overall_deadline + one max_delay`.  Specifically:
-/// - The loop exits before sleeping if `now >= overall_deadline`.
+/// - Every `op()` call is itself raced against `overall_deadline` via
+///   `tokio::time::timeout_at`, so an in-flight attempt cannot overshoot the
+///   deadline by its own transport-level bound (up to 60s) — the SAME
+///   deadline governs both attempt duration and inter-attempt sleeps.
 /// - If a sleep starts, it runs for at most `max_delay` regardless of the
 ///   remaining time (we do NOT trim the sleep to fit the deadline exactly,
 ///   because the poll interval already handles the hard cutoff at the deadline
@@ -490,6 +493,18 @@ fn jitter_delay(attempt: u32, base_delay: Duration, max_delay: Duration) -> Dura
 ///
 /// A malicious server cannot cause an unbounded wait: we never read
 /// `Retry-After` from server responses; blind backoff is used instead.
+///
+/// # Deadline-cutoff attempts are terminal, never retried
+///
+/// When `overall_deadline` elapses WHILE an attempt is in flight, the attempt
+/// is cut off and [`stellar_rpc_client::Error::TransactionSubmissionTimeout`]
+/// is returned immediately — the SAME variant `submit_transaction_and_wait`'s
+/// own poll-timeout path already returns, so callers' existing mapping (e.g.
+/// `map_send_error` → `NetworkError::RpcTimeout`) classifies it identically.
+/// This is deliberately NOT routed through `is_retryable`: a deadline cutoff
+/// is never eligible for another attempt (unlike a normal `op()` error, which
+/// IS classified and may be retried) — retrying past the caller's own budget
+/// would defeat the deadline entirely.
 ///
 /// # Arguments
 ///
@@ -540,9 +555,9 @@ where
     let mut last_err: Option<stellar_rpc_client::Error> = None;
 
     for attempt in 0..policy.max_attempts {
-        match op().await {
-            Ok(val) => return Ok(val),
-            Err(e) => {
+        match tokio::time::timeout_at(overall_deadline, op()).await {
+            Ok(Ok(val)) => return Ok(val),
+            Ok(Err(e)) => {
                 if !is_retryable(&e) {
                     // Non-retryable: surface immediately without sleeping.
                     return Err(e);
@@ -559,6 +574,15 @@ where
 
                 let delay = jitter_delay(attempt, policy.base_delay, policy.max_delay);
                 tokio::time::sleep(delay).await;
+            }
+            // `overall_deadline` elapsed while THIS attempt was in flight — a
+            // one-off transport hang cannot overshoot the shared deadline by
+            // its own bound. Terminal: no `is_retryable` classification, no
+            // sleep, no further attempt. Reuses the same variant
+            // `submit_transaction_and_wait`'s own timeout path returns, so
+            // this maps through existing caller error-handling unchanged.
+            Err(_elapsed) => {
+                return Err(stellar_rpc_client::Error::TransactionSubmissionTimeout);
             }
         }
     }
@@ -934,6 +958,59 @@ mod tests {
         assert!(
             distinct > 10,
             "expected high diversity in jitter samples, got {distinct} distinct out of 20"
+        );
+    }
+
+    /// An attempt that hangs past `overall_deadline` is cut off AT the shared
+    /// deadline rather than being allowed to run to its own (much larger)
+    /// internal duration. Without the `timeout_at` wrapper this attempt would
+    /// run for its full 120s before the deadline check (which only fires
+    /// BEFORE a sleep) ever got a chance to observe it — overshooting the 5s
+    /// deadline by over 20x. Also asserts the terminal error is
+    /// `TransactionSubmissionTimeout` (not retried, not `last_err` from a
+    /// prior attempt) and that no further attempt is made afterward.
+    #[tokio::test(start_paused = true)]
+    async fn in_flight_attempt_is_cut_off_at_shared_deadline() {
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc = Arc::clone(&call_count);
+
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(100),
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        let result = retry_with_backoff(&policy, deadline, is_retryable_poll_error, || {
+            let cc = Arc::clone(&cc);
+            async move {
+                cc.fetch_add(1, Ordering::SeqCst);
+                // Simulate a hung transport call far longer than the shared
+                // deadline; without the `timeout_at` wrapper this would run
+                // to completion before the deadline check is ever consulted.
+                tokio::time::sleep(Duration::from_secs(120)).await;
+                Ok::<u32, stellar_rpc_client::Error>(42)
+            }
+        })
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(stellar_rpc_client::Error::TransactionSubmissionTimeout)
+            ),
+            "expected TransactionSubmissionTimeout, got {result:?}"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "a deadline cutoff must not be retried — exactly one attempt was made"
+        );
+        assert_eq!(
+            Instant::now().duration_since(deadline - Duration::from_secs(5)),
+            Duration::from_secs(5),
+            "the attempt must be cut off exactly at the shared deadline, not after its own \
+             120s duration"
         );
     }
 

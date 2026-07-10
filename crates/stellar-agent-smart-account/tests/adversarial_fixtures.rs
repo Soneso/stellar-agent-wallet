@@ -26,6 +26,7 @@
 //! | [`contract_mutability_non_address_admin_value`] | fail-closed Mutable on non-address Admin value |
 //! | [`contract_mutability_non_map_instance_storage`] | fail-closed Mutable on non-map instance storage |
 //! | [`divergence_failure_self_audit_writer`] | write-path divergence failures emit via `self.audit_writer` |
+//! | [`divergence_collective_budget_mock`] | `check_divergence_for_auth_rule_ids` collective wall-clock budget across `auth_rule_ids` |
 //! | [`wasm_hash_canonicalisation_parity`] | WASM hash canonicalisation regression-lock: byte-identical no-drift + idempotence + first8 formatter determinism |
 //! | [`rule_id_downgrade`] | Rule-ID downgrade regression-lock: 5 divergence sub-codes + wire-code mapping + comparator ordering |
 //! | [`multicall_inner_invocation_count_cap_51_inner`] | Amplification-defence via `evaluate_bundle` (51-inner deny + 49/50 boundary) |
@@ -125,6 +126,9 @@ mod contract_mutability_non_map_instance_storage;
 
 #[path = "smart-account-fixtures/adversarial/divergence_failure_self_audit_writer.rs"]
 mod divergence_failure_self_audit_writer;
+
+#[path = "smart-account-fixtures/adversarial/divergence_collective_budget_mock.rs"]
+mod divergence_collective_budget_mock;
 
 #[cfg(feature = "test-helpers")]
 #[path = "smart-account-fixtures/adversarial/wasm_hash_canonicalisation_parity.rs"]

@@ -1187,6 +1187,59 @@ impl WalletServer {
         // dispatch_gate step 3).
         authoritative_args["chain_id"] = serde_json::Value::String(args.chain_id.clone());
 
+        // ── Validate G-strkeys ────────────────────────────────────────────────
+        // Runs BEFORE the account fetch below: `fetch_account` itself parses
+        // `args.source`/`args.destination` via the same strkey check and would
+        // otherwise surface a malformed value as a redacted RPC-error business
+        // envelope instead of this dedicated `invalid_params` protocol error.
+        validate_g_strkey(&args.source, "source")?;
+        validate_g_strkey(&args.destination, "destination")?;
+
+        // ── Re-fetch source (+ destination) account state (feeds the policy
+        // gate's views; sequence number also consumed by the rebuild below) ──
+        // Moved ahead of the gate so `dispatch_gate_with_views` evaluates
+        // `minimum_reserve` against the SAME on-chain source state the commit
+        // path already needs for the sequence number — reused below, no
+        // second fetch. Nothing state-mutating (nonce decode/replay-window,
+        // approval writes, signing) runs before this point: nonce decode and
+        // replay-window consumption both still run strictly after this gate.
+        let rpc_url = self.profile.rpc_url.as_str();
+        let client = match StellarRpcClient::new(rpc_url) {
+            Ok(c) => c,
+            Err(err) => {
+                return Err(rmcp::ErrorData::internal_error(
+                    redact_rpc_error_detail("rpc_client_error", &err),
+                    None,
+                ));
+            }
+        };
+
+        let account_view = match fetch_account(&client, &args.source, &[]).await {
+            Ok(v) => v,
+            Err(err) => {
+                let envelope = redacted_wallet_error_envelope(&err);
+                let json = envelope
+                    .to_json_pretty()
+                    .unwrap_or_else(|_| String::from("{}"));
+                let mut result = CallToolResult::success(vec![Content::text(json)]);
+                result.is_error = Some(true);
+                return Ok(result);
+            }
+        };
+        let source_sequence = account_view.sequence_number;
+
+        // Destination fetch is non-fatal (matches `stellar_pay`'s simulate
+        // phase): a not-yet-created destination has no `home_domain`, so
+        // `identity_view` is simply `None`.
+        let dest_view = fetch_account(&client, &args.destination, &[]).await.ok();
+        let source_adapter = crate::policy_adapter::AccountViewAdapter::new(&account_view);
+        let dest_adapter = dest_view
+            .as_ref()
+            .map(crate::policy_adapter::AccountViewAdapter::new);
+        let identity_view = dest_adapter
+            .as_ref()
+            .map(|a| a as &dyn stellar_agent_core::policy::v1::AccountIdentityView);
+
         // ── Dispatch gate (uses authoritative args, not caller args) ─────────
         // destructive_hint = true → engine evaluates per profile.policy.engine;
         // Noop refuses on mainnet, V1 evaluates typed criteria.
@@ -1207,7 +1260,13 @@ impl WalletServer {
                 // Still run dispatch_gate for chain_id validation + Deny check;
                 // override Allow with the forced outcome if the gate does not deny.
                 let gate_outcome = match self
-                    .dispatch_gate("stellar_pay_commit", &authoritative_args, &args.chain_id)
+                    .dispatch_gate_with_views(
+                        "stellar_pay_commit",
+                        &authoritative_args,
+                        &args.chain_id,
+                        Some(&source_adapter),
+                        identity_view,
+                    )
                     .await
                 {
                     Ok(o) => o,
@@ -1230,7 +1289,13 @@ impl WalletServer {
             None => {
                 // Normal path: use the policy-engine outcome directly.
                 match self
-                    .dispatch_gate("stellar_pay_commit", &authoritative_args, &args.chain_id)
+                    .dispatch_gate_with_views(
+                        "stellar_pay_commit",
+                        &authoritative_args,
+                        &args.chain_id,
+                        Some(&source_adapter),
+                        identity_view,
+                    )
                     .await
                 {
                     Ok(o) => o,
@@ -1239,25 +1304,24 @@ impl WalletServer {
             }
         };
 
-        // ── Validate G-strkeys ────────────────────────────────────────────────
-        validate_g_strkey(&args.source, "source")?;
-        validate_g_strkey(&args.destination, "destination")?;
-
         // ── Attestation verification gate ────────────────────────────────────
         //
-        // Placed BEFORE nonce parse and RPC fetch to:
+        // Placed BEFORE nonce parse to:
         //   (a) Ensure the attestation gate fires before nonce HMAC+replay.
-        //   (b) Avoid expensive RPC/nonce-HMAC operations when the attestation
-        //       is absent or forged (fail-fast principle).
+        //   (b) Avoid expensive nonce-HMAC operations when the attestation is
+        //       absent or forged (fail-fast principle). The source (+
+        //       optionally destination) account fetch runs before the policy
+        //       gate because the gate consumes its `account_view` /
+        //       `identity_view`.
         //   (c) Make toolset-gated tests practical: the `forced_dispatch_outcome`
         //       override causes this gate to ALWAYS run for toolset-routed payments
         //       regardless of policy, so tests can verify the gate fires without
         //       needing a live RPC.
         //
-        // Ordering note: `stellar_create_account_commit` runs the gate AFTER its
+        // Ordering note: `stellar_create_account_commit` runs this gate AFTER its
         // high-value cross-check (there is no toolset-gated variant to test without
         // RPC, so no motivation to hoist it above that work).  The ordering
-        // invariant is satisfied in both tools: the gate fires before nonce
+        // invariant is satisfied in both tools: this gate fires before nonce
         // HMAC+replay either way.
         //
         // This is a no-op when `dispatch_outcome` is `DispatchOutcome::Allow`.
@@ -1321,36 +1385,12 @@ impl WalletServer {
             Err(err) => return Ok(commit_path_error_result(err)),
         };
 
-        // ── Re-fetch source account state and re-build envelope ───────────────
-        let rpc_url = self.profile.rpc_url.as_str();
-        let client = match StellarRpcClient::new(rpc_url) {
-            Ok(c) => c,
-            Err(err) => {
-                return Err(rmcp::ErrorData::internal_error(
-                    redact_rpc_error_detail("rpc_client_error", &err),
-                    None,
-                ));
-            }
-        };
-
-        let account_view = match fetch_account(&client, &args.source, &[]).await {
-            Ok(v) => v,
-            Err(err) => {
-                let envelope = redacted_wallet_error_envelope(&err);
-                let json = envelope
-                    .to_json_pretty()
-                    .unwrap_or_else(|_| String::from("{}"));
-                let mut result = CallToolResult::success(vec![Content::text(json)]);
-                result.is_error = Some(true);
-                return Ok(result);
-            }
-        };
-
-        let source_sequence = account_view.sequence_number;
-        // Pass `source_sequence` (current on-chain value) directly.
-        // `stellar_baselib::TransactionBuilder::build` auto-increments via
-        // `Account::increment_sequence_number`; an explicit +1 produces
-        // CURRENT+2 → TxBadSeq.
+        // `account_view`/`source_sequence`/`client` were fetched above (ahead of
+        // the policy gate) and are reused here for the envelope rebuild — no
+        // second source-account fetch. Pass `source_sequence` (current on-chain
+        // value) directly: `stellar_baselib::TransactionBuilder::build`
+        // auto-increments via `Account::increment_sequence_number`; an explicit
+        // +1 produces CURRENT+2 → TxBadSeq.
 
         let total_fee_from_envelope = match authoritative_args
             .get("total_fee_stroops")
