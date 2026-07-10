@@ -146,15 +146,28 @@ jobs:
           # Failing iterations must still seed the build cache, or every
           # retry recompiles the dependency tree cold on a slow runner.
           cache-on-failure: true
+      # Compilation is unbounded below the job ceiling (a compile progresses
+      # or errors; only cold-cache runs need the headroom). Test EXECUTION is
+      # where a Windows lock deadlock can hang, so every test step runs under
+      # a 10-minute GNU timeout (Git Bash) — a hang costs minutes, not the
+      # rest of the job budget.
+      - name: Build test binaries (unbounded compile phase)
+        shell: bash
+        run: |
+          cargo test -p stellar-agent-core --lib --no-run
+          cargo test -p stellar-agent-smart-account --lib --no-run
       - name: Audit-log writer single-handle regression (stellar-agent-core)
         # The two skipped rotation tests fail on Windows for campaign-tracked
         # reasons (see the TEMPORARY SCOPE note above); they rejoin with the
         # reader module.
-        run: "cargo test -p stellar-agent-core --lib audit_log::writer:: -- --skip hmac_sidecar_renamed_on_rotation --skip post_rotation_active_path_is_locked"
+        shell: bash
+        run: "timeout 600 cargo test -p stellar-agent-core --lib audit_log::writer:: -- --skip hmac_sidecar_renamed_on_rotation --skip post_rotation_active_path_is_locked --skip rotation_lock_failure_returns_partial_rotation_and_poisons_writer"
       - name: Approval + toolset-grant store persist regression (stellar-agent-core)
-        run: "cargo test -p stellar-agent-core --lib -- approval::store::tests::persist approval::toolset_grant::tests::persist"
+        shell: bash
+        run: "timeout 600 cargo test -p stellar-agent-core --lib -- approval::store::tests::persist approval::toolset_grant::tests::persist"
       - name: SaError wire-code coverage (stellar-agent-smart-account)
-        run: "cargo test -p stellar-agent-smart-account --lib error::"
+        shell: bash
+        run: "timeout 600 cargo test -p stellar-agent-smart-account --lib error::"
 
   machete:
     name: unused-deps
