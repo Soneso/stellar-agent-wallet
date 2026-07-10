@@ -278,9 +278,28 @@ async fn t1_classic_trustline_add_two_phase_happy_path_under_minimum_reserve_rul
     assert_eq!(tx_hash.len(), 64, "tx_hash must be a 32-byte hex digest");
 
     // ── On-chain effect: the trustline now exists with the requested limit ──
-    let refreshed = fetch_account(&client, &source_g, &[])
+    // The confirmed transaction's ledger entry can lag the load-balanced RPC's
+    // read path by a ledger or two; retry the fetch until the trustline is
+    // visible, bounded well under the suite pace.
+    let mut refreshed = fetch_account(&client, &source_g, &[])
         .await
         .expect("source account fetch after commit");
+    let usdc_present = |account: &stellar_agent_network::AccountView| {
+        account.balances.iter().any(|b| {
+            b.asset.asset_type == "USDC"
+                && b.asset.issuer.as_deref()
+                    == Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5")
+        })
+    };
+    for _ in 0..20 {
+        if usdc_present(&refreshed) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+        refreshed = fetch_account(&client, &source_g, &[])
+            .await
+            .expect("source account re-fetch while waiting for the trustline");
+    }
     let usdc_line = refreshed
         .balances
         .iter()

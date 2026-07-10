@@ -61,6 +61,14 @@
 //! `run_initialises_keyring_store_before_policy_gate` spy test (and the
 //! equivalent spy tests in `commands::claim` and `commands::accounts::create`).
 //!
+//! # Self-skip on hosts without a platform keyring
+//!
+//! The v1 policy path registers the platform keyring store before the gate
+//! and refuses when registration fails, so this suite requires a functioning
+//! platform keyring even though the owner key itself comes from the file
+//! source. On hosts without one (headless CI runners with no Secret Service)
+//! the test prints a driver-visible `SKIP` marker and returns.
+//!
 //! Gated behind `testnet-acceptance`:
 //!
 //! ```text
@@ -325,6 +333,26 @@ fn run_pay(
 /// ledger inclusion.
 #[tokio::test]
 async fn pay_v1_per_tx_cap_denies_over_cap_and_submits_under_cap() {
+    // The v1 policy path registers the platform keyring store before the gate
+    // and refuses when registration fails, so this suite needs a functioning
+    // platform keyring (macOS Keychain; a Secret Service on Linux). Headless
+    // CI runners have none — self-skip with the driver-visible marker instead
+    // of failing on an infrastructure precondition.
+    if stellar_agent_network::init_platform_keyring_store().is_err() {
+        // The driver script counts SKIP markers from the suite's output; the
+        // workspace denies print_stderr, so scope the exception to this one
+        // infrastructure-precondition marker.
+        #[allow(clippy::print_stderr, reason = "driver-visible self-skip marker")]
+        {
+            eprintln!(
+                "[v1] SKIP: no functioning platform keyring on this host (Secret \
+                 Service init failed); the v1 policy path requires keyring-store \
+                 registration before the gate."
+            );
+        }
+        return;
+    }
+
     let home = tempfile::TempDir::new().expect("tempdir");
 
     // ── Fixture: owner keypair, signed policy, profile, pubkey file ──────────
