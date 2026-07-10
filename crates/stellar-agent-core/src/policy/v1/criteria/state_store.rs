@@ -327,6 +327,44 @@ impl PolicyStateStore {
 
         Ok(())
     }
+
+    /// Removes every entry for every key, resetting the store to empty.
+    ///
+    /// Used by a long-lived engine (the MCP server) to REPLACE its in-memory
+    /// view with a freshly re-hydrated one from the persisted window-state
+    /// store before each dispatch, rather than merging on top of
+    /// potentially-stale entries: `clear()` then re-append is the "replace,
+    /// not merge" discipline that keeps a long-running process from
+    /// accumulating entries a concurrent process (e.g. the CLI) has already
+    /// superseded on disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateStoreError::LockPoisoned`] if the mutex was poisoned by
+    /// a previous panic.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
+    ///
+    /// let store = PolicyStateStore::new();
+    /// let key = StateKey::new("alice", 1, "native", 3_600);
+    /// store.append(&key, 1_000, 500).unwrap();
+    /// store.clear().unwrap();
+    /// let (sum, count) = store.query_window(&key, 2_000).unwrap();
+    /// assert_eq!((sum, count), (0, 0));
+    /// ```
+    pub fn clear(&self) -> Result<(), StateStoreError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| StateStoreError::LockPoisoned {
+                detail: e.to_string(),
+            })?;
+        guard.clear();
+        Ok(())
+    }
 }
 
 impl Default for PolicyStateStore {

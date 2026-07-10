@@ -289,6 +289,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stellar-agent-network::policy_view` (re-exported from its former path for
   compatibility) so the CLI can use it without a new dependency on the MCP
   crate. (#45)
+- `per_period_cap` and `rate_limit` (and their bundle counterparts,
+  `bundle_per_period_cap` / `bundle_rate_limit`) now actually accumulate
+  across calls: a new HMAC-protected, single-writer, atomically-written
+  per-profile window-state store (`<state>/stellar-agent/policy/<profile>.window`,
+  keyed by the new `policy_window_state_key_id` profile coordinate) persists
+  the rolling-window history that was previously reconstructed empty on every
+  invocation, so these criteria evaluated every call against zero history and
+  never actually capped anything across calls. `profile rotate-policy-state-key`
+  rotates the HMAC key (re-signing the store so history is preserved, not
+  invalidated); `profile reset-window-state` recovers from an unreadable,
+  tampered, or unparseable store by re-initialising it to empty (audited via
+  a new `PolicyWindowStateReset` audit row). The multicall bundle path's
+  per-invocation throwaway state store is replaced with the persisted one.
+  (#50)
+- `stellar_pay` / `stellar_pay_commit` path-payment envelopes
+  (`PathPaymentStrictReceive` / `PathPaymentStrictSend`) now size the policy
+  gate's debit leg from the SEND side (`send_max` / `send_amount`), not the
+  destination side (`dest_amount`) — the wallet's actual spendable-balance
+  debit. `PathPaymentStrictSend` additionally now uses `send_asset` (not
+  `dest_asset`) for the debit's asset. The destination side is still
+  surfaced, as a separate non-debit informational leg, so counterparty checks
+  continue to see the recipient. (#51)
 
 ### Changed
 

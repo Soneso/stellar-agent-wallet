@@ -1214,6 +1214,24 @@ impl PolicyEngine for PolicyEngineV1 {
             decision,
         })
     }
+
+    /// Delegates to the inherent [`PolicyEngineV1::record_confirmed`] — see
+    /// that method's documentation for the recording semantics.
+    fn record_confirmed(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        value: &value::ValueClass,
+    ) -> Result<Vec<(criteria::state_store::StateKey, u64, i128)>, PolicyError> {
+        PolicyEngineV1::record_confirmed(self, tool, profile, value)
+    }
+
+    /// Returns `Some(&self.state_store)` — see the trait method's
+    /// documentation for why a caller needs this to refresh a long-lived
+    /// engine's window state before evaluation.
+    fn window_state_store(&self) -> Option<&criteria::state_store::PolicyStateStore> {
+        Some(&self.state_store)
+    }
 }
 
 /// Extracts the sized [`value::ValueEffects`] from a resolved descriptor, but
@@ -1319,6 +1337,84 @@ impl PolicyEngineV1 {
 
         // No matching rule — default-deny.
         Ok(Decision::Deny(DenyReason::NoMatchingRule))
+    }
+
+    /// Returns the profile name this engine was constructed for.
+    #[must_use]
+    pub fn profile_name(&self) -> &str {
+        &self.profile_name
+    }
+
+    /// Returns the engine's in-memory sliding-window state store.
+    ///
+    /// Callers use this to hydrate the store from a persisted window-state
+    /// file before evaluation, or to inspect the entries a confirmed
+    /// [`Self::record_confirmed`] / [`Self::record_confirmed_bundle`] call
+    /// appended so they can be persisted to disk.
+    #[must_use]
+    pub fn state_store(&self) -> &PolicyStateStore {
+        &self.state_store
+    }
+
+    /// Records a CONFIRMED single-tx call's contribution into the shared
+    /// window-state store, for the SAME rule and criteria [`Self::evaluate_inner`]
+    /// resolved when the call was originally gated (recording side of the
+    /// single-derivation invariant).
+    ///
+    /// `value` MUST be the SAME [`value::ValueClass`] the original gate
+    /// evaluated (the `value_action_submitted` audit row's `ValueEffects`
+    /// wrapped back into a `ValueClass::Value`, or `ValueClass::ReadOnly` for
+    /// a call that carries no resolved value effects) — never re-derived.
+    ///
+    /// Mutates `self.state_store` in place (via each criterion's
+    /// `record_confirmed`, which appends through `&PolicyStateStore`'s
+    /// interior mutability) and returns every `(key, timestamp_ms, amount)`
+    /// tuple appended, for the caller to persist to the on-disk window-state
+    /// store.
+    ///
+    /// Recording is best-effort at the RULE level: only the rule that would
+    /// match `tool` is consulted (mirroring `evaluate_inner`'s first-match
+    /// semantics), so a call whose rule carries no stateful criterion appends
+    /// nothing and returns an empty vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] if any criterion's
+    /// `record_confirmed` fails (state-store lock poisoning or a clock read
+    /// failure).
+    pub fn record_confirmed(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        value: &value::ValueClass,
+    ) -> Result<Vec<(criteria::state_store::StateKey, u64, i128)>, PolicyError> {
+        let rules = self.matching_rules(&self.profile_name, self.project_id.as_deref());
+        for rule in rules {
+            if !rule.matches_tool(tool) {
+                continue;
+            }
+            let ctx = EvalContext {
+                tool,
+                args: &Value::Null,
+                profile_name: &self.profile_name,
+                profile,
+                value: value.clone(),
+                account_view: None,
+                identity_view: None,
+                quorum: None,
+                counterparty_cache: None,
+                sep10_sessions: None,
+                sep45_sessions: None,
+                state_store: &self.state_store,
+                bundle: None,
+            };
+            let mut recorded = Vec::new();
+            for criterion in &rule.criteria {
+                recorded.extend(criterion.record_confirmed(&ctx)?);
+            }
+            return Ok(recorded);
+        }
+        Ok(Vec::new())
     }
 }
 
@@ -1584,6 +1680,61 @@ impl PolicyEngineV1 {
         }
 
         Ok(rule.decision.clone())
+    }
+
+    /// Records a CONFIRMED multicall bundle submit's contribution into the
+    /// shared window-state store, for the SAME rule [`Self::evaluate_bundle`]
+    /// resolved when the bundle was originally gated (recording side of the
+    /// single-derivation invariant).
+    ///
+    /// Iterates every criterion of the matching rule (both bundle-level and
+    /// per-inner) and calls [`Criterion::record_confirmed`] with a bundle-scoped
+    /// [`EvalContext`]; per-inner criteria such as `PerPeriodCapCriterion` see
+    /// `ctx.value = ValueClass::ReadOnly` on the bundle path and no-op
+    /// (matching `evaluate`'s NotApplicable classification for a bundle tool),
+    /// while `BundlePerPeriodCapCriterion` / `BundleRateLimitCriterion` record
+    /// once per matching inner.
+    ///
+    /// Mutates `self.state_store` in place and returns every
+    /// `(key, timestamp_ms, amount)` tuple appended, for the caller to persist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] if any criterion's
+    /// `record_confirmed` fails.
+    pub fn record_confirmed_bundle(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        bundle: &BundleView<'_>,
+    ) -> Result<Vec<(criteria::state_store::StateKey, u64, i128)>, PolicyError> {
+        let rules = self.matching_rules(&self.profile_name, self.project_id.as_deref());
+        for rule in rules {
+            if !rule.matches_tool(tool) {
+                continue;
+            }
+            let ctx = EvalContext {
+                tool,
+                args: &Value::Null,
+                profile_name: &self.profile_name,
+                profile,
+                value: value::ValueClass::ReadOnly,
+                account_view: None,
+                identity_view: None,
+                quorum: None,
+                counterparty_cache: None,
+                sep10_sessions: None,
+                sep45_sessions: None,
+                state_store: &self.state_store,
+                bundle: Some(bundle),
+            };
+            let mut recorded = Vec::new();
+            for criterion in &rule.criteria {
+                recorded.extend(criterion.record_confirmed(&ctx)?);
+            }
+            return Ok(recorded);
+        }
+        Ok(Vec::new())
     }
 }
 
@@ -2697,5 +2848,230 @@ mod tests {
             Decision::Allow,
             "rate_limit at boundary (recorded=4, max=5, 1-inner) must Allow; got {result:?}"
         );
+    }
+
+    // ── PolicyEngineV1::record_confirmed / record_confirmed_bundle ──────────
+
+    /// The success-then-deny round-trip: a `per_period_cap` rule allows a
+    /// first call, `record_confirmed` appends the debit, and an identical
+    /// second call is then DENIED because the accumulated total now exceeds
+    /// the cap — pinning that recording actually feeds back into evaluation.
+    #[test]
+    fn record_confirmed_per_period_cap_accumulates_then_second_call_denies() {
+        use crate::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
+        use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
+
+        let window = Window::parse("1d").unwrap();
+        // Cap: 100 XLM. Each call attempts 60 XLM.
+        let criterion = PerPeriodCapCriterion::new("native".into(), window, 1_000_000_000);
+        let doc = allow_all_doc_with_criteria(vec![Box::new(criterion)]);
+        let engine = PolicyEngineV1::new(doc, "alice".into());
+        let td = tool("stellar_pay", "stellar:testnet");
+        let profile = testnet_profile();
+        let value = ValueClass::Value(ValueEffects::single(ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(600_000_000),
+            asset: Some("native".to_owned()),
+            destination: Some("GAAA".to_owned()),
+        }));
+
+        // Call 1: empty window, 60 XLM < 100 XLM cap → Allow.
+        let d1 = engine
+            .evaluate_with_value(
+                &td,
+                &Value::Null,
+                &profile,
+                value.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(d1, Decision::Allow, "first call must be allowed");
+
+        let recorded = engine.record_confirmed(&td, &profile, &value).unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one debit entry recorded");
+        assert_eq!(
+            recorded[0].2, 600_000_000,
+            "recorded amount must match the debit leg"
+        );
+
+        // Call 2: window now holds 60 XLM; 60 + 60 = 120 XLM > 100 XLM cap → Deny.
+        let d2 = engine
+            .evaluate_with_value(
+                &td,
+                &Value::Null,
+                &profile,
+                value,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            matches!(d2, Decision::Deny(DenyReason::PerPeriodCapExceeded { .. })),
+            "second call must be denied by the accumulated window, got {d2:?}"
+        );
+    }
+
+    /// `rate_limit` counts calls: three confirmed calls under a cap of 3
+    /// exhaust it; a fourth is denied.
+    #[test]
+    fn record_confirmed_rate_limit_accumulates_calls_until_cap() {
+        use crate::policy::v1::criteria::per_period_cap::Window;
+        use crate::policy::v1::criteria::rate_limit::RateLimitCriterion;
+        use crate::policy::v1::value::ValueClass;
+
+        let window = Window::parse("1m").unwrap();
+        let criterion = RateLimitCriterion::new(window, 3);
+        let doc = allow_all_doc_with_criteria(vec![Box::new(criterion)]);
+        let engine = PolicyEngineV1::new(doc, "alice".into());
+        let td = tool("stellar_pay", "stellar:testnet");
+        let profile = testnet_profile();
+
+        for i in 0..3 {
+            let d = engine
+                .evaluate_with_value(
+                    &td,
+                    &Value::Null,
+                    &profile,
+                    ValueClass::ReadOnly,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(d, Decision::Allow, "call {i} must be allowed");
+            let recorded = engine
+                .record_confirmed(&td, &profile, &ValueClass::ReadOnly)
+                .unwrap();
+            assert_eq!(recorded.len(), 1, "call {i} must record one call entry");
+        }
+
+        let d4 = engine
+            .evaluate_with_value(
+                &td,
+                &Value::Null,
+                &profile,
+                ValueClass::ReadOnly,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            matches!(d4, Decision::Deny(DenyReason::RateLimitExceeded { .. })),
+            "the 4th call must be denied by the accumulated rate limit, got {d4:?}"
+        );
+    }
+
+    /// `record_confirmed` on the single-tx path is a no-op for
+    /// `PerPeriodCapCriterion` when `value` is `ReadOnly` (e.g. the bundle
+    /// path, which records via `record_confirmed_bundle` instead).
+    #[test]
+    fn record_confirmed_read_only_value_is_noop_for_per_period_cap() {
+        use crate::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
+        use crate::policy::v1::value::ValueClass;
+
+        let window = Window::parse("1d").unwrap();
+        let criterion = PerPeriodCapCriterion::new("native".into(), window, 1_000_000_000);
+        let doc = allow_all_doc_with_criteria(vec![Box::new(criterion)]);
+        let engine = PolicyEngineV1::new(doc, "alice".into());
+        let td = tool("stellar_pay", "stellar:testnet");
+        let profile = testnet_profile();
+
+        let recorded = engine
+            .record_confirmed(&td, &profile, &ValueClass::ReadOnly)
+            .unwrap();
+        assert!(recorded.is_empty(), "ReadOnly value must record nothing");
+    }
+
+    /// `record_confirmed_bundle` appends one entry per matching `TokenTransfer`
+    /// inner for `BundlePerPeriodCapCriterion`, and the recorded total then
+    /// denies a subsequent bundle that would tip the cap.
+    #[test]
+    fn record_confirmed_bundle_per_period_cap_accumulates_then_denies() {
+        use crate::policy::v1::criteria::bundle_per_period_cap::BundlePerPeriodCapCriterion;
+        use crate::policy::v1::criteria::per_period_cap::Window;
+
+        let window = Window::parse("1d").unwrap();
+        // Cap 100 XLM.
+        let criterion = BundlePerPeriodCapCriterion::new("native".into(), window, 1_000_000_000);
+        let doc = allow_all_doc_with_criteria(vec![Box::new(criterion)]);
+        let engine = PolicyEngineV1::new(doc, "alice".into());
+        let td = tool("wallet_multicall", "stellar:testnet");
+        let profile = testnet_profile();
+
+        // Bundle 1: two 30 XLM inners = 60 XLM, under the 100 XLM cap.
+        let inners1 = vec![
+            token_transfer_inner(300_000_000),
+            token_transfer_inner(300_000_000),
+        ];
+        let overlay1 = BundleStateOverlay::default();
+        let view1 = BundleView {
+            inners: &inners1,
+            overlay: &overlay1,
+        };
+        let d1 = engine
+            .evaluate_bundle(&td, &Value::Null, &profile, &view1)
+            .unwrap();
+        assert_eq!(d1, Decision::Allow, "first bundle (60 XLM) must be allowed");
+
+        let recorded = engine
+            .record_confirmed_bundle(&td, &profile, &view1)
+            .unwrap();
+        assert_eq!(recorded.len(), 2, "one entry per matching inner");
+
+        // Bundle 2: one 50 XLM inner; 60 (recorded) + 50 = 110 XLM > 100 XLM cap.
+        let inners2 = vec![token_transfer_inner(500_000_000)];
+        let overlay2 = BundleStateOverlay::default();
+        let view2 = BundleView {
+            inners: &inners2,
+            overlay: &overlay2,
+        };
+        let d2 = engine
+            .evaluate_bundle(&td, &Value::Null, &profile, &view2)
+            .unwrap();
+        assert!(
+            matches!(
+                d2,
+                Decision::Deny(DenyReason::BundleDenied {
+                    ref deny_reason,
+                    ..
+                }) if matches!(**deny_reason, DenyReason::PerPeriodCapExceeded { .. })
+            ),
+            "second bundle must be denied by the accumulated window, got {d2:?}"
+        );
+    }
+
+    /// `record_confirmed` returns an empty vector when no rule matches the
+    /// tool (mirrors `evaluate_inner`'s default-deny path — nothing to
+    /// record for a call that was never actually permitted under this
+    /// engine's document).
+    #[test]
+    fn record_confirmed_no_matching_rule_returns_empty() {
+        use crate::policy::v1::value::ValueClass;
+
+        let doc = PolicyDocument {
+            version: 1,
+            scope: ScopeId::AllProfiles,
+            rules: vec![],
+            signature: None,
+        };
+        let engine = PolicyEngineV1::new(doc, "alice".into());
+        let td = tool("stellar_pay", "stellar:testnet");
+        let profile = testnet_profile();
+        let recorded = engine
+            .record_confirmed(&td, &profile, &ValueClass::ReadOnly)
+            .unwrap();
+        assert!(recorded.is_empty());
     }
 }

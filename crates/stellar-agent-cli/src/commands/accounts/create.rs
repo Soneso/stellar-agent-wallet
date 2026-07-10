@@ -787,6 +787,14 @@ where
                 &args.profile,
                 audit_entry,
             );
+            crate::commands::policy_engine::record_confirmed_value_moving(
+                "accounts create",
+                &profile,
+                &args.profile,
+                "stellar_create_account",
+                chain_id,
+                create_effects.as_ref(),
+            );
 
             let result = CreateAccountResult {
                 account_id: new_account.g_strkey.clone(),

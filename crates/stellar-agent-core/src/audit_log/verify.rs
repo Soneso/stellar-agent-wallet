@@ -718,10 +718,11 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
             }
             EventKind::ValueActionSubmitted { .. }
             | EventKind::X402PaymentAuthorized { .. }
-            | EventKind::KeyringKeyWritten { .. } => {
-                // Value-action and key-write forensic rows. No rotation-handoff
-                // tracking needed; the hash-chain is maintained by the
-                // surrounding hash check.
+            | EventKind::KeyringKeyWritten { .. }
+            | EventKind::PolicyWindowStateReset { .. } => {
+                // Value-action, key-write, and window-state-reset forensic
+                // rows. No rotation-handoff tracking needed; the hash-chain is
+                // maintained by the surrounding hash check.
             }
             EventKind::AuditRotationHandoff { next_file_name } => {
                 if ctx.is_last_file {
@@ -1275,6 +1276,7 @@ mod tests {
             EventKind::ValueActionSubmitted { .. } => "value_action_submitted",
             EventKind::X402PaymentAuthorized { .. } => "x402_payment_authorized",
             EventKind::KeyringKeyWritten { .. } => "keyring_key_written",
+            EventKind::PolicyWindowStateReset { .. } => "policy_window_state_reset",
         }
     }
 

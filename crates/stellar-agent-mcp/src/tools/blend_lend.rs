@@ -265,6 +265,10 @@ impl WalletServer {
         // sized (single-derivation invariant).
         let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> =
             value_legs.iter().map(Into::into).collect();
+        // Also retain an owned clone for the window-state record after
+        // confirmed submit (single-derivation invariant on the recording
+        // side too) — `value_legs` itself moves into `ValueEffects::new` below.
+        let value_legs_for_record = value_legs.clone();
         let args_value = json!({
             "chain_id": args.chain_id,
             "pool_address": args.pool_address,
@@ -558,6 +562,19 @@ impl WalletServer {
 
         match submit_result {
             Ok(()) => {
+                // Non-fatal window-state record on confirmed submit: the SAME
+                // legs the gate sized (single-derivation invariant).
+                if let Some(descriptor) = self.tool_registry.get("stellar_blend_lend") {
+                    let value_class = ValueClass::Value(ValueEffects::new(value_legs_for_record));
+                    stellar_agent_network::policy_state::record_confirmed_window_state(
+                        self.policy_engine.as_ref(),
+                        descriptor,
+                        &self.profile,
+                        &audit_profile_name,
+                        &value_class,
+                    );
+                }
+
                 // blend_preview.requests carries BlendRequestEntry.amount as a
                 // core i128; the field is projected to a decimal string AT
                 // THIS MCP BOUNDARY (the stellar-agent-blend core type itself

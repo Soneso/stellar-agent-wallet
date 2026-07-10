@@ -170,7 +170,12 @@ serde_json                 = { workspace = true }
 # registry_walk.rs iterates McpToolRegistration records and cross-checks the
 # rmcp ToolRouter.
 inventory                  = { workspace = true }
-stellar-agent-core = { path = "../stellar-agent-core" }
+# test-helpers enables the STELLAR_AGENT_HOME override on
+# default_policy_window_state_path_for() in test builds — required by tests
+# that dispatch a stateful (per_period_cap / rate_limit) V1 policy engine
+# through dispatch_gate_inner's window-state refresh/record and need the
+# persisted store isolated to a temp dir instead of the real OS state dir.
+stellar-agent-core = { path = "../stellar-agent-core", features = ["test-helpers"] }
 stellar-agent-mcp-macros = { path = "../stellar-agent-mcp-macros" }
 # Wiremock for the friendbot + balances handler tests.
 wiremock                   = { workspace = true }

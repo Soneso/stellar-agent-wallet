@@ -223,6 +223,10 @@ impl WalletServer {
         // Capture the gate-derived leg as an audit record before it moves into
         // the value descriptor, so the row carries exactly what the gate sized.
         let audit_leg = ValueLegRecord::from(&value_leg);
+        // Also retain an owned clone for the window-state record after
+        // authorization (single-derivation invariant on the recording side
+        // too) — `value_leg` itself moves into `ValueClass::single` below.
+        let value_leg_for_record = value_leg.clone();
 
         // ── Telemetry preamble (redaction) ───────────────────────────────────
         let args_value = json!({
@@ -349,6 +353,29 @@ impl WalletServer {
             &self.profile_name_for_approval(),
             audit_entry,
         );
+
+        // Non-fatal window-state record at authorization — value is
+        // authorized for external settlement here; there is no on-chain
+        // submit on this path (see the audit-row comment above).
+        //
+        // Single-record invariant: this call records EXACTLY ONCE per
+        // authorized payment, here at signature production. There is
+        // currently no settle-confirmation callback into the wallet — the
+        // host settles externally and never reports back. If a future
+        // settle-confirmation path is added, it MUST NOT also call
+        // `record_confirmed_window_state` for the same payment, or the
+        // window total would double-count a single authorized value.
+        if let Some(descriptor) = self.tool_registry.get("stellar_x402_create_payment") {
+            let value_class =
+                stellar_agent_core::policy::v1::ValueClass::single(value_leg_for_record);
+            stellar_agent_network::policy_state::record_confirmed_window_state(
+                self.policy_engine.as_ref(),
+                descriptor,
+                &self.profile,
+                &self.profile_name_for_approval(),
+                &value_class,
+            );
+        }
 
         // ── Build response ────────────────────────────────────────────────────
         // amounts are public (payment values); account IDs in the response are

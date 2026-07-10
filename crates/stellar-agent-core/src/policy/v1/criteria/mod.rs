@@ -184,6 +184,36 @@ pub trait Criterion: Send + Sync + std::fmt::Debug {
     ) {
         // Default: no-op.
     }
+
+    /// Records this criterion's contribution to persisted window state after a
+    /// CONFIRMED submit.
+    ///
+    /// Called by [`crate::policy::v1::PolicyEngineV1::record_confirmed`] (single-tx
+    /// path) and [`crate::policy::v1::PolicyEngineV1::record_confirmed_bundle`]
+    /// (multicall path) for every criterion of the rule that governed the
+    /// decision — mirroring the SAME rule/criteria resolution `evaluate_inner`
+    /// used, so recording only touches criteria that actually governed the call.
+    ///
+    /// Implementations append into `ctx.state_store` via the SAME [`state_store::StateKey`]
+    /// derivation their `evaluate` uses (the read-key/write-key identity
+    /// invariant, same discipline as [`Self::accumulate_overlay`]), and return
+    /// every `(key, timestamp_ms, amount_or_count)` tuple appended so the
+    /// caller can persist the identical entries to the on-disk store.
+    ///
+    /// Default: no-op (most criteria are not stateful). Stateful criteria
+    /// (`per_period_cap`, `rate_limit`, `bundle_per_period_cap`,
+    /// `bundle_rate_limit`) override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] on a state-store
+    /// error (e.g. clock-skew or lock-poisoning) or a clock read failure.
+    fn record_confirmed(
+        &self,
+        _ctx: &EvalContext<'_>,
+    ) -> Result<Vec<(state_store::StateKey, u64, i128)>, PolicyError> {
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(test)]

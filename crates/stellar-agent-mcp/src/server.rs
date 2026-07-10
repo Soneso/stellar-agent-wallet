@@ -71,13 +71,14 @@ use rmcp::{
     tool_handler,
 };
 use serde_json::json;
-use stellar_agent_core::policy::v1::PolicyEngineV1;
+use stellar_agent_core::policy::v1::{PolicyEngineV1, PolicyStateStore};
 use stellar_agent_core::{
     policy::{BuildRegistryError, NoopPolicyEngine, PolicyEngine, ToolDescriptor},
     profile::loader,
     profile::schema::{KeyringEntryRef, PolicyEngineKind, Profile, default_policy_dir},
     timefmt::{Clock, default_clock},
 };
+use stellar_agent_network::policy_state::PersistedWindowStore;
 use stellar_agent_network::{CounterpartyResolver, NoopCounterpartyResolver, StellarTomlResolver};
 use stellar_agent_nonce::{NonceMint, ReplayWindow};
 use tokio::sync::Mutex as TokioMutex;
@@ -492,7 +493,30 @@ fn build_policy_engine(
                 source,
             })?;
 
-            Ok(Arc::new(PolicyEngineV1::new(document, profile_name)))
+            // Hydrate the persisted window-state store BEFORE constructing the
+            // engine — see `stellar-agent-cli`'s `build_v1_policy_engine` for
+            // the identical rationale. Fail-closed on a tampered/unparseable
+            // store file: the server MUST NOT start with an unhydrated engine,
+            // which would silently under-count accumulated `per_period_cap` /
+            // `rate_limit` / `bundle_per_period_cap` / `bundle_rate_limit`
+            // history.
+            let state_store = PolicyStateStore::new();
+            let window_store = PersistedWindowStore::for_profile(&profile_name);
+            window_store
+                .load_into(&profile_name, profile, &state_store)
+                .map_err(|e| BuildRegistryError::PolicyEngineError {
+                    detail: format!(
+                        "policy-window-state store for profile '{profile_name}' failed to \
+                         load ({e}); run `stellar-agent profile reset-window-state \
+                         {profile_name} --reason <reason>` to recover"
+                    ),
+                })?;
+
+            Ok(Arc::new(PolicyEngineV1::new_with_store(
+                document,
+                profile_name,
+                state_store,
+            )))
         }
         // Fail-closed: unknown PolicyEngineKind variants are NOT silently
         // downgraded to NoopPolicyEngine.  A silent downgrade would allow a

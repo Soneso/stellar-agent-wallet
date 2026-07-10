@@ -247,6 +247,48 @@ impl Criterion for BundlePerPeriodCapCriterion {
 
         Ok(None)
     }
+
+    /// Appends one entry per matching `TokenTransfer` inner into
+    /// `ctx.state_store`, using the SAME `StateKey` derivation `evaluate`
+    /// uses. No-op on the single-tx path (`ctx.bundle` is `None`).
+    fn record_confirmed(
+        &self,
+        ctx: &EvalContext<'_>,
+    ) -> Result<Vec<(StateKey, u64, i128)>, PolicyError> {
+        let Some(view) = ctx.bundle else {
+            return Ok(Vec::new());
+        };
+
+        let criterion_asset = asset_normalise(&self.asset);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .map_err(|e| PolicyError::CriterionEvaluationFailed {
+                detail: format!(
+                    "bundle_per_period_cap: record_confirmed system clock is before UNIX epoch: {e}"
+                ),
+            })?;
+        let state_key = StateKey::new(ctx.profile_name, 1, &criterion_asset, self.window.as_secs());
+
+        let mut recorded = Vec::new();
+        for inner in view.inners {
+            let InnerOpDescriptor::TokenTransfer { asset, amount, .. } = inner else {
+                continue;
+            };
+            if asset_normalise(asset) != criterion_asset {
+                continue;
+            }
+            ctx.state_store
+                .append(&state_key, now_ms, *amount)
+                .map_err(|e| PolicyError::CriterionEvaluationFailed {
+                    detail: format!(
+                        "bundle_per_period_cap: record_confirmed state store error: {e}"
+                    ),
+                })?;
+            recorded.push((state_key.clone(), now_ms, *amount));
+        }
+        Ok(recorded)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

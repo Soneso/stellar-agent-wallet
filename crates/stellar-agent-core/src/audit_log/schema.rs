@@ -276,6 +276,8 @@ pub enum ValueActionKind {
     MppCharge,
     /// See [`ActionKind::ContractInvoke`](crate::policy::v1::value::ActionKind::ContractInvoke).
     ContractInvoke,
+    /// See [`ActionKind::PathPaymentReceive`](crate::policy::v1::value::ActionKind::PathPaymentReceive).
+    PathPaymentReceive,
 }
 
 impl From<crate::policy::v1::value::ActionKind> for ValueActionKind {
@@ -296,6 +298,7 @@ impl From<crate::policy::v1::value::ActionKind> for ValueActionKind {
             ActionKind::X402Payment => Self::X402Payment,
             ActionKind::MppCharge => Self::MppCharge,
             ActionKind::ContractInvoke => Self::ContractInvoke,
+            ActionKind::PathPaymentReceive => Self::PathPaymentReceive,
         }
     }
 }
@@ -387,6 +390,8 @@ pub enum KeyPurpose {
     AuditHashChainHmac,
     /// The counterparty-cache HMAC key (`profile rotate-counterparty-key`).
     CounterpartyCacheHmac,
+    /// The policy-window-state HMAC key (`profile rotate-policy-state-key`).
+    PolicyWindowStateHmac,
 }
 
 impl std::fmt::Display for KeyPurpose {
@@ -398,6 +403,7 @@ impl std::fmt::Display for KeyPurpose {
             Self::AttestationHmac => "attestation_hmac",
             Self::AuditHashChainHmac => "audit_hash_chain_hmac",
             Self::CounterpartyCacheHmac => "counterparty_cache_hmac",
+            Self::PolicyWindowStateHmac => "policy_window_state_hmac",
         };
         f.write_str(s)
     }
@@ -2358,6 +2364,25 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         public_address: Option<RedactedStrkey>,
     },
+
+    /// The persisted policy-window-state store (`per_period_cap` /
+    /// `rate_limit` / `bundle_per_period_cap` / `bundle_rate_limit`
+    /// accumulated history) was re-initialised to empty.
+    ///
+    /// Emitted by `policy reset-window-state --profile <p>`. Corrupt-file
+    /// recovery is fail-closed until reset; this row is the audit trail for
+    /// that recovery action, including the operator-supplied reason.
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    PolicyWindowStateReset {
+        /// The profile whose window-state store was reset.
+        profile: String,
+        /// Operator-supplied reason for the reset (bounded to
+        /// [`RECORDED_STR_MAX`] characters at construction).
+        reason: String,
+    },
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -4223,6 +4248,41 @@ mod tests {
     }
 
     #[test]
+    fn event_kind_policy_window_state_reset_round_trip() {
+        let ev = EventKind::PolicyWindowStateReset {
+            profile: "alice".to_owned(),
+            reason: "corrupt-file recovery".to_owned(),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: EventKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(ev, back, "PolicyWindowStateReset must round-trip cleanly");
+        assert!(
+            s.contains("\"policy_window_state_reset\""),
+            "wire discriminant: {s}"
+        );
+        assert!(s.contains("\"profile\""), "profile field: {s}");
+        assert!(s.contains("\"reason\""), "reason field: {s}");
+        assert!(
+            !s.contains("\"request_id\""),
+            "request_id must NOT appear as a variant field: {s}"
+        );
+        assert!(
+            !s.contains("\"tool\""),
+            "tool must NOT appear as a variant field: {s}"
+        );
+    }
+
+    #[test]
+    fn event_kind_policy_window_state_reset_missing_fields_fail() {
+        let json = r#"{"kind":"policy_window_state_reset"}"#;
+        let result: Result<EventKind, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "missing-field deserialisation must fail for PolicyWindowStateReset"
+        );
+    }
+
+    #[test]
     fn key_purpose_serialization_forms() {
         let cases = [
             (KeyPurpose::McpSignerSeed, "mcp_signer_seed"),
@@ -4231,6 +4291,10 @@ mod tests {
             (KeyPurpose::AttestationHmac, "attestation_hmac"),
             (KeyPurpose::AuditHashChainHmac, "audit_hash_chain_hmac"),
             (KeyPurpose::CounterpartyCacheHmac, "counterparty_cache_hmac"),
+            (
+                KeyPurpose::PolicyWindowStateHmac,
+                "policy_window_state_hmac",
+            ),
         ];
         for (purpose, wire) in cases {
             let s = serde_json::to_string(&purpose).unwrap();

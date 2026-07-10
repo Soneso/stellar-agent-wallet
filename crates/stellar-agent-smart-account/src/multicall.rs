@@ -34,8 +34,8 @@ use tracing::warn;
 use stellar_agent_core::audit_log::AuditWriter;
 use stellar_agent_core::audit_log::schema::EventKind;
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
+use stellar_agent_core::policy::v1::PolicyEngineV1;
 use stellar_agent_core::policy::v1::bundle::{BundleStateOverlay, BundleView, decompose_bundle};
-use stellar_agent_core::policy::v1::{PolicyEngineV1, PolicyStateStore};
 use stellar_agent_core::policy::{Decision, DenyReason};
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_network::signing::Signer;
@@ -1316,7 +1316,6 @@ pub async fn submit_multicall_bundle(
         "smart_account": args.smart_account,
         "rule_id": args.rule_id,
     });
-    let state_store = PolicyStateStore::new();
 
     let policy_decision = args
         .policy_engine
@@ -1355,7 +1354,6 @@ pub async fn submit_multicall_bundle(
             post_submit_kind: None,
         });
     }
-    drop(state_store);
 
     // ── Step 3: submit via free function ─────────────────────────────────────
 
@@ -1424,7 +1422,11 @@ pub async fn submit_multicall_bundle(
 
     // Build the MulticallCheck for the submit path.
     let multicall_check = MulticallCheck {
-        bundle_descriptors: descriptors,
+        // Cloned (not moved): `descriptors` remains borrowed by `bundle_view`,
+        // which is read again after the submit confirms to record the
+        // policy window-state debits for the SAME descriptors the gate
+        // evaluated (single-derivation invariant).
+        bundle_descriptors: descriptors.clone(),
         registry_entry_address: registry_entry.address.clone(),
         registry_entry_wasm_sha256: registry_entry.wasm_sha256.clone(),
         network_passphrase: args.network_passphrase.to_owned(),
@@ -1583,6 +1585,51 @@ pub async fn submit_multicall_bundle(
                     rule_id = args.rule_id,
                     "multicall: audit emission failed post-submit (bundle landed on-chain)"
                 );
+            }
+
+            // ── Policy window-state recording (post-confirm, non-fatal) ──
+            //
+            // Records each matching inner's debit / call-count into the
+            // engine's in-memory state store (single-derivation invariant:
+            // the SAME bundle_view the policy gate evaluated), then persists
+            // the new entries to the shared on-disk window-state store so
+            // per_period_cap / rate_limit / bundle_per_period_cap /
+            // bundle_rate_limit criteria actually accumulate across
+            // dispatches. A failure here does NOT fail the (already
+            // confirmed, irreversible) submit — but it means the NEXT call's
+            // window total under-counts, so it is surfaced loudly.
+            match args
+                .policy_engine
+                .record_confirmed_bundle(&tool, args.profile, &bundle_view)
+            {
+                Ok(recorded) if !recorded.is_empty() => {
+                    let window_store =
+                        stellar_agent_network::policy_state::PersistedWindowStore::for_profile(
+                            args.policy_engine.profile_name(),
+                        );
+                    if let Err(e) = window_store.record_and_persist(args.profile, &recorded) {
+                        tracing::warn!(
+                            smart_account = %smart_account_redacted,
+                            rule_id = args.rule_id,
+                            error = ?e,
+                            "multicall: policy window-state persist failed post-confirm; \
+                             the next call's accumulated window total under-counts this bundle"
+                        );
+                    }
+                }
+                Ok(_) => {
+                    // No stateful criterion matched this rule — nothing to persist.
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        smart_account = %smart_account_redacted,
+                        rule_id = args.rule_id,
+                        error = %e,
+                        "multicall: policy window-state record_confirmed_bundle failed \
+                         post-confirm; the next call's accumulated window total under-counts \
+                         this bundle"
+                    );
+                }
             }
 
             Ok(MulticallResult {

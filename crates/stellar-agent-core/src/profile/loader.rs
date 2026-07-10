@@ -407,6 +407,10 @@ pub fn load_from_path(
     let audit_log_path = partial
         .audit_log_path
         .unwrap_or_else(|| default_audit_log_path().unwrap_or_else(|_| PathBuf::from("audit.log")));
+    let policy_window_state_key_id = partial
+        .policy_window_state_key_id
+        .clone()
+        .unwrap_or_else(|| super::schema::KeyringEntryRef::default_policy_window_state_key(name));
 
     // ── Step 4: validate smart_account_max_context_rule_scan_id bound.
     // Uses module-level `MIRRORED_UPPER_BOUND_MAX_SCAN_ID`.
@@ -458,6 +462,7 @@ pub fn load_from_path(
         pool_master_key_id: partial.pool_master_key_id,
         pool_config: partial.pool_config,
         remote_approval: partial.remote_approval,
+        policy_window_state_key_id,
     };
 
     // ── Step 5: validate rpc_url.
@@ -719,6 +724,10 @@ pub fn load_with_overlay_from_dir(
     let audit_log_path = partial
         .audit_log_path
         .unwrap_or_else(|| default_audit_log_path().unwrap_or_else(|_| PathBuf::from("audit.log")));
+    let policy_window_state_key_id = partial
+        .policy_window_state_key_id
+        .clone()
+        .unwrap_or_else(|| super::schema::KeyringEntryRef::default_policy_window_state_key(name));
 
     // Validate smart_account_max_context_rule_scan_id bound.
     // Uses module-level `MIRRORED_UPPER_BOUND_MAX_SCAN_ID`.
@@ -770,6 +779,7 @@ pub fn load_with_overlay_from_dir(
         pool_master_key_id: partial.pool_master_key_id,
         pool_config: partial.pool_config,
         remote_approval: partial.remote_approval,
+        policy_window_state_key_id,
     };
 
     profile
@@ -929,6 +939,11 @@ struct PartialProfile {
     /// predating remote approval; defaults to `None` (off).
     #[serde(default)]
     remote_approval: Option<super::schema::RemoteApprovalConfig>,
+    /// Keyring entry for the persisted policy-window-state HMAC key. Absent
+    /// from profiles predating this field; the loader derives the
+    /// conventional per-profile coordinate when `None`.
+    #[serde(default)]
+    policy_window_state_key_id: Option<super::schema::KeyringEntryRef>,
 }
 
 fn require_policy_section(
@@ -1021,6 +1036,31 @@ account = "default"
             crate::profile::schema::PolicyEngineKind::V1
         );
         assert_eq!(p.oracle_provider_url, None);
+        // policy_window_state_key_id is absent from the fixture TOML; the
+        // loader derives the conventional per-profile coordinate so existing
+        // profile files (predating this field) keep loading unchanged.
+        assert_eq!(
+            p.policy_window_state_key_id.service,
+            "stellar-agent-policy-window-test-profile"
+        );
+        assert_eq!(p.policy_window_state_key_id.account, "default");
+    }
+
+    /// A profile TOML that explicitly sets `[policy_window_state_key_id]`
+    /// overrides the name-derived default.
+    #[test]
+    fn load_explicit_policy_window_state_key_id_overrides_derived_default() {
+        let toml = format!(
+            "{}\n[policy_window_state_key_id]\nservice = \"custom-window-service\"\naccount = \"custom-account\"\n",
+            minimal_toml()
+        );
+        let (dir, name) = write_profile(&toml);
+        let p = load_from_dir(&name, dir.path(), None).unwrap();
+        assert_eq!(
+            p.policy_window_state_key_id.service,
+            "custom-window-service"
+        );
+        assert_eq!(p.policy_window_state_key_id.account, "custom-account");
     }
 
     #[test]

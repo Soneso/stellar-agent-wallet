@@ -2815,3 +2815,211 @@ async fn simulate_nonce_mint_failed_envelope_shape() {
         "an absent nonce-key keyring entry must surface nonce.mint_failed"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Two-phase persisted per_period_cap: the second dispatch denies via the
+// PERSISTED window-state store, not merely in-memory accumulation within one
+// engine instance.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Builds a `PolicyEngineV1` with one `Decision::Allow` `per_period_cap` rule
+/// per tool name in `tools`.
+///
+/// `profile_name` MUST equal the target `Profile`'s
+/// `profile_name_for_approval()` value exactly: the engine bakes
+/// `profile_name` into every `StateKey` its `evaluate`/`record_confirmed`
+/// calls derive, while `dispatch_gate_inner`'s window-state refresh
+/// reconstructs `StateKey`s using `profile_name_for_approval()` when
+/// re-hydrating from the persisted file. A mismatch does not error — it
+/// silently makes the refreshed entries invisible to the engine's own
+/// criteria, breaking cross-dispatch persistence without any test failure to
+/// flag it. (The shared `common::v1_engine_mock::minimum_reserve_engine`
+/// helper hardcodes `"default"` — safe there only because `minimum_reserve`
+/// is stateless and never touches the window-state store.)
+fn per_period_cap_engine(
+    tools: &[&str],
+    profile_name: &str,
+    cap_stroops: i128,
+    window: &str,
+) -> stellar_agent_core::policy::v1::PolicyEngineV1 {
+    use stellar_agent_core::policy::Decision;
+    use stellar_agent_core::policy::v1::criteria::Criterion;
+    use stellar_agent_core::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
+    use stellar_agent_core::policy::v1::loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
+
+    let parsed_window = Window::parse(window).expect("valid window literal");
+    let rules = tools
+        .iter()
+        .map(|tool| {
+            let criterion: Box<dyn Criterion> = Box::new(PerPeriodCapCriterion::new(
+                "native".to_owned(),
+                parsed_window,
+                cap_stroops,
+            ));
+            PolicyRule {
+                r#match: RuleMatch {
+                    tool: (*tool).to_owned(),
+                    chain: "*".to_owned(),
+                },
+                criteria: vec![criterion],
+                decision: Decision::Allow,
+                allow_opaque_signing: false,
+            }
+        })
+        .collect();
+    let document = PolicyDocument {
+        version: 1,
+        scope: ScopeId::AllProfiles,
+        rules,
+        signature: None,
+    };
+    stellar_agent_core::policy::v1::PolicyEngineV1::new(document, profile_name.to_owned())
+}
+
+/// Two dispatches of `stellar_pay` through the SAME server instance under a
+/// `per_period_cap` rule (cap 100 XLM, each payment 60 XLM): the first
+/// simulates, commits, and submits successfully, which records the confirmed
+/// amount to the PERSISTED window-state store (not just the engine's
+/// in-memory state — the commit handler's post-submit
+/// `record_confirmed_window_state` call writes through to disk). The second
+/// simulate call is DENIED: `dispatch_gate_inner`'s window-state refresh
+/// clears the in-memory store and re-hydrates from the file BEFORE
+/// evaluating, so the deny is driven by the on-disk record, proving the
+/// persist -> refresh -> evaluate wiring end to end through the real MCP
+/// dispatch path.
+///
+/// (`end_to_end_persist_seam_second_process_denies` in
+/// `stellar-agent-network`'s `store.rs` covers the same invariant at the
+/// store+engine layer directly, bypassing `dispatch_gate_inner` entirely;
+/// this test is the seam that isolated test cannot reach.)
+#[tokio::test]
+#[serial]
+async fn pay_two_phase_per_period_cap_second_call_denied_by_persisted_window() {
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(210);
+
+    let home_dir = tempfile::TempDir::new().expect("tempdir");
+    let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home_dir.path());
+
+    let seed = [0x51_u8; 32];
+    let source_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+
+    let account_key_xdr = account_ledger_key_xdr(&source_g);
+    // 10_000_000 XLM: comfortably covers two 60 XLM payments, base reserve,
+    // and fees.
+    let account_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(PaySubmitSuccessRpcResponder {
+            account_key_xdr,
+            account_xdr,
+        })
+        .mount(&mock_server)
+        .await;
+
+    let profile = testnet_profile_with_rpc(&mock_server.uri());
+    let mut server = WalletServer::new(profile).expect("WalletServer::new");
+    let profile_name = server.profile_name_for_approval();
+    server.set_policy_engine_for_test(Arc::new(per_period_cap_engine(
+        &["stellar_pay", "stellar_pay_commit"],
+        &profile_name,
+        1_000_000_000, // 100 XLM cap
+        "1d",
+    )));
+
+    let pay_args = StellarPayArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        source: source_g.clone(),
+        destination: DEST_G.to_owned(),
+        amount: None,
+        amount_in_stroops: Some("600000000".to_owned()), // 60 XLM
+        asset: "native".to_owned(),
+        memo_text: None,
+        memo_id: None,
+        memo_hash_hex: None,
+        memo_return_hex: None,
+        classic_base: None,
+    };
+
+    // ── Call 1: simulate → commit → submit succeeds, recording 60 XLM ────────
+    let sim1 = server
+        .call_stellar_pay(pay_args.clone())
+        .await
+        .expect("first simulate must not error");
+    assert_ne!(
+        sim1.is_error,
+        Some(true),
+        "first simulate (60 XLM, under the 100 XLM cap) must succeed: {}",
+        call_result_text(&sim1)
+    );
+    let sim1_json = call_result_json(&sim1);
+    let sim1_data = sim1_json
+        .get("data")
+        .expect("first simulate success carries data");
+    let nonce1 = sim1_data
+        .get("nonce")
+        .and_then(serde_json::Value::as_str)
+        .expect("nonce present")
+        .to_owned();
+    let expires1 = sim1_data
+        .get("expires_at_unix_ms")
+        .and_then(serde_json::Value::as_u64)
+        .expect("expires_at_unix_ms present");
+    let envelope1 = sim1_data
+        .get("envelope_xdr")
+        .and_then(serde_json::Value::as_str)
+        .expect("envelope_xdr present")
+        .to_owned();
+
+    let commit1 = server
+        .call_stellar_pay_commit(StellarPayCommitArgs {
+            chain_id: pay_args.chain_id.clone(),
+            source: pay_args.source.clone(),
+            destination: pay_args.destination.clone(),
+            amount: pay_args.amount.clone(),
+            amount_in_stroops: pay_args.amount_in_stroops.clone(),
+            asset: pay_args.asset.clone(),
+            memo_text: None,
+            memo_id: None,
+            memo_hash_hex: None,
+            memo_return_hex: None,
+            nonce: nonce1,
+            expires_at_unix_ms: expires1,
+            envelope_xdr: envelope1,
+            approval_nonce: None,
+            approval_attestation: None,
+        })
+        .await
+        .expect("first commit must not error");
+    let commit1_json = call_result_json(&commit1);
+    assert_ne!(
+        commit1.is_error,
+        Some(true),
+        "first commit (60 XLM, under the 100 XLM cap) must submit on-chain: {commit1_json}"
+    );
+    assert!(
+        commit1_json["data"]["tx_hash"].as_str().is_some(),
+        "first commit must report an on-chain tx_hash: {commit1_json}"
+    );
+
+    // ── Call 2: simulate is DENIED — 60 + 60 = 120 XLM exceeds the cap ────────
+    // dispatch_gate_inner refreshes the window-state store from the file call
+    // 1's commit just wrote, before evaluating this second call.
+    let sim2 = server
+        .call_stellar_pay(pay_args)
+        .await
+        .expect("second simulate must return a business-error result, not a protocol error");
+    let (code, _message, _text) = common::assert_business_envelope(&sim2);
+    // `DenyReason::PerPeriodCapExceeded::code()` is the constant
+    // "per_period_cap_exceeded" regardless of the variant's field values
+    // (`stellar-agent-core/src/policy/mod.rs`).
+    assert_eq!(
+        code, "policy.deny.per_period_cap_exceeded",
+        "second call must be denied by the persisted window total, got: {code}"
+    );
+}

@@ -331,6 +331,50 @@ impl Criterion for PerPeriodCapCriterion {
         let state_key = StateKey::new(ctx.profile_name, 1, &criterion_asset, self.window.as_secs());
         overlay.accumulate(state_key, *amount);
     }
+
+    /// Appends the confirmed debit total for this window into `ctx.state_store`,
+    /// using the SAME `StateKey` derivation `evaluate` uses. No-op when the
+    /// call does not resolve `ValueClass::Value` effects matching this
+    /// criterion's asset (e.g. the single-tx path of a multicall bundle, whose
+    /// per-inner debits are recorded by `BundlePerPeriodCapCriterion` instead).
+    fn record_confirmed(
+        &self,
+        ctx: &EvalContext<'_>,
+    ) -> Result<Vec<(StateKey, u64, i128)>, PolicyError> {
+        let crate::policy::v1::value::ValueClass::Value(effects) = &ctx.value else {
+            return Ok(Vec::new());
+        };
+        let criterion_asset = asset_normalise(&self.asset);
+        let mut sum: i128 = 0;
+        let mut matched = false;
+        for leg in effects.legs() {
+            if !leg.kind.carries_debit() {
+                continue;
+            }
+            let Some(leg_asset) = leg.asset.as_deref() else {
+                continue;
+            };
+            if asset_normalise(leg_asset) != criterion_asset {
+                continue;
+            }
+            let Some(amount) = leg.amount else {
+                continue;
+            };
+            matched = true;
+            sum = sum.saturating_add(amount);
+        }
+        if !matched {
+            return Ok(Vec::new());
+        }
+        let now_ms = system_time_to_ms()?;
+        let state_key = StateKey::new(ctx.profile_name, 1, &criterion_asset, self.window.as_secs());
+        ctx.state_store
+            .append(&state_key, now_ms, sum)
+            .map_err(|e| PolicyError::CriterionEvaluationFailed {
+                detail: format!("per_period_cap: record_confirmed state store error: {e}"),
+            })?;
+        Ok(vec![(state_key, now_ms, sum)])
+    }
 }
 
 impl PerPeriodCapCriterion {

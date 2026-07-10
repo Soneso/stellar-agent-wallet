@@ -2026,6 +2026,43 @@ impl AuditEntry {
         }
     }
 
+    /// Constructs a `PolicyWindowStateReset` audit entry.
+    ///
+    /// Emitted by `policy reset-window-state --profile <p>` after the
+    /// persisted policy-window-state store is re-initialised to empty.
+    /// `reason` is bounded to [`crate::audit_log::schema::RECORDED_STR_MAX`]
+    /// characters via [`crate::audit_log::schema::bound_recorded_str`]. Not
+    /// policy-gated, so `policy_decision` is `Allow`; `chain_id` is absent —
+    /// the reset is chain-independent.
+    #[must_use]
+    pub fn new_policy_window_state_reset(
+        tool: impl Into<String>,
+        profile: impl Into<String>,
+        reason: impl Into<String>,
+        request_id: impl Into<String>,
+    ) -> Self {
+        use crate::audit_log::schema::bound_recorded_str;
+        let reason = reason.into();
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.into(),
+            chain_id: None,
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::PolicyWindowStateReset {
+                profile: profile.into(),
+                reason: bound_recorded_str(&reason),
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
     /// Constructs a `SaMulticallInnerExecuted` audit entry.
     ///
     /// Emitted once per inner invocation, immediately after

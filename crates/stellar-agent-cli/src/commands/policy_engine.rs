@@ -42,12 +42,15 @@
 //! owner **seed**/secret-key source anywhere in this codebase.
 
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::policy::v1::{AccountIdentityView, AccountReservesView, PolicyEngineV1};
+use stellar_agent_core::policy::v1::{
+    AccountIdentityView, AccountReservesView, PolicyEngineV1, PolicyStateStore,
+};
 use stellar_agent_core::policy::{
     Decision, McpToolRegistration, NoopPolicyEngine, PolicyEngine, ToolDescriptor, ToolValueKind,
 };
 use stellar_agent_core::profile::loader as profile_loader;
 use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile, default_policy_dir};
+use stellar_agent_network::policy_state::PersistedWindowStore;
 
 use crate::common::network::TargetNetwork;
 
@@ -154,7 +157,29 @@ pub(crate) fn build_v1_policy_engine(
                 }
             };
 
-            Ok(Box::new(PolicyEngineV1::new(document, profile_name)))
+            // Hydrate the persisted window-state store BEFORE constructing the
+            // engine so `per_period_cap` / `rate_limit` / `bundle_per_period_cap`
+            // / `bundle_rate_limit` evaluate against accumulated history, not an
+            // always-empty per-invocation store. Fail-closed on hydration
+            // error (tampered/unparseable store file): the caller MUST NOT
+            // fall back to an unhydrated engine, which would silently
+            // under-count and defeat the operator's configured caps.
+            let state_store = PolicyStateStore::new();
+            let window_store = PersistedWindowStore::for_profile(&profile_name);
+            if let Err(e) = window_store.load_into(&profile_name, profile, &state_store) {
+                return Err(format!(
+                    "policy.engine is 'v1' but the policy-window-state store for profile \
+                     '{profile_name}' failed to load ({e}); {verb} refuses (fail-closed); \
+                     run `stellar-agent profile reset-window-state {profile_name} --reason \
+                     <reason>` to recover"
+                ));
+            }
+
+            Ok(Box::new(PolicyEngineV1::new_with_store(
+                document,
+                profile_name,
+                state_store,
+            )))
         }
         _ => Err(format!(
             "unsupported policy engine kind {kind:?}; {verb} refuses (fail-closed)"
@@ -435,6 +460,103 @@ pub(crate) fn evaluate_value_moving_policy(
             format!("{e}"),
         )),
     }
+}
+
+/// Records a confirmed value-moving CLI verb's contribution into the
+/// persisted policy window-state store, after a confirmed on-chain submit.
+///
+/// Rebuilds a FRESH engine via [`build_v1_policy_engine`] rather than
+/// threading the evaluation-time engine instance through the caller's
+/// control flow: the accumulation entries land in the SAME on-disk
+/// window-state store regardless of which engine instance derived them (the
+/// store is the source of truth — see
+/// `stellar_agent_network::policy_state`), so a second policy-file
+/// load/signature-verify at record time is a safe, if slightly redundant,
+/// trade-off against a deeper signature change to every value-moving verb's
+/// evaluate function. `tool_name` / `chain_id` reconstruct the IDENTICAL
+/// [`ToolDescriptor`] shape [`evaluate_value_moving_policy`] used, so rule
+/// matching is unchanged. `effects` MUST be the SAME [`stellar_agent_core::policy::v1::ValueEffects`]
+/// the gate sized (single-derivation invariant) — the same value already
+/// passed to `emit_value_action_submitted_row` at this call site.
+///
+/// Non-fatal: mirrors the `value_action_submitted` audit-row emission
+/// discipline (the on-chain action already committed). A rebuild failure or a
+/// record/persist failure logs a `tracing::warn!` and returns without
+/// disturbing the caller.
+pub(crate) fn record_confirmed_value_moving(
+    verb: &str,
+    profile: &Profile,
+    profile_name: &str,
+    tool_name: &'static str,
+    chain_id: &str,
+    effects: Option<&stellar_agent_core::policy::v1::ValueEffects>,
+) {
+    let policy_engine = match build_v1_policy_engine(verb, &profile.policy.engine, profile) {
+        Ok(pe) => pe,
+        Err(e) => {
+            tracing::warn!(
+                profile = %profile_name,
+                verb,
+                error = %e,
+                "policy window-state record: could not rebuild the policy engine; \
+                 record skipped (the next call's accumulated window total under-counts \
+                 this one)"
+            );
+            return;
+        }
+    };
+    record_confirmed_value_moving_with_engine(
+        policy_engine.as_ref(),
+        profile,
+        profile_name,
+        tool_name,
+        chain_id,
+        effects,
+    );
+}
+
+/// Leaner sibling of [`record_confirmed_value_moving`] for callers that
+/// already hold the evaluation-time `policy_engine` in scope (e.g. `trustline`,
+/// whose single `run` function never drops it before the confirmed-submit
+/// audit row) — avoids a redundant policy-file reload/signature-verify.
+///
+/// `tool_name` / `chain_id` reconstruct the IDENTICAL [`ToolDescriptor`] shape
+/// [`evaluate_value_moving_policy`] used, so rule matching is unchanged.
+/// `effects` MUST be the SAME [`stellar_agent_core::policy::v1::ValueEffects`]
+/// the gate sized (single-derivation invariant).
+///
+/// Non-fatal: mirrors the `value_action_submitted` audit-row emission
+/// discipline.
+pub(crate) fn record_confirmed_value_moving_with_engine(
+    policy_engine: &dyn PolicyEngine,
+    profile: &Profile,
+    profile_name: &str,
+    tool_name: &'static str,
+    chain_id: &str,
+    effects: Option<&stellar_agent_core::policy::v1::ValueEffects>,
+) {
+    let reg = McpToolRegistration {
+        name: tool_name,
+        destructive_hint: true,
+        read_only_hint: false,
+        chain_id_required: true,
+        value_kind: ToolValueKind::MovesValue,
+    };
+    let mut tool_descriptor = ToolDescriptor::from_registration(&reg);
+    tool_descriptor.chain_id = chain_id.to_owned();
+
+    let value_class = match effects {
+        Some(e) => stellar_agent_core::policy::v1::ValueClass::Value(e.clone()),
+        None => stellar_agent_core::policy::v1::ValueClass::ReadOnly,
+    };
+
+    stellar_agent_network::policy_state::record_confirmed_window_state(
+        policy_engine,
+        &tool_descriptor,
+        profile,
+        profile_name,
+        &value_class,
+    );
 }
 
 /// Evaluates operator policy for a value-moving DeFi verb (`trade`, `lend`,
@@ -1642,6 +1764,140 @@ mod tests {
             result.is_err(),
             "a forged/corrupted policy signature must fail closed, not silently disable \
              enforcement"
+        );
+    }
+
+    // ── Cross-process shape: two independent `build_v1_policy_engine` calls
+    // over the SAME persisted window-state file ──────────────────────────────
+
+    /// Two SEPARATE `build_v1_policy_engine` calls — each constructing a
+    /// FRESH `PolicyStateStore` and hydrating it from the SAME on-disk
+    /// window-state file — model two sequential CLI process invocations
+    /// sharing state only through the file (the CLI has no long-lived
+    /// in-process engine; every real invocation is a fresh process, and
+    /// `record_confirmed_value_moving` already rebuilds a second fresh engine
+    /// internally between a verb's evaluate and confirm steps WITHIN one
+    /// process — this test extends that same shape across the two calls a
+    /// second process launch would make).
+    ///
+    /// The first call evaluates and confirms a 60 XLM payment, persisting it
+    /// to disk. The second, entirely independent `build_v1_policy_engine`
+    /// call evaluates the identical payment and is DENIED — proving
+    /// persistence survives across separate engine/store constructions over
+    /// the file. (`pay_policy_v1_testnet_acceptance.rs` covers the literal
+    /// subprocess-spawn version of this contract for `per_tx_cap`, live on
+    /// testnet; this test covers `per_period_cap`'s stateful accumulation,
+    /// in-process, without live network access.)
+    #[test]
+    #[serial_test::serial]
+    fn build_v1_policy_engine_cross_invocation_persists_window_state() {
+        use base64::Engine as _;
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+        use stellar_agent_core::policy::v1::{ActionKind, ValueClass, ValueEffects, ValueLeg};
+
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store init");
+
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let name = "cross-process-seam";
+        write_v1_profile_toml(home.path(), name);
+
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_pk = owner_sk.verifying_key().to_bytes();
+
+        // per_period_cap: 100 XLM cap, 1-day window, on the "pay" tool name
+        // `evaluate_value_moving_policy_with_value` / `record_confirmed_value_moving`
+        // use below.
+        let policy_body = format!(
+            "version = 1\nscope = \"profile:{name}\"\n\n\
+             [[rules]]\n\
+             match = {{ tool = \"pay\", chain = \"*\" }}\n\
+             criteria = [{{ kind = \"per_period_cap\", asset = \"native\", window = \"1d\", max_stroops = 1000000000 }}]\n\
+             decision = \"allow\"\n"
+        );
+        let canon = stellar_agent_core::policy::v1::canonical::canonical_bytes(&policy_body)
+            .expect("canonical_bytes");
+        let policy_digest = stellar_agent_core::policy::v1::signature::digest(&canon);
+        let sig = stellar_agent_core::policy::v1::signature::sign(&policy_digest, &owner_sk);
+        let sig_hex: String = sig.iter().map(|b| format!("{b:02x}")).collect();
+        let owner_g = stellar_strkey::ed25519::PublicKey(owner_pk)
+            .to_string()
+            .to_string();
+        let signed_policy =
+            format!("{policy_body}\n[signature]\nowner_id = \"{owner_g}\"\nsig = \"{sig_hex}\"\n");
+
+        let policies_dir = home.path().join("policies");
+        std::fs::create_dir_all(&policies_dir).expect("create policies dir");
+        std::fs::write(policies_dir.join(format!("{name}.toml")), signed_policy)
+            .expect("write policy toml");
+
+        let pubkey_file = home.path().join("owner_pubkey.txt");
+        std::fs::write(
+            &pubkey_file,
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(owner_pk),
+        )
+        .expect("write owner pubkey file");
+
+        let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let _pubkey_guard = TestEnvVarGuard::set(
+            "STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE",
+            pubkey_file.as_os_str(),
+        );
+
+        let profile = load_profile_or_synthesize_testnet(name).expect("v1 profile file must load");
+        let effects = ValueEffects::single(ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(600_000_000), // 60 XLM
+            asset: Some("native".to_owned()),
+            destination: Some("GAAA".to_owned()),
+        });
+
+        // ── "Invocation 1": build -> evaluate (Allow) -> record (persists) ────
+        let engine1 = build_v1_policy_engine("pay", &profile.policy.engine, &profile)
+            .expect("build_v1_policy_engine must succeed for a valid signed policy");
+        let result1 = evaluate_value_moving_policy_with_value(
+            engine1.as_ref(),
+            &profile,
+            "pay",
+            "stellar:testnet",
+            &serde_json::Value::Null,
+            ValueClass::Value(effects.clone()),
+            "pay",
+        );
+        assert!(
+            result1.is_ok(),
+            "first invocation's 60 XLM payment must be allowed under the 100 XLM cap: {result1:?}"
+        );
+        record_confirmed_value_moving(
+            "pay",
+            &profile,
+            name,
+            "pay",
+            "stellar:testnet",
+            Some(&effects),
+        );
+
+        // ── "Invocation 2": a FRESH build_v1_policy_engine call, over the
+        // SAME file, must see invocation 1's recorded 60 XLM and deny this
+        // identical payment (60 + 60 = 120 XLM > 100 XLM cap).
+        let engine2 = build_v1_policy_engine("pay", &profile.policy.engine, &profile)
+            .expect("second build_v1_policy_engine call must also succeed");
+        let result2 = evaluate_value_moving_policy_with_value(
+            engine2.as_ref(),
+            &profile,
+            "pay",
+            "stellar:testnet",
+            &serde_json::Value::Null,
+            ValueClass::Value(effects),
+            "pay",
+        );
+        let err = result2.expect_err(
+            "second invocation must be denied by the window state persisted by the first",
+        );
+        assert_eq!(
+            err.error.as_ref().map(|e| e.code.as_str()),
+            Some("policy.deny.per_period_cap_exceeded"),
+            "second invocation must be denied specifically by per_period_cap, got: {err:?}"
         );
     }
 }

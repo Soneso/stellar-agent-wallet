@@ -1130,6 +1130,48 @@ impl WalletServer {
                 }
             };
 
+        // Step 1.5 — refresh window state before evaluation.
+        //
+        // The MCP server is a long-lived process: `self.policy_engine` is
+        // constructed once and evaluates every dispatch for the life of the
+        // server. Without this step, its in-memory window-state store would
+        // be a startup-frozen snapshot, invisible to entries the CLI (or a
+        // sibling request) has since recorded on disk. This is a REPLACE,
+        // not a merge: `clear()` first, then `load_into` re-populates from
+        // the CURRENT on-disk file — see `stellar_agent_network::policy_state`'s
+        // module docs for the full rationale, the known intra-process race
+        // this does NOT close, and why construction-time hydration is kept
+        // in addition to this per-dispatch refresh.
+        //
+        // `window_state_store()` returns `None` for `NoopPolicyEngine` (no
+        // window state to refresh) — this step is then a no-op. A refresh
+        // failure (tampered/rolled-back/deleted store) is fail-closed: the
+        // dispatch refuses rather than evaluating stateful criteria against
+        // a store this process could not verify.
+        if let Some(store) = self.policy_engine.window_state_store() {
+            store.clear().map_err(|e| {
+                ToolError::Business(business_error_result(
+                    "policy.engine_required",
+                    format!("policy window-state refresh failed (in-memory clear): {e}"),
+                ))
+            })?;
+            let profile_name = self.profile_name_for_approval();
+            let window_store =
+                stellar_agent_network::policy_state::PersistedWindowStore::for_profile(
+                    &profile_name,
+                );
+            if let Err(e) = window_store.load_into(&profile_name, &self.profile, store) {
+                return Err(ToolError::Business(business_error_result(
+                    "policy.engine_required",
+                    format!(
+                        "policy window-state store failed to refresh ({e}); run \
+                         `profile reset-window-state {profile_name} --reason <reason>` to \
+                         recover"
+                    ),
+                )));
+            }
+        }
+
         // Step 2 — policy engine evaluation with explicit typed arms.
         //
         // The value-carrying path (`value = Some`) sizes the exact effect the

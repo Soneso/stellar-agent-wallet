@@ -847,13 +847,18 @@ impl WalletServer {
         // Extract the gate-sized legs for the post-submit audit row: the SAME
         // ValueEffects the gate evaluated (single-derivation invariant). Empty on
         // any non-value allow path.
-        let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> = match &dispatch_outcome
-        {
-            DispatchOutcome::Allow(Some(effects)) => {
-                effects.legs().iter().map(Into::into).collect()
-            }
-            _ => Vec::new(),
-        };
+        // Resolved once and reused for BOTH the audit row's legs and the
+        // window-state recording after confirmed submit (single-derivation
+        // invariant on the recording side too).
+        let gate_value_effects: Option<stellar_agent_core::policy::v1::ValueEffects> =
+            match &dispatch_outcome {
+                DispatchOutcome::Allow(Some(effects)) => Some(effects.clone()),
+                _ => None,
+            };
+        let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> = gate_value_effects
+            .as_ref()
+            .map(|effects| effects.legs().iter().map(Into::into).collect())
+            .unwrap_or_default();
 
         // ── Nonce verification + replay window ───────────────────────────────
         if let Err(e) = commit_envelope_and_verify_nonce(
@@ -948,6 +953,20 @@ impl WalletServer {
                     &self.profile_name_for_approval(),
                     audit_entry,
                 );
+
+                if let Some(descriptor) = self.tool_registry.get("stellar_claim_commit") {
+                    let value_class = gate_value_effects
+                        .clone()
+                        .map(stellar_agent_core::policy::v1::ValueClass::Value)
+                        .unwrap_or(stellar_agent_core::policy::v1::ValueClass::ReadOnly);
+                    stellar_agent_network::policy_state::record_confirmed_window_state(
+                        self.policy_engine.as_ref(),
+                        descriptor,
+                        &self.profile,
+                        &self.profile_name_for_approval(),
+                        &value_class,
+                    );
+                }
 
                 // Best-effort removal of the consumed approval entry so it
                 // cannot be replayed. Failure does not abort the response —

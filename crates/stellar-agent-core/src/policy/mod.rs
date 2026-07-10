@@ -1316,6 +1316,69 @@ pub trait PolicyEngine: Send + Sync {
             value_effects: None,
         })
     }
+
+    /// Records a CONFIRMED call's contribution into the engine's persisted
+    /// window state (stateful criteria: `per_period_cap`, `rate_limit`,
+    /// `bundle_per_period_cap`, `bundle_rate_limit`), for the same rule that
+    /// governed the original decision.
+    ///
+    /// `value` MUST be the SAME [`crate::policy::v1::ValueClass`] the
+    /// original gate evaluated (the single-derivation invariant) — never
+    /// re-derived from raw args.
+    ///
+    /// The default is a no-op returning an empty vector, correct for engines
+    /// that hold no window state ([`NoopPolicyEngine`]).
+    /// [`crate::policy::v1::PolicyEngineV1`] overrides this to delegate to its
+    /// inherent `record_confirmed`, which mutates its in-memory
+    /// [`crate::policy::v1::PolicyStateStore`] and returns the appended
+    /// `(key, timestamp_ms, amount)` entries for the caller to persist to the
+    /// on-disk window-state store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] if a stateful
+    /// criterion's recording step fails (state-store lock poisoning or a
+    /// clock read failure).
+    fn record_confirmed(
+        &self,
+        _tool: &ToolDescriptor,
+        _profile: &Profile,
+        _value: &crate::policy::v1::ValueClass,
+    ) -> Result<
+        Vec<(
+            crate::policy::v1::criteria::state_store::StateKey,
+            u64,
+            i128,
+        )>,
+        PolicyError,
+    > {
+        Ok(Vec::new())
+    }
+
+    /// Returns the engine's in-memory sliding-window state store, for a
+    /// caller that needs to REPLACE its contents with a freshly re-hydrated
+    /// view before evaluation (a long-lived engine instance — the MCP server
+    /// — must not evaluate stateful criteria against a startup-frozen store;
+    /// see [`crate::policy::v1::PolicyStateStore`]'s module docs for why a
+    /// merge-on-top-of-stale-entries approach is wrong here).
+    ///
+    /// The default is `None`, correct for engines that hold no window state
+    /// ([`NoopPolicyEngine`]). [`crate::policy::v1::PolicyEngineV1`] overrides
+    /// this to return `Some(&self.state_store)`.
+    ///
+    /// Callers that need a fresh view call
+    /// [`crate::policy::v1::criteria::state_store::PolicyStateStore::clear`]
+    /// on the returned store and then re-populate it from the persisted
+    /// on-disk store (`stellar_agent_network::policy_state::PersistedWindowStore::load_into`,
+    /// unreachable from this crate — see that module's crate-placement
+    /// rationale) — clear-then-load, never load-on-top, so entries a
+    /// concurrent process has since superseded cannot linger.
+    #[must_use]
+    fn window_state_store(
+        &self,
+    ) -> Option<&crate::policy::v1::criteria::state_store::PolicyStateStore> {
+        None
+    }
 }
 
 /// Outcome of a policy evaluation: the [`Decision`] plus the value descriptor

@@ -1345,16 +1345,18 @@ impl WalletServer {
         // threaded from the dispatch outcome — or, on the toolset-gated forced
         // path, from the Allow the override displaced. Empty when the engine
         // sized no value (the row then records an unsized allow).
-        let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> = match &dispatch_outcome
-        {
-            super::common::DispatchOutcome::Allow(Some(effects)) => {
-                effects.legs().iter().map(Into::into).collect()
-            }
-            _ => overridden_gate_effects
-                .as_ref()
-                .map(|effects| effects.legs().iter().map(Into::into).collect())
-                .unwrap_or_default(),
-        };
+        // Resolved once and reused for BOTH the audit row's legs and the
+        // window-state recording after confirmed submit (single-derivation
+        // invariant on the recording side too).
+        let gate_value_effects: Option<stellar_agent_core::policy::v1::ValueEffects> =
+            match &dispatch_outcome {
+                super::common::DispatchOutcome::Allow(Some(effects)) => Some(effects.clone()),
+                _ => overridden_gate_effects.clone(),
+            };
+        let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> = gate_value_effects
+            .as_ref()
+            .map(|effects| effects.legs().iter().map(Into::into).collect())
+            .unwrap_or_default();
 
         // ── Decode nonce — map parse error to nonce.expired (indistinguishability) ──
         let nonce = match stellar_agent_nonce::Nonce::from_base64(&args.nonce) {
@@ -1664,6 +1666,24 @@ impl WalletServer {
                     &self.profile_name_for_approval(),
                     audit_entry,
                 );
+
+                // Non-fatal window-state record: the SAME gate_value_effects
+                // the audit row above just carried (single-derivation
+                // invariant), keyed by the SAME registry descriptor the gate
+                // evaluated against.
+                if let Some(descriptor) = self.tool_registry.get("stellar_pay_commit") {
+                    let value_class = gate_value_effects
+                        .clone()
+                        .map(stellar_agent_core::policy::v1::ValueClass::Value)
+                        .unwrap_or(stellar_agent_core::policy::v1::ValueClass::ReadOnly);
+                    stellar_agent_network::policy_state::record_confirmed_window_state(
+                        self.policy_engine.as_ref(),
+                        descriptor,
+                        &self.profile,
+                        &self.profile_name_for_approval(),
+                        &value_class,
+                    );
+                }
 
                 // Remove the consumed approval entry from the store so it
                 // cannot be replayed.  This is best-effort: a failure to remove

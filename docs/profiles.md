@@ -110,6 +110,7 @@ actual keys (see [Migration and key rotation](#migration-and-key-rotation)).
 | `[policy_owner_key_id]` | keyring ref | yes | ed25519 owner PUBLIC key whose signature every V1 policy file must carry (enrolled with `profile enroll-owner-key`). |
 | `[attestation_key_id]` | keyring ref | yes | HMAC key minting approval attestations at `approve` time. |
 | `[counterparty_cache_key_id]` | keyring ref | yes | HMAC key protecting the local `stellar.toml` cache integrity. |
+| `[policy_window_state_key_id]` | keyring ref | no (name-derived default) | HMAC key protecting the persisted policy-window-state store (`per_period_cap` / `rate_limit` / `bundle_per_period_cap` / `bundle_rate_limit` accumulated history). Absent from profiles predating this field; the loader derives `stellar-agent-policy-window-<profile>` when omitted, so existing profile TOMLs keep loading unchanged. |
 
 ### Cross-check, MCP, and scan bounds
 
@@ -198,6 +199,8 @@ on error.
 | `stellar-agent profile rotate-audit-key <name>` | `audit_log_hash_chain_key_id` | Fresh 32-byte HMAC key. Rotation re-signs every existing per-file chain-root sidecar with the new key, so the whole log verifies under it; the old key stops verifying. |
 | `stellar-agent profile rotate-counterparty-key <name>` | `counterparty_cache_key_id` | Fresh 32-byte HMAC key. All cached `stellar.toml` entries are invalidated and re-fetched on next use. |
 | `stellar-agent profile rotate-nonce-key <name>` | `mcp_nonce_key_alias` | Fresh 32-byte HMAC key. Outstanding nonces minted with the old key are invalidated. |
+| `stellar-agent profile rotate-policy-state-key <name>` | `policy_window_state_key_id` | Fresh 32-byte HMAC key. Unlike the other rotations, the accumulated window-state store is re-signed under the new key, so `per_period_cap` / `rate_limit` history is preserved, not invalidated. |
+| `stellar-agent profile reset-window-state <name> --reason <reason>` | `policy_window_state_key_id` (mints if absent) | Re-initialises the window-state store to empty. Recovery path for an unreadable, tampered, or unparseable store — the affected criteria fail closed until reset. Discards accumulated history; the reset is audited. |
 
 ### Enroll the MCP signer
 

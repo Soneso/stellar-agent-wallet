@@ -806,4 +806,68 @@ mod tests {
              inflow leg), so a 100 XLM cap allows the call, got {result:?}"
         );
     }
+
+    // ── Path-payment debit sizing (#51) ─────────────────────────────────────
+    //
+    // These gate-level tests drive the REAL authoritative_args shape
+    // `envelope_decode::decode_pay_args` produces for a path payment (see
+    // `envelope_decode.rs`'s `path_payment_strict_receive_debit_is_send_side_not_dest_side`
+    // KAT), through `derive_value_class`, through the criterion — proving the
+    // fix end-to-end rather than only at the decoder or the derivation layer.
+
+    /// A `stellar_pay_commit` path-payment envelope send-side is native XLM
+    /// (send_max = 60 XLM), destination-side is USDC (dest_amount = 50 USDC).
+    /// A `per_tx_cap` on `native` at 55 XLM must DENY: the debit is the send
+    /// side (60 XLM), not the destination side.
+    #[test]
+    fn path_payment_send_asset_cap_binds_the_debit() {
+        let tool = make_tool("stellar_pay_commit");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = PerTxCapCriterion::new("native".into(), 550_000_000); // 55 XLM
+        let args = json!({
+            "source": "GAAA",
+            "destination": "GBBB",
+            "amount_stroops": "600000000",       // 60 XLM send_max — the debit
+            "asset": "native",
+            "dest_amount_stroops": "500000000",  // 50 USDC dest_amount — informational
+            "dest_asset": "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+        });
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::PerTxCapExceeded { attempted_stroops, .. })
+                if attempted_stroops == 600_000_000),
+            "a 55 XLM native per_tx_cap must deny a 60 XLM send-side debit, got {result:?}"
+        );
+    }
+
+    /// The SAME envelope against a cap configured on the destination asset
+    /// (USDC) must NOT bind — the destination-side leg carries no debit, so a
+    /// USDC per_tx_cap is not applicable to this call at all.
+    #[test]
+    fn path_payment_dest_asset_cap_does_not_bind_the_debit() {
+        let tool = make_tool("stellar_pay_commit");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = PerTxCapCriterion::new(
+            "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN".into(),
+            1, // any nonzero cap: even the smallest cap must not fire
+        );
+        let args = json!({
+            "source": "GAAA",
+            "destination": "GBBB",
+            "amount_stroops": "600000000",
+            "asset": "native",
+            "dest_amount_stroops": "500000000",
+            "dest_asset": "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+        });
+        let ctx = make_ctx(&tool, &profile, &args, &store);
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            result.is_none(),
+            "a USDC per_tx_cap must not bind the non-debit destination-side leg, \
+             got {result:?}"
+        );
+    }
 }

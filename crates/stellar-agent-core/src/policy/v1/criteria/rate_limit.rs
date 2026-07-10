@@ -181,6 +181,40 @@ impl Criterion for RateLimitCriterion {
         // Each passing inner counts as one call.
         overlay.accumulate(state_key, 1);
     }
+
+    /// Appends one call-count entry (unit weight 1) into `ctx.state_store` for
+    /// every confirmed call under a matched rule, using the SAME `StateKey`
+    /// derivation `evaluate` uses. Unlike [`crate::policy::v1::criteria::per_period_cap::PerPeriodCapCriterion`],
+    /// this criterion applies unconditionally (it counts calls, not value) —
+    /// it fires on the single-tx path regardless of `ctx.value`. Bundle-path
+    /// per-inner counting is handled by `BundleRateLimitCriterion` instead
+    /// (this criterion's `evaluate` is not called at bundle level either — see
+    /// its per-tool-call scoping).
+    fn record_confirmed(
+        &self,
+        ctx: &EvalContext<'_>,
+    ) -> Result<Vec<(StateKey, u64, i128)>, PolicyError> {
+        // Bundle path: per-inner counting is BundleRateLimitCriterion's job;
+        // this criterion counts single-tx calls only.
+        if ctx.bundle.is_some() {
+            return Ok(Vec::new());
+        }
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .map_err(|e| PolicyError::CriterionEvaluationFailed {
+                detail: format!(
+                    "rate_limit: record_confirmed system clock is before UNIX epoch: {e}"
+                ),
+            })?;
+        let state_key = StateKey::new(ctx.profile_name, 1, "rate_limit", self.window.as_secs());
+        ctx.state_store.append(&state_key, now_ms, 1).map_err(|e| {
+            PolicyError::CriterionEvaluationFailed {
+                detail: format!("rate_limit: record_confirmed state store error: {e}"),
+            }
+        })?;
+        Ok(vec![(state_key, now_ms, 1)])
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

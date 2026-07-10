@@ -496,6 +496,22 @@ pub fn decode_authoritative_args(
 
 /// Extracts `stellar_pay` policy-engine args from a `Payment`,
 /// `PathPaymentStrictReceive`, or `PathPaymentStrictSend` operation.
+///
+/// # Debit sizing for path payments
+///
+/// The wallet's spendable-balance debit for a path payment is the SEND side,
+/// not the destination side: `PathPaymentStrictReceiveOp.send_max` is the
+/// maximum the signer authorizes to spend (the operation fails on-chain if
+/// the actual send amount would exceed it); `PathPaymentStrictSendOp.send_amount`
+/// is the exact amount the signer pays. `asset` / `amount_stroops` carry this
+/// send-side value for both path-payment kinds, matching the plain `Payment`
+/// case where `asset` / `amount_stroops` are already the debit.
+///
+/// The destination side is surfaced separately as `dest_asset` /
+/// `dest_amount_stroops` — informational only (what the recipient receives or
+/// receives at minimum), not sized by value caps. `destination` names the
+/// recipient account regardless of which asset is debited, so counterparty
+/// checks are unaffected by this distinction.
 fn decode_pay_args(
     memo: &stellar_xdr::Memo,
     total_fee_stroops: u32,
@@ -505,22 +521,52 @@ fn decode_pay_args(
 ) -> Result<serde_json::Value, EnvelopeDecodeError> {
     use stellar_xdr::OperationBody;
 
-    let (dest_muxed, asset, amount_stroops) = match &op.body {
-        OperationBody::Payment(p) => (&p.destination, &p.asset, p.amount),
+    enum PayShape<'a> {
+        Simple {
+            dest: &'a stellar_xdr::MuxedAccount,
+            asset: &'a stellar_xdr::Asset,
+            amount: i64,
+        },
+        PathPayment {
+            dest: &'a stellar_xdr::MuxedAccount,
+            send_asset: &'a stellar_xdr::Asset,
+            send_debit_ceiling: i64,
+            dest_asset: &'a stellar_xdr::Asset,
+            dest_amount: i64,
+        },
+    }
 
-        OperationBody::PathPaymentStrictReceive(pp) => {
-            // For path payments, destination and dest_asset are the
-            // policy-engine's "destination" and "asset" fields; the amount
-            // is dest_amount (what the recipient actually receives).
-            (&pp.destination, &pp.dest_asset, pp.dest_amount)
-        }
+    let shape = match &op.body {
+        OperationBody::Payment(p) => PayShape::Simple {
+            dest: &p.destination,
+            asset: &p.asset,
+            amount: p.amount,
+        },
 
-        OperationBody::PathPaymentStrictSend(pp) => {
-            // For strict-send, destination and dest_asset are the target;
-            // send_amount is the amount the sender pays (authoritative).
-            // The policy engine receives the sent amount for cap checks.
-            (&pp.destination, &pp.dest_asset, pp.send_amount)
-        }
+        OperationBody::PathPaymentStrictReceive(pp) => PayShape::PathPayment {
+            dest: &pp.destination,
+            send_asset: &pp.send_asset,
+            // send_max is the maximum the signer authorizes to spend — the
+            // debit ceiling for a strict-receive path payment. A value cap
+            // or window-state record sized from this figure bounds the
+            // AUTHORIZED spend, not necessarily the exact settled amount
+            // (path payments on-chain may settle for less, never more).
+            send_debit_ceiling: pp.send_max,
+            dest_asset: &pp.dest_asset,
+            dest_amount: pp.dest_amount,
+        },
+
+        OperationBody::PathPaymentStrictSend(pp) => PayShape::PathPayment {
+            dest: &pp.destination,
+            send_asset: &pp.send_asset,
+            // send_amount is the exact amount the signer pays.
+            send_debit_ceiling: pp.send_amount,
+            dest_asset: &pp.dest_asset,
+            // dest_min is the floor the recipient is guaranteed to receive;
+            // the actual receive amount depends on the path at execution
+            // time, so the floor is the best informational value available.
+            dest_amount: pp.dest_min,
+        },
 
         other => {
             return Err(EnvelopeDecodeError::OperationKindMismatch {
@@ -531,22 +577,47 @@ fn decode_pay_args(
         }
     };
 
-    // muxed_account_to_strkey is infallible for XDR-decoded keys.
-    let dest_strkey = muxed_account_to_strkey(dest_muxed);
-
-    // xdr_asset_to_string returns EnvelopeDecodeError directly.
-    let asset_str = xdr_asset_to_string(asset)?;
-
     let memo_opt = memo_to_optional_string(memo)?;
 
-    let mut args = serde_json::json!({
-        "source": source_strkey,
-        "total_fee_stroops": total_fee_stroops,
-        "destination": dest_strkey,
-        "amount_stroops": amount_stroops.to_string(),
-        "asset": asset_str,
-        "memo": memo_opt,
-    });
+    let mut args = match shape {
+        PayShape::Simple {
+            dest,
+            asset,
+            amount,
+        } => {
+            let dest_strkey = muxed_account_to_strkey(dest);
+            let asset_str = xdr_asset_to_string(asset)?;
+            serde_json::json!({
+                "source": source_strkey,
+                "total_fee_stroops": total_fee_stroops,
+                "destination": dest_strkey,
+                "amount_stroops": amount.to_string(),
+                "asset": asset_str,
+                "memo": memo_opt,
+            })
+        }
+        PayShape::PathPayment {
+            dest,
+            send_asset,
+            send_debit_ceiling,
+            dest_asset,
+            dest_amount,
+        } => {
+            let dest_strkey = muxed_account_to_strkey(dest);
+            let send_asset_str = xdr_asset_to_string(send_asset)?;
+            let dest_asset_str = xdr_asset_to_string(dest_asset)?;
+            serde_json::json!({
+                "source": source_strkey,
+                "total_fee_stroops": total_fee_stroops,
+                "destination": dest_strkey,
+                "amount_stroops": send_debit_ceiling.to_string(),
+                "asset": send_asset_str,
+                "dest_amount_stroops": dest_amount.to_string(),
+                "dest_asset": dest_asset_str,
+                "memo": memo_opt,
+            })
+        }
+    };
     if let Some((field, value)) = structured_memo_field(memo)
         && let Some(obj) = args.as_object_mut()
     {
@@ -1287,11 +1358,16 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // PathPaymentStrictSend extracted with send_amount (authoritative amount)
+    // Path-payment debit sizing: the debit leg is the SEND side, not the
+    // destination side (#51).
     // ─────────────────────────────────────────────────────────────────────────
 
+    /// `PathPaymentStrictSend`: the debit (`asset` / `amount_stroops`) is the
+    /// send side (`send_asset` / `send_amount`, exact). The destination side
+    /// is surfaced separately as `dest_asset` / `dest_amount_stroops` — here
+    /// `dest_min`, the floor the recipient is guaranteed to receive.
     #[test]
-    fn path_payment_strict_send_extracts_send_amount() {
+    fn path_payment_strict_send_debit_is_send_side_not_dest_side() {
         use stellar_xdr::{AlphaNum4, AssetCode4, PathPaymentStrictSendOp};
         let mut code_bytes = [0u8; 4];
         code_bytes[..4].copy_from_slice(b"USDC");
@@ -1299,7 +1375,7 @@ mod tests {
             source_account: None,
             body: OperationBody::PathPaymentStrictSend(PathPaymentStrictSendOp {
                 send_asset: Asset::Native,
-                send_amount: 5_000_000, // 0.5 XLM sent (authoritative for policy cap)
+                send_amount: 5_000_000, // 0.5 XLM sent — the debit (authoritative for policy cap)
                 destination: g_to_muxed(DEST_G),
                 dest_asset: Asset::CreditAlphanum4(AlphaNum4 {
                     asset_code: AssetCode4(code_bytes),
@@ -1313,7 +1389,97 @@ mod tests {
         let xdr_b64 = to_b64(&env);
 
         let result = decode_authoritative_args(&xdr_b64, "stellar_pay_commit").unwrap();
-        assert_eq!(result["amount_stroops"], "5000000");
+        assert_eq!(
+            result["amount_stroops"], "5000000",
+            "debit amount must be send_amount"
+        );
+        assert_eq!(result["asset"], "XLM", "debit asset must be send_asset");
+        assert_eq!(
+            result["dest_amount_stroops"], "4900000",
+            "informational receive amount must be dest_min"
+        );
+        assert_eq!(
+            result["dest_asset"],
+            format!("USDC:{USDC_ISSUER_G}"),
+            "informational receive asset must be dest_asset"
+        );
+        assert_eq!(result["destination"], DEST_G);
+    }
+
+    /// `PathPaymentStrictReceive`: the debit (`asset` / `amount_stroops`) is
+    /// the send side (`send_asset` / `send_max`, the ceiling the signer
+    /// authorizes to spend) — NOT the destination side (`dest_asset` /
+    /// `dest_amount`, what the recipient actually receives). `send_max`
+    /// bounds the wallet's actual spend, so a value cap sized off
+    /// `dest_amount`/`dest_asset` could be bypassed by routing through an
+    /// asset the cap does not cover.
+    #[test]
+    fn path_payment_strict_receive_debit_is_send_side_not_dest_side() {
+        use stellar_xdr::{AlphaNum4, AssetCode4, PathPaymentStrictReceiveOp};
+        let mut code_bytes = [0u8; 4];
+        code_bytes[..4].copy_from_slice(b"USDC");
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::PathPaymentStrictReceive(PathPaymentStrictReceiveOp {
+                send_asset: Asset::Native,
+                send_max: 6_000_000, // ceiling the signer authorizes — the debit
+                destination: g_to_muxed(DEST_G),
+                dest_asset: Asset::CreditAlphanum4(AlphaNum4 {
+                    asset_code: AssetCode4(code_bytes),
+                    issuer: g_to_account_id(USDC_ISSUER_G),
+                }),
+                dest_amount: 5_000_000,
+                path: VecM::default(),
+            }),
+        };
+        let env = build_envelope(SOURCE_G, op, Memo::None);
+        let xdr_b64 = to_b64(&env);
+
+        let result = decode_authoritative_args(&xdr_b64, "stellar_pay_commit").unwrap();
+        assert_eq!(
+            result["amount_stroops"], "6000000",
+            "debit amount must be send_max, not dest_amount"
+        );
+        assert_eq!(result["asset"], "XLM", "debit asset must be send_asset");
+        assert_eq!(
+            result["dest_amount_stroops"], "5000000",
+            "informational receive amount must be dest_amount"
+        );
+        assert_eq!(
+            result["dest_asset"],
+            format!("USDC:{USDC_ISSUER_G}"),
+            "informational receive asset must be dest_asset"
+        );
+        assert_eq!(result["destination"], DEST_G);
+    }
+
+    /// A plain `Payment` carries neither `dest_asset` nor
+    /// `dest_amount_stroops` — the single-leg shape is unchanged by the
+    /// path-payment fix.
+    #[test]
+    fn plain_payment_carries_no_dest_fields() {
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(stellar_xdr::PaymentOp {
+                destination: g_to_muxed(DEST_G),
+                asset: Asset::Native,
+                amount: 1_000_000,
+            }),
+        };
+        let env = build_envelope(SOURCE_G, op, Memo::None);
+        let xdr_b64 = to_b64(&env);
+
+        let result = decode_authoritative_args(&xdr_b64, "stellar_pay_commit").unwrap();
+        assert_eq!(result["amount_stroops"], "1000000");
+        assert_eq!(result["asset"], "XLM");
+        assert!(
+            result.get("dest_amount_stroops").is_none(),
+            "a plain Payment must not carry dest_amount_stroops"
+        );
+        assert!(
+            result.get("dest_asset").is_none(),
+            "a plain Payment must not carry dest_asset"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────

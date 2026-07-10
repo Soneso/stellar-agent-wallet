@@ -548,6 +548,14 @@ where
                 &sub_result.tx_hash,
                 sub_result.ledger,
             );
+            crate::commands::policy_engine::record_confirmed_value_moving(
+                "pay",
+                &profile,
+                &args.profile,
+                "stellar_pay_commit",
+                chain_id,
+                pay_effects.as_ref(),
+            );
 
             let result = PayResult {
                 envelope_xdr: signed_xdr,
@@ -839,6 +847,14 @@ where
                 pay_effects.as_ref(),
                 &sub_result.tx_hash,
                 sub_result.ledger,
+            );
+            crate::commands::policy_engine::record_confirmed_value_moving(
+                "pay",
+                &profile,
+                &args.profile,
+                "stellar_pay",
+                chain_id,
+                pay_effects.as_ref(),
             );
 
             let result = PayResult {

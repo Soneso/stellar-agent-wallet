@@ -238,6 +238,10 @@ impl WalletServer {
         let audit_legs = vec![stellar_agent_core::audit_log::ValueLegRecord::from(
             &value_leg,
         )];
+        // Also retain an owned clone for the window-state record after
+        // confirmed submit (single-derivation invariant on the recording
+        // side too) — `value_leg` itself moves into `ValueClass::single` below.
+        let value_leg_for_record = value_leg.clone();
         let args_value = json!({
             "chain_id": args.chain_id,
             "from_address": args.from_address,
@@ -379,6 +383,19 @@ impl WalletServer {
 
         match submit_result {
             Ok(()) => {
+                // Non-fatal window-state record on confirmed submit: the SAME
+                // leg the gate sized (single-derivation invariant).
+                if let Some(descriptor) = self.tool_registry.get("stellar_dex_trade") {
+                    let value_class = ValueClass::single(value_leg_for_record);
+                    stellar_agent_network::policy_state::record_confirmed_window_state(
+                        self.policy_engine.as_ref(),
+                        descriptor,
+                        &self.profile,
+                        &audit_profile_name,
+                        &value_class,
+                    );
+                }
+
                 let resp = json!({
                     "status": "submitted",
                     "preview": {

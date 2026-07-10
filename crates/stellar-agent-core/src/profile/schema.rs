@@ -224,6 +224,33 @@ impl KeyringEntryRef {
             "default",
         )
     }
+
+    /// Constructs the default policy-window-state HMAC key keyring entry
+    /// reference for a profile.
+    ///
+    /// Entry name: `stellar-agent-policy-window-<profile>` / `default`.
+    ///
+    /// Used to authenticate the persisted per-profile sliding-window store
+    /// (`per_period_cap` / `rate_limit` / `bundle_per_period_cap` /
+    /// `bundle_rate_limit` accumulated history) against post-write local
+    /// tampering.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::profile::schema::KeyringEntryRef;
+    ///
+    /// let r = KeyringEntryRef::default_policy_window_state_key("alice");
+    /// assert_eq!(r.service, "stellar-agent-policy-window-alice");
+    /// assert_eq!(r.account, "default");
+    /// ```
+    #[must_use]
+    pub fn default_policy_window_state_key(profile_name: &str) -> Self {
+        Self::new(
+            format!("stellar-agent-policy-window-{profile_name}"),
+            "default",
+        )
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -697,6 +724,25 @@ pub struct Profile {
     /// profile alone cannot silently turn on network exposure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_approval: Option<RemoteApprovalConfig>,
+
+    /// Keyring entry for the persisted policy-window-state HMAC key.
+    ///
+    /// A per-profile 32-byte HMAC key authenticating the on-disk sliding-window
+    /// store (`<state>/policy/<profile>.window`) that backs the `per_period_cap`,
+    /// `rate_limit`, `bundle_per_period_cap`, and `bundle_rate_limit` criteria.
+    /// Rotating this key invalidates the existing store file's tag; `profile
+    /// rotate-policy-state-key` re-signs the file under the new key so
+    /// accumulated history is not lost.
+    ///
+    /// Absent from profiles written before this field existed: the loader
+    /// derives the conventional coordinate (`stellar-agent-policy-window-<profile>`)
+    /// from the profile name when the TOML omits it, so existing profile files
+    /// keep loading unchanged. Key material mints lazily on first store write.
+    ///
+    /// Resolved by the loader (mirroring `rpc_url` / `audit_log_path`), not by
+    /// a serde field default — the conventional coordinate is derived from the
+    /// profile name, which is not available to a per-field serde default.
+    pub policy_window_state_key_id: KeyringEntryRef,
 }
 
 /// A single channel record within the channel-account pool.
@@ -916,6 +962,10 @@ impl std::fmt::Debug for Profile {
             )
             .field("pool_master_key_id", &self.pool_master_key_id)
             .field("pool_config", &self.pool_config)
+            .field(
+                "policy_window_state_key_id",
+                &self.policy_window_state_key_id,
+            )
             .field("remote_approval", &self.remote_approval)
             .finish()
     }
@@ -1016,6 +1066,9 @@ impl Profile {
             policy_owner_key_id: KeyringEntryRef::default_owner_key(&derived_name),
             attestation_key_id: KeyringEntryRef::default_attestation_key(&derived_name),
             counterparty_cache_key_id: KeyringEntryRef::default_counterparty_key(&derived_name),
+            policy_window_state_key_id: KeyringEntryRef::default_policy_window_state_key(
+                &derived_name,
+            ),
             oracle_provider_url: None,
             policy: PolicyConfig::default(),
             wallet: WalletConfig::default(),
@@ -1073,6 +1126,9 @@ impl Profile {
             policy_owner_key_id: KeyringEntryRef::default_owner_key(&derived_name),
             attestation_key_id: KeyringEntryRef::default_attestation_key(&derived_name),
             counterparty_cache_key_id: KeyringEntryRef::default_counterparty_key(&derived_name),
+            policy_window_state_key_id: KeyringEntryRef::default_policy_window_state_key(
+                &derived_name,
+            ),
             oracle_provider_url: None,
             policy: PolicyConfig::default(),
             wallet: WalletConfig::default(),
@@ -1132,6 +1188,7 @@ pub struct ProfileBuilder {
     policy_owner_key_id: KeyringEntryRef,
     attestation_key_id: KeyringEntryRef,
     counterparty_cache_key_id: KeyringEntryRef,
+    policy_window_state_key_id: KeyringEntryRef,
     oracle_provider_url: Option<Url>,
     policy: PolicyConfig,
     wallet: WalletConfig,
@@ -1167,6 +1224,7 @@ impl ProfileBuilder {
         self.policy_owner_key_id = KeyringEntryRef::default_owner_key(name);
         self.attestation_key_id = KeyringEntryRef::default_attestation_key(name);
         self.counterparty_cache_key_id = KeyringEntryRef::default_counterparty_key(name);
+        self.policy_window_state_key_id = KeyringEntryRef::default_policy_window_state_key(name);
         self
     }
 
@@ -1369,6 +1427,7 @@ impl ProfileBuilder {
             // Remote approval is off by default; the operator opts in by
             // writing a `[remote_approval]` block to the profile TOML.
             remote_approval: None,
+            policy_window_state_key_id: self.policy_window_state_key_id,
         }
     }
 }
@@ -1451,6 +1510,63 @@ fn default_audit_log_dir() -> Option<PathBuf> {
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         Some(dirs.data_local_dir().join("stellar-agent").join("audit"))
+    }
+}
+
+/// Returns the OS-conventional policy-window-state file path for
+/// `profile_name`.
+///
+/// `<state>/stellar-agent/policy/<profile_name>.window`, mirroring
+/// [`default_audit_log_path_for`]'s per-profile file-naming convention (same
+/// `profile_name` sanitisation) with a sibling `policy/` leaf distinct from
+/// the `policies/` directory [`default_policy_dir`] returns for signed policy
+/// rule-set TOML files — this path holds accumulated runtime window state,
+/// not policy configuration.
+///
+/// Tests may set `STELLAR_AGENT_HOME` to redirect the directory to
+/// `$STELLAR_AGENT_HOME/policy`, mirroring [`default_policy_dir`]'s override.
+/// The env-var read is **gated behind `#[cfg(any(test, feature =
+/// "test-helpers"))]`** so production release builds never honour it —
+/// closing the same env-injection store-swap surface `default_profile_dir`
+/// documents.
+#[must_use]
+pub fn default_policy_window_state_path_for(profile_name: &str) -> PathBuf {
+    let file_name = format!("{}.window", audit_log_file_stem(profile_name));
+    #[cfg(any(test, feature = "test-helpers"))]
+    if let Some(home) = std::env::var_os("STELLAR_AGENT_HOME") {
+        return PathBuf::from(home).join("policy").join(&file_name);
+    }
+    default_policy_window_state_dir()
+        .map(|dir| dir.join(&file_name))
+        .unwrap_or_else(|| PathBuf::from("stellar-agent/policy").join(file_name))
+}
+
+fn default_policy_window_state_dir() -> Option<PathBuf> {
+    let dirs = directories::BaseDirs::new()?;
+
+    #[cfg(target_os = "linux")]
+    {
+        Some(
+            dirs.state_dir()
+                .unwrap_or_else(|| dirs.data_local_dir())
+                .join("stellar-agent")
+                .join("policy"),
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Some(dirs.data_local_dir().join("stellar-agent").join("policy"))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        Some(dirs.data_local_dir().join("stellar-agent").join("policy"))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        Some(dirs.data_local_dir().join("stellar-agent").join("policy"))
     }
 }
 

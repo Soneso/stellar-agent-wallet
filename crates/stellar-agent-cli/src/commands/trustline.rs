@@ -719,6 +719,14 @@ where
                 &args.profile,
                 audit_entry,
             );
+            crate::commands::policy_engine::record_confirmed_value_moving_with_engine(
+                policy_engine.as_ref(),
+                &profile,
+                &args.profile,
+                "stellar_trustline",
+                chain_id,
+                trustline_effects.as_ref(),
+            );
 
             render_json(&Envelope::ok(json!({
                 "status": "submitted",

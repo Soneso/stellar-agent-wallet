@@ -218,6 +218,14 @@ pub enum ActionKind {
     MppCharge,
     /// A generic Soroban contract invocation that moves value.
     ContractInvoke,
+    /// The destination-side leg of a path payment (`stellar_pay` /
+    /// `stellar_pay_commit` over `PathPaymentStrictReceive` /
+    /// `PathPaymentStrictSend`): informational only, carrying the asset and
+    /// amount the recipient receives (or receives at minimum). Not a
+    /// spendable-balance debit — the wallet's debit is the paired
+    /// [`ActionKind::Payment`] leg sized from the send side. See
+    /// [`carries_debit`](Self::carries_debit).
+    PathPaymentReceive,
 }
 
 impl ActionKind {
@@ -242,7 +250,11 @@ impl ActionKind {
             | Self::X402Payment
             | Self::MppCharge
             | Self::ContractInvoke => true,
-            Self::Claim | Self::Trustline | Self::LendWithdraw | Self::VaultWithdraw => false,
+            Self::Claim
+            | Self::Trustline
+            | Self::LendWithdraw
+            | Self::VaultWithdraw
+            | Self::PathPaymentReceive => false,
         }
     }
 }
@@ -365,12 +377,41 @@ pub fn derive_value_class(tool_name: &str, args: &Value) -> ValueClass {
                 .get("destination")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            ValueClass::single(ValueLeg {
+            let debit_leg = ValueLeg {
                 kind: ActionKind::Payment,
                 amount,
                 asset,
-                destination,
-            })
+                destination: destination.clone(),
+            };
+
+            // A path-payment envelope carries `dest_asset` /
+            // `dest_amount_stroops` alongside the send-side `asset` /
+            // `amount_stroops` (see `envelope_decode::decode_pay_args`). When
+            // present, surface the destination side as a second, non-debit
+            // informational leg so the descriptor records what the recipient
+            // receives without letting it size a value cap. A plain `Payment`
+            // carries neither field, so it stays single-leg.
+            let dest_amount = args
+                .get("dest_amount_stroops")
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse::<i64>().ok())
+                .map(i128::from);
+            let dest_asset = args
+                .get("dest_asset")
+                .and_then(Value::as_str)
+                .map(asset_normalise);
+
+            if dest_amount.is_some() || dest_asset.is_some() {
+                let receive_leg = ValueLeg {
+                    kind: ActionKind::PathPaymentReceive,
+                    amount: dest_amount,
+                    asset: dest_asset,
+                    destination,
+                };
+                ValueClass::Value(ValueEffects::new(vec![debit_leg, receive_leg]))
+            } else {
+                ValueClass::single(debit_leg)
+            }
         }
         "stellar_create_account" | "stellar_create_account_commit" => {
             let amount = resolve_pay_or_create_account_stroops(tool_name, args, "derive")
@@ -616,6 +657,52 @@ mod tests {
         assert_eq!(leg.amount, Some(500_000_000_i128));
         // "XLM" normalises to the canonical "native".
         assert_eq!(leg.asset.as_deref(), Some("native"));
+    }
+
+    /// A path-payment `authoritative_args` shape (carrying `dest_asset` /
+    /// `dest_amount_stroops` alongside the send-side `amount_stroops` /
+    /// `asset`) derives TWO legs: a debit `Payment` leg sized from the send
+    /// side, and a non-debit `PathPaymentReceive` leg carrying the
+    /// destination-side asset/amount for informational/counterparty use.
+    #[test]
+    fn derive_pay_commit_path_payment_shape_builds_debit_and_receive_legs() {
+        let args = json!({
+            "source": "GAAA",
+            "destination": "GBBB",
+            "amount_stroops": "6000000",
+            "asset": "XLM",
+            "dest_amount_stroops": "5000000",
+            "dest_asset": "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+        });
+        let vc = derive_value_class("stellar_pay_commit", &args);
+        let ValueClass::Value(effects) = vc else {
+            panic!("expected Value, got {vc:?}");
+        };
+        assert_eq!(effects.legs().len(), 2, "must derive exactly two legs");
+
+        let debit = &effects.legs()[0];
+        assert_eq!(debit.kind, ActionKind::Payment);
+        assert!(debit.kind.carries_debit(), "the send-side leg must debit");
+        assert_eq!(debit.amount, Some(6_000_000_i128));
+        assert_eq!(debit.asset.as_deref(), Some("native"));
+        assert_eq!(debit.destination.as_deref(), Some("GBBB"));
+
+        let receive = &effects.legs()[1];
+        assert_eq!(receive.kind, ActionKind::PathPaymentReceive);
+        assert!(
+            !receive.kind.carries_debit(),
+            "the receive-side leg must NOT debit"
+        );
+        assert_eq!(receive.amount, Some(5_000_000_i128));
+        assert_eq!(
+            receive.asset.as_deref(),
+            Some("USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN")
+        );
+        assert_eq!(
+            receive.destination.as_deref(),
+            Some("GBBB"),
+            "the recipient is the same account regardless of which asset is debited"
+        );
     }
 
     #[test]

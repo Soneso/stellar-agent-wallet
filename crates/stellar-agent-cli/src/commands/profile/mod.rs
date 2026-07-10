@@ -30,10 +30,12 @@ pub mod enroll_signer;
 pub mod key_ops;
 pub mod list;
 pub mod migrate;
+pub mod reset_window_state;
 pub mod rotate_attestation_key;
 pub mod rotate_audit_key;
 pub mod rotate_counterparty_key;
 pub mod rotate_nonce_key;
+pub mod rotate_policy_state_key;
 pub mod show;
 pub mod sign_policy;
 
@@ -120,6 +122,21 @@ pub enum ProfileSubcommand {
     /// See `docs/runbooks/counterparty-cache-rotation.md` for operator
     /// guidance on coordinating cache invalidation.
     RotateCounterpartyKey(rotate_counterparty_key::RotateCounterpartyKeyArgs),
+    /// Rotate the persisted policy-window-state HMAC key for a profile.
+    ///
+    /// Generates 32 bytes from `OsRng` and stores them in the platform
+    /// keyring entry for `policy_window_state_key_id`. The accumulated
+    /// `per_period_cap` / `rate_limit` window-state store is re-signed under
+    /// the new key so its history is preserved (not invalidated) by
+    /// rotation.
+    RotatePolicyStateKey(rotate_policy_state_key::RotatePolicyStateKeyArgs),
+    /// Re-initialise the persisted policy-window-state store to empty.
+    ///
+    /// Recovery path for an unreadable, tampered, or unparseable window-state
+    /// store: the stateful criteria (`per_period_cap`, `rate_limit`,
+    /// `bundle_per_period_cap`, `bundle_rate_limit`) fail closed until reset.
+    /// Discards accumulated history for the profile; the reset is audited.
+    ResetWindowState(reset_window_state::ResetWindowStateArgs),
 }
 
 /// Runs the `profile` subcommand group.
@@ -147,5 +164,7 @@ pub async fn run(args: &ProfileArgs) -> i32 {
         ProfileSubcommand::RotateAttestationKey(a) => rotate_attestation_key::run(a).await,
         ProfileSubcommand::RotateAuditKey(a) => rotate_audit_key::run(a).await,
         ProfileSubcommand::RotateCounterpartyKey(a) => rotate_counterparty_key::run(a).await,
+        ProfileSubcommand::RotatePolicyStateKey(a) => rotate_policy_state_key::run(a).await,
+        ProfileSubcommand::ResetWindowState(a) => reset_window_state::run(a).await,
     }
 }

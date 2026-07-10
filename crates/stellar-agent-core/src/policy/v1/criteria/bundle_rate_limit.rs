@@ -180,6 +180,39 @@ impl Criterion for BundleRateLimitCriterion {
 
         Ok(None)
     }
+
+    /// Appends one call-count entry (unit weight 1) per inner into
+    /// `ctx.state_store`, using the SAME `StateKey` derivation `evaluate`
+    /// uses. No-op on the single-tx path (`ctx.bundle` is `None`).
+    fn record_confirmed(
+        &self,
+        ctx: &EvalContext<'_>,
+    ) -> Result<Vec<(StateKey, u64, i128)>, PolicyError> {
+        let Some(view) = ctx.bundle else {
+            return Ok(Vec::new());
+        };
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .map_err(|e| PolicyError::CriterionEvaluationFailed {
+                detail: format!(
+                    "bundle_rate_limit: record_confirmed system clock is before UNIX epoch: {e}"
+                ),
+            })?;
+        let state_key = StateKey::new(ctx.profile_name, 1, "rate_limit", self.window.as_secs());
+
+        let mut recorded = Vec::with_capacity(view.inners.len());
+        for _inner in view.inners {
+            ctx.state_store.append(&state_key, now_ms, 1).map_err(|e| {
+                PolicyError::CriterionEvaluationFailed {
+                    detail: format!("bundle_rate_limit: record_confirmed state store error: {e}"),
+                }
+            })?;
+            recorded.push((state_key.clone(), now_ms, 1));
+        }
+        Ok(recorded)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

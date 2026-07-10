@@ -291,6 +291,7 @@ fn apply_migrations(name: &str, path: &Path, from_version: u32) -> Result<Profil
 /// | `policy_owner_key_id` | `stellar-agent-owner-<name>/default` | `enroll-owner-key` |
 /// | `attestation_key_id` | `stellar-agent-attestation-<name>/default` | `rotate-attestation-key` |
 /// | `counterparty_cache_key_id` | `stellar-agent-counterparty-<name>/default` | `rotate-counterparty-key` |
+/// | `policy_window_state_key_id` | `stellar-agent-policy-window-<name>/default` | lazy-mint on first store write, or `rotate-policy-state-key` |
 /// | `oracle_provider_url` | `None` | operator action |
 /// | `policy.engine` | `Noop` | operator action |
 /// | `classic_fee_per_op_stroops` | `None` | operator action |
@@ -333,6 +334,7 @@ fn migrate_v1_to_v2(profile_name: &str, v1: PartialV1Profile) -> Profile {
         policy_owner_key_id: KeyringEntryRef::default_owner_key(profile_name),
         attestation_key_id: KeyringEntryRef::default_attestation_key(profile_name),
         counterparty_cache_key_id: KeyringEntryRef::default_counterparty_key(profile_name),
+        policy_window_state_key_id: KeyringEntryRef::default_policy_window_state_key(profile_name),
         oracle_provider_url: None,
         policy: PolicyConfig {
             engine: PolicyEngineKind::Noop,
