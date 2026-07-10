@@ -125,11 +125,15 @@ pub struct Sep43SignAndSubmitTransactionArgs {
 /// Implements the SEP-43 sign-and-submit flow corresponding to the WalletConnect
 /// v2 `stellar_signAndSubmitXDR` method.
 ///
-/// Returns `{ "signedTxXdr": "<base64>", "txHash": "<hex64>", "status": "success" }`
-/// on confirmed submission, or `{ "signedTxXdr": "<base64>", "txHash": "", "status": "pending" }`
-/// when the polling window expired before ledger confirmation.
+/// Returns `{ ok: true, data: { "signedTxXdr": "<base64>", "txHash": "<hex64>",
+/// "status": "success" }, request_id }` on confirmed submission, or the same
+/// shape with `"txHash": ""` and `"status": "pending"` when the polling window
+/// expired before ledger confirmation (`ok: true` in both cases — pending is
+/// not a failure).
 ///
-/// Errors return a SEP-43 spec-compliant `{ "code": N, "message": "..." }` object.
+/// Errors return `{ ok: false, error: { code, message }, request_id }` with a
+/// `sep43.*` wire code (or `network.mainnet_write_forbidden` for the mainnet
+/// guard, shared with the sign-only tools).
 ///
 /// # Tool annotations
 ///
@@ -241,15 +245,13 @@ impl WalletServer {
             match signer_from_keyring(&self.profile.mcp_signer_default, account).await {
                 Ok(h) => h,
                 Err(err) => {
-                    let resp = stellar_agent_sep43::Sep43Error::WalletUnlockFailed {
+                    let sep43_err = stellar_agent_sep43::Sep43Error::WalletUnlockFailed {
                         detail: format!("keyring load failed: {err}"),
-                    }
-                    .to_sep43_response();
-                    let json_str =
-                        serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-                    let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                    result.is_error = Some(true);
-                    return Ok(result);
+                    };
+                    return Ok(crate::tools::common::business_error_result(
+                        sep43_err.wire_code(),
+                        sep43_err.to_string(),
+                    ));
                 }
             };
 
@@ -270,12 +272,10 @@ impl WalletServer {
         {
             Ok(v) => v,
             Err(err) => {
-                let resp = err.to_sep43_response();
-                let json_str =
-                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-                let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                result.is_error = Some(true);
-                return Ok(result);
+                return Ok(crate::tools::common::business_error_result(
+                    err.wire_code(),
+                    err.to_string(),
+                ));
             }
         };
 
@@ -287,15 +287,13 @@ impl WalletServer {
         {
             Some(xdr) => xdr.to_owned(),
             None => {
-                let resp = stellar_agent_sep43::Sep43Error::XdrSerializationFailed {
+                let sep43_err = stellar_agent_sep43::Sep43Error::XdrSerializationFailed {
                     detail: "sign_transaction response missing signedTxXdr field".to_owned(),
-                }
-                .to_sep43_response();
-                let json_str =
-                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-                let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                result.is_error = Some(true);
-                return Ok(result);
+                };
+                return Ok(crate::tools::common::business_error_result(
+                    sep43_err.wire_code(),
+                    sep43_err.to_string(),
+                ));
             }
         };
 
@@ -304,15 +302,13 @@ impl WalletServer {
         let client = match StellarRpcClient::new(rpc_url) {
             Ok(c) => c,
             Err(err) => {
-                let resp = stellar_agent_sep43::Sep43Error::RpcError {
+                let sep43_err = stellar_agent_sep43::Sep43Error::RpcError {
                     detail: redact_rpc_error_detail("rpc_client_construction_failed", &err),
-                }
-                .to_sep43_response();
-                let json_str =
-                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-                let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                result.is_error = Some(true);
-                return Ok(result);
+                };
+                return Ok(crate::tools::common::business_error_result(
+                    sep43_err.wire_code(),
+                    sep43_err.to_string(),
+                ));
             }
         };
 
@@ -376,8 +372,10 @@ impl WalletServer {
                     "txHash": result.tx_hash,
                     "status": "success",
                 });
-                let json_str =
-                    serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_owned());
+                let envelope = stellar_agent_core::envelope::Envelope::ok(response);
+                let json_str = envelope
+                    .to_json_pretty()
+                    .unwrap_or_else(|_| String::from("{}"));
                 Ok(CallToolResult::success(vec![Content::text(json_str)]))
             }
 
@@ -399,27 +397,29 @@ impl WalletServer {
                     "txHash": tx_hash,
                     "status": "pending",
                 });
-                let json_str =
-                    serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_owned());
+                let envelope = stellar_agent_core::envelope::Envelope::ok(response);
+                let json_str = envelope
+                    .to_json_pretty()
+                    .unwrap_or_else(|_| String::from("{}"));
                 Ok(CallToolResult::success(vec![Content::text(json_str)]))
             }
 
             Err(stellar_agent_core::WalletError::Network(
                 stellar_agent_core::error::NetworkError::MainnetWriteForbidden,
             )) => {
-                // Mainnet-write guard — surface as MainnetSigningForbidden (-3),
-                // the same SEP-43 code the sign-only tools use for the structural
-                // mainnet refusal, rather than the external-service RpcError (-2).
-                // Same refusal class, one code group across the sep43 family.
-                let resp = stellar_agent_sep43::Sep43Error::MainnetSigningForbidden {
-                    detail: crate::tools::common::mainnet_signing_refusal_detail(),
-                }
-                .to_sep43_response();
-                let json_str =
-                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-                let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                result.is_error = Some(true);
-                Ok(result)
+                // Mainnet-write guard — surface under the SAME canonical
+                // `network.mainnet_write_forbidden` code the sign-only tools use
+                // for the structural mainnet refusal (mirrors
+                // `mainnet_signing_forbidden_result`), rather than a SEP-43
+                // RpcError code. Same refusal class, one code across the sep43
+                // family.
+                Ok(crate::tools::common::business_error_result(
+                    stellar_agent_core::error::NetworkError::MainnetWriteForbidden.code(),
+                    stellar_agent_sep43::Sep43Error::MainnetSigningForbidden {
+                        detail: crate::tools::common::mainnet_signing_refusal_detail(),
+                    }
+                    .to_string(),
+                ))
             }
 
             Err(stellar_agent_core::WalletError::Network(
@@ -428,15 +428,13 @@ impl WalletServer {
                 // URL is in the RpcUnreachable struct; strip it to prevent credential
                 // or endpoint leak to the dapp caller.
                 tracing::warn!("sep43_sign_and_submit: rpc_unreachable");
-                let resp = stellar_agent_sep43::Sep43Error::RpcError {
+                let sep43_err = stellar_agent_sep43::Sep43Error::RpcError {
                     detail: "rpc_unreachable".to_owned(),
-                }
-                .to_sep43_response();
-                let json_str =
-                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-                let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                result.is_error = Some(true);
-                Ok(result)
+                };
+                Ok(crate::tools::common::business_error_result(
+                    sep43_err.wire_code(),
+                    sep43_err.to_string(),
+                ))
             }
 
             Err(stellar_agent_core::WalletError::Network(
@@ -447,24 +445,22 @@ impl WalletServer {
                 // it to prevent endpoint leak to the dapp caller, mirroring the
                 // RpcUnreachable arm above.
                 tracing::warn!("sep43_sign_and_submit: rpc_timeout");
-                let resp = stellar_agent_sep43::Sep43Error::RpcError {
+                let sep43_err = stellar_agent_sep43::Sep43Error::RpcError {
                     detail: "rpc_timeout".to_owned(),
-                }
-                .to_sep43_response();
-                let json_str =
-                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-                let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                result.is_error = Some(true);
-                Ok(result)
+                };
+                Ok(crate::tools::common::business_error_result(
+                    sep43_err.wire_code(),
+                    sep43_err.to_string(),
+                ))
             }
 
             Err(err) => {
                 // All other errors (XDR decode failure, on-chain FAILED, bad auth,
-                // etc.) map to SEP-43 code -1.
+                // etc.) map to the SEP-43 `RpcError` wire code (`sep43.rpc_error`).
                 // `stellar_agent_network::submit` error taxonomy:
-                // WalletError::Protocol → XdrCodecFailed (code -1 per "internal")
-                // WalletError::Submission → TxMalformed (code -1)
-                // WalletError::Ledger   → on-chain failure (code -1)
+                // WalletError::Protocol → XdrCodecFailed
+                // WalletError::Submission → TxMalformed
+                // WalletError::Ledger   → on-chain failure
                 //
                 // NOTE: WalletError::Network variants RpcUnreachable and RpcTimeout
                 // are handled in explicit arms above to strip URL from Display.
@@ -474,15 +470,13 @@ impl WalletServer {
                     error = %err,
                     "sep43_sign_and_submit: submission failed",
                 );
-                let resp = stellar_agent_sep43::Sep43Error::RpcError {
+                let sep43_err = stellar_agent_sep43::Sep43Error::RpcError {
                     detail: submission_failed_detail(&err),
-                }
-                .to_sep43_response();
-                let json_str =
-                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-                let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                result.is_error = Some(true);
-                Ok(result)
+                };
+                Ok(crate::tools::common::business_error_result(
+                    sep43_err.wire_code(),
+                    sep43_err.to_string(),
+                ))
             }
         }
     }
@@ -518,7 +512,7 @@ impl WalletServer {
     /// Propagates `rmcp::ErrorData` from the `dispatch_gate` preamble (e.g.
     /// chain_id mismatch, policy deny).  SEP-43 semantic errors (signing
     /// failures, submission failures) are returned as `Ok(CallToolResult)` with
-    /// `is_error = Some(true)` per the SEP-43 error-object contract.
+    /// the normalised business-error envelope (`is_error = Some(true)`).
     ///
     /// # Panics
     ///

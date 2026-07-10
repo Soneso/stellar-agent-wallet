@@ -85,8 +85,11 @@
 //! # Atomic writes
 //!
 //! All mutations persist via `tempfile::NamedTempFile` + `persist()` (rename)
-//! in the same parent directory.  After rename, the parent directory fd is
-//! fsynced to commit the directory entry.  File permissions are `0o600` on
+//! in the same parent directory.  On Unix, the parent directory is opened and
+//! fsynced after rename to commit the directory entry; this step is skipped
+//! on Windows, where opening a directory as a file requires
+//! `FILE_FLAG_BACKUP_SEMANTICS` (not set by the stable `std::fs::File::open`
+//! API) and fails with `ERROR_ACCESS_DENIED`.  File permissions are `0o600` on
 //! Unix.
 //!
 //! # Security
@@ -4285,8 +4288,8 @@ impl PendingApprovalStore {
     /// Persists the in-memory entries to disk via atomic temp-file rename.
     ///
     /// Creates a `NamedTempFile` in the same parent directory, writes TOML,
-    /// persists (renames) to the store path, then fsyncs the file and the
-    /// parent directory.  File mode is `0o600` on Unix.
+    /// persists (renames) to the store path, then fsyncs the file and (on
+    /// Unix only) the parent directory.  File mode is `0o600` on Unix.
     fn persist(&self) -> Result<(), ApprovalError> {
         let parent = self.path.parent().ok_or_else(|| {
             ApprovalError::from_io_detail(
@@ -4322,12 +4325,23 @@ impl PendingApprovalStore {
             .persist(&self.path)
             .map_err(|e| ApprovalError::from_io(e.error))?;
 
-        // fsync the final file handle and the parent directory entry.
+        // fsync the final file handle.
         final_path.sync_data().map_err(ApprovalError::from_io)?;
 
-        // fsync parent directory to commit the directory entry change.
-        let parent_file = File::open(parent).map_err(ApprovalError::from_io)?;
-        parent_file.sync_data().map_err(ApprovalError::from_io)?;
+        // fsync parent directory to commit the directory entry change. Opening
+        // a directory path via `std::fs::File::open` requires
+        // `FILE_FLAG_BACKUP_SEMANTICS` on Windows (which the stable API does
+        // not set) and fails with `ERROR_ACCESS_DENIED`; POSIX has no such
+        // restriction. Skip on non-Unix — NTFS journals directory-entry
+        // metadata itself, so a crash immediately after `persist` above still
+        // leaves the store re-openable; the pending entries this store holds
+        // are re-derivable by re-running the approval flow, so losing the
+        // last write to a crash is recoverable, not silently corrupting.
+        #[cfg(unix)]
+        {
+            let parent_file = fs::File::open(parent).map_err(ApprovalError::from_io)?;
+            parent_file.sync_data().map_err(ApprovalError::from_io)?;
+        }
 
         Ok(())
     }
@@ -4541,6 +4555,29 @@ mod tests {
 
         let store2 = PendingApprovalStore::open(path).unwrap();
         assert!(store2.get(&nonce).is_some());
+    }
+
+    /// Windows regression: `persist()` must succeed across repeated
+    /// insert-triggered rename cycles. Each `persist()` call renames a fresh
+    /// temp file over the store path, then (Unix-only) fsyncs the parent
+    /// directory; on Windows that step is skipped entirely rather than
+    /// opening the directory as a file. This test exercises the persist path
+    /// multiple times in the same process, so a regression that re-enables
+    /// an unconditional directory-open would fail here on `windows-storage`
+    /// CI even though it passes on every POSIX runner.
+    #[test]
+    fn persist_succeeds_across_repeated_inserts() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        for _ in 0..5 {
+            let entry = make_payment_entry(DEFAULT_TTL_MS);
+            store.insert(entry, TEST_NOW_MS).unwrap();
+        }
+        drop(store);
+
+        let reopened = PendingApprovalStore::open(path).unwrap();
+        assert_eq!(reopened.len(), 5, "all five persisted entries must reload");
     }
 
     // ── Duplicate nonce ──────────────────────────────────────────────────────

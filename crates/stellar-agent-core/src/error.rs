@@ -1002,6 +1002,29 @@ pub enum AuthError {
     #[error("platform keyring backend error; check keyring service configuration")]
     KeyringPlatformError,
 
+    /// Windows Credential Manager refused access because the current process
+    /// has no interactive logon session.
+    ///
+    /// Maps from `keyring_core::Error::NoStorageAccess(_)` specifically when
+    /// the underlying `windows-native-keyring-store` backend reports Win32
+    /// `ERROR_NO_SUCH_LOGON_SESSION` (1312) — the platform crate's `Display`
+    /// text for that case is `"Windows ERROR_NO_SUCH_LOGON_SESSION"`, the only
+    /// signal available across the crate boundary (the inner platform-error
+    /// type is not public). Other `NoStorageAccess` causes keep mapping to
+    /// [`AuthError::KeyringPlatformError`].
+    ///
+    /// Windows Credential Manager requires an interactive logon session:
+    /// non-interactive contexts (a Windows service, an SSH session, a
+    /// scheduled task) cannot access it, and the same operator credentials
+    /// unlock fine from an interactive desktop session. Carries no fields; no
+    /// secret material crosses the variant boundary.
+    #[error(
+        "Windows Credential Manager requires an interactive logon session; \
+         this process is running in a non-interactive session (service, SSH, \
+         or scheduled task) and cannot access the credential store"
+    )]
+    KeyringInteractiveSessionRequired,
+
     /// The specified keyring entry was not found.
     ///
     /// `name` holds the keyring entry label as supplied by the caller.
@@ -1058,6 +1081,7 @@ impl AuthError {
         match self {
             Self::KeyringLocked => "auth.keyring_locked",
             Self::KeyringPlatformError => "auth.keyring_platform_error",
+            Self::KeyringInteractiveSessionRequired => "auth.keyring_interactive_session_required",
             Self::KeyringNotFound { .. } => "auth.keyring_not_found",
             Self::HardwareUserRefused => "auth.hardware_user_refused",
             Self::SignerKeyMismatch { .. } => "auth.signer_key_mismatch",
@@ -2029,6 +2053,10 @@ mod tests {
                 "auth.keyring_platform_error",
             ),
             (
+                AuthError::KeyringInteractiveSessionRequired,
+                "auth.keyring_interactive_session_required",
+            ),
+            (
                 AuthError::KeyringNotFound {
                     name: "main".to_owned(),
                 },
@@ -2476,6 +2504,7 @@ mod tests {
         let cases = [
             WalletError::Auth(AuthError::KeyringLocked),
             WalletError::Auth(AuthError::KeyringPlatformError),
+            WalletError::Auth(AuthError::KeyringInteractiveSessionRequired),
             WalletError::Auth(AuthError::KeyringNotFound {
                 name: "main".to_owned(),
             }),

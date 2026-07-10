@@ -111,15 +111,15 @@ fn build_signers_manager(
 ) -> Result<SignersManager, SaError> {
     let log_path = default_audit_log_path_for(RULES_OBSERVABILITY_PROFILE);
     if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| SaError::NetworksTomlIo {
-            source: e,
+        std::fs::create_dir_all(parent).map_err(|e| SaError::AuditWriterIo {
+            detail: e.to_string(),
             path: log_path.clone(),
         })?;
     }
     let writer: Arc<Mutex<AuditWriter>> =
         AuditWriterRegistry::get_or_open(RULES_OBSERVABILITY_PROFILE, &log_path, None).map_err(
-            |e| SaError::NetworksTomlIo {
-                source: std::io::Error::other(e.to_string()),
+            |e| SaError::AuditWriterIo {
+                detail: e.to_string(),
                 path: log_path.clone(),
             },
         )?;

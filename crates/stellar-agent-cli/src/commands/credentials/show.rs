@@ -12,14 +12,17 @@
 //! # Output envelope
 //!
 //! ```json
-//! {"credential_id":"<redacted>","credential_name":"<name>","rp_id":"<rp-id>","transports":"usb","registered_at_unix_ms":0}
+//! {"ok":true,"data":{"credential_id":"<redacted>","credential_name":"<name>","rp_id":"<rp-id>","transports":"usb","registered_at_unix_ms":0},"request_id":"..."}
 //! ```
 
 use clap::Args;
 use serde::Serialize;
+use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::redact_first5_last5;
-use stellar_agent_smart_account::managers::credentials::{CredentialsError, CredentialsManager};
+use stellar_agent_smart_account::managers::credentials::CredentialsManager;
 
+use crate::commands::credentials::credentials_error_code;
+use crate::common::render::render_json;
 use crate::common::{resolve_profile_name, validate_path_component_ascii_safe};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -73,30 +76,29 @@ pub fn run(args: &ShowArgs) -> i32 {
 
     // Validate profile name as a path component.
     if let Err(reason) = validate_path_component_ascii_safe(&profile) {
-        return emit_error(&format!("invalid profile name '{profile}': {reason}"));
+        return emit_error(
+            "credentials.invalid_profile_name",
+            format!("invalid profile name '{profile}': {reason}"),
+        );
     }
 
     let mgr = match CredentialsManager::from_defaults_readonly(&profile, &args.rp_id) {
         Ok(m) => m,
-        Err(e) => return emit_error(&e.to_string()),
+        Err(e) => return emit_error(credentials_error_code(&e), e.to_string()),
     };
 
     let meta = match mgr.show(&args.name) {
         Ok(m) => m,
-        Err(CredentialsError::NotFound { name }) => {
-            return emit_error(&format!("credential '{name}' not found"));
-        }
-        Err(e) => return emit_error(&e.to_string()),
+        Err(e) => return emit_error(credentials_error_code(&e), e.to_string()),
     };
 
-    let envelope = ShowEnvelope {
+    render_json(&Envelope::ok(ShowEnvelope {
         credential_id: redact_first5_last5(&meta.credential_id_b64url),
         credential_name: meta.credential_name,
         rp_id: meta.rp_id,
         transports: meta.transports,
         registered_at_unix_ms: meta.registered_at_unix_ms,
-    };
-    print_json(&envelope);
+    }));
     0
 }
 
@@ -104,26 +106,7 @@ pub fn run(args: &ShowArgs) -> i32 {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[allow(
-    clippy::print_stdout,
-    clippy::print_stderr,
-    reason = "CLI binary intentional JSON output; errors to stderr"
-)]
-fn print_json<T: Serialize>(value: &T) {
-    match serde_json::to_string(value) {
-        Ok(s) => println!("{s}"),
-        Err(e) => eprintln!("stellar-agent: JSON serialisation error: {e}"),
-    }
-}
-
-#[allow(clippy::print_stdout, reason = "CLI binary intentional JSON output")]
-fn emit_error(detail: &str) -> i32 {
-    let envelope = serde_json::json!({ "status": "error", "error": detail });
-    println!(
-        "{}",
-        serde_json::to_string(&envelope).unwrap_or_else(|_| String::from(
-            r#"{"status":"error","error":"serialisation_failed"}"#
-        ))
-    );
+fn emit_error(code: &'static str, message: String) -> i32 {
+    render_json(&Envelope::<()>::err_raw(code, message));
     1
 }

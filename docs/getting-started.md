@@ -93,6 +93,13 @@ signer seed, nonce key, and all HMAC keys live in the platform keyring (macOS
 Keychain, Linux Secret Service, Windows Credential Manager). The profile TOML is
 safe to back up.
 
+**Windows: Credential Manager requires an interactive logon session.** A
+non-interactive process — a Windows service, an SSH session, or a scheduled
+task — cannot access Credential Manager and every keyring operation fails with
+`auth.keyring_interactive_session_required`. Run the wallet from an interactive
+desktop session (Remote Desktop counts), or deploy it inside a container /
+Linux VM where the platform keyring backend does not have this restriction.
+
 Profiles live in the OS-conventional directory, one TOML file per profile name:
 
 | Platform | Path |

@@ -115,9 +115,11 @@ impl WalletServer {
 
         match discover_claimed_seps(rpc_url, &args.contract_id).await {
             Ok(seps) => {
-                let resp = json!({ "supported_seps": seps });
-                let json_str =
-                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
+                let envelope =
+                    stellar_agent_core::envelope::Envelope::ok(json!({ "supported_seps": seps }));
+                let json_str = envelope
+                    .to_json_pretty()
+                    .unwrap_or_else(|_| String::from("{}"));
                 Ok(CallToolResult::success(vec![Content::text(json_str)]))
             }
             Err(e) => Ok(crate::tools::common::business_error_result(

@@ -27,10 +27,27 @@
 //! advisory lock on POSIX (Linux `OFD_SETLK`, macOS `flock`).
 //! `std::fs::File::try_lock()` is the non-blocking variant; returns
 //! `Err(WouldBlock)` when the lock is held by another OFD.  The lock is
-//! released when the `LockHandle`'s inner `File` is dropped (OFD closed).
+//! released when the writer's `File` is dropped (OFD closed).
 //!
 //! The stable standard-library `File::try_lock` API is used in preference to
 //! the `fd-lock` crate.
+//!
+//! # Single-handle requirement (Windows)
+//!
+//! The lock-holding handle and every read/write against the active log file
+//! are the SAME `std::fs::File`. On Windows, `LockFileEx`'s exclusive lock
+//! (which `File::try_lock` maps to; see `sys/fs/windows.rs`) is enforced
+//! against I/O issued through any OTHER handle to the same file, INCLUDING a
+//! second handle opened by the SAME process for the SAME path — this is
+//! documented Win32 behaviour ("Locking and Unlocking Byte Ranges in Files",
+//! Microsoft Learn), unlike POSIX advisory locks (OFD/flock) which never
+//! restrict I/O through a different descriptor, only other lock requests. A
+//! second `File::open`/`OpenOptions::open` of the active log path while this
+//! writer's handle is alive — for a read, a write, or a metadata-adjacent
+//! content scan — fails on Windows with `ERROR_ACCESS_DENIED` (raw os error
+//! 5). All reads and writes against the active log file therefore go through
+//! `AuditWriter::file`; no other function opens a second handle onto the
+//! active path while the writer is alive.
 //!
 //! # Per-file HMAC sidecar
 //!
@@ -130,22 +147,14 @@ static ROTATION_COLLISION_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct AuditWriter {
     /// Path to the active log file.
     path: PathBuf,
-    /// Exclusive OFD advisory lock over the log file.
+    /// The single OS handle used for BOTH the exclusive lock and every read
+    /// and write against the active log file.
     ///
-    /// Held for the entire `AuditWriter` lifetime.  The advisory lock is
-    /// released when the underlying `File` inside `LockHandle` is dropped
-    /// (i.e. when the OFD is closed by the OS), so simply dropping
-    /// `LockHandle` — either explicitly or at end-of-scope — is sufficient to
-    /// release the lock.  No explicit `unlock` call is needed.
-    _lock_handle: LockHandle,
-    /// Write-side file handle, opened in `O_APPEND` mode for appends.
-    ///
-    /// Two-OFD design: `_lock_handle` holds the lock on one file description;
-    /// `file` is a separate open of the same path used exclusively for
-    /// appending.  Under POSIX advisory-lock semantics, both OFDs reference the
-    /// same inode but are independent — the lock is not attached to the inode
-    /// itself, only to the lock-holder's OFD.  Appending through the second OFD
-    /// is therefore safe and avoids passing the lock FD through the I/O path.
+    /// Held for the entire `AuditWriter` lifetime; dropping it releases the
+    /// lock (OFD/handle closed) and closes the file.  No explicit `unlock`
+    /// call is needed.  See the module-level "Single-handle requirement
+    /// (Windows)" section for why this must be one handle rather than a
+    /// separate lock-holder plus a separate I/O handle.
     file: File,
     /// SHA-256 hash of the last entry written to the current file.
     ///
@@ -253,16 +262,16 @@ impl AuditWriter {
 
         // Acquire the exclusive advisory lock BEFORE reading the existing file
         // so no other process can append between the read and the first write.
-        let lock_handle = LockHandle::acquire(&path)?;
+        // This handle is used for BOTH the lock and every subsequent read/write
+        // against the active log file — see the module-level "Single-handle
+        // requirement (Windows)" section.
+        let file = acquire_locked_handle(&path)?;
 
         // Detect partial-rotation state after acquiring the lock, before reading
         // the chain.  Returns IntegrityViolation(VerifyError::PartialRotation)
         // on any anomaly; Ok(()) when the directory is clean.
         // No auto-recovery — silent recovery could mask a tamper attempt.
-        detect_partial_rotation(&path)?;
-
-        // Open the log file in O_APPEND mode for writing.
-        let file = open_append_0600(&path)?;
+        detect_partial_rotation(&path, &file)?;
 
         // Check if the file is empty (determines chain root vs continuation).
         let is_new_file = file.metadata()?.len() == 0;
@@ -271,12 +280,11 @@ impl AuditWriter {
         let last_hash = if is_new_file {
             ZERO_BLOCK_HASH.to_owned()
         } else {
-            read_and_verify_entry_chain_at_open(&path)?
+            read_and_verify_entry_chain_at_open(&file)?
         };
 
         Ok(Self {
             path,
-            _lock_handle: lock_handle,
             file,
             last_hash,
             is_new_file,
@@ -467,7 +475,7 @@ impl AuditWriter {
     /// Recovery: the next successful rotation produces a correctly-named archive.
     ///
     /// **Potentially unrecoverable — `fs::rename` succeeded but
-    /// `open_create_new_0600` / `LockHandle::acquire` failed:**
+    /// `acquire_locked_handle_create_new` failed:**
     /// The active file has been archived but the new active path could not be
     /// created or locked.  The writer is left in an inconsistent state and the
     /// current `AuditWriter` instance cannot be used again.  The next
@@ -526,31 +534,29 @@ impl AuditWriter {
         // Prune excess rotated files.
         self.prune_rotated_files()?;
 
-        // Open a new active file and acquire its lock BEFORE swapping the
-        // writer state.  Reordering is critical:
+        // Open and lock the new active file BEFORE swapping the writer state.
+        // Reordering is critical:
         //
-        // After `fs::rename`, the old `_lock_handle` holds the lock on the
-        // *rotated archive's* inode (POSIX flock follows the file descriptor,
-        // not the path).  The new active path is unlocked between the rename
-        // and the new `LockHandle::acquire`.  If we swap `self.file` first and
-        // THEN call `LockHandle::acquire`, a competing process can `try_lock`
-        // the new active path in that window and succeed — our subsequent
-        // `acquire` would return `FileLocked`, leaving the writer half-rotated.
+        // After `fs::rename`, the old handle holds the lock on the *rotated
+        // archive's* inode (POSIX flock follows the file descriptor, not the
+        // path). The new active path is unlocked between the rename and the
+        // new `acquire_locked_handle_create_new` call.  If we swap `self.file`
+        // first and THEN acquire the new lock, a competing process can
+        // `try_lock` the new active path in that window and succeed — our
+        // subsequent acquire would return `FileLocked`, leaving the writer
+        // half-rotated.
         //
         // Correct order:
-        //   1. Open the new active file.
-        //   2. Acquire the lock on the new active path.
-        //   3. Atomically assign both `self.file` and `self._lock_handle`,
-        //      dropping the OLD lock handle (releases the rotated-archive lock)
-        //      and OLD file handle at the same time.
+        //   1. Open AND lock the new active file (one handle, one call).
+        //   2. Assign `self.file`, dropping the OLD handle (releases the
+        //      rotated-archive lock and closes the old file) at the same time.
         // Use create_new (O_CREAT|O_EXCL) to defend against a race where an
         // attacker pre-creates the new active path between our fs::rename and
         // this open.  AlreadyExists from a crash-recovery scenario (stale
         // partial file) is surfaced as Io so the caller can intervene;
         // the stale file MUST NOT be reused because its chain state is unknown.
-        let new_file = open_create_new_0600(&self.path)?;
-        let new_lock_handle = match LockHandle::acquire(&self.path) {
-            Ok(lock_handle) => lock_handle,
+        let new_file = match acquire_locked_handle_create_new(&self.path) {
+            Ok(file) => file,
             Err(_) => {
                 let archive_name = PathBuf::from(&rotated_name);
                 self.partial_rotation_archive = Some(archive_name.clone());
@@ -561,9 +567,8 @@ impl AuditWriter {
             }
         };
 
-        // Atomic swap: old file and old lock are dropped here.
+        // Atomic swap: the old handle is dropped here.
         self.file = new_file;
-        self._lock_handle = new_lock_handle;
         self.last_hash = handoff_hash;
         self.is_new_file = true;
 
@@ -723,52 +728,73 @@ pub(crate) fn is_rotated_sibling(stem: &str, name: &str) -> bool {
     base_suffix[9..].bytes().all(|b| b.is_ascii_digit())
 }
 
-// ── LockHandle ────────────────────────────────────────────────────────────────
+// ── Lock acquisition ─────────────────────────────────────────────────────────
+//
+// A single handle serves as both the exclusive-lock holder and the I/O handle
+// for all reads/writes against the active log file — see the module-level
+// "Single-handle requirement (Windows)" section for why a separate
+// lock-holder handle plus a separate I/O handle is unsound on Windows.
 
-/// Holds an exclusive advisory lock on the audit log file.
-///
-/// The lock is acquired via [`std::fs::File::try_lock`] (stable Rust 1.89;
-/// exclusive lock by default on all platforms).  The lock is released when
-/// the `LockHandle` is dropped (OFD closed / file handle dropped).
+/// Returns `Err(WriterError::FileLocked)` if a test has armed the forced
+/// lock-acquire failure seam for `path`, consuming the arm.  A no-op outside
+/// `#[cfg(test)]`.
+fn check_forced_lock_failure(path: &Path) -> Result<(), WriterError> {
+    #[cfg(test)]
+    if let Ok(mut force_path) = FORCE_NEXT_LOCK_ACQUIRE_FAILURE_PATH.lock()
+        && force_path.as_deref() == Some(path)
+    {
+        *force_path = None;
+        return Err(WriterError::FileLocked);
+    }
+    #[cfg(not(test))]
+    let _ = path;
+    Ok(())
+}
+
+/// Calls `File::try_lock()` (stable Rust 1.89; exclusive lock by default on
+/// all platforms) on an already-open `file` and returns it locked.
 ///
 /// The `fd-lock` crate was removed in favour of this stable standard-library
 /// API.
-struct LockHandle {
-    /// Holding this `File` keeps the OFD-level advisory exclusive lock active
-    /// on the log path that was passed to [`LockHandle::acquire`].  Dropping
-    /// this `File` (and hence dropping the `LockHandle`) releases the lock and
-    /// closes the file descriptor.  The leading underscore suppresses
-    /// "unused field" lints while making the lifecycle role explicit.
-    _file: File,
+///
+/// # Errors
+///
+/// - [`WriterError::FileLocked`] if the lock is held by another OFD/handle
+///   (another process, or another handle on the same path in this process).
+/// - [`WriterError::Io`] on lock failure.
+fn try_lock_file(file: File) -> Result<File, WriterError> {
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(WriterError::FileLocked),
+        Err(std::fs::TryLockError::Error(e)) => Err(WriterError::Io(e)),
+    }
 }
 
-impl LockHandle {
-    /// Acquires an exclusive advisory lock on `path` (non-blocking).
-    ///
-    /// Opens `path` for writing (creating it if absent, mode 0600 on POSIX),
-    /// then calls `File::try_lock()`.
-    ///
-    /// # Errors
-    ///
-    /// - [`WriterError::FileLocked`] if the lock is held by another OFD
-    ///   (another process or another `LockHandle` on the same path).
-    /// - [`WriterError::Io`] on open or lock failure.
-    fn acquire(path: &Path) -> Result<Self, WriterError> {
-        #[cfg(test)]
-        if let Ok(mut force_path) = FORCE_NEXT_LOCK_ACQUIRE_FAILURE_PATH.lock()
-            && force_path.as_deref() == Some(path)
-        {
-            *force_path = None;
-            return Err(WriterError::FileLocked);
-        }
+/// Opens `path` for append (creating it if absent, mode 0600 on POSIX) and
+/// acquires an exclusive advisory lock on it (non-blocking), returning the
+/// SAME handle for both roles.
+///
+/// # Errors
+///
+/// - [`WriterError::FileLocked`] if the lock is held by another OFD/handle.
+/// - [`WriterError::Io`] on open or lock failure.
+fn acquire_locked_handle(path: &Path) -> Result<File, WriterError> {
+    check_forced_lock_failure(path)?;
+    try_lock_file(open_append_0600(path)?)
+}
 
-        let file = open_append_0600(path)?;
-        match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
-            Err(std::fs::TryLockError::WouldBlock) => Err(WriterError::FileLocked),
-            Err(std::fs::TryLockError::Error(e)) => Err(WriterError::Io(e)),
-        }
-    }
+/// Creates `path` exclusively (`O_CREAT | O_EXCL`, mode 0600 on POSIX) and
+/// acquires an exclusive advisory lock on it (non-blocking), returning the
+/// SAME handle for both roles.  Used when opening the new active file after a
+/// rotation.
+///
+/// # Errors
+///
+/// - [`WriterError::FileLocked`] if the lock is held by another OFD/handle.
+/// - [`WriterError::Io`] on open (including `AlreadyExists`) or lock failure.
+fn acquire_locked_handle_create_new(path: &Path) -> Result<File, WriterError> {
+    check_forced_lock_failure(path)?;
+    try_lock_file(open_create_new_0600(path)?)
 }
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
@@ -824,8 +850,14 @@ fn compute_entry_hash_streamed(
 
 // ── Platform-specific file open ───────────────────────────────────────────────
 
-/// Opens (or creates) the file at `path` in `O_APPEND | O_WRONLY | O_CREAT`
+/// Opens (or creates) the file at `path` in `O_APPEND | O_RDWR | O_CREAT`
 /// mode with permissions `0600` on POSIX.
+///
+/// Read access is included (not just append) because this handle also
+/// performs the partial-rotation scan and the chain-recovery read at open
+/// time — see the module-level "Single-handle requirement (Windows)" section
+/// for why those reads must go through this SAME handle rather than a second
+/// open of the same path.
 fn open_append_0600(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
@@ -833,12 +865,17 @@ fn open_append_0600(path: &Path) -> io::Result<File> {
         OpenOptions::new()
             .create(true)
             .append(true)
+            .read(true)
             .mode(0o600)
             .open(path)
     }
     #[cfg(not(unix))]
     {
-        OpenOptions::new().create(true).append(true).open(path)
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(path)
     }
 }
 
@@ -863,12 +900,17 @@ fn open_create_new_0600(path: &Path) -> io::Result<File> {
         OpenOptions::new()
             .create_new(true)
             .append(true)
+            .read(true)
             .mode(0o600)
             .open(path)
     }
     #[cfg(not(unix))]
     {
-        OpenOptions::new().create_new(true).append(true).open(path)
+        OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .read(true)
+            .open(path)
     }
 }
 
@@ -934,9 +976,13 @@ fn read_last_entry_hash(path: &Path) -> Result<String, WriterError> {
     }
 }
 
-fn read_and_verify_entry_chain_at_open(path: &Path) -> Result<String, WriterError> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
+fn read_and_verify_entry_chain_at_open(file: &File) -> Result<String, WriterError> {
+    // Reuse the caller's already-open (and already-locked) handle rather than
+    // opening a second one — see the module-level "Single-handle requirement
+    // (Windows)" section.
+    let mut cursor = file;
+    cursor.seek(SeekFrom::Start(0))?;
+    let reader = BufReader::new(cursor);
 
     let mut expected_previous_hash = ZERO_BLOCK_HASH.to_owned();
     let mut last_hash = ZERO_BLOCK_HASH.to_owned();
@@ -1183,6 +1229,11 @@ fn basename_lossy_path(path: &Path) -> String {
 /// any suspicious intermediate-state file causes an error rather than silent
 /// continuation.
 ///
+/// `active_file` is the SAME locked handle `AuditWriter::open` just acquired
+/// for `log_path`; the active-file scan (rule 3) reads through it instead of
+/// opening a second handle — see the module-level "Single-handle requirement
+/// (Windows)" section.
+///
 /// # Detection rules (in precedence order)
 ///
 /// 1. **[`PartialRotationState::OrphanSidecar`]** — a `.root_hmac` sidecar
@@ -1210,7 +1261,7 @@ fn basename_lossy_path(path: &Path) -> String {
 /// Returns [`WriterError::Io`] on filesystem read failures unrelated to the
 /// detection logic.
 ///
-fn detect_partial_rotation(log_path: &Path) -> Result<(), WriterError> {
+fn detect_partial_rotation(log_path: &Path, active_file: &File) -> Result<(), WriterError> {
     use super::verify::{PartialRotationState, VerifyError};
 
     let parent = match log_path.parent() {
@@ -1314,7 +1365,7 @@ fn detect_partial_rotation(log_path: &Path) -> Result<(), WriterError> {
     let log_is_regular_file = fs::symlink_metadata(log_path)
         .map(|m| m.is_file())
         .unwrap_or(false);
-    if log_is_regular_file && let Some(state) = detect_partial_last_entry(log_path)? {
+    if log_is_regular_file && let Some(state) = detect_partial_last_entry(active_file, log_path)? {
         // Basename only in the human-readable hint; full path in structured fields.
         let log_name = basename_lossy_path(log_path);
         let recovery = format!(
@@ -1354,13 +1405,17 @@ fn detect_partial_rotation(log_path: &Path) -> Result<(), WriterError> {
 /// start the entire accumulated buffer IS the last line, so no newline is
 /// needed.
 fn detect_partial_last_entry(
+    file: &File,
     log_path: &Path,
 ) -> Result<Option<super::verify::PartialRotationState>, WriterError> {
     // Chunk size for the backward scan.  Large enough to hold one typical
     // entry; small enough to avoid reading the whole file on the hot path.
     const SCAN_CHUNK: u64 = 4096;
 
-    let mut file = fs::File::open(log_path)?;
+    // Reuse the caller's already-open (and already-locked) handle rather than
+    // opening a second one — see the module-level "Single-handle requirement
+    // (Windows)" section.
+    let mut file = file;
     let file_size = file.metadata()?.len();
     if file_size == 0 {
         return Ok(None);
@@ -1794,6 +1849,48 @@ mod tests {
 
         let writer2 = open_no_key(path);
         assert_eq!(writer2.last_entry_hash(), hash_after_first);
+    }
+
+    /// Re-opening a NON-EMPTY audit log and then writing a further entry must
+    /// succeed through a SINGLE handle.
+    ///
+    /// `AuditWriter::open` exercises the partial-rotation last-entry scan and
+    /// the chain-recovery read only when the file already has entries —
+    /// exactly the case here. Both reads (and the following write) go through
+    /// the same handle that holds the exclusive lock. On Windows,
+    /// `LockFileEx`'s exclusive lock blocks I/O issued through any OTHER
+    /// handle to the same file, including a second handle opened by the SAME
+    /// process, so a two-handle design would fail this exact sequence with
+    /// `ERROR_ACCESS_DENIED` (raw os error 5). POSIX advisory locks never
+    /// block a second handle's I/O, so this test cannot distinguish a
+    /// single-handle design from a two-handle one on this platform; the
+    /// `windows-storage` CI job runs it on `windows-latest`, where the
+    /// distinction is observable.
+    #[test]
+    fn reopen_nonempty_log_then_write_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        {
+            let mut writer = open_no_key(path.clone());
+            writer
+                .write_entry(make_entry(writer.last_entry_hash()))
+                .unwrap();
+        } // Lock released, handle closed.
+
+        // Re-open against the now non-empty file: exercises the
+        // partial-rotation last-entry scan and the chain-recovery read.
+        let mut writer = open_no_key(path.clone());
+        writer
+            .write_entry(make_entry(writer.last_entry_hash()))
+            .unwrap();
+        drop(writer);
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            contents.lines().filter(|l| !l.trim().is_empty()).count(),
+            2,
+            "both entries (pre- and post-reopen) must be present"
+        );
     }
 
     #[test]
@@ -2873,7 +2970,8 @@ mod tests {
         // `previous_entry_hash` does not match the preceding entry's hash.
         // We therefore call `detect_partial_last_entry` directly to isolate
         // the detection logic from chain-hash verification.
-        let result = detect_partial_last_entry(&path);
+        let scan_file = fs::File::open(&path).unwrap();
+        let result = detect_partial_last_entry(&scan_file, &path);
         assert!(
             matches!(result, Ok(None)),
             "large complete JSON entry must not trigger PartialHandoffWrite; got: {result:?}"

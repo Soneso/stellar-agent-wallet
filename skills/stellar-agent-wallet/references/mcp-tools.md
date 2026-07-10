@@ -73,8 +73,9 @@ The six sign-only tools — `stellar_sep43_sign_transaction`,
 `stellar_sep53_sign_message`, `stellar_x402_create_payment`, and
 `stellar_x402_authenticated_payment` — refuse `stellar:mainnet` structurally at
 handler entry with `network.mainnet_write_forbidden`, before any policy
-evaluation and regardless of engine. On the SEP-43 tools this crosses the wire
-as the SEP-43 error object with code `-3`.
+evaluation and regardless of engine. This crosses the wire as the standard
+business-error envelope on every one of these tools, including the SEP-43
+family.
 
 How `RequireApproval` is satisfied depends on tool shape:
 

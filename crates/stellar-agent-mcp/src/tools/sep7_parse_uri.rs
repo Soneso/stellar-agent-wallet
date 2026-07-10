@@ -152,24 +152,37 @@ impl WalletServer {
             return e.into_result();
         }
 
-        // Parse the URI and determine signature status.
+        // Parse the URI and determine signature status. A parse/verify failure
+        // is a business refusal on the caller-supplied URI content, not a
+        // JSON-RPC protocol fault — it surfaces through the documented result
+        // envelope with a `sep7.*` wire code, matching every other normalised
+        // tool.
         let (request, status) = if args.verify_origin {
             // `parse_and_verify_uri` performs its own bounded HTTPS fetch of
             // `stellar.toml` for the origin domain (HTTPS-only, no-redirect).
-            parse_and_verify_uri(&args.uri).await.map_err(|e| {
-                let (code, detail) = sep7_error_to_wire(&e);
-                rmcp::ErrorData::invalid_params(code, Some(json!({ "detail": detail })))
-            })?
+            match parse_and_verify_uri(&args.uri).await {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    let (code, detail) = sep7_error_to_wire(&e);
+                    return Ok(crate::tools::common::business_error_result(code, detail));
+                }
+            }
         } else {
-            parse_uri(&args.uri).map_err(|e| {
-                let (code, detail) = sep7_error_to_wire(&e);
-                rmcp::ErrorData::invalid_params(code, Some(json!({ "detail": detail })))
-            })?
+            match parse_uri(&args.uri) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    let (code, detail) = sep7_error_to_wire(&e);
+                    return Ok(crate::tools::common::business_error_result(code, detail));
+                }
+            }
         };
 
         let preview = build_preview(&request, &status);
 
-        let json_str = serde_json::to_string_pretty(&preview).unwrap_or_else(|_| "{}".to_owned());
+        let envelope = stellar_agent_core::envelope::Envelope::ok(preview);
+        let json_str = envelope
+            .to_json_pretty()
+            .unwrap_or_else(|_| String::from("{}"));
         Ok(CallToolResult::success(vec![Content::text(json_str)]))
     }
 }
@@ -178,52 +191,54 @@ impl WalletServer {
 // Error mapping
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Maps a [`Sep7Error`] to a wire-safe (machine_code, detail) pair.
+/// Maps a [`Sep7Error`] to a wire-safe (dotted code, detail) pair.
 ///
-/// The `detail` field never leaks the full fetch URL.
+/// The code is in the `sep7.*` namespace, matching the dotted wire-code
+/// taxonomy every other normalised tool uses. The `detail` field never leaks
+/// the full fetch URL.
 fn sep7_error_to_wire(err: &stellar_agent_sep7::Sep7Error) -> (&'static str, String) {
     use stellar_agent_sep7::Sep7Error;
     match err {
-        Sep7Error::MalformedUri { detail } => ("sep7_malformed_uri", detail.clone()),
+        Sep7Error::MalformedUri { detail } => ("sep7.malformed_uri", detail.clone()),
         Sep7Error::UnknownOperation { operation } => (
-            "sep7_unknown_operation",
+            "sep7.unknown_operation",
             format!("unknown operation: {operation:?}"),
         ),
         Sep7Error::MissingRequiredParam { param } => (
-            "sep7_missing_required_param",
+            "sep7.missing_required_param",
             format!("missing required parameter: {param}"),
         ),
         Sep7Error::InvalidParamValue { param, detail } => (
-            "sep7_invalid_param_value",
+            "sep7.invalid_param_value",
             format!("invalid '{param}': {detail}"),
         ),
         Sep7Error::MsgTooLong { len } => (
-            "sep7_msg_too_long",
+            "sep7.msg_too_long",
             format!("msg is {len} chars; maximum is 300"),
         ),
         Sep7Error::TooManyChainLevels { depth } => (
-            "sep7_too_many_chain_levels",
+            "sep7.too_many_chain_levels",
             format!("chain depth {depth} exceeds maximum of 7"),
         ),
-        Sep7Error::InvalidOriginDomain { detail } => ("sep7_invalid_origin_domain", detail.clone()),
+        Sep7Error::InvalidOriginDomain { detail } => ("sep7.invalid_origin_domain", detail.clone()),
         Sep7Error::TomlFetchFailed { authority_hint } => (
-            "sep7_toml_fetch_failed",
+            "sep7.toml_fetch_failed",
             // Redacted — only the authority hint, not the full URL.
             format!("stellar.toml fetch failed: {authority_hint}"),
         ),
         Sep7Error::SigningKeyNotInToml => (
-            "sep7_signing_key_not_in_toml",
+            "sep7.signing_key_not_in_toml",
             "origin_domain stellar.toml does not contain URI_REQUEST_SIGNING_KEY".to_owned(),
         ),
         Sep7Error::SignatureVerificationFailed { detail } => {
-            ("sep7_signature_verification_failed", detail.clone())
+            ("sep7.signature_verification_failed", detail.clone())
         }
         Sep7Error::SignatureMissingWithOriginDomain => (
-            "sep7_signature_missing_with_origin_domain",
+            "sep7.signature_missing_with_origin_domain",
             "origin_domain is present but signature is absent; request is untrusted".to_owned(),
         ),
         // Non-exhaustive match arm for future variants.
-        _ => ("sep7_error", err.to_string()),
+        _ => ("sep7.error", err.to_string()),
     }
 }
 
@@ -244,5 +259,103 @@ impl WalletServer {
         args: Sep7ParseUriArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         self.stellar_sep7_parse_uri(Parameters(args)).await
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test-only; panics acceptable in unit tests"
+    )]
+
+    use super::*;
+    use stellar_agent_core::profile::schema::Profile;
+
+    fn make_server() -> crate::server::WalletServer {
+        crate::server::WalletServer::new(
+            Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+                .with_noop_engine()
+                .build(),
+        )
+        .expect("WalletServer::new must not fail in tests")
+    }
+
+    /// A well-formed `pay` URI with no `origin_domain` parses successfully
+    /// under the documented `{ ok: true, data: {...}, request_id }` envelope.
+    #[tokio::test]
+    async fn valid_pay_uri_parses_under_normalised_envelope() {
+        let server = make_server();
+        let args = Sep7ParseUriArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            uri: "web+stellar:pay?destination=\
+                  GCALNQQBXAPZ2WIRSDDBMSTAKCUH5SG6U76YBFLQLIXJTF7FE5AX7AOO"
+                .to_owned(),
+            verify_origin: false,
+        };
+        let result = server
+            .invoke_stellar_sep7_parse_uri(args)
+            .await
+            .expect("a well-formed URI must not be a protocol error");
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "success must not set is_error = true"
+        );
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("result must carry a text content block");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("must be JSON");
+        assert_eq!(value["ok"], serde_json::json!(true));
+        assert_eq!(value["data"]["operation"], serde_json::json!("pay"));
+        assert!(
+            value["request_id"].as_str().is_some_and(|s| !s.is_empty()),
+            "envelope must carry a non-empty request_id: {value}"
+        );
+    }
+
+    /// A malformed `web+stellar:` URI is a business refusal
+    /// (`sep7.malformed_uri`), not a JSON-RPC protocol error.
+    #[tokio::test]
+    async fn malformed_uri_is_business_error() {
+        let server = make_server();
+        let args = Sep7ParseUriArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            uri: "not-a-stellar-uri".to_owned(),
+            verify_origin: false,
+        };
+        let result = server
+            .invoke_stellar_sep7_parse_uri(args)
+            .await
+            .expect("a malformed URI must surface as a business-error envelope, not Err");
+        let (code, _message, _text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "sep7.malformed_uri");
+    }
+
+    /// An unsupported operation in the URI path is `sep7.unknown_operation`,
+    /// not a JSON-RPC protocol error.
+    #[tokio::test]
+    async fn unknown_operation_is_business_error() {
+        let server = make_server();
+        let args = Sep7ParseUriArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            uri: "web+stellar:swap?foo=bar".to_owned(),
+            verify_origin: false,
+        };
+        let result = server
+            .invoke_stellar_sep7_parse_uri(args)
+            .await
+            .expect("an unknown operation must surface as a business-error envelope, not Err");
+        let (code, _message, _text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "sep7.unknown_operation");
     }
 }

@@ -370,6 +370,10 @@ impl ToolsetGrantStore {
         tmp.write_all(file_content.as_bytes())
             .map_err(ApprovalError::from_io)?;
         tmp.flush().map_err(ApprovalError::from_io)?;
+        // Durable content before rename: `flush` only empties the userspace
+        // buffer; the rename must never publish a file whose bytes are not
+        // yet on stable storage.
+        tmp.as_file().sync_data().map_err(ApprovalError::from_io)?;
 
         // Set file permissions to 0o600 on Unix before rename.
         #[cfg(unix)]
@@ -382,7 +386,14 @@ impl ToolsetGrantStore {
         tmp.persist(&self.path)
             .map_err(|e| ApprovalError::from_io(e.error))?;
 
-        // fsync parent directory to commit the directory entry.
+        // fsync parent directory to commit the directory entry. Opening a
+        // directory path via `std::fs::File::open` requires
+        // `FILE_FLAG_BACKUP_SEMANTICS` on Windows (which the stable API does
+        // not set) and fails with `ERROR_ACCESS_DENIED`; POSIX has no such
+        // restriction. Skip on non-Unix — NTFS journals directory-entry
+        // metadata itself, and a crash losing the last grant write only means
+        // the operator re-approves the first-invoke gate once more.
+        #[cfg(unix)]
         fs::File::open(parent)
             .and_then(|f| f.sync_all())
             .map_err(ApprovalError::from_io)?;
@@ -764,6 +775,37 @@ mod tests {
             NOW_MS,
         );
         assert!(found.is_some(), "should find matching grant");
+    }
+
+    /// Windows regression: `persist()` (invoked by `insert`) must succeed
+    /// across repeated rename cycles in the same process. Each call renames a
+    /// fresh temp file over the store path, then (Unix-only) fsyncs the
+    /// parent directory; on Windows that step is skipped entirely rather than
+    /// opening the directory as a file. A regression that re-enables an
+    /// unconditional directory-open would fail here on `windows-storage` CI
+    /// even though it passes on every POSIX runner.
+    #[test]
+    fn persist_succeeds_across_repeated_inserts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("default.toolset_grants.toml");
+        let mut store = ToolsetGrantStore::open(path.clone(), NOW_MS).unwrap();
+        let key = [0x42u8; 32];
+        for i in 0..5u32 {
+            let grant = make_grant(
+                &format!("test-toolset-{i}"),
+                "sign-payment",
+                0,
+                10_000_000,
+                86_400_000,
+                &key,
+            );
+            store.insert(grant).unwrap();
+        }
+        assert_eq!(store.len(), 5);
+        drop(store);
+
+        let reopened = ToolsetGrantStore::open(path, NOW_MS).unwrap();
+        assert_eq!(reopened.len(), 5, "all five persisted grants must reload");
     }
 
     #[test]

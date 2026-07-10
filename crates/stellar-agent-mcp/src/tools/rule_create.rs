@@ -695,14 +695,14 @@ fn open_rule_create_audit_writer(
     let profile_name = server.profile_name_for_approval();
     let log_path = default_audit_log_path_for(&profile_name);
     if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| SaError::NetworksTomlIo {
-            source: e,
+        std::fs::create_dir_all(parent).map_err(|e| SaError::AuditWriterIo {
+            detail: e.to_string(),
             path: log_path.clone(),
         })?;
     }
     AuditWriterRegistry::get_or_open(&profile_name, &log_path, None).map_err(|e| {
-        SaError::NetworksTomlIo {
-            source: std::io::Error::other(e.to_string()),
+        SaError::AuditWriterIo {
+            detail: e.to_string(),
             path: log_path,
         }
     })

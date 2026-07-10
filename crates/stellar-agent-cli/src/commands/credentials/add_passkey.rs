@@ -22,13 +22,13 @@
 //! # Output envelope (registered)
 //!
 //! ```json
-//! {"status":"registered","credential_id":"<redacted>","credential_name":"<name>","rp_id":"<rp-id>","registered_at_unix_ms":0}
+//! {"ok":true,"data":{"credential_id":"<redacted>","credential_name":"<name>","rp_id":"<rp-id>","registered_at_unix_ms":0},"request_id":"..."}
 //! ```
 //!
 //! # Output envelope (timeout)
 //!
 //! ```json
-//! {"status":"timeout","credential_name":"<name>"}
+//! {"ok":false,"error":{"code":"credentials.registration_timeout","message":"..."},"request_id":"..."}
 //! ```
 //!
 //! # First-registration RP-ID binding warning
@@ -51,36 +51,29 @@ use stellar_agent_core::approval::retry::{
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, open_with_retry,
 };
 use stellar_agent_core::audit_log::writer::{AuditWriter, AuditWriterRegistry};
+use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::profile::loader;
 use stellar_agent_core::redact_first5_last5;
-use stellar_agent_smart_account::managers::credentials::{
-    AddPasskeyOutcome, CredentialsError, CredentialsManager,
-};
+use stellar_agent_smart_account::managers::credentials::{AddPasskeyOutcome, CredentialsManager};
 use stellar_agent_webauthn_bridge::start_bridge_register_only;
 use tokio::sync::Mutex;
 use tracing::warn;
 
+use crate::commands::credentials::credentials_error_code;
+use crate::common::render::render_json;
 use crate::common::{resolve_profile_name, validate_path_component_ascii_safe};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Wire types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Successful registration output envelope.
+/// Successful registration payload, carried under the envelope `data` field.
 #[derive(Debug, Serialize)]
-struct RegisteredEnvelope {
-    status: &'static str,
+struct RegisteredSuccess {
     credential_id: String,
     credential_name: String,
     rp_id: String,
     registered_at_unix_ms: u64,
-}
-
-/// Timeout, user-canceled, or entry-missing envelope.
-#[derive(Debug, Serialize)]
-struct NonSuccessEnvelope {
-    status: &'static str,
-    credential_name: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -144,7 +137,10 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
     // Validate the profile name as a path component before it is used to
     // construct filesystem paths.
     if let Err(reason) = validate_path_component_ascii_safe(&profile) {
-        return emit_error(&format!("invalid profile name '{profile}': {reason}"));
+        return emit_error(
+            "credentials.invalid_profile_name",
+            format!("invalid profile name '{profile}': {reason}"),
+        );
     }
 
     // ── Open the approval store ONCE; wrap in Arc<Mutex<>> ───────────────────
@@ -154,7 +150,10 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
     let approval_store_path = match stellar_agent_core::profile::schema::default_approval_dir() {
         Ok(dir) => dir.join(format!("{profile}.toml")),
         Err(_) => {
-            return emit_error("could not determine approval store directory for this platform");
+            return emit_error(
+                "credentials.approval_store_dir_unavailable",
+                "could not determine approval store directory for this platform".to_owned(),
+            );
         }
     };
 
@@ -164,14 +163,22 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
         DEFAULT_RETRY_BACKOFF,
     ) {
         Ok(s) => Arc::new(Mutex::new(s)),
-        Err(e) => return emit_error(&format!("approval store open failed: {e}")),
+        Err(e) => {
+            return emit_error(
+                "credentials.approval_store_open_failed",
+                format!("approval store open failed: {e}"),
+            );
+        }
     };
 
     // ── Construct the manager with the shared store Arc ───────────────────────
     let passkeys_dir = match stellar_agent_core::profile::schema::default_passkeys_dir() {
         Ok(d) => d,
         Err(_) => {
-            return emit_error("could not determine passkeys directory for this platform");
+            return emit_error(
+                "credentials.state_dir_unavailable",
+                "could not determine passkeys directory for this platform".to_owned(),
+            );
         }
     };
     let mgr = CredentialsManager::new(
@@ -185,13 +192,12 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
     if !args.accept_rp_id_binding_risk {
         match mgr.is_empty() {
             Ok(true) => {
-                if !show_rcor5_warning(&args.rp_id) {
-                    print_rcor5_refusal();
-                    return 1;
+                if !show_rp_id_binding_warning(&args.rp_id) {
+                    return emit_rp_id_binding_warning_declined();
                 }
             }
             Ok(false) => {}
-            Err(e) => return emit_error(&e.to_string()),
+            Err(e) => return emit_error(credentials_error_code(&e), e.to_string()),
         }
     }
 
@@ -199,7 +205,12 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
     let bridge = match start_bridge_register_only(Arc::clone(&shared_store), bind_addr).await {
         Ok(h) => h,
-        Err(e) => return emit_error(&format!("bridge start failed: {e}")),
+        Err(e) => {
+            return emit_error(
+                "credentials.bridge_start_failed",
+                format!("bridge start failed: {e}"),
+            );
+        }
     };
     let bridge_addr = bridge.local_addr();
 
@@ -210,19 +221,9 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
         .await
     {
         Ok(h) => h,
-        Err(CredentialsError::DuplicateName { name }) => {
-            let _ = bridge.shutdown().await;
-            return emit_error(&format!(
-                "credential '{name}' already exists; use a different name or delete the existing one"
-            ));
-        }
-        Err(CredentialsError::InvalidName { reason, .. }) => {
-            let _ = bridge.shutdown().await;
-            return emit_error(&format!("invalid credential name: {reason}"));
-        }
         Err(e) => {
             let _ = bridge.shutdown().await;
-            return emit_error(&e.to_string());
+            return emit_error(credentials_error_code(&e), e.to_string());
         }
     };
 
@@ -287,43 +288,38 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
     // ── Emit result JSON ───────────────────────────────────────────────────
     match outcome {
         Ok(AddPasskeyOutcome::Registered { metadata }) => {
-            let envelope = RegisteredEnvelope {
-                status: "registered",
+            render_json(&Envelope::ok(RegisteredSuccess {
                 credential_id: redact_first5_last5(&metadata.credential_id_b64url),
                 credential_name: metadata.credential_name,
                 rp_id: metadata.rp_id,
                 registered_at_unix_ms: metadata.registered_at_unix_ms,
-            };
-            print_json(&envelope);
+            }));
             0
         }
-        Ok(AddPasskeyOutcome::Timeout) => {
-            let envelope = NonSuccessEnvelope {
-                status: "timeout",
-                credential_name: args.name.clone(),
-            };
-            print_json(&envelope);
-            1
-        }
-        Ok(AddPasskeyOutcome::UserCanceled) => {
-            let envelope = NonSuccessEnvelope {
-                status: "user_canceled",
-                credential_name: args.name.clone(),
-            };
-            print_json(&envelope);
-            1
-        }
-        Ok(AddPasskeyOutcome::EntryMissing) => {
-            let envelope = NonSuccessEnvelope {
-                status: "entry_missing",
-                credential_name: args.name.clone(),
-            };
-            print_json(&envelope);
-            1
-        }
-        Err(e) => emit_error(&e.to_string()),
+        Ok(AddPasskeyOutcome::Timeout) => emit_error(
+            "credentials.registration_timeout",
+            format!(
+                "registration of '{}' timed out before the ceremony completed",
+                args.name
+            ),
+        ),
+        Ok(AddPasskeyOutcome::UserCanceled) => emit_error(
+            "credentials.registration_user_canceled",
+            format!("registration of '{}' was canceled by the user", args.name),
+        ),
+        Ok(AddPasskeyOutcome::EntryMissing) => emit_error(
+            "credentials.registration_entry_missing",
+            format!(
+                "registration of '{}' failed: the approval-store entry was not found (TTL-expired or never persisted)",
+                args.name
+            ),
+        ),
+        Err(e) => emit_error(credentials_error_code(&e), e.to_string()),
         // Non-exhaustive: future variants are non-success.
-        Ok(_) => emit_error("unknown registration outcome"),
+        Ok(_) => emit_error(
+            "credentials.unknown_registration_outcome",
+            "unknown registration outcome".to_owned(),
+        ),
     }
 }
 
@@ -336,7 +332,7 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
 ///
 /// This prompt is shown when `credentials list` is empty (no prior passkeys)
 /// and `--accept-rp-id-binding-risk` is NOT set.
-fn show_rcor5_warning(rp_id: &str) -> bool {
+fn show_rp_id_binding_warning(rp_id: &str) -> bool {
     #[allow(clippy::print_stdout, reason = "CLI binary intentional warning output")]
     {
         println!();
@@ -368,18 +364,16 @@ fn show_rcor5_warning(rp_id: &str) -> bool {
     }
 }
 
-/// Prints the refusal message (user declined the binding warning).
-fn print_rcor5_refusal() {
-    #[allow(clippy::print_stdout, reason = "CLI binary intentional output")]
-    {
-        let envelope = serde_json::json!({
-            "status": "user_canceled",
-            "reason": "rcor5_binding_warning_declined",
-            "hint": "Set up a Delegated-fallback signer first: stellar-agent accounts add-signer-delegated",
-            "runbook": "docs/runbooks/passkey-rp-id-recovery.md"
-        });
-        println!("{}", serde_json::to_string(&envelope).unwrap_or_default());
-    }
+/// Emits the refusal result (operator declined the RP-ID binding warning) and
+/// returns exit code `1`.
+fn emit_rp_id_binding_warning_declined() -> i32 {
+    emit_error(
+        "credentials.rp_id_binding_warning_declined",
+        "operator declined the RP-ID binding warning; set up a Delegated-fallback signer first \
+         (stellar-agent accounts add-signer-delegated) — see \
+         docs/runbooks/passkey-rp-id-recovery.md"
+            .to_owned(),
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -493,27 +487,8 @@ async fn open_profile_audit_writer_non_fatal(
     }
 }
 
-#[allow(
-    clippy::print_stdout,
-    clippy::print_stderr,
-    reason = "CLI binary intentional JSON output; errors to stderr"
-)]
-fn print_json<T: Serialize>(value: &T) {
-    match serde_json::to_string(value) {
-        Ok(s) => println!("{s}"),
-        Err(e) => eprintln!("stellar-agent: JSON serialisation error: {e}"),
-    }
-}
-
-#[allow(clippy::print_stdout, reason = "CLI binary intentional JSON output")]
-fn emit_error(detail: &str) -> i32 {
-    let envelope = serde_json::json!({ "status": "error", "error": detail });
-    println!(
-        "{}",
-        serde_json::to_string(&envelope).unwrap_or_else(|_| String::from(
-            r#"{"status":"error","error":"serialisation_failed"}"#
-        ))
-    );
+fn emit_error(code: &'static str, message: String) -> i32 {
+    render_json(&Envelope::<()>::err_raw(code, message));
     1
 }
 

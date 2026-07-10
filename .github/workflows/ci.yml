@@ -104,6 +104,46 @@ jobs:
       # without erroring; run it explicitly so this job actually covers it.
       - run: cargo test -p stellar-agent-cli --features test-helpers
 
+  windows-storage:
+    name: windows-storage
+    runs-on: windows-latest
+    timeout-minutes: 30
+    # Targeted regression coverage for Windows-only local-storage bugs that
+    # ubuntu-latest cannot catch:
+    #
+    # 1. Audit-log single-handle fix: `AuditWriter` uses one handle for BOTH
+    #    the exclusive lock and every read/write against the active log file
+    #    — a separate lock-holder handle plus a separate I/O handle is
+    #    unsound on Windows. POSIX advisory locks never block a second
+    #    handle's I/O; `LockFileEx`'s exclusive lock is enforced against I/O
+    #    issued through any OTHER handle to the same file, including a second
+    #    handle opened by the SAME process.
+    # 2. Parent-directory-fsync fix: `PendingApprovalStore`/`ToolsetGrantStore`
+    #    open the parent directory as a file to fsync it after an atomic
+    #    rename (a POSIX durability idiom) — `std::fs::File::open` on a
+    #    directory path requires `FILE_FLAG_BACKUP_SEMANTICS` on Windows,
+    #    which the stable API does not set, and fails with
+    #    `ERROR_ACCESS_DENIED`. Both stores now skip this step on non-Unix.
+    #
+    # Bounded to the touched crates' unit tests (not the full workspace
+    # matrix) to keep this job cheap.
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          prefix-key: windows-storage
+      - name: Audit-log writer + registry tests (stellar-agent-core)
+        run: cargo test -p stellar-agent-core --lib audit_log
+      - name: Approval + toolset-grant store persist tests (stellar-agent-core)
+        run: cargo test -p stellar-agent-core --lib approval::
+      - name: SaError wire-code coverage (stellar-agent-smart-account)
+        run: cargo test -p stellar-agent-smart-account --lib error::
+      - name: MCP smart-account rule tools (stellar-agent-mcp)
+        run: cargo test -p stellar-agent-mcp --lib -- rule_create rules::
+
   machete:
     name: unused-deps
     runs-on: ubuntu-latest

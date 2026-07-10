@@ -5,9 +5,11 @@
 
 use clap::Args;
 use serde::Serialize;
+use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::profile::schema::default_toolsets_dir;
 use stellar_agent_toolsets_runtime::{ToolsetListEntry, list_pinned_toolsets};
-use tracing::error;
+
+use crate::common::render::render_json;
 
 /// Arguments for `toolset list`.
 #[derive(Debug, Args)]
@@ -17,28 +19,20 @@ pub struct ToolsetListArgs {
     pub toolsets_dir: Option<std::path::PathBuf>,
 }
 
-/// JSON output for `toolset list`.
+/// JSON success payload for `toolset list`, carried under the envelope `data` field.
 #[derive(Debug, Serialize)]
-struct ListResult {
-    /// Always `"ok"` on success.
-    status: &'static str,
+struct ListSuccess {
     /// Installed toolsets.
     toolsets: Vec<ToolsetListEntry>,
-}
-
-/// JSON error output.
-#[derive(Debug, Serialize)]
-struct ListError {
-    status: &'static str,
-    error: String,
 }
 
 /// Runs the `toolset list` subcommand.
 ///
 /// # Exit codes
 ///
-/// - `0` on success (prints JSON array of installed-toolset entries to stdout).
-/// - `1` on any error.
+/// - `0` on success (prints the standard `{ ok: true, data: {...}, request_id }`
+///   envelope to stdout, `data.toolsets` carrying the installed-toolset entries).
+/// - `1` on any error (prints `{ ok: false, error: { code, message }, request_id }`).
 pub async fn run(args: &ToolsetListArgs) -> i32 {
     let toolsets_root = if let Some(dir) = &args.toolsets_dir {
         dir.clone()
@@ -46,21 +40,10 @@ pub async fn run(args: &ToolsetListArgs) -> i32 {
         match default_toolsets_dir() {
             Ok(d) => d,
             Err(e) => {
-                let err_output = ListError {
-                    status: "error",
-                    error: format!("cannot resolve toolsets dir: {e}"),
-                };
-                match serde_json::to_string_pretty(&err_output) {
-                    Ok(json) => {
-                        #[allow(clippy::print_stdout)]
-                        {
-                            println!("{json}");
-                        }
-                    }
-                    Err(e2) => {
-                        error!(error = %e2, "failed to serialise list error");
-                    }
-                }
+                render_json(&Envelope::<()>::err_raw(
+                    "toolsets.dir_resolve_failed",
+                    format!("cannot resolve toolsets dir: {e}"),
+                ));
                 return 1;
             }
         }
@@ -68,40 +51,14 @@ pub async fn run(args: &ToolsetListArgs) -> i32 {
 
     match list_pinned_toolsets(&toolsets_root) {
         Ok(toolsets) => {
-            let result = ListResult {
-                status: "ok",
-                toolsets,
-            };
-            match serde_json::to_string_pretty(&result) {
-                Ok(json) => {
-                    #[allow(clippy::print_stdout)]
-                    {
-                        println!("{json}");
-                    }
-                    0
-                }
-                Err(e) => {
-                    error!(error = %e, "failed to serialise list result");
-                    1
-                }
-            }
+            render_json(&Envelope::ok(ListSuccess { toolsets }));
+            0
         }
         Err(e) => {
-            let err_output = ListError {
-                status: "error",
-                error: e.to_string(),
-            };
-            match serde_json::to_string_pretty(&err_output) {
-                Ok(json) => {
-                    #[allow(clippy::print_stdout)]
-                    {
-                        println!("{json}");
-                    }
-                }
-                Err(e2) => {
-                    error!(error = %e2, "failed to serialise list error");
-                }
-            }
+            render_json(&Envelope::<()>::err_raw(
+                "toolsets.list_failed",
+                e.to_string(),
+            ));
             1
         }
     }

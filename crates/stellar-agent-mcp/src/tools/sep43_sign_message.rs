@@ -148,15 +148,13 @@ impl WalletServer {
             match signer_from_keyring(&self.profile.mcp_signer_default, account).await {
                 Ok(h) => h,
                 Err(err) => {
-                    let resp = stellar_agent_sep43::Sep43Error::WalletUnlockFailed {
+                    let sep43_err = stellar_agent_sep43::Sep43Error::WalletUnlockFailed {
                         detail: format!("keyring load failed: {err}"),
-                    }
-                    .to_sep43_response();
-                    let json_str =
-                        serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-                    let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                    result.is_error = Some(true);
-                    return Ok(result);
+                    };
+                    return Ok(crate::tools::common::business_error_result(
+                        sep43_err.wire_code(),
+                        sep43_err.to_string(),
+                    ));
                 }
             };
 
@@ -174,18 +172,16 @@ impl WalletServer {
             .await
         {
             Ok(value) => {
-                let json_str =
-                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_owned());
+                let envelope = stellar_agent_core::envelope::Envelope::ok(value);
+                let json_str = envelope
+                    .to_json_pretty()
+                    .unwrap_or_else(|_| String::from("{}"));
                 Ok(CallToolResult::success(vec![Content::text(json_str)]))
             }
-            Err(err) => {
-                let resp = err.to_sep43_response();
-                let json_str =
-                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-                let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                result.is_error = Some(true);
-                Ok(result)
-            }
+            Err(err) => Ok(crate::tools::common::business_error_result(
+                err.wire_code(),
+                err.to_string(),
+            )),
         }
     }
 }
@@ -290,9 +286,9 @@ mod tests {
     }
 
     /// A mainnet profile MUST refuse `stellar_sep43_sign_message` structurally
-    /// before any key access: the result is an `is_error` SEP-43 object carrying
-    /// the canonical `network.mainnet_write_forbidden` wire code (SEP-43 code -3),
-    /// and it MUST NOT contain a `signedMessage`.
+    /// before any key access: the result is the normalised business-error
+    /// envelope carrying the canonical `network.mainnet_write_forbidden` wire
+    /// code, and it MUST NOT contain a `signedMessage`.
     ///
     /// The keyring mock is intentionally NOT installed, and the message asserts
     /// the refusal did not reach the keyring (no `keyring`/`unlock` string), so a
@@ -311,32 +307,18 @@ mod tests {
             .call_stellar_sep43_sign_message(args)
             .await
             .expect("structural mainnet refusal is surfaced as Ok(is_error), not Err");
+        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
         assert_eq!(
-            result.is_error,
-            Some(true),
-            "mainnet refusal must set is_error = true"
-        );
-        let text = result
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.as_str())
-            .expect("refusal result must carry a text content block");
-        let value: serde_json::Value =
-            serde_json::from_str(text).expect("refusal content must be a SEP-43 JSON object");
-        assert_eq!(value["code"], -3_i32, "mainnet refusal is SEP-43 code -3");
-        let message = value["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains("network.mainnet_write_forbidden"),
-            "message must carry the canonical wire code; got: {value}"
+            code, "network.mainnet_write_forbidden",
+            "mainnet refusal must carry the canonical wire code"
         );
         assert!(
             !message.contains("keyring") && !message.contains("unlock"),
-            "refusal must fire before key access — message must not mention keyring/unlock: {value}"
+            "refusal must fire before key access — message must not mention keyring/unlock: {message}"
         );
         assert!(
-            value.get("signedMessage").is_none(),
-            "no signature must be produced on mainnet; got: {value}"
+            !text.contains("signedMessage"),
+            "no signature must be produced on mainnet; got: {text}"
         );
     }
 

@@ -177,8 +177,10 @@ impl WalletServer {
         // ── Render typed args ──────────────────────────────────────────────────
         match render_typed_args(&entries, &contract_strkey, &function_name, &arg_vals) {
             Ok(preview) => {
-                let json_str =
-                    serde_json::to_string_pretty(&preview).unwrap_or_else(|_| "{}".to_owned());
+                let envelope = stellar_agent_core::envelope::Envelope::ok(preview);
+                let json_str = envelope
+                    .to_json_pretty()
+                    .unwrap_or_else(|_| String::from("{}"));
                 Ok(CallToolResult::success(vec![Content::text(json_str)]))
             }
             Err(e) => Ok(crate::tools::common::business_error_result(

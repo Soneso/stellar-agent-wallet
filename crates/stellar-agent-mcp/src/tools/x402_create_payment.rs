@@ -388,7 +388,10 @@ impl WalletServer {
             "payTo": requirements.pay_to,
             "network": requirements.network,
         });
-        let json_str = serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_owned());
+        let envelope = stellar_agent_core::envelope::Envelope::ok(response);
+        let json_str = envelope
+            .to_json_pretty()
+            .unwrap_or_else(|_| String::from("{}"));
         Ok(CallToolResult::success(vec![Content::text(json_str)]))
     }
 }

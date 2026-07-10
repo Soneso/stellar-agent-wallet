@@ -165,24 +165,24 @@ impl WalletServer {
             }
         }
 
-        // Decode the message bytes.
+        // Decode the message bytes. A bad encoding is a business refusal on
+        // caller-supplied input, not a JSON-RPC protocol fault.
         let encoding = args.message_encoding.as_deref().unwrap_or("utf8");
         let message_bytes: Vec<u8> = match encoding {
-            "base64" => base64::engine::general_purpose::STANDARD
-                .decode(&args.message)
-                .map_err(|e| {
-                    rmcp::ErrorData::invalid_params(
-                        "sep53_sign_message_invalid_base64",
-                        Some(json!({ "detail": format!("message base64 decode failed: {e}") })),
-                    )
-                })?,
+            "base64" => match base64::engine::general_purpose::STANDARD.decode(&args.message) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return Ok(crate::tools::common::business_error_result(
+                        "sep53.invalid_message_base64",
+                        format!("message base64 decode failed: {e}"),
+                    ));
+                }
+            },
             "utf8" => args.message.as_bytes().to_vec(),
             other => {
-                return Err(rmcp::ErrorData::invalid_params(
-                    "sep53_sign_message_invalid_encoding",
-                    Some(json!({
-                        "detail": format!("unsupported message_encoding: {other:?}; use 'utf8' or 'base64'")
-                    })),
+                return Ok(crate::tools::common::business_error_result(
+                    "sep53.invalid_encoding",
+                    format!("unsupported message_encoding: {other:?}; use 'utf8' or 'base64'"),
                 ));
             }
         };
@@ -245,12 +245,14 @@ impl WalletServer {
                     "sep53 message signed"
                 );
 
-                let json_str = serde_json::to_string_pretty(&json!({
+                let envelope = stellar_agent_core::envelope::Envelope::ok(json!({
                     "signature": signature_b64,
                     "signer_public_key": signer_public_key,
                     "message_encoding": encoding,
-                }))
-                .unwrap_or_else(|_| "{}".to_owned());
+                }));
+                let json_str = envelope
+                    .to_json_pretty()
+                    .unwrap_or_else(|_| String::from("{}"));
                 Ok(CallToolResult::success(vec![Content::text(json_str)]))
             }
             Err(err) => Ok(crate::tools::common::business_error_result(

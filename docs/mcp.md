@@ -72,6 +72,14 @@ On startup the process, in order:
 You normally do not launch `stellar-agent-mcp` by hand. The MCP client spawns
 it. The command above is what the client is configured to run.
 
+**Windows deployment note:** Credential Manager requires an interactive logon
+session. Running the server as a Windows service, over SSH, or from a
+scheduled task means every keyring operation fails with
+`auth.keyring_interactive_session_required` — the server itself starts, but
+every signing tool refuses at the keyring step. Launch it from an interactive
+desktop session (including Remote Desktop), or run it inside a container /
+Linux VM where the platform keyring backend has no such restriction.
+
 ### How a profile selects the signer and keys
 
 The wallet holds no secrets in its config. A [profile](./profiles.md) is a
@@ -311,16 +319,17 @@ terms.
 | `stellar_sep43_sign_message` | Sign an arbitrary UTF-8 message via `sha256(message)` then ed25519; return `signedMessage` (hex) and `signerAddress`. | Signs; does not submit. |
 | `stellar_sep43_sign_and_submit_transaction` | Sign a `TransactionEnvelope` XDR, submit it, and poll until confirmed; return `signedTxXdr`, `txHash`, and `status`. | Signs and submits; policy gate. |
 
-These six tools preserve SEP-43 v1.2.1 wire compatibility: their results and
-protocol errors are the SEP-43 `{ code, message }` object with SEP-43 numeric
-codes, not the standard `{ ok, error, request_id }` result envelope, on both
-success and failure. The structural mainnet refusal is SEP-43 code `-3`
-(`MainnetSigningForbidden`) and a missing signer keyring entry surfaces as a
-SEP-43 wallet-unlock error. The one exception is a policy `RequireApproval`
-verdict, which every single-shot sign tool — SEP-43 included — refuses through
-the standard envelope as `policy.approval_required_unsupported`. SEP-53 and x402
-have no spec-defined error object and use the standard envelope for every
-business error.
+These six tools use the standard `{ ok, data, request_id }` / `{ ok, error:
+{ code, message }, request_id }` result envelope like every other tool. The
+SEP-43 raw protocol payload (`signedTxXdr`, `signerAddress`, `network`, etc.)
+is carried inside `data` on success. Business and validation failures carry a
+`sep43.*` wire code derived from the SEP-43 error taxonomy (e.g.
+`sep43.wallet_unlock_failed`, `sep43.invalid_network_passphrase`); the
+structural mainnet refusal shares the canonical `network.mainnet_write_forbidden`
+code used everywhere else in the wallet, rather than a SEP-43-specific code.
+A policy `RequireApproval` verdict — which every single-shot sign tool,
+SEP-43 included, refuses fail-closed — carries `policy.approval_required_unsupported`.
+SEP-53 and x402 use the same standard envelope for every business error.
 
 ### SEP-45, SEP-47, SEP-48, SEP-53
 
@@ -372,6 +381,6 @@ profile, or a duplicate tool registration) cause the process to exit non-zero
 before serving any request.
 
 Business errors return `{ "ok": false, "error": { "code", "message" }, "request_id" }`
-with `is_error` set; consumers branch on `error.code`. The SEP-43 tools are the
-exception, returning the spec-mandated `{ code, message }` object. See
+with `is_error` set; consumers branch on `error.code`. Every tool, including
+the SEP-43 family, uses this same envelope — see
 [The result envelope](agents.md#the-result-envelope).

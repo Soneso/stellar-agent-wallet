@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows: the audit-log writer acquired its exclusive lock on one file handle
+  and performed reads/writes against the SAME active log file through separate
+  handles (the partial-rotation last-entry scan, the chain-recovery read at
+  open, and the append handle itself). `LockFileEx`'s exclusive lock is
+  enforced against I/O issued through any OTHER handle to the same file,
+  including a second handle opened by the SAME process — unlike POSIX
+  advisory locks, which never restrict I/O through a different descriptor.
+  Re-opening a non-empty audit log (the common case once a profile has any
+  history) failed with `ERROR_ACCESS_DENIED`, surfaced through the smart-account
+  MCP flow as a misattributed `"networks.toml I/O error"` at the audit path.
+  `AuditWriter` now uses a single handle for the lock and every read/write
+  against the active log file. Adds `SaError::AuditWriterIo` so an
+  audit-writer-open failure is attributed to the audit subsystem rather than
+  the networks-registry subsystem. Adds a `windows-storage` CI job running
+  the audit-log and touched-crate tests on `windows-latest`. (#59)
+- Windows: Credential Manager refuses access from a non-interactive session
+  (a service, an SSH session, a scheduled task) with Win32
+  `ERROR_NO_SUCH_LOGON_SESSION`. The keyring error mapping surfaced this as
+  the generic `auth.keyring_platform_error`; it now maps to a dedicated
+  `auth.keyring_interactive_session_required` code whose message states the
+  cause and the deployment implication. The headless-secret-path design for
+  non-interactive deployments remains a separate, open item. (#57)
+- Windows: `PendingApprovalStore` (the approval spine, including
+  `credentials add-passkey`'s registration flow) and `ToolsetGrantStore`
+  (toolset first-invoke grants) durably persist a write by renaming a temp
+  file into place, then opening the PARENT DIRECTORY as a file to fsync it —
+  a POSIX idiom. `std::fs::File::open` on a directory path requires
+  `FILE_FLAG_BACKUP_SEMANTICS` on Windows (not set by the stable API) and
+  fails with `ERROR_ACCESS_DENIED`, even though the content write and rename
+  immediately before it succeed. Both stores now skip the directory fsync on
+  non-Unix, matching the pattern already used by the policy-window store and
+  the audit-log rotation sidecar writer. The `windows-storage` CI job now
+  also runs the approval-store and toolset-grant-store persist tests. (#61)
+
+### Changed
+
+- Every SEP MCP tool (`stellar_sep43_*`, `stellar_sep7_parse_uri`,
+  `stellar_sep53_sign_message`, `stellar_sep53_verify_message`,
+  `stellar_sep47_discover`, `stellar_sep48_preview_invocation`,
+  `stellar_sep6_deposit_info`, `stellar_sep24_interactive_url`) and the CLI
+  `toolsets` and `credentials` command groups now use the standard
+  `{ok:true,data,request_id}` / `{ok:false,error:{code,message},request_id}`
+  result envelope. Business and validation failures that previously surfaced
+  as bare objects, ad-hoc `{"status":...}` shapes, or (for SEP-43) the raw
+  SEP-43 `{code,message}` object now carry a stable dotted wire code
+  (`sep43.*`, `sep7.*`, `sep53.*`, `sep24.*`, `anchor.*`, `sep47.*`,
+  `sep48.*`, `toolsets.*`/`toolset.*`, `credentials.*`); the structural
+  mainnet-signing refusal on every sign-only tool now shares the canonical
+  `network.mainnet_write_forbidden` code instead of a SEP-43-specific one.
+  Docs (`docs/mcp.md`, `docs/toolsets.md`,
+  `docs/cli-reference/profile-and-governance.md`) and the knowledge skill
+  under `skills/stellar-agent-wallet/` are updated to match; the packaged
+  skill zip is regenerated. The x402 tools' success payloads
+  (`stellar_x402_create_payment`, `stellar_x402_authenticated_payment`,
+  `stellar_x402_parse_receipt`) are wrapped under `data` for the same
+  consistency; their business errors were already normalised. The agent-facing
+  contract — one envelope shape, one dotted-code taxonomy — now holds across
+  every MCP tool and CLI verb these fixes touch. (#60)
+- `credentials add-passkey`'s declined-RP-ID-binding-warning outcome no longer
+  leaks the internal requirement-tracking tag into the wire code: renamed to
+  the semantic `credentials.rp_id_binding_warning_declined` (and the internal
+  helper functions to matching names). The closed set of `credentials.*`
+  wire codes is documented in `docs/cli-reference/profile-and-governance.md`
+  and the knowledge skill's `cli-reference.md`. (#62)
+
 ## [0.1.0-alpha.3] - 2026-07-10
 
 ### Added

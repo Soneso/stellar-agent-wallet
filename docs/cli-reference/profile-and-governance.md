@@ -4,7 +4,7 @@ This page documents four `stellar-agent` command groups: `profile`, `credentials
 
 For the conventions shared by every command (profile and network resolution, the signer-source flags, the JSON output envelope, exit codes, and the mainnet-write refusal), see the [CLI reference index](index.md). For the underlying concepts (the policy engine, the approval spine, attestations, the audit log, and toolset gating), see [concepts](../concepts.md). For profile file structure, see [profiles](../profiles.md), and for toolset gating see [toolsets](../toolsets.md).
 
-All four groups operate on local state — TOML files and platform-keyring entries. None of them submits a Stellar transaction, so the network flags and the mainnet-write gate do not apply here. Every command prints JSON on stdout and exits `0` on success or `1` on any error. The `profile`, `approve`, and `audit` commands use the standard `{ok, data, request_id}` envelope; the `credentials` commands print a flat status/result object (shown per command below).
+All four groups operate on local state — TOML files and platform-keyring entries. None of them submits a Stellar transaction, so the network flags and the mainnet-write gate do not apply here. Every command prints JSON on stdout and exits `0` on success or `1` on any error, using the standard `{ok, data, request_id}` envelope.
 
 ## `profile`
 
@@ -166,6 +166,8 @@ Two flags are common to every subcommand:
 
 `credential_id` values are redacted to first-five-last-five base64url everywhere they are printed.
 
+Every subcommand's failure `error.code` is one of a closed set: the verb-specific codes noted under each subcommand below, plus these codes shared across the whole group: `credentials.invalid_profile_name` (any subcommand given a malformed `--profile`), and — from the underlying `CredentialsError` — `credentials.not_found`, `credentials.duplicate_name`, `credentials.invalid_name`, `credentials.io_error`, `credentials.registry_parse_failed`, `credentials.registry_serialise_failed`, `credentials.state_dir_unavailable`, `credentials.approval_store_error`, `credentials.approval_store_unavailable`, `credentials.bridge_start_failed`, `credentials.bridge_shutdown_failed`, `credentials.atomic_write_failed`, `credentials.signing_failed`, `credentials.missing_public_key`, `credentials.malformed_public_key`, and a generic `credentials.error` fallback for any other internal variant. `add-passkey` additionally emits `credentials.approval_store_dir_unavailable`, `credentials.approval_store_open_failed`, and `credentials.unknown_registration_outcome`. An agent can switch on `error.code` alone; `error.message` carries the human-readable detail only.
+
 ### `credentials add-passkey <NAME>`
 
 State-changing (writes the registry; performs a browser WebAuthn ceremony). Opens the OS default browser to the wallet-owned bridge registration URL and polls the approval store until the browser-side ceremony completes or the deadline elapses. On success it writes the credential metadata to the registry. If the browser cannot be launched, the URL is printed to stderr and polling continues.
@@ -182,10 +184,16 @@ On the first registration for a profile (the registry is empty), the command pri
 stellar-agent credentials add-passkey laptop-key --rp-id wallet.example.com
 ```
 
-The completion envelope reports a status of `registered`, `timeout`, `user_canceled`, or `entry_missing`. A declined first-registration prompt also emits status `user_canceled` (with a recovery `hint` and `runbook`), and internal failures emit status `error`:
+On success, `data` carries the registered credential's metadata. Timeout, user
+cancellation, and a missing approval-store entry all surface as `ok:false`
+with `error.code` of `credentials.registration_timeout`,
+`credentials.registration_user_canceled`, or
+`credentials.registration_entry_missing` respectively. A declined
+first-registration prompt is `credentials.rp_id_binding_warning_declined`
+(the message names the recovery runbook).
 
 ```json
-{"status":"registered","credential_id":"AABBC...IJJKK","credential_name":"laptop-key","rp_id":"wallet.example.com","registered_at_unix_ms":0}
+{"ok":true,"data":{"credential_id":"AABBC...IJJKK","credential_name":"laptop-key","rp_id":"wallet.example.com","registered_at_unix_ms":0},"request_id":"..."}
 ```
 
 ### `credentials list`
@@ -200,7 +208,7 @@ Read-only. Lists the registered passkeys for the resolved profile and RP-ID.
 - `--rp-id <DOMAIN>` — relying-party ID (default `localhost`).
 
 ```json
-{"credentials":[{"credential_id":"AABBC...IJJKK","credential_name":"laptop-key","rp_id":"localhost","registered_at_unix_ms":0}]}
+{"ok":true,"data":{"credentials":[{"credential_id":"AABBC...IJJKK","credential_name":"laptop-key","rp_id":"localhost","registered_at_unix_ms":0}]},"request_id":"..."}
 ```
 
 ### `credentials show <NAME>`
@@ -215,7 +223,7 @@ Read-only. Prints the metadata for one named passkey, including its transports. 
 - `--profile <NAME>` — profile override.
 - `--rp-id <DOMAIN>` — relying-party ID (default `localhost`).
 
-Exits `1` when the credential is not found.
+Exits `1` with `error.code` `credentials.not_found` when the credential is not found.
 
 ### `credentials delete <NAME>`
 
@@ -230,7 +238,7 @@ State-changing (removes the registry entry). Verifies the credential exists, pro
 - `--rp-id <DOMAIN>` — relying-party ID (default `localhost`).
 - `--yes`, `-y` — skip the confirmation prompt.
 
-Declining the prompt exits `1` with a `canceled` status; a missing credential exits `1` with a not-found error.
+Declining the prompt exits `1` with `error.code` `credentials.delete_canceled`; a missing credential exits `1` with `credentials.not_found`.
 
 ## `approve`
 

@@ -17,7 +17,7 @@ Every command prints one JSON object on stdout. Exit code `0` means success; exi
 {"ok": false, "error": {"code": "...", "message": "..."}, "request_id": "..."}
 ```
 
-Exceptions: the `credentials` and `toolsets` groups print a flat object using a `status` field (for example `{"status":"ok", ...}` or `{"status":"error","error":"..."}`) rather than the `{ok, data|error, request_id}` shape.
+The `credentials` and `toolsets` groups use this same envelope; a `credentials.*` or `toolsets.*` / `toolset.*` wire code identifies the specific refusal.
 
 ### Value formats
 
@@ -383,16 +383,18 @@ stellar-agent profile rotate-attestation-key default
 
 ## credentials
 
-WebAuthn passkey lifecycle for a profile. The registry holds only public metadata (credential name, redacted credential ID, RP-ID, transports, registration timestamp); the private key never leaves the authenticator. `credential_id` is redacted to first-five-last-five base64url. These print a flat status/result object, not the `{ok, data, request_id}` envelope.
+WebAuthn passkey lifecycle for a profile. The registry holds only public metadata (credential name, redacted credential ID, RP-ID, transports, registration timestamp); the private key never leaves the authenticator. `credential_id` is redacted to first-five-last-five base64url. Uses the standard `{ok, data|error, request_id}` envelope; failures carry a `credentials.*` wire code.
 
 Two common flags: `--profile <NAME>` (resolves `--profile` → `STELLAR_AGENT_PROFILE` → `"default"`), `--rp-id <DOMAIN>` (default `localhost`; set the deployment domain for a self-hosted deployment; IP literals rejected; changing it after registration breaks existing passkeys).
 
+Closed set of `error.code` values across the group: the verb-specific codes in the table below, plus `credentials.invalid_profile_name` (any subcommand, malformed `--profile`), plus these codes shared from the underlying `CredentialsError`: `credentials.not_found`, `.duplicate_name`, `.invalid_name`, `.io_error`, `.registry_parse_failed`, `.registry_serialise_failed`, `.state_dir_unavailable`, `.approval_store_error`, `.approval_store_unavailable`, `.bridge_start_failed`, `.bridge_shutdown_failed`, `.atomic_write_failed`, `.signing_failed`, `.missing_public_key`, `.malformed_public_key`, and a generic `.error` fallback. `add-passkey` additionally emits `.approval_store_dir_unavailable`, `.approval_store_open_failed`, and `.unknown_registration_outcome`. Switch on `error.code`, never on `error.message`.
+
 | Verb | Form | Notes |
 |---|---|---|
-| `add-passkey <NAME>` | `credentials add-passkey laptop-key --rp-id wallet.example.com` | State-changing; opens the browser to the bridge registration URL and polls. `<NAME>`: 1–64 printable ASCII, no `/ \ :`. Extra flags: `--timeout-seconds` (default `300`), `--accept-rp-id-binding-risk`. First registration prompts `[y/N]` with an RP-ID binding warning unless the flag is set. Status: `registered`/`timeout`/`user_canceled`/`entry_missing`/`error`. |
-| `list` | `credentials list` | Read-only. Lists registered passkeys for the profile+RP-ID. |
-| `show <NAME>` | `credentials show laptop-key` | Read-only. Metadata incl. transports. Exits `1` when not found. |
-| `delete <NAME>` | `credentials delete laptop-key --yes` | State-changing; prompts `[y/N]` (skip with `--yes`/`-y`). Does not remove the on-chain signer. Declining exits `1` (status `canceled`). |
+| `add-passkey <NAME>` | `credentials add-passkey laptop-key --rp-id wallet.example.com` | State-changing; opens the browser to the bridge registration URL and polls. `<NAME>`: 1–64 printable ASCII, no `/ \ :`. Extra flags: `--timeout-seconds` (default `300`), `--accept-rp-id-binding-risk`. First registration prompts `[y/N]` with an RP-ID binding warning unless the flag is set. On success `data` carries the registered credential's metadata; timeout, user cancellation, a missing approval-store entry, or a declined binding warning surface as `ok:false` with `credentials.registration_timeout` / `credentials.registration_user_canceled` / `credentials.registration_entry_missing` / `credentials.rp_id_binding_warning_declined`. |
+| `list` | `credentials list` | Read-only. Lists registered passkeys for the profile+RP-ID under `data.credentials`. |
+| `show <NAME>` | `credentials show laptop-key` | Read-only. Metadata incl. transports. Exits `1` with `credentials.not_found` when not found. |
+| `delete <NAME>` | `credentials delete laptop-key --yes` | State-changing; prompts `[y/N]` (skip with `--yes`/`-y`). Does not remove the on-chain signer. Declining exits `1` with `credentials.delete_canceled`. |
 
 ---
 
@@ -545,7 +547,7 @@ stellar-agent audit verify ~/.local/state/stellar-agent/audit/default.jsonl --pr
 
 ## toolsets
 
-Install, list, run, and uninstall agent toolsets with cryptographic provenance verification. These print a flat object with a `status` field, not the `{ok, data, request_id}` envelope. JSON by default. All four accept `--toolsets-dir <PATH>` to override the OS-conventional toolsets root. The binary subcommand is `toolsets` (plural).
+Install, list, run, and uninstall agent toolsets with cryptographic provenance verification. Uses the standard `{ok, data|error, request_id}` envelope; failures carry a `toolsets.*` (directory/install/uninstall) or `toolset.*` (enforcement, shared with the MCP `stellar_toolset_invoke` tool) wire code. JSON by default. All four accept `--toolsets-dir <PATH>` to override the OS-conventional toolsets root. The binary subcommand is `toolsets` (plural).
 
 ### `toolsets install <PKG@VERSION> [flags]`
 
@@ -566,7 +568,7 @@ Installs a toolset from a signed local `.tar.gz`. The publisher key must be in t
 | `--allow-downgrade` | Allow installing an older version over a newer one (only with `--force`) |
 | `--toolsets-dir <PATH>` | Override toolsets root |
 
-Output reports `status`, `package`, `version`, and `attestation` (`"attested"` / `"overridden"` / `"not-required"` — the actual gate decision, not an inference from flags). Refusals include attestation-required and auditor-untrusted (no partial install).
+On success `data` carries `package`, `version`, and `attestation` (`"attested"` / `"overridden"` / `"not-required"` — the actual gate decision, not an inference from flags). Refusals (attestation-required, auditor-untrusted — no partial install — or any other install failure) carry `error.code` `toolsets.install_failed`, with the distinguishing detail in `error.message`.
 
 ```bash
 stellar-agent toolsets install my-toolset@1.0.0 --file ./my-toolset-1.0.0.tar.gz \
@@ -575,7 +577,7 @@ stellar-agent toolsets install my-toolset@1.0.0 --file ./my-toolset-1.0.0.tar.gz
 
 ### `toolsets list [--toolsets-dir PATH]`
 
-Read-only. The canonical scriptable enumeration of installed toolsets and their capability-derived action lists (not parsed from `--help`). Reports `status` and `toolsets`.
+Read-only. The canonical scriptable enumeration of installed toolsets and their capability-derived action lists (not parsed from `--help`). Reports `data.toolsets`.
 
 ### `toolsets run <TOOLSET-NAME> <ACTION> [--toolsets-dir PATH]`
 
@@ -584,7 +586,7 @@ Runs the four-part capability enforcement check for an installed toolset action 
 - `<TOOLSET-NAME>` (positional, required) — installed toolset package name.
 - `<ACTION>` (positional, required) — must be an exact registry tool name the toolset's capabilities grant, e.g. `stellar_balances`.
 
-On success, exit `0` and `status:"resolved"` with `toolset`, `action`, `routed_to`, and a `note` clarifying that enforcement passed but the tool was not run. On failure, exit `1`, `status:"error"`, with a `code`: `toolset.not_installed`, `toolset.unknown_action`, `toolset.capability_not_declared`, `toolset.tool_not_allowed`, `toolset.io_error`, or `toolset.error`. The toolset gate is additive: the routed tool's operator policy and chain gates still apply at execution time.
+On success, exit `0` with `data` carrying `toolset`, `action`, `routed_to`, and a `note` clarifying that enforcement passed but the tool was not run. On failure, exit `1` with `error.code`: `toolset.not_installed`, `toolset.unknown_action`, `toolset.capability_not_declared`, `toolset.tool_not_allowed`, `toolset.io_error`, or `toolset.error`. The toolset gate is additive: the routed tool's operator policy and chain gates still apply at execution time.
 
 ```bash
 stellar-agent toolsets run balance-reporter stellar_balances
@@ -592,7 +594,7 @@ stellar-agent toolsets run balance-reporter stellar_balances
 
 ### `toolsets uninstall <PACKAGE> [--toolsets-dir PATH]`
 
-Removes the toolset directory and pin record; refuses if not installed. `<PACKAGE>` (positional, required) is the package name (`[a-z0-9-]`). Reports `status` and `package`.
+Removes the toolset directory and pin record; refuses if not installed (`toolsets.uninstall_failed`). `<PACKAGE>` (positional, required) is the package name (`[a-z0-9-]`). On success `data` carries `package`.
 
 ```bash
 stellar-agent toolsets uninstall my-toolset

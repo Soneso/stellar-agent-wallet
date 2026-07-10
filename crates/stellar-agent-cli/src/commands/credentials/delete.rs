@@ -7,31 +7,34 @@
 //! # Output envelope (success)
 //!
 //! ```json
-//! {"status":"deleted","credential_name":"<name>"}
+//! {"ok":true,"data":{"credential_name":"<name>"},"request_id":"..."}
 //! ```
 //!
 //! # Output envelope (not found)
 //!
 //! ```json
-//! {"status":"error","error":"credential '<name>' not found"}
+//! {"ok":false,"error":{"code":"credentials.not_found","message":"credential '<name>' not found"},"request_id":"..."}
 //! ```
 
 use std::io::{self, BufRead as _, Write as _};
 
 use clap::Args;
 use serde::Serialize;
-use stellar_agent_smart_account::managers::credentials::{CredentialsError, CredentialsManager};
+use stellar_agent_core::envelope::Envelope;
+use stellar_agent_smart_account::managers::credentials::CredentialsManager;
 
+use crate::commands::credentials::credentials_error_code;
+use crate::common::render::render_json;
 use crate::common::{resolve_profile_name, validate_path_component_ascii_safe};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Wire types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Output envelope for `credentials delete`.
+/// JSON success payload for `credentials delete`, carried under the envelope
+/// `data` field.
 #[derive(Debug, Serialize)]
-struct DeleteEnvelope {
-    status: &'static str,
+struct DeleteSuccess {
     credential_name: String,
 }
 
@@ -75,52 +78,38 @@ pub fn run(args: &DeleteArgs) -> i32 {
 
     // Validate profile name as a path component.
     if let Err(reason) = validate_path_component_ascii_safe(&profile) {
-        return emit_error(&format!("invalid profile name '{profile}': {reason}"));
+        return emit_error(
+            "credentials.invalid_profile_name",
+            format!("invalid profile name '{profile}': {reason}"),
+        );
     }
 
     let mgr = match CredentialsManager::from_defaults_readonly(&profile, &args.rp_id) {
         Ok(m) => m,
-        Err(e) => return emit_error(&e.to_string()),
+        Err(e) => return emit_error(credentials_error_code(&e), e.to_string()),
     };
 
     // Verify the credential exists before asking for confirmation.
-    match mgr.show(&args.name) {
-        Ok(_) => {}
-        Err(CredentialsError::NotFound { name }) => {
-            return emit_error(&format!("credential '{name}' not found"));
-        }
-        Err(e) => return emit_error(&e.to_string()),
+    if let Err(e) = mgr.show(&args.name) {
+        return emit_error(credentials_error_code(&e), e.to_string());
     }
 
     // Confirmation prompt (skipped with --yes).
     if !args.yes && !confirm_delete(&args.name) {
-        #[allow(clippy::print_stdout, reason = "CLI binary intentional output")]
-        {
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                    "status": "canceled",
-                    "credential_name": &args.name
-                }))
-                .unwrap_or_default()
-            );
-        }
-        return 1;
+        return emit_error(
+            "credentials.delete_canceled",
+            format!("deletion of '{}' was canceled by the operator", args.name),
+        );
     }
 
     match mgr.delete(&args.name) {
         Ok(()) => {
-            let envelope = DeleteEnvelope {
-                status: "deleted",
+            render_json(&Envelope::ok(DeleteSuccess {
                 credential_name: args.name.clone(),
-            };
-            print_json(&envelope);
+            }));
             0
         }
-        Err(CredentialsError::NotFound { name }) => {
-            emit_error(&format!("credential '{name}' not found"))
-        }
-        Err(e) => emit_error(&e.to_string()),
+        Err(e) => emit_error(credentials_error_code(&e), e.to_string()),
     }
 }
 
@@ -147,26 +136,7 @@ fn confirm_delete(name: &str) -> bool {
     }
 }
 
-#[allow(
-    clippy::print_stdout,
-    clippy::print_stderr,
-    reason = "CLI binary intentional JSON output; errors to stderr"
-)]
-fn print_json<T: Serialize>(value: &T) {
-    match serde_json::to_string(value) {
-        Ok(s) => println!("{s}"),
-        Err(e) => eprintln!("stellar-agent: JSON serialisation error: {e}"),
-    }
-}
-
-#[allow(clippy::print_stdout, reason = "CLI binary intentional JSON output")]
-fn emit_error(detail: &str) -> i32 {
-    let envelope = serde_json::json!({ "status": "error", "error": detail });
-    println!(
-        "{}",
-        serde_json::to_string(&envelope).unwrap_or_else(|_| String::from(
-            r#"{"status":"error","error":"serialisation_failed"}"#
-        ))
-    );
+fn emit_error(code: &'static str, message: String) -> i32 {
+    render_json(&Envelope::<()>::err_raw(code, message));
     1
 }

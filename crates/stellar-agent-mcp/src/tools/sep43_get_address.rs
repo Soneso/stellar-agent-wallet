@@ -127,18 +127,16 @@ impl WalletServer {
 
         match module.get_address().await {
             Ok(value) => {
-                let json_str =
-                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_owned());
+                let envelope = stellar_agent_core::envelope::Envelope::ok(value);
+                let json_str = envelope
+                    .to_json_pretty()
+                    .unwrap_or_else(|_| String::from("{}"));
                 Ok(CallToolResult::success(vec![Content::text(json_str)]))
             }
-            Err(err) => {
-                let resp = err.to_sep43_response();
-                let json_str =
-                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-                let mut result = CallToolResult::success(vec![Content::text(json_str)]);
-                result.is_error = Some(true);
-                Ok(result)
-            }
+            Err(err) => Ok(crate::tools::common::business_error_result(
+                err.wire_code(),
+                err.to_string(),
+            )),
         }
     }
 }

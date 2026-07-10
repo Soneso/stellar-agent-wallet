@@ -140,60 +140,70 @@ impl WalletServer {
             return e.into_result();
         }
 
-        // Decode the message bytes (same logic as sign tool).
+        // Decode the message bytes (same logic as sign tool). Every failure
+        // below is a business refusal on caller-supplied input, not a
+        // JSON-RPC protocol fault, so it surfaces via the documented result
+        // envelope with a `sep53.*` wire code.
         let encoding = args.message_encoding.as_deref().unwrap_or("utf8");
         let message_bytes: Vec<u8> = match encoding {
-            "base64" => base64::engine::general_purpose::STANDARD
-                .decode(&args.message)
-                .map_err(|e| {
-                    rmcp::ErrorData::invalid_params(
-                        "sep53_verify_message_invalid_message_base64",
-                        Some(json!({ "detail": format!("message base64 decode failed: {e}") })),
-                    )
-                })?,
+            "base64" => match base64::engine::general_purpose::STANDARD.decode(&args.message) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return Ok(crate::tools::common::business_error_result(
+                        "sep53.invalid_message_base64",
+                        format!("message base64 decode failed: {e}"),
+                    ));
+                }
+            },
             "utf8" => args.message.as_bytes().to_vec(),
             other => {
-                return Err(rmcp::ErrorData::invalid_params(
-                    "sep53_verify_message_invalid_encoding",
-                    Some(json!({
-                        "detail": format!("unsupported message_encoding: {other:?}; use 'utf8' or 'base64'")
-                    })),
+                return Ok(crate::tools::common::business_error_result(
+                    "sep53.invalid_encoding",
+                    format!("unsupported message_encoding: {other:?}; use 'utf8' or 'base64'"),
                 ));
             }
         };
 
         // Parse the G-strkey public key.
-        let public_key = stellar_strkey::ed25519::PublicKey::from_string(&args.public_key)
-            .map_err(|e| {
-                rmcp::ErrorData::invalid_params(
-                    "sep53_verify_message_invalid_public_key",
-                    Some(json!({ "detail": format!("public_key is not a valid G-strkey: {e}") })),
-                )
-            })?;
+        let public_key = match stellar_strkey::ed25519::PublicKey::from_string(&args.public_key) {
+            Ok(pk) => pk,
+            Err(e) => {
+                return Ok(crate::tools::common::business_error_result(
+                    "sep53.invalid_public_key",
+                    format!("public_key is not a valid G-strkey: {e}"),
+                ));
+            }
+        };
 
         // Decode the base64 signature.
-        let sig_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&args.signature)
-            .map_err(|e| {
-                rmcp::ErrorData::invalid_params(
-                    "sep53_verify_message_invalid_signature_base64",
-                    Some(json!({ "detail": format!("signature base64 decode failed: {e}") })),
-                )
-            })?;
+        let sig_bytes = match base64::engine::general_purpose::STANDARD.decode(&args.signature) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return Ok(crate::tools::common::business_error_result(
+                    "sep53.invalid_signature_base64",
+                    format!("signature base64 decode failed: {e}"),
+                ));
+            }
+        };
 
         // Validate the signature is exactly 64 bytes.
-        let sig_arr: [u8; 64] = sig_bytes.try_into().map_err(|_| {
-            rmcp::ErrorData::invalid_params(
-                "sep53_verify_message_signature_wrong_length",
-                Some(json!({ "detail": "signature must be exactly 64 bytes after base64 decode" })),
-            )
-        })?;
+        let sig_arr: [u8; 64] = match sig_bytes.try_into() {
+            Ok(arr) => arr,
+            Err(_) => {
+                return Ok(crate::tools::common::business_error_result(
+                    "sep53.signature_wrong_length",
+                    "signature must be exactly 64 bytes after base64 decode",
+                ));
+            }
+        };
 
         // Perform SEP-53 verification.
         match stellar_agent_sep53::verify_message(&message_bytes, &sig_arr, &public_key) {
             Ok(()) => {
-                let json_str = serde_json::to_string_pretty(&json!({ "valid": true }))
-                    .unwrap_or_else(|_| r#"{"valid":true}"#.to_owned());
+                let envelope = stellar_agent_core::envelope::Envelope::ok(json!({ "valid": true }));
+                let json_str = envelope
+                    .to_json_pretty()
+                    .unwrap_or_else(|_| String::from("{}"));
                 Ok(CallToolResult::success(vec![Content::text(json_str)]))
             }
             Err(err) => Ok(crate::tools::common::business_error_result(
@@ -201,5 +211,153 @@ impl WalletServer {
                 err.to_string(),
             )),
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl WalletServer {
+    /// Calls `stellar_sep53_verify_message` with the given args, bypassing the
+    /// rmcp transport.
+    ///
+    /// # Errors
+    ///
+    /// Propagates `rmcp::ErrorData` from the `dispatch_gate` preamble.
+    /// Verification failures are returned as `Ok(CallToolResult)` with the
+    /// normalised business-error envelope.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    ///
+    /// # Feature gate
+    ///
+    /// Gated on the `test-helpers` feature or `#[cfg(test)]`.
+    #[doc(hidden)]
+    pub async fn call_stellar_sep53_verify_message(
+        &self,
+        args: Sep53VerifyMessageArgs,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.stellar_sep53_verify_message(rmcp::handler::server::wrapper::Parameters(args))
+            .await
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test-only; panics acceptable in unit tests"
+    )]
+
+    use super::*;
+    use stellar_agent_core::profile::schema::Profile;
+
+    fn make_server() -> crate::server::WalletServer {
+        crate::server::WalletServer::new(
+            Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+                .with_noop_engine()
+                .build(),
+        )
+        .expect("WalletServer::new must not fail in tests")
+    }
+
+    /// A valid ed25519 signature over the SEP-53 prefixed digest verifies
+    /// successfully, and the result carries the documented `{ ok: true,
+    /// data: { valid: true }, request_id }` envelope.
+    #[tokio::test]
+    async fn valid_signature_verifies_under_normalised_envelope() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let message = b"hello stellar";
+        let digest = stellar_agent_sep53::message_digest(message);
+        let signature: ed25519_dalek::Signature =
+            ed25519_dalek::Signer::sign(&signing_key, &digest);
+        let public_key = stellar_strkey::ed25519::PublicKey(verifying_key.to_bytes()).to_string();
+
+        let server = make_server();
+        let args = Sep53VerifyMessageArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            message: "hello stellar".to_owned(),
+            message_encoding: None,
+            signature: base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()),
+            public_key: public_key.as_str().to_owned(),
+        };
+        let result = server
+            .call_stellar_sep53_verify_message(args)
+            .await
+            .expect("verification must not be a protocol error");
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "success must not set is_error = true"
+        );
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("result must carry a text content block");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("must be JSON");
+        assert_eq!(value["ok"], serde_json::json!(true));
+        assert_eq!(value["data"]["valid"], serde_json::json!(true));
+        assert!(
+            value["request_id"].as_str().is_some_and(|s| !s.is_empty()),
+            "envelope must carry a non-empty request_id: {value}"
+        );
+    }
+
+    /// A malformed G-strkey public key is a business refusal
+    /// (`sep53.invalid_public_key`), not a JSON-RPC protocol error.
+    #[tokio::test]
+    async fn invalid_public_key_is_business_error() {
+        let server = make_server();
+        let args = Sep53VerifyMessageArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            message: "hello stellar".to_owned(),
+            message_encoding: None,
+            signature: base64::engine::general_purpose::STANDARD.encode([0u8; 64]),
+            public_key: "not-a-strkey".to_owned(),
+        };
+        let result = server
+            .call_stellar_sep53_verify_message(args)
+            .await
+            .expect("invalid input must surface as a business-error envelope, not Err");
+        let (code, _message, _text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "sep53.invalid_public_key");
+    }
+
+    /// A signature that fails ed25519 verification against the supplied
+    /// public key is `sep53.verify_failed`, not a JSON-RPC protocol error.
+    #[tokio::test]
+    async fn wrong_signature_is_verify_failed_business_error() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let public_key = stellar_strkey::ed25519::PublicKey(verifying_key.to_bytes()).to_string();
+
+        let server = make_server();
+        let args = Sep53VerifyMessageArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            message: "hello stellar".to_owned(),
+            message_encoding: None,
+            // 64 zero bytes: well-formed length, wrong signature.
+            signature: base64::engine::general_purpose::STANDARD.encode([0u8; 64]),
+            public_key: public_key.as_str().to_owned(),
+        };
+        let result = server
+            .call_stellar_sep53_verify_message(args)
+            .await
+            .expect("a failed verification must surface as a business-error envelope, not Err");
+        let (code, _message, _text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "sep53.verify_failed");
     }
 }

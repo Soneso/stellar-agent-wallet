@@ -1079,6 +1079,31 @@ pub enum SaError {
         path: PathBuf,
     },
 
+    /// The audit-log writer could not be opened for a smart-account manager
+    /// (directory creation or [`AuditWriterRegistry::get_or_open`] failure).
+    ///
+    /// Distinct from [`SaError::NetworksTomlIo`]: the failing path here is the
+    /// audit log (`audit/<profile>.jsonl`), never `networks.toml`.  Routing an
+    /// audit-writer failure through `NetworksTomlIo` misattributes the failing
+    /// subsystem in the operator-facing message (a Windows audit-log
+    /// collision would otherwise surface as `"networks.toml I/O error at
+    /// .../audit/<profile>.jsonl: ..."`).
+    ///
+    /// `path` is the audit-log path that failed; `detail` is the underlying
+    /// `io::Error` or `WriterError` rendered as a string (neither carries
+    /// secret material).
+    ///
+    /// [`AuditWriterRegistry::get_or_open`]: stellar_agent_core::audit_log::writer::AuditWriterRegistry::get_or_open
+    #[error("audit writer setup error at {path}: {detail}")]
+    #[serde(rename = "sa.audit_writer_io")]
+    AuditWriterIo {
+        /// Human-readable I/O diagnostic (`io::Error` or `WriterError`
+        /// display text).
+        detail: String,
+        /// Filesystem path of the audit log that failed to open.
+        path: PathBuf,
+    },
+
     /// TOML parse error reading `~/.config/stellar-agent/networks.toml`
     /// (or the `STELLAR_AGENT_NETWORKS_TOML` override path).
     ///
@@ -2345,6 +2370,7 @@ impl SaError {
             }
             Self::BatchSignerAddRefused { .. } => "sa.batch_signer_add_refused",
             Self::NetworksTomlIo { .. } => "sa.networks_toml_io",
+            Self::AuditWriterIo { .. } => "sa.audit_writer_io",
             Self::NetworksTomlParse { .. } => "sa.networks_toml_parse",
             Self::WebAuthnAssertionInvalid { reason } => match reason {
                 WebAuthnInvalidReason::WrongType => "sa.webauthn_assertion_invalid:wrong_type",
@@ -2815,6 +2841,13 @@ mod tests {
                 SaError::NetworksTomlIo {
                     source: io::Error::other("mock io error"),
                     path: PathBuf::from("/mock/path"),
+                },
+            ),
+            (
+                "sa.audit_writer_io",
+                SaError::AuditWriterIo {
+                    detail: "mock io error".to_owned(),
+                    path: PathBuf::from("/mock/path/audit/default.jsonl"),
                 },
             ),
             (
@@ -3417,6 +3450,14 @@ mod tests {
                 &["source", "path"],
             ),
             (
+                "sa.audit_writer_io",
+                SaError::AuditWriterIo {
+                    detail: "mock io error".to_owned(),
+                    path: PathBuf::from("/mock/path/audit/default.jsonl"),
+                },
+                &["detail", "path"],
+            ),
+            (
                 "sa.networks_toml_parse",
                 SaError::NetworksTomlParse {
                     source: toml::from_str::<toml::Value>("invalid = ").unwrap_err(),
@@ -3847,6 +3888,10 @@ mod tests {
                 source: io::Error::other("mock io error"),
                 path: PathBuf::from("/mock/path"),
             },
+            SaError::AuditWriterIo {
+                detail: "mock io error".to_owned(),
+                path: PathBuf::from("/mock/path/audit/default.jsonl"),
+            },
             SaError::NetworksTomlParse {
                 source: toml::from_str::<toml::Value>("invalid = ").unwrap_err(),
                 path: PathBuf::from("/mock/path"),
@@ -4026,6 +4071,7 @@ mod tests {
             "sa.weighted_threshold_policy_identification_failed",
             "sa.batch_signer_add_refused",
             "sa.networks_toml_io",
+            "sa.audit_writer_io",
             "sa.networks_toml_parse",
             "sa.threshold_policy_not_installed",
             "sa.signer_set_missing_baseline",
@@ -4077,7 +4123,7 @@ mod tests {
             );
         }
 
-        assert_eq!(seen.len(), 71, "closed set must have exactly 71 wire codes");
+        assert_eq!(seen.len(), 72, "closed set must have exactly 72 wire codes");
     }
 
     /// Verifies the sub-code closed set is exhaustively matched by tests.

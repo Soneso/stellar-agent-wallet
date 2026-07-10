@@ -854,7 +854,7 @@ pub(crate) fn mainnet_signing_refusal_detail() -> String {
 /// caller can broadcast externally, so the submit-layer mainnet gate never
 /// fires. On a mainnet profile these tools MUST refuse structurally, before any
 /// key access, so no valid mainnet signature is ever produced. The refusal is
-/// surfaced as a SEP-43 error object (`is_error = true`) carrying the canonical
+/// surfaced as the documented business-error envelope (`ok:false`, `is_error = true`) carrying the canonical
 /// `network.mainnet_write_forbidden` wire code so it correlates with the CLI and
 /// submit-layer guards.
 ///
@@ -868,15 +868,13 @@ pub(crate) fn mainnet_signing_refusal_detail() -> String {
 /// is `false` for these sign-only tools, so the policy engine alone does not
 /// stop them.
 pub(crate) fn mainnet_signing_forbidden_result() -> rmcp::model::CallToolResult {
-    let resp = stellar_agent_sep43::Sep43Error::MainnetSigningForbidden {
+    let err = stellar_agent_sep43::Sep43Error::MainnetSigningForbidden {
         detail: mainnet_signing_refusal_detail(),
-    }
-    .to_sep43_response();
-    let json_str = serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
-    let mut result =
-        rmcp::model::CallToolResult::success(vec![rmcp::model::Content::text(json_str)]);
-    result.is_error = Some(true);
-    result
+    };
+    business_error_result(
+        stellar_agent_core::error::NetworkError::MainnetWriteForbidden.code(),
+        err.to_string(),
+    )
 }
 
 /// Returns the structural mainnet-signing refusal for the sign-only x402 tools.

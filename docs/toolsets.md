@@ -285,8 +285,10 @@ stellar-agent toolsets install balance-reporter@1.0.0 \
   --publisher GABC...WXYZ
 ```
 
-The success envelope reports `status`, `package`, `version`, and `attestation`
-(`attested` / `overridden` / `not-required`).
+On success, `data` carries `package`, `version`, and `attestation` (`attested` /
+`overridden` / `not-required`). On failure, `error.code` is
+`toolsets.install_failed` for every refusal reason (parse, attestation-gate, or
+install-library failure); the distinguishing detail is in `error.message`.
 
 ### `toolsets list`
 
@@ -309,8 +311,8 @@ stellar-agent toolsets list
 
 Runs the four-part capability enforcement check for a toolset action and resolves the
 trusted registry tool it routes to. It does **not** execute the routed tool; on
-success it reports `status: "resolved"` with the `routed_to` tool name and a note
-that execution is not wired in the CLI. Use the MCP surface for execution.
+success `data` carries the `routed_to` tool name and a note that execution is
+not wired in the CLI. Use the MCP surface for execution.
 
 Positionals: `<TOOLSET-NAME>` — the installed package name (e.g. `balance-reporter`);
 `<ACTION>` — the exact registry tool name granted by the toolset's capabilities
@@ -324,9 +326,10 @@ Positionals: `<TOOLSET-NAME>` — the installed package name (e.g. `balance-repo
 stellar-agent toolsets run balance-reporter stellar_balances
 ```
 
-On enforcement failure the error envelope carries a `code` such as
-`toolset.not_installed`, `toolset.unknown_action`, `toolset.capability_not_declared`, or
-`toolset.tool_not_allowed`.
+On enforcement failure `error.code` is one of `toolset.not_installed`,
+`toolset.unknown_action`, `toolset.capability_not_declared`, or
+`toolset.tool_not_allowed` — the same codes the MCP `stellar_toolset_invoke`
+tool uses for the identical enforcement failures.
 
 ### `toolsets uninstall <PACKAGE>`
 
@@ -353,8 +356,9 @@ fixed. See [mcp.md](mcp.md) for the server as a whole.
 
 Takes no arguments and returns a JSON array of installed-toolset entries. Each entry
 has the same per-toolset shape as the elements of the `toolsets` array inside the
-`toolsets list` envelope; the MCP tool returns the bare array rather than the
-`{status, toolsets}` wrapper. Read-only and non-destructive.
+`toolsets list` command's `data.toolsets`; the MCP tool returns the bare array
+rather than the standard `{ ok, data, request_id }` envelope. Read-only and
+non-destructive.
 
 ```json
 {}

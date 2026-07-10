@@ -46,7 +46,7 @@ Tool `stellar_sep7_parse_uri`:
 
 Preview fields: `operation` (`"tx"`/`"pay"`), parsed operation fields, `callback` (authority host for SSRF inspection), `origin_domain`, `origin_verified`, `signature_status` (`verified`/`failed`/`missing_required`/`absent`), `will_auto_submit` (always `false`), `will_auto_post_callback` (always `false`).
 
-Does NOT: sign a URI; auto-POST to a `callback`; auto-submit. Origin-domain verification always fetches a fresh `stellar.toml` (never cached). SEP-7 carries no nonce/timestamp, so replay protection is the host's responsibility. Error codes are `sep7_*` (e.g. `sep7_malformed_uri`, `sep7_missing_required_param`, `sep7_invalid_param_value`, `sep7_msg_too_long` [`msg` max 300 chars], `sep7_too_many_chain_levels` [max 7], `sep7_toml_fetch_failed` [URL redacted], `sep7_signing_key_not_in_toml`, `sep7_signature_verification_failed`, `sep7_signature_missing_with_origin_domain`).
+Does NOT: sign a URI; auto-POST to a `callback`; auto-submit. Origin-domain verification always fetches a fresh `stellar.toml` (never cached). SEP-7 carries no nonce/timestamp, so replay protection is the host's responsibility. Parse and verify failures are business errors under the standard envelope with `sep7.*` wire codes (e.g. `sep7.malformed_uri`, `sep7.missing_required_param`, `sep7.invalid_param_value`, `sep7.msg_too_long` [`msg` max 300 chars], `sep7.too_many_chain_levels` [max 7], `sep7.toml_fetch_failed` [URL redacted], `sep7.signing_key_not_in_toml`, `sep7.signature_verification_failed`, `sep7.signature_missing_with_origin_domain`).
 
 ## SEP-10 — Stellar Web Authentication
 
@@ -90,7 +90,7 @@ Both tools do NOT: transmit any SEP-9 KYC field — the arg structs have none by
 
 ## SEP-43 — Wallet Protocol (signing)
 
-Agent-side `ModuleInterface` dispatch. Errors use the SEP-43 stable wire shape `{ "code": N, "message": "..." }`.
+Agent-side `ModuleInterface` dispatch. Results use the standard `{ ok, data | error, request_id }` envelope like every other tool; the SEP-43 raw protocol payload (`{ address }`, `{ signedTxXdr, signerAddress }`, etc.) is carried inside `data` on success.
 
 | Tool | Method | Read-only | Submits | Returns |
 |---|---|---|---|---|
@@ -101,7 +101,7 @@ Agent-side `ModuleInterface` dispatch. Errors use the SEP-43 stable wire shape `
 | `stellar_sep43_sign_message` | `signMessage` | no | no | `{ signedMessage (hex), signerAddress }` |
 | `stellar_sep43_sign_and_submit_transaction` | sign + submit | no | yes (destructive) | `{ signedTxXdr, txHash, status }` |
 
-Common signing args: `chain_id` (required), the payload field, optional `network_passphrase` (if provided must equal the profile passphrase exactly; mismatch → SEP-43 code `-3`), optional `address` G-strkey (if provided must match the active signer; mismatch → `-3`).
+Common signing args: `chain_id` (required), the payload field, optional `network_passphrase` (if provided must equal the profile passphrase exactly; mismatch → `sep43.invalid_network_passphrase`), optional `address` G-strkey (if provided must match the active signer; mismatch → `sep43.invalid_address`).
 
 - `get_address` / `get_network`: `chain_id` is optional (chain-agnostic per spec); when omitted, the profile's chain is used. No keyring access.
 - `sign_transaction`: arg `transaction_xdr` (base64 `TransactionEnvelope`). Signs only; the optional SEP-43 `submit`/`submitUrl` opts are NOT implemented here.
@@ -109,14 +109,16 @@ Common signing args: `chain_id` (required), the payload field, optional `network
 - `sign_message`: arg `message` (non-empty UTF-8). Computes `sha256(message_bytes)` with **no prefix** and signs; result `signedMessage` is hex. Optional `network_passphrase` is a caller-intent gate only — it is not mixed into the signed bytes (message signing is network-independent).
 - `sign_and_submit_transaction`: arg `transaction_xdr`. Signs, submits via Stellar RPC, and polls until ledger confirmation. `status` is `"success"` (confirmed; `txHash` is a hex64) or `"pending"` (polling window expired before confirmation; `txHash` empty, the tx may still confirm). RPC endpoint/timeout errors strip the URL before surfacing.
 
-SEP-43 error codes (`to_sep43_response` → `{ code, message }`):
+SEP-43 wire codes (`error.code` under the standard envelope, from `Sep43Error::wire_code()`):
 
-| Code | Meaning | Example variants |
-|---|---|---|
-| `-1` | Internal wallet error | wallet-unlock failed, signer unavailable, XDR serialization failed, keyring error |
-| `-2` | External service error | Horizon error, RPC error |
-| `-3` | Client-invalid request | invalid XDR, invalid address, invalid network passphrase, missing address, malformed auth entry, invalid message |
-| `-4` | User rejected | user rejected |
+| Code | Meaning |
+|---|---|
+| `sep43.wallet_unlock_failed`, `sep43.signer_unavailable`, `sep43.xdr_serialization_failed`, `sep43.keyring_error` | Internal wallet error |
+| `sep43.horizon_error`, `sep43.rpc_error` | External service error |
+| `sep43.invalid_xdr`, `sep43.invalid_address`, `sep43.invalid_network_passphrase`, `sep43.missing_address`, `sep43.malformed_auth_entry`, `sep43.invalid_message` | Client-invalid request |
+| `sep43.user_rejected` | User rejected |
+
+The structural mainnet refusal (sign-only tools, before any key access) carries the canonical `network.mainnet_write_forbidden` code shared with every other signing surface, not a `sep43.*` code.
 
 SEP-43 opens no HTTP/HTTPS connections of its own (interop is stdio via MCP); `sign_and_submit` is the only path that submits, via the profile-configured RPC.
 

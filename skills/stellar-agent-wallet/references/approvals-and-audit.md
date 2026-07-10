@@ -21,9 +21,9 @@ that `stellar-agent audit verify` checks for tampering.
 
 ## Conventions used across these surfaces
 
-- Result envelope (for `profile`, `approve`, `audit`): `{ok, data, request_id}`
-  on success, `{ok: false, error, request_id}` on failure. The `credentials`
-  group prints a flat status/result object instead.
+- Result envelope: `{ok, data, request_id}` on success, `{ok: false, error,
+  request_id}` on failure, used by every command group including `profile`,
+  `approve`, `audit`, `credentials`, and `toolsets`.
 - Exit code: `0` on success, `1` on any error.
 - Amounts are decimal strings with a unit (for example `"10 XLM"`), never JSON
   numbers. Asset is `native`/`XLM` or `CODE:GISSUER`.

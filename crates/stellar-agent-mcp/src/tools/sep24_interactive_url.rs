@@ -182,32 +182,38 @@ impl WalletServer {
             return e.into_result();
         }
 
-        // Parse operation.
+        // Parse operation. A caller-supplied value outside the two accepted
+        // operations is a business refusal, not a JSON-RPC protocol fault.
         let operation = match args.operation.as_str() {
             "deposit" => Sep24Operation::Deposit,
             "withdraw" => Sep24Operation::Withdraw,
             other => {
-                return Err(rmcp::ErrorData::invalid_params(
-                    "sep24_invalid_operation",
-                    Some(
-                        json!({ "detail": format!("operation must be 'deposit' or 'withdraw', got {other:?}") }),
-                    ),
+                return Ok(crate::tools::common::business_error_result(
+                    "sep24.invalid_operation",
+                    format!("operation must be 'deposit' or 'withdraw', got {other:?}"),
                 ));
             }
         };
 
         // Resolve transfer_server_sep0024.
         let (transfer_server_sep0024, anchor_domain_str, anchor_network_passphrase) =
-            resolve_transfer_server_sep0024(
+            match resolve_transfer_server_sep0024(
                 args.anchor_domain.as_deref(),
                 args.transfer_server_sep0024.as_deref(),
             )
             .await
-            .map_err(|e| {
-                let (code, detail) = anchor_error_to_wire(&e);
-                rmcp::ErrorData::invalid_params(code, Some(json!({ "detail": detail })))
-            })?;
-        validate_sep24_chain_binding(&args.chain_id, anchor_network_passphrase.as_deref())?;
+            {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    let (code, detail) = anchor_error_to_wire(&e);
+                    return Ok(crate::tools::common::business_error_result(code, detail));
+                }
+            };
+        if let Err(result) =
+            validate_sep24_chain_binding(&args.chain_id, anchor_network_passphrase.as_deref())
+        {
+            return Ok(result);
+        }
 
         // Build SEP-24 params — ONLY non-PII fields.
         // deposit_hint (AnchorAmount) maps to the SEP-24 wire `amount` parameter.
@@ -227,7 +233,7 @@ impl WalletServer {
         };
 
         // POST interactive endpoint.
-        let result = start_sep24_interactive(
+        let result = match start_sep24_interactive(
             &transfer_server_sep0024,
             anchor_domain_str.as_deref(),
             operation,
@@ -235,10 +241,13 @@ impl WalletServer {
             &args.jwt,
         )
         .await
-        .map_err(|e| {
-            let (code, detail) = anchor_error_to_wire(&e);
-            rmcp::ErrorData::invalid_params(code, Some(json!({ "detail": detail })))
-        })?;
+        {
+            Ok(result) => result,
+            Err(e) => {
+                let (code, detail) = anchor_error_to_wire(&e);
+                return Ok(crate::tools::common::business_error_result(code, detail));
+            }
+        };
 
         let output = json!({
             "interactive_url": result.interactive_url,
@@ -249,7 +258,10 @@ impl WalletServer {
             "asset_code": args.asset_code,
         });
 
-        let json_str = serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_owned());
+        let envelope = stellar_agent_core::envelope::Envelope::ok(output);
+        let json_str = envelope
+            .to_json_pretty()
+            .unwrap_or_else(|_| String::from("{}"));
         Ok(CallToolResult::success(vec![Content::text(json_str)]))
     }
 }
@@ -299,28 +311,30 @@ async fn resolve_transfer_server_sep0024(
     }
 }
 
+/// Validates the resolved anchor's network passphrase against `chain_id`.
+///
+/// Returns `Err(result)` with a ready-to-return business-error `CallToolResult`
+/// on mismatch (never a JSON-RPC protocol error): both an unparseable
+/// `chain_id` and an anchor/chain network mismatch are business refusals on
+/// caller-supplied or anchor-supplied input.
 fn validate_sep24_chain_binding(
     chain_id: &str,
     anchor_network_passphrase: Option<&str>,
-) -> Result<(), rmcp::ErrorData> {
+) -> Result<(), CallToolResult> {
     let Some(anchor_passphrase) = anchor_network_passphrase else {
         return Ok(());
     };
     let requested_chain: Caip2 = chain_id.parse::<Caip2>().map_err(|err| {
-        rmcp::ErrorData::invalid_params(
-            "sep24_chain_id_invalid",
-            Some(json!({ "detail": err.to_string() })),
-        )
+        crate::tools::common::business_error_result("sep24.chain_id_invalid", err.to_string())
     })?;
     let expected = requested_chain.network_passphrase();
     if anchor_passphrase != expected {
-        return Err(rmcp::ErrorData::invalid_params(
-            "sep24_chain_anchor_network_mismatch",
-            Some(json!({
-                "chain_id": chain_id,
-                "expected_network_passphrase": expected,
-                "anchor_network_passphrase": anchor_passphrase,
-            })),
+        return Err(crate::tools::common::business_error_result(
+            "sep24.chain_anchor_network_mismatch",
+            format!(
+                "chain_id {chain_id:?} expects network passphrase {expected:?}, \
+                 anchor declared {anchor_passphrase:?}"
+            ),
         ));
     }
     Ok(())
@@ -430,18 +444,18 @@ mod tests {
 
     #[test]
     fn sep24_chain_binding_rejects_testnet_chain_with_mainnet_anchor() {
-        let err = match validate_sep24_chain_binding(
+        let result = match validate_sep24_chain_binding(
             "stellar:testnet",
             Some("Public Global Stellar Network ; September 2015"),
         ) {
             Ok(()) => panic!("mainnet anchor passphrase must not satisfy stellar:testnet"),
-            Err(err) => err,
+            Err(result) => result,
         };
 
-        assert!(
-            err.message.contains("sep24_chain_anchor_network_mismatch"),
-            "mismatch must produce typed SEP-24 chain binding error; got: {}",
-            err.message
+        let (code, _message, _text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(
+            code, "sep24.chain_anchor_network_mismatch",
+            "mismatch must produce the typed SEP-24 chain-binding business error"
         );
     }
 }

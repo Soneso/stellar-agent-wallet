@@ -8,11 +8,13 @@ use std::path::PathBuf;
 
 use clap::Args;
 use serde::Serialize;
+use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::profile::schema::default_toolsets_dir;
 use stellar_agent_toolsets_install::{
     InstallOptions, MAX_ATTESTATION_BYTES, ToolsetAttestation, install_toolset_from_path,
 };
-use tracing::error;
+
+use crate::common::render::render_json;
 
 /// Arguments for `toolsets install`.
 #[derive(Debug, Args)]
@@ -91,11 +93,10 @@ pub struct ToolsetInstallArgs {
     pub override_attestation: bool,
 }
 
-/// JSON output for `toolsets install`.
+/// JSON success payload for `toolsets install`, carried under the envelope
+/// `data` field.
 #[derive(Debug, Serialize)]
 struct InstallResult {
-    /// Always `"ok"` on success.
-    status: &'static str,
     /// Package name.
     package: String,
     /// Installed version.
@@ -114,56 +115,27 @@ struct InstallResult {
     attestation: &'static str,
 }
 
-/// JSON error output.
-#[derive(Debug, Serialize)]
-struct InstallError {
-    status: &'static str,
-    error: String,
-}
-
 /// Runs the `toolsets install` subcommand.
 ///
 /// # Exit codes
 ///
-/// - `0` on success.
-/// - `1` on any error.
+/// - `0` on success (`{ ok: true, data: { package, version, attestation },
+///   request_id }`).
+/// - `1` on any error (`{ ok: false, error: { code, message }, request_id }`).
+///   `code` is `"toolsets.install_failed"` for every refusal reason (parse,
+///   attestation-gate, or install-library failure); the distinguishing detail
+///   is in `message`.
 pub async fn run(args: &ToolsetInstallArgs) -> i32 {
     match run_inner(args) {
         Ok(result) => {
-            // JSON output.
-            match serde_json::to_string_pretty(&result) {
-                Ok(json) => {
-                    #[allow(clippy::print_stdout)]
-                    {
-                        println!("{json}");
-                    }
-                    0
-                }
-                Err(e) => {
-                    error!(error = %e, "failed to serialise install result");
-                    1
-                }
-            }
+            render_json(&Envelope::ok(result));
+            0
         }
         Err(e) => {
-            let err_output = InstallError {
-                status: "error",
-                error: e.to_string(),
-            };
-            match serde_json::to_string_pretty(&err_output) {
-                Ok(json) => {
-                    #[allow(clippy::print_stderr)]
-                    {
-                        eprintln!("{json}");
-                    }
-                }
-                Err(_) => {
-                    #[allow(clippy::print_stderr)]
-                    {
-                        eprintln!("error: {e}");
-                    }
-                }
-            }
+            render_json(&Envelope::<()>::err_raw(
+                "toolsets.install_failed",
+                e.to_string(),
+            ));
             1
         }
     }
@@ -258,7 +230,6 @@ fn run_inner(args: &ToolsetInstallArgs) -> Result<InstallResult, Box<dyn std::er
     )?;
 
     Ok(InstallResult {
-        status: "ok",
         package,
         version,
         // Report the ACTUAL gate decision returned by the library, not an inference

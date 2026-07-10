@@ -20,9 +20,11 @@
 
 use clap::Args;
 use serde::Serialize;
+use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::profile::schema::default_toolsets_dir;
 use stellar_agent_toolsets_runtime::resolve_toolset_and_check;
-use tracing::error;
+
+use crate::common::render::render_json;
 
 /// Arguments for `toolsets run`.
 #[derive(Debug, Args)]
@@ -45,48 +47,40 @@ pub struct ToolsetRunArgs {
     pub toolsets_dir: Option<std::path::PathBuf>,
 }
 
-/// JSON output for `toolsets run` enforcement-check pass.
+/// JSON success payload for `toolsets run`'s enforcement-check pass, carried
+/// under the envelope `data` field.
 ///
-/// Reports `status: "resolved"` — enforcement passed and routing was resolved,
+/// Reaching this payload means enforcement passed and routing was resolved,
 /// but the routed tool is NOT executed by this command.
 #[derive(Debug, Serialize)]
 struct RunResult {
-    /// Always `"resolved"` (enforcement passed; tool not executed).
-    ///
-    /// Use the MCP surface (`stellar_toolset_invoke`) for actual execution.
-    status: &'static str,
     toolset: String,
     action: String,
     routed_to: String,
     /// Human-readable note explaining that enforcement passed but execution
-    /// is not wired in this command — prevents misreading `status` as a
-    /// successful run.
+    /// is not wired in this command — prevents misreading `ok: true` as a
+    /// completed tool invocation.
     note: &'static str,
-}
-
-/// JSON error output for `toolsets run`.
-#[derive(Debug, Serialize)]
-struct RunError {
-    status: &'static str,
-    error: String,
-    code: String,
 }
 
 /// Runs the `toolsets run <name> <action>` subcommand.
 ///
 /// Performs the four-part capability enforcement check and prints the
-/// resolved trusted tool name with `status: "resolved"` on success.
+/// resolved trusted tool name under `data.routed_to` on success.
 ///
 /// ## Scope
 ///
 /// This command is an enforcement-check + routing-resolution command only.
-/// The routed tool is NOT executed.  Use the MCP surface
+/// The routed tool is NOT executed. Use the MCP surface
 /// (`stellar_toolset_invoke`) for actual tool execution.
 ///
 /// ## Exit codes
 ///
-/// - `0` — enforcement passed; `status: "resolved"` in JSON output.
-/// - `1` — enforcement failure or I/O error; `status: "error"` in JSON output.
+/// - `0` — enforcement passed (`{ ok: true, data: {...}, request_id }`).
+/// - `1` — enforcement failure or I/O error (`{ ok: false, error: { code,
+///   message }, request_id }`), `code` one of the `toolset.*` enforcement
+///   codes shared with the MCP `stellar_toolset_invoke` tool, or
+///   `toolsets.dir_resolve_failed`.
 pub async fn run(args: &ToolsetRunArgs) -> i32 {
     let toolsets_root = if let Some(dir) = &args.toolsets_dir {
         dir.clone()
@@ -94,10 +88,10 @@ pub async fn run(args: &ToolsetRunArgs) -> i32 {
         match default_toolsets_dir() {
             Ok(d) => d,
             Err(e) => {
-                print_error(
-                    "toolsets_dir_error",
-                    &format!("cannot resolve toolsets dir: {e}"),
-                );
+                render_json(&Envelope::<()>::err_raw(
+                    "toolsets.dir_resolve_failed",
+                    format!("cannot resolve toolsets dir: {e}"),
+                ));
                 return 1;
             }
         }
@@ -106,26 +100,13 @@ pub async fn run(args: &ToolsetRunArgs) -> i32 {
     match resolve_toolset_and_check(&args.name, &args.action, &toolsets_root) {
         Ok((tool_name, _pin)) => {
             let result = RunResult {
-                // "resolved": enforcement passed; tool NOT executed by this command.
-                status: "resolved",
                 toolset: args.name.clone(),
                 action: args.action.clone(),
                 routed_to: tool_name.to_owned(),
                 note: "enforcement passed; CLI execution not wired — use the MCP surface (stellar_toolset_invoke) for actual execution",
             };
-            match serde_json::to_string_pretty(&result) {
-                Ok(json) => {
-                    #[allow(clippy::print_stdout)]
-                    {
-                        println!("{json}");
-                    }
-                    0
-                }
-                Err(e) => {
-                    error!(error = %e, "failed to serialise run result");
-                    1
-                }
-            }
+            render_json(&Envelope::ok(result));
+            0
         }
         Err(e) => {
             use stellar_agent_toolsets_runtime::ToolsetRuntimeError;
@@ -139,27 +120,8 @@ pub async fn run(args: &ToolsetRunArgs) -> i32 {
                 ToolsetRuntimeError::Io(_) => "toolset.io_error",
                 _ => "toolset.error",
             };
-            print_error(code, &e.to_string());
+            render_json(&Envelope::<()>::err_raw(code, e.to_string()));
             1
-        }
-    }
-}
-
-fn print_error(code: &str, message: &str) {
-    let err_output = RunError {
-        status: "error",
-        error: message.to_owned(),
-        code: code.to_owned(),
-    };
-    match serde_json::to_string_pretty(&err_output) {
-        Ok(json) => {
-            #[allow(clippy::print_stdout)]
-            {
-                println!("{json}");
-            }
-        }
-        Err(e) => {
-            error!(error = %e, "failed to serialise run error");
         }
     }
 }

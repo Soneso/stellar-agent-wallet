@@ -29,6 +29,35 @@ pub mod list;
 pub mod show;
 
 use clap::{Args, Subcommand};
+use stellar_agent_smart_account::managers::credentials::CredentialsError;
+
+/// Maps a [`CredentialsError`] to a stable dotted wire code in the
+/// `credentials.*` namespace, shared by every `credentials` subcommand so the
+/// same underlying failure always carries the same code regardless of which
+/// verb surfaced it.
+pub(crate) fn credentials_error_code(err: &CredentialsError) -> &'static str {
+    match err {
+        CredentialsError::Io { .. } => "credentials.io_error",
+        CredentialsError::RegistryParse { .. } => "credentials.registry_parse_failed",
+        CredentialsError::RegistrySerialise { .. } => "credentials.registry_serialise_failed",
+        CredentialsError::StateDirUnavailable => "credentials.state_dir_unavailable",
+        CredentialsError::NotFound { .. } => "credentials.not_found",
+        CredentialsError::DuplicateName { .. } => "credentials.duplicate_name",
+        CredentialsError::InvalidName { .. } => "credentials.invalid_name",
+        CredentialsError::ApprovalStore { .. } => "credentials.approval_store_error",
+        CredentialsError::BridgeStart { .. } => "credentials.bridge_start_failed",
+        CredentialsError::BridgeShutdown { .. } => "credentials.bridge_shutdown_failed",
+        CredentialsError::ApprovalStoreUnavailable => "credentials.approval_store_unavailable",
+        CredentialsError::AtomicWrite { .. } => "credentials.atomic_write_failed",
+        CredentialsError::Signing { .. } => "credentials.signing_failed",
+        CredentialsError::MissingPublicKey { .. } => "credentials.missing_public_key",
+        CredentialsError::MalformedPublicKey { .. } => "credentials.malformed_public_key",
+        // Forward-compatibility wildcard: future variants (e.g. the
+        // divergence-check family) default to a generic code rather than
+        // failing to compile on every new variant added upstream.
+        _ => "credentials.error",
+    }
+}
 
 /// Arguments for the `credentials` subcommand group.
 #[derive(Debug, Args)]
@@ -50,16 +79,16 @@ pub enum CredentialsSubcommand {
     /// the browser-side WebAuthn ceremony completes. On success, stores the
     /// credential metadata in the per-profile passkeys registry.
     ///
-    /// Prints a JSON envelope on completion:
+    /// Prints the standard result envelope on completion:
     ///
     /// ```json
-    /// {"status":"registered","credential_id":"<redacted>","credential_name":"<name>","rp_id":"<rp-id>","registered_at_unix_ms":0}
+    /// {"ok":true,"data":{"credential_id":"<redacted>","credential_name":"<name>","rp_id":"<rp-id>","registered_at_unix_ms":0},"request_id":"..."}
     /// ```
     ///
     /// When the browser cannot be launched, prints the URL to stderr and
-    /// continues polling normally. Non-success outcomes are surfaced as
-    /// `"status":"timeout" | "user_canceled" | "entry_missing"` in the
-    /// envelope.
+    /// continues polling normally. Non-success outcomes (timeout, user
+    /// cancellation, missing approval-store entry) surface as `ok:false` with
+    /// a `credentials.registration_*` wire code.
     AddPasskey(add_passkey::AddPasskeyArgs),
 
     /// List registered passkeys for a profile.
@@ -96,5 +125,49 @@ pub async fn run(args: &CredentialsArgs) -> i32 {
         CredentialsSubcommand::List(a) => list::run(a),
         CredentialsSubcommand::Delete(a) => delete::run(a),
         CredentialsSubcommand::Show(a) => show::run(a),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `credentials` subcommand routes its `CredentialsError` through
+    /// this single mapping, so the same underlying failure carries the same
+    /// dotted `credentials.*` code everywhere it can surface.
+    #[test]
+    fn credentials_error_code_covers_common_variants() {
+        let cases: &[(CredentialsError, &str)] = &[
+            (
+                CredentialsError::NotFound {
+                    name: "x".to_owned(),
+                },
+                "credentials.not_found",
+            ),
+            (
+                CredentialsError::DuplicateName {
+                    name: "x".to_owned(),
+                },
+                "credentials.duplicate_name",
+            ),
+            (
+                CredentialsError::InvalidName {
+                    name: "x".to_owned(),
+                    reason: "too long",
+                },
+                "credentials.invalid_name",
+            ),
+            (
+                CredentialsError::StateDirUnavailable,
+                "credentials.state_dir_unavailable",
+            ),
+        ];
+        for (err, expected_code) in cases {
+            assert_eq!(
+                credentials_error_code(err),
+                *expected_code,
+                "wire code mismatch for {err:?}"
+            );
+        }
     }
 }

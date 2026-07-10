@@ -120,32 +120,43 @@ impl WalletServer {
             return e.into_result();
         }
 
-        // Resolve transfer_server URL.
-        let (transfer_server, anchor_domain_str) = resolve_transfer_server(
+        // Resolve transfer_server URL. A resolution failure is a business
+        // refusal on caller-supplied input (bad domain, unreachable anchor,
+        // malformed stellar.toml), not a JSON-RPC protocol fault.
+        let (transfer_server, anchor_domain_str) = match resolve_transfer_server(
             args.anchor_domain.as_deref(),
             args.transfer_server.as_deref(),
         )
         .await
-        .map_err(|e| {
-            let (code, detail) = anchor_error_to_wire(&e);
-            rmcp::ErrorData::invalid_params(code, Some(json!({ "detail": detail })))
-        })?;
+        {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                let (code, detail) = anchor_error_to_wire(&e);
+                return Ok(crate::tools::common::business_error_result(code, detail));
+            }
+        };
 
         // Fetch and decode /info.
-        let info = get_sep6_info(
+        let info = match get_sep6_info(
             &transfer_server,
             anchor_domain_str.as_deref(),
             args.asset_code.as_deref(),
             args.lang.as_deref(),
         )
         .await
-        .map_err(|e| {
-            let (code, detail) = anchor_error_to_wire(&e);
-            rmcp::ErrorData::invalid_params(code, Some(json!({ "detail": detail })))
-        })?;
+        {
+            Ok(info) => info,
+            Err(e) => {
+                let (code, detail) = anchor_error_to_wire(&e);
+                return Ok(crate::tools::common::business_error_result(code, detail));
+            }
+        };
 
         let output = build_sep6_output(&info);
-        let json_str = serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_owned());
+        let envelope = stellar_agent_core::envelope::Envelope::ok(output);
+        let json_str = envelope
+            .to_json_pretty()
+            .unwrap_or_else(|_| String::from("{}"));
         Ok(CallToolResult::success(vec![Content::text(json_str)]))
     }
 }
@@ -254,20 +265,22 @@ fn build_sep6_output(info: &Sep6Info) -> serde_json::Value {
 // Error mapping (pub(crate) for reuse by sep24_interactive_url)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Maps [`AnchorError`] to a wire-safe (machine_code, detail) pair.
+/// Maps [`AnchorError`] to a wire-safe (dotted code, detail) pair.
 ///
-/// URLs are redacted to authority-only.
+/// The code is in the `anchor.*` namespace, matching the dotted wire-code
+/// taxonomy every other normalised tool uses. URLs are redacted to
+/// authority-only.
 pub(crate) fn anchor_error_to_wire(
     err: &stellar_agent_anchor::AnchorError,
 ) -> (&'static str, String) {
     use stellar_agent_anchor::AnchorError;
     match err {
-        AnchorError::InvalidAnchorDomain { detail } => ("anchor_invalid_domain", detail.clone()),
+        AnchorError::InvalidAnchorDomain { detail } => ("anchor.invalid_domain", detail.clone()),
         AnchorError::TransferServerHostMismatch {
             anchor_domain,
             resolved_host,
         } => (
-            "anchor_transfer_server_host_mismatch",
+            "anchor.transfer_server_host_mismatch",
             format!(
                 "SSRF bind rejected: resolved host {resolved_host:?} does not match \
                  anchor domain {anchor_domain:?}"
@@ -277,29 +290,29 @@ pub(crate) fn anchor_error_to_wire(
             authority_hint,
             detail,
         } => (
-            "anchor_fetch_failed",
+            "anchor.fetch_failed",
             format!("fetch failed at {authority_hint}: {detail}"),
         ),
         AnchorError::AnchorResponseDecodeFailed {
             authority_hint,
             detail,
         } => (
-            "anchor_response_decode_failed",
+            "anchor.response_decode_failed",
             format!("decode failed at {authority_hint}: {detail}"),
         ),
         AnchorError::HttpStatusError {
             authority_hint,
             status,
         } => (
-            "anchor_http_status_error",
+            "anchor.http_status_error",
             format!("HTTP {status} at {authority_hint}"),
         ),
         AnchorError::Sep24UnexpectedResponseType { response_type } => (
-            "anchor_sep24_unexpected_response_type",
+            "anchor.sep24_unexpected_response_type",
             format!("unexpected response type: {response_type:?}"),
         ),
-        AnchorError::InvalidDirectUrl { detail } => ("anchor_invalid_direct_url", detail.clone()),
+        AnchorError::InvalidDirectUrl { detail } => ("anchor.invalid_direct_url", detail.clone()),
         // Non-exhaustive: catch-all for future variants.
-        _ => ("anchor_error", format!("{err}")),
+        _ => ("anchor.error", format!("{err}")),
     }
 }

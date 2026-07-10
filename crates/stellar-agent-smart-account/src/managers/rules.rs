@@ -4699,6 +4699,7 @@ pub(crate) fn sa_error_to_invocation_result(
         | SaError::WeightedThresholdPolicyProvenanceMismatch { .. }
         | SaError::WeightedThresholdPolicySha256Drift { .. }
         | SaError::NetworksTomlIo { .. }
+        | SaError::AuditWriterIo { .. }
         | SaError::NetworksTomlParse { .. }
         // Signer-threshold pre-submission refusal variants.
         // All fire before any chain submission attempt.
