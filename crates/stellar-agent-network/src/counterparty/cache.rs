@@ -363,13 +363,10 @@ impl CounterpartyResolver for StellarTomlResolver {
     ///
     /// Never panics.
     async fn refresh(&self, home_domain: &str) -> Result<StellarTomlBinding, CounterpartyError> {
-        // Normalise to ASCII lowercase before any use: the policy criteria
-        // query the cache with the lowercased on-chain home_domain, so a
-        // mixed-case refresh argument would key an entry the lookup can never
-        // hit and a legitimate counterparty would deny as unverified.
-        let home_domain = &home_domain.to_ascii_lowercase();
-
-        // Validate the domain before touching the filesystem.
+        // Validate the domain before touching the filesystem. Validation
+        // rejects non-lowercase input outright, so every cache key is
+        // lowercase by construction and always matches the lowercased
+        // on-chain home_domain the policy criteria query with.
         crate::counterparty::fetch::validate_home_domain(home_domain)?;
 
         // Acquire the single-writer flock.
