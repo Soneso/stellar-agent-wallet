@@ -138,11 +138,11 @@ jobs:
       - name: Audit-log writer + registry tests (stellar-agent-core)
         run: cargo test -p stellar-agent-core --lib audit_log
       - name: Approval + toolset-grant store persist tests (stellar-agent-core)
-        run: cargo test -p stellar-agent-core --lib approval::
+        run: "cargo test -p stellar-agent-core --lib approval::"
       - name: SaError wire-code coverage (stellar-agent-smart-account)
-        run: cargo test -p stellar-agent-smart-account --lib error::
+        run: "cargo test -p stellar-agent-smart-account --lib error::"
       - name: MCP smart-account rule tools (stellar-agent-mcp)
-        run: cargo test -p stellar-agent-mcp --lib -- rule_create rules::
+        run: "cargo test -p stellar-agent-mcp --lib -- rule_create rules::"
 
   machete:
     name: unused-deps
