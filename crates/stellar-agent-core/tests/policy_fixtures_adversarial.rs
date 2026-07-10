@@ -372,7 +372,7 @@ fn seed_state_store(store: &PolicyStateStore, profile_name: &str, seeds: &[State
     for seed in seeds {
         let ts_ms = now_ms.saturating_sub(seed.offset_secs_ago.saturating_mul(1_000));
         store
-            .append(&key, ts_ms, seed.amount_stroops)
+            .append(&key, ts_ms, i128::from(seed.amount_stroops))
             .expect("state store append must succeed");
     }
 }

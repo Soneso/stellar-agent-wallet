@@ -59,6 +59,38 @@ pub(crate) fn acquire_value_audit_writer(
 /// append the row logs a `tracing::warn!` and returns without disturbing the
 /// caller. Callers construct `entry` with the gate-derived legs already in hand
 /// (e.g. [`stellar_agent_core::audit_log::AuditEntry::new_value_action_submitted`]).
+/// Constructs and emits the allow-path `value_action_submitted` row for a
+/// confirmed CLI submit: the SAME legs the policy gate sized
+/// (single-derivation invariant), the redacted transaction hash, and the
+/// confirmed ledger. Non-fatal, via [`emit_value_audit_row`].
+pub(crate) fn emit_value_action_submitted_row(
+    profile: &Profile,
+    profile_name: &str,
+    tool: &'static str,
+    chain_id: &str,
+    effects: Option<&stellar_agent_core::policy::v1::ValueEffects>,
+    tx_hash: &str,
+    ledger: u32,
+) {
+    let legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> = effects
+        .map(|e| e.legs().iter().map(Into::into).collect())
+        .unwrap_or_default();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let tx_redacted = stellar_agent_network::submit::redact_tx_hash(tx_hash);
+    let entry = AuditEntry::new_value_action_submitted(
+        tool,
+        chain_id,
+        legs,
+        tx_redacted.as_str(),
+        ledger,
+        stellar_agent_core::audit_log::PolicyDecision::Allow,
+        None,
+        None,
+        &request_id,
+    );
+    emit_value_audit_row(profile, profile_name, entry);
+}
+
 pub(crate) fn emit_value_audit_row(profile: &Profile, profile_name: &str, entry: AuditEntry) {
     let Some(writer_arc) = acquire_value_audit_writer(profile, profile_name) else {
         return;

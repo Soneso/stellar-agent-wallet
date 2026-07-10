@@ -922,9 +922,20 @@ fn parse_criterion(
                     }
                 }
             }
-            Ok(Box::new(CounterpartyAllowlistCriterion::new(
-                kinds, allowlist,
-            )))
+            // `gate_inflows`: KNOWN_ISSUER-only opt-in, absent → false so
+            // existing policy files parse unchanged.
+            let gate_inflows = match table.get("gate_inflows") {
+                None => false,
+                Some(item) => item
+                    .as_bool()
+                    .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+                        detail: format!("{loc}: `gate_inflows` must be a boolean"),
+                    })?,
+            };
+            Ok(Box::new(
+                CounterpartyAllowlistCriterion::new(kinds, allowlist)
+                    .with_gate_inflows(gate_inflows),
+            ))
         }
         "minimum_reserve" => {
             let margin_stroops = require_i64(table, "margin_stroops", &loc)?;
@@ -2022,6 +2033,103 @@ garbage = "not-a-number"
         let doc = load_signed_policy(&path, "alice", &pk).unwrap();
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(doc.rules[0].criteria[0].kind(), "counterparty_allowlist");
+    }
+
+    /// Constructs an `EvalContext` carrying a single inflow (`LendWithdraw`,
+    /// non-debit) leg with `asset`, for the `gate_inflows` loader tests below.
+    /// A bespoke context (rather than `eval_first_criterion`, which derives
+    /// the value descriptor from `(tool.name, args)`) is required because no
+    /// classic-tool name derives an inflow leg — the descriptor must be
+    /// supplied directly, mirroring the DeFi dispatch sites.
+    fn eval_first_criterion_with_inflow_leg(
+        doc: &PolicyDocument,
+        asset: &str,
+    ) -> Option<DenyReason> {
+        use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
+
+        let tool = test_tool("stellar_blend_lend");
+        let profile = test_profile();
+        let args = serde_json::json!({});
+        let store = PolicyStateStore::new();
+        let leg = ValueLeg {
+            kind: ActionKind::LendWithdraw,
+            amount: Some(1),
+            asset: Some(asset.to_owned()),
+            destination: Some("CAAA".to_owned()),
+        };
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+            .with_value(ValueClass::Value(ValueEffects::single(leg)));
+        doc.rules[0].criteria[0]
+            .evaluate(&ctx)
+            .expect("criterion evaluation must succeed")
+    }
+
+    /// `gate_inflows` absent from the TOML criterion table parses to
+    /// `false` — an inflow leg from an issuer not on the allowlist is still
+    /// allowed, pinning that existing policy files (authored before this
+    /// flag existed) parse and behave unchanged.
+    #[test]
+    fn criterion_counterparty_allowlist_gate_inflows_absent_defaults_false() {
+        let (sk, pk) = make_keypair();
+        let dir = TempDir::new().unwrap();
+        let body = body_with_criterion(
+            r#"{ kind = "counterparty_allowlist", kinds = ["KNOWN_ISSUER"], allowlist = ["USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"] }"#,
+        );
+        let toml = make_signed_toml(&body, &sk, "GABCDE");
+        let path = write_policy(&dir, "alice.toml", &toml);
+
+        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let result = eval_first_criterion_with_inflow_leg(
+            &doc,
+            "MYTOKEN:GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+        );
+        assert!(
+            result.is_none(),
+            "gate_inflows absent must default to false and not gate the inflow leg, \
+             got {result:?}"
+        );
+    }
+
+    /// `gate_inflows = true` round-trips through the TOML parser: an inflow
+    /// leg from an issuer not on the allowlist now denies.
+    #[test]
+    fn criterion_counterparty_allowlist_gate_inflows_true_round_trips() {
+        let (sk, pk) = make_keypair();
+        let dir = TempDir::new().unwrap();
+        let body = body_with_criterion(
+            r#"{ kind = "counterparty_allowlist", kinds = ["KNOWN_ISSUER"], allowlist = ["USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"], gate_inflows = true }"#,
+        );
+        let toml = make_signed_toml(&body, &sk, "GABCDE");
+        let path = write_policy(&dir, "alice.toml", &toml);
+
+        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let result = eval_first_criterion_with_inflow_leg(
+            &doc,
+            "MYTOKEN:GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+        );
+        assert!(
+            matches!(result, Some(DenyReason::CounterpartyDenied { ref kind, .. }) if kind == "KNOWN_ISSUER"),
+            "gate_inflows = true in TOML must round-trip to true and gate the inflow leg, \
+             got {result:?}"
+        );
+    }
+
+    /// `gate_inflows` present but non-boolean is a parse error (fail-closed).
+    #[test]
+    fn criterion_counterparty_allowlist_gate_inflows_non_bool_fails_to_load() {
+        let (sk, pk) = make_keypair();
+        let dir = TempDir::new().unwrap();
+        let body = body_with_criterion(
+            r#"{ kind = "counterparty_allowlist", kinds = ["KNOWN_ISSUER"], allowlist = ["USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"], gate_inflows = "yes" }"#,
+        );
+        let toml = make_signed_toml(&body, &sk, "GABCDE");
+        let path = write_policy(&dir, "alice.toml", &toml);
+
+        let result = load_signed_policy(&path, "alice", &pk);
+        assert!(
+            matches!(result, Err(PolicyError::PolicyFileParseFailed { .. })),
+            "a non-boolean gate_inflows must fail to load, got {result:?}"
+        );
     }
 
     #[test]

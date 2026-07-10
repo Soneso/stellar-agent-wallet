@@ -204,9 +204,8 @@ impl Criterion for BundlePerPeriodCapCriterion {
 
         // Accumulate inner amounts against the period cap, tracking which inner
         // tips the sum.  Only `TokenTransfer` inners whose asset matches fire.
-        // `i128` end-to-end (no clamp): `period_used_recorded` is widened from
-        // the state store's own storage type once, up front.
-        let period_used_recorded: i128 = i128::from(period_used_recorded);
+        // `i128` end-to-end (no clamp): `period_used_recorded` is already
+        // `i128` from the state store (see `PolicyStateStore::query_window`).
         let mut running_sum: i128 = 0;
 
         for (idx, inner) in view.inners.iter().enumerate() {

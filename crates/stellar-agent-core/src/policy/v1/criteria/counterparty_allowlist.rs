@@ -20,11 +20,14 @@
 //! ```toml
 //! { kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], allowlist = ["GABC...", "GXYZ..."] }
 //! { kind = "counterparty_allowlist", kinds = ["KNOWN_ISSUER"], allowlist = ["USDC:GA5Z..."] }
+//! { kind = "counterparty_allowlist", kinds = ["KNOWN_ISSUER"], allowlist = ["USDC:GA5Z..."], gate_inflows = true }
 //! { kind = "counterparty_allowlist", kinds = ["HOME_DOMAIN"], allowlist = ["circle.com", "stellar.org"] }
 //! ```
 //!
 //! `kinds` selects which counterparty dimension(s) to check; `allowlist` is
-//! the approved set for all listed kinds.
+//! the approved set for all listed kinds. `gate_inflows` (bool, default
+//! `false`) is a `KNOWN_ISSUER`-only opt-in — see the KNOWN_ISSUER section
+//! below.
 //!
 //! # G_ACCOUNT logic
 //!
@@ -43,6 +46,27 @@
 //! issuer G-strkey is matched against the allowlist entries of the form
 //! `"CODE:Gissuer"`.  A native-asset payment passes through (no issuer to
 //! check).
+//!
+//! ## Debit-only scoping (default) and the `gate_inflows` opt-in
+//!
+//! By default `KNOWN_ISSUER` checks only DEBIT legs (an outflow leaving the
+//! wallet) — an inflow leg (e.g. a Blend withdraw/borrow or a vault
+//! withdrawal, [`ActionKind::carries_debit`](crate::policy::v1::value::ActionKind::carries_debit)
+//! `== false`) is never scrutinised, so tokens received from an
+//! un-allowlisted issuer are not gated. Setting the criterion's `gate_inflows`
+//! flag to `true` (TOML: `gate_inflows = true`; default `false`, so existing
+//! policy files parse unchanged and existing rules keep today's debit-only
+//! behavior) extends `KNOWN_ISSUER` to evaluate EVERY leg of the descriptor,
+//! debit and inflow alike: an inflow leg whose asset issuer is not
+//! allowlisted denies with the same [`DenyReason::CounterpartyDenied`] shape,
+//! with an inflow-specific `value` detail so an operator can distinguish an
+//! inflow denial from a debit denial in triage. An inflow leg whose asset is
+//! `None` (unresolved — e.g. a share-denominated withdrawal with no
+//! resolvable underlying asset) denies fail-closed when `gate_inflows` is
+//! `true`, the same posture as the existing asset-`None` debit handling.
+//! `gate_inflows` affects `KNOWN_ISSUER` only; the other counterparty kinds
+//! (`G_ACCOUNT` / `C_ACCOUNT` / `HOME_DOMAIN`) keep their existing leg
+//! scoping regardless of this flag.
 //!
 //! # HOME_DOMAIN logic — trust model
 //!
@@ -208,10 +232,16 @@ pub struct CounterpartyAllowlistCriterion {
     /// Approved counterparty entries.  For `G_ACCOUNT`/`C_ACCOUNT` these are
     /// strkeys; for `KNOWN_ISSUER` these are `"CODE:Gissuer"` strings.
     allowlist: Vec<String>,
+    /// `KNOWN_ISSUER`-only opt-in: when `true`, evaluates every leg of the
+    /// descriptor (debit and inflow alike) instead of debit legs only.  See
+    /// the module-level `# KNOWN_ISSUER logic` section.  Defaults to `false`.
+    gate_inflows: bool,
 }
 
 impl CounterpartyAllowlistCriterion {
-    /// Constructs a new [`CounterpartyAllowlistCriterion`].
+    /// Constructs a new [`CounterpartyAllowlistCriterion`] with `gate_inflows`
+    /// defaulted to `false` (today's debit-only `KNOWN_ISSUER` scoping,
+    /// unchanged). Use [`Self::with_gate_inflows`] to opt in.
     ///
     /// # Examples
     ///
@@ -227,7 +257,38 @@ impl CounterpartyAllowlistCriterion {
     /// ```
     #[must_use]
     pub fn new(kinds: Vec<CounterpartyKind>, allowlist: Vec<String>) -> Self {
-        Self { kinds, allowlist }
+        Self {
+            kinds,
+            allowlist,
+            gate_inflows: false,
+        }
+    }
+
+    /// Sets the `KNOWN_ISSUER`-only `gate_inflows` opt-in.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::policy::v1::criteria::counterparty_allowlist::{
+    ///     CounterpartyAllowlistCriterion, CounterpartyKind,
+    /// };
+    ///
+    /// let criterion = CounterpartyAllowlistCriterion::new(
+    ///     vec![CounterpartyKind::KnownIssuer],
+    ///     vec!["USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN".to_owned()],
+    /// )
+    /// .with_gate_inflows(true);
+    /// ```
+    #[must_use]
+    pub fn with_gate_inflows(mut self, gate_inflows: bool) -> Self {
+        self.gate_inflows = gate_inflows;
+        self
+    }
+
+    /// Returns whether the `KNOWN_ISSUER`-only inflow-gating opt-in is set.
+    #[must_use]
+    pub fn gate_inflows(&self) -> bool {
+        self.gate_inflows
     }
 }
 
@@ -415,13 +476,19 @@ impl CounterpartyAllowlistCriterion {
         Ok(None)
     }
 
-    /// Checks each debit leg's `asset` issuer against the allowlist.
+    /// Checks each leg's `asset` issuer against the allowlist.
     ///
-    /// A native-asset debit leg has no issuer and is skipped. A debit leg whose
-    /// asset is `None` (unresolved) denies fail-closed
-    /// ([`DenyReason::CounterpartyDenied`], `kind = "KNOWN_ISSUER"`): the
-    /// operator asked to bound issuers and this leg's issuer cannot be
-    /// established, so it is never waved through.
+    /// Debit legs are always checked. Inflow legs (`carries_debit() ==
+    /// false`) are checked only when `self.gate_inflows` is `true` — the
+    /// default (`false`) preserves today's debit-only scoping exactly.
+    ///
+    /// A native-asset leg has no issuer and is skipped, debit or inflow
+    /// alike. A checked leg whose asset is `None` (unresolved) denies
+    /// fail-closed ([`DenyReason::CounterpartyDenied`], `kind =
+    /// "KNOWN_ISSUER"`): the operator asked to bound issuers and this leg's
+    /// issuer cannot be established, so it is never waved through. An inflow
+    /// denial carries a `value` detail distinct from a debit denial's, so an
+    /// operator can tell the direction apart during triage.
     ///
     /// # Errors
     ///
@@ -434,17 +501,23 @@ impl CounterpartyAllowlistCriterion {
         effects: &ValueEffects,
     ) -> Result<Option<DenyReason>, PolicyError> {
         for leg in effects.legs() {
-            if !leg.kind.carries_debit() {
+            let is_debit = leg.kind.carries_debit();
+            if !is_debit && !self.gate_inflows {
                 continue;
             }
-            // A debit leg whose asset the dispatch site could not resolve cannot
-            // be checked against the issuer allowlist, so it denies fail-closed
-            // (design §2.2) — mirroring the None-destination posture in
-            // `check_g_account_legs`. A `None` here is never a silent pass.
+            // A checked leg whose asset the dispatch site could not resolve
+            // cannot be checked against the issuer allowlist, so it denies
+            // fail-closed — mirroring the None-destination
+            // posture in `check_g_account_legs`. A `None` here is never a
+            // silent pass, for either direction.
             let Some(asset_str) = leg.asset.as_deref() else {
                 return Ok(Some(DenyReason::CounterpartyDenied {
                     kind: "KNOWN_ISSUER".to_owned(),
-                    value: String::new(),
+                    value: if is_debit {
+                        String::new()
+                    } else {
+                        "inflow leg carries no resolvable asset".to_owned()
+                    },
                 }));
             };
             if asset_str.eq_ignore_ascii_case("native") || asset_str.eq_ignore_ascii_case("xlm") {
@@ -464,7 +537,11 @@ impl CounterpartyAllowlistCriterion {
             if !on_list {
                 return Ok(Some(DenyReason::CounterpartyDenied {
                     kind: "KNOWN_ISSUER".to_owned(),
-                    value: issuer,
+                    value: if is_debit {
+                        issuer
+                    } else {
+                        format!("inflow leg issuer {issuer} not allowlisted")
+                    },
                 }));
             }
         }
@@ -1003,6 +1080,181 @@ mod tests {
             matches!(&result, Some(DenyReason::CounterpartyDenied { kind, .. }) if kind.as_str() == "KNOWN_ISSUER"),
             "a debit leg with no resolvable asset must deny under a KNOWN_ISSUER rule, got {result:?}"
         );
+    }
+
+    // ── gate_inflows tests ───────────────────────────────────────────────────
+
+    /// Constructs an inflow (`LendWithdraw`, non-debit) leg with the given
+    /// asset for the `gate_inflows` test matrix.
+    fn inflow_leg(asset: Option<&str>) -> crate::policy::v1::value::ValueLeg {
+        use crate::policy::v1::value::ActionKind;
+        crate::policy::v1::value::ValueLeg {
+            kind: ActionKind::LendWithdraw,
+            amount: Some(1),
+            asset: asset.map(str::to_owned),
+            destination: Some("CAAA".to_owned()),
+        }
+    }
+
+    /// `gate_inflows` defaults to `false`: an inflow leg from an issuer NOT on
+    /// the allowlist is allowed — pins today's debit-only scoping unchanged.
+    #[test]
+    fn gate_inflows_default_false_allows_unknown_issuer_inflow() {
+        use crate::policy::v1::value::{ValueClass, ValueEffects};
+
+        let tool = make_tool("stellar_blend_lend");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        // Allowlist does NOT include this issuer; with gate_inflows unset
+        // (default false) the inflow leg must still pass.
+        let criterion = CounterpartyAllowlistCriterion::new(
+            vec![CounterpartyKind::KnownIssuer],
+            vec![format!("USDC:{G_DENIED}")],
+        );
+        let args = json!({});
+        let leg = inflow_leg(Some(&format!("MYTOKEN:{USDC_ISSUER}")));
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+            .with_value(ValueClass::Value(ValueEffects::single(leg)));
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            result.is_none(),
+            "gate_inflows=false (default) must not gate an inflow leg, got {result:?}"
+        );
+    }
+
+    /// `gate_inflows = true`: an inflow leg from an issuer NOT on the
+    /// allowlist denies, with a `value` detail distinct from a debit denial.
+    #[test]
+    fn gate_inflows_true_denies_unknown_issuer_inflow() {
+        use crate::policy::v1::value::{ValueClass, ValueEffects};
+
+        let tool = make_tool("stellar_blend_lend");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = CounterpartyAllowlistCriterion::new(
+            vec![CounterpartyKind::KnownIssuer],
+            vec![format!("USDC:{G_DENIED}")],
+        )
+        .with_gate_inflows(true);
+        let args = json!({});
+        let leg = inflow_leg(Some(&format!("MYTOKEN:{USDC_ISSUER}")));
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+            .with_value(ValueClass::Value(ValueEffects::single(leg)));
+        let result = criterion.evaluate(&ctx).unwrap();
+        match result {
+            Some(DenyReason::CounterpartyDenied {
+                ref kind,
+                ref value,
+            }) => {
+                assert_eq!(kind, "KNOWN_ISSUER");
+                assert!(
+                    value.contains("inflow") && value.contains(USDC_ISSUER),
+                    "an inflow denial must carry an inflow-specific detail; got: {value}"
+                );
+            }
+            other => panic!("gate_inflows=true must deny an unlisted-issuer inflow; got {other:?}"),
+        }
+    }
+
+    /// `gate_inflows = true`: an inflow leg from an ALLOWLISTED issuer passes.
+    #[test]
+    fn gate_inflows_true_allows_allowlisted_issuer_inflow() {
+        use crate::policy::v1::value::{ValueClass, ValueEffects};
+
+        let tool = make_tool("stellar_blend_lend");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = CounterpartyAllowlistCriterion::new(
+            vec![CounterpartyKind::KnownIssuer],
+            vec![format!("USDC:{USDC_ISSUER}")],
+        )
+        .with_gate_inflows(true);
+        let args = json!({});
+        let leg = inflow_leg(Some(&format!("USDC:{USDC_ISSUER}")));
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+            .with_value(ValueClass::Value(ValueEffects::single(leg)));
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            result.is_none(),
+            "gate_inflows=true must allow an allowlisted-issuer inflow, got {result:?}"
+        );
+    }
+
+    /// `gate_inflows = true`: an inflow leg with no resolvable asset denies
+    /// fail-closed, the same posture as the existing asset-`None` debit
+    /// handling.
+    #[test]
+    fn gate_inflows_true_asset_none_inflow_denies_fail_closed() {
+        use crate::policy::v1::value::{ValueClass, ValueEffects};
+
+        let tool = make_tool("stellar_blend_lend");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = CounterpartyAllowlistCriterion::new(
+            vec![CounterpartyKind::KnownIssuer],
+            vec![format!("USDC:{USDC_ISSUER}")],
+        )
+        .with_gate_inflows(true);
+        let args = json!({});
+        let leg = inflow_leg(None);
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+            .with_value(ValueClass::Value(ValueEffects::single(leg)));
+        let result = criterion.evaluate(&ctx).unwrap();
+        match result {
+            Some(DenyReason::CounterpartyDenied {
+                ref kind,
+                ref value,
+            }) => {
+                assert_eq!(kind, "KNOWN_ISSUER");
+                assert!(
+                    value.contains("inflow"),
+                    "an asset-None inflow denial must carry an inflow-specific detail; \
+                     got: {value}"
+                );
+            }
+            other => panic!("gate_inflows=true must deny an asset-None inflow; got {other:?}"),
+        }
+    }
+
+    /// `gate_inflows = true`: a debit leg's behavior is unchanged — an
+    /// unlisted-issuer debit still denies with the plain (non-inflow) `value`
+    /// shape, exactly as it does with `gate_inflows` unset.
+    #[test]
+    fn gate_inflows_true_debit_leg_behavior_unchanged() {
+        use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
+
+        let tool = make_tool("stellar_blend_lend");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = CounterpartyAllowlistCriterion::new(
+            vec![CounterpartyKind::KnownIssuer],
+            vec![format!("USDC:{G_DENIED}")],
+        )
+        .with_gate_inflows(true);
+        let args = json!({});
+        let leg = ValueLeg {
+            kind: ActionKind::Lend,
+            amount: Some(1),
+            asset: Some(format!("MYTOKEN:{USDC_ISSUER}")),
+            destination: Some("CAAA".to_owned()),
+        };
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+            .with_value(ValueClass::Value(ValueEffects::single(leg)));
+        let result = criterion.evaluate(&ctx).unwrap();
+        match result {
+            Some(DenyReason::CounterpartyDenied {
+                ref kind,
+                ref value,
+            }) => {
+                assert_eq!(kind, "KNOWN_ISSUER");
+                assert_eq!(
+                    value, USDC_ISSUER,
+                    "a debit denial's value must stay the bare issuer, not the inflow phrasing, \
+                     even when gate_inflows is true"
+                );
+            }
+            other => panic!("unlisted-issuer debit must still deny; got {other:?}"),
+        }
     }
 
     // ── HOME_DOMAIN tests ─────────────────────────────────────────────────────

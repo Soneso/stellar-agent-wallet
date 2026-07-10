@@ -7,6 +7,17 @@
 //! configured window are evicted on each read pass.
 //!
 //! The store is in-process only; persistence across restarts is not provided.
+//! Every entry it holds is therefore reconstructed fresh at process start —
+//! there is no on-disk wire form or legacy-numeric-vs-string boundary for this
+//! store to migrate across.
+//!
+//! # Accumulator width
+//!
+//! The recorded amount is `i128`, exact across the full range a token
+//! quantity or an aggregated per-period stroop total can take (a Soroban SAC
+//! transfer, or a rolling-window sum across many legs, can exceed
+//! `i64::MAX`). `query_window` sums entries with `i128::saturating_add`; the
+//! call-count field stays `u32` (call counts never approach that range).
 //!
 //! # Sliding-window API pattern
 //!
@@ -145,12 +156,14 @@ impl StateKey {
 #[derive(Debug)]
 pub struct PolicyStateStore {
     /// Map from state key to a deque of (timestamp_ms, amount_or_count)
-    /// entries in insertion order (oldest at front).
+    /// entries in insertion order (oldest at front).  The amount is `i128`
+    /// (see the module-level "Accumulator width" section) — exact across the
+    /// full range a per-period stroop total can take.
     ///
     /// `Mutex<HashMap<...>>` enables `Send + Sync` without `parking_lot`
     /// (not yet a workspace dep; std Mutex is adequate here because this
     /// store is never held across an await point).
-    inner: Mutex<HashMap<StateKey, VecDeque<(u64, i64)>>>,
+    inner: Mutex<HashMap<StateKey, VecDeque<(u64, i128)>>>,
 }
 
 /// Error variants for [`PolicyStateStore`] operations.
@@ -228,7 +241,11 @@ impl PolicyStateStore {
     /// assert_eq!(sum, 100);
     /// assert_eq!(count, 1);
     /// ```
-    pub fn query_window(&self, key: &StateKey, now_ms: u64) -> Result<(i64, u32), StateStoreError> {
+    pub fn query_window(
+        &self,
+        key: &StateKey,
+        now_ms: u64,
+    ) -> Result<(i128, u32), StateStoreError> {
         let mut guard = self
             .inner
             .lock()
@@ -258,7 +275,7 @@ impl PolicyStateStore {
             deque.pop_front();
         }
 
-        let mut sum: i64 = 0;
+        let mut sum: i128 = 0;
         let mut count: u32 = 0;
         for &(_, amount) in deque.iter() {
             sum = sum.saturating_add(amount);
@@ -294,7 +311,7 @@ impl PolicyStateStore {
         &self,
         key: &StateKey,
         timestamp_ms: u64,
-        amount_or_count: i64,
+        amount_or_count: i128,
     ) -> Result<(), StateStoreError> {
         let mut guard = self
             .inner
@@ -444,5 +461,89 @@ mod tests {
         let (sum, count) = store.query_window(&key(), 0).unwrap();
         assert_eq!(sum, 0);
         assert_eq!(count, 0);
+    }
+
+    // ── i128 accumulator round-trip matrix ──────────────────────────────────
+    //
+    // Every shape a window record can hold, written via the real `append` /
+    // `query_window` API pair and read back exactly. This store has no
+    // on-disk form (see the module-level doc), so "round-trip" here means:
+    // write via one store handle, read via `query_window` — the only
+    // persistence boundary this store has.
+
+    /// Fresh: an empty store's query returns `(0, 0)` exactly.
+    #[test]
+    fn round_trip_fresh_store_reads_zero() {
+        let store = PolicyStateStore::new();
+        let k = key();
+        let (sum, count) = store.query_window(&k, 1_000_000).unwrap();
+        assert_eq!(sum, 0_i128);
+        assert_eq!(count, 0);
+    }
+
+    /// Accumulated, small (well within the old `i64` width): several entries
+    /// summing to a value any `i64`-backed store could also have held — pins
+    /// that ordinary sub-`i64::MAX` accounting is unaffected by the widening.
+    #[test]
+    fn round_trip_accumulated_small_total_reads_exact() {
+        let store = PolicyStateStore::new();
+        let k = key();
+        store.append(&k, 1_000_000, 500_000_000).unwrap();
+        store.append(&k, 1_100_000, 250_000_000).unwrap();
+        store.append(&k, 1_200_000, 250_000_000).unwrap();
+        let (sum, count) = store.query_window(&k, 1_300_000).unwrap();
+        assert_eq!(sum, 1_000_000_000_i128);
+        assert_eq!(count, 3);
+    }
+
+    /// A single entry at exactly `i64::MAX` — the old accumulator's ceiling —
+    /// round-trips exactly under the widened `i128` type.
+    #[test]
+    fn round_trip_single_entry_at_i64_max_reads_exact() {
+        let store = PolicyStateStore::new();
+        let k = key();
+        let at_i64_max = i128::from(i64::MAX);
+        store.append(&k, 1_000_000, at_i64_max).unwrap();
+        let (sum, count) = store.query_window(&k, 1_100_000).unwrap();
+        assert_eq!(sum, at_i64_max);
+        assert_eq!(count, 1);
+    }
+
+    /// A single entry strictly above `i64::MAX` round-trips exactly — the
+    /// core new capability: no truncation, wraparound, or saturation to
+    /// `i64::MAX`.
+    #[test]
+    fn round_trip_single_entry_above_i64_max_reads_exact() {
+        let store = PolicyStateStore::new();
+        let k = key();
+        let beyond_i64_max = i128::from(i64::MAX) + 1_000;
+        store.append(&k, 1_000_000, beyond_i64_max).unwrap();
+        let (sum, count) = store.query_window(&k, 1_100_000).unwrap();
+        assert_eq!(
+            sum, beyond_i64_max,
+            "a single above-i64::MAX entry must read back exactly, not clamped to i64::MAX"
+        );
+        assert_eq!(count, 1);
+    }
+
+    /// Several entries whose SUM exceeds `i64::MAX`, though no single entry
+    /// does — proves the accumulation itself (not just a single stored value)
+    /// is exact across the boundary.
+    #[test]
+    fn round_trip_accumulated_sum_above_i64_max_reads_exact() {
+        let store = PolicyStateStore::new();
+        let k = key();
+        let half = i128::from(i64::MAX) / 2 + 1_000_000_000;
+        store.append(&k, 1_000_000, half).unwrap();
+        store.append(&k, 1_100_000, half).unwrap();
+        store.append(&k, 1_200_000, half).unwrap();
+        let expected = half.saturating_mul(3);
+        assert!(
+            expected > i128::from(i64::MAX),
+            "test fixture must actually cross the i64::MAX boundary"
+        );
+        let (sum, count) = store.query_window(&k, 1_300_000).unwrap();
+        assert_eq!(sum, expected);
+        assert_eq!(count, 3);
     }
 }

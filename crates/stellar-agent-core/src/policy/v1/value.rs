@@ -275,7 +275,10 @@ impl ValueLeg {
 pub enum OpaqueReason {
     /// The tool signs a caller-supplied transaction envelope whose value
     /// effect the wallet does not decode (`sep43_sign_transaction`,
-    /// `sep43_sign_and_submit_transaction`).
+    /// `sep43_sign_and_submit_transaction`; also the CLI `pay`/`claim`
+    /// staged `--sign-only` / `--submit-only` gate when the supplied
+    /// envelope does not decode into a sized shape via
+    /// [`crate::envelope_decode::decode_authoritative_args`]).
     RawTransactionSignature,
     /// The tool signs a caller-supplied Soroban authorization entry
     /// (`sep43_sign_auth_entry`).

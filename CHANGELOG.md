@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `counterparty_allowlist`'s `KNOWN_ISSUER` kind gains an opt-in `gate_inflows`
+  flag (default `false`, so existing policy files parse and behave unchanged).
+  When `true`, `KNOWN_ISSUER` evaluates every leg of the descriptor — debit
+  and inflow alike — instead of debit legs only, so tokens received from an
+  un-allowlisted issuer (Blend withdraw/borrow proceeds, vault withdrawals)
+  are gated too. An inflow leg whose asset is unresolvable denies fail-closed,
+  the same posture as the existing debit handling. The other counterparty
+  kinds (`G_ACCOUNT` / `C_ACCOUNT` / `HOME_DOMAIN`) are unaffected. (#39)
+
 - `profile enroll-owner-key` enrols the policy-file owner ed25519 PUBLIC key
   from an operator-held seed, and `profile sign-policy` signs a V1 policy file
   with that seed so the engine accepts it. Together they make
@@ -74,6 +83,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CLI `pay --sign-only` / `--submit-only` and `claim --sign-only` /
+  `--submit-only` now evaluate operator policy on the supplied envelope before
+  signing or broadcasting, instead of running unconditionally under
+  `policy.engine = "v1"`. Each stage decodes the envelope through the same
+  decoder the MCP `stellar_pay_commit` / `stellar_claim_commit` path uses and
+  evaluates the decoded amount/asset/destination — sizing comes from the
+  envelope, not caller-supplied args. `--submit-only` gates even though the
+  envelope arrives pre-signed, because broadcasting still spends funds. An
+  envelope the decoder cannot classify into a sized shape follows the
+  opaque-signing posture: denies `policy.deny.unsizable_value_effect` under a
+  matched value rule unless it sets `allow_opaque_signing = true`, mirroring
+  the `stellar_sep43_*` tools' posture. `policy.engine = "noop"` is unaffected
+  — the staged flows remain ungated there, as before. The staged flows
+  match policy rules under the `stellar_pay_commit` / `stellar_claim_commit`
+  tool names (the same names the MCP commit phase matches), not `stellar_pay`
+  / `stellar_claim`: a ruleset that names only the base tools default-denies
+  the staged flows, so operators cover both names, or use `tool = "*"`, for
+  uniform behavior across invocation modes. (#40)
+- The per-period rolling-window accumulator (`PolicyStateStore`) is now
+  `i128`-width: cumulative recorded spend within a rolling window is exact
+  across the full `i128` range, superseding the previous `i64`-width
+  accounting and its fail-closed refusal above `i64::MAX` (#20). The
+  accumulator is in-process state only (no persistence across restarts, as
+  before), so there is no legacy on-disk form to migrate. (#42)
 - Documented that `minimum_reserve` and identity-class criteria
   (`home_domain_resolved`) are inapplicable to the smart-account verbs
   (`stellar_blend_lend`, `stellar_dex_trade`, `stellar_defindex_vault_deposit`,
@@ -134,12 +167,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   single-transaction debit above `i64::MAX` is represented exactly instead of
   saturating. These amounts cross the MCP wire as decimal strings
   (JSON-number-unsafe beyond 2^53); consumers must parse them as `i128` /
-  decimal strings rather than `i64`. The persisted per-period window
-  accumulator remains `i64`-width: cumulative recorded spend within a rolling
-  window is tracked exactly up to `i64::MAX` stroops per asset per window, and a
-  per-period rule refuses fail-closed rather than silently saturating when a
-  call's resulting window total would exceed that bound; single-transaction
-  sizing is unaffected. (#20)
+  decimal strings rather than `i64`. (The per-period window accumulator's own
+  width is covered separately above, (#42).) (#20)
 - Breaking (policy file behavior): `counterparty_allowlist`'s `HOME_DOMAIN`
   kind now requires the destination's on-chain `home_domain` to be
   independently VERIFIED through the operator's counterparty cache before the

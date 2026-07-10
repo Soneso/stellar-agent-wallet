@@ -141,7 +141,7 @@ stellar-agent accounts deploy-c \
 Sends a payment from a source account to a destination, enforcing SEP-29 memo-required before signing (see [protocols](../protocols.md)).
 
 - **Signing.** By default the command builds, signs, and submits atomically. Three staged flags split the pipeline: `--build-only` emits the unsigned envelope XDR and exits (no signing); `--sign-only <XDR>` signs a prebuilt envelope and emits signed XDR; `--submit-only <XDR>` submits a pre-signed envelope. The stage flags are mutually exclusive.
-- **Policy.** After the envelope is built and before signing (in both the full pipeline and `--build-only`), the amount/asset/destination are evaluated against `--profile`'s policy engine — the same evaluation the `stellar_pay` MCP tool runs. With no persisted `<name>.toml` profile, an in-memory `Noop`-engine testnet profile is synthesized, so the command works without an authored profile file until an operator opts into `policy.engine = "v1"`. The staged `--sign-only` and `--submit-only` flows are not policy-sized under `v1`: they operate on an opaque prebuilt envelope, so an operator using the split staged pipeline is responsible for sizing at the `--build-only` step, which is gated.
+- **Policy.** After the envelope is built and before signing (in both the full pipeline and `--build-only`), the amount/asset/destination are evaluated against `--profile`'s policy engine — the same evaluation the `stellar_pay` MCP tool runs. With no persisted `<name>.toml` profile, an in-memory `Noop`-engine testnet profile is synthesized, so the command works without an authored profile file until an operator opts into `policy.engine = "v1"`. The staged `--sign-only` and `--submit-only` flows are gated too: each decodes the supplied envelope through the same decoder the MCP `stellar_pay_commit` path uses and evaluates the decoded amount/asset/destination before signing (`--sign-only`) or before broadcasting (`--submit-only` — the envelope arrives pre-signed, but broadcasting still spends funds). An envelope the decoder cannot classify into a sized shape follows the opaque-signing posture: under a matched value rule it denies `policy.deny.unsizable_value_effect` unless the rule sets `allow_opaque_signing = true`. The staged flows match policy rules under the `stellar_pay_commit` tool name (the same name the MCP commit phase matches); a ruleset that names only `stellar_pay` default-denies them, so author rules for both names, or `tool = "*"`, for uniform behavior. Under `policy.engine = "noop"` the staged flows are ungated, matching the rest of the command.
 - **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` returns `network.mainnet_write_forbidden` before any RPC call, with a submit-layer URL rejection as defence in depth.
 - **Relayer.** `--use-oz-relayer` is not implemented in this build. Passing it emits an AGPL-3.0 disclosure to stderr and declines the operation rather than submitting.
 
@@ -212,9 +212,19 @@ asset — an authorized trustline with enough limit headroom exists
   in-memory `Noop`-engine testnet profile is synthesized, so the command works
   without an authored profile file until an operator opts into
   `policy.engine = "v1"`. The staged `--sign-only` and `--submit-only` flows are
-  not policy-sized under `v1`: they operate on an opaque prebuilt envelope, so an
-  operator using the split staged pipeline is responsible for sizing at the
-  `--build-only` step, which is gated.
+  gated too: each decodes the supplied envelope through the same decoder the
+  MCP `stellar_claim_commit` path uses and evaluates it before signing
+  (`--sign-only`) or before broadcasting (`--submit-only` — the envelope
+  arrives pre-signed, but broadcasting still spends funds). An envelope the
+  decoder cannot classify into a sized shape follows the opaque-signing
+  posture: under a matched value rule it denies
+  `policy.deny.unsizable_value_effect` unless the rule sets
+  `allow_opaque_signing = true`. The staged flows match policy rules under the
+  `stellar_claim_commit` tool name (the same name the MCP commit phase
+  matches); a ruleset that names only `stellar_claim` default-denies them, so
+  author rules for both names, or `tool = "*"`, for uniform behavior. Under
+  `policy.engine = "noop"` the staged flows are ungated, matching the rest of
+  the command.
 - **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` returns
   `network.mainnet_write_forbidden` before any RPC call.
 - **Timing.** The predicate is evaluated against the local clock; on-chain

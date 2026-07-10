@@ -202,7 +202,7 @@ Each criterion is a `Box<dyn Criterion>` (`Send + Sync`) with a snake_case kind 
 | `per_tx_cap` | Per-transaction value cap |
 | `per_period_cap` | Sliding-window per-period value cap |
 | `rate_limit` | Sliding-window call-rate limit |
-| `counterparty_allowlist` | Destination allowlist (`ADDRESS` / `HOME_DOMAIN` / `SEP10_IDENTITY` / `ONE_TIME_ADDRESS`) |
+| `counterparty_allowlist` | Destination allowlist (`ADDRESS` / `HOME_DOMAIN` / `SEP10_IDENTITY` / `ONE_TIME_ADDRESS`); `KNOWN_ISSUER` checks debit legs only unless the criterion's `gate_inflows = true` opt-in extends it to inflow legs too |
 | `minimum_reserve` | Minimum-reserve guard (classic-account tools only — see below) |
 | `inner_invocation_count_cap` | Multicall inner-count cap |
 | `bundle_aggregate_cap` | Multicall aggregate-value cap (implicitly enforces the Generic-rejection check below, on any rule that carries it) |

@@ -520,6 +520,89 @@ pub(crate) fn evaluate_value_moving_policy_with_value(
     }
 }
 
+/// Evaluates operator policy for a call whose value effect cannot be sized —
+/// an envelope [`stellar_agent_core::envelope_decode::decode_authoritative_args`]
+/// could not classify into a sized shape (staged `--sign-only` /
+/// `--submit-only` XDR the decoder does not recognise).
+///
+/// Mirrors the MCP `stellar_sep43_sign_transaction` / `stellar_sep43_sign_auth_entry`
+/// opaque-signing posture exactly: builds a [`ToolDescriptor`] with
+/// `value_kind: ToolValueKind::OpaqueSign` (NOT `MovesValue` —
+/// [`PolicyEngineV1`]'s population guard debug-asserts a `MovesValue`
+/// descriptor always carries a resolved [`stellar_agent_core::policy::v1::ValueClass::Value`],
+/// so an opaque call must use the `OpaqueSign` tool-kind instead) and
+/// evaluates through [`PolicyEngine::evaluate_with_value_full`] with
+/// `ValueClass::Opaque(reason)`. Under a matched value rule this denies
+/// `policy.deny.unsizable_value_effect` unless the rule sets
+/// `allow_opaque_signing = true` — the same code, the same rule flag, no new
+/// taxonomy.
+///
+/// Returns `Ok(())` on [`Decision::Allow`]; returns `Err(envelope)` — a
+/// fully-rendered refusal envelope — for every other outcome, mirroring
+/// [`evaluate_value_moving_policy`]'s refusal-message shapes verbatim.
+///
+/// # Errors
+///
+/// Returns `Err(envelope)` on `Decision::Deny`, `Decision::RequireApproval`,
+/// an unexpected `Decision` variant, or a policy-engine evaluation error.
+pub(crate) fn evaluate_opaque_signing_policy(
+    policy_engine: &dyn PolicyEngine,
+    profile: &Profile,
+    tool_name: &'static str,
+    chain_id: &str,
+    reason: stellar_agent_core::policy::v1::OpaqueReason,
+    verb: &str,
+) -> Result<(), Envelope<()>> {
+    let reg = McpToolRegistration {
+        name: tool_name,
+        destructive_hint: true,
+        read_only_hint: false,
+        chain_id_required: true,
+        value_kind: ToolValueKind::OpaqueSign,
+    };
+    let mut tool_descriptor = ToolDescriptor::from_registration(&reg);
+    tool_descriptor.chain_id = chain_id.to_owned();
+
+    // No structured args are available — the envelope did not decode into a
+    // recognised shape, so there is nothing to carry beyond the opaque
+    // classification itself.
+    let policy_args = serde_json::json!({});
+
+    match policy_engine.evaluate_with_value_full(
+        &tool_descriptor,
+        &policy_args,
+        profile,
+        stellar_agent_core::policy::v1::ValueClass::Opaque(reason),
+        None,
+        None,
+        None,
+        None,
+        None,
+    ) {
+        Ok(evaluation) => match evaluation.decision {
+            Decision::Allow => Ok(()),
+            Decision::Deny(reason) => Err(Envelope::<()>::err_raw(
+                format!("policy.deny.{}", reason.code()),
+                format!("{verb} operation denied by operator policy"),
+            )),
+            Decision::RequireApproval(_) => Err(Envelope::<()>::err_raw(
+                "policy.approval_required",
+                format!(
+                    "{verb} operation requires approval; use the MCP server for two-phase approval"
+                ),
+            )),
+            _ => Err(Envelope::<()>::err_raw(
+                "policy.unexpected_decision",
+                "unexpected policy decision — operation refused (fail-closed)".to_owned(),
+            )),
+        },
+        Err(e) => Err(Envelope::<()>::err_raw(
+            "policy.engine_required",
+            format!("{e}"),
+        )),
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────

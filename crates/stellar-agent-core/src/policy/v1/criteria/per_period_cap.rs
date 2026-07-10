@@ -241,9 +241,6 @@ impl Criterion for PerPeriodCapCriterion {
     /// - The required amount field is missing or unparseable.
     /// - [`SystemTime`] is before UNIX epoch (should not occur in practice).
     /// - The state store detects clock skew exceeding 30 seconds.
-    /// - The resulting cumulative window total would exceed the `i64`
-    ///   accounting bound (interim fail-closed guard until the store carries
-    ///   `i128`).
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
         let tool_name = ctx.tool.name.as_str();
 
@@ -345,17 +342,17 @@ impl PerPeriodCapCriterion {
     /// an `(asset, attempted_stroops)` pair.
     ///
     /// The decision arithmetic is `i128` end-to-end (no clamp): the
-    /// state-store-recorded total and the bundle overlay contribution are
-    /// each widened from their own storage type before being combined with
-    /// `attempted_stroops` and compared against `self.max_stroops`.
+    /// state-store-recorded total (itself `i128`; see
+    /// [`crate::policy::v1::criteria::state_store::PolicyStateStore`]) and the
+    /// bundle overlay contribution are combined with `attempted_stroops` and
+    /// compared against `self.max_stroops`, exact across the full `i128`
+    /// range.
     ///
     /// # Errors
     ///
     /// Returns [`PolicyError::CriterionEvaluationFailed`] when [`SystemTime`]
-    /// is before UNIX epoch, the state store detects clock skew exceeding
-    /// 30 seconds, or the resulting cumulative window total would exceed the
-    /// `i64` accounting bound (interim fail-closed guard until the store
-    /// carries `i128`).
+    /// is before UNIX epoch, or the state store detects clock skew exceeding
+    /// 30 seconds.
     fn check_window(
         &self,
         ctx: &EvalContext<'_>,
@@ -390,7 +387,7 @@ impl PerPeriodCapCriterion {
             .unwrap_or(0);
 
         let period_used_stroops =
-            i128::from(period_used_stroops_recorded).saturating_add(bundle_accumulated_stroops);
+            period_used_stroops_recorded.saturating_add(bundle_accumulated_stroops);
 
         // Would-exceed check: period_used + attempted > max?
         let would_use = period_used_stroops.saturating_add(attempted_stroops);
@@ -402,29 +399,6 @@ impl PerPeriodCapCriterion {
                 attempted_stroops,
                 period_used_stroops,
             }));
-        }
-
-        // Interim fail-closed guard at the i128→i64 state-store boundary. The
-        // rolling-window accumulator persists as `i64`. A call the cap would
-        // otherwise allow, but whose resulting cumulative window total
-        // (`would_use`) exceeds `i64::MAX`, cannot be recorded faithfully: the
-        // dispatch site's post-commit `append` would saturate, silently
-        // under-counting the window and raising the effective cap on later
-        // calls. Refuse such a call so the under-count surfaces as a visible
-        // refusal. `would_use >= attempted_stroops >= any single appended debit`,
-        // so this one bound covers both the amount about to be recorded and the
-        // aggregate window total; it holds the store's cumulative at or below
-        // `i64::MAX` by construction, keeping the recorded read faithful.
-        if would_use > i128::from(i64::MAX) {
-            return Err(PolicyError::CriterionEvaluationFailed {
-                detail: format!(
-                    "per_period_cap: rolling-window total for asset '{}' would exceed the \
-                     i64 accounting bound (attempted={attempted_stroops}, \
-                     period_used={period_used_stroops}); refused fail-closed to avoid \
-                     silently under-counting the window",
-                    self.asset
-                ),
-            });
         }
 
         Ok(None)
@@ -1100,26 +1074,33 @@ mod tests {
         );
     }
 
-    /// Interim fail-closed guard at the i128→i64 state-store boundary: a call
-    /// the i128 cap would otherwise ALLOW (cap set above `i64::MAX`), but whose
-    /// resulting cumulative window total exceeds `i64::MAX`, is refused
-    /// fail-closed rather than silently under-counted by the `i64` accumulator.
-    /// Distinct from `debit_leg_amount_beyond_i64_max_denies_without_clamp`,
-    /// where the cap itself denies first; here the cap passes and only the
-    /// store-boundary guard refuses. Nothing is recorded.
+    /// Boundary test: a window total already recorded ABOVE `i64::MAX`
+    /// (via real `PolicyStateStore::append` calls, simulating prior committed
+    /// spend) is read back and combined with an attempted debit EXACTLY — no
+    /// clamp, no fail-closed refusal at the store boundary. A cap set just
+    /// below the exact resulting total denies with the precise
+    /// `period_used_stroops` figure, proving the store no longer truncates
+    /// silently at `i64::MAX`.
     #[test]
     #[serial]
-    fn window_total_beyond_i64_store_bound_denies_fail_closed_nothing_recorded() {
+    fn window_total_above_i64_max_denies_at_exact_cap_boundary() {
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
         let tool = make_tool("stellar_multicall");
         let profile = make_profile();
         let store = PolicyStateStore::new();
         let w = Window::parse("1d").unwrap();
-        // Cap ABOVE i64::MAX so the i128 cap comparison ALLOWS the call; the
-        // store-boundary guard is what must refuse it.
-        let cap: i128 = i128::from(i64::MAX) * 4;
-        let attempted: i128 = i128::from(i64::MAX) + 1_000;
+
+        // Pre-record a window total strictly above i64::MAX.
+        let recorded_total: i128 = i128::from(i64::MAX) + 1_000_000_000;
+        let key = StateKey::new("alice", 1, "native", w.as_secs());
+        let now_ms = system_time_to_ms().unwrap();
+        store.append(&key, now_ms - 1_000, recorded_total).unwrap();
+
+        // Cap set to exactly (recorded_total + attempted) - 1: the attempted
+        // debit must tip it by exactly 1 stroop.
+        let attempted: i128 = 500;
+        let cap: i128 = recorded_total.saturating_add(attempted) - 1;
         let criterion = PerPeriodCapCriterion::new("native".into(), w, cap);
         let args = json!({});
         let leg = ValueLeg {
@@ -1131,21 +1112,55 @@ mod tests {
         let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
 
-        let result = criterion.evaluate(&ctx);
+        let result = criterion.evaluate(&ctx).unwrap();
         assert!(
-            matches!(result, Err(PolicyError::CriterionEvaluationFailed { .. })),
-            "a debit whose cumulative window total exceeds the i64 store bound must be \
-             refused fail-closed even when the i128 cap would allow it, got {result:?}"
+            matches!(result, Some(DenyReason::PerPeriodCapExceeded {
+                period_used_stroops, attempted_stroops, ..
+            }) if period_used_stroops == recorded_total && attempted_stroops == attempted),
+            "a window total above i64::MAX must be read back and compared EXACTLY, \
+             got {result:?}"
         );
+    }
 
-        // Nothing recorded: evaluation is read-only; the window remains empty,
-        // so the refusal cannot have narrowed or written state.
+    /// Boundary test: a window total already recorded ABOVE `i64::MAX`
+    /// still ALLOWS a further debit when the exact `i128` arithmetic keeps
+    /// the resulting total under a (correspondingly large) cap — proving
+    /// exact accounting works in both directions, not just the deny path.
+    #[test]
+    #[serial]
+    fn window_total_above_i64_max_allows_when_still_under_cap() {
+        use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
+
+        let tool = make_tool("stellar_multicall");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let w = Window::parse("1d").unwrap();
+
+        let recorded_total: i128 = i128::from(i64::MAX) + 1_000_000_000;
         let key = StateKey::new("alice", 1, "native", w.as_secs());
         let now_ms = system_time_to_ms().unwrap();
-        let (recorded, _) = store.query_window(&key, now_ms).unwrap();
-        assert_eq!(
-            recorded, 0,
-            "a fail-closed refusal must not record anything into the window"
+        store.append(&key, now_ms - 1_000, recorded_total).unwrap();
+
+        // Cap set to exactly (recorded_total + attempted): the attempted debit
+        // must land exactly AT the cap, which does not exceed it.
+        let attempted: i128 = 500;
+        let cap: i128 = recorded_total.saturating_add(attempted);
+        let criterion = PerPeriodCapCriterion::new("native".into(), w, cap);
+        let args = json!({});
+        let leg = ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(attempted),
+            asset: Some("native".to_owned()),
+            destination: Some("GAAA".to_owned()),
+        };
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+            .with_value(ValueClass::Value(ValueEffects::single(leg)));
+
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            result.is_none(),
+            "a debit landing exactly at the cap (both operands above i64::MAX) must \
+             allow under exact i128 arithmetic, got {result:?}"
         );
     }
 }

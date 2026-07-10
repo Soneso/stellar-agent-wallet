@@ -49,15 +49,25 @@
 //! # Operator policy evaluation
 //!
 //! The profile is resolved (and, when it carries `policy.engine = "v1"`, the
-//! platform keyring store is initialised) before any network build, in both
-//! the full pipeline and `--build-only`. After the envelope is built and
-//! before signing, the resolved amount/asset/destination are evaluated
-//! against the operator-signed `PolicyEngineV1` (V1 profiles) or the
-//! permissive `NoopPolicyEngine` (`Noop` profiles), mirroring the
-//! `stellar_pay` MCP tool's dispatch gate. When `--profile` names no
-//! persisted `<name>.toml` file, an in-memory `Noop`-engine testnet profile is
-//! synthesized so the command keeps working without an authored profile file
-//! — and without ever touching the OS keyring.
+//! platform keyring store is initialised) before any network build, in every
+//! stage. In the full pipeline and `--build-only`, the resolved
+//! amount/asset/destination are evaluated after the envelope is built and
+//! before signing. `--sign-only` and `--submit-only` gate too: each decodes
+//! the supplied envelope through
+//! [`stellar_agent_core::envelope_decode::decode_authoritative_args`] (the
+//! same decoder the MCP `stellar_pay_commit` path uses) and evaluates the
+//! decoded fields before signing or broadcasting — `--submit-only` gates even
+//! though the envelope arrives pre-signed, because broadcasting still spends
+//! funds. An envelope the decoder cannot classify into a sized shape follows
+//! the opaque-signing posture (`policy.deny.unsizable_value_effect` under a
+//! matched value rule, unless the rule sets `allow_opaque_signing = true`).
+//! Every stage evaluates against the operator-signed `PolicyEngineV1` (V1
+//! profiles) or the permissive `NoopPolicyEngine` (`Noop` profiles), mirroring
+//! the `stellar_pay` / `stellar_pay_commit` MCP tools' dispatch gates. When
+//! `--profile` names no persisted `<name>.toml` file, an in-memory
+//! `Noop`-engine testnet profile is synthesized so the command keeps working
+//! without an authored profile file — and without ever touching the OS
+//! keyring.
 //!
 //! # Behavior
 //!
@@ -72,7 +82,8 @@ use clap::{ArgGroup, Args};
 use stellar_agent_core::StellarAmount;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{AuthError, NetworkError, ValidationError, WalletError};
-use stellar_agent_core::policy::v1::AccountIdentityView;
+use stellar_agent_core::policy::PolicyEngine;
+use stellar_agent_core::policy::v1::{AccountIdentityView, AccountReservesView};
 use stellar_xdr::Memo;
 
 use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile};
@@ -87,8 +98,8 @@ use stellar_agent_network::{
 };
 
 use crate::commands::policy_engine::{
-    build_v1_policy_engine, caip2_chain_id_for_network, evaluate_value_moving_policy,
-    load_profile_or_synthesize_testnet, pay_policy_args,
+    build_v1_policy_engine, caip2_chain_id_for_network, evaluate_opaque_signing_policy,
+    evaluate_value_moving_policy, load_profile_or_synthesize_testnet, pay_policy_args,
 };
 use crate::common::network::TargetNetwork;
 use crate::common::render::{render_json, sanitize_for_table};
@@ -375,16 +386,17 @@ where
         return 1;
     }
 
-    // Determine execution stage. Only the gated stages (`--build-only` and
-    // the full pipeline) read the owner key from the keyring via
-    // `build_v1_policy_engine`, so only they receive the injected
-    // profile-loader/keyring-initialiser pair.
+    // Every gated stage reads the owner key from the keyring via
+    // `build_v1_policy_engine` when the resolved profile is V1 — including
+    // `--sign-only` / `--submit-only`, which now gate the decoded envelope
+    // before signing/broadcasting — so all four stages receive the
+    // injected profile-loader/keyring-initialiser pair.
     if args.build_only {
         run_build_only(args, load_profile, init_keyring).await
     } else if let Some(ref xdr) = args.sign_only {
-        run_sign_only(args, xdr).await
+        run_sign_only(args, xdr, load_profile, init_keyring).await
     } else if let Some(ref xdr) = args.submit_only {
-        run_submit_only(args, xdr).await
+        run_submit_only(args, xdr, load_profile, init_keyring).await
     } else {
         run_full_pipeline(args, load_profile, init_keyring).await
     }
@@ -460,7 +472,25 @@ where
     }
 }
 
-async fn run_sign_only(args: &PayArgs, unsigned_xdr: &str) -> i32 {
+async fn run_sign_only<LoadProfile, InitKeyring>(
+    args: &PayArgs,
+    unsigned_xdr: &str,
+    load_profile: LoadProfile,
+    init_keyring: InitKeyring,
+) -> i32
+where
+    LoadProfile: Fn(&str) -> Result<Profile, String>,
+    InitKeyring: Fn() -> Result<(), WalletError>,
+{
+    let profile = match resolve_profile_and_keyring(args, load_profile, init_keyring) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let chain_id = caip2_chain_id_for_network(args.network);
+    if let Err(code) = evaluate_staged_pay_policy(args, unsigned_xdr, chain_id, &profile).await {
+        return code;
+    }
+
     match sign_envelope(args, unsigned_xdr).await {
         Ok(signed_xdr) => {
             let result = PayResult {
@@ -483,9 +513,42 @@ async fn run_sign_only(args: &PayArgs, unsigned_xdr: &str) -> i32 {
     }
 }
 
-async fn run_submit_only(args: &PayArgs, signed_xdr: &str) -> i32 {
+async fn run_submit_only<LoadProfile, InitKeyring>(
+    args: &PayArgs,
+    signed_xdr: &str,
+    load_profile: LoadProfile,
+    init_keyring: InitKeyring,
+) -> i32
+where
+    LoadProfile: Fn(&str) -> Result<Profile, String>,
+    InitKeyring: Fn() -> Result<(), WalletError>,
+{
+    let profile = match resolve_profile_and_keyring(args, load_profile, init_keyring) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let chain_id = caip2_chain_id_for_network(args.network);
+    // The envelope arrives pre-signed, but broadcasting it still spends
+    // funds — gate here even though signing already happened elsewhere.
+    let pay_effects = match evaluate_staged_pay_policy(args, signed_xdr, chain_id, &profile).await {
+        Ok(effects) => effects,
+        Err(code) => return code,
+    };
+
     match submit_envelope(args, signed_xdr).await {
         Ok((signed_xdr, sub_result)) => {
+            // Non-fatal allow-path audit row: the SAME legs the gate sized
+            // (single-derivation invariant), on confirmed submit.
+            crate::commands::value_audit::emit_value_action_submitted_row(
+                &profile,
+                &args.profile,
+                "stellar_pay_commit",
+                chain_id,
+                pay_effects.as_ref(),
+                &sub_result.tx_hash,
+                sub_result.ledger,
+            );
+
             let result = PayResult {
                 envelope_xdr: signed_xdr,
                 tx_hash: Some(sub_result.tx_hash.clone()),
@@ -503,6 +566,186 @@ async fn run_submit_only(args: &PayArgs, signed_xdr: &str) -> i32 {
             print_error(&envelope, args.output);
             1
         }
+    }
+}
+
+/// Resolves the profile and conditionally initialises the platform keyring
+/// store, mirroring `run_build_only` / `run_full_pipeline`'s ordering: the
+/// store is registered before any V1 policy-engine owner-key read.
+fn resolve_profile_and_keyring<LoadProfile, InitKeyring>(
+    args: &PayArgs,
+    load_profile: LoadProfile,
+    init_keyring: InitKeyring,
+) -> Result<Profile, i32>
+where
+    LoadProfile: Fn(&str) -> Result<Profile, String>,
+    InitKeyring: Fn() -> Result<(), WalletError>,
+{
+    let profile = load_profile(&args.profile).map_err(|msg| {
+        print_error(
+            &Envelope::<()>::err_raw("profile.load_failed", msg),
+            args.output,
+        );
+        1
+    })?;
+    if !matches!(profile.policy.engine, PolicyEngineKind::Noop)
+        && let Err(e) = init_keyring()
+    {
+        print_error(&Envelope::<()>::err(&e), args.output);
+        return Err(1);
+    }
+    Ok(profile)
+}
+
+/// Gates a staged (`--sign-only` / `--submit-only`) envelope before it is
+/// signed or broadcast.
+///
+/// Decodes `envelope_xdr` via the SAME decoder the MCP `stellar_pay_commit`
+/// path uses ([`decode_authoritative_args`]), fetches the account views the
+/// decoded fields need, and delegates the decision to
+/// [`dispatch_staged_pay_gate`] — the pure, network-free dispatch this
+/// function's tests exercise directly. Returns `Ok(effects)` on allow
+/// (`Some` when the envelope decoded into a sized shape, `None` for the
+/// no-op engine or an opaque allow); returns `Err(exit_code)` — with the
+/// refusal envelope already rendered — on any refusal.
+async fn evaluate_staged_pay_policy(
+    args: &PayArgs,
+    envelope_xdr: &str,
+    chain_id: &str,
+    profile: &Profile,
+) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, i32> {
+    let policy_engine = match build_v1_policy_engine("pay", &profile.policy.engine, profile) {
+        Ok(pe) => pe,
+        Err(msg) => {
+            print_error(
+                &Envelope::<()>::err_raw("policy.engine_unavailable", msg),
+                args.output,
+            );
+            return Err(1);
+        }
+    };
+
+    let decode_result = stellar_agent_core::envelope_decode::decode_authoritative_args(
+        envelope_xdr,
+        "stellar_pay_commit",
+    );
+
+    // Views are populated only when the decode succeeded — a bounded fetch of
+    // the decoded `source` (feeds `minimum_reserve`) and the
+    // destination-derived `identity_view` (feeds `home_domain_resolved`),
+    // matching `pay`'s established posture (`evaluate_pay_policy`). Held in
+    // owned locals so their borrows outlive the `dispatch_staged_pay_gate`
+    // call below.
+    let mut source_view_holder = None;
+    let mut dest_view_holder = None;
+    if let Ok(ref authoritative_args) = decode_result {
+        let client = match StellarRpcClient::new(&args.rpc_url) {
+            Ok(c) => c,
+            Err(e) => {
+                print_error(&Envelope::<()>::err(&e), args.output);
+                return Err(1);
+            }
+        };
+        let source = authoritative_args
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let destination = authoritative_args
+            .get("destination")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+
+        source_view_holder = match stellar_agent_network::fetch_account(&client, source, &[]).await
+        {
+            Ok(v) => Some(v),
+            Err(e) => {
+                print_error(&Envelope::<()>::err(&e), args.output);
+                return Err(1);
+            }
+        };
+        // Destination fetch is non-fatal, matching `evaluate_pay_policy`.
+        dest_view_holder = stellar_agent_network::fetch_account(&client, destination, &[])
+            .await
+            .ok();
+    }
+    let source_adapter = source_view_holder
+        .as_ref()
+        .map(stellar_agent_network::policy_view::AccountViewAdapter::new);
+    let dest_adapter = dest_view_holder
+        .as_ref()
+        .map(stellar_agent_network::policy_view::AccountViewAdapter::new);
+
+    match dispatch_staged_pay_gate(
+        policy_engine.as_ref(),
+        profile,
+        chain_id,
+        decode_result,
+        source_adapter
+            .as_ref()
+            .map(|a| a as &dyn AccountReservesView),
+        dest_adapter.as_ref().map(|a| a as &dyn AccountIdentityView),
+    ) {
+        Ok(effects) => Ok(effects),
+        Err(envelope) => {
+            print_error(&envelope, args.output);
+            Err(1)
+        }
+    }
+}
+
+/// Pure post-decode dispatch for the staged `pay` gate: no network or
+/// keyring access, so it is exercised directly by tests with a hand-built
+/// [`PolicyEngineV1`](stellar_agent_core::policy::v1::PolicyEngineV1) and a
+/// real (or absent) decode outcome.
+///
+/// `decode_result` is the outcome of decoding the staged envelope via
+/// [`decode_authoritative_args`] under `"stellar_pay_commit"`. `Ok` evaluates
+/// the decoded fields through [`evaluate_value_moving_policy`] under the same
+/// tool name — the same rule-matching scope and wire codes the commit-phase
+/// MCP twin uses, so sizing comes from the ENVELOPE, not caller-supplied
+/// args. `Err` (an envelope the decoder cannot classify: not a
+/// `TransactionV1`, wrong operation count, or an operation kind other than a
+/// payment) follows the opaque-signing posture via
+/// [`evaluate_opaque_signing_policy`]: denies
+/// `policy.deny.unsizable_value_effect` under a matched value rule unless it
+/// sets `allow_opaque_signing = true`.
+///
+/// # Errors
+///
+/// Returns `Err(envelope)` — a fully-rendered refusal envelope — on deny,
+/// approval-required, or an engine error.
+fn dispatch_staged_pay_gate(
+    policy_engine: &dyn PolicyEngine,
+    profile: &Profile,
+    chain_id: &str,
+    decode_result: Result<
+        serde_json::Value,
+        stellar_agent_core::envelope_decode::EnvelopeDecodeError,
+    >,
+    account_view: Option<&dyn AccountReservesView>,
+    identity_view: Option<&dyn AccountIdentityView>,
+) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, Envelope<()>> {
+    match decode_result {
+        Ok(authoritative_args) => evaluate_value_moving_policy(
+            policy_engine,
+            profile,
+            "stellar_pay_commit",
+            stellar_agent_core::policy::ToolValueKind::MovesValue,
+            chain_id,
+            &authoritative_args,
+            "pay",
+            account_view,
+            identity_view,
+        ),
+        Err(_decode_err) => evaluate_opaque_signing_policy(
+            policy_engine,
+            profile,
+            "stellar_pay_commit",
+            chain_id,
+            stellar_agent_core::policy::v1::OpaqueReason::RawTransactionSignature,
+            "pay",
+        )
+        .map(|()| None),
     }
 }
 
@@ -586,30 +829,16 @@ where
     // 3. Submit.
     match submit_envelope(args, &signed_xdr).await {
         Ok((xdr, sub_result)) => {
-            // Non-fatal allow-path audit row carrying the SAME legs the gate
-            // sized (single-derivation invariant), recorded on confirmed submit.
-            let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> = pay_effects
-                .as_ref()
-                .map(|e| e.legs().iter().map(Into::into).collect())
-                .unwrap_or_default();
-            let audit_request_id = uuid::Uuid::new_v4().to_string();
-            let audit_tx_redacted =
-                stellar_agent_network::submit::redact_tx_hash(&sub_result.tx_hash);
-            let audit_entry = stellar_agent_core::audit_log::AuditEntry::new_value_action_submitted(
-                "stellar_pay",
-                chain_id,
-                audit_legs,
-                audit_tx_redacted.as_str(),
-                sub_result.ledger,
-                stellar_agent_core::audit_log::PolicyDecision::Allow,
-                None,
-                None,
-                &audit_request_id,
-            );
-            crate::commands::value_audit::emit_value_audit_row(
+            // Non-fatal allow-path audit row: the SAME legs the gate sized
+            // (single-derivation invariant), on confirmed submit.
+            crate::commands::value_audit::emit_value_action_submitted_row(
                 &profile,
                 &args.profile,
-                audit_entry,
+                "stellar_pay",
+                chain_id,
+                pay_effects.as_ref(),
+                &sub_result.tx_hash,
+                sub_result.ledger,
             );
 
             let result = PayResult {
@@ -1766,6 +1995,290 @@ mod tests {
         assert_eq!(
             code, 1,
             "missing --source must still refuse (unrelated to the keyring gate)"
+        );
+    }
+
+    // ── staged sign/submit-only gate tests ───────────────────────────────────
+    //
+    // `dispatch_staged_pay_gate` is network- and keyring-free, so these tests
+    // exercise it directly with hand-built XDR fixtures and a hand-built
+    // `PolicyEngineV1` — the same construction convention
+    // `commands::policy_engine`'s own gate-parity tests use. `run_sign_only`
+    // and `run_submit_only` both call this SAME function with the SAME
+    // arguments (only the subsequent sign-vs-submit action differs), so
+    // exercising it once here proves both staged stages gate identically.
+
+    use stellar_agent_core::policy::Decision;
+    use stellar_agent_core::policy::v1::PolicyEngineV1;
+    use stellar_agent_core::policy::v1::criteria::per_tx_cap::PerTxCapCriterion;
+    use stellar_agent_core::policy::v1::loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
+    use stellar_xdr::{
+        AccountId, Asset, CreateAccountOp, Limits, MuxedAccount, Operation, OperationBody,
+        PaymentOp, Preconditions, PublicKey as XdrPublicKey, SequenceNumber, Transaction,
+        TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM, WriteXdr,
+    };
+
+    fn g_to_bytes(g: &str) -> [u8; 32] {
+        stellar_strkey::ed25519::PublicKey::from_string(g)
+            .expect("valid G-strkey in test fixture")
+            .0
+    }
+
+    fn g_to_muxed(g: &str) -> MuxedAccount {
+        MuxedAccount::Ed25519(Uint256(g_to_bytes(g)))
+    }
+
+    fn g_to_account_id(g: &str) -> AccountId {
+        AccountId(XdrPublicKey::PublicKeyTypeEd25519(Uint256(g_to_bytes(g))))
+    }
+
+    fn build_envelope_b64(tx_source: &str, op: Operation) -> String {
+        let tx = Transaction {
+            source_account: g_to_muxed(tx_source),
+            fee: 100,
+            seq_num: SequenceNumber(101),
+            cond: Preconditions::None,
+            memo: stellar_xdr::Memo::None,
+            operations: vec![op].try_into().expect("single op vec"),
+            ext: TransactionExt::V0,
+        };
+        let env = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        });
+        env.to_xdr_base64(Limits::none())
+            .expect("XDR encoding must succeed")
+    }
+
+    /// A `stellar_pay`-shaped envelope: a single native `Payment` operation
+    /// for `amount_stroops` from `SOURCE_G` to `DEST_G`.
+    fn pay_envelope_b64(amount_stroops: i64) -> String {
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: g_to_muxed(DEST_G),
+                asset: Asset::Native,
+                amount: amount_stroops,
+            }),
+        };
+        build_envelope_b64(SOURCE_G, op)
+    }
+
+    /// An envelope the pay decoder cannot classify: a `CreateAccount`
+    /// operation presented where a `Payment` is expected.
+    fn unclassifiable_envelope_b64() -> String {
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::CreateAccount(CreateAccountOp {
+                destination: g_to_account_id(DEST_G),
+                starting_balance: 10_000_000,
+            }),
+        };
+        build_envelope_b64(SOURCE_G, op)
+    }
+
+    fn per_tx_cap_engine(max_stroops: i64, allow_opaque_signing: bool) -> PolicyEngineV1 {
+        let rule = PolicyRule {
+            r#match: RuleMatch {
+                tool: "stellar_pay_commit".to_owned(),
+                chain: "*".to_owned(),
+            },
+            criteria: vec![Box::new(PerTxCapCriterion::new(
+                "native".to_owned(),
+                i128::from(max_stroops),
+            ))],
+            decision: Decision::Allow,
+            allow_opaque_signing,
+        };
+        let doc = PolicyDocument {
+            version: 1,
+            scope: ScopeId::AllProfiles,
+            rules: vec![rule],
+            signature: None,
+        };
+        PolicyEngineV1::new(doc, "alice".to_owned())
+    }
+
+    fn staged_test_profile() -> Profile {
+        Profile::builder_testnet(
+            "stellar-agent-signer",
+            "alice",
+            "stellar-agent-nonce",
+            "alice",
+        )
+        .build()
+    }
+
+    fn envelope_code(
+        result: &Result<Option<stellar_agent_core::policy::v1::ValueEffects>, Envelope<()>>,
+    ) -> &str {
+        result
+            .as_ref()
+            .expect_err("expected a refusal envelope")
+            .error
+            .as_ref()
+            .expect("refusal envelope must carry an error block")
+            .code
+            .as_str()
+    }
+
+    /// A within-cap envelope under a satisfied `per_tx_cap` rule allows.
+    #[test]
+    fn dispatch_staged_pay_gate_within_cap_allows() {
+        let engine = per_tx_cap_engine(1_000_000_000, false); // 100 XLM cap
+        let profile = staged_test_profile();
+        let xdr = pay_envelope_b64(500_000_000); // 50 XLM
+        let decode_result = stellar_agent_core::envelope_decode::decode_authoritative_args(
+            &xdr,
+            "stellar_pay_commit",
+        );
+        let result = dispatch_staged_pay_gate(
+            &engine,
+            &profile,
+            "stellar:testnet",
+            decode_result,
+            None,
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "a within-cap staged envelope must allow, got {result:?}"
+        );
+    }
+
+    /// An over-cap envelope denies with the cap's wire code — proving the
+    /// sizing came from the ENVELOPE (the decoded amount), not any
+    /// caller-supplied args (none are passed to `dispatch_staged_pay_gate`
+    /// at all on the `Ok` branch other than the decoded fields).
+    #[test]
+    fn dispatch_staged_pay_gate_over_cap_denies_with_envelope_derived_amount() {
+        let engine = per_tx_cap_engine(1_000_000_000, false); // 100 XLM cap
+        let profile = staged_test_profile();
+        let xdr = pay_envelope_b64(1_500_000_000); // 150 XLM
+        let decode_result = stellar_agent_core::envelope_decode::decode_authoritative_args(
+            &xdr,
+            "stellar_pay_commit",
+        );
+        let result = dispatch_staged_pay_gate(
+            &engine,
+            &profile,
+            "stellar:testnet",
+            decode_result,
+            None,
+            None,
+        );
+        assert_eq!(
+            envelope_code(&result),
+            "policy.deny.per_tx_cap_exceeded",
+            "an over-cap staged envelope must deny with the cap's wire code, sized from the \
+             decoded envelope amount"
+        );
+    }
+
+    /// An envelope the decoder cannot classify, under a matched value rule,
+    /// denies `policy.deny.unsizable_value_effect`.
+    #[test]
+    fn dispatch_staged_pay_gate_unclassifiable_envelope_denies_unsizable() {
+        let engine = per_tx_cap_engine(1_000_000_000, false);
+        let profile = staged_test_profile();
+        let xdr = unclassifiable_envelope_b64();
+        let decode_result = stellar_agent_core::envelope_decode::decode_authoritative_args(
+            &xdr,
+            "stellar_pay_commit",
+        );
+        assert!(
+            decode_result.is_err(),
+            "fixture must be undecodable as a payment"
+        );
+        let result = dispatch_staged_pay_gate(
+            &engine,
+            &profile,
+            "stellar:testnet",
+            decode_result,
+            None,
+            None,
+        );
+        assert_eq!(
+            envelope_code(&result),
+            "policy.deny.unsizable_value_effect",
+            "an unclassifiable staged envelope under a matched value rule must deny \
+             unsizable, got {result:?}"
+        );
+    }
+
+    /// The same unclassifiable envelope, under a rule with
+    /// `allow_opaque_signing = true`, proceeds (allows).
+    #[test]
+    fn dispatch_staged_pay_gate_unclassifiable_envelope_with_allow_opaque_signing_allows() {
+        let engine = per_tx_cap_engine(1_000_000_000, true);
+        let profile = staged_test_profile();
+        let xdr = unclassifiable_envelope_b64();
+        let decode_result = stellar_agent_core::envelope_decode::decode_authoritative_args(
+            &xdr,
+            "stellar_pay_commit",
+        );
+        let result = dispatch_staged_pay_gate(
+            &engine,
+            &profile,
+            "stellar:testnet",
+            decode_result,
+            None,
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "allow_opaque_signing = true must let the unclassifiable envelope proceed, \
+             got {result:?}"
+        );
+        assert_eq!(
+            result.expect("checked is_ok above"),
+            None,
+            "an opaque allow surfaces no gate-sized effects"
+        );
+    }
+
+    /// The no-op engine allows every staged flow unconditionally, decodable
+    /// or not — matching the default pipeline's conditionality (the gate
+    /// only bites under `policy.engine = v1`).
+    #[test]
+    fn dispatch_staged_pay_gate_noop_engine_allows_regardless_of_decodability() {
+        let engine = stellar_agent_core::policy::NoopPolicyEngine;
+        let profile = staged_test_profile();
+
+        let decodable = pay_envelope_b64(1_500_000_000);
+        let decode_result = stellar_agent_core::envelope_decode::decode_authoritative_args(
+            &decodable,
+            "stellar_pay_commit",
+        );
+        let result = dispatch_staged_pay_gate(
+            &engine,
+            &profile,
+            "stellar:testnet",
+            decode_result,
+            None,
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "Noop engine must allow a decodable envelope"
+        );
+
+        let undecodable = unclassifiable_envelope_b64();
+        let decode_result = stellar_agent_core::envelope_decode::decode_authoritative_args(
+            &undecodable,
+            "stellar_pay_commit",
+        );
+        let result = dispatch_staged_pay_gate(
+            &engine,
+            &profile,
+            "stellar:testnet",
+            decode_result,
+            None,
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "Noop engine must allow an undecodable (opaque) envelope too"
         );
     }
 }
