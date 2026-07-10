@@ -45,6 +45,23 @@ PACE="${PACE:-30}"
 RETRY_COOLDOWN="${RETRY_COOLDOWN:-60}"
 FILTER="${FILTER:-}"
 
+# Completeness guard: every live-network test file on disk must be listed in
+# SUITES below. The per-suite zero-tests guard cannot catch a file that is
+# never invoked at all, so an unlisted file would silently not execute while
+# the run reports green.
+check_suite_completeness() {
+  local missing=0
+  while IFS= read -r f; do
+    local target
+    target="$(basename "$f" .rs)"
+    if ! printf '%s\n' "${SUITES[@]}" | grep -q " ${target}$"; then
+      echo "ERROR: ${f} is not listed in SUITES — add it (or rename it away from the *testnet* pattern if it is not a live suite)" >&2
+      missing=1
+    fi
+  done < <(find crates -path '*/tests/*' -name '*testnet*.rs' -not -path '*fixtures*' | sort)
+  return "$missing"
+}
+
 # "<crate> <feature> <test target>", ordered light-to-heavy: auth round-trips
 # and read-only previews first, single-tx submit flows next, then the
 # smart-account deploy-heavy suites so Friendbot usage ramps up gradually.
@@ -70,6 +87,10 @@ SUITES=(
   "stellar-agent-defindex testnet-acceptance defindex_vault_testnet_acceptance"
   "stellar-agent-defindex testnet-acceptance defindex_deposit_submit_testnet_acceptance"
   "stellar-agent-mcp testnet-acceptance pay_commit_testnet_acceptance"
+  "stellar-agent-mcp testnet-acceptance create_account_testnet_acceptance"
+  "stellar-agent-mcp testnet-acceptance trustline_classic_testnet_acceptance"
+  "stellar-agent-mcp testnet-acceptance policy_value_descriptor_testnet_acceptance"
+  "stellar-agent-mcp testnet-acceptance rule_create_commit_testnet_acceptance"
   "stellar-agent-mcp testnet-acceptance sep43_sign_and_submit_transaction_testnet_acceptance"
   "stellar-agent-mcp testnet-acceptance toolset_sign_payment_gated_testnet_acceptance"
   "stellar-agent-mcp testnet-acceptance x402_create_payment_testnet_acceptance"
@@ -78,6 +99,7 @@ SUITES=(
   "stellar-agent-mcp testnet-acceptance approve_serve_testnet_acceptance"
   "stellar-agent-mcp testnet-acceptance dex_quote_wire_testnet_acceptance"
   "stellar-agent-cli testnet-acceptance claim_testnet_acceptance"
+  "stellar-agent-cli testnet-acceptance pay_policy_v1_testnet_acceptance"
   "stellar-agent-cli testnet-acceptance smart_account_execute_testnet_acceptance"
   "stellar-agent-smart-account testnet-integration deploy_c_testnet_acceptance"
   "stellar-agent-smart-account testnet-integration quorum_authorization_info_testnet_acceptance"
@@ -145,6 +167,8 @@ run_suite() {
 declare -a report_status report_suite
 failures=0
 ran=0
+
+check_suite_completeness || exit 3
 
 for line in "${SUITES[@]}"; do
   read -r crate feature target <<< "$line"
