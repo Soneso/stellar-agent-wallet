@@ -278,10 +278,18 @@ async fn t1_classic_trustline_add_two_phase_happy_path_under_minimum_reserve_rul
     assert_eq!(tx_hash.len(), 64, "tx_hash must be a 32-byte hex digest");
 
     // ── On-chain effect: the trustline now exists with the requested limit ──
-    // The confirmed transaction's ledger entry can lag the load-balanced RPC's
-    // read path by a ledger or two; retry the fetch until the trustline is
-    // visible, bounded well under the suite pace.
-    let mut refreshed = fetch_account(&client, &source_g, &[])
+    // `fetch_account` returns only the trustline entries explicitly requested
+    // (getLedgerEntries needs their ledger keys), so the USDC line must be in
+    // the request list. The confirmed transaction's ledger entry can also lag
+    // the load-balanced RPC's read path by a ledger or two; retry the fetch
+    // until the trustline is visible, bounded well under the suite pace.
+    let usdc_asset = stellar_agent_network::Asset::from_code_and_issuer(
+        "USDC",
+        "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+    )
+    .expect("pinned USDC asset parses");
+    let trustline_request = [usdc_asset];
+    let mut refreshed = fetch_account(&client, &source_g, &trustline_request)
         .await
         .expect("source account fetch after commit");
     let usdc_present = |account: &stellar_agent_network::AccountView| {
@@ -296,7 +304,7 @@ async fn t1_classic_trustline_add_two_phase_happy_path_under_minimum_reserve_rul
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
-        refreshed = fetch_account(&client, &source_g, &[])
+        refreshed = fetch_account(&client, &source_g, &trustline_request)
             .await
             .expect("source account re-fetch while waiting for the trustline");
     }
