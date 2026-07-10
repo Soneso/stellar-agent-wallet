@@ -26,7 +26,8 @@
 use serde_json::json;
 use stellar_agent_core::error::{NetworkError, WalletError};
 use stellar_agent_network::fund_with_friendbot;
-use wiremock::matchers::method;
+use stellar_agent_test_support::EchoIdResponder;
+use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Stellar mainnet passphrase — used to trigger the structural rejection path.
@@ -40,6 +41,27 @@ const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
 
 /// A valid-looking testnet G-strkey for use in tests.
 const TEST_ACCOUNT: &str = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
+
+/// Mounts a `getLedgerEntries` mock on `mock_server` that reports `address` as
+/// present — satisfies `fund_with_friendbot`'s post-funding verification poll.
+async fn mount_account_present(mock_server: &MockServer, address: &str) {
+    use stellar_agent_test_support::xdr_fixtures::{account_entry_xdr, account_ledger_key_xdr};
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(EchoIdResponder::new(json!({
+            "entries": [
+                {
+                    "key": account_ledger_key_xdr(address),
+                    "xdr": account_entry_xdr(address, 100_000_000_000, 0),
+                    "lastModifiedLedgerSeq": 100
+                }
+            ],
+            "latestLedger": 100
+        })))
+        .mount(mock_server)
+        .await;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Happy path: Friendbot returns 200 with a hash
@@ -67,10 +89,16 @@ async fn fund_with_friendbot_happy_path() {
         .expect(1)
         .mount(&mock_server)
         .await;
+    mount_account_present(&mock_server, TEST_ACCOUNT).await;
 
-    let result = fund_with_friendbot(&mock_server.uri(), TEST_ACCOUNT, TESTNET_PASSPHRASE)
-        .await
-        .expect("fund_with_friendbot must succeed for a mocked 200 response");
+    let result = fund_with_friendbot(
+        &mock_server.uri(),
+        TEST_ACCOUNT,
+        TESTNET_PASSPHRASE,
+        &mock_server.uri(),
+    )
+    .await
+    .expect("fund_with_friendbot must succeed for a mocked 200 response");
 
     assert_eq!(
         result.tx_hash, expected_hash,
@@ -115,7 +143,13 @@ async fn fund_with_friendbot_mainnet_rejected_no_http_issued() {
         .mount(&mock_server)
         .await;
 
-    let result = fund_with_friendbot(&mock_server.uri(), TEST_ACCOUNT, MAINNET_PASSPHRASE).await;
+    let result = fund_with_friendbot(
+        &mock_server.uri(),
+        TEST_ACCOUNT,
+        MAINNET_PASSPHRASE,
+        &mock_server.uri(),
+    )
+    .await;
 
     // Assert the structural rejection error variant.
     assert!(
@@ -159,7 +193,13 @@ async fn fund_with_friendbot_non_200_mapped_to_rpc_unreachable() {
         .mount(&mock_server)
         .await;
 
-    let result = fund_with_friendbot(&mock_server.uri(), TEST_ACCOUNT, TESTNET_PASSPHRASE).await;
+    let result = fund_with_friendbot(
+        &mock_server.uri(),
+        TEST_ACCOUNT,
+        TESTNET_PASSPHRASE,
+        &mock_server.uri(),
+    )
+    .await;
 
     assert!(result.is_err(), "non-200 response must return an error");
     assert_eq!(
@@ -192,7 +232,13 @@ async fn fund_with_friendbot_missing_hash_field_returns_error() {
         .mount(&mock_server)
         .await;
 
-    let result = fund_with_friendbot(&mock_server.uri(), TEST_ACCOUNT, TESTNET_PASSPHRASE).await;
+    let result = fund_with_friendbot(
+        &mock_server.uri(),
+        TEST_ACCOUNT,
+        TESTNET_PASSPHRASE,
+        &mock_server.uri(),
+    )
+    .await;
 
     assert!(result.is_err(), "missing hash field must return an error");
     assert_eq!(

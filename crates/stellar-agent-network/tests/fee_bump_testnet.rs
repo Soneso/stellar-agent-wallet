@@ -114,6 +114,7 @@ mod live {
             TESTNET_FRIENDBOT_URL,
             &inner_source_gstrkey,
             TESTNET_PASSPHRASE,
+            TESTNET_RPC_URL,
         )
         .await;
         if fb_result.is_err() {
@@ -129,6 +130,7 @@ mod live {
             TESTNET_FRIENDBOT_URL,
             &fee_payer_gstrkey,
             TESTNET_PASSPHRASE,
+            TESTNET_RPC_URL,
         )
         .await;
         if fb_result2.is_err() {

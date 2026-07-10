@@ -44,6 +44,18 @@ const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
 /// Stellar Futurenet network passphrase.
 const FUTURENET_PASSPHRASE: &str = "Test SDF Future Network ; October 2022";
 
+/// Default RPC URL used to verify testnet Friendbot funding landed.
+const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
+
+/// Default RPC URL used to verify Futurenet Friendbot funding landed.
+///
+/// The verification RPC must observe the SAME network the funding targets: a
+/// testnet RPC can never see a Futurenet account, so a network-mismatched
+/// default would report every successful Futurenet funding as
+/// `network.friendbot_funding_not_confirmed`. The default is therefore
+/// derived from `--network`; an explicit `--rpc-url` always wins.
+const FUTURENET_RPC_URL: &str = "https://rpc-futurenet.stellar.org";
+
 /// Network selector for the `friendbot` subcommand.
 ///
 /// `Mainnet` exists in the type system so the structural rejection in [`run`]
@@ -127,6 +139,19 @@ pub struct FriendbotArgs {
     /// `stellar_friendbot` tool validates every URL unconditionally.
     #[arg(long, default_value_t = false)]
     pub friendbot_url_unchecked: bool,
+
+    /// RPC URL used to verify that Friendbot funding actually landed.
+    ///
+    /// After a successful Friendbot HTTP response, the command polls this RPC
+    /// endpoint until the funded account is queryable before reporting
+    /// success — see [`stellar_agent_network::fund_with_friendbot`].
+    ///
+    /// When omitted, the default is derived from `--network` (the SDF testnet
+    /// or Futurenet RPC endpoint) so the verification always queries the
+    /// network the funding targeted. Supply an explicit URL for a private
+    /// network or a non-SDF RPC provider.
+    #[arg(long, value_name = "URL")]
+    pub rpc_url: Option<String>,
 
     /// Output format: `json` (default) or `table`.
     #[arg(
@@ -214,9 +239,9 @@ pub async fn run(args: &FriendbotArgs) -> i32 {
         return 1;
     }
 
-    let network_passphrase = match args.network {
-        FriendbotNetwork::Testnet => TESTNET_PASSPHRASE,
-        FriendbotNetwork::Futurenet => FUTURENET_PASSPHRASE,
+    let (network_passphrase, default_rpc_url) = match args.network {
+        FriendbotNetwork::Testnet => (TESTNET_PASSPHRASE, TESTNET_RPC_URL),
+        FriendbotNetwork::Futurenet => (FUTURENET_PASSPHRASE, FUTURENET_RPC_URL),
         // The mainnet arm above returned early, so reaching this branch
         // means a new `FriendbotNetwork` variant was added without updating
         // this match. `#[non_exhaustive]` applies across crate boundaries;
@@ -238,7 +263,11 @@ pub async fn run(args: &FriendbotArgs) -> i32 {
         }
     };
 
-    match fund_with_friendbot(&friendbot_url, &args.account, network_passphrase).await {
+    // Explicit --rpc-url wins; otherwise the default follows --network so the
+    // verification always queries the network the funding targeted.
+    let rpc_url = args.rpc_url.as_deref().unwrap_or(default_rpc_url);
+
+    match fund_with_friendbot(&friendbot_url, &args.account, network_passphrase, rpc_url).await {
         Ok(result) => {
             let envelope = Envelope::ok(result);
             print_success(&envelope, args.output);
@@ -385,6 +414,8 @@ mod tests {
             // mainnet check (ordering: mainnet check fires first, but the
             // URL validation would also reject http://127.0.0.1:1).
             friendbot_url_unchecked: true,
+            // Non-routable: the mainnet check must fire before this is ever used.
+            rpc_url: Some("http://127.0.0.1:1".to_owned()),
             output: OutputFormat::Json,
         };
 
@@ -402,6 +433,8 @@ mod tests {
             network: FriendbotNetwork::Testnet,
             friendbot_url: Some("https://evil.example.com/friendbot".to_owned()),
             friendbot_url_unchecked: false,
+            // Non-routable: the allow-list check must fire before this is ever used.
+            rpc_url: Some("http://127.0.0.1:1".to_owned()),
             output: OutputFormat::Json,
         };
 
@@ -423,6 +456,9 @@ mod tests {
             // Use a URL that the allow-list would normally reject.
             friendbot_url: Some("http://127.0.0.1:1/friendbot".to_owned()),
             friendbot_url_unchecked: true,
+            // Non-routable: the Friendbot HTTP call itself must fail before
+            // verification would ever poll this.
+            rpc_url: Some("http://127.0.0.1:1".to_owned()),
             output: OutputFormat::Json,
         };
 

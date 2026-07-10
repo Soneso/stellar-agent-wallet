@@ -148,7 +148,13 @@ mod live {
             ("fee payer", &fee_payer_gstrkey),
             ("effect target", &effect_target_gstrkey),
         ] {
-            let fb = fund_with_friendbot(TESTNET_FRIENDBOT_URL, gstrkey, TESTNET_PASSPHRASE).await;
+            let fb = fund_with_friendbot(
+                TESTNET_FRIENDBOT_URL,
+                gstrkey,
+                TESTNET_PASSPHRASE,
+                TESTNET_RPC_URL,
+            )
+            .await;
             if fb.is_err() {
                 eprintln!(
                     "skipped: Friendbot funding failed for {label}: {:?}",

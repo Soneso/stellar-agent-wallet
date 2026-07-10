@@ -78,10 +78,24 @@ jobs:
           # The testnet feature set builds a different dependency graph from
           # the offline jobs; keep it in its own cache.
           prefix-key: testnet
+      # pay_policy_v1_testnet_acceptance (stellar-agent-cli) registers the
+      # platform keyring store before its policy gate and requires a
+      # functioning Secret Service; the runner has no login session or
+      # keyring by default. gnome-keyring provides the Secret Service
+      # implementation; dbus provides `dbus-run-session`, which brackets the
+      # whole driver invocation in a private D-Bus session bus so the keyring
+      # daemon and every `cargo test` / `stellar-agent` child process it
+      # spawns land on the same bus scope.
+      - name: Install gnome-keyring (Linux Secret Service for the CLI v1-policy suite)
+        run: sudo apt-get install -y gnome-keyring dbus
       # Serialization, inter-suite pacing, one-retry-with-cooldown, and the
       # zero-tests-executed guard all live in the driver script so the same
       # entrypoint runs locally and in CI.
       - name: Run testnet acceptance suites
         env:
           FILTER: ${{ inputs.filter }}
-        run: .github/scripts/run-testnet-acceptance.sh
+        run: |
+          dbus-run-session -- bash -c '
+            gnome-keyring-daemon --components=secrets --daemonize --unlock <<< "ci-headless-keyring-password"
+            exec .github/scripts/run-testnet-acceptance.sh
+          '

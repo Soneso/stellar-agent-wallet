@@ -165,6 +165,21 @@ pub(crate) const SUBMIT_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// semantics.
 pub(crate) const ORACLE_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Bound on rebuild attempts in [`high_value_cross_check`] before a rebuild
+/// FAILURE (as opposed to a byte-level mismatch) is treated as divergence.
+///
+/// The oracle rebuild closure re-fetches source-account state from the
+/// independent RPC; when the account or entry has not yet propagated there,
+/// the rebuild errors even though nothing is actually wrong — a transient
+/// "environment not ready" condition, not a "wrong result". A successful
+/// rebuild that byte-mismatches the primary envelope is never retried here;
+/// only the inability to obtain a comparison value at all is.
+const ORACLE_REBUILD_RETRY_ATTEMPTS: u32 = 3;
+
+/// Delay between [`ORACLE_REBUILD_RETRY_ATTEMPTS`] rebuild attempts (2 delays
+/// across 3 attempts ≈ 15s total re-poll window).
+const ORACLE_REBUILD_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(7);
+
 /// Resolves the submit timeout for a profile, falling back to the documented
 /// 60-second default when the profile omits an override.
 #[must_use]
@@ -1745,7 +1760,7 @@ pub(crate) async fn high_value_cross_check<F, Fut>(
     tool_name: &'static str,
 ) -> Result<CrossCheckOutcome, rmcp::model::CallToolResult>
 where
-    F: FnOnce(stellar_agent_network::StellarRpcClient) -> Fut,
+    F: Fn(stellar_agent_network::StellarRpcClient) -> Fut,
     Fut: std::future::Future<Output = Result<String, ErrorData>>,
 {
     use stellar_agent_network::StellarRpcClient;
@@ -1797,19 +1812,6 @@ where
     const CROSS_CHECK_DIVERGENCE_DETAIL: &str =
         "independent-RPC cross-check failed; re-simulate to obtain a fresh envelope";
 
-    // Build a client for the oracle/independent RPC URL.
-    let oracle_client = StellarRpcClient::new(oracle_provider_url.as_str()).map_err(|e| {
-        // Full error detail retained in debug logs for operator forensics only.
-        // The wire response is the canonical CROSS_CHECK_DIVERGENCE_DETAIL;
-        // indistinguishability discipline prohibits non-uniform wire bodies.
-        tracing::debug!(
-            tool = tool_name,
-            error = %e,
-            "oracle RPC client construction failed; treating as divergence"
-        );
-        business_error_result("simulation.divergence", CROSS_CHECK_DIVERGENCE_DETAIL)
-    })?;
-
     tracing::info!(
         tool = tool_name,
         source_prefix = redact_account_id_value(source_account),
@@ -1818,22 +1820,50 @@ where
         "high-value cross-check: re-building envelope against independent RPC"
     );
 
-    // Invoke the caller-supplied rebuild closure against the oracle client,
-    // bounded by ORACLE_RPC_TIMEOUT.  A slow or unresponsive oracle is treated
-    // as divergence — the wallet cannot confirm envelope safety without a valid
-    // oracle comparison.
-    let oracle_xdr =
+    // Invoke the caller-supplied rebuild closure against a fresh oracle
+    // client, bounded by ORACLE_RPC_TIMEOUT per attempt. A rebuild FAILURE
+    // (as opposed to a byte mismatch) most often means the source account or
+    // entry has not yet propagated to the independent RPC — an
+    // environment-not-ready condition — so it gets ORACLE_REBUILD_RETRY_ATTEMPTS
+    // bounded attempts before being treated as divergence. A slow or
+    // unresponsive oracle (timeout) is treated as divergence immediately: it is
+    // a distinct failure mode from propagation lag and is not retried here.
+    let mut rebuild_attempt: u32 = 0;
+    let oracle_xdr = loop {
+        let oracle_client = StellarRpcClient::new(oracle_provider_url.as_str()).map_err(|e| {
+            // Full error detail retained in debug logs for operator forensics only.
+            // The wire response is the canonical CROSS_CHECK_DIVERGENCE_DETAIL;
+            // indistinguishability discipline prohibits non-uniform wire bodies.
+            tracing::debug!(
+                tool = tool_name,
+                error = %e,
+                "oracle RPC client construction failed; treating as divergence"
+            );
+            business_error_result("simulation.divergence", CROSS_CHECK_DIVERGENCE_DETAIL)
+        })?;
+
         match tokio::time::timeout(ORACLE_RPC_TIMEOUT, oracle_rebuild_fn(oracle_client)).await {
-            Ok(Ok(xdr)) => xdr,
+            Ok(Ok(xdr)) => break xdr,
             Ok(Err(_)) => {
+                rebuild_attempt += 1;
+                if rebuild_attempt >= ORACLE_REBUILD_RETRY_ATTEMPTS {
+                    tracing::debug!(
+                        tool = tool_name,
+                        attempts = rebuild_attempt,
+                        "oracle RPC rebuild failed after the bounded re-poll window; treating as divergence"
+                    );
+                    return Err(business_error_result(
+                        "simulation.divergence",
+                        CROSS_CHECK_DIVERGENCE_DETAIL,
+                    ));
+                }
                 tracing::debug!(
                     tool = tool_name,
-                    "oracle RPC rebuild failed; treating as divergence"
+                    attempt = rebuild_attempt,
+                    "oracle RPC rebuild failed; re-polling within the bounded window before \
+                     treating as divergence"
                 );
-                return Err(business_error_result(
-                    "simulation.divergence",
-                    CROSS_CHECK_DIVERGENCE_DETAIL,
-                ));
+                tokio::time::sleep(ORACLE_REBUILD_RETRY_BACKOFF).await;
             }
             Err(_elapsed) => {
                 tracing::warn!(
@@ -1846,7 +1876,8 @@ where
                     CROSS_CHECK_DIVERGENCE_DETAIL,
                 ));
             }
-        };
+        }
+    };
 
     // Byte-identical comparison.
     if oracle_xdr != primary_rebuilt_xdr {
@@ -1923,7 +1954,7 @@ mod tests {
     use super::*;
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     };
     use stellar_agent_core::AuthError;
 
@@ -2683,7 +2714,10 @@ mod tests {
             "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI",
             true,
             i64::try_from(profile.effective_usd_threshold()).unwrap(),
-            |_client| async { Ok(oracle_xdr) },
+            |_client| {
+                let xdr = oracle_xdr.clone();
+                async move { Ok(xdr) }
+            },
             "stellar_pay_commit",
         )
         .with_subscriber(subscriber)
@@ -2721,6 +2755,106 @@ mod tests {
         assert!(
             captured.contains("sequence_delta=7"),
             "warning must include sequence delta field: {captured}"
+        );
+    }
+
+    // ── high_value_cross_check: bounded rebuild-failure retry ─────────────────
+
+    /// A rebuild failure (not a byte mismatch) on the first
+    /// `ORACLE_REBUILD_RETRY_ATTEMPTS - 1` attempts, succeeding on the last
+    /// allowed attempt, must still pass — the environment-not-ready retry
+    /// window absorbs transient rebuild failures.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn high_value_cross_check_recovers_within_the_rebuild_retry_window() {
+        let mut profile = Profile::builder_mainnet("svc", "acct", "n-svc", "n-acct")
+            .with_noop_engine()
+            .build();
+        profile.rpc_url = "https://primary.example.com".to_owned();
+        profile.oracle_provider_url = Some(url::Url::parse("https://oracle.example.com").unwrap());
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_for_closure = Arc::clone(&calls);
+
+        let outcome = high_value_cross_check(
+            &profile,
+            "same-envelope-xdr",
+            "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI",
+            true,
+            i64::try_from(profile.effective_usd_threshold()).unwrap(),
+            move |_client| {
+                let calls = Arc::clone(&calls_for_closure);
+                async move {
+                    let attempt = calls.fetch_add(1, Ordering::SeqCst);
+                    if attempt + 1 < ORACLE_REBUILD_RETRY_ATTEMPTS {
+                        return Err(rmcp::ErrorData::internal_error(
+                            "oracle account not yet propagated".to_owned(),
+                            None,
+                        ));
+                    }
+                    Ok("same-envelope-xdr".to_owned())
+                }
+            },
+            "stellar_pay_commit",
+        )
+        .await
+        .expect("recovery within the bounded retry window must pass");
+
+        assert!(
+            matches!(outcome, CrossCheckOutcome::Passed),
+            "outcome must be Passed once the rebuild succeeds within the window, got {outcome:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            ORACLE_REBUILD_RETRY_ATTEMPTS,
+            "must have retried up to and including the attempt that finally succeeded"
+        );
+    }
+
+    /// A rebuild that fails on EVERY attempt must still fail after exactly
+    /// `ORACLE_REBUILD_RETRY_ATTEMPTS` attempts — the bounded window never
+    /// converts a persistent rebuild failure into a pass.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn high_value_cross_check_fails_after_exhausting_the_rebuild_retry_window() {
+        let mut profile = Profile::builder_mainnet("svc", "acct", "n-svc", "n-acct")
+            .with_noop_engine()
+            .build();
+        profile.rpc_url = "https://primary.example.com".to_owned();
+        profile.oracle_provider_url = Some(url::Url::parse("https://oracle.example.com").unwrap());
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_for_closure = Arc::clone(&calls);
+
+        let err = high_value_cross_check(
+            &profile,
+            "same-envelope-xdr",
+            "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI",
+            true,
+            i64::try_from(profile.effective_usd_threshold()).unwrap(),
+            move |_client| {
+                let calls = Arc::clone(&calls_for_closure);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err::<String, _>(rmcp::ErrorData::internal_error(
+                        "oracle account still not propagated".to_owned(),
+                        None,
+                    ))
+                }
+            },
+            "stellar_pay_commit",
+        )
+        .await
+        .expect_err("a rebuild that never succeeds must fail");
+
+        let (is_err, code, _message) = error_envelope_parts(&err);
+        assert!(is_err, "exhausted-retry envelope must set is_error = true");
+        assert_eq!(
+            code, "simulation.divergence",
+            "exhausted-retry envelope code must be simulation.divergence"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            ORACLE_REBUILD_RETRY_ATTEMPTS,
+            "must attempt exactly ORACLE_REBUILD_RETRY_ATTEMPTS times, never more, never fewer"
         );
     }
 

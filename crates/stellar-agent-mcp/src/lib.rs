@@ -62,6 +62,11 @@ pub mod transport;
 /// when populating `EvalContext.account_view`.  Per-tool wiring is deferred.
 pub mod policy_adapter;
 
+/// In-process per-source-account confirmed-sequence floor and bounded
+/// catch-up poll (see the module docs for the propagation-lag problem this
+/// solves and the CLI-out-of-scope rationale).
+pub(crate) mod sequence_floor;
+
 /// MCP tool implementations organised by tool family.
 ///
 /// Crate-internal: every public type defined here is re-exported by

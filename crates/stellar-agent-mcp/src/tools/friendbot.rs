@@ -182,6 +182,7 @@ impl WalletServer {
             &friendbot_url,
             &args.account_id,
             network_passphrase,
+            &self.profile.rpc_url,
         )
         .await
         {

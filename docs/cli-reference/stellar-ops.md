@@ -315,6 +315,7 @@ Funds a testnet or futurenet account via the Stellar Friendbot HTTP endpoint.
 
 - **Signing.** No local signing or key access; Friendbot funds the account.
 - **Network.** `--network` accepts `testnet`, `futurenet`, or `mainnet` at the parser, but `mainnet` is structurally refused at dispatch with `network.friendbot_mainnet_forbidden` before any HTTP call. The endpoint URL is validated against an allow-list (`friendbot.stellar.org`, `friendbot-futurenet.stellar.org`) unless `--friendbot-url-unchecked` is set.
+- **Funding verification.** After a successful Friendbot HTTP response, the command polls `--rpc-url` until the funded account is queryable before reporting success. The JSON envelope's `data.funding_confirmed_after_ms` reports how long that took. If the account never becomes queryable, the command exits `1` with `network.friendbot_funding_not_confirmed` rather than reporting a Friendbot HTTP success that has not actually landed.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
@@ -322,6 +323,7 @@ Funds a testnet or futurenet account via the Stellar Friendbot HTTP endpoint.
 | `--network <NETWORK>` | `testnet`, `futurenet`, or `mainnet` (mainnet refused at dispatch) | optional | `testnet` |
 | `--friendbot-url <URL>` | Override the Friendbot endpoint URL; when omitted, resolves at runtime to the SDF testnet URL (`https://friendbot.stellar.org`) regardless of `--network`, so `futurenet` needs an explicit override | optional | `https://friendbot.stellar.org` (testnet) |
 | `--friendbot-url-unchecked` | Bypass the URL allow-list (development/test escape hatch) | optional | `false` |
+| `--rpc-url <URL>` | Soroban RPC endpoint used to verify that funding landed; the default follows `--network` so the verification queries the network the funding targeted | optional | derived from `--network` (`https://soroban-testnet.stellar.org` / `https://rpc-futurenet.stellar.org`) |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 
 Example — fund a testnet account:

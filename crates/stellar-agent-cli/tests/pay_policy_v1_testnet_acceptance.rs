@@ -49,25 +49,24 @@
 //! Both invocations reuse the same source/destination pair (the over-cap
 //! refusal happens before signing, so it does not consume a sequence number).
 //!
-//! # Coverage note: the OS keyring is not exercised here
+//! # Coverage note: the OS keyring write/read path is not exercised here
 //!
 //! The owner PUBLIC key is supplied via the `STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE`
-//! file source described above, which bypasses the OS keyring entirely. This
-//! acceptance test therefore does NOT cover
-//! `stellar_agent_network::init_platform_keyring_store` — the call
-//! `commands::pay::run_full_pipeline` / `run_build_only` make (conditioned on
-//! `profile.policy.engine == V1`) before `build_v1_policy_engine`'s owner-key
-//! read. That coverage lives in `commands::pay`'s
-//! `run_initialises_keyring_store_before_policy_gate` spy test (and the
-//! equivalent spy tests in `commands::claim` and `commands::accounts::create`).
+//! file source described above, which bypasses reading the owner key FROM the
+//! OS keyring. This acceptance test therefore does not cover the keyring
+//! read/write round trip for the owner coordinate — that coverage lives in
+//! `commands::profile::enroll_owner_key`'s unit tests and the equivalent spy
+//! tests in `commands::pay`, `commands::claim`, and
+//! `commands::accounts::create`.
 //!
-//! # Self-skip on hosts without a platform keyring
+//! # Platform keyring precondition
 //!
 //! The v1 policy path registers the platform keyring store before the gate
 //! and refuses when registration fails, so this suite requires a functioning
 //! platform keyring even though the owner key itself comes from the file
-//! source. On hosts without one (headless CI runners with no Secret Service)
-//! the test prints a driver-visible `SKIP` marker and returns.
+//! source (macOS Keychain in local dev; a headless Secret Service, provisioned
+//! by the CI workflow via gnome-keyring, in CI). Keyring init failure fails
+//! this test — it is not an infrastructure precondition to be skipped.
 //!
 //! Gated behind `testnet-acceptance`:
 //!
@@ -335,23 +334,10 @@ fn run_pay(
 async fn pay_v1_per_tx_cap_denies_over_cap_and_submits_under_cap() {
     // The v1 policy path registers the platform keyring store before the gate
     // and refuses when registration fails, so this suite needs a functioning
-    // platform keyring (macOS Keychain; a Secret Service on Linux). Headless
-    // CI runners have none — self-skip with the driver-visible marker instead
-    // of failing on an infrastructure precondition.
-    if stellar_agent_network::init_platform_keyring_store().is_err() {
-        // The driver script counts SKIP markers from the suite's output; the
-        // workspace denies print_stderr, so scope the exception to this one
-        // infrastructure-precondition marker.
-        #[allow(clippy::print_stderr, reason = "driver-visible self-skip marker")]
-        {
-            eprintln!(
-                "[v1] SKIP: no functioning platform keyring on this host (Secret \
-                 Service init failed); the v1 policy path requires keyring-store \
-                 registration before the gate."
-            );
-        }
-        return;
-    }
+    // platform keyring (macOS Keychain locally; a headless Secret Service,
+    // provisioned by the CI workflow, on Linux CI runners).
+    stellar_agent_network::init_platform_keyring_store()
+        .expect("platform keyring store must initialise on this host");
 
     let home = tempfile::TempDir::new().expect("tempdir");
 

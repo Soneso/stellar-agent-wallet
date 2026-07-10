@@ -44,7 +44,8 @@ use stellar_agent_mcp::server::{StellarFriendbotArgs, WalletServer};
 use stellar_agent_network::friendbot::{
     default_friendbot_url, validate_friendbot_url_allowing_loopback,
 };
-use wiremock::matchers::{method, query_param};
+use stellar_agent_test_support::EchoIdResponder;
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -53,6 +54,27 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// A valid testnet G-strkey for use in tests.
 const TEST_ACCOUNT: &str = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
+
+/// Mounts a `getLedgerEntries` mock on `mock_server` that reports `address` as
+/// present — satisfies `fund_with_friendbot`'s post-funding verification poll.
+async fn mount_account_present(mock_server: &MockServer, address: &str) {
+    use stellar_agent_test_support::xdr_fixtures::{account_entry_xdr, account_ledger_key_xdr};
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(EchoIdResponder::new(json!({
+            "entries": [
+                {
+                    "key": account_ledger_key_xdr(address),
+                    "xdr": account_entry_xdr(address, 100_000_000_000, 0),
+                    "lastModifiedLedgerSeq": 100
+                }
+            ],
+            "latestLedger": 100
+        })))
+        .mount(mock_server)
+        .await;
+}
 
 fn disposable_s_strkey() -> String {
     stellar_strkey::ed25519::PrivateKey::from_payload(&[1_u8; 32])
@@ -419,12 +441,14 @@ async fn friendbot_happy_path_via_wiremock() {
         validate_friendbot_url_allowing_loopback(&mock_server.uri()).is_ok(),
         "wiremock URL must be accepted by test validator"
     );
+    mount_account_present(&mock_server, TEST_ACCOUNT).await;
 
     // Call fund_with_friendbot directly with the wiremock URL.
     let result = stellar_agent_network::fund_with_friendbot(
         &mock_server.uri(),
         TEST_ACCOUNT,
         "Test SDF Network ; September 2015",
+        &mock_server.uri(),
     )
     .await
     .expect("fund_with_friendbot must succeed for mocked 200 response");

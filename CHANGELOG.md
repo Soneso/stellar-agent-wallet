@@ -339,6 +339,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeping the owner seed offline. Profiles that relied on `rotate-owner-key`
   must re-enrol the owner public key and re-sign their policy files. (#30)
 
+### Changed
+
+- Testnet acceptance CI now provisions a headless Linux Secret Service
+  (gnome-keyring under a private D-Bus session) for the CLI's `pay` v1-policy
+  acceptance suite, which registers the platform keyring store before its
+  policy gate; the suite's self-skip on missing keyring is removed — keyring
+  init failure now fails the suite instead of silently skipping it. (#52)
+- Acceptance-suite environmental-flake hardening, none of it weakening any
+  assertion: the shared test-support Friendbot funding helper re-requests
+  funding once and re-confirms if the account is still absent after the
+  confirm wait; the MCP high-value independent-RPC cross-check retries a
+  rebuild FAILURE (not a byte mismatch) up to 3 times over a bounded window
+  before treating it as divergence, distinguishing "the independent RPC
+  hasn't caught up yet" from "the two RPCs disagree"; and browser-driven
+  acceptance suites (WebAuthn, remote-approval, rule-proposal, operator
+  enrollment) get one additional retry with a longer cooldown in the
+  testnet-acceptance driver script, on top of the universal retry-once
+  default. (#53)
+
+### Fixed
+
+- `fund_with_friendbot` (the CLI `friendbot` command, the MCP
+  `stellar_friendbot` tool, and `accounts create --fund-with-friendbot`) now
+  polls the RPC endpoint until the funded account is actually queryable
+  before reporting success, instead of returning as soon as Friendbot's HTTP
+  response arrives; a funded account that never becomes visible within the
+  bounded window returns the new `network.friendbot_funding_not_confirmed`
+  error instead of a premature success. `FriendbotResult` gains
+  `funding_confirmed_after_ms`. The MCP server now tracks, per source
+  account, the highest sequence number a confirmed submit in this process
+  consumed; when a build-time account fetch observes a sequence below that
+  floor, it re-polls within a bounded window before proceeding, removing
+  avoidable read-after-write propagation lag on the `stellar_pay_commit` /
+  `stellar_claim_commit` / `stellar_trustline_commit` /
+  `stellar_create_account_commit` build paths (and their simulate-phase
+  twins). Neither mitigation invents a sequence number or blocks
+  indefinitely: a genuinely stale build still fails typed
+  `submission.sequence_number_stale` exactly as before. (#54)
+
 ## [0.1.0-alpha.2] - 2026-07-07
 
 ### Added

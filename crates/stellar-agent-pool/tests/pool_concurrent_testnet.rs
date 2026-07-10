@@ -162,7 +162,14 @@ mod live {
         let (funder_strkey, funder_signer) = gen_ephemeral_key();
         eprintln!("Funder: {}", redact_strkey_first5_last5(&funder_strkey));
 
-        match fund_with_friendbot(TESTNET_FRIENDBOT_URL, &funder_strkey, TESTNET_PASSPHRASE).await {
+        match fund_with_friendbot(
+            TESTNET_FRIENDBOT_URL,
+            &funder_strkey,
+            TESTNET_PASSPHRASE,
+            TESTNET_RPC_URL,
+        )
+        .await
+        {
             Ok(r) => eprintln!(
                 "Friendbot funded funder; tx_hash={}",
                 stellar_agent_network::submit::redact_tx_hash(&r.tx_hash)

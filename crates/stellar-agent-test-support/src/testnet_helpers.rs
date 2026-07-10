@@ -206,7 +206,7 @@ where
         redact_strkey(&signer_g_strkey)
     );
 
-    fund_with_friendbot(friendbot_url, &signer_g_strkey, "signer G-account").await?;
+    fund_with_friendbot(friendbot_url, rpc_url, &signer_g_strkey, "signer G-account").await?;
     eprintln!(
         "{log_prefix} signer G-account funded: {}",
         redact_strkey(&signer_g_strkey)
@@ -222,7 +222,7 @@ where
     let deployer_seed: Zeroizing<[u8; 32]> = Zeroizing::new(deployer_sk.to_bytes());
     let deployer_signer = make_signer(deployer_seed);
 
-    fund_with_friendbot(friendbot_url, &deployer_g_strkey, "deployer").await?;
+    fund_with_friendbot(friendbot_url, rpc_url, &deployer_g_strkey, "deployer").await?;
     eprintln!(
         "{log_prefix} deployer funded: {}",
         redact_strkey(&deployer_g_strkey)
@@ -309,7 +309,7 @@ where
     );
     let funder_seed: Zeroizing<[u8; 32]> = Zeroizing::new(funder_sk.to_bytes());
 
-    fund_with_friendbot(friendbot_url, &funder_g, "funder G-account").await?;
+    fund_with_friendbot(friendbot_url, rpc_url, &funder_g, "funder G-account").await?;
     eprintln!(
         "{log_prefix} funder G-account funded: {}",
         redact_strkey(&funder_g)
@@ -560,7 +560,63 @@ where
     ))
 }
 
+/// Bound on existence-check polls per confirm-wait round in
+/// [`fund_with_friendbot`].
+const FRIENDBOT_CONFIRM_POLLS: u32 = 30;
+
+/// Delay between existence-check polls in [`fund_with_friendbot`]'s
+/// confirm-wait (30 polls × 500ms ≈ 15s per round).
+const FRIENDBOT_CONFIRM_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Requests Friendbot funding for `account_id`, then confirms the account
+/// became visible on `rpc_url` before returning.
+///
+/// The funding REQUESTS are best-effort; on-RPC visibility is the sole pass
+/// criterion. This shape covers three distinct environmental flakes without
+/// weakening the check: Friendbot accepting a request whose transaction fails
+/// to land under load (the `TxNoAccount` class), the HTTP request itself
+/// timing out even though Friendbot may still process it, and a re-request
+/// against an account that landed late (Friendbot rejects double funding, but
+/// the account IS there). After one bounded confirm-wait the funding is
+/// re-requested ONCE and a second bounded wait runs before giving up. A flow
+/// whose account never becomes visible fails exactly as it did before — this
+/// never converts a persistent Friendbot outage into a pass.
 async fn fund_with_friendbot(
+    friendbot_url: &str,
+    rpc_url: &str,
+    account_id: &str,
+    label: &str,
+) -> TestnetHelperResult<()> {
+    let client = stellar_rpc_client::Client::new(rpc_url)
+        .map_err(|e| TestnetHelperError::new(e.to_string()))?;
+
+    if let Err(e) = request_friendbot_funding(friendbot_url, account_id, label).await {
+        eprintln!(
+            "{label}: Friendbot request failed ({e}); polling visibility before one re-request"
+        );
+    }
+    if wait_for_account_visible(&client, account_id).await {
+        return Ok(());
+    }
+
+    eprintln!(
+        "{label}: account not visible after the confirm wait; re-requesting Friendbot funding once"
+    );
+    if let Err(e) = request_friendbot_funding(friendbot_url, account_id, label).await {
+        eprintln!("{label}: Friendbot re-request failed ({e}); final visibility poll decides");
+    }
+    if wait_for_account_visible(&client, account_id).await {
+        return Ok(());
+    }
+
+    Err(Box::new(TestnetHelperError::new(format!(
+        "Friendbot-funded {label} still not visible on RPC after a re-request"
+    ))))
+}
+
+/// Issues the Friendbot HTTP funding request. Does not confirm the account
+/// became visible — see [`fund_with_friendbot`] for the confirm-wait.
+async fn request_friendbot_funding(
     friendbot_url: &str,
     account_id: &str,
     label: &str,
@@ -574,4 +630,18 @@ async fn fund_with_friendbot(
             response.status()
         ))))
     }
+}
+
+/// Polls `account_id`'s presence on `client`, bounded by
+/// [`FRIENDBOT_CONFIRM_POLLS`] / [`FRIENDBOT_CONFIRM_POLL_INTERVAL`].
+async fn wait_for_account_visible(client: &stellar_rpc_client::Client, account_id: &str) -> bool {
+    for attempt in 0..FRIENDBOT_CONFIRM_POLLS {
+        if attempt > 0 {
+            tokio::time::sleep(FRIENDBOT_CONFIRM_POLL_INTERVAL).await;
+        }
+        if client.get_account(account_id).await.is_ok() {
+            return true;
+        }
+    }
+    false
 }

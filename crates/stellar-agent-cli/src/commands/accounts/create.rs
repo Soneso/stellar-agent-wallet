@@ -515,7 +515,14 @@ async fn run_friendbot(args: &CreateArgs) -> i32 {
     let passphrase = args.network.passphrase();
 
     // Second layer: fund_with_friendbot rejects mainnet passphrase.
-    match fund_with_friendbot(&args.friendbot_url, &new_account.g_strkey, passphrase).await {
+    match fund_with_friendbot(
+        &args.friendbot_url,
+        &new_account.g_strkey,
+        passphrase,
+        &args.rpc_url,
+    )
+    .await
+    {
         Ok(fb_result) => {
             let result = build_friendbot_result(&new_account, &fb_result);
             let envelope = Envelope::ok(result);

@@ -185,7 +185,7 @@ async fn run_benchmark() {
     // Redact: first-5-last-5 of the G-strkey.
     eprintln!("Funder: {}", redact_strkey_first5_last5(&funder));
 
-    match fund_with_friendbot(FRIENDBOT_URL, &funder, TESTNET_PASSPHRASE).await {
+    match fund_with_friendbot(FRIENDBOT_URL, &funder, TESTNET_PASSPHRASE, TESTNET_RPC).await {
         Ok(r) => eprintln!(
             "Friendbot: tx_hash={}",
             stellar_agent_network::submit::redact_tx_hash(&r.tx_hash)

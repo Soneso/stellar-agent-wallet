@@ -15,10 +15,14 @@
 //! The validation applies to both the MCP tool and the CLI command (with a
 //! CLI-only `--friendbot-url-unchecked` escape for test/development use).
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 use stellar_agent_core::error::{NetworkError, WalletError};
 
+use crate::account::fetch_account;
+use crate::client::StellarRpcClient;
 use crate::redact::{redact_rpc_error, redact_url_authority};
 
 /// Mainnet passphrase — structurally rejected for Friendbot calls.
@@ -262,13 +266,119 @@ pub struct FriendbotResult {
     /// report which endpoint was used without requiring the caller to
     /// separately track the URL.
     pub friendbot_url_used: String,
+
+    /// Milliseconds elapsed between the Friendbot HTTP response and the
+    /// funded account first becoming visible on the queried RPC endpoint.
+    ///
+    /// [`fund_with_friendbot`] does not return `Ok` until the funded account
+    /// is RPC-queryable, so this field is present precisely because
+    /// verification succeeded; it exists to give operators and log consumers
+    /// visibility into the RPC's propagation lag on a per-call basis, rather
+    /// than only when it is slow enough to be noticed some other way.
+    pub funding_confirmed_after_ms: u64,
 }
 
-/// Funds a testnet account via the Stellar Friendbot HTTP endpoint.
+/// Upper bound on the number of `fetch_account` polls after a successful
+/// Friendbot HTTP response, before [`fund_with_friendbot`] gives up and
+/// reports [`NetworkError::FriendbotFundingNotConfirmed`].
+const FUNDING_VERIFICATION_MAX_POLLS: u32 = 10;
+
+/// Delay before each verification poll after the first (which fires
+/// immediately following the Friendbot HTTP response). Capped exponential
+/// backoff; the 9 delays here plus the 10 polls in
+/// [`FUNDING_VERIFICATION_MAX_POLLS`] sum to roughly 30 seconds of total
+/// verification window.
+const FUNDING_VERIFICATION_BACKOFF: [Duration; 9] = [
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(3),
+    Duration::from_secs(4),
+    Duration::from_secs(4),
+    Duration::from_secs(5),
+    Duration::from_secs(5),
+    Duration::from_secs(5),
+];
+
+/// Polls `fetch_account` against `rpc_url` until `account_id` is queryable,
+/// bounded by [`FUNDING_VERIFICATION_MAX_POLLS`] / [`FUNDING_VERIFICATION_BACKOFF`].
+///
+/// Returns the elapsed time on success. This is a read-side wait only — it
+/// never rebuilds or resubmits anything, so it carries none of the
+/// re-signing implications a submit-side retry would.
+///
+/// # Errors
+///
+/// Returns [`WalletError::Network`] wrapping
+/// [`NetworkError::FriendbotFundingNotConfirmed`] if the account was simply
+/// absent for the whole verification window; the last poll's own error when
+/// the window exhausts on anything other than account absence (e.g. a
+/// persistently unreachable or misconfigured RPC — propagation lag and a
+/// broken RPC are different operator problems and must read differently); or
+/// a client-construction error if `rpc_url` cannot be parsed.
+async fn verify_funding_landed(rpc_url: &str, account_id: &str) -> Result<Duration, WalletError> {
+    verify_funding_landed_with(
+        rpc_url,
+        account_id,
+        FUNDING_VERIFICATION_MAX_POLLS,
+        &FUNDING_VERIFICATION_BACKOFF,
+    )
+    .await
+}
+
+/// [`verify_funding_landed`] with caller-supplied poll count and backoff
+/// schedule. Production goes through the wrapper above with the module
+/// constants; tests inject millisecond-scale schedules so the exhausted-window
+/// paths run without real multi-second sleeps. `backoff` must hold at least
+/// `max_polls - 1` entries.
+async fn verify_funding_landed_with(
+    rpc_url: &str,
+    account_id: &str,
+    max_polls: u32,
+    backoff: &[Duration],
+) -> Result<Duration, WalletError> {
+    let client = StellarRpcClient::new(rpc_url)?;
+    let start = std::time::Instant::now();
+    // Polling continues through transport errors — an RPC blip mid-window is
+    // the same environmental condition the verification exists to absorb —
+    // but the FINAL failure must not misreport a persistently unreachable or
+    // misconfigured RPC as propagation lag: if the last poll's failure was
+    // anything other than the account being absent, that error is surfaced
+    // instead of `FriendbotFundingNotConfirmed`.
+    let mut last_error: Option<WalletError> = None;
+    for attempt in 0..max_polls {
+        if attempt > 0 {
+            tokio::time::sleep(backoff[(attempt - 1) as usize]).await;
+        }
+        match fetch_account(&client, account_id, &[]).await {
+            Ok(_) => return Ok(start.elapsed()),
+            Err(e) => last_error = Some(e),
+        }
+    }
+    match last_error {
+        Some(WalletError::Network(NetworkError::AccountNotFound { .. })) | None => Err(
+            WalletError::Network(NetworkError::FriendbotFundingNotConfirmed {
+                account_id: account_id.to_owned(),
+                waited_secs: start.elapsed().as_secs(),
+            }),
+        ),
+        Some(other) => Err(other),
+    }
+}
+
+/// Funds a testnet account via the Stellar Friendbot HTTP endpoint, and
+/// verifies the funding landed before returning.
 ///
 /// Makes a single async HTTP GET to `{friendbot_url}?addr={account_id}`
 /// via `reqwest`. The caller awaits the future; the CLI binary runs under
-/// `#[tokio::main]`.
+/// `#[tokio::main]`. On a successful HTTP response, polls `rpc_url` via
+/// `fetch_account` until the funded account is queryable (see
+/// [`verify_funding_landed`]) — Friendbot's HTTP response confirms the
+/// funding transaction was submitted, not that it has propagated to the
+/// queried RPC endpoint, and callers that build a follow-on transaction
+/// against an unpropagated account fail with a confusing `TxNoAccount`
+/// downstream. This verification is a read-side wait only: it never
+/// resubmits or rebuilds anything.
 ///
 /// Mainnet is rejected structurally before any network call: if
 /// `network_passphrase` equals the Stellar mainnet passphrase or if
@@ -282,6 +392,9 @@ pub struct FriendbotResult {
 ///   the Friendbot HTTP endpoint is unreachable or returns an error.
 /// - [`WalletError::Network`] wrapping [`NetworkError::AccountNotFound`] if
 ///   the Friendbot response cannot be parsed (unexpected Friendbot response).
+/// - [`WalletError::Network`] wrapping [`NetworkError::FriendbotFundingNotConfirmed`]
+///   if the funded account never becomes queryable on `rpc_url` within the
+///   verification window.
 ///
 /// # Panics
 ///
@@ -297,6 +410,7 @@ pub struct FriendbotResult {
 ///     "https://friendbot.stellar.org",
 ///     "GABC...XYZ",
 ///     "Test SDF Network ; September 2015",
+///     "https://soroban-testnet.stellar.org",
 /// ).await?;
 /// println!("funded with tx: {}", result.tx_hash);
 /// # Ok(()) }
@@ -305,6 +419,7 @@ pub async fn fund_with_friendbot(
     friendbot_url: &str,
     account_id: &str,
     network_passphrase: &str,
+    rpc_url: &str,
 ) -> Result<FriendbotResult, WalletError> {
     // Structural mainnet rejection — no network call on mainnet.
     if network_passphrase == MAINNET_PASSPHRASE {
@@ -367,10 +482,13 @@ pub async fn fund_with_friendbot(
         })?
         .to_owned();
 
+    let confirmed_after = verify_funding_landed(rpc_url, account_id).await?;
+
     Ok(FriendbotResult {
         tx_hash,
         account_id: account_id.to_owned(),
         friendbot_url_used: friendbot_url.to_owned(),
+        funding_confirmed_after_ms: u64::try_from(confirmed_after.as_millis()).unwrap_or(u64::MAX),
     })
 }
 
@@ -390,8 +508,13 @@ mod tests {
 
     #[tokio::test]
     async fn mainnet_rejected_before_network_call() {
-        let result =
-            fund_with_friendbot("https://friendbot.stellar.org", "GABC", MAINNET_PASSPHRASE).await;
+        let result = fund_with_friendbot(
+            "https://friendbot.stellar.org",
+            "GABC",
+            MAINNET_PASSPHRASE,
+            "http://127.0.0.1:1",
+        )
+        .await;
         assert!(
             matches!(
                 result,
@@ -402,6 +525,141 @@ mod tests {
             "expected FriendbotMainnetForbidden, got: {result:?}"
         );
     }
+
+    // ── funding-verification tests (account-present / account-absent) ────────
+
+    /// A successful Friendbot HTTP response followed by the account becoming
+    /// queryable on the FIRST verification poll succeeds immediately, with
+    /// `funding_confirmed_after_ms` populated.
+    #[tokio::test(flavor = "current_thread")]
+    async fn verification_succeeds_when_account_is_immediately_present() {
+        use stellar_agent_test_support::EchoIdResponder;
+        use stellar_agent_test_support::xdr_fixtures::{account_entry_xdr, account_ledger_key_xdr};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let address = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
+        let mock_server = MockServer::start().await;
+        let expected_hash = "abc123def456abc123def456abc123def456abc123def456abc123def456abc1";
+
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "hash": expected_hash,
+                "_links": {}
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(EchoIdResponder::new(serde_json::json!({
+                "entries": [
+                    {
+                        "key": account_ledger_key_xdr(address),
+                        "xdr": account_entry_xdr(address, 100_000_000_000, 0),
+                        "lastModifiedLedgerSeq": 100
+                    }
+                ],
+                "latestLedger": 100
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let result = fund_with_friendbot(
+            &mock_server.uri(),
+            address,
+            TESTNET_PASSPHRASE_FOR_TESTS,
+            &mock_server.uri(),
+        )
+        .await
+        .expect("verification must succeed when the account is already present");
+
+        assert_eq!(result.tx_hash, expected_hash);
+    }
+
+    /// A successful Friendbot HTTP response, but the account NEVER becomes
+    /// queryable on the RPC, exhausts the bounded verification window and
+    /// returns `FriendbotFundingNotConfirmed` rather than a false success.
+    #[tokio::test(flavor = "current_thread")]
+    async fn verification_fails_when_account_never_becomes_present() {
+        use stellar_agent_test_support::EchoIdResponder;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer};
+
+        let address = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
+        let mock_server = MockServer::start().await;
+
+        // Every verification poll gets a well-formed getLedgerEntries response
+        // with NO entries — `fetch_account` maps that to `AccountNotFound`, so
+        // the exhausted window reports genuine account absence.
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(EchoIdResponder::new(serde_json::json!({
+                "entries": [],
+                "latestLedger": 100
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Millisecond-scale injected schedule: same code path as the
+        // production wrapper, without its ~30s of real backoff.
+        let result = verify_funding_landed_with(
+            &mock_server.uri(),
+            address,
+            3,
+            &[Duration::from_millis(1), Duration::from_millis(1)],
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(WalletError::Network(
+                    NetworkError::FriendbotFundingNotConfirmed { .. }
+                ))
+            ),
+            "expected FriendbotFundingNotConfirmed after the bounded window, got: {result:?}"
+        );
+    }
+
+    /// A persistently BROKEN RPC (every poll an unmatched 404 → transport
+    /// error, never a well-formed "no entries" response) exhausts the window
+    /// and surfaces the transport error itself — a misconfigured or
+    /// unreachable RPC must not be misreported as funding propagation lag.
+    #[tokio::test(flavor = "current_thread")]
+    async fn verification_surfaces_transport_error_over_not_confirmed() {
+        use wiremock::MockServer;
+
+        let address = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
+        // No mocks mounted at all: every poll gets wiremock's unmatched 404.
+        let mock_server = MockServer::start().await;
+
+        let result = verify_funding_landed_with(
+            &mock_server.uri(),
+            address,
+            3,
+            &[Duration::from_millis(1), Duration::from_millis(1)],
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "verification against a broken RPC must not succeed, got: {result:?}"
+        );
+        assert!(
+            !matches!(
+                result,
+                Err(WalletError::Network(
+                    NetworkError::FriendbotFundingNotConfirmed { .. }
+                ))
+            ),
+            "a persistent transport error must surface as itself, not as \
+             FriendbotFundingNotConfirmed: {result:?}"
+        );
+    }
+
+    /// Testnet passphrase, named distinctly from [`MAINNET_PASSPHRASE`] to
+    /// keep the verification tests self-contained.
+    const TESTNET_PASSPHRASE_FOR_TESTS: &str = "Test SDF Network ; September 2015";
 
     // ── validate_friendbot_url tests ──────────────────────────────────────────
 

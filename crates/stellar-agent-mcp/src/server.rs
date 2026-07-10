@@ -587,6 +587,15 @@ pub struct WalletServer {
     /// lock is contended.  The lock is held only for the duration of the
     /// `verify` call (sub-microsecond, no await inside).
     pub(crate) replay_window: Arc<TokioMutex<ReplayWindow>>,
+    /// In-process per-source-account confirmed-sequence floor.
+    ///
+    /// Populated by confirmed-submit sites, consulted by build-time
+    /// `fetch_account` calls via
+    /// `sequence_floor::fetch_account_with_sequence_catchup` to wait out
+    /// avoidable read-after-write propagation lag. `TokioMutex` for the same
+    /// reason as [`Self::replay_window`] — the lock is held only for a brief,
+    /// non-blocking map read or write, never across a network `.await`.
+    pub(crate) sequence_floor: Arc<TokioMutex<crate::sequence_floor::SequenceFloorTracker>>,
     /// Per-profile counterparty resolver used to build a frozen cache snapshot
     /// for policy evaluation at each MCP dispatch.
     pub(crate) counterparty_resolver: Arc<dyn CounterpartyResolver>,
@@ -712,6 +721,9 @@ impl WalletServer {
             tool_catalogue,
             nonce_mint: Arc::new(nonce_mint),
             replay_window: Arc::new(TokioMutex::new(ReplayWindow::new())),
+            sequence_floor: Arc::new(TokioMutex::new(
+                crate::sequence_floor::SequenceFloorTracker::new(),
+            )),
             counterparty_resolver,
             tool_router: Self::merged_tool_router(),
             clock,

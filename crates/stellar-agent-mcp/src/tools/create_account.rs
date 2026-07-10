@@ -367,7 +367,14 @@ impl WalletServer {
             }
         };
 
-        let account_view = match fetch_account(&client, &args.source, &[]).await {
+        let account_view = match crate::sequence_floor::fetch_account_with_sequence_catchup(
+            &self.sequence_floor,
+            &client,
+            &args.source,
+            &[],
+        )
+        .await
+        {
             Ok(v) => v,
             Err(err) => {
                 let envelope = redacted_wallet_error_envelope(&err);
@@ -790,7 +797,14 @@ impl WalletServer {
             }
         };
 
-        let account_view = match fetch_account(&client, &args.source, &[]).await {
+        let account_view = match crate::sequence_floor::fetch_account_with_sequence_catchup(
+            &self.sequence_floor,
+            &client,
+            &args.source,
+            &[],
+        )
+        .await
+        {
             Ok(v) => v,
             Err(err) => {
                 let envelope = redacted_wallet_error_envelope(&err);
@@ -935,37 +949,55 @@ impl WalletServer {
                 &args.source,
                 asset_is_native,
                 starting_balance_stroops,
-                |oracle_client| async move {
-                    // Re-fetch account state from the independent RPC.
-                    let oracle_account_view = fetch_account(&oracle_client, &oracle_source, &[])
-                        .await
-                        .map_err(|e| {
-                            rmcp::ErrorData::internal_error(format!("oracle_rpc_error: {e}"), None)
-                        })?;
-                    // SAFETY-MIRROR: this builder configuration MUST match the
-                    // primary rebuild above exactly.  Any change here that is not
-                    // mirrored in the primary rebuild above silently breaks the
-                    // high-value cross-check.
-                    let mut oracle_builder = ClassicOpBuilder::new(
-                        &oracle_source,
-                        oracle_account_view.sequence_number,
-                        &oracle_network_passphrase,
-                        fee_per_op_stroops,
-                    );
-                    oracle_builder
-                        .create_account(
-                            &oracle_destination,
-                            oracle_starting_balance.into_stellar_amount(),
-                        )
-                        .map_err(|e| {
+                |oracle_client| {
+                    // `high_value_cross_check` may invoke this closure more than
+                    // once within its bounded rebuild-retry window (the rebuild
+                    // may fail transiently while the independent RPC catches up),
+                    // so every non-`Copy` capture is cloned per-call rather than
+                    // moved once into the `async move` block.
+                    let oracle_source = oracle_source.clone();
+                    let oracle_destination = oracle_destination.clone();
+                    let oracle_network_passphrase = oracle_network_passphrase.clone();
+                    let oracle_starting_balance = oracle_starting_balance.clone();
+                    async move {
+                        // Re-fetch account state from the independent RPC.
+                        let oracle_account_view =
+                            fetch_account(&oracle_client, &oracle_source, &[])
+                                .await
+                                .map_err(|e| {
+                                    rmcp::ErrorData::internal_error(
+                                        format!("oracle_rpc_error: {e}"),
+                                        None,
+                                    )
+                                })?;
+                        // SAFETY-MIRROR: this builder configuration MUST match the
+                        // primary rebuild above exactly.  Any change here that is not
+                        // mirrored in the primary rebuild above silently breaks the
+                        // high-value cross-check.
+                        let mut oracle_builder = ClassicOpBuilder::new(
+                            &oracle_source,
+                            oracle_account_view.sequence_number,
+                            &oracle_network_passphrase,
+                            fee_per_op_stroops,
+                        );
+                        oracle_builder
+                            .create_account(
+                                &oracle_destination,
+                                oracle_starting_balance.into_stellar_amount(),
+                            )
+                            .map_err(|e| {
+                                rmcp::ErrorData::internal_error(
+                                    format!("oracle_build_error: {e}"),
+                                    None,
+                                )
+                            })?;
+                        oracle_builder.build().map_err(|e| {
                             rmcp::ErrorData::internal_error(
                                 format!("oracle_build_error: {e}"),
                                 None,
                             )
-                        })?;
-                    oracle_builder.build().map_err(|e| {
-                        rmcp::ErrorData::internal_error(format!("oracle_build_error: {e}"), None)
-                    })
+                        })
+                    }
                 },
                 "stellar_create_account_commit",
             )
@@ -1166,6 +1198,16 @@ impl WalletServer {
                         &value_class,
                     );
                 }
+
+                // Record the confirmed sequence for this source account so a
+                // later build in this same process can wait out avoidable
+                // read-after-write propagation lag (source_sequence is the
+                // PRE-submit value; the submitted envelope's sequence is
+                // source_sequence + 1).
+                self.sequence_floor
+                    .lock()
+                    .await
+                    .record_confirmed(&args.source, source_sequence + 1);
 
                 // Remove the consumed approval entry from the store so it
                 // cannot be replayed.  Best-effort: failure does NOT abort the

@@ -43,7 +43,27 @@ set -u -o pipefail
 
 PACE="${PACE:-30}"
 RETRY_COOLDOWN="${RETRY_COOLDOWN:-60}"
+BROWSER_RETRY_COOLDOWN="${BROWSER_RETRY_COOLDOWN:-90}"
 FILTER="${FILTER:-}"
+
+# Suites that launch a headless Chromium (see the module comment above for
+# which test within each suite actually drives the browser). Page-load
+# failures in a headless Chromium under CI load are a distinct environmental
+# flake from the rest of the suites' RPC/Friendbot flakiness, so these get
+# ONE additional retry beyond the universal retry-once default, preceded by
+# BROWSER_RETRY_COOLDOWN instead of RETRY_COOLDOWN.
+BROWSER_SUITE_TARGETS=(
+  "smart_account_rules_webauthn_testnet_acceptance"
+  "smart_account_ergonomics_testnet_acceptance"
+  "operator_enroll_browser_acceptance"
+  "remote_approval_browser_testnet_acceptance"
+  "rule_proposal_remote_browser_testnet_acceptance"
+)
+
+is_browser_suite() {
+  local target="$1"
+  printf '%s\n' "${BROWSER_SUITE_TARGETS[@]}" | grep -qxF "$target"
+}
 
 # Completeness guard: every live-network test file on disk must be listed in
 # SUITES below. The per-suite zero-tests guard cannot catch a file that is
@@ -205,6 +225,22 @@ for line in "${SUITES[@]}"; do
         result="pass (retry)"
         if [ "${LAST_SKIPS:-0}" -gt 0 ]; then
           result="pass (retry, ${LAST_SKIPS} skip marker(s))"
+        fi
+      elif is_browser_suite "$target"; then
+        # Headless-Chromium page-load failures are a distinct environmental
+        # flake from the rest of this suite's dependencies; browser suites get
+        # one additional retry beyond the universal retry-once default.
+        echo "browser suite $suite failed twice; retrying once more after \
+${BROWSER_RETRY_COOLDOWN}s cooldown"
+        sleep "$BROWSER_RETRY_COOLDOWN"
+        if run_suite "$crate" "$feature" "$target"; then
+          result="pass (retry 2)"
+          if [ "${LAST_SKIPS:-0}" -gt 0 ]; then
+            result="pass (retry 2, ${LAST_SKIPS} skip marker(s))"
+          fi
+        else
+          result="FAIL"
+          failures=$((failures + 1))
         fi
       else
         result="FAIL"

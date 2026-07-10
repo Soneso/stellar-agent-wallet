@@ -161,7 +161,7 @@ stellar-agent-test-support = { path = "../stellar-agent-test-support", features 
 stellar-agent-network = { path = "../stellar-agent-network", features = ["test-loopback"] }
 stellar-agent-nonce = { path = "../stellar-agent-nonce", features = ["test-helpers"] }
 tempfile                   = { workspace = true }
-tokio                      = { workspace = true, features = ["rt-multi-thread", "process", "io-util", "time", "sync"] }
+tokio                      = { workspace = true, features = ["rt-multi-thread", "process", "io-util", "time", "sync", "test-util"] }
 regex-lite                 = { workspace = true }
 # The loopback approval-inbox server, driven over real HTTP in the
 # approve-serve testnet acceptance test (gated behind testnet-acceptance).

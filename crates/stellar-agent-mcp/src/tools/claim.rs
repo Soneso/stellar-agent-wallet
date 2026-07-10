@@ -37,7 +37,7 @@ use stellar_agent_core::approval::{
 use stellar_agent_core::envelope_decode::decode_authoritative_args;
 use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_network::{
-    BASE_RESERVE_STROOPS, BalanceView, ClassicOpBuilder, StellarRpcClient, fetch_account,
+    BASE_RESERVE_STROOPS, BalanceView, ClassicOpBuilder, StellarRpcClient,
     keyring::signer_from_keyring,
     parse_classic_fee_choice, resolve_classic_fee_selection,
     signing::envelope_signing::attach_signature,
@@ -333,7 +333,14 @@ impl WalletServer {
         };
 
         // ── Fetch source account (sequence number + native balance) ───────────
-        let account_view = match fetch_account(&client, &source, &[]).await {
+        let account_view = match crate::sequence_floor::fetch_account_with_sequence_catchup(
+            &self.sequence_floor,
+            &client,
+            &source,
+            &[],
+        )
+        .await
+        {
             Ok(v) => v,
             Err(err) => {
                 let envelope = redacted_wallet_error_envelope(&err);
@@ -690,7 +697,14 @@ impl WalletServer {
         // ── Re-fetch source account (feeds the policy gate's `account_view`;
         // sequence number also consumed by the rebuild below) ────────────────
         // Reused for the whole commit path — no second fetch.
-        let account_view = match fetch_account(&client, &source, &[]).await {
+        let account_view = match crate::sequence_floor::fetch_account_with_sequence_catchup(
+            &self.sequence_floor,
+            &client,
+            &source,
+            &[],
+        )
+        .await
+        {
             Ok(v) => v,
             Err(err) => {
                 let envelope = redacted_wallet_error_envelope(&err);
@@ -967,6 +981,16 @@ impl WalletServer {
                         &value_class,
                     );
                 }
+
+                // Record the confirmed sequence for this source account so a
+                // later build in this same process can wait out avoidable
+                // read-after-write propagation lag (source_sequence is the
+                // PRE-submit value; the submitted envelope's sequence is
+                // source_sequence + 1).
+                self.sequence_floor
+                    .lock()
+                    .await
+                    .record_confirmed(&source, source_sequence + 1);
 
                 // Best-effort removal of the consumed approval entry so it
                 // cannot be replayed. Failure does not abort the response —

@@ -55,6 +55,27 @@ const NEW_ACCOUNT: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMW
 const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
 const MAINNET_PASSPHRASE: &str = "Public Global Stellar Network ; September 2015";
 
+/// Mounts a `getLedgerEntries` mock on `mock_server` that reports `address` as
+/// present — satisfies `fund_with_friendbot`'s post-funding verification poll.
+async fn mount_account_present(mock_server: &MockServer, address: &str) {
+    use stellar_agent_test_support::xdr_fixtures::{account_entry_xdr, account_ledger_key_xdr};
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(EchoIdResponder::new(json!({
+            "entries": [
+                {
+                    "key": account_ledger_key_xdr(address),
+                    "xdr": account_entry_xdr(address, 100_000_000_000, 0),
+                    "lastModifiedLedgerSeq": 100
+                }
+            ],
+            "latestLedger": 100
+        })))
+        .mount(mock_server)
+        .await;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ClassicOpBuilder::create_account XDR round-trip
 // ─────────────────────────────────────────────────────────────────────────────
@@ -117,10 +138,16 @@ async fn friendbot_mode_happy_path() {
         .expect(1)
         .mount(&mock_server)
         .await;
+    mount_account_present(&mock_server, NEW_ACCOUNT).await;
 
-    let result = fund_with_friendbot(&mock_server.uri(), NEW_ACCOUNT, TESTNET_PASSPHRASE)
-        .await
-        .expect("fund_with_friendbot must succeed for a mocked 200 response");
+    let result = fund_with_friendbot(
+        &mock_server.uri(),
+        NEW_ACCOUNT,
+        TESTNET_PASSPHRASE,
+        &mock_server.uri(),
+    )
+    .await
+    .expect("fund_with_friendbot must succeed for a mocked 200 response");
 
     assert_eq!(
         result.tx_hash, expected_hash,
@@ -144,7 +171,13 @@ async fn friendbot_mainnet_rejected_zero_http_requests() {
 
     // No mock registered: any request would cause an unexpected-request error.
 
-    let result = fund_with_friendbot(&mock_server.uri(), NEW_ACCOUNT, MAINNET_PASSPHRASE).await;
+    let result = fund_with_friendbot(
+        &mock_server.uri(),
+        NEW_ACCOUNT,
+        MAINNET_PASSPHRASE,
+        &mock_server.uri(),
+    )
+    .await;
 
     assert!(
         matches!(

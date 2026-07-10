@@ -928,6 +928,26 @@ pub enum NetworkError {
         /// Non-secret description of the diverging value.
         context: String,
     },
+
+    /// A Friendbot HTTP response was successful but the funded account never
+    /// became visible on the queried RPC endpoint within the verification
+    /// window.
+    ///
+    /// `account_id` holds the public account ID (`G…`) that was funded. The
+    /// full ID is shown for operator auditability, matching
+    /// [`NetworkError::AccountNotFound`]. `waited_secs` holds the elapsed
+    /// verification time so the operator can tell a slow-but-progressing
+    /// network from Friendbot silently failing.
+    #[error(
+        "Friendbot funded account '{account_id}' but it did not become visible on RPC \
+         within {waited_secs}s"
+    )]
+    FriendbotFundingNotConfirmed {
+        /// The public account ID (`G…`) that was funded but not yet visible.
+        account_id: String,
+        /// Seconds spent polling before giving up.
+        waited_secs: u64,
+    },
 }
 
 impl NetworkError {
@@ -943,6 +963,7 @@ impl NetworkError {
             Self::HorizonUnavailable { .. } => "network.horizon_unavailable",
             Self::RpcResponseMalformed { .. } => "network.rpc_response_malformed",
             Self::RpcDivergence { .. } => "network.rpc_divergence",
+            Self::FriendbotFundingNotConfirmed { .. } => "network.friendbot_funding_not_confirmed",
         }
     }
 }

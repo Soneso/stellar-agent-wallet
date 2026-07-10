@@ -510,7 +510,14 @@ impl WalletServer {
         // ── Step 3: Fetch source account (feeds the policy gate's
         // account_view; sequence number consumed by the envelope build at
         // Step 8) ──────────────────────────────────────────────────────────
-        let source_account_view = match fetch_account(&client, &args.from, &[]).await {
+        let source_account_view = match crate::sequence_floor::fetch_account_with_sequence_catchup(
+            &self.sequence_floor,
+            &client,
+            &args.from,
+            &[],
+        )
+        .await
+        {
             Ok(v) => v,
             Err(err) => {
                 let envelope = redacted_wallet_error_envelope(&err);
@@ -1061,7 +1068,14 @@ impl WalletServer {
             }
         };
 
-        let source_account_view = match fetch_account(&client, &args.from, &[]).await {
+        let source_account_view = match crate::sequence_floor::fetch_account_with_sequence_catchup(
+            &self.sequence_floor,
+            &client,
+            &args.from,
+            &[],
+        )
+        .await
+        {
             Ok(v) => v,
             Err(err) => {
                 let envelope = redacted_wallet_error_envelope(&err);
@@ -1282,6 +1296,16 @@ impl WalletServer {
                         &value_class,
                     );
                 }
+
+                // Record the confirmed sequence for this source account so a
+                // later build in this same process can wait out avoidable
+                // read-after-write propagation lag (source_sequence is the
+                // PRE-submit value; the submitted envelope's sequence is
+                // source_sequence + 1).
+                self.sequence_floor
+                    .lock()
+                    .await
+                    .record_confirmed(&args.from, source_sequence + 1);
 
                 // Best-effort: remove the consumed approval entry.
                 if let Some(ref approval_nonce_str) = args.approval_nonce
