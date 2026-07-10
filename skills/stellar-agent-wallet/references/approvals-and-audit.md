@@ -78,8 +78,8 @@ Evaluation is first-match, default-deny:
 
 A Criterion is one typed check: per-transaction cap, per-period (windowed) cap,
 rate limit, counterparty allowlist (by classic account, contract account, asset
-issuer, or resolved home domain), minimum-reserve guard, Soroban resource-fee
-cap, multicall bundle-level checks (inner-count cap, aggregate cap, rejection of
+issuer, or resolved home domain), minimum-reserve guard, multicall bundle-level
+checks (inner-count cap, aggregate cap, rejection of
 unrecognized inner shapes), quorum satisfaction, a home-domain-resolved guard,
 and SEP-10 / SEP-45 session-active checks. Criteria needing external state
 (reserves, identity, the counterparty cache, an active session) receive it as an
@@ -306,6 +306,11 @@ never logged — only their key names. Strkeys in a decision reason are redacted
 first-five-last-five and transaction hashes to first-eight-last-eight; the
 envelope hash is left intact (it is a SHA-256 digest carrying no user data).
 
+Beyond tool invocations, the log records `value_action_submitted` on every
+confirmed value-moving submit (carrying the gate-sized value legs),
+`keyring_key_written` on each key-writing profile command, and
+`x402_payment_authorized` on x402 authorization signing.
+
 Each entry's hash is computed over its own canonical JSON (with the previous-hash
 field treated as empty) concatenated with the previous entry's hash, chaining
 every entry to the one before it. The first entry of the very first file chains
@@ -378,7 +383,7 @@ The policy-file owner key is not rotated here — it is enrolled with `profile e
 | Subcommand | Key kind | Effect on outstanding material |
 |---|---|---|
 | `profile rotate-attestation-key <NAME>` | 32-byte HMAC | All pending approvals invalidated; re-run the simulate-and-approve round trip. |
-| `profile rotate-audit-key <NAME>` | 32-byte HMAC | New log files use the new key for their chain-root signature; existing files keep the key active when they were opened. |
+| `profile rotate-audit-key <NAME>` | 32-byte HMAC | Re-signs every existing per-file chain-root sidecar with the new key; `audit verify --profile <p>` stays green across the rotation and the old key stops verifying; the response carries `sidecars_resigned`. |
 | `profile rotate-nonce-key <NAME>` | 32-byte HMAC | All outstanding nonces minted with the old key are invalidated. |
 | `profile rotate-counterparty-key <NAME>` | 32-byte HMAC | Invalidates every cached counterparty binding; the wallet re-fetches on the next counterparty-allowlist check. |
 

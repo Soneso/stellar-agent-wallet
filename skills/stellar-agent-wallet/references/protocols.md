@@ -179,7 +179,7 @@ Payer-side construction and signing of a `PAYMENT-SIGNATURE` payload for the x40
 | `chain_id` | string | yes | CAIP-2; validated against the profile |
 | `address` | string | no | signer G-strkey; must match the active signer if given |
 
-Flow: validate → build SAC transfer → simulate → sign auth entry → re-simulate → serialize. Returns `{ paymentSignature, payer, asset, amount, payTo, network }` (`paymentSignature` is the standard-base64 `PAYMENT-SIGNATURE` header value; `asset` is the SAC C-strkey; `amount` is the atomic-unit string from `PaymentRequirements`). Errors return `{ code: "x402.error", message }` with `isError = true`.
+Flow: validate → build SAC transfer → simulate → sign auth entry → re-simulate → serialize. Returns `{ paymentSignature, payer, asset, amount, payTo, network }` (`paymentSignature` is the standard-base64 `PAYMENT-SIGNATURE` header value; `asset` is the SAC C-strkey; `amount` is the atomic-unit string from `PaymentRequirements`). Errors carry per-variant codes `x402.<reason>` (for example `x402.invalid_payment_required`, `x402.unsupported_scheme`, `x402.rpc_simulate_failed`) in the standard `{ok:false, error:{code, message}, request_id}` envelope with `is_error` set.
 
 ### `stellar_x402_authenticated_payment`
 

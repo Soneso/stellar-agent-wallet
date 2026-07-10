@@ -259,6 +259,11 @@ request id, the event kind, and the previous entry's hash. Each entry is
 hash-chained to the one before it; each file carries a root-HMAC sidecar signed
 with the profile's audit key.
 
+Beyond tool invocations, the log records `value_action_submitted` on every
+confirmed value-moving submit (carrying the gate-sized value legs),
+`keyring_key_written` on each key-writing profile command, and
+`x402_payment_authorized` on x402 authorization signing.
+
 Operators verify the chain end-to-end:
 
 ```text

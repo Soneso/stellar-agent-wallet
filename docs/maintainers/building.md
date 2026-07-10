@@ -189,6 +189,10 @@ Friendbot and the RPC load balancer are not hit back-to-back:
 FILTER=stellar-agent-dex .github/scripts/run-testnet-acceptance.sh   # one crate
 ```
 
+The driver enforces a completeness guard: it fails the run if any `tests/*testnet*.rs`
+file on disk is missing from its suite list, so a new live suite must be added to
+`SUITES` in `.github/scripts/run-testnet-acceptance.sh`.
+
 The same script backs the `Testnet acceptance` workflow
 (`.github/workflows/testnet.yml`), which runs on manual dispatch (with an
 optional suite filter input) and on a weekly schedule; it is deliberately not

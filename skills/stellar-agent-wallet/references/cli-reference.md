@@ -136,9 +136,12 @@ Staged pipeline (mutually exclusive): `--build-only` emits unsigned envelope XDR
 | `--secret-env <VAR>` | Env-var name holding source S-strkey | — |
 | `--sign-with-ledger` / `--account-index <INDEX>` | Ledger signer / BIP index | `false` / `0` |
 | `--build-only` / `--sign-only <XDR>` / `--submit-only <XDR>` | Stage selection (at most one) | — |
+| `--profile <NAME>` | Profile whose policy engine, keys, and audit writer to use | `default` |
 | `--fee` / `--network` / `--timeout-seconds` / `--rpc-url` / `--output` | shared | as above |
 
-Memo flags are a mutually exclusive group (at most one). 
+Memo flags are a mutually exclusive group (at most one).
+
+Under `policy.engine = "v1"` `pay` evaluates operator policy before signing. The staged `--sign-only` / `--submit-only` stages gate too: they decode the supplied envelope and match rules under the `stellar_pay_commit` tool name, and deny `policy.deny.unsizable_value_effect` on an envelope the decoder cannot size unless the matched rule sets `allow_opaque_signing = true`.
 
 ```bash
 export WALLET_SK="S..."
@@ -196,8 +199,11 @@ stellar-agent trustline --from GABC...WXYZ --asset USDC --profile default
 | `--secret-env <VAR>` | Env-var name holding source S-strkey | — |
 | `--sign-with-ledger` / `--account-index <INDEX>` | Ledger signer / BIP index | `false` / `0` |
 | `--build-only` / `--sign-only <XDR>` / `--submit-only <XDR>` | Stage selection (at most one) | — |
+| `--profile <NAME>` | Profile whose policy engine, keys, and audit writer to use | `default` |
 | `--network` | `testnet` or `mainnet` (`mainnet` structurally refused for writes) | `testnet` |
 | `--timeout-seconds` / `--rpc-url` / `--output` | shared | as above |
+
+Under `policy.engine = "v1"` `claim` evaluates operator policy before signing. The staged `--sign-only` / `--submit-only` stages gate too: they decode the supplied envelope and match rules under the `stellar_claim_commit` tool name, and deny `policy.deny.unsizable_value_effect` on an envelope the decoder cannot size unless the matched rule sets `allow_opaque_signing = true`.
 
 The build stage prints a typed preview (balance id, asset, amount, claimants, `is_claimant`, predicate verdict) to stdout before the guards run, so the operator sees the balance disclosure even when a guard subsequently refuses.
 
@@ -352,6 +358,7 @@ Lists, shows, and migrates profiles, and rotates the keyring-backed keys a profi
 | `list` | `profile list` | Read-only. Returns known profile names sorted as a JSON array. No flags. |
 | `show <NAME>` | `profile show default` | Read-only. Resolved config; keyring refs appear as opaque `{service, account}`, secrets never read. Exits `1` with `ProfileNotFound` or an unsupported-version error. |
 | `migrate <NAME>` | `profile migrate default` | State-changing (atomic temp+rename). No-op if already current (`status:"no_op"`); else `status:"migrated"` with `from_version`/`to_version`/`path`. |
+| `enroll-signer` | `profile enroll-signer --profile default --secret-env WALLET_SK` | State-changing (keyring). Imports the operator's `S...` ed25519 seed from the named env var and stores it verbatim at the profile's `mcp_signer_default` coordinate (the signer every MCP fund-movement tool and keyring-signing CLI verb resolves). Refuses unless the seed derives to that coordinate's `account`. `--secret-env <VAR>` (required, the variable name), `--profile <NAME>` (default `default`), `--expected-address <G_STRKEY>`, `--force`. |
 | `enroll-owner-key` | `profile enroll-owner-key --profile default --secret-env WALLET_OWNER_SK` | State-changing (keyring). Derives the owner ed25519 PUBLIC key from an operator `S...` seed and stores it at `policy_owner_key_id` (the key the V1 engine verifies against). The seed is never stored. `--expected-address`, `--force`. |
 | `sign-policy` | `profile sign-policy --profile default --secret-env WALLET_OWNER_SK` | State-changing (writes the policy file, atomic). Signs `<state_dir>/policies/<profile>.toml` (or `--file`) with the owner seed and writes the `[signature]` table. Refuses if the seed does not match the enrolled owner key. |
 
@@ -364,7 +371,7 @@ The policy-file owner key is NOT rotated here — it is an ed25519 key enrolled 
 | Subcommand | Keyring entry | Effect |
 |---|---|---|
 | `rotate-attestation-key` | approval-spine attestation HMAC (`attestation_key_id`) | Invalidates all pending approvals; the simulate-and-approve round trip must be re-run. `key_kind:"hmac_32_bytes"`. |
-| `rotate-audit-key` | audit-log chain-root HMAC (`audit_log_hash_chain_key_id`) | New log files use the new chain-root key; open files keep their key. `key_kind:"hmac_32_bytes"`. |
+| `rotate-audit-key` | audit-log chain-root HMAC (`audit_log_hash_chain_key_id`) | Re-signs every existing per-file chain-root sidecar with the new key, so `audit verify --profile <NAME>` stays green and the old key stops verifying. Adds `key_kind:"hmac_32_bytes"` and `sidecars_resigned`. |
 | `rotate-nonce-key` | HMAC nonce key (`mcp_nonce_key_alias`) | Invalidates outstanding nonces. Returns only `profile` + `rotated`. |
 | `rotate-counterparty-key` | `stellar.toml` cache-integrity HMAC (`counterparty_cache_key_id`) | Invalidates every cached counterparty binding (re-fetched on next check). Adds `key_kind:"hmac_32_bytes"` and `cache_invalidated:true`. |
 

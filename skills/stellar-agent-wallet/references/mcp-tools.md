@@ -68,6 +68,14 @@ signing. The two engines are Noop (testnet allow-all; mainnet read-only allow,
 mainnet destructive refused) and V1 (signature-verified typed criteria,
 first-match default-deny).
 
+The six sign-only tools — `stellar_sep43_sign_transaction`,
+`stellar_sep43_sign_auth_entry`, `stellar_sep43_sign_message`,
+`stellar_sep53_sign_message`, `stellar_x402_create_payment`, and
+`stellar_x402_authenticated_payment` — refuse `stellar:mainnet` structurally at
+handler entry with `network.mainnet_write_forbidden`, before any policy
+evaluation and regardless of engine. On the SEP-43 tools this crosses the wire
+as the SEP-43 error object with code `-3`.
+
 How `RequireApproval` is satisfied depends on tool shape:
 
 - Two-phase signing verbs (`stellar_pay`, `stellar_create_account`,
@@ -198,7 +206,7 @@ optional `approval_nonce` / `approval_attestation` pair as `stellar_pay_commit`.
 
 | Field | Type | Required | Notes |
 | --- | --- | --- | --- |
-| `chain_id` | string | yes | Only `stellar:testnet` succeeds; mainnet returns `policy.engine_required`. |
+| `chain_id` | string | yes | Only `stellar:testnet` succeeds; mainnet returns `network.friendbot_mainnet_forbidden`. |
 | `account_id` | string | yes | G-strkey to fund. |
 
 (An optional Friendbot endpoint override is accepted; the default URL for the

@@ -73,7 +73,7 @@ Both binaries share a single release archive. The `[package.metadata.binstall]` 
 
 | Crate | Responsibility |
 | --- | --- |
-| `stellar-agent-core` | Synchronous, runtime-free substrate: typed amounts, nine-category `WalletError`, JSON `Envelope`, profiles, observability, smart-account auth-digest helpers, the policy-engine trait and Noop/V1 implementations, the approval spine, and the audit log. |
+| `stellar-agent-core` | Synchronous, runtime-free substrate: typed amounts, nine-category `WalletError`, JSON `Envelope`, profiles, observability, smart-account auth-digest helpers, the policy-engine trait and Noop/V1 implementations, the approval spine, the audit log, and the `rpc_budget` module — a shared wall-clock budget primitive (`SequentialRpcBudget` / `bound_stage`) that bounds sequential RPC flows: deployment stages, rule scans, divergence checks, list operations, and retry attempts. |
 | `stellar-agent-network` | Async Stellar RPC client, account-view projection, transaction assembly, SEP-29 memo enforcement, hardware-signer preparation, Friendbot funding, and the idempotent submit primitive. |
 | `stellar-agent-claimable` | Claimable-balance domain logic: balance-id normalization, predicate evaluation, entry and trustline fetch, and claim preview; drives the `claim` verb. |
 | `stellar-agent-sep5` | SEP-5 / BIP-44 HD ed25519 key derivation (`m/44'/148'/index'`, SLIP-0010 hardened) from a BIP-39 mnemonic or seed; no I/O or RNG. |

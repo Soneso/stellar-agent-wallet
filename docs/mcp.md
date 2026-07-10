@@ -370,3 +370,8 @@ shaped like their CLI counterparts. The server runs until the MCP client closes
 the connection. Startup failures (no supported keyring backend, an unloadable
 profile, or a duplicate tool registration) cause the process to exit non-zero
 before serving any request.
+
+Business errors return `{ "ok": false, "error": { "code", "message" }, "request_id" }`
+with `is_error` set; consumers branch on `error.code`. The SEP-43 tools are the
+exception, returning the spec-mandated `{ code, message }` object. See
+[The result envelope](agents.md#the-result-envelope).

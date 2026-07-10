@@ -94,17 +94,19 @@ The non-regular-file check rejects directories and symlinks before open, closing
 
 ### Value-action emission sites
 
-Every verb that moves value writes a `value_action_submitted` row after — and only after — the on-chain action confirms, carrying the SAME value legs the policy gate sized (single-derivation invariant: the legs are the `ValueEffects` the gate evaluated, never re-derived at the emission site). The redacted transaction hash (first-8-last-8) and confirmed ledger are recorded; the row never carries key material. Emission is non-fatal: a row-write failure after a confirmed submit logs a warning and never changes the result. A DeFi adapter that instead FAILS at submit records a `sa_raw_invocation` row (with the mapped `SaInvocationResult`) in its error arm.
+Every verb that moves value writes a `value_action_submitted` row after — and only after — the on-chain action confirms, carrying the SAME value legs the policy gate sized (single-derivation invariant: the legs are the `ValueEffects` the gate evaluated, never re-derived at the emission site). The redacted transaction hash (first-8-last-8) and confirmed ledger are recorded; the row never carries key material. Emission is non-fatal: a row-write failure after a confirmed submit logs a warning and never changes the result. A DeFi adapter that instead FAILS at submit records a `sa_raw_invocation` row (with the mapped `SaInvocationResult`) in its error arm. x402 authorization signing is the exception to the row kind: it writes `x402_payment_authorized` — its own `EventKind` carrying legs, network, and scheme — rather than `value_action_submitted`, because the wallet signs the payment authorization without submitting.
 
 | Surface | Verb / tool | Row |
 | --- | --- | --- |
 | MCP | `stellar_pay_commit`, `stellar_create_account_commit`, `stellar_claim_commit`, `stellar_trustline_commit` | `value_action_submitted` (sized legs) |
 | MCP | `stellar_blend_lend`, `stellar_dex_trade`, `stellar_defindex_vault_deposit`, `stellar_defindex_vault_withdraw` | `value_action_submitted` on success; `sa_raw_invocation` on submit failure |
-| MCP | `stellar_x402_create_payment`, `stellar_x402_authenticated_payment` | `value_action_submitted` (authorization legs) |
+| MCP | `stellar_x402_create_payment`, `stellar_x402_authenticated_payment` | `x402_payment_authorized` (its own `EventKind` carrying legs, network, and scheme) |
 | MCP | `stellar_sep43_sign_and_submit_transaction` | `value_action_submitted` (opaque: empty legs + `opaque_reason`) |
 | CLI | `pay`, `claim`, `accounts create` (sponsored mode only), `trustline`, `trade` | `value_action_submitted` (sized legs) |
 
 The value descriptor reaches the emission site through the policy engine's `evaluate_full` / `evaluate_with_value_full`, which surface the sized `ValueEffects` on the allow path; the decision-only `evaluate` / `evaluate_with_value` views discard it and must never gate a value-moving dispatch (see the rustdoc on those methods). Rows are written under the profile's `audit_log_hash_chain_key_id`, loaded through the single `stellar_agent_network::keyring::load_hmac_key_32` source, so `audit verify` covers them.
+
+The emission layer differs by surface. The CLI `pay`, `claim`, `accounts create`, and `trustline` verbs and the CLI `trade` verb emit at the CLI layer. The Blend, DEX, and DeFindex submits emit inside the shared DeFi adapters, so both the MCP and CLI DeFi paths route through the same emission site rather than each surface emitting its own row.
 
 ### Key-write emission sites
 
@@ -202,7 +204,7 @@ Each criterion is a `Box<dyn Criterion>` (`Send + Sync`) with a snake_case kind 
 | `per_tx_cap` | Per-transaction value cap |
 | `per_period_cap` | Sliding-window per-period value cap |
 | `rate_limit` | Sliding-window call-rate limit |
-| `counterparty_allowlist` | Destination allowlist (`ADDRESS` / `HOME_DOMAIN` / `SEP10_IDENTITY` / `ONE_TIME_ADDRESS`); `KNOWN_ISSUER` checks debit legs only unless the criterion's `gate_inflows = true` opt-in extends it to inflow legs too |
+| `counterparty_allowlist` | Destination allowlist (`G_ACCOUNT` / `C_ACCOUNT` / `KNOWN_ISSUER` / `HOME_DOMAIN`; `SEP10_IDENTITY` and `ONE_TIME_ADDRESS` are reserved, not evaluated); `KNOWN_ISSUER` checks debit legs only unless the criterion's `gate_inflows = true` opt-in extends it to inflow legs too |
 | `minimum_reserve` | Minimum-reserve guard (classic-account tools only — see below) |
 | `inner_invocation_count_cap` | Multicall inner-count cap |
 | `bundle_aggregate_cap` | Multicall aggregate-value cap (implicitly enforces the Generic-rejection check below, on any rule that carries it) |
@@ -220,6 +222,10 @@ Multicall bundles also carry a hard floor independent of policy: `evaluate_bundl
 ### Injected views fail closed when absent
 
 Several criteria need state the core crate cannot fetch itself (account reserves, identity, counterparty cache, SEP-10/SEP-45 sessions, quorum). To avoid a circular dependency on the network and smart-account crates, these arrive as optional trait objects on `EvalContext` — `AccountReservesView`, `AccountIdentityView`, `CounterpartyCacheView`, `Sep10SessionView`, `Sep45SessionView`, `QuorumView` — populated by adapters in `stellar-agent-mcp` at the dispatch site. When a configured criterion's required view is `None`, the criterion returns `Err(PolicyError::CriterionEvaluationFailed)` rather than silently passing: `minimum_reserve` with no `account_view`, `sep10_session_active` with no session view, and `home_domain_resolved` with no counterparty cache all fail closed. `AccountIdentityView` is deliberately a separate trait with no default methods so a missing `home_domain` cannot become a silent allow.
+
+### HOME_DOMAIN allowlist verification
+
+`HOME_DOMAIN` matching in `counterparty_allowlist` requires the domain to be verified through the counterparty cache, not merely asserted. The destination's self-asserted on-chain `home_domain` must be resolved in the cache, AND the cached `stellar.toml`'s `ACCOUNTS` list must contain the account (`CounterpartyCacheView::is_account_listed`, default `false`, fail-closed). A domain absent from the cache, or present but not listing the account, denies. Operators populate the cache with `stellar-agent counterparty warm-up` / `counterparty refresh <domain>`. The deny detail distinguishes an unverified domain (not resolved in the cache) from an unlisted account (resolved, but the account is absent from `ACCOUNTS`).
 
 ### `minimum_reserve` is inapplicable to smart-account verbs
 

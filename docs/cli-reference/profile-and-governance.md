@@ -10,6 +10,8 @@ All four groups operate on local state — TOML files and platform-keyring entri
 
 The `profile` group lists, shows, and migrates profiles, and rotates the keyring-backed keys a profile names. A profile is a per-environment TOML config (schema version 2) binding a CAIP-2 chain id, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. It holds no secrets; it only names keyring entries.
 
+The six key-writing commands — `enroll-signer`, `enroll-owner-key`, and the four key-rotation subcommands — each write a `keyring_key_written` audit row recording the key purpose and, where applicable, the redacted public address.
+
 The subcommands that take a profile name do so as a positional `<NAME>` argument, not as a `--profile` flag, and they have no confirmation flag.
 
 ### `profile list`
@@ -92,7 +94,7 @@ Enrolls the policy-file owner PUBLIC key into the profile's `policy_owner_key_id
 - `--expected-address <G_STRKEY>` — refuse unless the seed derives to this address.
 - `--force` — replace an already-enrolled owner key (refused without it when one exists; replacing invalidates every policy file signed by the previous owner key).
 
-The owner coordinate's `account` is the literal `"default"` (the value the engine reads); the stored value is the URL-safe base64 (no padding) encoding of the 32-byte public key. On success the data object reports the derived `owner_address`, the `keyring_service`/`keyring_account` written, and `replaced`. The prior key's stored value is never decoded or reported: the legacy `rotate-owner-key` wrote the owner seed at this coordinate in the same encoding, so rendering it could print a private key; `replaced: true` conveys that a prior entry existed.
+The owner coordinate's `account` is the literal `"default"` (the value the engine reads); the stored value is the URL-safe base64 (no padding) encoding of the 32-byte public key. On success the data object reports the derived `owner_address`, the `keyring_service`/`keyring_account` written, and `replaced`. The prior key's stored value is never decoded or reported: a prior entry at this coordinate may have held an owner seed in the same encoding, so rendering it could print a private key; `replaced: true` conveys that a prior entry existed.
 
 ```json
 {"ok":true,"data":{"profile":"default","enrolled":true,"owner_address":"G...","keyring_service":"stellar-agent-owner-default","keyring_account":"default","replaced":false},"request_id":"..."}
@@ -128,7 +130,7 @@ Each rotation subcommand generates a fresh 32-byte secret from the OS CSPRNG, en
 | Subcommand | Keyring entry rotated | Key kind | Effect on outstanding material |
 |---|---|---|---|
 | `rotate-attestation-key` | approval-spine attestation HMAC key (`attestation_key_id`) | 32-byte HMAC | All pending approvals are invalidated; the simulate-and-approve round trip must be re-run. |
-| `rotate-audit-key` | audit-log chain-root HMAC key (`audit_log_hash_chain_key_id`) | 32-byte HMAC | New log files use the new key for their chain-root signature; existing files keep the key active when they were opened. |
+| `rotate-audit-key` | audit-log chain-root HMAC key (`audit_log_hash_chain_key_id`) | 32-byte HMAC | Rotation re-signs every existing per-file chain-root sidecar with the new key; `audit verify` passes under the new key and the old key stops verifying. |
 | `rotate-nonce-key` | HMAC nonce key (`mcp_nonce_key_alias`) | 32-byte HMAC | All outstanding nonces minted with the old key are invalidated. |
 
 All three mint raw 32-byte HMAC keys.
@@ -139,10 +141,14 @@ stellar-agent profile rotate-audit-key default
 stellar-agent profile rotate-nonce-key default
 ```
 
-Each returns the profile name and a `rotated` flag. The attestation-key and audit-key paths additionally report a `key_kind` (`hmac_32_bytes`); `rotate-nonce-key` returns only `profile` and `rotated`:
+Each returns the profile name and a `rotated` flag. The attestation-key and audit-key paths additionally report a `key_kind` (`hmac_32_bytes`); the audit-key path also reports `sidecars_resigned`, the count of per-file chain-root sidecars re-signed with the new key. `rotate-nonce-key` returns only `profile` and `rotated`:
 
 ```json
 {"ok":true,"data":{"profile":"default","rotated":true,"key_kind":"hmac_32_bytes"},"request_id":"..."}
+```
+
+```json
+{"ok":true,"data":{"profile":"default","rotated":true,"key_kind":"hmac_32_bytes","sidecars_resigned":2},"request_id":"..."}
 ```
 
 A fourth rotation subcommand, `profile rotate-counterparty-key <NAME>`, rotates the `stellar.toml` cache-integrity HMAC key (`counterparty_cache_key_id`); it invalidates every cached counterparty binding, which the wallet re-fetches on the next counterparty-allowlist check. Its data object adds `"key_kind": "hmac_32_bytes"` and `"cache_invalidated": true` to the `profile` and `rotated` fields. This rotates the same keyring entry as `stellar-agent counterparty rotate-hmac-key` (see [core operations](stellar-ops.md)); the two verbs are interchangeable.
@@ -428,4 +434,4 @@ stellar-agent audit verify ~/.local/state/stellar-agent/audit/default.jsonl --pr
 3. The agent surface verifies the attestation and executes. Every invocation and lifecycle event is appended to the hash-chained audit log.
 4. The operator periodically runs `audit verify` to confirm the log has not been tampered with, supplying `--profile` to check the chain-root HMAC sidecars as well as the hash chain.
 
-Key rotation backs this loop: `rotate-attestation-key` invalidates outstanding approvals, and `rotate-audit-key` re-keys the chain root for new log files. See [concepts](../concepts.md) for the full model.
+Key rotation backs this loop: `rotate-attestation-key` invalidates outstanding approvals, and `rotate-audit-key` re-keys the chain root and re-signs every existing per-file sidecar. See [concepts](../concepts.md) for the full model.

@@ -134,10 +134,10 @@ Each DeFi venue is a signing adapter behind a common interface. They share a pos
   - Oracle allowlist is Reflector-only. Oracle staleness is bounded (600s default); a per-invocation override emits a distinct audit event.
   - The `liquidate` verb is deferred; flash-loan and `submit_with_allowance` (v2-only) are out of scope.
 
-### Soroswap — trade and quote (`trade`, `quote`)
+### Soroswap — trade (`trade`, `stellar_dex_quote`)
 
 - **Protocol:** Soroswap router-direct swap.
-- **Capability:** Real on-chain swap with an absolute `amount_out_min`, plus a read-only quote. The `trade` (signing) and `quote` (read-only) verbs are dispatched through MCP and the CLI.
+- **Capability:** Real on-chain swap with an absolute `amount_out_min`, plus a read-only quote. The `trade` (signing) verb is dispatched through both MCP and the CLI. The read-only quote is the MCP `stellar_dex_quote` tool; the CLI has no separate `quote` subcommand, so CLI price discovery happens inside `trade` via the on-chain `router_get_amounts_out` re-check at signing time.
 - **Refusals and constraints:**
   - Slippage must be an absolute floor (`amount_out_min`). A percent-string slippage is refused, fail-closed.
   - An on-chain `router_get_amounts_out` re-fetch runs immediately before signing; an absent quote or a quote below the absolute floor refuses the swap. This re-check is a front-run floor using the same routine the swap uses, not an independent price oracle.
@@ -173,12 +173,12 @@ Each DeFi venue is a signing adapter behind a common interface. They share a pos
 | x402 v2 Exact Stellar | Payer-side `PAYMENT-SIGNATURE` construction and signing (Stellar-only, `exact`-only) | MCP |
 | x402 identity gate | SEP-10 counterparty-identity gate returning a Bearer JWT companion (never in the XDR) | MCP |
 | Blend | `lend` preview and submit; Reflector-only oracle, WASM-pinned, fail-closed health guard | CLI, MCP |
-| Soroswap | `trade` (signing) and `quote` (read-only); absolute slippage floor, pre-sign re-verify, WASM-pinned | CLI, MCP |
+| Soroswap | `trade` (signing, CLI + MCP) and the read-only `stellar_dex_quote` (MCP only); absolute slippage floor, pre-sign re-verify, WASM-pinned | CLI, MCP |
 | DeFindex | `vault` deposit/withdraw; `min_out` required, role disclosure, `Upgradable:true` refused by default | CLI, MCP |
 
 ## Related pages
 
 - [Stellar operations CLI reference](cli-reference/stellar-ops.md) — core on-chain commands.
-- [DeFi and pool commands](cli-reference/defi-and-pool.md) — `lend`, `trade`, `quote`, `vault`, and channel-account pool commands.
+- [DeFi and pool commands](cli-reference/defi-and-pool.md) — `lend`, `trade`, `vault`, and channel-account pool commands.
 - [MCP server](mcp.md) — the `stellar-agent-mcp` stdio server and its tool catalog.
 - [Toolsets](toolsets.md) — how toolset-routed capabilities reach signing-adjacent tools under the first-invoke gate and per-action approval.

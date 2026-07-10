@@ -206,9 +206,30 @@ invalidates policy files signed by the previous one.
 | Command | Mints into | Notes |
 |---------|------------|-------|
 | `stellar-agent profile rotate-attestation-key <name>` | `attestation_key_id` | Fresh 32-byte HMAC key. All pending approvals are invalidated. |
-| `stellar-agent profile rotate-audit-key <name>` | `audit_log_hash_chain_key_id` | Fresh 32-byte HMAC key. New audit-log files opened after rotation use the new key for their chain-root signature. |
+| `stellar-agent profile rotate-audit-key <name>` | `audit_log_hash_chain_key_id` | Fresh 32-byte HMAC key. Re-signs every existing per-file chain-root sidecar with the new key, so `audit verify --profile <name>` stays green across the rotation and the old key stops verifying; the response carries `sidecars_resigned`. |
 | `stellar-agent profile rotate-counterparty-key <name>` | `counterparty_cache_key_id` | Fresh 32-byte HMAC key. All cached `stellar.toml` entries are invalidated and re-fetched on next use. |
 | `stellar-agent profile rotate-nonce-key <name>` | `mcp_nonce_key_alias` | Fresh 32-byte HMAC key. Outstanding nonces minted with the old key are invalidated. |
+
+### Enroll the MCP signer
+
+The signer seed is imported, not minted. `stellar-agent profile enroll-signer`
+reads the operator's `S...` ed25519 secret from a named environment variable and
+stores it verbatim at the profile's `mcp_signer_default` keyring coordinate — the
+signer every MCP fund-movement tool and every keyring-signing CLI verb
+(`trustline`, `lend`, `trade`, `vault`) resolves. On a clean install that entry
+is absent and those paths fail with `auth.keyring_not_found`.
+
+```bash
+export WALLET_SK=S...signer-secret...
+stellar-agent profile enroll-signer --profile default --secret-env WALLET_SK
+```
+
+Flags: `--secret-env <VAR>` (required; the variable NAME, never the secret),
+`--profile <NAME>` (default `default`), `--expected-address <G_STRKEY>` (refuse
+unless the seed derives to it), `--force` (replace an already-enrolled entry).
+Enrollment derives the seed's public address and refuses unless it equals the
+profile's `mcp_signer_default` account, printing the address to set `account` to;
+the profile TOML is never rewritten.
 
 ### Opt in to V1
 

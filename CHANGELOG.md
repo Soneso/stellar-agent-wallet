@@ -31,9 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recording the SAME value legs the policy gate sized (single-derivation
   invariant), the redacted transaction hash, and the ledger. This covers the MCP
   `stellar_pay` / `stellar_create_account` / `stellar_claim` / `stellar_trustline`
-  commit tools, the Blend / DEX / DeFindex adapters, the x402 payment
-  authorizers, the opaque `stellar_sep43_sign_and_submit_transaction` path, and
-  the CLI `pay` / `claim` / `accounts create` (sponsored) / `trustline` verbs. A
+  commit tools, the Blend / DEX / DeFindex adapters, the opaque
+  `stellar_sep43_sign_and_submit_transaction` path, and the CLI `pay` /
+  `claim` / `accounts create` (sponsored) / `trustline` verbs. The x402
+  payment authorizers write their own `x402_payment_authorized` row at
+  authorization signing (there is no on-chain submit on that path), carrying
+  the gate-sized legs plus the settle network and scheme. A
   DeFi adapter that fails on submit records a `sa_raw_invocation` row instead.
   Emission is non-fatal post-submit: a row-write failure logs a warning and
   never changes the result. (#21)

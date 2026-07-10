@@ -233,6 +233,10 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
   refuses every fund-moving tool with `policy.engine_required`, before any RPC
   call. Mainnet writes require the operator to rotate keys and opt in to the V1
   engine.
+- The sign-only tools (the SEP-43 sign verbs, SEP-53 `sign_message`, and the two
+  x402 payment tools) refuse `stellar:mainnet` structurally with
+  `network.mainnet_write_forbidden` at handler entry, before the policy gate and
+  regardless of engine. Branch on BOTH codes when handling a mainnet refusal.
 - Argument values are never written to the audit log — only key names. The
   operator verifies the chain with `stellar-agent audit verify`.
 
@@ -282,6 +286,9 @@ will keep failing.
 
 **Mainnet writes are refused by default.** Expect `policy.engine_required` for any
 fund-moving tool on `stellar:mainnet` until the operator opts in to the V1 engine.
+The sign-only tools (SEP-43 sign verbs, SEP-53 `sign_message`, x402 payment tools)
+refuse mainnet earlier and structurally with `network.mainnet_write_forbidden`,
+before the policy gate — branch on both codes for mainnet refusals.
 
 **Branch on `ok` and the error `code`, not the message.** The human message text
 is not a stable contract; the wire `code` is.
