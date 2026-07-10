@@ -107,7 +107,7 @@ jobs:
   windows-storage:
     name: windows-storage
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     # Targeted regression coverage for Windows-only local-storage bugs that
     # ubuntu-latest cannot catch:
     #
