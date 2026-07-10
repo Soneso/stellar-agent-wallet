@@ -2434,12 +2434,15 @@ mod tests {
             .unwrap();
 
         {
+            // Threshold padding must go through the writer's OWN handle: the
+            // writer holds the exclusive lock on the active file, and Windows
+            // refuses a write issued through any other handle to a locked
+            // file. Append-mode semantics make the write position-independent
+            // on every platform.
             use std::io::Write as _;
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .unwrap();
-            file.write_all(&vec![b'\n'; ROTATION_THRESHOLD_BYTES as usize])
+            writer
+                .file
+                .write_all(&vec![b'\n'; ROTATION_THRESHOLD_BYTES as usize])
                 .unwrap();
         }
 
