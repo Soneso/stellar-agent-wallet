@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.3] - 2026-07-10
+
 ### Added
 
 - `counterparty_allowlist`'s `KNOWN_ISSUER` kind gains an opt-in `gate_inflows`
@@ -513,6 +515,7 @@ policy engine, operator-approval spine, and tamper-evident audit log.
 - An agent integration guide (`docs/agents.md`) and capability-isolation example
   toolsets under `examples/toolsets/`.
 
-[Unreleased]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.2...HEAD
+[Unreleased]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.3...HEAD
+[0.1.0-alpha.3]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.2...v0.1.0-alpha.3
 [0.1.0-alpha.2]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.1...v0.1.0-alpha.2
 [0.1.0-alpha.1]: https://github.com/Soneso/stellar-agent-wallet/releases/tag/v0.1.0-alpha.1
