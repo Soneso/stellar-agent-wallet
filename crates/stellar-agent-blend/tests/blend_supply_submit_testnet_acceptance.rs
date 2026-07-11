@@ -197,6 +197,36 @@ fn make_testnet_signer(seed: Zeroizing<[u8; 32]>) -> Box<dyn Signer + Send + Syn
     Box::new(SoftwareSigningKey::new_from_zeroizing(seed))
 }
 
+/// Spy [`stellar_agent_network::SequenceFloorHook`] standing in for
+/// `stellar-agent-mcp`'s process-local `SequenceFloorTracker`.
+///
+/// Records every `record_confirmed` call so this test can assert, against a
+/// REAL confirmed on-chain submit, that `BlendLendAdapter::submit` ->
+/// `submit_signed_invoke` threads `DefiAdapterCtx::sequence_floor` through to
+/// `SubmitInvokeArgs::sequence_floor` and invokes it exactly as the MCP tool
+/// layer's classic commit verbs invoke their own tracker.
+#[derive(Default)]
+struct SequenceFloorSpy {
+    recorded: std::sync::Mutex<Vec<(String, i64)>>,
+}
+
+#[async_trait::async_trait]
+impl stellar_agent_network::SequenceFloorHook for SequenceFloorSpy {
+    async fn floor(&self, _account_id: &str) -> Option<i64> {
+        // No floor recorded yet in this fresh spy — the pre-submit fetch
+        // proceeds without a catch-up poll, exactly like a first call in a
+        // freshly started MCP server.
+        None
+    }
+
+    async fn record_confirmed(&self, account_id: &str, consumed_sequence: i64) {
+        self.recorded
+            .lock()
+            .expect("lock")
+            .push((account_id.to_owned(), consumed_sequence));
+    }
+}
+
 async fn deploy_testnet_smart_account(
     request: DeploySmartAccountRequest<Box<dyn Signer + Send + Sync>>,
 ) -> Result<DeploySmartAccountOutcome, Box<dyn Error + Send + Sync>> {
@@ -428,6 +458,17 @@ async fn blend_supply_submit_and_confirm() {
 
     let primary_rpc = testnet_rpc();
 
+    // The pre-submit sequence, captured independently of the adapter's
+    // own internal fetch, so the assertion below verifies the EXACT consumed
+    // sequence the spy observed (pre-submit sequence + 1), not merely that
+    // *some* call happened.
+    let pre_submit_sequence = fetch_account(&primary_rpc, &wallet_c, &[])
+        .await
+        .expect("fetch pre-submit sequence")
+        .sequence_number;
+
+    let sequence_floor_spy = SequenceFloorSpy::default();
+
     // Build DefiAdapterCtx with full submit context.
     let mut ctx = DefiAdapterCtx::new_with_submit_ctx(
         "default",
@@ -439,6 +480,9 @@ async fn blend_supply_submit_and_confirm() {
         None, // single-RPC for testnet acceptance
         Some(Duration::from_secs(120)),
     );
+    // DefiAdapterCtx -> SubmitInvokeArgs::sequence_floor threading:
+    // stand in for the MCP server's process-local SequenceFloorTracker.
+    ctx.sequence_floor = Some(&sequence_floor_spy);
 
     // Build LendArgs: supply SUPPLY_AMOUNT of the reserve asset from wallet_c.
     let lend_args = LendArgs {
@@ -508,6 +552,19 @@ async fn blend_supply_submit_and_confirm() {
                     row["kind"] == "value_action_submitted" && row["tool"] == "stellar_blend_lend"
                 }),
                 "confirmed Blend supply must record a value_action_submitted row: {audit_rows:?}"
+            );
+
+            // The confirmed on-chain supply must have recorded the
+            // consumed sequence into the threaded SequenceFloorHook, exactly
+            // as the classic commit verbs record into their tracker on
+            // confirmed submit (source_sequence + 1).
+            let recorded = sequence_floor_spy.recorded.lock().expect("lock").clone();
+            assert_eq!(
+                recorded,
+                vec![(wallet_c.clone(), pre_submit_sequence + 1)],
+                "confirmed Blend supply must record exactly one \
+                 (source_account, consumed_sequence) pair into the sequence \
+                 floor hook, matching pre_submit_sequence + 1: {recorded:?}"
             );
         }
         Err(e) => {

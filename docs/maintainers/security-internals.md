@@ -65,6 +65,12 @@ The very first file's first entry chains off `ZERO_BLOCK_HASH`, which is `SHA-25
 
 On rotation, the outgoing file's last entry is an `AuditRotationHandoff { next_file_name }`. The next file's first entry chains off that handoff entry's hash, not the zero-block hash, bridging the chain across files. The `next_file_name` records the rotated archive name of the file the handoff is written into, binding the rotation to a specific filename.
 
+### Writer lock and reader concurrency
+
+The writer's mutual exclusion lives on a sidecar lock file (`<log>.lock`), never on the log file itself: `AuditWriter::open` acquires an exclusive OS lock on the sidecar before touching the log, holds it for the writer's whole life (including across rotation, whose archive rename and exclusive create rely on it), and the OS releases it on drop or process death. The log file carries no OS lock on any platform, so readers (`audit verify`, the `find_*` scans) never contend with a live writer — load-bearing on Windows, where an exclusive file lock is enforced against reads through every other handle. The writer keeps a single handle for every read and write of the active log as a consistency invariant.
+
+Readers can observe two transient states: a torn last line during an in-flight append (reported as a parse error on that entry, exactly as a genuine truncation would be), and a briefly absent active file between rotation's rename and create. For the latter, readers and `verify_log` re-scan within a small bounded window, gated on the sidecar lock being observably held by a live writer; an unheld lock reports the gap immediately, and the tolerance can only delay — never suppress — a `RotationGap`, chain-break, or HMAC failure. The lock-liveness probe momentarily acquires the sidecar lock, so `verify` may create the `.lock` file (and can, in a microsecond window, surface spurious contention to a concurrently STARTING writer — fail-closed and retryable); verification of a copied-off audit directory is therefore not strictly side-effect-free on that anomalous path.
+
 ### Per-file root HMAC sidecar
 
 Each log file gets a `<file>.root_hmac` sidecar holding an HMAC-SHA256 tag (`sha256:<hex>`) over the chain root, keyed by the profile's `audit_log_hash_chain_key_id`. `sign_chain_root` mints it; `verify_chain_root` checks it with a constant-time comparison (`subtle::ConstantTimeEq`) against the supplied key. The sidecar is renamed alongside the log file on rotation.
@@ -148,6 +154,31 @@ On `mlock` failure the module emits a structured `tracing::warn!` carrying `prof
 The default TTL is `DEFAULT_TTL_SECONDS` (30); the hard cap is `MAX_TTL_SECONDS` (600). `unlock` rejects `ttl_seconds == 0` or `ttl_seconds > 600` with `WalletLifecycleError::TtlInvalid`. The profile field `wallet.unlock_ttl_seconds` is validated against that range when the window is constructed: a value of 0 or above 600 is refused, never clamped.
 
 A background `tokio` task sleeps for the TTL and then marks the wallet disposed. A shared `AtomicBool` cancel flag lets an early `dispose()` short-circuit the timer. On every drop path — normal return, `?` propagation, or panic-unwind — `Drop` calls `dispose()` unconditionally, zeroizing the seed and releasing the lock. `Wallet` is intentionally **not** `Send + Sync`; callers needing shared access wrap it in `Arc<Mutex<Wallet>>` or use the MCP server's per-request ownership model.
+
+## Headless keyring store
+
+Windows Credential Manager requires an interactive logon session; a Windows service, an SSH/WinRM session, or a scheduled task fails every keyring read/write with `auth.keyring_interactive_session_required`. The `stellar-agent-headless-keyring` crate provides an opt-in, file-backed alternative for exactly this deployment shape. It implements `keyring_core::api::CredentialStoreApi` / `CredentialApi` and slots in behind the SAME `KeyringEntryRef` (service, account) coordinates every existing enroll/rotate/sign call site already uses — `keyring_core::Entry::new(service, account)` is unchanged everywhere; only which concrete store answers it differs.
+
+### Activation surface
+
+`stellar_agent_network::keyring::init_platform_keyring_store` — called unchanged at every existing keyring-consuming call site across the CLI and MCP server (~25 sites) — checks the `STELLAR_AGENT_KEYRING_BACKEND` environment variable FIRST. Unset: the platform keyring (unchanged default). Set to `"headless-env"` or `"headless-dpapi"`: the headless store is registered as the process default instead, and initialisation NEVER falls back to the platform keyring on any failure (missing/invalid key, unsupported platform, or state-directory resolution failure all refuse). There is no profile-file `[keyring] backend = ...` surface: threading a `Profile` reference through every `init_platform_keyring_store()` call site (most of which have no loaded profile in scope at that point) was judged not worth it against an env var that already fully serves the deployment shape this feature targets.
+
+### Protection modes and trust model
+
+| Mode | Env var | Primitive | Trust boundary |
+|------|---------|-----------|-----------------|
+| `headless-env` | `STELLAR_AGENT_HEADLESS_KEYRING_KEY` (32-byte URL-safe base64, no padding) | XChaCha20-Poly1305 (`chacha20poly1305` crate) | The env var is the root of trust: any reader of it can decrypt every entry. Targets Linux services and CI where a secret manager already injects env vars under trusted access control. |
+| `headless-dpapi` (Windows only) | none | `CryptProtectData` / `CryptUnprotectData`, CurrentUser scope, via `stellar-agent-windows-identity`'s `dpapi_protect` / `dpapi_unprotect` (`CRYPTPROTECT_UI_FORBIDDEN` — never blocks on a UI prompt) | The SAME trust boundary as Windows Credential Manager (any process running as the same Windows user can decrypt), minus the interactive-logon-session requirement DPAPI CurrentUser scope does not have. |
+
+Both modes are tamper-evident and fail closed: XChaCha20-Poly1305 carries its own Poly1305 authentication tag (a tampered ciphertext fails to decrypt); DPAPI blobs are self-authenticating (`CryptUnprotectData` fails on a modified blob). The `env-key` mode additionally binds `service`||`\0`||`account` as AEAD associated data, so a ciphertext relocated to a different entry coordinate fails to open — DPAPI has no AAD concept, so this binding does not apply to `headless-dpapi` (documented scope limitation, same as Credential Manager's own lack of one).
+
+### Storage
+
+One JSON file for the whole host/user (not one per profile — the `(service, account)` coordinate space inside the file is already profile-scoped by convention, mirroring the platform keyring's own single-shared-store shape) at `<state>/stellar-agent/headless-keyring/store.keyring`. Written atomically: temp-file + `sync_data` + rename + parent-directory fsync (`0600` on Unix), the same discipline `PersistedWindowStore` (policy window-state) and the audit-log sidecar writer use. A corrupted or unparseable file fails every subsequent read closed (`keyring_core::Error::BadStoreFormat`) rather than silently behaving as an empty store. This store does not coordinate concurrent writers across OS processes beyond the atomic rename's own last-writer-wins guarantee — out of scope for the target deployment shape (one long-lived MCP server process, or one-shot CLI invocations that do not overlap).
+
+### Audit and logging
+
+Enrollments/rotations through this store emit the SAME `KeyringKeyWritten` audit row every existing profile command already emits (that emission is keyed off `keyring_core::Entry::set_password` succeeding, which is backend-agnostic — no code change was needed for this to work). The store additionally emits a `headless_keyring.write` tracing log line naming the active protection mode (`backend = "headless-env" | "headless-dpapi"`), so the backend kind is visible in logs without a hash-chained audit-schema change.
 
 ## Nonce scheme
 

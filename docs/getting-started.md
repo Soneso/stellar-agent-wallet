@@ -97,8 +97,19 @@ safe to back up.
 non-interactive process — a Windows service, an SSH session, or a scheduled
 task — cannot access Credential Manager and every keyring operation fails with
 `auth.keyring_interactive_session_required`. Run the wallet from an interactive
-desktop session (Remote Desktop counts), or deploy it inside a container /
-Linux VM where the platform keyring backend does not have this restriction.
+desktop session (Remote Desktop counts), deploy it inside a container / Linux
+VM where the platform keyring backend does not have this restriction, or opt
+into the headless keyring store described below.
+
+**Headless deployments (Windows service/SSH/CI, Linux services): the opt-in
+file-backed keyring store.** Set `STELLAR_AGENT_KEYRING_BACKEND=headless-dpapi`
+(Windows, DPAPI CurrentUser scope) or `STELLAR_AGENT_KEYRING_BACKEND=headless-env`
+(any platform; also requires `STELLAR_AGENT_HEADLESS_KEYRING_KEY`, a 32-byte
+URL-safe-base64 key) on the process environment before running any
+`stellar-agent` or `stellar-agent-mcp` command. The platform keyring remains
+the default when this variable is unset. See [security-internals.md's headless
+keyring section](maintainers/security-internals.md#headless-keyring-store)
+for the trust model and protection-mode details before enabling it.
 
 Profiles live in the OS-conventional directory, one TOML file per profile name:
 

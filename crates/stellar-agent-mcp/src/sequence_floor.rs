@@ -24,12 +24,26 @@
 //! history to track against, so this tracker is MCP-server-only; the CLI is
 //! out of scope by design (see the module's own single-process lifetime
 //! discussion in `stellar_agent_network::policy_state`).
+//!
+//! # DeFi adapter submit paths
+//!
+//! The classic commit verbs below thread [`SequenceFloorTracker`] directly.
+//! The DeFi adapter submit paths (`stellar_dex_trade`, `stellar_blend_lend`,
+//! `stellar_defindex_vault_*`) delegate build and submit to their adapter
+//! crates via `DefiAdapterCtx`, which never sees this tracker's concrete
+//! type. Those call sites instead thread [`hook`]'s
+//! `stellar_agent_network::SequenceFloorHook` object into
+//! `DefiAdapterCtx::sequence_floor`, which reaches the adapter's own
+//! `submit_signed_invoke` call through `SubmitInvokeArgs::sequence_floor`.
+//! Both paths read and write the SAME tracker; a confirmed classic-verb
+//! submit and a confirmed DeFi submit for the same source account advance
+//! one shared floor.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use stellar_agent_core::error::WalletError;
-use stellar_agent_network::{AccountView, Asset, StellarRpcClient, fetch_account};
+use stellar_agent_network::{AccountView, Asset, StellarRpcClient};
 use tokio::sync::Mutex as TokioMutex;
 
 /// Maximum distinct source accounts tracked at once.
@@ -139,6 +153,11 @@ pub(crate) async fn fetch_account_with_sequence_catchup(
 /// interval. Production goes through the wrapper above with the module
 /// constants; tests inject millisecond-scale timing so the exhausted-window
 /// path runs without real multi-second sleeps.
+///
+/// Delegates to `stellar_agent_network::sequence_floor`'s shared catch-up
+/// loop via [`TrackerHook`] — the SAME implementation the DeFi adapter submit
+/// paths use through `DefiAdapterCtx::sequence_floor`, so both surfaces share
+/// one poll algorithm.
 async fn fetch_account_with_sequence_catchup_using(
     tracker: &TokioMutex<SequenceFloorTracker>,
     client: &StellarRpcClient,
@@ -147,23 +166,48 @@ async fn fetch_account_with_sequence_catchup_using(
     max_polls: u32,
     poll_interval: Duration,
 ) -> Result<AccountView, WalletError> {
-    let mut account = fetch_account(client, account_id, trustline_assets).await?;
+    let hook = TrackerHook(tracker);
+    stellar_agent_network::sequence_floor::fetch_account_with_sequence_catchup_using(
+        Some(&hook),
+        client,
+        account_id,
+        trustline_assets,
+        max_polls,
+        poll_interval,
+    )
+    .await
+}
 
-    let Some(floor) = tracker.lock().await.floor(account_id) else {
-        return Ok(account);
-    };
-    if account.sequence_number >= floor {
-        return Ok(account);
+// ─────────────────────────────────────────────────────────────────────────────
+// TrackerHook — SequenceFloorHook adapter for DefiAdapterCtx threading
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Local newtype satisfying Rust's orphan rules for implementing the shared
+/// `stellar_agent_network::SequenceFloorHook` trait over this crate's
+/// `TokioMutex`-guarded [`SequenceFloorTracker`].
+struct TrackerHook<'a>(&'a TokioMutex<SequenceFloorTracker>);
+
+#[async_trait::async_trait]
+impl stellar_agent_network::SequenceFloorHook for TrackerHook<'_> {
+    async fn floor(&self, account_id: &str) -> Option<i64> {
+        self.0.lock().await.floor(account_id)
     }
 
-    for _ in 0..max_polls {
-        tokio::time::sleep(poll_interval).await;
-        account = fetch_account(client, account_id, trustline_assets).await?;
-        if account.sequence_number >= floor {
-            break;
-        }
+    async fn record_confirmed(&self, account_id: &str, consumed_sequence: i64) {
+        self.0
+            .lock()
+            .await
+            .record_confirmed(account_id, consumed_sequence);
     }
-    Ok(account)
+}
+
+/// Builds a [`SequenceFloorHook`](stellar_agent_network::SequenceFloorHook)
+/// borrowing `tracker`, for threading into `DefiAdapterCtx::sequence_floor`
+/// at the DeFi MCP tool call sites (`dex_trade`, `blend_lend`, `vault`).
+pub(crate) fn hook(
+    tracker: &TokioMutex<SequenceFloorTracker>,
+) -> impl stellar_agent_network::SequenceFloorHook + '_ {
+    TrackerHook(tracker)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

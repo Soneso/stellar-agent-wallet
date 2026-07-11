@@ -224,6 +224,19 @@ pub struct DefiAdapterCtx<'a> {
     /// MCP/CLI tool identity for the audit row's outer `tool` field (e.g.
     /// `"stellar_blend_lend"`). Emission is skipped when `None`.
     pub audit_tool: Option<&'a str>,
+    /// Confirmed-sequence floor hook, threaded through to
+    /// `SubmitInvokeArgs::sequence_floor` at the adapter's `submit_signed_invoke`
+    /// call site.
+    ///
+    /// `Some` for MCP tool call sites (wired to the server's process-local
+    /// `SequenceFloorTracker`): the adapter's own account fetch inside
+    /// `submit_signed_invoke` benefits from the bounded catch-up poll, and a
+    /// confirmed submit records its consumed sequence back into the tracker.
+    /// `None` for CLI call sites and preview-only contexts — CLI processes are
+    /// short-lived and hold no cross-call history to track against, matching
+    /// `stellar_agent_mcp::sequence_floor`'s CLI-out-of-scope-by-design
+    /// discipline for the classic commit verbs.
+    pub sequence_floor: Option<&'a dyn stellar_agent_network::SequenceFloorHook>,
 }
 
 impl<'a> DefiAdapterCtx<'a> {
@@ -269,6 +282,7 @@ impl<'a> DefiAdapterCtx<'a> {
             audit_writer: None,
             audit_legs: None,
             audit_tool: None,
+            sequence_floor: None,
         }
     }
 
@@ -322,6 +336,7 @@ impl<'a> DefiAdapterCtx<'a> {
             audit_writer: None,
             audit_legs: None,
             audit_tool: None,
+            sequence_floor: None,
         }
     }
 

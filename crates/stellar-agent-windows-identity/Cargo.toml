@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Windows account-SID lookup used to bind approval attestations to the current OS user. Safe wrapper isolating the Win32 FFI from the unsafe-free core crate."
+description = "Windows account-SID lookup and DPAPI protect/unprotect. Safe wrappers isolating Win32 FFI from the unsafe-free core crate."
 readme = "README.md"
 keywords = ["stellar", "windows", "sid", "identity", "wallet"]
 categories = ["os::windows-apis", "authentication"]
@@ -21,6 +21,7 @@ windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
     "Win32_System_Threading",
 ] }
 

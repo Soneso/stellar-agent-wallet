@@ -51,6 +51,7 @@ pub mod policy_view;
 pub mod redact;
 pub mod retry;
 pub mod sep29;
+pub mod sequence_floor;
 pub mod signing;
 pub mod simulation_audit;
 pub mod submit;
@@ -87,6 +88,10 @@ pub use friendbot::{
 pub use idempotent_submit::{reconcile_receipt, submit_transaction_idempotent};
 pub use keyring::{KeyringSignHandle, init_platform_keyring_store, signer_from_keyring};
 pub use retry::RetryPolicy;
+pub use sequence_floor::{
+    CATCHUP_MAX_POLLS, CATCHUP_POLL_INTERVAL, SequenceFloorHook,
+    fetch_account_with_sequence_catchup,
+};
 pub use signing::source::{signer_from_env, signer_from_ledger};
 pub use signing::wallet::signer_from_wallet;
 pub use signing::{HardwareSigningKey, Signer, SigningKey, SoftwareSigningKey, WebAuthnAssertion};

@@ -125,20 +125,22 @@ Exits `1` with `ProfileNotFound` if the profile does not exist, `sign_policy.own
 
 ### Key-rotation subcommands
 
-Each rotation subcommand generates a fresh 32-byte secret from the OS CSPRNG, encodes it as URL-safe base64 (no padding), and atomically replaces one keyring entry the profile names. The raw bytes never leave the keyring, are never logged, and are never returned. All three take the profile as a positional `<NAME>` argument, change keyring state (no network), and are not reversible. Rotate deliberately, because each one invalidates material minted under the old key. (The policy-file owner ed25519 key is not rotated here; it is enrolled with `enroll-owner-key`.)
+Each rotation subcommand generates a fresh 32-byte secret from the OS CSPRNG, encodes it as URL-safe base64 (no padding), and atomically replaces one keyring entry the profile names. The raw bytes never leave the keyring, are never logged, and are never returned. Every rotation subcommand takes the profile as a positional `<NAME>` argument, changes keyring state (no network), and is not reversible. Rotate deliberately, because each one invalidates material minted under the old key. (The policy-file owner ed25519 key is not rotated here; it is enrolled with `enroll-owner-key`.)
 
 | Subcommand | Keyring entry rotated | Key kind | Effect on outstanding material |
 |---|---|---|---|
 | `rotate-attestation-key` | approval-spine attestation HMAC key (`attestation_key_id`) | 32-byte HMAC | All pending approvals are invalidated; the simulate-and-approve round trip must be re-run. |
 | `rotate-audit-key` | audit-log chain-root HMAC key (`audit_log_hash_chain_key_id`) | 32-byte HMAC | Rotation re-signs every existing per-file chain-root sidecar with the new key; `audit verify` passes under the new key and the old key stops verifying. |
 | `rotate-nonce-key` | HMAC nonce key (`mcp_nonce_key_alias`) | 32-byte HMAC | All outstanding nonces minted with the old key are invalidated. |
+| `rotate-policy-state-key` | policy-window-state HMAC key (`policy_window_state_key_id`) | 32-byte HMAC | The persisted window-state store is re-signed under the new key, so accumulated `per_period_cap` / `rate_limit` history is preserved, not invalidated. Rotation is refused if the store file does not verify under the current key (run `reset-window-state` instead). |
 
-All three mint raw 32-byte HMAC keys.
+All of the above mint raw 32-byte HMAC keys.
 
 ```bash
 stellar-agent profile rotate-attestation-key default
 stellar-agent profile rotate-audit-key default
 stellar-agent profile rotate-nonce-key default
+stellar-agent profile rotate-policy-state-key default
 ```
 
 Each returns the profile name and a `rotated` flag. The attestation-key and audit-key paths additionally report a `key_kind` (`hmac_32_bytes`); the audit-key path also reports `sidecars_resigned`, the count of per-file chain-root sidecars re-signed with the new key. `rotate-nonce-key` returns only `profile` and `rotated`:
@@ -151,9 +153,17 @@ Each returns the profile name and a `rotated` flag. The attestation-key and audi
 {"ok":true,"data":{"profile":"default","rotated":true,"key_kind":"hmac_32_bytes","sidecars_resigned":2},"request_id":"..."}
 ```
 
-A fourth rotation subcommand, `profile rotate-counterparty-key <NAME>`, rotates the `stellar.toml` cache-integrity HMAC key (`counterparty_cache_key_id`); it invalidates every cached counterparty binding, which the wallet re-fetches on the next counterparty-allowlist check. Its data object adds `"key_kind": "hmac_32_bytes"` and `"cache_invalidated": true` to the `profile` and `rotated` fields. This rotates the same keyring entry as `stellar-agent counterparty rotate-hmac-key` (see [core operations](stellar-ops.md)); the two verbs are interchangeable.
+A further rotation subcommand, `profile rotate-counterparty-key <NAME>`, rotates the `stellar.toml` cache-integrity HMAC key (`counterparty_cache_key_id`); it invalidates every cached counterparty binding, which the wallet re-fetches on the next counterparty-allowlist check. Its data object adds `"key_kind": "hmac_32_bytes"` and `"cache_invalidated": true` to the `profile` and `rotated` fields. This rotates the same keyring entry as `stellar-agent counterparty rotate-hmac-key` (see [core operations](stellar-ops.md)); the two verbs are interchangeable.
 
 Each rotation exits `1` with `ProfileNotFound` if the profile does not exist, or with a keyring error if the platform keyring is unavailable.
+
+### `reset-window-state <NAME> --reason <REASON>`
+
+Not a rotation: the fail-closed recovery path for the persisted policy-window-state store. An unreadable, tampered, or unparseable store file makes the stateful criteria (`per_period_cap`, `rate_limit`, and their bundle forms) refuse every matched call until the store is re-initialised. `reset-window-state` re-initialises it to empty (minting the HMAC key if absent), discards all accumulated window history, and writes a `policy_window_state_reset` audit row recording the profile and the required `--reason`. The reset is audited BEFORE the mutation, so the audit trail records the request even if the re-initialisation fails midway.
+
+```bash
+stellar-agent profile reset-window-state default --reason "store file corrupted after disk failure"
+```
 
 ## `credentials`
 

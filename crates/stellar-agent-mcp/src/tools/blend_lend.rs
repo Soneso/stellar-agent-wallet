@@ -521,6 +521,7 @@ impl WalletServer {
             "blend-contracts", // abi_source_provenance
         );
 
+        let sequence_floor_hook = crate::sequence_floor::hook(&self.sequence_floor);
         let mut ctx = DefiAdapterCtx::new_with_submit_ctx(
             "default",
             &pool_pin,
@@ -531,6 +532,11 @@ impl WalletServer {
             secondary_rpc.as_ref(),
             Some(timeout),
         );
+        // Thread the shared confirmed-sequence floor so this adapter's own
+        // account fetch benefits from the same bounded catch-up poll the
+        // classic commit verbs use, and its confirmed submit advances the
+        // same floor.
+        ctx.sequence_floor = Some(&sequence_floor_hook);
         // Thread the audit writer + gate-derived legs so the adapter emits the
         // ValueActionSubmitted row after a confirmed submit. Non-fatal: a failed
         // writer acquisition leaves the fields unset and the adapter skips the row.

@@ -11,10 +11,12 @@
 //! # Fixture setup
 //!
 //! A fresh temp directory stands in for `STELLAR_AGENT_HOME` (only ever set on
-//! the CHILD process's environment, never the test-process environment):
+//! the CHILD process's environment, never the test-process environment). The
+//! profile name is unique per test run (`pay-v1-acceptance-<pid>-<unix_secs>`)
+//! so the OS keyring coordinate it drives (below) never collides with a
+//! concurrent or prior local run.
 //!
-//! 1. An ed25519 owner keypair is generated in-process (never touches the OS
-//!    keyring).
+//! 1. An ed25519 owner keypair is generated in-process.
 //! 2. A signed V1 policy document — one `per_tx_cap` rule matching
 //!    `stellar_pay` on `stellar:testnet`, cap 100 XLM — is built with the
 //!    REAL primitives `sign_policy.rs` uses:
@@ -28,12 +30,23 @@
 //!    `policy_owner_key_id.service = "stellar-agent-owner-<profile>"` (the
 //!    prefix `build_v1_policy_engine` strips to recover the profile name) is
 //!    written to `<home>/profiles/<profile>.toml`.
-//! 4. The owner PUBLIC key (base64 URL-safe-no-pad) is written to a file; the
-//!    child process's `STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE` env var points at
-//!    it, routing `commands::policy_engine::owner_pubkey_b64`'s gated
-//!    test-only file source instead of the OS keyring.
+//! 4. The owner **PUBLIC** key is enrolled into the REAL OS keyring by
+//!    spawning `stellar-agent profile enroll-owner-key --secret-env <VAR>
+//!    --expected-address <owner_g>` as its own subprocess (the owner seed is
+//!    set only on that subprocess's environment) — the production write path
+//!    `enroll_owner_key.rs` drives, at the exact coordinate
+//!    `commands::policy_engine::owner_pubkey_b64`'s production (non-test)
+//!    branch reads from at gate time. No test-only file override is used
+//!    anywhere in this suite.
 //! 5. A source and a destination account are generated and Friendbot-funded
 //!    (native `pay` requires an existing destination).
+//!
+//! # Cleanup
+//!
+//! The enrolled owner-key keyring entry is deleted by an RAII guard that runs
+//! on every exit path (success, assertion failure, or early return) so a
+//! panicking assertion never leaks a keyring entry — belt-and-suspenders on
+//! top of the per-run unique profile name.
 //!
 //! # Scenarios
 //!
@@ -49,24 +62,26 @@
 //! Both invocations reuse the same source/destination pair (the over-cap
 //! refusal happens before signing, so it does not consume a sequence number).
 //!
-//! # Coverage note: the OS keyring write/read path is not exercised here
+//! # Coverage: the full production owner-key read path
 //!
-//! The owner PUBLIC key is supplied via the `STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE`
-//! file source described above, which bypasses reading the owner key FROM the
-//! OS keyring. This acceptance test therefore does not cover the keyring
-//! read/write round trip for the owner coordinate — that coverage lives in
-//! `commands::profile::enroll_owner_key`'s unit tests and the equivalent spy
-//! tests in `commands::pay`, `commands::claim`, and
-//! `commands::accounts::create`.
+//! This suite covers the FULL production path for the owner coordinate:
+//! profile load -> `enroll-owner-key` keyring registration (subprocess) ->
+//! `pay`'s V1 gate reading the owner public key from that SAME OS keyring
+//! entry -> signature verification -> `per_tx_cap` evaluation -> (on allow)
+//! sign -> submit -> confirm. The window-state HMAC key and generation
+//! counter already round-trip the real keyring in this same suite (via
+//! `PersistedWindowStore`, unconditionally, no test-only override exists for
+//! that coordinate); the owner coordinate now exercises the identical
+//! keyring backend end to end.
 //!
 //! # Platform keyring precondition
 //!
 //! The v1 policy path registers the platform keyring store before the gate
 //! and refuses when registration fails, so this suite requires a functioning
-//! platform keyring even though the owner key itself comes from the file
-//! source (macOS Keychain in local dev; a headless Secret Service, provisioned
-//! by the CI workflow via gnome-keyring, in CI). Keyring init failure fails
-//! this test — it is not an infrastructure precondition to be skipped.
+//! platform keyring (macOS Keychain in local dev; a headless Secret Service,
+//! provisioned by the CI workflow via gnome-keyring, in CI). Keyring init
+//! failure fails this test — it is not an infrastructure precondition to be
+//! skipped.
 //!
 //! Gated behind `testnet-acceptance`:
 //!
@@ -86,7 +101,6 @@
 use std::process::Command;
 use std::time::Duration;
 
-use base64::Engine as _;
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use stellar_agent_network::{StellarRpcClient, fetch_account};
@@ -106,9 +120,6 @@ const TESTNET_FRIENDBOT_URL: &str = "https://friendbot.stellar.org";
 /// uses for both the owner-key lookup and the policy-file path.
 const OWNER_KEY_SERVICE_PREFIX: &str = "stellar-agent-owner-";
 
-/// Profile / policy scope name used throughout this test.
-const PROFILE_NAME: &str = "pay-v1-acceptance";
-
 /// The `per_tx_cap` rule's cap: 100 XLM, in stroops.
 const CAP_STROOPS: i64 = 1_000_000_000;
 
@@ -116,10 +127,26 @@ const CAP_STROOPS: i64 = 1_000_000_000;
 /// source account's S-strkey secret from. Set only on the child process.
 const PAY_SECRET_ENV_VAR: &str = "PAY_POLICY_V1_ACCEPTANCE_SECRET";
 
-/// Name of the env var pointing the child process's gated owner-PUBLIC-key
-/// file source (`commands::policy_engine::owner_pubkey_b64`) at the fixture
-/// file. Must match the constant of the same name in `policy_engine.rs`.
-const OWNER_PUBKEY_FILE_ENV_VAR: &str = "STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE";
+/// Name of the env var the spawned `stellar-agent profile enroll-owner-key`
+/// process reads the owner account's S-strkey secret from. Set only on that
+/// subprocess's environment, never the test-process environment.
+const OWNER_SECRET_ENV_VAR: &str = "PAY_POLICY_V1_ACCEPTANCE_OWNER_SECRET";
+
+/// Builds a profile name unique to this test run: `pay-v1-acceptance-<pid>-<unix_secs>`.
+///
+/// The profile TOML and policy TOML live inside the test's own fresh
+/// tempdir and so cannot collide across runs on their own, but the OS
+/// keyring coordinate `enroll-owner-key` writes to
+/// (`{OWNER_KEY_SERVICE_PREFIX}<profile>` / `"default"`) is OS-global, not
+/// tempdir-scoped — the profile name must be unique per run so repeated
+/// local runs (or a concurrent CI matrix) never collide on that entry.
+fn unique_profile_name() -> String {
+    let unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must work")
+        .as_secs();
+    format!("pay-v1-acceptance-{}-{unix_secs}", std::process::id())
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Keypair / funding helpers (mirrors `claim_testnet_acceptance.rs`)
@@ -238,9 +265,7 @@ fn write_signed_policy_toml(
     let sig: [u8; 64] =
         stellar_agent_core::policy::v1::signature::sign(&policy_digest, owner_signing_key);
     let sig_hex: String = sig.iter().map(|b| format!("{b:02x}")).collect();
-    let owner_g = stellar_strkey::ed25519::PublicKey(owner_pubkey)
-        .to_string()
-        .to_string();
+    let owner_g = stellar_strkey::ed25519::PublicKey(owner_pubkey).to_string();
 
     let signed =
         format!("{policy_body}\n[signature]\nowner_id = \"{owner_g}\"\nsig = \"{sig_hex}\"\n");
@@ -252,16 +277,89 @@ fn write_signed_policy_toml(
     owner_pubkey
 }
 
-/// Writes the owner public key (base64 URL-safe-no-pad) to
-/// `<home>/owner_pubkey.txt` and returns the path.
-fn write_owner_pubkey_file(home: &std::path::Path, owner_pubkey: &[u8; 32]) -> std::path::PathBuf {
-    let path = home.join("owner_pubkey.txt");
-    std::fs::write(
-        &path,
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(owner_pubkey),
-    )
-    .expect("write owner pubkey file");
-    path
+// ─────────────────────────────────────────────────────────────────────────────
+// Owner-key enrollment (real keyring) + cleanup guard
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// RAII guard that deletes the enrolled owner-key keyring entry on drop
+/// (success, assertion panic, or early return alike), so a failed test run
+/// never leaks an entry into the OS keyring — belt-and-suspenders on top of
+/// [`unique_profile_name`]'s per-run namespacing.
+struct OwnerKeyringGuard {
+    coord: stellar_agent_core::profile::schema::KeyringEntryRef,
+}
+
+impl Drop for OwnerKeyringGuard {
+    fn drop(&mut self) {
+        if let Ok(entry) = keyring_core::Entry::new(&self.coord.service, &self.coord.account) {
+            // Best-effort: a delete failure here must not mask the test's own
+            // pass/fail outcome (Drop cannot propagate an error), and a
+            // leftover entry from a rare delete failure is harmless — the
+            // per-run unique profile name means it will never collide with a
+            // future run's own coordinate.
+            let _ = entry.delete_credential();
+        }
+    }
+}
+
+/// Enrolls `owner_s_strkey`'s derived public key into the REAL OS keyring for
+/// `profile`, by spawning `stellar-agent profile enroll-owner-key` as its own
+/// subprocess — the exact production write path `enroll_owner_key.rs` drives.
+///
+/// The owner secret is set ONLY on the enrollment subprocess's environment,
+/// never the test-process environment nor (afterwards) the `pay` subprocess's
+/// environment: the owner key is a signing key the online agent must never
+/// hold, only its enrolled public counterpart.
+///
+/// Returns an [`OwnerKeyringGuard`] that removes the entry when dropped.
+fn enroll_owner_key_via_cli(
+    home: &std::path::Path,
+    profile: &str,
+    owner_s_strkey: &str,
+    owner_g_strkey: &str,
+) -> OwnerKeyringGuard {
+    let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
+    let output = Command::new(bin_path)
+        .args([
+            "profile",
+            "enroll-owner-key",
+            "--profile",
+            profile,
+            "--secret-env",
+            OWNER_SECRET_ENV_VAR,
+            "--expected-address",
+            owner_g_strkey,
+        ])
+        .env(OWNER_SECRET_ENV_VAR, owner_s_strkey)
+        .env("STELLAR_AGENT_HOME", home)
+        .output()
+        .expect("stellar-agent profile enroll-owner-key subprocess must spawn");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let exit_code = output.status.code().unwrap_or_else(|| {
+        panic!("enroll-owner-key must exit with a status code; stderr={stderr}")
+    });
+    assert_eq!(
+        exit_code, 0,
+        "enroll-owner-key must succeed against a clean owner coordinate; stdout={stdout} stderr={stderr}"
+    );
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("enroll-owner-key stdout must be valid JSON ({e}): {stdout}"));
+    assert_eq!(
+        envelope["ok"].as_bool(),
+        Some(true),
+        "enroll-owner-key envelope must be ok=true: {envelope}"
+    );
+    assert_eq!(
+        envelope["data"]["enrolled"].as_bool(),
+        Some(true),
+        "enroll-owner-key envelope must report enrolled=true: {envelope}"
+    );
+
+    OwnerKeyringGuard {
+        coord: stellar_agent_core::profile::schema::KeyringEntryRef::default_owner_key(profile),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -273,7 +371,7 @@ fn write_owner_pubkey_file(home: &std::path::Path, owner_pubkey: &[u8; 32]) -> s
 /// returns `(exit_code, stdout_json_envelope)`.
 fn run_pay(
     home: &std::path::Path,
-    owner_pubkey_file: &std::path::Path,
+    profile: &str,
     source_g: &str,
     source_secret: &str,
     destination_g: &str,
@@ -290,7 +388,7 @@ fn run_pay(
             "--secret-env",
             PAY_SECRET_ENV_VAR,
             "--profile",
-            PROFILE_NAME,
+            profile,
             "--network",
             "testnet",
             "--rpc-url",
@@ -298,7 +396,6 @@ fn run_pay(
         ])
         .env(PAY_SECRET_ENV_VAR, source_secret)
         .env("STELLAR_AGENT_HOME", home)
-        .env(OWNER_PUBKEY_FILE_ENV_VAR, owner_pubkey_file)
         .output()
         .expect("stellar-agent pay subprocess must spawn");
 
@@ -340,12 +437,27 @@ async fn pay_v1_per_tx_cap_denies_over_cap_and_submits_under_cap() {
         .expect("platform keyring store must initialise on this host");
 
     let home = tempfile::TempDir::new().expect("tempdir");
+    let profile_name = unique_profile_name();
 
-    // ── Fixture: owner keypair, signed policy, profile, pubkey file ──────────
+    // ── Fixture: owner keypair, signed policy, profile, real-keyring enrollment ─
     let owner_signing_key = SigningKey::generate(&mut OsRng);
-    let owner_pubkey = write_signed_policy_toml(home.path(), PROFILE_NAME, &owner_signing_key);
-    write_profile_toml(home.path(), PROFILE_NAME);
-    let owner_pubkey_file = write_owner_pubkey_file(home.path(), &owner_pubkey);
+    let owner_pubkey = write_signed_policy_toml(home.path(), &profile_name, &owner_signing_key);
+    write_profile_toml(home.path(), &profile_name);
+
+    let owner_g_strkey = stellar_strkey::ed25519::PublicKey(owner_pubkey).to_string();
+    // `Unredacted::to_string` yields a stack-allocated heapless string (the
+    // secret never touches an intermediate heap buffer); `as_str().to_owned()`
+    // converts it to the owned String the env-var API needs.
+    let owner_s_strkey: String = stellar_strkey::ed25519::PrivateKey(owner_signing_key.to_bytes())
+        .as_unredacted()
+        .to_string()
+        .as_str()
+        .to_owned();
+    // Enroll the owner PUBLIC key through the REAL OS keyring via the
+    // production `enroll-owner-key` subprocess; `_owner_keyring_guard` deletes
+    // the entry when it drops at the end of this function (every exit path).
+    let _owner_keyring_guard =
+        enroll_owner_key_via_cli(home.path(), &profile_name, &owner_s_strkey, &owner_g_strkey);
 
     // ── Fixture: source + destination accounts ────────────────────────────────
     let (source_g, source_seed) = fresh_keypair();
@@ -370,7 +482,7 @@ async fn pay_v1_per_tx_cap_denies_over_cap_and_submits_under_cap() {
 
     let (exit_code, envelope) = run_pay(
         home.path(),
-        &owner_pubkey_file,
+        &profile_name,
         &source_g,
         &source_s_strkey,
         &dest_g,
@@ -411,7 +523,7 @@ async fn pay_v1_per_tx_cap_denies_over_cap_and_submits_under_cap() {
 
     let (exit_code, envelope) = run_pay(
         home.path(),
-        &owner_pubkey_file,
+        &profile_name,
         &source_g,
         &source_s_strkey,
         &dest_g,

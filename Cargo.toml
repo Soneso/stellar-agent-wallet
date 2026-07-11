@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/stellar-agent-sep5", "crates/stellar-agent-toolsets", "crates/stellar-agent-sep10", "crates/stellar-agent-sep45", "crates/stellar-agent-test-support", "crates/stellar-agent-windows-identity", "crates/stellar-agent-core", "crates/stellar-agent-network", "crates/stellar-agent-sep53", "crates/stellar-agent-nonce", "crates/stellar-agent-sep7", "crates/stellar-agent-sep43", "crates/stellar-agent-stablecoin", "crates/stellar-agent-pool", "crates/stellar-agent-xdr-limits", "crates/stellar-agent-sep48", "crates/stellar-agent-defi", "crates/stellar-agent-anchor", "crates/stellar-agent-toolsets-install", "crates/stellar-agent-mcp-macros", "crates/stellar-agent-toolsets-runtime", "crates/stellar-agent-smart-account", "crates/stellar-agent-webauthn-bridge", "crates/stellar-agent-approval-ui", "crates/stellar-agent-loopback-http", "crates/stellar-agent-blend", "crates/stellar-agent-dex", "crates/stellar-agent-defindex", "crates/stellar-agent-x402", "crates/stellar-agent-x402-identity", "crates/stellar-agent-mcp", "crates/stellar-agent-cli", "crates/stellar-agent-claimable", "crates/stellar-agent-approval-remote"]
+members = ["crates/stellar-agent-sep5", "crates/stellar-agent-toolsets", "crates/stellar-agent-sep10", "crates/stellar-agent-sep45", "crates/stellar-agent-test-support", "crates/stellar-agent-windows-identity", "crates/stellar-agent-core", "crates/stellar-agent-network", "crates/stellar-agent-sep53", "crates/stellar-agent-nonce", "crates/stellar-agent-sep7", "crates/stellar-agent-sep43", "crates/stellar-agent-stablecoin", "crates/stellar-agent-pool", "crates/stellar-agent-xdr-limits", "crates/stellar-agent-sep48", "crates/stellar-agent-defi", "crates/stellar-agent-anchor", "crates/stellar-agent-toolsets-install", "crates/stellar-agent-mcp-macros", "crates/stellar-agent-toolsets-runtime", "crates/stellar-agent-smart-account", "crates/stellar-agent-webauthn-bridge", "crates/stellar-agent-approval-ui", "crates/stellar-agent-loopback-http", "crates/stellar-agent-blend", "crates/stellar-agent-dex", "crates/stellar-agent-defindex", "crates/stellar-agent-x402", "crates/stellar-agent-x402-identity", "crates/stellar-agent-mcp", "crates/stellar-agent-cli", "crates/stellar-agent-claimable", "crates/stellar-agent-approval-remote", "crates/stellar-agent-headless-keyring"]
 
 [workspace.package]
 version = "0.1.0-alpha.3"
@@ -25,6 +25,7 @@ tempfile = "=3.27.0"
 thiserror = "2.0.18"
 yaml-rust2 = { version = "=0.11.0", default-features = false }
 zeroize = { version = "=1.9.0", default-features = false }
+chacha20poly1305 = "=0.11.0"
 stellar-xdr = { version = "27.0.0", features = ["base64"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
 base64 = { version = "=0.22.1", default-features = false, features = ["std"] }
@@ -54,6 +55,7 @@ region = "=3.0.2"
 proptest = "1.11.0"
 stellar-agent-test-support = { path = "crates/stellar-agent-test-support", version = "0.1.0-alpha.3" }
 stellar-agent-windows-identity = { path = "crates/stellar-agent-windows-identity", version = "0.1.0-alpha.3" }
+stellar-agent-headless-keyring = { path = "crates/stellar-agent-headless-keyring", version = "0.1.0-alpha.3" }
 stellar-agent-core = { path = "crates/stellar-agent-core", version = "0.1.0-alpha.3" }
 stellar-agent-network = { path = "crates/stellar-agent-network", version = "0.1.0-alpha.3" }
 stellar-agent-sep5 = { path = "crates/stellar-agent-sep5", version = "0.1.0-alpha.3" }

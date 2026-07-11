@@ -1,0 +1,44 @@
+[package]
+name = "stellar-agent-headless-keyring"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Opt-in file-backed keyring store for headless deployments (Windows service/SSH/CI, Linux services) where the platform keyring is unavailable or unusable."
+readme = "README.md"
+keywords = ["stellar", "keyring", "headless", "dpapi", "wallet"]
+categories = ["cryptography", "authentication"]
+
+[lib]
+name = "stellar_agent_headless_keyring"
+
+[dependencies]
+keyring-core = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+zeroize = { workspace = true, features = ["alloc"] }
+thiserror = { workspace = true }
+rand_core = { workspace = true }
+directories = { workspace = true }
+tracing = { workspace = true }
+# XChaCha20-Poly1305 AEAD for the env-key protection mode. 0.11.0 verified
+# current latest stable at authoring time (2026-07-11); no other AEAD crate
+# is already in the workspace dependency tree (checked Cargo.lock).
+chacha20poly1305 = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+stellar-agent-windows-identity = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+serial_test = { workspace = true }
+
+[features]
+# STELLAR_AGENT_HOME override on headless_keyring_path, for the CLI/MCP
+# acceptance-test harness. Never enabled in a release build.
+test-helpers = []
+
+[lints]
+workspace = true

@@ -1,10 +1,21 @@
-//! Safe wrapper for the Windows process-user account SID lookup.
+//! Safe wrappers for Windows-only Win32 FFI: the process-user account SID
+//! lookup and DPAPI (`CryptProtectData`/`CryptUnprotectData`) CurrentUser-scope
+//! protect/unprotect.
 //!
-//! `stellar-agent-core` forbids unsafe code. This small Windows-only helper
-//! contains the Win32 FFI required to read the current process token's user
-//! account SID and exposes a safe, string-returning API. The SID binds approval
-//! attestations to the OS user that created them, so an attestation blob minted
-//! by one user cannot be replayed by another user on the same machine.
+//! `stellar-agent-core` forbids unsafe code. This small Windows-only crate
+//! contains the Win32 FFI these two callers need and exposes safe APIs.
+//!
+//! - [`current_user_sid_string`] reads the current process token's user
+//!   account SID. The SID binds approval attestations to the OS user that
+//!   created them, so an attestation blob minted by one user cannot be
+//!   replayed by another user on the same machine.
+//! - [`dpapi_protect`] / [`dpapi_unprotect`] wrap DPAPI CurrentUser-scope
+//!   protect/unprotect, consumed by `stellar-agent-headless-keyring`'s
+//!   `dpapi` protection mode. DPAPI CurrentUser scope works in the SSH /
+//!   service / Session-0 "network logon" sessions where Windows Credential
+//!   Manager fails closed (see that crate's module docs for the trust-model
+//!   writeup); both calls pass `CRYPTPROTECT_UI_FORBIDDEN` so a headless
+//!   session can never block on a UI prompt.
 
 /// Errors returned by the Windows SID lookup wrapper.
 #[derive(Debug, thiserror::Error)]
@@ -58,6 +69,87 @@ pub fn current_user_sid_string() -> Result<String, WindowsIdentityError> {
 #[cfg(not(target_os = "windows"))]
 pub fn current_user_sid_string() -> Result<String, WindowsIdentityError> {
     Err(WindowsIdentityError::UnsupportedPlatform)
+}
+
+/// Errors returned by the DPAPI protect/unprotect wrappers.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum DpapiError {
+    /// A DPAPI Win32 API returned failure. The code is from `GetLastError()`.
+    #[error("{api} failed with Windows error {code}")]
+    Win32 {
+        /// The Win32 API label (`"CryptProtectData"` or `"CryptUnprotectData"`).
+        api: &'static str,
+        /// The numeric `GetLastError()` value.
+        code: u32,
+    },
+    /// DPAPI returned a null output buffer despite reporting success.
+    #[error("{api} reported success but returned a null buffer")]
+    NullBuffer {
+        /// The Win32 API label.
+        api: &'static str,
+    },
+    /// The input exceeds DPAPI's `u32` length field. Unreachable for
+    /// keyring-sized secrets; refusing is strictly safer than sealing a
+    /// silently truncated prefix.
+    #[error("input exceeds the DPAPI maximum length")]
+    InputTooLarge,
+    /// Returned only by the non-Windows stubs of [`dpapi_protect`] /
+    /// [`dpapi_unprotect`]; unreachable when the crate is used as intended,
+    /// behind a Windows cfg.
+    #[error("DPAPI is only available on Windows")]
+    UnsupportedPlatform,
+}
+
+/// Encrypts `plaintext` with DPAPI CurrentUser scope
+/// (`CryptProtectData`, no optional entropy, no `LOCAL_MACHINE` flag).
+///
+/// Any process running as the same Windows user can decrypt the result with
+/// [`dpapi_unprotect`] — the SAME trust boundary as Windows Credential
+/// Manager, minus the interactive-logon-session requirement. Passes
+/// `CRYPTPROTECT_UI_FORBIDDEN` so the call can never block on a UI prompt in a
+/// headless session.
+///
+/// # Errors
+///
+/// Returns [`DpapiError`] if the underlying `CryptProtectData` call fails.
+#[cfg(target_os = "windows")]
+pub fn dpapi_protect(plaintext: &[u8]) -> Result<Vec<u8>, DpapiError> {
+    dpapi::protect(plaintext)
+}
+
+/// Decrypts `ciphertext` previously produced by [`dpapi_protect`].
+///
+/// # Errors
+///
+/// Returns [`DpapiError`] if the underlying `CryptUnprotectData` call fails
+/// (including the fail-closed case of a corrupted or tampered blob — DPAPI
+/// blobs carry their own integrity protection, and a modified blob fails to
+/// unprotect rather than silently returning altered plaintext).
+#[cfg(target_os = "windows")]
+pub fn dpapi_unprotect(ciphertext: &[u8]) -> Result<Vec<u8>, DpapiError> {
+    dpapi::unprotect(ciphertext)
+}
+
+/// Non-Windows stub; see [`current_user_sid_string`]'s stub doc for the
+/// rationale (this crate must stay buildable on authoring hosts).
+///
+/// # Errors
+///
+/// Always returns [`DpapiError::UnsupportedPlatform`] on non-Windows targets.
+#[cfg(not(target_os = "windows"))]
+pub fn dpapi_protect(_plaintext: &[u8]) -> Result<Vec<u8>, DpapiError> {
+    Err(DpapiError::UnsupportedPlatform)
+}
+
+/// Non-Windows stub; see [`dpapi_protect`]'s stub doc for the rationale.
+///
+/// # Errors
+///
+/// Always returns [`DpapiError::UnsupportedPlatform`] on non-Windows targets.
+#[cfg(not(target_os = "windows"))]
+pub fn dpapi_unprotect(_ciphertext: &[u8]) -> Result<Vec<u8>, DpapiError> {
+    Err(DpapiError::UnsupportedPlatform)
 }
 
 // The Win32 FFI is the only place in the crate that needs unsafe; the workspace
@@ -208,6 +300,149 @@ mod windows {
     }
 }
 
+/// DPAPI CurrentUser-scope protect/unprotect. The Win32 FFI is the only place
+/// in this module that needs unsafe; the workspace `unsafe_code = "deny"`
+/// lint stays in force everywhere else.
+#[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
+mod dpapi {
+    use std::ffi::c_void;
+    use std::ptr::null_mut;
+
+    use windows_sys::Win32::Foundation::{GetLastError, LocalFree};
+    use windows_sys::Win32::Security::Cryptography::{
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
+    };
+
+    use super::DpapiError;
+
+    /// Wraps a `LocalAlloc`-backed `CRYPT_INTEGER_BLOB` output buffer, freeing
+    /// it with `LocalFree` on drop.
+    struct OutBlob(CRYPT_INTEGER_BLOB);
+
+    impl Default for OutBlob {
+        fn default() -> Self {
+            Self(CRYPT_INTEGER_BLOB {
+                cbData: 0,
+                pbData: null_mut(),
+            })
+        }
+    }
+
+    impl Drop for OutBlob {
+        fn drop(&mut self) {
+            if !self.0.pbData.is_null() {
+                // SAFETY: `pbData` was allocated by DPAPI (via LocalAlloc) on
+                // the success path that sets it non-null; the buffer may hold
+                // recovered PLAINTEXT (the unprotect path), so it is wiped
+                // before release — a freed-but-unwiped LocalAlloc block would
+                // retain a plaintext copy. Freeing exactly once on drop
+                // matches the Win32 ownership contract.
+                unsafe {
+                    std::ptr::write_bytes(self.0.pbData, 0, self.0.cbData as usize);
+                    LocalFree(self.0.pbData.cast::<c_void>());
+                }
+            }
+        }
+    }
+
+    /// Copies a `CRYPT_INTEGER_BLOB`'s bytes into an owned `Vec<u8>`.
+    ///
+    /// # Safety
+    ///
+    /// `blob.pbData` must be non-null and point to at least `blob.cbData`
+    /// readable bytes.
+    unsafe fn blob_to_vec(blob: &CRYPT_INTEGER_BLOB) -> Vec<u8> {
+        // SAFETY: caller guarantees `pbData` is valid for `cbData` bytes.
+        unsafe { std::slice::from_raw_parts(blob.pbData, blob.cbData as usize) }.to_vec()
+    }
+
+    pub(super) fn protect(plaintext: &[u8]) -> Result<Vec<u8>, DpapiError> {
+        let mut input = CRYPT_INTEGER_BLOB {
+            cbData: u32::try_from(plaintext.len()).map_err(|_| DpapiError::InputTooLarge)?,
+            // CryptProtectData does not mutate the input blob despite the
+            // non-const pointer in its signature; casting away const here
+            // matches the documented (if awkwardly typed) Win32 contract.
+            pbData: plaintext.as_ptr().cast_mut(),
+        };
+        let mut out = OutBlob::default();
+
+        // SAFETY: `input` points to `plaintext` for `plaintext.len()` bytes,
+        // live for the duration of the call. `out.0` is a valid out-pointer;
+        // DPAPI allocates its `pbData` via LocalAlloc on success, freed by
+        // `OutBlob::drop`. No optional entropy, no prompt struct (forbidden by
+        // the flag below), no description string.
+        let ok = unsafe {
+            CryptProtectData(
+                &mut input,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut out.0,
+            )
+        };
+        if ok == 0 {
+            // SAFETY: `GetLastError` has no preconditions.
+            let code = unsafe { GetLastError() };
+            return Err(DpapiError::Win32 {
+                api: "CryptProtectData",
+                code,
+            });
+        }
+        if out.0.pbData.is_null() {
+            return Err(DpapiError::NullBuffer {
+                api: "CryptProtectData",
+            });
+        }
+        // SAFETY: `out.0.pbData` was just checked non-null and DPAPI reported
+        // `cbData` valid bytes on success.
+        Ok(unsafe { blob_to_vec(&out.0) })
+    }
+
+    pub(super) fn unprotect(ciphertext: &[u8]) -> Result<Vec<u8>, DpapiError> {
+        let mut input = CRYPT_INTEGER_BLOB {
+            cbData: u32::try_from(ciphertext.len()).map_err(|_| DpapiError::InputTooLarge)?,
+            pbData: ciphertext.as_ptr().cast_mut(),
+        };
+        let mut out = OutBlob::default();
+
+        // SAFETY: same discipline as `protect` above; `ppszDataDescr` is
+        // null (the description string is not used by this wrapper).
+        let ok = unsafe {
+            CryptUnprotectData(
+                &mut input,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut out.0,
+            )
+        };
+        if ok == 0 {
+            // A tampered/corrupted blob surfaces here as an ordinary Win32
+            // failure (DPAPI blobs are self-authenticating) — the fail-closed
+            // path callers rely on.
+            // SAFETY: `GetLastError` has no preconditions.
+            let code = unsafe { GetLastError() };
+            return Err(DpapiError::Win32 {
+                api: "CryptUnprotectData",
+                code,
+            });
+        }
+        if out.0.pbData.is_null() {
+            return Err(DpapiError::NullBuffer {
+                api: "CryptUnprotectData",
+            });
+        }
+        // SAFETY: `out.0.pbData` was just checked non-null and DPAPI reported
+        // `cbData` valid bytes on success.
+        Ok(unsafe { blob_to_vec(&out.0) })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -259,6 +494,72 @@ mod tests {
         assert_eq!(
             WindowsIdentityError::UnsupportedPlatform.to_string(),
             "Windows SID lookup is only available on Windows"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn dpapi_protect_unprotect_round_trips() {
+        let plaintext = b"stellar-agent headless-keyring DPAPI round-trip test";
+        let ciphertext = dpapi_protect(plaintext).expect("CryptProtectData must succeed");
+        assert_ne!(
+            ciphertext, plaintext,
+            "DPAPI output must not equal the plaintext"
+        );
+        let decrypted = dpapi_unprotect(&ciphertext).expect("CryptUnprotectData must succeed");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn dpapi_unprotect_rejects_tampered_ciphertext() {
+        let plaintext = b"tamper-detection fixture";
+        let mut ciphertext = dpapi_protect(plaintext).expect("CryptProtectData must succeed");
+        let last = ciphertext.len() - 1;
+        ciphertext[last] ^= 0xFF;
+        assert!(
+            dpapi_unprotect(&ciphertext).is_err(),
+            "a tampered DPAPI blob must fail to unprotect (fail-closed)"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn dpapi_functions_are_windows_only() {
+        assert!(matches!(
+            dpapi_protect(b"x"),
+            Err(DpapiError::UnsupportedPlatform)
+        ));
+        assert!(matches!(
+            dpapi_unprotect(b"x"),
+            Err(DpapiError::UnsupportedPlatform)
+        ));
+    }
+
+    #[test]
+    fn dpapi_error_display_is_stable_for_every_variant() {
+        assert_eq!(
+            DpapiError::Win32 {
+                api: "CryptProtectData",
+                code: 5,
+            }
+            .to_string(),
+            "CryptProtectData failed with Windows error 5"
+        );
+        assert_eq!(
+            DpapiError::NullBuffer {
+                api: "CryptUnprotectData",
+            }
+            .to_string(),
+            "CryptUnprotectData reported success but returned a null buffer"
+        );
+        assert_eq!(
+            DpapiError::InputTooLarge.to_string(),
+            "input exceeds the DPAPI maximum length"
+        );
+        assert_eq!(
+            DpapiError::UnsupportedPlatform.to_string(),
+            "DPAPI is only available on Windows"
         );
     }
 }

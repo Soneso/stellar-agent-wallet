@@ -88,6 +88,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   helper functions to matching names). The closed set of `credentials.*`
   wire codes is documented in `docs/cli-reference/profile-and-governance.md`
   and the knowledge skill's `cli-reference.md`. (#62)
+- The MCP server's confirmed-sequence floor (`stellar_pay_commit`,
+  `stellar_claim_commit`, `stellar_create_account_commit`,
+  `stellar_trustline_commit`, sep43 sign-and-submit) now also covers the DeFi
+  adapter submit paths (`stellar_dex_trade`, `stellar_blend_lend`,
+  `stellar_defindex_vault_deposit`/`_withdraw`): `DefiAdapterCtx` and
+  `SubmitInvokeArgs` gain an optional `sequence_floor` hook so the shared
+  `submit_signed_invoke` substrate's own account fetch benefits from the same
+  bounded catch-up poll, and a confirmed DeFi submit advances the same
+  process-local tracker a classic commit verb for the same source account
+  would consult next. Advisory only, as before: never fabricates a sequence,
+  never blocks beyond the bounded window. (#55)
+- `pay_policy_v1_testnet_acceptance.rs` now enrolls the operator owner key
+  through the real OS keyring via the production `stellar-agent profile
+  enroll-owner-key` subprocess (uniquely namespaced per run, cleaned up by an
+  RAII guard) instead of a test-only file source, so the suite covers the
+  full production owner-key path: profile load, keyring registration,
+  keyring read, policy-signature verification, `per_tx_cap` evaluation,
+  sign, submit, confirm. (#56)
+
+### Added
+
+- An opt-in, file-backed headless keyring store
+  (`stellar-agent-headless-keyring`) for deployments where the platform
+  keyring is unavailable or unusable — a Windows service, an SSH/WinRM
+  session, or a scheduled task (Windows Credential Manager requires an
+  interactive logon session), and Linux services/CI. Activated via
+  `STELLAR_AGENT_KEYRING_BACKEND=headless-env` (XChaCha20-Poly1305, key from
+  `STELLAR_AGENT_HEADLESS_KEYRING_KEY`) or `STELLAR_AGENT_KEYRING_BACKEND=headless-dpapi`
+  (Windows only; DPAPI CurrentUser scope via a new `stellar-agent-windows-identity`
+  `dpapi_protect`/`dpapi_unprotect` wrapper). The platform keyring remains the
+  default; the headless store never activates implicitly and never falls
+  back to the platform keyring on any initialisation failure. Slots in
+  behind the same `KeyringEntryRef` coordinates every existing enroll/rotate/
+  sign call site already uses, so every existing keyring-consuming code path
+  works unchanged once activated. See
+  `docs/maintainers/security-internals.md`'s "Headless keyring store" section
+  for the trust model and `docs/getting-started.md` / `docs/mcp.md` for the
+  activation surface. (#57)
 
 ## [0.1.0-alpha.3] - 2026-07-10
 

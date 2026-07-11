@@ -77,8 +77,13 @@ session. Running the server as a Windows service, over SSH, or from a
 scheduled task means every keyring operation fails with
 `auth.keyring_interactive_session_required` — the server itself starts, but
 every signing tool refuses at the keyring step. Launch it from an interactive
-desktop session (including Remote Desktop), or run it inside a container /
-Linux VM where the platform keyring backend has no such restriction.
+desktop session (including Remote Desktop), run it inside a container /
+Linux VM where the platform keyring backend has no such restriction, or set
+`STELLAR_AGENT_KEYRING_BACKEND=headless-dpapi` on the process environment to
+opt into the headless file-backed keyring store (DPAPI CurrentUser scope,
+works in exactly these non-interactive session types). See
+[security-internals.md's headless keyring section](maintainers/security-internals.md#headless-keyring-store)
+for the trust model before enabling it.
 
 ### How a profile selects the signer and keys
 

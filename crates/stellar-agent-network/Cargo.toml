@@ -40,6 +40,9 @@ testnet-acceptance = ["test-helpers"]
 [dependencies]
 stellar-agent-core = { workspace = true }
 stellar-agent-xdr-limits = { workspace = true }
+# Opt-in headless keyring store: init_platform_keyring_store dispatches
+# here when STELLAR_AGENT_KEYRING_BACKEND is set.
+stellar-agent-headless-keyring = { workspace = true }
 stellar-rpc-client = { workspace = true }
 stellar-baselib = { workspace = true }
 stellar-xdr = { workspace = true }
@@ -90,6 +93,9 @@ windows-native-keyring-store = { workspace = true }
 
 [dev-dependencies]
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["wiremock-helpers", "test-helpers"] }
+# STELLAR_AGENT_HOME override on headless_keyring_path, for the
+# init_platform_keyring_store headless-dispatch test.
+stellar-agent-headless-keyring = { path = "../stellar-agent-headless-keyring", features = ["test-helpers"] }
 wiremock = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "test-util"] }
 # jsonrpsee-core builds Error::JsonRpc fixtures in retry.rs unit tests. The pin

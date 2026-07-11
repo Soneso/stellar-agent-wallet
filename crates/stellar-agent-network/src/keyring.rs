@@ -67,6 +67,19 @@
 //! [`AuthError::KeyringNotFound`] immediately with a diagnostic naming the
 //! unsupported OS — see [`init_platform_keyring_store`] for details.
 //!
+//! # Headless deployments
+//!
+//! [`init_platform_keyring_store`] checks
+//! `stellar_agent_headless_keyring::requested_backend()` FIRST: if the
+//! `STELLAR_AGENT_KEYRING_BACKEND` environment variable is set (to
+//! `"headless-env"` or `"headless-dpapi"`), it registers the opt-in
+//! file-backed store from [`stellar_agent_headless_keyring`] instead of the
+//! platform store, and never falls back to the platform store on any
+//! failure. Every existing `init_platform_keyring_store()` call site across
+//! the CLI and MCP server picks this up automatically, unchanged — see that
+//! crate's module docs for the activation surface, protection modes, and
+//! trust model.
+//!
 //! # Related
 //!
 //! - [`super::signing::source`] — `signer_from_env` / `signer_from_ledger`
@@ -136,6 +149,15 @@ use crate::signing::{Signer, WebAuthnAssertion, software::SoftwareSigningKey};
 /// init_platform_keyring_store().expect("platform keyring unavailable");
 /// ```
 pub fn init_platform_keyring_store() -> Result<(), WalletError> {
+    if let Some(backend) = stellar_agent_headless_keyring::requested_backend() {
+        return stellar_agent_headless_keyring::init_headless_store(&backend).map_err(|e| {
+            tracing::debug!(error = %e, backend = %backend, "headless keyring store init failure");
+            WalletError::Auth(AuthError::KeyringNotFound {
+                name: format!("headless keyring backend '{backend}' failed to initialise: {e}"),
+            })
+        });
+    }
+
     #[cfg(target_os = "macos")]
     {
         use apple_native_keyring_store::keychain::Store;

@@ -152,6 +152,10 @@ reqwest = { workspace = true }
 # Zeroize attestation key bytes on drop.
 zeroize = { workspace = true }
 
+# TrackerHook's SequenceFloorHook impl (sequence_floor.rs) threading the
+# process-local tracker into DefiAdapterCtx for the DeFi adapter submit paths.
+async-trait = { workspace = true }
+
 [dev-dependencies]
 stellar-agent-toolsets-runtime = { path = "../stellar-agent-toolsets-runtime", features = ["test-helpers"] }
 # Path-only self-reference: enables this crate's own test features for its tests
@@ -180,8 +184,6 @@ stellar-agent-mcp-macros = { path = "../stellar-agent-mcp-macros" }
 # Wiremock for the friendbot + balances handler tests.
 wiremock                   = { workspace = true }
 url                        = { workspace = true }
-# async_trait for the handler-level capability tests.
-async-trait                = { workspace = true }
 # rmcp model types (ErrorCode, CallToolResult) used in capability-test assertions.
 rmcp                       = { workspace = true }
 # serial_test for tests that mutate the process-global keyring store.

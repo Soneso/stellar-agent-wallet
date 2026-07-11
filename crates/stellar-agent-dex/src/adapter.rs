@@ -525,6 +525,7 @@ impl DefiAdapter for DexSwapAdapter {
                 .timeout(timeout)
                 .op_label(DEX_SUBMIT_OP_LABEL)
                 .emit_observability_logs(true)
+                .maybe_sequence_floor(ctx.sequence_floor)
                 .build(),
         )
         .await;

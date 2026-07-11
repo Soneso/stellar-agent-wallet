@@ -32,7 +32,7 @@ use sha2::{Digest as _, Sha256};
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::signing::Signer;
 use stellar_agent_network::signing::envelope_signing::attach_signature;
-use stellar_agent_network::{StellarRpcClient, fetch_account, submit_transaction_and_wait};
+use stellar_agent_network::{StellarRpcClient, submit_transaction_and_wait};
 use stellar_baselib::account::{Account as BaselibAccount, AccountBehavior};
 use stellar_baselib::transaction::TransactionBehavior;
 use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilderBehavior};
@@ -446,6 +446,17 @@ pub struct SubmitInvokeArgs<'a> {
     /// immediately with [`SaError::AuthEntryConstructionFailed`], before any
     /// network I/O.
     pub ed25519_rule_signer: Option<Ed25519RuleSigner<'a>>,
+
+    /// Confirmed-sequence floor hook (see
+    /// `stellar_agent_network::sequence_floor::SequenceFloorHook`).
+    ///
+    /// When `Some`, the initial source-account fetch (Step 1's pre-submit
+    /// stage) routes through the hook's bounded catch-up poll instead of a
+    /// plain fetch, and a confirmed submit (Step 6) records its consumed
+    /// sequence back into the hook. `None` (the default) reproduces the
+    /// original plain-fetch, no-recording behaviour exactly — every caller
+    /// other than the DeFi adapter submit paths leaves this unset.
+    pub sequence_floor: Option<&'a dyn stellar_agent_network::SequenceFloorHook>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -618,7 +629,12 @@ pub async fn submit_signed_invoke(
     let source_view = bound_pre_submit_stage(
         pre_submit_budget,
         "fetch_account_initial",
-        fetch_account(&primary_rpc_client, &source_pubkey_strkey, &[]),
+        stellar_agent_network::sequence_floor::fetch_account_with_sequence_catchup(
+            args.sequence_floor,
+            &primary_rpc_client,
+            &source_pubkey_strkey,
+            &[],
+        ),
     )
     .await?
     .map_err(|e| auth_payload_err(format!("source-account fetch failed: {e}")))?;
@@ -1313,6 +1329,18 @@ pub async fn submit_signed_invoke(
             op_label = %op,
             "{op}: transaction confirmed on-chain",
         );
+    }
+
+    // Record the confirmed sequence for this source account so a later build
+    // in this same process (e.g. the next DeFi submit for the same signer)
+    // can wait out avoidable read-after-write propagation lag.
+    // `source_view.sequence_number` is the PRE-submit value fetched at Step 1
+    // (via the catch-up-aware fetch above); the submitted envelope's sequence
+    // is that value plus one, mirroring the MCP classic-verb tool layer's own
+    // `record_confirmed(&args.source, source_sequence + 1)` call.
+    if let Some(hook) = args.sequence_floor {
+        hook.record_confirmed(&source_pubkey_strkey, source_view.sequence_number + 1)
+            .await;
     }
 
     // ── Step 7: Return ────────────────────────────────────────────────────────

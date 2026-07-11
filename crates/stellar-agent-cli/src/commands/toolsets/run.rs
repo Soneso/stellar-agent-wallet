@@ -9,8 +9,9 @@
 //! routed tool.  Full execution requires wiring the WalletServer / profile / MCP
 //! context into the CLI binary.
 //!
-//! The output reports `status: "resolved"` (not `"ok"` / `"executed"`) to
-//! make clear that enforcement passed and routing was resolved, but no tool was run.
+//! The success envelope's `data` carries `routed_to` plus a `note` making
+//! clear that enforcement passed and routing was resolved, but no tool was
+//! run.
 //!
 //! The toolset gate is ADDITIVE: operator policy + chain gates of the routed
 //! tool also apply when wired through the MCP surface.
