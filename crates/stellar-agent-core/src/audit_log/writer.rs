@@ -12,14 +12,34 @@
 //!
 //! # Single-writer invariant
 //!
-//! An exclusive advisory lock is held on the log file itself using
+//! An exclusive advisory lock is held on a **sidecar** lock file
+//! (`<log>.lock`, next to the log — see [`lock_sidecar_path`] and
+//! [`crate::audit_log::lock::AuditWriterLock`]) using
 //! [`std::fs::File::lock`] (stable since Rust 1.89; exclusive by default).
-//! The lock is held for the lifetime of the [`AuditWriter`].  A second process
-//! attempting to open the same file receives [`WriterError::FileLocked`]
-//! immediately (non-blocking `try_lock`).
+//! The log file itself is NEVER locked.  The lock is held for the entire
+//! lifetime of the [`AuditWriter`], including across every rotation — it is
+//! acquired once in [`AuditWriter::open`] and never re-acquired or released
+//! until the writer drops.  A second process attempting to open the same
+//! profile receives [`WriterError::FileLocked`] immediately (non-blocking
+//! `try_lock`).
 //!
 //! Within a process, callers must share one `AuditWriter` instance via
 //! `Arc<Mutex<AuditWriter>>`.
+//!
+//! # Why the sidecar, not the log file
+//!
+//! `File::try_lock()` maps to `LockFileEx` on Windows, whose exclusivity is
+//! enforced against ALL I/O issued through any OTHER handle to the SAME file
+//! — including reads, and including a second handle opened by the SAME
+//! process for the SAME path (documented Win32 behaviour, "Locking and
+//! Unlocking Byte Ranges in Files", Microsoft Learn).  POSIX advisory locks
+//! (OFD/flock) never restrict I/O through a different descriptor, only other
+//! lock requests.  Locking the log file directly therefore made every
+//! concurrent reader — `AuditReader`, `verify_log`, a second in-process
+//! `File::open` — fail on Windows with a lock-violation error while a writer
+//! was alive, even though the same code was harmless on POSIX.  Locking a
+//! sidecar file instead preserves the single-writer invariant without ever
+//! placing an OS lock on data any reader needs to touch, on every platform.
 //!
 //! # File-lock implementation note
 //!
@@ -27,27 +47,22 @@
 //! advisory lock on POSIX (Linux `OFD_SETLK`, macOS `flock`).
 //! `std::fs::File::try_lock()` is the non-blocking variant; returns
 //! `Err(WouldBlock)` when the lock is held by another OFD.  The lock is
-//! released when the writer's `File` is dropped (OFD closed).
+//! released when the sidecar lock file's handle is dropped (OFD/handle
+//! closed).
 //!
 //! The stable standard-library `File::try_lock` API is used in preference to
 //! the `fd-lock` crate.
 //!
-//! # Single-handle requirement (Windows)
+//! # Single-handle I/O against the active log file
 //!
-//! The lock-holding handle and every read/write against the active log file
-//! are the SAME `std::fs::File`. On Windows, `LockFileEx`'s exclusive lock
-//! (which `File::try_lock` maps to; see `sys/fs/windows.rs`) is enforced
-//! against I/O issued through any OTHER handle to the same file, INCLUDING a
-//! second handle opened by the SAME process for the SAME path — this is
-//! documented Win32 behaviour ("Locking and Unlocking Byte Ranges in Files",
-//! Microsoft Learn), unlike POSIX advisory locks (OFD/flock) which never
-//! restrict I/O through a different descriptor, only other lock requests. A
-//! second `File::open`/`OpenOptions::open` of the active log path while this
-//! writer's handle is alive — for a read, a write, or a metadata-adjacent
-//! content scan — fails on Windows with `ERROR_ACCESS_DENIED` (raw os error
-//! 5). All reads and writes against the active log file therefore go through
-//! `AuditWriter::file`; no other function opens a second handle onto the
-//! active path while the writer is alive.
+//! `AuditWriter::file` is the SAME `std::fs::File` used for every read and
+//! write against the active log file (the initial chain-recovery scan, the
+//! partial-rotation detection scan, and every subsequent `write_entry`).
+//! The log file carries no OS lock (the writer's lock lives on the sidecar),
+//! so this is purely a consistency invariant: a single handle guarantees the
+//! writer's in-memory state (`last_hash`, `is_new_file`) is always derived
+//! from exactly the bytes it will next append after, with no possibility of
+//! a second handle observing a different buffered view of the same file.
 //!
 //! # Per-file HMAC sidecar
 //!
@@ -107,7 +122,7 @@ use crate::timefmt::current_iso8601_utc;
 pub use super::rotation::{MAX_ROTATED_FILES, ROTATION_THRESHOLD_BYTES};
 
 #[cfg(test)]
-static FORCE_NEXT_LOCK_ACQUIRE_FAILURE_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+static FORCE_NEXT_ROTATION_CREATE_FAILURE_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 static LAST_ROTATION_TIMESTAMP_MS: AtomicU64 = AtomicU64::new(0);
 static ROTATION_COLLISION_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -147,14 +162,22 @@ static ROTATION_COLLISION_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct AuditWriter {
     /// Path to the active log file.
     path: PathBuf,
-    /// The single OS handle used for BOTH the exclusive lock and every read
-    /// and write against the active log file.
+    /// Exclusive advisory lock on the sidecar `<path>.lock` file.
     ///
-    /// Held for the entire `AuditWriter` lifetime; dropping it releases the
-    /// lock (OFD/handle closed) and closes the file.  No explicit `unlock`
-    /// call is needed.  See the module-level "Single-handle requirement
-    /// (Windows)" section for why this must be one handle rather than a
-    /// separate lock-holder plus a separate I/O handle.
+    /// Held for the entire `AuditWriter` lifetime, including across every
+    /// rotation — never released or re-acquired until the writer drops.  The
+    /// log file at `path` itself carries no lock; see the module-level
+    /// "Single-writer invariant" and "Why the sidecar, not the log file"
+    /// sections.  This field is never read; its only purpose is to hold the
+    /// lock for as long as the `AuditWriter` lives.
+    _lock: crate::audit_log::lock::AuditWriterLock,
+    /// The single OS handle used for every read and write against the active
+    /// log file.
+    ///
+    /// Held for the entire `AuditWriter` lifetime; dropping it closes the
+    /// file.  See the module-level "Single-handle I/O against the active log
+    /// file" section for why one handle is used rather than a fresh handle
+    /// per operation.
     file: File,
     /// SHA-256 hash of the last entry written to the current file.
     ///
@@ -260,12 +283,20 @@ impl AuditWriter {
             fs::create_dir_all(parent)?;
         }
 
-        // Acquire the exclusive advisory lock BEFORE reading the existing file
-        // so no other process can append between the read and the first write.
-        // This handle is used for BOTH the lock and every subsequent read/write
-        // against the active log file — see the module-level "Single-handle
-        // requirement (Windows)" section.
-        let file = acquire_locked_handle(&path)?;
+        // Acquire the exclusive sidecar lock BEFORE touching the data file at
+        // all, so no other process can append between the chain-recovery read
+        // and the first write, and a losing opener never even creates the
+        // data file.  The log file itself is never locked — see the
+        // module-level "Single-writer invariant" and "Why the sidecar, not
+        // the log file" sections.
+        let lock_path = lock_sidecar_path(&path);
+        let lock = crate::audit_log::lock::AuditWriterLock::acquire(&lock_path)?;
+
+        // Open the data file. No lock is placed on it; see above. This is the
+        // single handle used for every subsequent read and write against the
+        // active log file — see the module-level "Single-handle I/O against
+        // the active log file" section.
+        let file = open_append_0600(&path)?;
 
         // Detect partial-rotation state after acquiring the lock, before reading
         // the chain.  Returns IntegrityViolation(VerifyError::PartialRotation)
@@ -285,6 +316,7 @@ impl AuditWriter {
 
         Ok(Self {
             path,
+            _lock: lock,
             file,
             last_hash,
             is_new_file,
@@ -475,12 +507,13 @@ impl AuditWriter {
     /// Recovery: the next successful rotation produces a correctly-named archive.
     ///
     /// **Potentially unrecoverable — `fs::rename` succeeded but
-    /// `acquire_locked_handle_create_new` failed:**
+    /// `create_new_active_file_after_rotation` failed:**
     /// The active file has been archived but the new active path could not be
-    /// created or locked.  The writer is left in an inconsistent state and the
-    /// current `AuditWriter` instance cannot be used again.  The next
-    /// `AuditWriter::open` on the same path will create a fresh chain, losing
-    /// the cross-file chain bridge.
+    /// created.  The writer is left in an inconsistent state (`self.file`
+    /// still refers to the now-archived file, though it holds no lock on it —
+    /// any reader may open it freely) and the current `AuditWriter` instance
+    /// cannot be used again.  The next `AuditWriter::open` on the same path
+    /// will create a fresh chain, losing the cross-file chain bridge.
     fn rotate(&mut self) -> Result<(), WriterError> {
         let stem = self
             .path
@@ -534,28 +567,24 @@ impl AuditWriter {
         // Prune excess rotated files.
         self.prune_rotated_files()?;
 
-        // Open and lock the new active file BEFORE swapping the writer state.
-        // Reordering is critical:
+        // Open the new active file BEFORE swapping the writer state.
         //
-        // After `fs::rename`, the old handle holds the lock on the *rotated
-        // archive's* inode (POSIX flock follows the file descriptor, not the
-        // path). The new active path is unlocked between the rename and the
-        // new `acquire_locked_handle_create_new` call.  If we swap `self.file`
-        // first and THEN acquire the new lock, a competing process can
-        // `try_lock` the new active path in that window and succeed — our
-        // subsequent acquire would return `FileLocked`, leaving the writer
-        // half-rotated.
+        // Unlike a per-file lock scheme, no race window opens up here: the
+        // sidecar lock acquired in `AuditWriter::open` is held continuously
+        // across the whole rotation (never released, never re-acquired), so
+        // no other process can ever hold the writer role while we are
+        // between `fs::rename` and this `create_new` call — the active path
+        // being briefly absent from the directory is a filesystem-visible
+        // detail, not a lock-ownership race. A concurrent READER observing
+        // this brief absence is expected and handled — see
+        // `reader::collect_files_newest_first`'s rotation-window tolerance.
         //
-        // Correct order:
-        //   1. Open AND lock the new active file (one handle, one call).
-        //   2. Assign `self.file`, dropping the OLD handle (releases the
-        //      rotated-archive lock and closes the old file) at the same time.
         // Use create_new (O_CREAT|O_EXCL) to defend against a race where an
         // attacker pre-creates the new active path between our fs::rename and
         // this open.  AlreadyExists from a crash-recovery scenario (stale
         // partial file) is surfaced as Io so the caller can intervene;
         // the stale file MUST NOT be reused because its chain state is unknown.
-        let new_file = match acquire_locked_handle_create_new(&self.path) {
+        let new_file = match create_new_active_file_after_rotation(&self.path) {
             Ok(file) => file,
             Err(_) => {
                 let archive_name = PathBuf::from(&rotated_name);
@@ -728,73 +757,48 @@ pub(crate) fn is_rotated_sibling(stem: &str, name: &str) -> bool {
     base_suffix[9..].bytes().all(|b| b.is_ascii_digit())
 }
 
-// ── Lock acquisition ─────────────────────────────────────────────────────────
+// ── Rotation create-failure test seam ────────────────────────────────────────
 //
-// A single handle serves as both the exclusive-lock holder and the I/O handle
-// for all reads/writes against the active log file — see the module-level
-// "Single-handle requirement (Windows)" section for why a separate
-// lock-holder handle plus a separate I/O handle is unsound on Windows.
+// The sidecar lock (see `lock.rs`) is acquired once in `AuditWriter::open` and
+// held for the writer's entire lifetime, including across rotation — rotation
+// never acquires or releases any lock. The only failure `rotate()` can hit
+// when establishing the new active file is the CREATE itself (e.g. a stale
+// leftover file from a previous crash). This seam lets a test force that
+// create to fail deterministically, without needing to engineer a real
+// pre-existing file collision.
 
-/// Returns `Err(WriterError::FileLocked)` if a test has armed the forced
-/// lock-acquire failure seam for `path`, consuming the arm.  A no-op outside
-/// `#[cfg(test)]`.
-fn check_forced_lock_failure(path: &Path) -> Result<(), WriterError> {
+/// Returns `Err(WriterError::Io)` if a test has armed the forced
+/// rotation-create failure seam for `path`, consuming the arm.  A no-op
+/// outside `#[cfg(test)]`.
+fn check_forced_rotation_create_failure(path: &Path) -> Result<(), WriterError> {
     #[cfg(test)]
-    if let Ok(mut force_path) = FORCE_NEXT_LOCK_ACQUIRE_FAILURE_PATH.lock()
+    if let Ok(mut force_path) = FORCE_NEXT_ROTATION_CREATE_FAILURE_PATH.lock()
         && force_path.as_deref() == Some(path)
     {
         *force_path = None;
-        return Err(WriterError::FileLocked);
+        return Err(WriterError::Io(io::Error::other(
+            "test fault: forced rotation create failure",
+        )));
     }
     #[cfg(not(test))]
     let _ = path;
     Ok(())
 }
 
-/// Calls `File::try_lock()` (stable Rust 1.89; exclusive lock by default on
-/// all platforms) on an already-open `file` and returns it locked.
-///
-/// The `fd-lock` crate was removed in favour of this stable standard-library
-/// API.
-///
-/// # Errors
-///
-/// - [`WriterError::FileLocked`] if the lock is held by another OFD/handle
-///   (another process, or another handle on the same path in this process).
-/// - [`WriterError::Io`] on lock failure.
-fn try_lock_file(file: File) -> Result<File, WriterError> {
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => Err(WriterError::FileLocked),
-        Err(std::fs::TryLockError::Error(e)) => Err(WriterError::Io(e)),
-    }
-}
-
-/// Opens `path` for append (creating it if absent, mode 0600 on POSIX) and
-/// acquires an exclusive advisory lock on it (non-blocking), returning the
-/// SAME handle for both roles.
+/// Creates the new active file after a rotation (`O_CREAT | O_EXCL`, mode
+/// 0600 on POSIX). No lock is acquired here — the sidecar lock acquired in
+/// `AuditWriter::open` already excludes every other writer for the entire
+/// rotation, so there is no race window for a second lock acquisition to
+/// close.
 ///
 /// # Errors
 ///
-/// - [`WriterError::FileLocked`] if the lock is held by another OFD/handle.
-/// - [`WriterError::Io`] on open or lock failure.
-fn acquire_locked_handle(path: &Path) -> Result<File, WriterError> {
-    check_forced_lock_failure(path)?;
-    try_lock_file(open_append_0600(path)?)
-}
-
-/// Creates `path` exclusively (`O_CREAT | O_EXCL`, mode 0600 on POSIX) and
-/// acquires an exclusive advisory lock on it (non-blocking), returning the
-/// SAME handle for both roles.  Used when opening the new active file after a
-/// rotation.
-///
-/// # Errors
-///
-/// - [`WriterError::FileLocked`] if the lock is held by another OFD/handle.
-/// - [`WriterError::Io`] on open (including `AlreadyExists`) or lock failure.
-fn acquire_locked_handle_create_new(path: &Path) -> Result<File, WriterError> {
-    check_forced_lock_failure(path)?;
-    try_lock_file(open_create_new_0600(path)?)
+/// - [`WriterError::Io`] on create failure (including `AlreadyExists` from a
+///   stale leftover file), or if a test has armed the forced-failure seam for
+///   `path`.
+fn create_new_active_file_after_rotation(path: &Path) -> Result<File, WriterError> {
+    check_forced_rotation_create_failure(path)?;
+    open_create_new_0600(path).map_err(WriterError::Io)
 }
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
@@ -817,6 +821,118 @@ pub(super) fn hmac_sidecar_path(log_path: &Path) -> PathBuf {
         .to_owned();
     sidecar.set_file_name(format!("{existing}.root_hmac"));
     sidecar
+}
+
+/// Returns the sidecar lock-file path for `log_path`.
+///
+/// For `audit.jsonl` → `audit.jsonl.lock`.
+///
+/// This path is derived from the ACTIVE log path's stem and is never
+/// recomputed against a rotated archive name — the sidecar lock stays fixed
+/// at this path for the writer's entire lifetime, including across rotation
+/// (see the module-level "Single-writer invariant" section).  `.lock` is
+/// already excluded from [`is_rotated_sibling`]'s pattern (see
+/// `is_rotated_sibling_rejects_lock_sidecar`), so rotation's directory scan
+/// and pruning never touch it.
+pub(super) fn lock_sidecar_path(log_path: &Path) -> PathBuf {
+    let mut sidecar = log_path.to_path_buf();
+    let existing = sidecar
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_owned();
+    sidecar.set_file_name(format!("{existing}.lock"));
+    sidecar
+}
+
+/// Returns `true` if the sidecar lock for `log_path` is currently held by a
+/// live writer (in this process or another).
+///
+/// Performs a non-blocking probe: attempts to acquire the lock itself and
+/// immediately releases it (drop) if that succeeds. Used by
+/// `reader::collect_files_newest_first` to distinguish a genuinely
+/// out-of-band-deleted active file from the microsecond-scale window between
+/// `rotate()`'s archive rename and its new active file's `create_new`, during
+/// which a live writer still holds this lock throughout.
+///
+/// Returns `false` on any I/O error other than contention (e.g. the parent
+/// directory does not exist) — an ambiguous probe result must never be
+/// treated as "a writer is live", or a genuine integrity violation could be
+/// silently retried away.
+///
+/// Two accepted side effects, both confined to the anomalous
+/// active-file-absent path this probe serves:
+///
+/// - The probe CREATES the sidecar file when absent (acquisition opens with
+///   create), so `verify` against a copied-off audit directory is not
+///   strictly non-mutating on this path. On a read-only filesystem the
+///   acquisition fails, which degrades to `false` — the correct give-up
+///   direction.
+/// - While a successful probe momentarily holds the lock, a concurrently
+///   STARTING writer's `open()` can observe spurious contention and refuse
+///   with `FileLocked`. The window is microseconds, the refusal is
+///   fail-closed and indistinguishable from genuine contention, and every
+///   opener already treats `FileLocked` as retryable; a live writer is never
+///   affected (the probe cannot acquire a held lock).
+///
+/// On the reader path this probe is vacuous-by-construction: `AuditReader`
+/// keeps its writer alive, so the lock is always held and the fast give-up
+/// branch is reachable only through writer-independent entry points
+/// (`verify::verify_log`).
+pub(super) fn sidecar_lock_is_held(log_path: &Path) -> bool {
+    matches!(
+        crate::audit_log::lock::AuditWriterLock::acquire(&lock_sidecar_path(log_path)),
+        Err(WriterError::FileLocked)
+    )
+}
+
+/// Bounded number of re-scan attempts tolerated for the rotation window (see
+/// the `audit_log` module's "Reader consistency posture" docs).
+pub(super) const ROTATION_WINDOW_RETRY_ATTEMPTS: u32 = 20;
+
+/// Delay between re-scan attempts. Small enough that the total bound
+/// (`ROTATION_WINDOW_RETRY_ATTEMPTS * ROTATION_WINDOW_RETRY_DELAY` = a
+/// nominal 20ms; coarser OS sleep granularity — Windows timers tick at
+/// ~15.6ms by default — stretches the real elapsed bound accordingly, still
+/// finite and small) is imperceptible to any caller, large enough to give a
+/// concurrent writer's rotation a realistic chance to complete. The waits
+/// are synchronous `thread::sleep`s: callers on an async executor should
+/// reach these reader/verify APIs through `spawn_blocking` (as with any of
+/// this module's file I/O).
+pub(super) const ROTATION_WINDOW_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(1);
+
+/// Shared bounded-retry primitive for the rotation-window tolerance used by
+/// both `reader::collect_files_newest_first` and `verify::collect_file_chain`.
+///
+/// Re-invokes `rescan` up to [`ROTATION_WINDOW_RETRY_ATTEMPTS`] times while
+/// `is_still_absent` reports the active file is still missing from the most
+/// recent scan AND the writer's sidecar lock for `log_path` is observably
+/// held by a live writer. Returns as soon as `is_still_absent` reports the
+/// file has reappeared, or once the bound is exhausted, or immediately if no
+/// writer holds the lock (an unheld lock means the absence is not a live
+/// rotation in progress, so waiting would only delay a genuine integrity
+/// error for no benefit). Never turns a genuine gap into success — it only
+/// ever delays, by at most `ROTATION_WINDOW_RETRY_ATTEMPTS *
+/// ROTATION_WINDOW_RETRY_DELAY`, the point at which a still-missing file is
+/// reported as one.
+pub(super) fn wait_out_transient_rotation_window<T, E>(
+    log_path: &Path,
+    mut latest: T,
+    is_still_absent: impl Fn(&T) -> bool,
+    mut rescan: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    for _ in 0..ROTATION_WINDOW_RETRY_ATTEMPTS {
+        if !is_still_absent(&latest) {
+            return Ok(latest);
+        }
+        if !sidecar_lock_is_held(log_path) {
+            break;
+        }
+        std::thread::sleep(ROTATION_WINDOW_RETRY_DELAY);
+        latest = rescan()?;
+    }
+    Ok(latest)
 }
 
 struct Sha256Writer<'a>(&'a mut Sha256);
@@ -1099,10 +1215,11 @@ pub enum WriterError {
     #[error("audit log I/O error: {0}")]
     Io(#[from] io::Error),
 
-    /// The audit log file is locked by another process.
+    /// The audit log's sidecar lock (`<log>.lock`) is held by another process.
     ///
     /// Only one `AuditWriter` per log file is permitted across all processes.
-    /// Use `Arc<Mutex<AuditWriter>>` to share within a process.
+    /// Use `Arc<Mutex<AuditWriter>>` to share within a process. The log file
+    /// itself is never locked; readers are unaffected by this condition.
     #[error("audit log file is locked by another process (audit.writer_locked)")]
     FileLocked,
 
@@ -1127,17 +1244,24 @@ pub enum WriterError {
     #[error("audit log hash chain error: {0}")]
     Hash(#[source] super::chain::HashError),
 
-    /// Rotation archived the old file but could not lock the new active file.
+    /// Rotation archived the old file but could not create the new active
+    /// file.
     ///
     /// The caller must discard the current writer. Reusing it could append a
     /// second handoff entry to the archived file and corrupt the rotation tail.
+    /// The writer's sidecar lock (see `lock.rs`) remains held throughout —
+    /// this variant is never caused by a lock conflict, since no lock is
+    /// acquired when establishing the new active file.
     #[error(
-        "audit log partial rotation: archived {archive_name:?}, active lock holder {active_locked_by:?}"
+        "audit log partial rotation: archived {archive_name:?}, new active file could not be created (lock holder if known: {active_locked_by:?})"
     )]
     PartialRotation {
-        /// Basename of the archive created before the active-path lock failure.
+        /// Basename of the archive created before the new active file could
+        /// be created.
         archive_name: PathBuf,
-        /// PID of the active-path lock holder if known.
+        /// Reserved for future PID-based holder identification against the
+        /// writer's own sidecar lock; always `None` today, since this
+        /// variant is never caused by a lock conflict (see the variant docs).
         active_locked_by: Option<u32>,
     },
 
@@ -2099,6 +2223,76 @@ mod tests {
         );
     }
 
+    // ── sidecar lock: mechanism + cross-process exclusion ────────────────────
+
+    /// The sidecar lock file exists at `<path>.lock` (never at `path` itself)
+    /// once a writer is open, and a raw second acquire against that exact
+    /// sidecar path — bypassing `AuditWriter` entirely — is excluded while the
+    /// writer is alive and succeeds once it drops. This exercises the
+    /// exclusion mechanism directly rather than only through `AuditWriter`,
+    /// simulating two independent processes racing for the same sidecar file.
+    #[test]
+    fn sidecar_lock_file_excludes_second_raw_acquire_and_releases_on_drop() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+
+        let writer = open_no_key(path.clone());
+
+        let lock_path = lock_sidecar_path(&path);
+        assert!(
+            lock_path.exists(),
+            "sidecar lock file must exist: {lock_path:?}"
+        );
+        assert_ne!(
+            lock_path, path,
+            "the log file itself must never be the lock path"
+        );
+
+        let second = crate::audit_log::lock::AuditWriterLock::acquire(&lock_path);
+        assert!(
+            matches!(second, Err(WriterError::FileLocked)),
+            "a second raw acquire of the same sidecar path must be excluded, got: {second:?}"
+        );
+
+        drop(writer);
+
+        let third = crate::audit_log::lock::AuditWriterLock::acquire(&lock_path);
+        assert!(
+            third.is_ok(),
+            "acquire after the writer drops must succeed, got: {third:?}"
+        );
+    }
+
+    /// Pins the invariant this campaign establishes: a reader with its own,
+    /// completely independent file handle completes successfully while a live
+    /// writer holds its lock — on every platform. This passed on POSIX before
+    /// the sidecar redesign (advisory locks never block a second handle's
+    /// I/O) and is the exact case that failed on Windows under the old
+    /// data-file-locking scheme (`ERROR_LOCK_VIOLATION`/`ERROR_ACCESS_DENIED`
+    /// on any second handle to the locked log file).
+    #[test]
+    fn reader_completes_while_live_writer_holds_lock() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+
+        let mut writer = open_no_key(path.clone());
+        writer
+            .write_entry(make_entry(writer.last_entry_hash()))
+            .unwrap();
+
+        // `writer` (and its sidecar lock) stays alive for the whole call
+        // below. `verify_log` opens its own independent handles on the log
+        // file — the same code path a separate `audit verify` process would
+        // use against a log a different process's writer is actively holding.
+        let result = crate::audit_log::verify::verify_log(&path, None);
+        assert!(
+            result.is_ok(),
+            "reader must complete while the writer is alive, got: {result:?}"
+        );
+
+        drop(writer);
+    }
+
     // ── hmac_sidecar_renamed_on_rotation ────────────────────────────────────
 
     #[test]
@@ -2425,7 +2619,7 @@ mod tests {
     }
 
     #[test]
-    fn rotation_lock_failure_returns_partial_rotation_and_poisons_writer() {
+    fn rotation_create_failure_returns_partial_rotation_and_poisons_writer() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("audit.jsonl");
         let mut writer = open_no_key(path.clone());
@@ -2433,25 +2627,19 @@ mod tests {
             .write_entry(make_entry(writer.last_entry_hash()))
             .unwrap();
 
-        {
-            // Threshold padding must go through the writer's OWN handle: the
-            // writer holds the exclusive lock on the active file, and Windows
-            // refuses a write issued through any other handle to a locked
-            // file. Append-mode semantics make the write position-independent
-            // on every platform.
-            use std::io::Write as _;
-            writer
-                .file
-                .write_all(&vec![b'\n'; ROTATION_THRESHOLD_BYTES as usize])
-                .unwrap();
-        }
+        // Force rotation by padding the file to exceed the threshold. The log
+        // file carries no lock, so a plain second-handle write is fine on
+        // every platform; the garbage content is archived away untouched by
+        // the rotation this test triggers below.
+        let large_content = vec![0u8; ROTATION_THRESHOLD_BYTES as usize];
+        fs::write(&path, &large_content).unwrap();
 
-        if let Ok(mut force_path) = FORCE_NEXT_LOCK_ACQUIRE_FAILURE_PATH.lock() {
+        if let Ok(mut force_path) = FORCE_NEXT_ROTATION_CREATE_FAILURE_PATH.lock() {
             *force_path = Some(path.clone());
         }
         let err = writer
             .write_entry(make_entry(writer.last_entry_hash()))
-            .expect_err("forced post-rename lock failure must be surfaced");
+            .expect_err("forced post-rename create failure must be surfaced");
         assert!(
             matches!(
                 err,

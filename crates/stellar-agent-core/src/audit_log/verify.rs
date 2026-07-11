@@ -43,7 +43,10 @@ use super::{
     chain::{ZERO_BLOCK_HASH, compute_entry_hash, verify_chain_root},
     entry::AuditEntry,
     schema::EventKind,
-    writer::{MAX_ROTATED_FILES, hmac_sidecar_path, is_rotated_sibling},
+    writer::{
+        MAX_ROTATED_FILES, hmac_sidecar_path, is_rotated_sibling,
+        wait_out_transient_rotation_window,
+    },
 };
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -154,7 +157,28 @@ pub fn verify_log(log_path: &Path, hmac_key: Option<&[u8; 32]>) -> Result<Verify
     let mut files_walked = 0usize;
 
     // Collect the ordered list of files: oldest rotated first, then active.
+    //
+    // Rotation-window tolerance: `AuditWriter::rotate` renames the active
+    // file to its archive name and creates the new active file as two
+    // separate filesystem operations, so a concurrent reader can observe the
+    // active path (the LAST element here) transiently absent even though the
+    // log is not actually empty. When that happens and rotated siblings are
+    // present, re-scan a small bounded number of times while the writer's
+    // sidecar lock is observably held by a live writer before concluding the
+    // file is genuinely missing — see `reader`'s "Reader consistency
+    // posture" docs, which this mirrors for the writer-independent
+    // entrypoint.
     let file_chain = collect_file_chain(log_path)?;
+    let file_chain = if file_chain.len() > 1 && !file_chain.last().is_some_and(|p| p.exists()) {
+        wait_out_transient_rotation_window(
+            log_path,
+            file_chain,
+            |chain: &Vec<PathBuf>| !chain.last().is_some_and(|p| p.exists()),
+            || collect_file_chain(log_path),
+        )?
+    } else {
+        file_chain
+    };
     let active_stem = log_path
         .file_name()
         .and_then(|s| s.to_str())
@@ -2373,6 +2397,119 @@ mod tests {
         assert_eq!(ok.per_file[1].path, path);
         assert_eq!(ok.per_file[1].entries_verified, 1);
         assert_eq!(ok.per_file[1].hmac_verified, None);
+    }
+
+    /// With rotated siblings present, an absent active file and NO live
+    /// writer (sidecar lock unheld) is a genuine integrity gap: the
+    /// rotation-window tolerance gives up on its first probe and `verify_log`
+    /// reports `RotationGap`. The elapsed ceiling is a hang guard only, far
+    /// above the retry budget — immediacy is the probe's documented contract,
+    /// not something a wall-clock assertion can pin without flaking.
+    #[test]
+    fn verify_missing_active_no_writer_reports_rotation_gap() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+
+        {
+            let mut writer = AuditWriter::open(path.clone(), None).unwrap();
+            writer
+                .write_entry(new_tool_invocation(
+                    "pre_rotation",
+                    "stellar:testnet",
+                    vec![],
+                    None,
+                    None,
+                    PolicyDecision::Allow,
+                    None,
+                    uuid::Uuid::new_v4().to_string(),
+                ))
+                .unwrap();
+            writer.force_rotate_for_test().unwrap();
+            writer
+                .write_entry(new_tool_invocation(
+                    "post_rotation",
+                    "stellar:testnet",
+                    vec![],
+                    None,
+                    None,
+                    PolicyDecision::Allow,
+                    None,
+                    uuid::Uuid::new_v4().to_string(),
+                ))
+                .unwrap();
+        } // writer dropped: sidecar lock released.
+
+        fs::remove_file(&path).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = verify_log(&path, None)
+            .expect_err("an absent active file with no live writer is a gap");
+        assert!(
+            matches!(err, VerifyError::RotationGap { .. }),
+            "expected RotationGap, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "gap reporting must never hang"
+        );
+    }
+
+    /// The transient active-file absence during a live writer's rotation is
+    /// waited out by `verify_log` too (the writer-independent entry point):
+    /// with the sidecar lock held and the file reappearing inside the retry
+    /// budget, verification succeeds over the full chain.
+    #[test]
+    fn verify_active_transient_absence_while_writer_alive_recovers() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+
+        let mut writer = AuditWriter::open(path.clone(), None).unwrap();
+        writer
+            .write_entry(new_tool_invocation(
+                "pre_rotation",
+                "stellar:testnet",
+                vec![],
+                None,
+                None,
+                PolicyDecision::Allow,
+                None,
+                uuid::Uuid::new_v4().to_string(),
+            ))
+            .unwrap();
+        writer.force_rotate_for_test().unwrap();
+        writer
+            .write_entry(new_tool_invocation(
+                "post_rotation",
+                "stellar:testnet",
+                vec![],
+                None,
+                None,
+                PolicyDecision::Allow,
+                None,
+                uuid::Uuid::new_v4().to_string(),
+            ))
+            .unwrap();
+
+        let saved_active_contents = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        let recreate_path = path.clone();
+        let recreate_handle = std::thread::spawn(move || {
+            // Comfortably inside the nominal retry budget; on platforms with
+            // coarse sleep granularity the budget only grows.
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            fs::write(&recreate_path, &saved_active_contents).unwrap();
+        });
+
+        // The writer stays alive (lock held) across the verification.
+        let result = verify_log(&path, None);
+        recreate_handle.join().unwrap();
+        drop(writer);
+
+        let ok = result.expect("transient rotation-window absence must not surface as RotationGap");
+        assert_eq!(ok.files_walked, 2);
+        // pre_rotation + the rotation-handoff row in the archive + post_rotation.
+        assert_eq!(ok.entries_verified, 3);
     }
 
     #[test]

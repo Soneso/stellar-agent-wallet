@@ -31,6 +31,39 @@
 //! reinterpreted as `Ok(None)`. `Ok(None)` is reserved for "full chain
 //! traversal completed cleanly with no matching row" — it never silently masks
 //! integrity violations.
+//!
+//! # Reader consistency posture
+//!
+//! `AuditWriter` places no OS lock on the log file itself (the exclusive lock
+//! lives on a sidecar file — see `writer::lock_sidecar_path` and
+//! `crate::audit_log::lock`), so a reader may observe the log directory
+//! mid-write or mid-rotation, on every platform:
+//!
+//! - **Mid-append** (a write in progress): the active file's last line may be
+//!   incomplete. This is the pre-existing torn-tail case, surfaced as
+//!   [`AuditLogIntegrityError::ParseError`] — never silently treated as
+//!   `Ok(None)`. Unaffected by this module's design.
+//!
+//! - **Mid-rotation** (the active file transiently absent): `AuditWriter::rotate`
+//!   renames the active file to its archive name and then creates the new
+//!   active file as two separate filesystem operations; a reader can observe
+//!   the directory in the microsecond-scale window between them, in which the
+//!   active path does not exist even though the log is not actually empty.
+//!   [`collect_files_newest_first`] tolerates this: when the active file is
+//!   absent but rotated siblings are present, it re-scans the directory a
+//!   small bounded number of times (never indefinitely) WHILE the writer's
+//!   sidecar lock is observably held by a live writer (probed by
+//!   `writer::wait_out_transient_rotation_window`, shared with
+//!   `verify::verify_log`'s equivalent tolerance), on the theory that the
+//!   combination of "no active file" + "a writer is currently alive" is far
+//!   more likely to be this transient window than out-of-band tampering. If
+//!   the file reappears, the scan proceeds normally with the fresh file
+//!   listing. If the bound is exhausted, or no writer is alive to begin with,
+//!   the absence is treated exactly as before: [`AuditLogIntegrityError::RotationGap`]
+//!   for a non-active missing file, or "empty log" for an active file absent
+//!   with no rotated siblings. This bounded tolerance never turns a genuine
+//!   integrity violation into `Ok` — it only delays, by a few milliseconds at
+//!   most, the point at which a still-absent file is reported as a gap.
 
 use std::{
     io::{BufRead, BufReader},
@@ -46,7 +79,7 @@ use super::{
     schema::EventKind,
     signer_set::{ObservedSignerSet, SignerSetStatePayload},
     verify::VerifyError,
-    writer::{AuditWriter, is_rotated_sibling},
+    writer::{AuditWriter, is_rotated_sibling, wait_out_transient_rotation_window},
 };
 
 /// Pinned wasm-hash record for one rule, extracted from the `SaContextRuleCreated`
@@ -702,7 +735,34 @@ impl AuditReader {
 ///
 /// This invariant is verified by the `rotation_suffix_lex_sort_matches_chronological`
 /// unit test in `audit_log/rotation.rs::tests`.
+///
+/// # Rotation-window tolerance
+///
+/// If the active file is absent from the listing but rotated siblings are
+/// present, re-scans the directory a small bounded number of times while the
+/// writer's sidecar lock is observably held by a live writer, tolerating the
+/// microsecond-scale window `AuditWriter::rotate` opens between archiving the
+/// old active file and creating the new one — see the module-level "Reader
+/// consistency posture" section. This never masks a genuine gap: callers
+/// still see the active file missing (and, when siblings are present, still
+/// get `RotationGap`) if it never reappears within the bound.
 fn collect_files_newest_first(log_path: &Path) -> Result<Vec<PathBuf>, AuditLogIntegrityError> {
+    let chain = scan_files_newest_first(log_path)?;
+    if chain.len() > 1 && !chain[0].exists() {
+        return wait_out_transient_rotation_window(
+            log_path,
+            chain,
+            |chain: &Vec<PathBuf>| !chain[0].exists(),
+            || scan_files_newest_first(log_path),
+        );
+    }
+    Ok(chain)
+}
+
+/// Performs one directory scan, returning the active file first followed by
+/// rotated siblings newest-first. See [`collect_files_newest_first`] for the
+/// scan-order contract; this function performs no retry.
+fn scan_files_newest_first(log_path: &Path) -> Result<Vec<PathBuf>, AuditLogIntegrityError> {
     let dir = log_path
         .parent()
         .ok_or_else(|| AuditLogIntegrityError::PathContract {
@@ -2097,6 +2157,13 @@ mod tests {
         }
 
         // Remove the active file to simulate out-of-band deletion / tampering.
+        // `writer` stays alive (and its sidecar lock held) for the rest of the
+        // test, so this exercises the "genuinely missing, not a transient
+        // rotation window" path of `wait_out_transient_rotation_window`: the
+        // lock IS held, so the scan retries up to its bound before giving up,
+        // but the file never reappears (nothing recreates it here), so the
+        // final outcome is unchanged — just reached after a bounded delay of
+        // at most 20ms rather than immediately.
         std::fs::remove_file(&path).unwrap();
 
         let reader = AuditReader::new(Arc::clone(&writer), None);
@@ -2110,6 +2177,51 @@ mod tests {
                 panic!("expected RotationGap for missing active file with siblings, got: {other:?}")
             }
         }
+    }
+
+    // ── 8b. Active file transiently absent during a live rotation ────────────
+
+    /// Pins the rotation-window tolerance: if the active file reappears
+    /// before the retry bound is exhausted, the scan proceeds normally
+    /// instead of surfacing a spurious `RotationGap`.
+    ///
+    /// Simulates the window `AuditWriter::rotate` opens between archiving the
+    /// old active file and creating the new one by removing the active file
+    /// and having a background thread recreate it (with its real content)
+    /// after a short delay, while the writer — and its sidecar lock — stays
+    /// alive throughout, exactly as a live writer's rotation would.
+    #[test]
+    fn active_file_transient_absence_while_writer_alive_recovers() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+
+        {
+            let mut w = writer.lock().unwrap();
+            write_event(&mut w, baselined_event(1, "CDABC...12345", 2, 2));
+            // Force rotation to create a rotated sibling.
+            w.force_rotate_for_test().unwrap();
+            write_event(&mut w, baselined_event(1, "CDABC...12345", 3, 3));
+        }
+
+        let saved_active_contents = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let recreate_path = path.clone();
+        let recreate_handle = std::thread::spawn(move || {
+            // Comfortably inside the retry bound (20 attempts x 1ms = 20ms).
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            std::fs::write(&recreate_path, &saved_active_contents).unwrap();
+        });
+
+        let reader = AuditReader::new(Arc::clone(&writer), None);
+        let result = reader.find_latest_signer_set_state(1, "CDABC...12345");
+        recreate_handle.join().unwrap();
+
+        let payload = result
+            .expect("transient rotation-window absence must not surface as RotationGap")
+            .expect("row must still be found once the active file reappears");
+        assert_eq!(payload.state().signer_count, 3);
     }
 
     // ── 9. Single-row predecessor-hash tamper → ChainBroken ──────────────────

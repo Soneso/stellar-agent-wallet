@@ -19,11 +19,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Re-opening a non-empty audit log (the common case once a profile has any
   history) failed with `ERROR_ACCESS_DENIED`, surfaced through the smart-account
   MCP flow as a misattributed `"networks.toml I/O error"` at the audit path.
-  `AuditWriter` now uses a single handle for the lock and every read/write
-  against the active log file. Adds `SaError::AuditWriterIo` so an
-  audit-writer-open failure is attributed to the audit subsystem rather than
-  the networks-registry subsystem. Adds a `windows-storage` CI job running
-  the audit-log and touched-crate tests on `windows-latest`. (#59)
+  `AuditWriter` now locks a sidecar file (`<log>.lock`) instead of the log
+  itself — the log file carries no OS lock on any platform — and keeps a
+  single handle for every read and write against the active log. Adds
+  `SaError::AuditWriterIo` so an audit-writer-open failure is attributed to
+  the audit subsystem rather than the networks-registry subsystem. Adds a
+  `windows-storage` CI job running the audit-log and touched-crate tests on
+  `windows-latest`. (#59)
+- Windows: audit-log READERS (`audit verify`, the `find_*` state scans) failed
+  wholesale — and one blocked indefinitely — while any writer was alive,
+  because the writer's exclusive lock lived on the log file itself and
+  Windows enforces such a lock against reads through every other handle. With
+  the writer's lock on the sidecar, readers never contend with it. Readers
+  and `verify` additionally tolerate the transient active-file absence during
+  a concurrent rotation (bounded re-scan, gated on a live writer holding the
+  sidecar lock; a genuine gap is still reported, only its detection is
+  delayed by the bound). The blocking reader path was a line iterator
+  treating per-read lock violations as ordinary items and never reaching
+  end-of-file; readers now complete regardless of writer liveness, pinned by
+  a dedicated concurrency test on the `windows-storage` CI job, which runs
+  the full audit-log module again. (#64)
 - Windows: Credential Manager refuses access from a non-interactive session
   (a service, an SSH session, a scheduled task) with Win32
   `ERROR_NO_SUCH_LOGON_SESSION`. The keyring error mapping surfaced this as

@@ -7,14 +7,15 @@
 //! ```text
 //! ┌──────────────────────┐
 //! │   AuditWriter        │  per-profile singleton (Arc<Mutex<AuditWriter>>)
-//! │   (writer.rs)        │  O_APPEND + File::lock() + per-line fsync
+//! │   (writer.rs)        │  O_APPEND + sidecar File::lock() + per-line fsync
 //! └────────┬─────────────┘
-//!          │ appends
+//!          │ appends (data file itself is never locked)
 //!          ▼
 //! ┌──────────────────────────────────────────────────────┐
 //! │   ~/.local/state/stellar-agent/audit/<profile>.jsonl │
 //! │   (one JSON line per entry; 10 MiB rotation;         │
 //! │    10 retained rotated files)                        │
+//! │   sidecar lock: <profile>.jsonl.lock (lock.rs)       │
 //! └──────────────────────────────────────────────────────┘
 //!          │ hash chain
 //!          ▼
@@ -73,9 +74,14 @@
 //! # Single-writer invariant
 //!
 //! [`AuditWriter::open`] acquires an exclusive advisory lock via
-//! `std::fs::File::try_lock()` (stable Rust 1.89; exclusive by default).  A
-//! second process attempting to open the same file receives
-//! [`crate::audit_log::WriterError::FileLocked`].
+//! `std::fs::File::try_lock()` (stable Rust 1.89; exclusive by default) on a
+//! **sidecar** lock file (`<profile>.jsonl.lock`), never on the log file
+//! itself — see `audit_log::lock` and the "Single-writer invariant" section of
+//! `writer.rs` for why. A second process attempting to open the same profile
+//! receives [`crate::audit_log::WriterError::FileLocked`]. Because the log
+//! file itself carries no OS lock, readers ([`reader::AuditReader`],
+//! [`verify::verify_log`]) can scan it freely while a writer is alive, on
+//! every platform.
 //!
 //! # Redaction discipline
 //!
@@ -103,6 +109,7 @@
 pub mod chain;
 pub mod entry;
 pub mod health;
+mod lock;
 pub mod reader;
 pub(crate) mod redact;
 pub mod rotation;

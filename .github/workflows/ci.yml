@@ -111,13 +111,15 @@ jobs:
     # Targeted regression coverage for Windows-only local-storage bugs that
     # ubuntu-latest cannot catch:
     #
-    # 1. Audit-log single-handle fix: `AuditWriter` uses one handle for BOTH
-    #    the exclusive lock and every read/write against the active log file
-    #    — a separate lock-holder handle plus a separate I/O handle is
-    #    unsound on Windows. POSIX advisory locks never block a second
-    #    handle's I/O; `LockFileEx`'s exclusive lock is enforced against I/O
-    #    issued through any OTHER handle to the same file, including a second
-    #    handle opened by the SAME process.
+    # 1. Audit-log sidecar-lock design: `AuditWriter` locks a sidecar file
+    #    (`<log>.lock`), never the log file itself. `LockFileEx`'s exclusive
+    #    lock is enforced against I/O issued through any OTHER handle to the
+    #    SAME file, including a second handle opened by the SAME process —
+    #    unlike POSIX advisory locks, which never block a second handle's
+    #    I/O. An exclusive lock on the log file itself would make every concurrent
+    #    reader fail on Windows while a writer is alive; the sidecar design
+    #    keeps the log file lock-free on every platform, so this job runs the
+    #    full `audit_log` module, including the reader suite and rotation.
     # 2. Parent-directory-fsync fix: `PendingApprovalStore`/`ToolsetGrantStore`
     #    open the parent directory as a file to fsync it after an atomic
     #    rename (a POSIX durability idiom) — `std::fs::File::open` on a
@@ -126,15 +128,10 @@ jobs:
     #    `ERROR_ACCESS_DENIED`. Both stores now skip this step on non-Unix.
     #
     # Bounded to the touched crates' unit tests (not the full workspace
-    # matrix) to keep this job cheap.
-    #
-    # TEMPORARY SCOPE: the audit-log READER opens its own handle on the
-    # active log; while a writer holds the exclusive lock, Windows blocks
-    # reads through any other handle, so the reader test module fails
-    # wholesale on windows-latest until the lock design allows concurrent
-    # readers. Until that campaign lands, this job runs only the suites
-    # that are proven or lock-free on Windows; the reader module, the MCP
-    # rule tools, and the full audit_log module rejoin afterwards.
+    # matrix) to keep this job cheap. The smart-account and MCP suites stay
+    # out of scope: `stellar-agent-smart-account`'s dev-dependency closure
+    # pulls `openssl-sys`, which does not build on bare windows-latest (no
+    # OpenSSL/perl); restoring that coverage is separately tracked.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
@@ -154,12 +151,9 @@ jobs:
       - name: Build test binaries (unbounded compile phase)
         shell: bash
         run: cargo test -p stellar-agent-core --lib --no-run
-      - name: Audit-log writer single-handle regression (stellar-agent-core)
-        # The two skipped rotation tests fail on Windows for campaign-tracked
-        # reasons (see the TEMPORARY SCOPE note above); they rejoin with the
-        # reader module.
+      - name: Audit-log regression (stellar-agent-core)
         shell: bash
-        run: "timeout 600 cargo test -p stellar-agent-core --lib audit_log::writer:: -- --skip hmac_sidecar_renamed_on_rotation --skip post_rotation_active_path_is_locked --skip rotation_lock_failure_returns_partial_rotation_and_poisons_writer"
+        run: "timeout 600 cargo test -p stellar-agent-core --lib audit_log::"
       - name: Approval + toolset-grant store persist regression (stellar-agent-core)
         shell: bash
         run: "timeout 600 cargo test -p stellar-agent-core --lib -- approval::store::tests::persist approval::toolset_grant::tests::persist"
