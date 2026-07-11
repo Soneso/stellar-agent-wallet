@@ -261,7 +261,7 @@ impl AuditWriter {
         // Enforce parent-component contract: a bare filename has no known
         // parent directory, making rotated-sibling placement and directory-mode
         // enforcement impossible.  Callers must supply an explicit parent, e.g.
-        // `~/.local/state/stellar-agent/audit/default.jsonl`.
+        // `~/.local/share/stellar-agent/audit/default.jsonl`.
         let parent = path.parent().ok_or_else(|| WriterError::PathContract {
             detail: "audit log path must have a parent directory component \
                      (e.g. /path/to/audit/default.jsonl, not a bare filename)"
@@ -1229,7 +1229,7 @@ pub enum WriterError {
     /// component (i.e. is a bare filename resolved against CWD, which makes
     /// rotated-sibling placement and directory-mode enforcement impossible).
     /// Always supply a path with an explicit parent directory, e.g.
-    /// `~/.local/state/stellar-agent/audit/default.jsonl`.
+    /// `~/.local/share/stellar-agent/audit/default.jsonl`.
     #[error("audit log path contract violated: {detail}")]
     PathContract {
         /// Human-readable description of the contract violation.
@@ -1750,7 +1750,7 @@ impl AuditWriterRegistry {
     /// full concurrency rationale and the race-loser behaviour.
     ///
     /// The `log_path` parameter carries the full path to the log file (e.g.
-    /// `~/.local/state/stellar-agent/audit/default.jsonl`).  The profile name
+    /// `~/.local/share/stellar-agent/audit/default.jsonl`).  The profile name
     /// is used only as the registry cache key; path construction — including
     /// any sanitisation of the profile name into a safe file-stem — is the
     /// caller's responsibility.  See

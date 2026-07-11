@@ -429,14 +429,14 @@ The `audit` group verifies the per-profile audit log, an append-only, hash-chain
 
 Read-only. Walks the log at `<LOG_PATH>`, following rotation manifests across rotated files, and verifies that the hash chain is intact end to end. When `--profile` is supplied, it additionally loads that profile's audit chain-root HMAC key and verifies the chain-root sidecars; without `--profile`, only the hash chain is checked and `hmac_verified` is reported as `false`.
 
-- `<LOG_PATH>` (positional, required) — path to the audit log file. By default this is `~/.local/state/stellar-agent/audit/<profile>.jsonl` on Linux, `~/Library/Application Support/stellar-agent/audit/<profile>.jsonl` on macOS, and `%LOCALAPPDATA%\stellar-agent\audit\<profile>.jsonl` on Windows.
+- `<LOG_PATH>` (positional, required) — path to the audit log file. By default this is `~/.local/share/stellar-agent/audit/<profile>.jsonl` on Linux, `~/Library/Application Support/Soneso.stellar-agent/audit/<profile>.jsonl` on macOS, and `%LOCALAPPDATA%\Soneso\stellar-agent\data\audit\<profile>.jsonl` on Windows.
 - `--profile <NAME>` — the profile whose chain-root HMAC key verifies the sidecars. Optional; when omitted, only the hash chain is verified.
 - `--output <FORMAT>` — output format. `json` is the default and only stable format.
 
 On Unix, the command refuses to verify a log whose parent directory is owned by a different user, since such a directory could be used to substitute log files or sidecars. It exits `0` when the chain is intact and `1` on any integrity violation (a broken chain, a rotation gap, an HMAC mismatch, a missing sidecar, or an unparseable line), a path-contract failure, or an I/O error.
 
 ```bash
-stellar-agent audit verify ~/.local/state/stellar-agent/audit/default.jsonl --profile default
+stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --profile default
 ```
 
 ```json

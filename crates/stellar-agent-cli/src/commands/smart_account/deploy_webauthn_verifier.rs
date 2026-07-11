@@ -2,7 +2,7 @@
 //!
 //! Deploys the vendored OZ WebAuthn-verifier contract WASM to a Stellar network and
 //! records the resulting contract address in the wallet-local verifier registry
-//! (`~/.config/stellar-agent/networks.toml`).
+//! (`<canonical_data_root>/networks.toml`).
 //!
 //! # Signer modes
 //!

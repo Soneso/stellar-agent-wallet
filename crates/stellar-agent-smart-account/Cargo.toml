@@ -172,7 +172,6 @@ serde_json = { workspace = true }
 p256 = { workspace = true }
 toml = { workspace = true }
 tempfile = { workspace = true }
-directories = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 # stellar-governance: OZ timelock module (Timelock trait + TimelockError).
 stellar-governance = { workspace = true }

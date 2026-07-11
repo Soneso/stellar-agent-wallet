@@ -121,9 +121,6 @@ uuid = { workspace = true }
 # URL parsing for same-endpoint cross-check diagnostics.
 url = { workspace = true }
 
-# OS-conventional counterparty cache directory resolution.
-directories = { workspace = true }
-
 # Codec framing for the bounded max-line transport (FramedRead / FramedWrite).
 tokio-util = { workspace = true }
 

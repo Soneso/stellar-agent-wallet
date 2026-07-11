@@ -70,7 +70,7 @@ stellar-agent smart-account deploy-spending-limit-policy --deployer-secret-env D
 ```
 
 Both addresses are recorded in the local verifier registry
-(`~/.config/stellar-agent/networks.toml`); later commands resolve them from
+(`<canonical_data_root>/networks.toml`); later commands resolve them from
 there automatically.
 
 ### 2. Generate the agent's Ed25519 key

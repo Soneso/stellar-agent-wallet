@@ -11,12 +11,12 @@
 //! └────────┬─────────────┘
 //!          │ appends (data file itself is never locked)
 //!          ▼
-//! ┌──────────────────────────────────────────────────────┐
-//! │   ~/.local/state/stellar-agent/audit/<profile>.jsonl │
-//! │   (one JSON line per entry; 10 MiB rotation;         │
-//! │    10 retained rotated files)                        │
-//! │   sidecar lock: <profile>.jsonl.lock (lock.rs)       │
-//! └──────────────────────────────────────────────────────┘
+//! ┌──────────────────────────────────────────────────────────┐
+//! │   <canonical_data_root>/audit/<profile>.jsonl             │
+//! │   (one JSON line per entry; 10 MiB rotation;             │
+//! │    10 retained rotated files)                            │
+//! │   sidecar lock: <profile>.jsonl.lock (lock.rs)           │
+//! └──────────────────────────────────────────────────────────┘
 //!          │ hash chain
 //!          ▼
 //! ┌──────────────────────┐
@@ -93,9 +93,9 @@
 //!
 //! # File path
 //!
-//! `~/.local/state/stellar-agent/audit/<profile>.jsonl` (Linux).
-//! `~/Library/Application Support/stellar-agent/audit/<profile>.jsonl` (macOS).
-//! `%LOCALAPPDATA%\stellar-agent\audit\<profile>.jsonl` (Windows).
+//! `~/.local/share/stellar-agent/audit/<profile>.jsonl` (Linux).
+//! `~/Library/Application Support/Soneso.stellar-agent/audit/<profile>.jsonl` (macOS).
+//! `%LOCALAPPDATA%\Soneso\stellar-agent\data\audit\<profile>.jsonl` (Windows).
 //!
 //! # Reserved event kinds
 //!

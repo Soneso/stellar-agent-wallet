@@ -106,8 +106,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   full production owner-key path: profile load, keyring registration,
   keyring read, policy-signature verification, `per_tx_cap` evaluation,
   sign, submit, confirm. (#56)
+- Every wallet-state platform-directory derivation now routes through one
+  canonical root, `directories::ProjectDirs::from("", "Soneso",
+  "stellar-agent").data_local_dir()`
+  (`stellar_agent_core::profile::schema::canonical_data_root`; the
+  `stellar-agent-headless-keyring` crate replicates the same derivation
+  locally, pinned to the core function by a dev-dependency byte-equality
+  test, to avoid pulling core's dependency closure into a minimal
+  headless-deployment crate). The audit-log directory and the
+  policy-window-state directory move off their prior `BaseDirs`-derived
+  roots onto the canonical one; `networks.toml` moves from the OS config
+  directory to the canonical data root, and its four independent
+  derivations collapse to one shared helper,
+  `stellar_agent_smart_account::verifiers::default_networks_toml_path`. No
+  migration: no installation predates this change. `STELLAR_AGENT_HOME`
+  override behaviour is unchanged everywhere it already applied. (#63)
 
 ### Added
+
+- The getting-started guide documents the macOS Gatekeeper behavior for the
+  prebuilt release binaries (ad-hoc signed, not notarized): verify the
+  download against `SHA256SUMS` or its Sigstore bundle, then approve the
+  binary once via `xattr -d com.apple.quarantine` or Finder's right-click
+  Open. Developer-ID signing and notarization remain open. (#58)
 
 - An opt-in, file-backed headless keyring store
   (`stellar-agent-headless-keyring`) for deployments where the platform

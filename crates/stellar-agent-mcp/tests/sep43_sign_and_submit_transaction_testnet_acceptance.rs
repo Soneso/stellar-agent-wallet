@@ -230,8 +230,21 @@ async fn sign_and_submit_self_payment_succeeds() {
     // `text` is consumed by JSON-parse below; keeping it bound here lets the
     // assertion message above include the wire response on failure (useful for
     // testnet debugging — friendbot rate, RPC flakiness, etc.).
-    let response: serde_json::Value =
+    let envelope: serde_json::Value =
         serde_json::from_str(&text).expect("result text must be valid JSON");
+
+    // The standard result envelope wraps the protocol payload under `data`.
+    assert_eq!(
+        envelope["ok"], true,
+        "a confirmed sign-and-submit must return ok:true (got {envelope})"
+    );
+    assert!(
+        envelope["request_id"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty()),
+        "the envelope must carry a non-empty request_id"
+    );
+    let response = &envelope["data"];
 
     // signedTxXdr is present and non-empty.
     let signed_tx_xdr = response["signedTxXdr"]

@@ -50,7 +50,6 @@ rand_core = { workspace = true }
 hex = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-directories = { workspace = true }
 tempfile = { workspace = true }
 # `pkcs8` decodes the ECDSA P-256 PKCS#8 DER private key CDP's
 # `WebAuthn.getCredentials` returns, for the operator-enroll browser

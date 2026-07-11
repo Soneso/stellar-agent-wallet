@@ -493,7 +493,7 @@ There is currently no MCP tool for this verb; see [MCP: why there is no agent-fa
 
 ## `smart-account multicall`
 
-Submits an atomic multicall bundle (1–50 invocations) through the registered multicall router contract for the target network. Signs and submits. The router address is resolved from the local registry (`~/.config/stellar-agent/networks.toml`); `mainnet` is accepted at the flag level but requires a router registered for mainnet. A signer source is required.
+Submits an atomic multicall bundle (1–50 invocations) through the registered multicall router contract for the target network. Signs and submits. The router address is resolved from the local registry (`<canonical_data_root>/networks.toml`); `mainnet` is accepted at the flag level but requires a router registered for mainnet. A signer source is required.
 
 Each `--invocation` value has the form `<target>:<fn>:<json-args>`, where `<target>` is the C-strkey of the contract to invoke, `<fn>` is the function name, and `<json-args>` is a JSON array of XDR-encoded arguments.
 
@@ -524,7 +524,7 @@ Deploy-time, registry-management, migration, and upgrade-timelock operations tha
 
 ### `smart-account deploy-webauthn-verifier`
 
-Deploys the OpenZeppelin WebAuthn-verifier WASM and records its address in the verifier registry (`~/.config/stellar-agent/networks.toml`). Idempotent: if the registry already holds an entry for the target network with the same WASM hash, it returns `status: "already_deployed"` with no RPC traffic. Signs and submits unless `--dry-run`. Testnet only.
+Deploys the OpenZeppelin WebAuthn-verifier WASM and records its address in the verifier registry (`<canonical_data_root>/networks.toml`). Idempotent: if the registry already holds an entry for the target network with the same WASM hash, it returns `status: "already_deployed"` with no RPC traffic. Signs and submits unless `--dry-run`. Testnet only.
 
 Exactly one deployer source is required (mutually exclusive group): `--deployer-secret-env <VAR>` or `--sign-with-ledger`.
 
@@ -630,7 +630,7 @@ stellar-agent smart-account list-rules --account CABC...WXYZ
 
 ### `smart-account register-multicall`
 
-Registers a deployed multicall router address and its WASM hash in the local registry (`~/.config/stellar-agent/networks.toml`). State-changing on a local file plus an audit row. Idempotent. Refuses if `--wasm-sha256` does not equal the binary's compiled-in `MULTICALL_WASM_SHA256` (typo and config-plant defence).
+Registers a deployed multicall router address and its WASM hash in the local registry (`<canonical_data_root>/networks.toml`). State-changing on a local file plus an audit row. Idempotent. Refuses if `--wasm-sha256` does not equal the binary's compiled-in `MULTICALL_WASM_SHA256` (typo and config-plant defence).
 
 Flags:
 

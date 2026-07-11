@@ -77,8 +77,6 @@ ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }
 # Entry::new / set_password / get_password (key_ops.rs).
 keyring-core = { workspace = true }
-# OS-conventional cache-dir resolution (counterparty/{list,refresh}.rs).
-directories = { workspace = true }
 # Read-only HOME_DOMAIN allowlist extraction from owner-signed policy TOML
 # (counterparty/warm_up.rs).
 toml_edit = { workspace = true }

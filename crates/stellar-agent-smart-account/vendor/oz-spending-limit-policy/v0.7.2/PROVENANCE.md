@@ -57,7 +57,7 @@
   (`spending_limit.rs:145-147`), so one deployed instance serves every account and every
   context rule on the network.  The wallet deploys exactly one per network via
   `smart-account deploy-spending-limit-policy` and records the address in the wallet-local
-  registry (`~/.config/stellar-agent/networks.toml`).
+  registry (`<canonical_data_root>/networks.toml`).
 - **Why deployable (release/), not deps/:** This contract is deployed on-chain via
   `UploadContractWasm` and called by the smart-account's `__check_auth` to enforce the
   spending limit at signing time.  On-chain storage cost scales with size; the `release`

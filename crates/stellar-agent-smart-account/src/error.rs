@@ -1060,7 +1060,7 @@ pub enum SaError {
         reason: String,
     },
 
-    /// File I/O error reading or writing `~/.config/stellar-agent/networks.toml`
+    /// File I/O error reading or writing `<canonical_data_root>/networks.toml`
     /// (or the `STELLAR_AGENT_NETWORKS_TOML` override path).
     ///
     /// `path` is the filesystem path that failed; `source` is the underlying
@@ -1104,7 +1104,7 @@ pub enum SaError {
         path: PathBuf,
     },
 
-    /// TOML parse error reading `~/.config/stellar-agent/networks.toml`
+    /// TOML parse error reading `<canonical_data_root>/networks.toml`
     /// (or the `STELLAR_AGENT_NETWORKS_TOML` override path).
     ///
     /// `path` is the filesystem path that failed to parse; `source` is the

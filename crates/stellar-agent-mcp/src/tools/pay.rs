@@ -405,7 +405,7 @@ impl WalletServer {
     /// Persists a [`PendingApproval`] entry for a `stellar_pay` simulate call.
     ///
     /// Opens (or creates) the profile-scoped approval store at
-    /// `~/.local/state/stellar-agent/approvals/<profile_name>.toml`, constructs
+    /// `~/.local/share/stellar-agent/approvals/<profile_name>.toml`, constructs
     /// an unattested entry from the payment arguments, inserts it, and returns
     /// the entry for nonce / expiry extraction by the caller.
     ///

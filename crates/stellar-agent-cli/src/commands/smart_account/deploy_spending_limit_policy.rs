@@ -2,7 +2,7 @@
 //!
 //! Deploys the vendored OZ spending-limit-policy contract WASM to a Stellar
 //! network and records the resulting contract address in the wallet-local
-//! verifier registry (`~/.config/stellar-agent/networks.toml`).
+//! verifier registry (`<canonical_data_root>/networks.toml`).
 //!
 //! The policy is a per-network singleton: one deployed instance serves every
 //! account and every context rule on the network (the OZ policy keys all state by

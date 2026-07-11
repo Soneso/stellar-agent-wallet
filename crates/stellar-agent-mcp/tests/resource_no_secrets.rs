@@ -44,13 +44,14 @@ fn usage_md_no_keyring_service_names() {
 #[test]
 fn usage_md_no_profile_paths() {
     let content = usage_md_content();
-    // Profile-file path patterns.
+    // Profile-file path patterns, matching the canonical data-root shapes
+    // the wallet actually derives per platform.
     assert!(
-        !content.contains(".local/state/stellar-agent"),
+        !content.contains(".local/share/stellar-agent"),
         "usage.md must not contain Linux profile state directory paths"
     );
     assert!(
-        !content.contains("Application Support/stellar-agent"),
+        !content.contains("Application Support/Soneso.stellar-agent"),
         "usage.md must not contain macOS profile state directory paths"
     );
     assert!(

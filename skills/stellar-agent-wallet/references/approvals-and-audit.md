@@ -338,9 +338,9 @@ Default log path by OS:
 
 | OS | Path |
 |---|---|
-| Linux | `~/.local/state/stellar-agent/audit/<profile>.jsonl` |
-| macOS | `~/Library/Application Support/stellar-agent/audit/<profile>.jsonl` |
-| Windows | `%LOCALAPPDATA%\stellar-agent\audit\<profile>.jsonl` |
+| Linux | `~/.local/share/stellar-agent/audit/<profile>.jsonl` |
+| macOS | `~/Library/Application Support/Soneso.stellar-agent/audit/<profile>.jsonl` |
+| Windows | `%LOCALAPPDATA%\Soneso\stellar-agent\data\audit\<profile>.jsonl` |
 
 On Unix, the command refuses to verify a log whose parent directory is owned by
 a different user (such a directory could be used to substitute files or
@@ -350,7 +350,7 @@ of wire codes, for example `audit.chain_broken`, `audit.rotation_gap`,
 `audit.hmac_mismatch`, with line and file detail kept out of the code.
 
 ```bash
-stellar-agent audit verify ~/.local/state/stellar-agent/audit/default.jsonl --profile default
+stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --profile default
 ```
 ```json
 {"ok":true,"data":{"entries_verified":42,"files_walked":2,"hmac_verified":true,"per_file":[],"warnings":[],"audit_writer_degraded":false},"request_id":"..."}

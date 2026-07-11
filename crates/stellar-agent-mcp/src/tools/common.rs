@@ -196,7 +196,7 @@ pub(crate) fn submit_timeout(profile: &Profile) -> std::time::Duration {
 
 /// Default TTL for pending approvals persisted by simulate handlers: 24 hours.
 ///
-/// An approval entry written to `~/.local/state/stellar-agent/approvals/<profile>.toml`
+/// An approval entry written to `~/.local/share/stellar-agent/approvals/<profile>.toml`
 /// is valid for 24 hours from the time of the simulate call.  Entries older
 /// than this are treated as expired and return `policy.approval_required` at
 /// the commit boundary (per the indistinguishability rule).

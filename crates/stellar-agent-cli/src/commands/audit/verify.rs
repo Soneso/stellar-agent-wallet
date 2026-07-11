@@ -45,9 +45,9 @@ use zeroize::Zeroizing;
 pub struct VerifyArgs {
     /// Path to the audit log file to verify.
     ///
-    /// Typically `~/.local/state/stellar-agent/audit/<profile>.jsonl` on
-    /// Linux, `~/Library/Application Support/stellar-agent/audit/<profile>.jsonl`
-    /// on macOS, or `%LOCALAPPDATA%\stellar-agent\audit\<profile>.jsonl` on
+    /// Typically `~/.local/share/stellar-agent/audit/<profile>.jsonl` on
+    /// Linux, `~/Library/Application Support/Soneso.stellar-agent/audit/<profile>.jsonl`
+    /// on macOS, or `%LOCALAPPDATA%\Soneso\stellar-agent\data\audit\<profile>.jsonl` on
     /// Windows.
     #[arg(value_name = "LOG_PATH")]
     pub log_path: PathBuf,

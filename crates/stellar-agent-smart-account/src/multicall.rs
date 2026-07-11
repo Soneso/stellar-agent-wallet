@@ -255,21 +255,28 @@ pub struct MulticallInnerResult {
 ///
 /// When set to a non-empty path, `MulticallRegistry::load` uses that path
 /// instead of the caller-supplied `config_path` argument.  This supports test
-/// isolation (writing to a temp file instead of `~/.config/stellar-agent/networks.toml`)
-/// and operator overrides for non-standard installation layouts.
+/// isolation (writing to a temp file instead of
+/// `<canonical_data_root>/networks.toml`) and operator overrides for
+/// non-standard installation layouts.
+///
+/// Re-exported from [`crate::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV`] —
+/// the same env var gates both registries' default-path resolution; see
+/// [`crate::verifiers::default_networks_toml_path`] for the single
+/// derivation point both registries' callers resolve the default path
+/// through.
 ///
 /// # Example
 ///
 /// ```sh
 /// STELLAR_AGENT_NETWORKS_TOML=/tmp/my-networks.toml smart-account register-multicall ...
 /// ```
-pub const STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV: &str = "STELLAR_AGENT_NETWORKS_TOML";
+pub use crate::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV as STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV;
 
 /// Per-network multicall router registry.
 ///
 /// Maps network passphrases to deployed multicall router contract addresses and
 /// their associated WASM SHA-256 fingerprints. Backed by
-/// `~/.config/stellar-agent/networks.toml` (same file as `VerifierRegistry`;
+/// `<canonical_data_root>/networks.toml` (same file as `VerifierRegistry`;
 /// each registry type owns its own `[multicall.<network_safename>]` section).
 ///
 /// # Binary-const trust-anchor consistency

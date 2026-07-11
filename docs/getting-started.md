@@ -55,6 +55,25 @@ The release archives these commands fetch are published with each tagged
 release on the repository's releases page. If none is listed yet, build from
 source as shown below. crates.io publication is planned for a future release.
 
+Every release ships supply-chain verification artifacts alongside the
+archives: a `SHA256SUMS` file, a Sigstore bundle per archive, and in-toto
+build provenance. Verify a download against those before running it.
+
+#### macOS Gatekeeper note
+
+The macOS binaries are currently ad-hoc signed, not Developer-ID signed or
+notarized, so a downloaded binary is blocked on first run with "Apple cannot
+check it for malicious software." After verifying the archive against
+`SHA256SUMS` or its Sigstore bundle, approve the binary once with either:
+
+```bash
+xattr -d com.apple.quarantine ./stellar-agent ./stellar-agent-mcp
+```
+
+or right-click the binary in Finder and choose Open. Binaries built from
+source or installed via `cargo install` carry no quarantine attribute and are
+unaffected.
+
 ### Build from source
 
 Building from source works today. Clone the repository and build with Cargo:

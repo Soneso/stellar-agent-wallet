@@ -535,15 +535,15 @@ mod tests {
     fn wallet_io_error_redacts_home_prefixed_path() {
         let home = std::env::var("HOME").expect("HOME is set in test environment");
         let message = format!(
-            "networks.toml I/O error at {home}/.config/stellar-agent/mainnet/networks.toml: Permission denied"
+            "networks.toml I/O error at {home}/.local/share/stellar-agent/networks.toml: Permission denied"
         );
 
         let err = wallet_io_error(IoSource::MulticallRegistryLoad, message);
 
         match err {
             WalletError::Io { message, .. } => {
-                assert!(message.contains("<HOME>/.config/stellar-agent/mainnet/networks.toml"));
-                assert!(!message.contains(&format!("{home}/.config/")));
+                assert!(message.contains("<HOME>/.local/share/stellar-agent/networks.toml"));
+                assert!(!message.contains(&format!("{home}/.local/share/")));
             }
             other => panic!("expected WalletError::Io, got {other:?}"),
         }
@@ -563,9 +563,7 @@ mod tests {
         let toml_text = "not = valid = toml";
         let source: toml::de::Error = toml::from_str::<toml::Value>(toml_text)
             .expect_err("malformed TOML must fail to parse");
-        let path = PathBuf::from(format!(
-            "{home}/.config/stellar-agent/mainnet/networks.toml"
-        ));
+        let path = PathBuf::from(format!("{home}/.local/share/stellar-agent/networks.toml"));
         let sa_err = SaError::NetworksTomlParse { source, path };
 
         let wallet_err = build_sa_error_envelope(&sa_err);
@@ -574,11 +572,11 @@ mod tests {
             WalletError::SmartAccount { wire_code, message } => {
                 assert_eq!(wire_code, "sa.networks_toml_parse");
                 assert!(
-                    message.contains("<HOME>/.config/stellar-agent/mainnet/networks.toml"),
+                    message.contains("<HOME>/.local/share/stellar-agent/networks.toml"),
                     "expected <HOME>-redacted path in message: {message}"
                 );
                 assert!(
-                    !message.contains(&format!("{home}/.config/")),
+                    !message.contains(&format!("{home}/.local/share/")),
                     "raw home-prefixed path must not leak: {message}"
                 );
             }

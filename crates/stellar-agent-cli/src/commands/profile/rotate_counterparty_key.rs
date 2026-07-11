@@ -134,7 +134,7 @@ pub async fn run(args: &RotateCounterpartyKeyArgs) -> i32 {
             tracing::info!(
                 "after rotation, run `stellar-agent counterparty refresh <home-domain>` \
                  for each home domain you previously cached, OR delete the cache directory \
-                 at ~/.local/state/stellar-agent/counterparty/<profile>/"
+                 at <canonical_data_root>/counterparty/<profile>/"
             );
             render::render_json(&Envelope::ok(RotateCounterpartyKeyData {
                 profile: args.name.clone(),

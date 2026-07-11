@@ -419,7 +419,7 @@ impl ReceiptStore {
     /// Opens (or creates) the receipt store for `profile_name` in the
     /// OS-conventional profile directory.
     ///
-    /// The file is located at `<data_local_dir>/stellar-agent/receipts/<profile_name>.json`.
+    /// The file is located at `<canonical_data_root>/receipts/<profile_name>.json`.
     /// If the file does not exist it is treated as an empty store.
     ///
     /// # Errors
@@ -915,20 +915,17 @@ fn persist_locked(guard: &mut MutexGuard<'_, StoreState>) -> Result<(), ReceiptS
 
 /// Returns the OS-conventional receipts directory.
 ///
-/// - Linux:   `~/.local/share/stellar-agent/receipts/`
-/// - macOS:   `~/Library/Application Support/stellar-agent/receipts/`
-/// - Windows: `%LOCALAPPDATA%\stellar-agent\receipts\`
-///
-/// Mirrors the pattern used by `profile::schema::default_profile_dir()`.
+/// `<canonical_data_root>/receipts` — see
+/// [`crate::profile::schema::canonical_data_root`] for the per-platform root.
 ///
 /// # Errors
 ///
 /// Returns an [`io::Error`] when the platform directories library cannot
 /// determine the user's data directory (rare; typically means `$HOME` is unset).
 pub fn default_receipts_dir() -> Result<PathBuf, io::Error> {
-    directories::ProjectDirs::from("", "Soneso", "stellar-agent")
-        .map(|d| d.data_local_dir().join("receipts"))
-        .ok_or_else(|| {
+    crate::profile::schema::canonical_data_root()
+        .map(|root| root.join("receipts"))
+        .map_err(|_| {
             io::Error::other("could not determine OS-conventional data directory for stellar-agent")
         })
 }

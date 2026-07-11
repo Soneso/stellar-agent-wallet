@@ -522,14 +522,14 @@ Read-only. Walks the log at `<LOG_PATH>`, following rotation manifests, and veri
 
 | Flag / arg | Meaning |
 |---|---|
-| `<LOG_PATH>` (positional, required) | Path to the audit log file. Default location by OS: Linux `~/.local/state/stellar-agent/audit/<profile>.jsonl`; macOS `~/Library/Application Support/stellar-agent/audit/<profile>.jsonl`; Windows `%LOCALAPPDATA%\stellar-agent\audit\<profile>.jsonl` |
+| `<LOG_PATH>` (positional, required) | Path to the audit log file. Default location by OS: Linux `~/.local/share/stellar-agent/audit/<profile>.jsonl`; macOS `~/Library/Application Support/Soneso.stellar-agent/audit/<profile>.jsonl`; Windows `%LOCALAPPDATA%\Soneso\stellar-agent\data\audit\<profile>.jsonl` |
 | `--profile <NAME>` | Profile whose chain-root HMAC key verifies sidecars |
 | `--output <FORMAT>` | `json` is the default and only stable format |
 
 On Unix, refuses to verify a log whose parent directory is owned by a different user. Exits `0` when the chain is intact, `1` on any integrity violation (broken chain, rotation gap, HMAC mismatch, missing sidecar, unparseable line), path-contract failure, or I/O error.
 
 ```bash
-stellar-agent audit verify ~/.local/state/stellar-agent/audit/default.jsonl --profile default
+stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --profile default
 ```
 
 ```json

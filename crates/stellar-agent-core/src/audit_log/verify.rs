@@ -129,7 +129,7 @@ pub enum VerifyWarning {
 /// # Arguments
 ///
 /// - `log_path` — path to the active log file (e.g.
-///   `~/.local/state/stellar-agent/audit/default.jsonl`).
+///   `~/.local/share/stellar-agent/audit/default.jsonl`).
 /// - `hmac_key` — optional 32-byte key for verifying the chain-root HMAC tag
 ///   on each file.  If `None`, HMAC verification is skipped (the hash chain
 ///   is still verified).  If `Some` and the sidecar is missing, returns
@@ -392,7 +392,7 @@ struct VerifySingleFileContext<'a> {
 ///
 /// Returns [`VerifyError::PathContract`] if `log_path` has no parent directory
 /// component (bare filename).  Supply an explicit parent directory, e.g.
-/// `~/.local/state/stellar-agent/audit/default.jsonl`.  This shares the wire
+/// `~/.local/share/stellar-agent/audit/default.jsonl`.  This shares the wire
 /// code `audit.path_contract` with the non-UTF-8 file-name rejection so that
 /// operators see one error class for "the supplied path is structurally
 /// unusable", rather than conflating it into `audit.io_error`

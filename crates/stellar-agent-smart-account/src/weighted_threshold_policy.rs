@@ -39,7 +39,7 @@
 //! and every context rule on the network. The wallet deploys exactly one per
 //! network via `smart-account deploy-policy --kind weighted-threshold` and
 //! records the address in the wallet-local registry
-//! (`~/.config/stellar-agent/networks.toml`).
+//! (`<canonical_data_root>/networks.toml`).
 //!
 //! # Supply-chain integrity
 //!

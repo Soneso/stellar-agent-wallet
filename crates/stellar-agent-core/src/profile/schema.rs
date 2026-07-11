@@ -529,10 +529,8 @@ pub struct Profile {
 
     /// Path to the structured audit-log file.
     ///
-    /// Defaults to the OS-conventional state directory:
-    /// - Linux: `~/.local/share/stellar-agent/audit/<profile>.jsonl`
-    /// - macOS: `~/Library/Application Support/stellar-agent/audit/<profile>.jsonl`
-    /// - Windows: `%LOCALAPPDATA%\stellar-agent\audit\<profile>.jsonl`
+    /// Defaults to `<canonical_data_root>/audit/<profile>.jsonl` — see
+    /// [`canonical_data_root`] for the per-platform root.
     pub audit_log_path: PathBuf,
 
     /// Disables the MCP server when `true`.
@@ -1442,31 +1440,59 @@ impl ProfileBuilder {
 #[error("could not determine OS-conventional state directory for stellar-agent")]
 pub struct StateDirError;
 
+/// Returns the canonical OS-conventional data root under which every
+/// `stellar-agent` wallet-state subsystem stores its files.
+///
+/// Every per-subsystem path helper below joins a subsystem-specific leaf
+/// (`profiles`, `policies`, `audit`, `policy`, `networks.toml`, ...) onto this
+/// root; none derives `directories::ProjectDirs`/`BaseDirs` independently. A
+/// crate that cannot depend on `stellar-agent-core` without introducing a
+/// dependency cycle (`stellar-agent-headless-keyring`) replicates this exact
+/// derivation locally instead, cross-referencing this function and pinning
+/// byte-equality of the two roots with a unit test.
+///
+/// Platform roots (`directories` v6.0.0; verified against
+/// `directories-6.0.0/src/{lin,mac,win}.rs` — `ProjectDirs::from("", "Soneso",
+/// "stellar-agent").data_local_dir()`):
+///
+/// - Linux: `$XDG_DATA_HOME/stellar-agent` (default
+///   `~/.local/share/stellar-agent`). The `organization` qualifier
+///   (`"Soneso"`) is dropped by `directories` on Linux — only `application`
+///   (`"stellar-agent"`) appears in the path.
+/// - macOS: `~/Library/Application Support/Soneso.stellar-agent`.
+/// - Windows: `%LOCALAPPDATA%\Soneso\stellar-agent\data`.
+///
+/// # Errors
+///
+/// Returns [`StateDirError`] when the platform directories library cannot
+/// determine the user's data-local directory (rare; CI containers without
+/// `$HOME`).
+pub fn canonical_data_root() -> Result<PathBuf, StateDirError> {
+    let dirs =
+        directories::ProjectDirs::from("", "Soneso", "stellar-agent").ok_or(StateDirError)?;
+    Ok(dirs.data_local_dir().to_path_buf())
+}
+
 /// Returns the OS-conventional default audit-log path for this process.
 ///
-/// - Linux: `~/.local/share/stellar-agent/audit.log`
-/// - macOS: `~/Library/Application Support/stellar-agent/audit.log`
-/// - Windows: `%LOCALAPPDATA%\stellar-agent\audit.log`
+/// `<canonical_data_root>/audit.log` — see [`canonical_data_root`] for the
+/// per-platform root.
 ///
 /// # Errors
 ///
 /// Returns [`StateDirError`] when the platform directories library cannot
 /// determine the user's state directory.
 pub fn default_audit_log_path() -> Result<PathBuf, StateDirError> {
-    let dirs =
-        directories::ProjectDirs::from("", "Soneso", "stellar-agent").ok_or(StateDirError)?;
-    Ok(dirs.data_local_dir().join("audit.log"))
+    Ok(canonical_data_root()?.join("audit.log"))
 }
 
 /// Returns the OS-conventional audit-log file path for `profile_name`.
 ///
-/// On Linux: `~/.local/share/stellar-agent/audit/<profile_name>.jsonl`.
-/// On macOS: `~/Library/Application Support/stellar-agent/audit/<profile_name>.jsonl`.
-/// On Windows: `%LOCALAPPDATA%\stellar-agent\audit\<profile_name>.jsonl`.
+/// `<canonical_data_root>/audit/<profile_name>.jsonl` — see
+/// [`canonical_data_root`] for the per-platform root.
 ///
-/// Falls back to `./stellar-agent/audit/<profile_name>.jsonl` if
-/// `directories::BaseDirs::new` returns `None` (rare; CI containers without
-/// `$HOME`).
+/// Falls back to `./stellar-agent/audit/<profile_name>.jsonl` if the
+/// canonical root cannot be determined (rare; CI containers without `$HOME`).
 ///
 /// `profile_name` is normalised to a filename-safe stem before `.jsonl` is
 /// appended. ASCII letters, digits, `-`, and `_` are preserved; all other
@@ -1485,38 +1511,14 @@ pub fn default_audit_log_path_for(profile_name: &str) -> PathBuf {
 }
 
 fn default_audit_log_dir() -> Option<PathBuf> {
-    let dirs = directories::BaseDirs::new()?;
-
-    #[cfg(target_os = "linux")]
-    {
-        Some(
-            dirs.state_dir()
-                .unwrap_or_else(|| dirs.data_local_dir())
-                .join("stellar-agent")
-                .join("audit"),
-        )
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        Some(dirs.data_local_dir().join("stellar-agent").join("audit"))
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        Some(dirs.data_local_dir().join("stellar-agent").join("audit"))
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        Some(dirs.data_local_dir().join("stellar-agent").join("audit"))
-    }
+    canonical_data_root().ok().map(|root| root.join("audit"))
 }
 
 /// Returns the OS-conventional policy-window-state file path for
 /// `profile_name`.
 ///
-/// `<state>/stellar-agent/policy/<profile_name>.window`, mirroring
+/// `<canonical_data_root>/policy/<profile_name>.window` — see
+/// [`canonical_data_root`] for the per-platform root — mirroring
 /// [`default_audit_log_path_for`]'s per-profile file-naming convention (same
 /// `profile_name` sanitisation) with a sibling `policy/` leaf distinct from
 /// the `policies/` directory [`default_policy_dir`] returns for signed policy
@@ -1542,32 +1544,7 @@ pub fn default_policy_window_state_path_for(profile_name: &str) -> PathBuf {
 }
 
 fn default_policy_window_state_dir() -> Option<PathBuf> {
-    let dirs = directories::BaseDirs::new()?;
-
-    #[cfg(target_os = "linux")]
-    {
-        Some(
-            dirs.state_dir()
-                .unwrap_or_else(|| dirs.data_local_dir())
-                .join("stellar-agent")
-                .join("policy"),
-        )
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        Some(dirs.data_local_dir().join("stellar-agent").join("policy"))
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        Some(dirs.data_local_dir().join("stellar-agent").join("policy"))
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        Some(dirs.data_local_dir().join("stellar-agent").join("policy"))
-    }
+    canonical_data_root().ok().map(|root| root.join("policy"))
 }
 
 fn audit_log_file_stem(profile_name: &str) -> String {
@@ -1623,9 +1600,8 @@ fn is_windows_reserved_file_stem(stem: &str) -> bool {
 ///
 /// Profile TOML files are stored as `<profile_dir>/<name>.toml`.
 ///
-/// - Linux: `~/.local/share/stellar-agent/profiles/`
-/// - macOS: `~/Library/Application Support/stellar-agent/profiles/`
-/// - Windows: `%LOCALAPPDATA%\stellar-agent\profiles\`
+/// `<canonical_data_root>/profiles` — see [`canonical_data_root`] for the
+/// per-platform root.
 ///
 /// Tests may set `STELLAR_AGENT_HOME` to redirect this directory to
 /// `$STELLAR_AGENT_HOME/profiles`. The env-var read is **gated behind
@@ -1650,19 +1626,15 @@ pub fn default_profile_dir() -> Result<PathBuf, StateDirError> {
         return Ok(PathBuf::from(home).join("profiles"));
     }
 
-    let dirs =
-        directories::ProjectDirs::from("", "Soneso", "stellar-agent").ok_or(StateDirError)?;
-    Ok(dirs.data_local_dir().join("profiles"))
+    Ok(canonical_data_root()?.join("profiles"))
 }
 
 /// Returns the OS-conventional policy directory.
 ///
 /// Owner-signed policy TOML files are stored as `<policy_dir>/<profile_name>.toml`.
 ///
-/// - Linux: `~/.local/share/stellar-agent/policies/`
-///   (`$XDG_DATA_HOME/stellar-agent/policies/` when `$XDG_DATA_HOME` is set)
-/// - macOS: `~/Library/Application Support/stellar-agent/policies/`
-/// - Windows: `%LOCALAPPDATA%\stellar-agent\policies\`
+/// `<canonical_data_root>/policies` — see [`canonical_data_root`] for the
+/// per-platform root.
 ///
 /// Tests may set `STELLAR_AGENT_HOME` to redirect this directory to
 /// `$STELLAR_AGENT_HOME/policies`. The env-var read is **gated behind
@@ -1687,9 +1659,7 @@ pub fn default_policy_dir() -> Result<PathBuf, StateDirError> {
         return Ok(PathBuf::from(home).join("policies"));
     }
 
-    let dirs =
-        directories::ProjectDirs::from("", "Soneso", "stellar-agent").ok_or(StateDirError)?;
-    Ok(dirs.data_local_dir().join("policies"))
+    Ok(canonical_data_root()?.join("policies"))
 }
 
 /// Returns the OS-conventional approvals directory.
@@ -1698,10 +1668,13 @@ pub fn default_policy_dir() -> Result<PathBuf, StateDirError> {
 /// `<approvals_dir>/<profile_name>.toml`.  The sidecar lock files are stored
 /// alongside as `<profile_name>.toml.lock`.
 ///
-/// - Linux: `~/.local/share/stellar-agent/approvals/`
-///   (`$XDG_DATA_HOME/stellar-agent/approvals/` when `$XDG_DATA_HOME` is set)
-/// - macOS: `~/Library/Application Support/stellar-agent/approvals/`
-/// - Windows: `%LOCALAPPDATA%\stellar-agent\approvals\`
+/// `<canonical_data_root>/approvals` — see [`canonical_data_root`] for the
+/// per-platform root.
+///
+/// This helper does not honour `STELLAR_AGENT_HOME`, unlike
+/// [`default_profile_dir`]/[`default_policy_dir`]/[`default_passkeys_dir`]/
+/// [`default_toolsets_dir`]/[`default_operator_approval_credentials_dir`] —
+/// the override surface is inconsistent across these helpers.
 ///
 /// # Errors
 ///
@@ -1719,9 +1692,7 @@ pub fn default_policy_dir() -> Result<PathBuf, StateDirError> {
 /// }
 /// ```
 pub fn default_approval_dir() -> Result<PathBuf, StateDirError> {
-    let dirs =
-        directories::ProjectDirs::from("", "Soneso", "stellar-agent").ok_or(StateDirError)?;
-    Ok(dirs.data_local_dir().join("approvals"))
+    Ok(canonical_data_root()?.join("approvals"))
 }
 
 /// Returns the OS-conventional passkeys registry directory.
@@ -1729,15 +1700,8 @@ pub fn default_approval_dir() -> Result<PathBuf, StateDirError> {
 /// Per-profile passkey credential registries are stored as
 /// `<passkeys_dir>/<profile_name>.toml`.
 ///
-/// - Linux: `~/.local/share/stellar-agent/passkeys/`
-///   (`$XDG_DATA_HOME/stellar-agent/passkeys/` when `$XDG_DATA_HOME` is set)
-/// - macOS: `~/Library/Application Support/stellar-agent/passkeys/`
-/// - Windows: `%LOCALAPPDATA%\stellar-agent\passkeys\`
-///
-/// Uses `directories::ProjectDirs::data_local_dir` which maps to
-/// `$XDG_DATA_HOME` (default `~/.local/share`) on Linux, NOT `$XDG_STATE_HOME`
-/// (`~/.local/state`). Verified against `directories` v6 source
-/// (`src/lin.rs:15-16`, `src/lin.rs:70`).
+/// `<canonical_data_root>/passkeys` — see [`canonical_data_root`] for the
+/// per-platform root.
 ///
 /// Tests may set `STELLAR_AGENT_HOME` to redirect this directory to
 /// `$STELLAR_AGENT_HOME/passkeys`. The env-var read is **gated behind
@@ -1771,17 +1735,13 @@ pub fn default_passkeys_dir() -> Result<PathBuf, StateDirError> {
         return Ok(PathBuf::from(home).join("passkeys"));
     }
 
-    let dirs =
-        directories::ProjectDirs::from("", "Soneso", "stellar-agent").ok_or(StateDirError)?;
-    Ok(dirs.data_local_dir().join("passkeys"))
+    Ok(canonical_data_root()?.join("passkeys"))
 }
 
 /// Returns the OS-conventional toolsets root directory.
 ///
-/// Platform-specific locations:
-/// - **Linux:**   `~/.local/share/stellar-agent/toolsets/`
-/// - **macOS:**   `~/Library/Application Support/stellar-agent/toolsets/`
-/// - **Windows:** `%LOCALAPPDATA%\stellar-agent\toolsets\`
+/// `<canonical_data_root>/toolsets` — see [`canonical_data_root`] for the
+/// per-platform root.
 ///
 /// Toolset packages are installed as one sub-directory per package under this
 /// root.  The `stellar-agent-toolsets-install` crate resolves this path once
@@ -1812,9 +1772,7 @@ pub fn default_toolsets_dir() -> Result<PathBuf, StateDirError> {
         return Ok(PathBuf::from(home).join("toolsets"));
     }
 
-    let dirs =
-        directories::ProjectDirs::from("", "Soneso", "stellar-agent").ok_or(StateDirError)?;
-    Ok(dirs.data_local_dir().join("toolsets"))
+    Ok(canonical_data_root()?.join("toolsets"))
 }
 
 /// Returns the OS-conventional operator-approval credential registry
@@ -1827,11 +1785,8 @@ pub fn default_toolsets_dir() -> Result<PathBuf, StateDirError> {
 /// to a pending wallet-controlled approval from a remote device) and must
 /// never be conflated by sharing storage.
 ///
-/// - Linux: `~/.local/share/stellar-agent/operator-approval-credentials/`
-///   (`$XDG_DATA_HOME/stellar-agent/operator-approval-credentials/` when
-///   `$XDG_DATA_HOME` is set)
-/// - macOS: `~/Library/Application Support/stellar-agent/operator-approval-credentials/`
-/// - Windows: `%LOCALAPPDATA%\stellar-agent\operator-approval-credentials\`
+/// `<canonical_data_root>/operator-approval-credentials` — see
+/// [`canonical_data_root`] for the per-platform root.
 ///
 /// Tests may set `STELLAR_AGENT_HOME` to redirect this directory to
 /// `$STELLAR_AGENT_HOME/operator-approval-credentials`. The env-var read is
@@ -1860,9 +1815,7 @@ pub fn default_operator_approval_credentials_dir() -> Result<PathBuf, StateDirEr
         return Ok(PathBuf::from(home).join("operator-approval-credentials"));
     }
 
-    let dirs =
-        directories::ProjectDirs::from("", "Soneso", "stellar-agent").ok_or(StateDirError)?;
-    Ok(dirs.data_local_dir().join("operator-approval-credentials"))
+    Ok(canonical_data_root()?.join("operator-approval-credentials"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2194,16 +2147,18 @@ mod tests {
         #[cfg(target_os = "macos")]
         {
             assert!(
-                rendered.contains("/Library/Application Support/stellar-agent/audit/alice.jsonl"),
-                "macOS path should use Application Support: {rendered}"
+                rendered.contains(
+                    "/Library/Application Support/Soneso.stellar-agent/audit/alice.jsonl"
+                ),
+                "macOS path should use Application Support/Soneso.stellar-agent: {rendered}"
             );
         }
 
         #[cfg(target_os = "windows")]
         {
             assert!(
-                rendered.ends_with(r"stellar-agent\audit\alice.jsonl"),
-                "windows path should end under stellar-agent\\audit: {rendered}"
+                rendered.ends_with(r"Soneso\stellar-agent\data\audit\alice.jsonl"),
+                "windows path should end under Soneso\\stellar-agent\\data\\audit: {rendered}"
             );
         }
     }

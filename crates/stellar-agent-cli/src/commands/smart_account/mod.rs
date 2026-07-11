@@ -22,13 +22,13 @@
 //!   multicall router contract.
 //! - [`deploy_webauthn_verifier`] — `smart-account deploy-webauthn-verifier` —
 //!   deploy the vendored OZ WebAuthn-verifier WASM contract and record the
-//!   address in `~/.config/stellar-agent/networks.toml`.
+//!   address in `<canonical_data_root>/networks.toml`.
 //! - [`deploy_ed25519_verifier`] — `smart-account deploy-ed25519-verifier` —
 //!   deploy the vendored OZ Ed25519-verifier WASM contract and record the
-//!   address in `~/.config/stellar-agent/networks.toml`.
+//!   address in `<canonical_data_root>/networks.toml`.
 //! - [`deploy_spending_limit_policy`] — `smart-account deploy-spending-limit-policy`
 //!   — deploy the vendored OZ spending-limit-policy WASM contract (per-network
-//!   singleton) and record the address in `~/.config/stellar-agent/networks.toml`.
+//!   singleton) and record the address in `<canonical_data_root>/networks.toml`.
 //! - [`migrate_verifier`] — `smart-account migrate-verifier` — construct a
 //!   [`MigrationPlan`] for moving all `External` signers from one verifier to
 //!   another. Currently `--dry-run` only.
@@ -98,7 +98,7 @@ pub enum SmartAccountSubcommand {
     ///
     /// The bundle is submitted via `submit_multicall_bundle` using the registered
     /// multicall router for the target network. The router address is resolved from
-    /// `~/.config/stellar-agent/networks.toml`.
+    /// `<canonical_data_root>/networks.toml`.
     ///
     /// The cardinality gate (1–50 invocations per bundle) is enforced at the CLI
     /// layer before any RPC traffic is issued.
@@ -164,7 +164,7 @@ pub enum SmartAccountSubcommand {
     Signers(Box<signers::SignersArgs>),
 
     /// Deploy the OZ WebAuthn-verifier WASM contract and record the address in the
-    /// verifier registry (`~/.config/stellar-agent/networks.toml`).
+    /// verifier registry (`<canonical_data_root>/networks.toml`).
     ///
     /// Supports two mutually-exclusive deployer-source modes:
     ///
@@ -182,7 +182,7 @@ pub enum SmartAccountSubcommand {
     DeployWebAuthnVerifier(Box<deploy_webauthn_verifier::DeployWebAuthnVerifierArgs>),
 
     /// Deploy the OZ Ed25519-verifier WASM contract and record the address in the
-    /// verifier registry (`~/.config/stellar-agent/networks.toml`).
+    /// verifier registry (`<canonical_data_root>/networks.toml`).
     ///
     /// Supports two mutually-exclusive deployer-source modes:
     ///
@@ -204,7 +204,7 @@ pub enum SmartAccountSubcommand {
 
     /// Deploy the OZ spending-limit-policy WASM contract (per-network singleton)
     /// and record the address in the verifier registry
-    /// (`~/.config/stellar-agent/networks.toml`).
+    /// (`<canonical_data_root>/networks.toml`).
     ///
     /// Supports two mutually-exclusive deployer-source modes:
     ///
@@ -226,7 +226,7 @@ pub enum SmartAccountSubcommand {
     /// Deploy one of the three OZ policy contracts (`--kind simple-threshold`,
     /// `--kind spending-limit`, or `--kind weighted-threshold`) and record the
     /// address in the verifier registry
-    /// (`~/.config/stellar-agent/networks.toml`).
+    /// (`<canonical_data_root>/networks.toml`).
     ///
     /// Supports two mutually-exclusive deployer-source modes:
     ///
@@ -288,7 +288,7 @@ pub enum SmartAccountSubcommand {
     /// Register a deployed multicall router contract in the local registry.
     ///
     /// Records the address and WASM SHA-256 in
-    /// `~/.config/stellar-agent/networks.toml` under
+    /// `<canonical_data_root>/networks.toml` under
     /// `[multicall.<network_safename>]`. The `--wasm-sha256` MUST equal the
     /// `MULTICALL_WASM_SHA256` binary constant compiled into this wallet binary —
     /// any mismatch is refused at the CLI layer before writing to disk (typo and

@@ -109,20 +109,18 @@ pub(crate) fn format_system_time(t: std::time::SystemTime) -> String {
 
 /// Builds the OS-conventional counterparty cache directory for a profile.
 ///
-/// Path: `<data_local_dir>/counterparty/<profile>`.
+/// Path: `<canonical_data_root>/counterparty/<profile>` — see
+/// [`stellar_agent_core::profile::schema::canonical_data_root`] for the
+/// per-platform root.
 ///
 /// # Errors
 ///
 /// Returns a [`WalletError`] when the OS-conventional state directory cannot
 /// be determined.
 pub(crate) fn counterparty_cache_dir(profile_name: &str) -> Result<PathBuf, WalletError> {
-    directories::ProjectDirs::from("", "Soneso", "stellar-agent")
-        .map(|dirs| {
-            dirs.data_local_dir()
-                .join("counterparty")
-                .join(profile_name)
-        })
-        .ok_or_else(|| {
+    stellar_agent_core::profile::schema::canonical_data_root()
+        .map(|root| root.join("counterparty").join(profile_name))
+        .map_err(|_| {
             WalletError::Internal(InternalError::UnexpectedState {
                 detail: "OS-conventional state directory cannot be determined".to_owned(),
             })

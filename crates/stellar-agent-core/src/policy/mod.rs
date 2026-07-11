@@ -181,12 +181,13 @@ pub enum BuildRegistryError {
 
     /// The OS-conventional policy directory could not be resolved.
     ///
-    /// Returned by `default_policy_dir()` when `dirs::state_dir()` (Linux) or
-    /// `dirs::data_dir()` (macOS/Windows) returns `None`, which happens when
-    /// the home directory is not set in the process environment.
+    /// Returned by `default_policy_dir()` when
+    /// [`crate::profile::schema::canonical_data_root`] cannot determine the
+    /// user's data-local directory, which happens when the home directory is
+    /// not set in the process environment.
     #[error(
-        "cannot determine OS-conventional state directory for policy files; \
-         ensure HOME (or XDG_STATE_HOME) is set in the process environment"
+        "cannot determine OS-conventional data directory for policy files; \
+         ensure HOME is set in the process environment"
     )]
     PolicyDirResolutionFailed,
 

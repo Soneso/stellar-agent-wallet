@@ -404,11 +404,9 @@ fn profile_name_from_key_ref(profile: &Profile) -> Result<String, BuildRegistryE
 }
 
 fn counterparty_cache_dir(profile_name: &str) -> Option<std::path::PathBuf> {
-    directories::ProjectDirs::from("", "Soneso", "stellar-agent").map(|dirs| {
-        dirs.data_local_dir()
-            .join("counterparty")
-            .join(profile_name)
-    })
+    stellar_agent_core::profile::schema::canonical_data_root()
+        .ok()
+        .map(|root| root.join("counterparty").join(profile_name))
 }
 
 fn build_counterparty_resolver(profile: &Profile) -> Arc<dyn CounterpartyResolver> {
@@ -844,7 +842,7 @@ impl WalletServer {
     /// `KeyringEntryRef::default_owner_key`.
     ///
     /// The returned string is used to construct the pending-approval store path:
-    /// `~/.local/state/stellar-agent/approvals/<profile_name>.toml`.
+    /// `~/.local/share/stellar-agent/approvals/<profile_name>.toml`.
     ///
     /// Exposed as `pub` (not `pub(crate)`) because integration tests in
     /// `tests/approval_spine_integration.rs` need to verify the name-derivation

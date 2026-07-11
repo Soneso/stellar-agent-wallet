@@ -46,7 +46,7 @@
 //!
 //! The verifier is deployed once per network via
 //! `smart-account deploy-ed25519-verifier` and the contract-id is recorded in
-//! wallet-local config (`~/.config/stellar-agent/networks.toml`). Subsequent
+//! wallet-local config (`<canonical_data_root>/networks.toml`). Subsequent
 //! `smart-account signers add --signer-ed25519` invocations resolve the
 //! verifier address from this config when `--verifier` is omitted.
 //!

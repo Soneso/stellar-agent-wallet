@@ -65,7 +65,7 @@
   (`weighted_threshold.rs:158`), so one deployed instance serves every account and
   every context rule on the network.  The wallet deploys exactly one per network via
   `smart-account deploy-policy --kind weighted-threshold` and records the address in
-  the wallet-local registry (`~/.config/stellar-agent/networks.toml`).
+  the wallet-local registry (`<canonical_data_root>/networks.toml`).
 - **Why deployable (release/), not deps/:** This contract is deployed on-chain via
   `UploadContractWasm` and called by the smart-account's `__check_auth` to enforce
   the weighted-signer quorum at signing time.  On-chain storage cost scales with

@@ -49,7 +49,7 @@ The first-invoke gate is a re-prompt suppressor only. The per-action `PaymentSim
 
 ## Audit hash-chain
 
-The audit log is a per-profile append-only JSONL file (`~/.local/state/stellar-agent/audit/<profile>.jsonl` on Linux; the OS-conventional state path elsewhere). The entry schema and canonical-JSON rules live in `crates/stellar-agent-core/src/audit_log/entry.rs`; the chain primitives in `audit_log/chain.rs`; verification in `audit_log/verify.rs`.
+The audit log is a per-profile append-only JSONL file (`~/.local/share/stellar-agent/audit/<profile>.jsonl` on Linux; `~/Library/Application Support/Soneso.stellar-agent/audit/<profile>.jsonl` on macOS; `%LOCALAPPDATA%\Soneso\stellar-agent\data\audit\<profile>.jsonl` on Windows — see `stellar_agent_core::profile::schema::canonical_data_root` for the derivation). The entry schema and canonical-JSON rules live in `crates/stellar-agent-core/src/audit_log/entry.rs`; the chain primitives in `audit_log/chain.rs`; verification in `audit_log/verify.rs`.
 
 ### Per-entry hash
 
@@ -174,7 +174,7 @@ Both modes are tamper-evident and fail closed: XChaCha20-Poly1305 carries its ow
 
 ### Storage
 
-One JSON file for the whole host/user (not one per profile — the `(service, account)` coordinate space inside the file is already profile-scoped by convention, mirroring the platform keyring's own single-shared-store shape) at `<state>/stellar-agent/headless-keyring/store.keyring`. Written atomically: temp-file + `sync_data` + rename + parent-directory fsync (`0600` on Unix), the same discipline `PersistedWindowStore` (policy window-state) and the audit-log sidecar writer use. A corrupted or unparseable file fails every subsequent read closed (`keyring_core::Error::BadStoreFormat`) rather than silently behaving as an empty store. This store does not coordinate concurrent writers across OS processes beyond the atomic rename's own last-writer-wins guarantee — out of scope for the target deployment shape (one long-lived MCP server process, or one-shot CLI invocations that do not overlap).
+One JSON file for the whole host/user (not one per profile — the `(service, account)` coordinate space inside the file is already profile-scoped by convention, mirroring the platform keyring's own single-shared-store shape) at `<canonical_data_root>/headless-keyring/store.keyring`. Written atomically: temp-file + `sync_data` + rename + parent-directory fsync (`0600` on Unix), the same discipline `PersistedWindowStore` (policy window-state) and the audit-log sidecar writer use. A corrupted or unparseable file fails every subsequent read closed (`keyring_core::Error::BadStoreFormat`) rather than silently behaving as an empty store. This store does not coordinate concurrent writers across OS processes beyond the atomic rename's own last-writer-wins guarantee — out of scope for the target deployment shape (one long-lived MCP server process, or one-shot CLI invocations that do not overlap).
 
 ### Audit and logging
 
@@ -254,7 +254,7 @@ Multicall bundles also carry a hard floor independent of policy: `evaluate_bundl
 
 `per_period_cap`, `rate_limit`, `bundle_per_period_cap`, and `bundle_rate_limit` are stateful: their evaluation reads accumulated history from `PolicyStateStore` (`policy/v1/criteria/state_store.rs`), an in-memory `Mutex<HashMap<StateKey, VecDeque<(timestamp_ms, amount)>>>`. In-memory state alone would reset to empty on every process start (and every CLI invocation is its own process), so a durable backing store is required for these criteria to actually accumulate across calls.
 
-`PersistedWindowStore` (`stellar-agent-network::policy_state`, not `stellar-agent-core` — see the crate-placement rationale in that module's rustdoc: the store needs the keyring primitives that live in `stellar-agent-network`, and `stellar-agent-core` must not depend on `stellar-agent-network`) is one file per profile at `<state>/stellar-agent/policy/<profile>.window`.
+`PersistedWindowStore` (`stellar-agent-network::policy_state`, not `stellar-agent-core` — see the crate-placement rationale in that module's rustdoc: the store needs the keyring primitives that live in `stellar-agent-network`, and `stellar-agent-core` must not depend on `stellar-agent-network`) is one file per profile at `<canonical_data_root>/policy/<profile>.window`.
 
 - **Format**: `[32-byte HMAC-SHA256 tag] || [canonical JSON body]`, an embedded-tag layout mirroring the counterparty `stellar.toml` cache's v2 format. `i128` amounts serialise as decimal strings, never a bare JSON number.
 - **Key**: the profile's `policy_window_state_key_id` keyring coordinate (`stellar-agent-policy-window-<profile>` by convention), lazily minted on first write.

@@ -219,7 +219,7 @@ impl WalletServer {
     /// simulate call.
     ///
     /// Opens (or creates) the profile-scoped approval store at
-    /// `~/.local/state/stellar-agent/approvals/<profile_name>.toml`, constructs
+    /// `~/.local/share/stellar-agent/approvals/<profile_name>.toml`, constructs
     /// an unattested entry from the create-account arguments, inserts it, and
     /// returns the entry for nonce / expiry extraction by the caller.
     ///

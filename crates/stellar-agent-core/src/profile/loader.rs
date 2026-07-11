@@ -10,13 +10,13 @@
 //!
 //! # Path resolution
 //!
-//! Profile files live at the OS-conventional state directory:
+//! Profile files live at the OS-conventional data directory:
 //!
 //! | Platform | Path |
 //! |----------|------|
-//! | Linux    | `~/.local/state/stellar-agent/profiles/<name>.toml` |
-//! | macOS    | `~/Library/Application Support/stellar-agent/profiles/<name>.toml` |
-//! | Windows  | `%LOCALAPPDATA%\stellar-agent\profiles\<name>.toml` |
+//! | Linux    | `~/.local/share/stellar-agent/profiles/<name>.toml` |
+//! | macOS    | `~/Library/Application Support/Soneso.stellar-agent/profiles/<name>.toml` |
+//! | Windows  | `%LOCALAPPDATA%\Soneso\stellar-agent\data\profiles\<name>.toml` |
 //!
 //! # Version enforcement
 //!

@@ -192,7 +192,7 @@ impl NewToolInvocation {
 /// One entry in the hash-chained structured audit log.
 ///
 /// Each entry is serialised as a single JSON line (`\n`-terminated) and
-/// written in append mode to `~/.local/state/stellar-agent/audit/<profile>.jsonl`
+/// written in append mode to `~/.local/share/stellar-agent/audit/<profile>.jsonl`
 /// (or the OS-conventional equivalent).
 ///
 /// # Hash-chain mechanism

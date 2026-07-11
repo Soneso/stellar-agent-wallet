@@ -541,8 +541,14 @@ async fn value_gate_allow_opaque_signing_exemption_permits_raw_signing() {
         !text.contains("policy.deny.unsizable_value_effect"),
         "the allow_opaque_signing exemption must not deny with unsizable_value_effect: {text}"
     );
-    let value: serde_json::Value =
+    let envelope: serde_json::Value =
         serde_json::from_str(text).expect("tool result text must be valid JSON");
+    // The standard result envelope wraps the protocol payload under `data`.
+    assert_eq!(
+        envelope["ok"], true,
+        "the exempted sign-and-submit must return ok:true: {text}"
+    );
+    let value = &envelope["data"];
     assert_eq!(
         value["status"], "success",
         "the exempted sign-and-submit must confirm on-chain: {text}"

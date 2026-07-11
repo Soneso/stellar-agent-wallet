@@ -1,7 +1,7 @@
 //! `stellar-agent smart-account register-multicall` subcommand.
 //!
 //! Registers a deployed multicall router contract address in the local
-//! registry (`~/.config/stellar-agent/networks.toml`).
+//! registry (`<canonical_data_root>/networks.toml`).
 //!
 //! # Flags
 //!
@@ -30,8 +30,6 @@
 //! `MulticallRegistry::register` is idempotent: re-registering the same address
 //! with the same SHA is a no-op (returns `Ok(())`).
 
-use std::path::PathBuf;
-
 use clap::Args;
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::envelope::Envelope;
@@ -39,8 +37,9 @@ use stellar_agent_core::error::{IoSource, ValidationError, WalletError};
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_smart_account::multicall::{
     MULTICALL_WASM_SHA256, MulticallRegistry, MulticallRegistryEntry,
-    STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV, network_safename_from_passphrase,
+    network_safename_from_passphrase,
 };
+use stellar_agent_smart_account::verifiers::default_networks_toml_path;
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
@@ -142,7 +141,10 @@ pub async fn run(args: &RegisterMulticallArgs) -> i32 {
     }
 
     // Load the registry.
-    let networks_toml_path = resolve_networks_toml_path();
+    let networks_toml_path = match default_networks_toml_path() {
+        Ok(p) => p,
+        Err(e) => return emit_multicall_registry_error(&e, IoSource::MulticallRegistryLoad),
+    };
     let mut registry = match MulticallRegistry::load(&networks_toml_path) {
         Ok(r) => r,
         Err(e) => {
@@ -235,18 +237,6 @@ pub async fn run(args: &RegisterMulticallArgs) -> i32 {
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Resolves the path to `networks.toml`, respecting the env-var override.
-fn resolve_networks_toml_path() -> PathBuf {
-    if let Ok(override_str) = std::env::var(STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV)
-        && !override_str.is_empty()
-    {
-        return PathBuf::from(override_str);
-    }
-    directories::BaseDirs::new()
-        .map(|b| b.config_dir().join("stellar-agent").join("networks.toml"))
-        .unwrap_or_else(|| PathBuf::from("~/.config/stellar-agent/networks.toml"))
-}
 
 fn parse_wasm_sha256(input: &str) -> Result<String, String> {
     if input.len() != 64 {
@@ -350,16 +340,5 @@ mod tests {
             "error should describe length without echoing input: {err}"
         );
         assert!(!err.contains("abcdef"));
-    }
-
-    #[test]
-    fn resolve_networks_toml_path_returns_path() {
-        // Without the env-var override, the function returns some path.
-        // We do not assert on the exact path (depends on the OS and user).
-        let path = resolve_networks_toml_path();
-        assert!(
-            path.to_str().is_some(),
-            "resolve_networks_toml_path must return a valid UTF-8 path"
-        );
     }
 }

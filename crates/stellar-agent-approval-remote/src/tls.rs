@@ -122,9 +122,9 @@ pub fn tls_file_paths(profile_name: &str) -> Result<(PathBuf, PathBuf), TlsProvi
         ));
     }
 
-    let dirs = directories::ProjectDirs::from("", "Soneso", "stellar-agent")
-        .ok_or(TlsProvisionError::StateDirUnavailable)?;
-    let dir = dirs.data_local_dir().join("remote-approval-tls");
+    let root = stellar_agent_core::profile::schema::canonical_data_root()
+        .map_err(|_| TlsProvisionError::StateDirUnavailable)?;
+    let dir = root.join("remote-approval-tls");
     Ok((
         dir.join(format!("{profile_name}-cert.pem")),
         dir.join(format!("{profile_name}-key.pem")),

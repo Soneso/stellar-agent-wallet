@@ -2,7 +2,7 @@
 //!
 //! Deploys the vendored OZ `multisig_ed25519_verifier_example.wasm` to a Stellar
 //! network and records the resulting contract address in the wallet-local
-//! [`VerifierRegistry`] (`~/.config/stellar-agent/networks.toml`).
+//! [`VerifierRegistry`] (`<canonical_data_root>/networks.toml`).
 //!
 //! # Deploy flow
 //!

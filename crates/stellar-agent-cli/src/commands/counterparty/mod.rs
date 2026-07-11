@@ -18,9 +18,9 @@
 //! # Cache directory
 //!
 //! Cache files are stored at the OS-conventional path:
-//! `~/.local/state/stellar-agent/counterparty/<profile>/` (Linux).  On macOS:
-//! `~/Library/Application Support/stellar-agent/counterparty/<profile>/`.
-//! On Windows: `%LOCALAPPDATA%\stellar-agent\counterparty\<profile>\`.
+//! `~/.local/share/stellar-agent/counterparty/<profile>/` (Linux).  On macOS:
+//! `~/Library/Application Support/Soneso.stellar-agent/counterparty/<profile>/`.
+//! On Windows: `%LOCALAPPDATA%\Soneso\stellar-agent\data\counterparty\<profile>\`.
 //!
 //! Provides the CLI surface for counterparty resolution and HOME_DOMAIN
 //! binding cache management, backing the counterparty allowlist policy.

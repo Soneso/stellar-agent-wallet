@@ -12,7 +12,7 @@
 //!   `stellar-agent-network`.
 //! - [`mod@deploy_webauthn_verifier`] — deploy-only path for the OZ WebAuthn-verifier
 //!   WASM; no `__constructor` args; records result in
-//!   `VerifierRegistry` (`~/.config/stellar-agent/networks.toml`).
+//!   `VerifierRegistry` (`<canonical_data_root>/networks.toml`).
 //! - [`mod@deploy_ed25519_verifier`] — deploy-only path for the OZ Ed25519-verifier
 //!   WASM; no `__constructor` args; records result in `VerifierRegistry`.
 //! - [`mod@deploy_spending_limit_policy`] — deploy-only path for the OZ

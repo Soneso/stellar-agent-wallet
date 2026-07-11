@@ -1,7 +1,7 @@
 //! `stellar-agent smart-account unregister-multicall` subcommand.
 //!
 //! Removes the multicall router registry entry for the given network from
-//! `~/.config/stellar-agent/networks.toml`.
+//! `<canonical_data_root>/networks.toml`.
 //!
 //! # Flags
 //!
@@ -25,7 +25,7 @@
 //!
 //! **Pre-`--force` operator discipline (4 steps)**:
 //!
-//! 1. Inspect the corrupted entry: `cat ~/.config/stellar-agent/networks.toml`
+//! 1. Inspect the corrupted entry: `cat <canonical_data_root>/networks.toml`
 //!    and locate the `[multicall.<network_safename>]` section.
 //! 2. Validate the prior `address` value against your out-of-band deploy-time
 //!    record (operator runbook, secure-note, encrypted ops-log). If mismatch: STOP.
@@ -55,9 +55,8 @@ use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{IoSource, ValidationError, WalletError};
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
-use stellar_agent_smart_account::multicall::{
-    MulticallRegistry, STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV, network_safename_from_passphrase,
-};
+use stellar_agent_smart_account::multicall::{MulticallRegistry, network_safename_from_passphrase};
+use stellar_agent_smart_account::verifiers::default_networks_toml_path;
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
@@ -91,7 +90,7 @@ pub struct UnregisterMulticallArgs {
     /// Complete the 4-step pre-`--force` operator discipline before using
     /// this flag:
     ///
-    /// 1. Inspect `~/.config/stellar-agent/networks.toml` and locate the
+    /// 1. Inspect `<canonical_data_root>/networks.toml` and locate the
     ///    corrupted `[multicall.<network_safename>]` section.
     /// 2. Validate the prior `address` against your out-of-band deploy-time record.
     ///    If mismatch: STOP. Investigate filesystem integrity.
@@ -149,7 +148,10 @@ pub async fn run(args: &UnregisterMulticallArgs) -> i32 {
     let audit_writer = open_audit_writer(&profile_name).ok();
 
     // Load the registry.
-    let networks_toml_path = resolve_networks_toml_path();
+    let networks_toml_path = match default_networks_toml_path() {
+        Ok(p) => p,
+        Err(e) => return emit_multicall_registry_error(&e, IoSource::MulticallRegistryLoad),
+    };
     let mut registry = match MulticallRegistry::load(&networks_toml_path) {
         Ok(r) => r,
         Err(e) => {
@@ -376,18 +378,6 @@ async fn run_force(
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Resolves the path to `networks.toml`, respecting the env-var override.
-fn resolve_networks_toml_path() -> PathBuf {
-    if let Ok(override_str) = std::env::var(STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV)
-        && !override_str.is_empty()
-    {
-        return PathBuf::from(override_str);
-    }
-    directories::BaseDirs::new()
-        .map(|b| b.config_dir().join("stellar-agent").join("networks.toml"))
-        .unwrap_or_else(|| PathBuf::from("~/.config/stellar-agent/networks.toml"))
-}
-
 /// Returns `true` when stdin is a TTY (interactive terminal).
 ///
 /// Uses `std::io::IsTerminal` (stabilised in Rust 1.70).
@@ -415,7 +405,7 @@ fn prompt_force_confirm(network_safename: &str) -> bool {
     eprintln!();
     eprintln!("Confirm you have completed the 4-step pre-force discipline");
     eprintln!("before proceeding:");
-    eprintln!(" 1. Inspected ~/.config/stellar-agent/networks.toml");
+    eprintln!(" 1. Inspected <canonical_data_root>/networks.toml");
     eprintln!(" 2. Validated the prior address against your out-of-band record");
     eprintln!(" 3. Confirmed the prior values match");
     eprintln!(" 4. Planned to re-register and verify after this step");
@@ -491,11 +481,5 @@ mod tests {
             !refused,
             "force with yes flag on non-TTY must not be refused"
         );
-    }
-
-    #[test]
-    fn resolve_networks_toml_path_is_utf8() {
-        let path = resolve_networks_toml_path();
-        assert!(path.to_str().is_some(), "path must be valid UTF-8");
     }
 }

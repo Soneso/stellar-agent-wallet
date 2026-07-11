@@ -34,6 +34,11 @@ stellar-agent-windows-identity = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 serial_test = { workspace = true }
+# Dev-only: pins byte-equality between this crate's replicated canonical-root
+# derivation and stellar-agent-core's `canonical_data_root`. Never a
+# production dependency of this crate — see `headless_keyring_path`'s rustdoc
+# for why this crate cannot depend on stellar-agent-core in `[dependencies]`.
+stellar-agent-core = { path = "../stellar-agent-core" }
 
 [features]
 # STELLAR_AGENT_HOME override on headless_keyring_path, for the CLI/MCP

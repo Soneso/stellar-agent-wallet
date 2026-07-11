@@ -1,11 +1,12 @@
-//! Deployed-contract registry (`~/.config/stellar-agent/networks.toml`).
+//! Deployed-contract registry (`<canonical_data_root>/networks.toml`).
 //!
 //! Maps Stellar network passphrases to the wallet's per-network deployed
 //! contracts — the WebAuthn verifier, the Ed25519 verifier, and the
 //! spending-limit policy — together with their vendored WASM SHA-256
-//! fingerprints.  Backed by a TOML file at the OS-conventional config path
-//! (`~/.config/stellar-agent/networks.toml` on macOS/Linux, overridable via
-//! `STELLAR_AGENT_NETWORKS_TOML` for tests and non-standard deployments).
+//! fingerprints.  Backed by a TOML file at the OS-conventional data root (see
+//! [`stellar_agent_core::profile::schema::canonical_data_root`]),
+//! overridable via `STELLAR_AGENT_NETWORKS_TOML` for tests and non-standard
+//! deployments.
 //!
 //! # Additive schema contract
 //!
@@ -45,7 +46,7 @@
 //! # File schema (TOML)
 //!
 //! ```toml
-//! # ~/.config/stellar-agent/networks.toml
+//! # <canonical_data_root>/networks.toml
 //! [networks."Test SDF Network ; September 2015"]
 //! webauthn_verifier_address = "CABC...XYZ"
 //! webauthn_verifier_wasm_sha256 = "9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7"
@@ -463,9 +464,9 @@ impl From<NetworkEntry> for NetworkRecord {
 
 /// WebAuthn-verifier contract registry.
 ///
-/// Backed by `~/.config/stellar-agent/networks.toml` (or `STELLAR_AGENT_NETWORKS_TOML`
-/// override).  Load with [`VerifierRegistry::open`]; persist with
-/// [`VerifierRegistry::persist`].
+/// Backed by `<canonical_data_root>/networks.toml` (or
+/// `STELLAR_AGENT_NETWORKS_TOML` override).  Load with
+/// [`VerifierRegistry::open`]; persist with [`VerifierRegistry::persist`].
 ///
 /// # Thread safety
 ///
@@ -492,28 +493,25 @@ pub struct VerifierRegistry {
 }
 
 impl VerifierRegistry {
-    /// Opens the registry from the default OS-config path or `STELLAR_AGENT_NETWORKS_TOML`
-    /// env-var override.
+    /// Opens the registry from the default data-root path or
+    /// `STELLAR_AGENT_NETWORKS_TOML` env-var override.
     ///
     /// If the file does not exist the registry is initialised empty; calling
     /// [`VerifierRegistry::persist`] will create the file.
     ///
     /// # Default path resolution
     ///
-    /// | Platform | Default path |
-    /// |----------|--------------|
-    /// | macOS    | `~/Library/Application Support/stellar-agent/networks.toml` |
-    /// | Linux    | `~/.config/stellar-agent/networks.toml` |
-    /// | Windows  | `%APPDATA%\stellar-agent\networks.toml` |
-    ///
-    /// The env-var `STELLAR_AGENT_NETWORKS_TOML` overrides the platform default when set.
+    /// `<canonical_data_root>/networks.toml` — see
+    /// [`stellar_agent_core::profile::schema::canonical_data_root`] for the
+    /// per-platform root. The env-var `STELLAR_AGENT_NETWORKS_TOML` overrides
+    /// the platform default when set to a non-empty value.
     ///
     /// # Errors
     ///
     /// - [`SaError::NetworksTomlIo`] — the file exists but cannot be read.
     /// - [`SaError::NetworksTomlParse`] — the file exists but contains invalid TOML.
-    /// - [`SaError::NetworksTomlIo`] — the default config directory cannot be
-    ///   determined (XDG / home-dir resolution failure).
+    /// - [`SaError::NetworksTomlIo`] — the default data directory cannot be
+    ///   determined (home-dir resolution failure).
     ///
     /// # Panics
     ///
@@ -527,7 +525,7 @@ impl VerifierRegistry {
     /// let reg = VerifierRegistry::open().expect("open registry");
     /// ```
     pub fn open() -> Result<Self, SaError> {
-        let path = resolve_default_path()?;
+        let path = default_networks_toml_path()?;
         Self::open_at(path)
     }
 
@@ -1084,55 +1082,58 @@ fn unix_duration_to_ms(duration: Result<Duration, std::time::SystemTimeError>) -
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
-/// Resolves the default registry path from the OS config directory or `STELLAR_AGENT_NETWORKS_TOML`.
+/// Resolves the canonical `networks.toml` registry path.
+///
+/// The single derivation point for this file's path: [`VerifierRegistry::open`],
+/// [`crate::multicall::MulticallRegistry`]'s CLI call sites, and the CLI
+/// `smart-account` multicall subcommands (`multicall`, `register-multicall`,
+/// `unregister-multicall`) all resolve the default path through this
+/// function; none derives it independently.
+///
+/// # Resolution order
+///
+/// 1. `STELLAR_AGENT_NETWORKS_TOML`, if set to a non-empty value, is used
+///    verbatim.
+/// 2. Otherwise, `<canonical_data_root>/networks.toml` — see
+///    [`stellar_agent_core::profile::schema::canonical_data_root`] for the
+///    per-platform root.
 ///
 /// # Errors
 ///
-/// Returns [`SaError::NetworksTomlIo`] if neither the env-var override nor the
-/// OS config directory can be resolved.
-fn resolve_default_path() -> Result<PathBuf, SaError> {
+/// Returns [`SaError::NetworksTomlIo`] if the env-var override is unset (or
+/// empty) and the canonical data root cannot be determined.
+pub fn default_networks_toml_path() -> Result<PathBuf, SaError> {
     let env_override = std::env::var(STELLAR_AGENT_NETWORKS_TOML_ENV).ok();
-    resolve_default_path_with_override(env_override.as_deref())
+    default_networks_toml_path_with_override(env_override.as_deref())
 }
 
-/// Inner helper for [`resolve_default_path`] that takes the env-var value as a
-/// pure parameter.
+/// Inner helper for [`default_networks_toml_path`] that takes the env-var
+/// value as a pure parameter.
 ///
-/// Split out of `resolve_default_path` so the env-var override branch is unit-
-/// testable without process-global env-var mutation (which is `unsafe fn` in
-/// Rust 2024 and incompatible with the crate's `#![forbid(unsafe_code)]`).  The
-/// outer function is a thin wrapper that reads `std::env::var` and forwards.
-fn resolve_default_path_with_override(env_override: Option<&str>) -> Result<PathBuf, SaError> {
-    if let Some(val) = env_override {
+/// Split out so the env-var override branch is unit-testable without
+/// process-global env-var mutation (which is `unsafe fn` in Rust 2024 and
+/// incompatible with the crate's `#![forbid(unsafe_code)]`).  The outer
+/// function is a thin wrapper that reads `std::env::var` and forwards.
+fn default_networks_toml_path_with_override(
+    env_override: Option<&str>,
+) -> Result<PathBuf, SaError> {
+    if let Some(val) = env_override
+        && !val.is_empty()
+    {
         return Ok(PathBuf::from(val));
     }
 
-    let config_dir = dirs_config_dir().ok_or_else(|| SaError::NetworksTomlIo {
-        source: std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "cannot determine OS config directory; set STELLAR_AGENT_NETWORKS_TOML",
-        ),
-        path: PathBuf::from("<config-dir>"),
+    let root = stellar_agent_core::profile::schema::canonical_data_root().map_err(|_| {
+        SaError::NetworksTomlIo {
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "cannot determine OS data directory; set STELLAR_AGENT_NETWORKS_TOML",
+            ),
+            path: PathBuf::from("<data-dir>"),
+        }
     })?;
 
-    Ok(config_dir.join("stellar-agent").join("networks.toml"))
-}
-
-/// Returns the OS-conventional user config directory.
-///
-/// | Platform | Path |
-/// |----------|------|
-/// | macOS    | `~/Library/Application Support` |
-/// | Linux    | `~/.config` (XDG `$XDG_CONFIG_HOME` if set) |
-/// | Windows  | `%APPDATA%` |
-///
-/// Returns `None` when home-directory resolution fails (rare but possible in
-/// container / CI environments with no `$HOME`).
-fn dirs_config_dir() -> Option<PathBuf> {
-    // `directories` crate: ProjectDirs and BaseDirs resolution per OS conventions.
-    // We use `directories::BaseDirs::new()` which gives XDG config on Linux,
-    // ~/Library/Application Support on macOS, %APPDATA% on Windows.
-    directories::BaseDirs::new().map(|b| b.config_dir().to_path_buf())
+    Ok(root.join("networks.toml"))
 }
 
 /// Creates a directory (and all parents) with mode `0700` on POSIX, or using the
@@ -1567,42 +1568,92 @@ mod tests {
         );
     }
 
-    /// `resolve_default_path_with_override(Some(path))` returns the env-supplied
-    /// path verbatim, bypassing OS-conventional config-dir resolution.
+    /// `default_networks_toml_path_with_override(Some(path))` returns the
+    /// env-supplied path verbatim, bypassing canonical-root resolution.
     ///
-    /// Tested via the inner `resolve_default_path_with_override(env_override)`
-    /// helper rather than `resolve_default_path()` directly so the test does
-    /// not need to mutate process-global env state — env-var mutation is
+    /// Tested via the inner `default_networks_toml_path_with_override(env_override)`
+    /// helper rather than `default_networks_toml_path()` directly so the test
+    /// does not need to mutate process-global env state — env-var mutation is
     /// `unsafe fn` in Rust 2024 and incompatible with the crate's
     /// `#![forbid(unsafe_code)]`.
     #[test]
-    fn resolve_default_path_honours_env_override() {
+    fn default_networks_toml_path_honours_env_override() {
         let (_guard, override_path) = temp_registry();
         let override_str = override_path.to_str().expect("path must be utf-8");
 
-        let resolved = resolve_default_path_with_override(Some(override_str))
+        let resolved = default_networks_toml_path_with_override(Some(override_str))
             .expect("override path must resolve");
         assert_eq!(
             resolved, override_path,
-            "env-var path must take precedence over OS config dir"
+            "env-var path must take precedence over the canonical data root"
         );
     }
 
-    /// `resolve_default_path_with_override(None)` falls through to the OS-
-    /// conventional config-dir path.  Best-effort: this depends on
-    /// `dirs::config_dir()` being resolvable on the test host.  When unresolvable
-    /// (rare CI / container environment), the function returns
-    /// `NetworksTomlIo` — also a valid outcome, so the test accepts
-    /// either successful resolution (with the expected suffix) or that error.
+    /// An empty env-var value must NOT be treated as an override to an empty
+    /// path; it falls through to the canonical default, matching
+    /// [`crate::multicall::MulticallRegistry::load`]'s own
+    /// override-emptiness check — the two are now required to agree since
+    /// both resolve `STELLAR_AGENT_NETWORKS_TOML`.
     #[test]
-    fn resolve_default_path_falls_through_to_os_config() {
-        match resolve_default_path_with_override(None) {
+    fn default_networks_toml_path_treats_empty_override_as_unset() {
+        match default_networks_toml_path_with_override(Some("")) {
             Ok(path) => assert!(
-                path.ends_with("stellar-agent/networks.toml"),
-                "OS-conventional path must end with stellar-agent/networks.toml, got: {path:?}"
+                path.ends_with("networks.toml"),
+                "empty override must fall through to the canonical default, got: {path:?}"
             ),
             Err(SaError::NetworksTomlIo { .. }) => {
-                // Acceptable on hosts with no resolvable config dir.
+                // Acceptable on hosts with no resolvable data directory.
+            }
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
+    }
+
+    /// `default_networks_toml_path_with_override(None)` falls through to the
+    /// canonical data root.  Best-effort: this depends on
+    /// [`stellar_agent_core::profile::schema::canonical_data_root`] being
+    /// resolvable on the test host.  When unresolvable (rare CI / container
+    /// environment), the function returns `NetworksTomlIo` — also a valid
+    /// outcome, so the test accepts either successful resolution (with the
+    /// expected per-platform shape) or that error.
+    #[test]
+    fn default_networks_toml_path_falls_through_to_canonical_root() {
+        match default_networks_toml_path_with_override(None) {
+            Ok(path) => {
+                assert!(
+                    path.ends_with("networks.toml"),
+                    "canonical path must end with networks.toml, got: {path:?}"
+                );
+                #[cfg(target_os = "linux")]
+                {
+                    let expected_suffix = PathBuf::from("stellar-agent").join("networks.toml");
+                    assert!(
+                        path.ends_with(&expected_suffix),
+                        "Linux canonical path must be <data-root>/stellar-agent/networks.toml, got: {path:?}"
+                    );
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    let expected_suffix =
+                        PathBuf::from("Soneso.stellar-agent").join("networks.toml");
+                    assert!(
+                        path.ends_with(&expected_suffix),
+                        "macOS canonical path must be <data-root>/Soneso.stellar-agent/networks.toml, got: {path:?}"
+                    );
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    let expected_suffix = PathBuf::from("Soneso")
+                        .join("stellar-agent")
+                        .join("data")
+                        .join("networks.toml");
+                    assert!(
+                        path.ends_with(&expected_suffix),
+                        "Windows canonical path must be <data-root>/Soneso/stellar-agent/data/networks.toml, got: {path:?}"
+                    );
+                }
+            }
+            Err(SaError::NetworksTomlIo { .. }) => {
+                // Acceptable on hosts with no resolvable data directory.
             }
             Err(e) => panic!("unexpected error: {e:?}"),
         }

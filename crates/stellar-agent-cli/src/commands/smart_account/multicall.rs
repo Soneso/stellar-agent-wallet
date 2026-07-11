@@ -45,7 +45,6 @@
 //! "ledger": N, "inner_results": [...], "audit_degraded": false }`. On error: typed
 //! wire-code envelope.
 //!
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,8 +58,9 @@ use stellar_agent_network::{ClassicFeeChoice, parse_classic_fee_choice};
 use stellar_agent_smart_account::ResolvedFeePerOp;
 use stellar_agent_smart_account::multicall::{
     MULTICALL_BUNDLE_CAP, MulticallInvocation, MulticallRegistry, MulticallSubmitArgs,
-    STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV, submit_multicall_bundle,
+    submit_multicall_bundle,
 };
+use stellar_agent_smart_account::verifiers::default_networks_toml_path;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -271,7 +271,10 @@ pub async fn run(args: &MulticallArgs) -> i32 {
     let chain_id = network_to_chain_id(args.network).to_owned();
 
     // Load the multicall registry.
-    let networks_toml_path = resolve_networks_toml_path();
+    let networks_toml_path = match default_networks_toml_path() {
+        Ok(p) => p,
+        Err(e) => return emit_multicall_registry_error(&e, IoSource::MulticallRegistryLoad),
+    };
     let registry = match MulticallRegistry::load(&networks_toml_path) {
         Ok(r) => {
             if !r.partial_load_warnings.is_empty() {
@@ -498,20 +501,6 @@ fn parse_single_invocation(raw: &str) -> MulticallInvocation {
         fn_name,
         args_json,
     }
-}
-
-/// Resolves the path to `networks.toml`, respecting the env-var override.
-fn resolve_networks_toml_path() -> PathBuf {
-    // Honour the same env-var override that MulticallRegistry::load uses.
-    if let Ok(override_str) = std::env::var(STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV)
-        && !override_str.is_empty()
-    {
-        return PathBuf::from(override_str);
-    }
-    // OS-conventional default.
-    directories::BaseDirs::new()
-        .map(|b| b.config_dir().join("stellar-agent").join("networks.toml"))
-        .unwrap_or_else(|| PathBuf::from("~/.config/stellar-agent/networks.toml"))
 }
 
 /// Constructs a permissive `PolicyEngineV1` for the CLI multicall path.

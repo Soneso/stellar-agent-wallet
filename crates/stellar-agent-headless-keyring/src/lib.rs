@@ -219,7 +219,7 @@ pub fn init_headless_store(backend: &str) -> Result<(), HeadlessKeyringInitError
 }
 
 /// Returns the OS-conventional headless-keyring file path:
-/// `<state>/stellar-agent/headless-keyring/store.keyring`.
+/// `<canonical_data_root>/headless-keyring/store.keyring`.
 ///
 /// One file for the whole host/user — see [`init_headless_store`]'s docs for
 /// why this is safe (the coordinate space inside the file is already
@@ -230,6 +230,21 @@ pub fn init_headless_store(backend: &str) -> Result<(), HeadlessKeyringInitError
 /// redirect the directory to `$STELLAR_AGENT_HOME/headless-keyring`,
 /// mirroring the profile-loader's own override — gated behind `#[cfg(any(test,
 /// feature = "test-helpers"))]` so production release builds never honour it.
+///
+/// # Canonical-root replication, not reuse
+///
+/// This crate cannot depend on `stellar-agent-core` (it is a low-level,
+/// minimal-dependency store meant for headless/service deployments; pulling
+/// in core's XDR/signing/tokio dependency closure here would be a layering
+/// violation with no functional benefit — see the "prefer separate crates"
+/// project convention). It therefore replicates
+/// `stellar_agent_core::profile::schema::canonical_data_root`'s derivation
+/// byte-for-byte instead of importing it: `directories::ProjectDirs::from("",
+/// "Soneso", "stellar-agent").data_local_dir()`. The
+/// `canonical_data_root_matches_stellar_agent_core` test below pins
+/// byte-equality between the two crates' derivations (as a dev-dependency
+/// only — this does not add `stellar-agent-core` to the crate's production
+/// dependency graph) so the two cannot silently drift.
 fn headless_keyring_path() -> Result<PathBuf, HeadlessKeyringInitError> {
     #[cfg(any(test, feature = "test-helpers"))]
     if let Some(home) = std::env::var_os("STELLAR_AGENT_HOME") {
@@ -238,12 +253,19 @@ fn headless_keyring_path() -> Result<PathBuf, HeadlessKeyringInitError> {
             .join("store.keyring"));
     }
 
-    let dirs = directories::BaseDirs::new().ok_or(HeadlessKeyringInitError::StateDirUnavailable)?;
-    Ok(dirs
-        .data_local_dir()
-        .join("stellar-agent")
+    Ok(canonical_data_root()?
         .join("headless-keyring")
         .join("store.keyring"))
+}
+
+/// Replicates
+/// `stellar_agent_core::profile::schema::canonical_data_root`'s derivation.
+/// See `headless_keyring_path`'s rustdoc for why this crate cannot import
+/// that function directly.
+fn canonical_data_root() -> Result<PathBuf, HeadlessKeyringInitError> {
+    directories::ProjectDirs::from("", "Soneso", "stellar-agent")
+        .map(|dirs| dirs.data_local_dir().to_path_buf())
+        .ok_or(HeadlessKeyringInitError::StateDirUnavailable)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -381,6 +403,22 @@ mod tests {
         assert_eq!(
             path,
             dir.path().join("headless-keyring").join("store.keyring")
+        );
+    }
+
+    /// Pins byte-equality between this crate's replicated canonical-root
+    /// derivation and `stellar_agent_core::profile::schema::canonical_data_root`.
+    /// Guards against the two independently-maintained derivations silently
+    /// drifting apart (see `headless_keyring_path`'s rustdoc).
+    #[test]
+    fn canonical_data_root_matches_stellar_agent_core() {
+        let local = canonical_data_root().expect("local derivation must resolve");
+        let core = stellar_agent_core::profile::schema::canonical_data_root()
+            .expect("stellar-agent-core derivation must resolve");
+        assert_eq!(
+            local, core,
+            "headless-keyring's replicated canonical root must byte-match \
+             stellar-agent-core::profile::schema::canonical_data_root"
         );
     }
 }

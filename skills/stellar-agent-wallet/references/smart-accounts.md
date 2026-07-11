@@ -127,7 +127,7 @@ Drift detection: `smart-account rules verify-pins` compares a rule's pinned veri
 
 ### Verifier deploy and migration
 
-`smart-account deploy-webauthn-verifier` deploys the OZ WebAuthn-verifier WASM and records its address in the verifier registry (`~/.config/stellar-agent/networks.toml`). Idempotent — if the registry already holds a same-WASM-hash entry for the network it returns `status: "already_deployed"` with no RPC traffic. Testnet only.
+`smart-account deploy-webauthn-verifier` deploys the OZ WebAuthn-verifier WASM and records its address in the verifier registry (`<canonical_data_root>/networks.toml`). Idempotent — if the registry already holds a same-WASM-hash entry for the network it returns `status: "already_deployed"` with no RPC traffic. Testnet only.
 
 - Deployer source (exactly one): `--deployer-secret-env <VAR>` or `--sign-with-ledger`; `--account-index <INDEX>` default `0`.
 - `--rpc-url` default `https://soroban-testnet.stellar.org`. `--fee <STROOPS|auto[:pNN]>` (`auto` = p95; also `auto:p50`/`auto:p75`/`auto:p95`/`auto:p99`; absent uses the profile default 100-stroop base plus simulated Soroban resource fees). `--timeout-seconds` default `60`.
@@ -170,7 +170,7 @@ stellar-agent smart-account migrate-verifier \
 
 ### Multicall router registry
 
-`smart-account register-multicall` records a deployed multicall-router address and its WASM hash in `~/.config/stellar-agent/networks.toml` (local file plus audit row, idempotent). Refuses if `--wasm-sha256` does not equal the binary's compiled-in router WASM hash.
+`smart-account register-multicall` records a deployed multicall-router address and its WASM hash in `<canonical_data_root>/networks.toml` (local file plus audit row, idempotent). Refuses if `--wasm-sha256` does not equal the binary's compiled-in router WASM hash.
 
 - `--network` (default `testnet`), `--address <C>` (req), `--wasm-sha256 <HEX>` (req, 64-char lowercase hex), `--profile`.
 

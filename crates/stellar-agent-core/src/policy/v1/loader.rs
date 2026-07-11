@@ -425,7 +425,7 @@ impl RuleMatch {
 /// // In production: owner_pubkey comes from the keyring.
 /// let owner_pubkey = [0u8; 32];
 /// let doc = load_signed_policy(
-///     Path::new("/home/user/.local/state/stellar-agent/policies/alice.toml"),
+///     Path::new("/home/user/.local/share/stellar-agent/policies/alice.toml"),
 ///     "alice",
 ///     &owner_pubkey,
 /// );
