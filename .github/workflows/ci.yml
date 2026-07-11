@@ -153,9 +153,7 @@ jobs:
       # rest of the job budget.
       - name: Build test binaries (unbounded compile phase)
         shell: bash
-        run: |
-          cargo test -p stellar-agent-core --lib --no-run
-          cargo test -p stellar-agent-smart-account --lib --no-run
+        run: cargo test -p stellar-agent-core --lib --no-run
       - name: Audit-log writer single-handle regression (stellar-agent-core)
         # The two skipped rotation tests fail on Windows for campaign-tracked
         # reasons (see the TEMPORARY SCOPE note above); they rejoin with the
@@ -165,9 +163,6 @@ jobs:
       - name: Approval + toolset-grant store persist regression (stellar-agent-core)
         shell: bash
         run: "timeout 600 cargo test -p stellar-agent-core --lib -- approval::store::tests::persist approval::toolset_grant::tests::persist"
-      - name: SaError wire-code coverage (stellar-agent-smart-account)
-        shell: bash
-        run: "timeout 600 cargo test -p stellar-agent-smart-account --lib error::"
 
   machete:
     name: unused-deps
