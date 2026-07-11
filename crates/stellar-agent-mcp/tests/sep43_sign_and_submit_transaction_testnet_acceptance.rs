@@ -313,17 +313,18 @@ async fn sign_and_submit_invalid_xdr_returns_sep43_error() {
     );
 
     let text = extract_text(result);
-    let response: serde_json::Value =
+    let envelope: serde_json::Value =
         serde_json::from_str(&text).expect("error text must be valid JSON");
-
-    // Sep43Error::InvalidXdr → code -3.
-    let code = response["code"].as_i64().expect("code must be integer");
+    assert_eq!(envelope["ok"], false, "invalid XDR must return ok:false");
+    let code = envelope["error"]["code"]
+        .as_str()
+        .expect("error.code must be a dotted wire code string");
     assert_eq!(
-        code, -3,
-        "invalid XDR must return SEP-43 code -3 (got {code})"
+        code, "sep43.invalid_xdr",
+        "invalid XDR must return sep43.invalid_xdr (got {code})"
     );
 
-    let message = response["message"]
+    let message = envelope["error"]["message"]
         .as_str()
         .expect("message must be a string");
     assert!(!message.is_empty(), "error message must be non-empty");
@@ -359,13 +360,17 @@ async fn sign_and_submit_passphrase_mismatch_returns_sep43_error() {
     );
 
     let text = extract_text(result);
-    let response: serde_json::Value =
+    let envelope: serde_json::Value =
         serde_json::from_str(&text).expect("error text must be valid JSON");
-
-    // Sep43Error::InvalidNetworkPassphrase → code -3.
-    let code = response["code"].as_i64().expect("code must be integer");
     assert_eq!(
-        code, -3,
-        "passphrase mismatch must return SEP-43 code -3 (got {code})"
+        envelope["ok"], false,
+        "passphrase mismatch must return ok:false"
+    );
+    let code = envelope["error"]["code"]
+        .as_str()
+        .expect("error.code must be a dotted wire code string");
+    assert_eq!(
+        code, "sep43.invalid_network_passphrase",
+        "passphrase mismatch must return sep43.invalid_network_passphrase (got {code})"
     );
 }
