@@ -150,7 +150,7 @@ The **per-action payment approval** (`PaymentSimulated`) fires unconditionally o
 
 ## The hash-chained audit log
 
-The Audit log is a per-profile, append-only JSONL file recording every tool invocation and lifecycle event. The writer is a per-profile singleton holding an exclusive lock, appending with an fsync per line; a second opener is rejected. Files rotate at a size bound with a fixed number of rotated files retained.
+The Audit log is a per-profile, append-only JSONL file recording every tool invocation and lifecycle event. The writer is a per-profile singleton holding an exclusive lock on a sidecar lock file (never on the log itself), appending with an fsync per line; a second writer is rejected, while readers — `audit verify`, tailing, log shipping — are never blocked. Files rotate at a size bound with a fixed number of rotated files retained.
 
 ### What is recorded
 

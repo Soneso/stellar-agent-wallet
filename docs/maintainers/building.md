@@ -113,12 +113,20 @@ network is unreachable. For a strictly offline run, use plain `cargo test` (no
 ### Coverage
 
 ```bash
-cargo llvm-cov
+cargo llvm-cov --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov.json
+python3 .github/scripts/check-coverage.py cov.json
 ```
 
-Line coverage is expected to be at least 90% per crate. A shortfall is acceptable
-only when justified in review, for example a live-network path exercised by the
-testnet-acceptance tests rather than by offline unit tests.
+The enforced gate is the per-crate floor set in
+`.github/scripts/check-coverage.py`: a default floor of 85% offline line
+coverage, with explicit lower floors for the crates whose remaining lines are
+live-network or on-chain paths exercised only by the `testnet-acceptance` /
+`testnet-integration` suites (which do not run in this offline gate). The
+floors are a regression ratchet, set a few points below each crate's current
+offline coverage, and 90% per crate remains the aspirational target new code
+is reviewed against. The measurement uses the offline feature set (deliberately not
+`--all-features`, which would compile in the live tiers and attempt real RPC
+and Friendbot access).
 
 ### Unused dependencies
 
@@ -136,6 +144,17 @@ cargo deny check
 
 See [Licenses](#licenses) for the allow-list posture.
 
+### Windows storage regression (CI-only)
+
+CI runs a `windows-storage` job on a Windows runner covering the storage
+behaviors that differ on Windows and cannot be exercised locally on
+macOS/Linux: the audit-log module (including the writer's sidecar-lock
+semantics, where `LockFileEx` on the log file itself would block readers) and
+the approval / toolset-grant store persistence tests, scoped to
+`stellar-agent-core`. There is no local equivalent off Windows; changes to
+`audit_log`, the approval store, or file-locking behavior should expect this
+job to be the deciding signal.
+
 ## Test tiers
 
 Tests fall into two tiers, selected by per-crate Cargo features.
@@ -148,6 +167,9 @@ declared on individual crates (and on `stellar-agent-test-support`), are:
 
 - `test-helpers` — exposes test-only helpers and fixtures. Must not be enabled in
   production builds.
+- `test-hooks` — test-only observation and fault-injection hooks in
+  `stellar-agent-network` and `stellar-agent-nonce`.
+- `test-loopback` — loopback-listener test surface in `stellar-agent-network`.
 - `testnet-helpers` — keypair generation, Friendbot HTTP, and live-network client
   helpers in `stellar-agent-test-support`. Pulled in transitively by the
   `testnet-acceptance` feature of the crates that submit on-chain.
@@ -155,6 +177,9 @@ declared on individual crates (and on `stellar-agent-test-support`), are:
   `stellar-agent-test-support`.
 - `wiremock-helpers` — `wiremock`-based HTTP doubles in
   `stellar-agent-test-support`.
+
+The CI `test (offline)` and coverage jobs run the offline tier with
+`--features test-helpers,test-hooks,test-loopback,verifier-registry`.
 
 ### Live testnet-acceptance tests
 
@@ -175,7 +200,10 @@ The `testnet-acceptance` feature is dev- and CI-only and must not be enabled in 
 release-artifact feature set. The crates that submit on-chain (for example
 `stellar-agent-blend`, `stellar-agent-defindex`, `stellar-agent-dex`,
 `stellar-agent-stablecoin`) pull `stellar-agent-test-support/testnet-helpers` in
-through their own `testnet-acceptance` feature.
+through their own `testnet-acceptance` feature. A sibling `testnet-integration`
+feature on `stellar-agent-sep10`, `stellar-agent-sep45`, and
+`stellar-agent-smart-account` gates their live suites the same way; the
+serialized driver and the `Testnet acceptance` workflow run both.
 
 These tests require network reachability to testnet RPC and Friendbot. Testnet is
 the default network; Friendbot funding is testnet-only. Write and signing commands

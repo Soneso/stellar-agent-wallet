@@ -47,13 +47,13 @@ from GitHub release archives. A single release archive carries both binaries:
 - Binaries inside: `stellar-agent` and `stellar-agent-mcp`.
 
 ```bash
-cargo binstall --git https://github.com/Soneso/stellar-agent-wallet stellar-agent-cli
-cargo binstall --git https://github.com/Soneso/stellar-agent-wallet stellar-agent-mcp
+cargo binstall stellar-agent-cli@0.1.0-alpha.4 stellar-agent-mcp@0.1.0-alpha.4
 ```
 
-The release archives these commands fetch are published with each tagged
-release on the repository's releases page. If none is listed yet, build from
-source as shown below. crates.io publication is planned for a future release.
+While only prerelease (alpha) versions are published on crates.io, the version
+must be spelled out — a bare crate name matches stable versions only. The
+release archives this command fetches are published with each tagged release
+on the repository's releases page.
 
 Every release ships supply-chain verification artifacts alongside the
 archives: a `SHA256SUMS` file, a Sigstore bundle per archive, and in-toto
@@ -74,9 +74,19 @@ or right-click the binary in Finder and choose Open. Binaries built from
 source or installed via `cargo install` carry no quarantine attribute and are
 unaffected.
 
+### cargo install (from crates.io)
+
+Builds the binaries from the sources published on crates.io and places them on
+your `PATH`; the `stellar-agent-cli` crate installs the binary named
+`stellar-agent`:
+
+```bash
+cargo install stellar-agent-cli@0.1.0-alpha.4 stellar-agent-mcp@0.1.0-alpha.4
+```
+
 ### Build from source
 
-Building from source works today. Clone the repository and build with Cargo:
+Clone the repository and build with Cargo:
 
 ```bash
 git clone https://github.com/Soneso/stellar-agent-wallet
@@ -88,10 +98,6 @@ The two binaries are produced at:
 
 - `target/release/stellar-agent`
 - `target/release/stellar-agent-mcp`
-
-`cargo install --git https://github.com/Soneso/stellar-agent-wallet` also works
-to place the binaries on your `PATH`; the `stellar-agent-cli` crate installs the
-binary named `stellar-agent`.
 
 When `stellar-agent` is on your `PATH`, the incumbent `stellar-cli` discovers it
 as an external subcommand: `stellar agent ...` and `stellar-agent ...` invoke the

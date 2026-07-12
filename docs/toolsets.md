@@ -96,7 +96,7 @@ trusted tool names:
 | Capability | Tools granted |
 |---|---|
 | `read-balance` | `stellar_balances` |
-| `propose-transaction` | `stellar_pay`, `stellar_claim` (build unsigned only) |
+| `propose-transaction` | `stellar_pay`, `stellar_claim`, `stellar_rule_create` (build unsigned / simulate only) |
 | `suggest-destination` | `stellar_sep47_discover`, `stellar_sep48_preview_invocation`, `stellar_sep7_parse_uri` |
 | `observe-event` | (none) |
 | `read-rules` | `stellar_rules_list`, `stellar_rules_get` |

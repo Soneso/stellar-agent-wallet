@@ -33,9 +33,11 @@ every reviewer approves with no blocking findings.
 
 ### 3. Tests and coverage
 
-- Line coverage is at least 90% per crate. Any shortfall is justified in the
-  review (for example, live-network paths exercised by acceptance tests rather
-  than unit tests).
+- Line coverage clears the per-crate floors enforced by
+  `.github/scripts/check-coverage.py` (a regression ratchet set a few points
+  below current offline coverage); 90% per crate is the aspirational target,
+  and any shortfall below it is justified in the review (for example,
+  live-network paths exercised by acceptance tests rather than unit tests).
 - **Tests assert correct behavior.** A test must fail if the behavior it covers
   regresses. A test that only raises the coverage number by exercising or
   asserting wrong or buggy behavior, or that would still pass if the code were

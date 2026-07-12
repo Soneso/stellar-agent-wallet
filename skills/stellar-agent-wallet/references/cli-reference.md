@@ -351,7 +351,7 @@ stellar-agent pool init --size 5 --profile default
 
 ## profile
 
-Lists, shows, and migrates profiles, and rotates the keyring-backed keys a profile names. A profile is a per-environment TOML config (schema version 2) holding no secrets. The subcommands that take a profile name take it as a positional `<NAME>`, not a `--profile` flag, and have no confirmation flag. All operate on local state — no network, no mainnet gate. Uses the `{ok, data, request_id}` envelope.
+Lists, shows, and migrates profiles, and rotates the keyring-backed keys a profile names. A profile is a per-environment TOML config (schema version 2) holding no secrets. The profile-name argument takes two forms: `enroll-signer`, `enroll-owner-key`, and `sign-policy` take a `--profile <NAME>` flag (default `default`), while `show`, `migrate`, the `rotate-*` subcommands, and `reset-window-state` take a required positional `<NAME>`. No subcommand has a confirmation flag. All operate on local state — no network, no mainnet gate. Uses the `{ok, data, request_id}` envelope.
 
 | Verb | Form | Notes |
 |---|---|---|
@@ -374,10 +374,13 @@ The policy-file owner key is NOT rotated here — it is an ed25519 key enrolled 
 | `rotate-audit-key` | audit-log chain-root HMAC (`audit_log_hash_chain_key_id`) | Re-signs every existing per-file chain-root sidecar with the new key, so `audit verify --profile <NAME>` stays green and the old key stops verifying. Adds `key_kind:"hmac_32_bytes"` and `sidecars_resigned`. |
 | `rotate-nonce-key` | HMAC nonce key (`mcp_nonce_key_alias`) | Invalidates outstanding nonces. Returns only `profile` + `rotated`. |
 | `rotate-counterparty-key` | `stellar.toml` cache-integrity HMAC (`counterparty_cache_key_id`) | Invalidates every cached counterparty binding (re-fetched on next check). Adds `key_kind:"hmac_32_bytes"` and `cache_invalidated:true`. |
+| `rotate-policy-state-key` | policy-window-state HMAC (`policy_window_state_key_id`) | Re-signs the persisted window-state store under the new key, so accumulated `per_period_cap` / `rate_limit` history is preserved, not invalidated. Refused if the store does not verify under the current key (use `reset-window-state` instead). Adds `key_kind:"hmac_32_bytes"` and `sidecars_resigned`. |
 
 ```bash
 stellar-agent profile rotate-attestation-key default
 ```
+
+Related but not a rotation: `profile reset-window-state <NAME> --reason <REASON>` is the fail-closed recovery path for the persisted policy-window-state store. An unreadable, tampered, or unparseable store makes the stateful criteria (`per_period_cap`, `rate_limit`, and their bundle forms) refuse every matched call until the store is re-initialised; `reset-window-state` re-initialises it to empty (minting the HMAC key if absent), discards all accumulated window history, and writes a `policy_window_state_reset` audit row recording the required `--reason`.
 
 ---
 

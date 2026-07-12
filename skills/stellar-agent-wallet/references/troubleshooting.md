@@ -130,11 +130,14 @@ agent-recoverable at runtime.
 | Code | Meaning | Agent action |
 |---|---|---|
 | `keyring.error` | A platform keyring read failed while loading the nonce key or an HMAC key on a two-phase verb. | Often the active profile names a keyring entry that holds no secret yet (the first-run testnet fallback profile uses placeholder coordinates). Only read-only tools that never touch the keyring still work: the simulate step already fails at nonce mint (`nonce.mint_failed`) when the nonce key is missing, so the flow stops there, before any commit. The operator must populate the keyring entry. Report to the operator. |
+| `auth.keyring_interactive_session_required` | Windows Credential Manager requires an interactive logon session; the process is running non-interactively (service, SSH, scheduled task). | Not retryable in-place. The operator must either run from an interactive desktop session or opt into the headless keyring store (`STELLAR_AGENT_KEYRING_BACKEND=headless-dpapi` or `headless-env` — see profiles-and-keys.md). Report to the operator. |
+| `io.audit_writer_setup` | The audit-log writer could not be set up (directory unwritable, or another writer process holds the `<log>.lock` sidecar). | Signing verbs refuse rather than run unaudited. Check for a second wallet process against the same profile, and that the data directory is writable. Report to the operator. |
 
 A missing or empty **signer** keyring entry on a single-shot SEP-43 sign tool
-surfaces as a SEP-43 error envelope (a wallet-unlock failure), not a `keyring.*`
-code. At the auth layer a missing keyring entry maps to `auth.keyring_not_found`.
-In every case the operator must enroll the secret for the active profile.
+surfaces as `sep43.wallet_unlock_failed` under the standard envelope, not a
+`keyring.*` code. At the auth layer a missing keyring entry maps to
+`auth.keyring_not_found`. In every case the operator must enroll the secret for
+the active profile.
 
 Keyring failures on the attestation key during a commit do not surface as a
 keyring code: they are folded into the uniform `policy.approval_required` so the

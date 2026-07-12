@@ -174,7 +174,27 @@ Consequences:
   envelope; keyring references appear as opaque `{service, account}` objects,
   never the secret.
 
-## Migration and key rotation
+### Headless deployments: the opt-in file-backed keyring store
+
+The platform keyring is unreachable in some deployment shapes — most notably
+Windows Credential Manager, which requires an interactive logon session:
+running under a Windows service, an SSH session, or a "run whether user is
+logged on or not" scheduled task fails closed with
+`auth.keyring_interactive_session_required`. For exactly those shapes the
+wallet ships an opt-in, file-backed store. Set on the process environment
+before any `stellar-agent` / `stellar-agent-mcp` command:
+
+- `STELLAR_AGENT_KEYRING_BACKEND=headless-dpapi` — Windows only; entries are
+  protected with DPAPI (CurrentUser scope).
+- `STELLAR_AGENT_KEYRING_BACKEND=headless-env` — any platform; entries are
+  encrypted with XChaCha20-Poly1305 under a 32-byte URL-safe-base64 key
+  supplied in `STELLAR_AGENT_HEADLESS_KEYRING_KEY`.
+
+The platform keyring remains the default when the variable is unset; there is
+no silent fallback in either direction — a misconfigured backend fails closed
+rather than switching stores. In `headless-env` mode the operator-held
+environment key is the custody boundary: whoever can read the process
+environment can decrypt the store, so scope it to the service user.
 
 A profile migrated from schema v1 stays on the `noop` engine, which keeps the
 mainnet-write gate in force, until the operator completes key rotation and opts

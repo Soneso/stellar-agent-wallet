@@ -2,10 +2,10 @@
 name: stellar-agent-wallet
 description: Operate the Stellar Agent Wallet — a self-custodial Stellar wallet built for AI agents — through its stellar-agent CLI and stellar-agent-mcp MCP server. Use when an agent needs to read Stellar account state, send XLM or asset payments, create accounts, manage trustlines, claim claimable balances, run OpenZeppelin smart-account governance, lend/trade/deposit on DeFi, or handle SEP and x402 flows, all under a local policy engine, an operator-approval gate (satisfiable via the CLI, a local web inbox, or a TLS-protected remote-approval surface), and a tamper-evident audit log. Covers the two-phase build-then-commit signing pattern, the simulate-approve-commit handshake, chain_id and the JSON result envelope, and the mainnet write gate. Reach for it when the user mentions the stellar-agent wallet, an AI-agent wallet on Stellar, MCP-driven Stellar payments, or autonomous-agent key custody.
 license: Apache-2.0
-compatibility: Requires the stellar-agent CLI and stellar-agent-mcp server (v0.1.0-alpha.2 public alpha; install with cargo binstall/install --git from the GitHub repository, or build from source). Targets Stellar testnet (default) and mainnet.
+compatibility: Requires the stellar-agent CLI and stellar-agent-mcp server (v0.1.0-alpha.4 public alpha; install from crates.io with a pinned version, e.g. cargo binstall stellar-agent-cli@0.1.0-alpha.4 stellar-agent-mcp@0.1.0-alpha.4, or build from source). Targets Stellar testnet (default) and mainnet.
 metadata:
-  version: "0.1.1"
-  wallet_version: "0.1.0-alpha.2"
+  version: "0.2.0"
+  wallet_version: "0.1.0-alpha.4"
 ---
 
 # Stellar Agent Wallet
@@ -32,12 +32,19 @@ a central server.
 
 ## Installation
 
-This is a public alpha; build the binaries from source:
+This is a public alpha. Install the two binaries from crates.io — while only
+prerelease versions are published, the version must be spelled out:
 
 ```bash
-cargo build --release -p stellar-agent-cli -p stellar-agent-mcp
-# produces target/release/stellar-agent and target/release/stellar-agent-mcp
+# Prebuilt binaries (fetched from the GitHub release archive):
+cargo binstall stellar-agent-cli@0.1.0-alpha.4 stellar-agent-mcp@0.1.0-alpha.4
+# Or build from the published sources:
+cargo install stellar-agent-cli@0.1.0-alpha.4 stellar-agent-mcp@0.1.0-alpha.4
 ```
+
+Building from a repository clone also works
+(`cargo build --release -p stellar-agent-cli -p stellar-agent-mcp` produces
+`target/release/stellar-agent` and `target/release/stellar-agent-mcp`).
 
 Point your MCP client at the server binary:
 
@@ -76,13 +83,16 @@ keyring and signing failures, submit failures, and the SEP-53, x402, and DeFi
 verbs alike; codes follow a `<family>.<reason>` convention (for example
 `x402.insufficient_funds`, `sep53.sign_failed`, `nonce.mint_failed`).
 
-The six `stellar_sep43_*` tools are the one exception: to preserve SEP-43
-v1.2.1 wire compatibility, their signing results and protocol errors — including
-the structural mainnet-signing refusal and keyring-unlock failures — use the
-SEP-43 `{ code, message }` object with SEP-43 numeric codes, not this envelope,
-on both success and failure. The single case where a SEP-43 tool falls back to
-the standard envelope is a policy `RequireApproval` verdict, refused as
-`policy.approval_required_unsupported`.
+The six `stellar_sep43_*` tools use this same standard envelope: the SEP-43
+raw protocol payload (`{ address }`, `{ signedTxXdr, signerAddress }`, and so
+on) is carried inside `data` on success, and failures surface as
+`{ ok: false, error: { code, message } }` with dotted `sep43.*` codes (for
+example `sep43.invalid_xdr`, `sep43.invalid_network_passphrase`); the
+structural mainnet-signing refusal carries the canonical
+`network.mainnet_write_forbidden` code shared with every signing surface. Do
+not expect the raw SEP-43 `{ code, message }` numeric-code object at the top
+level. See references/protocols.md for the per-tool payloads and the full
+wire-code table.
 
 ### chain_id
 

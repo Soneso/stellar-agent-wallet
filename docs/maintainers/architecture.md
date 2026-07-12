@@ -1,12 +1,12 @@
 # Architecture
 
-This document maps the workspace for maintainers and contributors. It describes how the 34 crates are layered, which crate owns which responsibility, and how the two shipped binaries wire the tool surface to the policy, approval, and audit substrate.
+This document maps the workspace for maintainers and contributors. It describes how the 35 crates are layered, which crate owns which responsibility, and how the two shipped binaries wire the tool surface to the policy, approval, and audit substrate.
 
 For concept-level background read [../concepts.md](../concepts.md). For build and toolchain instructions read [building.md](building.md). For the security-relevant internals read [security-internals.md](security-internals.md). The contributor gate checklist is [review-checklist.md](review-checklist.md).
 
 ## Workspace overview
 
-The repository is a single Cargo workspace (`resolver = "2"`) with 34 member crates under `crates/`, all named `stellar-agent-*`. Shared package metadata is inherited from `[workspace.package]`: version `0.1.0-alpha.2`, Rust edition `2024`, license `Apache-2.0`, repository `https://github.com/Soneso/stellar-agent-wallet`, author `Soneso`. Every member crate is prepared for crates.io publication (publish-enabled manifests with per-crate metadata); a future release will publish the whole workspace at one shared version via `cargo publish --workspace` from the tagged commit. Nothing is on crates.io yet.
+The repository is a single Cargo workspace (`resolver = "2"`) with 35 member crates under `crates/`, all named `stellar-agent-*`. Shared package metadata is inherited from `[workspace.package]`: version `0.1.0-alpha.4`, Rust edition `2024`, license `Apache-2.0`, repository `https://github.com/Soneso/stellar-agent-wallet`, author `Soneso`. Every member crate is published on crates.io at the shared workspace version, in dependency order from the tagged release commit.
 
 Shared dependency pins live in `[workspace.dependencies]` in the root `Cargo.toml` and are added when a crate first needs them, so the workspace only carries dependencies it actually uses.
 
@@ -44,7 +44,7 @@ Crates form a directed acyclic graph from foundational substrate up to the two b
 
 ### Layer 1 — orchestration and platform
 
-`stellar-agent-smart-account` (off-chain orchestration over OpenZeppelin `stellar-accounts`), `stellar-agent-webauthn-bridge` (loopback HTTP listener into the core approval store), `stellar-agent-loopback-http` (shared loopback-HTTP middleware behind the browser-facing listeners), `stellar-agent-approval-ui` and `stellar-agent-approval-remote` (the loopback and TLS-plus-passkey operator approval surfaces), `stellar-agent-claimable` (claimable-balance domain logic over `core`/`network`), `stellar-agent-pool` (channel-account pool over `core`/`network`/`sep5`), and `stellar-agent-windows-identity` (platform leaf).
+`stellar-agent-smart-account` (off-chain orchestration over OpenZeppelin `stellar-accounts`), `stellar-agent-webauthn-bridge` (loopback HTTP listener into the core approval store), `stellar-agent-loopback-http` (shared loopback-HTTP middleware behind the browser-facing listeners), `stellar-agent-approval-ui` and `stellar-agent-approval-remote` (the loopback and TLS-plus-passkey operator approval surfaces), `stellar-agent-claimable` (claimable-balance domain logic over `core`/`network`), `stellar-agent-pool` (channel-account pool over `core`/`network`/`sep5`), `stellar-agent-windows-identity` (platform leaf), and `stellar-agent-headless-keyring` (opt-in file-backed keyring store; a leaf except for `windows-identity` on Windows).
 
 ### Layer 2 — protocol and SEP crates
 
@@ -67,7 +67,7 @@ The wallet ships two surfaces from two binary crates.
 
 The two binaries are siblings, not a dependency pair. `stellar-agent-cli` does not depend on `stellar-agent-mcp`. The CLI carries none of the SEP, anchor, or x402 protocol crates; the MCP binary adds that protocol surface plus the `mcp-macros` proc-macro with the `inventory` runtime. The per-crate table below carries the detail.
 
-Both binaries share a single release archive. The `[package.metadata.binstall]` blocks in both crates point at the same `stellar-agent-{version}-{target}.tar.xz` (`.zip` on Windows), and `{ bin }` resolves to each crate's own binary name. Those archives and the `cargo binstall` assets they reference are published with each tagged release; `cargo binstall` resolves them via the `--git` URL until crates.io publication lands. Building from source with `cargo build --release` (or `cargo install --git https://github.com/Soneso/stellar-agent-wallet`) always works. See [building.md](building.md) for the build flow.
+Both binaries share a single release archive. The `[package.metadata.binstall]` blocks in both crates point at the same `stellar-agent-{version}-{target}.tar.xz` (`.zip` on Windows), and `{ bin }` resolves to each crate's own binary name. Those archives are published with each tagged release; `cargo binstall` resolves the crate on crates.io and fetches the matching archive from the release assets. Building from source with `cargo build --release` (or `cargo install stellar-agent-cli@<version> stellar-agent-mcp@<version>` from crates.io) always works. See [building.md](building.md) for the build flow.
 
 ## Per-crate responsibility
 
@@ -84,7 +84,8 @@ Both binaries share a single release archive. The `[package.metadata.binstall]` 
 | `stellar-agent-loopback-http` | Shared tower/axum defence-in-depth middleware for the wallet's loopback-only HTTP listeners: Host and Origin allowlists and hardened security headers. |
 | `stellar-agent-approval-ui` | Localhost approval-inbox web UI: a loopback HTTP server surfacing the pending-approval queue for browser approve/reject (`approve serve`). |
 | `stellar-agent-approval-remote` | TLS-protected, passkey-authenticated remote approval surface: approve or reject pending actions from a device other than the wallet host (`approve serve --remote`). |
-| `stellar-agent-windows-identity` | Windows-only safe wrapper reading the process token user SID to bind approval attestations to the OS user. Absent off Windows; uses `unsafe` for its Win32 FFI. |
+| `stellar-agent-windows-identity` | Windows-only safe wrapper reading the process token user SID to bind approval attestations to the OS user, plus DPAPI protect/unprotect wrappers for the headless keyring store. Absent off Windows; uses `unsafe` for its Win32 FFI. |
+| `stellar-agent-headless-keyring` | Opt-in, file-backed `keyring-core` credential store for non-interactive deployments (services, SSH sessions, scheduled tasks) where the platform keyring is unreachable: XChaCha20-Poly1305 under an operator-supplied environment key, or DPAPI protection on Windows; sidecar-locked, fail-closed, never a silent fallback. |
 | `stellar-agent-pool` | SEP-5-derived channel-account pool with in-pool sequence management for concurrent submission without `tx_bad_seq`. |
 | `stellar-agent-sep7` | Inbound `web+stellar:` URI parse and anti-phishing origin-domain signature verification; never signs, submits, or auto-POSTs. |
 | `stellar-agent-sep10` | SEP-10 web-auth client: challenge parse and validation, JWT session, HTTP challenge fetch and submit, ephemeral-key flow. |
@@ -111,7 +112,7 @@ Both binaries share a single release archive. The `[package.metadata.binstall]` 
 ## Crate classification
 
 - **Binaries (2):** `stellar-agent-cli` (binary `stellar-agent`) and `stellar-agent-mcp` (binary `stellar-agent-mcp`, plus a library re-export for integration tests).
-- **Plain libraries:** `core`, `network`, `claimable`, `sep5`, `xdr-limits`, `nonce`, `smart-account`, `webauthn-bridge`, `loopback-http`, `approval-ui`, `approval-remote`, `pool`, `sep7`, `sep10`, `sep43`, `sep45`, `sep48`, `sep53`, `anchor`, `toolsets`, `toolsets-install`, `toolsets-runtime`, `defi`, `blend`, `defindex`, `dex`, `stablecoin`, `x402`, `x402-identity`.
+- **Plain libraries:** `core`, `network`, `claimable`, `sep5`, `xdr-limits`, `nonce`, `headless-keyring`, `smart-account`, `webauthn-bridge`, `loopback-http`, `approval-ui`, `approval-remote`, `pool`, `sep7`, `sep10`, `sep43`, `sep45`, `sep48`, `sep53`, `anchor`, `toolsets`, `toolsets-install`, `toolsets-runtime`, `defi`, `blend`, `defindex`, `dex`, `stablecoin`, `x402`, `x402-identity`.
 - **Proc-macro library:** `mcp-macros`, the compiler-plugin companion to the `inventory` runtime in `mcp`.
 - **Platform-gated:** `windows-identity`, target-gated to `cfg(target_os = "windows")`. It uses `unsafe` for Win32 FFI as its core capability and is absent off Windows. (The CLI also carries a narrowly-scoped `#[allow(unsafe_code)]` for a POSIX `geteuid` FFI declaration in the audit-verify owner check.)
 - **Dev-only:** `test-support`, consumed strictly as a `[dev-dependencies]` entry behind gated test-harness features and never as a runtime dependency.

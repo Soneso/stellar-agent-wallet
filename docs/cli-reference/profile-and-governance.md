@@ -10,9 +10,9 @@ All four groups operate on local state — TOML files and platform-keyring entri
 
 The `profile` group lists, shows, and migrates profiles, and rotates the keyring-backed keys a profile names. A profile is a per-environment TOML config (schema version 2) binding a CAIP-2 chain id, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. It holds no secrets; it only names keyring entries.
 
-The six key-writing commands — `enroll-signer`, `enroll-owner-key`, and the four key-rotation subcommands — each write a `keyring_key_written` audit row recording the key purpose and, where applicable, the redacted public address.
+The seven key-writing commands — `enroll-signer`, `enroll-owner-key`, and the five key-rotation subcommands — each write a `keyring_key_written` audit row recording the key purpose and, where applicable, the redacted public address. `reset-window-state` writes the same row when the reset mints the window-state key on first use.
 
-The subcommands that take a profile name do so as a positional `<NAME>` argument, not as a `--profile` flag, and they have no confirmation flag.
+The profile-name argument takes two forms depending on the subcommand: `enroll-signer`, `enroll-owner-key`, and `sign-policy` take a `--profile <NAME>` flag (default `default`), while `show`, `migrate`, the `rotate-*` subcommands, and `reset-window-state` take a required positional `<NAME>`. None of them has a confirmation flag.
 
 ### `profile list`
 

@@ -9,15 +9,20 @@ name: CI
 on:
   push:
     branches: [main]
-    # A commit that touches only documentation cannot affect any gate below.
+    # A commit that touches only documentation, the downloadable agent skill,
+    # or the plugin manifest cannot affect any gate below.
     paths-ignore:
       - '**/*.md'
       - 'LICENSE'
+      - 'skills/**'
+      - '.claude-plugin/**'
   pull_request:
     branches: [main]
     paths-ignore:
       - '**/*.md'
       - 'LICENSE'
+      - 'skills/**'
+      - '.claude-plugin/**'
 
 # Supersede in-flight runs for the same ref so rapid pushes do not queue stale
 # work.

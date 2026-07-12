@@ -84,7 +84,8 @@ freely; sign-without-submit tools (the other SEP-43 signing tools and
 
 Fund-moving classic verbs split into a **build/simulate** call and a **commit**
 call. This is the core safe pattern; follow it for `stellar_pay`,
-`stellar_create_account`, and `stellar_trustline` (each paired with a `*_commit`).
+`stellar_create_account`, `stellar_trustline`, and `stellar_claim` (each paired
+with a `*_commit`).
 
 1. **Build.** Call `stellar_pay` with the payment fields. It builds an unsigned
    envelope, runs the SEP-29 memo check, mints a single-use nonce, and returns

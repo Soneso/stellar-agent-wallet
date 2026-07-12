@@ -24,9 +24,10 @@ Public alpha, under active development.
   (wire code `network.mainnet_write_forbidden`).
 - Friendbot funding is testnet/futurenet only; mainnet is structurally refused.
 
-Release archives and `cargo binstall` assets are published on the
+Release archives are published on the
 [releases page](https://github.com/Soneso/stellar-agent-wallet/releases) for
-each tagged release. If no release is listed there yet, build from source.
+each tagged release, and every workspace crate is published on
+[crates.io](https://crates.io/crates/stellar-agent-cli).
 
 ## Highlights
 
@@ -64,23 +65,37 @@ audit log, and toolset model in detail.
 
 Prebuilt binaries are published on the
 [releases page](https://github.com/Soneso/stellar-agent-wallet/releases) for each
-tagged release. crates.io publication is planned for a future release.
+tagged release, and all crates are published on crates.io.
 
-### cargo binstall (from the GitHub releases)
+While only prerelease (alpha) versions are published, `cargo install` and
+`cargo binstall` need the version spelled out — a bare crate name matches
+stable versions only.
 
-Point `cargo binstall` at this repository with `--git`; it resolves the release
-archive for your target from the tagged release assets:
+### cargo binstall (prebuilt binaries)
+
+`cargo binstall` resolves the crate on crates.io and downloads the prebuilt
+release archive for your target from the tagged release assets:
 
 ```bash
-cargo binstall --git https://github.com/Soneso/stellar-agent-wallet stellar-agent-cli
-cargo binstall --git https://github.com/Soneso/stellar-agent-wallet stellar-agent-mcp
+cargo binstall stellar-agent-cli@0.1.0-alpha.4 stellar-agent-mcp@0.1.0-alpha.4
 ```
 
 The CLI and MCP binaries ship in one release archive
 (`stellar-agent-{version}-{target}.tar.xz`, or `.zip` on Windows), so both
-commands draw from the same download. You can also download the archive directly
+installs draw from the same download. You can also download the archive directly
 from the [releases page](https://github.com/Soneso/stellar-agent-wallet/releases)
 and extract the two binaries onto your `PATH`.
+
+### cargo install (from crates.io)
+
+Builds the binaries from the published sources:
+
+```bash
+cargo install stellar-agent-cli@0.1.0-alpha.4 stellar-agent-mcp@0.1.0-alpha.4
+```
+
+This installs the `stellar-agent` and `stellar-agent-mcp` executables. Building
+requires the stable Rust toolchain (edition 2024).
 
 ### Build from source
 
@@ -91,8 +106,7 @@ cargo build --release
 ```
 
 The binaries land at `target/release/stellar-agent` and
-`target/release/stellar-agent-mcp`. `cargo install --git https://github.com/Soneso/stellar-agent-wallet`
-also works. Building requires the stable Rust toolchain (edition 2024).
+`target/release/stellar-agent-mcp`.
 
 The CLI is also discoverable as `stellar agent ...` through the `stellar-cli`
 external-binary plugin convention when `stellar-agent` is on your `PATH`.
@@ -180,23 +194,12 @@ behind the same policy engine, approval spine, and audit log as the CLI. See
 
 ## Documentation
 
-- [docs/getting-started.md](docs/getting-started.md) — install, first profile,
-  first payment.
-- [docs/concepts.md](docs/concepts.md) — profiles, policy engine, approval spine,
-  attestations, audit log, toolsets.
-- [docs/cli-reference/index.md](docs/cli-reference/index.md) — `stellar-agent`
-  command reference.
-- [docs/mcp.md](docs/mcp.md) — running the MCP server and its tools.
-- [docs/agents.md](docs/agents.md) — wiring the wallet into an AI agent runtime.
-- [docs/protocols.md](docs/protocols.md) — SEP, x402, and DeFi venue coverage and
-  constraints.
-- [docs/toolsets.md](docs/toolsets.md) — authoring, signing, installing, and
-  running agent toolsets, with runnable [examples](examples/toolsets/).
-- [docs/profiles.md](docs/profiles.md) — profile schema and keyring entry
-  references.
-- [docs/remote-approval.md](docs/remote-approval.md) — approving pending actions
-  from another device over TLS with a passkey, without SSH.
-- [docs/maintainers/](docs/maintainers/) — maintainer and review documentation.
+- [Documentation for users](docs/README.md#for-users) — getting started,
+  concepts, the CLI and MCP references, protocols, toolsets, profiles, and
+  remote approval.
+- [Documentation for maintainers](docs/README.md#for-maintainers) —
+  architecture, building and testing, security internals, and the review
+  checklist.
 
 ## Agent skill
 

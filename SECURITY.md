@@ -14,8 +14,9 @@ This project is a pre-1.0 public alpha. Only the latest `0.1.x` alpha is support
 | latest `0.1.x` | Yes |
 | any older `0.1.x` | No |
 
-There are no backports to earlier alpha builds. No tagged release exists yet, so build
-from source (see the [README](README.md)) and report against the latest build.
+There are no backports to earlier alpha builds. Install the latest tagged release
+(see the [README](README.md) for the release archives and crates.io install paths)
+or build from source, and report against that latest build.
 
 ## Reporting a vulnerability
 

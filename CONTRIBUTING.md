@@ -60,8 +60,9 @@ These gates must pass before a change is accepted:
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --all-features` (unit, integration, and doc-tests)
-- `cargo llvm-cov` (line coverage at least 90% per crate, shortfalls justified in
-  review)
+- `cargo llvm-cov` + `python3 .github/scripts/check-coverage.py` (per-crate
+  line-coverage floors; 90% per crate is the aspirational target, shortfalls
+  below it justified in review)
 - `cargo machete` (no unused dependencies)
 - `cargo deny check` (permissive-only license allow-list and advisory check)
 

@@ -72,6 +72,9 @@ usage efficient.
 ## Status
 
 This is a public alpha. The `stellar-agent` and `stellar-agent-mcp` binaries
-install from a tagged release when one is available, or build from source; the
-skill teaches the same surface either way. See the repository
-[README](https://github.com/Soneso/stellar-agent-wallet) for build instructions.
+install from crates.io with a pinned prerelease version
+(`cargo binstall stellar-agent-cli@0.1.0-alpha.4 stellar-agent-mcp@0.1.0-alpha.4`
+for the prebuilt release archives, or `cargo install` with the same pins), or
+build from source; the skill teaches the same surface either way. See the
+repository [README](https://github.com/Soneso/stellar-agent-wallet) for the
+full install options.
