@@ -33,8 +33,9 @@ pub enum PoolSubcommand {
     /// Channel accounts derive deterministically from the pool master seed
     /// at `m/44'/148'/1'` through `m/44'/148'/N'`.
     ///
-    /// Rejects `--size 0` and `--size > 33` (N×3 must not exceed the
-    /// 100-operation classic-transaction limit).
+    /// Rejects `--size 0` and `--size > 19`: the funder plus N channel
+    /// signatures must fit the 20-signature cap on the sandwich envelope
+    /// (`ChannelPool::MAX_SIZE`).
     Init(init::PoolInitArgs),
 
     /// List all channels in the pool with cached sequence numbers and status.

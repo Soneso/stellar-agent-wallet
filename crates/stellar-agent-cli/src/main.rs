@@ -136,7 +136,7 @@ enum Commands {
     ///
     /// Provides:
     /// - `pool init --size N [--profile P]` — fund N channel accounts via
-    ///   one CAP-33 sponsored-reserve sandwich. `--size` must be 1..=33.
+    ///   one CAP-33 sponsored-reserve sandwich. `--size` must be 1..=19.
     /// - `pool list [--profile P]` — list channels + cached seq / status.
     /// - `pool status [--profile P]` — utilisation: free / in-flight / total.
     Pool(commands::pool::PoolArgs),

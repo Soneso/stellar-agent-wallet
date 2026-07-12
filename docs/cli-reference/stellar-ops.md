@@ -51,7 +51,7 @@ Argument groups (enforced by the parser):
 | `--starting-balance <AMOUNT>` | Starting balance with explicit units, e.g. `"5 XLM"` (bare numbers rejected) | sponsored mode | — |
 | `--secret-env <VAR>` | Env-var name holding the sponsor S-strkey | signer group (sponsored) | — |
 | `--sign-with-ledger` | Sign with a connected Ledger | signer group (sponsored) | `false` |
-| `--account-index <INDEX>` | Ledger BIP-32 account index | optional | `0` |
+| `--account-index <INDEX>` | Ledger BIP-44 account index | optional | `0` |
 | `--fund-with-friendbot` | Fund the account via Friendbot (testnet only) | one of the mode group | `false` |
 | `--friendbot-url <URL>` | Friendbot endpoint URL (Friendbot mode) | optional | `https://friendbot.stellar.org` |
 | `--network <NETWORK>` | Target network; `testnet` or `mainnet` (`mainnet` parses but is structurally refused for writes) | optional | `testnet` |
@@ -164,7 +164,7 @@ Argument groups (enforced by the parser):
 | `--memo-return <64_HEX>` | Memo return hash (64 hex chars / 32 bytes) | one of the memo group | — |
 | `--secret-env <VAR>` | Env-var name holding the source S-strkey | signer group | — |
 | `--sign-with-ledger` | Sign with a connected Ledger | signer group | `false` |
-| `--account-index <INDEX>` | Ledger BIP-32 account index | optional | `0` |
+| `--account-index <INDEX>` | Ledger BIP-44 account index | optional | `0` |
 | `--build-only` | Emit the unsigned envelope XDR and exit | stage group | `false` |
 | `--sign-only <BASE64_XDR>` | Sign the given XDR, emit signed XDR | stage group | — |
 | `--submit-only <BASE64_XDR>` | Submit the given signed XDR | stage group | — |
@@ -238,7 +238,7 @@ asset — an authorized trustline with enough limit headroom exists
 | `--source <G_STRKEY>` | Claiming account; must be a claimant | yes | — |
 | `--secret-env <VAR>` | Env-var name holding the source S-strkey | signer group | — |
 | `--sign-with-ledger` | Sign with a connected Ledger | signer group | `false` |
-| `--account-index <INDEX>` | Ledger BIP-32 account index | optional | `0` |
+| `--account-index <INDEX>` | Ledger BIP-44 account index | optional | `0` |
 | `--build-only` | Emit the unsigned envelope XDR and exit | stage group | `false` |
 | `--sign-only <BASE64_XDR>` | Sign the given XDR, emit signed XDR | stage group | — |
 | `--submit-only <BASE64_XDR>` | Submit the given signed XDR | stage group | — |

@@ -199,7 +199,7 @@ pub struct ClaimArgs {
     #[arg(long, group = "signer_group")]
     pub sign_with_ledger: bool,
 
-    /// Ledger BIP-32 account index (default 0).
+    /// Ledger BIP-44 account index (default 0).
     #[arg(long, default_value_t = 0_u32, value_name = "INDEX")]
     pub account_index: u32,
 
