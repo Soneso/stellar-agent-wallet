@@ -329,6 +329,7 @@ async fn blend_supply_submit_and_confirm() {
     .await
     .unwrap_or_else(|e| panic!("FAIL — smart-account deployment failed: {e:?}"));
     let wallet_c = deployed.wallet_c;
+    let signer_g = deployed.signer_g_strkey;
     let signer = deployed.signer;
 
     // ── Step 3: Fund smart-account C-address with XLM SAC balance ────────────
@@ -458,11 +459,14 @@ async fn blend_supply_submit_and_confirm() {
 
     let primary_rpc = testnet_rpc();
 
-    // The pre-submit sequence, captured independently of the adapter's
+    // The pre-submit sequence of the TRANSACTION SOURCE — the signer's
+    // G-account, the account whose sequence the submit consumes and the key
+    // `submit_signed_invoke` records into the hook (the smart-account
+    // C-address holds no sequence). Captured independently of the adapter's
     // own internal fetch, so the assertion below verifies the EXACT consumed
     // sequence the spy observed (pre-submit sequence + 1), not merely that
     // *some* call happened.
-    let pre_submit_sequence = fetch_account(&primary_rpc, &wallet_c, &[])
+    let pre_submit_sequence = fetch_account(&primary_rpc, &signer_g, &[])
         .await
         .expect("fetch pre-submit sequence")
         .sequence_number;
@@ -561,7 +565,7 @@ async fn blend_supply_submit_and_confirm() {
             let recorded = sequence_floor_spy.recorded.lock().expect("lock").clone();
             assert_eq!(
                 recorded,
-                vec![(wallet_c.clone(), pre_submit_sequence + 1)],
+                vec![(signer_g.clone(), pre_submit_sequence + 1)],
                 "confirmed Blend supply must record exactly one \
                  (source_account, consumed_sequence) pair into the sequence \
                  floor hook, matching pre_submit_sequence + 1: {recorded:?}"
