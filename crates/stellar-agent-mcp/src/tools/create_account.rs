@@ -916,7 +916,8 @@ impl WalletServer {
         // ── High-value independent-RPC cross-check ───────────────────────────
         //
         // `CreateAccount` always transfers native XLM (the `starting_balance`).
-        // For transactions at or above `profile.effective_usd_threshold()`,
+        // For transactions at or above
+        // `profile.effective_cross_check_threshold_stroops()`,
         // re-builds the envelope against `profile.oracle_provider_url` and
         // asserts byte-identity with the primary rebuild.
         //

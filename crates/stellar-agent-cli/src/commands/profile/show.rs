@@ -12,13 +12,13 @@
 //! {
 //!   "ok": true,
 //!   "data": {
-//!     "version": 1,
+//!     "version": 2,
 //!     "chain_id": "stellar:testnet",
 //!     "rpc_url": "https://soroban-testnet.stellar.org",
 //!     "network_passphrase": "Test SDF Network ; September 2015",
 //!     "mcp_signer_default": { "service": "...", "account": "..." },
 //!     "mcp_nonce_key_alias": { "service": "...", "account": "..." },
-//!     "usd_threshold": 10000000000000,
+//!     "cross_check_threshold_stroops": 10000000000000,
 //!     "audit_log_path": "...",
 //!     "mcp_disabled": false
 //!   },

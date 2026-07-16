@@ -20,6 +20,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and audited explicit pruning. The file stores prepared authorization material
   and digests, never credentials or raw receipts.
 
+### Changed
+
+- Renamed the profile field `usd_threshold` to `cross_check_threshold_stroops`
+  (the accessor to `effective_cross_check_threshold_stroops()` and the builder
+  method to `cross_check_threshold_stroops(...)`) because the value is
+  compared against stroop-denominated transaction amounts, not a USD figure.
+  The floor remains 1000 XLM (10^10 stroops). Profile TOML files carrying the
+  legacy `usd_threshold` key still load via a serde alias; saved profiles now
+  write only the new key. A profile rewritten by a save is read by alpha.4
+  binaries as having no threshold, so their effective value falls back to the
+  1000 XLM floor (the cross-check fires more often, never less).
+  `stellar-agent profile show` and the MCP `mcp-resource://profiles/<name>`
+  resource now emit `cross_check_threshold_stroops` in their JSON output.
+
 ### Removed
 
 - Breaking (CLI): the `smart-account migrate-verifier --confirm-mainnet-migrate`

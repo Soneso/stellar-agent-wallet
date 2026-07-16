@@ -92,7 +92,7 @@ secret.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `usd_threshold` | integer (stroops) | no | `0` | High-value cross-check threshold. The effective value is `max(usd_threshold, 10_000_000_000)`; the floor of 1000 XLM (10^10 stroops) cannot be configured lower, so a profile with `usd_threshold = 0` behaves as if it were the floor. Transactions at or above the effective threshold trigger the independent-RPC cross-check when `oracle_provider_url` is set. |
+| `cross_check_threshold_stroops` | integer (stroops) | no | `0` | High-value cross-check threshold. The effective value is `max(cross_check_threshold_stroops, 10_000_000_000)`; the floor of 1000 XLM (10^10 stroops) cannot be configured lower, so a profile with `cross_check_threshold_stroops = 0` behaves as if it were the floor. Transactions at or above the effective threshold trigger the independent-RPC cross-check when `oracle_provider_url` is set. The legacy key `usd_threshold` is still accepted on load; do not set both keys (across the file, environment, and CLI sources) — the load is refused as a duplicate field. |
 | `classic_fee_per_op_stroops` | integer | no | unset (protocol default) | Per-operation base fee for classic transactions, in stroops. When unset, classic tools use the built-in default. |
 | `classic_max_fee_per_op_stroops` | integer | no | unset (no cap) | Per-operation fee cap, in stroops. When set, classic tools fail before envelope construction if the selected fee exceeds the cap. This is a guardrail, not a silent clamp. |
 | `submit_timeout_seconds` | integer | no | `60` | How long the wallet polls for transaction confirmation. |
@@ -247,7 +247,7 @@ A minimal testnet profile on the V1 engine:
 version = 2
 chain_id = "stellar:testnet"
 rpc_url = "https://soroban-testnet.stellar.org"
-usd_threshold = 50000000000
+cross_check_threshold_stroops = 50000000000
 mcp_disabled = false
 
 [mcp_signer_default]
