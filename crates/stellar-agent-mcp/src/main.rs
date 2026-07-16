@@ -193,11 +193,15 @@ async fn main() {
     // The fallback profile is a synthesised testnet default with placeholder
     // keyring coordinates.  Any tool that touches the keyring (e.g.
     // `stellar_create_account_commit`) will return `KeyringNotFound` until the
-    // user runs `stellar-agent profile init` to create a real profile and
-    // register a signing key.  This is the intended behaviour: the fallback
-    // profile enables `stellar_balances` and `stellar_create_account` (simulate
-    // step, which does NOT touch the signer keyring) without requiring a prior
-    // setup step.
+    // user runs `stellar-agent profile init` to create a real profile, then
+    // `stellar-agent profile enroll-signer` to register a signing key.  Note
+    // that `profile init` writes `engine = "v1"` by default, and a v1 profile
+    // makes THIS server refuse to start until the V1 ceremony completes
+    // (owner key, attestation key, audit key, signed policy); an operator who
+    // wants the server up immediately initialises with `--engine noop`.  This
+    // is the intended behaviour: the fallback profile enables
+    // `stellar_balances` and `stellar_create_account` (simulate step, which
+    // does NOT touch the signer keyring) without requiring a prior setup step.
     let profile = match loader::load_default_or_testnet_fallback() {
         Ok(p) => {
             tracing::info!(

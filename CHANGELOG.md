@@ -19,8 +19,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cross-process locking, atomic writes, replay protection, terminal retention,
   and audited explicit pruning. The file stores prepared authorization material
   and digests, never credentials or raw receipts.
+- Added `stellar-agent profile init`, which creates and persists a new profile
+  TOML with per-profile-derived keyring entry references. `--profile` defaults
+  to `default`, `--network` to `testnet`, `--engine` to `v1`. `--rpc-url` is
+  optional for testnet (defaults to the built-in testnet endpoint) but
+  required — and required to be `https://` — for `--network mainnet` (the
+  built-in mainnet default requires an API key and answers HTTP 401
+  unauthenticated, so persisting it would mint a broken configuration);
+  mainnet without `--rpc-url` is refused with
+  `validation.mainnet_rpc_url_required`, and a plaintext mainnet endpoint
+  with `validation.config_invalid`. Refuses without writing or modifying
+  anything if the named profile already exists
+  (`validation.profile_already_exists`); the write itself is no-clobber, so a
+  file appearing concurrently is never overwritten. Mints no key material and
+  emits no audit row; docs and the MCP server's first-run guidance, which
+  already referenced this command, now match an implemented one.
 
 ### Changed
+
+- `stellar-agent profile enroll-signer` now pins the profile's
+  `mcp_signer_default.account` to the enrolled seed's derived G-strkey when
+  the on-disk account is the literal placeholder `init` mints, patching only
+  that key in the profile TOML before the keyring write. Classification and
+  the pin operate on the raw on-disk document, so `STELLAR_AGENT_*`
+  environment overlays stay load-time-only and can never be persisted into
+  the trust root. A profile whose account already pins a different G-strkey
+  is unaffected: enrollment still refuses on a mismatch and never rewrites
+  it; an account value that is neither the placeholder nor a valid G-strkey
+  is refused with the new `enroll_signer.account_malformed` code instead of
+  being replaced. Every refusal path leaves the profile unmodified. This
+  closes the gap that made an `init`-minted profile otherwise unable to ever
+  enroll a working signer. The success envelope adds `account_populated`,
+  reporting which case a given run took.
 
 - Renamed the profile field `usd_threshold` to `cross_check_threshold_stroops`
   (the accessor to `effective_cross_check_threshold_stroops()` and the builder

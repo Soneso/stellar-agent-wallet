@@ -779,6 +779,55 @@ pub enum ValidationError {
         /// Display path of the missing primary audit-log file.
         path: String,
     },
+
+    /// `stellar-agent profile init` selected mainnet without an explicit
+    /// `--rpc-url`.
+    ///
+    /// The built-in mainnet default endpoint
+    /// ([`crate::profile::caip2::MAINNET_RPC_URL`]) requires an API key and
+    /// answers HTTP 401 unauthenticated; a command that mints a mainnet
+    /// profile MUST NOT silently persist it as the effective endpoint, since
+    /// the resulting configuration would be broken. The operator must pass
+    /// `--rpc-url <URL>` naming a trusted provider.
+    ///
+    /// `default_rpc_url` is informational only — the built-in default that was
+    /// NOT used; the command never contacts it.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.mainnet_rpc_url_required"`.
+    #[error(
+        "mainnet requires an explicit --rpc-url; the built-in default \
+         ({default_rpc_url}) requires an API key and answers HTTP 401 \
+         unauthenticated, so persisting it would mint a broken configuration"
+    )]
+    MainnetRpcUrlRequired {
+        /// The built-in mainnet default RPC URL that was not used.
+        default_rpc_url: &'static str,
+    },
+
+    /// A profile-creation command refused to overwrite an existing profile
+    /// file.
+    ///
+    /// `stellar-agent profile init` never clobbers an existing `<name>.toml`:
+    /// the existence check happens before any write, and the write itself
+    /// uses `stellar_agent_core::profile::loader::save_new_to_dir`, whose
+    /// no-clobber persist repeats the refusal atomically. The operator must
+    /// choose a different `--profile` name or remove the existing file
+    /// explicitly.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.profile_already_exists"`.
+    #[error(
+        "profile '{name}' already exists at {path}; choose a different --profile name or remove the file"
+    )]
+    ProfileAlreadyExists {
+        /// The profile name that already has a persisted TOML file.
+        name: String,
+        /// Display path of the existing profile file.
+        path: String,
+    },
 }
 
 impl ValidationError {
@@ -817,6 +866,8 @@ impl ValidationError {
             // Audit taxonomy code on a validation-class variant: the code names
             // the subsystem (audit.*) while the category stays Validation.
             Self::AuditLogNotFound { .. } => "audit.log_not_found",
+            Self::MainnetRpcUrlRequired { .. } => "validation.mainnet_rpc_url_required",
+            Self::ProfileAlreadyExists { .. } => "validation.profile_already_exists",
         }
     }
 }
@@ -1879,6 +1930,19 @@ mod tests {
                 },
                 "audit.log_not_found",
             ),
+            (
+                ValidationError::MainnetRpcUrlRequired {
+                    default_rpc_url: "https://mainnet.stellar.validationcloud.io/v1/stellar",
+                },
+                "validation.mainnet_rpc_url_required",
+            ),
+            (
+                ValidationError::ProfileAlreadyExists {
+                    name: "default".to_owned(),
+                    path: "/home/user/.local/share/stellar-agent/profiles/default.toml".to_owned(),
+                },
+                "validation.profile_already_exists",
+            ),
         ];
 
         for (variant, expected_code) in cases {
@@ -1983,6 +2047,15 @@ mod tests {
                 }
                 ValidationError::AuditLogNotFound { path } => {
                     ValidationError::AuditLogNotFound { path: path.clone() }
+                }
+                ValidationError::MainnetRpcUrlRequired { default_rpc_url } => {
+                    ValidationError::MainnetRpcUrlRequired { default_rpc_url }
+                }
+                ValidationError::ProfileAlreadyExists { name, path } => {
+                    ValidationError::ProfileAlreadyExists {
+                        name: name.clone(),
+                        path: path.clone(),
+                    }
                 }
             });
             assert_eq!(

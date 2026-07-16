@@ -195,6 +195,17 @@ pub enum ProfileLoadError {
         path: PathBuf,
     },
 
+    /// The on-disk `[mcp_signer_default]` reference could not be read
+    /// verbatim (I/O, TOML parse, or missing table/keys).
+    ///
+    /// Produced by [`read_signer_ref_on_disk`], which reads the stored
+    /// document without environment or CLI overlays.
+    #[error("profile signer reference unreadable: {detail}")]
+    SignerRefUnreadable {
+        /// Human-readable failure detail (path and cause; no secrets).
+        detail: String,
+    },
+
     /// figment failed to extract or merge the configuration sources.
     #[error("profile '{name}' could not be loaded: {source}")]
     Figment {
@@ -621,6 +632,175 @@ pub fn save_to_dir(name: &str, profile: &Profile, dir: &Path) -> Result<PathBuf,
     Ok(dest)
 }
 
+/// Saves a NEW profile to an explicit directory, refusing atomically when the
+/// destination already exists.
+///
+/// [`save_to_dir`]'s rename-based persist replaces an existing destination;
+/// creation paths use this variant so the no-overwrite guarantee holds even
+/// against a file appearing between an existence check and the write.
+///
+/// # Errors
+///
+/// - [`ProfileSaveError::AlreadyExists`] when `<name>.toml` exists in `dir`.
+/// - Any other [`ProfileSaveError`] on I/O or serialization failure.
+pub fn save_new_to_dir(
+    name: &str,
+    profile: &Profile,
+    dir: &Path,
+) -> Result<PathBuf, ProfileSaveError> {
+    std::fs::create_dir_all(dir).map_err(ProfileSaveError::Io)?;
+    let dest = dir.join(format!("{name}.toml"));
+
+    let toml_str = toml::to_string_pretty(profile).map_err(ProfileSaveError::Serialize)?;
+
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(ProfileSaveError::Io)?;
+    std::io::Write::write_all(&mut tmp, toml_str.as_bytes()).map_err(ProfileSaveError::Io)?;
+    tmp.persist_noclobber(&dest).map_err(|e| {
+        if e.error.kind() == std::io::ErrorKind::AlreadyExists {
+            ProfileSaveError::AlreadyExists { path: dest.clone() }
+        } else {
+            ProfileSaveError::Io(e.error)
+        }
+    })?;
+
+    Ok(dest)
+}
+
+/// Canonical-directory wrapper for [`read_signer_ref_on_disk`].
+///
+/// # Errors
+///
+/// See [`read_signer_ref_on_disk`]; additionally
+/// [`ProfileLoadError::NoStateDir`] when the OS-conventional profile
+/// directory cannot be determined.
+pub fn read_signer_ref(name: &str) -> Result<super::schema::KeyringEntryRef, ProfileLoadError> {
+    read_signer_ref_on_disk(name, &default_profile_dir()?)
+}
+
+/// Canonical-directory wrapper for [`pin_signer_account_on_disk`].
+///
+/// # Errors
+///
+/// See [`pin_signer_account_on_disk`]; additionally
+/// [`ProfileSaveError::NoStateDir`] when the OS-conventional profile
+/// directory cannot be determined.
+pub fn pin_signer_account(name: &str, account: &str) -> Result<PathBuf, ProfileSaveError> {
+    pin_signer_account_on_disk(
+        name,
+        &default_profile_dir().map_err(ProfileSaveError::NoStateDir)?,
+        account,
+    )
+}
+
+/// Reads the `[mcp_signer_default]` keyring reference exactly as stored in
+/// the profile's on-disk TOML, with NO environment or CLI overlays applied.
+///
+/// The signer reference is part of the persistent trust root: enrollment
+/// decisions (placeholder vs pinned identity) and the on-disk pin written by
+/// `profile enroll-signer` are derived from the stored document alone, so a
+/// transient `STELLAR_AGENT_*` environment overlay can never influence what
+/// gets persisted. Environment overlays remain load-time-only ([`load`]).
+///
+/// # Errors
+///
+/// - [`ProfileLoadError::NotFound`] when the profile file does not exist.
+/// - [`ProfileLoadError::SignerRefUnreadable`] on I/O or TOML parse failure,
+///   or when the table or its `service`/`account` string keys are absent.
+pub fn read_signer_ref_on_disk(
+    name: &str,
+    dir: &Path,
+) -> Result<super::schema::KeyringEntryRef, ProfileLoadError> {
+    let path = dir.join(format!("{name}.toml"));
+    if !path.exists() {
+        return Err(ProfileLoadError::NotFound {
+            name: name.to_owned(),
+            path,
+        });
+    }
+    let raw =
+        std::fs::read_to_string(&path).map_err(|e| ProfileLoadError::SignerRefUnreadable {
+            detail: format!("failed to read '{}': {e}", path.display()),
+        })?;
+    let doc: toml::Value =
+        toml::from_str(&raw).map_err(|e| ProfileLoadError::SignerRefUnreadable {
+            detail: format!("failed to parse '{}': {e}", path.display()),
+        })?;
+    let table =
+        doc.get("mcp_signer_default")
+            .ok_or_else(|| ProfileLoadError::SignerRefUnreadable {
+                detail: format!("'{}' has no [mcp_signer_default] table", path.display()),
+            })?;
+    let service = table
+        .get("service")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| ProfileLoadError::SignerRefUnreadable {
+            detail: format!(
+                "'{}' [mcp_signer_default] has no string 'service' key",
+                path.display()
+            ),
+        })?;
+    let account = table
+        .get("account")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| ProfileLoadError::SignerRefUnreadable {
+            detail: format!(
+                "'{}' [mcp_signer_default] has no string 'account' key",
+                path.display()
+            ),
+        })?;
+    Ok(super::schema::KeyringEntryRef::new(service, account))
+}
+
+/// Sets ONLY `mcp_signer_default.account` in the profile's on-disk TOML
+/// document, preserving every other stored key verbatim, and writes the
+/// result atomically.
+///
+/// This is the persistence half of `profile enroll-signer`'s
+/// placeholder-population step. It deliberately does NOT round-trip through
+/// [`load`] + [`save`]: that pair would merge `STELLAR_AGENT_*` environment
+/// overlays and materialise derived defaults into the stored document,
+/// turning transient overrides into persistent trust-root state.
+///
+/// # Errors
+///
+/// - [`ProfileSaveError::Io`] when the file cannot be read, parsed, or
+///   written (a parse failure is surfaced as `InvalidData`).
+/// - [`ProfileSaveError::Serialize`] on TOML re-serialization failure.
+pub fn pin_signer_account_on_disk(
+    name: &str,
+    dir: &Path,
+    account: &str,
+) -> Result<PathBuf, ProfileSaveError> {
+    let dest = dir.join(format!("{name}.toml"));
+    let raw = std::fs::read_to_string(&dest).map_err(ProfileSaveError::Io)?;
+    let mut doc: toml::Value = toml::from_str(&raw).map_err(|e| {
+        ProfileSaveError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("failed to parse '{}': {e}", dest.display()),
+        ))
+    })?;
+    let table = doc
+        .get_mut("mcp_signer_default")
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| {
+            ProfileSaveError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("'{}' has no [mcp_signer_default] table", dest.display()),
+            ))
+        })?;
+    table.insert(
+        "account".to_owned(),
+        toml::Value::String(account.to_owned()),
+    );
+
+    let toml_str = toml::to_string_pretty(&doc).map_err(ProfileSaveError::Serialize)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(ProfileSaveError::Io)?;
+    std::io::Write::write_all(&mut tmp, toml_str.as_bytes()).map_err(ProfileSaveError::Io)?;
+    tmp.persist(&dest)
+        .map_err(|e| ProfileSaveError::Io(e.error))?;
+    Ok(dest)
+}
+
 /// Errors produced when saving a profile.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -634,6 +814,15 @@ pub enum ProfileSaveError {
     /// An I/O error occurred.
     #[error("I/O error writing profile: {0}")]
     Io(std::io::Error),
+    /// The destination profile file already exists.
+    ///
+    /// Produced only by [`save_new_to_dir`], whose no-clobber persist makes
+    /// creation refusals atomic (no check-then-write window).
+    #[error("profile file already exists at '{path}'")]
+    AlreadyExists {
+        /// The destination path that already exists.
+        path: PathBuf,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -841,22 +1030,25 @@ pub fn load_default_or_testnet_fallback() -> Result<Profile, ProfileLoadError> {
 /// The asymmetry between this fallback and a newly-minted profile is
 /// intentional: newly-minted profiles default to `V1`, but the synthesised
 /// first-run fallback retains `Noop` because no owner-key has been minted yet.
-/// The operator opts in to `V1` via the `enroll-owner-key` +
-/// `rotate-attestation-key` + `rotate-audit-key` ceremony.
+/// V1 becomes operational through the ceremony `enroll-owner-key` +
+/// `rotate-attestation-key` + `rotate-audit-key` + `sign-policy` (the
+/// normative list is the CLI reference's `profile init` entry).
 ///
 /// # Design note
 ///
 /// The synthesised profile is never persisted — it is in-memory only for the
-/// duration of the current process.  A newly-initialised deployment creates an
-/// explicit `default.toml` (with `engine = "v1"`) on first
-/// `stellar-agent profile init`; from that point the fallback arm is no longer
-/// taken.
+/// duration of the current process.  A newly-initialised deployment creates
+/// an explicit `default.toml` via `stellar-agent profile init` (which writes
+/// `engine = "v1"` by default, or `engine = "noop"` with `--engine noop`);
+/// from that point the fallback arm is no longer taken.
 fn synthesise_default_first_run_profile() -> Profile {
+    let signer = super::schema::KeyringEntryRef::default_signer("default");
+    let nonce = super::schema::KeyringEntryRef::default_nonce("default");
     Profile::builder_testnet(
-        "stellar-agent-signer-default",
-        "default",
-        "stellar-agent-nonce-default",
-        "default",
+        &signer.service,
+        &signer.account,
+        &nonce.service,
+        &nonce.account,
     )
     .with_profile_name("default")
     .with_noop_engine()
@@ -1999,6 +2191,110 @@ account = "a"
         assert_eq!(
             loaded.effective_cross_check_threshold_stroops(),
             above_floor
+        );
+    }
+
+    // ── save_new_to_dir / read_signer_ref_on_disk / pin_signer_account ──────
+
+    /// `save_new_to_dir` writes a fresh profile and refuses an existing
+    /// destination atomically, leaving the existing file byte-identical.
+    #[test]
+    fn save_new_to_dir_refuses_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+            .with_profile_name("fresh")
+            .audit_log_path(dir.path().join("audit.log"))
+            .build();
+
+        let dest = save_new_to_dir("fresh", &profile, dir.path()).unwrap();
+        let original = std::fs::read_to_string(&dest).unwrap();
+
+        let second = save_new_to_dir("fresh", &profile, dir.path());
+        assert!(
+            matches!(second, Err(ProfileSaveError::AlreadyExists { .. })),
+            "second save_new_to_dir must refuse; got: {second:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            original,
+            "the existing file must be byte-identical after the refusal"
+        );
+    }
+
+    /// `read_signer_ref_on_disk` returns the stored service/account verbatim.
+    #[test]
+    fn read_signer_ref_on_disk_reads_raw_values() {
+        let (dir, name) = write_profile(minimal_toml());
+        let raw_ref = read_signer_ref_on_disk(&name, dir.path()).unwrap();
+        assert_eq!(raw_ref.service, "stellar-agent-signer");
+        assert_eq!(raw_ref.account, "test");
+    }
+
+    /// A missing profile file surfaces as `NotFound`.
+    #[test]
+    fn read_signer_ref_on_disk_missing_profile_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = read_signer_ref_on_disk("absent", dir.path());
+        assert!(
+            matches!(result, Err(ProfileLoadError::NotFound { .. })),
+            "missing profile must be NotFound; got: {result:?}"
+        );
+    }
+
+    // `read_signer_ref_on_disk` is structurally environment-free: it reads
+    // the file with std::fs and parses with `toml`, never through figment,
+    // so no `STELLAR_AGENT_*` overlay can reach it. The dynamic pin (env set,
+    // raw read unchanged) lives in the CLI's enroll-signer tests, where env
+    // mutation is permitted; this crate forbids `unsafe_code` outright.
+
+    /// `pin_signer_account_on_disk` patches exactly one key: every other
+    /// stored key survives verbatim, including keys the loader does not
+    /// model, and no derived field (`network_passphrase`,
+    /// `policy_window_state_key_id`, explicit `rpc_url`) is materialised
+    /// into the document.
+    #[test]
+    fn pin_signer_account_on_disk_patches_only_the_account() {
+        const PINNED_G: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        let toml = format!("future_key = \"kept\"\n{}", minimal_toml());
+        let (dir, name) = write_profile(&toml);
+
+        pin_signer_account_on_disk(&name, dir.path(), PINNED_G).unwrap();
+
+        let written = std::fs::read_to_string(dir.path().join(format!("{name}.toml"))).unwrap();
+        assert!(
+            written.contains(&format!("account = \"{PINNED_G}\"")),
+            "the signer account must be pinned; got:\n{written}"
+        );
+        assert!(
+            written.contains("service = \"stellar-agent-signer\""),
+            "the signer service must be preserved; got:\n{written}"
+        );
+        assert!(
+            written.contains("future_key = \"kept\""),
+            "unknown stored keys must survive the patch verbatim; got:\n{written}"
+        );
+        assert!(
+            !written.contains("network_passphrase"),
+            "derived fields must not be materialised into the document; got:\n{written}"
+        );
+        assert!(
+            !written.contains("policy_window_state_key_id"),
+            "derived key refs must not be materialised into the document; got:\n{written}"
+        );
+
+        let loaded = load_from_dir(&name, dir.path(), None).unwrap();
+        assert_eq!(loaded.mcp_signer_default.account, PINNED_G);
+        assert_eq!(loaded.mcp_signer_default.service, "stellar-agent-signer");
+    }
+
+    /// Pinning against a missing profile file errors instead of creating one.
+    #[test]
+    fn pin_signer_account_on_disk_missing_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = pin_signer_account_on_disk("absent", dir.path(), "GABC");
+        assert!(
+            matches!(result, Err(ProfileSaveError::Io(_))),
+            "pinning a missing profile must error; got: {result:?}"
         );
     }
 

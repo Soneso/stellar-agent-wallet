@@ -8,11 +8,34 @@ All four groups operate on local state — TOML files and platform-keyring entri
 
 ## `profile`
 
-The `profile` group lists, shows, and migrates profiles, and rotates the keyring-backed keys a profile names. A profile is a per-environment TOML config (schema version 2) binding a CAIP-2 chain id, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. It holds no secrets; it only names keyring entries.
+The `profile` group creates, lists, shows, and migrates profiles, and rotates the keyring-backed keys a profile names. A profile is a per-environment TOML config (schema version 2) binding a CAIP-2 chain id, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. It holds no secrets; it only names keyring entries.
 
-The seven key-writing commands — `enroll-signer`, `enroll-owner-key`, and the five key-rotation subcommands — each write a `keyring_key_written` audit row recording the key purpose and, where applicable, the redacted public address. `reset-window-state` writes the same row when the reset mints the window-state key on first use.
+The seven key-writing commands — `enroll-signer`, `enroll-owner-key`, and the five key-rotation subcommands — each write a `keyring_key_written` audit row recording the key purpose and, where applicable, the redacted public address. `reset-window-state` writes the same row when the reset mints the window-state key on first use. `init` mints no key material and emits no audit row.
 
-The profile-name argument takes two forms depending on the subcommand: `enroll-signer`, `enroll-owner-key`, and `sign-policy` take a `--profile <NAME>` flag (default `default`), while `show`, `migrate`, the `rotate-*` subcommands, and `reset-window-state` take a required positional `<NAME>`. None of them has a confirmation flag.
+The profile-name argument takes two forms depending on the subcommand: `init`, `enroll-signer`, `enroll-owner-key`, and `sign-policy` take a `--profile <NAME>` flag (default `default`), while `show`, `migrate`, the `rotate-*` subcommands, and `reset-window-state` take a required positional `<NAME>`. None of them has a confirmation flag.
+
+### `profile init`
+
+```bash
+stellar-agent profile init --profile default --network testnet
+```
+
+State-changing (writes the profile file; no network, no keyring). Creates and persists a new profile TOML with per-profile-derived keyring entry references, then reports the enrollment steps needed before the profile can sign. Mints no key material and emits no audit row — the key-writing commands documented below mint their own keys.
+
+- `--profile <NAME>` — profile name to create (default `default`).
+- `--network <testnet|mainnet>` — target network (default `testnet`).
+- `--rpc-url <URL>` — Soroban RPC endpoint. Optional for testnet (defaults to the built-in testnet endpoint); **required, and required to be `https://`,** for `--network mainnet` — the built-in mainnet default requires an API key and answers HTTP 401 unauthenticated, so persisting it silently would mint a broken configuration, and the explicit-endpoint requirement exists for endpoint trust (a plaintext scheme is refused with `validation.config_invalid`). This is a configuration-time refusal, distinct from the mainnet-write gate the rest of this page's intro describes — `init` never submits a transaction on any network.
+- `--engine <v1|noop>` — policy engine (default `v1`). `v1` is the default for newly-minted profiles (see the `[policy]` block in [profiles.md](../profiles.md)). A v1 profile refuses MCP-server startup and policy-gated dispatch until the V1 ceremony completes. The normative ceremony, in order, is: `profile enroll-owner-key`, `profile rotate-attestation-key`, `profile rotate-audit-key`, then `profile sign-policy` — `next_steps` in the success payload mirrors it. `--engine noop` is the zero-ceremony testnet opt-out: the profile works immediately under the Noop engine (testnet allow, mainnet read-only).
+
+The signer and nonce keyring coordinates are named `stellar-agent-signer-<name>` / `stellar-agent-nonce-<name>`, each seeded with the placeholder account `"default"` — the signer's eventual G-strkey is not known until a seed is enrolled (see `profile enroll-signer` below). The five security-substrate references (`audit_log_hash_chain_key_id`, `policy_owner_key_id`, `attestation_key_id`, `counterparty_cache_key_id`, `policy_window_state_key_id`) are derived from the profile name the same way `profile migrate` derives them.
+
+`init` refuses, without writing or modifying anything, if `<name>.toml` already exists; the write itself is no-clobber, so a file appearing concurrently is never overwritten either.
+
+```json
+{"ok":true,"data":{"profile":"default","path":"/home/user/.local/share/stellar-agent/profiles/default.toml","chain_id":"stellar:testnet","rpc_url":"https://soroban-testnet.stellar.org","engine":"v1","next_steps":["Run `stellar-agent profile enroll-signer --profile default --secret-env <VAR>` to register the MCP signer seed.","Run `stellar-agent profile enroll-owner-key --profile default --secret-env <VAR>` to enroll the policy-file owner key.","Run `stellar-agent profile rotate-attestation-key default` to mint the approval-attestation key.","Run `stellar-agent profile rotate-audit-key default` to mint the audit-log hash-chain key.","Run `stellar-agent profile sign-policy --profile default --secret-env <VAR>` to sign the V1 policy file."]},"request_id":"..."}
+```
+
+Exits `1` with `validation.address_invalid` if `--profile` is not a safe path component, `validation.mainnet_rpc_url_required` if `--network mainnet` is selected without `--rpc-url`, `validation.config_invalid` if a mainnet `--rpc-url` is not `https://` or the resolved `rpc_url` fails URL validation, `validation.profile_already_exists` if the named profile already exists, or an internal error if the write itself fails (I/O error, unwritable directory).
 
 ### `profile list`
 
@@ -65,20 +88,20 @@ export WALLET_SK=S...signer-secret...
 stellar-agent profile enroll-signer --profile default --secret-env WALLET_SK
 ```
 
-Imports an operator-held ed25519 seed into the profile's `mcp_signer_default` keyring entry — the signer every MCP fund-movement tool and every keyring-signing CLI verb (`trustline`, `lend`, `trade`, `vault`) resolves. On a clean install that entry is absent and those paths fail with `auth.keyring_not_found`; this command is the way to populate it. State-changing (keyring), no network. The seed is read from a named environment variable through the shared mlock-protected ceremony and stored verbatim; it is never printed, logged, or returned.
+Imports an operator-held ed25519 seed into the profile's `mcp_signer_default` keyring entry — the signer every MCP fund-movement tool and every keyring-signing CLI verb (`trustline`, `lend`, `trade`, `vault`) resolves. On a clean install that entry is absent and those paths fail with `auth.keyring_not_found`; this command is the way to populate it. State-changing (keyring; also the profile TOML the first time a profile enrolls a signer — see below), no network. The seed is read from a named environment variable through the shared mlock-protected ceremony and stored verbatim; it is never printed, logged, or returned.
 
 - `--secret-env <VAR>` (required) — name of the environment variable holding the signer's `S...` strkey. The flag takes the variable name, never the secret.
 - `--profile <NAME>` — profile whose `mcp_signer_default` entry is written (default `default`).
 - `--expected-address <G_STRKEY>` — refuse unless the seed derives to this address.
 - `--force` — replace an already-enrolled entry (refused without it when one exists).
 
-The coordinate's `account` field is the signer identity: `signer_from_keyring` verifies the loaded seed derives to it, so `account` must equal the seed's public address (not a placeholder like `"default"`). Enrollment refuses on a mismatch and prints the address to set `account` to; it never rewrites the profile TOML. On success the data object reports the derived `public_address`, the `keyring_service`/`keyring_account` written, and `replaced` (with `previous_address` when an entry was replaced):
+The coordinate's `account` field is the signer identity: `signer_from_keyring` verifies the loaded seed derives to it, so `account` must equal the seed's public address. Enrollment classifies the field from its raw on-disk value (environment overlays never influence what gets persisted) and resolves three cases. A profile fresh from `profile init` (and a v1-migrated profile that still carries it) holds the literal placeholder `"default"`: enrollment pins the derived address into `account` — patching only that key in the profile TOML — before writing the keyring entry. Once `account` holds a G-strkey — from that first enrollment, or set by hand — enrollment refuses on a mismatch and prints the address to set `account` to, and the profile TOML is left untouched. Any other value (a typo'd or truncated pin) is refused with `enroll_signer.account_malformed` rather than replaced. Every refusal leaves the file unmodified. On success the data object reports the derived `public_address`, the `keyring_service`/`keyring_account` written, `replaced` (with `previous_address` when an entry was replaced), and `account_populated` (`true` when the placeholder was just pinned):
 
 ```json
-{"ok":true,"data":{"profile":"default","enrolled":true,"public_address":"G...","keyring_service":"stellar-agent-signer-default","keyring_account":"G...","replaced":false},"request_id":"..."}
+{"ok":true,"data":{"profile":"default","enrolled":true,"public_address":"G...","keyring_service":"stellar-agent-signer-default","keyring_account":"G...","replaced":false,"account_populated":true},"request_id":"..."}
 ```
 
-Exits `1` with `ProfileNotFound` if the profile does not exist, `enroll_signer.account_identity_mismatch` if the seed does not match the profile's signer account, `enroll_signer.expected_address_mismatch` if `--expected-address` does not match, `enroll_signer.entry_exists` if an entry exists without `--force`, or a keyring error if the platform keyring is unavailable.
+Exits `1` with `ProfileNotFound` if the profile does not exist, `enroll_signer.account_identity_mismatch` if the seed does not match a pinned signer account, `enroll_signer.account_malformed` if the stored account is neither the placeholder nor a valid G-strkey, `enroll_signer.expected_address_mismatch` if `--expected-address` does not match, `enroll_signer.entry_exists` if an entry exists without `--force`, or a keyring error if the platform keyring is unavailable.
 
 ### `profile enroll-owner-key`
 

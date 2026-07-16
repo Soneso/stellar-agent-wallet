@@ -2,6 +2,7 @@
 //!
 //! Parent module for all profile-management subcommands.  Provides:
 //!
+//! - [`init`] — create and persist a new profile TOML.
 //! - [`list`] — list known profile names from the OS-conventional profile directory.
 //! - [`show`] — print a profile's resolved configuration (excluding keyring
 //!   secrets, which are never stored in the TOML).
@@ -27,6 +28,7 @@
 pub mod audit_emit;
 pub mod enroll_owner_key;
 pub mod enroll_signer;
+pub mod init;
 pub mod key_ops;
 pub mod list;
 pub mod migrate;
@@ -54,6 +56,15 @@ pub struct ProfileArgs {
 #[derive(Debug, Subcommand)]
 #[non_exhaustive]
 pub enum ProfileSubcommand {
+    /// Create and persist a new profile TOML.
+    ///
+    /// Mints a version-2 profile with per-profile-derived keyring entry
+    /// references and writes it to `<profile_dir>/<name>.toml`. Mints no key
+    /// material and emits no audit row; the key-writing commands
+    /// (`enroll-signer`, `enroll-owner-key`, the `rotate-*` subcommands) do
+    /// that. Refuses if the named profile already exists, or if `--network
+    /// mainnet` is selected without an explicit `--rpc-url`.
+    Init(init::InitArgs),
     /// List known profile names.
     ///
     /// Reads the OS-conventional profile directory and prints one profile
@@ -154,6 +165,7 @@ pub enum ProfileSubcommand {
 /// Never panics.
 pub async fn run(args: &ProfileArgs) -> i32 {
     match &args.subcommand {
+        ProfileSubcommand::Init(a) => init::run(a).await,
         ProfileSubcommand::List(a) => list::run(a).await,
         ProfileSubcommand::Show(a) => show::run(a).await,
         ProfileSubcommand::Migrate(a) => migrate::run(a).await,
