@@ -133,10 +133,9 @@ default-deny); profiles carried over from an older schema are set to Noop
 explicitly so the mainnet gate stays in place until the operator stands up a V1
 owner key.
 
-The narrow exceptions are explicit, consent-gated mainnet operations, e.g.
-`smart-account migrate-verifier` which requires `--confirm-mainnet-migrate`. Friendbot
-funding is scoped to `testnet` and `futurenet` and refuses `mainnet` with
-`network.friendbot_mainnet_forbidden`.
+There are no consent-gated mainnet write exceptions: every write surface refuses
+mainnet structurally. Friendbot funding is scoped to `testnet` and `futurenet`
+and refuses `mainnet` with `network.friendbot_mainnet_forbidden`.
 
 Agent rule: if you receive `network.mainnet_write_forbidden` or
 `policy.engine_required`, the action is structurally blocked on that chain.

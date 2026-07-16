@@ -20,12 +20,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and audited explicit pruning. The file stores prepared authorization material
   and digests, never credentials or raw receipts.
 
+### Removed
+
+- Breaking (CLI): the `smart-account migrate-verifier --confirm-mainnet-migrate`
+  flag. The flag could never lead to a successful submit — the network layer
+  forbids mainnet writes unconditionally in this alpha — so the command now
+  structurally refuses mainnet submit up front with
+  `network.mainnet_write_forbidden`, matching every other write surface.
+  Mainnet dry-run stays available (read-only). The `mainnet_confirm_missing`
+  migration phase is removed from the `sa.verifier_migration_failed` closed
+  phase set, and comments referencing a nonexistent `--accept-mainnet` flag
+  are removed.
+
+### Fixed
+
+- Documentation: `docs/agents.md`, `docs/profiles.md`, and the agent skill no
+  longer imply that key rotation plus V1 opt-in unlocks mainnet writes. The
+  alpha refuses every mainnet write structurally at the network layer
+  regardless of policy engine or enrolled keys; the docs now state both
+  refusal layers and their wire codes. The `network.mainnet_write_forbidden`
+  envelope message likewise no longer attributes the refusal to a missing
+  policy-engine configuration.
+
 ### Security
 
 - MPP mainnet, unsponsored, push, smart-account, transport-automation, channel,
   and toolset-routing modes are structurally unsupported. The wallet returns a
   credential but does not send the paid request or submit the server-sponsored
   transaction.
+- The idempotent-submission retention-poll write path now carries the same
+  URL-heuristic defence-in-depth mainnet guard as the primary submit path,
+  which it previously lacked (the passphrase guard, the primary control, was
+  already present on both paths). The idempotent entry point additionally
+  refuses mainnet before decoding the envelope or writing any receipt state,
+  so a refused mainnet submission no longer strands a pending receipt.
 
 ## [0.1.0-alpha.4] - 2026-07-11
 

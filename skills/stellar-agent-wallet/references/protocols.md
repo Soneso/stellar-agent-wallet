@@ -8,7 +8,7 @@ The supported Stellar ecosystem protocols, the wallet surface for each, and the 
 - **Fail-closed.** Validation refuses on any failed check rather than guessing. Unknown discriminants, ambiguous tokens, missing floors, and stale reads are refused before signing.
 - **Never auto-submit untrusted requests.** Inbound requests (a SEP-7 URI, a contract invocation) are parsed into a preview for the operator and policy engine. The wallet does not sign or submit on a dApp's behalf without the policy engine and approval flow.
 
-Write and signing paths are testnet-only in this alpha. Every signing tool structurally refuses `stellar:mainnet` (wire code `network.mainnet_write_forbidden`) before any RPC call or signing. Read-only tools accept mainnet.
+Write and signing paths are testnet-only in this alpha. Every signing tool structurally refuses `stellar:mainnet` (wire code `network.mainnet_write_forbidden`): tools with an early handler gate refuse before any RPC call or signing, and every remaining path is refused at the network submit layer before any transaction is sent. Read-only tools accept mainnet.
 
 ## Result envelope and conventions
 

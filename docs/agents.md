@@ -133,13 +133,19 @@ forged, or expired, so a caller learns nothing from the failure). Treat
 `policy.approval_required` as "ask the operator to approve, then retry the commit"
 — never as a transient error to retry blindly.
 
-## Mainnet is read-only by default
+## Mainnet is read-only in this alpha
 
-On `stellar:mainnet` the default Noop engine allows read-only tools and refuses
-every fund-moving tool with `policy.engine_required`, before any RPC call or
-signing. Writes on mainnet require the operator to rotate keys and opt in to the
-V1 engine (see [profiles.md](profiles.md)). Design the agent to expect refusal of
-mainnet writes until the operator has done so.
+On `stellar:mainnet`, read-only tools work; every write is refused. Two
+independent layers enforce this. The policy layer refuses fund-moving tools
+under the default Noop engine with `policy.engine_required`, before any RPC
+call or signing. Below it, the network layer structurally refuses every
+mainnet write with `network.mainnet_write_forbidden`, regardless of the
+configured policy engine or enrolled keys — no profile configuration unlocks
+mainnet writes in this alpha. A V1 engine with enrolled keys (see
+[profiles.md](profiles.md)) is the intended foundation for a future explicit
+mainnet opt-in, not a current unlock. Design the agent to treat every mainnet
+write refusal as structural: do not retry, and do not try configuration
+changes to get past it.
 
 ## Using installed toolsets
 

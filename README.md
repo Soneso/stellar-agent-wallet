@@ -20,8 +20,10 @@ Public alpha, under active development.
 - mainnet (`stellar:mainnet`) is accepted for read-only commands, selected
   via `--network` where the command exposes it or via `--rpc-url` for
   `balances` (which has no `--network` flag). Every write or signing command
-  structurally refuses mainnet in this alpha, before any RPC call or signing
-  (wire code `network.mainnet_write_forbidden`).
+  structurally refuses mainnet in this alpha (wire code
+  `network.mainnet_write_forbidden`): `--network` commands refuse before any
+  RPC call or signing, and profile-driven flows are refused at the network
+  submit layer before any transaction is sent.
 - Friendbot funding is testnet/futurenet only; mainnet is structurally refused.
 
 Release archives are published on the

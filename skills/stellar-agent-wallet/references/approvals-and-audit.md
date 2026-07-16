@@ -46,8 +46,10 @@ Each invocation is evaluated before it does anything. Three decisions:
 The engine that runs is selected per profile in `[policy]`. Two structural rules
 apply on every surface: the default network is `stellar:testnet`, and every
 write or signing command structurally refuses `stellar:mainnet`
-(`network.mainnet_write_forbidden`) before any RPC call or signature, while
-`stellar:mainnet` stays accepted for read-only commands.
+(`network.mainnet_write_forbidden`) — `--network` commands before any RPC call
+or signature, profile-driven flows at the network submit layer before any
+transaction is sent — while `stellar:mainnet` stays accepted for read-only
+commands.
 
 ### Noop engine
 

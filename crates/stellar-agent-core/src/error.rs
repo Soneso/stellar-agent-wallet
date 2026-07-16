@@ -888,9 +888,10 @@ pub enum NetworkError {
         account_id: String,
     },
 
-    /// A mainnet write operation was attempted but the policy engine has not
-    /// been initialised.
-    #[error("mainnet write operations require the policy engine to be configured")]
+    /// A mainnet write operation was attempted; every mainnet write is
+    /// structurally refused in this alpha, regardless of the configured
+    /// policy engine or enrolled keys.
+    #[error("mainnet writes are structurally refused in this alpha")]
     MainnetWriteForbidden,
 
     /// The Horizon API returned an unexpected HTTP status code.

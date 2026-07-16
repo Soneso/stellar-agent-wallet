@@ -380,7 +380,8 @@ for the full flag set.
 
 ### Mainnet is refused for writes
 
-Targeting mainnet on a write command is refused before any RPC call or signing:
+Targeting mainnet on a `--network` write command is refused before any RPC call
+or signing (profile-driven flows are refused at the network submit layer):
 
 ```bash
 stellar-agent pay GDEST...WXYZ "10 XLM" \

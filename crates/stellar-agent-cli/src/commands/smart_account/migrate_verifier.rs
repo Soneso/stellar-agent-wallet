@@ -20,19 +20,18 @@
 //! | `--dry-run` | no | Plan-only: no transactions submitted. |
 //! | `--signer-secret-env <VAR>` | yes (submit) | Env-var holding the S-strkey seed. |
 //! | `--sign-with-ledger` | yes (submit) | Ledger hardware-wallet signing. |
-//! | `--confirm-mainnet-migrate` | yes (mainnet submit) | Explicit mainnet-migrate consent. |
 //! | `--network` | no | `testnet` (default) or `mainnet`. |
 //! | `--rpc-url` | no | Soroban RPC endpoint. |
 //! | `--secondary-rpc-url` | no | Secondary RPC for two-RPC consultation. |
 //! | `--timeout-seconds` | no | Submission timeout (default 60). |
 //!
-//! # Mainnet refusal cascade
+//! # Mainnet refusal
 //!
-//! Dry-run mode allows mainnet (read-only).  On-chain submit on mainnet
-//! requires `--confirm-mainnet-migrate` (separate from the `--accept-mainnet`
-//! flag used by other mainnet write operations; each write surface has its
-//! own explicit consent flag).  Without the flag:
-//! `SaError::VerifierMigrationFailed { phase: "mainnet_confirm_missing" }`.
+//! Dry-run mode allows mainnet (read-only).  On-chain submit structurally
+//! refuses mainnet before any signing, key access, or RPC call, with the same
+//! wire code as every other write surface:
+//! `WalletError::Network(NetworkError::MainnetWriteForbidden)`
+//! (`network.mainnet_write_forbidden`).
 //!
 //! # Pre-flight gates (fail-CLOSED)
 //!
@@ -44,6 +43,7 @@
 //!
 //! # Wire codes rendered
 //!
+//! - `network.mainnet_write_forbidden` — structural mainnet-submit refusal
 //! - `sa.verifier_migration_failed` — [`SaError::VerifierMigrationFailed`]
 //! - `sa.verifier_wasm_revoked` — [`SaError::VerifierWasmRevoked`]
 //! - `sa.verifier_wasm_retired` — [`SaError::VerifierWasmRetired`]
@@ -53,8 +53,8 @@ use clap::Args;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{ValidationError, WalletError};
-use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
+use stellar_agent_core::error::{NetworkError, ValidationError, WalletError};
+use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::migration::{
     MigrationPlan, MigrationPlanner, MigrationSubmitResult,
@@ -100,7 +100,8 @@ const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
         [ { --signer-secret-env <VAR> | --sign-with-ledger } ]",
     after_help = "SUBMIT PATH: Without --dry-run, provide exactly one of --signer-secret-env \
         or --sign-with-ledger. \
-        On mainnet, also pass --confirm-mainnet-migrate. \
+        Mainnet submit is structurally refused (network.mainnet_write_forbidden); \
+        mainnet --dry-run is allowed (read-only). \
         Without --dry-run, transactions are submitted in pairs (remove_signer + add_signer \
         per affected External signer per context rule). \
 \n\
@@ -145,7 +146,8 @@ pub struct MigrateVerifierArgs {
 
     /// Target network (`testnet` or `mainnet`).
     ///
-    /// Mainnet dry-run is allowed.  Mainnet submit requires `--confirm-mainnet-migrate`.
+    /// Mainnet dry-run is allowed (read-only).  Mainnet submit is structurally
+    /// refused (`network.mainnet_write_forbidden`).
     #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
     pub network: TargetNetwork,
 
@@ -172,17 +174,6 @@ pub struct MigrateVerifierArgs {
     /// mode (read-only RPC calls only).
     #[arg(long)]
     pub dry_run: bool,
-
-    /// Explicit consent for mainnet on-chain migration.
-    ///
-    /// Required when `--network mainnet` and `--dry-run` is NOT set.
-    /// Absent flag causes `SaError::VerifierMigrationFailed {
-    /// phase: "mainnet_confirm_missing" }`.
-    ///
-    /// Distinct from `--accept-mainnet` (used by other mainnet write operations).
-    /// Each write surface carries its own explicit consent flag.
-    #[arg(long)]
-    pub confirm_mainnet_migrate: bool,
 }
 
 impl CommonArgsView for MigrateVerifierArgs {
@@ -366,27 +357,11 @@ fn dry_run_signers_manager(
 pub async fn run(args: &MigrateVerifierArgs) -> i32 {
     let request_id = Uuid::new_v4().to_string();
 
-    // Mainnet submit refusal cascade.
-    // Dry-run on mainnet is allowed (read-only).
-    // Submit on mainnet requires --confirm-mainnet-migrate.
-    if args.network == TargetNetwork::Mainnet && !args.dry_run && !args.confirm_mainnet_migrate {
-        // Surface `phase: "mainnet_confirm_missing"` via VerifierMigrationFailed
-        // rather than `SaError::MainnetWriteRefused`: every migrate-verifier
-        // refusal channels through the VerifierMigrationFailed envelope so
-        // operator triage starts at one error type. `mainnet_confirm_missing`
-        // is part of the MIGRATION_PHASES closed set so this refusal remains
-        // structurally classified with other migrate-verifier failures.
-        return emit_error_sa(
-            &SaError::VerifierMigrationFailed {
-                phase: "mainnet_confirm_missing",
-                smart_account_redacted: RedactedStrkey::from_full(&args.account),
-                detail: "mainnet on-chain migration requires --confirm-mainnet-migrate; \
-                         re-run with that flag to confirm"
-                    .to_owned(),
-                request_id: request_id.clone(),
-            },
-            &request_id,
-        );
+    // Structural mainnet refusal — first gate, before flag-value validation,
+    // key access, or any RPC call.  Dry-run on mainnet stays allowed
+    // (read-only).
+    if let Some(err) = mainnet_submit_refusal(args.network, args.dry_run) {
+        return emit_error(&err, &request_id);
     }
 
     // Parse the `--from` hex hash.
@@ -570,6 +545,18 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
 // ─────────────────────────────────────────────────────────────────────────────
 // Private helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Structural mainnet-submit refusal, evaluated first in [`run`].
+///
+/// Dry-run on mainnet is allowed (read-only).  On-chain submit refuses mainnet
+/// before any signing, key access, or RPC call: the network submit layer
+/// forbids mainnet writes unconditionally in this alpha, so the command
+/// surface refuses up front with the same wire code as every other write
+/// surface (`network.mainnet_write_forbidden`).
+fn mainnet_submit_refusal(network: TargetNetwork, dry_run: bool) -> Option<WalletError> {
+    (network == TargetNetwork::Mainnet && !dry_run)
+        .then_some(WalletError::Network(NetworkError::MainnetWriteForbidden))
+}
 
 /// Parses a 64-char lowercase hex string into a 32-byte WASM hash.
 ///
@@ -864,6 +851,120 @@ mod tests {
         assert_eq!(
             value["request_id"], "req-partial",
             "request_id must be threaded through"
+        );
+    }
+
+    /// Baseline args: valid strkeys/hash, unroutable RPC, no signer source.
+    ///
+    /// `to_verifier` is a checksum-valid production contract strkey (the
+    /// Reflector oracle pin) so tests that reach `--to` parsing pass it.
+    fn minimal_args() -> MigrateVerifierArgs {
+        MigrateVerifierArgs {
+            account: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+            from: "a".repeat(64),
+            to_verifier: "CCVTVW2CVA7JLH4ROQGP3CU4T3EXVCK66AZGSM4MUQPXAI4QHCZPOATS".to_owned(),
+            profile: None,
+            signer_source: SignerSourceFlags {
+                signer_secret_env: None,
+                sign_with_ledger: false,
+                account_index: Some(0),
+            },
+            network: TargetNetwork::Testnet,
+            rpc_url: "http://127.0.0.1:1".to_owned(),
+            secondary_rpc_url: None,
+            timeout_seconds: 1,
+            dry_run: false,
+        }
+    }
+
+    /// Mainnet submit is the FIRST structural refusal, with its exact wire code.
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "test-only; expect on expected-Some is the assertion"
+    )]
+    fn mainnet_submit_refused_with_mainnet_write_forbidden() {
+        let err = mainnet_submit_refusal(TargetNetwork::Mainnet, false)
+            .expect("mainnet submit must refuse");
+        assert_eq!(err.code(), "network.mainnet_write_forbidden");
+    }
+
+    /// Mainnet dry-run and testnet submit are not structurally refused.
+    #[test]
+    fn mainnet_dry_run_and_testnet_submit_pass_the_structural_gate() {
+        assert!(
+            mainnet_submit_refusal(TargetNetwork::Mainnet, true).is_none(),
+            "mainnet dry-run must stay available (read-only)"
+        );
+        assert!(
+            mainnet_submit_refusal(TargetNetwork::Testnet, false).is_none(),
+            "testnet submit must pass the structural gate"
+        );
+    }
+
+    /// Test-only env guard; mirrors `policy_engine`'s `TestEnvVarGuard`.
+    struct TestEnvVarGuard {
+        var: &'static str,
+    }
+    impl TestEnvVarGuard {
+        fn set(var: &'static str, value: &std::ffi::OsStr) -> Self {
+            #[allow(
+                unsafe_code,
+                reason = "test-only env mutation; serialised by #[serial]"
+            )]
+            // SAFETY: serialised by the caller's `#[serial]`; restored on Drop.
+            unsafe {
+                std::env::set_var(var, value);
+            }
+            Self { var }
+        }
+    }
+    impl Drop for TestEnvVarGuard {
+        fn drop(&mut self) {
+            #[allow(unsafe_code, reason = "test-only env cleanup")]
+            // SAFETY: same as `set`; serialised by the caller's `#[serial]`.
+            unsafe {
+                std::env::remove_var(self.var);
+            }
+        }
+    }
+
+    /// run()-level: the wired gate refuses a mainnet submit with no RPC
+    /// attempt (the mock server records zero requests) and exit code 1.
+    ///
+    /// The fixture supplies a valid signer source and valid strkeys, so every
+    /// earlier refusal path is out of play: if the gate were unwired from
+    /// `run()`, execution would reach plan building, hit the mock server, and
+    /// fail the zero-request assertion.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn run_mainnet_submit_refused_before_any_network_call() {
+        const SIGNER_ENV: &str = "MIGRATE_VERIFIER_MAINNET_GATE_TEST_SEED";
+
+        let server = wiremock::MockServer::start().await;
+        let seed = stellar_strkey::ed25519::PrivateKey([7u8; 32])
+            .as_unredacted()
+            .to_string()
+            .to_string();
+        let _guard = TestEnvVarGuard::set(SIGNER_ENV, std::ffi::OsStr::new(&seed));
+
+        let mut args = minimal_args();
+        args.network = TargetNetwork::Mainnet;
+        args.rpc_url = server.uri();
+        args.secondary_rpc_url = Some(server.uri());
+        args.signer_source.signer_secret_env = Some(SIGNER_ENV.to_owned());
+
+        let code = run(&args).await;
+        assert_eq!(code, 1, "mainnet submit must exit with code 1");
+
+        let request_count = server
+            .received_requests()
+            .await
+            .map(|reqs| reqs.len())
+            .unwrap_or_default();
+        assert_eq!(
+            request_count, 0,
+            "mainnet submit must be refused before any RPC request"
         );
     }
 

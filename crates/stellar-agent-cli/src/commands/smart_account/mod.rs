@@ -259,7 +259,8 @@ pub enum SmartAccountSubcommand {
     /// 2. Destination audit status MUST be `Audited`, `Provisional`, or `Unaudited`.
     /// 3. Destination contract MUST be immutable (no admin/owner key).
     ///
-    /// Mainnet submit requires `--confirm-mainnet-migrate`.
+    /// Mainnet submit is structurally refused (`network.mainnet_write_forbidden`);
+    /// mainnet dry-run is allowed (read-only).
     #[command(name = "migrate-verifier")]
     MigrateVerifier(Box<migrate_verifier::MigrateVerifierArgs>),
 

@@ -180,6 +180,19 @@ pub async fn submit_transaction_idempotent(
     store: &ReceiptStore,
     recorded_at_ledger: u32,
 ) -> Result<SubmissionResult, WalletError> {
+    // ── Step 0: structural mainnet refusal ─────────────────────────────────
+    //
+    // Both guard layers, same as `submit_transaction_and_wait`. Refusing
+    // before the decode, the receipt-store read, and `try_begin` keeps a
+    // refused mainnet submission from writing a Pending receipt or issuing
+    // any RPC read; the inner write paths repeat the guards defence-in-depth.
+    if network_passphrase == crate::submit::MAINNET_PASSPHRASE {
+        return Err(WalletError::Network(NetworkError::MainnetWriteForbidden));
+    }
+    if crate::submit::is_mainnet_url(&client.url) {
+        return Err(WalletError::Network(NetworkError::MainnetWriteForbidden));
+    }
+
     // ── Step 1: decode XDR and compute idempotency key ─────────────────────
     let (envelope, envelope_hash) = decode_and_hash_envelope(envelope_xdr)?;
 
@@ -862,6 +875,17 @@ pub(crate) async fn submit_with_retention_poll(
 
     let redacted = redact_envelope_hash(envelope_hash);
 
+    // Mainnet guard (shared with `submit_transaction_and_wait`): the
+    // passphrase comparison is the primary check; the URL heuristic is the
+    // defence-in-depth layer. Every write path carries both, before the
+    // envelope decode and before any state write or RPC call.
+    if network_passphrase == crate::submit::MAINNET_PASSPHRASE {
+        return Err(WalletError::Network(NetworkError::MainnetWriteForbidden));
+    }
+    if crate::submit::is_mainnet_url(&client.url) {
+        return Err(WalletError::Network(NetworkError::MainnetWriteForbidden));
+    }
+
     // Decode envelope to submit via send_transaction (same as submit.rs path).
     // The envelope is caller-supplied and untrusted; bounded limits prevent a
     // deeply nested auth-invocation tree from exhausting the stack.
@@ -885,37 +909,12 @@ pub(crate) async fn submit_with_retention_poll(
         })?
     };
 
-    // Mainnet guard: delegate to submit_transaction_and_wait for the send step
-    // (it carries the mainnet passphrase check). After PENDING status is
-    // returned we own the poll loop.
-    //
-    // However, submit_transaction_and_wait does its own poll loop. To avoid
-    // duplicating the send logic and the mainnet guard, we use a short timeout
-    // on submit_transaction_and_wait to get the tx hash from sendTransaction,
-    // then re-enter our retention-aware poll.
-    //
-    // Alternative: call send_transaction directly. But that bypasses the
-    // mainnet guard in submit_transaction_and_wait, which is authoritative.
-    // Instead: call submit_transaction_and_wait with the full timeout —
-    // if it returns Ok, we are done (no retention issue occurred within the
-    // timeout). If it times out (TxTimeout), we check retention and surface
-    // Ambiguous if appropriate.
-    //
-    // This is the correct design: submit_transaction_and_wait handles all
-    // normal paths (SUCCESS, FAILED, timeout); we add a retention check for
-    // the case where its timeout fires while we are still NOT_FOUND.
-    //
-    // For the NOT_FOUND→retention case: we need to intercept NOT_FOUND
-    // iterations to call get_health. The cleanest approach is to send via
-    // sendTransaction (with the mainnet guard supplied by an explicit check
-    // here) and then run our own poll loop. We replicate the mainnet guard
-    // from submit.rs here since we are taking ownership of the flow.
-
-    // Mainnet guard (mirrors submit.rs MAINNET_PASSPHRASE check).
-    const MAINNET_PASSPHRASE: &str = "Public Global Stellar Network ; September 2015";
-    if network_passphrase == MAINNET_PASSPHRASE {
-        return Err(WalletError::Network(NetworkError::MainnetWriteForbidden));
-    }
+    // This function sends via send_transaction directly (rather than through
+    // submit_transaction_and_wait) because it owns a retention-aware poll
+    // loop: NOT_FOUND iterations are intercepted to call get_health so ledger
+    // retention can be checked, which submit_transaction_and_wait's poll does
+    // not do. Owning the send step is why both mainnet guard layers are
+    // enforced explicitly above.
 
     // Mark the receipt as submitted BEFORE calling send_transaction.
     //
@@ -1915,6 +1914,85 @@ mod tests {
         assert!(
             store.get(&envelope_hash).unwrap().is_none(),
             "no receipt must be written for a rejected fee-bump envelope"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Retention-poll mainnet guard tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Builds a valid unsigned V1 envelope and its hash for guard tests.
+    fn guard_test_envelope() -> (String, String) {
+        use crate::builder::{Asset, ClassicOpBuilder};
+        use stellar_agent_core::StellarAmount;
+
+        const SRC: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        const DST: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
+        let mut b = ClassicOpBuilder::new(SRC, 100, "Test SDF Network ; September 2015", 100);
+        b.payment(DST, StellarAmount::from_stroops(1), &Asset::Native)
+            .unwrap();
+        let xdr = b.build().unwrap();
+        let (_, envelope_hash) = decode_and_hash_envelope(&xdr).unwrap();
+        (xdr, envelope_hash)
+    }
+
+    /// The retention-poll write path refuses the mainnet passphrase before any
+    /// receipt write or RPC call.
+    #[tokio::test]
+    async fn retention_poll_refuses_mainnet_passphrase() {
+        let (xdr, envelope_hash) = guard_test_envelope();
+        let (_dir, store) = open_temp_store();
+        // Client must never be contacted: unroutable URL.
+        let client = crate::StellarRpcClient::new("https://localhost:19999").unwrap();
+
+        let result = submit_with_retention_poll(
+            &client,
+            &store,
+            &xdr,
+            Duration::from_secs(5),
+            "Public Global Stellar Network ; September 2015",
+            &envelope_hash,
+            0,
+            100,
+        )
+        .await;
+
+        let err = result.expect_err("mainnet passphrase must be refused");
+        assert_eq!(err.code(), "network.mainnet_write_forbidden");
+        assert!(
+            store.get(&envelope_hash).unwrap().is_none(),
+            "no receipt must be written for a refused mainnet submission"
+        );
+    }
+
+    /// The retention-poll write path carries the second-layer URL heuristic:
+    /// a mainnet-looking RPC URL is refused even when the passphrase is NOT
+    /// the mainnet passphrase.  The URL is unroutable, so reaching the network
+    /// layer would surface a different error class; the guard returns first.
+    #[tokio::test]
+    async fn retention_poll_refuses_mainnet_url_with_non_mainnet_passphrase() {
+        let (xdr, envelope_hash) = guard_test_envelope();
+        let (_dir, store) = open_temp_store();
+        // Matches the is_mainnet_url heuristic ("pubnet") but stays local.
+        let client = crate::StellarRpcClient::new("https://pubnet.localhost:19999").unwrap();
+
+        let result = submit_with_retention_poll(
+            &client,
+            &store,
+            &xdr,
+            Duration::from_secs(5),
+            "Test SDF Network ; September 2015",
+            &envelope_hash,
+            0,
+            100,
+        )
+        .await;
+
+        let err = result.expect_err("mainnet-looking URL must be refused");
+        assert_eq!(err.code(), "network.mainnet_write_forbidden");
+        assert!(
+            store.get(&envelope_hash).unwrap().is_none(),
+            "no receipt must be written for a refused mainnet submission"
         );
     }
 

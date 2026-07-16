@@ -53,7 +53,7 @@ stellar-agent pay GDEST...WXYZ "10 XLM" --source GSRC...WXYZ --secret-env WALLET
 
 ### Mainnet-write refusal
 
-This is a testnet-first alpha. `mainnet` is accepted for read-only commands but every write or signing command structurally refuses `mainnet` before any RPC call and before any signing key is touched. The refusal surfaces as `network.mainnet_write_forbidden` (the `friendbot` command and `accounts create --fund-with-friendbot` use `network.friendbot_mainnet_forbidden`). Exception: `smart-account migrate-verifier` permits a mainnet submit when `--confirm-mainnet-migrate` is supplied.
+This is a testnet-first alpha. `mainnet` is accepted for read-only commands but every write or signing command structurally refuses `mainnet`: commands that take `--network` refuse before any RPC call and before any signing key is touched, and profile-driven flows are refused at the network submit layer before any transaction is sent. The refusal surfaces as `network.mainnet_write_forbidden` (the `friendbot` command and `accounts create --fund-with-friendbot` use `network.friendbot_mainnet_forbidden`).
 
 ---
 
@@ -336,7 +336,7 @@ Every verb's exact flags, the mainnet-refusal matrix, signer-kind discriminators
 | `deploy-ed25519-verifier` | Deploy the OZ Ed25519-verifier WASM (backs `--signer-ed25519`); testnet only |
 | `deploy-spending-limit-policy` | Deploy the OZ spending-limit-policy WASM (per-network singleton); testnet only |
 | `deploy-policy` | Deploy any of the three OZ policy contracts via one `--kind`; recommended; testnet only |
-| `migrate-verifier` | Move all External signers from one verifier to another across rules; mainnet submit needs `--confirm-mainnet-migrate` |
+| `migrate-verifier` | Move all External signers from one verifier to another across rules; mainnet submit refused, mainnet dry-run allowed |
 | `list-verifiers` | Enumerate the compile-time verifier allowlist and audit-status taxonomy (read-only, no network) |
 | `register-multicall` / `unregister-multicall` | Edit the local multicall-router registry |
 | `timelock schedule` / `cancel` / `execute` / `list-pending` | OpenZeppelin upgrade-timelock lifecycle; write verbs refuse `mainnet`, `list-pending` is read-only |

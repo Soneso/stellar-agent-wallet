@@ -2,9 +2,8 @@
 
 The `smart-account` command group (also available under the shorter alias `sa`) governs an on-chain OpenZeppelin smart-account: its context rules, its signer sets and thresholds, the policy contracts attached to each rule, and the supporting infrastructure (verifier registry, multicall router registry, upgrade timelock). It also submits multicall bundles through the registered router.
 
-Most on-chain signing verbs that mutate context-rule, signer, or timelock state structurally refuse `mainnet` before any RPC call or signing key access, surfacing the wire code `network.mainnet_write_forbidden`: the `smart-account rules` write verbs, all `smart-account signers` verbs (including `list` and `refresh`, which emit audit rows), `smart-account execute`, the timelock write verbs (`schedule`, `cancel`, `execute`), and the deploy verbs (`smart-account deploy-webauthn-verifier`, `smart-account deploy-ed25519-verifier`, `smart-account deploy-spending-limit-policy`, `smart-account deploy-policy`). The exceptions:
+Every on-chain signing verb that mutates context-rule, signer, or timelock state structurally refuses `mainnet` before any RPC call or signing key access, surfacing the wire code `network.mainnet_write_forbidden`: the `smart-account rules` write verbs, all `smart-account signers` verbs (including `list` and `refresh`, which emit audit rows), `smart-account execute`, `smart-account migrate-verifier` (submit mode; a mainnet dry-run stays allowed read-only), the timelock write verbs (`schedule`, `cancel`, `execute`), and the deploy verbs (`smart-account deploy-webauthn-verifier`, `smart-account deploy-ed25519-verifier`, `smart-account deploy-spending-limit-policy`, `smart-account deploy-policy`). The exceptions:
 
-- `smart-account migrate-verifier` allows a mainnet dry-run and permits a mainnet submit only when `--confirm-mainnet-migrate` is supplied; it never returns `network.mainnet_write_forbidden`.
 - `smart-account multicall` accepts `mainnet` at the flag level but requires a multicall router registered for mainnet.
 - `smart-account register-multicall` / `smart-account unregister-multicall` accept `mainnet` as a local-registry key.
 - The read-only verbs (`smart-account rules get`, `smart-account rules get-spending-limit`, `smart-account rules verify-pins`, `smart-account rules list` / `smart-account list-rules`, `smart-account list-verifiers`, `smart-account timelock list-pending`) accept `mainnet` unconditionally.
@@ -579,7 +578,7 @@ stellar-agent smart-account deploy-policy \
 
 ### `smart-account migrate-verifier`
 
-Builds and optionally executes a plan that moves all `External` signers from one verifier to another across every context rule on a smart-account. Dry-run is read-only and renders the plan as JSON; without `--dry-run` it signs and submits `remove_signer` / `add_signer` pairs. Mainnet dry-run is allowed; mainnet submit additionally requires `--confirm-mainnet-migrate`.
+Builds and optionally executes a plan that moves all `External` signers from one verifier to another across every context rule on a smart-account. Dry-run is read-only and renders the plan as JSON; without `--dry-run` it signs and submits `remove_signer` / `add_signer` pairs. Mainnet dry-run is allowed (read-only); mainnet submit is structurally refused (`network.mainnet_write_forbidden`).
 
 Pre-flight gates (fail-closed): the destination verifier hash must be in the allowlist, its audit status must be `Audited`, `Provisional`, or `Unaudited`, and the destination contract must be immutable.
 
@@ -589,7 +588,6 @@ Flags:
 - `--from <HASH_HEX>` (required) — 64-char hex SHA-256 of the source verifier WASM; only `External` signers whose verifier matches are included.
 - `--to <C_STRKEY>` (required) — destination verifier contract.
 - `--dry-run` — plan only, no transactions submitted.
-- `--confirm-mainnet-migrate` — explicit consent, required for a mainnet submit (distinct from the consent flag on other write surfaces).
 - Shared: `--profile`, signer-source group (required for submit, not for dry-run), `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`.
 
 ```bash
