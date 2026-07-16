@@ -40,24 +40,25 @@ use super::caip2::Caip2;
 // MINIMUM_FLOOR
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Minimum effective USD threshold, expressed in XLM-equivalent stroops.
+/// Minimum effective cross-check threshold, expressed in stroops.
 ///
 /// Represents 1 000 XLM × 10 000 000 stroops/XLM = 10 000 000 000 stroops.
 ///
 /// The resolver caps the effective threshold at
-/// `max(profile.usd_threshold, MINIMUM_FLOOR)` regardless of the profile
-/// value.  A profile with `usd_threshold = 0` therefore behaves as if it had
-/// `usd_threshold = MINIMUM_FLOOR`.
+/// `max(profile.cross_check_threshold_stroops, MINIMUM_FLOOR)` regardless of
+/// the profile value.  A profile with `cross_check_threshold_stroops = 0`
+/// therefore behaves as if it had `cross_check_threshold_stroops =
+/// MINIMUM_FLOOR`.
 ///
 /// The floor ensures an agent cannot be configured to permit all operations
-/// without a meaningful threshold check.  1 000 XLM equivalent is a
-/// conservative constant.
+/// without a meaningful threshold check.  1 000 XLM is a conservative
+/// constant.
 ///
 /// # Security note
 ///
 /// The high-value independent-RPC cross-check fires when
-/// `value_stroops >= effective_usd_threshold()`.  The constant is
-/// `10_000_000_000` (10^10 stroops = 1 000 XLM).
+/// `value_stroops >= effective_cross_check_threshold_stroops()`.  The
+/// constant is `10_000_000_000` (10^10 stroops = 1 000 XLM).
 pub const MINIMUM_FLOOR: u64 = 10_000_000_000; // 1 000 XLM in stroops
 
 // Compile-time assertion: locks MINIMUM_FLOOR to the correct value so that an
@@ -428,7 +429,7 @@ const fn default_unlock_ttl_seconds() -> u32 {
 /// version = 2
 /// chain_id = "stellar:testnet"
 /// rpc_url = "https://soroban-testnet.stellar.org"
-/// usd_threshold = 50000000000
+/// cross_check_threshold_stroops = 50000000000
 /// mcp_disabled = false
 /// classic_fee_per_op_stroops = 100
 /// # Include this only when an independent RPC is configured.
@@ -509,17 +510,19 @@ pub struct Profile {
     /// location information.
     pub mcp_nonce_key_alias: KeyringEntryRef,
 
-    /// USD-equivalent threshold in stroops.
+    /// High-value cross-check threshold, in stroops.
     ///
-    /// The effective threshold is `max(usd_threshold, MINIMUM_FLOOR)` —
-    /// callers MUST call [`Profile::effective_usd_threshold`] rather than
+    /// The effective threshold is `max(cross_check_threshold_stroops,
+    /// MINIMUM_FLOOR)` — callers MUST call
+    /// [`Profile::effective_cross_check_threshold_stroops`] rather than
     /// reading this field directly.
     ///
-    /// The floor ([`MINIMUM_FLOOR`]) is 1 000 XLM equivalent (10^10 stroops)
+    /// The floor ([`MINIMUM_FLOOR`]) is 1 000 XLM (10^10 stroops)
     /// and cannot be configured below this value.  Transactions at or above
     /// the effective threshold trigger the high-value independent-RPC
     /// cross-check when `oracle_provider_url` is configured.
-    pub usd_threshold: u64,
+    #[serde(alias = "usd_threshold")]
+    pub cross_check_threshold_stroops: u64,
 
     /// Optional classic-operation base fee override, in stroops per operation.
     ///
@@ -611,8 +614,9 @@ pub struct Profile {
     /// Optional independent RPC endpoint URL for high-value cross-check.
     ///
     /// Used by the commit path when the transaction value exceeds
-    /// `usd_threshold` to re-simulate against a second independent RPC
-    /// endpoint.  Mismatch surfaces as `simulation.divergence`.
+    /// `cross_check_threshold_stroops` to re-simulate against a second
+    /// independent RPC endpoint.  Mismatch surfaces as
+    /// `simulation.divergence`.
     ///
     /// When this field is `None`, the high-value cross-check is skipped.
     /// Operators MUST set this field before enabling `policy.engine = "v1"` for
@@ -942,7 +946,10 @@ impl std::fmt::Debug for Profile {
             .field("network_passphrase", &self.network_passphrase)
             .field("mcp_signer_default", &self.mcp_signer_default)
             .field("mcp_nonce_key_alias", &self.mcp_nonce_key_alias)
-            .field("usd_threshold", &self.usd_threshold)
+            .field(
+                "cross_check_threshold_stroops",
+                &self.cross_check_threshold_stroops,
+            )
             .field(
                 "classic_fee_per_op_stroops",
                 &self.classic_fee_per_op_stroops,
@@ -988,13 +995,14 @@ impl std::fmt::Debug for Profile {
 }
 
 impl Profile {
-    /// Returns the effective USD threshold, enforcing the minimum floor.
+    /// Returns the effective cross-check threshold, enforcing the minimum floor.
     ///
-    /// Returns `max(self.usd_threshold, MINIMUM_FLOOR)`.  Callers MUST use
-    /// this method rather than reading `usd_threshold` directly.
+    /// Returns `max(self.cross_check_threshold_stroops, MINIMUM_FLOOR)`.
+    /// Callers MUST use this method rather than reading
+    /// `cross_check_threshold_stroops` directly.
     ///
-    /// A profile with `usd_threshold = 0` behaves as if the threshold were
-    /// [`MINIMUM_FLOOR`].
+    /// A profile with `cross_check_threshold_stroops = 0` behaves as if the
+    /// threshold were [`MINIMUM_FLOOR`].
     ///
     /// # Examples
     ///
@@ -1002,15 +1010,15 @@ impl Profile {
     /// use stellar_agent_core::profile::schema::{Profile, MINIMUM_FLOOR};
     ///
     /// let mut p = Profile::builder_testnet("svc", "acct", "nonce-svc", "nonce-acct").build();
-    /// p.usd_threshold = 0;
-    /// assert_eq!(p.effective_usd_threshold(), MINIMUM_FLOOR);
+    /// p.cross_check_threshold_stroops = 0;
+    /// assert_eq!(p.effective_cross_check_threshold_stroops(), MINIMUM_FLOOR);
     ///
-    /// p.usd_threshold = u64::MAX;
-    /// assert_eq!(p.effective_usd_threshold(), u64::MAX);
+    /// p.cross_check_threshold_stroops = u64::MAX;
+    /// assert_eq!(p.effective_cross_check_threshold_stroops(), u64::MAX);
     /// ```
     #[must_use]
-    pub fn effective_usd_threshold(&self) -> u64 {
-        self.usd_threshold.max(MINIMUM_FLOOR)
+    pub fn effective_cross_check_threshold_stroops(&self) -> u64 {
+        self.cross_check_threshold_stroops.max(MINIMUM_FLOOR)
     }
 
     /// Validates the `rpc_url` field as a well-formed URL.
@@ -1072,7 +1080,7 @@ impl Profile {
             network_passphrase: TESTNET_PASSPHRASE.to_owned(),
             mcp_signer_default: KeyringEntryRef::new(signer_service, signer_account),
             mcp_nonce_key_alias: KeyringEntryRef::new(nonce_service, nonce_account),
-            usd_threshold: MINIMUM_FLOOR,
+            cross_check_threshold_stroops: MINIMUM_FLOOR,
             classic_fee_per_op_stroops: None,
             classic_max_fee_per_op_stroops: None,
             submit_timeout_seconds: None,
@@ -1132,7 +1140,7 @@ impl Profile {
             network_passphrase: MAINNET_PASSPHRASE.to_owned(),
             mcp_signer_default: KeyringEntryRef::new(signer_service, signer_account),
             mcp_nonce_key_alias: KeyringEntryRef::new(nonce_service, nonce_account),
-            usd_threshold: MINIMUM_FLOOR,
+            cross_check_threshold_stroops: MINIMUM_FLOOR,
             classic_fee_per_op_stroops: None,
             classic_max_fee_per_op_stroops: None,
             submit_timeout_seconds: None,
@@ -1194,7 +1202,7 @@ pub struct ProfileBuilder {
     network_passphrase: String,
     mcp_signer_default: KeyringEntryRef,
     mcp_nonce_key_alias: KeyringEntryRef,
-    usd_threshold: u64,
+    cross_check_threshold_stroops: u64,
     classic_fee_per_op_stroops: Option<u32>,
     classic_max_fee_per_op_stroops: Option<u32>,
     submit_timeout_seconds: Option<u64>,
@@ -1251,10 +1259,10 @@ impl ProfileBuilder {
         self
     }
 
-    /// Overrides the USD threshold (stroops).
+    /// Overrides the cross-check threshold, in stroops.
     #[must_use = "builder setters return the updated builder by value"]
-    pub fn usd_threshold(mut self, threshold: u64) -> Self {
-        self.usd_threshold = threshold;
+    pub fn cross_check_threshold_stroops(mut self, threshold: u64) -> Self {
+        self.cross_check_threshold_stroops = threshold;
         self
     }
 
@@ -1421,7 +1429,7 @@ impl ProfileBuilder {
             network_passphrase: self.network_passphrase,
             mcp_signer_default: self.mcp_signer_default,
             mcp_nonce_key_alias: self.mcp_nonce_key_alias,
-            usd_threshold: self.usd_threshold,
+            cross_check_threshold_stroops: self.cross_check_threshold_stroops,
             classic_fee_per_op_stroops: self.classic_fee_per_op_stroops,
             classic_max_fee_per_op_stroops: self.classic_max_fee_per_op_stroops,
             submit_timeout_seconds: self.submit_timeout_seconds,
@@ -1981,31 +1989,34 @@ mod tests {
     }
 
     #[test]
-    fn effective_usd_threshold_floor_on_zero() {
+    fn effective_cross_check_threshold_stroops_floor_on_zero() {
         let mut p = make_testnet_profile();
-        p.usd_threshold = 0;
-        assert_eq!(p.effective_usd_threshold(), MINIMUM_FLOOR);
+        p.cross_check_threshold_stroops = 0;
+        assert_eq!(p.effective_cross_check_threshold_stroops(), MINIMUM_FLOOR);
     }
 
     #[test]
-    fn effective_usd_threshold_floor_on_below_minimum() {
+    fn effective_cross_check_threshold_stroops_floor_on_below_minimum() {
         let mut p = make_testnet_profile();
-        p.usd_threshold = MINIMUM_FLOOR - 1;
-        assert_eq!(p.effective_usd_threshold(), MINIMUM_FLOOR);
+        p.cross_check_threshold_stroops = MINIMUM_FLOOR - 1;
+        assert_eq!(p.effective_cross_check_threshold_stroops(), MINIMUM_FLOOR);
     }
 
     #[test]
-    fn effective_usd_threshold_above_floor_passes_through() {
+    fn effective_cross_check_threshold_stroops_above_floor_passes_through() {
         let mut p = make_testnet_profile();
-        p.usd_threshold = MINIMUM_FLOOR + 500;
-        assert_eq!(p.effective_usd_threshold(), MINIMUM_FLOOR + 500);
+        p.cross_check_threshold_stroops = MINIMUM_FLOOR + 500;
+        assert_eq!(
+            p.effective_cross_check_threshold_stroops(),
+            MINIMUM_FLOOR + 500
+        );
     }
 
     #[test]
-    fn effective_usd_threshold_max_passthrough() {
+    fn effective_cross_check_threshold_stroops_max_passthrough() {
         let mut p = make_testnet_profile();
-        p.usd_threshold = u64::MAX;
-        assert_eq!(p.effective_usd_threshold(), u64::MAX);
+        p.cross_check_threshold_stroops = u64::MAX;
+        assert_eq!(p.effective_cross_check_threshold_stroops(), u64::MAX);
     }
 
     #[test]
@@ -2527,11 +2538,11 @@ mod tests {
     }
 
     #[test]
-    fn builder_usd_threshold_override() {
+    fn builder_cross_check_threshold_stroops_override() {
         let p = Profile::builder_testnet("s", "a", "n", "b")
-            .usd_threshold(999_999_999_999)
+            .cross_check_threshold_stroops(999_999_999_999)
             .build();
-        assert_eq!(p.usd_threshold, 999_999_999_999);
+        assert_eq!(p.cross_check_threshold_stroops, 999_999_999_999);
     }
 
     #[test]

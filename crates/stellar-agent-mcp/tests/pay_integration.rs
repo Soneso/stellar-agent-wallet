@@ -1897,8 +1897,8 @@ async fn pay_commit_high_value_cross_check_passes_on_match() {
     let mut profile = testnet_profile_with_rpc(&primary_mock.uri());
     profile.oracle_provider_url = Some(url::Url::parse(&oracle_mock.uri()).unwrap());
     // 2 000 XLM payment is above the 1 000 XLM MINIMUM_FLOOR threshold.
-    // usd_threshold = 0 → effective = MINIMUM_FLOOR = 10_000_000_000 stroops.
-    profile.usd_threshold = 0;
+    // cross_check_threshold_stroops = 0 → effective = MINIMUM_FLOOR = 10_000_000_000 stroops.
+    profile.cross_check_threshold_stroops = 0;
     let server = WalletServer::new(profile).expect("WalletServer::new");
 
     use base64::Engine;
@@ -2022,7 +2022,7 @@ async fn pay_commit_high_value_cross_check_fails_on_mismatch() {
 
     let mut profile = testnet_profile_with_rpc(&primary_mock.uri());
     profile.oracle_provider_url = Some(url::Url::parse(&oracle_mock.uri()).unwrap());
-    profile.usd_threshold = 0;
+    profile.cross_check_threshold_stroops = 0;
     let server = WalletServer::new(profile).expect("WalletServer::new");
 
     use base64::Engine;
@@ -2117,7 +2117,7 @@ async fn pay_commit_high_value_cross_check_skips_when_oracle_url_unset() {
     let mut profile = testnet_profile_with_rpc(&primary_mock.uri());
     // No oracle URL: cross-check skipped with tracing::warn!.
     profile.oracle_provider_url = None;
-    profile.usd_threshold = 0;
+    profile.cross_check_threshold_stroops = 0;
     let server = WalletServer::new(profile).expect("WalletServer::new");
 
     use base64::Engine;
@@ -2247,9 +2247,10 @@ async fn pay_commit_below_threshold_skips_cross_check_unconditionally() {
 
     let mut profile = testnet_profile_with_rpc(&primary_mock.uri());
     profile.oracle_provider_url = Some(url::Url::parse(&oracle_mock.uri()).unwrap());
-    // Force effective threshold to MINIMUM_FLOOR by setting usd_threshold = 0.
+    // Force effective threshold to MINIMUM_FLOOR by setting
+    // cross_check_threshold_stroops = 0.
     // 999 XLM = 9_990_000_000 stroops < 10_000_000_000 → below threshold.
-    profile.usd_threshold = 0;
+    profile.cross_check_threshold_stroops = 0;
     let server = WalletServer::new(profile).expect("WalletServer::new");
 
     use base64::Engine;

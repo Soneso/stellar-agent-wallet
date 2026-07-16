@@ -73,6 +73,8 @@ struct PartialV1Profile {
     rpc_url: Option<String>,
     mcp_signer_default: KeyringEntryRef,
     mcp_nonce_key_alias: KeyringEntryRef,
+    /// `usd_threshold` is the v1 wire key name; it maps onto the v2
+    /// `Profile::cross_check_threshold_stroops` field during migration.
     #[serde(default)]
     usd_threshold: u64,
     audit_log_path: Option<std::path::PathBuf>,
@@ -323,7 +325,7 @@ fn migrate_v1_to_v2(profile_name: &str, v1: PartialV1Profile) -> Profile {
         network_passphrase,
         mcp_signer_default: v1.mcp_signer_default,
         mcp_nonce_key_alias: v1.mcp_nonce_key_alias,
-        usd_threshold: v1.usd_threshold,
+        cross_check_threshold_stroops: v1.usd_threshold,
         classic_fee_per_op_stroops: None,
         classic_max_fee_per_op_stroops: None,
         submit_timeout_seconds: None,
@@ -525,9 +527,57 @@ account = "{name}"
         assert_eq!(loaded.mcp_nonce_key_alias.service, "stellar-agent-nonce");
         assert_eq!(loaded.mcp_nonce_key_alias.account, name);
         assert_eq!(loaded.chain_id, crate::profile::caip2::Caip2::Testnet);
-        // usd_threshold was not set in v1 TOML → defaults to 0 (effective = MINIMUM_FLOOR)
-        assert_eq!(loaded.effective_usd_threshold(), MINIMUM_FLOOR);
+        // usd_threshold (v1 wire key) was not set in v1 TOML → defaults to 0
+        // (effective = MINIMUM_FLOOR)
+        assert_eq!(
+            loaded.effective_cross_check_threshold_stroops(),
+            MINIMUM_FLOOR
+        );
         assert!(!loaded.mcp_disabled);
+    }
+
+    /// An explicit v1 `usd_threshold` value is carried into
+    /// `cross_check_threshold_stroops`, and the migrated file on disk is
+    /// written with the current key only (never the v1 wire key).
+    #[test]
+    fn migrate_v1_carries_explicit_usd_threshold_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "carry-threshold";
+        let above_floor = crate::profile::schema::MINIMUM_FLOOR + 11;
+        let toml = format!(
+            r#"version = 1
+chain_id = "stellar:testnet"
+usd_threshold = {above_floor}
+
+[mcp_signer_default]
+service = "stellar-agent-signer"
+account = "{name}"
+
+[mcp_nonce_key_alias]
+service = "stellar-agent-nonce"
+account = "{name}"
+"#
+        );
+        std::fs::write(dir.path().join(format!("{name}.toml")), toml).unwrap();
+
+        migrate(name, dir.path()).unwrap();
+
+        let written = std::fs::read_to_string(dir.path().join(format!("{name}.toml"))).unwrap();
+        assert!(
+            written.contains("cross_check_threshold_stroops ="),
+            "migrated profile must serialize the current key; got:\n{written}"
+        );
+        assert!(
+            !written.contains("usd_threshold"),
+            "migrated profile must not serialize the v1 wire key; got:\n{written}"
+        );
+
+        let loaded = load_from_dir(name, dir.path(), None).unwrap();
+        assert_eq!(loaded.cross_check_threshold_stroops, above_floor);
+        assert_eq!(
+            loaded.effective_cross_check_threshold_stroops(),
+            above_floor
+        );
     }
 
     // ── migrate_not_found ─────────────────────────────────────────────────────

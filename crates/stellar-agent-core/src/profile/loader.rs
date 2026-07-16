@@ -443,7 +443,7 @@ pub fn load_from_path(
         network_passphrase,
         mcp_signer_default: partial.mcp_signer_default,
         mcp_nonce_key_alias: partial.mcp_nonce_key_alias,
-        usd_threshold: partial.usd_threshold,
+        cross_check_threshold_stroops: partial.cross_check_threshold_stroops,
         classic_fee_per_op_stroops: partial.classic_fee_per_op_stroops,
         classic_max_fee_per_op_stroops: partial.classic_max_fee_per_op_stroops,
         submit_timeout_seconds: partial.submit_timeout_seconds,
@@ -760,7 +760,7 @@ pub fn load_with_overlay_from_dir(
         network_passphrase,
         mcp_signer_default: partial.mcp_signer_default,
         mcp_nonce_key_alias: partial.mcp_nonce_key_alias,
-        usd_threshold: partial.usd_threshold,
+        cross_check_threshold_stroops: partial.cross_check_threshold_stroops,
         classic_fee_per_op_stroops: partial.classic_fee_per_op_stroops,
         classic_max_fee_per_op_stroops: partial.classic_max_fee_per_op_stroops,
         submit_timeout_seconds: partial.submit_timeout_seconds,
@@ -894,8 +894,8 @@ struct PartialProfile {
     rpc_url: Option<String>,
     mcp_signer_default: super::schema::KeyringEntryRef,
     mcp_nonce_key_alias: super::schema::KeyringEntryRef,
-    #[serde(default)]
-    usd_threshold: u64,
+    #[serde(default, alias = "usd_threshold")]
+    cross_check_threshold_stroops: u64,
     #[serde(default)]
     classic_fee_per_op_stroops: Option<u32>,
     #[serde(default)]
@@ -1309,7 +1309,10 @@ account = "default"
             loaded.mcp_nonce_key_alias.service,
             profile.mcp_nonce_key_alias.service
         );
-        assert_eq!(loaded.usd_threshold, profile.usd_threshold);
+        assert_eq!(
+            loaded.cross_check_threshold_stroops,
+            profile.cross_check_threshold_stroops
+        );
         assert!(!loaded.mcp_disabled);
         // v2 fields round-trip
         assert_eq!(
@@ -1357,13 +1360,14 @@ account = "default"
     }
 
     #[test]
-    fn usd_threshold_defaults_to_minimum_floor_on_load() {
-        // A profile TOML with no usd_threshold field should default to 0
-        // (the serde default), and effective_usd_threshold() returns MINIMUM_FLOOR.
+    fn cross_check_threshold_stroops_defaults_to_minimum_floor_on_load() {
+        // A profile TOML with no cross_check_threshold_stroops field should
+        // default to 0 (the serde default), and
+        // effective_cross_check_threshold_stroops() returns MINIMUM_FLOOR.
         let (dir, name) = write_profile(minimal_toml());
         let p = load_from_dir(&name, dir.path(), None).unwrap();
         // raw value is 0 (omitted), effective is MINIMUM_FLOOR
-        assert_eq!(p.effective_usd_threshold(), MINIMUM_FLOOR);
+        assert_eq!(p.effective_cross_check_threshold_stroops(), MINIMUM_FLOOR);
     }
 
     #[test]
@@ -1961,24 +1965,92 @@ account = "a"
         );
     }
 
-    // ── usd_threshold above MINIMUM_FLOOR ────────────────────────────────────
+    // ── cross_check_threshold_stroops above MINIMUM_FLOOR ────────────────────
 
-    /// When `usd_threshold` in the TOML exceeds `MINIMUM_FLOOR`, the raw value
-    /// is preserved and `effective_usd_threshold()` returns that higher value.
+    /// When `cross_check_threshold_stroops` in the TOML exceeds
+    /// `MINIMUM_FLOOR`, the raw value is preserved and
+    /// `effective_cross_check_threshold_stroops()` returns that higher value.
+    /// The saved file carries only the current key: the legacy `usd_threshold`
+    /// name is a deserialize-only alias and must never be written.
     #[test]
-    fn usd_threshold_above_floor_preserved() {
+    fn cross_check_threshold_stroops_above_floor_preserved() {
         let dir = tempfile::tempdir().unwrap();
         let above_floor = MINIMUM_FLOOR + 1;
         let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
-            .with_profile_name("usd-test")
+            .with_profile_name("cross-check-test")
             .audit_log_path(dir.path().join("audit.log"))
-            .usd_threshold(above_floor)
+            .cross_check_threshold_stroops(above_floor)
             .build();
 
-        save_to_dir("usd-test", &profile, dir.path()).unwrap();
-        let loaded = load_from_dir("usd-test", dir.path(), None).unwrap();
-        assert_eq!(loaded.usd_threshold, above_floor);
-        assert_eq!(loaded.effective_usd_threshold(), above_floor);
+        save_to_dir("cross-check-test", &profile, dir.path()).unwrap();
+
+        let written = std::fs::read_to_string(dir.path().join("cross-check-test.toml")).unwrap();
+        assert!(
+            written.contains("cross_check_threshold_stroops ="),
+            "saved profile must serialize the current key; got:\n{written}"
+        );
+        assert!(
+            !written.contains("usd_threshold"),
+            "saved profile must not serialize the legacy key; got:\n{written}"
+        );
+
+        let loaded = load_from_dir("cross-check-test", dir.path(), None).unwrap();
+        assert_eq!(loaded.cross_check_threshold_stroops, above_floor);
+        assert_eq!(
+            loaded.effective_cross_check_threshold_stroops(),
+            above_floor
+        );
+    }
+
+    /// A TOML carrying BOTH the legacy `usd_threshold` key and the current
+    /// `cross_check_threshold_stroops` key is refused at load (serde rejects
+    /// the alias collision as a duplicate field) — fail-closed rather than
+    /// picking one value.
+    #[test]
+    fn both_threshold_keys_present_refuses_to_load() {
+        let toml = minimal_toml_with_extra(&format!(
+            "usd_threshold = {}\ncross_check_threshold_stroops = {}",
+            MINIMUM_FLOOR + 3,
+            MINIMUM_FLOOR + 5
+        ));
+        let (dir, name) = write_profile(&toml);
+        let result = load_from_dir(&name, dir.path(), None);
+        assert!(
+            result.is_err(),
+            "a profile carrying both threshold keys must refuse to load; got: {result:?}"
+        );
+    }
+
+    /// A v2 profile TOML written with the legacy `usd_threshold` key still
+    /// loads via `#[serde(alias = "usd_threshold")]`, and the value populates
+    /// `cross_check_threshold_stroops`.
+    #[test]
+    fn legacy_usd_threshold_key_alias_loads_into_cross_check_threshold_stroops() {
+        let above_floor = MINIMUM_FLOOR + 7;
+        let toml = minimal_toml_with_extra(&format!("usd_threshold = {above_floor}"));
+        let (dir, name) = write_profile(&toml);
+        let loaded = load_from_dir(&name, dir.path(), None).unwrap();
+        assert_eq!(loaded.cross_check_threshold_stroops, above_floor);
+        assert_eq!(
+            loaded.effective_cross_check_threshold_stroops(),
+            above_floor
+        );
+    }
+
+    /// A v2 profile TOML written with the current `cross_check_threshold_stroops`
+    /// key loads identically to the legacy-key form.
+    #[test]
+    fn current_cross_check_threshold_stroops_key_loads() {
+        let above_floor = MINIMUM_FLOOR + 7;
+        let toml =
+            minimal_toml_with_extra(&format!("cross_check_threshold_stroops = {above_floor}"));
+        let (dir, name) = write_profile(&toml);
+        let loaded = load_from_dir(&name, dir.path(), None).unwrap();
+        assert_eq!(loaded.cross_check_threshold_stroops, above_floor);
+        assert_eq!(
+            loaded.effective_cross_check_threshold_stroops(),
+            above_floor
+        );
     }
 
     // ── Mainnet profile round-trip ────────────────────────────────────────────

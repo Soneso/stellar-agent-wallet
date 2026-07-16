@@ -112,7 +112,7 @@ struct ProfileMetadataResource {
     rpc_url: String,
     network_passphrase: String,
     mcp_disabled: bool,
-    usd_threshold: u64,
+    cross_check_threshold_stroops: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -140,7 +140,7 @@ impl From<&Profile> for ProfileMetadataResource {
             rpc_url: profile.rpc_url.clone(),
             network_passphrase: profile.network_passphrase.clone(),
             mcp_disabled: profile.mcp_disabled,
-            usd_threshold: profile.usd_threshold,
+            cross_check_threshold_stroops: profile.cross_check_threshold_stroops,
         }
     }
 }
@@ -1225,7 +1225,7 @@ mod tests {
             "default",
         )
         .with_profile_name("alice")
-        .usd_threshold(MINIMUM_FLOOR + 42)
+        .cross_check_threshold_stroops(MINIMUM_FLOOR + 42)
         .build()
     }
 
@@ -1270,15 +1270,15 @@ mod tests {
             keys,
             [
                 "chain_id",
+                "cross_check_threshold_stroops",
                 "mcp_disabled",
                 "network_passphrase",
                 "rpc_url",
-                "usd_threshold"
             ]
         );
         assert_eq!(value["chain_id"], "stellar:testnet");
         assert_eq!(value["mcp_disabled"], false);
-        assert_eq!(value["usd_threshold"], MINIMUM_FLOOR + 42);
+        assert_eq!(value["cross_check_threshold_stroops"], MINIMUM_FLOOR + 42);
 
         assert!(!text.contains("stellar-agent-signer"));
         assert!(!text.contains("stellar-agent-nonce"));

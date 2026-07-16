@@ -1710,8 +1710,8 @@ pub(crate) enum CrossCheckOutcome {
 /// 1. `asset_is_native` is `true` (native XLM only; non-native skipped
 ///    unconditionally — native-stroop threshold; non-native expansion paired
 ///    with a USD oracle is a future candidate).
-/// 2. `value_stroops >= profile.effective_usd_threshold()` — the transaction
-///    value is at or above the configured high-value floor.
+/// 2. `value_stroops >= profile.effective_cross_check_threshold_stroops()` —
+///    the transaction value is at or above the configured high-value floor.
 /// 3. `profile.oracle_provider_url` is configured.
 ///
 /// When condition 2 is met but `oracle_provider_url` is unset, the cross-check
@@ -1769,7 +1769,7 @@ where
     }
 
     // Guard 2: value must be at or above the effective threshold.
-    let threshold = profile.effective_usd_threshold();
+    let threshold = profile.effective_cross_check_threshold_stroops();
     // i64 → u64: Stellar protocol enforces non-negative stroop amounts for
     // Payment and CreateAccount operations at the XDR-validation layer.
     // `decode_authoritative_args` already rejects negative values via serde_json
@@ -2661,7 +2661,7 @@ mod tests {
             "same-envelope-xdr",
             "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI",
             true,
-            i64::try_from(profile.effective_usd_threshold()).unwrap(),
+            i64::try_from(profile.effective_cross_check_threshold_stroops()).unwrap(),
             |_client| async { Ok("same-envelope-xdr".to_owned()) },
             "stellar_pay_commit",
         )
@@ -2711,7 +2711,7 @@ mod tests {
             &primary_xdr,
             "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI",
             true,
-            i64::try_from(profile.effective_usd_threshold()).unwrap(),
+            i64::try_from(profile.effective_cross_check_threshold_stroops()).unwrap(),
             |_client| {
                 let xdr = oracle_xdr.clone();
                 async move { Ok(xdr) }
@@ -2778,7 +2778,7 @@ mod tests {
             "same-envelope-xdr",
             "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI",
             true,
-            i64::try_from(profile.effective_usd_threshold()).unwrap(),
+            i64::try_from(profile.effective_cross_check_threshold_stroops()).unwrap(),
             move |_client| {
                 let calls = Arc::clone(&calls_for_closure);
                 async move {
@@ -2827,7 +2827,7 @@ mod tests {
             "same-envelope-xdr",
             "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI",
             true,
-            i64::try_from(profile.effective_usd_threshold()).unwrap(),
+            i64::try_from(profile.effective_cross_check_threshold_stroops()).unwrap(),
             move |_client| {
                 let calls = Arc::clone(&calls_for_closure);
                 async move {
