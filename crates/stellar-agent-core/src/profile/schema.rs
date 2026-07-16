@@ -29,7 +29,9 @@
 //! look up those entries.  The lookup itself happens in
 //! `stellar-agent-network::keyring`.
 
+use std::fmt;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -120,6 +122,48 @@ impl KeyringEntryRef {
             service: service.into(),
             account: account.into(),
         }
+    }
+
+    /// Constructs the default MCP-signer keyring entry reference for a
+    /// profile.
+    ///
+    /// Entry name: `stellar-agent-signer-<profile>` / `default`. The
+    /// `account` is the placeholder that `profile enroll-signer` pins to the
+    /// signer's derived G-strkey at first enrollment; until then no keyring
+    /// entry exists at this coordinate.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::profile::schema::KeyringEntryRef;
+    ///
+    /// let r = KeyringEntryRef::default_signer("alice");
+    /// assert_eq!(r.service, "stellar-agent-signer-alice");
+    /// assert_eq!(r.account, "default");
+    /// ```
+    #[must_use]
+    pub fn default_signer(profile_name: &str) -> Self {
+        Self::new(format!("stellar-agent-signer-{profile_name}"), "default")
+    }
+
+    /// Constructs the default HMAC nonce-key keyring entry reference for a
+    /// profile.
+    ///
+    /// Entry name: `stellar-agent-nonce-<profile>` / `default`. The `account`
+    /// is a coordinate label only (no identity semantics).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::profile::schema::KeyringEntryRef;
+    ///
+    /// let r = KeyringEntryRef::default_nonce("alice");
+    /// assert_eq!(r.service, "stellar-agent-nonce-alice");
+    /// assert_eq!(r.account, "default");
+    /// ```
+    #[must_use]
+    pub fn default_nonce(profile_name: &str) -> Self {
+        Self::new(format!("stellar-agent-nonce-{profile_name}"), "default")
     }
 
     /// Constructs the default audit-key keyring entry reference for a profile.
@@ -311,6 +355,49 @@ pub enum PolicyEngineKind {
     /// `rotate-audit-key` runbook steps.
     #[default]
     V1,
+}
+
+impl fmt::Display for PolicyEngineKind {
+    /// Renders the wire-format engine name (`"noop"` or `"v1"`) — the same
+    /// strings the TOML `[policy] engine` field and [`FromStr::from_str`]
+    /// accept.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Noop => "noop",
+            Self::V1 => "v1",
+        })
+    }
+}
+
+impl FromStr for PolicyEngineKind {
+    type Err = PolicyEngineKindParseError;
+
+    /// Parses a policy-engine name, case-insensitively.
+    ///
+    /// Accepted values: `"noop"`, `"v1"`. Used by `clap` to parse the
+    /// `stellar-agent profile init --engine` flag via `#[arg(default_value_t
+    /// = ...)]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyEngineKindParseError`] for any other input.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "noop" => Ok(Self::Noop),
+            "v1" => Ok(Self::V1),
+            other => Err(PolicyEngineKindParseError::Unknown(other.to_owned())),
+        }
+    }
+}
+
+/// Error returned by [`PolicyEngineKind::from_str`] for an unrecognised
+/// engine name.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PolicyEngineKindParseError {
+    /// The supplied string is not `"noop"` or `"v1"`.
+    #[error("unknown policy engine '{0}'; supported values: noop, v1")]
+    Unknown(String),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2307,6 +2394,42 @@ mod tests {
         };
         let toml_str = toml::to_string(&cfg).unwrap();
         assert!(toml_str.contains("noop"), "noop must serialise as 'noop'");
+    }
+
+    #[test]
+    fn policy_engine_kind_from_str_round_trips() {
+        assert_eq!(
+            PolicyEngineKind::from_str("v1").unwrap(),
+            PolicyEngineKind::V1
+        );
+        assert_eq!(
+            PolicyEngineKind::from_str("V1").unwrap(),
+            PolicyEngineKind::V1
+        );
+        assert_eq!(
+            PolicyEngineKind::from_str("noop").unwrap(),
+            PolicyEngineKind::Noop
+        );
+        assert_eq!(
+            PolicyEngineKind::from_str("NOOP").unwrap(),
+            PolicyEngineKind::Noop
+        );
+        assert!(PolicyEngineKind::from_str("v2").is_err());
+        assert!(PolicyEngineKind::from_str("").is_err());
+    }
+
+    #[test]
+    fn policy_engine_kind_display_matches_wire_strings() {
+        assert_eq!(PolicyEngineKind::V1.to_string(), "v1");
+        assert_eq!(PolicyEngineKind::Noop.to_string(), "noop");
+    }
+
+    #[test]
+    fn policy_engine_kind_display_from_str_are_inverses() {
+        for kind in [PolicyEngineKind::V1, PolicyEngineKind::Noop] {
+            let s = kind.to_string();
+            assert_eq!(PolicyEngineKind::from_str(&s).unwrap(), kind);
+        }
     }
 
     #[test]

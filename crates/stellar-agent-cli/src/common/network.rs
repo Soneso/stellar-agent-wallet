@@ -1,6 +1,7 @@
 //! [`TargetNetwork`] enum — shared network selector for all write subcommands.
 //!
-//! Unifies the network selector across `pay` and `accounts create`.
+//! Unifies the network selector across `pay`, `accounts create`, and
+//! `profile init`.
 //! Implements `FromStr` + `Display` so clap can use it with
 //! `default_value = "testnet"`.
 //!

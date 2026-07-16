@@ -177,7 +177,11 @@ stellar-agent pay GDEST...WXYZ "10 XLM" --source GABC...WXYZ --secret-env WALLET
 
 `stellar-agent profile show default` requires an existing profile file and exits
 `1` on a clean install. The synthesised in-memory testnet default is used only by
-`stellar-agent-mcp` startup, not by `profile show`.
+`stellar-agent-mcp` startup, not by `profile show`. Run
+`stellar-agent profile init` to create `default.toml` — it writes
+`engine = "v1"` by default, which keeps the MCP server refusing to start until
+the V1 key ceremony completes; pass `--engine noop` for a zero-ceremony testnet
+profile that works immediately.
 
 Commands print a JSON envelope on stdout by default and exit `0` on success or
 `1` on any error. A profile holds no secrets: it binds a CAIP-2 chain

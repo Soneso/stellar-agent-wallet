@@ -148,8 +148,36 @@ The default profile name is `default`. The `balances` and `pay` commands below
 take an explicit `--account`/`--source` and `--rpc-url` (defaulting to the
 testnet RPC), so they work without authoring a profile file. Profile-aware
 commands synthesise an in-memory testnet profile when no `default.toml` exists.
-To make a profile persistent, place a TOML file at the path above. A minimal
-version-2 testnet profile:
+
+To create a persistent profile, run `profile init`:
+
+```bash
+stellar-agent profile init
+```
+
+This writes `<profile_dir>/default.toml` with `engine = "v1"` (the default)
+and placeholder signer/nonce keyring coordinates. The full setup flow is:
+
+1. `profile init` — create the profile file (this step).
+2. [`profile enroll-signer`](#enroll-the-mcp-signer) — register the MCP signer seed.
+3. For the `v1` engine only, the full ceremony: `profile enroll-owner-key`,
+   `profile rotate-attestation-key`, `profile rotate-audit-key`, then
+   `profile sign-policy` (the normative list is the
+   [`profile init` reference entry](cli-reference/profile-and-governance.md#profile-init);
+   see also [Opt in to V1](profiles.md#opt-in-to-v1)).
+
+Pass `--profile <NAME>` for a non-default profile, `--rpc-url <URL>` to
+override the testnet default, `--network mainnet --rpc-url <URL>` for a
+mainnet profile (mainnet requires an explicit `https://` `--rpc-url` — the
+built-in default requires an API key and answers HTTP 401 unauthenticated, so
+persisting it would mint a broken configuration), and `--engine noop` to
+skip the V1 owner-key ceremony for now. See [`profile
+init`](cli-reference/profile-and-governance.md#profile-init) for the full
+flag reference.
+
+For reference, here is the shape a testnet profile takes after enrolling a
+signer (a minimal version-2 profile; shown here with `engine = "noop"` for a
+permissive testnet start — `profile init`'s default is `engine = "v1"`):
 
 ```toml
 version = 2
@@ -187,10 +215,13 @@ engine = "noop"
 In `[mcp_signer_default]`, `account` is the signer's identity: it must be the
 G-strkey (public address) that the enrolled signer seed derives to. The MCP tools
 and the keyring-signing CLI verbs verify the loaded seed against this value, so a
-placeholder such as `"default"` never signs. Replace `GABC...WXYZ` with your
-signer's public address and enroll the matching seed with
-[`profile enroll-signer`](#enroll-the-mcp-signer). The `account` field on the
-other entries is only a keyring coordinate label and may stay `"default"`.
+placeholder such as `"default"` never signs. A profile minted by `profile init`
+starts with that placeholder; running
+[`profile enroll-signer`](#enroll-the-mcp-signer) populates it automatically
+with the enrolled seed's derived address. To pin the signer identity to a
+specific address in advance — refusing any other seed — set `account` to that
+G-strkey yourself before enrolling. The `account` field on the other entries is
+only a keyring coordinate label and may stay `"default"`.
 
 The `[policy] engine` value is `noop` or `v1`:
 
@@ -264,13 +295,18 @@ those paths fail with `auth.keyring_not_found` until you enroll a seed. Enrollme
 reads the `S...` secret from a named environment variable, derives its public
 address, and stores it in the platform keyring — the secret is never printed.
 
-Set `[mcp_signer_default] account` in the profile to the signer's public address
-first (enrollment refuses if it does not match the seed), then enroll:
+On a profile fresh from `profile init`, `mcp_signer_default.account` is still
+the placeholder `"default"`; enrollment populates it automatically with the
+enrolled seed's derived address:
 
 ```bash
 export WALLET_SK=S...your-testnet-secret...
 stellar-agent profile enroll-signer --profile default --secret-env WALLET_SK
 ```
+
+To pin the signer identity to a specific address in advance — refusing any
+other seed — set `account` to that G-strkey yourself before enrolling;
+enrollment then refuses on a mismatch rather than overwriting it.
 
 Flags:
 
@@ -282,8 +318,10 @@ Flags:
   seed derives to this address.
 - `--force` — replace an already-enrolled entry.
 
-The JSON envelope reports the derived `public_address` and the keyring coordinate
-written. If the profile's `account` does not match the derived address, the
+The JSON envelope reports the derived `public_address`, the keyring coordinate
+written, and `account_populated` (`true` when a placeholder was filled in,
+`false` when the account already pinned an identity). If the profile's
+`account` already pins a *different* G-strkey than the derived address, the
 command refuses and prints the address to set `account` to.
 
 ## Check a balance

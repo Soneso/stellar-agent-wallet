@@ -31,6 +31,10 @@ the MCP server reads on startup; when no `default.toml` exists yet, the server
 falls back to an in-memory testnet configuration so it can still serve read-only
 requests (this fallback is never written to disk).
 
+Create a new profile file with `stellar-agent profile init`; see
+[cli-reference/profile-and-governance.md](cli-reference/profile-and-governance.md#profile-init)
+for flags and defaults.
+
 ## Loader source order
 
 A profile is assembled from three layered sources. Higher-priority sources
@@ -207,25 +211,36 @@ on error.
 ### Enroll the MCP signer
 
 The signer seed is imported, not minted: it is the operator's own account key.
-Set `[mcp_signer_default] account` to that account's G-strkey (public address),
-then import the matching `S...` secret from a named environment variable:
+Import the `S...` secret from a named environment variable:
 
 ```bash
 export WALLET_SK=S...signer-secret...
 stellar-agent profile enroll-signer --profile <name> --secret-env WALLET_SK
 ```
 
-Enrollment derives the seed's public address, refuses if it does not equal the
-profile's `account` (printing the address to set `account` to), and stores the
-seed in the keyring. Without it, the MCP tools and the keyring-signing CLI verbs
-(`trustline`, `lend`, `trade`, `vault`) fail with `auth.keyring_not_found`. See
+Enrollment derives the seed's public address and stores the seed in the
+keyring. What happens to `[mcp_signer_default] account` depends on its current
+value: a profile fresh from `profile init` (and a v1-migrated profile that
+still carries it) holds the
+placeholder `"default"`, which enrollment overwrites in place with the derived
+address; a profile whose `account` already pins a G-strkey — from a prior
+enrollment, or set by hand — is left untouched, and enrollment refuses if the
+seed does not derive to that exact address (printing the address to set
+`account` to). Without an enrolled seed, the MCP tools and the
+keyring-signing CLI verbs (`trustline`, `lend`, `trade`, `vault`) fail with
+`auth.keyring_not_found`. See
 [cli-reference/profile-and-governance.md](cli-reference/profile-and-governance.md#profile-enroll-signer)
 for flags and the envelope shape.
 
 ### Opt in to V1
 
-After rotating the owner, attestation, and audit keys, set the engine to V1 in
-the profile TOML:
+The ceremony is the same for both profile origins: enroll the owner key, mint
+the attestation and audit keys, and sign a policy file (the normative command
+list is the
+[`profile init` reference entry](cli-reference/profile-and-governance.md#profile-init)).
+An `init`-minted profile already carries `engine = "v1"` — complete the
+ceremony and it becomes operational. A profile migrated from schema v1 stays
+on `noop`; after the ceremony, set the engine in the profile TOML:
 
 ```toml
 [policy]

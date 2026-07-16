@@ -15,10 +15,36 @@
 //!
 //! The `mcp_signer_default` coordinate's `account` field is both the keyring
 //! account name and the G-strkey identity that `signer_from_keyring` verifies
-//! the loaded seed against.  A seed whose derived address does not equal that
-//! `account` can never sign, so enrollment refuses when they differ and reports
-//! the address the operator must set `account` to.  The operator's profile TOML
-//! is never rewritten.
+//! the loaded seed against.  `stellar-agent profile init` mints new profiles
+//! with the literal placeholder account `"default"` because the signer's
+//! eventual G-strkey is not known until a seed is enrolled.  Enrollment
+//! classifies the coordinate from its RAW ON-DISK value
+//! (`loader::read_signer_ref`) — never from the environment-merged load, so a
+//! transient `STELLAR_AGENT_*` overlay cannot influence what gets persisted
+//! into the trust root — and resolves three cases:
+//!
+//! - **Placeholder** (`account` is exactly the literal `"default"`) — this is
+//!   the coordinate's first enrollment.  `loader::pin_signer_account` patches
+//!   ONLY `mcp_signer_default.account` in the on-disk document to the derived
+//!   G-strkey (every other stored key survives verbatim), BEFORE the keyring
+//!   write, so `signer_from_keyring` resolves correctly the moment the
+//!   profile is next loaded.  Persisting the account first keeps the flow
+//!   convergent: if the process dies between the two writes, the account
+//!   already equals the derived address, so re-running enroll-signer takes
+//!   the "pinned" branch below and simply retries the keyring write.  Every
+//!   refusal path precedes the pin, so a refused run modifies nothing.
+//! - **Pinned** (`account` parses as a G-strkey — set by a prior enrollment,
+//!   or by an operator who hand-edited the TOML) — enrollment refuses unless
+//!   the supplied seed derives to that exact address, printing the address to
+//!   set `account` to.  A different secret can never silently redirect an
+//!   already-established signer identity, and the profile TOML is never
+//!   rewritten in this branch.
+//! - **Malformed** (anything else — a typo'd or truncated strkey, an
+//!   M-strkey, stray whitespace) — refused with
+//!   `enroll_signer.account_malformed` rather than treated as a placeholder:
+//!   a broken pin is surfaced to the operator, never silently replaced.
+//!
+//! `EnrollSignerData::account_populated` reports which branch a given run took.
 //!
 //! # Secret handling
 //!
@@ -42,11 +68,14 @@
 //!     "public_address": "G...",
 //!     "keyring_service": "stellar-agent-signer-default",
 //!     "keyring_account": "G...",
-//!     "replaced": false
+//!     "replaced": false,
+//!     "account_populated": true
 //!   },
 //!   "request_id": "..."
 //! }
 //! ```
+
+use std::path::PathBuf;
 
 use clap::Args;
 use keyring_core::Entry as KeyringEntry;
@@ -58,7 +87,7 @@ use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{AuthError, InternalError, ValidationError, WalletError};
 use stellar_agent_core::observability::RedactedStrkey;
 use stellar_agent_core::profile::loader;
-use stellar_agent_core::profile::schema::Profile;
+use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
 use stellar_agent_network::Signer as _;
 use stellar_agent_network::keyring::{init_platform_keyring_store, signer_from_keyring};
 use uuid::Uuid;
@@ -67,6 +96,11 @@ use crate::common::render;
 use crate::common::signer_ceremony::resolve_software_signer_from_env;
 
 use super::audit_emit::emit_keyring_key_written;
+
+/// The literal placeholder account minted by `profile init` and the first-run
+/// fallback. Only this exact value is populated at enrollment; any other
+/// non-G-strkey value is refused as a malformed pin.
+const PLACEHOLDER_ACCOUNT: &str = "default";
 
 /// Arguments for `stellar-agent profile enroll-signer`.
 #[derive(Debug, Args)]
@@ -117,6 +151,12 @@ struct EnrollSignerData {
     /// existed and its stored value could be parsed.  Absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     previous_address: Option<String>,
+    /// `true` when the profile's on-disk `mcp_signer_default.account` was the
+    /// literal placeholder `"default"` and this run pinned it to the derived
+    /// public address (patching only that key in the profile file).  `false`
+    /// when the account already pinned a G-strkey identity (see
+    /// "Account-as-identity" in the module documentation).
+    account_populated: bool,
 }
 
 /// Runs `stellar-agent profile enroll-signer`.
@@ -134,28 +174,44 @@ pub(crate) async fn run(args: &EnrollSignerArgs) -> i32 {
     run_with_dependencies(
         args,
         |name| loader::load(name, None),
+        loader::read_signer_ref,
+        loader::pin_signer_account,
         init_platform_keyring_store,
     )
     .await
 }
 
-/// Testable core of [`run`] with the profile loader and the platform-keyring
+/// Testable core of [`run`] with the profile loader, the raw on-disk
+/// signer-ref reader, the single-field pin writer, and the platform-keyring
 /// initialiser injected.
 ///
-/// Production callers use [`run`], which supplies the real profile loader and
-/// [`init_platform_keyring_store`]. Tests substitute an in-memory profile and a
-/// spy initialiser so the enrollment path can be exercised against a mock
-/// keyring store without touching the OS keychain.
-async fn run_with_dependencies<LoadProfile, InitKeyring>(
+/// Production callers use [`run`], which supplies the real loader
+/// ([`loader::load`], for the audit-emission context only),
+/// [`loader::read_signer_ref`] (the raw on-disk read that classification is
+/// built on — environment overlays never reach it), and
+/// [`loader::pin_signer_account`] (the raw-document patch that writes only
+/// `mcp_signer_default.account`). Tests substitute in-memory equivalents so
+/// the enrollment path — including the placeholder-account pin, see
+/// "Account-as-identity" in the module documentation — can be exercised
+/// against a mock keyring store without touching the OS keychain or a
+/// persisted profile file.
+async fn run_with_dependencies<LoadProfile, ReadRawSignerRef, PinSigner, InitKeyring>(
     args: &EnrollSignerArgs,
     load_profile: LoadProfile,
+    read_raw_signer_ref: ReadRawSignerRef,
+    pin_signer: PinSigner,
     init_keyring: InitKeyring,
 ) -> i32
 where
     LoadProfile: Fn(&str) -> Result<Profile, loader::ProfileLoadError>,
+    ReadRawSignerRef: Fn(&str) -> Result<KeyringEntryRef, loader::ProfileLoadError>,
+    PinSigner: Fn(&str, &str) -> Result<PathBuf, loader::ProfileSaveError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
     // ── Load profile first, then initialise the keyring store ─────────────────
+    // The env-merged load supplies the audit-emission context at the end of
+    // the flow; every enrollment DECISION below uses the raw on-disk signer
+    // reference instead, so environment overlays stay load-time-only.
     let profile = match load_profile(&args.profile) {
         Ok(p) => p,
         Err(loader::ProfileLoadError::NotFound { name, .. }) => {
@@ -176,7 +232,29 @@ where
         return 1;
     }
 
-    let entry_ref = &profile.mcp_signer_default;
+    // ── Raw on-disk signer reference ───────────────────────────────────────────
+    // Classification (placeholder vs pinned) and the pin itself operate on
+    // the stored document alone: a `STELLAR_AGENT_MCP_SIGNER_DEFAULT`
+    // environment overlay can redirect a load, but must never influence what
+    // enrollment persists into the trust root.
+    let signer_ref = match read_raw_signer_ref(&args.profile) {
+        Ok(r) => r,
+        Err(loader::ProfileLoadError::NotFound { name, .. }) => {
+            let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
+            render::render_json(&Envelope::<()>::err(&err));
+            return 1;
+        }
+        Err(e) => {
+            let err = WalletError::Internal(InternalError::UnexpectedState {
+                detail: format!(
+                    "failed to read the on-disk signer reference for profile '{}': {e}",
+                    args.profile
+                ),
+            });
+            render::render_json(&Envelope::<()>::err(&err));
+            return 1;
+        }
+    };
 
     // ── Derive the public address from the env S-strkey ───────────────────────
     // Reuses the shared mlock-protected env-seed ceremony; the seed never leaves
@@ -223,10 +301,16 @@ where
         }
     }
 
-    // ── Account-as-identity guard (no write on mismatch) ──────────────────────
-    // signer_from_keyring verifies the loaded seed derives to the coordinate's
-    // `account`; a seed for a different address could never sign.
-    if entry_ref.account != derived_g {
+    // ── Account-as-identity resolution ────────────────────────────────────────
+    // See "Account-as-identity" in the module documentation, evaluated on the
+    // RAW on-disk value: the literal placeholder `"default"` (the value
+    // `profile init` and the first-run fallback mint) is populated; a valid
+    // G-strkey is a pinned identity (refuse on mismatch, never rewrite); any
+    // other value is a malformed pin and is refused rather than replaced.
+    let account_is_pinned_identity =
+        stellar_strkey::ed25519::PublicKey::from_string(&signer_ref.account).is_ok();
+
+    if account_is_pinned_identity && signer_ref.account != derived_g {
         render::render_json(&Envelope::<()>::err_raw(
             "enroll_signer.account_identity_mismatch",
             format!(
@@ -234,11 +318,30 @@ where
                  derives to '{derived_g}'. Set the profile's mcp_signer_default account to \
                  '{derived_g}' (or supply the seed whose address is '{}') and re-run; no entry \
                  was written.",
-                args.profile, entry_ref.account, entry_ref.account
+                args.profile, signer_ref.account, signer_ref.account
             ),
         ));
         return 1;
     }
+
+    if !account_is_pinned_identity && signer_ref.account != PLACEHOLDER_ACCOUNT {
+        render::render_json(&Envelope::<()>::err_raw(
+            "enroll_signer.account_malformed",
+            format!(
+                "profile '{}' names signer account '{}', which is neither the placeholder \
+                 '{PLACEHOLDER_ACCOUNT}' nor a valid G-strkey; a malformed pin is refused \
+                 rather than replaced. Set the profile's mcp_signer_default account to \
+                 '{PLACEHOLDER_ACCOUNT}' (to enroll fresh) or to the signer's G-strkey, then \
+                 re-run; no entry was written and the profile was not modified.",
+                args.profile, signer_ref.account
+            ),
+        ));
+        return 1;
+    }
+
+    let account_populated = !account_is_pinned_identity;
+
+    let entry_ref = KeyringEntryRef::new(signer_ref.service.clone(), derived_g.clone());
 
     // ── Overwrite protection ──────────────────────────────────────────────────
     let entry = match KeyringEntry::new(&entry_ref.service, &entry_ref.account) {
@@ -291,7 +394,7 @@ where
     // Derive the address the replaced entry resolves to for the envelope. Reuses
     // the real keyring consumer path; addresses only, never the seed.
     let previous_address: Option<String> = if existing_present {
-        match signer_from_keyring(entry_ref, &entry_ref.account).await {
+        match signer_from_keyring(&entry_ref, &entry_ref.account).await {
             // `KeyringSignHandle::public_key` returns the cached derived address
             // synchronously and infallibly.
             Ok(handle) => Some(handle.public_key().to_string().to_string()),
@@ -301,6 +404,27 @@ where
     } else {
         None
     };
+
+    // ── Placeholder pin: persist the derived address into the TOML ────────────
+    // Every refusal path above is write-free; the pin runs only once the
+    // enrollment is definitely proceeding, and BEFORE the keyring write. If
+    // the process fails between the two writes, the on-disk account already
+    // equals the derived address, so a re-run takes the "pinned" branch and
+    // simply retries the keyring write — the flow always converges. The pin
+    // patches only `mcp_signer_default.account` on the stored document;
+    // nothing else in the file changes, and no environment overlay can leak
+    // into it.
+    if account_populated && let Err(e) = pin_signer(&args.profile, &derived_g) {
+        render::render_json(&Envelope::<()>::err(&WalletError::Internal(
+            InternalError::UnexpectedState {
+                detail: format!(
+                    "failed to persist the derived signer address into profile '{}': {e}",
+                    args.profile
+                ),
+            },
+        )));
+        return 1;
+    }
 
     // ── Write the S-strkey verbatim to the keyring coordinate ─────────────────
     let s_strkey: Zeroizing<String> = match std::env::var(&args.secret_env) {
@@ -332,7 +456,7 @@ where
         &args.profile,
         "profile_enroll_signer",
         KeyPurpose::McpSignerSeed,
-        entry_ref,
+        &entry_ref,
         Some(RedactedStrkey::from_full(&derived_g)),
         &request_id,
     );
@@ -348,6 +472,7 @@ where
         keyring_account: entry_ref.account.clone(),
         replaced: existing_present,
         previous_address,
+        account_populated,
     }));
     0
 }
@@ -440,6 +565,31 @@ mod tests {
         format!("ENROLL_SIGNER_TEST_{tag}_{}", std::process::id())
     }
 
+    /// A `pin_signer` stub that panics if invoked.
+    ///
+    /// Used by every fixture whose `mcp_signer_default.account` already pins a
+    /// G-strkey identity (and by refusal fixtures), asserting those paths
+    /// never write the profile TOML (see "Account-as-identity" in the module
+    /// documentation).
+    fn pin_signer_must_not_be_called(
+        _name: &str,
+        _account: &str,
+    ) -> Result<PathBuf, loader::ProfileSaveError> {
+        panic!(
+            "pin_signer must not be called when the account already pins a \
+             G-strkey identity or the run refuses"
+        );
+    }
+
+    /// Builds the raw-signer-ref injection for a profile fixture: the raw
+    /// on-disk view in these unit tests is the fixture's own signer ref.
+    fn raw_ref_of(
+        profile: &Profile,
+    ) -> impl Fn(&str) -> Result<KeyringEntryRef, loader::ProfileLoadError> + 'static {
+        let r = profile.mcp_signer_default.clone();
+        move |_n| Ok(r.clone())
+    }
+
     #[tokio::test]
     #[serial]
     async fn enroll_happy_path_writes_entry_and_produces_working_signer() {
@@ -451,9 +601,12 @@ mod tests {
         let profile = profile_with_signer_account(&derived_g);
         let entry_ref = profile.mcp_signer_default.clone();
 
+        let raw = raw_ref_of(&profile);
         let code = run_with_dependencies(
             &args(&var, None, false),
             move |_n| Ok(profile.clone()),
+            raw,
+            pin_signer_must_not_be_called,
             || Ok(()),
         )
         .await;
@@ -490,9 +643,12 @@ mod tests {
         // A different, valid G-strkey as the wrong expectation.
         let (_other_s, other_g) = seed_material([0x33u8; 32]);
 
+        let raw = raw_ref_of(&profile);
         let code = run_with_dependencies(
             &args(&var, Some(&other_g), false),
             move |_n| Ok(profile.clone()),
+            raw,
+            pin_signer_must_not_be_called,
             || Ok(()),
         )
         .await;
@@ -519,9 +675,12 @@ mod tests {
         let profile = profile_with_signer_account(&wrong_account);
         let entry_ref = profile.mcp_signer_default.clone();
 
+        let raw = raw_ref_of(&profile);
         let code = run_with_dependencies(
             &args(&var, None, false),
             move |_n| Ok(profile.clone()),
+            raw,
+            pin_signer_must_not_be_called,
             || Ok(()),
         )
         .await;
@@ -549,9 +708,12 @@ mod tests {
         let pre = KeyringEntry::new(&entry_ref.service, &entry_ref.account).unwrap();
         pre.set_password("preexisting-sentinel").unwrap();
 
+        let raw = raw_ref_of(&profile);
         let code = run_with_dependencies(
             &args(&var, None, false),
             move |_n| Ok(profile.clone()),
+            raw,
+            pin_signer_must_not_be_called,
             || Ok(()),
         )
         .await;
@@ -582,9 +744,12 @@ mod tests {
         let pre = KeyringEntry::new(&entry_ref.service, &entry_ref.account).unwrap();
         pre.set_password(&other_s).unwrap();
 
+        let raw = raw_ref_of(&profile);
         let code = run_with_dependencies(
             &args(&var, None, true),
             move |_n| Ok(profile.clone()),
+            raw,
+            pin_signer_must_not_be_called,
             || Ok(()),
         )
         .await;
@@ -596,6 +761,174 @@ mod tests {
         assert!(
             stored == s_strkey,
             "the coordinate must now hold the newly enrolled S-strkey"
+        );
+    }
+
+    /// The completeness round trip a `profile init`-minted profile requires:
+    /// the on-disk `mcp_signer_default.account` starts as the literal
+    /// placeholder `"default"`, so enrollment must pin it to the derived
+    /// G-strkey BEFORE writing the keyring secret, and the keyring write
+    /// itself must land at the DERIVED coordinate, not the placeholder one.
+    /// The pin closure asserts the ordering: when it runs, the keyring
+    /// coordinate must still be empty. Without this flow, an `init`-created
+    /// profile could never enroll a working signer (see "Account-as-identity"
+    /// in the module documentation).
+    #[tokio::test]
+    #[serial]
+    async fn enroll_on_placeholder_account_populates_profile_before_keyring_write() {
+        keyring_mock::install().expect("mock store");
+        let (s_strkey, derived_g) = seed_material([0x77u8; 32]);
+        let var = unique_var("PLACEHOLDER");
+        let _guard = EnvGuard::set(var.clone(), &s_strkey);
+
+        // The literal placeholder `profile init` mints.
+        let profile = profile_with_signer_account("default");
+        let signer_service = profile.mcp_signer_default.service.clone();
+        let raw = raw_ref_of(&profile);
+
+        let pinned: std::sync::Arc<std::sync::Mutex<Option<(String, String)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let pinned_for_closure = pinned.clone();
+        let service_for_closure = signer_service.clone();
+
+        let code = run_with_dependencies(
+            &args(&var, None, false),
+            move |_n| Ok(profile.clone()),
+            raw,
+            move |name, account| {
+                // Ordering pin: the keyring write must not have happened yet
+                // when the profile pin runs (TOML-before-keyring convergence).
+                let probe = KeyringEntry::new(&service_for_closure, account).unwrap();
+                assert!(
+                    probe.get_password().is_err(),
+                    "the keyring coordinate must still be empty when the pin runs"
+                );
+                *pinned_for_closure.lock().unwrap() = Some((name.to_owned(), account.to_owned()));
+                Ok(PathBuf::from("/unused-in-test/default.toml"))
+            },
+            || Ok(()),
+        )
+        .await;
+        assert_eq!(code, 0, "enroll must succeed against a placeholder account");
+
+        let (pinned_name, pinned_account) = pinned
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("pin_signer must have been called for a placeholder account");
+        assert_eq!(pinned_name, "enroll-signer-test");
+        assert_eq!(
+            pinned_account, derived_g,
+            "the pin must carry the derived G-strkey"
+        );
+
+        // The keyring secret itself lands at the DERIVED coordinate, not the
+        // placeholder — the exact coordinate a subsequent profile load (which
+        // now carries the derived account) resolves via `signer_from_keyring`.
+        let entry = KeyringEntry::new(&signer_service, &derived_g).unwrap();
+        let stored = entry
+            .get_password()
+            .expect("entry must be present at the derived coordinate");
+        assert!(
+            stored == s_strkey,
+            "the stored value must be the verbatim S-strkey"
+        );
+
+        let entry_ref = KeyringEntryRef::new(signer_service, derived_g.clone());
+        let handle = signer_from_keyring(&entry_ref, &derived_g)
+            .await
+            .expect("signer_from_keyring must succeed after enroll");
+        assert_eq!(handle.public_key().to_string().to_string(), derived_g);
+    }
+
+    /// An on-disk account that is neither the literal placeholder nor a valid
+    /// G-strkey (a typo'd pin) is refused: nothing is pinned and no keyring
+    /// entry is written. A broken pin must be surfaced, never replaced.
+    #[tokio::test]
+    #[serial]
+    async fn malformed_account_pin_refuses_without_writing() {
+        keyring_mock::install().expect("mock store");
+        let (s_strkey, derived_g) = seed_material([0x88u8; 32]);
+        let var = unique_var("MALFORMED");
+        let _guard = EnvGuard::set(var.clone(), &s_strkey);
+
+        // A truncated G-strkey: not the placeholder, not a valid strkey.
+        let profile = profile_with_signer_account("GAQAA5L65LSYH7CQ3VTJ7F3HHLG");
+        let signer_service = profile.mcp_signer_default.service.clone();
+        let raw = raw_ref_of(&profile);
+
+        let code = run_with_dependencies(
+            &args(&var, None, false),
+            move |_n| Ok(profile.clone()),
+            raw,
+            pin_signer_must_not_be_called,
+            || Ok(()),
+        )
+        .await;
+        assert_eq!(code, 1, "a malformed account pin must refuse");
+
+        let entry = KeyringEntry::new(&signer_service, &derived_g).unwrap();
+        assert!(
+            entry.get_password().is_err(),
+            "no keyring entry must be written on a malformed-pin refusal"
+        );
+    }
+
+    /// End-to-end environment immunity through the PRODUCTION loader
+    /// functions: a `STELLAR_AGENT_MCP_SIGNER_DEFAULT` overlay must neither
+    /// influence the enrollment classification nor leak into the pinned
+    /// on-disk document. The profile lives in a real temp dir; the raw read
+    /// and the pin are the production `read_signer_ref_on_disk` /
+    /// `pin_signer_account_on_disk` over that dir.
+    #[tokio::test]
+    #[serial]
+    async fn env_overlay_never_reaches_the_on_disk_pin() {
+        keyring_mock::install().expect("mock store");
+        let (s_strkey, derived_g) = seed_material([0x99u8; 32]);
+        let var = unique_var("ENVIMMUNE");
+        let _seed_guard = EnvGuard::set(var.clone(), &s_strkey);
+        // An overlay that would redirect the signer ref on an env-merged load.
+        let _overlay_guard = EnvGuard::set(
+            "STELLAR_AGENT_MCP_SIGNER_DEFAULT".to_owned(),
+            r#"{service="env-injected-svc",account="default"}"#,
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let profile = profile_with_signer_account("default");
+        loader::save_to_dir("enroll-signer-test", &profile, dir.path()).unwrap();
+
+        let dir_for_read = dir.path().to_path_buf();
+        let dir_for_pin = dir.path().to_path_buf();
+        let profile_for_load = profile.clone();
+        let code = run_with_dependencies(
+            &args(&var, None, false),
+            move |_n| Ok(profile_for_load.clone()),
+            move |n| loader::read_signer_ref_on_disk(n, &dir_for_read),
+            move |n, g| loader::pin_signer_account_on_disk(n, &dir_for_pin, g),
+            || Ok(()),
+        )
+        .await;
+        assert_eq!(code, 0, "enroll must succeed with the overlay set");
+
+        let written = std::fs::read_to_string(dir.path().join("enroll-signer-test.toml")).unwrap();
+        assert!(
+            written.contains(&format!("account = \"{derived_g}\"")),
+            "the on-disk pin must carry the derived G-strkey; got:\n{written}"
+        );
+        assert!(
+            written.contains(&format!("service = \"{SIGNER_SERVICE}\"")),
+            "the on-disk service must be the stored one; got:\n{written}"
+        );
+        assert!(
+            !written.contains("env-injected-svc"),
+            "no environment overlay value may leak into the stored document; got:\n{written}"
+        );
+
+        // The keyring write landed at the ON-DISK service, not the env one.
+        let entry = KeyringEntry::new(SIGNER_SERVICE, &derived_g).unwrap();
+        assert!(
+            entry.get_password().is_ok(),
+            "the secret must be stored at the on-disk service coordinate"
         );
     }
 

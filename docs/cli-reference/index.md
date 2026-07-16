@@ -118,7 +118,7 @@ Before dispatching any command, the CLI runs a local-only startup advisory: it s
 | `vault` | Deposit into or withdraw from a DeFindex vault via the smart-account (signing). | [defi-and-pool](defi-and-pool.md) |
 | `trade` | Swap tokens via the Soroswap router-direct path via the smart-account (signing). | [defi-and-pool](defi-and-pool.md) |
 | `pool` | Initialise and inspect a channel-account pool for parallel transaction submission. | [defi-and-pool](defi-and-pool.md) |
-| `profile` | List, show, migrate, and rotate the keyring-backed keys of a profile. | [profile-and-governance](profile-and-governance.md) |
+| `profile` | Create, list, show, migrate, and rotate the keyring-backed keys of a profile. | [profile-and-governance](profile-and-governance.md) |
 | `credentials` | Register, list, show, and delete WebAuthn passkeys in the per-profile registry. | [profile-and-governance](profile-and-governance.md) |
 | `approve` | Read a pending approval, prompt y/n, and record the HMAC attestation; garbage-collect expired approvals. | [profile-and-governance](profile-and-governance.md) |
 | `audit` | Walk and verify the integrity of a hash-chained audit log. | [profile-and-governance](profile-and-governance.md) |

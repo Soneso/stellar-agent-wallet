@@ -121,6 +121,7 @@ SUITES=(
   "stellar-agent-mcp testnet-acceptance dex_quote_wire_testnet_acceptance"
   "stellar-agent-cli testnet-acceptance claim_testnet_acceptance"
   "stellar-agent-cli testnet-acceptance pay_policy_v1_testnet_acceptance"
+  "stellar-agent-cli testnet-acceptance profile_init_enroll_signer_testnet_acceptance"
   "stellar-agent-cli testnet-acceptance smart_account_execute_testnet_acceptance"
   "stellar-agent-smart-account testnet-integration deploy_c_testnet_acceptance"
   "stellar-agent-smart-account testnet-integration quorum_authorization_info_testnet_acceptance"

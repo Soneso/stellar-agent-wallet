@@ -24,6 +24,10 @@ the MCP server reads on startup; when no `default.toml` exists yet, the server
 falls back to an in-memory testnet configuration so it can still serve read-only
 requests. This fallback is never written to disk.
 
+Create a new profile file with `stellar-agent profile init` (default `default`,
+testnet, `engine = "v1"`); mainnet requires an explicit `https://` `--rpc-url`.
+See [cli-reference.md](cli-reference.md) for flags.
+
 ## Loader source order
 
 A profile is assembled from three layered sources. Higher-priority sources
@@ -249,15 +253,22 @@ stellar-agent profile enroll-signer --profile default --secret-env WALLET_SK
 Flags: `--secret-env <VAR>` (required; the variable NAME, never the secret),
 `--profile <NAME>` (default `default`), `--expected-address <G_STRKEY>` (refuse
 unless the seed derives to it), `--force` (replace an already-enrolled entry).
-Enrollment derives the seed's public address and refuses unless it equals the
-profile's `mcp_signer_default` account, printing the address to set `account` to;
-the profile TOML is never rewritten.
+Enrollment derives the seed's public address. A profile fresh from
+`profile init` (and a v1-migrated profile that still carries it) holds the placeholder `"default"` in
+`mcp_signer_default.account`; enrollment overwrites it in place with the
+derived address. A profile whose `account` already pins a G-strkey — from a
+prior enrollment, or set by hand — is left untouched, and enrollment refuses if
+the seed does not derive to that exact address, printing the address to set
+`account` to.
 
 ### Opt in to V1
 
-After enrolling the owner key (`profile enroll-owner-key`), signing the policy
-file (`profile sign-policy`), and rotating the attestation and audit keys, set
-the engine to V1 in the profile TOML:
+The ceremony, in order, is `profile enroll-owner-key`,
+`profile rotate-attestation-key`, `profile rotate-audit-key`, then
+`profile sign-policy`. An `init`-minted profile already carries
+`engine = "v1"` — complete the ceremony and it becomes operational. A profile
+migrated from schema v1 stays on `noop`; after the ceremony, set the engine in
+the profile TOML:
 
 ```toml
 [policy]
