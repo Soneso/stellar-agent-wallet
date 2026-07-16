@@ -90,9 +90,13 @@ fn open_store(dir: &tempfile::TempDir, name: &str) -> ReceiptStore {
 /// `submit_transaction_idempotent` with the mainnet passphrase returns
 /// `MainnetWriteForbidden` before any receipt is written or any RPC call is made.
 ///
-/// The mainnet guard fires inside `submit_with_retention_poll` (the winner
-/// path), which is entered for a fresh (no-prior-receipt) submission.  The
-/// envelope must be a valid V1 envelope so the V1 guard does not fire first.
+/// The mainnet guard fires at the `submit_transaction_idempotent` entry point,
+/// before the envelope decode, the receipt-store read, and `try_begin`; the
+/// retention-poll winner path repeats it defence-in-depth.  A valid signed V1
+/// envelope keeps every later refusal path out of play, so the zero-request
+/// and empty-store assertions pin the entry-point guard specifically: were it
+/// absent, `try_begin` would write a Pending receipt before the inner guard
+/// refused.
 #[tokio::test]
 async fn mainnet_passphrase_rejected_mainnet_write_forbidden() {
     let signed_xdr = build_signed_envelope().await;
@@ -125,6 +129,11 @@ async fn mainnet_passphrase_rejected_mainnet_write_forbidden() {
         server.received_requests().await.unwrap().len(),
         0,
         "no RPC call must occur when the mainnet guard fires"
+    );
+    let envelope_hash = envelope_hash_for(&signed_xdr);
+    assert!(
+        store.get(&envelope_hash).unwrap().is_none(),
+        "no receipt must be written when the entry-point mainnet guard fires"
     );
 }
 

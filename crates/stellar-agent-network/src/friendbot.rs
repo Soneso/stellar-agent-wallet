@@ -24,9 +24,9 @@ use stellar_agent_core::error::{NetworkError, WalletError};
 use crate::account::fetch_account;
 use crate::client::StellarRpcClient;
 use crate::redact::{redact_rpc_error, redact_url_authority};
-
-/// Mainnet passphrase — structurally rejected for Friendbot calls.
-const MAINNET_PASSPHRASE: &str = "Public Global Stellar Network ; September 2015";
+// Structurally rejected for Friendbot calls; shared with the submit-layer
+// guards so every refusal compares against the same canonical constant.
+use crate::submit::MAINNET_PASSPHRASE;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Friendbot URL allow-list

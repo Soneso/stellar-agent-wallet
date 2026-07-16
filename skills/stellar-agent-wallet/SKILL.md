@@ -4,7 +4,7 @@ description: Operate the Stellar Agent Wallet — a self-custodial Stellar walle
 license: Apache-2.0
 compatibility: Requires the stellar-agent CLI and stellar-agent-mcp server (v0.1.0-alpha.4 public alpha; install from crates.io with a pinned version, e.g. cargo binstall stellar-agent-cli@0.1.0-alpha.4 stellar-agent-mcp@0.1.0-alpha.4, or build from source). Targets Stellar testnet (default) and mainnet.
 metadata:
-  version: "0.3.0"
+  version: "0.3.1"
   wallet_version: "0.1.0-alpha.4"
 ---
 
@@ -244,8 +244,9 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
 
 - On `stellar:mainnet` the default policy engine allows read-only tools and
   refuses every fund-moving tool with `policy.engine_required`, before any RPC
-  call. Mainnet writes require the operator to rotate keys and opt in to the V1
-  engine.
+  call. Below the policy layer, the network layer structurally refuses every
+  mainnet write with `network.mainnet_write_forbidden` regardless of engine or
+  keys — no configuration unlocks mainnet writes in this alpha.
 - The sign-only tools (the SEP-43 sign verbs, SEP-53 `sign_message`, and the two
   x402 payment tools), plus every MPP tool, refuse `stellar:mainnet`
   structurally with
@@ -303,11 +304,14 @@ reconcile the transaction. Keep credential and receipt values out of logs.
 must approve and relay the `approval_attestation`. Retrying the commit unchanged
 will keep failing.
 
-**Mainnet writes are refused by default.** Expect `policy.engine_required` for any
-fund-moving tool on `stellar:mainnet` until the operator opts in to the V1 engine.
-The sign-only tools (SEP-43 sign verbs, SEP-53 `sign_message`, x402 payment tools)
-refuse mainnet earlier and structurally with `network.mainnet_write_forbidden`,
-before the policy gate — branch on both codes for mainnet refusals.
+**Mainnet writes are refused in this alpha.** Expect `policy.engine_required` for
+any fund-moving tool on `stellar:mainnet` under the default Noop engine, and
+`network.mainnet_write_forbidden` from the network layer, which refuses every
+mainnet write regardless of engine or keys — no configuration unlocks mainnet
+writes. The sign-only tools (SEP-43 sign verbs, SEP-53 `sign_message`, x402
+payment tools) refuse mainnet at handler entry with
+`network.mainnet_write_forbidden`, before the policy gate — branch on both codes
+for mainnet refusals.
 
 **Branch on `ok` and the error `code`, not the message.** The human message text
 is not a stable contract; the wire `code` is.

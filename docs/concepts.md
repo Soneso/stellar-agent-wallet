@@ -13,7 +13,7 @@ An AI agent calls wallet tools on its own initiative. The model does not assume 
 
 A fifth control addresses a different risk — not what the agent decides, but which tool definitions it may load. **Toolsets** package third-party or untrusted tool definitions behind capability isolation: a toolset installs only after publisher-signature and hash verification, and a structural boundary keeps it from reaching a signing tool it was not granted. Where the four controls above constrain each action, toolsets constrain the surface an agent can act through. See [Toolsets](toolsets.md).
 
-Two structural rules apply across all surfaces in this alpha. The default network is `stellar:testnet`. Every write or signing command structurally refuses `stellar:mainnet` (wire code `network.mainnet_write_forbidden`) before any RPC call or signing, while `stellar:mainnet` remains accepted for read-only commands.
+Two structural rules apply across all surfaces in this alpha. The default network is `stellar:testnet`. Every write or signing command structurally refuses `stellar:mainnet` (wire code `network.mainnet_write_forbidden`): commands that take `--network` refuse before any RPC call or signing, and profile-driven flows are refused at the network submit layer before any transaction is sent. `stellar:mainnet` remains accepted for read-only commands.
 
 ## Two account models
 
@@ -76,7 +76,7 @@ The Noop engine is the binding gate used when no full engine is configured. Its 
 | mainnet | read-only | Allow |
 | mainnet | destructive | refused with `policy.engine_required` |
 
-A destructive tool on a mainnet profile cannot pass the Noop engine. Newly minted profiles default to the V1 engine; profiles carried over from schema version 1 are set to Noop explicitly so they retain the mainnet gate until the operator completes the key-rotation steps that stand up a V1 owner key.
+A destructive tool on a mainnet profile cannot pass the Noop engine. Newly minted profiles default to the V1 engine; profiles carried over from schema version 1 are set to Noop explicitly until the operator completes the key-rotation steps that stand up a V1 owner key. The engine choice governs the policy layer only: every mainnet write is additionally refused at the network layer (`network.mainnet_write_forbidden`) in this alpha, on Noop and V1 alike.
 
 ### V1 engine
 

@@ -196,10 +196,12 @@ rather than switching stores. In `headless-env` mode the operator-held
 environment key is the custody boundary: whoever can read the process
 environment can decrypt the store, so scope it to the service user.
 
-A profile migrated from schema v1 stays on the `noop` engine, which keeps the
-mainnet-write gate in force, until the operator completes key rotation and opts
-in to `v1`. Migration populates the four security-key reference names but mints
-no key material; the rotation commands below mint the actual keys.
+A profile migrated from schema v1 stays on the `noop` engine until the operator
+completes key rotation and opts in to `v1`. Migration populates the four
+security-key reference names but mints no key material; the rotation commands
+below mint the actual keys. The engine choice governs the policy layer only:
+every mainnet write is additionally refused at the network layer
+(`network.mainnet_write_forbidden`) in this alpha, on `noop` and `v1` alike.
 
 ### Migrate first
 
@@ -262,8 +264,10 @@ the engine to V1 in the profile TOML:
 engine = "v1"
 ```
 
-Until this is done, a migrated profile continues to run under `noop` and refuses
-mainnet destructive operations.
+Until this is done, a migrated profile continues to run under `noop`, which
+refuses mainnet destructive operations with `policy.engine_required`. Opting in
+to `v1` changes the policy layer only — mainnet writes stay structurally refused
+at the network layer in this alpha.
 
 ## Example profile
 

@@ -12,13 +12,12 @@ This file is self-contained. For the MCP tool surface and result-envelope shape 
 
 ## Mainnet write refusal
 
-Most signing verbs that mutate context-rule, signer, or timelock state refuse `mainnet` structurally — before any RPC call or signing-key access — surfacing the wire code `network.mainnet_write_forbidden`. This covers: the `smart-account rules` write verbs, all `smart-account signers` verbs (including `list` and `refresh`, which emit audit rows), the timelock write verbs (`schedule`, `cancel`, `execute`), and the deploy verbs (`smart-account deploy-webauthn-verifier`, `smart-account deploy-ed25519-verifier`, `smart-account deploy-spending-limit-policy`).
+Every signing verb that mutates context-rule, signer, or timelock state refuses `mainnet` structurally — before any RPC call or signing-key access — surfacing the wire code `network.mainnet_write_forbidden`. This covers: the `smart-account rules` write verbs, all `smart-account signers` verbs (including `list` and `refresh`, which emit audit rows), `smart-account execute`, `smart-account migrate-verifier` (submit mode; a mainnet dry-run stays allowed read-only), the timelock write verbs (`schedule`, `cancel`, `execute`), and the deploy verbs (`smart-account deploy-webauthn-verifier`, `smart-account deploy-ed25519-verifier`, `smart-account deploy-spending-limit-policy`, `smart-account deploy-policy`).
 
 Exceptions:
 
 | Verb | Mainnet behavior |
 |------|------------------|
-| `smart-account migrate-verifier` | Mainnet dry-run allowed; mainnet submit allowed only with `--confirm-mainnet-migrate`; never returns `network.mainnet_write_forbidden`. |
 | `smart-account multicall` | `mainnet` accepted at the flag level but requires a router registered for mainnet. |
 | `smart-account register-multicall` / `unregister-multicall` | Accept `mainnet` as a local-registry key. |
 | Read-only verbs | `smart-account rules get`, `smart-account rules get-spending-limit`, `smart-account rules verify-pins`, `smart-account rules list` / `smart-account list-rules`, `smart-account list-verifiers`, `smart-account timelock list-pending` accept `mainnet` unconditionally. |
@@ -150,9 +149,9 @@ stellar-agent smart-account deploy-spending-limit-policy --deployer-secret-env D
 stellar-agent smart-account deploy-policy --kind weighted-threshold --deployer-secret-env DEPLOYER_SK
 ```
 
-`smart-account migrate-verifier` builds and optionally executes a plan that moves all `external` signers from one verifier to another across every context rule. Dry-run is read-only and renders the plan as JSON; without `--dry-run` it signs and submits `remove_signer` / `add_signer` pairs. Mainnet dry-run allowed; mainnet submit additionally requires `--confirm-mainnet-migrate`. Pre-flight gates (fail-closed): destination verifier hash must be allowlisted, its audit status must be `audited`, `provisional`, or `unaudited`, and the destination contract must be immutable.
+`smart-account migrate-verifier` builds and optionally executes a plan that moves all `external` signers from one verifier to another across every context rule. Dry-run is read-only and renders the plan as JSON; without `--dry-run` it signs and submits `remove_signer` / `add_signer` pairs. Mainnet dry-run allowed (read-only); mainnet submit structurally refused (`network.mainnet_write_forbidden`). Pre-flight gates (fail-closed): destination verifier hash must be allowlisted, its audit status must be `audited`, `provisional`, or `unaudited`, and the destination contract must be immutable.
 
-- `--account <C>` (req), `--from <HASH_HEX>` (req, 64-char hex SHA-256 of the source verifier WASM), `--to <C>` (req, destination verifier), `--dry-run`, `--confirm-mainnet-migrate`, signer-source group (required for submit, not for dry-run).
+- `--account <C>` (req), `--from <HASH_HEX>` (req, 64-char hex SHA-256 of the source verifier WASM), `--to <C>` (req, destination verifier), `--dry-run`, signer-source group (required for submit, not for dry-run).
 
 ```bash
 stellar-agent smart-account migrate-verifier \

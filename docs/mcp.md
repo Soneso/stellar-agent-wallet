@@ -99,8 +99,10 @@ secret held in the platform keyring; it is never the secret itself.
 The loaded profile therefore determines:
 
 - which network the server operates on (`stellar:testnet` by default;
-  `stellar:mainnet` is accepted for read-only tools but structurally refuses
-  every write before any RPC call or signing);
+  `stellar:mainnet` is accepted for read-only tools while every write is
+  structurally refused — see
+  [How gating applies to every tool call](#how-gating-applies-to-every-tool-call)
+  for the two refusal layers);
 - which keyring entries the signing tools resolve their seed from;
 - which policy engine evaluates each tool call.
 
@@ -168,6 +170,10 @@ runs. The gate looks up the tool's registry descriptor and calls
 Separately, on `stellar:mainnet` the Noop engine fails closed for any
 destructive tool by returning the engine error `policy.engine_required` before
 producing a verdict, so every write is refused before any RPC call or signing.
+Below the policy layer, the network layer structurally refuses every mainnet
+write with `network.mainnet_write_forbidden` regardless of the configured
+engine or enrolled keys — no profile configuration unlocks mainnet writes in
+this alpha.
 
 The two [policy engines](./concepts.md) are Noop (testnet allow-all; mainnet
 read-only allow, mainnet destructive refused) and V1 (signature-verified typed

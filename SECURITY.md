@@ -49,12 +49,12 @@ before any public disclosure.
 Keep the following properties of the current alpha in mind when assessing impact.
 
 - Writes and signing are testnet-only. Read-only commands accept both
-  `stellar:testnet` and `stellar:mainnet`, but nearly all write and signing commands
-  structurally refuse `stellar:mainnet` (wire code `network.mainnet_write_forbidden`)
-  before any RPC call or signing takes place. The narrow exceptions are explicit,
-  consent-gated mainnet operations (for example `smart-account migrate-verifier`, which
-  requires `--confirm-mainnet-migrate`). Friendbot funding is scoped to `testnet` and
-  `futurenet` and structurally refuses `mainnet`
+  `stellar:testnet` and `stellar:mainnet`, but every write and signing surface
+  structurally refuses `stellar:mainnet` (wire code `network.mainnet_write_forbidden`);
+  there are no consent-gated mainnet write exceptions. Commands that take `--network`
+  refuse before any RPC call or signing; profile-driven flows are refused at the
+  network submit layer before any transaction is sent. Friendbot funding is scoped to
+  `testnet` and `futurenet` and structurally refuses `mainnet`
   (`network.friendbot_mainnet_forbidden`).
 - The threat model centers on an autonomous agent transacting under wallet guardrails:
   a policy engine, an out-of-band operator-approval spine, and a tamper-evident audit
@@ -62,8 +62,7 @@ Keep the following properties of the current alpha in mind when assessing impact
   example, executing a signing action that should have been denied, forced to approval,
   or recorded — are in scope and of high interest.
 - A report that lets an autonomous agent reach `stellar:mainnet` for a write or signing
-  action, despite the structural refusal (outside the explicitly consent-gated
-  exceptions), is in scope.
+  action, despite the structural refusal, is in scope.
 
 Out of scope: defects in your own keyring backend, operating system, RPC endpoint, or
 anchor; and issues that require already holding the wallet's keyring secrets (the seed,

@@ -1596,7 +1596,7 @@ pub enum SaError {
     VerifierMigrationFailed {
         /// Closed-set phase discriminator.
         ///
-        /// MUST be one of the 6 values in `MIGRATION_PHASES`. `&'static str`
+        /// MUST be one of the 5 values in `MIGRATION_PHASES`. `&'static str`
         /// for zero-allocation construction on the error path; the audit-log
         /// consumer allocates an owned `String` at write time.
         phase: &'static str,
@@ -1925,7 +1925,7 @@ impl From<stellar_agent_core::audit_log::signer_set::SignerSetCanonicalBodyError
 /// Canonical closed set for `SaError::VerifierMigrationFailed::phase`.
 ///
 /// Every production emit site MUST use a string from this set. The test
-/// `migration_phase_constant_set_is_closed` verifies the set has exactly 6
+/// `migration_phase_constant_set_is_closed` verifies the set has exactly 5
 /// values, mirroring the `KNOWN_PHASES` / `phase_string_constant_set_is_closed`
 /// discipline for `SaError::DeploymentFailed`.
 ///
@@ -1938,7 +1938,6 @@ pub(crate) const MIGRATION_PHASES: &[&str] = &[
     "plan_build",
     "submit_simulate",
     "submit_send",
-    "mainnet_confirm_missing",
 ];
 
 /// Canonical inventory of every `SaError::AuthEntryConstructionFailed::stage`
@@ -4868,21 +4867,20 @@ mod tests {
         );
     }
 
-    /// Verifies the `MIGRATION_PHASES` closed set has exactly 6 entries and
+    /// Verifies the `MIGRATION_PHASES` closed set has exactly 5 entries and
     /// covers the documented phase discriminators.
     ///
     /// Mirrors `phase_string_constant_set_is_closed` for `DeploymentFailed`.
     /// A typo'd phase literal registered in `MIGRATION_PHASES` will fail here.
     #[test]
     fn migration_phase_constant_set_is_closed() {
-        /// Canonical 6-value closed set for `SaError::VerifierMigrationFailed::phase`.
+        /// Canonical 5-value closed set for `SaError::VerifierMigrationFailed::phase`.
         const KNOWN_MIGRATION_PHASES: &[&str] = &[
             "preflight_destination_unknown",
             "preflight_destination_mutable",
             "plan_build",
             "submit_simulate",
             "submit_send",
-            "mainnet_confirm_missing",
         ];
 
         for emitted in MIGRATION_PHASES {
@@ -4894,13 +4892,13 @@ mod tests {
 
         assert_eq!(
             KNOWN_MIGRATION_PHASES.len(),
-            6,
-            "canonical migration-phase set is 6 values"
+            5,
+            "canonical migration-phase set is 5 values"
         );
         assert_eq!(
             MIGRATION_PHASES.len(),
-            6,
-            "MIGRATION_PHASES must have exactly 6 entries"
+            5,
+            "MIGRATION_PHASES must have exactly 5 entries"
         );
     }
 }

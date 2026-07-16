@@ -171,10 +171,12 @@ Consequences:
 
 ## Migration and key rotation
 
-A profile migrated from schema v1 stays on the `noop` engine, which keeps the
-mainnet-write gate in force, until the operator completes key rotation and opts
-in to `v1`. Migration populates the four security-key reference names but mints
-no key material; the rotation commands below mint the actual keys.
+A profile migrated from schema v1 stays on the `noop` engine until the operator
+completes key rotation and opts in to `v1`. Migration populates the four
+security-key reference names but mints no key material; the rotation commands
+below mint the actual keys. Note that the engine choice governs the policy
+layer only: every mainnet write is additionally refused at the network layer
+(`network.mainnet_write_forbidden`) in this alpha, on `noop` and `v1` alike.
 
 ### Migrate first
 
@@ -230,9 +232,11 @@ the profile TOML:
 engine = "v1"
 ```
 
-Until this is done, a migrated profile continues to run under `noop` and refuses
-mainnet destructive operations. For the governance flow that V1 then enforces,
-see
+Until this is done, a migrated profile continues to run under `noop`, which
+refuses mainnet destructive operations with `policy.engine_required`. Opting in
+to `v1` changes the policy layer only — mainnet writes stay structurally
+refused at the network layer in this alpha. For the governance flow that V1
+enforces, see
 [cli-reference/profile-and-governance.md](cli-reference/profile-and-governance.md).
 
 ## Example profile

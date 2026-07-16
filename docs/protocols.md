@@ -8,7 +8,7 @@ Three principles shape every integration:
 - **Fail-closed.** Validation refuses on any failed check rather than proceeding on a guess. Unknown discriminants, ambiguous tokens, missing slippage floors, and stale oracle reads are refused before signing.
 - **Never auto-submit untrusted requests.** Inbound requests (a SEP-7 URI, a contract invocation) are parsed into a preview for the operator and policy engine. The wallet does not sign or submit on a dApp's behalf without going through the policy engine and [approval spine](concepts.md#the-approval-spine).
 
-All write and signing paths are testnet-only in this alpha: every signing command structurally refuses `stellar:mainnet` (wire code `network.mainnet_write_forbidden`) before any RPC call or signing. Read-only commands accept mainnet.
+All write and signing paths are testnet-only in this alpha: every signing command structurally refuses `stellar:mainnet` (wire code `network.mainnet_write_forbidden`) — `--network` commands before any RPC call or signing, profile-driven flows at the network submit layer before any transaction is sent. Read-only commands accept mainnet.
 
 ## SEP protocols
 

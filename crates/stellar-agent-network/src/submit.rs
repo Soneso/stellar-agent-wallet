@@ -54,7 +54,9 @@ use crate::retry::{
 };
 
 // Mainnet network passphrase (canonical; same constant used by friendbot.rs).
-const MAINNET_PASSPHRASE: &str = "Public Global Stellar Network ; September 2015";
+// `pub(crate)` so every in-crate write path (idempotent_submit's retention
+// poll) shares the same guard constant instead of duplicating it.
+pub(crate) const MAINNET_PASSPHRASE: &str = "Public Global Stellar Network ; September 2015";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Poll interval
@@ -335,8 +337,10 @@ pub(crate) fn bytes_to_hex(bytes: &[u8]) -> String {
 ///
 /// Best-effort heuristic for the second-layer mainnet guard. Catches
 /// programmatic callers that supply a mainnet RPC URL regardless of how
-/// the network passphrase is configured.
-fn is_mainnet_url(url: &str) -> bool {
+/// the network passphrase is configured. `pub(crate)` so every in-crate
+/// write path (idempotent_submit's retention poll) carries the same
+/// defence-in-depth layer.
+pub(crate) fn is_mainnet_url(url: &str) -> bool {
     let lower = url.to_lowercase();
     // Known SDF mainnet RPC hostnames.
     lower.contains("mainnet.stellar")
