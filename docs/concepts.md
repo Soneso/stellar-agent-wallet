@@ -175,6 +175,19 @@ Some agent accounts are on-chain OpenZeppelin smart accounts rather than plain k
 
 Passkey (WebAuthn) ceremonies use a browser handoff: registration and signing entries live in the approval spine, the assertion is pre-verified off-chain (including signature normalization) before being accepted, and the registration and assertion are recorded as audit events. The approval-spine and attestation mechanics these entries rely on are detailed in [Security internals](maintainers/security-internals.md).
 
+## MPP authorization is not settlement
+
+The sponsored MPP lifecycle records three independent facts. `authorized` means
+the wallet consumed value-policy budget, signed once, cleared re-simulation and
+audit, and attempted one-shot credential delivery. `receipt_observed` means a
+trusted host reported success; it is not ledger proof. Only reconciliation can
+set the independent ledger outcome to `settled` or `failed` after verifying the
+exact transaction and payer authorization through RPC.
+
+Missing delivery or receipt does not restore policy budget and does not permit a
+fallback signature. `authorized_withheld` and `indeterminate` are no-retry
+states. See [Agent payments with MPP](agent-payments.md).
+
 ## Glossary
 
 | Term | Meaning |

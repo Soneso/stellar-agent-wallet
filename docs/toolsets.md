@@ -348,6 +348,10 @@ stellar-agent toolsets uninstall balance-reporter
 
 ## MCP tools
 
+MPP tools are intentionally absent from the toolset registry. An installed
+toolset cannot prepare, commit, inspect, record, or reconcile an MPP
+authorization; use the full MCP server or the operator CLI directly.
+
 The MCP server exposes two statically registered toolset tools. Their routing is
 dynamic (it reads installed pin records at call time), but the tools themselves are
 fixed. See [mcp.md](mcp.md) for the server as a whole.

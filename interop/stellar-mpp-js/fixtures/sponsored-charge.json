@@ -1,0 +1,44 @@
+{
+  "provenance": {
+    "package": "@stellar/mpp@0.7.1",
+    "sourceCommit": "9f2f8254421e09906dfb7e983e2491a273120adf",
+    "stellarSdk": "15.1.0",
+    "mppx": "0.6.31",
+    "node": "24.5.0",
+    "pnpm": "10.33.0",
+    "license": "MIT/Apache-2.0 dependency set"
+  },
+  "challenge": {
+    "expires": "2026-07-16T12:05:00Z",
+    "id": "challenge-interop-1",
+    "intent": "charge",
+    "method": "stellar",
+    "realm": "merchant.example",
+    "request": {
+      "amount": "10000000",
+      "currency": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+      "methodDetails": {
+        "network": "stellar:testnet",
+        "feePayer": true,
+        "credentialTypes": [
+          "transaction"
+        ]
+      },
+      "recipient": "GAJZR5RMNUNEK7CRXJVEWXZ5XUXWT7FJGILCDDOITF7EC26RPWJ4UVOE"
+    }
+  },
+  "challengeHeader": "Payment id=\"challenge-interop-1\", realm=\"merchant.example\", method=\"stellar\", intent=\"charge\", request=\"eyJhbW91bnQiOiIxMDAwMDAwMCIsImN1cnJlbmN5IjoiQ0JJRUxUSzZZQlpKVTVVUDJXV1FFVUNZS0xQVTZBVU5aMkJRNFdXRkVJRTNVU0NJSE1YUURBTUEiLCJtZXRob2REZXRhaWxzIjp7ImNyZWRlbnRpYWxUeXBlcyI6WyJ0cmFuc2FjdGlvbiJdLCJmZWVQYXllciI6dHJ1ZSwibmV0d29yayI6InN0ZWxsYXI6dGVzdG5ldCJ9LCJyZWNpcGllbnQiOiJHQUpaUjVSTU5VTkVLN0NSWEpWRVdYWjVYVVhXVDdGSkdJTENERE9JVEY3RUMyNlJQV0o0VVZPRSJ9\", expires=\"2026-07-16T12:05:00Z\"",
+  "credential": {
+    "authorization": "Payment eyJjaGFsbGVuZ2UiOnsiZXhwaXJlcyI6IjIwMjYtMDctMTZUMTI6MDU6MDBaIiwiaWQiOiJjaGFsbGVuZ2UtaW50ZXJvcC0xIiwiaW50ZW50IjoiY2hhcmdlIiwibWV0aG9kIjoic3RlbGxhciIsInJlYWxtIjoibWVyY2hhbnQuZXhhbXBsZSIsInJlcXVlc3QiOiJleUpoYlc5MWJuUWlPaUl4TURBd01EQXdNQ0lzSW1OMWNuSmxibU41SWpvaVEwSkpSVXhVU3paWlFscEtWVFZWVURKWFYxRkZWVU5aUzB4UVZUWkJWVTVhTWtKUk5GZFhSa1ZKUlROVlUwTkpTRTFZVVVSQlRVRWlMQ0p0WlhSb2IyUkVaWFJoYVd4eklqcDdJbU55WldSbGJuUnBZV3hVZVhCbGN5STZXeUowY21GdWMyRmpkR2x2YmlKZExDSm1aV1ZRWVhsbGNpSTZkSEoxWlN3aWJtVjBkMjl5YXlJNkluTjBaV3hzWVhJNmRHVnpkRzVsZENKOUxDSnlaV05wY0dsbGJuUWlPaUpIUVVwYVVqVlNUVTVWVGtWTE4wTlNXRXBXUlZkWVdqVllWVmhYVkRkR1NrZEpURU5FUkU5SlZFWTNSVU15TmxKUVYwbzBWVlpQUlNKOSJ9LCJwYXlsb2FkIjp7InR5cGUiOiJ0cmFuc2FjdGlvbiIsInRyYW5zYWN0aW9uIjoiQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQT0ifSwic291cmNlIjoiZGlkOnBraDpzdGVsbGFyOnRlc3RuZXQ6R0FBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFXSEYifQ",
+    "transaction": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  "receipt": {
+    "paymentReceipt": "eyJtZXRob2QiOiJzdGVsbGFyIiwicmVmZXJlbmNlIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsInN0YXR1cyI6InN1Y2Nlc3MiLCJ0aW1lc3RhbXAiOiIyMDI2LTA3LTE2VDEyOjA2OjAwWiJ9",
+    "value": {
+      "method": "stellar",
+      "reference": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "status": "success",
+      "timestamp": "2026-07-16T12:06:00Z"
+    }
+  }
+}

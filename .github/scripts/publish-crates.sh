@@ -15,9 +15,17 @@
 # short-lived OIDC token minted by rust-lang/crates-io-auth-action).
 set -u
 
-if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-  echo "CARGO_REGISTRY_TOKEN is not set" >&2
+MODE="publish"
+if [ "$#" -gt 1 ]; then
+  echo "usage: $0 [--check]" >&2
   exit 2
+fi
+if [ "$#" -eq 1 ]; then
+  if [ "$1" != "--check" ]; then
+    echo "usage: $0 [--check]" >&2
+    exit 2
+  fi
+  MODE="check"
 fi
 
 TIER0="stellar-agent-loopback-http stellar-agent-mcp-macros stellar-agent-sep5 stellar-agent-test-support stellar-agent-toolsets stellar-agent-windows-identity stellar-agent-xdr-limits"
@@ -25,7 +33,7 @@ TIER1="stellar-agent-core stellar-agent-headless-keyring stellar-agent-sep10 ste
 TIER2="stellar-agent-network stellar-agent-toolsets-install"
 TIER3="stellar-agent-anchor stellar-agent-claimable stellar-agent-defi stellar-agent-nonce stellar-agent-pool stellar-agent-sep48 stellar-agent-sep53 stellar-agent-sep7 stellar-agent-smart-account stellar-agent-stablecoin stellar-agent-toolsets-runtime stellar-agent-x402-identity"
 TIER4="stellar-agent-approval-ui stellar-agent-blend stellar-agent-defindex stellar-agent-dex stellar-agent-sep43 stellar-agent-webauthn-bridge"
-TIER5="stellar-agent-approval-remote stellar-agent-x402"
+TIER5="stellar-agent-approval-remote stellar-agent-mpp stellar-agent-x402"
 TIER6="stellar-agent-cli stellar-agent-mcp"
 
 # Completeness guard: every workspace member must appear in exactly the tier
@@ -37,6 +45,16 @@ ALL_WORKSPACE=$(cargo metadata --no-deps --format-version 1 |
 if [ "$ALL_TIERED" != "$ALL_WORKSPACE" ]; then
   echo "Tier lists do not match the workspace members:" >&2
   diff <(echo "$ALL_TIERED") <(echo "$ALL_WORKSPACE") >&2
+  exit 2
+fi
+
+if [ "$MODE" = "check" ]; then
+  echo "Publish tiers match every workspace member exactly once."
+  exit 0
+fi
+
+if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+  echo "CARGO_REGISTRY_TOKEN is not set" >&2
   exit 2
 fi
 

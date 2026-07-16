@@ -742,6 +742,10 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
             }
             EventKind::ValueActionSubmitted { .. }
             | EventKind::X402PaymentAuthorized { .. }
+            | EventKind::MppChargeAuthorized { .. }
+            | EventKind::MppAuthorizationWithheld { .. }
+            | EventKind::MppReceiptObserved { .. }
+            | EventKind::MppSettlementReconciled { .. }
             | EventKind::KeyringKeyWritten { .. }
             | EventKind::PolicyWindowStateReset { .. } => {
                 // Value-action, key-write, and window-state-reset forensic
@@ -1299,6 +1303,10 @@ mod tests {
             EventKind::ApprovalRejectedRemote { .. } => "approval_rejected_remote",
             EventKind::ValueActionSubmitted { .. } => "value_action_submitted",
             EventKind::X402PaymentAuthorized { .. } => "x402_payment_authorized",
+            EventKind::MppChargeAuthorized { .. } => "mpp_charge_authorized",
+            EventKind::MppAuthorizationWithheld { .. } => "mpp_authorization_withheld",
+            EventKind::MppReceiptObserved { .. } => "mpp_receipt_observed",
+            EventKind::MppSettlementReconciled { .. } => "mpp_settlement_reconciled",
             EventKind::KeyringKeyWritten { .. } => "keyring_key_written",
             EventKind::PolicyWindowStateReset { .. } => "policy_window_state_reset",
         }
@@ -1682,6 +1690,42 @@ mod tests {
                 network: "stellar:testnet".to_owned(),
                 scheme: "exact".to_owned(),
             },
+            EventKind::MppChargeAuthorized {
+                authorization_id_hash: "a".repeat(64),
+                fingerprint_hash: "b".repeat(64),
+                legs: vec![ValueLegRecord {
+                    action: ValueActionKind::MppCharge,
+                    amount: Some(10_000_000),
+                    asset: Some(
+                        "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA".to_owned(),
+                    ),
+                    destination_redacted: Some("GAAAA...AAAWHF".to_owned()),
+                }],
+                network: "stellar:testnet".to_owned(),
+                payer_redacted: RedactedStrkey::from_already_redacted("GABCD...VWXYZ"),
+                sponsorship_mode: "sponsored_pull".to_owned(),
+                approval_present: true,
+            },
+            EventKind::MppAuthorizationWithheld {
+                authorization_id_hash: "c".repeat(64),
+                fingerprint_hash: "d".repeat(64),
+                failure_stage: "authorization_audit".to_owned(),
+                key_access_began: true,
+                policy_budget_consumed: true,
+            },
+            EventKind::MppReceiptObserved {
+                authorization_id_hash: "e".repeat(64),
+                receipt_digest: "f".repeat(64),
+                transaction_reference_redacted: "aaaaaaaa...aaaaaaaa".to_owned(),
+                source_transport: "mcp".to_owned(),
+                claimed_status: "success".to_owned(),
+            },
+            EventKind::MppSettlementReconciled {
+                authorization_id_hash: "1".repeat(64),
+                transaction_reference_redacted: "bbbbbbbb...bbbbbbbb".to_owned(),
+                ledger: 42,
+                verified_outcome: "settled".to_owned(),
+            },
             EventKind::KeyringKeyWritten {
                 key_purpose: KeyPurpose::AuditHashChainHmac,
                 keyring_service: "stellar-agent-audit".to_owned(),
@@ -1924,6 +1968,10 @@ mod tests {
                 "approval_rejected_remote",
                 "value_action_submitted",
                 "x402_payment_authorized",
+                "mpp_charge_authorized",
+                "mpp_authorization_withheld",
+                "mpp_receipt_observed",
+                "mpp_settlement_reconciled",
                 "keyring_key_written",
             ]
         );

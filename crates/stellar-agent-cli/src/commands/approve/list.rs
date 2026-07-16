@@ -271,6 +271,15 @@ fn render_summary_line(view: &PendingApprovalView) -> String {
             summary_line,
             ..
         } => format!("{summary_line} on {smart_account_redacted}"),
+        ApprovalSummaryView::MppCharge {
+            amount,
+            currency,
+            payer_redacted,
+            recipient_redacted,
+            ..
+        } => format!(
+            "authorize {amount} base units {currency} from {payer_redacted} to {recipient_redacted}"
+        ),
         ApprovalSummaryView::Rejected { original_kind_name } => {
             format!("rejected ({original_kind_name})")
         }

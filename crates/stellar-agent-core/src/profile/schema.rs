@@ -251,6 +251,24 @@ impl KeyringEntryRef {
             "default",
         )
     }
+
+    /// Constructs the default MPP authorization-state HMAC key reference.
+    ///
+    /// Entry name: `stellar-agent-mpp-state-<profile>` / `default`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::profile::schema::KeyringEntryRef;
+    ///
+    /// let r = KeyringEntryRef::default_mpp_state_key("alice");
+    /// assert_eq!(r.service, "stellar-agent-mpp-state-alice");
+    /// assert_eq!(r.account, "default");
+    /// ```
+    #[must_use]
+    pub fn default_mpp_state_key(profile_name: &str) -> Self {
+        Self::new(format!("stellar-agent-mpp-state-{profile_name}"), "default")
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -180,6 +180,20 @@ The wallet signs x402 v2 Exact Stellar payments without submitting:
 identity gate against a `home_domain` first; `stellar_x402_parse_receipt` decodes
 the settlement receipt. See [protocols.md](protocols.md) for the flow.
 
+## Sponsored MPP charges
+
+For an MPP Payment challenge, call `stellar_mpp_charge_prepare` with the exact
+HTTP or MCP request context. Review the returned preview and nonce. If approval
+is required, wait for the operator; then call `stellar_mpp_charge_commit` once
+with only the authorization ID and returned nonce fields. Deliver the resulting
+credential only through the trusted host to the exact bound request.
+
+Never retry commit, alter terms, switch transports, route MPP through a toolset,
+or create an x402/classic-payment fallback after an ambiguous result. Use
+`stellar_mpp_authorization_status`, record a host receipt, and reconcile the
+server transaction instead. The complete testnet-only workflow is in
+[Agent payments with MPP](agent-payments.md).
+
 ## Operating safely
 
 - Branch on `ok` and the error `code`, not the human message.

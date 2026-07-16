@@ -166,6 +166,22 @@ form-urlencoded body or a non-string field value.
 
 ## Recovery quick reference
 
+MPP codes are closed and redacted. Input/selection failures include
+`mpp.challenge_invalid`, `mpp.challenge_ambiguous`,
+`mpp.challenge_mismatch`, `mpp.challenge_expired`, `mpp.unsupported_method`,
+`mpp.unsupported_intent`, `mpp.unsupported_mode`, `mpp.network_forbidden`, and
+`mpp.input_too_large`. Approval/state/signing failures include
+`mpp.approval_required`, `mpp.approval_invalid`,
+`mpp.authorization_replayed`, `mpp.authorization_indeterminate`,
+`mpp.state_unavailable`, `mpp.simulation_failed`, `mpp.signing_failed`, and
+`mpp.credential_too_large`. Observation failures are `mpp.receipt_invalid`,
+`mpp.receipt_conflict`, and `mpp.reconciliation_unavailable`.
+
+For `mpp.approval_required`, wait for the operator and resume the exact stored
+authorization. For replayed, indeterminate, withheld, signing, state, receipt,
+or reconciliation ambiguity, do not retry commit or create another payment;
+query authorization status and reconcile any known server transaction.
+
 - Approval needed (`policy.approval_required`, `toolset.first_invoke_approval_required`):
   ask the operator to run `stellar-agent approve --id <nonce>`, then re-submit
   the commit with `approval_nonce` and `approval_attestation`.

@@ -264,6 +264,15 @@ confirmed value-moving submit (carrying the gate-sized value legs),
 `keyring_key_written` on each key-writing profile command, and
 `x402_payment_authorized` on x402 authorization signing.
 
+MPP credentials follow a stricter one-shot rule. Durable state is atomically
+claimed before policy accounting or signer access; value budget is recorded
+before signing. A post-key-access ambiguity becomes `indeterminate` or
+`authorized_withheld`, and the same charge can never sign or deliver again.
+Never retry MPP commit or create a fallback payment. Use redacted status, host
+receipt recording, and independent transaction reconciliation. MPP is
+testnet-only and absent from toolset routing; its configured RPC sees signed
+authorization during mandatory re-simulation.
+
 Operators verify the chain end-to-end:
 
 ```text

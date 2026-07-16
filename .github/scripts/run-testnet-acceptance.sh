@@ -101,6 +101,7 @@ SUITES=(
   "stellar-agent-pool testnet-acceptance load_testnet"
   "stellar-agent-stablecoin testnet-acceptance trustline_testnet_acceptance"
   "stellar-agent-x402 testnet-acceptance x402_exact_testnet_acceptance"
+  "stellar-agent-mpp testnet-acceptance sponsored_testnet_acceptance"
   "stellar-agent-dex testnet-acceptance dex_swap_testnet_acceptance"
   "stellar-agent-blend testnet-acceptance blend_lend_testnet_acceptance"
   "stellar-agent-blend testnet-acceptance blend_supply_submit_testnet_acceptance"

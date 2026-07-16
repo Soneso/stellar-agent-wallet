@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added testnet-only sponsored Machine Payments Protocol charges for classic
+  G-account payers. The CLI and five MCP tools validate HTTP or native MCP
+  challenges, simulate and authorize one SEP-41 transfer, use the existing
+  value-policy and approval spine, return a one-shot credential, record trusted
+  host receipts, and independently reconcile final direct or fee-bump
+  transactions.
+- Added a per-profile, keyring-HMAC-protected MPP authorization state file with
+  cross-process locking, atomic writes, replay protection, terminal retention,
+  and audited explicit pruning. The file stores prepared authorization material
+  and digests, never credentials or raw receipts.
+
+### Security
+
+- MPP mainnet, unsponsored, push, smart-account, transport-automation, channel,
+  and toolset-routing modes are structurally unsupported. The wallet returns a
+  credential but does not send the paid request or submit the server-sponsored
+  transaction.
+
 ## [0.1.0-alpha.4] - 2026-07-11
 
 ### Fixed

@@ -115,6 +115,20 @@ pub(crate) fn emit_value_audit_row(profile: &Profile, profile_name: &str, entry:
     }
 }
 
+/// Writes an authorization row and propagates failures while the caller can
+/// still withhold the credential.
+pub(crate) fn emit_value_audit_row_strict(
+    profile: &Profile,
+    profile_name: &str,
+    entry: AuditEntry,
+) -> Result<(), ()> {
+    let key = load_audit_hmac_key(profile).map_err(|_| ())?;
+    let writer = AuditWriterRegistry::get_or_open(profile_name, &profile.audit_log_path, Some(key))
+        .map_err(|_| ())?;
+    let mut guard = writer.lock().map_err(|_| ())?;
+    guard.write_entry(entry).map_err(|_| ())
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

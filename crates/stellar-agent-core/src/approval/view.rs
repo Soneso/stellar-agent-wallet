@@ -194,6 +194,33 @@ pub enum ApprovalSummaryView {
         summary_line: String,
     },
 
+    /// [`ApprovalKind::MppChargeSimulated`] operator-visible terms.
+    MppCharge {
+        /// Owning wallet profile.
+        profile: String,
+        /// CAIP-2 chain identifier.
+        chain_id: String,
+        /// First-5-last-5 redacted payer G-strkey.
+        payer_redacted: String,
+        /// Bound request transport.
+        transport: String,
+        /// Bound HTTPS authority or MCP server identifier.
+        authority: String,
+        /// Bound HTTP path or MCP operation name.
+        target: String,
+        /// Canonical token amount.
+        amount: String,
+        /// Asset-contract C-strkey.
+        currency: String,
+        /// First-5-last-5 redacted recipient G- or C-strkey.
+        recipient_redacted: String,
+        /// Challenge expiry as Unix seconds.
+        challenge_expires_at_unix: u64,
+        /// Simulated transaction fee in stroops, decimal-string encoded.
+        #[serde(with = "crate::wire_stroops::u32")]
+        simulated_fee_stroops: u32,
+    },
+
     /// [`ApprovalKind::Rejected`] tombstone — carries no summary data, only
     /// the kind name of the entry that was rejected.
     Rejected {
@@ -209,7 +236,8 @@ impl PendingApprovalView {
             ApprovalKind::PaymentSimulated { .. }
             | ApprovalKind::ClaimSimulated { .. }
             | ApprovalKind::TrustlineClawbackOptIn { .. }
-            | ApprovalKind::RuleProposalSimulated { .. } => entry.attestation_blob_b64.is_some(),
+            | ApprovalKind::RuleProposalSimulated { .. }
+            | ApprovalKind::MppChargeSimulated { .. } => entry.attestation_blob_b64.is_some(),
             ApprovalKind::SignWithPasskey { .. } => entry.passkey_assertion.is_some(),
             ApprovalKind::RegisterPasskey {
                 registration_input, ..
@@ -309,6 +337,32 @@ impl PendingApprovalView {
                 definition: definition.clone(),
                 proposal_sha256_hex: proposal_sha256.iter().map(|b| format!("{b:02x}")).collect(),
                 summary_line: summary_line.clone(),
+            },
+            ApprovalKind::MppChargeSimulated {
+                profile,
+                chain_id,
+                payer,
+                transport,
+                authority,
+                target,
+                amount,
+                currency,
+                recipient,
+                challenge_expires_at_unix,
+                simulated_fee_stroops,
+                ..
+            } => ApprovalSummaryView::MppCharge {
+                profile: profile.clone(),
+                chain_id: chain_id.clone(),
+                payer_redacted: redact_g_strkey(payer),
+                transport: transport.clone(),
+                authority: authority.clone(),
+                target: target.clone(),
+                amount: amount.clone(),
+                currency: currency.clone(),
+                recipient_redacted: redact_g_strkey(recipient),
+                challenge_expires_at_unix: *challenge_expires_at_unix,
+                simulated_fee_stroops: *simulated_fee_stroops,
             },
             ApprovalKind::Rejected { original_kind_name } => ApprovalSummaryView::Rejected {
                 original_kind_name: original_kind_name.clone(),
@@ -778,5 +832,54 @@ mod tests {
         assert_eq!(json["expired"], false);
         assert_eq!(json["attested"], false);
         assert_eq!(json["summary"]["kind"], "payment");
+    }
+
+    #[test]
+    fn mpp_summary_is_short_lived_and_redacts_accounts() {
+        let dir = TempDir::new().unwrap();
+        let mut store = open_store(&dir);
+        let now = crate::timefmt::now_unix_ms().unwrap();
+        let payer = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let recipient = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        let entry = PendingApproval::new_mpp_charge_pending(
+            [0x11; 32],
+            [0x22; 32],
+            "default".to_owned(),
+            "stellar:testnet".to_owned(),
+            payer.to_owned(),
+            "http".to_owned(),
+            "merchant.example".to_owned(),
+            "/checkout".to_owned(),
+            "1000000".to_owned(),
+            recipient.to_owned(),
+            recipient.to_owned(),
+            now / 1_000 + 3_600,
+            1_100,
+            uid(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        assert!(entry.expires_at_unix_ms <= entry.created_at_unix_ms + 5 * 60 * 1_000);
+        store.insert(entry, now).unwrap();
+
+        let view = &store.snapshot(now)[0];
+        let ApprovalSummaryView::MppCharge {
+            payer_redacted,
+            recipient_redacted,
+            amount,
+            currency,
+            ..
+        } = &view.summary
+        else {
+            panic!("expected MPP summary")
+        };
+        assert_eq!(payer_redacted, "GAAAA...AAAAA");
+        assert_eq!(recipient_redacted, "CAAAA...AD2KM");
+        assert_eq!(amount, "1000000");
+        assert_eq!(currency, recipient);
+        let json = serde_json::to_string(view).unwrap();
+        assert!(!json.contains(payer));
+        assert!(!json.contains(&["11"; 32].concat()));
+        assert!(!json.contains(&["22"; 32].concat()));
     }
 }

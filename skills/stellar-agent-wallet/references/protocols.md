@@ -208,3 +208,22 @@ Read-only. Arg `payment_response` (base64 `PAYMENT-RESPONSE` header value or raw
 - Targets x402 v2, not v3.x.
 - No HTTP retry loop; the host orchestrates the HTTP exchange. The wallet produces the signed payload (and, for the authenticated variant, the Bearer token); it does not submit.
 - `create_payment` validation refuses when `scheme != "exact"`, `network` is not `"stellar:pubnet"`/`"stellar:testnet"`, the x402 `network` passphrase mismatches the profile, `extra.areFeesSponsored != true`, or `amount` cannot be parsed as `i128`.
+
+## MPP sponsored Stellar charges
+
+MPP is a separate Payment challenge/credential protocol, validated against the
+released `@stellar/mpp` 0.7.1 behavior. The wallet supports only
+`method="stellar"`, `intent="charge"`, a classic G-account payer, testnet, and
+sponsored pull settlement. It uses one SEP-41 transfer authorization and SEP-43
+Ed25519 signing.
+
+Flow: prepare with the exact HTTP or native MCP request context, wait for
+operator approval when required, commit once, then give the returned credential
+to the trusted host. The host sends the exact bound paid request over TLS and the
+server sponsors/submits. Record its receipt separately and reconcile the final
+transaction for ledger proof.
+
+Unsupported: mainnet, unsponsored, push, smart-account payer, automatic
+transport/retry, channels, and toolset routing. The wallet never sends the paid
+request or submits the server-sponsored transaction. The configured RPC sees
+the signed authorization during mandatory re-simulation.

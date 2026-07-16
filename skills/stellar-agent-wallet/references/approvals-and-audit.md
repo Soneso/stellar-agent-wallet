@@ -309,7 +309,18 @@ envelope hash is left intact (it is a SHA-256 digest carrying no user data).
 Beyond tool invocations, the log records `value_action_submitted` on every
 confirmed value-moving submit (carrying the gate-sized value legs),
 `keyring_key_written` on each key-writing profile command, and
-`x402_payment_authorized` on x402 authorization signing.
+`x402_payment_authorized` on x402 authorization signing. MPP adds
+`mpp_charge_authorized`, `mpp_authorization_withheld`, `mpp_receipt_observed`,
+and `mpp_settlement_reconciled`; these carry only hashes, redacted references,
+the exact policy-sized legs, and closed status labels, never a credential,
+challenge, receipt, XDR, or signature.
+
+`MppChargeSimulated` is a dedicated short-lived approval kind. It binds the
+authorization fingerprint, prepared artifact hash, profile, testnet, payer,
+transport authority/target, amount, token, recipient, simulated fee, and
+challenge expiry. Local and remote views redact payer/recipient. A policy change
+from allow to require-approval promotes the stored authorization into this flow;
+commit cannot sign until the matching attestation exists.
 
 Each entry's hash is computed over its own canonical JSON (with the previous-hash
 field treated as empty) concatenated with the previous entry's hash, chaining

@@ -202,6 +202,37 @@ pub fn record_confirmed_window_state(
     }
 }
 
+/// Records authorized external-settlement value before signer access and
+/// propagates every failure to the caller.
+///
+/// MPP uses this fail-closed variant because a credential can still be
+/// withheld when accounting fails; unlike post-submit paths, no irreversible
+/// on-chain action has occurred yet.
+///
+/// # Errors
+///
+/// Returns a typed window-store error when in-memory accounting or durable
+/// persistence fails.
+pub fn record_authorized_window_state(
+    engine: &dyn stellar_agent_core::policy::PolicyEngine,
+    tool: &stellar_agent_core::policy::ToolDescriptor,
+    profile: &stellar_agent_core::profile::schema::Profile,
+    profile_name: &str,
+    value: &stellar_agent_core::policy::v1::ValueClass,
+) -> Result<(), WindowStoreError> {
+    let recorded = engine
+        .record_confirmed(tool, profile, value)
+        .map_err(|error| WindowStoreError::Invalid {
+            detail: format!("policy authorization accounting failed: {error}"),
+        })?;
+    if recorded.is_empty() {
+        return Ok(());
+    }
+    PersistedWindowStore::for_profile(profile_name)
+        .record_and_persist(profile, &recorded)
+        .map(|_outcome| ())
+}
+
 /// Error variants for [`PersistedWindowStore`] operations.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

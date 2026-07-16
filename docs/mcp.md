@@ -368,6 +368,25 @@ that `stellar_sep24_interactive_url` consumes; it has no standalone tool. See
 | `stellar_x402_parse_receipt` | Decode an x402 v2 `PAYMENT-RESPONSE` into a structured settlement receipt. | Read-only; no keyring, no network. No `chain_id`. |
 | `stellar_x402_authenticated_payment` | Run a SEP-10 identity gate against a `home_domain` (stellar.toml, SSRF bind, ephemeral challenge/response, JWT), then construct the `PAYMENT-SIGNATURE`. Any identity failure aborts before payment. | Signs the payment authorization entry; does not submit. |
 
+### Machine Payments Protocol
+
+MPP is testnet-only, sponsored-pull, and credential-only. The server refuses all
+five tools on a mainnet profile before state, RPC, keyring, or signer access.
+
+| Tool | Arguments | Purpose |
+| --- | --- | --- |
+| `stellar_mpp_charge_prepare` | `profile`, tagged `challenge` | Strictly validate and context-bind an HTTP/native-MCP challenge, simulate, evaluate policy, and persist a preview plus nonce. Never signs. |
+| `stellar_mpp_charge_commit` | `authorization_id`, `nonce`, `expires_at_unix_ms` | Load only stored exact terms, verify approval/policy, sign once, re-simulate, audit, and return one sensitive credential. |
+| `stellar_mpp_record_receipt` | `authorization_id`, tagged `receipt` | Record a trusted-host receipt digest without claiming ledger settlement. |
+| `stellar_mpp_reconcile_transaction` | `authorization_id`, lowercase `transaction_hash` | Verify the exact final transaction, transfer, payer authorization and signature through RPC. |
+| `stellar_mpp_authorization_status` | `authorization_id` | Return redacted lifecycle, accounting, receipt, and ledger-outcome state. |
+
+Commit accepts no replacement payment terms. The trusted host must use the exact
+bound request context over TLS, keep credentials and receipts out of logs, avoid
+fallback payment after ambiguity, and never retry a consumed commit. The
+configured RPC sees signed authorization during mandatory re-simulation. See
+[Agent payments with MPP](agent-payments.md) for schemas and recovery behavior.
+
 ### Toolsets
 
 | Tool | Purpose | Gating |

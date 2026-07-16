@@ -30,6 +30,10 @@ every reviewer approves with no blocking findings.
   infallible with an inline justification.
 - Every error path fails closed; nothing fails open.
 - No secrets or mainnet keys are committed.
+- A credential or authorization returned without local submission is treated as
+  a one-shot value action: policy accounting happens before signing, durable
+  replay state is claimed first, and an ambiguous post-key-access result cannot
+  sign or deliver again.
 
 ### 3. Tests and coverage
 

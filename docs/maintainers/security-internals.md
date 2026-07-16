@@ -282,6 +282,38 @@ Several criteria need state the core crate cannot fetch itself (account reserves
 
 The policy loader (`policy/v1/loader.rs`) is fail-closed at parse time. An unknown criterion kind, a malformed criterion definition, an empty `match.tool` or `match.chain`, or any item the dispatcher cannot fully type returns `PolicyError::PolicyFileParseFailed` — the document does not load and the engine does not start with a partially-understood ruleset. Tool-registry construction is likewise fatal on duplicate registrations or an unknown engine variant, preventing a `destructive_hint = false` shadow of a destructive tool.
 
+## MPP sponsored authorization
+
+The testnet MPP path adds a one-shot authorization lifecycle on top of the
+existing value policy, approval, signer, and audit substrates. The complete
+module map and state graph live in [MPP internals](mpp.md).
+
+The versioned authorization fingerprint length-prefixes profile, network
+passphrase digest, payer, normalized request-context digest, exact challenge
+digest, method, intent, sponsored mode, amount, token, recipient, and expiry.
+The MPP approval additionally binds the prepared-artifact hash and every
+operator-visible term. Attestation expiry is capped by both five minutes and the
+challenge lifetime.
+
+The per-profile state file is authenticated by a dedicated keyring HMAC key and
+serialized under a sibling-file cross-process lock. Reads reject symlinks,
+non-regular/oversized files, invalid HMAC, invalid records, reconstructed-XDR
+mismatch, and duplicate identities. Writes use a bounded temporary regular file,
+flush, atomic rename, and parent sync. Credentials, raw receipts, and exact
+transaction hashes are never persisted.
+
+Commit claims durable state before policy accounting or key access. Policy usage
+is recorded before signing and is never refunded from an absent receipt. The
+signer handle loads the secret only at the actual sign call. Mandatory signed
+re-simulation precedes the authorization audit delivery gate. Any ambiguous
+post-claim path becomes `indeterminate` or `authorized_withheld` and cannot sign
+again. The configured RPC therefore observes signed authorization and is part of
+the trust boundary.
+
+Mainnet refusal occurs at every public MPP adapter and again in the sponsored
+library boundary before RPC, state creation, keyring access, or signing. MPP is
+also absent from the toolset capability router.
+
 ## Smart-account auth digest
 
 The auth digest binds a Soroban signing payload to the context-rule ids that govern it. The primitive is `compute_auth_digest` in `crates/stellar-agent-core/src/smart_account/auth_digest.rs`.

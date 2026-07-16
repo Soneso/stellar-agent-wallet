@@ -1,12 +1,12 @@
 # Architecture
 
-This document maps the workspace for maintainers and contributors. It describes how the 35 crates are layered, which crate owns which responsibility, and how the two shipped binaries wire the tool surface to the policy, approval, and audit substrate.
+This document maps the workspace for maintainers and contributors. It describes how the 36 crates are layered, which crate owns which responsibility, and how the two shipped binaries wire the tool surface to the policy, approval, and audit substrate.
 
 For concept-level background read [../concepts.md](../concepts.md). For build and toolchain instructions read [building.md](building.md). For the security-relevant internals read [security-internals.md](security-internals.md). The contributor gate checklist is [review-checklist.md](review-checklist.md).
 
 ## Workspace overview
 
-The repository is a single Cargo workspace (`resolver = "2"`) with 35 member crates under `crates/`, all named `stellar-agent-*`. Shared package metadata is inherited from `[workspace.package]`: version `0.1.0-alpha.4`, Rust edition `2024`, license `Apache-2.0`, repository `https://github.com/Soneso/stellar-agent-wallet`, author `Soneso`. Every member crate is published on crates.io at the shared workspace version, in dependency order from the tagged release commit.
+The repository is a single Cargo workspace (`resolver = "2"`) with 36 member crates under `crates/`, all named `stellar-agent-*`. Shared package metadata is inherited from `[workspace.package]`: version `0.1.0-alpha.4`, Rust edition `2024`, license `Apache-2.0`, repository `https://github.com/Soneso/stellar-agent-wallet`, author `Soneso`. Every member crate is published on crates.io at the shared workspace version, in dependency order from the tagged release commit.
 
 Shared dependency pins live in `[workspace.dependencies]` in the root `Cargo.toml` and are added when a crate first needs them, so the workspace only carries dependencies it actually uses.
 
@@ -48,7 +48,7 @@ Crates form a directed acyclic graph from foundational substrate up to the two b
 
 ### Layer 2 — protocol and SEP crates
 
-`stellar-agent-sep7`, `stellar-agent-sep10`, `stellar-agent-sep43`, `stellar-agent-sep45`, `stellar-agent-sep48`, `stellar-agent-sep53`, `stellar-agent-anchor`, `stellar-agent-x402`, `stellar-agent-x402-identity`, and the toolsets triad `stellar-agent-toolsets` with `stellar-agent-toolsets-install` and `stellar-agent-toolsets-runtime`. Several lean SEP crates depend only on `xdr-limits` for untrusted-XDR bounds rather than on the heavier `core`. These protocol crates are consumed on the MCP side (directly or transitively), never by the CLI.
+`stellar-agent-sep7`, `stellar-agent-sep10`, `stellar-agent-sep43`, `stellar-agent-sep45`, `stellar-agent-sep48`, `stellar-agent-sep53`, `stellar-agent-anchor`, `stellar-agent-x402`, `stellar-agent-x402-identity`, `stellar-agent-mpp`, and the toolsets triad `stellar-agent-toolsets` with `stellar-agent-toolsets-install` and `stellar-agent-toolsets-runtime`. Several lean SEP crates depend only on `xdr-limits` for untrusted-XDR bounds rather than on the heavier `core`. MPP is the exception to the former MCP-only protocol pattern: its shared library is adapted by both the CLI and MCP binaries.
 
 ### Layer 3 — DeFi substrate and adapters
 
@@ -65,7 +65,7 @@ The wallet ships two surfaces from two binary crates.
 - `stellar-agent` is built from `stellar-agent-cli`. It is installed on `PATH` and is also discovered as `stellar agent ...` by the incumbent `stellar-cli` through its external-binary plugin convention. The crate root is `crates/stellar-agent-cli/src/main.rs`.
 - `stellar-agent-mcp` is built from `stellar-agent-mcp`. It is an MCP server spoken over stdio. The crate has both `src/lib.rs` (re-exported for integration tests) and `src/main.rs` (the binary entry point that starts the server process).
 
-The two binaries are siblings, not a dependency pair. `stellar-agent-cli` does not depend on `stellar-agent-mcp`. The CLI carries none of the SEP, anchor, or x402 protocol crates; the MCP binary adds that protocol surface plus the `mcp-macros` proc-macro with the `inventory` runtime. The per-crate table below carries the detail.
+The two binaries are siblings, not a dependency pair. `stellar-agent-cli` does not depend on `stellar-agent-mcp`. Most SEP, anchor, and x402 protocol crates remain MCP-only; `stellar-agent-mpp` is shared by both binaries because MPP has a first-class operator CLI. The MCP binary adds the wider protocol surface plus the `mcp-macros` proc-macro with the `inventory` runtime. The per-crate table below carries the detail.
 
 Both binaries share a single release archive. The `[package.metadata.binstall]` blocks in both crates point at the same `stellar-agent-{version}-{target}.tar.xz` (`.zip` on Windows), and `{ bin }` resolves to each crate's own binary name. Those archives are published with each tagged release; `cargo binstall` resolves the crate on crates.io and fetches the matching archive from the release assets. Building from source with `cargo build --release` (or `cargo install stellar-agent-cli@<version> stellar-agent-mcp@<version>` from crates.io) always works. See [building.md](building.md) for the build flow.
 
@@ -104,6 +104,7 @@ Both binaries share a single release archive. The `[package.metadata.binstall]` 
 | `stellar-agent-stablecoin` | Stablecoin substrate: USDC/EURC issuer pins, denomination resolver, USDT hard-refusal, clawback disclosure, typed trustline preview; backs the `trustline` verb. |
 | `stellar-agent-x402` | Payer-side x402 Exact-Stellar payment payload builder (validate, build, simulate, sign, re-simulate, finalize). |
 | `stellar-agent-x402-identity` | SEP-10 counterparty-identity pre-payment gate for x402, returning a JWT Bearer companion bound at the HTTP layer; never mutates the payment XDR. |
+| `stellar-agent-mpp` | Strict testnet sponsored MPP charge parsing, request binding, simulation, one-shot payer authorization, durable lifecycle, credential encoding, receipt observation, and ledger reconciliation; shared by CLI and MCP. |
 | `stellar-agent-mcp-macros` | Proc-macro crate exporting `#[mcp_tool_router]`, which scans `#[mcp_tool_item(...)]` markers and emits `inventory::submit!` tool-registry entries. |
 | `stellar-agent-mcp` | MCP stdio server library and binary: `WalletServer`, the bounded stdio transport, per-family tool modules, and the inventory-collected tool registry feeding the policy engine. |
 | `stellar-agent-cli` | The `stellar-agent` CLI binary (discovered as `stellar agent ...`); a clap dispatch layer over the library crates. |
@@ -112,7 +113,7 @@ Both binaries share a single release archive. The `[package.metadata.binstall]` 
 ## Crate classification
 
 - **Binaries (2):** `stellar-agent-cli` (binary `stellar-agent`) and `stellar-agent-mcp` (binary `stellar-agent-mcp`, plus a library re-export for integration tests).
-- **Plain libraries:** `core`, `network`, `claimable`, `sep5`, `xdr-limits`, `nonce`, `headless-keyring`, `smart-account`, `webauthn-bridge`, `loopback-http`, `approval-ui`, `approval-remote`, `pool`, `sep7`, `sep10`, `sep43`, `sep45`, `sep48`, `sep53`, `anchor`, `toolsets`, `toolsets-install`, `toolsets-runtime`, `defi`, `blend`, `defindex`, `dex`, `stablecoin`, `x402`, `x402-identity`.
+- **Plain libraries:** `core`, `network`, `claimable`, `sep5`, `xdr-limits`, `nonce`, `headless-keyring`, `smart-account`, `webauthn-bridge`, `loopback-http`, `approval-ui`, `approval-remote`, `pool`, `sep7`, `sep10`, `sep43`, `sep45`, `sep48`, `sep53`, `anchor`, `toolsets`, `toolsets-install`, `toolsets-runtime`, `defi`, `blend`, `defindex`, `dex`, `stablecoin`, `x402`, `x402-identity`, `mpp`.
 - **Proc-macro library:** `mcp-macros`, the compiler-plugin companion to the `inventory` runtime in `mcp`.
 - **Platform-gated:** `windows-identity`, target-gated to `cfg(target_os = "windows")`. It uses `unsafe` for Win32 FFI as its core capability and is absent off Windows. (The CLI also carries a narrowly-scoped `#[allow(unsafe_code)]` for a POSIX `geteuid` FFI declaration in the audit-verify owner check.)
 - **Dev-only:** `test-support`, consumed strictly as a `[dev-dependencies]` entry behind gated test-harness features and never as a runtime dependency.

@@ -123,6 +123,7 @@ Before dispatching any command, the CLI runs a local-only startup advisory: it s
 | `approve` | Read a pending approval, prompt y/n, and record the HMAC attestation; garbage-collect expired approvals. | [profile-and-governance](profile-and-governance.md) |
 | `audit` | Walk and verify the integrity of a hash-chained audit log. | [profile-and-governance](profile-and-governance.md) |
 | `toolsets` | Install, list, run, and uninstall agent toolsets with cryptographic provenance verification. | [toolsets](../toolsets.md) |
+| `mpp` | Authorize a sponsored testnet MPP charge, inspect durable state, record a host receipt, reconcile settlement, and prune old terminal replay markers. | [agent payments](../agent-payments.md) |
 
 ## Related pages
 
@@ -131,4 +132,5 @@ Before dispatching any command, the CLI runs a local-only startup advisory: it s
 - [DeFi and channel-account pool commands](defi-and-pool.md)
 - [Profiles, credentials, approval, and audit](profile-and-governance.md)
 - [Toolsets](../toolsets.md)
+- [MPP agent payments](../agent-payments.md)
 - [Concepts](../concepts.md)

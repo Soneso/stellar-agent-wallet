@@ -29,7 +29,7 @@ jobs:
     name: publish (${{ inputs.tag }})
     runs-on: ubuntu-latest
     environment: crates-io
-    # 35 sequential verify builds plus registry rate-limit waits.
+    # 36 sequential verify builds plus registry rate-limit waits.
     timeout-minutes: 300
     permissions:
       contents: read

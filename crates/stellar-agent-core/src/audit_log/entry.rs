@@ -1985,6 +1985,161 @@ impl AuditEntry {
         }
     }
 
+    /// Constructs an `MppChargeAuthorized` audit entry before credential delivery.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "flat audit-field constructor mirrors the event schema"
+    )]
+    pub fn new_mpp_charge_authorized(
+        tool: impl Into<String>,
+        chain_id: impl IntoOptionalChainId,
+        authorization_id_hash: impl Into<String>,
+        fingerprint_hash: impl Into<String>,
+        legs: Vec<ValueLegRecord>,
+        payer_redacted: impl Into<RedactedStrkey>,
+        approval_present: bool,
+        policy_decision: PolicyDecision,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.into(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::MppChargeAuthorized {
+                authorization_id_hash: super::schema::bound_recorded_str(
+                    &authorization_id_hash.into(),
+                ),
+                fingerprint_hash: super::schema::bound_recorded_str(&fingerprint_hash.into()),
+                legs,
+                network: "stellar:testnet".to_owned(),
+                payer_redacted: payer_redacted.into(),
+                sponsorship_mode: "sponsored_pull".to_owned(),
+                approval_present,
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
+    /// Constructs an `MppAuthorizationWithheld` audit entry.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "flat audit-field constructor mirrors the event schema"
+    )]
+    pub fn new_mpp_authorization_withheld(
+        authorization_id_hash: impl Into<String>,
+        fingerprint_hash: impl Into<String>,
+        failure_stage: impl Into<String>,
+        key_access_began: bool,
+        policy_budget_consumed: bool,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "stellar_mpp_charge_commit".to_owned(),
+            chain_id: Some("stellar:testnet".to_owned()),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Deny("mpp.authorization_withheld".to_owned()),
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::MppAuthorizationWithheld {
+                authorization_id_hash: super::schema::bound_recorded_str(
+                    &authorization_id_hash.into(),
+                ),
+                fingerprint_hash: super::schema::bound_recorded_str(&fingerprint_hash.into()),
+                failure_stage: super::schema::bound_recorded_str(&failure_stage.into()),
+                key_access_began,
+                policy_budget_consumed,
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
+    /// Constructs an `MppReceiptObserved` audit entry.
+    #[must_use]
+    pub fn new_mpp_receipt_observed(
+        authorization_id_hash: impl Into<String>,
+        receipt_digest: impl Into<String>,
+        transaction_reference_redacted: impl Into<String>,
+        source_transport: impl Into<String>,
+        claimed_status: impl Into<String>,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "stellar_mpp_record_receipt".to_owned(),
+            chain_id: Some("stellar:testnet".to_owned()),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::MppReceiptObserved {
+                authorization_id_hash: super::schema::bound_recorded_str(
+                    &authorization_id_hash.into(),
+                ),
+                receipt_digest: super::schema::bound_recorded_str(&receipt_digest.into()),
+                transaction_reference_redacted: super::schema::bound_recorded_str(
+                    &transaction_reference_redacted.into(),
+                ),
+                source_transport: super::schema::bound_recorded_str(&source_transport.into()),
+                claimed_status: super::schema::bound_recorded_str(&claimed_status.into()),
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
+    /// Constructs an `MppSettlementReconciled` audit entry.
+    #[must_use]
+    pub fn new_mpp_settlement_reconciled(
+        authorization_id_hash: impl Into<String>,
+        transaction_reference_redacted: impl Into<String>,
+        ledger: u32,
+        verified_outcome: impl Into<String>,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "stellar_mpp_reconcile_transaction".to_owned(),
+            chain_id: Some("stellar:testnet".to_owned()),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::MppSettlementReconciled {
+                authorization_id_hash: super::schema::bound_recorded_str(
+                    &authorization_id_hash.into(),
+                ),
+                transaction_reference_redacted: super::schema::bound_recorded_str(
+                    &transaction_reference_redacted.into(),
+                ),
+                ledger,
+                verified_outcome: super::schema::bound_recorded_str(&verified_outcome.into()),
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
     /// Constructs a `KeyringKeyWritten` audit entry.
     ///
     /// Emitted after a key-writing profile command successfully writes
@@ -6296,5 +6451,59 @@ mod tests {
         };
         assert_eq!(network.chars().count(), RECORDED_STR_MAX);
         assert_eq!(scheme.chars().count(), RECORDED_STR_MAX);
+    }
+
+    #[test]
+    fn mpp_audit_constructors_serialize_only_redacted_bounded_fields() {
+        use crate::audit_log::schema::{RECORDED_STR_MAX, ValueActionKind, ValueLegRecord};
+
+        let authorized = AuditEntry::new_mpp_charge_authorized(
+            "stellar_mpp_charge_commit",
+            "stellar:testnet",
+            "a".repeat(64),
+            "b".repeat(64),
+            vec![ValueLegRecord {
+                action: ValueActionKind::MppCharge,
+                amount: Some(10_000_000),
+                asset: Some("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned()),
+                destination_redacted: Some("GAAAA...AAAWHF".to_owned()),
+            }],
+            RedactedStrkey::from_already_redacted("GABCD...VWXYZ"),
+            true,
+            PolicyDecision::Allow,
+            "request-1",
+        );
+        let withheld = AuditEntry::new_mpp_authorization_withheld(
+            "c".repeat(64),
+            "d".repeat(64),
+            "x".repeat(RECORDED_STR_MAX * 2),
+            true,
+            true,
+            "request-2",
+        );
+        let receipt = AuditEntry::new_mpp_receipt_observed(
+            "e".repeat(64),
+            "f".repeat(64),
+            "aaaaaaaa...aaaaaaaa",
+            "mcp",
+            "success",
+            "request-3",
+        );
+        let reconciled = AuditEntry::new_mpp_settlement_reconciled(
+            "1".repeat(64),
+            "bbbbbbbb...bbbbbbbb",
+            42,
+            "settled",
+            "request-4",
+        );
+        let json = serde_json::to_string(&vec![authorized, withheld, receipt, reconciled])
+            .expect("audit JSON");
+        assert!(json.contains("mpp_charge_authorized"));
+        assert!(json.contains("mpp_authorization_withheld"));
+        assert!(json.contains("mpp_receipt_observed"));
+        assert!(json.contains("mpp_settlement_reconciled"));
+        assert!(!json.contains("Payment ey"));
+        assert!(!json.contains("AAAAAgAAA"));
+        assert!(!json.contains(&"x".repeat(RECORDED_STR_MAX + 1)));
     }
 }

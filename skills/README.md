@@ -11,7 +11,8 @@ others).
 When installed, the skill gives your AI agent working knowledge of the wallet:
 how to create a profile and custody keys, read account state, send payments
 through the two-phase build-then-commit flow, satisfy the operator-approval gate,
-drive smart-account governance and DeFi, and use the SEP and x402 surfaces — with
+drive smart-account governance and DeFi, and use the SEP, x402, and sponsored
+MPP charge surfaces — with
 the correct commands, MCP tool names, arguments, and safe call patterns so the
 agent does not have to guess or clone the repository.
 

@@ -575,6 +575,30 @@ Arguments:
   `chain_id`, required `home_domain` (the SEP-10 counterparty domain); optional
   `address`.
 
+## Machine Payments Protocol
+
+MPP tools are available only on a testnet full-wallet server and are never
+toolset-routable.
+
+| Tool | Required arguments | Result |
+|---|---|---|
+| `stellar_mpp_charge_prepare` | `profile`, tagged `challenge` | Redacted exact-term preview, authorization ID, process nonce and expiry. Never signs. |
+| `stellar_mpp_charge_commit` | `authorization_id`, `nonce`, `expires_at_unix_ms` | One sensitive HTTP/native-MCP credential. Accepts no replacement terms. |
+| `stellar_mpp_record_receipt` | `authorization_id`, tagged `receipt` | Host-observation state only, not settlement proof. |
+| `stellar_mpp_reconcile_transaction` | `authorization_id`, lowercase 64-hex `transaction_hash` | Verified `settled`/`failed` outcome and ledger. |
+| `stellar_mpp_authorization_status` | `authorization_id` | Redacted lifecycle, accounting, receipt and ledger axes. |
+
+The `challenge` tag is `transport: "http"` with `www_authenticate`, optional
+`selected_challenge_id`, and exact HTTPS context; or `transport: "mcp"` with
+native `challenges`, optional selection, and the server/operation/target/params
+digest context. The receipt tag is `transport: "http"` with the base64url field
+`value`, or `transport: "mcp"` with the native `receipt` object.
+
+Commit is one-shot. After any ambiguous or lost result, use status and
+reconciliation; never call commit again or create a fallback payment. The
+trusted host, not the wallet, delivers the credential to the exact bound request
+over TLS. Treat credentials and receipts as secrets.
+
 ## Toolsets
 
 | Tool | Purpose | Gating |

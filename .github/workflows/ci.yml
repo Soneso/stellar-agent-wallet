@@ -9,19 +9,17 @@ name: CI
 on:
   push:
     branches: [main]
-    # A commit that touches only documentation, the downloadable agent skill,
-    # or the plugin manifest cannot affect any gate below.
+    # Plain documentation and the root plugin manifest cannot affect a gate.
+    # Skill changes do run CI because release-contracts verifies the archive.
     paths-ignore:
       - '**/*.md'
       - 'LICENSE'
-      - 'skills/**'
       - '.claude-plugin/**'
   pull_request:
     branches: [main]
     paths-ignore:
       - '**/*.md'
       - 'LICENSE'
-      - 'skills/**'
       - '.claude-plugin/**'
 
 # Supersede in-flight runs for the same ref so rapid pushes do not queue stale
@@ -109,6 +107,28 @@ jobs:
       # without erroring; run it explicitly so this job actually covers it.
       - run: cargo test -p stellar-agent-cli --features test-helpers
 
+  mpp-interop:
+    name: mpp released-sdk interop
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24.5.0
+      - run: corepack enable
+      - run: .github/scripts/test-mpp-interop.sh
+
+  release-contracts:
+    name: release contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - run: .github/scripts/test-publish-crates-check.sh
+      - run: .github/scripts/publish-crates.sh --check
+      - run: .github/scripts/package-skill.sh --check
+
   windows-storage:
     name: windows-storage
     runs-on: windows-latest
@@ -131,6 +151,9 @@ jobs:
     #    directory path requires `FILE_FLAG_BACKUP_SEMANTICS` on Windows,
     #    which the stable API does not set, and fails with
     #    `ERROR_ACCESS_DENIED`. Both stores now skip this step on non-Unix.
+    # 3. MPP authorization state: NamedTempFile replacement, sidecar locking,
+    #    authenticated-record validation, and repeated mutation must preserve
+    #    the same behavior on Windows as on Unix.
     #
     # Bounded to the touched crates' unit tests (not the full workspace
     # matrix) to keep this job cheap. The smart-account and MCP suites stay
@@ -155,13 +178,16 @@ jobs:
       # rest of the job budget.
       - name: Build test binaries (unbounded compile phase)
         shell: bash
-        run: cargo test -p stellar-agent-core --lib --no-run
+        run: cargo test -p stellar-agent-core -p stellar-agent-mpp --lib --no-run
       - name: Audit-log regression (stellar-agent-core)
         shell: bash
         run: "timeout 600 cargo test -p stellar-agent-core --lib audit_log::"
       - name: Approval + toolset-grant store persist regression (stellar-agent-core)
         shell: bash
         run: "timeout 600 cargo test -p stellar-agent-core --lib -- approval::store::tests::persist approval::toolset_grant::tests::persist"
+      - name: MPP authorization-store regression
+        shell: bash
+        run: "timeout 600 cargo test -p stellar-agent-mpp --lib store::tests::"
 
   machete:
     name: unused-deps

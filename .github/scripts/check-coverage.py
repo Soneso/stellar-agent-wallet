@@ -39,6 +39,7 @@ FLOORS = {
     "stellar-agent-loopback-http": 95,
     "stellar-agent-mcp": 46,
     "stellar-agent-mcp-macros": 95,
+    "stellar-agent-mpp": 90,
     "stellar-agent-network": 85,
     "stellar-agent-nonce": 95,
     "stellar-agent-pool": 88,

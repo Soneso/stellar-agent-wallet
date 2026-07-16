@@ -1,10 +1,10 @@
 ---
 name: stellar-agent-wallet
-description: Operate the Stellar Agent Wallet — a self-custodial Stellar wallet built for AI agents — through its stellar-agent CLI and stellar-agent-mcp MCP server. Use when an agent needs to read Stellar account state, send XLM or asset payments, create accounts, manage trustlines, claim claimable balances, run OpenZeppelin smart-account governance, lend/trade/deposit on DeFi, or handle SEP and x402 flows, all under a local policy engine, an operator-approval gate (satisfiable via the CLI, a local web inbox, or a TLS-protected remote-approval surface), and a tamper-evident audit log. Covers the two-phase build-then-commit signing pattern, the simulate-approve-commit handshake, chain_id and the JSON result envelope, and the mainnet write gate. Reach for it when the user mentions the stellar-agent wallet, an AI-agent wallet on Stellar, MCP-driven Stellar payments, or autonomous-agent key custody.
+description: Operate the Stellar Agent Wallet — a self-custodial Stellar wallet built for AI agents — through its stellar-agent CLI and stellar-agent-mcp MCP server. Use when an agent needs to read Stellar account state, send XLM or asset payments, create accounts, manage trustlines, claim claimable balances, run OpenZeppelin smart-account governance, lend/trade/deposit on DeFi, or handle SEP, x402, and sponsored MPP charge flows, all under a local policy engine, an operator-approval gate (satisfiable via the CLI, a local web inbox, or a TLS-protected remote-approval surface), and a tamper-evident audit log. Covers the two-phase build-then-commit signing pattern, the simulate-approve-commit handshake, chain_id and the JSON result envelope, and the mainnet write gate. Reach for it when the user mentions the stellar-agent wallet, an AI-agent wallet on Stellar, MCP-driven Stellar payments, or autonomous-agent key custody.
 license: Apache-2.0
 compatibility: Requires the stellar-agent CLI and stellar-agent-mcp server (v0.1.0-alpha.4 public alpha; install from crates.io with a pinned version, e.g. cargo binstall stellar-agent-cli@0.1.0-alpha.4 stellar-agent-mcp@0.1.0-alpha.4, or build from source). Targets Stellar testnet (default) and mainnet.
 metadata:
-  version: "0.2.0"
+  version: "0.3.0"
   wallet_version: "0.1.0-alpha.4"
 ---
 
@@ -226,7 +226,10 @@ SEP-7 URI parsing, SEP-10/45 web auth, SEP-24/6 transfer hand-off, SEP-43 wallet
 signing (`get_address`, `get_network`, `sign_transaction`, `sign_auth_entry`,
 `sign_message`, `sign_and_submit_transaction`), SEP-47/48 contract discovery, and
 SEP-53 signed messages. The wallet also signs x402 v2 Exact Stellar agent
-payments. See `references/protocols.md`.
+payments and testnet sponsored MPP charges. MPP uses
+`stellar_mpp_charge_prepare` then one `stellar_mpp_charge_commit`; the trusted
+host sends the returned credential to the exact bound HTTP or MCP request. See
+`references/protocols.md`.
 
 ## 8. The wallet's toolsets feature
 
@@ -244,7 +247,8 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
   call. Mainnet writes require the operator to rotate keys and opt in to the V1
   engine.
 - The sign-only tools (the SEP-43 sign verbs, SEP-53 `sign_message`, and the two
-  x402 payment tools) refuse `stellar:mainnet` structurally with
+  x402 payment tools), plus every MPP tool, refuse `stellar:mainnet`
+  structurally with
   `network.mainnet_write_forbidden` at handler entry, before the policy gate and
   regardless of engine. Branch on BOTH codes when handling a mainnet refusal.
 - Argument values are never written to the audit log — only key names. The
@@ -289,6 +293,11 @@ not work and is recorded in the audit log.
 
 **Each build mints a fresh single-use nonce.** You cannot reuse a `nonce` across
 commits or call commit twice with the same one. Build again to get a new nonce.
+
+**An MPP credential is one-shot.** Never retry MPP commit, replace its stored
+terms, switch transport, or create an x402/classic fallback after an ambiguous
+result. Query `stellar_mpp_authorization_status`, record the host receipt, and
+reconcile the transaction. Keep credential and receipt values out of logs.
 
 **`policy.approval_required` is not a transient error.** It means the operator
 must approve and relay the `approval_attestation`. Retrying the commit unchanged
