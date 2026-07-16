@@ -77,6 +77,31 @@ against the [review checklist](docs/maintainers/review-checklist.md) before it i
 committed. Review repeats on a fresh pass until every reviewer approves with no
 blocking findings.
 
+## Contributing with a coding agent
+
+This is a wallet built for AI agents, and contributions built with AI agents are
+welcome. Two things make that work:
+
+- **You own the pull request.** The quality bar above does not move: the gate
+  suite must pass, and you — the human contributor — are expected to understand
+  the change, answer review questions, and make requested revisions. A PR whose
+  author cannot explain it will not clear review, however it was produced.
+- **Teach your agent the wallet first.** The repository ships an
+  [agent knowledge skill](skills/) that teaches a coding agent the CLI surface,
+  the MCP tools, the error-code families, and the security model. Installing it
+  before you start means your agent works from the project's actual conventions
+  instead of guessing; see [skills/README.md](skills/README.md) for setup.
+
+Good entry points are the issues labeled
+[`help wanted`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22)
+and
+[`good first issue`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
+Issues touching signing paths, key handling, or serialized state get the full
+three-reviewer pass and are better second contributions than first ones.
+
+Changes land through pull requests from a fork. CI runs the offline gate suite
+on every pull request and must be green before merge.
+
 ## Commit and pull request conventions
 
 - Write commit messages in conventional-commit style, for example
