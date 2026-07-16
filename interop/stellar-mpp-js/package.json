@@ -1,0 +1,19 @@
+{
+  "name": "stellar-agent-mpp-interop",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.5.0"
+  },
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "check": "node check.mjs"
+  },
+  "dependencies": {
+    "@stellar/mpp": "0.7.1",
+    "@stellar/stellar-sdk": "15.1.0",
+    "mppx": "0.6.31",
+    "viem": "2.53.1"
+  }
+}

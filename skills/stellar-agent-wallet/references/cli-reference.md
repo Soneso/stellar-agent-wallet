@@ -151,6 +151,37 @@ stellar-agent pay GDEST...WXYZ "10 XLM" --source GSRC...WXYZ \
 
 ---
 
+## mpp
+
+Testnet-only sponsored MPP charge authorization for the profile's classic
+G-account signer. The wallet returns a credential; it does not send the paid
+request or submit the server-sponsored transaction.
+
+```bash
+stellar-agent mpp charge authorize --profile default --input-file challenge.json
+stellar-agent mpp charge authorize --profile default --input-stdin < challenge.json
+stellar-agent mpp charge authorize --profile default --approval-id <approval-id>
+stellar-agent mpp authorization status --profile default --authorization-id <id>
+stellar-agent mpp receipt record --profile default --authorization-id <id> \
+  --transport http --receipt-file receipt.txt
+stellar-agent mpp settlement reconcile --profile default --authorization-id <id> \
+  --reference-file transaction-hash.txt
+stellar-agent mpp state prune --profile default --reason-file reason.txt
+```
+
+Each input operation requires exactly one stdin/file source; files must be
+bounded regular non-symlinks. `authorize` returns `mpp.approval_required` when
+operator consent is needed. Approve the returned ID through the normal approval
+surface, then resume with `--approval-id`; no challenge may be supplied on
+resume. Credential output is one-shot and sensitive.
+
+Receipt observation does not prove settlement. Reconcile requires the lowercase
+transaction hash and verifies the exact envelope and payer authorization through
+RPC. Prune is audited, requires a bounded reason, retains indeterminate records,
+and removes only terminal markers older than 30 days.
+
+---
+
 ## balances
 
 `balances [flags]` — reads native XLM balance and trustlines via RPC `getLedgerEntries`. Read-only; no mainnet gate. `--account` is required in practice (omitting it exits `1`).

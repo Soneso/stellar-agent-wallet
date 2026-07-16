@@ -3516,6 +3516,7 @@ mod value_descriptor_enumeration {
 
     use std::collections::HashSet;
 
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use serde_json::json;
     use stellar_agent_blend::abi::{BlendRequest, RequestType};
     use stellar_agent_blend::value::blend_value_legs;
@@ -3524,6 +3525,10 @@ mod value_descriptor_enumeration {
     use stellar_agent_core::policy::{McpToolRegistration, ToolValueKind};
     use stellar_agent_defindex::value::{vault_deposit_value_legs, vault_withdraw_value_leg};
     use stellar_agent_dex::value::dex_trade_value_leg;
+    use stellar_agent_mpp::{
+        ChallengeInput, HttpRequestContext, json::canonical_json, mpp_value_effects,
+        select_and_validate,
+    };
 
     use super::{decode_payment_required_input, x402_value_leg};
 
@@ -3563,6 +3568,8 @@ mod value_descriptor_enumeration {
         "stellar_defindex_vault_withdraw",
         "stellar_x402_create_payment",
         "stellar_x402_authenticated_payment",
+        "stellar_mpp_charge_prepare",
+        "stellar_mpp_charge_commit",
     ];
 
     fn sample_x402_requirements() -> stellar_agent_x402::wire::PaymentRequirements {
@@ -3577,6 +3584,35 @@ mod value_descriptor_enumeration {
         })
         .to_string();
         decode_payment_required_input(&json).expect("sample x402 requirements must decode")
+    }
+
+    fn sample_mpp_legs() -> Vec<stellar_agent_core::policy::v1::ValueLeg> {
+        let request = json!({
+            "amount": "2500000",
+            "currency": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+            "methodDetails": {"feePayer": true, "network": "stellar:testnet"},
+            "recipient": DESTINATION
+        });
+        let encoded = URL_SAFE_NO_PAD.encode(canonical_json(&request).expect("canonical request"));
+        let selected = select_and_validate(
+            &ChallengeInput::Http {
+                www_authenticate: vec![format!(
+                    "Payment id=one, realm=merchant, method=stellar, intent=charge, request={encoded}"
+                )],
+                selected_challenge_id: None,
+                context: HttpRequestContext::new(
+                    "https://merchant.example",
+                    "POST",
+                    "https://merchant.example/charge",
+                    None,
+                    None,
+                )
+                .expect("context"),
+            },
+            1_700_000_000,
+        )
+        .expect("selected challenge");
+        mpp_value_effects(&selected).legs().to_vec()
     }
 
     /// Builds the non-empty leg vector a family-(b) tool would pass to
@@ -3613,6 +3649,7 @@ mod value_descriptor_enumeration {
                 let requirements = sample_x402_requirements();
                 vec![x402_value_leg(&requirements).expect("valid requirements must build a leg")]
             }
+            "stellar_mpp_charge_prepare" | "stellar_mpp_charge_commit" => sample_mpp_legs(),
             other => panic!("family_b_legs_for: unrecognised family-(b) tool name '{other}'"),
         }
     }
@@ -3879,6 +3916,21 @@ mod value_descriptor_enumeration {
                 x402_legs[0].destination.as_deref(),
                 Some(DESTINATION),
                 "x402 leg destination must be requirements.pay_to verbatim"
+            );
+        }
+
+        // MPP: prepare and commit derive the same single debit leg from the
+        // exact validated challenge persisted between the two phases.
+        for tool_name in ["stellar_mpp_charge_prepare", "stellar_mpp_charge_commit"] {
+            let mpp_legs = family_b_legs_for(tool_name);
+            assert_eq!(mpp_legs.len(), 1);
+            assert_eq!(mpp_legs[0].kind, ActionKind::MppCharge);
+            assert!(mpp_legs[0].kind.carries_debit(), "an MPP charge is a debit");
+            assert_eq!(mpp_legs[0].amount, Some(2_500_000_i128));
+            assert_eq!(
+                mpp_legs[0].destination.as_deref(),
+                Some(DESTINATION),
+                "MPP destination must be the validated challenge recipient"
             );
         }
     }

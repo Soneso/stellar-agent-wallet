@@ -15,7 +15,9 @@
 //! @x402/stellar reference implementation.
 
 use stellar_strkey::Strkey;
-use stellar_xdr::{ContractId, InvokeContractArgs, ScAddress, ScSymbol, ScVal, StringM, VecM};
+#[cfg(test)]
+use stellar_xdr::ScVal;
+use stellar_xdr::{ContractId, InvokeContractArgs, ScAddress};
 
 use crate::X402Error;
 
@@ -158,35 +160,16 @@ pub fn build_sac_transfer_invoke(
     let from_sc = g_strkey_to_account_address(from)?;
     let to_sc = strkey_to_recipient_sc_address(to)?;
 
-    // SEP-41 `transfer` signature:
-    //   transfer(from: Address, to: Address, amount: i128) -> ()
-    let args_vec: Vec<ScVal> = vec![
-        ScVal::Address(from_sc),
-        ScVal::Address(to_sc),
-        ScVal::from(amount),
-    ];
+    let ScAddress::Contract(contract) = contract_address else {
+        return Err(X402Error::InvalidAssetAddress {
+            detail: format!("asset {sac_contract:?} is not a contract address"),
+        });
+    };
 
-    let args: VecM<ScVal> = args_vec
-        .try_into()
-        .map_err(|e| X402Error::TransactionBuildFailed {
-            detail: format!("SAC transfer args VecM construction failed: {e:?}"),
-        })?;
-
-    // `ScSymbol` wraps a `StringM<32>` (max 32 bytes).
-    // "transfer" is 8 bytes — well within the limit.
-    let function_name_str: StringM<32> =
-        "transfer"
-            .try_into()
-            .map_err(|e| X402Error::TransactionBuildFailed {
-                detail: format!("ScSymbol construction failed: {e:?}"),
-            })?;
-    let function_name = ScSymbol(function_name_str);
-
-    Ok(InvokeContractArgs {
-        contract_address,
-        function_name,
-        args,
-    })
+    stellar_agent_network::sep41::build_sep41_transfer_invoke(contract, from_sc, to_sc, amount)
+        .map_err(|error| X402Error::TransactionBuildFailed {
+            detail: error.to_string(),
+        })
 }
 
 #[cfg(test)]

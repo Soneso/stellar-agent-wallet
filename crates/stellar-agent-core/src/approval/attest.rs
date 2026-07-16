@@ -574,6 +574,34 @@ pub fn attest_and_persist(
             );
             Some(blob_b64)
         }
+        ApprovalKind::MppChargeSimulated {
+            prepared_artifact_hash,
+            ..
+        } => {
+            let attestation_blob = compute_attestation(
+                &key_arr,
+                &entry.approval_nonce,
+                prepared_artifact_hash,
+                &entry.process_uid,
+            );
+            record_attestation_on_store(store, &entry.approval_nonce, attestation_blob)?;
+            let blob_b64 = URL_SAFE_NO_PAD.encode(attestation_blob);
+            emit_attested_audit(
+                &mut audit,
+                "MppChargeSimulated",
+                "stellar_mpp_charge_commit",
+                Some(
+                    prepared_artifact_hash
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
+                ),
+                &entry.approval_nonce,
+                surface,
+                operator_credential_id_b64url,
+            );
+            Some(blob_b64)
+        }
         ApprovalKind::Rejected { .. } => {
             return Err(WalletError::Internal(InternalError::UnexpectedState {
                 detail: "approval.rejected: this pending approval was rejected by the operator \
@@ -585,8 +613,8 @@ pub fn attest_and_persist(
             return Err(WalletError::Internal(InternalError::UnexpectedState {
                 detail: format!(
                     "approval.wrong_kind: attest_and_persist does not support {}, \
-                     expected PaymentSimulated, ClaimSimulated, ToolsetFirstInvokeGate, \
-                     TrustlineClawbackOptIn, or RuleProposalSimulated",
+                     expected PaymentSimulated, ClaimSimulated, MppChargeSimulated, \
+                     ToolsetFirstInvokeGate, TrustlineClawbackOptIn, or RuleProposalSimulated",
                     other.kind_name()
                 ),
             }));

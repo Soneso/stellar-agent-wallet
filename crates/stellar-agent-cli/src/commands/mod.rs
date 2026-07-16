@@ -14,6 +14,7 @@ pub mod friendbot;
 pub(crate) mod policy_engine;
 // Blend lending adapter — lend verb.
 pub mod lend;
+pub mod mpp;
 pub mod pay;
 pub mod pool;
 pub mod profile;

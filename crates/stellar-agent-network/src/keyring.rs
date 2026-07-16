@@ -637,6 +637,34 @@ impl Signer for KeyringSignHandle {
     }
 }
 
+/// Constructs a lazy keyring signing handle from the profile's expected
+/// public account without opening or reading the keyring entry.
+///
+/// The first signing call loads the seed and verifies that its derived public
+/// key matches `expected_source_g` before producing a signature. This is useful
+/// for flows that must durably claim an operation before any secret-key access.
+///
+/// # Errors
+///
+/// Returns a signer-key mismatch error when `expected_source_g` is not a
+/// canonical ed25519 public-key strkey.
+pub fn lazy_signer_from_keyring(
+    entry_ref: &KeyringEntryRef,
+    expected_source_g: &str,
+) -> Result<KeyringSignHandle, WalletError> {
+    let public_key =
+        stellar_strkey::ed25519::PublicKey::from_string(expected_source_g).map_err(|_error| {
+            WalletError::Auth(AuthError::SignerKeyMismatch {
+                expected: redact_strkey_first5_last5(expected_source_g),
+                got: "invalid public account".to_owned(),
+            })
+        })?;
+    Ok(KeyringSignHandle {
+        entry_ref: entry_ref.clone(),
+        cached_pubkey_bytes: public_key.0,
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // signer_from_keyring
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1274,5 +1302,24 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err.category(), ErrorCategory::Auth);
         assert_eq!(err.code(), "auth.keyring_not_found");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn lazy_signer_construction_does_not_open_the_keyring() {
+        keyring_core::unset_default_store();
+        let expected_g = gstrkey_for_seed([0x42; 32]);
+        let entry_ref = KeyringEntryRef::new("stellar-agent-lazy-signer-test", "default");
+
+        let handle = lazy_signer_from_keyring(&entry_ref, &expected_g)
+            .expect("public identity alone constructs the handle");
+        assert_eq!(handle.public_key().to_string(), expected_g.as_str());
+
+        let error = handle
+            .sign_tx_payload(&[0x11; 32])
+            .await
+            .expect_err("first signature call must open the missing keyring");
+        assert_eq!(error.code(), "auth.keyring_not_found");
+        assert!(lazy_signer_from_keyring(&entry_ref, "not-a-g-strkey").is_err());
     }
 }

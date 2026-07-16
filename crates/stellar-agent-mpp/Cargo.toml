@@ -1,0 +1,48 @@
+[package]
+name = "stellar-agent-mpp"
+description = "Strict Machine Payments Protocol support for Stellar agent wallets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+testnet-acceptance = []
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+hmac.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+schemars = { workspace = true, features = ["derive"] }
+serde_json_canonicalizer.workspace = true
+sha2.workspace = true
+stellar-agent-core.workspace = true
+stellar-agent-network.workspace = true
+stellar-agent-sep43.workspace = true
+stellar-agent-xdr-limits.workspace = true
+stellar-baselib.workspace = true
+stellar-rpc-client.workspace = true
+stellar-strkey.workspace = true
+stellar-xdr.workspace = true
+subtle.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+time.workspace = true
+url.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+rand_core.workspace = true
+reqwest.workspace = true
+serial_test.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

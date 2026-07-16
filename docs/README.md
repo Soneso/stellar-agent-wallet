@@ -22,6 +22,9 @@ shipping a `stellar-agent` CLI and a `stellar-agent-mcp` MCP server.
   server and the call patterns that keep funds safe.
 - [Protocols and integrations](protocols.md) — the supported SEPs, x402, and DeFi
   venues.
+- [Agent payments with MPP](agent-payments.md) — sponsored testnet charge
+  authorization, CLI/MCP workflows, receipt and settlement semantics, and the
+  trusted-host boundary.
 - [Agent toolsets](toolsets.md) — packaging, signing, and running the wallet's
   capability-restricting toolsets.
 - [Profile configuration](profiles.md) — the profile TOML reference and the
@@ -43,6 +46,8 @@ from the capability-restriction toolsets feature above.
   and the test tiers.
 - [Security internals](maintainers/security-internals.md) — the cryptographic
   detail behind the model.
+- [MPP internals](maintainers/mpp.md) — protocol pins, module ownership, durable
+  lifecycle, fixtures, and release gates.
 - [Review checklist](maintainers/review-checklist.md) — the production-readiness
   gate every change passes.
 

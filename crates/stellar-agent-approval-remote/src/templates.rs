@@ -60,6 +60,7 @@ fn kind_is_approvable(summary: &ApprovalSummaryView) -> bool {
             | ApprovalSummaryView::ToolsetFirstInvokeGate { .. }
             | ApprovalSummaryView::TrustlineClawbackOptIn { .. }
             | ApprovalSummaryView::RuleProposal { .. }
+            | ApprovalSummaryView::MppCharge { .. }
     )
 }
 
@@ -458,6 +459,39 @@ fn render_summary_html(summary: &ApprovalSummaryView) -> String {
             s.push_str(&row("Smart account", smart_account_redacted));
             s.push_str(&row("Chain ID", chain_id));
             s.push_str(&row("Proposal digest", proposal_sha256_hex));
+            s
+        }
+        ApprovalSummaryView::MppCharge {
+            profile,
+            chain_id,
+            payer_redacted,
+            transport,
+            authority,
+            target,
+            amount,
+            currency,
+            recipient_redacted,
+            challenge_expires_at_unix,
+            simulated_fee_stroops,
+        } => {
+            let mut s = String::new();
+            s.push_str(&row("Profile", profile));
+            s.push_str(&row("Network", chain_id));
+            s.push_str(&row("Payer", payer_redacted));
+            s.push_str(&row("Transport", transport));
+            s.push_str(&row("Authority", authority));
+            s.push_str(&row("Target", target));
+            s.push_str(&row("Amount (base units)", amount));
+            s.push_str(&row("Token contract", currency));
+            s.push_str(&row("Recipient", recipient_redacted));
+            s.push_str(&row(
+                "Challenge expires (Unix)",
+                &challenge_expires_at_unix.to_string(),
+            ));
+            s.push_str(&row(
+                "Simulated fee (stroops)",
+                &simulated_fee_stroops.to_string(),
+            ));
             s
         }
         ApprovalSummaryView::Rejected { original_kind_name } => {

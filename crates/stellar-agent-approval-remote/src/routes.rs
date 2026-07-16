@@ -180,7 +180,8 @@ fn require_csrf(session: &SessionState, headers: &HeaderMap, nonce: &str) -> Res
 /// for `entry`, per [`ApprovalKind`].
 ///
 /// `PaymentSimulated` / `ClaimSimulated` entries carry a real envelope
-/// SHA-256. `RuleProposalSimulated` has no envelope but carries its own
+/// SHA-256. MPP and rule-proposal entries carry their own content digests.
+/// `RuleProposalSimulated` has no envelope but carries its own
 /// domain-separated `proposal_sha256` digest over the resolved rule
 /// definition — using it here (rather than falling back to the zero
 /// placeholder) binds the per-action challenge to the EXACT rule the
@@ -205,6 +206,10 @@ fn entry_envelope_sha256(entry: &PendingApproval) -> [u8; 32] {
         ApprovalKind::RuleProposalSimulated {
             proposal_sha256, ..
         } => *proposal_sha256,
+        ApprovalKind::MppChargeSimulated {
+            prepared_artifact_hash,
+            ..
+        } => *prepared_artifact_hash,
         _ => [0u8; 32],
     }
 }
@@ -2040,6 +2045,30 @@ mod tests {
             entry_envelope_sha256(&rule_proposal),
             [0x11u8; 32],
             "RuleProposalSimulated must bind to proposal_sha256, not the zero placeholder"
+        );
+
+        let mpp = stellar_agent_core::approval::PendingApproval::new_mpp_charge_pending(
+            [0x22; 32],
+            [0x33; 32],
+            "default".to_owned(),
+            "stellar:testnet".to_owned(),
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "http".to_owned(),
+            "merchant.example".to_owned(),
+            "/checkout".to_owned(),
+            "1000".to_owned(),
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            u64::MAX / 1_000,
+            1_000,
+            "424242".to_owned(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        assert_eq!(
+            entry_envelope_sha256(&mpp),
+            [0x33; 32],
+            "MppChargeSimulated must bind to its prepared artifact"
         );
 
         // Kinds with no content digest of their own correctly fall back to

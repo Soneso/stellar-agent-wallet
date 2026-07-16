@@ -132,6 +132,9 @@ enum Commands {
     /// `--submit-only <xdr>`. Default: build → sign → submit atomically.
     Pay(Box<commands::pay::PayArgs>),
 
+    /// Testnet-only sponsored Machine Payments Protocol charges.
+    Mpp(commands::mpp::MppArgs),
+
     /// Channel-account pool subcommand group.
     ///
     /// Provides:
@@ -315,6 +318,7 @@ async fn main() {
         Commands::Fees(args) => commands::fees::run(&args).await,
         Commands::Friendbot(args) => commands::friendbot::run(&args).await,
         Commands::Pay(args) => commands::pay::run(&args).await,
+        Commands::Mpp(args) => commands::mpp::run(args).await,
         Commands::Pool(args) => commands::pool::run(&args).await,
         Commands::Profile(args) => commands::profile::run(&args).await,
         Commands::Toolsets(args) => commands::toolsets::run(&args).await,

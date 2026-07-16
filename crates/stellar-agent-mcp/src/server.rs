@@ -784,6 +784,7 @@ impl WalletServer {
         router.merge(Self::friendbot_tool_router());
         router.merge(Self::create_account_tool_router());
         router.merge(Self::pay_tool_router());
+        router.merge(Self::mpp_tool_router());
         // SEP-43 ModuleInterface tools.
         router.merge(Self::sep43_get_address_tool_router());
         router.merge(Self::sep43_get_network_tool_router());
@@ -1034,6 +1035,18 @@ impl ServerHandler for WalletServer {
              paymentSignature + authorization (Bearer JWT) + payer + asset + \
              amount + payTo + home_domain + network + payto_anchored, gate aborts \
              BEFORE payment on any identity failure, read_only=false, not destructive); \
+             stellar_mpp_charge_prepare (MPP sponsored charge prepare: strictly \
+             validate an HTTP/native-MCP Payment challenge, simulate, evaluate \
+             exact value policy, and persist a testnet authorization; never signs); \
+             stellar_mpp_charge_commit (MPP sponsored charge commit: verify the \
+             stored authorization, nonce, approval, and exact value policy; sign and \
+             return one credential, destructive and never retryable); \
+             stellar_mpp_record_receipt (record a trusted-host MPP receipt digest \
+             without treating it as settlement proof); \
+             stellar_mpp_reconcile_transaction (independently verify the exact MPP \
+             transaction, payer authorization, transfer, and ledger outcome); \
+             stellar_mpp_authorization_status (read redacted MPP lifecycle, receipt, \
+             accounting, and ledger-outcome state); \
              stellar_fee_stats (fetch network fee statistics for fee estimation, \
              read-only); \
              stellar_blend_lend (Blend lending pool supply/withdraw/borrow/repay \

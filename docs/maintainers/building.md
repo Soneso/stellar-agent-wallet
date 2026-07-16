@@ -181,6 +181,35 @@ declared on individual crates (and on `stellar-agent-test-support`), are:
 The CI `test (offline)` and coverage jobs run the offline tier with
 `--features test-helpers,test-hooks,test-loopback,verifier-registry`.
 
+MPP development should run its focused protocol/security suite and both binary
+adapters before the full workspace gates:
+
+```bash
+cargo test -p stellar-agent-mpp
+cargo test -p stellar-agent-core -p stellar-agent-approval-ui \
+  -p stellar-agent-approval-remote
+cargo test -p stellar-agent-cli -p stellar-agent-mcp
+bash .github/scripts/publish-crates.sh --check
+bash .github/scripts/test-publish-crates-check.sh
+bash .github/scripts/package-skill.sh --check
+```
+
+Release preparation must bump the workspace and every internal dependency pin
+to the next unpublished version before verifying the packaged MPP crate with
+`cargo package -p stellar-agent-mpp`. Before that bump, Cargo correctly resolves
+the already-published registry copies of the current-version `core` and
+`network` crates during package verification; those copies do not contain the
+new MPP APIs. `cargo package -p stellar-agent-mpp --no-verify` may be used on the
+feature branch to inspect the source archive, but it is not a substitute for
+the post-bump verification.
+
+MPP storage uses the same cross-platform locking contract as the approval and
+policy stores. Windows CI must cover MPP state lock contention, atomic replace,
+symlink/reparse-point refusal, tamper failure, and restart behavior whenever the
+store changes. The new crate has an explicit coverage floor and a 90% offline
+target; live SDK/RPC paths do not justify weakening parser, state, or signing
+branch coverage.
+
 ### Live testnet-acceptance tests
 
 The `testnet-acceptance` feature gates end-to-end tests that hit the live Stellar
@@ -208,6 +237,11 @@ serialized driver and the `Testnet acceptance` workflow run both.
 These tests require network reachability to testnet RPC and Friendbot. Testnet is
 the default network; Friendbot funding is testnet-only. Write and signing commands
 structurally refuse mainnet in this alpha, so there is no mainnet acceptance tier.
+
+The MPP acceptance target also requires Node.js and pnpm for the pinned released
+`@stellar/mpp` server harness. Its package and lock files must contain the exact
+SDK/runtime versions. The suite is registered in the serialized driver and a
+skip marker does not count as MPP acceptance.
 
 To run the full live leg, use the serialized driver, which paces the suites so
 Friendbot and the RPC load balancer are not hit back-to-back:

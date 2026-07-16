@@ -128,6 +128,9 @@ use super::rule_proposal::{ContextRuleProposalSnapshot, validate_context_rule_pr
 /// Default approval TTL: 24 hours in milliseconds.
 pub const DEFAULT_TTL_MS: u64 = 86_400_000;
 
+/// Maximum lifetime for a sponsored MPP charge approval.
+pub const MPP_APPROVAL_MAX_TTL_MS: u64 = 5 * 60 * 1_000;
+
 /// Expected nonce length in characters (16 bytes as URL-safe base64 no-pad).
 pub const EXPECTED_NONCE_LEN: usize = 22;
 
@@ -610,6 +613,42 @@ pub enum ApprovalKind {
         summary_line: String,
     },
 
+    /// A prepared sponsored MPP charge awaiting wallet-owner HMAC attestation.
+    ///
+    /// The challenge, prepared XDR, and eventual credential remain in the
+    /// dedicated HMAC-protected MPP store. This approval record contains only
+    /// the digests needed to bind consent and the non-secret terms shown to the
+    /// operator.
+    MppChargeSimulated {
+        /// SHA-256 fingerprint binding profile, network, request context, and
+        /// exact challenge terms.
+        authorization_fingerprint: [u8; 32],
+        /// SHA-256 of the authoritative prepared transaction artifact.
+        prepared_artifact_hash: [u8; 32],
+        /// Wallet profile that owns the payer account.
+        profile: String,
+        /// Supported CAIP-2 network identifier (`stellar:testnet`).
+        chain_id: String,
+        /// Canonical G-strkey payer account.
+        payer: String,
+        /// Bound transport (`http` or `mcp`).
+        transport: String,
+        /// Bound HTTPS authority or MCP server identifier.
+        authority: String,
+        /// Bound HTTP path or MCP operation name.
+        target: String,
+        /// Positive canonical decimal token amount.
+        amount: String,
+        /// Canonical Stellar asset contract C-strkey.
+        currency: String,
+        /// Canonical recipient G- or C-strkey.
+        recipient: String,
+        /// Challenge expiry as Unix seconds.
+        challenge_expires_at_unix: u64,
+        /// Simulated transaction fee in stroops.
+        simulated_fee_stroops: u32,
+    },
+
     /// A short-TTL tombstone left behind after the operator explicitly rejects
     /// a pending approval via [`PendingApprovalStore::reject`].
     ///
@@ -640,6 +679,7 @@ impl ApprovalKind {
             Self::RegisterPasskey { .. } => "RegisterPasskey",
             Self::ToolsetFirstInvokeGate { .. } => "ToolsetFirstInvokeGate",
             Self::RuleProposalSimulated { .. } => "RuleProposalSimulated",
+            Self::MppChargeSimulated { .. } => "MppChargeSimulated",
             Self::Rejected { .. } => "Rejected",
         }
     }
@@ -803,6 +843,42 @@ impl std::fmt::Debug for ApprovalKind {
                     .field("summary_line", summary_line)
                     .finish()
             }
+            Self::MppChargeSimulated {
+                authorization_fingerprint,
+                prepared_artifact_hash,
+                profile,
+                chain_id,
+                payer,
+                transport,
+                authority,
+                target,
+                amount,
+                currency,
+                recipient,
+                challenge_expires_at_unix,
+                simulated_fee_stroops,
+            } => f
+                .debug_struct("MppChargeSimulated")
+                .field(
+                    "authorization_fingerprint_hex",
+                    &hex_encode(authorization_fingerprint),
+                )
+                .field(
+                    "prepared_artifact_hash_hex",
+                    &hex_encode(prepared_artifact_hash),
+                )
+                .field("profile", profile)
+                .field("chain_id", chain_id)
+                .field("payer_redacted", &redact_g_strkey(payer))
+                .field("transport", transport)
+                .field("authority", authority)
+                .field("target", target)
+                .field("amount", amount)
+                .field("currency_redacted", &redact_g_strkey(currency))
+                .field("recipient_redacted", &redact_g_strkey(recipient))
+                .field("challenge_expires_at_unix", challenge_expires_at_unix)
+                .field("simulated_fee_stroops", simulated_fee_stroops)
+                .finish(),
             Self::Rejected { original_kind_name } => f
                 .debug_struct("Rejected")
                 .field("original_kind_name", original_kind_name)
@@ -974,6 +1050,24 @@ struct RuleProposalSimulatedWire {
     summary_line: String,
 }
 
+/// Wire representation for `ApprovalKind::MppChargeSimulated`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MppChargeSimulatedWire {
+    authorization_fingerprint: [u8; 32],
+    prepared_artifact_hash: [u8; 32],
+    profile: String,
+    chain_id: String,
+    payer: String,
+    transport: String,
+    authority: String,
+    target: String,
+    amount: String,
+    currency: String,
+    recipient: String,
+    challenge_expires_at_unix: u64,
+    simulated_fee_stroops: u32,
+}
+
 /// Flat on-disk representation of a `PendingApproval` entry.
 ///
 /// Used by the custom `Serialize`/`Deserialize` impls to map between the
@@ -1032,6 +1126,10 @@ struct PendingApprovalOnDisk {
     // RuleProposalSimulated sub-table — present iff all other kind fields are absent.
     #[serde(default)]
     rule_proposal_simulated: Option<RuleProposalSimulatedWire>,
+
+    // MppChargeSimulated sub-table — present iff all other kind fields are absent.
+    #[serde(default)]
+    mpp_charge_simulated: Option<MppChargeSimulatedWire>,
 
     // Rejected sub-table — present iff all other kind fields are absent.
     #[serde(default)]
@@ -1286,6 +1384,7 @@ impl Serialize for PendingApproval {
             trustline_clawback_opt_in,
             claim_simulated,
             rule_proposal_simulated,
+            mpp_charge_simulated,
             rejected,
             // registration_input lives inside the RegisterPasskey arm; extract it here
             // so it can be written to the top-level on-disk field.
@@ -1315,6 +1414,7 @@ impl Serialize for PendingApproval {
                 None::<TrustlineClawbackOptInWire>,
                 None::<ClaimSimulatedWire>,
                 None::<RuleProposalSimulatedWire>,
+                None::<MppChargeSimulatedWire>,
                 None::<RejectedWire>,
                 None::<RegistrationInput>,
             ),
@@ -1347,6 +1447,7 @@ impl Serialize for PendingApproval {
                 None::<TrustlineClawbackOptInWire>,
                 None::<ClaimSimulatedWire>,
                 None::<RuleProposalSimulatedWire>,
+                None::<MppChargeSimulatedWire>,
                 None::<RejectedWire>,
                 None::<RegistrationInput>,
             ),
@@ -1378,6 +1479,7 @@ impl Serialize for PendingApproval {
                 None::<TrustlineClawbackOptInWire>,
                 None::<ClaimSimulatedWire>,
                 None::<RuleProposalSimulatedWire>,
+                None::<MppChargeSimulatedWire>,
                 None::<RejectedWire>,
                 registration_input.clone(),
             ),
@@ -1410,6 +1512,7 @@ impl Serialize for PendingApproval {
                 None::<TrustlineClawbackOptInWire>,
                 None::<ClaimSimulatedWire>,
                 None::<RuleProposalSimulatedWire>,
+                None::<MppChargeSimulatedWire>,
                 None::<RejectedWire>,
                 None::<RegistrationInput>,
             ),
@@ -1436,6 +1539,7 @@ impl Serialize for PendingApproval {
                 }),
                 None::<ClaimSimulatedWire>,
                 None::<RuleProposalSimulatedWire>,
+                None::<MppChargeSimulatedWire>,
                 None::<RejectedWire>,
                 None::<RegistrationInput>,
             ),
@@ -1474,6 +1578,7 @@ impl Serialize for PendingApproval {
                     summary_simulated_seq_num: *summary_simulated_seq_num,
                 }),
                 None::<RuleProposalSimulatedWire>,
+                None::<MppChargeSimulatedWire>,
                 None::<RejectedWire>,
                 None::<RegistrationInput>,
             ),
@@ -1508,6 +1613,54 @@ impl Serialize for PendingApproval {
                     proposal_sha256: *proposal_sha256,
                     summary_line: summary_line.clone(),
                 }),
+                None::<MppChargeSimulatedWire>,
+                None::<RejectedWire>,
+                None::<RegistrationInput>,
+            ),
+            ApprovalKind::MppChargeSimulated {
+                authorization_fingerprint,
+                prepared_artifact_hash,
+                profile,
+                chain_id,
+                payer,
+                transport,
+                authority,
+                target,
+                amount,
+                currency,
+                recipient,
+                challenge_expires_at_unix,
+                simulated_fee_stroops,
+            } => (
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None::<SignWithPasskeyWire>,
+                None::<RegisterPasskeyWire>,
+                None::<ToolsetFirstInvokeGateWire>,
+                None::<TrustlineClawbackOptInWire>,
+                None::<ClaimSimulatedWire>,
+                None::<RuleProposalSimulatedWire>,
+                Some(MppChargeSimulatedWire {
+                    authorization_fingerprint: *authorization_fingerprint,
+                    prepared_artifact_hash: *prepared_artifact_hash,
+                    profile: profile.clone(),
+                    chain_id: chain_id.clone(),
+                    payer: payer.clone(),
+                    transport: transport.clone(),
+                    authority: authority.clone(),
+                    target: target.clone(),
+                    amount: amount.clone(),
+                    currency: currency.clone(),
+                    recipient: recipient.clone(),
+                    challenge_expires_at_unix: *challenge_expires_at_unix,
+                    simulated_fee_stroops: *simulated_fee_stroops,
+                }),
                 None::<RejectedWire>,
                 None::<RegistrationInput>,
             ),
@@ -1526,6 +1679,7 @@ impl Serialize for PendingApproval {
                 None::<TrustlineClawbackOptInWire>,
                 None::<ClaimSimulatedWire>,
                 None::<RuleProposalSimulatedWire>,
+                None::<MppChargeSimulatedWire>,
                 Some(RejectedWire {
                     original_kind_name: original_kind_name.clone(),
                 }),
@@ -1552,6 +1706,7 @@ impl Serialize for PendingApproval {
             trustline_clawback_opt_in,
             claim_simulated,
             rule_proposal_simulated,
+            mpp_charge_simulated,
             rejected,
             attestation_blob_b64: self.attestation_blob_b64.clone(),
             passkey_assertion: self.passkey_assertion.clone(),
@@ -1613,6 +1768,35 @@ impl<'de> Deserialize<'de> for PendingApproval {
         D: Deserializer<'de>,
     {
         let raw = PendingApprovalOnDisk::deserialize(deserializer)?;
+
+        let present_subtables = [
+            ("sign_with_passkey", raw.sign_with_passkey.is_some()),
+            ("register_passkey", raw.register_passkey.is_some()),
+            (
+                "toolset_first_invoke_gate",
+                raw.toolset_first_invoke_gate.is_some(),
+            ),
+            (
+                "trustline_clawback_opt_in",
+                raw.trustline_clawback_opt_in.is_some(),
+            ),
+            ("claim_simulated", raw.claim_simulated.is_some()),
+            (
+                "rule_proposal_simulated",
+                raw.rule_proposal_simulated.is_some(),
+            ),
+            ("mpp_charge_simulated", raw.mpp_charge_simulated.is_some()),
+            ("rejected", raw.rejected.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, present)| present.then_some(name))
+        .collect::<Vec<_>>();
+        if present_subtables.len() > 1 {
+            return Err(serde::de::Error::custom(format!(
+                "cross-kind field contamination: approval entry carries multiple kind sub-tables: {}",
+                present_subtables.join(", ")
+            )));
+        }
 
         let kind = if let Some(swp) = raw.sign_with_passkey {
             // Cross-kind contamination check: SignWithPasskey must not carry
@@ -2016,6 +2200,50 @@ impl<'de> Deserialize<'de> for PendingApproval {
                 definition: rps.definition,
                 proposal_sha256: rps.proposal_sha256,
                 summary_line: rps.summary_line,
+            }
+        } else if let Some(mpp) = raw.mpp_charge_simulated {
+            for (field, present) in [
+                ("envelope_xdr_b64", raw.envelope_xdr_b64.is_some()),
+                ("envelope_sha256_hex", raw.envelope_sha256_hex.is_some()),
+                ("summary_to", raw.summary_to.is_some()),
+                (
+                    "summary_amount_stroops",
+                    raw.summary_amount_stroops.is_some(),
+                ),
+                ("summary_asset", raw.summary_asset.is_some()),
+                ("summary_memo", raw.summary_memo.is_some()),
+                (
+                    "summary_simulated_fee_stroops",
+                    raw.summary_simulated_fee_stroops.is_some(),
+                ),
+                (
+                    "summary_simulated_seq_num",
+                    raw.summary_simulated_seq_num.is_some(),
+                ),
+                ("passkey_assertion", raw.passkey_assertion.is_some()),
+                ("registration_input", raw.registration_input.is_some()),
+            ] {
+                if present {
+                    return Err(serde::de::Error::custom(format!(
+                        "cross-kind field contamination: MppChargeSimulated entry must not carry field `{field}`",
+                    )));
+                }
+            }
+            validate_mpp_charge_simulated_invariants(&mpp).map_err(serde::de::Error::custom)?;
+            ApprovalKind::MppChargeSimulated {
+                authorization_fingerprint: mpp.authorization_fingerprint,
+                prepared_artifact_hash: mpp.prepared_artifact_hash,
+                profile: mpp.profile,
+                chain_id: mpp.chain_id,
+                payer: mpp.payer,
+                transport: mpp.transport,
+                authority: mpp.authority,
+                target: mpp.target,
+                amount: mpp.amount,
+                currency: mpp.currency,
+                recipient: mpp.recipient,
+                challenge_expires_at_unix: mpp.challenge_expires_at_unix,
+                simulated_fee_stroops: mpp.simulated_fee_stroops,
             }
         } else if let Some(r) = raw.rejected {
             // Cross-kind contamination check: Rejected must not carry
@@ -2816,11 +3044,200 @@ impl PendingApproval {
         })
     }
 
+    /// Constructs an unattested sponsored MPP charge approval.
+    ///
+    /// The approval expiry is capped by both `ttl_ms` and the challenge
+    /// expiry. The prepared artifact hash is the digest placed in the generic
+    /// HMAC attestation slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApprovalError::Invalid`] for unsupported or unsafe terms and
+    /// [`ApprovalError::Io`] if the system clock is unavailable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "MPP approval must carry every operator-visible bound term"
+    )]
+    pub fn new_mpp_charge_pending(
+        authorization_fingerprint: [u8; 32],
+        prepared_artifact_hash: [u8; 32],
+        profile: String,
+        chain_id: String,
+        payer: String,
+        transport: String,
+        authority: String,
+        target: String,
+        amount: String,
+        currency: String,
+        recipient: String,
+        challenge_expires_at_unix: u64,
+        simulated_fee_stroops: u32,
+        process_uid: String,
+        ttl_ms: u64,
+    ) -> Result<Self, ApprovalError> {
+        let created_at_unix_ms = approval_now_unix_ms()?;
+        Self::new_mpp_charge_pending_at(
+            authorization_fingerprint,
+            prepared_artifact_hash,
+            profile,
+            chain_id,
+            payer,
+            transport,
+            authority,
+            target,
+            amount,
+            currency,
+            recipient,
+            challenge_expires_at_unix,
+            simulated_fee_stroops,
+            process_uid,
+            ttl_ms,
+            created_at_unix_ms,
+        )
+    }
+
+    /// Creates a pending MPP charge approval using the caller's captured clock.
+    ///
+    /// This is used by prepare orchestration so challenge validation, durable
+    /// authorization state, and approval expiry share one time observation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApprovalError::Invalid`] for unsupported, unsafe, or already
+    /// expired terms.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "MPP approval must carry every operator-visible bound term"
+    )]
+    pub fn new_mpp_charge_pending_at(
+        authorization_fingerprint: [u8; 32],
+        prepared_artifact_hash: [u8; 32],
+        profile: String,
+        chain_id: String,
+        payer: String,
+        transport: String,
+        authority: String,
+        target: String,
+        amount: String,
+        currency: String,
+        recipient: String,
+        challenge_expires_at_unix: u64,
+        simulated_fee_stroops: u32,
+        process_uid: String,
+        ttl_ms: u64,
+        created_at_unix_ms: u64,
+    ) -> Result<Self, ApprovalError> {
+        let wire = MppChargeSimulatedWire {
+            authorization_fingerprint,
+            prepared_artifact_hash,
+            profile: profile.clone(),
+            chain_id: chain_id.clone(),
+            payer: payer.clone(),
+            transport: transport.clone(),
+            authority: authority.clone(),
+            target: target.clone(),
+            amount: amount.clone(),
+            currency: currency.clone(),
+            recipient: recipient.clone(),
+            challenge_expires_at_unix,
+            simulated_fee_stroops,
+        };
+        validate_mpp_charge_simulated_invariants(&wire)
+            .map_err(|reason| ApprovalError::Invalid { reason })?;
+
+        let challenge_expires_at_ms = challenge_expires_at_unix.saturating_mul(1_000);
+        if challenge_expires_at_ms <= created_at_unix_ms {
+            return Err(ApprovalError::Invalid {
+                reason: "MPP challenge is already expired".to_owned(),
+            });
+        }
+        let expires_at_unix_ms = created_at_unix_ms
+            .saturating_add(ttl_ms.min(MPP_APPROVAL_MAX_TTL_MS))
+            .min(challenge_expires_at_ms);
+        let mut raw = [0u8; 16];
+        OsRng.fill_bytes(&mut raw);
+
+        Ok(Self {
+            approval_nonce: URL_SAFE_NO_PAD.encode(raw),
+            process_uid,
+            created_at_unix_ms,
+            expires_at_unix_ms,
+            kind: ApprovalKind::MppChargeSimulated {
+                authorization_fingerprint,
+                prepared_artifact_hash,
+                profile,
+                chain_id,
+                payer,
+                transport,
+                authority,
+                target,
+                amount,
+                currency,
+                recipient,
+                challenge_expires_at_unix,
+                simulated_fee_stroops,
+            },
+            attestation_blob_b64: None,
+            passkey_assertion: None,
+        })
+    }
+
     /// Returns `true` if this entry has expired relative to `now_unix_ms`.
     #[must_use]
     pub fn is_expired(&self, now_unix_ms: u64) -> bool {
         self.expires_at_unix_ms <= now_unix_ms
     }
+}
+
+fn validate_mpp_charge_simulated_invariants(mpp: &MppChargeSimulatedWire) -> Result<(), String> {
+    fn valid_strkey(value: &str, prefixes: &[char]) -> bool {
+        value.len() == 56
+            && value
+                .chars()
+                .next()
+                .is_some_and(|prefix| prefixes.contains(&prefix))
+            && value[1..]
+                .chars()
+                .all(|c| matches!(c, 'A'..='Z' | '2'..='7'))
+    }
+    fn valid_display(value: &str, max: usize) -> bool {
+        !value.is_empty()
+            && value.len() <= max
+            && value.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+    }
+
+    if !valid_display(&mpp.profile, 128) {
+        return Err("MPP profile must be 1-128 printable ASCII bytes".to_owned());
+    }
+    if mpp.chain_id != "stellar:testnet" {
+        return Err("MPP approvals support only stellar:testnet".to_owned());
+    }
+    if !valid_strkey(&mpp.payer, &['G']) {
+        return Err("MPP payer must be a canonical G-strkey".to_owned());
+    }
+    if !matches!(mpp.transport.as_str(), "http" | "mcp") {
+        return Err("MPP transport must be http or mcp".to_owned());
+    }
+    if !valid_display(&mpp.authority, 512) || !valid_display(&mpp.target, 512) {
+        return Err("MPP authority and target must be 1-512 printable ASCII bytes".to_owned());
+    }
+    let parsed = mpp
+        .amount
+        .parse::<i128>()
+        .map_err(|_| "MPP amount must be a canonical positive decimal integer".to_owned())?;
+    if parsed <= 0 || parsed.to_string() != mpp.amount {
+        return Err("MPP amount must be a canonical positive decimal integer".to_owned());
+    }
+    if !valid_strkey(&mpp.currency, &['C']) {
+        return Err("MPP currency must be a canonical asset-contract C-strkey".to_owned());
+    }
+    if !valid_strkey(&mpp.recipient, &['G', 'C']) {
+        return Err("MPP recipient must be a canonical G- or C-strkey".to_owned());
+    }
+    if mpp.challenge_expires_at_unix == 0 {
+        return Err("MPP challenge expiry must be nonzero".to_owned());
+    }
+    Ok(())
 }
 
 /// Runs all `SignWithPasskey` field invariants (credential_id length, rule_ids
@@ -3608,6 +4025,59 @@ impl PendingApprovalStore {
             .find(|e| e.approval_nonce == approval_nonce)
     }
 
+    /// Verifies an attested MPP approval against the exact stored digests.
+    ///
+    /// This fail-closed accessor intentionally returns only a boolean so
+    /// absence, expiry, wrong kind, substitution, malformed base64, and HMAC
+    /// failure remain indistinguishable at credential-commit boundaries.
+    #[must_use]
+    pub fn verify_mpp_charge_attestation(
+        &self,
+        key: &[u8; 32],
+        approval_nonce: &str,
+        authorization_fingerprint: &[u8; 32],
+        prepared_artifact_hash: &[u8; 32],
+        now_unix_ms: u64,
+    ) -> bool {
+        use super::attestation::verify_attestation;
+
+        let Some(entry) = self.get(approval_nonce) else {
+            return false;
+        };
+        if entry.is_expired(now_unix_ms) {
+            return false;
+        }
+        let ApprovalKind::MppChargeSimulated {
+            authorization_fingerprint: stored_fingerprint,
+            prepared_artifact_hash: stored_artifact,
+            ..
+        } = &entry.kind
+        else {
+            return false;
+        };
+        if stored_fingerprint != authorization_fingerprint
+            || stored_artifact != prepared_artifact_hash
+        {
+            return false;
+        }
+        let Some(encoded) = entry.attestation_blob_b64.as_deref() else {
+            return false;
+        };
+        let Ok(bytes) = URL_SAFE_NO_PAD.decode(encoded) else {
+            return false;
+        };
+        let Ok(blob) = <[u8; 32]>::try_from(bytes) else {
+            return false;
+        };
+        verify_attestation(
+            key,
+            &entry.approval_nonce,
+            prepared_artifact_hash,
+            &entry.process_uid,
+            &blob,
+        )
+    }
+
     /// Returns the total number of pending approvals currently in the store.
     ///
     /// Expired entries are removed automatically on each successful `insert`
@@ -3663,8 +4133,8 @@ impl PendingApprovalStore {
     /// - [`ApprovalError::NotFound`] if no entry with `approval_nonce` exists.
     /// - [`ApprovalError::Expired`] if the entry's TTL has elapsed.
     /// - [`ApprovalError::AlreadyAttested`] if the blob is already set.
-    /// - [`ApprovalError::WrongKind`] if the entry is neither `PaymentSimulated`
-    ///   nor `ClaimSimulated`.
+    /// - [`ApprovalError::WrongKind`] if the entry is not a supported
+    ///   digest-attested approval kind.
     /// - [`ApprovalError::Io`] / [`ApprovalError::Toml`] on persistence failure.
     pub fn record_attestation(
         &mut self,
@@ -3683,14 +4153,15 @@ impl PendingApprovalStore {
             return Err(ApprovalError::Expired);
         }
 
-        // Kind check: record_attestation is PaymentSimulated- or ClaimSimulated-only.
-        // Both share the envelope-hash HMAC attestation path.
+        // These kinds share the digest-HMAC attestation path.
         if !matches!(
             entry.kind,
-            ApprovalKind::PaymentSimulated { .. } | ApprovalKind::ClaimSimulated { .. }
+            ApprovalKind::PaymentSimulated { .. }
+                | ApprovalKind::ClaimSimulated { .. }
+                | ApprovalKind::MppChargeSimulated { .. }
         ) {
             return Err(ApprovalError::WrongKind {
-                expected: "PaymentSimulated or ClaimSimulated",
+                expected: "PaymentSimulated, ClaimSimulated, or MppChargeSimulated",
                 actual: entry.kind.kind_name(),
             });
         }
@@ -5204,11 +5675,12 @@ expires_at_unix_ms = 9999999999999
             matches!(
                 err,
                 ApprovalError::WrongKind {
-                    expected: "PaymentSimulated or ClaimSimulated",
+                    expected: "PaymentSimulated, ClaimSimulated, or MppChargeSimulated",
                     actual: "SignWithPasskey"
                 }
             ),
-            "expected WrongKind {{expected: PaymentSimulated or ClaimSimulated, \
+            "expected WrongKind {{expected: PaymentSimulated, ClaimSimulated, or \
+             MppChargeSimulated, \
              actual: SignWithPasskey}}, got {err:?}"
         );
     }
@@ -7306,7 +7778,7 @@ amount_max_stroops = 1000000
             matches!(
                 err,
                 ApprovalError::WrongKind {
-                    expected: "PaymentSimulated or ClaimSimulated",
+                    expected: "PaymentSimulated, ClaimSimulated, or MppChargeSimulated",
                     actual: "TrustlineClawbackOptIn"
                 }
             ),
@@ -8827,5 +9299,62 @@ is_proposer = true
         let debug_str = format!("{:?}", entry.kind);
         assert!(!debug_str.contains(RULE_PROPOSAL_SMART_ACCOUNT));
         assert!(debug_str.contains("smart_account_redacted"));
+    }
+
+    #[test]
+    fn mpp_attestation_round_trip_rejects_digest_substitution() {
+        let dir = TempDir::new().unwrap();
+        let mut store = open_store(&dir);
+        let now = crate::timefmt::now_unix_ms().unwrap();
+        let fingerprint = [0x11; 32];
+        let artifact = [0x22; 32];
+        let entry = PendingApproval::new_mpp_charge_pending(
+            fingerprint,
+            artifact,
+            "default".to_owned(),
+            "stellar:testnet".to_owned(),
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "mcp".to_owned(),
+            "merchant-server".to_owned(),
+            "tools/charge".to_owned(),
+            "1000000".to_owned(),
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            now / 1_000 + 3_600,
+            1_100,
+            "1000".to_owned(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let nonce = entry.approval_nonce.clone();
+        let process_uid = entry.process_uid.clone();
+        store.insert(entry, now).unwrap();
+        let key = [0x33; 32];
+        let blob =
+            super::super::attestation::compute_attestation(&key, &nonce, &artifact, &process_uid);
+        store.record_attestation(&nonce, blob).unwrap();
+        drop(store);
+
+        let reopened = open_store(&dir);
+        assert!(
+            reopened.verify_mpp_charge_attestation(&key, &nonce, &fingerprint, &artifact, now,)
+        );
+        assert!(
+            !reopened.verify_mpp_charge_attestation(&key, &nonce, &[0x44; 32], &artifact, now,)
+        );
+        assert!(!reopened.verify_mpp_charge_attestation(
+            &key,
+            &nonce,
+            &fingerprint,
+            &[0x55; 32],
+            now,
+        ));
+        assert!(!reopened.verify_mpp_charge_attestation(
+            &[0x66; 32],
+            &nonce,
+            &fingerprint,
+            &artifact,
+            now,
+        ));
     }
 }

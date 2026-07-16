@@ -2332,6 +2332,64 @@ pub enum EventKind {
         scheme: String,
     },
 
+    /// A sponsored MPP charge credential passed every delivery gate.
+    MppChargeAuthorized {
+        /// SHA-256 authorization-id digest, hex encoded.
+        authorization_id_hash: String,
+        /// SHA-256 authorization fingerprint, hex encoded.
+        fingerprint_hash: String,
+        /// Exact value legs used for policy evaluation and accounting.
+        legs: Vec<ValueLegRecord>,
+        /// CAIP-2 Stellar network identifier.
+        network: String,
+        /// First-5-last-5 redacted payer account.
+        payer_redacted: RedactedStrkey,
+        /// Fixed authorization mode (`"sponsored_pull"`).
+        sponsorship_mode: String,
+        /// Whether a dedicated approval attestation was present.
+        approval_present: bool,
+    },
+
+    /// An MPP credential was withheld after key access or construction.
+    MppAuthorizationWithheld {
+        /// SHA-256 authorization-id digest, hex encoded.
+        authorization_id_hash: String,
+        /// SHA-256 authorization fingerprint, hex encoded.
+        fingerprint_hash: String,
+        /// Bounded internal failure-stage label.
+        failure_stage: String,
+        /// Whether signer/key access had begun.
+        key_access_began: bool,
+        /// Whether value-policy budget remains consumed.
+        policy_budget_consumed: bool,
+    },
+
+    /// A trusted host reported an MPP receipt without establishing ledger proof.
+    MppReceiptObserved {
+        /// SHA-256 authorization-id digest, hex encoded.
+        authorization_id_hash: String,
+        /// Canonical receipt SHA-256 digest, hex encoded.
+        receipt_digest: String,
+        /// Redacted first-8-last-8 transaction reference.
+        transaction_reference_redacted: String,
+        /// Closed source transport (`"http"` or `"mcp"`).
+        source_transport: String,
+        /// Host-claimed receipt status.
+        claimed_status: String,
+    },
+
+    /// Ledger reconciliation established an MPP transaction outcome.
+    MppSettlementReconciled {
+        /// SHA-256 authorization-id digest, hex encoded.
+        authorization_id_hash: String,
+        /// Redacted first-8-last-8 transaction reference.
+        transaction_reference_redacted: String,
+        /// Final ledger sequence.
+        ledger: u32,
+        /// Verified outcome (`"settled"` or `"failed"`).
+        verified_outcome: String,
+    },
+
     /// Long-lived key material was written to the platform keyring.
     ///
     /// Emitted after a successful keyring write by a key-writing profile

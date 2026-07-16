@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/stellar-agent-sep5", "crates/stellar-agent-toolsets", "crates/stellar-agent-sep10", "crates/stellar-agent-sep45", "crates/stellar-agent-test-support", "crates/stellar-agent-windows-identity", "crates/stellar-agent-core", "crates/stellar-agent-network", "crates/stellar-agent-sep53", "crates/stellar-agent-nonce", "crates/stellar-agent-sep7", "crates/stellar-agent-sep43", "crates/stellar-agent-stablecoin", "crates/stellar-agent-pool", "crates/stellar-agent-xdr-limits", "crates/stellar-agent-sep48", "crates/stellar-agent-defi", "crates/stellar-agent-anchor", "crates/stellar-agent-toolsets-install", "crates/stellar-agent-mcp-macros", "crates/stellar-agent-toolsets-runtime", "crates/stellar-agent-smart-account", "crates/stellar-agent-webauthn-bridge", "crates/stellar-agent-approval-ui", "crates/stellar-agent-loopback-http", "crates/stellar-agent-blend", "crates/stellar-agent-dex", "crates/stellar-agent-defindex", "crates/stellar-agent-x402", "crates/stellar-agent-x402-identity", "crates/stellar-agent-mcp", "crates/stellar-agent-cli", "crates/stellar-agent-claimable", "crates/stellar-agent-approval-remote", "crates/stellar-agent-headless-keyring"]
+members = ["crates/stellar-agent-sep5", "crates/stellar-agent-toolsets", "crates/stellar-agent-sep10", "crates/stellar-agent-sep45", "crates/stellar-agent-test-support", "crates/stellar-agent-windows-identity", "crates/stellar-agent-core", "crates/stellar-agent-network", "crates/stellar-agent-sep53", "crates/stellar-agent-nonce", "crates/stellar-agent-sep7", "crates/stellar-agent-sep43", "crates/stellar-agent-stablecoin", "crates/stellar-agent-pool", "crates/stellar-agent-xdr-limits", "crates/stellar-agent-sep48", "crates/stellar-agent-defi", "crates/stellar-agent-anchor", "crates/stellar-agent-toolsets-install", "crates/stellar-agent-mcp-macros", "crates/stellar-agent-toolsets-runtime", "crates/stellar-agent-smart-account", "crates/stellar-agent-webauthn-bridge", "crates/stellar-agent-approval-ui", "crates/stellar-agent-loopback-http", "crates/stellar-agent-blend", "crates/stellar-agent-dex", "crates/stellar-agent-defindex", "crates/stellar-agent-x402", "crates/stellar-agent-x402-identity", "crates/stellar-agent-mpp", "crates/stellar-agent-mcp", "crates/stellar-agent-cli", "crates/stellar-agent-claimable", "crates/stellar-agent-approval-remote", "crates/stellar-agent-headless-keyring"]
 
 [workspace.package]
 version = "0.1.0-alpha.4"
@@ -21,6 +21,7 @@ sha2 = { version = "0.11.0", features = ["zeroize"] }
 stellar-strkey = { version = "0.0.18", default-features = false }
 serde = { version = "1", default-features = false, features = ["std"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
+serde_json_canonicalizer = "=0.3.2"
 tempfile = "=3.27.0"
 thiserror = "2.0.18"
 yaml-rust2 = { version = "=0.11.0", default-features = false }
@@ -45,6 +46,7 @@ uuid = { version = "1.23.3", default-features = false, features = ["std", "v4"] 
 figment = { version = "=0.10.19", features = ["toml", "env"] }
 toml = { version = "=1.1.2", default-features = false, features = ["display", "parse", "serde"] }
 url = { version = "=2.5.8", default-features = false, features = ["serde"] }
+time = { version = "=0.3.49", default-features = false, features = ["formatting", "parsing"] }
 directories = "=6.0.0"
 subtle = { version = "=2.6.1", default-features = false }
 inventory = "=0.3.24"
@@ -122,6 +124,7 @@ stellar-agent-dex = { path = "crates/stellar-agent-dex", version = "0.1.0-alpha.
 stellar-agent-defindex = { path = "crates/stellar-agent-defindex", version = "0.1.0-alpha.4" }
 stellar-agent-x402 = { path = "crates/stellar-agent-x402", version = "0.1.0-alpha.4" }
 stellar-agent-x402-identity = { path = "crates/stellar-agent-x402-identity", version = "0.1.0-alpha.4" }
+stellar-agent-mpp = { path = "crates/stellar-agent-mpp", version = "0.1.0-alpha.4" }
 # chromiumoxide: CDP virtual-authenticator client driving the headless-Chrome
 # WebAuthn ceremony in the smart-account testnet acceptance test (dev-only).
 chromiumoxide = { version = "=0.9.1", default-features = false }

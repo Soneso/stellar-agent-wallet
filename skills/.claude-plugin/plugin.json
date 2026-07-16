@@ -1,7 +1,7 @@
 {
   "name": "stellar-agent-wallet",
   "description": "Teaches AI agents how to operate the Stellar Agent Wallet through its CLI and MCP server.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": {
     "name": "Soneso"
   },

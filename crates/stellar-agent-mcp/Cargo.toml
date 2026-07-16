@@ -33,6 +33,7 @@ pkg-fmt = "zip"
 [dependencies]
 stellar-agent-core       = { workspace = true }
 stellar-agent-network    = { workspace = true }
+stellar-agent-mpp        = { workspace = true }
 # Smart-account rules observability — SignersManager / ContextRuleManager for
 # the stellar_rules_list / stellar_rules_get read-only tools.
 stellar-agent-smart-account = { workspace = true }
@@ -113,6 +114,7 @@ serde_json = { workspace = true }
 
 # Serde derive for the rules-observability output structs (Envelope<T: Serialize>).
 serde = { workspace = true }
+sha2 = { workspace = true }
 
 # Per-request correlation IDs for the rules-observability tools' smart-account
 # manager calls.
@@ -201,7 +203,6 @@ stellar-strkey             = { workspace = true }
 stellar-xdr                = { workspace = true }
 # SHA-256 for HashIdPreimage construction in the x402 / claim testnet
 # acceptance tests.
-sha2                       = { workspace = true }
 # Construct CreateClaimableBalance transactions directly in the claim testnet
 # acceptance test; production code has no balance-creation path (only
 # ClaimClaimableBalance, via ClassicOpBuilder), so the test builds the

@@ -43,6 +43,7 @@ pub(crate) mod common;
 pub(crate) mod create_account;
 pub(crate) mod fee_stats;
 pub(crate) mod friendbot;
+pub(crate) mod mpp;
 pub(crate) mod pay;
 pub(crate) mod sep43_get_address;
 pub(crate) mod sep43_get_network;

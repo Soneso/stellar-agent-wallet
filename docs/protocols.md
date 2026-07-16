@@ -119,6 +119,26 @@ All write and signing paths are testnet-only in this alpha: every signing comman
   - The ephemeral SEP-10 key is unfunded and is not the payment funding signer.
   - No SEP-45, no payee or facilitator logic, no caching or session reuse (a fresh ephemeral key per call), no on-chain submission.
 
+## Machine Payments Protocol (MPP)
+
+- **Protocol pins:** MPP HTTP/native-MCP payment challenge and credential shapes
+  validated against the released `@stellar/mpp` 0.7.1 SDK behavior; Stellar
+  settlement uses SEP-41 transfer semantics and SEP-43 authorization signing.
+- **Capability:** Payer-side, testnet-only sponsored `charge` authorization for
+  one classic G-account. The wallet binds the challenge to the exact HTTP or MCP
+  request context, simulates, evaluates value policy, optionally obtains a
+  dedicated approval, signs once, re-simulates, and returns a credential.
+- **Surfaces:** `stellar-agent mpp ...` and five `stellar_mpp_*` MCP tools.
+- **Boundary:** The wallet does not send the paid request or submit the
+  transaction. The trusted host protects and delivers the credential, records
+  any receipt, and invokes reconciliation when ledger proof is required.
+- **Unsupported:** mainnet, unsponsored and push payment modes, smart-account
+  payers, automatic transport, channels, and toolset routing.
+
+MPP and x402 are separate wire protocols. x402 returns an x402 v2
+`PAYMENT-SIGNATURE`; MPP returns an HTTP `Payment` or native MCP credential bound
+to a Payment challenge. See [Agent payments with MPP](agent-payments.md).
+
 ## DeFi venues
 
 Each DeFi venue is a signing adapter behind a common interface. They share a posture: no raw-vector or opaque-calldata signing, a venue/WASM pin verified before any signing, and predicted post-op figures shown for display only — never as a signing gate. See [DeFi and pool commands](cli-reference/defi-and-pool.md) for the CLI surface.
@@ -172,6 +192,7 @@ Each DeFi venue is a signing adapter behind a common interface. They share a pos
 | SEP-53 | Sign and verify prefixed off-chain messages | MCP |
 | x402 v2 Exact Stellar | Payer-side `PAYMENT-SIGNATURE` construction and signing (Stellar-only, `exact`-only) | MCP |
 | x402 identity gate | SEP-10 counterparty-identity gate returning a Bearer JWT companion (never in the XDR) | MCP |
+| MPP sponsored Stellar charge | Testnet G-account payer authorization; returns one HTTP/native-MCP credential, records a host receipt, and independently reconciles settlement | CLI, MCP |
 | Blend | `lend` preview and submit; Reflector-only oracle, WASM-pinned, fail-closed health guard | CLI, MCP |
 | Soroswap | `trade` (signing, CLI + MCP) and the read-only `stellar_dex_quote` (MCP only); absolute slippage floor, pre-sign re-verify, WASM-pinned | CLI, MCP |
 | DeFindex | `vault` deposit/withdraw; `min_out` required, role disclosure, `Upgradable:true` refused by default | CLI, MCP |

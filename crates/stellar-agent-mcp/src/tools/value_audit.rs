@@ -90,6 +90,23 @@ pub(crate) fn emit_value_audit_row(profile: &Profile, profile_name: &str, entry:
     }
 }
 
+/// Writes an authorization audit row and fails closed on every acquisition,
+/// locking, or persistence error.
+///
+/// MPP calls this before releasing a credential, so unlike the legacy
+/// post-submit helper above, failure can and must withhold the artifact.
+pub(crate) fn emit_value_audit_row_strict(
+    profile: &Profile,
+    profile_name: &str,
+    entry: AuditEntry,
+) -> Result<(), ()> {
+    let key = load_audit_hmac_key(profile).map_err(|_| ())?;
+    let writer = AuditWriterRegistry::get_or_open(profile_name, &profile.audit_log_path, Some(key))
+        .map_err(|_| ())?;
+    let mut guard = writer.lock().map_err(|_| ())?;
+    guard.write_entry(entry).map_err(|_| ())
+}
+
 /// Loads and decodes the profile's audit-log chain-root HMAC key from the
 /// platform keyring.
 ///

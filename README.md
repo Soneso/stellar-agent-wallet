@@ -44,6 +44,10 @@ each tagged release, and every workspace crate is published on
   SEP-53 prefixed message signing.
 - x402 agent payments: payer-side `PAYMENT-SIGNATURE` payloads for the x402 v2
   Exact Stellar scheme, with an optional SEP-10 counterparty-identity gate.
+- Machine Payments Protocol (MPP) sponsored charges: strict HTTP/native-MCP
+  challenge validation, one-shot G-account authorization, host receipts, and
+  independent settlement reconciliation. This credential-only flow is
+  testnet-only; the trusted host sends the paid request and server submission.
 - OpenZeppelin smart-account governance: deployment, context rules, threshold
   updates, and WebAuthn passkey signers, with signing bound to the on-chain
   authorization rules.
@@ -60,6 +64,9 @@ each tagged release, and every workspace crate is published on
 
 See [docs/concepts.md](docs/concepts.md) for the policy engine, approval spine,
 audit log, and toolset model in detail.
+
+The supported MPP flow, exact trust boundary, CLI commands, and five MCP tools
+are documented in [Agent payments with MPP](docs/agent-payments.md).
 
 ## Install
 
