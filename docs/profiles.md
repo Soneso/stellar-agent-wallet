@@ -57,6 +57,12 @@ After merging, the loader resolves derived fields and validates:
   with no `[policy]` block is refused rather than silently inheriting a default
   engine.
 
+Overlays are load-time-only. Commands that update an existing profile
+(`profile enroll-signer`, `pool init`) patch only the keys they own on the
+on-disk document; the merged view is never written back, so a transient
+override cannot become persistent configuration and derived defaults are not
+materialised into the stored file.
+
 ## Schema version handling
 
 Every profile carries a top-level `version` field. The loader dispatches on it:

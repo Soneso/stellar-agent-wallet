@@ -692,6 +692,26 @@ pub fn pin_signer_account(name: &str, account: &str) -> Result<PathBuf, ProfileS
     )
 }
 
+/// Canonical-directory wrapper for [`set_pool_state_on_disk`].
+///
+/// # Errors
+///
+/// See [`set_pool_state_on_disk`]; additionally
+/// [`ProfileSaveError::NoStateDir`] when the OS-conventional profile
+/// directory cannot be determined.
+pub fn set_pool_state(
+    name: &str,
+    pool_master_key_id: &super::schema::KeyringEntryRef,
+    pool_config: &super::schema::PoolConfig,
+) -> Result<PathBuf, ProfileSaveError> {
+    set_pool_state_on_disk(
+        name,
+        &default_profile_dir().map_err(ProfileSaveError::NoStateDir)?,
+        pool_master_key_id,
+        pool_config,
+    )
+}
+
 /// Reads the `[mcp_signer_default]` keyring reference exactly as stored in
 /// the profile's on-disk TOML, with NO environment or CLI overlays applied.
 ///
@@ -791,6 +811,66 @@ pub fn pin_signer_account_on_disk(
     table.insert(
         "account".to_owned(),
         toml::Value::String(account.to_owned()),
+    );
+
+    let toml_str = toml::to_string_pretty(&doc).map_err(ProfileSaveError::Serialize)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(ProfileSaveError::Io)?;
+    std::io::Write::write_all(&mut tmp, toml_str.as_bytes()).map_err(ProfileSaveError::Io)?;
+    tmp.persist(&dest)
+        .map_err(|e| ProfileSaveError::Io(e.error))?;
+    Ok(dest)
+}
+
+/// Sets ONLY `pool_master_key_id` and `[pool_config]` in the profile's
+/// on-disk TOML document, preserving every other stored key verbatim, and
+/// writes the result atomically.
+///
+/// This is the persistence half of `pool init`. The pool bookkeeping is part
+/// of the persistent trust root: this deliberately does NOT round-trip
+/// through [`load`] + [`save`], because that pair would merge
+/// `STELLAR_AGENT_*` environment overlays and materialise loader-derived
+/// defaults (`rpc_url`, `audit_log_path`, `network_passphrase`, derived key
+/// references) into the stored document, turning transient overrides into
+/// persistent trust-root state. Environment overlays remain load-time-only
+/// ([`load`]).
+///
+/// Both keys are replaced wholesale: a re-initialisation
+/// (`pool init --force`) overwrites any previous pool bookkeeping rather
+/// than merging with it.
+///
+/// # Errors
+///
+/// - [`ProfileSaveError::Io`] when the file cannot be read, parsed, or
+///   written (a parse failure is surfaced as `InvalidData`).
+/// - [`ProfileSaveError::Serialize`] on TOML value conversion or
+///   re-serialization failure.
+pub fn set_pool_state_on_disk(
+    name: &str,
+    dir: &Path,
+    pool_master_key_id: &super::schema::KeyringEntryRef,
+    pool_config: &super::schema::PoolConfig,
+) -> Result<PathBuf, ProfileSaveError> {
+    let dest = dir.join(format!("{name}.toml"));
+    let raw = std::fs::read_to_string(&dest).map_err(ProfileSaveError::Io)?;
+    let mut doc: toml::Value = toml::from_str(&raw).map_err(|e| {
+        ProfileSaveError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("failed to parse '{}': {e}", dest.display()),
+        ))
+    })?;
+    let table = doc.as_table_mut().ok_or_else(|| {
+        ProfileSaveError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("'{}' is not a TOML table document", dest.display()),
+        ))
+    })?;
+    table.insert(
+        "pool_master_key_id".to_owned(),
+        toml::Value::try_from(pool_master_key_id)?,
+    );
+    table.insert(
+        "pool_config".to_owned(),
+        toml::Value::try_from(pool_config)?,
     );
 
     let toml_str = toml::to_string_pretty(&doc).map_err(ProfileSaveError::Serialize)?;
@@ -1988,6 +2068,153 @@ engine = "v1"
         assert!(
             loaded.pool_master_key_id.is_none(),
             "pool_master_key_id must be None in fresh profile"
+        );
+    }
+
+    // ── set_pool_state_on_disk raw-document patch ─────────────────────────────
+
+    /// Builds a pool-state fixture: a master keyring reference plus a
+    /// two-channel config. The channel public keys are bookkeeping strings
+    /// (never parsed as strkeys by the loader), so elided placeholders are
+    /// sufficient.
+    fn pool_state_fixture() -> (
+        crate::profile::schema::KeyringEntryRef,
+        crate::profile::schema::PoolConfig,
+    ) {
+        use crate::profile::schema::{KeyringEntryRef, PoolChannelRecord, PoolConfig};
+        (
+            KeyringEntryRef::new("stellar-agent-pool-test-profile", "default"),
+            PoolConfig::new(
+                2,
+                vec![
+                    PoolChannelRecord::new(1, "GABC...CH1"),
+                    PoolChannelRecord::new(2, "GDEF...CH2"),
+                ],
+            ),
+        )
+    }
+
+    /// The raw-document patch writes exactly the two pool keys and leaves the
+    /// rest of the stored document semantically identical. In particular the
+    /// loader-derived fields (`rpc_url`, `network_passphrase`,
+    /// `audit_log_path`, `policy_window_state_key_id`) that a [`load`] +
+    /// [`save`] round trip would materialise must NOT appear: the fixture
+    /// TOML omits them, and they must still be absent after the patch.
+    #[test]
+    fn set_pool_state_on_disk_patches_only_the_pool_keys() {
+        let (dir, name) = write_profile(minimal_toml());
+        let before: toml::Value = toml::from_str(minimal_toml()).unwrap();
+        let (master_ref, cfg) = pool_state_fixture();
+
+        set_pool_state_on_disk(&name, dir.path(), &master_ref, &cfg).unwrap();
+
+        let written = std::fs::read_to_string(dir.path().join(format!("{name}.toml"))).unwrap();
+        let mut after: toml::Value = toml::from_str(&written).unwrap();
+        let table = after.as_table_mut().unwrap();
+
+        let got_ref: crate::profile::schema::KeyringEntryRef = table
+            .remove("pool_master_key_id")
+            .expect("pool_master_key_id must be written")
+            .try_into()
+            .unwrap();
+        let got_cfg: crate::profile::schema::PoolConfig = table
+            .remove("pool_config")
+            .expect("pool_config must be written")
+            .try_into()
+            .unwrap();
+        assert_eq!(got_ref, master_ref);
+        assert_eq!(got_cfg, cfg);
+
+        for derived in [
+            "rpc_url",
+            "network_passphrase",
+            "audit_log_path",
+            "policy_window_state_key_id",
+        ] {
+            assert!(
+                !table.contains_key(derived),
+                "loader-derived field '{derived}' must not be materialised \
+                 into the stored document; got:\n{written}"
+            );
+        }
+        assert_eq!(
+            after, before,
+            "with the pool keys removed, the patched document must equal the \
+             original; got:\n{written}"
+        );
+    }
+
+    /// Keys the profile schema does not model survive the patch: the raw
+    /// document is preserved verbatim, not filtered through the schema.
+    #[test]
+    fn set_pool_state_on_disk_preserves_unmodelled_keys() {
+        let toml_with_extra = format!("{}\nx_unmodelled_key = \"keep-me\"\n", minimal_toml());
+        let (dir, name) = write_profile(&toml_with_extra);
+        let (master_ref, cfg) = pool_state_fixture();
+
+        set_pool_state_on_disk(&name, dir.path(), &master_ref, &cfg).unwrap();
+
+        let written = std::fs::read_to_string(dir.path().join(format!("{name}.toml"))).unwrap();
+        assert!(
+            written.contains("x_unmodelled_key = \"keep-me\""),
+            "keys outside the schema must survive the raw-document patch; got:\n{written}"
+        );
+    }
+
+    /// A second `set_pool_state_on_disk` (the `pool init --force` shape)
+    /// replaces the previous pool bookkeeping wholesale.
+    #[test]
+    fn set_pool_state_on_disk_overwrites_previous_pool_state() {
+        use crate::profile::schema::{KeyringEntryRef, PoolChannelRecord, PoolConfig};
+        let (dir, name) = write_profile(minimal_toml());
+        let (master_ref, first_cfg) = pool_state_fixture();
+        set_pool_state_on_disk(&name, dir.path(), &master_ref, &first_cfg).unwrap();
+
+        let second_ref = KeyringEntryRef::new("stellar-agent-pool-test-profile", "rotated");
+        let second_cfg = PoolConfig::new(1, vec![PoolChannelRecord::new(1, "GXYZ...NEW")]);
+        set_pool_state_on_disk(&name, dir.path(), &second_ref, &second_cfg).unwrap();
+
+        let loaded = load_from_dir(&name, dir.path(), None).unwrap();
+        assert_eq!(loaded.pool_master_key_id, Some(second_ref));
+        let cfg = loaded.pool_config.expect("pool_config must be present");
+        assert_eq!(cfg, second_cfg);
+        assert_eq!(
+            cfg.channels.len(),
+            1,
+            "channels must be replaced, not appended"
+        );
+    }
+
+    /// The patched document loads through the normal loader and yields the
+    /// pool state as typed schema values (serde-shape parity with
+    /// [`save`]'s full-profile serialisation).
+    #[test]
+    fn set_pool_state_on_disk_round_trips_through_load() {
+        let (dir, name) = write_profile(minimal_toml());
+        let (master_ref, cfg) = pool_state_fixture();
+        set_pool_state_on_disk(&name, dir.path(), &master_ref, &cfg).unwrap();
+
+        let loaded = load_from_dir(&name, dir.path(), None).unwrap();
+        assert_eq!(loaded.pool_master_key_id, Some(master_ref));
+        assert_eq!(loaded.pool_config, Some(cfg));
+    }
+
+    /// A missing profile file is an I/O error, not a silent creation: pool
+    /// state is only ever patched into an existing profile document.
+    #[test]
+    fn set_pool_state_on_disk_missing_profile_is_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (master_ref, cfg) = pool_state_fixture();
+        let err = set_pool_state_on_disk("absent", dir.path(), &master_ref, &cfg).unwrap_err();
+        match err {
+            ProfileSaveError::Io(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected Io(NotFound), got {other:?}"),
+        }
+        assert!(
+            !dir.path().join("absent.toml").exists(),
+            "no profile file may be created by a failed patch"
         );
     }
 

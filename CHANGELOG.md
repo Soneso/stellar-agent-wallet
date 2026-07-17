@@ -106,6 +106,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `pool init` now persists its pool bookkeeping by patching only
+  `pool_master_key_id` and `[pool_config]` on the raw on-disk profile document
+  (`loader::set_pool_state`), instead of re-saving the loaded profile struct.
+  The previous load-merge-save round trip wrote the env-merged view into the
+  profile TOML: a transient `STELLAR_AGENT_*` environment override present
+  during the one-time pool initialization became persistent configuration, and
+  loader-derived defaults (`rpc_url`, `network_passphrase`, `audit_log_path`,
+  derived key references) the file never held were baked in. A profile updated
+  by `pool init` now differs from its previous on-disk form only in the two
+  pool keys.
 - Documentation: `docs/agents.md`, `docs/profiles.md`, and the agent skill no
   longer imply that key rotation plus V1 opt-in unlocks mainnet writes. The
   alpha refuses every mainnet write structurally at the network layer
