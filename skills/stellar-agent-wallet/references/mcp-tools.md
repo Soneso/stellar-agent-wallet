@@ -100,8 +100,11 @@ BEFORE the signer is loaded or anything is submitted, refusing
 [Approvals and audit](approvals-and-audit.md#fail-closed-on-an-unminted-audit-key)).
 `stellar_mpp_charge_commit` is exempt — it already fails closed on the same
 condition through its own stricter mechanism. The SEP-43 sign-only pair
-(`stellar_sep43_sign_transaction`, `stellar_sep43_sign_auth_entry`) is not yet
-covered by this pre-flight.
+(`stellar_sep43_sign_transaction`, `stellar_sep43_sign_auth_entry`) runs the
+same pre-flight and, once the signature is produced, records an
+`opaque_payload_signed` audit row (redacted payload digest and redacted
+signer; the caller broadcasts externally, so the row records signature
+production, not confirmation).
 
 ## chain_id requirement
 
@@ -488,8 +491,8 @@ decimal strings, not JSON numbers.
 | --- | --- | --- |
 | `stellar_sep43_get_address` | Return the active wallet address. | Read-only. |
 | `stellar_sep43_get_network` | Return the active network name and passphrase. | Read-only. |
-| `stellar_sep43_sign_transaction` | Sign a `TransactionEnvelope` XDR; return `signedTxXdr` and `signerAddress`. | Signs; no submit. |
-| `stellar_sep43_sign_auth_entry` | Sign a `SorobanAuthorizationEntry` XDR for G-key credentials; return `signedAuthEntry` and `signerAddress`. | Signs; no submit. |
+| `stellar_sep43_sign_transaction` | Sign a `TransactionEnvelope` XDR; return `signedTxXdr` and `signerAddress`. | Signs; no submit. Audit pre-flight + `opaque_payload_signed` row. |
+| `stellar_sep43_sign_auth_entry` | Sign a `SorobanAuthorizationEntry` XDR for G-key credentials; return `signedAuthEntry` and `signerAddress`. | Signs; no submit. Audit pre-flight + `opaque_payload_signed` row. |
 | `stellar_sep43_sign_message` | Sign an arbitrary UTF-8 message via `sha256(message)` then ed25519; return `signedMessage` (hex) and `signerAddress`. | Signs; no submit. |
 | `stellar_sep43_sign_and_submit_transaction` | Sign a `TransactionEnvelope` XDR, submit, poll until confirmed; return `signedTxXdr`, `txHash`, `status`. | Signs and submits; policy gate. |
 

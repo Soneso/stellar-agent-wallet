@@ -87,7 +87,7 @@ use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
     CommonArgsView, CommonHandlerContext, SignerSourceFlags, construct_signers_manager_from_fields,
-    network_to_chain_id, open_audit_writer,
+    network_to_chain_id, open_profile_audit_writer_read_only,
 };
 use crate::commands::smart_account::list_rules as sa_list_rules;
 use crate::common::network::TargetNetwork;
@@ -2767,10 +2767,11 @@ async fn get_spending_limit_run(args: &GetSpendingLimitArgs) -> i32 {
     // `CommonRulesReadArgs` has no `--profile` flag; resolve the default profile
     // (matches the read-only precedent set by `smart-account rules get`).
     let profile_name = resolve_profile_name(None);
-    let (audit_writer, audit_log_path) = match open_audit_writer(&profile_name) {
-        Ok(pair) => pair,
-        Err(e) => return emit_error(&e, args.common.output, &request_id),
-    };
+    let (_audit_profile, audit_writer, audit_log_path) =
+        match open_profile_audit_writer_read_only(&profile_name) {
+            Ok(triple) => triple,
+            Err(e) => return emit_error(&e, args.common.output, &request_id),
+        };
     let chain_id = network_to_chain_id(args.common.network);
     let manager = match construct_signers_manager_from_fields(
         &profile_name,

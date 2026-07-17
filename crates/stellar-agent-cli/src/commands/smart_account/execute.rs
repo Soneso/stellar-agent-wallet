@@ -70,7 +70,8 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
-    SignerSourceFlags, network_to_chain_id, open_audit_writer, resolve_signer, wrap_sa_error,
+    SignerSourceFlags, network_to_chain_id, open_profile_audit_writer, resolve_signer,
+    wrap_sa_error,
 };
 use crate::common::network::TargetNetwork;
 use crate::common::render::{render_json, sanitize_for_table};
@@ -379,6 +380,17 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     let network_passphrase = args.network.passphrase();
     let profile_name = resolve_profile_name(args.profile.as_deref());
 
+    // ── Audit pre-flight: prove the writer is acquirable BEFORE any signing ──
+    // key is touched or anything is submitted. A persisted profile whose
+    // audit chain key is unminted refuses here (audit.chain_key_unavailable);
+    // the SAME writer is reused for every post-confirm row below.
+    let audit_writer = match open_profile_audit_writer(&profile_name) {
+        Ok((_profile, writer, _path)) => Some(writer),
+        Err(e) => {
+            return emit_error(&e, args.output, &request_id);
+        }
+    };
+
     // ── Rule-signer key ceremony (shared mlock ceremony) ─────────────────────
     // Funded-source verification is SKIPPED: a rule key has no on-chain
     // account.
@@ -467,13 +479,6 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     // `rule_signer`'s SecretBox zeroizes on drop; the wallet it was derived
     // from has already been disposed inside the shared ceremony helper.
     drop(rule_signer);
-
-    // Best-effort audit writer (sibling convention): an audit-subsystem
-    // failure must never mask the outcome of a submission that has already
-    // confirmed on-chain.
-    let audit_writer = open_audit_writer(&profile_name)
-        .map(|(writer, _path)| writer)
-        .ok();
 
     if let Some(writer) = &audit_writer {
         record_mlock_degradation(

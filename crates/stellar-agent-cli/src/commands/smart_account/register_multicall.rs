@@ -43,7 +43,7 @@ use stellar_agent_smart_account::verifiers::default_networks_toml_path;
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
-    emit_multicall_registry_error, emit_sa_error, open_audit_writer,
+    emit_multicall_registry_error, emit_sa_error, open_profile_audit_writer,
 };
 use crate::common::network::TargetNetwork;
 use crate::common::render::render_json;
@@ -108,7 +108,9 @@ pub async fn run(args: &RegisterMulticallArgs) -> i32 {
     let request_id = Uuid::new_v4().to_string();
 
     // Open audit writer (non-fatal: log warning and continue on failure).
-    let audit_writer = open_audit_writer(&profile_name).ok();
+    let audit_writer = open_profile_audit_writer(&profile_name)
+        .map(|(_, w, p)| (w, p))
+        .ok();
 
     // CLI-level binary-const check: refuse if --wasm-sha256 != MULTICALL_WASM_SHA256.
     if args.wasm_sha256 != MULTICALL_WASM_SHA256 {

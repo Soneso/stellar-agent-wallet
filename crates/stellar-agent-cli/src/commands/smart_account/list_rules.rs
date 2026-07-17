@@ -73,7 +73,9 @@ use stellar_agent_smart_account::managers::rules::{
 };
 use tracing::{info, warn};
 
-use crate::commands::smart_account::common::{network_to_chain_id, open_audit_writer};
+use crate::commands::smart_account::common::{
+    network_to_chain_id, open_profile_audit_writer_read_only,
+};
 use crate::common::network::TargetNetwork;
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
@@ -344,9 +346,9 @@ pub async fn run(args: &ListRulesArgs) -> i32 {
     let max_scan_id = resolve_max_scan_id(args, &profile_name);
 
     // ── Open audit writer for audit-log cross-check ───────────────────────────
-    let (audit_writer, _audit_log_path): (Arc<Mutex<AuditWriter>>, _) =
-        match open_audit_writer(&profile_name) {
-            Ok(pair) => pair,
+    let (_audit_profile, audit_writer, _audit_log_path): (_, Arc<Mutex<AuditWriter>>, _) =
+        match open_profile_audit_writer_read_only(&profile_name) {
+            Ok(triple) => triple,
             Err(e) => return emit_error(&e),
         };
 

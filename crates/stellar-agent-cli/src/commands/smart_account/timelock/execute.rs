@@ -50,7 +50,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
-    SignerSourceFlags, emit_sa_error, open_audit_writer, resolve_signer,
+    SignerSourceFlags, emit_sa_error, open_profile_audit_writer, resolve_signer,
 };
 use crate::common::network::TargetNetwork;
 use crate::common::render::render_json;
@@ -234,14 +234,15 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
             }
         };
 
-    let (audit_writer, _audit_log_path) = match open_audit_writer(&profile_name) {
-        Ok(pair) => pair,
-        Err(e) => {
-            let envelope: Envelope<()> = Envelope::err(&e);
-            render_json(&envelope);
-            return 1;
-        }
-    };
+    let (_audit_profile, audit_writer, _audit_log_path) =
+        match open_profile_audit_writer(&profile_name) {
+            Ok(triple) => triple,
+            Err(e) => {
+                let envelope: Envelope<()> = Envelope::err(&e);
+                render_json(&envelope);
+                return 1;
+            }
+        };
     record_mlock_degradation(
         &audit_writer,
         mlock_degradation.as_ref(),

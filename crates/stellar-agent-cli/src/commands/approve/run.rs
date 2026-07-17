@@ -79,7 +79,7 @@ use stellar_agent_core::profile::schema::default_approval_dir;
 use stellar_agent_core::timefmt;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 
-use crate::commands::smart_account::common::open_audit_writer;
+use crate::commands::smart_account::common::open_profile_audit_writer;
 use crate::common::render;
 
 /// Arguments for `stellar-agent approve --id <nonce>`.
@@ -264,16 +264,17 @@ pub async fn run(args: RunArgs) -> i32 {
     };
 
     // ── 7b. Open the audit log (non-fatal: proceed without emission on failure) ──
-    let audit_writer_arc: Option<Arc<Mutex<AuditWriter>>> = match open_audit_writer(&profile_name) {
-        Ok((writer, _path)) => Some(writer),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "approve: audit writer open failed; continuing without audit emission"
-            );
-            None
-        }
-    };
+    let audit_writer_arc: Option<Arc<Mutex<AuditWriter>>> =
+        match open_profile_audit_writer(&profile_name) {
+            Ok((_profile, writer, _path)) => Some(writer),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "approve: audit writer open failed; continuing without audit emission"
+                );
+                None
+            }
+        };
     let mut audit_guard = audit_writer_arc.as_ref().map(|arc| arc.lock());
     let audit_writer_ref: Option<&mut AuditWriter> = match audit_guard.as_mut() {
         Some(Ok(g)) => Some(&mut **g),

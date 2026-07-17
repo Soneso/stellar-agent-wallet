@@ -2332,6 +2332,29 @@ pub enum EventKind {
         scheme: String,
     },
 
+    /// An opaque payload was signed without submission (SEP-43 sign-only).
+    ///
+    /// Emitted at the point the signature is produced and about to be
+    /// returned; the caller broadcasts externally, so the wallet never
+    /// observes a submit. Records only non-secret identifiers — a redacted
+    /// digest of the signed payload and the redacted signer address — never
+    /// the signature or the payload itself.
+    ///
+    /// This variant intentionally has NO field named `request_id` or `tool`
+    /// (the outer [`AuditEntry`](super::entry::AuditEntry) owns those).
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    OpaquePayloadSigned {
+        /// First-8-last-8 redacted SHA-256 hex digest of the signed payload
+        /// (the caller-supplied XDR string bytes).
+        payload_sha256_redacted: String,
+        /// First-5-last-5 redacted signer address the signature was produced
+        /// with.
+        signer_redacted: RedactedStrkey,
+    },
+
     /// A sponsored MPP charge credential passed every delivery gate.
     MppChargeAuthorized {
         /// SHA-256 authorization-id digest, hex encoded.
@@ -4257,6 +4280,44 @@ mod tests {
         assert!(
             result.is_err(),
             "missing-field deserialisation must fail for X402PaymentAuthorized"
+        );
+    }
+
+    #[test]
+    fn event_kind_opaque_payload_signed_round_trip() {
+        let ev = EventKind::OpaquePayloadSigned {
+            payload_sha256_redacted: "dfe78222...9d11baf1".to_owned(),
+            signer_redacted: RedactedStrkey::from_already_redacted("GBPXX...MWIVL"),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: EventKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(ev, back, "OpaquePayloadSigned must round-trip cleanly");
+        assert!(
+            s.contains("\"opaque_payload_signed\""),
+            "wire discriminant: {s}"
+        );
+        assert!(
+            s.contains("\"payload_sha256_redacted\""),
+            "payload digest field: {s}"
+        );
+        assert!(s.contains("\"signer_redacted\""), "signer field: {s}");
+        assert!(
+            !s.contains("request_id"),
+            "request_id must NOT appear as a variant field: {s}"
+        );
+        assert!(
+            !s.contains("\"tool\""),
+            "tool must NOT appear as a variant field: {s}"
+        );
+    }
+
+    #[test]
+    fn event_kind_opaque_payload_signed_missing_fields_fail() {
+        let json = r#"{"kind":"opaque_payload_signed"}"#;
+        let result: Result<EventKind, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "missing-field deserialisation must fail for OpaquePayloadSigned"
         );
     }
 

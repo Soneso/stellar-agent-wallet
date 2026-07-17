@@ -346,8 +346,9 @@ Read-only tools and the build/simulate stages of two-phase verbs never reach
 this pre-flight. The zero-config synthesized profile `pay`/`claim`/
 `accounts create` fall back to when no profile file exists stays fail-open for
 this specific check, matching its documented no-profile-required posture. The
-SEP-43 sign-only pair (`signTransaction`, `signAuthEntry`) is not yet covered
-by this pre-flight.
+SEP-43 sign-only pair (`signTransaction`, `signAuthEntry`) runs the same
+pre-flight and records an `opaque_payload_signed` row when the signature is
+produced.
 
 ### `audit verify` command reference
 

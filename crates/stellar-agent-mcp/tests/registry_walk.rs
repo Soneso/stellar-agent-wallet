@@ -1680,3 +1680,93 @@ fn every_moves_value_commit_handler_calls_require_value_audit_writer() {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audit-writer (path, key) discipline
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Walks every production source file in this crate and asserts the
+/// `AuditWriterRegistry::get_or_open` discipline: the registry pins one
+/// `(path, hmac_key)` pair per profile name for the process lifetime, so for
+/// a REAL profile name every open must register the profile's configured
+/// `audit_log_path` (value_audit.rs) or route through the keyed
+/// `require_value_audit_writer` acquisition (rule_create.rs). The only
+/// permitted `default_audit_log_path_for` registration is rules.rs's
+/// reserved observability profile name, which can never collide with an
+/// operator profile's registration in the same process.
+///
+/// A new call site in any other file fails this test until it is added here
+/// with its discipline verified.
+#[test]
+fn every_audit_writer_open_registers_the_profile_keyed_pair() {
+    fn production_half(source: &str) -> &str {
+        source.split("#[cfg(test)]").next().unwrap_or(source)
+    }
+
+    fn walk(dir: &std::path::Path, hits: &mut Vec<(String, String)>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(&path, hits);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let source = std::fs::read_to_string(&path).expect("read source");
+                if production_half(&source).contains("AuditWriterRegistry::get_or_open") {
+                    hits.push((path.display().to_string(), source));
+                }
+            }
+        }
+    }
+
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut hits = Vec::new();
+    walk(&src, &mut hits);
+
+    assert!(
+        !hits.is_empty(),
+        "expected at least the value_audit.rs and rules.rs call sites"
+    );
+
+    for (path, source) in &hits {
+        let production = production_half(source);
+        if path.ends_with("tools/rules.rs") {
+            assert!(
+                production.contains("RULES_OBSERVABILITY_PROFILE"),
+                "{path}: rules.rs must register only the reserved observability profile"
+            );
+            continue;
+        }
+        assert!(
+            path.ends_with("tools/value_audit.rs"),
+            "{path}: unexpected AuditWriterRegistry::get_or_open call site — register the \
+             profile's configured audit_log_path (or route through \
+             require_value_audit_writer) and add the file to this test's allow-set"
+        );
+        assert!(
+            production.contains("&profile.audit_log_path"),
+            "{path}: value_audit.rs must register profile.audit_log_path"
+        );
+        assert!(
+            !production.contains("default_audit_log_path_for("),
+            "{path}: production code must not register a name-derived default path"
+        );
+    }
+}
+
+/// rule_create's audit-writer acquisition must route through the keyed
+/// fail-closed pre-flight (require_value_audit_writer), never a
+/// name-derived default path with no HMAC key: a divergent registration
+/// bricks every later keyed open for the same profile name
+/// (PathMismatch/HmacKeyMismatch) for the remainder of the process.
+#[test]
+fn rule_create_audit_writer_routes_through_the_keyed_preflight() {
+    let source = include_str!("../src/tools/rule_create.rs");
+    let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+    assert!(
+        production.contains("require_value_audit_writer("),
+        "rule_create must acquire its audit writer via require_value_audit_writer"
+    );
+    assert!(
+        !production.contains("default_audit_log_path_for("),
+        "rule_create must not derive a default audit path from the profile name"
+    );
+}

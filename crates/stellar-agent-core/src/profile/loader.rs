@@ -40,7 +40,7 @@ use figment::{
     providers::{Env, Format, Serialized, Toml},
 };
 
-use super::schema::{Profile, default_audit_log_path};
+use super::schema::{Profile, default_audit_log_path_for};
 pub use super::schema::{default_approval_dir, default_policy_dir, default_profile_dir};
 use crate::profile::caip2::Caip2;
 
@@ -415,9 +415,13 @@ pub fn load_from_path(
         .rpc_url
         .unwrap_or_else(|| chain_id.default_rpc_url().to_owned());
     let network_passphrase = chain_id.network_passphrase().to_owned();
+    // Unset audit_log_path resolves to the PER-PROFILE location the field's
+    // contract documents (`<root>/audit/<name>.jsonl`), never a host-global
+    // shared file: hash-chained logs from unrelated profiles must not
+    // interleave.
     let audit_log_path = partial
         .audit_log_path
-        .unwrap_or_else(|| default_audit_log_path().unwrap_or_else(|_| PathBuf::from("audit.log")));
+        .unwrap_or_else(|| default_audit_log_path_for(name));
     let policy_window_state_key_id = partial
         .policy_window_state_key_id
         .clone()
@@ -990,9 +994,13 @@ pub fn load_with_overlay_from_dir(
         .rpc_url
         .unwrap_or_else(|| chain_id.default_rpc_url().to_owned());
     let network_passphrase = chain_id.network_passphrase().to_owned();
+    // Unset audit_log_path resolves to the PER-PROFILE location the field's
+    // contract documents (`<root>/audit/<name>.jsonl`), never a host-global
+    // shared file: hash-chained logs from unrelated profiles must not
+    // interleave.
     let audit_log_path = partial
         .audit_log_path
-        .unwrap_or_else(|| default_audit_log_path().unwrap_or_else(|_| PathBuf::from("audit.log")));
+        .unwrap_or_else(|| default_audit_log_path_for(name));
     let policy_window_state_key_id = partial
         .policy_window_state_key_id
         .clone()
@@ -2197,6 +2205,25 @@ engine = "v1"
         let loaded = load_from_dir(&name, dir.path(), None).unwrap();
         assert_eq!(loaded.pool_master_key_id, Some(master_ref));
         assert_eq!(loaded.pool_config, Some(cfg));
+    }
+
+    /// A TOML that omits `audit_log_path` loads with the PER-PROFILE default
+    /// the field's contract documents (`<root>/audit/<name>.jsonl`), keyed by
+    /// the profile name the loader was asked for — never a host-global
+    /// shared file.
+    #[test]
+    fn load_unset_audit_log_path_defaults_per_profile() {
+        let (dir, name) = write_profile(minimal_toml());
+        let loaded = load_from_dir(&name, dir.path(), None).unwrap();
+        assert_eq!(
+            loaded.audit_log_path,
+            crate::profile::schema::default_audit_log_path_for(&name),
+            "unset audit_log_path must resolve per-profile"
+        );
+        assert_eq!(
+            loaded.audit_log_path.file_name().unwrap(),
+            format!("{name}.jsonl").as_str()
+        );
     }
 
     /// A missing profile file is an I/O error, not a silent creation: pool

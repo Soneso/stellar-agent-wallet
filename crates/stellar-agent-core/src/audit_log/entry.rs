@@ -1944,6 +1944,42 @@ impl AuditEntry {
         }
     }
 
+    /// Constructs an `OpaquePayloadSigned` audit entry.
+    ///
+    /// Emitted at the point a SEP-43 sign-only tool produces a signature the
+    /// caller broadcasts externally — the wallet never observes a submit, so
+    /// this row records that the signature EXISTS, not that anything
+    /// confirmed. `payload_sha256_redacted` MUST be pre-redacted
+    /// (first-8-last-8 of the hex digest) at the call site; the signature and
+    /// payload are never recorded.
+    #[must_use]
+    pub fn new_opaque_payload_signed(
+        tool: impl Into<String>,
+        chain_id: impl IntoOptionalChainId,
+        payload_sha256_redacted: impl Into<String>,
+        signer_redacted: RedactedStrkey,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.into(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::OpaquePayloadSigned {
+                payload_sha256_redacted: payload_sha256_redacted.into(),
+                signer_redacted,
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
     /// Constructs an `X402PaymentAuthorized` audit entry.
     ///
     /// Emitted at the point an x402 payment authorization signature is

@@ -742,6 +742,7 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
             }
             EventKind::ValueActionSubmitted { .. }
             | EventKind::X402PaymentAuthorized { .. }
+            | EventKind::OpaquePayloadSigned { .. }
             | EventKind::MppChargeAuthorized { .. }
             | EventKind::MppAuthorizationWithheld { .. }
             | EventKind::MppReceiptObserved { .. }
@@ -1303,6 +1304,7 @@ mod tests {
             EventKind::ApprovalRejectedRemote { .. } => "approval_rejected_remote",
             EventKind::ValueActionSubmitted { .. } => "value_action_submitted",
             EventKind::X402PaymentAuthorized { .. } => "x402_payment_authorized",
+            EventKind::OpaquePayloadSigned { .. } => "opaque_payload_signed",
             EventKind::MppChargeAuthorized { .. } => "mpp_charge_authorized",
             EventKind::MppAuthorizationWithheld { .. } => "mpp_authorization_withheld",
             EventKind::MppReceiptObserved { .. } => "mpp_receipt_observed",
@@ -1690,6 +1692,12 @@ mod tests {
                 network: "stellar:testnet".to_owned(),
                 scheme: "exact".to_owned(),
             },
+            EventKind::OpaquePayloadSigned {
+                payload_sha256_redacted: "dfe78222...9d11baf1".to_owned(),
+                signer_redacted: crate::observability::RedactedStrkey::from_already_redacted(
+                    "GBPXX...WIVL",
+                ),
+            },
             EventKind::MppChargeAuthorized {
                 authorization_id_hash: "a".repeat(64),
                 fingerprint_hash: "b".repeat(64),
@@ -1968,6 +1976,7 @@ mod tests {
                 "approval_rejected_remote",
                 "value_action_submitted",
                 "x402_payment_authorized",
+                "opaque_payload_signed",
                 "mpp_charge_authorized",
                 "mpp_authorization_withheld",
                 "mpp_receipt_observed",

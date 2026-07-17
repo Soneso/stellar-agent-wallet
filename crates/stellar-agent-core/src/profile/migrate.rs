@@ -306,11 +306,13 @@ fn apply_migrations(name: &str, path: &Path, from_version: u32) -> Result<Profil
 /// returns `MigrateOutcome::NoOp` without ever reaching this function.
 ///
 fn migrate_v1_to_v2(profile_name: &str, v1: PartialV1Profile) -> Profile {
-    use super::schema::default_audit_log_path;
+    use super::schema::default_audit_log_path_for;
 
+    // Unset v1 audit_log_path migrates to the PER-PROFILE v2 location the
+    // field's contract documents; an explicit v1 value is carried verbatim.
     let audit_log_path = v1
         .audit_log_path
-        .unwrap_or_else(|| default_audit_log_path().unwrap_or_else(|_| PathBuf::from("audit.log")));
+        .unwrap_or_else(|| default_audit_log_path_for(profile_name));
 
     let chain_id = v1.chain_id;
     let rpc_url = v1
@@ -477,6 +479,13 @@ account = "{name}"
         assert_eq!(
             loaded.policy.engine,
             crate::profile::schema::PolicyEngineKind::Noop
+        );
+        // A v1 profile without an explicit audit_log_path migrates to the
+        // PER-PROFILE v2 location, never a host-global shared file.
+        assert_eq!(
+            loaded.audit_log_path,
+            crate::profile::schema::default_audit_log_path_for(&name),
+            "unset v1 audit_log_path must migrate to the per-profile default"
         );
     }
 

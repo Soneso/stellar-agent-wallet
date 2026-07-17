@@ -60,7 +60,7 @@ use stellar_agent_smart_account::verifiers::default_networks_toml_path;
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
-    emit_multicall_registry_error, emit_sa_error, open_audit_writer,
+    emit_multicall_registry_error, emit_sa_error, open_profile_audit_writer,
 };
 use crate::common::network::TargetNetwork;
 use crate::common::render::render_json;
@@ -145,7 +145,9 @@ pub async fn run(args: &UnregisterMulticallArgs) -> i32 {
     let chain_id: Option<String> = None;
 
     // Open audit writer (non-fatal: log warning and continue on failure).
-    let audit_writer = open_audit_writer(&profile_name).ok();
+    let audit_writer = open_profile_audit_writer(&profile_name)
+        .map(|(_, w, p)| (w, p))
+        .ok();
 
     // Load the registry.
     let networks_toml_path = match default_networks_toml_path() {

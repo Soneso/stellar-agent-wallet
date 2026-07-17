@@ -1196,6 +1196,7 @@ impl Profile {
             smart_account_max_context_rule_scan_id: None,
             session_rule_max_horizon_ledgers: None,
             secondary_rpc_url: None,
+            profile_name: derived_name,
         }
     }
 
@@ -1256,6 +1257,7 @@ impl Profile {
             smart_account_max_context_rule_scan_id: None,
             session_rule_max_horizon_ledgers: None,
             secondary_rpc_url: None,
+            profile_name: derived_name,
         }
     }
 
@@ -1316,6 +1318,7 @@ pub struct ProfileBuilder {
     smart_account_max_context_rule_scan_id: Option<u32>,
     session_rule_max_horizon_ledgers: Option<u32>,
     secondary_rpc_url: Option<String>,
+    profile_name: String,
 }
 
 impl ProfileBuilder {
@@ -1346,6 +1349,7 @@ impl ProfileBuilder {
         self.attestation_key_id = KeyringEntryRef::default_attestation_key(name);
         self.counterparty_cache_key_id = KeyringEntryRef::default_counterparty_key(name);
         self.policy_window_state_key_id = KeyringEntryRef::default_policy_window_state_key(name);
+        self.profile_name = name.to_owned();
         self
     }
 
@@ -1512,13 +1516,18 @@ impl ProfileBuilder {
     /// Builds the [`Profile`], using the default audit-log path if not set.
     ///
     /// If `audit_log_path` was not supplied via [`ProfileBuilder::audit_log_path`],
-    /// the method calls `default_audit_log_path()` and falls back to
-    /// `"audit.log"` (a relative path) when the OS-conventional directory
-    /// cannot be determined.  It never panics.
+    /// the method resolves the per-profile location via
+    /// [`default_audit_log_path_for`] (which carries its own relative-path
+    /// fallback when the OS-conventional directory cannot be determined).
+    /// It never panics.
     pub fn build(self) -> Profile {
-        let audit_log_path = self.audit_log_path.unwrap_or_else(|| {
-            default_audit_log_path().unwrap_or_else(|_| PathBuf::from("audit.log"))
-        });
+        // Unset audit_log_path resolves to the PER-PROFILE location the
+        // field's contract documents (`<root>/audit/<name>.jsonl`), never a
+        // host-global shared file: hash-chained logs from unrelated profiles
+        // must not interleave.
+        let audit_log_path = self
+            .audit_log_path
+            .unwrap_or_else(|| default_audit_log_path_for(&self.profile_name));
         Profile {
             version: self.version,
             chain_id: self.chain_id,
@@ -1591,22 +1600,21 @@ pub struct StateDirError;
 /// determine the user's data-local directory (rare; CI containers without
 /// `$HOME`).
 pub fn canonical_data_root() -> Result<PathBuf, StateDirError> {
+    // Gated env-var override: only honoured in test builds OR when the crate
+    // is compiled with `--features test-helpers`. Production release builds
+    // never read this variable, eliminating the env-injection root-swap
+    // surface. The per-directory helpers (`default_profile_dir`,
+    // `default_policy_dir`, ...) pre-check the same variable with the same
+    // join conventions, so every canonical-root-derived path — including the
+    // audit directory — resolves under one redirected root in tests.
+    #[cfg(any(test, feature = "test-helpers"))]
+    if let Some(home) = std::env::var_os("STELLAR_AGENT_HOME") {
+        return Ok(PathBuf::from(home));
+    }
+
     let dirs =
         directories::ProjectDirs::from("", "Soneso", "stellar-agent").ok_or(StateDirError)?;
     Ok(dirs.data_local_dir().to_path_buf())
-}
-
-/// Returns the OS-conventional default audit-log path for this process.
-///
-/// `<canonical_data_root>/audit.log` — see [`canonical_data_root`] for the
-/// per-platform root.
-///
-/// # Errors
-///
-/// Returns [`StateDirError`] when the platform directories library cannot
-/// determine the user's state directory.
-pub fn default_audit_log_path() -> Result<PathBuf, StateDirError> {
-    Ok(canonical_data_root()?.join("audit.log"))
 }
 
 /// Returns the OS-conventional audit-log file path for `profile_name`.
@@ -2956,18 +2964,40 @@ mod tests {
 
     // ── OS-conventional directory helpers ─────────────────────────────────────
 
+    /// An unset `audit_log_path` resolves to the PER-PROFILE location the
+    /// field's contract documents — never a host-global shared file whose
+    /// hash-chained rows would interleave across profiles.
     #[test]
-    fn default_audit_log_path_ends_with_audit_log() {
-        let path = default_audit_log_path().expect("default_audit_log_path must succeed on CI");
+    fn builder_unset_audit_log_path_resolves_per_profile() {
+        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+            .with_profile_name("alice")
+            .build();
         assert_eq!(
-            path.file_name().unwrap(),
-            "audit.log",
-            "default_audit_log_path must end with 'audit.log'; got: {path:?}"
+            profile.audit_log_path,
+            default_audit_log_path_for("alice"),
+            "unset audit_log_path must resolve to the per-profile default"
         );
-        assert!(
-            path.to_string_lossy().contains("stellar-agent"),
-            "default_audit_log_path must be under stellar-agent directory; got: {path:?}"
-        );
+        assert_eq!(profile.audit_log_path.file_name().unwrap(), "alice.jsonl");
+    }
+
+    /// Without `with_profile_name`, the audit path derives from the same
+    /// signer-account name base the v2 keyring references derive from.
+    #[test]
+    fn builder_unnamed_audit_path_derives_from_signer_account() {
+        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct").build();
+        assert_eq!(profile.audit_log_path, default_audit_log_path_for("acct"));
+    }
+
+    /// An explicit `audit_log_path` is never overridden by the per-profile
+    /// default resolution.
+    #[test]
+    fn builder_explicit_audit_log_path_is_respected() {
+        let explicit = std::path::PathBuf::from("/tmp/stellar-agent/explicit-audit.jsonl");
+        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+            .with_profile_name("alice")
+            .audit_log_path(explicit.clone())
+            .build();
+        assert_eq!(profile.audit_log_path, explicit);
     }
 
     /// `#[serial]`: see `default_passkeys_dir_ends_with_passkeys_component`.

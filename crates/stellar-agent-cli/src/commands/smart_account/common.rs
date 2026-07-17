@@ -13,11 +13,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::{ArgGroup, Args};
-use stellar_agent_core::audit_log::writer::{AuditWriter, AuditWriterRegistry};
+use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{AuthError, IoSource, ValidationError, WalletError};
 use stellar_agent_core::observability::redact_path_in_message;
 use stellar_agent_core::profile::loader as profile_loader;
+use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::wallet::MlockDegradation;
 use stellar_agent_network::Signer;
 use stellar_agent_smart_account::SaError;
@@ -129,7 +130,8 @@ impl CommonHandlerContext {
         let timeout = Duration::from_secs(args.timeout_seconds());
         let chain_id = network_to_chain_id(args.network()).to_owned();
 
-        let (audit_writer, audit_log_path) = open_audit_writer(&profile_name)?;
+        let (_audit_profile, audit_writer, audit_log_path) =
+            open_profile_audit_writer(&profile_name)?;
         record_mlock_degradation(
             &audit_writer,
             mlock_degradation.as_ref(),
@@ -402,18 +404,40 @@ pub(crate) fn emit_multicall_registry_error(e: &SaError, source: IoSource) -> i3
     }
 }
 
-/// Opens (or returns the cached) audit-log writer for `profile_name`.
+/// Resolves the profile for `profile_name` (or synthesizes the zero-config
+/// testnet fallback when no profile file exists) and opens the audit-log
+/// writer under the profile's configured `audit_log_path` and audit
+/// chain-root HMAC key.
 ///
-/// Delegates to [`AuditWriterRegistry::get_or_open`] so the same
-/// `Arc<Mutex<AuditWriter>>` is returned for every call with the same
-/// `profile_name` within the process, preventing multiple writers from racing
-/// to open the same file.
-pub(crate) fn open_audit_writer(
+/// Origin-aware, mirroring the value-verb discipline:
+///
+/// - A PERSISTED profile fails closed
+///   (`crate::commands::value_audit::require_value_audit_writer`): the
+///   operator minted a trust root, so a manager must not run with an
+///   unverifiable or divergent writer. `AuditWriterRegistry` pins one
+///   `(path, hmac_key)` pair per profile name for the process lifetime;
+///   registering anything but the keyed pair here would brick later opens
+///   (`PathMismatch`/`HmacKeyMismatch`) and leave rows outside
+///   `stellar-agent audit verify` coverage.
+/// - A SYNTHESIZED profile keeps the zero-config quickstart working:
+///   keyed when the derived key loads, otherwise an unkeyed writer at the
+///   same per-profile path
+///   (`crate::commands::value_audit::acquire_best_effort_audit_writer`).
+///
+/// Returns the resolved profile alongside the writer so callers stop
+/// re-deriving paths from the bare name.
+pub(crate) fn open_profile_audit_writer(
     profile_name: &str,
-) -> Result<(Arc<Mutex<AuditWriter>>, PathBuf), WalletError> {
-    use stellar_agent_core::profile::schema::default_audit_log_path_for;
+) -> Result<(Profile, Arc<Mutex<AuditWriter>>, PathBuf), WalletError> {
+    use crate::commands::policy_engine::{ProfileOrigin, load_profile_or_synthesize_testnet};
 
-    let log_path = default_audit_log_path_for(profile_name);
+    let (profile, origin) = load_profile_or_synthesize_testnet(profile_name).map_err(|detail| {
+        wallet_io_error(
+            IoSource::AuditWriterSetup,
+            format!("profile resolution failed: {detail}"),
+        )
+    })?;
+    let log_path = profile.audit_log_path.clone();
 
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
@@ -421,14 +445,55 @@ pub(crate) fn open_audit_writer(
         })?;
     }
 
-    let writer = AuditWriterRegistry::get_or_open(profile_name, &log_path, None).map_err(|e| {
-        wallet_io_error(
-            IoSource::AuditWriterSetup,
-            format!("open audit writer: {e}"),
-        )
-    })?;
+    let writer = match origin {
+        ProfileOrigin::Persisted => {
+            crate::commands::value_audit::require_value_audit_writer(&profile, profile_name)?
+        }
+        ProfileOrigin::Synthesized => {
+            crate::commands::value_audit::acquire_best_effort_audit_writer(&profile, profile_name)?
+        }
+    };
+    Ok((profile, writer, log_path))
+}
 
-    Ok((writer, log_path))
+/// Best-effort sibling of [`open_profile_audit_writer`] for READ-ONLY
+/// commands (list/inspect surfaces and dry-run simulation): they neither
+/// sign nor submit, so the fail-closed pre-flight does not apply to them,
+/// but manager construction still requires a writer object.
+///
+/// The acquisition is keyed-first through the same discipline
+/// ([`crate::commands::value_audit::acquire_best_effort_audit_writer`]); a
+/// profile whose chain key is unminted degrades to an unkeyed writer with a
+/// warning instead of refusing, so an operator can always inspect their own
+/// state.
+///
+/// # Errors
+///
+/// Returns [`WalletError`] on profile-resolution failure or when even the
+/// unkeyed open fails (I/O).
+pub(crate) fn open_profile_audit_writer_read_only(
+    profile_name: &str,
+) -> Result<(Profile, Arc<Mutex<AuditWriter>>, PathBuf), WalletError> {
+    use crate::commands::policy_engine::load_profile_or_synthesize_testnet;
+
+    let (profile, _origin) =
+        load_profile_or_synthesize_testnet(profile_name).map_err(|detail| {
+            wallet_io_error(
+                IoSource::AuditWriterSetup,
+                format!("profile resolution failed: {detail}"),
+            )
+        })?;
+    let log_path = profile.audit_log_path.clone();
+
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            wallet_io_error(IoSource::AuditWriterSetup, format!("create directory: {e}"))
+        })?;
+    }
+
+    let writer =
+        crate::commands::value_audit::acquire_best_effort_audit_writer(&profile, profile_name)?;
+    Ok((profile, writer, log_path))
 }
 
 #[cfg(test)]
@@ -436,6 +501,42 @@ mod tests {
     #![allow(clippy::expect_used, clippy::panic, reason = "test-only assertions")]
 
     use super::*;
+
+    /// The origin-aware writer gate every smart-account, approve, and
+    /// timelock command shares: a PERSISTED profile without a minted audit
+    /// chain key refuses (`audit.chain_key_unavailable`), with the key
+    /// minted it opens the writer at the profile's configured path, and the
+    /// SYNTHESIZED zero-config path (no profile file) still yields a writer.
+    #[test]
+    #[serial_test::serial]
+    fn open_profile_audit_writer_is_origin_aware() {
+        use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let _home = StellarAgentHomeGuard::new(dir.path());
+        keyring_mock::install().expect("mock store");
+
+        let profile = Profile::builder_testnet_named("gate-test", "svc", "acct", "n-svc", "n-acct")
+            .audit_log_path(dir.path().join("audit").join("gate-test.jsonl"))
+            .build();
+        profile_loader::save_to_dir("gate-test", &profile, &dir.path().join("profiles"))
+            .expect("persist profile");
+
+        let err = open_profile_audit_writer("gate-test")
+            .expect_err("a persisted profile without a minted audit key must refuse");
+        assert_eq!(err.code(), "audit.chain_key_unavailable");
+
+        stellar_agent_network::keyring::rotate_keyring_secret_32(
+            &profile.audit_log_hash_chain_key_id.service,
+            &profile.audit_log_hash_chain_key_id.account,
+        )
+        .expect("mint audit key");
+        let (loaded, _writer, path) =
+            open_profile_audit_writer("gate-test").expect("minted key must open the writer");
+        assert_eq!(path, loaded.audit_log_path);
+
+        let (_synth, _writer2, _path2) = open_profile_audit_writer("gate-absent")
+            .expect("the synthesized zero-config path must still yield a writer");
+    }
 
     /// The secret-env arm derives the same public key ed25519-dalek derives
     /// from the seed, end to end through the mlock ceremony (unlock, derive,
