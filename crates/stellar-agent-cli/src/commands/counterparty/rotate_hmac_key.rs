@@ -8,7 +8,7 @@
 use clap::Args;
 use serde::Serialize;
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{AuthError, ValidationError, WalletError};
+use stellar_agent_core::error::{ValidationError, WalletError};
 use stellar_agent_core::profile::loader;
 use stellar_agent_network::keyring::{init_platform_keyring_store, rotate_keyring_secret_32};
 
@@ -79,11 +79,12 @@ pub async fn run(args: &RotateHmacKeyArgs) -> i32 {
             0
         }
         Err(e) => {
+            // The shared helper classifies keyring failures — surface its
+            // error unchanged so environmental causes (a non-interactive
+            // Windows session) keep their typed code instead of collapsing
+            // into "not found".
             tracing::debug!(error = %e, "counterparty HMAC key rotation failed");
-            let err = WalletError::Auth(AuthError::KeyringNotFound {
-                name: "counterparty_cache_key_id".to_owned(),
-            });
-            render::render_json(&Envelope::err(&err));
+            render::render_json(&Envelope::err(&e));
             1
         }
     }

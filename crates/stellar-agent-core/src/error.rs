@@ -1138,12 +1138,20 @@ pub enum AuthError {
     /// Windows Credential Manager requires an interactive logon session:
     /// non-interactive contexts (a Windows service, an SSH session, a
     /// scheduled task) cannot access it, and the same operator credentials
-    /// unlock fine from an interactive desktop session. Carries no fields; no
-    /// secret material crosses the variant boundary.
+    /// unlock fine from an interactive desktop session. The condition affects
+    /// reads and writes alike, so keyring writes (`profile enroll-signer`,
+    /// `profile rotate-*`) classify through the same mapping as reads. The
+    /// message names the `STELLAR_AGENT_KEYRING_BACKEND=headless-dpapi`
+    /// escape hatch for deployments that cannot obtain an interactive
+    /// session. Carries no fields; no secret material crosses the variant
+    /// boundary.
     #[error(
         "Windows Credential Manager requires an interactive logon session; \
          this process is running in a non-interactive session (service, SSH, \
-         or scheduled task) and cannot access the credential store"
+         or scheduled task) and cannot access the credential store; run the \
+         command from an interactive desktop session, or set \
+         STELLAR_AGENT_KEYRING_BACKEND=headless-dpapi to use the DPAPI \
+         file-backed headless keyring instead"
     )]
     KeyringInteractiveSessionRequired,
 

@@ -50,7 +50,7 @@ use zeroize::Zeroizing;
 
 use stellar_agent_core::audit_log::KeyPurpose;
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{AuthError, InternalError, ValidationError, WalletError};
+use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
 use stellar_agent_core::observability::RedactedStrkey;
 use stellar_agent_core::profile::loader;
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
@@ -239,11 +239,9 @@ where
         Ok(e) => e,
         Err(e) => {
             tracing::debug!(error = %e, "enroll-owner-key: keyring entry construction failed");
-            render::render_json(&Envelope::<()>::err(&WalletError::Auth(
-                AuthError::KeyringNotFound {
-                    name: format!("{}:{}", owner_coord.service, owner_coord.account),
-                },
-            )));
+            render::render_json(&Envelope::<()>::err(
+                &stellar_agent_network::keyring::map_keyring_error(&e, &owner_coord.service),
+            ));
             return 1;
         }
     };
@@ -259,11 +257,9 @@ where
         Err(keyring_core::Error::NoEntry) => false,
         Err(e) => {
             tracing::debug!(error = %e, "enroll-owner-key: existence probe failed");
-            render::render_json(&Envelope::<()>::err(&WalletError::Auth(
-                AuthError::KeyringNotFound {
-                    name: format!("{}:{}", owner_coord.service, owner_coord.account),
-                },
-            )));
+            render::render_json(&Envelope::<()>::err(
+                &stellar_agent_network::keyring::map_keyring_error(&e, &owner_coord.service),
+            ));
             return 1;
         }
     };
@@ -288,11 +284,12 @@ where
     let encoded: Zeroizing<String> = Zeroizing::new(URL_SAFE_NO_PAD.encode(owner_pubkey.0));
     if let Err(e) = entry.set_password(&encoded) {
         tracing::debug!(error = %e, "enroll-owner-key: set_password failed");
-        render::render_json(&Envelope::<()>::err(&WalletError::Auth(
-            AuthError::KeyringNotFound {
-                name: format!("{}:{}", owner_coord.service, owner_coord.account),
-            },
-        )));
+        // Classify the write failure: a non-interactive Windows session must
+        // surface as auth.keyring_interactive_session_required, not "not
+        // found".
+        render::render_json(&Envelope::<()>::err(
+            &stellar_agent_network::keyring::map_keyring_error(&e, &owner_coord.service),
+        ));
         return 1;
     }
 

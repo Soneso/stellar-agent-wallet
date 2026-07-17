@@ -5,12 +5,14 @@
 //! - `load_key` → `get_password` failure: keyring entry missing (no key seeded)
 //!   returns `NonceError::KeyringError`.
 //! - `load_key` → `get_password` failure: mock `set_error` sentinel fires
-//!   and the error propagates as `NonceError::KeyringError`.
+//!   and the error propagates as `NonceError::KeyringError` with the failure
+//!   classified (a backend `NoStorageAccess` is `KeyringPlatformError`, not
+//!   "not found").
 //! - `load_key` → base64 decode failure: keyring entry contains invalid base64,
 //!   propagated as `NonceError::SerialiseFailed`.
 //! - `rotate_nonce_key` → `set_password` failure: mock `set_error` sentinel on
-//!   the nonce entry causes `rotate_keyring_secret_32` to fail, which
-//!   `rotate_nonce_key` maps to `WalletError::Auth(KeyringNotFound)`.
+//!   the nonce entry causes `rotate_keyring_secret_32` to fail;
+//!   `rotate_nonce_key` surfaces the classified error unchanged.
 
 #![allow(
     clippy::unwrap_used,
@@ -110,8 +112,12 @@ fn load_key_returns_keyring_error_on_get_password_no_storage_access() {
         .expect_err("NoStorageAccess sentinel must return KeyringError");
 
     assert!(
-        matches!(err, NonceError::KeyringError(_)),
-        "expected KeyringError, got: {err:?}"
+        matches!(
+            err,
+            NonceError::KeyringError(AuthError::KeyringPlatformError)
+        ),
+        "a backend NoStorageAccess must classify as KeyringPlatformError, \
+         not collapse into not-found; got: {err:?}"
     );
 }
 
@@ -161,15 +167,16 @@ fn load_key_returns_serialise_failed_on_invalid_base64() {
 
 // ─── rotate_nonce_key: set_password failure ───────────────────────────────────
 
-/// `rotate_nonce_key` returns `WalletError::Auth(AuthError::KeyringNotFound)`
-/// when the underlying `rotate_keyring_secret_32` → `set_password` call fails.
+/// `rotate_nonce_key` surfaces the CLASSIFIED keyring failure when the
+/// underlying `rotate_keyring_secret_32` → `set_password` call fails: a
+/// backend `NoStorageAccess` is `KeyringPlatformError`, not a "not found"
+/// claim about an entry that was never missing.
 ///
 /// Mechanism: the mock entry is seeded so it exists, then
 /// `set_error(Error::NoStorageAccess)` is armed so the next write (the
 /// `set_password` call inside `rotate_keyring_secret_32`) fires the sentinel.
 /// `rotate_keyring_secret_32` maps the error through `map_keyring_error`;
-/// `rotate_nonce_key` then maps the resulting `WalletError` to
-/// `WalletError::Auth(KeyringNotFound)`.
+/// `rotate_nonce_key` passes the classified error through unchanged.
 #[test]
 #[serial]
 fn rotate_nonce_key_returns_wallet_error_on_set_password_failure() {
@@ -211,7 +218,8 @@ fn rotate_nonce_key_returns_wallet_error_on_set_password_failure() {
 
     let err = result.expect_err("already asserted is_err");
     assert!(
-        matches!(err, WalletError::Auth(AuthError::KeyringNotFound { .. })),
-        "expected WalletError::Auth(KeyringNotFound), got: {err:?}"
+        matches!(err, WalletError::Auth(AuthError::KeyringPlatformError)),
+        "a backend NoStorageAccess on the write must classify as \
+         KeyringPlatformError, not collapse into not-found; got: {err:?}"
     );
 }

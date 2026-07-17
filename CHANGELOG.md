@@ -106,6 +106,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keyring write failures now classify through the same mapping as reads:
+  `profile enroll-signer`, `profile enroll-owner-key`, the rotate commands
+  (`rotate-nonce-key`, `rotate-audit-key`, `rotate-attestation-key`,
+  `rotate-counterparty-key`, `rotate-policy-state-key`,
+  `counterparty rotate-hmac-key`), the nonce-mint key
+  load, and `pool init`'s existence probe and post-confirmation seed write
+  report `auth.keyring_interactive_session_required` from a non-interactive
+  Windows session and `auth.keyring_platform_error` for other backend
+  failures, instead of collapsing every failure into
+  `auth.keyring_not_found`. First-run setup over SSH on Windows now names
+  the actual cause. The interactive-session message also names the
+  `STELLAR_AGENT_KEYRING_BACKEND=headless-dpapi` escape hatch.
+- The `windows-storage` CI job again runs the smart-account wire-code suite
+  and the MCP rule-tool suite (which exercises the audit path end-to-end on
+  Windows). The job provisions the same native Perl the release workflow's
+  Windows target uses, which is all the vendored OpenSSL build in that
+  closure needs on a `windows-latest` runner.
 - `pool init` now persists its pool bookkeeping by patching only
   `pool_master_key_id` and `[pool_config]` on the raw on-disk profile document
   (`loader::set_pool_state`), instead of re-saving the loaded profile struct.

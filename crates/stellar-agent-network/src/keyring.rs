@@ -781,30 +781,49 @@ fn open_entry(entry_ref: &KeyringEntryRef) -> Result<KeyringEntry, WalletError> 
 
 /// Maps a `keyring_core::Error` to a `WalletError`.
 ///
+/// Wire-level wrapper over [`classify_keyring_error`]; see there for the
+/// classification contract. Callers that render a `WalletError` envelope use
+/// this form; callers with their own error domain wrap the [`AuthError`]
+/// from [`classify_keyring_error`] instead.
+#[must_use]
+pub fn map_keyring_error(e: &keyring_core::Error, service: &str) -> WalletError {
+    WalletError::Auth(classify_keyring_error(e, service))
+}
+
+/// Classifies a `keyring_core::Error` into a typed [`AuthError`].
+///
+/// This is the single classification point for EVERY keyring operation —
+/// entry construction (`Entry::new`), reads (`get_password`), and writes
+/// (`set_password`). Write paths must route through it too: hand-rolling
+/// `KeyringNotFound` around a failed write misreports environmental causes
+/// (most notably a non-interactive Windows session, which must surface as
+/// [`AuthError::KeyringInteractiveSessionRequired`], not "not found").
+///
 /// The service name is included (non-secret keyring coordinate used in
 /// diagnostics); the password, account name, and any secret content are
 /// NEVER included in the error message.
-fn map_keyring_error(e: &keyring_core::Error, service: &str) -> WalletError {
+#[must_use]
+pub fn classify_keyring_error(e: &keyring_core::Error, service: &str) -> AuthError {
     match e {
-        keyring_core::Error::NoEntry => WalletError::Auth(AuthError::KeyringNotFound {
+        keyring_core::Error::NoEntry => AuthError::KeyringNotFound {
             name: service.to_owned(),
-        }),
-        keyring_core::Error::NoDefaultStore => WalletError::Auth(AuthError::KeyringNotFound {
+        },
+        keyring_core::Error::NoDefaultStore => AuthError::KeyringNotFound {
             name: format!(
                 "{service} (no OS credential store is available for this session; ensure the platform keychain — macOS Keychain, GNOME Keyring / KWallet, or Windows Credential Manager — is running and unlocked)"
             ),
-        }),
+        },
         keyring_core::Error::NoStorageAccess(inner) if is_windows_no_logon_session(inner) => {
-            WalletError::Auth(AuthError::KeyringInteractiveSessionRequired)
+            AuthError::KeyringInteractiveSessionRequired
         }
         keyring_core::Error::PlatformFailure(_) | keyring_core::Error::NoStorageAccess(_) => {
-            WalletError::Auth(AuthError::KeyringPlatformError)
+            AuthError::KeyringPlatformError
         }
         // All other variants (BadEncoding, Ambiguous, TooLong, Invalid, etc.)
         // are reported as KeyringNotFound with the service name only.
-        _ => WalletError::Auth(AuthError::KeyringNotFound {
+        _ => AuthError::KeyringNotFound {
             name: service.to_owned(),
-        }),
+        },
     }
 }
 

@@ -218,22 +218,17 @@ pub async fn run(args: &PoolInitArgs) -> i32 {
         KeyringProbe::Absent => {
             // Definitely not present; safe to proceed.
         }
-        KeyringProbe::BackendError(ref detail) => {
+        KeyringProbe::BackendError(ref e) => {
             // Cannot determine presence; refuse to proceed rather than risk
             // silently overwriting a key that may exist but be temporarily
             // unreadable.
             tracing::debug!(
                 service = %pool_master_ref.service,
-                detail = %detail,
+                error = %e,
                 "pool init: keyring existence probe returned a backend error; \
                  refusing to proceed"
             );
-            let err = WalletError::Auth(AuthError::KeyringNotFound {
-                name: format!(
-                    "{}:{} (keyring backend error — cannot determine existence)",
-                    pool_master_ref.service, pool_master_ref.account
-                ),
-            });
+            let err = classify_probe_backend_error(e, &pool_master_ref);
             render_json(&Envelope::<()>::err(&err));
             return 1;
         }
@@ -382,13 +377,11 @@ pub async fn run(args: &PoolInitArgs) -> i32 {
                 "pool init: keyring Entry::new failed AFTER on-chain success; \
                  channels are funded but seed is NOT persisted — re-run `pool init --force`"
             );
-            let err = WalletError::Auth(AuthError::KeyringNotFound {
-                name: format!(
-                    "{}:{} (on-chain init succeeded; keyring entry creation failed — \
-                     re-run with --force to re-sync)",
-                    pool_master_ref.service, pool_master_ref.account
-                ),
-            });
+            let err = classify_pool_seed_write_failure(
+                &e,
+                &pool_master_ref,
+                "keyring entry creation failed",
+            );
             render_json(&Envelope::<()>::err(&err));
             return 1;
         }
@@ -401,13 +394,7 @@ pub async fn run(args: &PoolInitArgs) -> i32 {
             "pool init: set_password failed AFTER on-chain success; \
              channels are funded but seed is NOT persisted — re-run `pool init --force`"
         );
-        let err = WalletError::Auth(AuthError::KeyringNotFound {
-            name: format!(
-                "{}:{} (on-chain init succeeded; keyring write failed — \
-                 re-run with --force to re-sync)",
-                pool_master_ref.service, pool_master_ref.account
-            ),
-        });
+        let err = classify_pool_seed_write_failure(&e, &pool_master_ref, "keyring write failed");
         render_json(&Envelope::<()>::err(&err));
         return 1;
     }
@@ -591,8 +578,10 @@ enum KeyringProbe {
     /// The entry does not exist (`keyring_core::Error::NoEntry`).
     Absent,
     /// The keyring backend returned an error other than `NoEntry`; presence
-    /// is ambiguous.
-    BackendError(String),
+    /// is ambiguous. Carries the typed error so the refusal site can
+    /// classify environmental causes (a non-interactive Windows session)
+    /// instead of reporting a generic backend failure.
+    BackendError(keyring_core::Error),
 }
 
 /// Probes whether a keyring entry exists, distinguishing `NoEntry` from backend
@@ -604,7 +593,7 @@ fn probe_keyring_entry(service: &str, account: &str) -> KeyringProbe {
     let entry = match KeyringEntry::new(service, account) {
         Ok(e) => e,
         Err(e) => {
-            return KeyringProbe::BackendError(format!("{e}"));
+            return KeyringProbe::BackendError(e);
         }
     };
     match entry.get_password() {
@@ -612,7 +601,61 @@ fn probe_keyring_entry(service: &str, account: &str) -> KeyringProbe {
         Err(keyring_core::Error::NoEntry) | Err(keyring_core::Error::NoDefaultStore) => {
             KeyringProbe::Absent
         }
-        Err(e) => KeyringProbe::BackendError(format!("{e}")),
+        Err(e) => KeyringProbe::BackendError(e),
+    }
+}
+
+/// Classifies an ambiguous existence-probe failure for the pool master
+/// coordinate.
+///
+/// Environmental causes keep their typed classification — most notably a
+/// non-interactive Windows session, which surfaces as
+/// `auth.keyring_interactive_session_required`. Only when the classification
+/// falls back to the generic not-found shape does the error carry the
+/// cannot-determine-existence guidance that explains why the probe refuses
+/// even with `--force`.
+fn classify_probe_backend_error(
+    e: &keyring_core::Error,
+    pool_master_ref: &KeyringEntryRef,
+) -> WalletError {
+    match stellar_agent_network::keyring::map_keyring_error(e, &pool_master_ref.service) {
+        WalletError::Auth(AuthError::KeyringNotFound { .. }) => {
+            WalletError::Auth(AuthError::KeyringNotFound {
+                name: format!(
+                    "{}:{} (keyring backend error — cannot determine existence)",
+                    pool_master_ref.service, pool_master_ref.account
+                ),
+            })
+        }
+        classified => classified,
+    }
+}
+
+/// Classifies a post-confirmation keyring failure while persisting the pool
+/// master seed.
+///
+/// The on-chain init has already succeeded when these failures occur, so the
+/// re-sync guidance matters as much as the cause: environmental causes keep
+/// their typed classification (a non-interactive Windows session surfaces as
+/// `auth.keyring_interactive_session_required`; the `tracing::warn!` at the
+/// call site carries the re-run guidance), while the generic not-found shape
+/// carries the guidance in its coordinate label.
+fn classify_pool_seed_write_failure(
+    e: &keyring_core::Error,
+    pool_master_ref: &KeyringEntryRef,
+    phase: &str,
+) -> WalletError {
+    match stellar_agent_network::keyring::map_keyring_error(e, &pool_master_ref.service) {
+        WalletError::Auth(AuthError::KeyringNotFound { .. }) => {
+            WalletError::Auth(AuthError::KeyringNotFound {
+                name: format!(
+                    "{}:{} (on-chain init succeeded; {phase} — \
+                     re-run with --force to re-sync)",
+                    pool_master_ref.service, pool_master_ref.account
+                ),
+            })
+        }
+        classified => classified,
     }
 }
 
@@ -720,6 +763,55 @@ mod tests {
             after, before_doc,
             "the persisted profile must differ from its pre-init form only in \
              the pool keys; got:\n{written}"
+        );
+    }
+
+    /// A non-interactive Windows session failure keeps its typed
+    /// classification through the existence probe and both
+    /// post-confirmation write phases: the operator sees
+    /// `auth.keyring_interactive_session_required`, not a generic
+    /// backend-error or not-found shape.
+    #[test]
+    fn pool_keyring_failures_classify_interactive_session_required() {
+        use stellar_agent_test_support::keyring_mock::WINDOWS_NO_LOGON_SESSION_TEXT;
+        let r = KeyringEntryRef::new("stellar-agent-pool-classify", "master");
+        let e = keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other(
+            WINDOWS_NO_LOGON_SESSION_TEXT,
+        )));
+        assert_eq!(
+            classify_probe_backend_error(&e, &r).code(),
+            "auth.keyring_interactive_session_required"
+        );
+        assert_eq!(
+            classify_pool_seed_write_failure(&e, &r, "keyring write failed").code(),
+            "auth.keyring_interactive_session_required"
+        );
+    }
+
+    /// Failures that classify to the generic not-found shape keep the
+    /// pool-specific operator guidance: the probe refusal explains the
+    /// cannot-determine-existence stance, and the post-confirmation write
+    /// failure carries the re-sync instruction.
+    #[test]
+    fn pool_keyring_generic_failures_keep_operator_guidance() {
+        let r = KeyringEntryRef::new("stellar-agent-pool-classify", "master");
+        let e = keyring_core::Error::NoEntry;
+
+        let probe = classify_probe_backend_error(&e, &r);
+        assert_eq!(probe.code(), "auth.keyring_not_found");
+        assert!(
+            probe.message().contains("cannot determine existence"),
+            "probe guidance lost: {}",
+            probe.message()
+        );
+
+        let write = classify_pool_seed_write_failure(&e, &r, "keyring write failed");
+        assert_eq!(write.code(), "auth.keyring_not_found");
+        assert!(
+            write.message().contains("on-chain init succeeded")
+                && write.message().contains("re-run with --force"),
+            "write guidance lost: {}",
+            write.message()
         );
     }
 

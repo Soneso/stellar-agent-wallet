@@ -348,11 +348,9 @@ where
         Ok(e) => e,
         Err(e) => {
             tracing::debug!(error = %e, "enroll-signer: keyring entry construction failed");
-            render::render_json(&Envelope::<()>::err(&WalletError::Auth(
-                AuthError::KeyringNotFound {
-                    name: format!("{}:{}", entry_ref.service, entry_ref.account),
-                },
-            )));
+            render::render_json(&Envelope::<()>::err(
+                &stellar_agent_network::keyring::map_keyring_error(&e, &entry_ref.service),
+            ));
             return 1;
         }
     };
@@ -370,11 +368,9 @@ where
         Err(keyring_core::Error::NoEntry) => false,
         Err(e) => {
             tracing::debug!(error = %e, "enroll-signer: existence probe failed");
-            render::render_json(&Envelope::<()>::err(&WalletError::Auth(
-                AuthError::KeyringNotFound {
-                    name: format!("{}:{}", entry_ref.service, entry_ref.account),
-                },
-            )));
+            render::render_json(&Envelope::<()>::err(
+                &stellar_agent_network::keyring::map_keyring_error(&e, &entry_ref.service),
+            ));
             return 1;
         }
     };
@@ -441,11 +437,12 @@ where
     if let Err(e) = entry.set_password(&s_strkey) {
         tracing::debug!(error = %e, "enroll-signer: set_password failed");
         drop(s_strkey);
-        render::render_json(&Envelope::<()>::err(&WalletError::Auth(
-            AuthError::KeyringNotFound {
-                name: format!("{}:{}", entry_ref.service, entry_ref.account),
-            },
-        )));
+        // Classify the write failure: a non-interactive Windows session must
+        // surface as auth.keyring_interactive_session_required (this is the
+        // first keyring write a new deployment performs), not "not found".
+        render::render_json(&Envelope::<()>::err(
+            &stellar_agent_network::keyring::map_keyring_error(&e, &entry_ref.service),
+        ));
         return 1;
     }
     drop(s_strkey);
