@@ -506,11 +506,17 @@ where
         Ok(p) => p,
         Err(code) => return code,
     };
-    // Origin-aware pre-flight: prove the audit writer is acquirable BEFORE the
-    // signing key below is touched, for a persisted profile — fails closed.
-    // The synthesized zero-config profile stays fail-open. `--sign-only` never
-    // submits, so the returned writer (if any) is not threaded further here —
-    // its only purpose on this stage is the refusal.
+    let chain_id = caip2_chain_id_for_network(args.network);
+    if let Err(code) = evaluate_staged_pay_policy(args, unsigned_xdr, chain_id, &profile).await {
+        return code;
+    }
+    // Origin-aware pre-flight: prove the audit writer is acquirable AFTER the
+    // policy gate (a denial is a clean refusal that signs nothing and needs
+    // no audit setup) but BEFORE the signing key below is touched, for a
+    // persisted profile — fails closed. The synthesized zero-config profile
+    // stays fail-open. `--sign-only` never submits, so the returned writer
+    // (if any) is not threaded further here — its only purpose on this stage
+    // is the refusal.
     if let Err(e) = crate::commands::value_audit::require_value_audit_writer_for_origin(
         &profile,
         &args.profile,
@@ -518,10 +524,6 @@ where
     ) {
         print_error(&Envelope::<()>::err(&e), args.output);
         return 1;
-    }
-    let chain_id = caip2_chain_id_for_network(args.network);
-    if let Err(code) = evaluate_staged_pay_policy(args, unsigned_xdr, chain_id, &profile).await {
-        return code;
     }
 
     match sign_envelope(args, unsigned_xdr).await {
@@ -560,11 +562,20 @@ where
         Ok(p) => p,
         Err(code) => return code,
     };
-    // Origin-aware pre-flight: prove the audit writer is acquirable BEFORE the
-    // transaction below is submitted, for a persisted profile — fails closed.
-    // The synthesized zero-config profile stays fail-open, yielding `None`
-    // when no writer could be acquired. Where `Some`, the writer is reused
-    // (not re-acquired) for the post-confirm emission.
+    let chain_id = caip2_chain_id_for_network(args.network);
+    // The envelope arrives pre-signed, but broadcasting it still spends
+    // funds — gate here even though signing already happened elsewhere.
+    let pay_effects = match evaluate_staged_pay_policy(args, signed_xdr, chain_id, &profile).await {
+        Ok(effects) => effects,
+        Err(code) => return code,
+    };
+    // Origin-aware pre-flight: prove the audit writer is acquirable AFTER the
+    // policy gate (a denial is a clean refusal that submits nothing and
+    // needs no audit setup) but BEFORE the transaction below is submitted,
+    // for a persisted profile — fails closed. The synthesized zero-config
+    // profile stays fail-open, yielding `None` when no writer could be
+    // acquired. Where `Some`, the writer is reused (not re-acquired) for the
+    // post-confirm emission.
     let audit_writer = match crate::commands::value_audit::require_value_audit_writer_for_origin(
         &profile,
         &args.profile,
@@ -575,13 +586,6 @@ where
             print_error(&Envelope::<()>::err(&e), args.output);
             return 1;
         }
-    };
-    let chain_id = caip2_chain_id_for_network(args.network);
-    // The envelope arrives pre-signed, but broadcasting it still spends
-    // funds — gate here even though signing already happened elsewhere.
-    let pay_effects = match evaluate_staged_pay_policy(args, signed_xdr, chain_id, &profile).await {
-        Ok(effects) => effects,
-        Err(code) => return code,
     };
 
     match submit_envelope(args, signed_xdr).await {
@@ -897,24 +901,6 @@ where
         }
     }
 
-    // Origin-aware pre-flight: prove the audit writer is acquirable BEFORE the
-    // signing key is touched below (step 2) and BEFORE the transaction is
-    // submitted (step 3), for a persisted profile — fails closed. The
-    // synthesized zero-config profile stays fail-open, yielding `None` when
-    // no writer could be acquired. Where `Some`, the writer is reused (not
-    // re-acquired) for the post-confirm emission.
-    let audit_writer = match crate::commands::value_audit::require_value_audit_writer_for_origin(
-        &profile,
-        &args.profile,
-        origin,
-    ) {
-        Ok(w) => w,
-        Err(e) => {
-            print_error(&Envelope::<()>::err(&e), args.output);
-            return 1;
-        }
-    };
-
     // 1. Build (includes SEP-29 check).
     let built = match build_unsigned_envelope(args).await {
         Ok(built) => built,
@@ -931,6 +917,26 @@ where
     let pay_effects = match evaluate_pay_policy(args, &built, chain_id, &profile) {
         Ok(effects) => effects,
         Err(code) => return code,
+    };
+
+    // Origin-aware pre-flight: prove the audit writer is acquirable AFTER the
+    // policy gate (a denial is a clean refusal that signs nothing and needs
+    // no audit setup) but BEFORE the signing key is touched below (step 2)
+    // and BEFORE the transaction is submitted (step 3), for a persisted
+    // profile — fails closed. The synthesized zero-config profile stays
+    // fail-open, yielding `None` when no writer could be acquired. Where
+    // `Some`, the writer is reused (not re-acquired) for the post-confirm
+    // emission.
+    let audit_writer = match crate::commands::value_audit::require_value_audit_writer_for_origin(
+        &profile,
+        &args.profile,
+        origin,
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            print_error(&Envelope::<()>::err(&e), args.output);
+            return 1;
+        }
     };
 
     let unsigned_xdr = built.envelope_xdr;

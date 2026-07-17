@@ -116,6 +116,23 @@ impl WalletServer {
             return Ok(crate::tools::common::mainnet_signing_forbidden_result());
         }
 
+        // ── Audit pre-flight: prove the writer is acquirable BEFORE signing ──
+        // Sign-only tool: the caller broadcasts externally, so the produced
+        // signature is the last event the wallet observes. The signature must
+        // not exist unless the row recording its production can be written.
+        let audit_writer = match crate::tools::value_audit::require_value_audit_writer(
+            &self.profile,
+            &self.profile_name_for_approval(),
+        ) {
+            Ok(w) => w,
+            Err(err) => {
+                return Ok(crate::tools::common::business_error_result(
+                    err.code(),
+                    err.to_string(),
+                ));
+            }
+        };
+
         let args_value = json!({
             "chain_id": &args.chain_id,
             "auth_entry_xdr_len": args.auth_entry_xdr.len(),
@@ -157,6 +174,7 @@ impl WalletServer {
                 }
             };
 
+        let signer_g = signer_handle.public_key().to_string();
         let profile = Arc::clone(&self.profile);
         let signer: Arc<dyn stellar_agent_network::signing::Signer + Send + Sync> =
             Arc::new(signer_handle);
@@ -171,6 +189,29 @@ impl WalletServer {
             .await
         {
             Ok(value) => {
+                // Record that the signature was produced: the payload digest
+                // (redacted) and the redacted signer — never the signature or
+                // the payload. Best-effort past this point: the signature
+                // exists, so a write failure warns and never changes the
+                // result.
+                let payload_digest = {
+                    use sha2::{Digest as _, Sha256};
+                    hex::encode(Sha256::digest(args.auth_entry_xdr.as_bytes()))
+                };
+                let entry =
+                    stellar_agent_core::audit_log::entry::AuditEntry::new_opaque_payload_signed(
+                        "stellar_sep43_sign_auth_entry",
+                        args.chain_id.as_str(),
+                        stellar_agent_network::submit::redact_tx_hash(&payload_digest),
+                        stellar_agent_core::observability::RedactedStrkey::from_full(&signer_g),
+                        uuid::Uuid::new_v4().to_string(),
+                    );
+                crate::tools::value_audit::emit_value_audit_row_with_writer(
+                    &audit_writer,
+                    &self.profile_name_for_approval(),
+                    entry,
+                );
+
                 let envelope = stellar_agent_core::envelope::Envelope::ok(value);
                 let json_str = envelope
                     .to_json_pretty()
@@ -261,12 +302,30 @@ mod tests {
 
     fn make_require_approval_server() -> crate::server::WalletServer {
         use std::sync::Arc;
-        let mut server = crate::server::WalletServer::new(
-            Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
-                .with_noop_engine()
-                .build(),
-        )
-        .expect("WalletServer::new must not fail in tests");
+        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+            .with_noop_engine()
+            .build();
+        // The audit pre-flight runs BEFORE the dispatch gate, so the audit
+        // chain-root key must be seeded here — otherwise the RequireApproval
+        // scenario this helper builds would never be reached; the call would
+        // refuse `audit.chain_key_unavailable` first. A FIXED key (not
+        // `rotate_keyring_secret_32`'s random one), because `AuditWriterRegistry`
+        // is a process-lifetime cache keyed by profile name: the shared
+        // `"svc"`/`"acct"` testnet placeholder is reused across many unit
+        // tests in this crate's single test binary, and a random key here
+        // would race against — and mismatch — whichever key another test
+        // using the same coordinate registered first.
+        {
+            use base64::Engine as _;
+            let coord = &profile.audit_log_hash_chain_key_id;
+            let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x37u8; 32]);
+            keyring_core::Entry::new(&coord.service, &coord.account)
+                .expect("Entry::new for audit key")
+                .set_password(&key_b64)
+                .expect("set_password for audit key");
+        }
+        let mut server = crate::server::WalletServer::new(profile)
+            .expect("WalletServer::new must not fail in tests");
         server.policy_engine = Arc::new(RequireApprovalEngine);
         server
     }
@@ -315,6 +374,42 @@ mod tests {
         assert!(
             !text.contains("signedAuthEntry"),
             "no signature must be produced on mainnet; got: {text}"
+        );
+    }
+
+    /// An unminted audit chain key refuses BEFORE any signing: the pre-flight
+    /// fires ahead of the dispatch gate and the signer load, so no signature
+    /// is ever produced and the wire code matches every other signing tool.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn unminted_audit_key_refused_before_signing() {
+        stellar_agent_test_support::keyring_mock::install().ok();
+        // Unique coordinates; the audit chain-root key is deliberately NOT
+        // seeded at this profile's derived coordinate.
+        let profile = Profile::builder_testnet(
+            "svc-s43ae-unminted",
+            "acct-s43ae-unminted",
+            "n-svc",
+            "n-acct",
+        )
+        .with_noop_engine()
+        .build();
+        let server = crate::server::WalletServer::new(profile).expect("WalletServer::new in tests");
+        let args = Sep43SignAuthEntryArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            auth_entry_xdr: "AAAAAQAA".to_owned(),
+            network_passphrase: None,
+            address: None,
+        };
+        let result = server
+            .call_stellar_sep43_sign_auth_entry(args)
+            .await
+            .expect("refusal must be a business envelope, not a protocol error");
+        let (code, _message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "audit.chain_key_unavailable");
+        assert!(
+            !text.contains("signedAuthEntry"),
+            "no signature may be produced on an audit pre-flight refusal; got: {text}"
         );
     }
 

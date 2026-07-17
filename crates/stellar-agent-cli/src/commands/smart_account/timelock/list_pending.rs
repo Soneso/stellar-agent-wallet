@@ -45,7 +45,7 @@ use stellar_agent_smart_account::timelock::{PendingTimelockOperation, TimelockOp
 use tracing::info;
 use uuid::Uuid;
 
-use crate::commands::smart_account::common::{emit_sa_error, open_audit_writer};
+use crate::commands::smart_account::common::{emit_sa_error, open_profile_audit_writer_read_only};
 use crate::common::network::TargetNetwork;
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
@@ -175,14 +175,15 @@ pub async fn run(args: &ListPendingArgs) -> i32 {
     let profile_name = resolve_profile_name(args.profile.as_deref());
     let request_id = Uuid::new_v4().to_string();
 
-    let (audit_writer, _audit_log_path) = match open_audit_writer(&profile_name) {
-        Ok(pair) => pair,
-        Err(e) => {
-            let envelope: Envelope<()> = Envelope::err(&e);
-            render_json(&envelope);
-            return 1;
-        }
-    };
+    let (_audit_profile, audit_writer, _audit_log_path) =
+        match open_profile_audit_writer_read_only(&profile_name) {
+            Ok(triple) => triple,
+            Err(e) => {
+                let envelope: Envelope<()> = Envelope::err(&e);
+                render_json(&envelope);
+                return 1;
+            }
+        };
 
     let secondary_rpc_url = args
         .secondary_rpc_url

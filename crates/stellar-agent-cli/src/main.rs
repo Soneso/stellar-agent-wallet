@@ -299,6 +299,11 @@ async fn main() {
     // strictly local and issues no network calls.
     {
         let profile_name = extract_profile_name_from_env_args();
+        // Reads the per-profile DEFAULT location without loading the profile
+        // (the advisory runs before any command parses its arguments). A
+        // profile with an explicit non-default audit_log_path is outside the
+        // advisory's scan; the per-command audit machinery always uses the
+        // loaded profile's configured path.
         let audit_log_path = default_audit_log_path_for(&profile_name);
         let _ = advisory::run_startup_advisory(&audit_log_path);
     }

@@ -64,16 +64,13 @@
 //!
 //! # Audit-log isolation
 //!
-//! `ProfileBuilder::build()` resolves an unset `audit_log_path` to
-//! `default_audit_log_path()` — a SINGLE file
-//! (`<canonical_data_root>/audit.log`) shared by every profile on the host,
-//! not the per-profile `default_audit_log_path_for(name)` the field's own doc
-//! comment describes — and `profile init` never overrides it. Left as-is,
-//! this test would write to, and `rotate-audit-key` would re-sign the
-//! chain-root sidecar of, a real file other profiles or processes on this
-//! host may also be using. Step 3 above rewrites the persisted
-//! `audit_log_path` field to a path inside this test's own tempdir before any
-//! subprocess reads it, so every step in this test is hermetic.
+//! An unset `audit_log_path` resolves to the per-profile
+//! `default_audit_log_path_for(name)` under the canonical data root — for a
+//! release-shaped subprocess that is still a real host location. Step 3
+//! above rewrites the persisted `audit_log_path` field to a path inside this
+//! test's own tempdir before any subprocess reads it, pinning the exact file
+//! the final row assertion reads and keeping every step hermetic regardless
+//! of how the subprocess binary resolves its data root.
 //!
 //! # Cleanup
 //!

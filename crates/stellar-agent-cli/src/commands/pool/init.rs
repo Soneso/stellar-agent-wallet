@@ -65,7 +65,6 @@ use clap::Args;
 use keyring_core::Entry as KeyringEntry;
 use rand_core::{OsRng, RngCore};
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::writer::AuditWriterRegistry;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{AuthError, InternalError, ValidationError, WalletError};
 use stellar_agent_core::observability::redact_strkey_first5_last5;
@@ -192,6 +191,19 @@ pub async fn run(args: &PoolInitArgs) -> i32 {
         render_json(&Envelope::<()>::err(&e));
         return 1;
     }
+
+    // ── Audit pre-flight: prove the writer is acquirable BEFORE any seed ──────
+    // generation or on-chain submit. pool init funds channel accounts on-chain;
+    // the ChannelPoolInitialised row must be writable before the wallet commits
+    // funds, and the SAME writer is reused for the post-confirm emission.
+    let audit_writer =
+        match crate::commands::value_audit::require_value_audit_writer(&profile, profile_name) {
+            Ok(w) => w,
+            Err(e) => {
+                render_json(&Envelope::<()>::err(&e));
+                return 1;
+            }
+        };
 
     // ── Resolve pool master keyring entry reference ───────────────────────────
     let pool_master_ref = profile
@@ -440,7 +452,7 @@ pub async fn run(args: &PoolInitArgs) -> i32 {
         result.ledger,
         &request_id,
     );
-    emit_pool_init_audit(&profile, profile_name, audit_entry);
+    emit_pool_init_audit(&audit_writer, profile_name, audit_entry);
 
     // ── Emit result JSON — no seed bytes ──────────────────────────────────────
     let pool_result = PoolInitResult {
@@ -460,47 +472,17 @@ pub async fn run(args: &PoolInitArgs) -> i32 {
 
 // ── Audit helper ──────────────────────────────────────────────────────────────
 
-/// Emits a `ChannelPoolInitialised` audit entry to the profile's audit log.
+/// Emits a `ChannelPoolInitialised` audit entry using the keyed writer the
+/// pre-flight acquired before the on-chain submit.
 ///
-/// Best-effort: opens the audit writer via [`AuditWriterRegistry::get_or_open`],
-/// writes the entry, and logs a warning on any failure.  The pool init already
-/// succeeded at this point; audit failure does NOT abort the command.
+/// Best-effort: the on-chain init already succeeded at this point, so a
+/// write failure logs a warning and never changes the command result.
 fn emit_pool_init_audit(
-    profile: &stellar_agent_core::profile::schema::Profile,
+    writer: &std::sync::Arc<std::sync::Mutex<stellar_agent_core::audit_log::writer::AuditWriter>>,
     profile_name: &str,
     entry: AuditEntry,
 ) {
-    // Load the audit HMAC key from the keyring; best-effort only.
-    let hmac_key = match load_pool_init_audit_hmac_key(profile) {
-        Ok(k) => Some(k),
-        Err(e) => {
-            tracing::warn!(
-                profile = %profile_name,
-                error = %e,
-                "pool init: could not load audit HMAC key; \
-                 ChannelPoolInitialised will be written without HMAC"
-            );
-            None
-        }
-    };
-
-    // Obtain or create the per-profile audit writer via the registry singleton.
-    let writer_arc =
-        match AuditWriterRegistry::get_or_open(profile_name, &profile.audit_log_path, hmac_key) {
-            Ok(arc) => arc,
-            Err(e) => {
-                tracing::warn!(
-                    profile = %profile_name,
-                    error = %e,
-                    "pool init: could not open audit writer; \
-                     ChannelPoolInitialised NOT emitted"
-                );
-                return;
-            }
-        };
-
-    // Lock and write the entry.
-    match writer_arc.lock() {
+    match writer.lock() {
         Ok(mut guard) => {
             if let Err(e) = guard.write_entry(entry) {
                 tracing::warn!(
@@ -519,51 +501,6 @@ fn emit_pool_init_audit(
             );
         }
     }
-}
-
-/// Loads and decodes the profile's audit-log HMAC key from the OS keyring.
-fn load_pool_init_audit_hmac_key(
-    profile: &stellar_agent_core::profile::schema::Profile,
-) -> Result<zeroize::Zeroizing<[u8; 32]>, WalletError> {
-    let entry_ref = &profile.audit_log_hash_chain_key_id;
-    let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).map_err(|e| {
-        tracing::debug!(
-            error = %e,
-            service = %entry_ref.service,
-            "keyring Entry::new failed for pool-init audit HMAC key"
-        );
-        WalletError::Auth(AuthError::KeyringNotFound {
-            name: format!("{}:{}", entry_ref.service, entry_ref.account),
-        })
-    })?;
-
-    let secret_b64 = zeroize::Zeroizing::new(entry.get_password().map_err(|e| {
-        tracing::debug!(
-            error = %e,
-            service = %entry_ref.service,
-            "get_password failed for pool-init audit HMAC key"
-        );
-        WalletError::Auth(AuthError::KeyringNotFound {
-            name: format!("{}:{}", entry_ref.service, entry_ref.account),
-        })
-    })?);
-
-    let decoded = URL_SAFE_NO_PAD.decode(secret_b64.as_bytes()).map_err(|e| {
-        WalletError::Internal(InternalError::UnexpectedState {
-            detail: format!("pool-init audit HMAC key base64 decode failed: {e}"),
-        })
-    })?;
-    if decoded.len() != 32 {
-        return Err(WalletError::Internal(InternalError::UnexpectedState {
-            detail: format!(
-                "pool-init audit HMAC key length mismatch: expected 32 bytes, got {}",
-                decoded.len()
-            ),
-        }));
-    }
-    let mut key = zeroize::Zeroizing::new([0u8; 32]);
-    key.copy_from_slice(&decoded);
-    Ok(key)
 }
 
 // ── Keyring existence probe ───────────────────────────────────────────────────

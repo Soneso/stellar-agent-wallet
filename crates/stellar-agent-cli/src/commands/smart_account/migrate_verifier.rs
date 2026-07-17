@@ -67,7 +67,7 @@ use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
     CommonArgsView, CommonHandlerContext, SignerSourceFlags, construct_signers_manager_from_fields,
-    network_to_chain_id, open_audit_writer, wrap_sa_error,
+    network_to_chain_id, open_profile_audit_writer_read_only, wrap_sa_error,
 };
 use crate::common::network::TargetNetwork;
 use crate::common::render::render_json;
@@ -329,7 +329,8 @@ fn dry_run_signers_manager(
         .as_deref()
         .unwrap_or(&args.rpc_url)
         .to_owned();
-    let (audit_writer, audit_log_path) = open_audit_writer(&profile_name)?;
+    let (_audit_profile, audit_writer, audit_log_path) =
+        open_profile_audit_writer_read_only(&profile_name)?;
     let manager = construct_signers_manager_from_fields(
         &profile_name,
         args.network.passphrase(),

@@ -409,6 +409,53 @@ mod tests {
         }
     }
 
+    /// RAII env-var guard; `#[serial]` on every test using it prevents
+    /// concurrent env access.
+    struct EnvGuard {
+        var: String,
+    }
+    impl EnvGuard {
+        #[allow(
+            unsafe_code,
+            reason = "test-only env mutation; #[serial] prevents concurrent access"
+        )]
+        fn set(var: String, value: &std::ffi::OsStr) -> Self {
+            // SAFETY: serialised by #[serial]; no concurrent env access.
+            unsafe {
+                std::env::set_var(&var, value);
+            }
+            Self { var }
+        }
+    }
+    impl Drop for EnvGuard {
+        #[allow(unsafe_code, reason = "test-only env cleanup")]
+        fn drop(&mut self) {
+            // SAFETY: same as set(); serialised by #[serial].
+            unsafe {
+                std::env::remove_var(&self.var);
+            }
+        }
+    }
+
+    /// The test-gated `STELLAR_AGENT_HOME` override reaches the audit-path
+    /// resolution: with the variable set, the per-profile audit default
+    /// resolves under the redirected root, so tests that follow the
+    /// documented override never write audit rows to the real host location.
+    #[test]
+    #[serial_test::serial]
+    fn audit_path_resolution_honors_the_test_home_override() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("STELLAR_AGENT_HOME".to_owned(), home.path().as_os_str());
+
+        let path = stellar_agent_core::profile::schema::default_audit_log_path_for("override-x");
+        assert!(
+            path.starts_with(home.path()),
+            "audit path must resolve under the overridden home; got: {path:?}"
+        );
+        assert_eq!(path.file_name().unwrap(), "override-x.jsonl");
+        assert_eq!(path.parent().unwrap().file_name().unwrap(), "audit");
+    }
+
     #[test]
     #[serial_test::serial]
     fn init_on_clean_dir_creates_a_loadable_v1_profile_with_derived_refs() {

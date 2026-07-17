@@ -71,8 +71,7 @@ use stellar_agent_core::approval::user_id::process_uid_for_attestation;
 use stellar_agent_core::approval::{
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, RuleProposalGateError, open_with_retry,
 };
-use stellar_agent_core::audit_log::writer::{AuditWriter, AuditWriterRegistry};
-use stellar_agent_core::profile::schema::default_audit_log_path_for;
+use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_network::keyring::signer_from_keyring;
 use stellar_agent_smart_account::error::SaError;
@@ -692,15 +691,21 @@ fn resolve_policies(
 fn open_rule_create_audit_writer(
     server: &WalletServer,
 ) -> Result<Arc<Mutex<AuditWriter>>, SaError> {
+    // Fail-closed, KEYED acquisition — the same (path, hmac_key) pair every
+    // value-moving tool registers via require_value_audit_writer. The
+    // AuditWriterRegistry pins (path, key) per profile name for the process
+    // lifetime, so registering anything else here would brick later opens
+    // (PathMismatch/HmacKeyMismatch) and leave these rows outside
+    // `stellar-agent audit verify` coverage.
     let profile_name = server.profile_name_for_approval();
-    let log_path = default_audit_log_path_for(&profile_name);
+    let log_path = server.profile.audit_log_path.clone();
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| SaError::AuditWriterIo {
             detail: e.to_string(),
             path: log_path.clone(),
         })?;
     }
-    AuditWriterRegistry::get_or_open(&profile_name, &log_path, None).map_err(|e| {
+    super::value_audit::require_value_audit_writer(&server.profile, &profile_name).map_err(|e| {
         SaError::AuditWriterIo {
             detail: e.to_string(),
             path: log_path,
@@ -720,7 +725,7 @@ fn build_write_context_rule_manager(server: &WalletServer) -> Result<ContextRule
     let network_passphrase = server.profile.network_passphrase.as_str();
     let chain_id = server.profile.chain_id.caip2_str();
 
-    let log_path = default_audit_log_path_for(&server.profile_name_for_approval());
+    let log_path = server.profile.audit_log_path.clone();
     let signers_manager = SignersManager::new(SignersManagerConfig::new(
         rpc_url.to_owned(),
         rpc_url.to_owned(),
@@ -921,6 +926,19 @@ impl WalletServer {
             "smart_account": &args.smart_account,
             "name": &args.name,
         });
+        // ── Audit pre-flight: prove the writer is acquirable BEFORE any ──────
+        // manager construction, signing, or submit — surfacing the same
+        // audit.chain_key_unavailable wire code the other signing tools use.
+        if let Err(err) = crate::tools::value_audit::require_value_audit_writer(
+            &self.profile,
+            &self.profile_name_for_approval(),
+        ) {
+            return Ok(crate::tools::common::business_error_result(
+                err.code(),
+                err.to_string(),
+            ));
+        }
+
         let dispatch_outcome = match self
             .dispatch_gate("stellar_rule_create", &args_value, &args.chain_id)
             .await
@@ -1159,6 +1177,20 @@ impl WalletServer {
             "chain_id": &args.chain_id,
             "approval_nonce": &args.approval_nonce,
         });
+
+        // ── Audit pre-flight: prove the writer is acquirable BEFORE any ──────
+        // manager construction, signing, or submit — surfacing the same
+        // audit.chain_key_unavailable wire code the other signing tools use.
+        if let Err(err) = crate::tools::value_audit::require_value_audit_writer(
+            &self.profile,
+            &self.profile_name_for_approval(),
+        ) {
+            return Ok(crate::tools::common::business_error_result(
+                err.code(),
+                err.to_string(),
+            ));
+        }
+
         let dispatch_outcome = match forced_dispatch_outcome {
             Some(forced) => {
                 let gate_outcome = match self
@@ -1634,10 +1666,27 @@ mod tests {
     /// identity `resolve_signers` compares `Delegated` addresses against for
     /// the `is_proposer` tag.
     fn test_server() -> WalletServer {
+        // The audit pre-flight in both tools requires a loadable chain key,
+        // so the fixture installs the mock store and seeds a FIXED key at the
+        // profile's derived coordinate (fixed, not random: the registry
+        // caches (path, key) per profile name for the process lifetime, and
+        // TEST_G is shared across this module's tests). Callers that install
+        // their own mock store BEFORE this fixture get the seed on that
+        // store; every test using this fixture is `#[serial(keyring)]`.
+        stellar_agent_test_support::keyring_mock::install().ok();
         let mut profile = Profile::builder_testnet("svc", TEST_G, "n-svc", "n-acct")
             .with_noop_engine()
             .build();
         profile.rpc_url = "http://127.0.0.1:1".to_owned();
+        {
+            use base64::Engine as _;
+            let coord = &profile.audit_log_hash_chain_key_id;
+            let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x37u8; 32]);
+            keyring_core::Entry::new(&coord.service, &coord.account)
+                .expect("Entry::new for audit key")
+                .set_password(&key_b64)
+                .expect("set_password for audit key");
+        }
         WalletServer::new(profile).expect("WalletServer::new must not fail")
     }
 
@@ -1677,6 +1726,7 @@ mod tests {
     // ── resolve_signers ────────────────────────────────────────────────────────
 
     #[test]
+    #[serial_test::serial(keyring)]
     fn resolve_signers_rejects_empty() {
         let server = test_server();
         let err = resolve_signers(&[], &server).unwrap_err();
@@ -1684,6 +1734,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(keyring)]
     fn resolve_signers_rejects_over_oz_max_signers() {
         let server = test_server();
         let signers: Vec<RuleCreateSignerArg> = (0..=OZ_MAX_SIGNERS)
@@ -1696,6 +1747,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(keyring)]
     fn resolve_signers_delegated_tags_proposer_when_address_matches_profile() {
         let server = test_server();
         let signers = vec![RuleCreateSignerArg::Delegated {
@@ -1711,6 +1763,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(keyring)]
     fn resolve_signers_delegated_does_not_tag_proposer_for_a_different_address() {
         let server = test_server();
         let signers = vec![RuleCreateSignerArg::Delegated {
@@ -1721,6 +1774,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(keyring)]
     fn resolve_signers_delegated_accepts_c_strkey() {
         let server = test_server();
         let signers = vec![RuleCreateSignerArg::Delegated {
@@ -1732,6 +1786,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(keyring)]
     fn resolve_signers_delegated_rejects_invalid_strkey() {
         let server = test_server();
         let signers = vec![RuleCreateSignerArg::Delegated {
@@ -1742,6 +1797,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(keyring)]
     fn resolve_signers_external_valid() {
         let server = test_server();
         let signers = vec![RuleCreateSignerArg::External {
@@ -1758,6 +1814,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(keyring)]
     fn resolve_signers_external_rejects_invalid_verifier_strkey() {
         let server = test_server();
         let signers = vec![RuleCreateSignerArg::External {
@@ -1769,6 +1826,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(keyring)]
     fn resolve_signers_external_rejects_invalid_hex() {
         let server = test_server();
         let signers = vec![RuleCreateSignerArg::External {
@@ -1780,6 +1838,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(keyring)]
     fn resolve_signers_external_rejects_oversized_pubkey() {
         let server = test_server();
         let signers = vec![RuleCreateSignerArg::External {
@@ -2000,6 +2059,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn commit_unknown_nonce_is_indistinguishable_approval_required() {
         let mut server = test_server();
         let dir = tempfile::tempdir().unwrap();
@@ -2017,6 +2077,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn commit_expired_entry_is_indistinguishable_approval_required() {
         let mut server = test_server();
         let dir = tempfile::tempdir().unwrap();
@@ -2032,6 +2093,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn commit_rejected_tombstone_returns_distinguishable_rejected() {
         let mut server = test_server();
         let dir = tempfile::tempdir().unwrap();
@@ -2067,6 +2129,7 @@ mod tests {
     /// attestation requirement — a rule-create `Allow` would otherwise let
     /// the agent grant itself permanent authority.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn commit_via_public_handler_with_allow_engine_still_requires_attestation() {
         let mut server = test_server();
         let dir = tempfile::tempdir().unwrap();
@@ -2087,6 +2150,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn commit_wrong_kind_entry_is_indistinguishable_approval_required() {
         let mut server = test_server();
         let dir = tempfile::tempdir().unwrap();
@@ -2124,6 +2188,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn commit_chain_id_mismatch_is_simulation_divergence() {
         let mut server = test_server();
         let dir = tempfile::tempdir().unwrap();
@@ -2143,6 +2208,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn commit_digest_mismatch_is_simulation_divergence() {
         let mut server = test_server();
         let dir = tempfile::tempdir().unwrap();
@@ -2169,6 +2235,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn commit_missing_attestation_when_required_is_indistinguishable_approval_required() {
         let mut server = test_server();
         let dir = tempfile::tempdir().unwrap();
@@ -2187,6 +2254,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn commit_malformed_attestation_base64_is_indistinguishable_approval_required() {
         let mut server = test_server();
         let dir = tempfile::tempdir().unwrap();
@@ -2237,6 +2305,7 @@ mod tests {
     // ── Mainnet write defence ─────────────────────────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn propose_refuses_mainnet_chain_id() {
         let server = test_server();
         let json = serde_json::json!({
@@ -2258,6 +2327,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn commit_refuses_mainnet_chain_id() {
         let server = test_server();
         // The mainnet refusal fires before any nonce lookup, so an

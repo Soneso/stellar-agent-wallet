@@ -106,6 +106,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An unset `audit_log_path` now resolves to the per-profile location the
+  field documents (`<root>/audit/<name>.jsonl`) in the profile builder, the
+  loader, and the v1 migration, instead of a host-global `audit.log` shared
+  by every profile on the machine — hash-chained logs from unrelated
+  profiles no longer interleave. Explicit `audit_log_path` values are
+  unchanged. The test-gated `STELLAR_AGENT_HOME` override now reaches every
+  canonical-data-root-derived path, including the audit directory.
+- Every audit-writer acquisition now registers the profile's configured
+  `audit_log_path` under the profile's audit chain-root key discipline.
+  `stellar_rule_create`/`stellar_rule_create_commit` and the smart-account,
+  approve, and timelock command families previously registered a
+  name-derived default path with no HMAC key; the first such open pinned the
+  process-lifetime writer-registry entry and bricked every later keyed open
+  for the same profile name, and rows written unkeyed fell outside
+  `stellar-agent audit verify` coverage. For a persisted profile, every
+  audit-writing signing verb in these families — `smart-account execute`,
+  `smart-account multicall`, the timelock `schedule`/`execute`/`cancel`
+  commands, the rules write path, `migrate-verifier`'s submit path,
+  `approve serve`, `rule_create`, and `pool init` — now fails closed
+  (`audit.chain_key_unavailable` until `profile rotate-audit-key` mints the
+  chain key). Read-only surfaces (`list-rules`, `timelock list-pending`,
+  `rules get-spending-limit`, `migrate-verifier --dry-run`), `approve run`'s
+  post-approval emission, and the local multicall registry commands
+  (`register-multicall`, `unregister-multicall`) stay best-effort: they
+  degrade with a warning, but their acquisition now goes through the same
+  keyed-first discipline, so a failure never poisons the registry. The
+  zero-config synthesized testnet profile keeps its quickstart behavior.
+  Source-scan tests pin the discipline in both the CLI and the MCP server.
+- The SEP-43 sign-only pair (`stellar_sep43_sign_transaction`,
+  `stellar_sep43_sign_auth_entry`) now proves the audit writer acquirable
+  before signing and records an `opaque_payload_signed` audit row — the
+  redacted payload digest and redacted signer address, never the signature
+  or payload — at the point the signature is produced. The caller broadcasts
+  externally, so the row records signature production, not on-chain
+  confirmation. `pool init` likewise acquires the audit writer before any
+  seed generation or on-chain submit and reuses it for the post-confirm
+  `channel_pool_initialised` row.
+- `pay` evaluates the operator policy gate BEFORE the audit pre-flight on
+  all three stages (one-shot, `--sign-only`, `--submit-only`): a policy
+  denial is a clean refusal that signs and submits nothing, so it no longer
+  requires a minted audit chain key to be reported. The pre-flight still
+  runs before any signing key is touched or transaction submitted.
 - Keyring write failures now classify through the same mapping as reads:
   `profile enroll-signer`, `profile enroll-owner-key`, the rotate commands
   (`rotate-nonce-key`, `rotate-audit-key`, `rotate-attestation-key`,

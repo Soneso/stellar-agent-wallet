@@ -102,7 +102,8 @@ properties:
   the zero-config synthesized profile `pay`/`claim`/`accounts create` fall back to when no
   `<name>.toml` file exists stays fail-open for this specific check, matching its
   documented no-profile-required posture. The SEP-43 sign-only pair (`signTransaction`,
-  `signAuthEntry`) is not yet covered by this pre-flight (tracked in issue #91).
+  `signAuthEntry`) runs the same pre-flight and records an
+  `opaque_payload_signed` audit row when the signature is produced.
 
 The core library compiles under `#![forbid(unsafe_code)]`. Logging redaction is enforced
 throughout: secret material is never written to logs, and account, strkey, and

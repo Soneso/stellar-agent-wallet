@@ -52,7 +52,9 @@ After merging, the loader resolves derived fields and validates:
   the TOML or any overlay.
 - `rpc_url` defaults to the chain's built-in endpoint when omitted, then is
   validated as a well-formed URL. A malformed URL fails the load.
-- `audit_log_path` defaults to the OS-conventional location when omitted.
+- `audit_log_path` defaults to the OS-conventional PER-PROFILE location
+  (`<data root>/audit/<name>.jsonl`) when omitted; profiles never share an
+  audit file unless one is configured explicitly.
 - A `version` 2 profile must carry an explicit `[policy]` section; a v2 file
   with no `[policy]` block is refused rather than silently inheriting a default
   engine.

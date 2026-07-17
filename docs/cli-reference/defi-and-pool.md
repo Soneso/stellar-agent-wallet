@@ -150,7 +150,7 @@ The channel pool is a set of channel accounts derived from a single pool master 
 
 ### `stellar-agent pool init`
 
-Fund `N` channel accounts on-chain via a single CAP-33 sponsored-reserve sandwich transaction. Signing command: the funder signer is loaded from the keyring. The pool master seed is generated in memory and written to the OS keyring only after the on-chain transaction confirms; the public `PoolConfig` bookkeeping is then persisted to the profile TOML. A failure before confirmation leaves no keyring entry and no config, so a clean retry needs no `--force`.
+Fund `N` channel accounts on-chain via a single CAP-33 sponsored-reserve sandwich transaction. Signing command: the funder signer is loaded from the keyring, and the profile's audit chain key must be minted (`profile rotate-audit-key`) — the audit writer is acquired before any seed generation or submit, refusing `audit.chain_key_unavailable` otherwise, and is reused for the post-confirm `channel_pool_initialised` row. The pool master seed is generated in memory and written to the OS keyring only after the on-chain transaction confirms; the public `PoolConfig` bookkeeping is then persisted to the profile TOML. A failure before confirmation leaves no keyring entry and no config, so a clean retry needs no `--force`.
 
 The persistence step patches only the two pool keys (`pool_master_key_id`, `[pool_config]`) on the on-disk profile document; every other stored key is preserved verbatim. `STELLAR_AGENT_*` environment overrides remain load-time-only: an override present during `pool init` affects that run (for example which RPC endpoint it submits to) but is never written into the profile.
 

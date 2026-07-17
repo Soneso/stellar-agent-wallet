@@ -147,17 +147,58 @@ pub(crate) fn require_value_audit_writer_for_origin(
     }
 }
 
+/// Best-effort keyed-first writer acquisition for callers that need a
+/// writer OBJECT but must not fail closed: the synthesized zero-config
+/// profile (manager-based smart-account commands cannot run without a
+/// writer), and read-only commands that neither sign nor submit and are
+/// exempt from the fail-closed pre-flight regardless of origin.
+///
+/// Keyed when the profile's chain-root key loads; otherwise falls back to an
+/// UNKEYED open at the profile's configured audit path. The unkeyed
+/// registration cannot brick a later keyed open in the same process: keyed
+/// acquisition requires the key to load, which is exactly what failed here,
+/// and a long-lived MCP server resolves its profile once at startup.
+///
+/// # Errors
+///
+/// Returns [`WalletError`] only when even the unkeyed open fails (I/O).
+pub(crate) fn acquire_best_effort_audit_writer(
+    profile: &Profile,
+    profile_name: &str,
+) -> Result<Arc<Mutex<AuditWriter>>, WalletError> {
+    if let Some(writer) = acquire_value_audit_writer(profile, profile_name) {
+        return Ok(writer);
+    }
+    tracing::warn!(
+        profile = %profile_name,
+        "value audit: keyed acquisition unavailable; \
+         opening the audit writer unkeyed (rows not covered by audit verify)"
+    );
+    AuditWriterRegistry::get_or_open(profile_name, &profile.audit_log_path, None)
+        .map_err(|e| audit_writer_open_failed_io(profile_name, &e))
+}
+
+fn audit_writer_open_failed_io(profile_name: &str, e: &impl std::fmt::Display) -> WalletError {
+    tracing::warn!(
+        profile = %profile_name,
+        error = %e,
+        "value audit: unkeyed audit writer open failed"
+    );
+    audit_writer_open_failed(profile_name)
+}
+
 /// Acquires the per-profile audit writer opened under the profile's audit
 /// chain-root HMAC key.
 ///
 /// Returns `None` (with a `tracing::warn!`) if the key cannot be loaded or the
 /// writer cannot be opened. Private: the callers are [`emit_value_audit_row`]
-/// (the one exempt, non-signing call site) and
+/// (the one exempt, non-signing call site),
 /// [`require_value_audit_writer_for_origin`]'s
 /// [`ProfileOrigin::Synthesized`](crate::commands::policy_engine::ProfileOrigin::Synthesized)
-/// arm (the zero-config quickstart's warn-only path). Every persisted-profile
-/// signing verb uses [`require_value_audit_writer`] instead, which fails
-/// closed.
+/// arm (the zero-config quickstart's warn-only path), and
+/// [`acquire_best_effort_audit_writer`]'s keyed attempt. Every
+/// persisted-profile signing verb uses [`require_value_audit_writer`]
+/// instead, which fails closed.
 fn acquire_value_audit_writer(
     profile: &Profile,
     profile_name: &str,

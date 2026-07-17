@@ -237,6 +237,30 @@ fn write_profile_toml(home: &std::path::Path, profile: &str) {
     std::fs::write(dir.join(format!("{profile}.toml")), toml).expect("write profile toml");
 }
 
+/// Mints the profile's audit chain-root key by spawning
+/// `stellar-agent profile rotate-audit-key` as its own subprocess — the exact
+/// production mint path. Returns an [`OwnerKeyringGuard`] (the guard is
+/// coordinate-generic) that removes the entry when dropped.
+fn rotate_audit_key_via_cli(home: &std::path::Path, profile: &str) -> OwnerKeyringGuard {
+    let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
+    let output = Command::new(bin_path)
+        .args(["profile", "rotate-audit-key", profile])
+        .env("STELLAR_AGENT_HOME", home)
+        .output()
+        .expect("spawn rotate-audit-key");
+    assert!(
+        output.status.success(),
+        "rotate-audit-key must succeed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    OwnerKeyringGuard {
+        coord: stellar_agent_core::profile::schema::KeyringEntryRef::new(
+            format!("stellar-agent-audit-{profile}"),
+            "default",
+        ),
+    }
+}
+
 /// Builds, signs (with the REAL `canonical_bytes` -> `digest` -> `sign`
 /// primitives `profile sign-policy` uses), and writes a V1 policy document
 /// with a single `per_tx_cap` rule (`stellar_pay`, `native`, `CAP_STROOPS`) to
@@ -517,6 +541,14 @@ async fn pay_v1_per_tx_cap_denies_over_cap_and_submits_under_cap() {
         source_balance_after, source_balance_before,
         "the source account's native balance must be unchanged: nothing was submitted"
     );
+
+    // ── Mint the audit chain-root key ─────────────────────────────────────────
+    // Scenario 1 above ran WITHOUT a minted key on purpose: a policy denial
+    // is a clean refusal that signs nothing and must not require audit
+    // setup. The ALLOW path below is fail-closed on a persisted profile —
+    // the submit must not proceed unaudited — so the key is minted here,
+    // through the production rotate-audit-key subprocess.
+    let _audit_key_guard = rotate_audit_key_via_cli(home.path(), &profile_name);
 
     // ── Scenario 2: UNDER-CAP (10 XLM <= 100 XLM cap) ─────────────────────────
     let (_dest_seq_before, dest_balance_before) = account_state(&client, &dest_g).await;
