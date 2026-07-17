@@ -272,6 +272,16 @@ receipt recording, and independent transaction reconciliation. MPP is
 testnet-only and absent from toolset routing; its configured RPC sees signed
 authorization during mandatory re-simulation.
 
+Every value-moving signing verb loaded from a persisted profile proves the
+audit writer is acquirable BEFORE the signing key is touched or a transaction
+is submitted, refusing `audit.chain_key_unavailable` if the profile's audit
+chain-root key was never minted (`profile init` mints the keyring coordinate
+only; run `profile rotate-audit-key <name>` to mint the key). The zero-config
+synthesized profile `pay`/`claim`/`accounts create` fall back to when no
+profile file exists stays fail-open for this specific check. The SEP-43
+sign-only pair (`signTransaction`, `signAuthEntry`) is not yet covered by this
+pre-flight. See [Troubleshooting](troubleshooting.md#audit-key-code).
+
 Operators verify the chain end-to-end:
 
 ```text

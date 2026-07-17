@@ -181,15 +181,22 @@ fn build_claim_envelope_b64(source_g: &str, op: stellar_xdr::Operation) -> Strin
 // Server / profile helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Testnet profile with `engine = Noop` and the given RPC URL.
+/// Testnet profile with `engine = Noop` and the given RPC URL, for test
+/// isolation.
 ///
 /// `Noop` is set explicitly so `WalletServer::new` succeeds without a signed
 /// policy file on disk (`PolicyEngineKind::default()` is `V1`).
+///
+/// Seeds the audit chain-root key via [`common::install_test_audit_key`]: the
+/// audit pre-flight runs BEFORE nonce-commit consumption on `stellar_claim_commit`,
+/// so any test reaching a commit-phase gate needs this seeded to reach the
+/// gate under test rather than refusing `audit.chain_key_unavailable` first.
 fn testnet_profile_with_rpc(rpc_url: &str) -> Profile {
     let mut p = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
         .with_noop_engine()
         .build();
     p.rpc_url = rpc_url.to_owned();
+    common::install_test_audit_key(&mut p);
     p
 }
 
@@ -658,9 +665,10 @@ fn commit_args(
 }
 
 /// Scenario 6: a genuine simulate-minted nonce committed twice.  The first
-/// commit records the nonce in the replay window before failing at keyring
-/// signing (no signer key is provisioned for the source); the second commit
-/// returns `nonce.replayed`.
+/// commit passes the audit pre-flight (`testnet_profile_with_rpc` seeds the
+/// audit chain-root key) and records the nonce in the replay window before
+/// failing at keyring signing (no signer key is provisioned for the source);
+/// the second commit returns `nonce.replayed`.
 #[tokio::test]
 #[serial]
 async fn commit_replayed_nonce_returns_replayed() {
@@ -689,8 +697,8 @@ async fn commit_replayed_nonce_returns_replayed() {
         .mount(&mock_server)
         .await;
 
-    let server =
-        WalletServer::new(testnet_profile_with_rpc(&mock_server.uri())).expect("WalletServer::new");
+    let profile = testnet_profile_with_rpc(&mock_server.uri());
+    let server = WalletServer::new(profile).expect("WalletServer::new");
 
     let simulate = server
         .call_stellar_claim(simulate_args())
@@ -698,10 +706,10 @@ async fn commit_replayed_nonce_returns_replayed() {
         .expect("simulate should succeed");
     let (nonce, expires, envelope) = extract_commit_triple(&simulate);
 
-    // First commit: passes divergence + nonce HMAC (recording the nonce in the
-    // replay window) and then fails at keyring signing because no signer key is
-    // provisioned for the source.  The recorded nonce is what makes the second
-    // call observable as a replay.
+    // First commit: passes the audit pre-flight, divergence, and nonce HMAC
+    // (recording the nonce in the replay window), then fails at keyring
+    // signing because no signer key is provisioned for the source.  The
+    // recorded nonce is what makes the second call observable as a replay.
     let first = server
         .call_stellar_claim_commit(commit_args(nonce.clone(), expires, envelope.clone()))
         .await;

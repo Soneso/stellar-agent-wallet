@@ -331,6 +331,24 @@ off a fixed zero block; the first entry of each later file chains off the prior
 file's rotation-handoff entry. Each file also carries a `root_hmac` sidecar
 signing the chain root with the profile's audit key.
 
+### Fail-closed on an unminted audit key
+
+`profile init` mints the audit chain-root key's keyring coordinate only, no key
+material. Every value-moving signing verb — CLI and MCP alike — loaded from a
+persisted profile proves the audit writer is acquirable BEFORE the signing key
+is touched or a transaction is submitted; if the key was never minted (run
+`stellar-agent profile rotate-audit-key <name>`), the verb refuses
+`audit.chain_key_unavailable` instead of signing unaudited. This applies on
+both policy engines. It is distinct from the writer's post-confirm emission
+(the `value_action_submitted` row above), which stays non-fatal: the
+transaction has already committed by then, so refusing helps nobody.
+Read-only tools and the build/simulate stages of two-phase verbs never reach
+this pre-flight. The zero-config synthesized profile `pay`/`claim`/
+`accounts create` fall back to when no profile file exists stays fail-open for
+this specific check, matching its documented no-profile-required posture. The
+SEP-43 sign-only pair (`signTransaction`, `signAuthEntry`) is not yet covered
+by this pre-flight.
+
 ### `audit verify` command reference
 
 `stellar-agent audit verify <LOG_PATH>` — read-only. Walks the log oldest-first,

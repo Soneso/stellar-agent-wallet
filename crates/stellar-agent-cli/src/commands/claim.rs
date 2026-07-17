@@ -57,9 +57,26 @@
 //! profiles) or the permissive `NoopPolicyEngine` (`Noop` profiles), mirroring
 //! the `stellar_claim` / `stellar_claim_commit` MCP tools' dispatch gates.
 //! When `--profile` names no persisted `<name>.toml` file, an in-memory
-//! `Noop`-engine testnet profile is synthesized so the command keeps working
-//! without an authored profile file — and without ever touching the OS
-//! keyring.
+//! `Noop`-engine testnet profile is synthesized (tagged
+//! [`crate::commands::policy_engine::ProfileOrigin::Synthesized`]) so the
+//! command keeps working without an authored profile file.
+//!
+//! # Audit pre-flight (fail-closed for a persisted profile; fail-open for the
+//! synthesized zero-config profile)
+//!
+//! Every stage that touches a signing key (`--sign-only`, the full pipeline)
+//! or submits a transaction (`--submit-only`, the full pipeline) resolves the
+//! audit writer via
+//! [`crate::commands::value_audit::require_value_audit_writer_for_origin`]
+//! BEFORE that signing/submission. For a persisted `<name>.toml` profile this
+//! fails closed with `audit.chain_key_unavailable` if the profile's audit
+//! chain-root HMAC key is not acquirable — an init-minted profile has no
+//! audit key until `stellar-agent profile rotate-audit-key <name>` mints one.
+//! For the synthesized zero-config profile the pre-flight stays fail-open
+//! (warn-only, no refusal), so an unauthored profile never blocks signing on a
+//! key-rotation step the operator never opted into. `--build-only` is exempt:
+//! it neither signs nor submits. Where a writer was acquired, it is reused
+//! (not re-acquired) for the post-confirm `value_action_submitted` row.
 
 use std::time::Duration;
 
@@ -89,7 +106,7 @@ use stellar_agent_network::{
 };
 
 use crate::commands::policy_engine::{
-    build_v1_policy_engine, caip2_chain_id_for_network, claim_policy_args,
+    ProfileOrigin, build_v1_policy_engine, caip2_chain_id_for_network, claim_policy_args,
     evaluate_opaque_signing_policy, evaluate_value_moving_policy,
     load_profile_or_synthesize_testnet,
 };
@@ -275,7 +292,7 @@ async fn run_with_dependencies<LoadProfile, InitKeyring>(
     init_keyring: InitKeyring,
 ) -> i32
 where
-    LoadProfile: Fn(&str) -> Result<Profile, String>,
+    LoadProfile: Fn(&str) -> Result<(Profile, ProfileOrigin), String>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
     // ── Mainnet structural rejection (first layer) ────────────────────────────
@@ -311,7 +328,7 @@ async fn run_build_only<LoadProfile, InitKeyring>(
     init_keyring: InitKeyring,
 ) -> i32
 where
-    LoadProfile: Fn(&str) -> Result<Profile, String>,
+    LoadProfile: Fn(&str) -> Result<(Profile, ProfileOrigin), String>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
     // ── Resolve profile & conditionally initialise the platform keyring ──────
@@ -319,8 +336,10 @@ where
     // from `evaluate_claim_policy` below) reads the owner PUBLIC key from the
     // OS keyring only when `profile.policy.engine == V1`, so the platform
     // keyring store is registered here — and only then — ahead of that read.
-    // The Noop-engine (zero-config) path never touches the keyring.
-    let profile = match load_profile(&args.profile) {
+    // `--build-only` never calls the audit pre-flight (it neither signs nor
+    // submits), so the Noop-engine path genuinely never touches the keyring
+    // on this stage, unlike the signing/submitting stages below.
+    let (profile, _origin) = match load_profile(&args.profile) {
         Ok(p) => p,
         Err(msg) => {
             print_error(
@@ -375,13 +394,26 @@ async fn run_sign_only<LoadProfile, InitKeyring>(
     init_keyring: InitKeyring,
 ) -> i32
 where
-    LoadProfile: Fn(&str) -> Result<Profile, String>,
+    LoadProfile: Fn(&str) -> Result<(Profile, ProfileOrigin), String>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
-    let profile = match resolve_profile_and_keyring(args, load_profile, init_keyring) {
+    let (profile, origin) = match resolve_profile_and_keyring(args, load_profile, init_keyring) {
         Ok(p) => p,
         Err(code) => return code,
     };
+    // Origin-aware pre-flight: prove the audit writer is acquirable BEFORE the
+    // signing key below is touched, for a persisted profile — fails closed.
+    // The synthesized zero-config profile stays fail-open. `--sign-only` never
+    // submits, so the returned writer (if any) is not threaded further here —
+    // its only purpose on this stage is the refusal.
+    if let Err(e) = crate::commands::value_audit::require_value_audit_writer_for_origin(
+        &profile,
+        &args.profile,
+        origin,
+    ) {
+        print_error(&Envelope::<()>::err(&e), args.output);
+        return 1;
+    }
     let chain_id = caip2_chain_id_for_network(args.network);
     if let Err(code) = evaluate_staged_claim_policy(args, unsigned_xdr, chain_id, &profile).await {
         return code;
@@ -413,12 +445,28 @@ async fn run_submit_only<LoadProfile, InitKeyring>(
     init_keyring: InitKeyring,
 ) -> i32
 where
-    LoadProfile: Fn(&str) -> Result<Profile, String>,
+    LoadProfile: Fn(&str) -> Result<(Profile, ProfileOrigin), String>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
-    let profile = match resolve_profile_and_keyring(args, load_profile, init_keyring) {
+    let (profile, origin) = match resolve_profile_and_keyring(args, load_profile, init_keyring) {
         Ok(p) => p,
         Err(code) => return code,
+    };
+    // Origin-aware pre-flight: prove the audit writer is acquirable BEFORE the
+    // transaction below is submitted, for a persisted profile — fails closed.
+    // The synthesized zero-config profile stays fail-open, yielding `None`
+    // when no writer could be acquired. Where `Some`, the writer is reused
+    // (not re-acquired) for the post-confirm emission.
+    let audit_writer = match crate::commands::value_audit::require_value_audit_writer_for_origin(
+        &profile,
+        &args.profile,
+        origin,
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            print_error(&Envelope::<()>::err(&e), args.output);
+            return 1;
+        }
     };
     let chain_id = caip2_chain_id_for_network(args.network);
     // The envelope arrives pre-signed, but broadcasting it still spends
@@ -432,16 +480,20 @@ where
     match submit_envelope(args, signed_xdr).await {
         Ok((signed_xdr, sub_result)) => {
             // Non-fatal allow-path audit row: the SAME legs the gate sized
-            // (single-derivation invariant), on confirmed submit.
-            crate::commands::value_audit::emit_value_action_submitted_row(
-                &profile,
-                &args.profile,
-                "stellar_claim_commit",
-                chain_id,
-                claim_effects.as_ref(),
-                &sub_result.tx_hash,
-                sub_result.ledger,
-            );
+            // (single-derivation invariant), on confirmed submit. Skipped
+            // entirely when no writer was acquired (the synthesized
+            // zero-config profile with an unminted audit key).
+            if let Some(writer) = &audit_writer {
+                crate::commands::value_audit::emit_value_action_submitted_row_with_writer(
+                    writer,
+                    &args.profile,
+                    "stellar_claim_commit",
+                    chain_id,
+                    claim_effects.as_ref(),
+                    &sub_result.tx_hash,
+                    sub_result.ledger,
+                );
+            }
             crate::commands::policy_engine::record_confirmed_value_moving(
                 "claim",
                 &profile,
@@ -468,32 +520,61 @@ where
     }
 }
 
-/// Resolves the profile and conditionally initialises the platform keyring
-/// store, mirroring `run_build_only` / `run_full_pipeline`'s ordering: the
-/// store is registered before any V1 policy-engine owner-key read.
+/// Resolves the profile and unconditionally attempts to initialise the
+/// platform keyring store.
+///
+/// Unconditional (not gated on `profile.policy.engine`): the origin-aware
+/// audit pre-flight both stages calling this helper (`--sign-only`,
+/// `--submit-only`) run next reads the profile's audit chain-root HMAC key
+/// from the platform keyring regardless of the policy engine — a `Noop`
+/// engine reads no OWNER key, but the audit key is a separate, engine-independent
+/// requirement.
+///
+/// The outcome of a failed initialisation attempt is origin-aware:
+/// [`ProfileOrigin::Persisted`] treats it as fatal — an operator who authored
+/// a profile file is expected to have a working platform keyring for both the
+/// fail-closed audit pre-flight and the keyring-backed owner-key read.
+/// [`ProfileOrigin::Synthesized`] (the zero-config quickstart — no profile
+/// file, no keyring ceremony the operator opted into) logs a
+/// `tracing::warn!` and continues: the origin-aware audit pre-flight run next
+/// already tolerates the SAME acquisition failure for a synthesized profile
+/// (see [`crate::commands::value_audit::require_value_audit_writer_for_origin`]),
+/// so a host with no platform keyring store (e.g. a container without a
+/// Secret Service) never blocks the documented no-setup quickstart.
 fn resolve_profile_and_keyring<LoadProfile, InitKeyring>(
     args: &ClaimArgs,
     load_profile: LoadProfile,
     init_keyring: InitKeyring,
-) -> Result<Profile, i32>
+) -> Result<(Profile, ProfileOrigin), i32>
 where
-    LoadProfile: Fn(&str) -> Result<Profile, String>,
+    LoadProfile: Fn(&str) -> Result<(Profile, ProfileOrigin), String>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
-    let profile = load_profile(&args.profile).map_err(|msg| {
+    let (profile, origin) = load_profile(&args.profile).map_err(|msg| {
         print_error(
             &Envelope::<()>::err_raw("profile.load_failed", msg),
             args.output,
         );
         1
     })?;
-    if !matches!(profile.policy.engine, PolicyEngineKind::Noop)
-        && let Err(e) = init_keyring()
-    {
-        print_error(&Envelope::<()>::err(&e), args.output);
-        return Err(1);
+    if let Err(e) = init_keyring() {
+        match origin {
+            ProfileOrigin::Persisted => {
+                print_error(&Envelope::<()>::err(&e), args.output);
+                return Err(1);
+            }
+            ProfileOrigin::Synthesized => {
+                tracing::warn!(
+                    profile = %args.profile,
+                    error = %e,
+                    "platform keyring store unavailable for the synthesized zero-config \
+                     profile; continuing warn-only — the audit pre-flight below already \
+                     tolerates this for a synthesized profile"
+                );
+            }
+        }
     }
-    Ok(profile)
+    Ok((profile, origin))
 }
 
 /// Gates a staged (`--sign-only` / `--submit-only`) envelope before it is
@@ -624,13 +705,20 @@ async fn run_full_pipeline<LoadProfile, InitKeyring>(
     init_keyring: InitKeyring,
 ) -> i32
 where
-    LoadProfile: Fn(&str) -> Result<Profile, String>,
+    LoadProfile: Fn(&str) -> Result<(Profile, ProfileOrigin), String>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
-    // ── Resolve profile & conditionally initialise the platform keyring ──────
-    // Same rationale as `run_build_only`: registered before any network
-    // build, and only when the resolved profile's engine is V1.
-    let profile = match load_profile(&args.profile) {
+    // ── Resolve profile & unconditionally attempt to initialise the platform
+    // keyring ──────────────────────────────────────────────────────────────
+    // Unconditional (see `resolve_profile_and_keyring`'s rustdoc): the
+    // origin-aware audit pre-flight below reads the profile's audit
+    // chain-root HMAC key from the platform keyring regardless of the policy
+    // engine, so the store must be registered before that read even on a
+    // `Noop`-engine profile. A failed attempt is origin-aware: fatal for a
+    // persisted profile; warn-only for the synthesized zero-config profile,
+    // matching the audit pre-flight's fail-open posture for that origin (see
+    // `resolve_profile_and_keyring`'s rustdoc for the full rationale).
+    let (profile, origin) = match load_profile(&args.profile) {
         Ok(p) => p,
         Err(msg) => {
             print_error(
@@ -640,18 +728,41 @@ where
             return 1;
         }
     };
-    // `PolicyEngineKind` is `#[non_exhaustive]` (a foreign-crate enum), so this
-    // cannot be a wildcard-free exhaustive match. `Noop` is the only engine that
-    // reads no owner key; every other engine — `V1` and any future variant —
-    // needs the keyring store registered before the gate's owner-key read.
-    // Default to initialising (fail toward registering the store) so a
-    // newly-added engine is never silently left without it.
-    if !matches!(profile.policy.engine, PolicyEngineKind::Noop)
-        && let Err(e) = init_keyring()
-    {
-        print_error(&Envelope::<()>::err(&e), args.output);
-        return 1;
+    if let Err(e) = init_keyring() {
+        match origin {
+            ProfileOrigin::Persisted => {
+                print_error(&Envelope::<()>::err(&e), args.output);
+                return 1;
+            }
+            ProfileOrigin::Synthesized => {
+                tracing::warn!(
+                    profile = %args.profile,
+                    error = %e,
+                    "platform keyring store unavailable for the synthesized zero-config \
+                     profile; continuing warn-only — the audit pre-flight below already \
+                     tolerates this for a synthesized profile"
+                );
+            }
+        }
     }
+
+    // Origin-aware pre-flight: prove the audit writer is acquirable BEFORE the
+    // signing key is touched below (step 2) and BEFORE the transaction is
+    // submitted (step 3), for a persisted profile — fails closed. The
+    // synthesized zero-config profile stays fail-open, yielding `None` when
+    // no writer could be acquired. Where `Some`, the writer is reused (not
+    // re-acquired) for the post-confirm emission.
+    let audit_writer = match crate::commands::value_audit::require_value_audit_writer_for_origin(
+        &profile,
+        &args.profile,
+        origin,
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            print_error(&Envelope::<()>::err(&e), args.output);
+            return 1;
+        }
+    };
 
     // 1. Build (fetch entry, preview, guards).
     let built = match build_unsigned_envelope(args).await {
@@ -683,16 +794,20 @@ where
     match submit_envelope(args, &signed_xdr).await {
         Ok((xdr, sub_result)) => {
             // Non-fatal allow-path audit row: the SAME legs the gate sized
-            // (single-derivation invariant), on confirmed submit.
-            crate::commands::value_audit::emit_value_action_submitted_row(
-                &profile,
-                &args.profile,
-                "stellar_claim",
-                chain_id,
-                claim_effects.as_ref(),
-                &sub_result.tx_hash,
-                sub_result.ledger,
-            );
+            // (single-derivation invariant), on confirmed submit. Skipped
+            // entirely when no writer was acquired (the synthesized
+            // zero-config profile with an unminted audit key).
+            if let Some(writer) = &audit_writer {
+                crate::commands::value_audit::emit_value_action_submitted_row_with_writer(
+                    writer,
+                    &args.profile,
+                    "stellar_claim",
+                    chain_id,
+                    claim_effects.as_ref(),
+                    &sub_result.tx_hash,
+                    sub_result.ledger,
+                );
+            }
             crate::commands::policy_engine::record_confirmed_value_moving(
                 "claim",
                 &profile,
@@ -831,9 +946,10 @@ async fn build_unsigned_envelope(args: &ClaimArgs) -> Result<BuiltClaimEnvelope,
 ///
 /// `profile` is the already-resolved profile from the caller's top-of-gated-
 /// path load (see `run_build_only` / `run_full_pipeline`); this function does
-/// not re-resolve it, so the platform keyring store the caller conditionally
-/// initialised for a V1 engine remains registered for the `build_v1_policy_engine`
-/// owner-key read below.
+/// not re-resolve it, so the platform keyring store the caller already
+/// initialised (conditionally on `run_build_only`; unconditionally on
+/// `run_full_pipeline`, ahead of its origin-aware audit pre-flight) remains
+/// registered for the `build_v1_policy_engine` owner-key read below.
 fn evaluate_claim_policy(
     args: &ClaimArgs,
     built: &BuiltClaimEnvelope,
@@ -917,8 +1033,10 @@ async fn sign_envelope(args: &ClaimArgs, unsigned_xdr: &str) -> Result<String, W
 
     if let Some(ref var_name) = args.secret_env {
         // mlock-protected signing window (shared ceremony, identical
-        // discipline to `pay`). `claim` has no audit-writer infrastructure
-        // either; see `pay::sign_envelope` for the same rationale.
+        // discipline to `pay`). A degraded mlock unlock is a separate,
+        // orthogonal concern from the audit pre-flight the caller already ran
+        // before this function; see `pay::sign_envelope` for the same
+        // rationale.
         let SignerCeremonyOutcome {
             signer,
             mlock_degradation: _,
@@ -1285,7 +1403,7 @@ mod tests {
             &args,
             move |_name| {
                 loaded_writer.store(true, Ordering::SeqCst);
-                Ok(Profile::builder_testnet_named(
+                let profile = Profile::builder_testnet_named(
                     "keyring-order-test",
                     "stellar-agent-signer",
                     "keyring-order-test",
@@ -1293,7 +1411,8 @@ mod tests {
                     "keyring-order-test",
                 )
                 .policy_engine(PolicyEngineKind::V1)
-                .build())
+                .build();
+                Ok((profile, ProfileOrigin::Persisted))
             },
             move || {
                 assert!(
@@ -1339,7 +1458,7 @@ mod tests {
         let code = run_with_dependencies(
             &args,
             |_name| {
-                Ok(Profile::builder_testnet_named(
+                let profile = Profile::builder_testnet_named(
                     "keyring-order-test-noop",
                     "stellar-agent-signer",
                     "keyring-order-test-noop",
@@ -1347,7 +1466,8 @@ mod tests {
                     "keyring-order-test-noop",
                 )
                 .policy_engine(PolicyEngineKind::Noop)
-                .build())
+                .build();
+                Ok((profile, ProfileOrigin::Persisted))
             },
             move || {
                 init_writer.store(true, Ordering::SeqCst);
@@ -1364,6 +1484,90 @@ mod tests {
             code, 1,
             "invalid balance id must still refuse (unrelated to the keyring gate)"
         );
+    }
+
+    // ── resolve_profile_and_keyring — origin-aware keyring-init failure (#88) ─
+    //
+    // `resolve_profile_and_keyring` backs `run_sign_only` / `run_submit_only`
+    // and is exercised directly here (sync, no RPC or gate involved): the
+    // Synthesized/Persisted split is the WHOLE behavior under test, so a
+    // direct call pins it precisely without the extra RPC-mocked surface a
+    // full `--sign-only` run would add.
+
+    /// A [`ProfileOrigin::Synthesized`] profile must tolerate a platform
+    /// keyring-init failure and return `Ok` — not refuse — matching the
+    /// zero-config quickstart's fail-open posture. Catches the regression
+    /// where this failure was unconditionally fatal regardless of origin,
+    /// which would break `claim --secret-env ...` with no profile file on any
+    /// host without a platform keyring (e.g. a container without a Secret
+    /// Service).
+    #[test]
+    fn resolve_profile_and_keyring_synthesized_tolerates_init_failure() {
+        let args = minimal_args();
+        let result = resolve_profile_and_keyring(
+            &args,
+            |name| {
+                let profile = Profile::builder_testnet_named(
+                    name,
+                    "stellar-agent-signer",
+                    name,
+                    "stellar-agent-nonce",
+                    name,
+                )
+                .policy_engine(PolicyEngineKind::Noop)
+                .build();
+                Ok((profile, ProfileOrigin::Synthesized))
+            },
+            || {
+                Err(WalletError::Auth(AuthError::KeyringNotFound {
+                    name: "resolve-profile-and-keyring-synthesized-sentinel".to_owned(),
+                }))
+            },
+        );
+        let (_profile, origin) =
+            result.expect("a synthesized zero-config profile must tolerate a keyring-init failure");
+        assert_eq!(origin, ProfileOrigin::Synthesized);
+    }
+
+    /// A [`ProfileOrigin::Persisted`] profile must refuse (`Err(1)`) when the
+    /// platform keyring store fails to initialise: an operator who authored a
+    /// profile file is expected to have a working platform keyring for both
+    /// the fail-closed audit pre-flight and the keyring-backed owner-key
+    /// read, so this failure stays fatal.
+    #[test]
+    fn resolve_profile_and_keyring_persisted_fails_on_init_failure() {
+        let args = minimal_args();
+        let result = resolve_profile_and_keyring(
+            &args,
+            |name| {
+                let profile = Profile::builder_testnet_named(
+                    name,
+                    "stellar-agent-signer",
+                    name,
+                    "stellar-agent-nonce",
+                    name,
+                )
+                .policy_engine(PolicyEngineKind::Noop)
+                .build();
+                Ok((profile, ProfileOrigin::Persisted))
+            },
+            || {
+                Err(WalletError::Auth(AuthError::KeyringNotFound {
+                    name: "resolve-profile-and-keyring-persisted-sentinel".to_owned(),
+                }))
+            },
+        );
+        match result {
+            Err(code) => assert_eq!(
+                code, 1,
+                "a persisted profile must refuse with exit code 1 when the platform \
+                 keyring store cannot be initialised"
+            ),
+            Ok(_) => panic!(
+                "a persisted profile must refuse when the platform keyring store cannot be \
+                 initialised, not fall back to the zero-config warn-only posture"
+            ),
+        }
     }
 
     // ── staged sign/submit-only gate tests ───────────────────────────────────

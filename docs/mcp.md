@@ -232,6 +232,28 @@ Argument values are never written to the [audit log](./concepts.md); only key
 names and lifecycle metadata are recorded. Verify the chain with
 `stellar-agent audit verify`.
 
+### Audit pre-flight (fail-closed)
+
+Separately from the policy verdict above, every commit/submit tool that moves
+value or signs (`stellar_pay_commit`, `stellar_claim_commit`,
+`stellar_create_account_commit`, `stellar_trustline_commit`,
+`stellar_sep43_sign_and_submit_transaction`, `stellar_x402_create_payment`,
+`stellar_x402_authenticated_payment`, `stellar_dex_trade`,
+`stellar_blend_lend`, `stellar_defindex_vault_deposit`,
+`stellar_defindex_vault_withdraw`) proves the active profile's audit
+chain-root key is acquirable BEFORE the signer is loaded or anything is
+submitted. `profile init` mints the audit-log keyring COORDINATE only, no key
+material, so a freshly-initialized profile refuses with
+`audit.chain_key_unavailable` until the operator runs
+`stellar-agent profile rotate-audit-key <name>`. Read-only tools and the
+simulate/build phases of the two-phase verbs above are unaffected — they
+never sign or submit, so they never reach this pre-flight; the MCP server's
+synthesized first-run fallback profile continues to serve them.
+`stellar_mpp_charge_commit` is exempt from this specific pre-flight: it
+already fails closed on the same underlying condition through its own
+stricter authorization-withholding mechanism (see
+[Agent payments with MPP](agent-payments.md)).
+
 ## Tool catalog
 
 The server registers 38 tools. For each tool below: the exact registered name,

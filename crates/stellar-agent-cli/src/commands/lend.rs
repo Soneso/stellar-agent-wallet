@@ -28,6 +28,17 @@
 //! (capability-witness seam); the policy evaluation runs alongside it.  Both
 //! paths enforce the operator policy document.
 //!
+//! # Audit pre-flight (fail-closed)
+//!
+//! Before the signer is loaded or the lend is submitted, requires the
+//! profile's audit chain-root HMAC key to be acquirable via
+//! [`crate::commands::value_audit::require_value_audit_writer`], refusing
+//! with `audit.chain_key_unavailable` if not — `lend` always loads a
+//! persisted `<name>.toml` profile (no zero-config synthesis), so the
+//! pre-flight fails closed unconditionally, unlike `pay` / `claim` /
+//! `accounts create`. The acquired writer is reused (not re-acquired) for
+//! `DefiAdapterCtx::audit_writer`.
+//!
 //! # Output
 //!
 //! JSON by default.  Returns `0` on success, `1` on error.
@@ -364,6 +375,11 @@ where
         }
     };
     let value_legs = blend_value_legs(&blend_requests, &args.pool);
+    // Capture the gate-derived legs as audit records before the descriptor
+    // moves into the gate, so the emitted row carries exactly what the gate
+    // sized (single-derivation invariant).
+    let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> =
+        value_legs.iter().map(Into::into).collect();
     let policy_args = json!({
         "pool_address": args.pool,
         "from_address": args.from,
@@ -399,6 +415,19 @@ where
         }
     };
 
+    // ── Audit pre-flight (fail-closed) ────────────────────────────────────────
+    // Proves the profile's audit chain-root key is acquirable BEFORE the
+    // signer is loaded (below) or the lend is submitted. Reused (not
+    // re-acquired) for `DefiAdapterCtx::audit_writer`.
+    let audit_writer =
+        match crate::commands::value_audit::require_value_audit_writer(&profile, &args.profile) {
+            Ok(w) => w,
+            Err(e) => {
+                render_json(&Envelope::<()>::err(&e));
+                return 1;
+            }
+        };
+
     // ── Build preview summary (for the result envelope) ───────────────────────
     let oracle_staleness_secs = staleness_view.as_ref().and_then(|v| {
         use stellar_agent_blend::oracle::OracleStalenessView;
@@ -433,7 +462,7 @@ where
     );
 
     let timeout = std::time::Duration::from_secs(60);
-    let ctx = DefiAdapterCtx::new_with_submit_ctx(
+    let mut ctx = DefiAdapterCtx::new_with_submit_ctx(
         "default",
         &pool_pin,
         &primary_rpc,
@@ -443,6 +472,12 @@ where
         secondary_rpc.as_ref(),
         Some(timeout),
     );
+    // Thread the pre-flight-acquired audit writer + gate-derived legs so the
+    // adapter emits the ValueActionSubmitted row after a confirmed submit
+    // (non-fatal past this point — the pre-flight above is what fails closed).
+    ctx.audit_writer = Some(std::sync::Arc::clone(&audit_writer));
+    ctx.audit_legs = Some(&audit_legs);
+    ctx.audit_tool = Some("stellar_blend_lend");
 
     // ── Build BlendLendArgs for the adapter ───────────────────────────────────
     let lend_args = BlendLendArgs {
@@ -497,8 +532,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use stellar_agent_core::error::AuthError;
+    use stellar_agent_core::profile::schema::PolicyEngineKind;
 
     use super::*;
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
 
     // ── keyring store initialisation ordering ─────────────────────────────────
 
@@ -563,6 +600,281 @@ mod tests {
         assert_eq!(
             code, 1,
             "run must surface the keyring init failure instead of reaching signer resolution"
+        );
+    }
+
+    // ── Audit pre-flight (fail-closed) after the ordered trust gate ──────────
+    //
+    // Unlike `trustline`'s zero-RPC ordering test, `lend`'s audit pre-flight
+    // (module doc: "Audit pre-flight (fail-closed)") runs AFTER the ordered
+    // trust gate's three RPC round trips (pool WASM-hash pin, pool oracle-address
+    // read, oracle `lastprice` staleness query — see the module doc's "Ordered
+    // trust gate" section and the call sequence in `run_with_dependencies`
+    // above), so a `server.received_requests().is_empty()` assertion would be
+    // structurally wrong here (see cycle-2 brief item B). These helpers mock the
+    // ordered trust gate to a genuine PASS so the run reaches the real
+    // production pre-flight call site instead of refusing earlier for an
+    // unrelated reason.
+
+    /// Builds the base64 XDR `(key, entry)` pair for a Blend pool's contract
+    /// instance ledger entry, carrying a pinned WASM executable hash and a
+    /// `PoolConfig.oracle` field — the SAME single instance entry both
+    /// `verify_blend_pool_wasm` (via `fetch_contract_wasm_hash`) and
+    /// `read_pool_oracle_address` decode, per their `getLedgerEntries` call
+    /// against `LedgerKeyContractInstance`.
+    ///
+    /// # ABI provenance
+    ///
+    /// `PoolConfig.oracle: Address` at instance-storage key `Symbol("Config")`,
+    /// per `stellar_agent_blend::oracle_fetch::read_pool_oracle_address`'s own
+    /// ABI-provenance rustdoc; only the `oracle` field is populated since
+    /// `extract_oracle_from_pool_config_scval` searches by key name and never
+    /// consumes any other `PoolConfig` field.
+    fn blend_pool_instance_key_and_entry_xdr(
+        pool_address: &str,
+        wasm_hash: [u8; 32],
+        oracle_address: &str,
+    ) -> (String, String) {
+        use stellar_xdr::{
+            ContractDataDurability, ContractDataEntry, ContractExecutable, ContractId,
+            ExtensionPoint, Hash, LedgerEntryData, LedgerKey, LedgerKeyContractData, Limits,
+            ScAddress, ScContractInstance, ScMap, ScMapEntry, ScSymbol, ScVal, StringM, WriteXdr,
+        };
+
+        let pool =
+            stellar_strkey::Contract::from_string(pool_address).expect("valid pool C-strkey");
+        let sc_addr = ScAddress::Contract(ContractId(Hash(pool.0)));
+
+        let oracle =
+            stellar_strkey::Contract::from_string(oracle_address).expect("valid oracle C-strkey");
+        let oracle_sc_addr = ScAddress::Contract(ContractId(Hash(oracle.0)));
+
+        let oracle_sym: StringM<32> = "oracle".try_into().expect("'oracle' fits ScSymbol");
+        let config_sym: StringM<32> = "Config".try_into().expect("'Config' fits ScSymbol");
+
+        let pool_config_map = ScMap(
+            vec![ScMapEntry {
+                key: ScVal::Symbol(ScSymbol(oracle_sym)),
+                val: ScVal::Address(oracle_sc_addr),
+            }]
+            .try_into()
+            .expect("single-entry ScMap fits VecM"),
+        );
+
+        let storage = ScMap(
+            vec![ScMapEntry {
+                key: ScVal::Symbol(ScSymbol(config_sym)),
+                val: ScVal::Map(Some(pool_config_map)),
+            }]
+            .try_into()
+            .expect("single-entry ScMap fits VecM"),
+        );
+
+        let instance = ScContractInstance {
+            executable: ContractExecutable::Wasm(Hash(wasm_hash)),
+            storage: Some(storage),
+        };
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: sc_addr.clone(),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+        });
+        let entry_data = LedgerEntryData::ContractData(ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: sc_addr,
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+            val: ScVal::ContractInstance(instance),
+        });
+
+        let key_b64 = key.to_xdr_base64(Limits::none()).expect("key XDR encode");
+        let val_b64 = entry_data
+            .to_xdr_base64(Limits::none())
+            .expect("entry XDR encode");
+        (key_b64, val_b64)
+    }
+
+    /// Builds the base64 XDR of a Reflector `Option<PriceData>` `ScVal` result
+    /// (the `Some` case) for a `simulateTransaction` `results[0].xdr` field.
+    ///
+    /// # ABI provenance
+    ///
+    /// Field order alphabetical (`price` < `timestamp`), `price: i128` encoded
+    /// as `ScVal::I128(Int128Parts{hi,lo})`, per
+    /// `stellar_agent_defi::reflector::decode_price_data`'s ABI-provenance
+    /// rustdoc.
+    fn reflector_price_data_scval_xdr(price: i128, timestamp: u64) -> String {
+        use stellar_xdr::{
+            Int128Parts, Limits, ScMap, ScMapEntry, ScSymbol, ScVal, StringM, WriteXdr,
+        };
+
+        let price_sym: StringM<32> = "price".try_into().expect("'price' fits ScSymbol");
+        let timestamp_sym: StringM<32> = "timestamp".try_into().expect("'timestamp' fits ScSymbol");
+
+        let hi = (price >> 64) as i64;
+        let lo = (price & i128::from(u64::MAX)) as u64;
+
+        let map = ScMap(
+            vec![
+                ScMapEntry {
+                    key: ScVal::Symbol(ScSymbol(price_sym)),
+                    val: ScVal::I128(Int128Parts { hi, lo }),
+                },
+                ScMapEntry {
+                    key: ScVal::Symbol(ScSymbol(timestamp_sym)),
+                    val: ScVal::U64(timestamp),
+                },
+            ]
+            .try_into()
+            .expect("two-entry ScMap fits VecM"),
+        );
+
+        ScVal::Map(Some(map))
+            .to_xdr_base64(Limits::none())
+            .expect("PriceData ScVal XDR encode")
+    }
+
+    /// Answers `getLedgerEntries` (the pool instance, reused by both the
+    /// WASM-pin check and the oracle-address read) and `simulateTransaction`
+    /// (the Reflector `lastprice` query) with fixed successful responses, so
+    /// the ordered trust gate completes and `run_with_dependencies` reaches
+    /// the audit pre-flight.
+    struct LendTrustGateResponder {
+        pool_entry_xdr: String,
+        price_scval_xdr: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Respond for LendTrustGateResponder {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let request_value = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            let req_id = request_value
+                .get("id")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(1));
+            let method = request_value
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+
+            let result = match method {
+                "getLedgerEntries" => serde_json::json!({
+                    "entries": [{
+                        "key": "unused-by-the-decoder",
+                        "xdr": self.pool_entry_xdr,
+                        "lastModifiedLedgerSeq": 1000
+                    }],
+                    "latestLedger": 1001
+                }),
+                "simulateTransaction" => serde_json::json!({
+                    "latestLedger": 1001,
+                    "minResourceFee": "100",
+                    "results": [{"auth": [], "xdr": self.price_scval_xdr}]
+                }),
+                _ => serde_json::json!({}),
+            };
+
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": result,
+                }))
+                .insert_header("content-type", "application/json")
+        }
+    }
+
+    /// Proves the audit pre-flight is still wired into `run_with_dependencies`'s
+    /// production path AFTER the ordered trust gate — not merely unit-tested in
+    /// isolation. Mocks the ordered gate to a genuine PASS (a matching pinned
+    /// WASM hash, an allowlisted oracle, a fresh positive price) so the run
+    /// reaches the real pre-flight call site and refuses there
+    /// (`audit.chain_key_unavailable`) because the profile's audit chain-root
+    /// key was never minted at its unique keyring coordinate. The exact
+    /// `received_requests` count of 3 (two `getLedgerEntries` — WASM-pin,
+    /// oracle-address — plus one `simulateTransaction` — oracle `lastprice`) is
+    /// what makes this discriminating: fewer requests would mean the gate was
+    /// short-circuited or bypassed before completing; more would mean an
+    /// unexpected extra round trip crept into the ordered gate.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn run_refuses_after_ordered_trust_gate_when_audit_key_unminted() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+
+        let pool_c = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        let oracle_c = stellar_agent_blend::pins::REFLECTOR_ORACLE_ALLOWLIST_TESTNET[0];
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_secs();
+
+        let (_pool_key_xdr, pool_entry_xdr) = blend_pool_instance_key_and_entry_xdr(
+            pool_c,
+            stellar_agent_blend::pins::BLEND_V2_POOL_WASM_HASH_TESTNET,
+            oracle_c,
+        );
+        let price_scval_xdr = reflector_price_data_scval_xdr(10_000_000, now_secs);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(LendTrustGateResponder {
+                pool_entry_xdr,
+                price_scval_xdr,
+            })
+            .mount(&server)
+            .await;
+        let rpc_url = server.uri();
+
+        let args = LendArgs {
+            profile: "lend-audit-preflight-test".to_owned(),
+            pool: pool_c.to_owned(),
+            from: pool_c.to_owned(),
+            op: LendOp::Supply,
+            asset: pool_c.to_owned(),
+            amount: 1_000_000,
+            override_oracle_staleness: false,
+            secondary_rpc_url: None,
+            max_staleness_secs: None,
+        };
+
+        let code = run_with_dependencies(
+            &args,
+            move |_name| {
+                let mut profile = Profile::builder_testnet_named(
+                    "lend-audit-preflight-test",
+                    "stellar-agent-signer",
+                    "lend-audit-preflight-test",
+                    "stellar-agent-nonce",
+                    "lend-audit-preflight-test",
+                )
+                .policy_engine(PolicyEngineKind::Noop)
+                .build();
+                profile.rpc_url = rpc_url.clone();
+                Ok(profile)
+            },
+            || Ok(()),
+        )
+        .await;
+
+        assert_eq!(
+            code, 1,
+            "run must refuse when the audit chain-root key is unminted, even \
+             after the ordered trust gate passes"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("request recording is enabled by default");
+        assert_eq!(
+            requests.len(),
+            3,
+            "the ordered trust gate must complete (pool WASM-pin + oracle-address \
+             read via getLedgerEntries, oracle lastprice via simulateTransaction) \
+             BEFORE the audit pre-flight refuses — a different count means the \
+             gate was bypassed, short-circuited, or the pre-flight fired at the \
+             wrong point"
         );
     }
 }

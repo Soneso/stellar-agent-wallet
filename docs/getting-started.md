@@ -160,9 +160,13 @@ and placeholder signer/nonce keyring coordinates. The full setup flow is:
 
 1. `profile init` — create the profile file (this step).
 2. [`profile enroll-signer`](#enroll-the-mcp-signer) — register the MCP signer seed.
-3. For the `v1` engine only, the full ceremony: `profile enroll-owner-key`,
-   `profile rotate-attestation-key`, `profile rotate-audit-key`, then
-   `profile sign-policy` (the normative list is the
+3. `profile rotate-audit-key` — mint the audit chain-root key. Required on
+   **every** engine, `noop` included: `init` mints the audit-log keyring
+   coordinate only, no key material, so every signing verb refuses
+   `audit.chain_key_unavailable` until this runs.
+4. For the `v1` engine only, the rest of the ceremony: `profile
+   enroll-owner-key`, `profile rotate-attestation-key`, then `profile
+   sign-policy` (the normative list is the
    [`profile init` reference entry](cli-reference/profile-and-governance.md#profile-init);
    see also [Opt in to V1](profiles.md#opt-in-to-v1)).
 
@@ -223,14 +227,16 @@ specific address in advance — refusing any other seed — set `account` to tha
 G-strkey yourself before enrolling. The `account` field on the other entries is
 only a keyring coordinate label and may stay `"default"`.
 
-The `[policy] engine` value is `noop` or `v1`:
+The `[policy] engine` value is `noop` or `v1`. Both engines require
+`profile rotate-audit-key` before any signing verb will proceed — that
+requirement is independent of the policy engine.
 
 - `noop` — the Noop engine: testnet allow-all; on mainnet it allows read-only
   commands and refuses destructive ones with `policy.engine_required`.
 - `v1` — the V1 engine: a signature-verified, typed-criteria, first-match
-  default-deny engine. The V1 engine requires the owner public key enrolled
-  (`profile enroll-owner-key`) plus the attestation and audit keyring keys
-  (`profile rotate-attestation-key`, `profile rotate-audit-key`), and a policy
+  default-deny engine. On top of the audit key above, the V1 engine requires
+  the owner public key enrolled (`profile enroll-owner-key`) plus the
+  attestation keyring key (`profile rotate-attestation-key`), and a policy
   file signed with `profile sign-policy`; enable it only after that setup.
 
 A version-2 profile must declare a `[policy]` block explicitly; there is no
@@ -294,6 +300,9 @@ The MCP fund-movement tools and the keyring-signing CLI verbs (`trustline`,
 those paths fail with `auth.keyring_not_found` until you enroll a seed. Enrollment
 reads the `S...` secret from a named environment variable, derives its public
 address, and stores it in the platform keyring — the secret is never printed.
+These same four verbs also require the profile's audit chain-root key to be
+minted (`profile rotate-audit-key <name>`, step 3 above); before that they
+refuse `audit.chain_key_unavailable`.
 
 On a profile fresh from `profile init`, `mcp_signer_default.account` is still
 the placeholder `"default"`; enrollment populates it automatically with the

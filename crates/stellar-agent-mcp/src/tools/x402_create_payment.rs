@@ -57,9 +57,9 @@ use stellar_agent_mcp_macros::mcp_tool_router;
 
 use crate::server::WalletServer;
 use crate::tools::common::{
-    decode_payment_required_input, x402_error_to_tool_result, x402_value_leg,
+    business_error_result, decode_payment_required_input, x402_error_to_tool_result, x402_value_leg,
 };
-use crate::tools::value_audit::emit_value_audit_row;
+use crate::tools::value_audit::emit_value_audit_row_with_writer;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Argument type
@@ -234,6 +234,21 @@ impl WalletServer {
             "payment_required_len": args.payment_required.len(),
         });
 
+        // ── Audit pre-flight (fail-closed) ────────────────────────────────────
+        // Proves the profile's audit chain-root key is acquirable BEFORE the
+        // dispatch gate below is consumed, the signer is loaded, or the
+        // payment is authorized. Reused (not re-acquired) for the
+        // post-signature `x402_payment_authorized` row.
+        let audit_writer = match crate::tools::value_audit::require_value_audit_writer(
+            &self.profile,
+            &self.profile_name_for_approval(),
+        ) {
+            Ok(w) => w,
+            Err(err) => {
+                return Ok(business_error_result(err.code(), err.to_string()));
+            }
+        };
+
         // ── dispatch_gate_with_value: registry lookup + policy evaluation +
         // chain_id, sizing the value criteria against `value_leg` ────────────
         // Single-shot sign tool: RequireApproval is fail-closed. The two-phase
@@ -348,8 +363,8 @@ impl WalletServer {
             PolicyDecision::Allow,
             &request_id,
         );
-        emit_value_audit_row(
-            &self.profile,
+        emit_value_audit_row_with_writer(
+            &audit_writer,
             &self.profile_name_for_approval(),
             audit_entry,
         );
@@ -604,12 +619,30 @@ mod tests {
 
     fn make_require_approval_server() -> crate::server::WalletServer {
         use std::sync::Arc;
-        let mut server = crate::server::WalletServer::new(
-            Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
-                .with_noop_engine()
-                .build(),
-        )
-        .expect("WalletServer::new must not fail in tests");
+        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+            .with_noop_engine()
+            .build();
+        // The audit pre-flight runs BEFORE the dispatch gate, so the audit
+        // chain-root key must be seeded here — otherwise the RequireApproval
+        // scenario this helper builds would never be reached; the call would
+        // refuse `audit.chain_key_unavailable` first. A FIXED key (not
+        // `rotate_keyring_secret_32`'s random one), because `AuditWriterRegistry`
+        // is a process-lifetime cache keyed by profile name: the shared
+        // `"svc"`/`"acct"` testnet placeholder is reused across many unit
+        // tests in this crate's single test binary, and a random key here
+        // would race against — and mismatch — whichever key another test
+        // using the same coordinate registered first.
+        {
+            use base64::Engine as _;
+            let coord = &profile.audit_log_hash_chain_key_id;
+            let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x37u8; 32]);
+            keyring_core::Entry::new(&coord.service, &coord.account)
+                .expect("Entry::new for audit key")
+                .set_password(&key_b64)
+                .expect("set_password for audit key");
+        }
+        let mut server = crate::server::WalletServer::new(profile)
+            .expect("WalletServer::new must not fail in tests");
         server.policy_engine = Arc::new(RequireApprovalEngine);
         server
     }

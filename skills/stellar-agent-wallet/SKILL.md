@@ -4,7 +4,7 @@ description: Operate the Stellar Agent Wallet — a self-custodial Stellar walle
 license: Apache-2.0
 compatibility: Requires the stellar-agent CLI and stellar-agent-mcp server (v0.1.0-alpha.4 public alpha; install from crates.io with a pinned version, e.g. cargo binstall stellar-agent-cli@0.1.0-alpha.4 stellar-agent-mcp@0.1.0-alpha.4, or build from source). Targets Stellar testnet (default) and mainnet.
 metadata:
-  version: "0.3.3"
+  version: "0.3.4"
   wallet_version: "0.1.0-alpha.4"
 ---
 

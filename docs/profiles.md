@@ -234,9 +234,10 @@ for flags and the envelope shape.
 
 ### Opt in to V1
 
-The ceremony is the same for both profile origins: enroll the owner key, mint
-the attestation and audit keys, and sign a policy file (the normative command
-list is the
+On top of `profile rotate-audit-key` (required on every engine, see above),
+the V1-specific ceremony, in order, is `profile enroll-owner-key`,
+`profile rotate-attestation-key`, then `profile sign-policy` (the normative
+command list is the
 [`profile init` reference entry](cli-reference/profile-and-governance.md#profile-init)).
 An `init`-minted profile already carries `engine = "v1"` — complete the
 ceremony and it becomes operational. A profile migrated from schema v1 stays

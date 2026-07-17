@@ -64,6 +64,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stellar-agent profile show` and the MCP `mcp-resource://profiles/<name>`
   resource now emit `cross_check_threshold_stroops` in their JSON output.
 
+- Breaking: every value-moving signing verb (`pay`, `claim`, `accounts create`
+  sponsored mode, `trustline`, `trade`, `lend`, `vault` deposit and withdraw,
+  the x402 authorizers, and `stellar_sep43_sign_and_submit_transaction`, CLI
+  and MCP alike) now proves the active profile's audit chain-root key is
+  acquirable BEFORE the signing key is touched or a transaction is
+  submitted, refusing `audit.chain_key_unavailable` if not. Previously, a
+  missing or unopenable audit writer logged a `tracing::warn!` and the
+  action proceeded unaudited — silently, with no `value_action_submitted`
+  row, and `lend`/`vault` had no pre-flight or audit row at all. `profile
+  init` mints the audit-log keyring coordinate only, no key material, so an
+  init-minted profile now requires `stellar-agent profile rotate-audit-key
+  <name>` before any of these verbs will sign or submit, on both policy
+  engines; `next_steps` in the `profile init` success payload names it,
+  right after `enroll-signer`. This pre-flight fails closed only for a
+  persisted `<name>.toml` profile: `pay`, `claim`, and `accounts create`
+  keep their documented zero-config posture — the in-memory profile
+  synthesized when no profile file exists stays fail-open on this specific
+  check, so the no-setup quickstart is unaffected. The post-confirm
+  `value_action_submitted` emission itself stays non-fatal — the transaction
+  has already committed by then, so refusing would help nobody.
+  `stellar_mpp_charge_commit` is unaffected: it already failed closed on the
+  same condition via its own stricter authorization-withholding mechanism.
+  The distinct failure mode of a key that loaded but whose writer could not
+  be opened (e.g. a registry path/key mismatch) now carries its own error
+  variant (`audit.chain_key_unavailable` wire code, distinct message) that
+  does not suggest `rotate-audit-key` as a remedy, since rotating the key
+  does not fix a path/key mismatch. (#88)
+
 ### Removed
 
 - Breaking (CLI): the `smart-account migrate-verifier --confirm-mainnet-migrate`

@@ -637,8 +637,16 @@ pub struct Profile {
 
     /// Path to the structured audit-log file.
     ///
-    /// Defaults to `<canonical_data_root>/audit/<profile>.jsonl` — see
-    /// [`canonical_data_root`] for the per-platform root.
+    /// When not set explicitly, [`ProfileBuilder::build`] resolves this via
+    /// [`default_audit_log_path`] — a single path shared across every
+    /// profile on the host (`<canonical_data_root>/audit.log`), NOT the
+    /// per-profile `<canonical_data_root>/audit/<profile>.jsonl` path
+    /// [`default_audit_log_path_for`] derives (used by call sites that key
+    /// audit-writer acquisition off an explicit profile name). This
+    /// contradicts the per-profile contract the rest of this schema assumes;
+    /// issue #89 tracks the redesign. Until then, an operator running
+    /// multiple profiles concurrently on the default path gets one shared
+    /// audit log unless `audit_log_path` is set explicitly per profile.
     pub audit_log_path: PathBuf,
 
     /// Disables the MCP server when `true`.

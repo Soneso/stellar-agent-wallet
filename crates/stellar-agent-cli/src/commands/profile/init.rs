@@ -25,6 +25,16 @@
 //! commands (`enroll-signer`, `enroll-owner-key`, the `rotate-*` subcommands)
 //! mint their own keys and emit their own `keyring_key_written` rows.
 //!
+//! # Audit key is required on every engine before signing
+//!
+//! Because `init` mints the `audit_log_hash_chain_key_id` keyring COORDINATE
+//! only (no key material), every value-moving signing verb refuses with
+//! `audit.chain_key_unavailable` until `stellar-agent profile rotate-audit-key
+//! <name>` mints the key — this applies to the `noop` engine exactly as it
+//! does to `v1`, since the audit pre-flight is independent of the policy
+//! engine. `next_steps` names `rotate-audit-key` in the ALWAYS list (right
+//! after `enroll-signer`) for both engines.
+//!
 //! # Engine default
 //!
 //! `--engine` defaults to `v1` — [`PolicyEngineKind::default`] is `V1`, and
@@ -32,11 +42,12 @@
 //! from the start (unlike a profile migrated from schema v1, which is set to
 //! `noop` explicitly). A v1 profile refuses MCP-server startup and
 //! policy-gated dispatch until the V1 ceremony completes (owner key,
-//! attestation key, audit key, signed policy — the normative list is in the
-//! CLI reference's `profile init` entry, mirrored in `next_steps`).
+//! attestation key, signed policy, on top of the audit key every engine
+//! needs — the normative list is in the CLI reference's `profile init` entry,
+//! mirrored in `next_steps`).
 //! `--engine noop` is the zero-ceremony testnet opt-out: the profile works
-//! immediately, with the Noop engine's testnet-allow / mainnet-read-only
-//! posture.
+//! immediately (once the audit key is minted), with the Noop engine's
+//! testnet-allow / mainnet-read-only posture.
 //!
 //! # Mainnet requires an explicit HTTPS `--rpc-url`
 //!
@@ -73,9 +84,9 @@
 //!     "engine": "v1",
 //!     "next_steps": [
 //!       "Run `stellar-agent profile enroll-signer --profile default --secret-env <VAR>` to register the MCP signer seed.",
+//!       "Run `stellar-agent profile rotate-audit-key default` to mint the audit-log hash-chain key (required before any signing verb will proceed).",
 //!       "Run `stellar-agent profile enroll-owner-key --profile default --secret-env <VAR>` to enroll the policy-file owner key.",
 //!       "Run `stellar-agent profile rotate-attestation-key default` to mint the approval-attestation key.",
-//!       "Run `stellar-agent profile rotate-audit-key default` to mint the audit-log hash-chain key.",
 //!       "Run `stellar-agent profile sign-policy --profile default --secret-env <VAR>` to sign the V1 policy file."
 //!     ]
 //!   },
@@ -146,8 +157,11 @@ struct InitData {
     /// Selected policy engine (`"v1"` or `"noop"`).
     engine: String,
     /// Operator-facing enrollment guidance: the follow-up commands needed
-    /// before the profile can sign, in order. Always names `enroll-signer`;
-    /// for the `v1` engine, also names `enroll-owner-key` and `sign-policy`.
+    /// before the profile can sign, in order. Always names `enroll-signer`
+    /// and `rotate-audit-key` (every signing verb requires the audit
+    /// chain-root key to be acquirable, regardless of policy engine); for the
+    /// `v1` engine, also names `enroll-owner-key`, `rotate-attestation-key`,
+    /// and `sign-policy`.
     next_steps: Vec<String>,
 }
 
@@ -307,14 +321,26 @@ fn run_with_dependencies(args: &InitArgs, profile_dir: &Path) -> i32 {
     };
 
     // ── Enrollment guidance ──────────────────────────────────────────────────
-    // The V1 list mirrors the normative ceremony in
+    // `rotate-audit-key` is in the ALWAYS list (both engines): every signing
+    // verb requires the profile's audit chain-root key to be acquirable
+    // BEFORE it signs or submits — `init` mints the keyring COORDINATE only,
+    // no key material, so an init-minted profile signs nothing until this
+    // step runs, Noop engine included. The remaining V1 list mirrors the
+    // normative ceremony in
     // docs/cli-reference/profile-and-governance.md#profile-init: owner key,
-    // attestation key, audit key, then the signed policy file.
-    let mut next_steps = vec![format!(
-        "Run `stellar-agent profile enroll-signer --profile {} --secret-env <VAR>` to \
-         register the MCP signer seed.",
-        args.profile
-    )];
+    // attestation key, then the signed policy file.
+    let mut next_steps = vec![
+        format!(
+            "Run `stellar-agent profile enroll-signer --profile {} --secret-env <VAR>` to \
+             register the MCP signer seed.",
+            args.profile
+        ),
+        format!(
+            "Run `stellar-agent profile rotate-audit-key {}` to mint the audit-log \
+             hash-chain key (required before any signing verb will proceed).",
+            args.profile
+        ),
+    ];
     if args.engine == PolicyEngineKind::V1 {
         next_steps.push(format!(
             "Run `stellar-agent profile enroll-owner-key --profile {} --secret-env <VAR>` \
@@ -324,11 +350,6 @@ fn run_with_dependencies(args: &InitArgs, profile_dir: &Path) -> i32 {
         next_steps.push(format!(
             "Run `stellar-agent profile rotate-attestation-key {}` to mint the \
              approval-attestation key.",
-            args.profile
-        ));
-        next_steps.push(format!(
-            "Run `stellar-agent profile rotate-audit-key {}` to mint the audit-log \
-             hash-chain key.",
             args.profile
         ));
         next_steps.push(format!(
@@ -389,6 +410,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn init_on_clean_dir_creates_a_loadable_v1_profile_with_derived_refs() {
         let dir = tempfile::tempdir().unwrap();
         let code = run_with_dependencies(&args("acceptance"), dir.path());
@@ -443,6 +465,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn init_default_name_is_loadable_without_the_synthesised_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let code = run_with_dependencies(&args("default"), dir.path());
@@ -542,6 +565,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn init_mainnet_with_rpc_url_writes_the_supplied_url() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = args("mainnet-ok");
@@ -567,6 +591,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn init_engine_noop_writes_noop() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = args("engine-noop");
@@ -590,6 +615,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn init_testnet_default_rpc_url_when_omitted() {
         let dir = tempfile::tempdir().unwrap();
         let code = run_with_dependencies(&args("testnet-default-rpc"), dir.path());
@@ -603,6 +629,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn init_testnet_explicit_rpc_url_overrides_default() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = args("testnet-explicit-rpc");

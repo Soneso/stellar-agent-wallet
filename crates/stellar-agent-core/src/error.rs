@@ -828,6 +828,69 @@ pub enum ValidationError {
         /// Display path of the existing profile file.
         path: String,
     },
+
+    /// A value-moving signing verb refused because the profile's audit
+    /// chain-root HMAC key could not be loaded from the platform keyring.
+    ///
+    /// `stellar-agent profile init` mints the audit-log keyring-coordinate
+    /// REFERENCE only — no key material — so an init-minted profile has no
+    /// audit chain-root key until `stellar-agent profile rotate-audit-key`
+    /// mints one. This is the fail-closed pre-flight: the verb proves the
+    /// audit writer is acquirable BEFORE any signing key is touched or
+    /// transaction submitted, refusing here instead of signing unaudited.
+    ///
+    /// Distinct from [`ValidationError::AuditLogNotFound`]: that variant is
+    /// `stellar-agent audit verify` finding no log file to verify (a read-path
+    /// concern); this variant is a signing verb finding the audit chain-root
+    /// key itself unavailable (a write-path pre-flight). Distinct from
+    /// [`ValidationError::AuditWriterOpenFailed`]: that variant covers a key
+    /// that loaded successfully but whose writer could not be opened (e.g. a
+    /// registry path/key mismatch) — a different remedy applies.
+    ///
+    /// # Wire code
+    ///
+    /// `"audit.chain_key_unavailable"`.
+    #[error(
+        "profile '{profile}' has no audit chain-root key available; signing refuses to \
+         proceed unaudited — run `stellar-agent profile rotate-audit-key {profile}` to mint one"
+    )]
+    AuditChainKeyUnavailable {
+        /// The profile name whose audit chain-root key is unavailable.
+        profile: String,
+    },
+
+    /// A value-moving signing verb refused because the profile's audit writer
+    /// could not be opened, even though its audit chain-root HMAC key loaded
+    /// successfully.
+    ///
+    /// `AuditWriterRegistry` is a process-lifetime cache keyed by profile
+    /// name: the first successful open for a given profile name pins its
+    /// `(log_path, hmac_key)` pair for the remainder of the process, so a
+    /// later open presenting a different path or key for the SAME profile
+    /// name fails here. Unlike [`ValidationError::AuditChainKeyUnavailable`],
+    /// running `stellar-agent profile rotate-audit-key` does not fix this — a
+    /// path or key mismatch requires resolving the conflicting registration
+    /// (or restarting the process), not minting a new key. Shares the same
+    /// fail-closed pre-flight discipline: the verb refuses here instead of
+    /// signing unaudited.
+    ///
+    /// # Wire code
+    ///
+    /// `"audit.chain_key_unavailable"` (same wire code as
+    /// [`ValidationError::AuditChainKeyUnavailable`] — the two variants carry
+    /// distinct operator-facing remedies via their `Display` text; the wire
+    /// code intentionally stays unified since both signal "the action is
+    /// unauditable, refusing").
+    #[error(
+        "profile '{profile}' has an audit chain-root key but its audit writer could not be \
+         opened; signing refuses to proceed unaudited — this is not fixed by rotating the \
+         audit key; check for a conflicting audit-log path or key registration for this \
+         profile name"
+    )]
+    AuditWriterOpenFailed {
+        /// The profile name whose audit writer could not be opened.
+        profile: String,
+    },
 }
 
 impl ValidationError {
@@ -868,6 +931,13 @@ impl ValidationError {
             Self::AuditLogNotFound { .. } => "audit.log_not_found",
             Self::MainnetRpcUrlRequired { .. } => "validation.mainnet_rpc_url_required",
             Self::ProfileAlreadyExists { .. } => "validation.profile_already_exists",
+            // Audit taxonomy code on a validation-class variant: see
+            // `AuditLogNotFound` above for the same rationale.
+            Self::AuditChainKeyUnavailable { .. } => "audit.chain_key_unavailable",
+            // Same wire code as `AuditChainKeyUnavailable` by design — see
+            // that variant's doc comment for why the `Display` text differs
+            // while the code stays unified.
+            Self::AuditWriterOpenFailed { .. } => "audit.chain_key_unavailable",
         }
     }
 }
@@ -1943,6 +2013,18 @@ mod tests {
                 },
                 "validation.profile_already_exists",
             ),
+            (
+                ValidationError::AuditChainKeyUnavailable {
+                    profile: "default".to_owned(),
+                },
+                "audit.chain_key_unavailable",
+            ),
+            (
+                ValidationError::AuditWriterOpenFailed {
+                    profile: "default".to_owned(),
+                },
+                "audit.chain_key_unavailable",
+            ),
         ];
 
         for (variant, expected_code) in cases {
@@ -2055,6 +2137,16 @@ mod tests {
                     ValidationError::ProfileAlreadyExists {
                         name: name.clone(),
                         path: path.clone(),
+                    }
+                }
+                ValidationError::AuditChainKeyUnavailable { profile } => {
+                    ValidationError::AuditChainKeyUnavailable {
+                        profile: profile.clone(),
+                    }
+                }
+                ValidationError::AuditWriterOpenFailed { profile } => {
+                    ValidationError::AuditWriterOpenFailed {
+                        profile: profile.clone(),
                     }
                 }
             });

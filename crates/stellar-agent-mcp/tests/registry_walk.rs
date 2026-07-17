@@ -1551,3 +1551,132 @@ fn value_kind_classification_matches_design() {
         "the OpaqueSign set must be exactly the three SEP-43 sign tools"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audit pre-flight companion test: every MovesValue commit/submit handler
+// calls require_value_audit_writer
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `(tool_name, source_text)` for every MCP tool that signs or submits
+/// value-moving state and therefore MUST call `require_value_audit_writer`
+/// (the fail-closed audit pre-flight) before doing so.
+///
+/// `include_str!` pulls each file in at compile time — a genuine scan of the
+/// shipped implementation, not a hand-copied duplicate. `vault.rs` appears
+/// twice (deposit and withdraw share one file); both checks are redundant
+/// against the same content, which is harmless.
+const MOVES_VALUE_COMMIT_HANDLER_SOURCES: &[(&str, &str)] = &[
+    ("stellar_pay_commit", include_str!("../src/tools/pay.rs")),
+    (
+        "stellar_create_account_commit",
+        include_str!("../src/tools/create_account.rs"),
+    ),
+    (
+        "stellar_claim_commit",
+        include_str!("../src/tools/claim.rs"),
+    ),
+    (
+        "stellar_trustline_commit",
+        include_str!("../src/tools/trustline.rs"),
+    ),
+    (
+        "stellar_blend_lend",
+        include_str!("../src/tools/blend_lend.rs"),
+    ),
+    (
+        "stellar_dex_trade",
+        include_str!("../src/tools/dex_trade.rs"),
+    ),
+    (
+        "stellar_defindex_vault_deposit",
+        include_str!("../src/tools/vault.rs"),
+    ),
+    (
+        "stellar_defindex_vault_withdraw",
+        include_str!("../src/tools/vault.rs"),
+    ),
+    (
+        "stellar_x402_authenticated_payment",
+        include_str!("../src/tools/x402_authenticated_payment.rs"),
+    ),
+    (
+        "stellar_x402_create_payment",
+        include_str!("../src/tools/x402_create_payment.rs"),
+    ),
+];
+
+/// `MovesValue` tools NOT covered by [`MOVES_VALUE_COMMIT_HANDLER_SOURCES`],
+/// with the reason each is exempt from the `require_value_audit_writer`
+/// pre-flight. This list, together with the sources array above, is the
+/// single authoritative statement of `MovesValue` audit-pre-flight coverage.
+///
+/// - `stellar_pay`, `stellar_create_account`, `stellar_claim`,
+///   `stellar_trustline`, `stellar_mpp_charge_prepare` — the simulate-phase
+///   half of a two-phase verb; each mints a nonce/preview but never signs or
+///   submits, so there is nothing to gate. The `_commit` sibling that DOES
+///   sign lives in the same source file (already covered above), except
+///   `stellar_mpp_charge_prepare`, whose sibling is the next exemption.
+/// - `stellar_mpp_charge_commit` — fails closed via
+///   `emit_value_audit_row_strict` instead: MPP's own strict-mode emission
+///   already withholds the authorization credential on any acquisition,
+///   locking, or persistence failure, so a duplicate
+///   `require_value_audit_writer` call would only change the wire code of an
+///   already fail-closed path (see `value_audit.rs`'s module doc).
+///
+/// Two related but OUT-OF-SCOPE surfaces are intentionally absent from both
+/// lists because they are not `MovesValue`-classified at all, so this test
+/// never iterates them: `stellar_friendbot` (funds from the external testnet
+/// faucet, not a keyring-signed value-moving action) and the SEP-43
+/// sign-only pair (`stellar_sep43_sign_transaction` /
+/// `stellar_sep43_sign_auth_entry`, classified `OpaqueSign` — signs a
+/// value-capable payload with no audit row; tracked by a follow-up issue, not
+/// this MovesValue-scoped test).
+const MOVES_VALUE_SIMULATE_PHASE_EXEMPT: &[&str] = &[
+    "stellar_pay",
+    "stellar_create_account",
+    "stellar_claim",
+    "stellar_trustline",
+    "stellar_mpp_charge_prepare",
+    "stellar_mpp_charge_commit",
+];
+
+/// Every `MovesValue`-classified tool either has its commit/submit handler
+/// source scanned for `require_value_audit_writer`
+/// ([`MOVES_VALUE_COMMIT_HANDLER_SOURCES`]) or is an explicitly documented
+/// exemption ([`MOVES_VALUE_SIMULATE_PHASE_EXEMPT`]).
+///
+/// The cross-check against the live inventory registry (not just a hand-typed
+/// set) means a new `MovesValue` tool added without wiring — or explicitly
+/// exempting — the audit pre-flight fails this test immediately, rather than
+/// silently shipping unaudited.
+#[test]
+fn every_moves_value_commit_handler_calls_require_value_audit_writer() {
+    use stellar_agent_core::policy::ToolValueKind;
+
+    let covered: HashSet<&str> = MOVES_VALUE_COMMIT_HANDLER_SOURCES
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    let exempt: HashSet<&str> = MOVES_VALUE_SIMULATE_PHASE_EXEMPT.iter().copied().collect();
+
+    for reg in inventory::iter::<McpToolRegistration>() {
+        if reg.value_kind != ToolValueKind::MovesValue {
+            continue;
+        }
+        assert!(
+            covered.contains(reg.name) || exempt.contains(reg.name),
+            "MovesValue tool '{}' is neither in MOVES_VALUE_COMMIT_HANDLER_SOURCES nor \
+             MOVES_VALUE_SIMULATE_PHASE_EXEMPT — a new value-moving commit/submit tool was \
+             added without wiring (or explicitly exempting) the audit pre-flight",
+            reg.name
+        );
+    }
+
+    for (tool_name, source) in MOVES_VALUE_COMMIT_HANDLER_SOURCES {
+        assert!(
+            source.contains("require_value_audit_writer"),
+            "the source file implementing '{tool_name}' does not call \
+             require_value_audit_writer — the fail-closed audit pre-flight is missing"
+        );
+    }
+}

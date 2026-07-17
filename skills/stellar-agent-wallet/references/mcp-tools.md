@@ -93,6 +93,16 @@ How `RequireApproval` is satisfied depends on tool shape:
   `policy.approval_required_unsupported`; the wallet never signs without a
   verified approval.
 
+Separately from the policy verdict, every commit/submit tool that signs or
+moves value proves the active profile's audit chain-root key is acquirable
+BEFORE the signer is loaded or anything is submitted, refusing
+`audit.chain_key_unavailable` otherwise (see
+[Approvals and audit](approvals-and-audit.md#fail-closed-on-an-unminted-audit-key)).
+`stellar_mpp_charge_commit` is exempt — it already fails closed on the same
+condition through its own stricter mechanism. The SEP-43 sign-only pair
+(`stellar_sep43_sign_transaction`, `stellar_sep43_sign_auth_entry`) is not yet
+covered by this pre-flight.
+
 ## chain_id requirement
 
 `chain_id` carries the CAIP-2 chain id (`stellar:testnet` or `stellar:mainnet`;
