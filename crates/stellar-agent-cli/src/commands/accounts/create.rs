@@ -58,10 +58,27 @@
 //! or the permissive `NoopPolicyEngine` (`Noop` profiles), mirroring the
 //! `stellar_create_account` MCP tool's dispatch gate. When `--profile` names
 //! no persisted `<name>.toml` file, an in-memory `Noop`-engine testnet
-//! profile is synthesized so sponsored mode keeps working without an
-//! authored profile file — and without ever touching the OS keyring.
-//! Friendbot mode is not gated: it funds the new account from the external
-//! Friendbot faucet and debits no wallet-held funds, and touches no keyring.
+//! profile is synthesized (tagged
+//! [`crate::commands::policy_engine::ProfileOrigin::Synthesized`]) so
+//! sponsored mode keeps working without an authored profile file. Friendbot
+//! mode is not gated: it funds the new account from the external Friendbot
+//! faucet and debits no wallet-held funds, and touches no keyring.
+//!
+//! # Audit pre-flight (sponsored mode only; fail-closed for a persisted
+//! profile, fail-open for the synthesized zero-config profile)
+//!
+//! Before `sponsored_create` touches the signer or submits, sponsored mode
+//! resolves the audit writer via
+//! [`crate::commands::value_audit::require_value_audit_writer_for_origin`].
+//! For a persisted `<name>.toml` profile this fails closed with
+//! `audit.chain_key_unavailable` if the profile's audit chain-root HMAC key
+//! is not acquirable — an init-minted profile has no audit key until
+//! `stellar-agent profile rotate-audit-key <name>` mints one. For the
+//! synthesized zero-config profile the pre-flight stays fail-open (warn-only,
+//! no refusal). Friendbot mode signs nothing and emits no audit row, so it is
+//! exempt (same rationale as the policy gate above). Where a writer was
+//! acquired, it is reused (not re-acquired) for the post-confirm
+//! `value_action_submitted` row.
 //!
 //! # Behavior
 //!
@@ -77,7 +94,7 @@ use rand_core::OsRng;
 use stellar_agent_core::StellarAmount;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{AuthError, NetworkError, ValidationError, WalletError};
-use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile};
+use stellar_agent_core::profile::schema::Profile;
 use zeroize::Zeroizing;
 
 use stellar_agent_network::builder::ClassicOpBuilder;
@@ -92,7 +109,7 @@ use stellar_agent_network::{
 use stellar_agent_network::{FriendbotResult, fund_with_friendbot};
 
 use crate::commands::policy_engine::{
-    build_v1_policy_engine, caip2_chain_id_for_network, create_policy_args,
+    ProfileOrigin, build_v1_policy_engine, caip2_chain_id_for_network, create_policy_args,
     evaluate_value_moving_policy, load_profile_or_synthesize_testnet,
 };
 use crate::common::network::TargetNetwork;
@@ -399,7 +416,7 @@ async fn run_with_dependencies<LoadProfile, InitKeyring>(
     init_keyring: InitKeyring,
 ) -> i32
 where
-    LoadProfile: Fn(&str) -> Result<Profile, String>,
+    LoadProfile: Fn(&str) -> Result<(Profile, ProfileOrigin), String>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
     if args.fund_with_friendbot {
@@ -572,9 +589,9 @@ fn build_friendbot_result(new_account: &NewAccount, fb: &FriendbotResult) -> Cre
 ///
 /// `profile` is the already-resolved profile from `run_sponsored`'s
 /// top-of-gated-path load; this function does not re-resolve it, so the
-/// platform keyring store `run_sponsored` conditionally initialised for a V1
-/// engine remains registered for the `build_v1_policy_engine` owner-key read
-/// below.
+/// platform keyring store `run_sponsored` unconditionally initialised (ahead
+/// of its origin-aware audit pre-flight) remains registered for the
+/// `build_v1_policy_engine` owner-key read below.
 fn evaluate_create_policy(
     args: &CreateArgs,
     profile: &Profile,
@@ -633,7 +650,7 @@ async fn run_sponsored<LoadProfile, InitKeyring>(
     init_keyring: InitKeyring,
 ) -> i32
 where
-    LoadProfile: Fn(&str) -> Result<Profile, String>,
+    LoadProfile: Fn(&str) -> Result<(Profile, ProfileOrigin), String>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
     // Sponsored mode — mainnet write forbidden.
@@ -694,14 +711,28 @@ where
         }
     };
 
-    // ── Resolve profile & conditionally initialise the platform keyring ──────
-    // Must happen before `sponsored_create`'s network build:
-    // `build_v1_policy_engine` (invoked from `evaluate_create_policy` below)
-    // reads the owner PUBLIC key from the OS keyring only when
-    // `profile.policy.engine == V1`, so the platform keyring store is
-    // registered here — and only then — ahead of that read. The Noop-engine
-    // (zero-config) path never touches the keyring.
-    let profile = match load_profile(&args.profile) {
+    // ── Resolve profile & unconditionally attempt to initialise the platform
+    // keyring ──────────────────────────────────────────────────────────────
+    // Must happen before `sponsored_create`'s network build. Unconditional
+    // (not gated on `profile.policy.engine`): the origin-aware audit
+    // pre-flight below reads the profile's audit chain-root HMAC key from the
+    // platform keyring regardless of the policy engine — a `Noop` engine
+    // reads no OWNER key, but the audit key is a separate, engine-independent
+    // requirement — so the store must be registered before that read even on
+    // a `Noop`-engine profile.
+    //
+    // A failed initialisation attempt is origin-aware: [`ProfileOrigin::Persisted`]
+    // treats it as fatal — an operator who authored a profile file is
+    // expected to have a working platform keyring for both the fail-closed
+    // audit pre-flight and the keyring-backed owner-key read.
+    // [`ProfileOrigin::Synthesized`] (the zero-config quickstart — no profile
+    // file, no keyring ceremony the operator opted into) logs a
+    // `tracing::warn!` and continues: the origin-aware audit pre-flight run
+    // next already tolerates the SAME acquisition failure for a synthesized
+    // profile, so a host with no platform keyring store (e.g. a container
+    // without a Secret Service) never blocks the documented no-setup
+    // quickstart.
+    let (profile, origin) = match load_profile(&args.profile) {
         Ok(p) => p,
         Err(msg) => {
             print_error(
@@ -711,18 +742,42 @@ where
             return 1;
         }
     };
-    // `PolicyEngineKind` is `#[non_exhaustive]` (a foreign-crate enum), so this
-    // cannot be a wildcard-free exhaustive match. `Noop` is the only engine that
-    // reads no owner key; every other engine — `V1` and any future variant —
-    // needs the keyring store registered before the gate's owner-key read.
-    // Default to initialising (fail toward registering the store) so a
-    // newly-added engine is never silently left without it.
-    if !matches!(profile.policy.engine, PolicyEngineKind::Noop)
-        && let Err(e) = init_keyring()
-    {
-        print_error(&Envelope::<()>::err(&e), args.output);
-        return 1;
+    if let Err(e) = init_keyring() {
+        match origin {
+            ProfileOrigin::Persisted => {
+                print_error(&Envelope::<()>::err(&e), args.output);
+                return 1;
+            }
+            ProfileOrigin::Synthesized => {
+                tracing::warn!(
+                    profile = %args.profile,
+                    error = %e,
+                    "platform keyring store unavailable for the synthesized zero-config \
+                     profile; continuing warn-only — the audit pre-flight below already \
+                     tolerates this for a synthesized profile"
+                );
+            }
+        }
     }
+
+    // ── Audit pre-flight (sponsored mode only; fail-closed for a persisted
+    // profile, fail-open for the synthesized zero-config profile) ───────────
+    // Friendbot mode signs nothing and is not gated — see the module doc
+    // comment. Proves the audit writer is acquirable BEFORE
+    // `sponsored_create` touches the signer or submits. Where `Some`, the
+    // writer is reused (not re-acquired) for the post-confirm
+    // `value_action_submitted` row.
+    let audit_writer = match crate::commands::value_audit::require_value_audit_writer_for_origin(
+        &profile,
+        &args.profile,
+        origin,
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            print_error(&Envelope::<()>::err(&e), args.output);
+            return 1;
+        }
+    };
 
     // ── Fetch sponsor account state (feeds the policy gate's account_view) ──
     // This fetch runs BEFORE the gate, mirroring the MCP twin's
@@ -789,11 +844,15 @@ where
                 None,
                 &audit_request_id,
             );
-            crate::commands::value_audit::emit_value_audit_row(
-                &profile,
-                &args.profile,
-                audit_entry,
-            );
+            // Skipped entirely when no writer was acquired (the synthesized
+            // zero-config profile with an unminted audit key).
+            if let Some(writer) = &audit_writer {
+                crate::commands::value_audit::emit_value_audit_row_with_writer(
+                    writer,
+                    &args.profile,
+                    audit_entry,
+                );
+            }
             crate::commands::policy_engine::record_confirmed_value_moving(
                 "accounts create",
                 &profile,
@@ -867,9 +926,10 @@ async fn sponsored_create(
         // 3. attach_signature exactly once.
         // 4. Drop SoftwareSigningKey -> SecretBox zeroised.
         //
-        // `accounts create` has no audit-writer infrastructure (no
-        // `--profile` flag): a degraded unlock is surfaced only via
-        // `Wallet::unlock`'s own `tracing::warn!`.
+        // A degraded mlock unlock is a separate, orthogonal concern from the
+        // audit pre-flight `run_sponsored` already ran before this function:
+        // it is surfaced only via `Wallet::unlock`'s own `tracing::warn!`,
+        // not via the audit writer.
         let SignerCeremonyOutcome {
             signer,
             mlock_degradation: _,
@@ -1026,6 +1086,8 @@ mod tests {
     )]
 
     use std::sync::Arc;
+
+    use stellar_agent_core::profile::schema::PolicyEngineKind;
 
     use super::*;
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
@@ -1731,7 +1793,7 @@ mod tests {
             &args,
             move |_name| {
                 loaded_writer.store(true, Ordering::SeqCst);
-                Ok(Profile::builder_testnet_named(
+                let profile = Profile::builder_testnet_named(
                     "keyring-order-test",
                     "stellar-agent-signer",
                     "keyring-order-test",
@@ -1739,7 +1801,8 @@ mod tests {
                     "keyring-order-test",
                 )
                 .policy_engine(PolicyEngineKind::V1)
-                .build())
+                .build();
+                Ok((profile, ProfileOrigin::Persisted))
             },
             move || {
                 assert!(
@@ -1764,30 +1827,25 @@ mod tests {
         );
     }
 
-    /// When the resolved profile's engine is `Noop` (the zero-config
-    /// default), the keyring initialiser must NOT be invoked — the `Noop`
-    /// engine never reads the owner key from the keyring.
+    /// Even when the resolved profile's engine is `Noop`, the keyring
+    /// initialiser IS invoked — the origin-aware audit pre-flight
+    /// (`require_value_audit_writer_for_origin`) reads the profile's audit
+    /// chain-root HMAC key from the platform keyring regardless of the policy
+    /// engine, so `run_sponsored` registers the store unconditionally.
     #[tokio::test]
-    async fn run_does_not_initialise_keyring_when_engine_is_noop() {
+    async fn run_initialises_keyring_even_when_engine_is_noop() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let init_invoked = Arc::new(AtomicBool::new(false));
         let init_writer = Arc::clone(&init_invoked);
 
-        // All arg resolution (sponsor, starting balance, new-account
-        // strkey) succeeds with no network touched, so `load_profile` is
-        // genuinely reached and the Noop branch is exercised. The
-        // non-routable `rpc_url` ensures that if `sponsored_create`'s
-        // subsequent RPC call were reached, it fails immediately with a
-        // connection error rather than making a real network round trip.
-        let mut args = minimal_sponsored_args();
-        args.rpc_url = "http://127.0.0.1:1".to_owned();
+        let args = minimal_sponsored_args();
 
         let code = run_with_dependencies(
             &args,
             |_name| {
-                Ok(Profile::builder_testnet_named(
+                let profile = Profile::builder_testnet_named(
                     "keyring-order-test-noop",
                     "stellar-agent-signer",
                     "keyring-order-test-noop",
@@ -1795,23 +1853,84 @@ mod tests {
                     "keyring-order-test-noop",
                 )
                 .policy_engine(PolicyEngineKind::Noop)
-                .build())
+                .build();
+                Ok((profile, ProfileOrigin::Persisted))
             },
             move || {
                 init_writer.store(true, Ordering::SeqCst);
-                Ok(())
+                Err(WalletError::Auth(AuthError::KeyringNotFound {
+                    name: "keyring-order-test-noop-sentinel".to_owned(),
+                }))
             },
         )
         .await;
 
         assert!(
-            !init_invoked.load(Ordering::SeqCst),
-            "the Noop engine must never trigger the keyring store initialisation"
+            init_invoked.load(Ordering::SeqCst),
+            "a Noop-engine profile must still trigger keyring store initialisation, \
+             because the audit pre-flight reads the audit key regardless of engine"
         );
         assert_eq!(
             code, 1,
-            "the non-routable RPC endpoint must still fail the operation \
-             (unrelated to the keyring gate)"
+            "run must surface the keyring init failure instead of reaching the network build"
+        );
+    }
+
+    /// A [`ProfileOrigin::Synthesized`] profile's sponsored run must NOT exit
+    /// fatally at the keyring-init step: it warns and continues past both the
+    /// keyring-init failure and the origin-aware audit pre-flight, reaching
+    /// the sponsor-account RPC fetch and the later "no signer configured"
+    /// refusal (`AuthError::KeyringLocked`, raised only once
+    /// `sponsored_create` reaches its signing branch) — a DIFFERENT, later
+    /// error than the injected keyring-init failure
+    /// (`AuthError::KeyringNotFound`). The `received_requests` assertion is
+    /// what makes this an ordering proof rather than a tautology: if the
+    /// keyring-init failure were still unconditionally fatal, the run would
+    /// exit before the mock server ever recorded a request. Catches the
+    /// regression where this failure was fatal regardless of origin, which
+    /// would break the zero-config quickstart on any host without a platform
+    /// keyring (e.g. a container without a Secret Service).
+    #[tokio::test]
+    async fn run_synthesized_profile_tolerates_keyring_init_failure() {
+        let server = mount_create_build_rpc("333").await;
+        let mut args = minimal_sponsored_args();
+        args.rpc_url = server.uri();
+
+        let code = run_with_dependencies(
+            &args,
+            |name| {
+                let profile = Profile::builder_testnet_named(
+                    name,
+                    "stellar-agent-signer",
+                    name,
+                    "stellar-agent-nonce",
+                    name,
+                )
+                .policy_engine(PolicyEngineKind::Noop)
+                .build();
+                Ok((profile, ProfileOrigin::Synthesized))
+            },
+            || {
+                Err(WalletError::Auth(AuthError::KeyringNotFound {
+                    name: "create-zero-config-keyring-init-failure-sentinel".to_owned(),
+                }))
+            },
+        )
+        .await;
+
+        assert_eq!(
+            code, 1,
+            "the run must still refuse for lack of a configured signer, not for the \
+             tolerated keyring-init failure"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("request recording is enabled by default");
+        assert!(
+            !requests.is_empty(),
+            "execution must reach the sponsor-account RPC fetch, proving the synthesized \
+             profile's keyring-init failure was tolerated rather than treated as fatal"
         );
     }
 }

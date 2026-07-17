@@ -93,7 +93,16 @@ properties:
   binds the approval nonce, the envelope SHA-256, and the OS process uid.
 - Tamper-evident audit log. Every tool invocation and lifecycle event is appended to a
   per-profile hash-chained JSONL audit log. Argument values are never logged — only key
-  names. The chain is verified end-to-end with `audit verify`.
+  names. The chain is verified end-to-end with `audit verify`. Every value-moving signing
+  or submitting verb (`pay`, `claim`, `accounts create`, `trustline`, `trade`, `lend`,
+  `vault`, the x402 payment tools) proves its audit writer is acquirable BEFORE the
+  signing key is touched or a transaction is submitted, refusing
+  (`audit.chain_key_unavailable`) rather than signing unaudited if the profile's audit
+  chain-root key was never minted. This pre-flight fails closed for a persisted profile;
+  the zero-config synthesized profile `pay`/`claim`/`accounts create` fall back to when no
+  `<name>.toml` file exists stays fail-open for this specific check, matching its
+  documented no-profile-required posture. The SEP-43 sign-only pair (`signTransaction`,
+  `signAuthEntry`) is not yet covered by this pre-flight (tracked in issue #91).
 
 The core library compiles under `#![forbid(unsafe_code)]`. Logging redaction is enforced
 throughout: secret material is never written to logs, and account, strkey, and

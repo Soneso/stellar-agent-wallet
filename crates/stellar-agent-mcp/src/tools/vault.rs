@@ -489,6 +489,25 @@ impl WalletServer {
         );
         let preview_summary = preview.summary();
 
+        // ── Audit pre-flight (fail-closed) ────────────────────────────────────
+        // Proves the profile's audit chain-root key is acquirable BEFORE the
+        // dispatch gate below is consumed, the signer is loaded, or the
+        // deposit is submitted. Reused (not re-acquired) for
+        // `DefiAdapterCtx::audit_writer`.
+        let audit_profile_name = self.profile_name_for_approval();
+        let audit_writer = match crate::tools::value_audit::require_value_audit_writer(
+            &self.profile,
+            &audit_profile_name,
+        ) {
+            Ok(w) => w,
+            Err(err) => {
+                return Ok(crate::tools::common::business_error_result(
+                    err.code(),
+                    err.to_string(),
+                ));
+            }
+        };
+
         // ── DeFi dispatch gate ────────────────────────────────────────────────
         let gate_result = dispatch_gate("vault", &args.vault_address);
         let witness = match gate_result {
@@ -551,13 +570,11 @@ impl WalletServer {
         // classic commit verbs use, and its confirmed submit advances the
         // same floor.
         ctx.sequence_floor = Some(&sequence_floor_hook);
-        // Thread the audit writer + gate-derived legs so the adapter emits the
-        // ValueActionSubmitted row after a confirmed submit (non-fatal).
-        let audit_profile_name = self.profile_name_for_approval();
-        ctx.audit_writer = crate::tools::value_audit::acquire_value_audit_writer(
-            &self.profile,
-            &audit_profile_name,
-        );
+        // Thread the pre-flight-acquired audit writer + gate-derived legs so
+        // the adapter emits the ValueActionSubmitted row after a confirmed
+        // submit (non-fatal past this point — the pre-flight above is what
+        // fails closed).
+        ctx.audit_writer = Some(std::sync::Arc::clone(&audit_writer));
         ctx.audit_legs = Some(&audit_legs);
         ctx.audit_tool = Some("stellar_defindex_vault_deposit");
 
@@ -900,6 +917,25 @@ impl WalletServer {
         );
         let preview_summary = preview.summary();
 
+        // ── Audit pre-flight (fail-closed) ────────────────────────────────────
+        // Proves the profile's audit chain-root key is acquirable BEFORE the
+        // dispatch gate below is consumed, the signer is loaded, or the
+        // withdrawal is submitted. Reused (not re-acquired) for
+        // `DefiAdapterCtx::audit_writer`.
+        let audit_profile_name = self.profile_name_for_approval();
+        let audit_writer = match crate::tools::value_audit::require_value_audit_writer(
+            &self.profile,
+            &audit_profile_name,
+        ) {
+            Ok(w) => w,
+            Err(err) => {
+                return Ok(crate::tools::common::business_error_result(
+                    err.code(),
+                    err.to_string(),
+                ));
+            }
+        };
+
         // ── DeFi dispatch gate ────────────────────────────────────────────────
         let gate_result = dispatch_gate("vault", &args.vault_address);
         let witness = match gate_result {
@@ -961,13 +997,11 @@ impl WalletServer {
         // classic commit verbs use, and its confirmed submit advances the
         // same floor.
         ctx.sequence_floor = Some(&sequence_floor_hook);
-        // Thread the audit writer + gate-derived leg so the adapter emits the
-        // ValueActionSubmitted row after a confirmed submit (non-fatal).
-        let audit_profile_name = self.profile_name_for_approval();
-        ctx.audit_writer = crate::tools::value_audit::acquire_value_audit_writer(
-            &self.profile,
-            &audit_profile_name,
-        );
+        // Thread the pre-flight-acquired audit writer + gate-derived leg so
+        // the adapter emits the ValueActionSubmitted row after a confirmed
+        // submit (non-fatal past this point — the pre-flight above is what
+        // fails closed).
+        ctx.audit_writer = Some(std::sync::Arc::clone(&audit_writer));
         ctx.audit_legs = Some(&audit_legs);
         ctx.audit_tool = Some("stellar_defindex_vault_withdraw");
 

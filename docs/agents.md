@@ -211,3 +211,7 @@ server transaction instead. The complete testnet-only workflow is in
 - The operator verifies the tamper-evident log with `stellar-agent audit verify`.
   Argument values are never logged — only key names — so passing data through the
   wallet does not leak it into the audit trail.
+- A commit/submit tool refuses `audit.chain_key_unavailable` if the profile's audit
+  chain-root key was never minted (an `init`-minted profile, before the operator runs
+  `rotate-audit-key`). This is an operator setup gap, not agent misuse: report the
+  error back and stop retrying until the operator has minted the key.

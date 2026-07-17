@@ -202,7 +202,7 @@ impl WalletServer {
         use stellar_agent_sep43::StellarAgentModule;
         use stellar_agent_sep43::module::ModuleAdapter;
 
-        use crate::tools::value_audit::emit_value_audit_row;
+        use crate::tools::value_audit::emit_value_audit_row_with_writer;
 
         // ── Telemetry preamble ────────────────────────────────────────────────
         // Redact account IDs to first-5-last-5; tx XDR length only (no content).
@@ -210,6 +210,24 @@ impl WalletServer {
             "chain_id": &args.chain_id,
             "transaction_xdr_len": args.transaction_xdr.len(),
         });
+
+        // ── Audit pre-flight (fail-closed) ────────────────────────────────────
+        // Proves the profile's audit chain-root key is acquirable BEFORE the
+        // dispatch gate below is consumed, the signer is loaded, or the
+        // transaction is submitted. Reused (not re-acquired) for the
+        // post-confirm `opaque_action_submitted` row.
+        let audit_writer = match crate::tools::value_audit::require_value_audit_writer(
+            &self.profile,
+            &self.profile_name_for_approval(),
+        ) {
+            Ok(w) => w,
+            Err(err) => {
+                return Ok(crate::tools::common::business_error_result(
+                    err.code(),
+                    err.to_string(),
+                ));
+            }
+        };
 
         // ── dispatch_gate: registry lookup + policy evaluation + chain_id ─────
         // Single-shot sign tool: a RequireApproval verdict is fail-closed.
@@ -361,8 +379,8 @@ impl WalletServer {
                     None,
                     &request_id,
                 );
-                emit_value_audit_row(
-                    &self.profile,
+                emit_value_audit_row_with_writer(
+                    &audit_writer,
                     &self.profile_name_for_approval(),
                     audit_entry,
                 );
@@ -592,12 +610,30 @@ mod tests {
 
     fn make_require_approval_server() -> crate::server::WalletServer {
         use std::sync::Arc;
-        let mut server = crate::server::WalletServer::new(
-            Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
-                .with_noop_engine()
-                .build(),
-        )
-        .expect("WalletServer::new must not fail in tests");
+        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+            .with_noop_engine()
+            .build();
+        // The audit pre-flight runs BEFORE the dispatch gate, so the audit
+        // chain-root key must be seeded here — otherwise the RequireApproval
+        // scenario this helper builds would never be reached; the call would
+        // refuse `audit.chain_key_unavailable` first. A FIXED key (not
+        // `rotate_keyring_secret_32`'s random one), because `AuditWriterRegistry`
+        // is a process-lifetime cache keyed by profile name: the shared
+        // `"svc"`/`"acct"` testnet placeholder is reused across many unit
+        // tests in this crate's single test binary, and a random key here
+        // would race against — and mismatch — whichever key another test
+        // using the same coordinate registered first.
+        {
+            use base64::Engine as _;
+            let coord = &profile.audit_log_hash_chain_key_id;
+            let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x37u8; 32]);
+            keyring_core::Entry::new(&coord.service, &coord.account)
+                .expect("Entry::new for audit key")
+                .set_password(&key_b64)
+                .expect("set_password for audit key");
+        }
+        let mut server = crate::server::WalletServer::new(profile)
+            .expect("WalletServer::new must not fail in tests");
         server.policy_engine = Arc::new(RequireApprovalEngine);
         server
     }

@@ -249,6 +249,34 @@ fn owner_pubkey_b64(profile_name: &str, verb: &str) -> Result<String, String> {
 // Zero-config profile resolution for the value-moving classic verbs
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Origin of a profile resolved by [`load_profile_or_synthesize_testnet`].
+///
+/// Two origin-aware behaviors key off this distinction, neither engine-aware:
+/// - Platform keyring store initialisation (e.g. `pay::resolve_profile_and_keyring`,
+///   the analogous helper in `claim`, and the inline attempt in `accounts
+///   create`'s sponsored path) logs a `tracing::warn!` and continues past a
+///   failed attempt for a [`Self::Synthesized`] profile, so a host with no
+///   platform keyring store (e.g. a container without a Secret Service) never
+///   blocks the zero-config quickstart's signing.
+/// - The audit pre-flight (see
+///   [`crate::commands::value_audit::require_value_audit_writer_for_origin`])
+///   stays fail-open (warn-only) for a [`Self::Synthesized`] profile when the
+///   audit chain-root key is unavailable.
+///
+/// A [`Self::Persisted`] profile fails closed on both conditions instead: an
+/// operator who authored a profile file — under either policy engine — is
+/// expected to have a working platform keyring and to have run
+/// `stellar-agent profile rotate-audit-key <name>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProfileOrigin {
+    /// Loaded from an operator-authored `<name>.toml` file.
+    Persisted,
+    /// No profile file exists; an in-memory `Noop`-engine testnet profile was
+    /// synthesized so `pay` / `claim` / `accounts create` keep working without
+    /// an authored profile.
+    Synthesized,
+}
+
 /// Loads the named profile, falling back to an in-memory `Noop`-engine
 /// testnet profile when no `<name>.toml` file exists.
 ///
@@ -262,16 +290,23 @@ fn owner_pubkey_b64(profile_name: &str, verb: &str) -> Result<String, String> {
 /// opted into. Once an operator persists a real profile — `V1` or `Noop` — that
 /// file's configured engine governs instead.
 ///
+/// Returns the resolved profile alongside its [`ProfileOrigin`], so callers
+/// can apply origin-aware policy to the audit pre-flight (see
+/// [`crate::commands::value_audit::require_value_audit_writer_for_origin`])
+/// without re-deriving which branch fired.
+///
 /// # Errors
 ///
 /// Returns `Err(message)` for any profile-load failure OTHER than `NotFound`
 /// (a malformed TOML file, an unsupported schema version, etc.) — those are
 /// genuine configuration errors the synthesis fallback must not mask.
-pub(crate) fn load_profile_or_synthesize_testnet(name: &str) -> Result<Profile, String> {
+pub(crate) fn load_profile_or_synthesize_testnet(
+    name: &str,
+) -> Result<(Profile, ProfileOrigin), String> {
     match profile_loader::load(name, None) {
-        Ok(p) => Ok(p),
+        Ok(p) => Ok((p, ProfileOrigin::Persisted)),
         Err(profile_loader::ProfileLoadError::NotFound { .. }) => {
-            Ok(Profile::builder_testnet_named(
+            let profile = Profile::builder_testnet_named(
                 name,
                 "stellar-agent-signer",
                 name,
@@ -279,7 +314,8 @@ pub(crate) fn load_profile_or_synthesize_testnet(name: &str) -> Result<Profile, 
                 name,
             )
             .policy_engine(PolicyEngineKind::Noop)
-            .build())
+            .build();
+            Ok((profile, ProfileOrigin::Synthesized))
         }
         Err(e) => Err(format!("profile '{name}' failed to load: {e}")),
     }
@@ -477,7 +513,7 @@ pub(crate) fn evaluate_value_moving_policy(
 /// [`ToolDescriptor`] shape [`evaluate_value_moving_policy`] used, so rule
 /// matching is unchanged. `effects` MUST be the SAME [`stellar_agent_core::policy::v1::ValueEffects`]
 /// the gate sized (single-derivation invariant) — the same value already
-/// passed to `emit_value_action_submitted_row` at this call site.
+/// passed to `emit_value_action_submitted_row_with_writer` at this call site.
 ///
 /// Non-fatal: mirrors the `value_action_submitted` audit-row emission
 /// discipline (the on-chain action already committed). A rebuild failure or a
@@ -1700,6 +1736,30 @@ mod tests {
         );
     }
 
+    /// With no `<name>.toml` file at all, `load_profile_or_synthesize_testnet`
+    /// returns the synthesized in-memory `Noop`-engine profile tagged
+    /// [`ProfileOrigin::Synthesized`] — the tag the audit pre-flight relies on
+    /// to stay fail-open for the zero-config quickstart.
+    #[test]
+    #[serial_test::serial]
+    fn absent_profile_file_synthesizes_noop_tagged_synthesized() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+
+        let (profile, origin) = load_profile_or_synthesize_testnet("never-authored")
+            .expect("an absent profile file must synthesize, not error");
+        assert_eq!(
+            origin,
+            ProfileOrigin::Synthesized,
+            "an absent profile file must resolve as Synthesized"
+        );
+        assert!(
+            matches!(profile.policy.engine, PolicyEngineKind::Noop),
+            "the synthesized profile must force the Noop engine regardless of \
+             Profile::builder_testnet's own default"
+        );
+    }
+
     /// A v1 profile whose policy file carries a signature that does not
     /// verify under the enrolled owner key (forged/corrupted) must refuse via
     /// `Err` from `build_v1_policy_engine` — the engine must not silently
@@ -1758,7 +1818,13 @@ mod tests {
             pubkey_file.as_os_str(),
         );
 
-        let profile = load_profile_or_synthesize_testnet(name).expect("v1 profile file must load");
+        let (profile, origin) =
+            load_profile_or_synthesize_testnet(name).expect("v1 profile file must load");
+        assert_eq!(
+            origin,
+            ProfileOrigin::Persisted,
+            "a written <name>.toml file must resolve as Persisted, not Synthesized"
+        );
         let result = build_v1_policy_engine("pay", &profile.policy.engine, &profile);
         assert!(
             result.is_err(),
@@ -1844,7 +1910,13 @@ mod tests {
             pubkey_file.as_os_str(),
         );
 
-        let profile = load_profile_or_synthesize_testnet(name).expect("v1 profile file must load");
+        let (profile, origin) =
+            load_profile_or_synthesize_testnet(name).expect("v1 profile file must load");
+        assert_eq!(
+            origin,
+            ProfileOrigin::Persisted,
+            "a written <name>.toml file must resolve as Persisted, not Synthesized"
+        );
         let effects = ValueEffects::single(ValueLeg {
             kind: ActionKind::Payment,
             amount: Some(600_000_000), // 60 XLM

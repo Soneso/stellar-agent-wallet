@@ -144,6 +144,17 @@ keyring code: they are folded into the uniform `policy.approval_required` so the
 approval path cannot be probed. Recovery is the same as for any
 `policy.approval_required`.
 
+## Audit-key code
+
+| Code | Meaning | Agent action |
+|---|---|---|
+| `audit.chain_key_unavailable` | A value-moving signing verb (`pay`, `claim`, `accounts create` sponsored mode, `trustline`, `trade`, `lend`, `vault`, and their MCP equivalents, plus the x402 payment tools and `stellar_sep43_sign_and_submit_transaction`) proved the profile's audit chain-root key is NOT acquirable, before touching the signer or submitting anything. `profile init` mints the audit-log keyring coordinate only, no key material. This pre-flight fails closed only for a persisted profile — the zero-config synthesized profile `pay`/`claim`/`accounts create` fall back to when no profile file exists stays fail-open here. The SEP-43 sign-only pair (`signTransaction`, `signAuthEntry`) is not yet covered. | Not agent-recoverable. The operator must run `stellar-agent profile rotate-audit-key <name>`, then retry. |
+
+Distinct from `io.audit_writer_setup` above, which covers smart-account
+governance writes (rule changes, timelock, multicall) failing to open their
+own audit writer (unwritable directory, lock contention) — a narrower,
+unrelated check that does not depend on the profile's audit chain-root key.
+
 ## SEP-24 interactive POST contract
 
 `stellar_sep24_interactive_url` performs the interactive deposit/withdraw
@@ -193,5 +204,6 @@ query authorization status and reconcile any known server transaction.
 - Hard policy refusal (`policy.deny.*`, `policy.engine_required`,
   `network.mainnet_write_forbidden`): do not retry; only the operator can change
   policy or network posture.
-- Environment or key problems (`keyring.*`, `mcp.disabled_per_profile`, other
-  non-zero startup exits): operator-side; not agent-recoverable at runtime.
+- Environment or key problems (`keyring.*`, `mcp.disabled_per_profile`,
+  `audit.chain_key_unavailable`, other non-zero startup exits): operator-side;
+  not agent-recoverable at runtime.

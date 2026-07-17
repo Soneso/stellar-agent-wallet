@@ -28,6 +28,13 @@ Create a new profile file with `stellar-agent profile init` (default `default`,
 testnet, `engine = "v1"`); mainnet requires an explicit `https://` `--rpc-url`.
 See [cli-reference.md](cli-reference.md) for flags.
 
+`init` mints the `audit_log_hash_chain_key_id` keyring COORDINATE only, no key
+material. Run `stellar-agent profile enroll-signer` then
+`stellar-agent profile rotate-audit-key <name>` next — required before any
+signing verb will proceed, on **either** policy engine — or every value-moving
+CLI command and MCP tool refuses `audit.chain_key_unavailable`. See
+[Approvals and audit](approvals-and-audit.md#fail-closed-on-an-unminted-audit-key).
+
 ## Loader source order
 
 A profile is assembled from three layered sources. Higher-priority sources
@@ -263,12 +270,12 @@ the seed does not derive to that exact address, printing the address to set
 
 ### Opt in to V1
 
-The ceremony, in order, is `profile enroll-owner-key`,
-`profile rotate-attestation-key`, `profile rotate-audit-key`, then
-`profile sign-policy`. An `init`-minted profile already carries
-`engine = "v1"` — complete the ceremony and it becomes operational. A profile
-migrated from schema v1 stays on `noop`; after the ceremony, set the engine in
-the profile TOML:
+On top of `profile rotate-audit-key` (required on every engine, see above),
+the V1-specific ceremony, in order, is `profile enroll-owner-key`,
+`profile rotate-attestation-key`, then `profile sign-policy`. An
+`init`-minted profile already carries `engine = "v1"` — complete the ceremony
+and it becomes operational. A profile migrated from schema v1 stays on
+`noop`; after the ceremony, set the engine in the profile TOML:
 
 ```toml
 [policy]

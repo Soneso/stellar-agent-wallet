@@ -38,6 +38,17 @@
 //! ones the MCP twins use).  Fail-closed: a configured-but-unbuildable policy
 //! refuses the value-moving vault op.
 //!
+//! # Audit pre-flight (fail-closed)
+//!
+//! Before the signer is loaded or the deposit/withdraw is submitted, both
+//! actions require the profile's audit chain-root HMAC key to be acquirable
+//! via [`crate::commands::value_audit::require_value_audit_writer`], refusing
+//! with `audit.chain_key_unavailable` if not — `vault` always loads a
+//! persisted `<name>.toml` profile (no zero-config synthesis), so the
+//! pre-flight fails closed unconditionally, unlike `pay` / `claim` /
+//! `accounts create`. The acquired writer is reused (not re-acquired) for
+//! `DefiAdapterCtx::audit_writer`.
+//!
 //! # Output
 //!
 //! JSON by default.  Returns `0` on success, `1` on error.
@@ -405,6 +416,11 @@ where
     let asset_addresses: Vec<String> = assets.iter().map(|a| a.address.clone()).collect();
     let value_legs =
         vault_deposit_value_legs(&vault_args.amounts_desired, &asset_addresses, &args.vault);
+    // Capture the gate-derived legs as audit records before the descriptor
+    // moves into the gate, so the emitted row carries exactly what the gate
+    // sized (single-derivation invariant).
+    let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> =
+        value_legs.iter().map(Into::into).collect();
     let policy_args = json!({
         "vault_address": args.vault,
         "from_address": args.from,
@@ -438,6 +454,19 @@ where
         }
     };
 
+    // ── Audit pre-flight (fail-closed) ────────────────────────────────────────
+    // Proves the profile's audit chain-root key is acquirable BEFORE the
+    // signer is loaded (below) or the deposit is submitted. Reused (not
+    // re-acquired) for `DefiAdapterCtx::audit_writer`.
+    let audit_writer =
+        match crate::commands::value_audit::require_value_audit_writer(&profile, &args.profile) {
+            Ok(w) => w,
+            Err(e) => {
+                render_json(&Envelope::<()>::err(&e));
+                return 1;
+            }
+        };
+
     // ── Load signer ───────────────────────────────────────────────────────────
     let signer_entry_ref = &profile.mcp_signer_default;
     let expected_g = signer_entry_ref.account.as_str();
@@ -470,7 +499,7 @@ where
         "f8b5c61",
     );
     let timeout = std::time::Duration::from_secs(60);
-    let ctx = DefiAdapterCtx::new_with_submit_ctx(
+    let mut ctx = DefiAdapterCtx::new_with_submit_ctx(
         "default",
         &vault_pin,
         &primary_rpc,
@@ -480,6 +509,12 @@ where
         secondary_rpc.as_ref(),
         Some(timeout),
     );
+    // Thread the pre-flight-acquired audit writer + gate-derived legs so the
+    // adapter emits the ValueActionSubmitted row after a confirmed submit
+    // (non-fatal past this point — the pre-flight above is what fails closed).
+    ctx.audit_writer = Some(std::sync::Arc::clone(&audit_writer));
+    ctx.audit_legs = Some(&audit_legs);
+    ctx.audit_tool = Some("stellar_defindex_vault_deposit");
 
     // ── Delegate to DefindexVaultAdapter::submit ──────────────────────────────
     let adapter = DefindexVaultAdapter::new();
@@ -706,6 +741,12 @@ where
         }
     };
     let value_leg = vault_withdraw_value_leg(vault_args.withdraw_shares, &args.vault);
+    // Capture the gate-derived leg as an audit record before the descriptor
+    // moves into the gate, so the emitted row carries exactly what the gate
+    // sized (single-derivation invariant).
+    let audit_legs = vec![stellar_agent_core::audit_log::ValueLegRecord::from(
+        &value_leg,
+    )];
     let policy_args = json!({
         "vault_address": args.vault,
         "from_address": args.from,
@@ -739,6 +780,19 @@ where
         }
     };
 
+    // ── Audit pre-flight (fail-closed) ────────────────────────────────────────
+    // Proves the profile's audit chain-root key is acquirable BEFORE the
+    // signer is loaded (below) or the withdrawal is submitted. Reused (not
+    // re-acquired) for `DefiAdapterCtx::audit_writer`.
+    let audit_writer =
+        match crate::commands::value_audit::require_value_audit_writer(&profile, &args.profile) {
+            Ok(w) => w,
+            Err(e) => {
+                render_json(&Envelope::<()>::err(&e));
+                return 1;
+            }
+        };
+
     // ── Load signer ───────────────────────────────────────────────────────────
     let signer_entry_ref = &profile.mcp_signer_default;
     let expected_g = signer_entry_ref.account.as_str();
@@ -771,7 +825,7 @@ where
         "f8b5c61",
     );
     let timeout = std::time::Duration::from_secs(60);
-    let ctx = DefiAdapterCtx::new_with_submit_ctx(
+    let mut ctx = DefiAdapterCtx::new_with_submit_ctx(
         "default",
         &vault_pin,
         &primary_rpc,
@@ -781,6 +835,12 @@ where
         secondary_rpc.as_ref(),
         Some(timeout),
     );
+    // Thread the pre-flight-acquired audit writer + gate-derived leg so the
+    // adapter emits the ValueActionSubmitted row after a confirmed submit
+    // (non-fatal past this point — the pre-flight above is what fails closed).
+    ctx.audit_writer = Some(std::sync::Arc::clone(&audit_writer));
+    ctx.audit_legs = Some(&audit_legs);
+    ctx.audit_tool = Some("stellar_defindex_vault_withdraw");
 
     // ── Delegate to DefindexVaultAdapter::submit ──────────────────────────────
     let adapter = DefindexVaultAdapter::new();
@@ -833,8 +893,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use stellar_agent_core::error::AuthError;
+    use stellar_agent_core::profile::schema::PolicyEngineKind;
 
     use super::*;
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
 
     fn test_profile() -> Profile {
         Profile::builder_testnet_named(
@@ -952,6 +1014,339 @@ mod tests {
         assert_eq!(
             code, 1,
             "withdraw must surface the keyring init failure instead of reaching signer resolution"
+        );
+    }
+
+    // ── Audit pre-flight (fail-closed) after the ordered trust gate ──────────
+    //
+    // `vault`'s audit pre-flight (module doc: "Audit pre-flight (fail-closed)")
+    // runs AFTER the ordered trust gate's four `getLedgerEntries` round trips
+    // (vault WASM-hash pin, upgradable-flag read, roles read, assets read —
+    // see the module doc's "Ordered trust gate" section and the call sequence
+    // in `run_deposit_with_dependencies` / `run_withdraw_with_dependencies`
+    // above), so a `server.received_requests().is_empty()` assertion would be
+    // structurally wrong here (see cycle-2 brief item B). These helpers mock
+    // the ordered trust gate to a genuine PASS — a matching pinned WASM hash,
+    // `upgradable:false` (never refused regardless of role data), and a single
+    // well-formed asset with no strategies — so deposit and withdraw both
+    // reach the real production pre-flight call site instead of refusing
+    // earlier for an unrelated reason. Both `read_vault_roles` calls resolve
+    // every role to absent (`None`); this is harmless because
+    // `UpgradableEvalExt::evaluate` short-circuits on `is_upgradable == false`
+    // before ever consulting the management mode derived from those roles.
+
+    /// Builds the base64 XDR `(key, entry)` pair for a DeFindex vault's
+    /// contract instance ledger entry, carrying a pinned WASM executable hash
+    /// and instance-storage entries for `Upgradable`, `TotalAssets`, and a
+    /// single `AssetStrategySet(0)` with no strategies — the SAME single
+    /// instance entry `verify_defindex_vault_wasm`, `read_vault_upgradable_flag`,
+    /// `read_vault_roles`, and `read_vault_assets` each independently decode via
+    /// their own `getLedgerEntries` call against `LedgerKeyContractInstance`.
+    ///
+    /// # ABI provenance
+    ///
+    /// - `DataKey::Upgradable` / `DataKey::TotalAssets`: unit-variant keys built
+    ///   via [`stellar_agent_defindex::storage::build_unit_variant_scval_key`]
+    ///   (the SAME production builder, imported directly to avoid ABI drift).
+    /// - `DataKey::AssetStrategySet(0)`: `ScVal::Vec([Symbol("AssetStrategySet"),
+    ///   U32(0)])` per `stellar_agent_defindex::storage::build_asset_strategy_set_key`'s
+    ///   ABI-provenance rustdoc (that builder is private to its crate; the shape
+    ///   is reproduced here byte-for-byte from the cited rustdoc).
+    /// - `AssetStrategySet { address, strategies: [] }`: fields sorted
+    ///   alphabetically (`address` < `strategies`) per
+    ///   `stellar_agent_defindex::storage::decode_asset_strategy_set_scval`'s
+    ///   ABI-layout rustdoc; `ScVal::Vec(None)` for an empty `strategies` list
+    ///   per that same function's explicit empty-vector arm.
+    fn defindex_vault_instance_key_and_entry_xdr(
+        vault_address: &str,
+        wasm_hash: [u8; 32],
+        asset_address: &str,
+    ) -> (String, String) {
+        use stellar_agent_defindex::storage::build_unit_variant_scval_key;
+        use stellar_xdr::{
+            ContractDataDurability, ContractDataEntry, ContractExecutable, ContractId,
+            ExtensionPoint, Hash, LedgerEntryData, LedgerKey, LedgerKeyContractData, Limits,
+            ScAddress, ScContractInstance, ScMap, ScMapEntry, ScSymbol, ScVal, ScVec, StringM,
+            WriteXdr,
+        };
+
+        let vault =
+            stellar_strkey::Contract::from_string(vault_address).expect("valid vault C-strkey");
+        let sc_addr = ScAddress::Contract(ContractId(Hash(vault.0)));
+
+        let asset =
+            stellar_strkey::Contract::from_string(asset_address).expect("valid asset C-strkey");
+        let asset_sc_addr = ScAddress::Contract(ContractId(Hash(asset.0)));
+
+        let upgradable_key =
+            build_unit_variant_scval_key("Upgradable").expect("'Upgradable' fits ScSymbol");
+        let total_assets_key =
+            build_unit_variant_scval_key("TotalAssets").expect("'TotalAssets' fits ScSymbol");
+
+        let asset_strategy_set_sym: StringM<32> =
+            "AssetStrategySet".try_into().expect("fits ScSymbol");
+        let asset_strategy_set_key = ScVal::Vec(Some(ScVec(
+            vec![
+                ScVal::Symbol(ScSymbol(asset_strategy_set_sym)),
+                ScVal::U32(0),
+            ]
+            .try_into()
+            .expect("two-element ScVec fits VecM"),
+        )));
+
+        let address_sym: StringM<32> = "address".try_into().expect("fits ScSymbol");
+        let strategies_sym: StringM<32> = "strategies".try_into().expect("fits ScSymbol");
+        let asset_strategy_set_val = ScVal::Map(Some(ScMap(
+            vec![
+                ScMapEntry {
+                    key: ScVal::Symbol(ScSymbol(address_sym)),
+                    val: ScVal::Address(asset_sc_addr),
+                },
+                ScMapEntry {
+                    key: ScVal::Symbol(ScSymbol(strategies_sym)),
+                    val: ScVal::Vec(None),
+                },
+            ]
+            .try_into()
+            .expect("two-entry ScMap fits VecM"),
+        )));
+
+        let storage = ScMap(
+            vec![
+                ScMapEntry {
+                    key: upgradable_key,
+                    val: ScVal::Bool(false),
+                },
+                ScMapEntry {
+                    key: total_assets_key,
+                    val: ScVal::U32(1),
+                },
+                ScMapEntry {
+                    key: asset_strategy_set_key,
+                    val: asset_strategy_set_val,
+                },
+            ]
+            .try_into()
+            .expect("three-entry ScMap fits VecM"),
+        );
+
+        let instance = ScContractInstance {
+            executable: ContractExecutable::Wasm(Hash(wasm_hash)),
+            storage: Some(storage),
+        };
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: sc_addr.clone(),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+        });
+        let entry_data = LedgerEntryData::ContractData(ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: sc_addr,
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+            val: ScVal::ContractInstance(instance),
+        });
+
+        let key_b64 = key.to_xdr_base64(Limits::none()).expect("key XDR encode");
+        let val_b64 = entry_data
+            .to_xdr_base64(Limits::none())
+            .expect("entry XDR encode");
+        (key_b64, val_b64)
+    }
+
+    /// Answers every `getLedgerEntries` request with the same fixed vault
+    /// instance entry, so the ordered trust gate's four independent reads
+    /// (WASM-pin, upgradable-flag, roles, assets — all against the SAME
+    /// `LedgerKeyContractInstance`) all resolve successfully.
+    struct VaultInstanceResponder {
+        entry_xdr: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Respond for VaultInstanceResponder {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let request_value = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            let req_id = request_value
+                .get("id")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(1));
+            let method = request_value
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+
+            let result = match method {
+                "getLedgerEntries" => serde_json::json!({
+                    "entries": [{
+                        "key": "unused-by-the-decoder",
+                        "xdr": self.entry_xdr,
+                        "lastModifiedLedgerSeq": 1000
+                    }],
+                    "latestLedger": 1001
+                }),
+                _ => serde_json::json!({}),
+            };
+
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": result,
+                }))
+                .insert_header("content-type", "application/json")
+        }
+    }
+
+    /// Proves the deposit audit pre-flight is still wired into
+    /// `run_deposit_with_dependencies`'s production path AFTER the ordered
+    /// trust gate — not merely unit-tested in isolation. Mocks the ordered
+    /// gate to a genuine PASS so the run reaches the real pre-flight call site
+    /// and refuses there (`audit.chain_key_unavailable`) because the profile's
+    /// audit chain-root key was never minted at its unique keyring coordinate.
+    /// The exact `received_requests` count of 4 (one `getLedgerEntries` per
+    /// gate step) is what makes this discriminating: fewer requests would mean
+    /// the gate was short-circuited or bypassed before completing; more would
+    /// mean an unexpected extra round trip (e.g. the empty-strategies asset
+    /// unexpectedly triggering a Blend-strategy WASM-hash lookup) crept in.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn run_deposit_refuses_after_ordered_trust_gate_when_audit_key_unminted() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+
+        let vault_c = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        let asset_c = "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN";
+        let (_key_xdr, entry_xdr) =
+            defindex_vault_instance_key_and_entry_xdr(vault_c, DEFINDEX_VAULT_WASM_HASH, asset_c);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(VaultInstanceResponder { entry_xdr })
+            .mount(&server)
+            .await;
+        let rpc_url = server.uri();
+
+        let args = VaultDepositCliArgs {
+            profile: "vault-deposit-audit-preflight-test".to_owned(),
+            vault: vault_c.to_owned(),
+            from: asset_c.to_owned(),
+            amounts_desired: vec![1_000_000],
+            amounts_min: vec![900_000],
+            invest: false,
+            override_upgradable: false,
+            secondary_rpc_url: None,
+        };
+
+        let code = run_deposit_with_dependencies(
+            &args,
+            move |_name| {
+                let mut profile = Profile::builder_testnet_named(
+                    "vault-deposit-audit-preflight-test",
+                    "stellar-agent-signer",
+                    "vault-deposit-audit-preflight-test",
+                    "stellar-agent-nonce",
+                    "vault-deposit-audit-preflight-test",
+                )
+                .policy_engine(PolicyEngineKind::Noop)
+                .build();
+                profile.rpc_url = rpc_url.clone();
+                Ok(profile)
+            },
+            || Ok(()),
+        )
+        .await;
+
+        assert_eq!(
+            code, 1,
+            "deposit must refuse when the audit chain-root key is unminted, even \
+             after the ordered trust gate passes"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("request recording is enabled by default");
+        assert_eq!(
+            requests.len(),
+            4,
+            "the ordered trust gate must complete (WASM-pin + upgradable-flag + \
+             roles + assets, each one getLedgerEntries call) BEFORE the audit \
+             pre-flight refuses — a different count means the gate was \
+             bypassed, short-circuited, or the pre-flight fired at the wrong \
+             point"
+        );
+    }
+
+    /// Withdraw counterpart of
+    /// `run_deposit_refuses_after_ordered_trust_gate_when_audit_key_unminted`;
+    /// see that test's doc comment for the full rationale. Proves
+    /// `run_withdraw_with_dependencies`'s own audit pre-flight call site is
+    /// independently wired — the deposit and withdraw paths are separate
+    /// functions with separate `require_value_audit_writer` call sites, so
+    /// proving one wired does not prove the other.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn run_withdraw_refuses_after_ordered_trust_gate_when_audit_key_unminted() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+
+        let vault_c = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        let asset_c = "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN";
+        let (_key_xdr, entry_xdr) =
+            defindex_vault_instance_key_and_entry_xdr(vault_c, DEFINDEX_VAULT_WASM_HASH, asset_c);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(VaultInstanceResponder { entry_xdr })
+            .mount(&server)
+            .await;
+        let rpc_url = server.uri();
+
+        let args = VaultWithdrawCliArgs {
+            profile: "vault-withdraw-audit-preflight-test".to_owned(),
+            vault: vault_c.to_owned(),
+            from: asset_c.to_owned(),
+            shares: 1_000_000,
+            min_amounts_out: vec![900_000],
+            override_upgradable: false,
+            secondary_rpc_url: None,
+        };
+
+        let code = run_withdraw_with_dependencies(
+            &args,
+            move |_name| {
+                let mut profile = Profile::builder_testnet_named(
+                    "vault-withdraw-audit-preflight-test",
+                    "stellar-agent-signer",
+                    "vault-withdraw-audit-preflight-test",
+                    "stellar-agent-nonce",
+                    "vault-withdraw-audit-preflight-test",
+                )
+                .policy_engine(PolicyEngineKind::Noop)
+                .build();
+                profile.rpc_url = rpc_url.clone();
+                Ok(profile)
+            },
+            || Ok(()),
+        )
+        .await;
+
+        assert_eq!(
+            code, 1,
+            "withdraw must refuse when the audit chain-root key is unminted, even \
+             after the ordered trust gate passes"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("request recording is enabled by default");
+        assert_eq!(
+            requests.len(),
+            4,
+            "the ordered trust gate must complete (WASM-pin + upgradable-flag + \
+             roles + assets, each one getLedgerEntries call) BEFORE the audit \
+             pre-flight refuses — a different count means the gate was \
+             bypassed, short-circuited, or the pre-flight fired at the wrong \
+             point"
         );
     }
 }

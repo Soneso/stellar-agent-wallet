@@ -874,6 +874,28 @@ impl WalletServer {
             .map(|effects| effects.legs().iter().map(Into::into).collect())
             .unwrap_or_default();
 
+        // ── Audit pre-flight (fail-closed) ────────────────────────────────────
+        // Proves the profile's audit chain-root key is acquirable BEFORE the
+        // nonce below is consumed, the signer is loaded, or the transaction is
+        // submitted — a refusal here burns no nonce/replay-window attestation.
+        // Reused (not re-acquired) for the post-confirm `value_action_submitted`
+        // row.
+        let audit_writer = match crate::tools::value_audit::require_value_audit_writer(
+            &self.profile,
+            &self.profile_name_for_approval(),
+        ) {
+            Ok(w) => w,
+            Err(err) => {
+                let envelope = stellar_agent_core::envelope::Envelope::<()>::err(&err);
+                let json = envelope
+                    .to_json_pretty()
+                    .unwrap_or_else(|_| String::from("{}"));
+                let mut result = CallToolResult::success(vec![Content::text(json)]);
+                result.is_error = Some(true);
+                return Ok(result);
+            }
+        };
+
         // ── Nonce verification + replay window ───────────────────────────────
         if let Err(e) = commit_envelope_and_verify_nonce(
             &self.nonce_mint,
@@ -962,8 +984,8 @@ impl WalletServer {
                         Some(nonce_id_prefix.to_string()),
                         &audit_request_id,
                     );
-                crate::tools::value_audit::emit_value_audit_row(
-                    &self.profile,
+                crate::tools::value_audit::emit_value_audit_row_with_writer(
+                    &audit_writer,
                     &self.profile_name_for_approval(),
                     audit_entry,
                 );

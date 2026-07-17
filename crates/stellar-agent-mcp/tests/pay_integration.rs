@@ -214,11 +214,19 @@ const DEST_G: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
 /// Explicitly sets `Noop` so `WalletServer::new` succeeds without a signed
 /// policy file on disk: `PolicyEngineKind::default()` is `V1`, which requires
 /// a signed policy file and a keyring owner-key entry.
+///
+/// Seeds the audit chain-root key via [`common::install_test_audit_key`]: the
+/// audit pre-flight runs BEFORE nonce-commit consumption on every `*_commit`
+/// tool, so any test reaching a commit-phase gate needs this seeded to reach
+/// the gate under test rather than refusing `audit.chain_key_unavailable`
+/// first. Tests that specifically exercise the unminted-audit-key refusal use
+/// a distinct profile/coordinate instead of this helper.
 fn testnet_profile_with_rpc(rpc_url: &str) -> Profile {
     let mut p = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
         .with_noop_engine()
         .build();
     p.rpc_url = rpc_url.to_owned();
+    common::install_test_audit_key(&mut p);
     p
 }
 
@@ -3022,5 +3030,183 @@ async fn pay_two_phase_per_period_cap_second_call_denied_by_persisted_window() {
     assert_eq!(
         code, "policy.deny.per_period_cap_exceeded",
         "second call must be denied by the persisted window total, got: {code}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audit pre-flight (fail-closed)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `stellar_pay_commit` refuses with the typed `audit.chain_key_unavailable`
+/// business error when the profile's audit chain-root key was never minted —
+/// mirroring an `init`-minted profile that has not yet run
+/// `rotate-audit-key`. The profile uses a distinct signer account (never used
+/// by another test in this binary) so `AuditWriterRegistry`'s process-lifetime
+/// cache has no pre-existing entry to interfere; the signer key and nonce key
+/// ARE seeded, isolating the audit chain-root key as the only missing piece.
+#[tokio::test]
+#[serial]
+async fn pay_commit_refuses_with_audit_chain_key_unavailable_when_key_unminted() {
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(220);
+
+    let seed = [0x88_u8; 32];
+    let source_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc-issue88-unminted", "acct-issue88-unminted")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+
+    let account_key_xdr = account_ledger_key_xdr(&source_g);
+    let account_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(PaySubmitSuccessRpcResponder {
+            account_key_xdr,
+            account_xdr,
+        })
+        .mount(&mock_server)
+        .await;
+
+    let mut profile = Profile::builder_testnet(
+        "svc-issue88-unminted",
+        "acct-issue88-unminted",
+        "n-svc",
+        "n-acct",
+    )
+    .with_noop_engine()
+    .build();
+    profile.rpc_url = mock_server.uri();
+    // Deliberately NOT calling `common::install_test_audit_key` — the audit
+    // chain-root key stays unminted at this profile's coordinate.
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    let pay_args = StellarPayArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        source: source_g.clone(),
+        destination: DEST_G.to_owned(),
+        amount: None,
+        amount_in_stroops: Some("1000000000".to_owned()), // 100 XLM
+        asset: "native".to_owned(),
+        memo_text: None,
+        memo_id: None,
+        memo_hash_hex: None,
+        memo_return_hex: None,
+        classic_base: None,
+    };
+    let sim_result = server
+        .call_stellar_pay(pay_args.clone())
+        .await
+        .expect("simulate must not error");
+    assert_ne!(
+        sim_result.is_error,
+        Some(true),
+        "simulate is unaffected by the missing audit key: {}",
+        call_result_text(&sim_result)
+    );
+    let sim_data = call_result_json(&sim_result);
+    let sim_data = sim_data.get("data").expect("simulate success carries data");
+    let nonce = sim_data
+        .get("nonce")
+        .and_then(serde_json::Value::as_str)
+        .expect("nonce present")
+        .to_owned();
+    let expires_at_unix_ms = sim_data
+        .get("expires_at_unix_ms")
+        .and_then(serde_json::Value::as_u64)
+        .expect("expires_at_unix_ms present");
+    let envelope_xdr = sim_data
+        .get("envelope_xdr")
+        .and_then(serde_json::Value::as_str)
+        .expect("envelope_xdr present")
+        .to_owned();
+
+    let commit_result = server
+        .call_stellar_pay_commit(StellarPayCommitArgs {
+            chain_id: pay_args.chain_id.clone(),
+            source: pay_args.source.clone(),
+            destination: pay_args.destination.clone(),
+            amount: pay_args.amount.clone(),
+            amount_in_stroops: pay_args.amount_in_stroops.clone(),
+            asset: pay_args.asset.clone(),
+            memo_text: None,
+            memo_id: None,
+            memo_hash_hex: None,
+            memo_return_hex: None,
+            nonce,
+            expires_at_unix_ms,
+            envelope_xdr,
+            approval_nonce: None,
+            approval_attestation: None,
+        })
+        .await
+        .expect("commit must not error at the protocol layer");
+    let (code, _message, _text) = common::assert_business_envelope(&commit_result);
+    assert_eq!(
+        code, "audit.chain_key_unavailable",
+        "commit must refuse fail-closed before the signer is loaded or anything is \
+         submitted when the audit chain-root key is unminted, got: {code}"
+    );
+}
+
+/// `stellar_pay` (simulate; `destructive_hint = false`, read-only) is
+/// unaffected by a missing audit chain-root key — it never calls
+/// `require_value_audit_writer`. Uses the SAME unminted-audit-key profile as
+/// the sibling refusal test above, proving the read-only surface is not
+/// gated by this pre-flight.
+#[tokio::test]
+#[serial]
+async fn pay_simulate_unaffected_by_missing_audit_key() {
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(221);
+
+    let source_g = gstrkey_for_seed([0x89_u8; 32]);
+    let account_key_xdr = account_ledger_key_xdr(&source_g);
+    let account_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(PaySubmitSuccessRpcResponder {
+            account_key_xdr,
+            account_xdr,
+        })
+        .mount(&mock_server)
+        .await;
+
+    let mut profile = Profile::builder_testnet(
+        "svc-issue88-readonly",
+        "acct-issue88-readonly",
+        "n-svc",
+        "n-acct",
+    )
+    .with_noop_engine()
+    .build();
+    profile.rpc_url = mock_server.uri();
+    // No signer seeded and no audit key seeded: `stellar_pay` (simulate) never
+    // touches either, so it must still succeed.
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    let sim_result = server
+        .call_stellar_pay(StellarPayArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            source: source_g,
+            destination: DEST_G.to_owned(),
+            amount: None,
+            amount_in_stroops: Some("1000000000".to_owned()),
+            asset: "native".to_owned(),
+            memo_text: None,
+            memo_id: None,
+            memo_hash_hex: None,
+            memo_return_hex: None,
+            classic_base: None,
+        })
+        .await
+        .expect("simulate must not error");
+    assert_ne!(
+        sim_result.is_error,
+        Some(true),
+        "read-only simulate must succeed with no audit key and no signer seeded: {}",
+        call_result_text(&sim_result)
     );
 }

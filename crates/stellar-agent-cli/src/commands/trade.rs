@@ -22,6 +22,14 @@
 //! into `DexTradeArgs` (the single-decode invariant). Fail-closed on build
 //! failures.
 //!
+//! # Audit pre-flight (fail-closed)
+//!
+//! Before the signer is loaded or the swap is submitted, requires the
+//! profile's audit chain-root HMAC key to be acquirable via
+//! [`crate::commands::value_audit::require_value_audit_writer`], refusing
+//! with `audit.chain_key_unavailable` if not. The acquired writer is reused
+//! (not re-acquired) for `DefiAdapterCtx::audit_writer`.
+//!
 //! # Output
 //!
 //! JSON by default.  Returns `0` on success, `1` on error.
@@ -269,6 +277,19 @@ where
         }
     };
 
+    // ── Audit pre-flight (fail-closed) ────────────────────────────────────────
+    // Proves the profile's audit chain-root key is acquirable BEFORE the
+    // signer is loaded (below) or the transaction is submitted. Reused (not
+    // re-acquired) for `DefiAdapterCtx::audit_writer`.
+    let audit_writer =
+        match crate::commands::value_audit::require_value_audit_writer(&profile, &args.profile) {
+            Ok(w) => w,
+            Err(e) => {
+                render_json(&Envelope::<()>::err(&e));
+                return 1;
+            }
+        };
+
     // ── Build DexTradeArgs for the adapter ───────────────────────────────────
     // `path` is the SAME `canonical_path` used to build `value_leg` above
     // (single-decode invariant).
@@ -316,10 +337,10 @@ where
         secondary_rpc.as_ref(),
         Some(timeout),
     );
-    // Thread the audit writer + gate-derived leg so the adapter emits the
-    // ValueActionSubmitted row after a confirmed submit (non-fatal).
-    ctx.audit_writer =
-        crate::commands::value_audit::acquire_value_audit_writer(&profile, &args.profile);
+    // Thread the pre-flight-acquired audit writer + gate-derived leg so the
+    // adapter emits the ValueActionSubmitted row after a confirmed submit
+    // (non-fatal past this point — the pre-flight above is what fails closed).
+    ctx.audit_writer = Some(std::sync::Arc::clone(&audit_writer));
     ctx.audit_legs = Some(&audit_legs);
     ctx.audit_tool = Some("stellar_dex_trade");
 

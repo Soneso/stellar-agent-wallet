@@ -77,11 +77,19 @@ const DEST_G: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
 /// Explicitly sets `Noop` so `WalletServer::new` succeeds without a signed
 /// policy file on disk: `PolicyEngineKind::default()` is `V1`, which requires
 /// a signed policy file and a keyring owner-key entry.
+///
+/// Seeds the audit chain-root key via [`common::install_test_audit_key`]: the
+/// audit pre-flight runs BEFORE nonce-commit consumption on every `*_commit`
+/// tool, so any test reaching a commit-phase gate needs this seeded to reach
+/// the gate under test rather than refusing `audit.chain_key_unavailable`
+/// first. Tests that specifically exercise the unminted-audit-key refusal use
+/// a distinct profile/coordinate instead of this helper.
 fn testnet_profile_with_rpc(rpc_url: &str) -> Profile {
     let mut p = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
         .with_noop_engine()
         .build();
     p.rpc_url = rpc_url.to_owned();
+    common::install_test_audit_key(&mut p);
     p
 }
 
