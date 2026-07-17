@@ -29,10 +29,7 @@
 //! drop.  Neither the raw bytes nor the encoded string is returned, logged, or
 //! stored outside the keyring.
 
-use stellar_agent_core::{
-    error::{AuthError, WalletError},
-    profile::schema::Profile,
-};
+use stellar_agent_core::{error::WalletError, profile::schema::Profile};
 use stellar_agent_network::keyring::rotate_keyring_secret_32;
 
 /// Generates a fresh 32-byte HMAC nonce key and atomically replaces the
@@ -51,10 +48,13 @@ use stellar_agent_network::keyring::rotate_keyring_secret_32;
 ///
 /// # Errors
 ///
-/// - [`WalletError::Auth`] wrapping [`AuthError::KeyringNotFound`] if the
-///   platform keyring is unavailable (not initialised, locked, or unsupported
-///   OS) or if `set_password` fails. The upstream error message is emitted
-///   at `tracing::debug!` level, not propagated to the typed error.
+/// - [`WalletError::Auth`] with the keyring failure classified by
+///   [`stellar_agent_network::keyring::classify_keyring_error`]:
+///   `KeyringInteractiveSessionRequired` when the Windows Credential Manager
+///   is unreachable from a non-interactive session,
+///   `KeyringPlatformError` for other backend failures, and
+///   `KeyringNotFound` when the platform keyring is unavailable (not
+///   initialised or unsupported OS).
 ///
 /// # Panics
 ///
@@ -76,11 +76,11 @@ use stellar_agent_network::keyring::rotate_keyring_secret_32;
 /// ```
 pub fn rotate_nonce_key(profile: &Profile) -> Result<(), WalletError> {
     let entry_ref = &profile.mcp_nonce_key_alias;
-    rotate_keyring_secret_32(&entry_ref.service, &entry_ref.account).map_err(|e| {
+    // The shared helper classifies keyring failures (interactive-session,
+    // platform, not-found) — surface its error unchanged so environmental
+    // causes keep their typed code instead of collapsing into "not found".
+    rotate_keyring_secret_32(&entry_ref.service, &entry_ref.account).inspect_err(|e| {
         tracing::debug!(error = %e, "rotate_nonce_key: shared rotation failed");
-        WalletError::Auth(AuthError::KeyringNotFound {
-            name: "nonce key set_password failed".to_owned(),
-        })
     })?;
     tracing::info!(
         profile.nonce_service = entry_ref.service,
@@ -153,6 +153,29 @@ mod tests {
         // With overwhelming probability the two 32-byte random keys differ.
         // There is a 1 in 2^256 chance they match.
         assert_ne!(first, second, "rotation must generate a fresh key");
+    }
+
+    /// The classified keyring failure must pass through unchanged: a
+    /// non-interactive Windows session (`ERROR_NO_SUCH_LOGON_SESSION` on the
+    /// `set_password` write) surfaces as
+    /// `auth.keyring_interactive_session_required`, not as a generic
+    /// `auth.keyring_not_found` claiming the entry is missing.
+    #[test]
+    #[serial]
+    fn rotate_surfaces_interactive_session_required_on_windows_write_failure() {
+        keyring_mock::install().expect("mock store");
+        let profile = test_profile("rotate-no-logon");
+        let entry_ref = &profile.mcp_nonce_key_alias;
+        keyring_mock::inject_no_logon_session(&entry_ref.service, &entry_ref.account)
+            .expect("inject");
+
+        let err = rotate_nonce_key(&profile).expect_err("rotation must fail");
+        assert_eq!(err.code(), "auth.keyring_interactive_session_required");
+        assert!(
+            err.message().contains("STELLAR_AGENT_KEYRING_BACKEND"),
+            "the message must name the headless escape hatch: {}",
+            err.message()
+        );
     }
 
     #[test]

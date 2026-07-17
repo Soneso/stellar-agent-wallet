@@ -84,6 +84,69 @@ pub fn install() -> Result<(), keyring_core::Error> {
     Ok(())
 }
 
+/// Canonical `Display` text of the `windows-native-keyring-store` platform
+/// error for Win32 `ERROR_NO_SUCH_LOGON_SESSION` (1312), as rendered inside
+/// `keyring_core::Error::NoStorageAccess`.
+///
+/// Tests inject this text to exercise the non-interactive-session
+/// classification on every platform; the production detector matches on the
+/// `Display` text because the platform crate's concrete error type is
+/// private.
+pub const WINDOWS_NO_LOGON_SESSION_TEXT: &str = "Windows ERROR_NO_SUCH_LOGON_SESSION";
+
+/// Injects a single-shot error into the mock credential at the given
+/// coordinates, creating the credential if absent.
+///
+/// The next keyring operation performed through ANY `keyring_core::Entry`
+/// resolving to `service`/`account` returns `err`; operations after that
+/// behave normally (the mock removes an injected error once it has been
+/// returned). The mock store reuses one credential per coordinate pair, so
+/// an injection placed here reaches entries constructed later by production
+/// code under test.
+///
+/// # Errors
+///
+/// - Any error from `keyring_core::Entry::new`.
+/// - `keyring_core::Error::NotSupportedByStore` when the process-global
+///   default store is not the keyring-core mock — call [`install`] first.
+pub fn inject_error(
+    service: &str,
+    account: &str,
+    err: keyring_core::Error,
+) -> Result<(), keyring_core::Error> {
+    let entry = keyring_core::Entry::new(service, account)?;
+    let Some(cred) = entry.as_any().downcast_ref::<keyring_core::mock::Cred>() else {
+        return Err(keyring_core::Error::NotSupportedByStore(
+            "keyring_mock::inject_error requires the keyring-core mock store; \
+             call keyring_mock::install() first"
+                .to_owned(),
+        ));
+    };
+    cred.set_error(err);
+    Ok(())
+}
+
+/// Injects the Windows no-logon-session failure shape at the given
+/// coordinates: `keyring_core::Error::NoStorageAccess` wrapping
+/// [`WINDOWS_NO_LOGON_SESSION_TEXT`].
+///
+/// This is the error a `windows-native-keyring-store` backend returns for
+/// every Credential Manager operation (read or write) in a non-interactive
+/// Windows session (service, SSH, scheduled task).
+///
+/// # Errors
+///
+/// See [`inject_error`].
+pub fn inject_no_logon_session(service: &str, account: &str) -> Result<(), keyring_core::Error> {
+    inject_error(
+        service,
+        account,
+        keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other(
+            WINDOWS_NO_LOGON_SESSION_TEXT,
+        ))),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -113,5 +176,28 @@ mod tests {
             e2.get_password().is_err(),
             "a fresh store must not carry a credential from before reinstall"
         );
+    }
+
+    /// An injected error surfaces on the next operation of an Entry
+    /// constructed AFTER the injection (the mock store shares one credential
+    /// per coordinate pair), and is single-shot: the operation after it
+    /// succeeds.
+    #[test]
+    #[serial]
+    fn injected_error_reaches_a_later_entry_and_is_single_shot() {
+        super::install().expect("mock store install");
+        super::inject_no_logon_session("inject-svc", "inject-user").expect("inject");
+
+        let entry = keyring_core::Entry::new("inject-svc", "inject-user").expect("entry");
+        let err = entry.set_password("value").expect_err("injected failure");
+        assert!(
+            matches!(err, keyring_core::Error::NoStorageAccess(ref inner)
+                if inner.to_string().contains(super::WINDOWS_NO_LOGON_SESSION_TEXT)),
+            "expected the injected no-logon-session shape, got {err:?}"
+        );
+
+        entry
+            .set_password("value")
+            .expect("the injection is single-shot; the retry must succeed");
     }
 }

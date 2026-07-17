@@ -154,12 +154,18 @@ jobs:
     # 3. MPP authorization state: NamedTempFile replacement, sidecar locking,
     #    authenticated-record validation, and repeated mutation must preserve
     #    the same behavior on Windows as on Unix.
+    # 4. Smart-account wire-code suite and MCP rule-tool suite: the rule
+    #    tools open the per-profile audit writer/reader through the same
+    #    sidecar-lock design as (1), so they exercise the audit path
+    #    end-to-end on Windows on top of the wire-code coverage.
     #
     # Bounded to the touched crates' unit tests (not the full workspace
-    # matrix) to keep this job cheap. The smart-account and MCP suites stay
-    # out of scope: `stellar-agent-smart-account`'s dev-dependency closure
-    # pulls `openssl-sys`, which does not build on bare windows-latest (no
-    # OpenSSL/perl); restoring that coverage is separately tracked.
+    # matrix) to keep this job cheap. The smart-account closure builds
+    # vendored OpenSSL from source (`openssl` with the `vendored` feature,
+    # carried by stellar-agent-smart-account for what webauthn-rs-core
+    # links), so this job provides the same native Perl the release
+    # workflow's Windows target uses; everything else in these closures
+    # builds with the runner image's MSVC and LLVM toolchains.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
@@ -171,6 +177,22 @@ jobs:
           # Failing iterations must still seed the build cache, or every
           # retry recompiles the dependency tree cold on a slow runner.
           cache-on-failure: true
+      # The vendored OpenSSL build runs OpenSSL's perl-based Configure, which
+      # needs a Windows-native Perl with its full module set; the MSYS perl
+      # that Git for Windows puts on PATH lacks it. openssl-src honors
+      # OPENSSL_SRC_PERL, so point it at Strawberry Perl (preinstalled on the
+      # runner image; installed on the spot if a future image drops it).
+      - name: Provide a native Perl for the vendored OpenSSL build
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'C:\Strawberry\perl\bin\perl.exe')) {
+            choco install strawberryperl --no-progress -y
+          }
+          if (-not (Test-Path 'C:\Strawberry\perl\bin\perl.exe')) {
+            Write-Error 'Strawberry Perl unavailable'
+            exit 1
+          }
+          Add-Content $env:GITHUB_ENV "OPENSSL_SRC_PERL=C:\Strawberry\perl\bin\perl.exe"
       # Compilation is unbounded below the job ceiling (a compile progresses
       # or errors; only cold-cache runs need the headroom). Test EXECUTION is
       # where a Windows lock deadlock can hang, so every test step runs under
@@ -178,7 +200,7 @@ jobs:
       # rest of the job budget.
       - name: Build test binaries (unbounded compile phase)
         shell: bash
-        run: cargo test -p stellar-agent-core -p stellar-agent-mpp --lib --no-run
+        run: cargo test -p stellar-agent-core -p stellar-agent-mpp -p stellar-agent-smart-account -p stellar-agent-mcp --lib --no-run
       - name: Audit-log regression (stellar-agent-core)
         shell: bash
         run: "timeout 600 cargo test -p stellar-agent-core --lib audit_log::"
@@ -188,6 +210,12 @@ jobs:
       - name: MPP authorization-store regression
         shell: bash
         run: "timeout 600 cargo test -p stellar-agent-mpp --lib store::tests::"
+      - name: Smart-account wire-code suite
+        shell: bash
+        run: "timeout 600 cargo test -p stellar-agent-smart-account --lib"
+      - name: MCP rule-tool suite (audit path end-to-end)
+        shell: bash
+        run: "timeout 600 cargo test -p stellar-agent-mcp --lib -- tools::rules:: tools::rule_create::"
 
   machete:
     name: unused-deps

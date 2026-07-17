@@ -51,10 +51,8 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-use stellar_agent_core::{
-    error::AuthError,
-    profile::schema::{KeyringEntryRef, Profile},
-};
+use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
+use stellar_agent_network::keyring::classify_keyring_error;
 
 use crate::{ReplayWindow, error::NonceError};
 
@@ -863,7 +861,10 @@ impl NonceMint {
     /// # Errors
     ///
     /// - [`NonceError::KeyringError`] if the platform keyring is unavailable,
-    ///   the entry does not exist, or the keyring is locked.
+    ///   the entry does not exist, or the keyring is locked. The wrapped
+    ///   `AuthError` is classified by
+    ///   [`stellar_agent_network::keyring::classify_keyring_error`]
+    ///   (interactive-session / platform / not-found).
     /// - [`NonceError::SerialiseFailed`] if the stored value is not valid base64.
     /// - [`NonceError::KeyTooShort`] if fewer than 32 bytes decode.
     ///
@@ -871,21 +872,20 @@ impl NonceMint {
     ///
     /// Never panics.
     fn load_key(&self) -> Result<Zeroizing<[u8; 32]>, NonceError> {
-        // Open the keyring entry (cheap: one Arc clone).
+        // Open the keyring entry (cheap: one Arc clone). Failures classify
+        // through the shared keyring mapping so environmental causes (a
+        // non-interactive Windows session, a backend outage) keep their
+        // typed code instead of collapsing into "not found".
         let entry =
             KeyringEntry::new(&self.entry_ref.service, &self.entry_ref.account).map_err(|e| {
                 tracing::debug!(error = %e, "nonce keyring entry construction failed");
-                NonceError::KeyringError(AuthError::KeyringNotFound {
-                    name: "nonce key entry construction failed".to_owned(),
-                })
+                NonceError::KeyringError(classify_keyring_error(&e, &self.entry_ref.service))
             })?;
 
         // Retrieve the password as a Zeroizing<String> to clear it on drop.
         let raw: Zeroizing<String> = Zeroizing::new(entry.get_password().map_err(|e| {
             tracing::debug!(error = %e, "nonce keyring get_password failed");
-            NonceError::KeyringError(AuthError::KeyringNotFound {
-                name: "nonce key not found in keyring".to_owned(),
-            })
+            NonceError::KeyringError(classify_keyring_error(&e, &self.entry_ref.service))
         })?);
 
         // Base64-decode into a Zeroizing<Vec<u8>>.
