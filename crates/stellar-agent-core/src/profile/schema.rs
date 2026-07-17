@@ -820,7 +820,9 @@ pub struct Profile {
     /// Persisted channel-account pool configuration.
     ///
     /// `None` when the pool has not been initialised.  Written by `pool init`
-    /// (atomically via `loader::save`) and read by `pool list` / `pool status`.
+    /// (atomically via `loader::set_pool_state`, which patches only the pool
+    /// keys on the raw on-disk document) and read by `pool list` /
+    /// `pool status`.
     ///
     /// Contains only public-safe data (pool size, channel G-strkeys, BIP-44
     /// indices).  The pool master seed lives separately in the OS keyring under

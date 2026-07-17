@@ -8,6 +8,17 @@
 //! failure before on-chain confirmation leaves NO keyring entry and NO config —
 //! clean retry with no `--force` needed.
 //!
+//! # Persistence discipline
+//!
+//! The profile TOML is a trust root: the persistence step patches ONLY the two
+//! pool keys (`pool_master_key_id`, `[pool_config]`) on the raw on-disk
+//! document via `loader::set_pool_state`.  The env-merged profile view loaded
+//! at the start of the run is used for runtime decisions only (RPC endpoint,
+//! signer, fees, audit paths) and is never written back: a `STELLAR_AGENT_*`
+//! overlay present during the one-time init must not become persistent
+//! configuration, and loader-derived defaults must not be materialised into
+//! the stored document.
+//!
 //! # Secret handling
 //!
 //! - The pool master 64-byte seed lives ONLY in the OS keyring (URL-safe
@@ -411,11 +422,12 @@ pub async fn run(args: &PoolInitArgs) -> i32 {
         .collect();
 
     // ── Persist PoolConfig + pool_master_key_id into profile TOML ────────────
-    let mut updated_profile = profile;
-    updated_profile.pool_master_key_id = Some(pool_master_ref.clone());
-    updated_profile.pool_config = Some(PoolConfig::new(n, pool_channels.clone()));
-
-    if let Err(e) = loader::save(profile_name, &updated_profile) {
+    // Raw-document patch: writes ONLY the two pool keys and preserves every
+    // other stored key verbatim.  A load + save round trip here would persist
+    // the env-merged view (`STELLAR_AGENT_*` overlays and loader-derived
+    // defaults baked into the trust root).
+    let pool_config = PoolConfig::new(n, pool_channels.clone());
+    if let Err(e) = loader::set_pool_state(profile_name, &pool_master_ref, &pool_config) {
         tracing::warn!(
             profile = %profile_name,
             error = %e,
@@ -441,7 +453,7 @@ pub async fn run(args: &PoolInitArgs) -> i32 {
         result.ledger,
         &request_id,
     );
-    emit_pool_init_audit(&updated_profile, profile_name, audit_entry);
+    emit_pool_init_audit(&profile, profile_name, audit_entry);
 
     // ── Emit result JSON — no seed bytes ──────────────────────────────────────
     let pool_result = PoolInitResult {
@@ -601,5 +613,138 @@ fn probe_keyring_entry(service: &str, account: &str) -> KeyringProbe {
             KeyringProbe::Absent
         }
         Err(e) => KeyringProbe::BackendError(format!("{e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test-only"
+    )]
+
+    use super::*;
+    use serial_test::serial;
+    use stellar_agent_core::profile::schema::Profile;
+
+    /// RAII env-var guard; `#[serial]` on every test using it prevents
+    /// concurrent env access.
+    struct EnvGuard {
+        var: String,
+    }
+    impl EnvGuard {
+        #[allow(
+            unsafe_code,
+            reason = "test-only env mutation; #[serial] prevents concurrent access"
+        )]
+        fn set(var: String, value: &str) -> Self {
+            // SAFETY: serialised by #[serial]; no concurrent env access.
+            unsafe {
+                std::env::set_var(&var, value);
+            }
+            Self { var }
+        }
+    }
+    impl Drop for EnvGuard {
+        #[allow(unsafe_code, reason = "test-only env cleanup")]
+        fn drop(&mut self) {
+            // SAFETY: same as set(); serialised by #[serial].
+            unsafe {
+                std::env::remove_var(&self.var);
+            }
+        }
+    }
+
+    /// End-to-end environment immunity for the pool persistence step, through
+    /// the PRODUCTION loader functions `run()` uses: a `STELLAR_AGENT_RPC_URL`
+    /// overlay is visible in the env-merged runtime view (asserted as a
+    /// sanity check) but must never reach the on-disk document, and the
+    /// persisted profile must differ from its pre-init form only in the two
+    /// pool keys. The profile lives in a real temp dir; the write is the
+    /// production `set_pool_state_on_disk` over that dir.
+    #[test]
+    #[serial]
+    fn env_overlay_never_reaches_the_persisted_pool_state() {
+        let _overlay = EnvGuard::set(
+            "STELLAR_AGENT_RPC_URL".to_owned(),
+            "https://env-injected.example.org",
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let profile = Profile::builder_testnet(
+            "stellar-agent-signer-pool-init-test",
+            "acct",
+            "stellar-agent-nonce-pool-init-test",
+            "acct",
+        )
+        .with_profile_name("pool-init-test")
+        .audit_log_path(dir.path().join("audit.log"))
+        .build();
+        loader::save_to_dir("pool-init-test", &profile, dir.path()).unwrap();
+        let before = std::fs::read_to_string(dir.path().join("pool-init-test.toml")).unwrap();
+
+        // Sanity: the env-merged runtime view DOES see the overlay — this is
+        // exactly the view the persistence step must never write back.
+        let merged = loader::load_from_dir("pool-init-test", dir.path(), None).unwrap();
+        assert_eq!(merged.rpc_url, "https://env-injected.example.org");
+
+        let master_ref = KeyringEntryRef::default_pool_master_key("pool-init-test");
+        let cfg = PoolConfig::new(1, vec![PoolChannelRecord::new(1, "GABC...CH1")]);
+        loader::set_pool_state_on_disk("pool-init-test", dir.path(), &master_ref, &cfg).unwrap();
+
+        let written = std::fs::read_to_string(dir.path().join("pool-init-test.toml")).unwrap();
+        assert!(
+            !written.contains("env-injected"),
+            "no environment overlay value may leak into the stored document; got:\n{written}"
+        );
+
+        let mut after: toml::Value = toml::from_str(&written).unwrap();
+        let table = after.as_table_mut().unwrap();
+        let got_ref: KeyringEntryRef = table
+            .remove("pool_master_key_id")
+            .expect("pool_master_key_id must be written")
+            .try_into()
+            .unwrap();
+        let got_cfg: PoolConfig = table
+            .remove("pool_config")
+            .expect("pool_config must be written")
+            .try_into()
+            .unwrap();
+        assert_eq!(got_ref, master_ref);
+        assert_eq!(got_cfg, cfg);
+
+        let before_doc: toml::Value = toml::from_str(&before).unwrap();
+        assert_eq!(
+            after, before_doc,
+            "the persisted profile must differ from its pre-init form only in \
+             the pool keys; got:\n{written}"
+        );
+    }
+
+    /// Source-scan companion to the env-immunity test above: `run()`'s
+    /// persistence step cannot be exercised without a live network, so this
+    /// pins the production call site instead. The production half of this
+    /// module must persist through the raw-document patch
+    /// (`loader::set_pool_state`) and must not contain a full-profile
+    /// `loader::save`, whose load-merge-save shape would write the env-merged
+    /// view into the trust root.
+    #[test]
+    fn production_persistence_call_site_is_the_raw_document_patch() {
+        let source = include_str!("init.rs");
+        let (production, _tests) = source
+            .split_once("#[cfg(test)]")
+            .expect("this module must contain a #[cfg(test)] marker");
+
+        assert!(
+            production.contains("loader::set_pool_state("),
+            "pool init must persist via the raw-document patch loader::set_pool_state"
+        );
+        assert!(
+            !production.contains("loader::save("),
+            "pool init must not persist via loader::save: re-saving a loaded \
+             profile writes the env-merged view into the profile TOML"
+        );
     }
 }
