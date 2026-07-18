@@ -131,3 +131,94 @@ fn signing_verbs_acquire_the_writer_before_submit() {
         );
     }
 }
+
+/// Deny-first ordering: on every reordered value verb, the operator policy
+/// gate runs BEFORE the audit pre-flight (a policy denial is a clean refusal
+/// that signs and submits nothing, so it must not require a minted audit
+/// chain key), and the pre-flight still precedes the stage's signing step.
+///
+/// EVERY pre-flight call site is checked: for each occurrence (staged files
+/// have several — sign-only, submit-only, full pipeline), a policy-eval CALL
+/// (definitions excluded) must appear between the previous pre-flight and
+/// this one, and a signing step must follow it before the next pre-flight.
+#[test]
+fn value_verbs_evaluate_policy_before_the_audit_preflight() {
+    fn call_indices(hay: &str, needles: &[&str]) -> Vec<usize> {
+        let mut out = Vec::new();
+        for needle in needles {
+            let mut at = 0;
+            while let Some(rel) = hay[at..].find(needle) {
+                let i = at + rel;
+                // Exclude fn definitions and rustdoc mentions.
+                let prefix = &hay[..i];
+                if !prefix.ends_with("fn ") && !prefix.ends_with("async fn ") {
+                    let line_start = prefix.rfind('\n').map_or(0, |p| p + 1);
+                    if !hay[line_start..i].trim_start().starts_with("///")
+                        && !hay[line_start..i].trim_start().starts_with("//")
+                    {
+                        out.push(i);
+                    }
+                }
+                at = i + needle.len();
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+    for (file, policy_calls, preflight_calls, sign_calls) in [
+        (
+            "commands/pay.rs",
+            &["evaluate_pay_policy(", "evaluate_staged_pay_policy("][..],
+            &["value_audit::require_value_audit_writer_for_origin("][..],
+            &["sign_envelope(", "submit_envelope("][..],
+        ),
+        (
+            "commands/claim.rs",
+            &["evaluate_claim_policy(", "evaluate_staged_claim_policy("][..],
+            &["value_audit::require_value_audit_writer_for_origin("][..],
+            &["sign_envelope(", "submit_envelope("][..],
+        ),
+        (
+            "commands/trustline.rs",
+            &["evaluate_value_moving_policy("][..],
+            &["value_audit::require_value_audit_writer("][..],
+            &["signer_from_keyring("][..],
+        ),
+        (
+            "commands/accounts/create.rs",
+            &["evaluate_create_policy("][..],
+            &["value_audit::require_value_audit_writer_for_origin("][..],
+            &["sponsored_create("][..],
+        ),
+    ] {
+        let source = std::fs::read_to_string(src.join(file)).expect("read source");
+        let production = production_half(&source);
+        let policies = call_indices(production, policy_calls);
+        let preflights = call_indices(production, preflight_calls);
+        let signs = call_indices(production, sign_calls);
+        assert!(
+            !preflights.is_empty(),
+            "{file}: no audit pre-flight call found"
+        );
+
+        let mut prev_preflight = 0usize;
+        for &preflight in &preflights {
+            assert!(
+                policies
+                    .iter()
+                    .any(|&p| p > prev_preflight && p < preflight),
+                "{file}: the pre-flight at byte {preflight} has no policy-eval \
+                 call in its own stage before it (deny-first violated)"
+            );
+            assert!(
+                signs.iter().any(|&s| s > preflight),
+                "{file}: the pre-flight at byte {preflight} has no signing \
+                 step after it"
+            );
+            prev_preflight = preflight;
+        }
+    }
+}

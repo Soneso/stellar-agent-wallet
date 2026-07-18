@@ -143,11 +143,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   confirmation. `pool init` likewise acquires the audit writer before any
   seed generation or on-chain submit and reuses it for the post-confirm
   `channel_pool_initialised` row.
-- `pay` evaluates the operator policy gate BEFORE the audit pre-flight on
-  all three stages (one-shot, `--sign-only`, `--submit-only`): a policy
-  denial is a clean refusal that signs and submits nothing, so it no longer
-  requires a minted audit chain key to be reported. The pre-flight still
-  runs before any signing key is touched or transaction submitted.
+- Every value verb evaluates the operator policy gate BEFORE the audit
+  pre-flight: a policy denial is a clean refusal that signs and submits
+  nothing, so it no longer requires a minted audit chain key to be reported.
+  `pay` and `claim` reorder all three stages (one-shot, `--sign-only`,
+  `--submit-only`); `trustline` and `accounts create` reorder their single
+  gated path; `trade`, `lend`, and `vault` already evaluated policy first.
+  The MCP tools are unchanged: policy denials fire at the simulate stage,
+  which has no pre-flight, and the commit-stage pre-flight stays ahead of
+  nonce consumption. The pre-flight still runs before any signing key is
+  touched or transaction submitted, pinned by a source-order test that
+  checks every pre-flight call site per verb.
 - Keyring write failures now classify through the same mapping as reads:
   `profile enroll-signer`, `profile enroll-owner-key`, the rotate commands
   (`rotate-nonce-key`, `rotate-audit-key`, `rotate-attestation-key`,

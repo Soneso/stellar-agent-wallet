@@ -760,25 +760,6 @@ where
         }
     }
 
-    // ── Audit pre-flight (sponsored mode only; fail-closed for a persisted
-    // profile, fail-open for the synthesized zero-config profile) ───────────
-    // Friendbot mode signs nothing and is not gated — see the module doc
-    // comment. Proves the audit writer is acquirable BEFORE
-    // `sponsored_create` touches the signer or submits. Where `Some`, the
-    // writer is reused (not re-acquired) for the post-confirm
-    // `value_action_submitted` row.
-    let audit_writer = match crate::commands::value_audit::require_value_audit_writer_for_origin(
-        &profile,
-        &args.profile,
-        origin,
-    ) {
-        Ok(w) => w,
-        Err(e) => {
-            print_error(&Envelope::<()>::err(&e), args.output);
-            return 1;
-        }
-    };
-
     // ── Fetch sponsor account state (feeds the policy gate's account_view) ──
     // This fetch runs BEFORE the gate, mirroring the MCP twin's
     // fetch-then-dispatch ordering; `build_sponsored_unsigned_envelope` below
@@ -815,6 +796,26 @@ where
     ) {
         Ok(effects) => effects,
         Err(code) => return code,
+    };
+
+    // ── Audit pre-flight (sponsored mode only; fail-closed for a persisted
+    // profile, fail-open for the synthesized zero-config profile) ───────────
+    // Friendbot mode signs nothing and is not gated — see the module doc
+    // comment. Proves the audit writer is acquirable AFTER the policy gate
+    // (a denial is a clean refusal that signs nothing and needs no audit
+    // setup) but BEFORE `sponsored_create` touches the signer or submits.
+    // Where `Some`, the writer is reused (not re-acquired) for the
+    // post-confirm `value_action_submitted` row.
+    let audit_writer = match crate::commands::value_audit::require_value_audit_writer_for_origin(
+        &profile,
+        &args.profile,
+        origin,
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            print_error(&Envelope::<()>::err(&e), args.output);
+            return 1;
+        }
     };
 
     // Sign and submit.
