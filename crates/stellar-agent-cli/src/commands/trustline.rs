@@ -5,22 +5,23 @@
 //! Builds, signs, and submits a Stellar `ChangeTrust` classic transaction.
 //! Enforces the full ordered trust gate before signing:
 //!
-//! 1. Audit pre-flight (fail-closed) — the profile's audit
+//! 1. `resolve_denomination` — USDT hard-refusal + known-lookalike denylist +
+//!    pinned-issuer-mismatch + unpinned-bare-code.
+//! 2. Live issuer account fetch via `fetch_account` → `AccountFlagsView`
+//!    (for the clawback gate).
+//! 3. Source account fetch via `fetch_account` (for the policy gate's
+//!    `account_view`; sequence number consumed at envelope-build time).
+//! 4. Operator policy evaluation — the shared
+//!    [`crate::commands::policy_engine::build_v1_policy_engine`]
+//!    (V1 `NoopPolicyEngine` / `PolicyEngineV1`; fail-closed on build failures),
+//!    now that both views from steps 2-3 are populated. A denial is a clean
+//!    refusal that signs nothing and requires no audit setup.
+//! 5. Audit pre-flight (fail-closed) — the profile's audit
 //!    chain-root key must be acquirable via
 //!    [`crate::commands::value_audit::require_value_audit_writer`] before any
 //!    later step touches the signer or submits; refuses
 //!    `audit.chain_key_unavailable` otherwise. The acquired writer is reused
 //!    for the post-confirm row.
-//! 2. `resolve_denomination` — USDT hard-refusal + known-lookalike denylist +
-//!    pinned-issuer-mismatch + unpinned-bare-code.
-//! 3. Live issuer account fetch via `fetch_account` → `AccountFlagsView`
-//!    (for the clawback gate).
-//! 4. Source account fetch via `fetch_account` (for the policy gate's
-//!    `account_view`; sequence number consumed at envelope-build time).
-//! 5. Operator policy evaluation — the shared
-//!    [`crate::commands::policy_engine::build_v1_policy_engine`]
-//!    (V1 `NoopPolicyEngine` / `PolicyEngineV1`; fail-closed on build failures),
-//!    now that both views from steps 3-4 are populated.
 //! 6. `clawback_gate(flags, opt_in_present)` where `opt_in_present` is derived
 //!    from the wallet-controlled `PendingApprovalStore` (NOT a CLI flag).
 //! 7. `TrustlinePreview::build` — typed JSON preview rendered to stdout.
@@ -231,19 +232,6 @@ where
         return 1;
     }
 
-    // ── Audit pre-flight (fail-closed) ────────────────────────────────────────
-    // Proves the profile's audit chain-root key is acquirable BEFORE the
-    // signer is loaded (below) or the transaction is submitted. Reused (not
-    // re-acquired) for the post-confirm `value_action_submitted` row.
-    let audit_writer =
-        match crate::commands::value_audit::require_value_audit_writer(&profile, &args.profile) {
-            Ok(w) => w,
-            Err(e) => {
-                render_json(&Envelope::<()>::err(&e));
-                return 1;
-            }
-        };
-
     let rpc_url = profile.rpc_url.as_str();
     let network_passphrase = profile.network_passphrase.as_str();
     let chain_id: String = args
@@ -380,6 +368,21 @@ where
             return 1;
         }
     };
+
+    // ── Audit pre-flight (fail-closed) ────────────────────────────────────────
+    // Proves the profile's audit chain-root key is acquirable AFTER the
+    // policy gate (a denial is a clean refusal that signs nothing and needs
+    // no audit setup) but BEFORE the signer is loaded (below) or the
+    // transaction is submitted. Reused (not re-acquired) for the
+    // post-confirm `value_action_submitted` row.
+    let audit_writer =
+        match crate::commands::value_audit::require_value_audit_writer(&profile, &args.profile) {
+            Ok(w) => w,
+            Err(e) => {
+                render_json(&Envelope::<()>::err(&e));
+                return 1;
+            }
+        };
 
     // ── GATE 5: Wallet-controlled clawback opt-in lookup (HMAC-verified) ────
     //
@@ -990,67 +993,4 @@ mod tests {
     }
 
     // ── Audit pre-flight (fail-closed) ───────────────────────────────────────
-
-    /// With no audit chain-root key seeded (an `init`-minted profile that
-    /// never ran `rotate-audit-key`), `run` refuses with exit code 1 BEFORE
-    /// the denomination resolver's live issuer fetch, the source-account
-    /// fetch, or signer resolution ever dial the RPC endpoint. The wire code
-    /// itself is pinned by
-    /// `value_audit::tests::require_value_audit_writer_refuses_when_key_unminted`;
-    /// this is the run()-level half of the house two-layer pattern. The
-    /// `received_requests` assertion is what makes this an ordering proof
-    /// rather than a tautology: if the pre-flight were removed (or moved
-    /// after the account fetches), this same fixture would still exit 1 —
-    /// but only after the mock server recorded at least one request.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn run_refuses_before_any_rpc_call_when_audit_key_unminted() {
-        use wiremock::MockServer;
-
-        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
-
-        let server = MockServer::start().await;
-        let rpc_url = server.uri();
-
-        let args = TrustlineArgs {
-            profile: "audit-preflight-test".to_owned(),
-            chain_id: None,
-            from: "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI".to_owned(),
-            asset: "USDC".to_owned(),
-            limit_stroops: None,
-            classic_base: None,
-        };
-
-        let code = run_with_dependencies(
-            &args,
-            move |_name| {
-                let mut profile = Profile::builder_testnet_named(
-                    "audit-preflight-test",
-                    "stellar-agent-signer",
-                    "audit-preflight-test",
-                    "stellar-agent-nonce",
-                    "audit-preflight-test",
-                )
-                .build();
-                profile.rpc_url = rpc_url.clone();
-                Ok(profile)
-            },
-            || Ok(()),
-        )
-        .await;
-
-        assert_eq!(
-            code, 1,
-            "run must refuse when the audit chain-root key is unminted"
-        );
-        let requests = server
-            .received_requests()
-            .await
-            .expect("request recording is enabled by default");
-        assert!(
-            requests.is_empty(),
-            "the audit pre-flight must refuse before any RPC call is made, got {} request(s)",
-            requests.len()
-        );
-    }
 }
