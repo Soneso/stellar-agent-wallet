@@ -41,7 +41,7 @@
     reason = "test-only; panics, unwraps, and eprintln acceptable in integration tests"
 )]
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
 use serde_json::json;
@@ -198,7 +198,18 @@ fn extract_seq_num_from_xdr(xdr_b64: &str) -> i64 {
 /// The `sendTransaction` method in `stellar-rpc-client` sends ObjectParams:
 /// `{"method":"sendTransaction","params":{"transaction":"<b64-xdr>"},...}`
 /// We capture and decode these to verify assertion (b).
-#[tokio::test(flavor = "multi_thread")]
+///
+/// # Rendezvous barrier
+///
+/// The distinct-channel assertion is only an invariant while all K leases are
+/// held simultaneously: after a task releases its channel, reuse by a later
+/// task is correct pool behavior. A `std::sync::Barrier` inside `build_ops`
+/// (which `submit_pooled` invokes between `acquire` and the first `.await`)
+/// blocks every task while it holds an `InFlight` lease until all K do, so no
+/// release can precede the last acquire. The barrier wait blocks the worker
+/// thread, hence `worker_threads = 8` guarantees enough OS threads for K
+/// simultaneous sync waits plus the mock server and the test task itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_submit_k4_distinct_channels_correct_seq_nums() {
     const K: usize = 4;
 
@@ -247,12 +258,16 @@ async fn concurrent_submit_k4_distinct_channels_correct_seq_nums() {
         Arc::new(StellarRpcClient::new(&mock_server.uri()).expect("mock server URL must be valid"));
 
     // ── Spawn K concurrent tasks ─────────────────────────────────────────────
+    // All K tasks rendezvous inside build_ops while holding their leases; see
+    // the test doc comment for why this is required for assertion (a).
+    let rendezvous = Arc::new(Barrier::new(K));
     let mut join_set: JoinSet<Result<u32, PoolError>> = JoinSet::new();
 
     for _ in 0..K {
         let pool_clone = Arc::clone(&pool);
         let client_clone = Arc::clone(&client);
         let seed_clone = Zeroizing::new(*seed);
+        let rendezvous_clone = Arc::clone(&rendezvous);
 
         join_set.spawn(async move {
             let result = submit_pooled(
@@ -263,6 +278,8 @@ async fn concurrent_submit_k4_distinct_channels_correct_seq_nums() {
                 FEE_PER_OP,
                 SUBMIT_TIMEOUT,
                 |builder| {
+                    // Hold the InFlight lease until all K tasks have acquired.
+                    rendezvous_clone.wait();
                     // 1-stroop XLM payment; mock RPC does not validate balances.
                     let _ = builder.payment(
                         DEST_KEY,
