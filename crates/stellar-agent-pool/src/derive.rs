@@ -29,6 +29,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use keyring_core::Entry as KeyringEntry;
 use secrecy::ExposeSecret;
 use stellar_agent_network::SoftwareSigningKey;
+use stellar_agent_network::keyring::classify_keyring_error;
 use stellar_agent_sep5::Sep5Wallet;
 use zeroize::Zeroizing;
 
@@ -63,13 +64,27 @@ pub fn load_pool_master_seed_from_keyring(
     service: &str,
     account: &str,
 ) -> Result<Zeroizing<[u8; 64]>, PoolError> {
-    let entry = KeyringEntry::new(service, account).map_err(|e| PoolError::InitFailed {
-        detail: format!("keyring entry open failed for pool master ({service}/{account}): {e}"),
+    let entry = KeyringEntry::new(service, account).map_err(|e| {
+        // The outward error is PoolError::InitFailed regardless of cause; the
+        // classified cause is diagnostic-only (debug level).
+        tracing::debug!(
+            cause = ?classify_keyring_error(&e, service),
+            "keyring entry open failed for pool master seed"
+        );
+        PoolError::InitFailed {
+            detail: format!("keyring entry open failed for pool master ({service}/{account}): {e}"),
+        }
     })?;
 
     // Wrap the returned password string immediately to ensure it zeroizes on drop.
-    let pw = Zeroizing::new(entry.get_password().map_err(|_| PoolError::InitFailed {
-        detail: format!("keyring get_password failed for pool master ({service}/{account})"),
+    let pw = Zeroizing::new(entry.get_password().map_err(|e| {
+        tracing::debug!(
+            cause = ?classify_keyring_error(&e, service),
+            "keyring get_password failed for pool master seed"
+        );
+        PoolError::InitFailed {
+            detail: format!("keyring get_password failed for pool master ({service}/{account})"),
+        }
     })?);
 
     // Decode into a Zeroizing<Vec<u8>> so the intermediate buffer is zeroed

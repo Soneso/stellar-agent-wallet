@@ -83,6 +83,7 @@ use stellar_agent_network::{
 };
 
 use stellar_agent_network::account::AccountFlagsView;
+use stellar_agent_network::keyring::classify_keyring_error;
 use stellar_agent_stablecoin::{
     preview::{GateDecisionView, TrustlinePreview},
     resolve::{DenominationInput, resolve_denomination},
@@ -798,8 +799,21 @@ fn load_attestation_key_for_verify(
     profile: &stellar_agent_core::profile::schema::Profile,
 ) -> Result<[u8; 32], ()> {
     let entry_ref = &profile.attestation_key_id;
-    let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).map_err(|_| ())?;
-    let raw = entry.get_password().map_err(|_| ())?;
+    let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).map_err(|e| {
+        // Fail-closed: the outward contract is a non-displayable unit error
+        // (opt-in absent). The classified cause is preserved at debug for
+        // operator forensics only.
+        tracing::debug!(
+            cause = ?classify_keyring_error(&e, &entry_ref.service),
+            "attestation key entry open failed for trustline opt-in verify (fail-closed)"
+        );
+    })?;
+    let raw = entry.get_password().map_err(|e| {
+        tracing::debug!(
+            cause = ?classify_keyring_error(&e, &entry_ref.service),
+            "attestation key read failed for trustline opt-in verify (fail-closed)"
+        );
+    })?;
     let bytes = URL_SAFE_NO_PAD.decode(raw.trim()).map_err(|_| ())?;
     if bytes.len() != 32 {
         return Err(());
@@ -819,6 +833,33 @@ mod tests {
     )]
 
     use super::*;
+
+    // ── attestation-key read is fail-closed ───────────────────────────────────
+
+    /// The trustline opt-in attestation-key read is fail-closed: even a
+    /// classified environmental keyring failure (a non-interactive Windows
+    /// session) surfaces as the opaque unit error (opt-in absent), never a
+    /// distinguishable outward error.
+    #[test]
+    #[serial_test::serial]
+    fn load_attestation_key_for_verify_is_fail_closed_on_environmental_failure() {
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let profile = Profile::builder_testnet_named(
+            "trustline-attest-no-logon-test",
+            "stellar-agent-signer",
+            "trustline-attest-no-logon-test",
+            "stellar-agent-nonce",
+            "trustline-attest-no-logon-test",
+        )
+        .build();
+        let entry_ref = &profile.attestation_key_id;
+        stellar_agent_test_support::keyring_mock::inject_no_logon_session(
+            &entry_ref.service,
+            &entry_ref.account,
+        )
+        .unwrap();
+        assert_eq!(load_attestation_key_for_verify(&profile), Err(()));
+    }
 
     // ── parse_denomination_input variants ─────────────────────────────────────
 

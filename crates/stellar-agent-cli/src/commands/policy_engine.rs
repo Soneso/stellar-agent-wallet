@@ -232,12 +232,20 @@ fn owner_pubkey_b64(profile_name: &str, verb: &str) -> Result<String, String> {
     }
 
     use keyring_core::Entry as KeyringEntry;
+    use stellar_agent_network::keyring::classify_keyring_error;
 
     let entry_ref =
         stellar_agent_core::profile::schema::KeyringEntryRef::default_owner_key(profile_name);
     KeyringEntry::new(&entry_ref.service, &entry_ref.account)
         .and_then(|e| e.get_password())
         .map_err(|e| {
+            // The outward contract is a fail-closed String error regardless of
+            // cause; the classified cause is diagnostic-only (debug level).
+            tracing::debug!(
+                cause = ?classify_keyring_error(&e, &entry_ref.service),
+                profile = %profile_name,
+                "owner key read failed for the v1 policy gate"
+            );
             format!(
                 "policy.engine is 'v1' but the owner key for profile '{profile_name}' could not \
                  be read from the keyring ({e}); {verb} refuses (fail-closed)"

@@ -28,7 +28,8 @@ use zeroize::Zeroizing;
 
 use crate::audit_log::entry::AuditEntry;
 use crate::audit_log::writer::AuditWriter;
-use crate::error::{AuthError, InternalError, WalletError};
+use crate::error::{InternalError, WalletError};
+use crate::keyring_errors::map_keyring_error;
 use crate::profile::schema::KeyringEntryRef;
 use crate::timefmt;
 
@@ -249,9 +250,7 @@ pub fn load_attestation_key(
             service = %entry_ref.service,
             "keyring Entry::new failed for attestation key"
         );
-        WalletError::Auth(AuthError::KeyringNotFound {
-            name: format!("{}:{}", entry_ref.service, entry_ref.account),
-        })
+        map_keyring_error(&e, &entry_ref.service)
     })?;
 
     let secret_b64 = Zeroizing::new(entry.get_password().map_err(|e| {
@@ -260,9 +259,7 @@ pub fn load_attestation_key(
             service = %entry_ref.service,
             "get_password failed for attestation key"
         );
-        WalletError::Auth(AuthError::KeyringNotFound {
-            name: format!("{}:{}", entry_ref.service, entry_ref.account),
-        })
+        map_keyring_error(&e, &entry_ref.service)
     })?);
 
     let key_bytes = Zeroizing::new(URL_SAFE_NO_PAD.decode(secret_b64.as_bytes()).map_err(|e| {
@@ -759,6 +756,40 @@ mod tests {
         let entry_ref = KeyringEntryRef::new(svc, "default");
         let key = load_attestation_key(&entry_ref).unwrap();
         assert_eq!(key.len(), 32);
+    }
+
+    /// A non-interactive Windows session (the `ERROR_NO_SUCH_LOGON_SESSION`
+    /// shape injected at the attestation-key coordinates) must surface as
+    /// `auth.keyring_interactive_session_required`, not `auth.keyring_not_found`.
+    #[test]
+    #[serial_test::serial]
+    fn load_attestation_key_surfaces_interactive_session_required() {
+        keyring_mock::install().unwrap();
+        let svc = "stellar-agent-attestation-core-test-no-logon";
+        keyring_mock::inject_no_logon_session(svc, "default").unwrap();
+        let entry_ref = KeyringEntryRef::new(svc, "default");
+        let err = load_attestation_key(&entry_ref).unwrap_err();
+        assert_eq!(err.code(), "auth.keyring_interactive_session_required");
+    }
+
+    /// A platform-store failure at the attestation-key coordinates must surface
+    /// as `auth.keyring_platform_error`, not `auth.keyring_not_found`.
+    #[test]
+    #[serial_test::serial]
+    fn load_attestation_key_surfaces_platform_error() {
+        keyring_mock::install().unwrap();
+        let svc = "stellar-agent-attestation-core-test-platform-err";
+        keyring_mock::inject_error(
+            svc,
+            "default",
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other(
+                "simulated platform failure",
+            ))),
+        )
+        .unwrap();
+        let entry_ref = KeyringEntryRef::new(svc, "default");
+        let err = load_attestation_key(&entry_ref).unwrap_err();
+        assert_eq!(err.code(), "auth.keyring_platform_error");
     }
 
     #[test]

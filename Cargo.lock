@@ -5071,6 +5071,7 @@ dependencies = [
  "stellar-agent-core",
  "stellar-agent-network",
  "stellar-agent-sep43",
+ "stellar-agent-test-support",
  "stellar-agent-xdr-limits",
  "stellar-baselib",
  "stellar-rpc-client",
@@ -5081,6 +5082,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tracing",
  "url",
  "zeroize",
 ]
