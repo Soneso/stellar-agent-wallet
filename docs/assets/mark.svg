@@ -1,17 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -10 120 130" role="img" aria-label="Stellar Agent Wallet mark">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img" aria-label="Stellar Agent Wallet mark">
     <style>
-    /* 6.2s cycle: SEND (antenna ring, 0-0.75s) -> 1s pause -> WINK + smirk
-       (1.7-2.2s) -> ~4s rest. Resting frame equals the static mark. */
-    @keyframes saw-mark-ping {
-      0%, 1% { opacity: 0; transform: scale(0.65); }
-      2% { opacity: 0.85; transform: scale(0.9); }
-      12%, 100% { opacity: 0; transform: scale(1.7); }
-    }
-    .saw-mark-ping-ring {
-      animation: saw-mark-ping 6.2s linear infinite;
-      transform-box: fill-box;
-      transform-origin: center;
-    }
+    /* One wink (with synced smirk) per 6.2s cycle; rest otherwise. Resting
+       frame equals the static mark. */
     @keyframes saw-mark-wink {
       0%, 27.5%, 35.5%, 100% { transform: scaleY(1); }
       30%, 33% { transform: scaleY(0.08); }
@@ -31,14 +21,12 @@
       transform-origin: center;
     }
     @media (prefers-reduced-motion: reduce) {
-      .saw-mark-ping-ring, .saw-mark-wink-eye, .saw-mark-smirk-mouth { animation: none; }
-      .saw-mark-ping-ring { opacity: 0; }
+      .saw-mark-wink-eye, .saw-mark-smirk-mouth { animation: none; }
     }
   </style>
   <!-- antenna -->
   <line x1="60" y1="14" x2="60" y2="30" stroke="#5b8cc9" stroke-width="7" stroke-linecap="round"/>
   <circle cx="60" cy="10" r="9" fill="#ffb35c"/>
-  <circle class="saw-mark-ping-ring" cx="60" cy="10" r="11" fill="none" stroke="#ffb35c" stroke-width="4" opacity="0"/>
   <!-- head -->
   <rect x="12" y="30" width="96" height="78" rx="24" fill="#ffffff" stroke="#5b8cc9" stroke-width="7"/>
   <circle cx="44" cy="64" r="9" fill="#2f5382"/>
