@@ -1,4 +1,67 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 320" role="img" aria-label="Stellar Agent Wallet">
+    <style>
+    /* One 12s master timeline telling the wallet's flow: WORK (star spins once,
+       card lines redraw, ~2.0-3.2s) -> SEND (antenna signal ring, ~4.4-5.2s)
+       -> SUCCESS (wink + smirk, ~6.8-7.3s). Rest otherwise; every gesture is
+       episodic and the resting frame equals the static banner. */
+    @keyframes saw-star-spin {
+      0%, 16.6% { transform: rotate(0deg); animation-timing-function: ease-in-out; }
+      25%, 100% { transform: rotate(360deg); }
+    }
+    .saw-star {
+      animation: saw-star-spin 12s linear infinite;
+      transform-box: fill-box;
+      transform-origin: center;
+    }
+    @keyframes saw-line-a {
+      0%, 16.6%, 27%, 100% { transform: scaleX(1); }
+      20% { transform: scaleX(0.55); }
+      23.5% { transform: scaleX(1.15); }
+    }
+    @keyframes saw-line-b {
+      0%, 18%, 28.5%, 100% { transform: scaleX(1); }
+      21.5% { transform: scaleX(0.6); }
+      25% { transform: scaleX(1.1); }
+    }
+    .saw-line-a, .saw-line-b {
+      transform-box: fill-box;
+      transform-origin: left center;
+    }
+    .saw-line-a { animation: saw-line-a 12s linear infinite; }
+    .saw-line-b { animation: saw-line-b 12s linear infinite; }
+    @keyframes saw-ping {
+      0%, 36.8% { opacity: 0; transform: scale(0.65); }
+      37.8% { opacity: 0.85; transform: scale(0.9); }
+      43.3%, 100% { opacity: 0; transform: scale(2.8); }
+    }
+    .saw-ping-ring {
+      animation: saw-ping 12s linear infinite;
+      transform-box: fill-box;
+      transform-origin: center;
+    }
+    @keyframes saw-wink {
+      0%, 56.5%, 61%, 100% { transform: scaleY(1); }
+      58%, 59.5% { transform: scaleY(0.08); }
+    }
+    .saw-wink-eye {
+      animation: saw-wink 12s linear infinite;
+      transform-box: fill-box;
+      transform-origin: center;
+    }
+    @keyframes saw-smirk {
+      0%, 56.5%, 61%, 100% { transform: translateY(0) rotate(0deg); }
+      58%, 59.5% { transform: translateY(-1.5px) rotate(-4deg); }
+    }
+    .saw-smirk-mouth {
+      animation: saw-smirk 12s linear infinite;
+      transform-box: fill-box;
+      transform-origin: center;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .saw-star, .saw-line-a, .saw-line-b, .saw-ping-ring, .saw-wink-eye, .saw-smirk-mouth { animation: none; }
+      .saw-ping-ring { opacity: 0; }
+    }
+  </style>
   <rect width="1280" height="320" fill="#e8f1fb"/>
   <rect x="1.5" y="1.5" width="1277" height="317" fill="none" stroke="#cfe0f2" stroke-width="3"/>
   <!-- friendly agent: rounded robot with wallet card -->
@@ -6,18 +69,19 @@
     <!-- antenna -->
     <line x1="105" y1="18" x2="105" y2="42" stroke="#5b8cc9" stroke-width="5" stroke-linecap="round"/>
     <circle cx="105" cy="14" r="9" fill="#ffb35c"/>
+    <circle class="saw-ping-ring" cx="105" cy="14" r="11" fill="none" stroke="#ffb35c" stroke-width="3" opacity="0"/>
     <!-- head -->
     <rect x="35" y="42" width="140" height="108" rx="30" fill="#ffffff" stroke="#5b8cc9" stroke-width="5"/>
     <circle cx="82" cy="90" r="11" fill="#2f5382"/>
-    <circle cx="128" cy="90" r="11" fill="#2f5382"/>
-    <path d="M78 118 Q105 138 132 118" fill="none" stroke="#2f5382" stroke-width="5" stroke-linecap="round"/>
+    <circle class="saw-wink-eye" cx="128" cy="90" r="11" fill="#2f5382"/>
+    <path class="saw-smirk-mouth" d="M78 118 Q105 138 132 118" fill="none" stroke="#2f5382" stroke-width="5" stroke-linecap="round"/>
     <!-- wallet card held below -->
     <g transform="translate(20,168)">
       <rect x="0" y="0" width="170" height="72" rx="14" fill="#ffffff" stroke="#5b8cc9" stroke-width="5"/>
-      <rect x="14" y="16" width="64" height="10" rx="5" fill="#9db9dc"/>
-      <rect x="14" y="36" width="96" height="10" rx="5" fill="#c3d6ec"/>
+      <rect class="saw-line-a" x="14" y="16" width="64" height="10" rx="5" fill="#9db9dc"/>
+      <rect class="saw-line-b" x="14" y="36" width="96" height="10" rx="5" fill="#c3d6ec"/>
       <!-- four-point star on the card -->
-      <path d="M140 22 L146 36 L160 42 L146 48 L140 62 L134 48 L120 42 L134 36 Z" fill="#ffb35c"/>
+      <path class="saw-star" d="M140 22 L146 36 L160 42 L146 48 L140 62 L134 48 L120 42 L134 36 Z" fill="#ffb35c"/>
     </g>
   </g>
   <g font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">

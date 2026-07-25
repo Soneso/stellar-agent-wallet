@@ -11,10 +11,11 @@
   <a href="https://soneso.com"><img src="https://img.shields.io/badge/built_by-Soneso-243b5c?style=for-the-badge" alt="Built by Soneso"></a>
 </p>
 
-# Stellar Agent Wallet
+# Stellar Agent Wallet <img src="docs/assets/mark.svg" alt="" height="30">
 
-Soneso's Stellar wallet for AI agents: autonomous transactions inside rules
-you define, approvals you grant, and an audit trail you can verify.
+A Stellar wallet for AI agents, built by Soneso: autonomous transactions
+inside rules you define, approvals you grant, and an audit trail you can
+verify.
 
 `stellar-agent-wallet` lets an AI agent transact on Stellar under guardrails. It
 ships two surfaces over one shared core: the `stellar-agent` CLI and the
@@ -42,8 +43,9 @@ Public alpha, under active development.
 
 Release archives are published on the
 [releases page](https://github.com/Soneso/stellar-agent-wallet/releases) for
-each tagged release, and every workspace crate is published on
-[crates.io](https://crates.io/crates/stellar-agent-cli).
+each tagged release, and the workspace crates are published to
+[crates.io](https://crates.io/crates/stellar-agent-cli) with each release
+(features merged since the last tag ship from source until the next one).
 
 ## Highlights
 
@@ -88,7 +90,7 @@ are documented in [Agent payments with MPP](docs/agent-payments.md).
 
 Prebuilt binaries are published on the
 [releases page](https://github.com/Soneso/stellar-agent-wallet/releases) for each
-tagged release, and all crates are published on crates.io.
+tagged release, and the crates are published to crates.io with each release.
 
 While only prerelease (alpha) versions are published, `cargo install` and
 `cargo binstall` need the version spelled out — a bare crate name matches

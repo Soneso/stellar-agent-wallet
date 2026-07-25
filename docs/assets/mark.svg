@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img" aria-label="Stellar Agent Wallet mark">
+  <!-- antenna -->
+  <line x1="60" y1="14" x2="60" y2="30" stroke="#5b8cc9" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="60" cy="10" r="9" fill="#ffb35c"/>
+  <!-- head -->
+  <rect x="12" y="30" width="96" height="78" rx="24" fill="#ffffff" stroke="#5b8cc9" stroke-width="7"/>
+  <circle cx="44" cy="64" r="9" fill="#2f5382"/>
+  <circle cx="76" cy="64" r="9" fill="#2f5382"/>
+  <path d="M40 84 Q60 100 80 84" fill="none" stroke="#2f5382" stroke-width="7" stroke-linecap="round"/>
+</svg>
