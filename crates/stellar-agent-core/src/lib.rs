@@ -80,6 +80,12 @@ pub mod counterparty;
 /// taxonomy overview, wire-format specification, and secret-material policy.
 pub mod error;
 
+/// Single classification point for platform-keyring failures
+/// (`classify_keyring_error`, `map_keyring_error`).  `stellar-agent-network`
+/// re-exports both from `stellar_agent_network::keyring`, so callers on that
+/// path are unaffected by the classifier living here.
+pub mod keyring_errors;
+
 /// Uniform JSON wire-format envelope for all CLI commands, MCP tools, and
 /// library APIs.  Provides [`envelope::Envelope<T>`] (success and error
 /// response wrapper), [`envelope::EnvelopeError`] (structured error payload),

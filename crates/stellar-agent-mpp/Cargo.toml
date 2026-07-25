@@ -33,6 +33,7 @@ subtle.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 time.workspace = true
+tracing.workspace = true
 url.workspace = true
 zeroize.workspace = true
 
@@ -41,6 +42,10 @@ proptest.workspace = true
 rand_core.workspace = true
 reqwest.workspace = true
 serial_test.workspace = true
+# Plain dev-dep (no features): the in-memory keyring mock for the
+# state-key-read classification test. No feature is enabled here, so the
+# testnet-helpers feature-unification hazard does not apply.
+stellar-agent-test-support = { path = "../stellar-agent-test-support" }
 tokio.workspace = true
 zeroize.workspace = true
 

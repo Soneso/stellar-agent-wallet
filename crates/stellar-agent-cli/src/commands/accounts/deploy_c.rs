@@ -45,12 +45,10 @@ use keyring_core::Entry as KeyringEntry;
 use rand_core::{OsRng, RngCore};
 use stellar_agent_core::audit_log::writer::{AuditWriter, AuditWriterRegistry};
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
-use stellar_agent_core::error::{
-    AuthError, InternalError, NetworkError, ValidationError, WalletError,
-};
+use stellar_agent_core::error::{InternalError, NetworkError, ValidationError, WalletError};
 use stellar_agent_core::profile::{loader, schema::Profile};
 use stellar_agent_core::wallet::MlockDegradation;
-use stellar_agent_network::keyring::init_platform_keyring_store;
+use stellar_agent_network::keyring::{init_platform_keyring_store, map_keyring_error};
 use stellar_agent_network::{
     StellarRpcClient, parse_classic_fee_choice, resolve_classic_fee_selection,
 };
@@ -589,9 +587,7 @@ fn load_audit_hmac_key(profile: &Profile) -> Result<Zeroizing<[u8; 32]>, WalletE
             service = %entry_ref.service,
             "keyring Entry::new failed for deploy-c audit HMAC key"
         );
-        WalletError::Auth(AuthError::KeyringNotFound {
-            name: format!("{}:{}", entry_ref.service, entry_ref.account),
-        })
+        map_keyring_error(&e, &entry_ref.service)
     })?;
 
     let secret_b64 = Zeroizing::new(entry.get_password().map_err(|e| {
@@ -600,9 +596,7 @@ fn load_audit_hmac_key(profile: &Profile) -> Result<Zeroizing<[u8; 32]>, WalletE
             service = %entry_ref.service,
             "get_password failed for deploy-c audit HMAC key"
         );
-        WalletError::Auth(AuthError::KeyringNotFound {
-            name: format!("{}:{}", entry_ref.service, entry_ref.account),
-        })
+        map_keyring_error(&e, &entry_ref.service)
     })?);
 
     let decoded = Zeroizing::new(URL_SAFE_NO_PAD.decode(secret_b64.as_bytes()).map_err(|e| {
@@ -1069,6 +1063,57 @@ mod tests {
         entry
             .set_password(&URL_SAFE_NO_PAD.encode([0x42u8; 32]))
             .unwrap();
+    }
+
+    fn audit_key_test_profile(name: &str) -> Profile {
+        Profile::builder_testnet_named(
+            name,
+            "stellar-agent-signer",
+            name,
+            "stellar-agent-nonce",
+            name,
+        )
+        .build()
+    }
+
+    /// A non-interactive Windows session (the `ERROR_NO_SUCH_LOGON_SESSION`
+    /// shape injected at the audit-key coordinates) must surface as
+    /// `auth.keyring_interactive_session_required`, not `auth.keyring_not_found`.
+    #[test]
+    #[serial]
+    fn load_audit_hmac_key_surfaces_interactive_session_required() {
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let profile = audit_key_test_profile("deploy-c-audit-no-logon-test");
+        let entry_ref = &profile.audit_log_hash_chain_key_id;
+        stellar_agent_test_support::keyring_mock::inject_no_logon_session(
+            &entry_ref.service,
+            &entry_ref.account,
+        )
+        .unwrap();
+
+        let err = load_audit_hmac_key(&profile).unwrap_err();
+        assert_eq!(err.code(), "auth.keyring_interactive_session_required");
+    }
+
+    /// A platform-store failure at the audit-key coordinates must surface as
+    /// `auth.keyring_platform_error`, not `auth.keyring_not_found`.
+    #[test]
+    #[serial]
+    fn load_audit_hmac_key_surfaces_platform_error() {
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let profile = audit_key_test_profile("deploy-c-audit-platform-err-test");
+        let entry_ref = &profile.audit_log_hash_chain_key_id;
+        stellar_agent_test_support::keyring_mock::inject_error(
+            &entry_ref.service,
+            &entry_ref.account,
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other(
+                "simulated platform failure",
+            ))),
+        )
+        .unwrap();
+
+        let err = load_audit_hmac_key(&profile).unwrap_err();
+        assert_eq!(err.code(), "auth.keyring_platform_error");
     }
 
     const TEST_DEPLOYER_ENV_VAR: &str = "__STELLAR_AGENT_TEST_DEPLOY_C_SKEY";

@@ -567,6 +567,13 @@ fn generation_entry_ref(profile: &Profile) -> KeyringEntryRef {
 /// never been minted — a genuine first-run signal, distinct from `Some(0)`
 /// (which cannot occur: [`bump_generation`] always writes a value `>= 1`).
 fn load_generation(entry_ref: &KeyringEntryRef) -> Result<Option<u64>, WindowStoreError> {
+    // Keyring failures are carried inside the crate-local `WindowStoreError::Keyring`
+    // with the raw error text; `NoEntry` is distinguished as the first-run signal.
+    // This path is not routed through `classify_keyring_error`, so a non-interactive
+    // Windows session reads as a generic keyring error rather than
+    // `auth.keyring_interactive_session_required`. On the T6 keyring-classification
+    // allow-set for that reason; full surface-layer classification here is a
+    // candidate follow-up (the generation counter is a non-secret integer).
     let entry = keyring_core::Entry::new(&entry_ref.service, &entry_ref.account).map_err(|e| {
         WindowStoreError::Keyring {
             detail: format!("generation entry open failed: {e}"),
@@ -599,6 +606,8 @@ fn bump_generation(entry_ref: &KeyringEntryRef) -> Result<u64, WindowStoreError>
         .ok_or_else(|| WindowStoreError::Invalid {
             detail: "policy window-state generation counter overflow".to_owned(),
         })?;
+    // Same keyring-error discipline as `load_generation` (T6 allow-set;
+    // classification follow-up candidate): raw text inside `WindowStoreError::Keyring`.
     let entry = keyring_core::Entry::new(&entry_ref.service, &entry_ref.account).map_err(|e| {
         WindowStoreError::Keyring {
             detail: format!("generation entry open failed: {e}"),

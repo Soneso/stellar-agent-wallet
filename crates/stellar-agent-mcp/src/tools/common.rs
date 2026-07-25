@@ -942,15 +942,28 @@ pub(crate) fn load_attestation_key(
 ) -> Result<[u8; 32], rmcp::model::CallToolResult> {
     use base64::Engine as _;
     use keyring_core::Entry as KeyringEntry;
+    use stellar_agent_network::keyring::classify_keyring_error;
 
     let entry_ref = &profile.attestation_key_id;
+    // The outward wire error stays uniform for every failure mode per the
+    // indistinguishability rule (see `approval_required_indistinguishable`), so
+    // an oracle cannot tell key-absence from an environmental keyring failure.
+    // The classified cause is preserved at debug for operator forensics only.
     let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).map_err(|e| {
-        tracing::debug!(error = %e, "attestation key entry open failed");
+        tracing::debug!(
+            error = %e,
+            cause = ?classify_keyring_error(&e, &entry_ref.service),
+            "attestation key entry open failed"
+        );
         approval_required_indistinguishable()
     })?;
 
     let raw = entry.get_password().map_err(|e| {
-        tracing::debug!(error = %e, "attestation key read failed");
+        tracing::debug!(
+            error = %e,
+            cause = ?classify_keyring_error(&e, &entry_ref.service),
+            "attestation key read failed"
+        );
         approval_required_indistinguishable()
     })?;
 

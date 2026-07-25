@@ -106,6 +106,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keyring failures on the audit-HMAC and attestation-key READ paths are now
+  classified instead of being reported as `auth.keyring_not_found` or
+  discarded. `stellar-agent audit verify`, `accounts deploy-c`, the CLI, core,
+  and MCP attestation-key loaders, the `profile sign-policy` owner-key read,
+  and the MCP server's owner-key read now surface the precise cause — most
+  importantly `auth.keyring_interactive_session_required` for a
+  non-interactive Windows session — while key absence still maps to
+  `auth.keyring_not_found` (and to `OwnerKeyAbsent` for the MCP owner key).
+  The fail-closed and indistinguishable read paths (the trustline opt-in
+  verify, the MPP state-key read, the MCP attestation gate, the
+  `credentials add-passkey` audit emission, the v1 policy-gate owner-key read,
+  and the channel-pool master-seed read) keep their outward contract unchanged
+  and now log the classified cause at debug for operator forensics. The single
+  keyring classifier (`classify_keyring_error` / `map_keyring_error`) now lives
+  in `stellar-agent-core` and is re-exported from `stellar_agent_network::keyring`,
+  so no call site or wire code changed for existing callers.
 - An unset `audit_log_path` now resolves to the per-profile location the
   field documents (`<root>/audit/<name>.jsonl`) in the profile builder, the
   loader, and the v1 migration, instead of a host-global `audit.log` shared

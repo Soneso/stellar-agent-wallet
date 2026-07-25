@@ -149,6 +149,29 @@ pub enum BuildRegistryError {
         detail: String,
     },
 
+    /// The owner keyring entry exists but could not be READ because of a
+    /// classified keyring failure that is not simple key-absence — most
+    /// notably a non-interactive Windows session
+    /// (`auth.keyring_interactive_session_required`) or a platform-store
+    /// failure.
+    ///
+    /// Distinct from [`Self::OwnerKeyAbsent`] so a present-but-unreadable key
+    /// is not misreported as an absent enrolment, which would send the
+    /// operator to re-run the enrolment ceremony instead of fixing the
+    /// session/store condition.
+    ///
+    /// `code` is the classified [`crate::error::WalletError`] wire code;
+    /// `detail` is its operator-facing message (no key material).
+    #[error("cannot read owner key for profile '{profile}' from the keyring: {detail} ({code})")]
+    OwnerKeyringReadFailed {
+        /// Profile name whose owner-key read failed.
+        profile: String,
+        /// Classified wire code (e.g. `auth.keyring_interactive_session_required`).
+        code: &'static str,
+        /// Non-secret classified diagnostic message.
+        detail: String,
+    },
+
     /// The value stored in the owner keyring entry could not be decoded as
     /// URL-safe base64.
     ///

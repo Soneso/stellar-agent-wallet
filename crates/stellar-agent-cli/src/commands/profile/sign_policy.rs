@@ -65,6 +65,7 @@ use stellar_agent_core::policy::v1::signature::{digest, sign};
 use stellar_agent_core::profile::loader;
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile, default_policy_dir};
 use stellar_agent_core::wallet::{MlockRequired, Wallet};
+use stellar_agent_network::keyring::map_keyring_error;
 
 use crate::commands::policy_engine::OWNER_KEY_SERVICE_PREFIX;
 use crate::common::render;
@@ -365,12 +366,25 @@ fn read_owner_pubkey(coord: &KeyringEntryRef) -> Result<[u8; 32], String> {
             coord.service, coord.account
         )
     })?;
-    let raw = entry.get_password().map_err(|_| {
-        format!(
+    let raw = entry.get_password().map_err(|e| match &e {
+        // Absence keeps the outward not-enrolled contract; any other cause is
+        // classified and surfaced, so a non-interactive Windows session is not
+        // misreported as a missing enrolment.
+        keyring_core::Error::NoEntry => format!(
             "no owner key is enrolled at keyring service '{}' account '{}'; run \
              `stellar-agent profile enroll-owner-key` first",
             coord.service, coord.account
-        )
+        ),
+        other => {
+            let classified = map_keyring_error(other, &coord.service);
+            format!(
+                "the owner key at keyring service '{}' account '{}' could not be read ({}): {}",
+                coord.service,
+                coord.account,
+                classified.code(),
+                classified.message()
+            )
+        }
     })?;
     let bytes = URL_SAFE_NO_PAD.decode(raw.trim()).map_err(|e| {
         format!(
@@ -628,6 +642,39 @@ mod tests {
             secret_env: var.to_owned(),
             file: Some(file.to_path_buf()),
         }
+    }
+
+    /// Owner-key absence keeps the outward not-enrolled contract.
+    #[test]
+    #[serial]
+    fn read_owner_pubkey_reports_not_enrolled_on_absence() {
+        keyring_mock::install().expect("mock store");
+        let coord = KeyringEntryRef::default_owner_key("sign-policy-owner-absent-test");
+        let err = read_owner_pubkey(&coord).unwrap_err();
+        assert!(
+            err.contains("no owner key is enrolled"),
+            "absence must keep the not-enrolled message, got: {err}"
+        );
+    }
+
+    /// A non-interactive Windows session is NOT misreported as a missing
+    /// enrolment: the classified `auth.keyring_interactive_session_required`
+    /// code is surfaced in the refusal message.
+    #[test]
+    #[serial]
+    fn read_owner_pubkey_surfaces_interactive_session_required() {
+        keyring_mock::install().expect("mock store");
+        let coord = KeyringEntryRef::default_owner_key("sign-policy-owner-no-logon-test");
+        keyring_mock::inject_no_logon_session(&coord.service, &coord.account).unwrap();
+        let err = read_owner_pubkey(&coord).unwrap_err();
+        assert!(
+            err.contains("auth.keyring_interactive_session_required"),
+            "a non-interactive session must surface the classified code, got: {err}"
+        );
+        assert!(
+            !err.contains("no owner key is enrolled"),
+            "an environmental failure must not be misreported as not-enrolled, got: {err}"
+        );
     }
 
     /// The acceptance law: real sign-policy → the REAL v1 loader accepts the

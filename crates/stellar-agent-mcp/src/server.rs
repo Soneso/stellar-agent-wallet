@@ -78,6 +78,7 @@ use stellar_agent_core::{
     profile::schema::{KeyringEntryRef, PolicyEngineKind, Profile, default_policy_dir},
     timefmt::{Clock, default_clock},
 };
+use stellar_agent_network::keyring::map_keyring_error;
 use stellar_agent_network::policy_state::PersistedWindowStore;
 use stellar_agent_network::{CounterpartyResolver, NoopCounterpartyResolver, StellarTomlResolver};
 use stellar_agent_nonce::{NonceMint, ReplayWindow};
@@ -342,12 +343,23 @@ fn fetch_owner_pubkey_from_keyring(
         }
     })?;
 
-    let raw = entry
-        .get_password()
-        .map_err(|e| BuildRegistryError::OwnerKeyAbsent {
+    let raw = entry.get_password().map_err(|e| match &e {
+        // Absence keeps the OwnerKeyAbsent contract; any other cause is
+        // classified and surfaced so a non-interactive Windows session is not
+        // misreported as an absent key.
+        keyring_core::Error::NoEntry => BuildRegistryError::OwnerKeyAbsent {
             profile: profile_name.to_owned(),
             detail: e.to_string(),
-        })?;
+        },
+        other => {
+            let classified = map_keyring_error(other, &entry_ref.service);
+            BuildRegistryError::OwnerKeyringReadFailed {
+                profile: profile_name.to_owned(),
+                code: classified.code(),
+                detail: classified.message(),
+            }
+        }
+    })?;
 
     // URL-safe base64, no padding — written at policy-sign time.
     use base64::Engine as _;
@@ -1238,6 +1250,42 @@ mod tests {
         )
         .with_profile_name("alice")
         .build()
+    }
+
+    /// The owner key being absent keeps the `OwnerKeyAbsent` contract.
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn fetch_owner_pubkey_reports_absent_on_no_entry() {
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let err = fetch_owner_pubkey_from_keyring("mcp-owner-absent-test").unwrap_err();
+        assert!(
+            matches!(err, BuildRegistryError::OwnerKeyAbsent { .. }),
+            "absence must map to OwnerKeyAbsent, got {err:?}"
+        );
+    }
+
+    /// A non-interactive Windows session is surfaced through the classified
+    /// `OwnerKeyringReadFailed` variant, not misreported as `OwnerKeyAbsent`.
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn fetch_owner_pubkey_surfaces_interactive_session_required() {
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let profile_name = "mcp-owner-no-logon-test";
+        let coord = KeyringEntryRef::default_owner_key(profile_name);
+        stellar_agent_test_support::keyring_mock::inject_no_logon_session(
+            &coord.service,
+            &coord.account,
+        )
+        .unwrap();
+        let err = fetch_owner_pubkey_from_keyring(profile_name).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                BuildRegistryError::OwnerKeyringReadFailed { code, .. }
+                    if *code == "auth.keyring_interactive_session_required"
+            ),
+            "expected OwnerKeyringReadFailed with the interactive-session code, got {err:?}"
+        );
     }
 
     #[test]

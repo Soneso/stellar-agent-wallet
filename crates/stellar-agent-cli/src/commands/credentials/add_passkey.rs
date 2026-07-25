@@ -413,6 +413,7 @@ async fn open_profile_audit_writer_non_fatal(
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use keyring_core::Entry as KeyringEntry;
+    use stellar_agent_network::keyring::classify_keyring_error;
     use zeroize::Zeroizing;
 
     let profile = match loader::load(profile_name, None) {
@@ -434,6 +435,7 @@ async fn open_profile_audit_writer_non_fatal(
             warn!(
                 service = %entry_ref.service,
                 error = %e,
+                cause = ?classify_keyring_error(&e, &entry_ref.service),
                 "credentials add-passkey: keyring Entry::new failed for audit HMAC key; audit entry will be skipped"
             );
             return None;
@@ -446,6 +448,7 @@ async fn open_profile_audit_writer_non_fatal(
             warn!(
                 service = %entry_ref.service,
                 error = %e,
+                cause = ?classify_keyring_error(&e, &entry_ref.service),
                 "credentials add-passkey: keyring get_password failed; audit entry will be skipped"
             );
             return None;

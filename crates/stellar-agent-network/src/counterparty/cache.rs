@@ -703,6 +703,13 @@ fn keyring_service_name(profile_name: &str) -> String {
 fn load_hmac_key(
     profile_name: &str,
 ) -> Result<zeroize::Zeroizing<[u8; HMAC_KEY_LEN]>, CounterpartyError> {
+    // Keyring failures are carried inside the crate-local
+    // `CounterpartyError::KeyringUnavailable`; `NoEntry` is distinguished and
+    // every other cause is routed to debug tracing (never embedded in the
+    // operator-visible detail, which could leak profile/account names). This
+    // path is not routed through `classify_keyring_error`, so it is on the T6
+    // keyring-classification allow-set; full surface-layer classification is a
+    // candidate follow-up.
     let service = keyring_service_name(profile_name);
     let entry = KeyringEntry::new(&service, KEYRING_ACCOUNT).map_err(|e| {
         CounterpartyError::KeyringUnavailable {
@@ -753,6 +760,10 @@ fn load_hmac_key(
 fn load_or_mint_hmac_key(
     profile_name: &str,
 ) -> Result<zeroize::Zeroizing<[u8; HMAC_KEY_LEN]>, CounterpartyError> {
+    // Same keyring-error discipline as `load_hmac_key` (T6 allow-set;
+    // classification follow-up candidate): `NoEntry` triggers the lazy-mint,
+    // every other cause is routed to debug tracing inside
+    // `CounterpartyError::KeyringUnavailable`.
     let service = keyring_service_name(profile_name);
     let entry = KeyringEntry::new(&service, KEYRING_ACCOUNT).map_err(|e| {
         CounterpartyError::KeyringUnavailable {

@@ -105,11 +105,24 @@ impl MppAuthorizationStore {
         let key = match load_hmac_key_32(&entry_ref) {
             Ok(key) => key,
             Err(_) if mint_if_absent && !placeholder.path.exists() => {
-                rotate_keyring_secret_32(&entry_ref.service, &entry_ref.account)
-                    .map_err(|_error| state_error())?;
-                load_hmac_key_32(&entry_ref).map_err(|_error| state_error())?
+                // The outward contract is the uniform `mpp.state_unavailable`;
+                // the already-classified `WalletError` is preserved at debug
+                // for operator forensics only.
+                rotate_keyring_secret_32(&entry_ref.service, &entry_ref.account).map_err(
+                    |error| {
+                        tracing::debug!(error = %error, "mpp state key rotation failed");
+                        state_error()
+                    },
+                )?;
+                load_hmac_key_32(&entry_ref).map_err(|error| {
+                    tracing::debug!(error = %error, "mpp state key reload after rotation failed");
+                    state_error()
+                })?
             }
-            Err(_) => return Err(state_error()),
+            Err(error) => {
+                tracing::debug!(error = %error, "mpp state key load failed");
+                return Err(state_error());
+            }
         };
         Ok(Self {
             path: placeholder.path,
@@ -680,6 +693,29 @@ mod tests {
     use serde_json::Value;
     use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
     use tempfile::TempDir;
+
+    /// A keyring failure while reading the per-profile state key surfaces as the
+    /// uniform `mpp.state_unavailable`, regardless of the classified cause: the
+    /// caller must not be able to distinguish a missing store from an
+    /// environmental keyring failure.
+    #[test]
+    #[serial_test::serial]
+    fn from_profile_keyring_maps_keyring_failure_to_state_unavailable() {
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let profile_name = "mpp-state-key-no-logon-test";
+        let entry_ref = stellar_agent_core::profile::schema::KeyringEntryRef::default_mpp_state_key(
+            profile_name,
+        );
+        stellar_agent_test_support::keyring_mock::inject_no_logon_session(
+            &entry_ref.service,
+            &entry_ref.account,
+        )
+        .expect("inject the no-logon-session failure at the state-key coordinates");
+
+        let err = MppAuthorizationStore::from_profile_keyring(profile_name, false)
+            .expect_err("a keyring read failure must surface an MppError");
+        assert_eq!(err.code(), "mpp.state_unavailable");
+    }
 
     #[test]
     fn empty_store_is_lazy_until_mutation() {
