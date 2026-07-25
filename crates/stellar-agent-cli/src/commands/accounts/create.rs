@@ -950,7 +950,12 @@ async fn sponsored_create(
         drop(signer);
         signed
     } else {
-        return Err(WalletError::Auth(AuthError::KeyringLocked));
+        return Err(WalletError::Validation(
+            ValidationError::SignerSourceRequired {
+                detail: "no signer flag specified; pass --secret-env <VAR> or --sign-with-ledger"
+                    .to_owned(),
+            },
+        ));
     };
 
     // Submit and wait for confirmation.
@@ -1881,7 +1886,7 @@ mod tests {
     /// fatally at the keyring-init step: it warns and continues past both the
     /// keyring-init failure and the origin-aware audit pre-flight, reaching
     /// the sponsor-account RPC fetch and the later "no signer configured"
-    /// refusal (`AuthError::KeyringLocked`, raised only once
+    /// refusal (`ValidationError::SignerSourceRequired`, raised only once
     /// `sponsored_create` reaches its signing branch) — a DIFFERENT, later
     /// error than the injected keyring-init failure
     /// (`AuthError::KeyringNotFound`). The `received_requests` assertion is

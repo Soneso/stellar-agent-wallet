@@ -105,7 +105,7 @@ use stellar_agent_core::{
 };
 use zeroize::Zeroizing;
 
-use crate::signing::source::signer_from_s_strkey;
+use crate::signing::source::{SecretStrkeySource, signer_from_s_strkey};
 use crate::signing::{Signer, WebAuthnAssertion, software::SoftwareSigningKey};
 
 // The single keyring-failure classification point lives in
@@ -741,23 +741,14 @@ pub async fn signer_from_keyring(
     // Delegate to the canonical parse-verify-zeroise helper in signing::source.
     // It applies the full zeroisation sequence (PrivateKey residue,
     // Zeroizing<String> drop, SecretBox heap) and verifies the G-strkey before
-    // returning. Map the generic "invalid S-strkey" error to name the keyring
-    // service.
-    let signer = signer_from_s_strkey(s_strkey, expected_source_g)
-        .await
-        .map_err(|e| match e {
-            WalletError::Auth(AuthError::KeyringNotFound { ref name })
-                if name == "invalid S-strkey" =>
-            {
-                WalletError::Auth(AuthError::KeyringNotFound {
-                    name: format!(
-                        "keyring entry '{}' contains an invalid S-strkey",
-                        entry_ref.service
-                    ),
-                })
-            }
-            other => other,
-        })?;
+    // returning. The keyring-entry source classifies a parse failure as a
+    // keyring-content condition naming the service alias.
+    let signer = signer_from_s_strkey(
+        s_strkey,
+        expected_source_g,
+        SecretStrkeySource::KeyringEntry(&entry_ref.service),
+    )
+    .await?;
 
     // Derive cached public key from the signer; vk holds no secret material.
     let pk: stellar_strkey::ed25519::PublicKey = signer.public_key().await?;

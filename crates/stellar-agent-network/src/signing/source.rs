@@ -32,12 +32,49 @@
 //! returns `AuthError::SignerKeyMismatch`, ensuring no RPC or network call
 //! proceeds if the key doesn't match the claimed source.
 
-use stellar_agent_core::error::{AuthError, WalletError};
+use stellar_agent_core::error::{AuthError, ValidationError, WalletError};
 use zeroize::Zeroizing;
 
 use crate::signing::Signer;
 use crate::signing::hardware::HardwareSigningKey;
 use crate::signing::software::SoftwareSigningKey;
+
+/// Identifies where a to-be-parsed S-strkey originates, so a parse failure is
+/// classified into its true failure domain instead of a generic
+/// keyring-not-found.
+///
+/// The two production callers of [`signer_from_s_strkey`] read the secret from
+/// different places and require different failure codes: an unset-or-malformed
+/// environment variable is an input-validation failure, while a keyring entry
+/// holding an unparseable value is a genuine keyring-content condition. This
+/// descriptor lets the inner helper construct the correct typed error directly,
+/// removing the fragile "match on a magic error string" rewrap each caller used
+/// to apply.
+pub(crate) enum SecretStrkeySource<'a> {
+    /// The S-strkey was read from the named environment variable. A parse
+    /// failure classifies as [`ValidationError::SecretEnvInvalid`].
+    EnvVar(&'a str),
+    /// The S-strkey was read from the named keyring entry (service alias). A
+    /// parse failure classifies as [`AuthError::KeyringNotFound`] naming the
+    /// entry — the keyring stored an unparseable value.
+    KeyringEntry(&'a str),
+}
+
+impl SecretStrkeySource<'_> {
+    /// Builds the classification error for an S-strkey that failed to parse,
+    /// naming only the source coordinate (variable name or keyring service
+    /// alias) — never the value.
+    fn invalid_strkey_error(&self) -> WalletError {
+        match self {
+            Self::EnvVar(var) => WalletError::Validation(ValidationError::SecretEnvInvalid {
+                var: (*var).to_owned(),
+            }),
+            Self::KeyringEntry(service) => WalletError::Auth(AuthError::KeyringNotFound {
+                name: format!("keyring entry '{service}' contains an invalid S-strkey"),
+            }),
+        }
+    }
+}
 
 /// Inner helper: construct a `SoftwareSigningKey` from a raw S-strkey string
 /// with full zeroisation discipline, then verify the public key.
@@ -47,31 +84,32 @@ use crate::signing::software::SoftwareSigningKey;
 /// `unsafe` in Rust 2024 edition, conflicting with `#![forbid(unsafe_code)]`
 /// on the library root).
 ///
-/// The outer `signer_from_env` is the only production call site.
+/// `source` identifies where `s_strkey` came from so a parse failure is
+/// classified into the correct failure domain. Its two production callers are
+/// [`signer_from_env`] (environment variable) and
+/// [`crate::keyring::signer_from_keyring`] (keyring entry).
 ///
 /// # Errors
 ///
-/// - [`WalletError::Auth`] wrapping `KeyringNotFound` with name
-///   `"invalid S-strkey"` if `s_strkey` cannot be parsed. The wrapper
-///   ([`signer_from_env`]) maps this into a more specific error naming the
-///   env-var source. The inner helper does not own the env-var diagnostics —
-///   it only owns the parse-and-verify contract.
-/// - [`WalletError::Auth`] wrapping `SignerKeyMismatch` on public-key mismatch.
+/// - [`WalletError::Validation`] wrapping [`ValidationError::SecretEnvInvalid`]
+///   when `source` is [`SecretStrkeySource::EnvVar`] and `s_strkey` cannot be
+///   parsed; [`WalletError::Auth`] wrapping [`AuthError::KeyringNotFound`] when
+///   `source` is [`SecretStrkeySource::KeyringEntry`]. In either case the error
+///   names only the source coordinate, never the value.
+/// - [`WalletError::Auth`] wrapping [`AuthError::SignerKeyMismatch`] on
+///   public-key mismatch.
 pub(crate) async fn signer_from_s_strkey(
     s_strkey: Zeroizing<String>,
     expected_source_g: &str,
+    source: SecretStrkeySource<'_>,
 ) -> Result<SoftwareSigningKey, WalletError> {
     // stellar_strkey::ed25519::PrivateKey is Copy and has no Drop/Zeroize.
     // Parse the S-strkey, immediately copy the 32-byte seed into a Zeroizing
     // wrapper, then explicitly zeroize the original local before it drops.
     // stellar-strkey's PrivateKey is Copy with no Drop/Zeroize, so the residue is
     // zeroized explicitly here.
-    let mut private_key =
-        stellar_strkey::ed25519::PrivateKey::from_string(&s_strkey).map_err(|_| {
-            WalletError::Auth(AuthError::KeyringNotFound {
-                name: "invalid S-strkey".to_owned(),
-            })
-        })?;
+    let mut private_key = stellar_strkey::ed25519::PrivateKey::from_string(&s_strkey)
+        .map_err(|_| source.invalid_strkey_error())?;
     let seed_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(private_key.0);
     // Two copies of the seed exist: `seed_bytes` (Zeroizing) and
     // `private_key.0` (plain [u8; 32]). Explicitly zeroize the latter.
@@ -106,8 +144,10 @@ pub(crate) async fn signer_from_s_strkey(
 ///
 /// # Errors
 ///
-/// - [`WalletError::Auth`] wrapping [`AuthError::KeyringNotFound`] if the
-///   environment variable is unset or contains an invalid S-strkey.
+/// - [`WalletError::Validation`] wrapping [`ValidationError::SecretEnvNotSet`]
+///   if the environment variable is not set, or
+///   [`ValidationError::SecretEnvInvalid`] if it holds a value that is not a
+///   valid S-strkey. Both name only the variable, never its value.
 /// - [`WalletError::Auth`] wrapping [`AuthError::SignerKeyMismatch`] if the
 ///   derived public key does not match `expected_source_g`.
 /// - Propagates any error from `signer.public_key()`.
@@ -136,25 +176,17 @@ pub async fn signer_from_env(
     // Wrap the env-var String in Zeroizing so the heap allocation is
     // cleared when this scope exits, regardless of the code path taken.
     let s_strkey: Zeroizing<String> = Zeroizing::new(std::env::var(var_name).map_err(|_| {
-        WalletError::Auth(AuthError::KeyringNotFound {
-            name: format!("environment variable '{var_name}' not set"),
+        WalletError::Validation(ValidationError::SecretEnvNotSet {
+            var: var_name.to_owned(),
         })
     })?);
 
-    // The inner helper owns parse+verify only; map its generic
-    // "invalid S-strkey" error to one that names the env-var source.
-    signer_from_s_strkey(s_strkey, expected_source_g)
-        .await
-        .map_err(|e| match e {
-            WalletError::Auth(AuthError::KeyringNotFound { ref name })
-                if name == "invalid S-strkey" =>
-            {
-                WalletError::Auth(AuthError::KeyringNotFound {
-                    name: format!("environment variable '{var_name}' contains an invalid S-strkey"),
-                })
-            }
-            other => other,
-        })
+    signer_from_s_strkey(
+        s_strkey,
+        expected_source_g,
+        SecretStrkeySource::EnvVar(var_name),
+    )
+    .await
 }
 
 /// Resolves a hardware signing key from the first connected Ledger device.
@@ -258,10 +290,14 @@ mod tests {
     // binary does not carry `forbid(unsafe_code)`.
 
     #[tokio::test]
-    async fn invalid_sstrkey_returns_keyring_not_found() {
-        // "not-a-valid-strkey" is not a valid S-strkey.
+    async fn env_source_invalid_sstrkey_returns_secret_env_invalid() {
+        // "not-a-valid-strkey" is not a valid S-strkey. With the env-var source,
+        // the parse failure classifies directly as the typed
+        // validation.secret_env_invalid — no magic-string rewrap in the caller.
         let bad = Zeroizing::new("not-a-valid-strkey".to_owned());
-        let result = signer_from_s_strkey(bad, "GDUMMY").await;
+        let result =
+            signer_from_s_strkey(bad, "GDUMMY", SecretStrkeySource::EnvVar("SOURCE_TEST_VAR"))
+                .await;
         assert!(result.is_err(), "invalid S-strkey must fail");
         // Extract the WalletError via explicit match to avoid the Debug
         // bound on T that unwrap_err() requires (SoftwareSigningKey
@@ -270,8 +306,31 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("expected Err"),
         };
+        assert_eq!(err.category(), ErrorCategory::Validation);
+        assert_eq!(err.code(), "validation.secret_env_invalid");
+        // The variable name appears; the (malformed) value must never be echoed.
+        assert!(err.message().contains("SOURCE_TEST_VAR"));
+        assert!(!err.message().contains("not-a-valid-strkey"));
+    }
+
+    #[tokio::test]
+    async fn keyring_source_invalid_sstrkey_returns_keyring_not_found() {
+        // With the keyring-entry source, the same parse failure classifies as a
+        // genuine keyring-content condition naming the service alias.
+        let bad = Zeroizing::new("not-a-valid-strkey".to_owned());
+        let result = signer_from_s_strkey(
+            bad,
+            "GDUMMY",
+            SecretStrkeySource::KeyringEntry("stellar-agent-signer"),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err"),
+        };
         assert_eq!(err.category(), ErrorCategory::Auth);
         assert_eq!(err.code(), "auth.keyring_not_found");
+        assert!(err.message().contains("stellar-agent-signer"));
     }
 
     #[tokio::test]
@@ -283,6 +342,7 @@ mod tests {
         let result = signer_from_s_strkey(
             s_strkey,
             "GDUMMYDUMMYDUMMYDUMMYDUMMYDUMMYDUMMYDUMMYDUMMYDUMMYDUMMY",
+            SecretStrkeySource::EnvVar("SOURCE_TEST_VAR"),
         )
         .await;
         assert!(result.is_err(), "key mismatch must fail");
@@ -300,9 +360,13 @@ mod tests {
         let s_strkey = sstrkey_for_seed(seed);
         let expected_g = gstrkey_for_seed(seed);
 
-        let signer = signer_from_s_strkey(s_strkey, &expected_g)
-            .await
-            .expect("matching key must succeed");
+        let signer = signer_from_s_strkey(
+            s_strkey,
+            &expected_g,
+            SecretStrkeySource::EnvVar("SOURCE_TEST_VAR"),
+        )
+        .await
+        .expect("matching key must succeed");
 
         // Verify the returned signer's public key matches the expected G-strkey.
         let pk: stellar_strkey::ed25519::PublicKey = signer.public_key().await.unwrap();
@@ -311,7 +375,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signer_from_env_missing_var_returns_keyring_not_found() {
+    async fn signer_from_env_missing_var_returns_secret_env_not_set() {
         // A var name that is guaranteed to be unset in CI. No set_var needed.
         let var = "STELLAR_AGENT_SOURCE_MISSING_VAR_ABCDEFGH12345";
         // The variable should not be set; if somehow it is, the test may give
@@ -327,8 +391,9 @@ mod tests {
             Ok(_) => panic!("expected Err for unset env var"),
         };
         // If the var happens to be set in the environment with invalid content,
-        // the error will be keyring_not_found either way (not-set OR invalid-strkey).
+        // the error is a validation.secret_env_* code either way (not-set OR
+        // invalid-strkey).
         // A valid S-strkey that matches GDUMMY is astronomically unlikely.
-        assert_eq!(err.category(), ErrorCategory::Auth);
+        assert_eq!(err.category(), ErrorCategory::Validation);
     }
 }

@@ -106,6 +106,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Failures on non-keyring signing paths now report failure-domain-accurate
+  error codes instead of being wrapped as `auth.keyring_not_found` (and, at
+  eight signer-source sites, `auth.keyring_locked`). Ledger-availability
+  failures during deployer and signer resolution report the classified
+  `wallet_state.hardware_not_found` (or the timeout / wrong-app variant); a
+  missing or malformed secret-env variable reports
+  `validation.secret_env_not_set` / `validation.secret_env_invalid` (naming the
+  variable, never its value); a failed wallet unlock reports
+  `wallet_state.unlock_failed`; and invoking a value-moving verb with no
+  signer-source flag reports `validation.signer_source_required`. The network
+  library's public `signer_from_env` is retyped to the same
+  `validation.secret_env_*` codes. Genuine keyring conditions still report
+  `auth.keyring_not_found` / `auth.keyring_locked`.
 - Keyring failures on the audit-HMAC and attestation-key READ paths are now
   classified instead of being reported as `auth.keyring_not_found` or
   discarded. `stellar-agent audit verify`, `accounts deploy-c`, the CLI, core,
