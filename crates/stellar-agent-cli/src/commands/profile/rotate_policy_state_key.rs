@@ -64,7 +64,7 @@
 //! Returns exit code `1` when the profile cannot be loaded or the keyring
 //! operation fails.
 
-use clap::Args;
+use clap::{ArgGroup, Args};
 use serde::Serialize;
 use stellar_agent_core::audit_log::KeyPurpose;
 use stellar_agent_core::envelope::Envelope;
@@ -82,10 +82,37 @@ use super::key_ops::rotate_hmac_like_key;
 /// Arguments for `stellar-agent profile rotate-policy-state-key`.
 #[derive(Debug, Args)]
 #[non_exhaustive]
+#[command(group(ArgGroup::new("profile_target").args(["name", "profile"]).required(true)))]
 pub(crate) struct RotatePolicyStateKeyArgs {
-    /// The profile name whose policy-window-state key should be rotated.
+    /// Profile name whose policy-window-state key should be rotated, positional
+    /// form.
+    ///
+    /// Exactly one of this positional `NAME` or the `--profile <NAME>` flag is
+    /// required; supplying both, or neither, is a usage error.
     #[arg(value_name = "NAME")]
-    pub(crate) name: String,
+    pub(crate) name: Option<String>,
+
+    /// Profile name whose policy-window-state key should be rotated, flag form;
+    /// an alternative to the positional `NAME`.
+    ///
+    /// Exactly one of the positional `NAME` or this `--profile <NAME>` flag is
+    /// required; supplying both, or neither, is a usage error.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) profile: Option<String>,
+}
+
+impl RotatePolicyStateKeyArgs {
+    /// Returns the resolved profile name.
+    ///
+    /// The clap arg group over the positional `NAME` and `--profile` is
+    /// `required` and mutually exclusive, so a parsed invocation sets exactly
+    /// one of the two fields; this returns whichever was supplied.
+    fn profile_name(&self) -> &str {
+        self.name
+            .as_deref()
+            .or(self.profile.as_deref())
+            .unwrap_or_default()
+    }
 }
 
 /// Success payload for the `rotate-policy-state-key` envelope.
@@ -114,7 +141,7 @@ struct RotatePolicyStateKeyData {
 pub async fn run(args: &RotatePolicyStateKeyArgs) -> i32 {
     // ── Step 0: load the profile FIRST so a nonexistent profile never
     // reaches the keyring init.
-    let profile = match loader::load(&args.name, None) {
+    let profile = match loader::load(args.profile_name(), None) {
         Ok(p) => p,
         Err(loader::ProfileLoadError::NotFound { name, .. }) => {
             let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
@@ -122,9 +149,9 @@ pub async fn run(args: &RotatePolicyStateKeyArgs) -> i32 {
             return 1;
         }
         Err(e) => {
-            tracing::debug!(profile = %args.name, error = %e, "profile load failed");
+            tracing::debug!(profile = %args.profile_name(), error = %e, "profile load failed");
             let err = WalletError::Validation(ValidationError::ProfileNotFound {
-                name: args.name.clone(),
+                name: args.profile_name().to_owned(),
             });
             render::render_json(&Envelope::err(&err));
             return 1;
@@ -137,7 +164,7 @@ pub async fn run(args: &RotatePolicyStateKeyArgs) -> i32 {
     }
 
     let entry_ref = &profile.policy_window_state_key_id;
-    let store = PersistedWindowStore::for_profile(&args.name);
+    let store = PersistedWindowStore::for_profile(args.profile_name());
 
     // ── Step 1: verify the store file's tag under the OLD key BEFORE that
     // key is destroyed — closes the tamper-laundering surface (see the
@@ -158,7 +185,7 @@ pub async fn run(args: &RotatePolicyStateKeyArgs) -> i32 {
                             "policy_window_state.pre_rotation_verify_failed: {e}; the store \
                              file did not verify under the current key — rotation refused; \
                              run `profile reset-window-state {} --reason <reason>` to recover",
-                            args.name
+                            args.profile_name()
                         ),
                     },
                 );
@@ -179,7 +206,7 @@ pub async fn run(args: &RotatePolicyStateKeyArgs) -> i32 {
                         "policy_window_state.pre_rotation_verify_failed: store file exists \
                          with no minted key — rotation refused; run \
                          `profile reset-window-state {} --reason <reason>` to recover",
-                        args.name
+                        args.profile_name()
                     ),
                 });
             render::render_json(&Envelope::err(&err));
@@ -212,7 +239,7 @@ pub async fn run(args: &RotatePolicyStateKeyArgs) -> i32 {
             return 1;
         }
     };
-    let store = PersistedWindowStore::for_profile(&args.name);
+    let store = PersistedWindowStore::for_profile(args.profile_name());
     if let Err(e) = store.resign(&new_key) {
         tracing::error!(
             error = ?e,
@@ -231,7 +258,7 @@ pub async fn run(args: &RotatePolicyStateKeyArgs) -> i32 {
     let request_id = Uuid::new_v4().to_string();
     emit_keyring_key_written(
         &profile,
-        &args.name,
+        args.profile_name(),
         "profile_rotate_policy_state_key",
         KeyPurpose::PolicyWindowStateHmac,
         entry_ref,
@@ -244,7 +271,7 @@ pub async fn run(args: &RotatePolicyStateKeyArgs) -> i32 {
          under the new key"
     );
     render::render_json(&Envelope::ok(RotatePolicyStateKeyData {
-        profile: args.name.clone(),
+        profile: args.profile_name().to_owned(),
         rotated: true,
         key_kind: "hmac_32_bytes",
     }));
@@ -263,9 +290,43 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
 
+    use clap::Parser;
+    use clap::error::ErrorKind;
     use serial_test::serial;
 
     use super::*;
+
+    /// Local flatten wrapper so the `RotatePolicyStateKeyArgs` clap contract
+    /// can be parsed in isolation from the full command tree.
+    #[derive(Debug, Parser)]
+    struct Wrap {
+        #[command(flatten)]
+        args: RotatePolicyStateKeyArgs,
+    }
+
+    #[test]
+    fn positional_name_is_accepted() {
+        let w = Wrap::try_parse_from(["prog", "acme"]).expect("positional parses");
+        assert_eq!(w.args.profile_name(), "acme");
+    }
+
+    #[test]
+    fn profile_flag_is_accepted() {
+        let w = Wrap::try_parse_from(["prog", "--profile", "acme"]).expect("flag parses");
+        assert_eq!(w.args.profile_name(), "acme");
+    }
+
+    #[test]
+    fn both_positional_and_flag_is_a_conflict() {
+        let err = Wrap::try_parse_from(["prog", "acme", "--profile", "other"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn neither_positional_nor_flag_is_missing_required() {
+        let err = Wrap::try_parse_from(["prog"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
 
     // Defensive #[serial] — see enroll_signer.rs for full rationale; the
     // test binary observes a flaky race during parallel execution that
@@ -274,7 +335,8 @@ mod tests {
     #[serial]
     async fn rotate_policy_state_key_nonexistent_profile_returns_exit_1() {
         let args = RotatePolicyStateKeyArgs {
-            name: "__nonexistent_rotate_policy_state_key__".to_owned(),
+            name: Some("__nonexistent_rotate_policy_state_key__".to_owned()),
+            profile: None,
         };
         let code = run(&args).await;
         assert_eq!(code, 1);

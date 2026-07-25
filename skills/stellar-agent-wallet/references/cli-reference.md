@@ -382,7 +382,7 @@ stellar-agent pool init --size 5 --profile default
 
 ## profile
 
-Creates, lists, shows, and migrates profiles, and rotates the keyring-backed keys a profile names. A profile is a per-environment TOML config (schema version 2) holding no secrets. The profile-name argument takes two forms: `init`, `enroll-signer`, `enroll-owner-key`, and `sign-policy` take a `--profile <NAME>` flag (default `default`), while `show`, `migrate`, the `rotate-*` subcommands, and `reset-window-state` take a required positional `<NAME>`. No subcommand has a confirmation flag. All operate on local state — no network, no mainnet gate (`init`'s `--network mainnet` guard is a configuration-time refusal, not the mainnet-write gate). Uses the `{ok, data, request_id}` envelope.
+Creates, lists, shows, and migrates profiles, and rotates the keyring-backed keys a profile names. A profile is a per-environment TOML config (schema version 2) holding no secrets. Every subcommand accepts a `--profile <NAME>` flag: `init`, `enroll-signer`, `enroll-owner-key`, and `sign-policy` take only that flag (default `default`), while `show`, `migrate`, the `rotate-*` subcommands, and `reset-window-state` accept it as an exactly-one-of alternative to their positional `<NAME>` (supply one; both or neither is a usage error), with no default. No subcommand has a confirmation flag. All operate on local state — no network, no mainnet gate (`init`'s `--network mainnet` guard is a configuration-time refusal, not the mainnet-write gate). Uses the `{ok, data, request_id}` envelope.
 
 | Verb | Form | Notes |
 |---|---|---|
@@ -396,7 +396,7 @@ Creates, lists, shows, and migrates profiles, and rotates the keyring-backed key
 
 ### Key-rotation subcommands
 
-Each generates a fresh 32-byte CSPRNG secret, atomically replaces one named keyring entry, and is not reversible. Each takes the profile as positional `<NAME>` and returns `profile` + `rotated`; some add `key_kind`.
+Each generates a fresh 32-byte CSPRNG secret, atomically replaces one named keyring entry, and is not reversible. Each takes the profile as either a positional `<NAME>` or a `--profile <NAME>` flag (exactly one) and returns `profile` + `rotated`; some add `key_kind`.
 
 The policy-file owner key is NOT rotated here — it is an ed25519 key enrolled with `enroll-owner-key` (public key stored) and used by `sign-policy` (seed supplied at sign time). All rotation subcommands below mint 32-byte HMAC keys.
 

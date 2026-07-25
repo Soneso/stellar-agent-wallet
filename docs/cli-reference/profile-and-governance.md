@@ -12,7 +12,7 @@ The `profile` group creates, lists, shows, and migrates profiles, and rotates th
 
 The seven key-writing commands — `enroll-signer`, `enroll-owner-key`, and the five key-rotation subcommands — each write a `keyring_key_written` audit row recording the key purpose and, where applicable, the redacted public address. `reset-window-state` writes the same row when the reset mints the window-state key on first use. `init` mints no key material and emits no audit row.
 
-The profile-name argument takes two forms depending on the subcommand: `init`, `enroll-signer`, `enroll-owner-key`, and `sign-policy` take a `--profile <NAME>` flag (default `default`), while `show`, `migrate`, the `rotate-*` subcommands, and `reset-window-state` take a required positional `<NAME>`. None of them has a confirmation flag.
+Every `profile` subcommand accepts a `--profile <NAME>` flag. For `init`, `enroll-signer`, `enroll-owner-key`, and `sign-policy` it is the only form and defaults to `default`. For `show`, `migrate`, the `rotate-*` subcommands, and `reset-window-state` it is an alternative to the positional `<NAME>`: supply exactly one of the positional `<NAME>` or `--profile <NAME>` (supplying both, or neither, is a usage error), with no default. None of them has a confirmation flag.
 
 ### `profile init`
 
@@ -59,7 +59,7 @@ stellar-agent profile show default
 
 Read-only. Loads the named profile (applying any environment-variable overlays) and prints its resolved configuration as a JSON envelope. Keyring entry references appear as opaque `{service, account}` objects; the secret material they name is never read or printed.
 
-- `<NAME>` (positional, required) — the profile to display.
+- `<NAME>` (positional) or `--profile <NAME>` — the profile to display. Supply exactly one; supplying both, or neither, is a usage error.
 
 Exits `1` with `ProfileNotFound` when the profile does not exist, or with an unsupported-version error when the on-disk schema version is one this build does not support.
 
@@ -71,7 +71,7 @@ stellar-agent profile migrate default
 
 State-changing (local file). Reads the named profile, applies any pending schema migrations, and writes the result atomically (temp-file plus rename). If the profile is already at the current version, the command is a no-op and the file is left untouched.
 
-- `<NAME>` (positional, required) — the profile to migrate.
+- `<NAME>` (positional) or `--profile <NAME>` — the profile to migrate. Supply exactly one; supplying both, or neither, is a usage error.
 
 On a no-op it reports `status` `no_op` and the current version; on a migration it reports `status` `migrated` with `from_version`, `to_version`, and the file path:
 
@@ -150,7 +150,7 @@ Exits `1` with `ProfileNotFound` if the profile does not exist, `sign_policy.own
 
 ### Key-rotation subcommands
 
-Each rotation subcommand generates a fresh 32-byte secret from the OS CSPRNG, encodes it as URL-safe base64 (no padding), and atomically replaces one keyring entry the profile names. The raw bytes never leave the keyring, are never logged, and are never returned. Every rotation subcommand takes the profile as a positional `<NAME>` argument, changes keyring state (no network), and is not reversible. Rotate deliberately, because each one invalidates material minted under the old key. (The policy-file owner ed25519 key is not rotated here; it is enrolled with `enroll-owner-key`.)
+Each rotation subcommand generates a fresh 32-byte secret from the OS CSPRNG, encodes it as URL-safe base64 (no padding), and atomically replaces one keyring entry the profile names. The raw bytes never leave the keyring, are never logged, and are never returned. Every rotation subcommand takes the profile as either a positional `<NAME>` argument or a `--profile <NAME>` flag — exactly one of the two, and supplying both, or neither, is a usage error — changes keyring state (no network), and is not reversible. Rotate deliberately, because each one invalidates material minted under the old key. (The policy-file owner ed25519 key is not rotated here; it is enrolled with `enroll-owner-key`.)
 
 | Subcommand | Keyring entry rotated | Key kind | Effect on outstanding material |
 |---|---|---|---|

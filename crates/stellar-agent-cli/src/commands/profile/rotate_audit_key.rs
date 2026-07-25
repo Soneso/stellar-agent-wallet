@@ -45,7 +45,7 @@
 //! Returns exit code `1` when the profile cannot be loaded or the keyring
 //! operation fails.
 
-use clap::Args;
+use clap::{ArgGroup, Args};
 use serde::Serialize;
 use stellar_agent_core::audit_log::{KeyPurpose, SidecarResignError, resign_chain_root_sidecars};
 use stellar_agent_core::envelope::Envelope;
@@ -63,10 +63,37 @@ use super::key_ops::rotate_hmac_like_key;
 /// Arguments for `stellar-agent profile rotate-audit-key`.
 #[derive(Debug, Args)]
 #[non_exhaustive]
+#[command(group(ArgGroup::new("profile_target").args(["name", "profile"]).required(true)))]
 pub(crate) struct RotateAuditKeyArgs {
-    /// The profile name whose audit-log chain-root key should be rotated.
+    /// Profile name whose audit-log chain-root key should be rotated,
+    /// positional form.
+    ///
+    /// Exactly one of this positional `NAME` or the `--profile <NAME>` flag is
+    /// required; supplying both, or neither, is a usage error.
     #[arg(value_name = "NAME")]
-    pub(crate) name: String,
+    pub(crate) name: Option<String>,
+
+    /// Profile name whose audit-log chain-root key should be rotated, flag
+    /// form; an alternative to the positional `NAME`.
+    ///
+    /// Exactly one of the positional `NAME` or this `--profile <NAME>` flag is
+    /// required; supplying both, or neither, is a usage error.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) profile: Option<String>,
+}
+
+impl RotateAuditKeyArgs {
+    /// Returns the resolved profile name.
+    ///
+    /// The clap arg group over the positional `NAME` and `--profile` is
+    /// `required` and mutually exclusive, so a parsed invocation sets exactly
+    /// one of the two fields; this returns whichever was supplied.
+    fn profile_name(&self) -> &str {
+        self.name
+            .as_deref()
+            .or(self.profile.as_deref())
+            .unwrap_or_default()
+    }
 }
 
 /// Success payload for the `rotate-audit-key` envelope.
@@ -133,7 +160,7 @@ where
 {
     // ── Setup A: load the profile FIRST so a nonexistent profile never reaches
     // the keyring init.  Eliminates the process-global keyring-store race.
-    let profile = match load_profile(&args.name) {
+    let profile = match load_profile(args.profile_name()) {
         Ok(p) => p,
         Err(loader::ProfileLoadError::NotFound { name, .. }) => {
             let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
@@ -141,9 +168,9 @@ where
             return 1;
         }
         Err(e) => {
-            tracing::debug!(profile = %args.name, error = %e, "profile load failed");
+            tracing::debug!(profile = %args.profile_name(), error = %e, "profile load failed");
             let err = WalletError::Validation(ValidationError::ProfileNotFound {
-                name: args.name.clone(),
+                name: args.profile_name().to_owned(),
             });
             render::render_json(&Envelope::err(&err));
             return 1;
@@ -196,7 +223,7 @@ where
     let request_id = Uuid::new_v4().to_string();
     emit_keyring_key_written(
         &profile,
-        &args.name,
+        args.profile_name(),
         "profile_rotate_audit_key",
         KeyPurpose::AuditHashChainHmac,
         entry_ref,
@@ -207,7 +234,7 @@ where
     // Info-level log omits the keyring service name to avoid leaking it.
     tracing::info!("audit-log chain-root key rotated; chain-root sidecars re-signed under new key");
     render::render_json(&Envelope::ok(RotateAuditKeyData {
-        profile: args.name.clone(),
+        profile: args.profile_name().to_owned(),
         rotated: true,
         key_kind: "hmac_32_bytes",
         sidecars_resigned,
@@ -227,9 +254,43 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
 
+    use clap::Parser;
+    use clap::error::ErrorKind;
     use serial_test::serial;
 
     use super::*;
+
+    /// Local flatten wrapper so the `RotateAuditKeyArgs` clap contract can be
+    /// parsed in isolation from the full command tree.
+    #[derive(Debug, Parser)]
+    struct Wrap {
+        #[command(flatten)]
+        args: RotateAuditKeyArgs,
+    }
+
+    #[test]
+    fn positional_name_is_accepted() {
+        let w = Wrap::try_parse_from(["prog", "acme"]).expect("positional parses");
+        assert_eq!(w.args.profile_name(), "acme");
+    }
+
+    #[test]
+    fn profile_flag_is_accepted() {
+        let w = Wrap::try_parse_from(["prog", "--profile", "acme"]).expect("flag parses");
+        assert_eq!(w.args.profile_name(), "acme");
+    }
+
+    #[test]
+    fn both_positional_and_flag_is_a_conflict() {
+        let err = Wrap::try_parse_from(["prog", "acme", "--profile", "other"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn neither_positional_nor_flag_is_missing_required() {
+        let err = Wrap::try_parse_from(["prog"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
 
     // Defensive #[serial] — see enroll_signer.rs for full rationale; the
     // test binary observes a flaky race during parallel execution that
@@ -238,7 +299,8 @@ mod tests {
     #[serial]
     async fn rotate_audit_key_nonexistent_profile_returns_exit_1() {
         let args = RotateAuditKeyArgs {
-            name: "__nonexistent_rotate_audit_key__".to_owned(),
+            name: Some("__nonexistent_rotate_audit_key__".to_owned()),
+            profile: None,
         };
         let code = run(&args).await;
         assert_eq!(code, 1);
@@ -306,7 +368,8 @@ mod tests {
         );
 
         let args = RotateAuditKeyArgs {
-            name: "rotate-run-e2e".to_owned(),
+            name: Some("rotate-run-e2e".to_owned()),
+            profile: None,
         };
         let cloned_profile = profile.clone();
         let code =

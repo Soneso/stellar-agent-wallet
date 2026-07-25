@@ -30,7 +30,7 @@
 //!
 //! Returns exit code `1` when the profile is not found or cannot be loaded.
 
-use clap::Args;
+use clap::{ArgGroup, Args};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
 use stellar_agent_core::profile::loader;
@@ -40,10 +40,36 @@ use crate::common::render;
 /// Arguments for `stellar-agent profile show`.
 #[derive(Debug, Args)]
 #[non_exhaustive]
+#[command(group(ArgGroup::new("profile_target").args(["name", "profile"]).required(true)))]
 pub struct ShowArgs {
-    /// The profile name to display.
+    /// Profile name to display, positional form.
+    ///
+    /// Exactly one of this positional `NAME` or the `--profile <NAME>` flag is
+    /// required; supplying both, or neither, is a usage error.
     #[arg(value_name = "NAME")]
-    pub name: String,
+    pub name: Option<String>,
+
+    /// Profile name to display, flag form; an alternative to the positional
+    /// `NAME`.
+    ///
+    /// Exactly one of the positional `NAME` or this `--profile <NAME>` flag is
+    /// required; supplying both, or neither, is a usage error.
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
+}
+
+impl ShowArgs {
+    /// Returns the resolved profile name.
+    ///
+    /// The clap arg group over the positional `NAME` and `--profile` is
+    /// `required` and mutually exclusive, so a parsed invocation sets exactly
+    /// one of the two fields; this returns whichever was supplied.
+    fn profile_name(&self) -> &str {
+        self.name
+            .as_deref()
+            .or(self.profile.as_deref())
+            .unwrap_or_default()
+    }
 }
 
 /// Runs `stellar-agent profile show <name>`.
@@ -58,7 +84,7 @@ pub struct ShowArgs {
 ///
 /// Never panics.
 pub async fn run(args: &ShowArgs) -> i32 {
-    match loader::load(&args.name, None) {
+    match loader::load(args.profile_name(), None) {
         Ok(profile) => {
             render::render_json(&Envelope::ok(profile));
             0
@@ -84,7 +110,7 @@ pub async fn run(args: &ShowArgs) -> i32 {
         }
         Err(err) => {
             let wallet_err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("failed to load profile '{}': {err}", args.name),
+                detail: format!("failed to load profile '{}': {err}", args.profile_name()),
             });
             render::render_json(&Envelope::err(&wallet_err));
             1
@@ -104,9 +130,19 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
 
+    use clap::Parser;
+    use clap::error::ErrorKind;
     use stellar_agent_core::profile::schema::Profile;
 
     use super::*;
+
+    /// Local flatten wrapper so the `ShowArgs` clap contract can be parsed in
+    /// isolation from the full command tree.
+    #[derive(Debug, Parser)]
+    struct Wrap {
+        #[command(flatten)]
+        args: ShowArgs,
+    }
 
     #[tokio::test]
     async fn show_not_found_returns_exit_1() {
@@ -116,10 +152,35 @@ mod tests {
         // This is more of a smoke-test; the loader unit tests cover the full
         // load paths.
         let args = ShowArgs {
-            name: "__nonexistent_profile_for_tests__".to_owned(),
+            name: Some("__nonexistent_profile_for_tests__".to_owned()),
+            profile: None,
         };
         let code = run(&args).await;
         assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn positional_name_is_accepted() {
+        let w = Wrap::try_parse_from(["prog", "acme"]).expect("positional parses");
+        assert_eq!(w.args.profile_name(), "acme");
+    }
+
+    #[test]
+    fn profile_flag_is_accepted() {
+        let w = Wrap::try_parse_from(["prog", "--profile", "acme"]).expect("flag parses");
+        assert_eq!(w.args.profile_name(), "acme");
+    }
+
+    #[test]
+    fn both_positional_and_flag_is_a_conflict() {
+        let err = Wrap::try_parse_from(["prog", "acme", "--profile", "other"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn neither_positional_nor_flag_is_missing_required() {
+        let err = Wrap::try_parse_from(["prog"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
     }
 
     #[test]

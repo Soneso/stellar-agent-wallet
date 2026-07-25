@@ -40,7 +40,7 @@
 //!
 //! Returns exit code `1` on any migration failure.
 
-use clap::Args;
+use clap::{ArgGroup, Args};
 use serde::Serialize;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
@@ -52,10 +52,36 @@ use crate::common::render;
 /// Arguments for `stellar-agent profile migrate`.
 #[derive(Debug, Args)]
 #[non_exhaustive]
+#[command(group(ArgGroup::new("profile_target").args(["name", "profile"]).required(true)))]
 pub struct MigrateArgs {
-    /// The profile name to migrate.
+    /// Profile name to migrate, positional form.
+    ///
+    /// Exactly one of this positional `NAME` or the `--profile <NAME>` flag is
+    /// required; supplying both, or neither, is a usage error.
     #[arg(value_name = "NAME")]
-    pub name: String,
+    pub name: Option<String>,
+
+    /// Profile name to migrate, flag form; an alternative to the positional
+    /// `NAME`.
+    ///
+    /// Exactly one of the positional `NAME` or this `--profile <NAME>` flag is
+    /// required; supplying both, or neither, is a usage error.
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
+}
+
+impl MigrateArgs {
+    /// Returns the resolved profile name.
+    ///
+    /// The clap arg group over the positional `NAME` and `--profile` is
+    /// `required` and mutually exclusive, so a parsed invocation sets exactly
+    /// one of the two fields; this returns whichever was supplied.
+    fn profile_name(&self) -> &str {
+        self.name
+            .as_deref()
+            .or(self.profile.as_deref())
+            .unwrap_or_default()
+    }
 }
 
 /// JSON payload returned by the migrate command on success.
@@ -102,7 +128,7 @@ pub async fn run(args: &MigrateArgs) -> i32 {
         }
     };
 
-    match migrate(&args.name, &profile_dir) {
+    match migrate(args.profile_name(), &profile_dir) {
         Ok(MigrateOutcome::NoOp { version }) => {
             render::render_json(&Envelope::ok(MigrateResult::NoOp { version }));
             0
@@ -132,11 +158,14 @@ pub async fn run(args: &MigrateArgs) -> i32 {
                 stellar_agent_core::profile::loader::ProfileLoadError::NotFound { .. }
             ) {
                 WalletError::Validation(ValidationError::ProfileNotFound {
-                    name: args.name.clone(),
+                    name: args.profile_name().to_owned(),
                 })
             } else {
                 WalletError::Internal(InternalError::UnexpectedState {
-                    detail: format!("migration load failed for '{}': {source}", args.name),
+                    detail: format!(
+                        "migration load failed for '{}': {source}",
+                        args.profile_name()
+                    ),
                 })
             };
             render::render_json(&Envelope::err(&wallet_err));
@@ -144,10 +173,60 @@ pub async fn run(args: &MigrateArgs) -> i32 {
         }
         Err(err) => {
             let wallet_err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("migration failed for '{}': {err}", args.name),
+                detail: format!("migration failed for '{}': {err}", args.profile_name()),
             });
             render::render_json(&Envelope::err(&wallet_err));
             1
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "test-only; panics acceptable in unit tests"
+    )]
+
+    use clap::Parser;
+    use clap::error::ErrorKind;
+
+    use super::*;
+
+    /// Local flatten wrapper so the `MigrateArgs` clap contract can be parsed
+    /// in isolation from the full command tree.
+    #[derive(Debug, Parser)]
+    struct Wrap {
+        #[command(flatten)]
+        args: MigrateArgs,
+    }
+
+    #[test]
+    fn positional_name_is_accepted() {
+        let w = Wrap::try_parse_from(["prog", "acme"]).expect("positional parses");
+        assert_eq!(w.args.profile_name(), "acme");
+    }
+
+    #[test]
+    fn profile_flag_is_accepted() {
+        let w = Wrap::try_parse_from(["prog", "--profile", "acme"]).expect("flag parses");
+        assert_eq!(w.args.profile_name(), "acme");
+    }
+
+    #[test]
+    fn both_positional_and_flag_is_a_conflict() {
+        let err = Wrap::try_parse_from(["prog", "acme", "--profile", "other"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn neither_positional_nor_flag_is_missing_required() {
+        let err = Wrap::try_parse_from(["prog"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
     }
 }
