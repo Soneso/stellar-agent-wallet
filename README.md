@@ -1,6 +1,20 @@
+<p align="center">
+  <img src="docs/assets/banner.svg" alt="Stellar Agent Wallet banner" width="100%">
+</p>
+
+<p align="center">
+  <a href="https://github.com/Soneso/stellar-agent-wallet/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Soneso/stellar-agent-wallet/ci.yml?branch=main&style=for-the-badge&label=CI" alt="CI status"></a>
+  <a href="https://crates.io/crates/stellar-agent-cli"><img src="https://img.shields.io/crates/v/stellar-agent-cli?style=for-the-badge&label=crates.io" alt="crates.io version"></a>
+  <a href="https://github.com/Soneso/stellar-agent-wallet/releases"><img src="https://img.shields.io/github/v/release/Soneso/stellar-agent-wallet?include_prereleases&style=for-the-badge&label=release" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Soneso/stellar-agent-wallet?style=for-the-badge" alt="License"></a>
+  <a href="docs/getting-started.md"><img src="https://img.shields.io/badge/docs-getting_started-4cc9f0?style=for-the-badge" alt="Getting started"></a>
+  <a href="https://soneso.com"><img src="https://img.shields.io/badge/built_by-Soneso-243b5c?style=for-the-badge" alt="Built by Soneso"></a>
+</p>
+
 # Stellar Agent Wallet
 
-A Stellar wallet for AI agents.
+Soneso's Stellar wallet for AI agents: autonomous transactions inside rules
+you define, approvals you grant, and an audit trail you can verify.
 
 `stellar-agent-wallet` lets an AI agent transact on Stellar under guardrails. It
 ships two surfaces over one shared core: the `stellar-agent` CLI and the

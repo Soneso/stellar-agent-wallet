@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 320" role="img" aria-label="Stellar Agent Wallet">
+  <rect width="1280" height="320" fill="#e8f1fb"/>
+  <rect x="1.5" y="1.5" width="1277" height="317" fill="none" stroke="#cfe0f2" stroke-width="3"/>
+  <!-- friendly agent: rounded robot with wallet card -->
+  <g transform="translate(950,60)">
+    <!-- antenna -->
+    <line x1="105" y1="18" x2="105" y2="42" stroke="#5b8cc9" stroke-width="5" stroke-linecap="round"/>
+    <circle cx="105" cy="14" r="9" fill="#ffb35c"/>
+    <!-- head -->
+    <rect x="35" y="42" width="140" height="108" rx="30" fill="#ffffff" stroke="#5b8cc9" stroke-width="5"/>
+    <circle cx="82" cy="90" r="11" fill="#2f5382"/>
+    <circle cx="128" cy="90" r="11" fill="#2f5382"/>
+    <path d="M78 118 Q105 138 132 118" fill="none" stroke="#2f5382" stroke-width="5" stroke-linecap="round"/>
+    <!-- wallet card held below -->
+    <g transform="translate(20,168)">
+      <rect x="0" y="0" width="170" height="72" rx="14" fill="#ffffff" stroke="#5b8cc9" stroke-width="5"/>
+      <rect x="14" y="16" width="64" height="10" rx="5" fill="#9db9dc"/>
+      <rect x="14" y="36" width="96" height="10" rx="5" fill="#c3d6ec"/>
+      <!-- four-point star on the card -->
+      <path d="M140 22 L146 36 L160 42 L146 48 L140 62 L134 48 L120 42 L134 36 Z" fill="#ffb35c"/>
+    </g>
+  </g>
+  <g font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <text x="72" y="126" font-size="26" letter-spacing="12" font-weight="600" fill="#7d9cc0">STELLAR</text>
+    <text x="70" y="190" font-size="64" letter-spacing="1" font-weight="800" fill="#243b5c">Agent Wallet</text>
+    <text x="72" y="242" font-size="21" font-weight="400" fill="#54739a">A Stellar wallet for AI agents. The agent acts; you stay in control.</text>
+  </g>
+  <rect x="72" y="206" width="420" height="5" rx="2.5" fill="#ffb35c"/>
+</svg>
