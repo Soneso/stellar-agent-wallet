@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file appearing concurrently is never overwritten. Mints no key material and
   emits no audit row; docs and the MCP server's first-run guidance, which
   already referenced this command, now match an implemented one.
+- Every `profile` subcommand now accepts a `--profile <NAME>` flag. `show`,
+  `migrate`, the `rotate-*` subcommands, and `reset-window-state` — which
+  previously took only a positional `<NAME>` — now accept either the positional
+  `<NAME>` or `--profile <NAME>` (exactly one; supplying both, or neither, is a
+  usage error), so a single profile-naming convention works across the group.
+  The positional forms remain valid, and these subcommands still require a
+  target with no default.
 
 ### Changed
 

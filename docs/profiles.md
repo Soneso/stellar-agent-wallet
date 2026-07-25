@@ -31,6 +31,11 @@ the MCP server reads on startup; when no `default.toml` exists yet, the server
 falls back to an in-memory testnet configuration so it can still serve read-only
 requests (this fallback is never written to disk).
 
+Every `profile` subcommand accepts a `--profile <NAME>` flag to name the
+profile it operates on; the subcommands that also take a positional `<NAME>`
+(`show`, `migrate`, the `rotate-*` commands, and `reset-window-state`) accept
+exactly one of the two.
+
 Create a new profile file with `stellar-agent profile init`; see
 [cli-reference/profile-and-governance.md](cli-reference/profile-and-governance.md#profile-init)
 for flags and defaults.

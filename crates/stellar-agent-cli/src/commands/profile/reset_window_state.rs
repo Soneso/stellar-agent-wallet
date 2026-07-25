@@ -56,7 +56,7 @@
 //! Returns exit code `1` when the profile cannot be loaded or the store
 //! reset fails.
 
-use clap::Args;
+use clap::{ArgGroup, Args};
 use serde::Serialize;
 use stellar_agent_core::audit_log::AuditEntry;
 use stellar_agent_core::audit_log::KeyPurpose;
@@ -76,15 +76,42 @@ use super::audit_emit::emit_keyring_key_written;
 /// Arguments for `stellar-agent profile reset-window-state`.
 #[derive(Debug, Args)]
 #[non_exhaustive]
+#[command(group(ArgGroup::new("profile_target").args(["name", "profile"]).required(true)))]
 pub(crate) struct ResetWindowStateArgs {
-    /// The profile name whose policy-window-state store should be reset.
+    /// Profile name whose policy-window-state store should be reset, positional
+    /// form.
+    ///
+    /// Exactly one of this positional `NAME` or the `--profile <NAME>` flag is
+    /// required; supplying both, or neither, is a usage error.
     #[arg(value_name = "NAME")]
-    pub(crate) name: String,
+    pub(crate) name: Option<String>,
+
+    /// Profile name whose policy-window-state store should be reset, flag form;
+    /// an alternative to the positional `NAME`.
+    ///
+    /// Exactly one of the positional `NAME` or this `--profile <NAME>` flag is
+    /// required; supplying both, or neither, is a usage error.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) profile: Option<String>,
 
     /// Operator-supplied reason for the reset, recorded in the audit row
     /// (e.g. `"corrupt-file recovery"`).
     #[arg(long)]
     pub(crate) reason: String,
+}
+
+impl ResetWindowStateArgs {
+    /// Returns the resolved profile name.
+    ///
+    /// The clap arg group over the positional `NAME` and `--profile` is
+    /// `required` and mutually exclusive, so a parsed invocation sets exactly
+    /// one of the two fields; this returns whichever was supplied.
+    fn profile_name(&self) -> &str {
+        self.name
+            .as_deref()
+            .or(self.profile.as_deref())
+            .unwrap_or_default()
+    }
 }
 
 /// Success payload for the `reset-window-state` envelope.
@@ -110,7 +137,7 @@ struct ResetWindowStateData {
 ///
 /// Never panics.
 pub async fn run(args: &ResetWindowStateArgs) -> i32 {
-    let profile = match loader::load(&args.name, None) {
+    let profile = match loader::load(args.profile_name(), None) {
         Ok(p) => p,
         Err(loader::ProfileLoadError::NotFound { name, .. }) => {
             let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
@@ -118,9 +145,9 @@ pub async fn run(args: &ResetWindowStateArgs) -> i32 {
             return 1;
         }
         Err(e) => {
-            tracing::debug!(profile = %args.name, error = %e, "profile load failed");
+            tracing::debug!(profile = %args.profile_name(), error = %e, "profile load failed");
             let err = WalletError::Validation(ValidationError::ProfileNotFound {
-                name: args.name.clone(),
+                name: args.profile_name().to_owned(),
             });
             render::render_json(&Envelope::err(&err));
             return 1;
@@ -132,7 +159,7 @@ pub async fn run(args: &ResetWindowStateArgs) -> i32 {
         return 1;
     }
 
-    let store = PersistedWindowStore::for_profile(&args.name);
+    let store = PersistedWindowStore::for_profile(args.profile_name());
     let request_id = Uuid::new_v4().to_string();
 
     // Audit row FIRST: records the operator's reset request, independent of
@@ -140,11 +167,11 @@ pub async fn run(args: &ResetWindowStateArgs) -> i32 {
     // "Audit-row ordering" section.
     let entry = AuditEntry::new_policy_window_state_reset(
         "profile_reset_window_state",
-        &args.name,
+        args.profile_name(),
         &args.reason,
         &request_id,
     );
-    emit_value_audit_row(&profile, &args.name, entry);
+    emit_value_audit_row(&profile, args.profile_name(), entry);
 
     let mint_outcome = match store.reset(&profile) {
         Ok(outcome) => outcome,
@@ -164,7 +191,7 @@ pub async fn run(args: &ResetWindowStateArgs) -> i32 {
     if mint_outcome.newly_minted {
         emit_keyring_key_written(
             &profile,
-            &args.name,
+            args.profile_name(),
             "profile_reset_window_state",
             KeyPurpose::PolicyWindowStateHmac,
             &profile.policy_window_state_key_id,
@@ -174,7 +201,7 @@ pub async fn run(args: &ResetWindowStateArgs) -> i32 {
     }
 
     render::render_json(&Envelope::ok(ResetWindowStateData {
-        profile: args.name.clone(),
+        profile: args.profile_name().to_owned(),
         reset: true,
         reason: args.reason.clone(),
     }));
@@ -193,15 +220,56 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
 
+    use clap::Parser;
+    use clap::error::ErrorKind;
     use serial_test::serial;
 
     use super::*;
+
+    /// Local flatten wrapper so the `ResetWindowStateArgs` clap contract can be
+    /// parsed in isolation from the full command tree. The required `--reason`
+    /// is supplied in every case so the only variable under test is the
+    /// profile-target group.
+    #[derive(Debug, Parser)]
+    struct Wrap {
+        #[command(flatten)]
+        args: ResetWindowStateArgs,
+    }
+
+    #[test]
+    fn positional_name_is_accepted() {
+        let w = Wrap::try_parse_from(["prog", "acme", "--reason", "recovery"])
+            .expect("positional parses");
+        assert_eq!(w.args.profile_name(), "acme");
+    }
+
+    #[test]
+    fn profile_flag_is_accepted() {
+        let w = Wrap::try_parse_from(["prog", "--profile", "acme", "--reason", "recovery"])
+            .expect("flag parses");
+        assert_eq!(w.args.profile_name(), "acme");
+    }
+
+    #[test]
+    fn both_positional_and_flag_is_a_conflict() {
+        let err =
+            Wrap::try_parse_from(["prog", "acme", "--profile", "other", "--reason", "recovery"])
+                .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn neither_positional_nor_flag_is_missing_required() {
+        let err = Wrap::try_parse_from(["prog", "--reason", "recovery"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
 
     #[tokio::test]
     #[serial]
     async fn reset_window_state_nonexistent_profile_returns_exit_1() {
         let args = ResetWindowStateArgs {
-            name: "__nonexistent_reset_window_state__".to_owned(),
+            name: Some("__nonexistent_reset_window_state__".to_owned()),
+            profile: None,
             reason: "test".to_owned(),
         };
         let code = run(&args).await;

@@ -407,8 +407,9 @@ stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --pr
 Rotation subcommands generate a fresh 32-byte secret from the OS CSPRNG and
 atomically replace one keyring entry the profile names. The raw bytes never
 leave the keyring, are never logged, and are never returned. Rotation is not
-reversible; each one invalidates material minted under the old key. All take the
-profile as a positional `<NAME>`.
+reversible; each one invalidates material minted under the old key. Each takes
+the profile as either a positional `<NAME>` or a `--profile <NAME>` flag
+(exactly one).
 
 The policy-file owner key is not rotated here — it is enrolled with `profile enroll-owner-key` (public key stored) and used by `profile sign-policy`. The rotation subcommands below mint 32-byte HMAC keys.
 
