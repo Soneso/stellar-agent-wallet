@@ -11,7 +11,7 @@
   <a href="https://soneso.com"><img src="https://img.shields.io/badge/built_by-Soneso-243b5c?style=for-the-badge" alt="Built by Soneso"></a>
 </p>
 
-# Stellar Agent Wallet <img src="docs/assets/mark.svg" alt="" height="30" align="middle">
+# Stellar Agent Wallet <img src="docs/assets/mark.svg?v=2" alt="" height="35" align="middle">
 
 A Stellar wallet for AI agents, built by Soneso: autonomous transactions
 inside rules you define, approvals you grant, and an audit trail you can
