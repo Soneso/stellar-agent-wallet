@@ -902,6 +902,61 @@ pub(super) const ROTATION_WINDOW_RETRY_ATTEMPTS: u32 = 20;
 pub(super) const ROTATION_WINDOW_RETRY_DELAY: std::time::Duration =
     std::time::Duration::from_millis(1);
 
+// Test-only observation point fired once per rotation-window retry iteration,
+// after the sidecar-lock probe and before the sleep + rescan, receiving the
+// 0-based attempt index. It exists so in-crate tests can drive the transient
+// active-file window deterministically on the scanning thread — restoring the
+// file from inside the retry loop rather than racing an external restorer
+// thread against the wall clock. Installed only via
+// `install_rotation_window_retry_observer`, which returns an RAII guard that
+// clears it on drop; a leaked observer would otherwise fire in an unrelated
+// test when libtest runs on a single thread. The whole hook is compiled out of
+// every non-test build.
+#[cfg(test)]
+type RotationWindowRetryObserver = Box<dyn FnMut(u32)>;
+
+#[cfg(test)]
+thread_local! {
+    static ROTATION_WINDOW_RETRY_OBSERVER: std::cell::RefCell<Option<RotationWindowRetryObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII handle for the thread-local rotation-window retry observer. Clearing
+/// the observer on drop is load-bearing, not hygiene: under
+/// `cargo test -- --test-threads=1` libtest runs every test on one thread, so
+/// an observer left installed past its test would fire in the next one.
+#[cfg(test)]
+pub(super) struct RotationWindowRetryObserverGuard;
+
+#[cfg(test)]
+impl Drop for RotationWindowRetryObserverGuard {
+    fn drop(&mut self) {
+        ROTATION_WINDOW_RETRY_OBSERVER.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
+/// Installs `observer` as the thread-local rotation-window retry observer for
+/// the current thread and returns a guard that uninstalls it on drop.
+///
+/// The observer runs on the scanning thread, once per retry iteration of
+/// [`wait_out_transient_rotation_window`], with the 0-based attempt index. The
+/// returned guard MUST be bound for the observed scope — dropping it
+/// immediately uninstalls the observer before any scan can run.
+///
+/// One observer per thread-scope: the guard's drop CLEARS the slot rather
+/// than restoring a previously installed observer, so installs do not nest.
+/// The observer is invoked while the slot's `RefCell` is mutably borrowed —
+/// an observer that re-enters a reader/verify scan (and thereby this wait)
+/// panics with a `BorrowMutError` rather than recursing.
+#[cfg(test)]
+#[must_use = "the observer is uninstalled as soon as the returned guard drops; bind it for the observed scope"]
+pub(super) fn install_rotation_window_retry_observer(
+    observer: impl FnMut(u32) + 'static,
+) -> RotationWindowRetryObserverGuard {
+    ROTATION_WINDOW_RETRY_OBSERVER.with(|cell| *cell.borrow_mut() = Some(Box::new(observer)));
+    RotationWindowRetryObserverGuard
+}
+
 /// Shared bounded-retry primitive for the rotation-window tolerance used by
 /// both `reader::collect_files_newest_first` and `verify::collect_file_chain`.
 ///
@@ -922,12 +977,32 @@ pub(super) fn wait_out_transient_rotation_window<T, E>(
     is_still_absent: impl Fn(&T) -> bool,
     mut rescan: impl FnMut() -> Result<T, E>,
 ) -> Result<T, E> {
+    #[cfg(test)]
+    let mut attempt: u32 = 0;
+    // The `attempt` counter is a `#[cfg(test)]` companion to the production
+    // range loop; it feeds only the test-only observer below, so clippy's
+    // manual-counter lint applies to the test build alone.
+    #[cfg_attr(test, allow(clippy::explicit_counter_loop))]
     for _ in 0..ROTATION_WINDOW_RETRY_ATTEMPTS {
         if !is_still_absent(&latest) {
             return Ok(latest);
         }
         if !sidecar_lock_is_held(log_path) {
             break;
+        }
+        // Test-only deterministic observation point; see
+        // `install_rotation_window_retry_observer`. Placed after the lock probe
+        // (so an unheld lock never reaches it) and before the sleep + rescan.
+        // Compiled out entirely in shipped builds, leaving the loop above
+        // byte-identical to production.
+        #[cfg(test)]
+        {
+            ROTATION_WINDOW_RETRY_OBSERVER.with(|cell| {
+                if let Some(observer) = cell.borrow_mut().as_mut() {
+                    observer(attempt);
+                }
+            });
+            attempt += 1;
         }
         std::thread::sleep(ROTATION_WINDOW_RETRY_DELAY);
         latest = rescan()?;
@@ -2260,6 +2335,109 @@ mod tests {
         assert!(
             third.is_ok(),
             "acquire after the writer drops must succeed, got: {third:?}"
+        );
+    }
+
+    // ── wait_out_transient_rotation_window: closure semantics ─────────────────
+
+    /// A present file (`is_still_absent` reports false on the first check)
+    /// returns immediately without probing the lock or rescanning.
+    #[test]
+    fn wait_out_rotation_window_returns_immediately_when_not_absent() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+
+        let mut rescan_calls = 0u32;
+        let out: Result<u32, std::convert::Infallible> = wait_out_transient_rotation_window(
+            &path,
+            7u32,
+            |_latest: &u32| false,
+            || {
+                rescan_calls += 1;
+                Ok(7u32)
+            },
+        );
+
+        assert_eq!(out.unwrap(), 7);
+        assert_eq!(
+            rescan_calls, 0,
+            "a present file must not trigger any rescan"
+        );
+    }
+
+    /// An unheld sidecar lock (no live writer) means the absence is not a live
+    /// rotation, so the loop gives up on its first iteration: it returns the
+    /// latest scan unchanged and never rescans. This is the give-up posture the
+    /// `sidecar_lock_is_held` break enforces.
+    #[test]
+    fn wait_out_rotation_window_gives_up_immediately_when_lock_unheld() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+
+        let mut rescan_calls = 0u32;
+        let out: Result<u32, std::convert::Infallible> = wait_out_transient_rotation_window(
+            &path,
+            1u32,
+            |_latest: &u32| true,
+            || {
+                rescan_calls += 1;
+                Ok(2u32)
+            },
+        );
+
+        assert_eq!(out.unwrap(), 1, "the latest scan is returned unchanged");
+        assert_eq!(
+            rescan_calls, 0,
+            "an unheld lock must not trigger any rescan"
+        );
+    }
+
+    /// A rescan error propagates through the primitive's `?`. The sidecar lock
+    /// is held so the loop reaches the rescan call rather than giving up first.
+    #[test]
+    fn wait_out_rotation_window_propagates_rescan_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+
+        let _held =
+            crate::audit_log::lock::AuditWriterLock::acquire(&lock_sidecar_path(&path)).unwrap();
+
+        let out: Result<u32, &'static str> = wait_out_transient_rotation_window(
+            &path,
+            0u32,
+            |_latest: &u32| true,
+            || Err("rescan failed"),
+        );
+
+        assert_eq!(out, Err("rescan failed"));
+    }
+
+    /// When the file reappears before the retry bound is exhausted, the loop
+    /// returns the reappeared scan at that iteration and does not run the full
+    /// bound. The sidecar lock is held so each iteration proceeds to a rescan.
+    #[test]
+    fn wait_out_rotation_window_stops_when_scan_reappears_before_bound() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+
+        let _held =
+            crate::audit_log::lock::AuditWriterLock::acquire(&lock_sidecar_path(&path)).unwrap();
+
+        let mut rescan_calls = 0u32;
+        let out: Result<u32, std::convert::Infallible> = wait_out_transient_rotation_window(
+            &path,
+            0u32,
+            |latest: &u32| *latest == 0,
+            || {
+                rescan_calls += 1;
+                Ok(if rescan_calls >= 3 { 1u32 } else { 0u32 })
+            },
+        );
+
+        assert_eq!(out.unwrap(), 1, "the reappeared scan result is returned");
+        assert_eq!(
+            rescan_calls, 3,
+            "must stop at the reappearing rescan, not exhaust the bound"
         );
     }
 

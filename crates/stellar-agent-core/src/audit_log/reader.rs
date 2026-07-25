@@ -1701,9 +1701,13 @@ mod tests {
         entry::{AuditEntry, NewToolInvocation},
         schema::PolicyDecision,
         signer_set::{BaselineReason, SignerPubkey},
-        writer::AuditWriter,
+        writer::{
+            AuditWriter, ROTATION_WINDOW_RETRY_ATTEMPTS, install_rotation_window_retry_observer,
+        },
     };
     use crate::observability::RedactedStrkey;
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -2160,11 +2164,18 @@ mod tests {
         // `writer` stays alive (and its sidecar lock held) for the rest of the
         // test, so this exercises the "genuinely missing, not a transient
         // rotation window" path of `wait_out_transient_rotation_window`: the
-        // lock IS held, so the scan retries up to its bound before giving up,
-        // but the file never reappears (nothing recreates it here), so the
-        // final outcome is unchanged — just reached after a bounded delay of
-        // at most 20ms rather than immediately.
+        // lock IS held, so the scan retries up to its bound before giving up.
+        // The observer never restores the file, so every retry iteration fires
+        // it; the recorded sequence pins that the loop probes exactly the full
+        // bound (indices 0..ROTATION_WINDOW_RETRY_ATTEMPTS) before reporting the
+        // gap, rather than giving up early or looping unbounded.
         std::fs::remove_file(&path).unwrap();
+
+        let observed_attempts = Rc::new(RefCell::new(Vec::<u32>::new()));
+        let observed_for_hook = Rc::clone(&observed_attempts);
+        let _observer_guard = install_rotation_window_retry_observer(move |attempt| {
+            observed_for_hook.borrow_mut().push(attempt);
+        });
 
         let reader = AuditReader::new(Arc::clone(&writer), None);
         let result = reader.find_latest_signer_set_state(1, "CDABC...12345");
@@ -2177,6 +2188,69 @@ mod tests {
                 panic!("expected RotationGap for missing active file with siblings, got: {other:?}")
             }
         }
+        assert_eq!(
+            *observed_attempts.borrow(),
+            (0..ROTATION_WINDOW_RETRY_ATTEMPTS).collect::<Vec<u32>>(),
+            "a lock-held, never-reappearing active file must probe exactly the full retry bound"
+        );
+    }
+
+    // ── 8a. Missing active file with NO live writer → immediate give-up ──────
+
+    /// The reader's rotation-window tolerance gives up on its first iteration
+    /// when the sidecar lock is not held by a live writer: an absent active
+    /// file with no writer is a genuine gap, not a live rotation in progress,
+    /// so waiting would only delay the eventual error. The observer is asserted
+    /// to fire ZERO times because the give-up break sits before it.
+    ///
+    /// This drives `collect_files_newest_first` directly — the reader's
+    /// tolerance entry point — because the public reader API
+    /// (`find_latest_signer_set_state`) requires a live `Arc<Mutex<AuditWriter>>`
+    /// for the scan's duration, which necessarily holds the sidecar lock and so
+    /// cannot reach the unheld-lock branch.
+    #[test]
+    fn missing_active_no_writer_gives_up_immediately() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+
+        {
+            let writer = open_writer(path.clone());
+            let mut w = writer.lock().unwrap();
+            write_event(&mut w, baselined_event(1, "CDABC...12345", 2, 2));
+            w.force_rotate_for_test().unwrap();
+            write_event(&mut w, baselined_event(99, "COTHER...OTHER", 1, 1));
+            // `w` then `writer` drop at the end of this block, releasing the
+            // sidecar lock: no live writer remains.
+        }
+
+        // Active file absent, rotated sibling present, no live writer.
+        std::fs::remove_file(&path).unwrap();
+
+        let observed_attempts = Rc::new(RefCell::new(Vec::<u32>::new()));
+        let observed_for_hook = Rc::clone(&observed_attempts);
+        let _observer_guard = install_rotation_window_retry_observer(move |attempt| {
+            observed_for_hook.borrow_mut().push(attempt);
+        });
+
+        let chain = collect_files_newest_first(&path).unwrap();
+
+        assert!(
+            observed_attempts.borrow().is_empty(),
+            "an unheld lock must give up before the observer runs; observed: {:?}",
+            observed_attempts.borrow()
+        );
+        assert_eq!(
+            chain[0], path,
+            "the active file is always the first scan entry"
+        );
+        assert!(
+            !chain[0].exists(),
+            "the tolerance must not resurrect a genuinely absent active file"
+        );
+        assert!(
+            chain.len() > 1,
+            "the rotated sibling must remain in the chain"
+        );
     }
 
     // ── 8b. Active file transiently absent during a live rotation ────────────
@@ -2186,10 +2260,14 @@ mod tests {
     /// instead of surfacing a spurious `RotationGap`.
     ///
     /// Simulates the window `AuditWriter::rotate` opens between archiving the
-    /// old active file and creating the new one by removing the active file
-    /// and having a background thread recreate it (with its real content)
-    /// after a short delay, while the writer — and its sidecar lock — stays
-    /// alive throughout, exactly as a live writer's rotation would.
+    /// old active file and creating the new one by removing the active file and
+    /// restoring its real content from inside the retry loop, on the scanning
+    /// thread, via the test-only retry observer. Restoring at attempt index 1
+    /// means the following rescan observes the file present and the loop exits
+    /// on attempt index 2's absence check — a deterministic sequence that does
+    /// not depend on wall-clock timing, so it is immune to scheduling load. The
+    /// writer — and its sidecar lock — stays alive throughout, exactly as a
+    /// live writer's rotation would.
     #[test]
     fn active_file_transient_absence_while_writer_alive_recovers() {
         let dir = TempDir::new().unwrap();
@@ -2207,21 +2285,29 @@ mod tests {
         let saved_active_contents = std::fs::read(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
 
-        let recreate_path = path.clone();
-        let recreate_handle = std::thread::spawn(move || {
-            // Comfortably inside the retry bound (20 attempts x 1ms = 20ms).
-            std::thread::sleep(std::time::Duration::from_millis(3));
-            std::fs::write(&recreate_path, &saved_active_contents).unwrap();
+        let observed_attempts = Rc::new(RefCell::new(Vec::<u32>::new()));
+        let observed_for_hook = Rc::clone(&observed_attempts);
+        let restore_path = path.clone();
+        let _observer_guard = install_rotation_window_retry_observer(move |attempt| {
+            observed_for_hook.borrow_mut().push(attempt);
+            if attempt == 1 {
+                std::fs::write(&restore_path, &saved_active_contents).unwrap();
+            }
         });
 
         let reader = AuditReader::new(Arc::clone(&writer), None);
         let result = reader.find_latest_signer_set_state(1, "CDABC...12345");
-        recreate_handle.join().unwrap();
 
         let payload = result
             .expect("transient rotation-window absence must not surface as RotationGap")
             .expect("row must still be found once the active file reappears");
         assert_eq!(payload.state().signer_count, 3);
+        assert_eq!(
+            *observed_attempts.borrow(),
+            vec![0, 1],
+            "attempt 0 observes the still-absent file, attempt 1 restores it, \
+             attempt 2's absence check exits before reaching the observer"
+        );
     }
 
     // ── 9. Single-row predecessor-hash tamper → ChainBroken ──────────────────

@@ -1238,10 +1238,15 @@ mod tests {
             ContractKind, KeyPurpose, PolicyDecision, ValueActionKind, ValueLegRecord,
             VerifierAdvisoryKind,
         },
-        writer::{AuditWriter, ROTATION_THRESHOLD_BYTES},
+        writer::{
+            AuditWriter, ROTATION_THRESHOLD_BYTES, ROTATION_WINDOW_RETRY_ATTEMPTS,
+            install_rotation_window_retry_observer,
+        },
     };
     use crate::observability::RedactedStrkey;
+    use std::cell::RefCell;
     use std::fs;
+    use std::rc::Rc;
     use tempfile::TempDir;
     use zeroize::Zeroizing;
 
@@ -2515,6 +2520,12 @@ mod tests {
     /// waited out by `verify_log` too (the writer-independent entry point):
     /// with the sidecar lock held and the file reappearing inside the retry
     /// budget, verification succeeds over the full chain.
+    ///
+    /// The file is restored from inside the retry loop, on the verifying
+    /// thread, via the test-only retry observer (restore at attempt index 1,
+    /// exit on attempt index 2's absence check). This makes the recovery
+    /// deterministic and immune to scheduling load rather than racing an
+    /// external restorer thread against the wall clock.
     #[test]
     fn verify_active_transient_absence_while_writer_alive_recovers() {
         let dir = TempDir::new().unwrap();
@@ -2550,23 +2561,93 @@ mod tests {
         let saved_active_contents = fs::read(&path).unwrap();
         fs::remove_file(&path).unwrap();
 
-        let recreate_path = path.clone();
-        let recreate_handle = std::thread::spawn(move || {
-            // Comfortably inside the nominal retry budget; on platforms with
-            // coarse sleep granularity the budget only grows.
-            std::thread::sleep(std::time::Duration::from_millis(3));
-            fs::write(&recreate_path, &saved_active_contents).unwrap();
+        let observed_attempts = Rc::new(RefCell::new(Vec::<u32>::new()));
+        let observed_for_hook = Rc::clone(&observed_attempts);
+        let restore_path = path.clone();
+        let _observer_guard = install_rotation_window_retry_observer(move |attempt| {
+            observed_for_hook.borrow_mut().push(attempt);
+            if attempt == 1 {
+                fs::write(&restore_path, &saved_active_contents).unwrap();
+            }
         });
 
         // The writer stays alive (lock held) across the verification.
         let result = verify_log(&path, None);
-        recreate_handle.join().unwrap();
         drop(writer);
 
         let ok = result.expect("transient rotation-window absence must not surface as RotationGap");
         assert_eq!(ok.files_walked, 2);
         // pre_rotation + the rotation-handoff row in the archive + post_rotation.
         assert_eq!(ok.entries_verified, 3);
+        assert_eq!(
+            *observed_attempts.borrow(),
+            vec![0, 1],
+            "attempt 0 observes the still-absent file, attempt 1 restores it, \
+             attempt 2's absence check exits before reaching the observer"
+        );
+    }
+
+    /// A lock-held active-file absence that never reappears exhausts the retry
+    /// bound and is then reported as a `RotationGap` — `verify_log` never turns
+    /// a genuine gap into success. The observer never restores the file, so it
+    /// fires on every iteration; the recorded sequence pins that the loop
+    /// probes exactly the full bound (indices 0..ROTATION_WINDOW_RETRY_ATTEMPTS)
+    /// before giving up.
+    #[test]
+    fn verify_active_absence_lock_held_exhausts_bound_then_reports_gap() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+
+        let mut writer = AuditWriter::open(path.clone(), None).unwrap();
+        writer
+            .write_entry(new_tool_invocation(
+                "pre_rotation",
+                "stellar:testnet",
+                vec![],
+                None,
+                None,
+                PolicyDecision::Allow,
+                None,
+                uuid::Uuid::new_v4().to_string(),
+            ))
+            .unwrap();
+        writer.force_rotate_for_test().unwrap();
+        writer
+            .write_entry(new_tool_invocation(
+                "post_rotation",
+                "stellar:testnet",
+                vec![],
+                None,
+                None,
+                PolicyDecision::Allow,
+                None,
+                uuid::Uuid::new_v4().to_string(),
+            ))
+            .unwrap();
+
+        // Active file absent, rotated sibling present, writer (and its sidecar
+        // lock) still alive — the loop retries the full bound before giving up.
+        fs::remove_file(&path).unwrap();
+
+        let observed_attempts = Rc::new(RefCell::new(Vec::<u32>::new()));
+        let observed_for_hook = Rc::clone(&observed_attempts);
+        let _observer_guard = install_rotation_window_retry_observer(move |attempt| {
+            observed_for_hook.borrow_mut().push(attempt);
+        });
+
+        let err = verify_log(&path, None)
+            .expect_err("a lock-held active-file absence that never reappears is a gap");
+        drop(writer);
+
+        assert!(
+            matches!(err, VerifyError::RotationGap { .. }),
+            "expected RotationGap, got {err:?}"
+        );
+        assert_eq!(
+            *observed_attempts.borrow(),
+            (0..ROTATION_WINDOW_RETRY_ATTEMPTS).collect::<Vec<u32>>(),
+            "a lock-held, never-reappearing active file must probe exactly the full retry bound"
+        );
     }
 
     #[test]
