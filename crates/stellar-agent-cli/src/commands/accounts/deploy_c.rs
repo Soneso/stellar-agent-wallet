@@ -884,9 +884,15 @@ fn decode_hex32(hex: &str) -> Result<[u8; 32], ()> {
 ///
 /// # Errors
 ///
-/// - [`WalletError::Auth`] — env var not set, S-strkey invalid, or Ledger not connected.
-/// - [`WalletError::Auth`] wrapping [`stellar_agent_core::error::AuthError::SignerKeyMismatch`]
-///   for Ledger public-key mismatch.
+/// - [`WalletError::Validation`] when no signer-source flag is supplied
+///   (`validation.signer_source_required`), the deployer secret-env variable
+///   is not set (`validation.secret_env_not_set`), or its value is not a valid
+///   S-strkey (`validation.secret_env_invalid`).
+/// - [`WalletError::WalletState`] when the Ledger device is unavailable
+///   (`wallet_state.hardware_not_found`, or the timeout / wrong-app variant).
+/// - [`WalletError::Auth`] wrapping
+///   [`stellar_agent_core::error::AuthError::SignerKeyMismatch`] for Ledger
+///   public-key mismatch.
 async fn resolve_deployer(
     args: &DeployCArgs,
 ) -> Result<(DeployerKeypair, Option<MlockDegradation>), WalletError> {
@@ -900,13 +906,7 @@ async fn resolve_deployer(
         // comparison. The deployment flow will fail at submission if the Ledger key
         // doesn't match the fetched account-sequence (fee-account must match signer).
         use stellar_agent_network::signing::hardware::HardwareSigningKey;
-        let hw_key = HardwareSigningKey::native()
-            .map_err(|e| {
-                WalletError::Auth(stellar_agent_core::error::AuthError::KeyringNotFound {
-                    name: format!("Ledger not found or Stellar app not open: {e}"),
-                })
-            })?
-            .with_account_index(args.account_index);
+        let hw_key = HardwareSigningKey::native()?.with_account_index(args.account_index);
 
         let signer: Box<dyn stellar_agent_network::Signer + Send + Sync> = Box::new(hw_key);
         return Ok((
@@ -919,12 +919,13 @@ async fn resolve_deployer(
     }
 
     // SecretEnv mode.
-    let var_name = args
-        .deployer_secret_env
-        .as_deref()
-        .ok_or(WalletError::Auth(
-            stellar_agent_core::error::AuthError::KeyringLocked,
-        ))?;
+    let var_name = args.deployer_secret_env.as_deref().ok_or_else(|| {
+        WalletError::Validation(ValidationError::SignerSourceRequired {
+            detail: "no deployer signer flag specified; pass --deployer-secret-env <VAR> \
+                     or --sign-with-ledger"
+                .to_owned(),
+        })
+    })?;
 
     // We need the G-strkey to pass to signer_from_env for the key-match check.
     // At deploy-c time, the deployer G-strkey is derived from the env-var S-strkey.

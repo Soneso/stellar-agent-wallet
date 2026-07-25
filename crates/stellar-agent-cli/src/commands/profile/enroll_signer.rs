@@ -426,9 +426,9 @@ where
     let s_strkey: Zeroizing<String> = match std::env::var(&args.secret_env) {
         Ok(v) => Zeroizing::new(v),
         Err(_) => {
-            render::render_json(&Envelope::<()>::err(&WalletError::Auth(
-                AuthError::KeyringNotFound {
-                    name: format!("environment variable '{}' not set", args.secret_env),
+            render::render_json(&Envelope::<()>::err(&WalletError::Validation(
+                ValidationError::SecretEnvNotSet {
+                    var: args.secret_env.clone(),
                 },
             )));
             return 1;

@@ -15,7 +15,7 @@ use std::time::Duration;
 use clap::{ArgGroup, Args};
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{AuthError, IoSource, ValidationError, WalletError};
+use stellar_agent_core::error::{IoSource, ValidationError, WalletError};
 use stellar_agent_core::observability::redact_path_in_message;
 use stellar_agent_core::profile::loader as profile_loader;
 use stellar_agent_core::profile::schema::Profile;
@@ -242,29 +242,27 @@ impl CommonHandlerContext {
 ///
 /// # Errors
 ///
-/// Returns a [`WalletError`] when no signer-source flag is supplied, the
-/// Ledger device is unavailable, or the env-var S-strkey is invalid.
+/// Returns a [`WalletError`] when no signer-source flag is supplied
+/// (`validation.signer_source_required`), the Ledger device is unavailable
+/// (`wallet_state.hardware_not_found` family), or the env-var S-strkey is
+/// missing or invalid (`validation.secret_env_not_set` /
+/// `validation.secret_env_invalid`).
 pub(crate) async fn resolve_signer(
     signer_source: &SignerSourceFlags,
     profile_name: Option<&str>,
 ) -> Result<(Box<dyn Signer + Send + Sync>, Option<MlockDegradation>), WalletError> {
     if signer_source.sign_with_ledger {
         use stellar_agent_network::signing::hardware::HardwareSigningKey;
-        let hw_key = HardwareSigningKey::native()
-            .map_err(|e| {
-                WalletError::Auth(AuthError::KeyringNotFound {
-                    name: format!("Ledger not found or Stellar app not open: {e}"),
-                })
-            })?
+        let hw_key = HardwareSigningKey::native()?
             .with_account_index(signer_source.account_index_or_default());
         return Ok((Box::new(hw_key), None));
     }
 
     let var_name = signer_source.signer_secret_env.as_deref().ok_or_else(|| {
-        WalletError::Auth(AuthError::KeyringNotFound {
-            name: "no signer-source flag specified; pass --signer-secret-env <VAR> \
-                   or --sign-with-ledger (or --dry-run on subcommands that support \
-                   read-only operation)"
+        WalletError::Validation(ValidationError::SignerSourceRequired {
+            detail: "no signer-source flag specified; pass --signer-secret-env <VAR> \
+                     or --sign-with-ledger (or --dry-run on subcommands that support \
+                     read-only operation)"
                 .to_owned(),
         })
     })?;
@@ -583,8 +581,8 @@ mod tests {
         }
     }
 
-    /// An unset env var refuses with the keyring-not-found error naming the
-    /// variable.
+    /// An unset env var refuses with `validation.secret_env_not_set` naming the
+    /// variable — an input-validation failure, not a keyring condition.
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_signer_unset_env_var_is_refused() {
         let flags = SignerSourceFlags {
@@ -596,6 +594,7 @@ mod tests {
             Ok(_) => panic!("unset env var must refuse"),
             Err(e) => e,
         };
+        assert_eq!(err.code(), "validation.secret_env_not_set");
         assert!(
             err.to_string()
                 .contains("COMMON_RESOLVE_SIGNER_UNSET_VAR_TEST"),
@@ -603,7 +602,9 @@ mod tests {
         );
     }
 
-    /// A malformed S-strkey refuses before any unlock.
+    /// A malformed S-strkey refuses before any unlock with
+    /// `validation.secret_env_invalid`, naming the variable but never echoing
+    /// its value.
     #[tokio::test(flavor = "multi_thread")]
     #[allow(
         unsafe_code,
@@ -623,13 +624,64 @@ mod tests {
             Ok(_) => panic!("malformed S-strkey must refuse"),
             Err(e) => e,
         };
+        assert_eq!(err.code(), "validation.secret_env_invalid");
         assert!(
-            err.to_string().contains("invalid S-strkey"),
-            "error must state the malformed key: {err}"
+            err.to_string().contains(var),
+            "error must name the variable: {err}"
+        );
+        assert!(
+            !err.to_string().contains("not-an-s-strkey"),
+            "error must not echo the malformed value: {err}"
         );
         unsafe {
             std::env::remove_var(var);
         }
+    }
+
+    /// The Ledger signer path never reports a keyring error: with no device
+    /// attached (CI) `resolve_signer` surfaces a `wallet_state.*` error; with a
+    /// live device it returns a signer. In every case the code is neither
+    /// `auth.keyring_not_found` nor `auth.keyring_locked` — a keyring lookup is
+    /// never performed on the hardware path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_signer_ledger_source_never_reports_keyring_error() {
+        let flags = SignerSourceFlags {
+            signer_secret_env: None,
+            sign_with_ledger: true,
+            account_index: Some(0),
+        };
+        let err = match resolve_signer(&flags, None).await {
+            // A live device resolved a signer; the no-keyring-lookup invariant
+            // still holds.
+            Ok(_) => return,
+            Err(e) => e,
+        };
+        let code = err.code();
+        assert_ne!(
+            code, "auth.keyring_not_found",
+            "the Ledger path must not surface a keyring-not-found error; got {code}"
+        );
+        assert_ne!(
+            code, "auth.keyring_locked",
+            "the Ledger path must not surface a keyring-locked error; got {code}"
+        );
+    }
+
+    /// With neither signer-source flag, `resolve_signer` refuses before any key
+    /// access or network call with `validation.signer_source_required` — a
+    /// missing-input failure, not a keyring condition.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_signer_missing_source_reports_signer_source_required() {
+        let flags = SignerSourceFlags {
+            signer_secret_env: None,
+            sign_with_ledger: false,
+            account_index: None,
+        };
+        let err = match resolve_signer(&flags, None).await {
+            Ok(_) => panic!("a missing signer-source flag must be refused"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code(), "validation.signer_source_required");
     }
 
     #[test]

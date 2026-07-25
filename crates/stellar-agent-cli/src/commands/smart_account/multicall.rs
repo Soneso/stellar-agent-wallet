@@ -51,7 +51,7 @@ use std::time::Duration;
 use clap::{ArgGroup, Args};
 use serde::{Deserialize, Serialize};
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{AuthError, IoSource, ValidationError, WalletError};
+use stellar_agent_core::error::{IoSource, ValidationError, WalletError};
 use stellar_agent_core::policy::v1::PolicyEngineV1;
 use stellar_agent_core::wallet::MlockDegradation;
 use stellar_agent_network::{ClassicFeeChoice, parse_classic_fee_choice};
@@ -595,20 +595,15 @@ async fn resolve_signer(
 > {
     if flags.sign_with_ledger {
         use stellar_agent_network::signing::hardware::HardwareSigningKey;
-        let hw_key = HardwareSigningKey::native()
-            .map_err(|e| {
-                WalletError::Auth(AuthError::KeyringNotFound {
-                    name: format!("Ledger not found or Stellar app not open: {e}"),
-                })
-            })?
-            .with_account_index(flags.account_index.unwrap_or(0));
+        let hw_key =
+            HardwareSigningKey::native()?.with_account_index(flags.account_index.unwrap_or(0));
         return Ok((Box::new(hw_key), None));
     }
 
     let var_name = flags.signer_secret_env.as_deref().ok_or_else(|| {
-        WalletError::Auth(AuthError::KeyringNotFound {
-            name: "no signer-source flag specified for smart-account multicall; \
-                   pass --signer-secret-env <VAR> or --sign-with-ledger"
+        WalletError::Validation(ValidationError::SignerSourceRequired {
+            detail: "no signer-source flag specified for smart-account multicall; \
+                     pass --signer-secret-env <VAR> or --sign-with-ledger"
                 .to_owned(),
         })
     })?;

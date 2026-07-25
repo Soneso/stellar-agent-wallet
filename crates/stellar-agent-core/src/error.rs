@@ -891,6 +891,61 @@ pub enum ValidationError {
         /// The profile name whose audit writer could not be opened.
         profile: String,
     },
+
+    /// A signing verb was asked to read a secret from a named environment
+    /// variable, but that variable is not set in this process's environment.
+    ///
+    /// `var` holds the environment variable name supplied by the operator
+    /// (e.g. `"DEPLOYER_SECRET"`). It is a non-secret identifier — the name of
+    /// the variable, never its value.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.secret_env_not_set"`.
+    #[error("environment variable '{var}' is not set in this process's environment")]
+    SecretEnvNotSet {
+        /// The environment variable name that is not set. Names the variable,
+        /// never its value.
+        var: String,
+    },
+
+    /// A named environment variable was set but its value is not a valid
+    /// ed25519 `S...` strkey.
+    ///
+    /// `var` holds the environment variable name supplied by the operator. The
+    /// variable's value is never included in the error — only the variable
+    /// name — so no secret material can leak through the wire envelope even
+    /// when the value is malformed.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.secret_env_invalid"`.
+    #[error("environment variable '{var}' does not contain a valid S-strkey")]
+    SecretEnvInvalid {
+        /// The environment variable name whose value failed to parse. Names the
+        /// variable, never its value.
+        var: String,
+    },
+
+    /// A value-moving signing verb was invoked without any signer-source flag.
+    ///
+    /// These verbs require the operator to name where the signing key comes
+    /// from (an environment variable holding an `S...` strkey, or a connected
+    /// Ledger device). When no such flag is supplied the verb refuses before
+    /// any key access or network call.
+    ///
+    /// `detail` carries the verb's own actionable flag guidance naming the
+    /// flags it accepts. It is operator-facing text with no secret material.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.signer_source_required"`.
+    #[error("{detail}")]
+    SignerSourceRequired {
+        /// Operator-facing guidance naming the signer-source flags this verb
+        /// accepts. Non-secret text.
+        detail: String,
+    },
 }
 
 impl ValidationError {
@@ -938,6 +993,9 @@ impl ValidationError {
             // that variant's doc comment for why the `Display` text differs
             // while the code stays unified.
             Self::AuditWriterOpenFailed { .. } => "audit.chain_key_unavailable",
+            Self::SecretEnvNotSet { .. } => "validation.secret_env_not_set",
+            Self::SecretEnvInvalid { .. } => "validation.secret_env_invalid",
+            Self::SignerSourceRequired { .. } => "validation.signer_source_required",
         }
     }
 }
@@ -1347,6 +1405,35 @@ pub enum WalletStateError {
         "passkey credential not found on the platform authenticator; re-register the credential"
     )]
     PasskeyCredentialNotFound,
+
+    /// The wallet unlock ceremony failed before a signing window could be
+    /// opened.
+    ///
+    /// Raised when [`crate::wallet::Wallet::unlock`] rejects the request — for
+    /// example a profile `unlock_ttl_seconds` outside the permitted
+    /// `(0, MAX_TTL_SECONDS]` range (refused, never clamped), or an mlock
+    /// refusal under `MlockRequired::True`. This is wallet-lifecycle state,
+    /// distinct from an authentication rejection ([`AuthError`]) and from a
+    /// missing keyring coordinate ([`AuthError::KeyringNotFound`]).
+    ///
+    /// `detail` carries the [`crate::wallet::WalletLifecycleError`] `Display`
+    /// text. The `Display`-text-in-`detail` shape is chosen over a `#[source]`
+    /// field for wire-envelope uniformity with the sibling
+    /// [`WalletStateError::KeyringCorrupted`] and
+    /// [`WalletStateError::PlatformAuthenticatorError`] variants, all of which
+    /// carry an operator-safe diagnostic string. `WalletLifecycleError`
+    /// guarantees that no variant surfaces secret material (see its module
+    /// documentation), so forwarding its `Display` text carries no seed bytes.
+    ///
+    /// # Wire code
+    ///
+    /// `"wallet_state.unlock_failed"`.
+    #[error("wallet unlock failed: {detail}")]
+    UnlockFailed {
+        /// Operator-safe diagnostic string from `WalletLifecycleError`. Carries
+        /// no secret material.
+        detail: String,
+    },
 }
 
 impl WalletStateError {
@@ -1364,6 +1451,7 @@ impl WalletStateError {
             }
             Self::PlatformAuthenticatorError { .. } => "wallet_state.platform_authenticator_error",
             Self::PasskeyCredentialNotFound => "wallet_state.passkey_credential_not_found",
+            Self::UnlockFailed { .. } => "wallet_state.unlock_failed",
         }
     }
 }
@@ -2033,6 +2121,26 @@ mod tests {
                 },
                 "audit.chain_key_unavailable",
             ),
+            (
+                ValidationError::SecretEnvNotSet {
+                    var: "DEPLOYER_SECRET".to_owned(),
+                },
+                "validation.secret_env_not_set",
+            ),
+            (
+                ValidationError::SecretEnvInvalid {
+                    var: "DEPLOYER_SECRET".to_owned(),
+                },
+                "validation.secret_env_invalid",
+            ),
+            (
+                ValidationError::SignerSourceRequired {
+                    detail: "no signer-source flag specified; pass --secret-env <VAR> \
+                             or --sign-with-ledger"
+                        .to_owned(),
+                },
+                "validation.signer_source_required",
+            ),
         ];
 
         for (variant, expected_code) in cases {
@@ -2155,6 +2263,17 @@ mod tests {
                 ValidationError::AuditWriterOpenFailed { profile } => {
                     ValidationError::AuditWriterOpenFailed {
                         profile: profile.clone(),
+                    }
+                }
+                ValidationError::SecretEnvNotSet { var } => {
+                    ValidationError::SecretEnvNotSet { var: var.clone() }
+                }
+                ValidationError::SecretEnvInvalid { var } => {
+                    ValidationError::SecretEnvInvalid { var: var.clone() }
+                }
+                ValidationError::SignerSourceRequired { detail } => {
+                    ValidationError::SignerSourceRequired {
+                        detail: detail.clone(),
                     }
                 }
             });
@@ -2314,6 +2433,12 @@ mod tests {
                     detail: "checksum mismatch".to_owned(),
                 },
                 "wallet_state.keyring_corrupted",
+            ),
+            (
+                WalletStateError::UnlockFailed {
+                    detail: "invalid TTL 601s: TTL exceeds the maximum".to_owned(),
+                },
+                "wallet_state.unlock_failed",
             ),
         ];
 
@@ -2638,6 +2763,17 @@ mod tests {
                 reason: "pass an explicit stroops value".to_owned(),
             }),
             WalletError::Validation(ValidationError::RelayerNotImplemented),
+            WalletError::Validation(ValidationError::SecretEnvNotSet {
+                var: "DEPLOYER_SECRET".to_owned(),
+            }),
+            WalletError::Validation(ValidationError::SecretEnvInvalid {
+                var: "DEPLOYER_SECRET".to_owned(),
+            }),
+            WalletError::Validation(ValidationError::SignerSourceRequired {
+                detail: "no signer-source flag specified; pass --secret-env <VAR> \
+                         or --sign-with-ledger"
+                    .to_owned(),
+            }),
         ];
         for err in &cases {
             let msg = err.message();
@@ -2695,6 +2831,9 @@ mod tests {
             }),
             WalletError::WalletState(WalletStateError::KeyringCorrupted {
                 detail: "bad checksum".to_owned(),
+            }),
+            WalletError::WalletState(WalletStateError::UnlockFailed {
+                detail: "invalid TTL 601s: TTL exceeds the maximum".to_owned(),
             }),
             WalletError::Protocol(ProtocolError::XdrCodecFailed {
                 detail: "bad bytes".to_owned(),

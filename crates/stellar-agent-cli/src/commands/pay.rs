@@ -1180,8 +1180,9 @@ fn evaluate_pay_policy(
 ///
 /// # Errors
 ///
-/// Propagates `WalletError` from seed parsing, Wallet::unlock, signing, or
-/// mlock failures.
+/// Propagates `WalletError` from seed parsing, `Wallet::unlock`, signing, or
+/// mlock failures. Returns `ValidationError::SignerSourceRequired` when neither
+/// signer flag is provided.
 async fn sign_envelope(args: &PayArgs, unsigned_xdr: &str) -> Result<String, WalletError> {
     let source = args.source.as_deref().ok_or_else(|| {
         WalletError::Validation(stellar_agent_core::error::ValidationError::AddressInvalid {
@@ -1232,7 +1233,12 @@ async fn sign_envelope(args: &PayArgs, unsigned_xdr: &str) -> Result<String, Wal
         return Ok(signed_xdr);
     }
 
-    Err(WalletError::Auth(AuthError::KeyringLocked))
+    Err(WalletError::Validation(
+        ValidationError::SignerSourceRequired {
+            detail: "no signer flag specified; pass --secret-env <VAR> or --sign-with-ledger"
+                .to_owned(),
+        },
+    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

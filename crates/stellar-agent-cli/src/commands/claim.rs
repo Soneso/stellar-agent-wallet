@@ -1026,8 +1026,8 @@ fn current_unix_secs() -> Result<u64, ClaimError> {
 /// # Errors
 ///
 /// Propagates `WalletError` from seed parsing, `Wallet::unlock`, the pubkey
-/// mismatch check, or the signing call. Returns `AuthError::KeyringLocked` when
-/// neither signer flag is provided.
+/// mismatch check, or the signing call. Returns
+/// `ValidationError::SignerSourceRequired` when neither signer flag is provided.
 async fn sign_envelope(args: &ClaimArgs, unsigned_xdr: &str) -> Result<String, WalletError> {
     let source = args.source.as_str();
     let passphrase = args.network.passphrase();
@@ -1064,7 +1064,12 @@ async fn sign_envelope(args: &ClaimArgs, unsigned_xdr: &str) -> Result<String, W
         return Ok(signed_xdr);
     }
 
-    Err(WalletError::Auth(AuthError::KeyringLocked))
+    Err(WalletError::Validation(
+        ValidationError::SignerSourceRequired {
+            detail: "no signer flag specified; pass --secret-env <VAR> or --sign-with-ledger"
+                .to_owned(),
+        },
+    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

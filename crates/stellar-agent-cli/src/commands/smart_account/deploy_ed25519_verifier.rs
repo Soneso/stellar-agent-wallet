@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use clap::{ArgGroup, Args};
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
-use stellar_agent_core::error::{AuthError, NetworkError, WalletError};
+use stellar_agent_core::error::{NetworkError, ValidationError, WalletError};
 use stellar_agent_network::{
     StellarRpcClient, parse_classic_fee_choice, resolve_classic_fee_selection,
 };
@@ -282,19 +282,18 @@ pub async fn run(args: &DeployEd25519VerifierArgs) -> i32 {
 ///
 /// # Errors
 ///
-/// - [`WalletError::Auth`] — env var not set, S-strkey invalid, or Ledger not connected.
+/// - [`WalletError::Validation`] when no signer-source flag is supplied
+///   (`validation.signer_source_required`), the deployer secret-env variable
+///   is not set (`validation.secret_env_not_set`), or its value is not a valid
+///   S-strkey (`validation.secret_env_invalid`).
+/// - [`WalletError::WalletState`] when the Ledger device is unavailable
+///   (`wallet_state.hardware_not_found`, or the timeout / wrong-app variant).
 async fn resolve_deployer(
     args: &DeployEd25519VerifierArgs,
 ) -> Result<DeployerKeypair, WalletError> {
     if args.sign_with_ledger {
         use stellar_agent_network::signing::hardware::HardwareSigningKey;
-        let hw_key = HardwareSigningKey::native()
-            .map_err(|e| {
-                WalletError::Auth(AuthError::KeyringNotFound {
-                    name: format!("Ledger not found or Stellar app not open: {e}"),
-                })
-            })?
-            .with_account_index(args.account_index);
+        let hw_key = HardwareSigningKey::native()?.with_account_index(args.account_index);
 
         let signer: Box<dyn stellar_agent_network::Signer + Send + Sync> = Box::new(hw_key);
         return Ok(DeployerKeypair::Ledger {
@@ -304,10 +303,13 @@ async fn resolve_deployer(
     }
 
     // SecretEnv mode.
-    let var_name = args
-        .deployer_secret_env
-        .as_deref()
-        .ok_or(WalletError::Auth(AuthError::KeyringLocked))?;
+    let var_name = args.deployer_secret_env.as_deref().ok_or_else(|| {
+        WalletError::Validation(ValidationError::SignerSourceRequired {
+            detail: "no deployer signer flag specified; pass --deployer-secret-env <VAR> \
+                     or --sign-with-ledger"
+                .to_owned(),
+        })
+    })?;
 
     // Shared mlock-protected secret-env ceremony: no `--profile` flag exists
     // on this verb, so the `[wallet]` posture falls back to
@@ -392,6 +394,7 @@ fn print_error(envelope: &Envelope<()>, format: OutputFormat) {
 mod tests {
     #![allow(clippy::unwrap_used, reason = "test-only")]
     #![allow(clippy::expect_used, reason = "test-only")]
+    #![allow(clippy::panic, reason = "test-only")]
 
     use serial_test::serial;
 
@@ -479,5 +482,21 @@ mod tests {
         let args = dry_run_args();
         let code = run(&args).await;
         assert_eq!(code, 0, "dry-run must succeed offline with exit code 0");
+    }
+
+    /// With neither `--deployer-secret-env` nor `--sign-with-ledger`,
+    /// `resolve_deployer` refuses before any key access or network call with a
+    /// `validation.signer_source_required` code — not a keyring error, which
+    /// would misclassify a missing-flag input failure as a keyring condition.
+    #[tokio::test]
+    async fn missing_signer_source_reports_signer_source_required() {
+        let mut args = dry_run_args();
+        args.deployer_secret_env = None;
+        args.sign_with_ledger = false;
+        let err = match resolve_deployer(&args).await {
+            Ok(_) => panic!("a missing signer-source flag must be refused"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code(), "validation.signer_source_required");
     }
 }
