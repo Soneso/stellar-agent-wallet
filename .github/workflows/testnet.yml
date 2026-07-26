@@ -88,6 +88,12 @@ jobs:
       # spawns land on the same bus scope.
       - name: Install gnome-keyring (Linux Secret Service for the CLI v1-policy suite)
         run: sudo apt-get install -y gnome-keyring dbus
+      # The MPP released-server interop suite asserts the frozen Node version
+      # it was validated against; the runner image's default Node drifts, so
+      # the workflow pins it explicitly.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.5.0"
       # Serialization, inter-suite pacing, one-retry-with-cooldown, and the
       # zero-tests-executed guard all live in the driver script so the same
       # entrypoint runs locally and in CI.

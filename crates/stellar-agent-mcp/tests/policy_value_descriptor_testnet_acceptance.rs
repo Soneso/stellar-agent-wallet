@@ -188,6 +188,18 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>, attestation_key: 
         .expect("attestation keyring entry")
         .set_password(&attest_key_b64)
         .expect("set attestation key");
+
+    // Audit chain-root key. Signing verbs prove the keyed audit writer
+    // acquirable before any signing (audit.chain_key_unavailable otherwise),
+    // so every profile that signs or submits in these scenarios needs the
+    // key minted. Each test uses a unique per-account profile name, so a
+    // fixed key cannot collide across the process-lifetime writer registry.
+    let audit_ref = &profile.audit_log_hash_chain_key_id;
+    let audit_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x37u8; 32]);
+    keyring_core::Entry::new(&audit_ref.service, &audit_ref.account)
+        .expect("audit chain-root keyring entry")
+        .set_password(&audit_key_b64)
+        .expect("set audit chain-root key");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

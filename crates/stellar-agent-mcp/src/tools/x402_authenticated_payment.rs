@@ -357,24 +357,6 @@ impl WalletServer {
             "payment_required_len": args.payment_required.len(),
         });
 
-        // ── Audit pre-flight (fail-closed) ────────────────────────────────────
-        // Proves the profile's audit chain-root key is acquirable BEFORE the
-        // dispatch gate below is consumed, the signer is loaded, or the
-        // payment is authorized. Reused (not re-acquired) for the
-        // post-signature `x402_payment_authorized` row.
-        let audit_writer = match crate::tools::value_audit::require_value_audit_writer(
-            &self.profile,
-            &self.profile_name_for_approval(),
-        ) {
-            Ok(w) => w,
-            Err(err) => {
-                return Ok(crate::tools::common::business_error_result(
-                    err.code(),
-                    err.to_string(),
-                ));
-            }
-        };
-
         // ── dispatch_gate_with_value: registry lookup + policy evaluation +
         // chain_id, sizing the value criteria against `value_leg` ────────────
         // Single-shot sign tool: RequireApproval is fail-closed. The two-phase
@@ -401,6 +383,27 @@ impl WalletServer {
                 return Ok(crate::tools::common::single_shot_require_approval_error());
             }
         }
+
+        // ── Audit pre-flight (fail-closed) ────────────────────────────────────
+        // Runs AFTER the dispatch gate: a policy denial or approval escalation
+        // authorizes no payment and needs no audit setup, so it must surface
+        // its own code rather than audit.chain_key_unavailable. The pre-flight
+        // still precedes the SEP-10 identity gate, the signer load, and the
+        // payment authorization — no signature may exist unless the row
+        // recording its production can be written. Reused (not re-acquired) for
+        // the post-signature `x402_payment_authorized` row.
+        let audit_writer = match crate::tools::value_audit::require_value_audit_writer(
+            &self.profile,
+            &self.profile_name_for_approval(),
+        ) {
+            Ok(w) => w,
+            Err(err) => {
+                return Ok(crate::tools::common::business_error_result(
+                    err.code(),
+                    err.to_string(),
+                ));
+            }
+        };
 
         tracing::debug!(
             chain_id = %args.chain_id,
@@ -804,7 +807,9 @@ mod tests {
         AccountIdentityView, AccountReservesView, CounterpartyCacheView, Sep10SessionView,
         Sep45SessionView,
     };
-    use stellar_agent_core::policy::{ApprovalRequest, Decision, PolicyEngine, PolicyError};
+    use stellar_agent_core::policy::{
+        ApprovalRequest, Decision, DenyReason, PolicyEngine, PolicyError,
+    };
     use stellar_agent_core::profile::schema::Profile;
 
     struct RequireApprovalEngine;
@@ -828,30 +833,33 @@ mod tests {
         }
     }
 
+    struct DenyEngine;
+
+    impl PolicyEngine for DenyEngine {
+        fn evaluate(
+            &self,
+            _tool: &ToolDescriptor,
+            _args: &serde_json::Value,
+            _profile: &Profile,
+            _account_view: Option<&dyn AccountReservesView>,
+            _identity_view: Option<&dyn AccountIdentityView>,
+            _counterparty_cache: Option<&dyn CounterpartyCacheView>,
+            _sep10_sessions: Option<&dyn Sep10SessionView>,
+            _sep45_sessions: Option<&dyn Sep45SessionView>,
+        ) -> Result<Decision, PolicyError> {
+            Ok(Decision::Deny(DenyReason::NoMatchingRule))
+        }
+    }
+
     fn make_require_approval_server() -> crate::server::WalletServer {
         use std::sync::Arc;
         let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
             .with_noop_engine()
             .build();
-        // The audit pre-flight runs BEFORE the dispatch gate, so the audit
-        // chain-root key must be seeded here — otherwise the RequireApproval
-        // scenario this helper builds would never be reached; the call would
-        // refuse `audit.chain_key_unavailable` first. A FIXED key (not
-        // `rotate_keyring_secret_32`'s random one), because `AuditWriterRegistry`
-        // is a process-lifetime cache keyed by profile name: the shared
-        // `"svc"`/`"acct"` testnet placeholder is reused across many unit
-        // tests in this crate's single test binary, and a random key here
-        // would race against — and mismatch — whichever key another test
-        // using the same coordinate registered first.
-        {
-            use base64::Engine as _;
-            let coord = &profile.audit_log_hash_chain_key_id;
-            let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x37u8; 32]);
-            keyring_core::Entry::new(&coord.service, &coord.account)
-                .expect("Entry::new for audit key")
-                .set_password(&key_b64)
-                .expect("set_password for audit key");
-        }
+        // No audit chain key is seeded at this profile's coordinate: gate
+        // verdicts (RequireApproval here) precede the audit pre-flight, so
+        // this scenario must complete without one — the test's assertion on
+        // the fail-closed approval error doubles as the ordering pin.
         let mut server = crate::server::WalletServer::new(profile)
             .expect("WalletServer::new must not fail in tests");
         server.policy_engine = Arc::new(RequireApprovalEngine);
@@ -941,6 +949,45 @@ mod tests {
         assert!(
             !text.contains("\"paymentSignature\"") && !text.contains("\"signature\""),
             "fail-closed approval refusal must not produce a signature; got: {text}"
+        );
+    }
+
+    /// A policy denial precedes the audit pre-flight: with a denying engine
+    /// AND an unminted audit chain key, the surfaced wire code is the policy
+    /// denial — a denial authorizes no payment, runs no SEP-10 session, and
+    /// needs no audit setup, so it must never be masked by
+    /// `audit.chain_key_unavailable`.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn policy_denial_precedes_the_audit_preflight() {
+        use std::sync::Arc;
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let profile = Profile::builder_testnet(
+            "svc-x402ap-denyfirst",
+            "acct-x402ap-denyfirst",
+            "n-svc",
+            "n-acct",
+        )
+        .with_noop_engine()
+        .build();
+        let mut server =
+            crate::server::WalletServer::new(profile).expect("WalletServer::new in tests");
+        server.policy_engine = Arc::new(DenyEngine);
+        let args = X402AuthenticatedPaymentArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            home_domain: "example.com".to_owned(),
+            payment_required: sample_requirements_json(),
+            address: None,
+        };
+        let result = server
+            .call_stellar_x402_authenticated_payment(args)
+            .await
+            .expect("denial must be a business envelope, not a protocol error");
+        let (code, _message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "policy.deny.no_matching_rule");
+        assert!(
+            !text.contains("\"paymentSignature\""),
+            "no payment signature may be produced on a policy denial; got: {text}"
         );
     }
 }
