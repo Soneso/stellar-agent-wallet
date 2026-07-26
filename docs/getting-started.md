@@ -47,7 +47,7 @@ from GitHub release archives. A single release archive carries both binaries:
 - Binaries inside: `stellar-agent` and `stellar-agent-mcp`.
 
 ```bash
-cargo binstall stellar-agent-cli@0.1.0-alpha.4 stellar-agent-mcp@0.1.0-alpha.4
+cargo binstall stellar-agent-cli@0.1.0-alpha.5 stellar-agent-mcp@0.1.0-alpha.5
 ```
 
 While only prerelease (alpha) versions are published on crates.io, the version
@@ -81,7 +81,7 @@ your `PATH`; the `stellar-agent-cli` crate installs the binary named
 `stellar-agent`:
 
 ```bash
-cargo install stellar-agent-cli@0.1.0-alpha.4 stellar-agent-mcp@0.1.0-alpha.4
+cargo install stellar-agent-cli@0.1.0-alpha.5 stellar-agent-mcp@0.1.0-alpha.5
 ```
 
 ### Build from source

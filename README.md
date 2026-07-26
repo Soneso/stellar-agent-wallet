@@ -102,7 +102,7 @@ stable versions only.
 release archive for your target from the tagged release assets:
 
 ```bash
-cargo binstall stellar-agent-cli@0.1.0-alpha.4 stellar-agent-mcp@0.1.0-alpha.4
+cargo binstall stellar-agent-cli@0.1.0-alpha.5 stellar-agent-mcp@0.1.0-alpha.5
 ```
 
 The CLI and MCP binaries ship in one release archive
@@ -116,7 +116,7 @@ and extract the two binaries onto your `PATH`.
 Builds the binaries from the published sources:
 
 ```bash
-cargo install stellar-agent-cli@0.1.0-alpha.4 stellar-agent-mcp@0.1.0-alpha.4
+cargo install stellar-agent-cli@0.1.0-alpha.5 stellar-agent-mcp@0.1.0-alpha.5
 ```
 
 This installs the `stellar-agent` and `stellar-agent-mcp` executables. Building

@@ -23,7 +23,7 @@ guardrail model.
 - Protocol version: `2024-11-05`. Declared capabilities: `tools` and
   `resources`.
 - Server identity reported at initialize: name `stellar-agent-mcp`, version
-  matching the crate's package version (`0.1.0-alpha.4` as of this release).
+  matching the crate's package version (`0.1.0-alpha.5` as of this release).
 
 `stdout` is reserved for the JSON-RPC wire. Structured logs go to `stderr`, and
 they pass through a redaction layer before they are written, so a client that
@@ -38,9 +38,9 @@ This alpha does not offer an HTTP or SSE transport. stdio is the only transport.
 ### Availability
 
 This is a public alpha. Install with
-`cargo binstall stellar-agent-mcp@0.1.0-alpha.4` (prebuilt binary from the
+`cargo binstall stellar-agent-mcp@0.1.0-alpha.5` (prebuilt binary from the
 tagged GitHub release, resolved via crates.io), with
-`cargo install stellar-agent-mcp@0.1.0-alpha.4` (built from the published
+`cargo install stellar-agent-mcp@0.1.0-alpha.5` (built from the published
 sources), or build from source. While only prerelease versions are published
 on crates.io, the version must be spelled out — a bare crate name matches
 stable versions only. See

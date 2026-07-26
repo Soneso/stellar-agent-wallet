@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.5] - 2026-07-26
+
 ### Added
 
 - Added testnet-only sponsored Machine Payments Protocol charges for classic
@@ -112,6 +114,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are removed.
 
 ### Fixed
+
+- The MCP single-shot signing tools (`stellar_sep43_sign_transaction`,
+  `stellar_sep43_sign_auth_entry`, `stellar_sep43_sign_and_submit_transaction`,
+  `stellar_x402_create_payment`, `stellar_x402_authenticated_payment`) now
+  evaluate the policy gate before the audit pre-flight, so a policy denial or
+  approval escalation surfaces its own wire code instead of
+  `audit.chain_key_unavailable` when the audit chain-root key is unminted. The
+  pre-flight still precedes every signing-key access. Ordering is pinned by a
+  per-tool test.
 
 - Failures on non-keyring signing paths now report failure-domain-accurate
   error codes instead of being wrapped as `auth.keyring_not_found` (and, at
@@ -889,7 +900,8 @@ policy engine, operator-approval spine, and tamper-evident audit log.
 - An agent integration guide (`docs/agents.md`) and capability-isolation example
   toolsets under `examples/toolsets/`.
 
-[Unreleased]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.4...HEAD
+[Unreleased]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.5...HEAD
+[0.1.0-alpha.5]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.4...v0.1.0-alpha.5
 [0.1.0-alpha.4]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.3...v0.1.0-alpha.4
 [0.1.0-alpha.3]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.2...v0.1.0-alpha.3
 [0.1.0-alpha.2]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.1...v0.1.0-alpha.2
