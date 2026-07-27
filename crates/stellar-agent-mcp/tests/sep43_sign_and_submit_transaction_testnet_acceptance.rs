@@ -129,6 +129,19 @@ fn build_test_server(g_strkey: &str, seed: &Zeroizing<[u8; 32]>) -> WalletServer
         .set_password(&s_strkey)
         .expect("keyring mock set_password must succeed");
 
+    // Audit chain-root key. Signing verbs prove the keyed audit writer
+    // acquirable before any signing (audit.chain_key_unavailable otherwise),
+    // so every profile that signs or submits in these scenarios needs the
+    // key minted. Each test uses a unique per-account profile name, so a
+    // fixed key cannot collide across the process-lifetime writer registry.
+    use base64::Engine as _;
+    let audit_ref = &profile.audit_log_hash_chain_key_id;
+    let audit_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x37u8; 32]);
+    keyring_core::Entry::new(&audit_ref.service, &audit_ref.account)
+        .expect("audit chain-root keyring entry")
+        .set_password(&audit_key_b64)
+        .expect("set audit chain-root key");
+
     WalletServer::new(profile).expect("WalletServer::new must succeed with mock keyring")
 }
 
