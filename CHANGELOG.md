@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `stellar-agent-mcp` now selects its profile per invocation. It accepts
+  `--profile <NAME>` and `--profile=<NAME>`, and honours `STELLAR_AGENT_PROFILE`
+  when the flag is absent, resolving flag > environment > `default` — the order
+  the CLI already documented. The selected profile binds at startup and stays
+  bound for the life of the process. `--help` documents both inputs. The
+  resolved name and which input supplied it are logged at startup.
+  Closes #105.
+- The MCP server refuses to start when the profile file's
+  `policy_owner_key_id.service` names a different profile than the one selected.
+  The server derives the name it uses for the signed policy file, the
+  pending-approval store, and the policy-window state from that field, so a
+  profile file renamed or copied from another profile would otherwise read and
+  write another profile's state under the selected name. The check runs for
+  every policy engine, including `noop`, and names both profiles, the offending
+  field, and the way out.
+- The MCP server's refusals for an incomplete V1 startup ceremony now name the
+  command that clears them. An absent owner key, an owner key that is not a
+  usable ed25519 public key, and a missing or unverifiable signed policy file
+  each point at `profile enroll-owner-key` or `profile sign-policy`, rather than
+  reporting only the wall that was hit.
+
+### Fixed
+
+- Profile names are validated as filesystem path components inside the profile
+  loader, before the path is built, on both the read and the write half. A name
+  carrying `..`, a path separator, or a control character is refused with a
+  typed error instead of being joined into a path. The guard previously sat at
+  individual call sites, so subcommands that did not call it — `profile show`,
+  `pool list`, `pool init`, `counterparty refresh`, `counterparty list`,
+  `approve serve`, `audit verify`, `fees stats`, `mpp`, and
+  `profile rotate-audit-key` among them — reached the loader with an unvalidated
+  operator-supplied name.
+- A profile named through `--profile` or `STELLAR_AGENT_PROFILE` is never
+  replaced by the MCP server's synthesised first-run profile. That fallback is a
+  testnet, `noop`-engine configuration, so substituting it for a named-but-
+  missing profile answered on the wrong network and downgraded a `v1` profile's
+  fail-closed governance to an unsigned-policy engine. The fallback now applies
+  only when no profile was named at all, keyed on where the name came from
+  rather than on the name itself, so `--profile default` on a host with no
+  `default.toml` refuses like any other named profile.
+- `stellar-agent-mcp` refuses arguments it does not recognise instead of
+  ignoring them. A mistyped `--profil mainnet-prod` in a client configuration
+  started the server on `default`, which is the silent wrong-profile start the
+  selection flag exists to prevent. The flag is also read from the whole
+  argument list rather than only the first position.
+- `docs/mcp.md` no longer states that startup exits non-zero without a keyring
+  backend; it warns and continues, with signing tools refusing at call time.
+  `docs/profiles.md` no longer refers to a `stellar-agent mcp` subcommand, which
+  does not exist.
+
 ## [0.1.0-alpha.5] - 2026-07-26
 
 ### Added

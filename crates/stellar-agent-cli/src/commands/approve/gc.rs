@@ -32,11 +32,11 @@ use stellar_agent_core::approval::{
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, open_with_retry,
 };
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{InternalError, WalletError};
+use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
 use stellar_agent_core::profile::schema::default_approval_dir;
 use stellar_agent_core::timefmt;
 
-use crate::common::render;
+use crate::common::{render, resolve_profile_name, validate_path_component_ascii_safe};
 
 /// Arguments for `stellar-agent approve gc`.
 ///
@@ -78,7 +78,19 @@ struct GcData {
 /// Never panics.
 pub async fn run(args: GcArgs) -> i32 {
     // ── 1. Resolve profile name ───────────────────────────────────────────────
-    let profile_name = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+
+    // The name becomes a path component below without passing through the
+    // loader, so it is validated here: these two commands build the approval
+    // path directly and would otherwise write outside the data root.
+    if let Err(reason) = validate_path_component_ascii_safe(&profile_name) {
+        let err = WalletError::Validation(ValidationError::ConfigInvalid {
+            component: "profile",
+            reason: format!("invalid profile name '{profile_name}': {reason}"),
+        });
+        render::render_json(&Envelope::<()>::err(&err));
+        return 1;
+    }
 
     // ── 2. Resolve store path ─────────────────────────────────────────────────
     let store_path = match default_approval_dir() {
@@ -142,14 +154,6 @@ pub async fn run(args: GcArgs) -> i32 {
 // Private helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Resolves the effective profile name from the CLI arg or `STELLAR_AGENT_PROFILE`.
-fn resolve_profile_name(arg: Option<&str>) -> String {
-    if let Some(name) = arg {
-        return name.to_owned();
-    }
-    std::env::var("STELLAR_AGENT_PROFILE").unwrap_or_else(|_| "default".to_owned())
-}
-
 /// Returns current Unix time in milliseconds for approval GC.
 fn approval_gc_now_unix_ms() -> Result<u64, WalletError> {
     timefmt::now_unix_ms().map_err(|e| {
@@ -199,21 +203,6 @@ mod tests {
 
     fn open_store_at(path: &std::path::Path) -> PendingApprovalStore {
         PendingApprovalStore::open(path.to_path_buf()).unwrap()
-    }
-
-    // ── resolve_profile_name ─────────────────────────────────────────────────
-
-    #[test]
-    fn resolve_profile_name_from_arg() {
-        let name = resolve_profile_name(Some("prod"));
-        assert_eq!(name, "prod");
-    }
-
-    #[test]
-    fn resolve_profile_name_explicit_arg_wins() {
-        // When the arg is present, it always wins regardless of env.
-        let name = resolve_profile_name(Some("explicit"));
-        assert_eq!(name, "explicit");
     }
 
     // `approval_store_open_error` now lives in `common.rs` and is tested there.

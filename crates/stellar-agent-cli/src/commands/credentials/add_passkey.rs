@@ -132,7 +132,7 @@ pub struct AddPasskeyArgs {
 ///
 /// Returns `0` on success, `1` on any error, user cancel, or timeout.
 pub async fn run(args: &AddPasskeyArgs) -> i32 {
-    let profile = resolve_profile_name(args.profile.as_deref());
+    let profile = resolve_profile_name(args.profile.as_deref()).name;
 
     // Validate the profile name as a path component before it is used to
     // construct filesystem paths.

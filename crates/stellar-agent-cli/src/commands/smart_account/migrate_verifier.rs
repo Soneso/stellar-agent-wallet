@@ -321,7 +321,7 @@ pub struct MigrateVerifierResult {
 fn dry_run_signers_manager(
     args: &MigrateVerifierArgs,
 ) -> Result<(SignersManager, String), WalletError> {
-    let profile_name = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
     let chain_id = network_to_chain_id(args.network).to_owned();
     let timeout = Duration::from_secs(args.timeout_seconds);
     let secondary_rpc_url = args

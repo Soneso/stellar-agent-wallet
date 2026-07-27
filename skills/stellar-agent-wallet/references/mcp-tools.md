@@ -13,9 +13,11 @@ approval attestations) see `./approvals-and-audit.md` and `./security.md`.
 
 ## Transport and identity
 
-- One process: the `stellar-agent-mcp` binary. It takes no command-line
-  arguments; configuration comes from the active profile resolved from disk and
-  the platform keyring.
+- One process: the `stellar-agent-mcp` binary. It serves one profile, selected
+  by `--profile <NAME>`, then `STELLAR_AGENT_PROFILE`, then the name `default`,
+  and bound for the life of the process. Everything else — network, keyring
+  coordinates, policy engine — comes from that profile. Any other argument is
+  refused with a non-zero exit.
 - Transport: MCP JSON-RPC over stdio (newline-delimited). `stdout` is the
   protocol wire; logs go to `stderr` (already redacted). The transport enforces a
   1 MiB maximum line length on inbound and outbound frames. There is no HTTP or
@@ -25,6 +27,11 @@ approval attestations) see `./approvals-and-audit.md` and `./security.md`.
   the crate's package version (`0.1.0-alpha.5` as of this release).
 - The server refuses to start if the active profile sets `mcp_disabled = true`,
   exiting non-zero with `mcp.disabled_per_profile`.
+- The server refuses to start when a named profile has no profile file (it is
+  never replaced by the first-run testnet fallback), when the profile name is
+  not a safe path component, or when the profile file's keyring coordinates name
+  a different profile than the one selected — the state a profile file copied
+  from another profile is in.
 
 A generic client stanza points the spawn command at the binary:
 
@@ -33,11 +40,13 @@ A generic client stanza points the spawn command at the binary:
   "mcpServers": {
     "stellar-agent": {
       "command": "/absolute/path/to/stellar-agent-mcp",
-      "args": []
+      "args": ["--profile", "alice"]
     }
   }
 }
 ```
+
+Omit the `args` entries to serve the `default` profile.
 
 ## The result envelope
 

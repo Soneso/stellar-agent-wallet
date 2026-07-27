@@ -190,6 +190,16 @@ skip the V1 owner-key ceremony for now. See [`profile
 init`](cli-reference/profile-and-governance.md#profile-init) for the full
 flag reference.
 
+Every profile-aware command takes the same `--profile <NAME>`, and so does the
+MCP server (`stellar-agent-mcp --profile <NAME>`); `STELLAR_AGENT_PROFILE` in
+the environment sets the name for both when the flag is absent. A profile file
+belongs to its name: back it up freely, but restoring it under a different file
+name does not create a second profile — run `profile init` for that.
+
+A `v1` profile does not serve MCP requests until the ceremony below is complete;
+the server refuses to start and names the step that is missing. `--engine noop`
+is the way to have a working server immediately.
+
 For reference, here is the shape a testnet profile takes after enrolling a
 signer (a minimal version-2 profile; shown here with `engine = "noop"` for a
 permissive testnet start — `profile init`'s default is `engine = "v1"`):

@@ -19,10 +19,18 @@ Profile files live one-per-name in the OS-conventional data directory:
 | macOS    | `~/Library/Application Support/Soneso.stellar-agent/profiles/<name>.toml` |
 | Windows  | `%LOCALAPPDATA%\Soneso\stellar-agent\data\profiles\<name>.toml` |
 
-A profile is selected by name (the file stem). The name `default` is the profile
-the MCP server reads on startup; when no `default.toml` exists yet, the server
-falls back to an in-memory testnet configuration so it can still serve read-only
-requests. This fallback is never written to disk.
+A profile is selected by name (the file stem): an explicit `--profile <NAME>`,
+then the `STELLAR_AGENT_PROFILE` environment variable, then `default`. Both the
+CLI and the MCP server resolve it that way. When no name was given and no
+`default.toml` exists yet, the MCP server falls back to an in-memory testnet
+configuration so it can still serve read-only requests. This fallback is never
+written to disk, and a profile that WAS named but has no file is refused rather
+than replaced by it.
+
+A profile file is bound to its name by its keyring coordinates. Renaming or
+copying `<a>.toml` to `<b>.toml` does not create profile `b`; the MCP server
+refuses to serve it under the new name. Use `profile init` for a second
+profile.
 
 Create a new profile file with `stellar-agent profile init` (default `default`,
 testnet, `engine = "v1"`); mainnet requires an explicit `https://` `--rpc-url`.
@@ -121,7 +129,7 @@ but mints no key material; the rotation commands mint the actual keys (see
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `oracle_provider_url` | string (URL) | no | unset (cross-check off) | Independent RPC endpoint used to re-simulate high-value transactions. When unset, the high-value cross-check is skipped. Set this before enabling V1 for mainnet high-value flows. |
-| `mcp_disabled` | bool | no | `false` | When `true`, `stellar-agent mcp` refuses to start with error `mcp.disabled_per_profile`. |
+| `mcp_disabled` | bool | no | `false` | When `true`, the `stellar-agent-mcp` server refuses to start with error `mcp.disabled_per_profile`. |
 | `audit_log_path` | string (path) | no | OS-conventional | Path to the per-profile audit log. |
 | `secondary_rpc_url` | string (URL) | no | unset | Independent secondary RPC for the multicall cross-RPC trust-anchor check. Must point to a node operated independently of `rpc_url`. Required when a multicall router is registered for the profile's network; loading otherwise fails. Redacted in debug output. |
 | `smart_account_max_context_rule_scan_id` | integer | no | engine default | Override for the maximum rule-id scan bound. Rejected at load when above `10000`. |

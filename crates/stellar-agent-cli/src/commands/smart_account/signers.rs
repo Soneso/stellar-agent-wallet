@@ -815,7 +815,7 @@ async fn add_run(args: &AddArgs) -> i32 {
                 }
             };
 
-            let profile = resolve_profile_name(args.profile.as_deref());
+            let profile = resolve_profile_name(args.profile.as_deref()).name;
             if let Err(reason) = validate_path_component_ascii_safe(&profile) {
                 return emit_error(
                     &WalletError::Validation(ValidationError::AddressInvalid {
@@ -2008,7 +2008,7 @@ async fn resolve_webauthn_source(
             }
         })?;
 
-    let profile_name = resolve_profile_name(profile);
+    let profile_name = resolve_profile_name(profile).name;
     validate_path_component_ascii_safe(&profile_name).map_err(|reason| {
         WalletError::Validation(ValidationError::AddressInvalid {
             input: format!("invalid profile name '{profile_name}': {reason}"),

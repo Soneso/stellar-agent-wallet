@@ -101,7 +101,12 @@ use crate::tools::common::{ToolCatalogueAdapter, build_tool_registry};
 /// `build_policy_engine` derives the profile name by stripping this prefix
 /// from `policy_owner_key_id.service` rather than using `account` (which is
 /// always `"default"`, making it useless as a discriminator).
-const OWNER_KEY_SERVICE_PREFIX: &str = "stellar-agent-owner-";
+///
+/// `pub(crate)` because the startup name-reconciliation check in
+/// [`crate::transport`] strips the same prefix to compare the profile the
+/// operator selected against the one the loaded file's owner-key coordinate
+/// names.
+pub(crate) const OWNER_KEY_SERVICE_PREFIX: &str = "stellar-agent-owner-";
 const USAGE_RESOURCE_URI: &str = "mcp-resource://usage.md";
 const PROFILE_RESOURCE_PREFIX: &str = "mcp-resource://profiles/";
 const ACCOUNT_RESOURCE_PREFIX: &str = "mcp-resource://accounts/";

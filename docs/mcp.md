@@ -50,27 +50,50 @@ instructions; the build that produces `stellar-agent` produces
 
 ## Launching the server
 
-The server is started by running the binary. It takes no command-line
-arguments; configuration comes from the active profile.
+The server is started by running the binary. Configuration comes from the
+selected profile.
 
 ```bash
-stellar-agent-mcp
+stellar-agent-mcp                    # profile `default`
+stellar-agent-mcp --profile alice    # profile `alice`
 ```
+
+The profile is selected by `--profile <NAME>` (also spelled
+`--profile=<NAME>`), then by the `STELLAR_AGENT_PROFILE` environment variable,
+then by the name `default` — the same order the CLI uses. The selected profile
+binds at startup and stays bound for the life of the process; there is no
+per-request profile switching. Any other argument is refused with a non-zero
+exit rather than ignored, so a mistyped flag cannot silently start the server on
+a different profile than intended.
 
 On startup the process, in order:
 
-1. Applies process-isolation hardening on Linux (`PR_SET_DUMPABLE 0`,
+1. Parses the command line, resolves the profile name (`--profile`, then
+   `STELLAR_AGENT_PROFILE`, then `default`), and validates that the name is
+   usable as a path component. An unrecognised argument or an unusable name is
+   refused here, before any of the steps below run.
+2. Applies process-isolation hardening on Linux (`PR_SET_DUMPABLE 0`,
    `PR_SET_NO_NEW_PRIVS 1`). On macOS and Windows it relies on the platform
    keyring's per-application access model and operator policy instead.
-2. Installs the redacting log subscriber on `stderr`.
-3. Initialises the platform keyring store. If the platform has no supported
-   keyring backend, the process exits non-zero with a diagnostic.
-4. Loads the active profile. A `--profile` flag is not wired; the server loads
-   the default profile, or synthesises a testnet fallback profile if no profile
-   file exists yet (the first-run case).
-5. Refuses to start if the active profile sets `mcp_disabled = true` (the
+3. Installs the redacting log subscriber on `stderr`.
+4. Initialises the platform keyring store. If the platform has no supported
+   keyring backend, it logs a warning and continues: the read-only and simulate
+   surface still works, and signing tools refuse at call time.
+5. Loads the selected profile. When no profile was named — neither `--profile`
+   nor `STELLAR_AGENT_PROFILE` — and no profile file exists yet, it synthesises
+   a testnet fallback profile (the first-run case). A profile that WAS named but
+   has no file is refused: the fallback is a testnet, `noop`-engine
+   configuration, so substituting it would answer on the wrong network and
+   downgrade the profile's policy engine.
+6. Refuses to start if the active profile sets `mcp_disabled = true` (the
    operator kill-switch), exiting non-zero with `mcp.disabled_per_profile`.
-6. Serves the MCP loop until the client disconnects.
+7. Refuses to start if the profile file's `policy_owner_key_id.service` names a
+   different profile than the one selected — the state a profile file renamed or
+   copied from another profile is in. The server derives the name it uses for
+   the signed policy file, the pending-approval store, and the policy-window
+   state from that field, so a mismatch would read and write another profile's
+   state.
+8. Serves the MCP loop until the client disconnects.
 
 You normally do not launch `stellar-agent-mcp` by hand. The MCP client spawns
 it. The command above is what the client is configured to run.
@@ -110,7 +133,9 @@ The synthesised testnet fallback profile carries placeholder keyring
 coordinates. Read-only tools and the simulate step of the two-phase signing
 verbs work under it, but any tool that touches the signer keyring returns a
 keyring-not-found error until a profile that names a populated signer keyring
-entry is in place.
+entry is in place. It applies only when no profile was named at all;
+`--profile <NAME>` and `STELLAR_AGENT_PROFILE` always require a real profile
+file.
 
 The profile field `mcp_disabled` is a per-profile kill-switch. When `true`, the
 server refuses to start, exiting non-zero with `mcp.disabled_per_profile`. The
@@ -139,8 +164,10 @@ Notes:
 
 - Use an absolute path to the binary, or ensure it is on the `PATH` the client
   uses to spawn subprocesses.
-- No arguments are required or accepted; the active profile is resolved from
-  disk and the platform keyring as described above.
+- No arguments are required. To bind the server to a profile other than
+  `default`, pass one: `"args": ["--profile", "alice"]`, or set
+  `STELLAR_AGENT_PROFILE` in the environment the client spawns the process with.
+  Arguments other than `--profile`, `--help`, and `--version` are refused.
 - The exact location and schema of the configuration file depend on the MCP
   client. Consult that client's documentation for where to place the stanza.
 

@@ -101,7 +101,7 @@ pub struct RegisterMulticallArgs {
 ///
 /// Never panics.
 pub async fn run(args: &RegisterMulticallArgs) -> i32 {
-    let profile_name = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
     let network_passphrase = args.network.passphrase().to_owned();
     let address_redacted = redact_strkey_first5_last5(&args.address);
     let network_safename = network_safename_from_passphrase(&network_passphrase);

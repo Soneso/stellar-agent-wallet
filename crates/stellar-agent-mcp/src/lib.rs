@@ -8,7 +8,8 @@
 //!
 //! - [`server`] — `WalletServer` struct, `new()`, `ServerHandler` impl, and
 //!   back-compat re-exports for all public argument types and resource helpers.
-//! - [`transport`] — `BoundedStdioTransport` and the `run()` async entry point.
+//! - [`transport`] — `BoundedStdioTransport`, the `build_server` / `serve`
+//!   startup seam, and the `run()` async entry point that composes them.
 //! - `resources` — MCP resource content generators (`usage_md_content`).
 //! - `tools` — per-family tool implementations (see `tools/mod.rs` for the
 //!   authoritative family list); e.g. `tools::balances`, `tools::pay`,
@@ -50,9 +51,10 @@ pub(crate) mod resources;
 /// MCP server handler, tool registry, and `WalletServer` construction.
 pub mod server;
 
-/// Bounded stdio transport and server startup (`run` fn).
+/// Bounded stdio transport and server startup.
 ///
-/// Public so the binary `main.rs` can call `transport::run(profile)`.
+/// Public so the binary `main.rs` can build the server and serve it as two
+/// steps, matching the typed construction error in between.
 pub mod transport;
 
 /// Bridges `stellar_agent_network::AccountView` to the

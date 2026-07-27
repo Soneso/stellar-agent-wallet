@@ -120,6 +120,12 @@ and other AI coding agents discover tools. A first session looks like this:
    claude mcp add stellar-agent -- /absolute/path/to/target/release/stellar-agent-mcp
    ```
 
+   The server serves the `default` profile unless you name another one:
+
+   ```bash
+   claude mcp add stellar-agent -- /absolute/path/to/target/release/stellar-agent-mcp --profile alice
+   ```
+
 4. **Optionally install the knowledge skill.** The [`skills/`](../skills/)
    directory ships a downloadable skill that teaches the agent how to
    operate the wallet well — which tools exist, the safe call patterns, and

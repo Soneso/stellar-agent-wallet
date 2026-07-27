@@ -172,7 +172,7 @@ fn pending_op_to_entry(op: PendingTimelockOperation) -> PendingOperationEntry {
 ///
 /// Never panics.
 pub async fn run(args: &ListPendingArgs) -> i32 {
-    let profile_name = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
     let request_id = Uuid::new_v4().to_string();
 
     let (_audit_profile, audit_writer, _audit_log_path) =
