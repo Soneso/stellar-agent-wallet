@@ -41,8 +41,11 @@ stdin/stdout. A generic client stanza:
 }
 ```
 
-The server takes no arguments; it resolves the active profile from disk and the
-platform keyring. After connecting, the client issues `initialize`, then
+The server resolves its profile from `--profile <NAME>`, then
+`STELLAR_AGENT_PROFILE`, then the name `default`; pass
+`"args": ["--profile", "alice"]` to bind it to a different one. Keys are
+resolved from the platform keyring named by that profile. After connecting, the
+client issues `initialize`, then
 `tools/list` and `resources/list`. The tool schemas returned by `tools/list` are
 the authoritative argument contract — prefer them over any example here. See
 [mcp.md](mcp.md#configuring-an-mcp-client) for startup details and the resources

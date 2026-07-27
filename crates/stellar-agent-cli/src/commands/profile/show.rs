@@ -94,6 +94,19 @@ pub async fn run(args: &ShowArgs) -> i32 {
             render::render_json(&Envelope::err(&wallet_err));
             1
         }
+        // A name that cannot be a path component is an input error, not a
+        // missing profile: the loader refuses it before the path is built.
+        // `ConfigInvalid` is the variant whose contract covers profile
+        // resolution; `AddressInvalid` is reserved for Stellar account
+        // addresses and would render the refusal as an address-parse failure.
+        Err(loader::ProfileLoadError::InvalidName { name, reason }) => {
+            let wallet_err = WalletError::Validation(ValidationError::ConfigInvalid {
+                component: "profile",
+                reason: format!("invalid profile name '{name}': {reason}"),
+            });
+            render::render_json(&Envelope::err(&wallet_err));
+            1
+        }
         Err(loader::ProfileLoadError::VersionUnsupported {
             name,
             found,

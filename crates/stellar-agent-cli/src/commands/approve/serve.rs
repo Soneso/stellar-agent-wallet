@@ -122,7 +122,7 @@ pub struct ServeArgs {
 ///
 /// Never panics.
 pub async fn run(args: ServeArgs) -> i32 {
-    let profile_name = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
 
     // Resolve the profile for the attestation-key reference.
     let profile = match loader::load(&profile_name, None) {

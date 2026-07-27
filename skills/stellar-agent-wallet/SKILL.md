@@ -59,8 +59,12 @@ Point your MCP client at the server binary:
 }
 ```
 
-The server takes no arguments; it resolves the active profile from disk and the
-platform keyring. After connecting, the client issues `initialize`, then
+The server serves the `default` profile unless another is named: pass
+`"args": ["--profile", "alice"]`, or set `STELLAR_AGENT_PROFILE` in the
+environment the client spawns it with. The flag wins over the variable. The
+selected profile binds at startup and stays bound; keys are resolved from the
+platform keyring that profile names. After connecting, the client issues
+`initialize`, then
 `tools/list` and `resources/list`. The schemas returned by `tools/list` are the
 authoritative argument contract — prefer them over any example here.
 

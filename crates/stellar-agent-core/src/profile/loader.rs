@@ -18,6 +18,16 @@
 //! | macOS    | `~/Library/Application Support/Soneso.stellar-agent/profiles/<name>.toml` |
 //! | Windows  | `%LOCALAPPDATA%\Soneso\stellar-agent\data\profiles\<name>.toml` |
 //!
+//! # Name safety
+//!
+//! The profile name becomes a path component, so every read and write entry
+//! point validates it with
+//! [`crate::profile::name::validate_path_component_ascii_safe`] **before** the
+//! join, refusing with [`ProfileLoadError::InvalidName`] or
+//! [`ProfileSaveError::InvalidName`]. The guard sits at the join rather than at
+//! each caller so that a caller which does not validate still cannot address a
+//! file outside the profile directory.
+//!
 //! # Version enforcement
 //!
 //! After loading, the `version` field is checked.  Any value other than `2`
@@ -40,6 +50,7 @@ use figment::{
     providers::{Env, Format, Serialized, Toml},
 };
 
+use super::name::validate_path_component_ascii_safe;
 use super::schema::{Profile, default_audit_log_path_for};
 pub use super::schema::{default_approval_dir, default_policy_dir, default_profile_dir};
 use crate::profile::caip2::Caip2;
@@ -151,6 +162,26 @@ pub enum ProfileLoadError {
         name: String,
         /// The full path that was checked.
         path: PathBuf,
+    },
+
+    /// The profile name is not safe to use as a filesystem path component.
+    ///
+    /// Every entry point that turns a name into `<dir>/<name>.toml` validates
+    /// it first, so a traversal attempt (`../../etc/passwd`) or a name carrying
+    /// path separators or control characters is refused before any path is
+    /// joined and before any file is touched. Callers do not have to remember
+    /// to validate: the join sites do it.
+    ///
+    /// # Fix
+    ///
+    /// Use a profile name of at most 64 printable-ASCII characters containing
+    /// no `/`, `\`, `:`, or `..`.
+    #[error("profile name '{name}' is not a valid profile name: {reason}")]
+    InvalidName {
+        /// The rejected profile name as supplied by the caller.
+        name: String,
+        /// Why it was rejected.
+        reason: &'static str,
     },
 
     /// The OS-conventional state directory could not be determined.
@@ -291,6 +322,31 @@ pub enum ProfileLoadError {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Path-component guards
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Refuses a profile name that is unsafe as a filesystem path component.
+///
+/// Called by every read entry point that builds `<dir>/<name>.toml`, before the
+/// join. Placing the guard at the join rather than at each caller is what makes
+/// the rule hold for all of them: a caller that forgets to validate still
+/// cannot reach outside the profile directory.
+fn guard_name_for_load(name: &str) -> Result<(), ProfileLoadError> {
+    validate_path_component_ascii_safe(name).map_err(|reason| ProfileLoadError::InvalidName {
+        name: name.to_owned(),
+        reason,
+    })
+}
+
+/// Write-half counterpart of [`guard_name_for_load`].
+fn guard_name_for_save(name: &str) -> Result<(), ProfileSaveError> {
+    validate_path_component_ascii_safe(name).map_err(|reason| ProfileSaveError::InvalidName {
+        name: name.to_owned(),
+        reason,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -343,6 +399,7 @@ pub fn load_from_dir(
     profile_dir: &Path,
     multicall_hook: Option<&dyn MulticallRegistryHook>,
 ) -> Result<Profile, ProfileLoadError> {
+    guard_name_for_load(name)?;
     let path = profile_dir.join(format!("{name}.toml"));
 
     if !path.exists() {
@@ -607,7 +664,9 @@ pub fn list_profiles_in_dir(dir: &Path) -> Result<Vec<String>, ProfileLoadError>
 ///
 /// # Errors
 ///
-/// Returns [`ProfileSaveError`] on I/O failure.
+/// - [`ProfileSaveError::InvalidName`] when `name` is not safe as a path
+///   component; refused before the destination path is built.
+/// - Any other [`ProfileSaveError`] on I/O or serialization failure.
 pub fn save(name: &str, profile: &Profile) -> Result<PathBuf, ProfileSaveError> {
     save_to_dir(
         name,
@@ -620,8 +679,11 @@ pub fn save(name: &str, profile: &Profile) -> Result<PathBuf, ProfileSaveError> 
 ///
 /// # Errors
 ///
-/// Returns [`ProfileSaveError`] on I/O failure.
+/// - [`ProfileSaveError::InvalidName`] when `name` is not safe as a path
+///   component; refused before the destination path is built.
+/// - Any other [`ProfileSaveError`] on I/O or serialization failure.
 pub fn save_to_dir(name: &str, profile: &Profile, dir: &Path) -> Result<PathBuf, ProfileSaveError> {
+    guard_name_for_save(name)?;
     std::fs::create_dir_all(dir).map_err(ProfileSaveError::Io)?;
     let dest = dir.join(format!("{name}.toml"));
 
@@ -645,6 +707,8 @@ pub fn save_to_dir(name: &str, profile: &Profile, dir: &Path) -> Result<PathBuf,
 ///
 /// # Errors
 ///
+/// - [`ProfileSaveError::InvalidName`] when `name` is not safe as a path
+///   component; refused before the destination path is built.
 /// - [`ProfileSaveError::AlreadyExists`] when `<name>.toml` exists in `dir`.
 /// - Any other [`ProfileSaveError`] on I/O or serialization failure.
 pub fn save_new_to_dir(
@@ -652,6 +716,7 @@ pub fn save_new_to_dir(
     profile: &Profile,
     dir: &Path,
 ) -> Result<PathBuf, ProfileSaveError> {
+    guard_name_for_save(name)?;
     std::fs::create_dir_all(dir).map_err(ProfileSaveError::Io)?;
     let dest = dir.join(format!("{name}.toml"));
 
@@ -727,6 +792,8 @@ pub fn set_pool_state(
 ///
 /// # Errors
 ///
+/// - [`ProfileLoadError::InvalidName`] when `name` is not safe as a path
+///   component; refused before the path is built.
 /// - [`ProfileLoadError::NotFound`] when the profile file does not exist.
 /// - [`ProfileLoadError::SignerRefUnreadable`] on I/O or TOML parse failure,
 ///   or when the table or its `service`/`account` string keys are absent.
@@ -734,6 +801,7 @@ pub fn read_signer_ref_on_disk(
     name: &str,
     dir: &Path,
 ) -> Result<super::schema::KeyringEntryRef, ProfileLoadError> {
+    guard_name_for_load(name)?;
     let path = dir.join(format!("{name}.toml"));
     if !path.exists() {
         return Err(ProfileLoadError::NotFound {
@@ -787,6 +855,8 @@ pub fn read_signer_ref_on_disk(
 ///
 /// # Errors
 ///
+/// - [`ProfileSaveError::InvalidName`] when `name` is not safe as a path
+///   component; refused before the destination path is built.
 /// - [`ProfileSaveError::Io`] when the file cannot be read, parsed, or
 ///   written (a parse failure is surfaced as `InvalidData`).
 /// - [`ProfileSaveError::Serialize`] on TOML re-serialization failure.
@@ -795,6 +865,7 @@ pub fn pin_signer_account_on_disk(
     dir: &Path,
     account: &str,
 ) -> Result<PathBuf, ProfileSaveError> {
+    guard_name_for_save(name)?;
     let dest = dir.join(format!("{name}.toml"));
     let raw = std::fs::read_to_string(&dest).map_err(ProfileSaveError::Io)?;
     let mut doc: toml::Value = toml::from_str(&raw).map_err(|e| {
@@ -844,6 +915,8 @@ pub fn pin_signer_account_on_disk(
 ///
 /// # Errors
 ///
+/// - [`ProfileSaveError::InvalidName`] when `name` is not safe as a path
+///   component; refused before the destination path is built.
 /// - [`ProfileSaveError::Io`] when the file cannot be read, parsed, or
 ///   written (a parse failure is surfaced as `InvalidData`).
 /// - [`ProfileSaveError::Serialize`] on TOML value conversion or
@@ -854,6 +927,7 @@ pub fn set_pool_state_on_disk(
     pool_master_key_id: &super::schema::KeyringEntryRef,
     pool_config: &super::schema::PoolConfig,
 ) -> Result<PathBuf, ProfileSaveError> {
+    guard_name_for_save(name)?;
     let dest = dir.join(format!("{name}.toml"));
     let raw = std::fs::read_to_string(&dest).map_err(ProfileSaveError::Io)?;
     let mut doc: toml::Value = toml::from_str(&raw).map_err(|e| {
@@ -889,6 +963,19 @@ pub fn set_pool_state_on_disk(
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ProfileSaveError {
+    /// The profile name is not safe to use as a filesystem path component.
+    ///
+    /// The write half enforces the same rule as the read half
+    /// ([`ProfileLoadError::InvalidName`]): a name is validated before it is
+    /// joined into a destination path, so no file outside the profile
+    /// directory can be created or patched.
+    #[error("profile name '{name}' is not a valid profile name: {reason}")]
+    InvalidName {
+        /// The rejected profile name as supplied by the caller.
+        name: String,
+        /// Why it was rejected.
+        reason: &'static str,
+    },
     /// The OS-conventional state directory could not be determined.
     #[error("could not determine profile directory: {0}")]
     NoStateDir(#[from] super::schema::StateDirError),
@@ -953,6 +1040,7 @@ pub fn load_with_overlay_from_dir(
     overlay: HashMap<&'static str, serde_json::Value>,
     multicall_hook: Option<&dyn MulticallRegistryHook>,
 ) -> Result<Profile, ProfileLoadError> {
+    guard_name_for_load(name)?;
     let path = profile_dir.join(format!("{name}.toml"));
 
     if !path.exists() {
@@ -2670,6 +2758,128 @@ account = "a"
                 }
             ),
             "expected VersionUnsupported found=3 supported=2, got: {err}"
+        );
+    }
+
+    // ── Path-component guard on the name ──────────────────────────────────────
+    //
+    // The name is joined into `<dir>/<name>.toml` by every entry point below.
+    // The guard lives at the join, so a caller that does not validate still
+    // cannot address a file outside `dir`. These tests are the pin for that: if
+    // the guard is removed, the traversal name reaches the filesystem and the
+    // error becomes `NotFound` (or the write succeeds outside `dir`).
+
+    #[test]
+    fn load_from_dir_refuses_a_traversal_name_before_touching_the_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = load_from_dir("../foo", dir.path(), None).unwrap_err();
+        match err {
+            ProfileLoadError::InvalidName { name, reason } => {
+                assert_eq!(name, "../foo");
+                assert!(!reason.is_empty(), "the refusal must carry a reason");
+            }
+            other => panic!("expected InvalidName, got: {other}"),
+        }
+
+        // A traversal that carries no path separator is refused by the `..`
+        // rule rather than the separator rule.
+        let err = load_from_dir("foo..bar", dir.path(), None).unwrap_err();
+        match err {
+            ProfileLoadError::InvalidName { reason, .. } => assert!(
+                reason.contains(".."),
+                "reason must name the traversal rule: {reason}"
+            ),
+            other => panic!("expected InvalidName, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn load_from_dir_refuses_a_name_carrying_a_path_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = load_from_dir("nested/profile", dir.path(), None).unwrap_err();
+        assert!(
+            matches!(err, ProfileLoadError::InvalidName { .. }),
+            "expected InvalidName, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_from_dir_accepts_an_ordinary_name() {
+        // The guard must not refuse the names operators actually use.
+        let (dir, name) = write_profile(minimal_toml());
+        assert!(load_from_dir(&name, dir.path(), None).is_ok());
+    }
+
+    #[test]
+    fn load_with_overlay_from_dir_refuses_a_traversal_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let err =
+            load_with_overlay_from_dir("../foo", dir.path(), HashMap::new(), None).unwrap_err();
+        assert!(
+            matches!(err, ProfileLoadError::InvalidName { .. }),
+            "expected InvalidName, got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_signer_ref_on_disk_refuses_a_traversal_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_signer_ref_on_disk("../foo", dir.path()).unwrap_err();
+        assert!(
+            matches!(err, ProfileLoadError::InvalidName { .. }),
+            "expected InvalidName, got: {err}"
+        );
+    }
+
+    #[test]
+    fn save_to_dir_refuses_a_traversal_name_and_writes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let profile_dir = root.path().join("profiles");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct").build();
+
+        let err = save_to_dir("../escaped", &profile, &profile_dir).unwrap_err();
+        assert!(
+            matches!(err, ProfileSaveError::InvalidName { .. }),
+            "expected InvalidName, got: {err}"
+        );
+        assert!(
+            !root.path().join("escaped.toml").exists(),
+            "the write must not land outside the profile directory"
+        );
+    }
+
+    #[test]
+    fn save_new_to_dir_refuses_a_traversal_name_and_writes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let profile_dir = root.path().join("profiles");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct").build();
+
+        let err = save_new_to_dir("../escaped", &profile, &profile_dir).unwrap_err();
+        assert!(
+            matches!(err, ProfileSaveError::InvalidName { .. }),
+            "expected InvalidName, got: {err}"
+        );
+        assert!(!root.path().join("escaped.toml").exists());
+    }
+
+    #[test]
+    fn on_disk_patch_helpers_refuse_a_traversal_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = pin_signer_account_on_disk("../foo", dir.path(), "GABC").unwrap_err();
+        assert!(
+            matches!(err, ProfileSaveError::InvalidName { .. }),
+            "expected InvalidName from pin_signer_account_on_disk, got: {err}"
+        );
+
+        let pool_key = super::super::schema::KeyringEntryRef::new("svc", "master");
+        let pool_config = super::super::schema::PoolConfig::new(0, Vec::new());
+        let err =
+            set_pool_state_on_disk("../foo", dir.path(), &pool_key, &pool_config).unwrap_err();
+        assert!(
+            matches!(err, ProfileSaveError::InvalidName { .. }),
+            "expected InvalidName from set_pool_state_on_disk, got: {err}"
         );
     }
 }

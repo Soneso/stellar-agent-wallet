@@ -194,7 +194,7 @@ pub async fn dispatch(args: OperatorArgs) -> i32 {
 }
 
 async fn run_enroll(args: EnrollArgs) -> i32 {
-    let profile_name = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
     if args.interactive {
         run_enroll_interactive(profile_name, args).await
     } else {

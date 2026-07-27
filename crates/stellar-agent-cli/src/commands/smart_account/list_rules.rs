@@ -326,7 +326,7 @@ pub struct ListRulesResult {
 ///
 /// Never panics.
 pub async fn run(args: &ListRulesArgs) -> i32 {
-    let profile_name = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
 
     // ── Parse --account C-strkey ──────────────────────────────────────────────
     let smart_account = match parse_c_strkey_to_smart_account(&args.account) {

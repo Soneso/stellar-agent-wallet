@@ -449,7 +449,7 @@ where
         record_mlock_degradation(
             writer,
             deployer_mlock_degradation.as_ref(),
-            &resolve_profile_name(args.profile.as_deref()),
+            &resolve_profile_name(args.profile.as_deref()).name,
             &Uuid::new_v4().to_string(),
         );
     }
@@ -679,7 +679,7 @@ async fn resolve_genesis_signer_source(
                 }
             })?;
 
-        let profile = resolve_profile_name(args.profile.as_deref());
+        let profile = resolve_profile_name(args.profile.as_deref()).name;
         validate_path_component_ascii_safe(&profile).map_err(|reason| {
             WalletError::Validation(ValidationError::AddressInvalid {
                 input: format!("invalid profile name '{profile}': {reason}"),
@@ -932,7 +932,7 @@ async fn resolve_deployer(
     // Unlike `create` (which has an explicit `--sponsor` G-strkey), `deploy-c` derives
     // the deployer G-strkey from the secret. We construct the signer first without
     // the mismatch check, then wrap in DeployerKeypair::SecretEnv.
-    let profile_name = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
     let SignerCeremonyOutcome {
         signer,
         mlock_degradation,

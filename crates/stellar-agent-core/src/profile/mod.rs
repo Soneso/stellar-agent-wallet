@@ -12,6 +12,10 @@
 //!   and [`crate::profile::schema::PolicyConfig`].
 //! - `loader` — figment-backed loader (TOML + env-var + CLI overlay).
 //! - `migrate` — version-dispatched migration command (`v1 → v2`).
+//! - `name` — profile-name resolution ([`crate::profile::name::resolve_profile_name`],
+//!   which reports the name's provenance) and the path-component safety rule
+//!   ([`crate::profile::name::validate_path_component_ascii_safe`]) both
+//!   binaries share.
 //!
 //! # Schema version 2
 //!
@@ -46,10 +50,15 @@
 pub mod caip2;
 pub mod loader;
 pub mod migrate;
+pub mod name;
 pub mod receipt;
 pub mod schema;
 
 pub use caip2::{ChainIdValidationError, validate_chain_id_matches_profile};
+pub use name::{
+    PROFILE_ENV_VAR, ProfileNameSource, ResolvedProfileName, resolve_profile_name,
+    validate_path_component_ascii_safe,
+};
 pub use receipt::{
     BeginOutcome, ReceiptStatus, ReceiptStore, ReceiptStoreError, SubmissionReceipt,
 };

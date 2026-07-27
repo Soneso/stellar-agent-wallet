@@ -74,7 +74,7 @@ pub struct DeleteArgs {
 ///
 /// Returns `0` on success, `1` on any error or user cancellation.
 pub fn run(args: &DeleteArgs) -> i32 {
-    let profile = resolve_profile_name(args.profile.as_deref());
+    let profile = resolve_profile_name(args.profile.as_deref()).name;
 
     // Validate profile name as a path component.
     if let Err(reason) = validate_path_component_ascii_safe(&profile) {

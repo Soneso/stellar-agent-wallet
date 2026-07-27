@@ -80,7 +80,7 @@ use stellar_agent_core::timefmt;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 
 use crate::commands::smart_account::common::open_profile_audit_writer;
-use crate::common::render;
+use crate::common::{render, resolve_profile_name};
 
 /// Arguments for `stellar-agent approve --id <nonce>`.
 ///
@@ -170,7 +170,7 @@ pub async fn run(args: RunArgs) -> i32 {
     };
 
     // ── 2. Resolve profile name ───────────────────────────────────────────────
-    let profile_name = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
 
     // ── 3. Load the profile for keyring entry ref ─────────────────────────────
     let profile = match loader::load(&profile_name, None) {
@@ -334,14 +334,6 @@ pub async fn run(args: RunArgs) -> i32 {
 // ─────────────────────────────────────────────────────────────────────────────
 // Private helpers
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Resolves the effective profile name from the CLI arg or `STELLAR_AGENT_PROFILE`.
-fn resolve_profile_name(arg: Option<&str>) -> String {
-    if let Some(name) = arg {
-        return name.to_owned();
-    }
-    std::env::var("STELLAR_AGENT_PROFILE").unwrap_or_else(|_| "default".to_owned())
-}
 
 /// Builds the store path for `<profile>` as `<approval_dir>/<profile>.toml`.
 fn build_store_path(profile_name: &str) -> Result<PathBuf, WalletError> {
@@ -899,21 +891,6 @@ mod tests {
     }
 
     // `approval_store_open_error` now lives in `common.rs` and is tested there.
-
-    // ── resolve_profile_name ─────────────────────────────────────────────────
-
-    #[test]
-    fn resolve_profile_name_from_arg() {
-        let name = resolve_profile_name(Some("myprofile"));
-        assert_eq!(name, "myprofile");
-    }
-
-    #[test]
-    fn resolve_profile_name_no_env_or_arg() {
-        // When the arg is present, it always wins regardless of env.
-        let name = resolve_profile_name(Some("explicit"));
-        assert_eq!(name, "explicit");
-    }
 
     // ── Full run with mock profile+store (--yes path) ─────────────────────────
     // These tests exercise the run() function end-to-end against a real temp

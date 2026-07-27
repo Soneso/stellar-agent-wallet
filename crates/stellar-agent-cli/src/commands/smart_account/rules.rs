@@ -753,7 +753,7 @@ async fn create_run(args: &CreateArgs) -> i32 {
 
         // Load the selected profile's passkeys registry read-only (no approval
         // store needed).
-        let profile = resolve_profile_name(args.common.profile.as_deref());
+        let profile = resolve_profile_name(args.common.profile.as_deref()).name;
         if let Err(reason) = validate_path_component_ascii_safe(&profile) {
             return emit_error(
                 &WalletError::Validation(ValidationError::AddressInvalid {
@@ -2302,7 +2302,7 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                     Err(e) => return emit_error(&e, args.output, &request_id),
                 };
 
-                let profile = resolve_profile_name(args.profile.as_deref());
+                let profile = resolve_profile_name(args.profile.as_deref()).name;
                 if let Err(reason) = validate_path_component_ascii_safe(&profile) {
                     return emit_error(
                         &WalletError::Validation(ValidationError::AddressInvalid {
@@ -2766,7 +2766,7 @@ async fn get_spending_limit_run(args: &GetSpendingLimitArgs) -> i32 {
     // both methods take `source_account_strkey: Option<&str>`, not a `Signer`.
     // `CommonRulesReadArgs` has no `--profile` flag; resolve the default profile
     // (matches the read-only precedent set by `smart-account rules get`).
-    let profile_name = resolve_profile_name(None);
+    let profile_name = resolve_profile_name(None).name;
     let (_audit_profile, audit_writer, audit_log_path) =
         match open_profile_audit_writer_read_only(&profile_name) {
             Ok(triple) => triple,

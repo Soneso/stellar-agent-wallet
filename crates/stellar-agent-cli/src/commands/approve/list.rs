@@ -48,12 +48,12 @@ use stellar_agent_core::approval::{
     open_with_retry,
 };
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
-use stellar_agent_core::error::{InternalError, WalletError};
+use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
 use stellar_agent_core::profile::schema::default_approval_dir;
 use stellar_agent_core::timefmt;
 
 use crate::common::render::{render_json, sanitize_for_table};
-use crate::common::resolve_profile_name;
+use crate::common::{resolve_profile_name, validate_path_component_ascii_safe};
 
 /// Arguments for `stellar-agent approve list`.
 ///
@@ -104,7 +104,19 @@ struct ListData {
 ///
 /// Never panics.
 pub async fn run(args: ListArgs) -> i32 {
-    let profile_name = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+
+    // The name becomes a path component below without passing through the
+    // loader, so it is validated here: these two commands build the approval
+    // path directly and would otherwise write outside the data root.
+    if let Err(reason) = validate_path_component_ascii_safe(&profile_name) {
+        let err = WalletError::Validation(ValidationError::ConfigInvalid {
+            component: "profile",
+            reason: format!("invalid profile name '{profile_name}': {reason}"),
+        });
+        render_json(&Envelope::<()>::err(&err));
+        return 1;
+    }
 
     let store_path = match default_approval_dir() {
         Ok(dir) => dir.join(format!("{profile_name}.toml")),

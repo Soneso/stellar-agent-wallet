@@ -249,7 +249,7 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         return 1;
     }
 
-    let profile_name = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
 
     // ── Audit pre-flight: prove the writer is acquirable BEFORE any signing ──
     // key is touched or the bundle is submitted. A persisted profile whose

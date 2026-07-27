@@ -181,7 +181,7 @@ pub async fn run(args: &ScheduleArgs) -> i32 {
         return 1;
     }
 
-    let profile_name = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
     let request_id = Uuid::new_v4().to_string();
 
     let (signer, mlock_degradation) =

@@ -113,7 +113,7 @@ impl CommonHandlerContext {
     /// Returns a wallet error when signer resolution, smart-account parsing,
     /// audit-log opening, or path setup fails.
     pub async fn new(args: &impl CommonArgsView) -> Result<Self, WalletError> {
-        let profile_name = resolve_profile_name(args.profile());
+        let profile_name = resolve_profile_name(args.profile()).name;
         let (signer, mlock_degradation) =
             resolve_signer(args.signer_source(), Some(&profile_name)).await?;
         let smart_account = parse_c_strkey_to_smart_account(args.account()).map_err(|e| {
