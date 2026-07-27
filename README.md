@@ -107,9 +107,21 @@ cargo binstall stellar-agent-cli@0.1.0-alpha.5 stellar-agent-mcp@0.1.0-alpha.5
 
 The CLI and MCP binaries ship in one release archive
 (`stellar-agent-{version}-{target}.tar.xz`, or `.zip` on Windows), so both
-installs draw from the same download. You can also download the archive directly
-from the [releases page](https://github.com/Soneso/stellar-agent-wallet/releases)
-and extract the two binaries onto your `PATH`.
+installs draw from the same download. You can also fetch and extract the
+archive directly, without any Rust tooling (substitute your target, e.g.
+`aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`):
+
+```bash
+curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.5/stellar-agent-0.1.0-alpha.5-aarch64-apple-darwin.tar.xz
+tar -xJf stellar-agent-0.1.0-alpha.5-aarch64-apple-darwin.tar.xz
+```
+
+then move the two binaries onto your `PATH`. On macOS, prefer this terminal
+download over the browser: archives fetched with `curl` carry no quarantine
+attribute, while browser downloads do — and the macOS binaries are ad-hoc
+signed, so Gatekeeper blocks a quarantined binary on first run. The override
+and the reasoning are documented in the
+[macOS Gatekeeper note](docs/getting-started.md#macos-gatekeeper-note).
 
 ### cargo install (from crates.io)
 

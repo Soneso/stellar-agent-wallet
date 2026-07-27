@@ -55,6 +55,14 @@ must be spelled out — a bare crate name matches stable versions only. The
 release archives this command fetches are published with each tagged release
 on the repository's releases page.
 
+Without any Rust tooling, fetch and extract the archive directly (substitute
+your target):
+
+```bash
+curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.5/stellar-agent-0.1.0-alpha.5-aarch64-apple-darwin.tar.xz
+tar -xJf stellar-agent-0.1.0-alpha.5-aarch64-apple-darwin.tar.xz
+```
+
 Every release ships supply-chain verification artifacts alongside the
 archives: a `SHA256SUMS` file, a Sigstore bundle per archive, and in-toto
 build provenance. Verify a download against those before running it.
@@ -62,9 +70,12 @@ build provenance. Verify a download against those before running it.
 #### macOS Gatekeeper note
 
 The macOS binaries are currently ad-hoc signed, not Developer-ID signed or
-notarized, so a downloaded binary is blocked on first run with "Apple cannot
-check it for malicious software." After verifying the archive against
-`SHA256SUMS` or its Sigstore bundle, approve the binary once with either:
+notarized. Gatekeeper blocks a QUARANTINED binary on first run with "Apple
+cannot check it for malicious software" — and the quarantine attribute is set
+by browser downloads, not by terminal downloads. Fetching the archive with
+`curl` (or `cargo binstall`) avoids the block entirely. For an archive that
+came through a browser, verify it against `SHA256SUMS` or its Sigstore
+bundle, then approve the binaries once with either:
 
 ```bash
 xattr -d com.apple.quarantine ./stellar-agent ./stellar-agent-mcp
