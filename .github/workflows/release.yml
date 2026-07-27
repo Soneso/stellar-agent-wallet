@@ -449,6 +449,12 @@ jobs:
             found { print }
           ' CHANGELOG.md > release-notes.txt
 
+          # Standing preface on every release while versions are prereleases.
+          if printf '%s' "$VERSION" | grep -q -- '-'; then
+            { echo '> Alpha software - no warranty, use at your own risk. See LICENSE (Apache-2.0, sections 7-8) and SECURITY.md.'; echo; cat release-notes.txt; } > release-notes.tmp
+            mv release-notes.tmp release-notes.txt
+          fi
+
           if [ ! -s release-notes.txt ]; then
             echo "No release notes found for v$VERSION in CHANGELOG.md"
             exit 1
