@@ -59,8 +59,8 @@ use stellar_agent_network::keyring::init_platform_keyring_store;
 use uuid::Uuid;
 
 use crate::commands::policy_engine::OWNER_KEY_SERVICE_PREFIX;
-use crate::common::render;
 use crate::common::signer_ceremony::resolve_software_signer_from_env;
+use crate::common::{render, resolve_profile_name};
 
 use super::audit_emit::emit_keyring_key_written;
 
@@ -69,8 +69,10 @@ use super::audit_emit::emit_keyring_key_written;
 #[non_exhaustive]
 pub(crate) struct EnrollOwnerKeyArgs {
     /// Profile whose owner public key should be enrolled.
-    #[arg(long, default_value = "default", value_name = "NAME")]
-    pub(crate) profile: String,
+    ///
+    /// Defaults to the `STELLAR_AGENT_PROFILE` env var, then `"default"`.
+    #[arg(long = "profile", value_name = "NAME")]
+    pub(crate) profile: Option<String>,
 
     /// Name of the environment variable that holds the owner `S...` strkey.
     ///
@@ -151,8 +153,11 @@ where
     LoadProfile: Fn(&str) -> Result<Profile, loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
+    // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+
     // ── Load profile first, then initialise the keyring store ─────────────────
-    let profile = match load_profile(&args.profile) {
+    let profile = match load_profile(&profile_name) {
         Ok(p) => p,
         Err(loader::ProfileLoadError::NotFound { name, .. }) => {
             let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
@@ -161,7 +166,7 @@ where
         }
         Err(e) => {
             let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("failed to load profile '{}': {e}", args.profile),
+                detail: format!("failed to load profile '{profile_name}': {e}"),
             });
             render::render_json(&Envelope::<()>::err(&err));
             return 1;
@@ -194,7 +199,7 @@ where
     let owner_pubkey = match resolve_software_signer_from_env(
         &args.secret_env,
         "profile-enroll-owner-key",
-        Some(&args.profile),
+        Some(&profile_name),
     )
     .await
     {
@@ -296,7 +301,7 @@ where
     let request_id = Uuid::new_v4().to_string();
     emit_keyring_key_written(
         &profile,
-        &args.profile,
+        &profile_name,
         "profile_enroll_owner_key",
         KeyPurpose::OwnerPublicKey,
         &owner_coord,
@@ -306,9 +311,9 @@ where
 
     // Info-level log omits the address and coordinate to avoid leaking operator
     // topology; the JSON envelope carries the full detail.
-    tracing::info!("owner key enrolled for profile '{}'", args.profile);
+    tracing::info!("owner key enrolled for profile '{profile_name}'");
     render::render_json(&Envelope::ok(EnrollOwnerKeyData {
-        profile: args.profile.clone(),
+        profile: profile_name.clone(),
         enrolled: true,
         owner_address,
         keyring_service: owner_coord.service,
@@ -428,7 +433,7 @@ mod tests {
         force: bool,
     ) -> EnrollOwnerKeyArgs {
         EnrollOwnerKeyArgs {
-            profile: profile.to_owned(),
+            profile: Some(profile.to_owned()),
             secret_env: secret_env.to_owned(),
             expected_address: expected.map(str::to_owned),
             force,
@@ -575,7 +580,7 @@ mod tests {
     #[serial]
     async fn enroll_nonexistent_profile_returns_exit_1() {
         let args = EnrollOwnerKeyArgs {
-            profile: "__nonexistent_enroll_owner_key__".to_owned(),
+            profile: Some("__nonexistent_enroll_owner_key__".to_owned()),
             secret_env: "__UNSET_ENROLL_OWNER_KEY_VAR__".to_owned(),
             expected_address: None,
             force: false,

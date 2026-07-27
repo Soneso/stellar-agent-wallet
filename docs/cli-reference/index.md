@@ -40,6 +40,8 @@ The effective profile name is resolved in this order:
 2. The `STELLAR_AGENT_PROFILE` environment variable.
 3. The literal `"default"`.
 
+Three commands are the exception: `accounts create`, `pay`, and `claim` take `--profile` with the literal default `"default"` and never consult `STELLAR_AGENT_PROFILE`. Their pages state this in their flag tables.
+
 Some commands take the profile as a positional argument instead of a flag (the `profile` group itself); those cases are noted on their page.
 
 ### Network
@@ -103,7 +105,7 @@ Every value-moving signing verb (`pay`, `claim`, `accounts create` sponsored mod
 
 ## Startup advisory
 
-Before dispatching any command, the CLI runs a local-only startup advisory: it scans the profile's audit log for context rules that reference revoked or retired verifier WASM hashes. The scan issues no network calls and is non-fatal. If it cannot run, the error is logged at warn level and the command proceeds. The advisory resolves its audit-log path from the first `--profile <NAME>` in the arguments, or `"default"` when absent.
+Before dispatching any command, the CLI runs a local-only startup advisory: it scans the profile's audit log for context rules that reference revoked or retired verifier WASM hashes. The scan issues no network calls and is non-fatal. If it cannot run, the error is logged at warn level and the command proceeds. The advisory reads the audit log of the profile the command it precedes operates on: it takes the profile the parsed subcommand resolved and applies the same resolution order as that subcommand, including for the three commands above that do not consult `STELLAR_AGENT_PROFILE`. The advisory therefore never opens — or appends to — a different profile's log than the command itself uses.
 
 ## Command index
 

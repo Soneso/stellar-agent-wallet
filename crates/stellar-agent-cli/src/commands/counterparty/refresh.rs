@@ -54,7 +54,7 @@ use stellar_agent_network::counterparty::CounterpartyResolver as _;
 
 use crate::commands::counterparty::envelope::to_counterparty_envelope;
 use crate::commands::counterparty::list::{counterparty_cache_dir, format_system_time};
-use crate::common::render;
+use crate::common::{render, resolve_profile_name};
 
 /// Arguments for `stellar-agent counterparty refresh`.
 #[derive(Debug, Args)]
@@ -69,9 +69,9 @@ pub(crate) struct RefreshArgs {
 
     /// Profile name whose counterparty cache should be updated.
     ///
-    /// Defaults to `"default"` when not supplied.
-    #[arg(long, value_name = "NAME", default_value = "default")]
-    pub(crate) profile: String,
+    /// Defaults to the `STELLAR_AGENT_PROFILE` env var, then `"default"`.
+    #[arg(long = "profile", value_name = "NAME")]
+    pub(crate) profile: Option<String>,
 }
 
 /// Success payload for the `counterparty refresh` envelope.
@@ -101,8 +101,11 @@ struct RefreshData {
 ///
 /// Never panics.
 pub async fn run(args: &RefreshArgs) -> i32 {
+    // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+
     // ── Step 1: load profile (fails fast on nonexistent profile).
-    let _profile = match loader::load(&args.profile, None) {
+    let _profile = match loader::load(&profile_name, None) {
         Ok(p) => p,
         Err(loader::ProfileLoadError::NotFound { name, .. }) => {
             let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
@@ -110,9 +113,9 @@ pub async fn run(args: &RefreshArgs) -> i32 {
             return 1;
         }
         Err(e) => {
-            tracing::debug!(profile = %args.profile, error = %e, "profile load failed");
+            tracing::debug!(profile = %profile_name, error = %e, "profile load failed");
             let err = WalletError::Validation(ValidationError::ProfileNotFound {
-                name: args.profile.clone(),
+                name: profile_name.clone(),
             });
             render::render_json(&Envelope::err(&err));
             return 1;
@@ -120,7 +123,7 @@ pub async fn run(args: &RefreshArgs) -> i32 {
     };
 
     // ── Step 2: determine and create the cache directory.
-    let cache_dir = match counterparty_cache_dir(&args.profile) {
+    let cache_dir = match counterparty_cache_dir(&profile_name) {
         Ok(d) => d,
         Err(e) => {
             render::render_json(&Envelope::err(&e));
@@ -155,7 +158,7 @@ pub async fn run(args: &RefreshArgs) -> i32 {
 
     // ── Step 3: construct the resolver.
     let resolver =
-        match StellarTomlResolver::new(&args.profile, &cache_dir, Duration::from_secs(3600)) {
+        match StellarTomlResolver::new(&profile_name, &cache_dir, Duration::from_secs(3600)) {
             Ok(r) => r,
             Err(e) => {
                 render::render_json(&to_counterparty_envelope(&e));
@@ -168,11 +171,11 @@ pub async fn run(args: &RefreshArgs) -> i32 {
         Ok(binding) => {
             tracing::info!(
                 home_domain = %binding.home_domain,
-                profile = %args.profile,
+                profile = %profile_name,
                 "counterparty cache refreshed; after rotation run refresh for each cached domain"
             );
             render::render_json(&Envelope::ok(RefreshData {
-                profile: args.profile.clone(),
+                profile: profile_name.clone(),
                 home_domain: binding.home_domain,
                 fetched_at: format_system_time(binding.fetched_at),
                 expires_at: format_system_time(binding.expires_at),
@@ -183,7 +186,7 @@ pub async fn run(args: &RefreshArgs) -> i32 {
         Err(e) => {
             tracing::warn!(
                 home_domain = %args.home_domain,
-                profile = %args.profile,
+                profile = %profile_name,
                 error = %e,
                 "counterparty refresh failed"
             );
@@ -211,7 +214,7 @@ mod tests {
     async fn refresh_nonexistent_profile_returns_exit_1() {
         let args = RefreshArgs {
             home_domain: "example.com".to_owned(),
-            profile: "__nonexistent_refresh_cpty__".to_owned(),
+            profile: Some("__nonexistent_refresh_cpty__".to_owned()),
         };
         let code = run(&args).await;
         assert_eq!(code, 1);

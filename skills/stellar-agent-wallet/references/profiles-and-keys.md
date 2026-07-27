@@ -21,7 +21,9 @@ Profile files live one-per-name in the OS-conventional data directory:
 
 A profile is selected by name (the file stem): an explicit `--profile <NAME>`,
 then the `STELLAR_AGENT_PROFILE` environment variable, then `default`. Both the
-CLI and the MCP server resolve it that way. When no name was given and no
+CLI and the MCP server resolve it that way, except for three CLI verbs —
+`pay`, `claim`, and `accounts create` — whose `--profile` carries the literal
+default `default` and never consults the environment variable. When no name was given and no
 `default.toml` exists yet, the MCP server falls back to an in-memory testnet
 configuration so it can still serve read-only requests. This fallback is never
 written to disk, and a profile that WAS named but has no file is refused rather
@@ -32,8 +34,9 @@ copying `<a>.toml` to `<b>.toml` does not create profile `b`; the MCP server
 refuses to serve it under the new name. Use `profile init` for a second
 profile.
 
-Create a new profile file with `stellar-agent profile init` (default `default`,
-testnet, `engine = "v1"`); mainnet requires an explicit `https://` `--rpc-url`.
+Create a new profile file with `stellar-agent profile init` (name resolves
+`--profile` -> `STELLAR_AGENT_PROFILE` -> `default`; testnet,
+`engine = "v1"`); mainnet requires an explicit `https://` `--rpc-url`.
 See [cli-reference.md](cli-reference.md) for flags.
 
 `init` mints the `audit_log_hash_chain_key_id` keyring COORDINATE only, no key
@@ -268,7 +271,8 @@ stellar-agent profile enroll-signer --profile default --secret-env WALLET_SK
 ```
 
 Flags: `--secret-env <VAR>` (required; the variable NAME, never the secret),
-`--profile <NAME>` (default `default`), `--expected-address <G_STRKEY>` (refuse
+`--profile <NAME>` (resolves `--profile` -> `STELLAR_AGENT_PROFILE` ->
+`default`), `--expected-address <G_STRKEY>` (refuse
 unless the seed derives to it), `--force` (replace an already-enrolled entry).
 Enrollment derives the seed's public address. A profile fresh from
 `profile init` (and a v1-migrated profile that still carries it) holds the placeholder `"default"` in

@@ -10,7 +10,7 @@ Every command emits a JSON envelope on stdout by default and returns exit code `
 
 `lend`, `vault deposit`, `vault withdraw`, and `trade` are all signing commands. Each one, before it signs anything:
 
-1. Loads the named profile (`--profile`, default `default`) and resolves the CAIP-2 chain id, RPC endpoint, and network passphrase from it.
+1. Loads the named profile (`--profile`, else `STELLAR_AGENT_PROFILE`, else `default`) and resolves the CAIP-2 chain id, RPC endpoint, and network passphrase from it.
 2. Pins the target contract by WASM hash (a two-RPC cross-check when `--secondary-rpc-url` is supplied) so the address you name actually runs the code the wallet expects.
 3. Evaluates the operator policy engine for the corresponding tool descriptor. A `Deny` decision refuses with `policy.deny.<code>`. A `RequireApproval` decision refuses with `policy.approval_required` and a message directing you to the MCP server for two-phase approval — the CLI has no interactive approval path for these verbs. A policy engine that is configured but cannot be built refuses with `policy.engine_unavailable` (fail-closed: the value-moving operation does not run permissively).
 4. Loads the signing key from the OS keyring entry named by the profile, then signs and submits through the venue adapter.
@@ -31,7 +31,7 @@ Only the six supply/borrow/repay/withdraw operations below are accepted by `--op
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--profile <NAME>` | Profile to load | Optional | `default` |
+| `--profile <NAME>` | Profile to load | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--pool <C-strkey>` | Blend pool contract address | Required | — |
 | `--from <C-strkey>` | Wallet smart-account address submitting the request | Required | — |
 | `--op <OP>` | Operation: `supply`, `withdraw`, `supply-collateral`, `withdraw-collateral`, `borrow`, `repay` | Required | — |
@@ -65,7 +65,7 @@ A self-managed vault — one where the depositor holds every fund-affecting role
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--profile <NAME>` | Profile to load | Optional | `default` |
+| `--profile <NAME>` | Profile to load | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--vault <C-strkey>` | DeFindex vault contract address | Required | — |
 | `--from <C-strkey>` | Wallet smart-account address submitting the deposit | Required | — |
 | `--amounts-desired <i128>...` | Desired deposit amount per asset, in declaration order (one or more values) | Required | — |
@@ -93,7 +93,7 @@ Withdraw assets from a DeFindex vault by redeeming shares. Same venue, signing p
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--profile <NAME>` | Profile to load | Optional | `default` |
+| `--profile <NAME>` | Profile to load | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--vault <C-strkey>` | DeFindex vault contract address | Required | — |
 | `--from <C-strkey>` | Wallet smart-account address submitting the withdrawal | Required | — |
 | `--shares <i128>` | Number of vault shares to redeem (raw on-chain value) | Required | — |
@@ -122,7 +122,7 @@ The router address and WASM hash are resolved per-network; a network with no pin
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--profile <NAME>` | Profile to load | Optional | `default` |
+| `--profile <NAME>` | Profile to load | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--from <C-strkey>` | Wallet smart-account address submitting the swap | Required | — |
 | `--amount-in <i128>` | Exact input token amount in base units | Required | — |
 | `--amount-out-min <i128>` | Minimum output amount, as an absolute floor (not a percent) | Required | — |
@@ -161,7 +161,7 @@ If a pool master key already exists for the profile, `pool init` refuses (messag
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
 | `--size <N>` | Number of channel accounts to create (`1..=19`) | Required | — |
-| `--profile <NAME>` | Profile for the funder key and RPC endpoint | Optional | `default` |
+| `--profile <NAME>` | Profile for the funder key and RPC endpoint | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--force` | Overwrite an existing pool master key (orphans previously funded channels) | Optional | `false` |
 | `--output <FORMAT>` | Output format: `json` or `table` | Optional | `json` |
 
@@ -181,7 +181,7 @@ The output includes a note; see the `in_flight` caveat under `pool status` below
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--profile <NAME>` | Profile to load | Optional | `default` |
+| `--profile <NAME>` | Profile to load | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--output <FORMAT>` | Output format: `json` or `table` | Optional | `json` |
 
 Example:
@@ -196,7 +196,7 @@ Report pool utilisation: `initialised`, `pool_size`, `free`, and `in_flight`. Re
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--profile <NAME>` | Profile to load | Optional | `default` |
+| `--profile <NAME>` | Profile to load | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--output <FORMAT>` | Output format: `json` or `table` | Optional | `json` |
 
 Example:

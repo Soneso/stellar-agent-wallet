@@ -12,7 +12,7 @@ The `profile` group creates, lists, shows, and migrates profiles, and rotates th
 
 The seven key-writing commands — `enroll-signer`, `enroll-owner-key`, and the five key-rotation subcommands — each write a `keyring_key_written` audit row recording the key purpose and, where applicable, the redacted public address. `reset-window-state` writes the same row when the reset mints the window-state key on first use. `init` mints no key material and emits no audit row.
 
-Every `profile` subcommand accepts a `--profile <NAME>` flag. For `init`, `enroll-signer`, `enroll-owner-key`, and `sign-policy` it is the only form and defaults to `default`. For `show`, `migrate`, the `rotate-*` subcommands, and `reset-window-state` it is an alternative to the positional `<NAME>`: supply exactly one of the positional `<NAME>` or `--profile <NAME>` (supplying both, or neither, is a usage error), with no default. None of them has a confirmation flag.
+Every `profile` subcommand accepts a `--profile <NAME>` flag. For `init`, `enroll-signer`, `enroll-owner-key`, and `sign-policy` it is the only form and resolves in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `show`, `migrate`, the `rotate-*` subcommands, and `reset-window-state` it is an alternative to the positional `<NAME>`: supply exactly one of the positional `<NAME>` or `--profile <NAME>` (supplying both, or neither, is a usage error), with no default. None of them has a confirmation flag.
 
 ### `profile init`
 
@@ -22,7 +22,7 @@ stellar-agent profile init --profile default --network testnet
 
 State-changing (writes the profile file; no network, no keyring). Creates and persists a new profile TOML with per-profile-derived keyring entry references, then reports the enrollment steps needed before the profile can sign. Mints no key material and emits no audit row — the key-writing commands documented below mint their own keys.
 
-- `--profile <NAME>` — profile name to create (default `default`).
+- `--profile <NAME>` — profile name to create (default: `STELLAR_AGENT_PROFILE`, else `default`).
 - `--network <testnet|mainnet>` — target network (default `testnet`).
 - `--rpc-url <URL>` — Soroban RPC endpoint. Optional for testnet (defaults to the built-in testnet endpoint); **required, and required to be `https://`,** for `--network mainnet` — the built-in mainnet default requires an API key and answers HTTP 401 unauthenticated, so persisting it silently would mint a broken configuration, and the explicit-endpoint requirement exists for endpoint trust (a plaintext scheme is refused with `validation.config_invalid`). This is a configuration-time refusal, distinct from the mainnet-write gate the rest of this page's intro describes — `init` never submits a transaction on any network.
 - `--engine <v1|noop>` — policy engine (default `v1`). `v1` is the default for newly-minted profiles (see the `[policy]` block in [profiles.md](../profiles.md)). A v1 profile refuses MCP-server startup and policy-gated dispatch until the V1 ceremony completes. The normative ceremony, in order, is: `profile enroll-owner-key`, `profile rotate-attestation-key`, then `profile sign-policy` (on top of `rotate-audit-key`, required on every engine — see below) — `next_steps` in the success payload mirrors it. `--engine noop` is the zero-ceremony testnet opt-out: the profile works immediately under the Noop engine (testnet allow, mainnet read-only), once the audit key is minted.
@@ -93,7 +93,7 @@ stellar-agent profile enroll-signer --profile default --secret-env WALLET_SK
 Imports an operator-held ed25519 seed into the profile's `mcp_signer_default` keyring entry — the signer every MCP fund-movement tool and every keyring-signing CLI verb (`trustline`, `lend`, `trade`, `vault`) resolves. On a clean install that entry is absent and those paths fail with `auth.keyring_not_found`; this command is the way to populate it. State-changing (keyring; also the profile TOML the first time a profile enrolls a signer — see below), no network. The seed is read from a named environment variable through the shared mlock-protected ceremony and stored verbatim; it is never printed, logged, or returned.
 
 - `--secret-env <VAR>` (required) — name of the environment variable holding the signer's `S...` strkey. The flag takes the variable name, never the secret.
-- `--profile <NAME>` — profile whose `mcp_signer_default` entry is written (default `default`).
+- `--profile <NAME>` — profile whose `mcp_signer_default` entry is written (default: `STELLAR_AGENT_PROFILE`, else `default`).
 - `--expected-address <G_STRKEY>` — refuse unless the seed derives to this address.
 - `--force` — replace an already-enrolled entry (refused without it when one exists).
 
@@ -115,7 +115,7 @@ stellar-agent profile enroll-owner-key --profile default --secret-env WALLET_OWN
 Enrolls the policy-file owner PUBLIC key into the profile's `policy_owner_key_id` keyring entry — the key the V1 policy engine verifies every policy file against. The owner key is the root of trust for policy: whoever can sign a policy file can authorise any action the policy permits. The always-online agent therefore holds only the public key; the operator keeps the seed offline and signs policy files with `sign-policy`. State-changing (keyring), no network. The owner `S...` seed is read from a named environment variable through the shared mlock-protected ceremony; only the derived public key is stored, and the seed is never printed, logged, or returned.
 
 - `--secret-env <VAR>` (required) — name of the environment variable holding the owner `S...` strkey. The flag takes the variable name, never the secret.
-- `--profile <NAME>` — profile whose owner coordinate is written (default `default`).
+- `--profile <NAME>` — profile whose owner coordinate is written (default: `STELLAR_AGENT_PROFILE`, else `default`).
 - `--expected-address <G_STRKEY>` — refuse unless the seed derives to this address.
 - `--force` — replace an already-enrolled owner key (refused without it when one exists; replacing invalidates every policy file signed by the previous owner key).
 
@@ -137,7 +137,7 @@ stellar-agent profile sign-policy --profile default --secret-env WALLET_OWNER_SK
 Signs a V1 policy file so the engine accepts it. The engine loads `<state_dir>/policies/<profile>.toml`, recomputes the canonical form (the `[signature]` table excluded), and verifies the signature against the enrolled owner public key. This command produces that `[signature]` table: it computes the same canonical BLAKE3 digest the loader computes, signs it with the owner seed, and writes `owner_id` (the owner G-strkey) and `sig` (hex) back into the file. State-changing (writes the policy file), no network. The owner seed is read from a named environment variable and held only in zeroizing memory; it is never printed, logged, or written to disk.
 
 - `--secret-env <VAR>` (required) — name of the environment variable holding the owner `S...` strkey.
-- `--profile <NAME>` — profile whose policy file is signed (default `default`).
+- `--profile <NAME>` — profile whose policy file is signed (default: `STELLAR_AGENT_PROFILE`, else `default`).
 - `--file <PATH>` — sign a policy file at a non-default path (default `<state_dir>/policies/<profile>.toml`, the only location the engine loads).
 
 Before writing, the seed's derived public key is cross-checked against the enrolled owner key; a seed that does not match is refused (`sign_policy.owner_key_mismatch`) so a file the engine would reject is never produced. Re-signing an already-signed file replaces the `[signature]` table in place and reports `replaced: true` with the previous `owner_id`. On success the data object reports the `owner_address`, the `policy_path`, the `digest` (hex), and the `signature` (hex):

@@ -80,3 +80,24 @@ pub async fn run(args: &ToolsetsArgs) -> i32 {
         ToolsetsSubcommand::Uninstall(uninstall_args) => uninstall::run(uninstall_args).await,
     }
 }
+
+impl ToolsetsArgs {
+    /// The profile name this invocation operates on, as the selected subcommand
+    /// resolves it.
+    ///
+    /// `None` means the subcommand supplied no name, so
+    /// [`resolve_profile_name`](crate::common::resolve_profile_name) falls through
+    /// to `STELLAR_AGENT_PROFILE` and then `"default"` — the same fall-through the
+    /// subcommand itself performs. The startup advisory consumes this so it scans
+    /// the audit log of the profile the command uses.
+    ///
+    /// No toolset subcommand selects a profile, so every arm is `None`.
+    pub(crate) fn profile_flag(&self) -> Option<&str> {
+        match &self.command {
+            ToolsetsSubcommand::Install(_)
+            | ToolsetsSubcommand::List(_)
+            | ToolsetsSubcommand::Run(_)
+            | ToolsetsSubcommand::Uninstall(_) => None,
+        }
+    }
+}

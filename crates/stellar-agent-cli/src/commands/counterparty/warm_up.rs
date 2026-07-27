@@ -20,15 +20,17 @@ use toml_edit::{DocumentMut, Item, Value};
 
 use crate::commands::counterparty::envelope::to_counterparty_envelope;
 use crate::commands::counterparty::list::{counterparty_cache_dir, format_system_time};
-use crate::common::render;
+use crate::common::{render, resolve_profile_name};
 
 /// Arguments for `stellar-agent counterparty warm-up`.
 #[derive(Debug, Args)]
 #[non_exhaustive]
 pub(crate) struct WarmUpArgs {
     /// Profile name whose counterparty allowlist should be refreshed.
-    #[arg(long, value_name = "NAME", default_value = "default")]
-    pub(crate) profile: String,
+    ///
+    /// Defaults to the `STELLAR_AGENT_PROFILE` env var, then `"default"`.
+    #[arg(long = "profile", value_name = "NAME")]
+    pub(crate) profile: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,7 +126,10 @@ fn extract_home_domain_allowlist_from_policy_toml(body: &str) -> Result<Vec<Stri
 /// Returns `0` when all discovered domains refresh successfully, `1` when
 /// profile loading, policy parsing, resolver construction, or any refresh fails.
 pub async fn run(args: &WarmUpArgs) -> i32 {
-    let _profile = match loader::load(&args.profile, None) {
+    // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+
+    let _profile = match loader::load(&profile_name, None) {
         Ok(p) => p,
         Err(loader::ProfileLoadError::NotFound { name, .. }) => {
             let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
@@ -132,9 +137,9 @@ pub async fn run(args: &WarmUpArgs) -> i32 {
             return 1;
         }
         Err(e) => {
-            tracing::debug!(profile = %args.profile, error = %e, "profile load failed");
+            tracing::debug!(profile = %profile_name, error = %e, "profile load failed");
             let err = WalletError::Validation(ValidationError::ProfileNotFound {
-                name: args.profile.clone(),
+                name: profile_name.clone(),
             });
             render::render_json(&Envelope::err(&err));
             return 1;
@@ -152,7 +157,7 @@ pub async fn run(args: &WarmUpArgs) -> i32 {
             return 1;
         }
     };
-    let policy_path = policy_dir.join(format!("{}.toml", args.profile));
+    let policy_path = policy_dir.join(format!("{profile_name}.toml"));
     let domains = if policy_path.exists() {
         match std::fs::read_to_string(&policy_path)
             .map_err(|e| {
@@ -172,7 +177,7 @@ pub async fn run(args: &WarmUpArgs) -> i32 {
         Vec::new()
     };
 
-    let cache_dir = match counterparty_cache_dir(&args.profile) {
+    let cache_dir = match counterparty_cache_dir(&profile_name) {
         Ok(d) => d,
         Err(e) => {
             render::render_json(&Envelope::err(&e));
@@ -189,7 +194,7 @@ pub async fn run(args: &WarmUpArgs) -> i32 {
     }
 
     let resolver =
-        match StellarTomlResolver::new(&args.profile, &cache_dir, Duration::from_secs(3600)) {
+        match StellarTomlResolver::new(&profile_name, &cache_dir, Duration::from_secs(3600)) {
             Ok(r) => r,
             Err(e) => {
                 render::render_json(&to_counterparty_envelope(&e));
@@ -220,7 +225,7 @@ pub async fn run(args: &WarmUpArgs) -> i32 {
         }
     }
     let failed = entries.iter().any(|entry| !entry.ok);
-    render::render_json(&warm_up_envelope(&args.profile, entries));
+    render::render_json(&warm_up_envelope(&profile_name, entries));
     if failed { 1 } else { 0 }
 }
 
@@ -240,7 +245,7 @@ mod tests {
     #[test]
     fn parse_warm_up_args() {
         let parsed = WarmUpArgsHarness::parse_from(["test", "--profile", "alice"]);
-        assert_eq!(parsed.args.profile, "alice");
+        assert_eq!(parsed.args.profile.as_deref(), Some("alice"));
     }
 
     #[test]

@@ -81,6 +81,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::common::render::render_json;
+use crate::common::resolve_profile_name;
 
 /// Arguments for `stellar-agent pool init`.
 #[derive(Debug, Args)]
@@ -94,7 +95,7 @@ pub struct PoolInitArgs {
 
     /// Profile name to use for funder key + RPC URL.
     ///
-    /// Defaults to `"default"` when absent.
+    /// Defaults to the `STELLAR_AGENT_PROFILE` env var, then `"default"`.
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
 
@@ -169,8 +170,9 @@ pub async fn run(args: &PoolInitArgs) -> i32 {
     }
 
     // ── Load profile ──────────────────────────────────────────────────────────
-    let profile_name = args.profile.as_deref().unwrap_or("default");
-    let profile = match loader::load(profile_name, None) {
+    // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+    let profile = match loader::load(&profile_name, None) {
         Ok(p) => p,
         Err(e) => {
             let err = match e {
@@ -197,7 +199,7 @@ pub async fn run(args: &PoolInitArgs) -> i32 {
     // the ChannelPoolInitialised row must be writable before the wallet commits
     // funds, and the SAME writer is reused for the post-confirm emission.
     let audit_writer =
-        match crate::commands::value_audit::require_value_audit_writer(&profile, profile_name) {
+        match crate::commands::value_audit::require_value_audit_writer(&profile, &profile_name) {
             Ok(w) => w,
             Err(e) => {
                 render_json(&Envelope::<()>::err(&e));
@@ -209,7 +211,7 @@ pub async fn run(args: &PoolInitArgs) -> i32 {
     let pool_master_ref = profile
         .pool_master_key_id
         .clone()
-        .unwrap_or_else(|| KeyringEntryRef::default_pool_master_key(profile_name));
+        .unwrap_or_else(|| KeyringEntryRef::default_pool_master_key(&profile_name));
 
     // ── Check for existing pool master (--force guard) ────────────────────────
     // Distinguish "definitely absent" (NoEntry) from "backend error" (ambiguous).
@@ -426,7 +428,7 @@ pub async fn run(args: &PoolInitArgs) -> i32 {
     // the env-merged view (`STELLAR_AGENT_*` overlays and loader-derived
     // defaults baked into the trust root).
     let pool_config = PoolConfig::new(n, pool_channels.clone());
-    if let Err(e) = loader::set_pool_state(profile_name, &pool_master_ref, &pool_config) {
+    if let Err(e) = loader::set_pool_state(&profile_name, &pool_master_ref, &pool_config) {
         tracing::warn!(
             profile = %profile_name,
             error = %e,
@@ -452,7 +454,7 @@ pub async fn run(args: &PoolInitArgs) -> i32 {
         result.ledger,
         &request_id,
     );
-    emit_pool_init_audit(&audit_writer, profile_name, audit_entry);
+    emit_pool_init_audit(&audit_writer, &profile_name, audit_entry);
 
     // ── Emit result JSON — no seed bytes ──────────────────────────────────────
     let pool_result = PoolInitResult {

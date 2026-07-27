@@ -32,6 +32,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `STELLAR_AGENT_PROFILE` selects the profile for the CLI verbs that
+  substituted the literal `"default"` for an absent `--profile`.
+  `trustline`, `lend`, `trade`, `vault deposit`, `vault withdraw`, the four
+  `mpp` subcommands, the five `counterparty` subcommands, `profile init`,
+  `profile enroll-signer`, `profile enroll-owner-key`, `profile sign-policy`,
+  and `pool init` / `list` / `status` now resolve flag > environment >
+  `default`, the order `docs/cli-reference/index.md` documents. Two shapes
+  defeated it: a clap `default_value`, which substitutes the literal before the
+  command runs (the DeFi, `mpp`, `counterparty`, and `profile` verbs), and a
+  handler-side `.unwrap_or("default")` on an optional flag (the three `pool`
+  verbs). A source-scan test refuses both, for any field named `profile` or
+  declaring `long = "profile"`. `pay`, `claim`, and `accounts create` keep
+  their literal default for now: they load through a helper that synthesises a
+  `noop`-engine profile when the named file is absent, so honouring the
+  variable before that synthesis refuses a named-but-missing profile would let
+  a stale variable disable the policy engine on the signing path. Closes #113.
+- The CLI's startup advisory scans the audit log of the profile the command
+  itself uses, taking the name from the parsed subcommand and resolving it the
+  way that subcommand does. It resolved the profile through a private argv scan
+  that fell back to the literal `"default"` and never read
+  `STELLAR_AGENT_PROFILE`, so under that variable the advisory read — and
+  appended its advisory rows to — one profile's log while the command operated
+  on another's. Closes #108.
 - Profile names are validated as filesystem path components inside the profile
   loader, before the path is built, on both the read and the write half. A name
   carrying `..`, a path separator, or a control character is refused with a

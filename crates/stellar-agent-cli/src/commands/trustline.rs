@@ -90,6 +90,7 @@ use stellar_agent_stablecoin::{
 };
 
 use crate::common::render::render_json;
+use crate::common::resolve_profile_name;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Private helpers
@@ -139,9 +140,9 @@ fn redact_asset_for_log(asset: &str) -> String {
 /// ```
 #[derive(Debug, Args)]
 pub struct TrustlineArgs {
-    /// Profile name to load (default: "default").
-    #[arg(long, default_value = "default")]
-    pub profile: String,
+    /// Profile name to load (default: `STELLAR_AGENT_PROFILE` env var, then `"default"`).
+    #[arg(long = "profile", value_name = "NAME")]
+    pub profile: Option<String>,
 
     /// CAIP-2 chain identifier (e.g. `stellar:testnet`).
     ///
@@ -212,8 +213,12 @@ where
     LoadProfile: Fn(&str) -> Result<Profile, profile_loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
+    // ── Resolve the profile name ──────────────────────────────────────────────
+    // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+
     // ── Load profile ──────────────────────────────────────────────────────────
-    let profile = match load_profile(&args.profile) {
+    let profile = match load_profile(&profile_name) {
         Ok(p) => p,
         Err(e) => {
             render_json(&Envelope::<()>::err_raw(
@@ -377,7 +382,7 @@ where
     // transaction is submitted. Reused (not re-acquired) for the
     // post-confirm `value_action_submitted` row.
     let audit_writer =
-        match crate::commands::value_audit::require_value_audit_writer(&profile, &args.profile) {
+        match crate::commands::value_audit::require_value_audit_writer(&profile, &profile_name) {
             Ok(w) => w,
             Err(e) => {
                 render_json(&Envelope::<()>::err(&e));
@@ -416,7 +421,7 @@ where
                 default_approval_dir()
                     .ok()
                     .map(|dir| {
-                        let store_path = dir.join(format!("{}.toml", args.profile));
+                        let store_path = dir.join(format!("{profile_name}.toml"));
                         open_with_retry(&store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
                             .map(|store| {
                                 store.verify_attested_trustline_clawback_opt_in(
@@ -489,7 +494,7 @@ where
                             "approval dir create_all failed; opt-in entry not minted"
                         );
                     } else {
-                        let store_path = dir.join(format!("{}.toml", args.profile));
+                        let store_path = dir.join(format!("{profile_name}.toml"));
                         match open_with_retry(
                             &store_path,
                             DEFAULT_RETRY_ATTEMPTS,
@@ -717,7 +722,7 @@ where
             // format matches every other value verb's rows.
             crate::commands::value_audit::emit_value_action_submitted_row_with_writer(
                 &audit_writer,
-                &args.profile,
+                &profile_name,
                 "stellar_trustline",
                 chain_id,
                 trustline_effects.as_ref(),
@@ -727,7 +732,7 @@ where
             crate::commands::policy_engine::record_confirmed_value_moving_with_engine(
                 policy_engine.as_ref(),
                 &profile,
-                &args.profile,
+                &profile_name,
                 "stellar_trustline",
                 chain_id,
                 trustline_effects.as_ref(),
@@ -989,7 +994,7 @@ mod tests {
         let init_writer = Arc::clone(&init_invoked);
 
         let args = TrustlineArgs {
-            profile: "keyring-order-test".to_owned(),
+            profile: Some("keyring-order-test".to_owned()),
             chain_id: None,
             from: String::new(),
             asset: String::new(),

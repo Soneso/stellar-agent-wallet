@@ -180,3 +180,35 @@ pub async fn run(args: &ProfileArgs) -> i32 {
         ProfileSubcommand::ResetWindowState(a) => reset_window_state::run(a).await,
     }
 }
+
+impl ProfileArgs {
+    /// The profile name this invocation operates on, as the selected subcommand
+    /// resolves it.
+    ///
+    /// `None` means the subcommand supplied no name, so
+    /// [`resolve_profile_name`](crate::common::resolve_profile_name) falls through
+    /// to `STELLAR_AGENT_PROFILE` and then `"default"` — the same fall-through the
+    /// subcommand itself performs. The startup advisory consumes this so it scans
+    /// the audit log of the profile the command uses.
+    ///
+    /// The positional-or-flag subcommands (`show`, `migrate`, the `rotate-*`
+    /// family, `reset-window-state`) always have a name: their clap group is
+    /// `required`, so their accessor is returned directly.
+    pub(crate) fn profile_flag(&self) -> Option<&str> {
+        match &self.subcommand {
+            ProfileSubcommand::Init(a) => a.profile.as_deref(),
+            ProfileSubcommand::EnrollSigner(a) => a.profile.as_deref(),
+            ProfileSubcommand::EnrollOwnerKey(a) => a.profile.as_deref(),
+            ProfileSubcommand::SignPolicy(a) => a.profile.as_deref(),
+            ProfileSubcommand::List(_) => None,
+            ProfileSubcommand::Show(a) => Some(a.profile_name()),
+            ProfileSubcommand::Migrate(a) => Some(a.profile_name()),
+            ProfileSubcommand::RotateNonceKey(a) => Some(a.profile_name()),
+            ProfileSubcommand::RotateAttestationKey(a) => Some(a.profile_name()),
+            ProfileSubcommand::RotateAuditKey(a) => Some(a.profile_name()),
+            ProfileSubcommand::RotateCounterpartyKey(a) => Some(a.profile_name()),
+            ProfileSubcommand::RotatePolicyStateKey(a) => Some(a.profile_name()),
+            ProfileSubcommand::ResetWindowState(a) => Some(a.profile_name()),
+        }
+    }
+}

@@ -14,7 +14,7 @@ use stellar_agent_network::counterparty::fetch::validate_home_domain;
 
 use crate::commands::counterparty::envelope::to_counterparty_envelope;
 use crate::commands::counterparty::list::counterparty_cache_dir;
-use crate::common::render;
+use crate::common::{render, resolve_profile_name};
 
 /// Arguments for `stellar-agent counterparty evict`.
 #[derive(Debug, Args)]
@@ -25,8 +25,10 @@ pub(crate) struct EvictArgs {
     pub(crate) home_domain: String,
 
     /// Profile name whose counterparty cache should be updated.
-    #[arg(long, value_name = "NAME", default_value = "default")]
-    pub(crate) profile: String,
+    ///
+    /// Defaults to the `STELLAR_AGENT_PROFILE` env var, then `"default"`.
+    #[arg(long = "profile", value_name = "NAME")]
+    pub(crate) profile: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -49,7 +51,10 @@ fn evict_envelope(profile: &str, home_domain: &str, evicted: bool) -> Envelope<E
 /// Returns `0` on success, including when the target cache file was already
 /// absent; returns `1` for profile, domain, or filesystem errors.
 pub async fn run(args: &EvictArgs) -> i32 {
-    let _profile = match loader::load(&args.profile, None) {
+    // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+
+    let _profile = match loader::load(&profile_name, None) {
         Ok(p) => p,
         Err(loader::ProfileLoadError::NotFound { name, .. }) => {
             let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
@@ -57,9 +62,9 @@ pub async fn run(args: &EvictArgs) -> i32 {
             return 1;
         }
         Err(e) => {
-            tracing::debug!(profile = %args.profile, error = %e, "profile load failed");
+            tracing::debug!(profile = %profile_name, error = %e, "profile load failed");
             let err = WalletError::Validation(ValidationError::ProfileNotFound {
-                name: args.profile.clone(),
+                name: profile_name.clone(),
             });
             render::render_json(&Envelope::err(&err));
             return 1;
@@ -71,7 +76,7 @@ pub async fn run(args: &EvictArgs) -> i32 {
         return 1;
     }
 
-    let cache_dir = match counterparty_cache_dir(&args.profile) {
+    let cache_dir = match counterparty_cache_dir(&profile_name) {
         Ok(d) => d,
         Err(e) => {
             render::render_json(&Envelope::err(&e));
@@ -92,7 +97,7 @@ pub async fn run(args: &EvictArgs) -> i32 {
         }
     };
 
-    render::render_json(&evict_envelope(&args.profile, &args.home_domain, evicted));
+    render::render_json(&evict_envelope(&profile_name, &args.home_domain, evicted));
     0
 }
 
@@ -113,7 +118,7 @@ mod tests {
     fn parse_evict_args() {
         let parsed = EvictArgsHarness::parse_from(["test", "circle.com", "--profile", "alice"]);
         assert_eq!(parsed.args.home_domain, "circle.com");
-        assert_eq!(parsed.args.profile, "alice");
+        assert_eq!(parsed.args.profile.as_deref(), Some("alice"));
     }
 
     #[test]

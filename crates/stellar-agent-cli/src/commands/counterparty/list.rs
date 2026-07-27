@@ -53,7 +53,7 @@ use stellar_agent_network::StellarTomlResolver;
 use stellar_agent_network::counterparty::CounterpartyResolver as _;
 
 use crate::commands::counterparty::envelope::to_counterparty_envelope;
-use crate::common::render;
+use crate::common::{render, resolve_profile_name};
 
 /// Arguments for `stellar-agent counterparty list`.
 #[derive(Debug, Args)]
@@ -68,9 +68,9 @@ pub(crate) struct ListArgs {
 
     /// Profile name whose counterparty cache should be listed.
     ///
-    /// Defaults to `"default"` when not supplied.
-    #[arg(long, value_name = "NAME", default_value = "default")]
-    pub(crate) profile: String,
+    /// Defaults to the `STELLAR_AGENT_PROFILE` env var, then `"default"`.
+    #[arg(long = "profile", value_name = "NAME")]
+    pub(crate) profile: Option<String>,
 }
 
 /// A single cached binding entry in the list response.
@@ -139,10 +139,13 @@ pub(crate) fn counterparty_cache_dir(profile_name: &str) -> Result<PathBuf, Wall
 ///
 /// Never panics.
 pub async fn run(args: &ListArgs) -> i32 {
+    // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+
     let _json_output_requested = args.json;
 
     // ── Step 1: load profile (fails fast on nonexistent profile).
-    let _profile = match loader::load(&args.profile, None) {
+    let _profile = match loader::load(&profile_name, None) {
         Ok(p) => p,
         Err(loader::ProfileLoadError::NotFound { name, .. }) => {
             let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
@@ -150,9 +153,9 @@ pub async fn run(args: &ListArgs) -> i32 {
             return 1;
         }
         Err(e) => {
-            tracing::debug!(profile = %args.profile, error = %e, "profile load failed");
+            tracing::debug!(profile = %profile_name, error = %e, "profile load failed");
             let err = WalletError::Validation(ValidationError::ProfileNotFound {
-                name: args.profile.clone(),
+                name: profile_name.clone(),
             });
             render::render_json(&Envelope::err(&err));
             return 1;
@@ -160,7 +163,7 @@ pub async fn run(args: &ListArgs) -> i32 {
     };
 
     // ── Step 2: determine the cache directory.
-    let cache_dir = match counterparty_cache_dir(&args.profile) {
+    let cache_dir = match counterparty_cache_dir(&profile_name) {
         Ok(d) => d,
         Err(e) => {
             render::render_json(&Envelope::err(&e));
@@ -172,7 +175,7 @@ pub async fn run(args: &ListArgs) -> i32 {
     // rather than an error — the operator has simply not yet run refresh.
     if !cache_dir.exists() {
         render::render_json(&Envelope::ok(ListData {
-            profile: args.profile.clone(),
+            profile: profile_name.clone(),
             entries: Vec::new(),
         }));
         return 0;
@@ -180,7 +183,7 @@ pub async fn run(args: &ListArgs) -> i32 {
 
     // ── Step 4: construct the resolver.
     let resolver =
-        match StellarTomlResolver::new(&args.profile, &cache_dir, Duration::from_secs(3600)) {
+        match StellarTomlResolver::new(&profile_name, &cache_dir, Duration::from_secs(3600)) {
             Ok(r) => r,
             Err(e) => {
                 render::render_json(&to_counterparty_envelope(&e));
@@ -200,14 +203,14 @@ pub async fn run(args: &ListArgs) -> i32 {
                 })
                 .collect();
             render::render_json(&Envelope::ok(ListData {
-                profile: args.profile.clone(),
+                profile: profile_name.clone(),
                 entries,
             }));
             0
         }
         Err(e) => {
             tracing::warn!(
-                profile = %args.profile,
+                profile = %profile_name,
                 error = %e,
                 "counterparty list_cached returned an error"
             );
@@ -259,7 +262,7 @@ mod tests {
     async fn list_nonexistent_profile_returns_exit_1() {
         let args = ListArgs {
             json: false,
-            profile: "__nonexistent_list_cpty__".to_owned(),
+            profile: Some("__nonexistent_list_cpty__".to_owned()),
         };
         let code = run(&args).await;
         assert_eq!(code, 1);
@@ -269,6 +272,6 @@ mod tests {
     fn json_flag_is_accepted_for_explicit_scripting() {
         let parsed = ListArgsHarness::parse_from(["test", "--json", "--profile", "default"]);
         assert!(parsed.args.json);
-        assert_eq!(parsed.args.profile, "default");
+        assert_eq!(parsed.args.profile.as_deref(), Some("default"));
     }
 }

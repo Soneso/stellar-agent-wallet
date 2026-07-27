@@ -92,8 +92,8 @@ use stellar_agent_network::Signer as _;
 use stellar_agent_network::keyring::{init_platform_keyring_store, signer_from_keyring};
 use uuid::Uuid;
 
-use crate::common::render;
 use crate::common::signer_ceremony::resolve_software_signer_from_env;
+use crate::common::{render, resolve_profile_name};
 
 use super::audit_emit::emit_keyring_key_written;
 
@@ -107,8 +107,10 @@ const PLACEHOLDER_ACCOUNT: &str = "default";
 #[non_exhaustive]
 pub(crate) struct EnrollSignerArgs {
     /// Profile whose MCP signer entry should be enrolled.
-    #[arg(long, default_value = "default", value_name = "NAME")]
-    pub(crate) profile: String,
+    ///
+    /// Defaults to the `STELLAR_AGENT_PROFILE` env var, then `"default"`.
+    #[arg(long = "profile", value_name = "NAME")]
+    pub(crate) profile: Option<String>,
 
     /// Name of the environment variable that holds the signer S-strkey.
     ///
@@ -208,11 +210,14 @@ where
     PinSigner: Fn(&str, &str) -> Result<PathBuf, loader::ProfileSaveError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
+    // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+
     // ── Load profile first, then initialise the keyring store ─────────────────
     // The env-merged load supplies the audit-emission context at the end of
     // the flow; every enrollment DECISION below uses the raw on-disk signer
     // reference instead, so environment overlays stay load-time-only.
-    let profile = match load_profile(&args.profile) {
+    let profile = match load_profile(&profile_name) {
         Ok(p) => p,
         Err(loader::ProfileLoadError::NotFound { name, .. }) => {
             let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
@@ -221,7 +226,7 @@ where
         }
         Err(e) => {
             let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("failed to load profile '{}': {e}", args.profile),
+                detail: format!("failed to load profile '{profile_name}': {e}"),
             });
             render::render_json(&Envelope::<()>::err(&err));
             return 1;
@@ -237,7 +242,7 @@ where
     // the stored document alone: a `STELLAR_AGENT_MCP_SIGNER_DEFAULT`
     // environment overlay can redirect a load, but must never influence what
     // enrollment persists into the trust root.
-    let signer_ref = match read_raw_signer_ref(&args.profile) {
+    let signer_ref = match read_raw_signer_ref(&profile_name) {
         Ok(r) => r,
         Err(loader::ProfileLoadError::NotFound { name, .. }) => {
             let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
@@ -247,8 +252,8 @@ where
         Err(e) => {
             let err = WalletError::Internal(InternalError::UnexpectedState {
                 detail: format!(
-                    "failed to read the on-disk signer reference for profile '{}': {e}",
-                    args.profile
+                    "failed to read the on-disk signer reference for profile \
+                     '{profile_name}': {e}"
                 ),
             });
             render::render_json(&Envelope::<()>::err(&err));
@@ -262,7 +267,7 @@ where
     let derived_g = match resolve_software_signer_from_env(
         &args.secret_env,
         "profile-enroll-signer",
-        Some(&args.profile),
+        Some(&profile_name),
     )
     .await
     {
@@ -314,11 +319,11 @@ where
         render::render_json(&Envelope::<()>::err_raw(
             "enroll_signer.account_identity_mismatch",
             format!(
-                "profile '{}' enrolls the MCP signer at account '{}', but the supplied seed \
-                 derives to '{derived_g}'. Set the profile's mcp_signer_default account to \
-                 '{derived_g}' (or supply the seed whose address is '{}') and re-run; no entry \
-                 was written.",
-                args.profile, signer_ref.account, signer_ref.account
+                "profile '{profile_name}' enrolls the MCP signer at account '{}', but the \
+                 supplied seed derives to '{derived_g}'. Set the profile's mcp_signer_default \
+                 account to '{derived_g}' (or supply the seed whose address is '{}') and \
+                 re-run; no entry was written.",
+                signer_ref.account, signer_ref.account
             ),
         ));
         return 1;
@@ -328,12 +333,12 @@ where
         render::render_json(&Envelope::<()>::err_raw(
             "enroll_signer.account_malformed",
             format!(
-                "profile '{}' names signer account '{}', which is neither the placeholder \
-                 '{PLACEHOLDER_ACCOUNT}' nor a valid G-strkey; a malformed pin is refused \
-                 rather than replaced. Set the profile's mcp_signer_default account to \
+                "profile '{profile_name}' names signer account '{}', which is neither the \
+                 placeholder '{PLACEHOLDER_ACCOUNT}' nor a valid G-strkey; a malformed pin is \
+                 refused rather than replaced. Set the profile's mcp_signer_default account to \
                  '{PLACEHOLDER_ACCOUNT}' (to enroll fresh) or to the signer's G-strkey, then \
                  re-run; no entry was written and the profile was not modified.",
-                args.profile, signer_ref.account
+                signer_ref.account
             ),
         ));
         return 1;
@@ -410,12 +415,12 @@ where
     // patches only `mcp_signer_default.account` on the stored document;
     // nothing else in the file changes, and no environment overlay can leak
     // into it.
-    if account_populated && let Err(e) = pin_signer(&args.profile, &derived_g) {
+    if account_populated && let Err(e) = pin_signer(&profile_name, &derived_g) {
         render::render_json(&Envelope::<()>::err(&WalletError::Internal(
             InternalError::UnexpectedState {
                 detail: format!(
-                    "failed to persist the derived signer address into profile '{}': {e}",
-                    args.profile
+                    "failed to persist the derived signer address into profile \
+                     '{profile_name}': {e}"
                 ),
             },
         )));
@@ -450,7 +455,7 @@ where
     let request_id = Uuid::new_v4().to_string();
     emit_keyring_key_written(
         &profile,
-        &args.profile,
+        &profile_name,
         "profile_enroll_signer",
         KeyPurpose::McpSignerSeed,
         &entry_ref,
@@ -460,9 +465,9 @@ where
 
     // Info-level log omits the address and coordinate to avoid leaking operator
     // topology; the JSON envelope carries the full detail.
-    tracing::info!("MCP signer enrolled for profile '{}'", args.profile);
+    tracing::info!("MCP signer enrolled for profile '{profile_name}'");
     render::render_json(&Envelope::ok(EnrollSignerData {
-        profile: args.profile.clone(),
+        profile: profile_name.clone(),
         enrolled: true,
         public_address: derived_g,
         keyring_service: entry_ref.service.clone(),
@@ -551,7 +556,7 @@ mod tests {
 
     fn args(secret_env: &str, expected: Option<&str>, force: bool) -> EnrollSignerArgs {
         EnrollSignerArgs {
-            profile: "enroll-signer-test".to_owned(),
+            profile: Some("enroll-signer-test".to_owned()),
             secret_env: secret_env.to_owned(),
             expected_address: expected.map(str::to_owned),
             force,
@@ -941,7 +946,7 @@ mod tests {
     #[serial]
     async fn enroll_nonexistent_profile_returns_exit_1() {
         let args = EnrollSignerArgs {
-            profile: "__nonexistent_enroll_signer__".to_owned(),
+            profile: Some("__nonexistent_enroll_signer__".to_owned()),
             secret_env: "__UNSET_ENROLL_SIGNER_VAR__".to_owned(),
             expected_address: None,
             force: false,
