@@ -12,15 +12,17 @@ use stellar_agent_core::error::{ValidationError, WalletError};
 use stellar_agent_core::profile::loader;
 use stellar_agent_network::keyring::{init_platform_keyring_store, rotate_keyring_secret_32};
 
-use crate::common::render;
+use crate::common::{render, resolve_profile_name};
 
 /// Arguments for `stellar-agent counterparty rotate-hmac-key`.
 #[derive(Debug, Args)]
 #[non_exhaustive]
 pub(crate) struct RotateHmacKeyArgs {
     /// Profile name whose counterparty cache HMAC key should be rotated.
-    #[arg(long, value_name = "NAME", default_value = "default")]
-    pub(crate) profile: String,
+    ///
+    /// Defaults to the `STELLAR_AGENT_PROFILE` env var, then `"default"`.
+    #[arg(long = "profile", value_name = "NAME")]
+    pub(crate) profile: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -47,7 +49,10 @@ fn rotate_hmac_key_envelope(profile: &str) -> Envelope<RotateHmacKeyData> {
 /// Returns `0` on success, `1` when the profile cannot be loaded, the platform
 /// keyring cannot be initialized, or the keyring write fails.
 pub async fn run(args: &RotateHmacKeyArgs) -> i32 {
-    let profile = match loader::load(&args.profile, None) {
+    // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+
+    let profile = match loader::load(&profile_name, None) {
         Ok(p) => p,
         Err(loader::ProfileLoadError::NotFound { name, .. }) => {
             let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
@@ -55,9 +60,9 @@ pub async fn run(args: &RotateHmacKeyArgs) -> i32 {
             return 1;
         }
         Err(e) => {
-            tracing::debug!(profile = %args.profile, error = %e, "profile load failed");
+            tracing::debug!(profile = %profile_name, error = %e, "profile load failed");
             let err = WalletError::Validation(ValidationError::ProfileNotFound {
-                name: args.profile.clone(),
+                name: profile_name.clone(),
             });
             render::render_json(&Envelope::err(&err));
             return 1;
@@ -75,7 +80,7 @@ pub async fn run(args: &RotateHmacKeyArgs) -> i32 {
             tracing::info!(
                 "counterparty HMAC key rotated; cached stellar.toml entries must be refreshed"
             );
-            render::render_json(&rotate_hmac_key_envelope(&args.profile));
+            render::render_json(&rotate_hmac_key_envelope(&profile_name));
             0
         }
         Err(e) => {
@@ -106,7 +111,7 @@ mod tests {
     #[test]
     fn parse_rotate_hmac_key_args() {
         let parsed = RotateHmacKeyArgsHarness::parse_from(["test", "--profile", "alice"]);
-        assert_eq!(parsed.args.profile, "alice");
+        assert_eq!(parsed.args.profile.as_deref(), Some("alice"));
     }
 
     #[test]

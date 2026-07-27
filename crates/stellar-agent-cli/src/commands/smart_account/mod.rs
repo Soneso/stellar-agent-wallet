@@ -380,3 +380,35 @@ pub async fn run(args: &SmartAccountArgs) -> i32 {
         SmartAccountSubcommand::Execute(args) => execute::run(args).await,
     }
 }
+
+impl SmartAccountArgs {
+    /// The profile name this invocation operates on, as the selected subcommand
+    /// resolves it.
+    ///
+    /// `None` means the subcommand supplied no name, so
+    /// [`resolve_profile_name`](crate::common::resolve_profile_name) falls through
+    /// to `STELLAR_AGENT_PROFILE` and then `"default"` — the same fall-through the
+    /// subcommand itself performs. The startup advisory consumes this so it scans
+    /// the audit log of the profile the command uses.
+    ///
+    /// The verifier- and policy-deployment subcommands expose no `--profile`
+    /// flag, so their arms are `None`.
+    pub(crate) fn profile_flag(&self) -> Option<&str> {
+        match &self.subcommand {
+            SmartAccountSubcommand::Multicall(a) => a.profile.as_deref(),
+            SmartAccountSubcommand::Rules(a) => a.profile_flag(),
+            SmartAccountSubcommand::Signers(a) => a.profile_flag(),
+            SmartAccountSubcommand::Timelock(a) => a.profile_flag(),
+            SmartAccountSubcommand::MigrateVerifier(a) => a.profile.as_deref(),
+            SmartAccountSubcommand::ListRules(a) => a.profile.as_deref(),
+            SmartAccountSubcommand::RegisterMulticall(a) => a.profile.as_deref(),
+            SmartAccountSubcommand::UnregisterMulticall(a) => a.profile.as_deref(),
+            SmartAccountSubcommand::Execute(a) => a.profile.as_deref(),
+            SmartAccountSubcommand::DeployWebAuthnVerifier(_)
+            | SmartAccountSubcommand::DeployEd25519Verifier(_)
+            | SmartAccountSubcommand::DeploySpendingLimitPolicy(_)
+            | SmartAccountSubcommand::DeployPolicy(_)
+            | SmartAccountSubcommand::ListVerifiers(_) => None,
+        }
+    }
+}

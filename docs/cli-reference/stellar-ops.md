@@ -12,7 +12,7 @@ For the concepts referenced below (profiles, the policy engine, the approval spi
 
 Several flags recur across the commands on this page with the same meaning. Their full description lives in the [global conventions](index.md#global-conventions) section of the index:
 
-- `--profile <NAME>` — selects the [profile](../concepts.md). On the commands here it defaults to `"default"` (`accounts deploy-c` and `fees stats` instead default to no profile); none of these commands consult `STELLAR_AGENT_PROFILE`. Each command's table states its own default.
+- `--profile <NAME>` — selects the [profile](../concepts.md). `trustline` and every `counterparty` subcommand resolve it in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. `accounts create`, `pay`, and `claim` do not consult `STELLAR_AGENT_PROFILE`; their flag defaults to the literal `"default"`. `accounts deploy-c` and `fees stats` default to no profile at all. Each command's table states its own default.
 - `--network <NETWORK>` — `testnet` (default) or `mainnet`, case-insensitive. Write and signing commands structurally refuse `mainnet`; see [Mainnet-write refusal](index.md#mainnet-write-refusal).
 - `--rpc-url <URL>` — the Soroban RPC endpoint. Default `https://soroban-testnet.stellar.org` where applicable.
 - `--output <FORMAT>` — `json` (default) or `table`.
@@ -296,7 +296,7 @@ Creates or removes a classic trustline (`ChangeTrust`) behind an ordered trust g
 | `--from <G_STRKEY>` | Account that will hold the trustline | yes | — |
 | `--asset <ASSET>` | `USDC` (bare, pin table), `CODE:ISSUER`, or a `C...` SAC address (deferred) | yes | — |
 | `--limit-stroops <I64>` | Explicit trustline limit; `0` removes the trustline | optional | unlimited (`i64::MAX`) |
-| `--profile <NAME>` | Profile to load | optional | `default` |
+| `--profile <NAME>` | Profile to load | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--chain-id <CAIP2>` | CAIP-2 chain id, e.g. `stellar:testnet` | optional | profile value |
 | `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee | optional | profile `classic_fee_per_op_stroops` |
 
@@ -369,7 +369,7 @@ Lists the cached bindings for a profile — home domain plus fetched and expiry 
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--profile <NAME>` | Profile whose cache to list | optional | `default` |
+| `--profile <NAME>` | Profile whose cache to list | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--json` | Emit the canonical JSON envelope (JSON is the only shape; the flag is a no-op for scripting compatibility) | optional | `false` |
 
 ```bash
@@ -383,7 +383,7 @@ Force-fetches `https://<home-domain>/.well-known/stellar.toml`, HMAC-protects th
 | Flag / arg | Meaning | Required | Default |
 |---|---|---|---|
 | `<HOME_DOMAIN>` (positional) | Domain to refresh (strict ASCII, 1-32 chars) | yes | — |
-| `--profile <NAME>` | Profile whose cache to update | optional | `default` |
+| `--profile <NAME>` | Profile whose cache to update | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 
 ```bash
 stellar-agent counterparty refresh circle.com --profile default
@@ -396,7 +396,7 @@ Deletes a single cached binding, leaving other domains untouched. Exits `0` even
 | Flag / arg | Meaning | Required | Default |
 |---|---|---|---|
 | `<HOME_DOMAIN>` (positional) | Domain whose cache file to remove | yes | — |
-| `--profile <NAME>` | Profile whose cache to update | optional | `default` |
+| `--profile <NAME>` | Profile whose cache to update | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 
 ```bash
 stellar-agent counterparty evict circle.com --profile alice
@@ -408,7 +408,7 @@ Refreshes every `HOME_DOMAIN` entry currently configured in the profile's policy
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--profile <NAME>` | Profile whose allowlist to refresh | optional | `default` |
+| `--profile <NAME>` | Profile whose allowlist to refresh | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 
 ```bash
 stellar-agent counterparty warm-up --profile default
@@ -420,7 +420,7 @@ Rotates the per-profile counterparty cache HMAC key. After rotation, existing ca
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--profile <NAME>` | Profile whose cache HMAC key to rotate | optional | `default` |
+| `--profile <NAME>` | Profile whose cache HMAC key to rotate | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 
 ```bash
 stellar-agent counterparty rotate-hmac-key --profile default

@@ -107,7 +107,7 @@ impl RotatePolicyStateKeyArgs {
     /// The clap arg group over the positional `NAME` and `--profile` is
     /// `required` and mutually exclusive, so a parsed invocation sets exactly
     /// one of the two fields; this returns whichever was supplied.
-    fn profile_name(&self) -> &str {
+    pub(super) fn profile_name(&self) -> &str {
         self.name
             .as_deref()
             .or(self.profile.as_deref())

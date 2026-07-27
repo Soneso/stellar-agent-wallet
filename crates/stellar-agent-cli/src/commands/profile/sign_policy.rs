@@ -68,15 +68,17 @@ use stellar_agent_core::wallet::{MlockRequired, Wallet};
 use stellar_agent_network::keyring::map_keyring_error;
 
 use crate::commands::policy_engine::OWNER_KEY_SERVICE_PREFIX;
-use crate::common::render;
+use crate::common::{render, resolve_profile_name};
 
 /// Arguments for `stellar-agent profile sign-policy`.
 #[derive(Debug, Args)]
 #[non_exhaustive]
 pub(crate) struct SignPolicyArgs {
     /// Profile whose policy file should be signed.
-    #[arg(long, default_value = "default", value_name = "NAME")]
-    pub(crate) profile: String,
+    ///
+    /// Defaults to the `STELLAR_AGENT_PROFILE` env var, then `"default"`.
+    #[arg(long = "profile", value_name = "NAME")]
+    pub(crate) profile: Option<String>,
 
     /// Name of the environment variable that holds the owner `S...` strkey.
     ///
@@ -147,8 +149,11 @@ where
     LoadProfile: Fn(&str) -> Result<Profile, loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
+    // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+
     // ── Load profile first, then initialise the keyring store ─────────────────
-    let profile = match load_profile(&args.profile) {
+    let profile = match load_profile(&profile_name) {
         Ok(p) => p,
         Err(loader::ProfileLoadError::NotFound { name, .. }) => {
             let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
@@ -157,7 +162,7 @@ where
         }
         Err(e) => {
             let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("failed to load profile '{}': {e}", args.profile),
+                detail: format!("failed to load profile '{profile_name}': {e}"),
             });
             render::render_json(&Envelope::<()>::err(&err));
             return 1;
@@ -321,9 +326,9 @@ where
         return 1;
     }
 
-    tracing::info!("policy file signed for profile '{}'", args.profile);
+    tracing::info!("policy file signed for profile '{profile_name}'");
     render::render_json(&Envelope::ok(SignPolicyData {
-        profile: args.profile.clone(),
+        profile: profile_name.clone(),
         signed: true,
         owner_address,
         policy_path: policy_path.display().to_string(),
@@ -638,7 +643,7 @@ mod tests {
 
     fn args(file: &std::path::Path, var: &str) -> SignPolicyArgs {
         SignPolicyArgs {
-            profile: PROFILE_NAME.to_owned(),
+            profile: Some(PROFILE_NAME.to_owned()),
             secret_env: var.to_owned(),
             file: Some(file.to_path_buf()),
         }
@@ -859,7 +864,7 @@ mod tests {
     #[serial]
     async fn nonexistent_profile_returns_exit_1() {
         let args = SignPolicyArgs {
-            profile: "__nonexistent_sign_policy__".to_owned(),
+            profile: Some("__nonexistent_sign_policy__".to_owned()),
             secret_env: "__UNSET_SIGN_POLICY_VAR__".to_owned(),
             file: None,
         };

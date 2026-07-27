@@ -28,7 +28,9 @@ Profile files live one-per-name in the OS-conventional data directory:
 
 A profile is selected by name (the file stem). Both binaries resolve the name
 the same way: an explicit `--profile <NAME>`, then the `STELLAR_AGENT_PROFILE`
-environment variable, then `default`. When no name was given and no
+environment variable, then `default`. Three CLI verbs are the exception —
+`pay`, `claim`, and `accounts create` carry the literal default `default` on
+`--profile` and do not consult the environment variable. When no name was given and no
 `default.toml` exists yet, the MCP server falls back to an in-memory testnet
 configuration so it can still serve read-only requests (this fallback is never
 written to disk). A profile that WAS named but has no file is refused rather

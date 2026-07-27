@@ -17,11 +17,14 @@ use stellar_agent_network::{StellarRpcClient, fetch_account};
 use stellar_agent_pool::PoolError;
 
 use crate::common::render::render_json;
+use crate::common::resolve_profile_name;
 
 /// Arguments for `stellar-agent pool list`.
 #[derive(Debug, Args)]
 pub struct PoolListArgs {
-    /// Profile name.  Defaults to `"default"`.
+    /// Profile name.
+    ///
+    /// Defaults to the `STELLAR_AGENT_PROFILE` env var, then `"default"`.
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
 
@@ -83,8 +86,9 @@ fn pool_err_to_wallet_err(e: &PoolError) -> WalletError {
 ///
 /// Never panics.
 pub async fn run(args: &PoolListArgs) -> i32 {
-    let profile_name = args.profile.as_deref().unwrap_or("default");
-    let profile = match loader::load(profile_name, None) {
+    // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+    let profile = match loader::load(&profile_name, None) {
         Ok(p) => p,
         Err(e) => {
             let err = match e {

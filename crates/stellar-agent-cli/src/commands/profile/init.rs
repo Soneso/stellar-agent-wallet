@@ -115,15 +115,17 @@ use stellar_agent_core::profile::schema::{KeyringEntryRef, PolicyEngineKind, Pro
 
 use crate::common::network::TargetNetwork;
 use crate::common::render;
-use crate::common::validate_path_component_ascii_safe;
+use crate::common::{resolve_profile_name, validate_path_component_ascii_safe};
 
 /// Arguments for `stellar-agent profile init`.
 #[derive(Debug, Args)]
 #[non_exhaustive]
 pub(crate) struct InitArgs {
     /// Name of the profile to create.
-    #[arg(long, default_value = "default", value_name = "NAME")]
-    pub(crate) profile: String,
+    ///
+    /// Defaults to the `STELLAR_AGENT_PROFILE` env var, then `"default"`.
+    #[arg(long = "profile", value_name = "NAME")]
+    pub(crate) profile: Option<String>,
 
     /// Target network for the new profile.
     #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
@@ -200,12 +202,12 @@ pub async fn run(args: &InitArgs) -> i32 {
 /// plaintext scheme is refused), and
 /// `validation.profile_already_exists` (destination file present; the
 /// no-clobber persist repeats this refusal atomically at write time).
-fn init_refusal(args: &InitArgs, profile_dir: &Path) -> Option<WalletError> {
+fn init_refusal(args: &InitArgs, profile_name: &str, profile_dir: &Path) -> Option<WalletError> {
     // The name becomes a path component (`<profile_dir>/<name>.toml`);
     // reject path traversal / control characters before any filesystem access.
-    if let Err(reason) = validate_path_component_ascii_safe(&args.profile) {
+    if let Err(reason) = validate_path_component_ascii_safe(profile_name) {
         return Some(WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("invalid profile name '{}': {reason}", args.profile),
+            input: format!("invalid profile name '{profile_name}': {reason}"),
         }));
     }
 
@@ -230,11 +232,11 @@ fn init_refusal(args: &InitArgs, profile_dir: &Path) -> Option<WalletError> {
         }
     }
 
-    let dest = profile_dir.join(format!("{}.toml", args.profile));
+    let dest = profile_dir.join(format!("{profile_name}.toml"));
     if dest.exists() {
         return Some(WalletError::Validation(
             ValidationError::ProfileAlreadyExists {
-                name: args.profile.clone(),
+                name: profile_name.to_owned(),
                 path: dest.display().to_string(),
             },
         ));
@@ -249,7 +251,10 @@ fn init_refusal(args: &InitArgs, profile_dir: &Path) -> Option<WalletError> {
 /// fresh `tempfile::tempdir()` path so unit tests never read or write the
 /// canonical data root.
 fn run_with_dependencies(args: &InitArgs, profile_dir: &Path) -> i32 {
-    if let Some(err) = init_refusal(args, profile_dir) {
+    // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+
+    if let Some(err) = init_refusal(args, &profile_name, profile_dir) {
         render::render_json(&Envelope::<()>::err(&err));
         return 1;
     }
@@ -260,19 +265,19 @@ fn run_with_dependencies(args: &InitArgs, profile_dir: &Path) -> i32 {
     // same helpers the loader's synthesised first-run fallback uses — with the
     // placeholder "default" account; `with_profile_name` derives the five
     // security-substrate references.
-    let signer = KeyringEntryRef::default_signer(&args.profile);
-    let nonce = KeyringEntryRef::default_nonce(&args.profile);
+    let signer = KeyringEntryRef::default_signer(&profile_name);
+    let nonce = KeyringEntryRef::default_nonce(&profile_name);
 
     let mut builder = match args.network {
         TargetNetwork::Testnet => Profile::builder_testnet_named(
-            &args.profile,
+            &profile_name,
             &signer.service,
             &signer.account,
             &nonce.service,
             &nonce.account,
         ),
         TargetNetwork::Mainnet => Profile::builder_mainnet_named(
-            &args.profile,
+            &profile_name,
             &signer.service,
             &signer.account,
             &nonce.service,
@@ -301,11 +306,11 @@ fn run_with_dependencies(args: &InitArgs, profile_dir: &Path) -> i32 {
     }
 
     // ── Persist (no-clobber: atomic refusal if a file appeared meanwhile) ────
-    let written_path = match loader::save_new_to_dir(&args.profile, &profile, profile_dir) {
+    let written_path = match loader::save_new_to_dir(&profile_name, &profile, profile_dir) {
         Ok(p) => p,
         Err(loader::ProfileSaveError::AlreadyExists { path }) => {
             let err = WalletError::Validation(ValidationError::ProfileAlreadyExists {
-                name: args.profile.clone(),
+                name: profile_name.clone(),
                 path: path.display().to_string(),
             });
             render::render_json(&Envelope::<()>::err(&err));
@@ -313,7 +318,7 @@ fn run_with_dependencies(args: &InitArgs, profile_dir: &Path) -> i32 {
         }
         Err(e) => {
             let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("failed to write profile '{}': {e}", args.profile),
+                detail: format!("failed to write profile '{profile_name}': {e}"),
             });
             render::render_json(&Envelope::<()>::err(&err));
             return 1;
@@ -333,29 +338,29 @@ fn run_with_dependencies(args: &InitArgs, profile_dir: &Path) -> i32 {
         format!(
             "Run `stellar-agent profile enroll-signer --profile {} --secret-env <VAR>` to \
              register the MCP signer seed.",
-            args.profile
+            profile_name
         ),
         format!(
             "Run `stellar-agent profile rotate-audit-key {}` to mint the audit-log \
              hash-chain key (required before any signing verb will proceed).",
-            args.profile
+            profile_name
         ),
     ];
     if args.engine == PolicyEngineKind::V1 {
         next_steps.push(format!(
             "Run `stellar-agent profile enroll-owner-key --profile {} --secret-env <VAR>` \
              to enroll the policy-file owner key.",
-            args.profile
+            profile_name
         ));
         next_steps.push(format!(
             "Run `stellar-agent profile rotate-attestation-key {}` to mint the \
              approval-attestation key.",
-            args.profile
+            profile_name
         ));
         next_steps.push(format!(
             "Run `stellar-agent profile sign-policy --profile {} --secret-env <VAR>` to \
              sign the V1 policy file.",
-            args.profile
+            profile_name
         ));
         if args.network == TargetNetwork::Mainnet {
             next_steps.push(
@@ -368,13 +373,13 @@ fn run_with_dependencies(args: &InitArgs, profile_dir: &Path) -> i32 {
     }
 
     tracing::info!(
-        profile = %args.profile,
+        profile = %profile_name,
         chain_id = %profile.chain_id,
         engine = %profile.policy.engine,
         "profile initialised"
     );
     render::render_json(&Envelope::ok(InitData {
-        profile: args.profile.clone(),
+        profile: profile_name.clone(),
         path: written_path.display().to_string(),
         chain_id: profile.chain_id.caip2_str().to_owned(),
         rpc_url: profile.rpc_url.clone(),
@@ -402,11 +407,17 @@ mod tests {
 
     fn args(profile: &str) -> InitArgs {
         InitArgs {
-            profile: profile.to_owned(),
+            profile: Some(profile.to_owned()),
             network: TargetNetwork::Testnet,
             rpc_url: None,
             engine: PolicyEngineKind::V1,
         }
+    }
+
+    /// The name `run_with_dependencies` resolves for these args — always the
+    /// explicit one, since `args` always sets it.
+    fn resolved_name(args: &InitArgs) -> String {
+        resolve_profile_name(args.profile.as_deref()).name
     }
 
     /// RAII env-var guard; `#[serial]` on every test using it prevents
@@ -573,7 +584,7 @@ mod tests {
         let mut a = args("pin-mainnet");
         a.network = TargetNetwork::Mainnet;
         a.rpc_url = None;
-        let err = init_refusal(&a, dir.path()).expect("must refuse");
+        let err = init_refusal(&a, resolved_name(&a).as_str(), dir.path()).expect("must refuse");
         assert_eq!(err.code(), "validation.mainnet_rpc_url_required");
     }
 
@@ -585,7 +596,7 @@ mod tests {
         let mut a = args("pin-plaintext");
         a.network = TargetNetwork::Mainnet;
         a.rpc_url = Some("http://mainnet.example.com/rpc".to_owned());
-        let err = init_refusal(&a, dir.path()).expect("must refuse");
+        let err = init_refusal(&a, resolved_name(&a).as_str(), dir.path()).expect("must refuse");
         assert_eq!(err.code(), "validation.config_invalid");
     }
 
@@ -594,7 +605,8 @@ mod tests {
     fn refusal_existing_profile_yields_typed_code() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("pin-exists.toml"), "version = 2\n").unwrap();
-        let err = init_refusal(&args("pin-exists"), dir.path()).expect("must refuse");
+        let a = args("pin-exists");
+        let err = init_refusal(&a, resolved_name(&a).as_str(), dir.path()).expect("must refuse");
         assert_eq!(err.code(), "validation.profile_already_exists");
     }
 
@@ -603,10 +615,17 @@ mod tests {
     #[test]
     fn refusal_unsafe_name_yields_typed_code_and_clean_state_passes() {
         let dir = tempfile::tempdir().unwrap();
-        let err = init_refusal(&args("../escape"), dir.path()).expect("must refuse");
+        let unsafe_name = args("../escape");
+        let err = init_refusal(
+            &unsafe_name,
+            resolved_name(&unsafe_name).as_str(),
+            dir.path(),
+        )
+        .expect("must refuse");
         assert_eq!(err.code(), "validation.address_invalid");
+        let clean = args("clean-name");
         assert!(
-            init_refusal(&args("clean-name"), dir.path()).is_none(),
+            init_refusal(&clean, resolved_name(&clean).as_str(), dir.path()).is_none(),
             "a clean state must pass the refusal gate"
         );
     }

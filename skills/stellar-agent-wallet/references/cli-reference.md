@@ -31,7 +31,7 @@ These recur with the same meaning across groups:
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--profile <NAME>` | Selects the per-environment TOML profile (binds CAIP-2 chain, RPC, keyring entry references, thresholds, policy engine). Holds no secrets. | resolves `--profile` → `STELLAR_AGENT_PROFILE` → `"default"` |
+| `--profile <NAME>` | Selects the per-environment TOML profile (binds CAIP-2 chain, RPC, keyring entry references, thresholds, policy engine). Holds no secrets. | resolves `--profile` → `STELLAR_AGENT_PROFILE` → `"default"`; `pay`, `claim`, and `accounts create` instead default to the literal `default` and skip the environment variable |
 | `--network <NETWORK>` | `testnet` (default) or `mainnet`, case-insensitive | `testnet` |
 | `--rpc-url <URL>` | Primary Soroban RPC endpoint (allow-list validated) | `https://soroban-testnet.stellar.org` |
 | `--secondary-rpc-url <URL>` | Second RPC for two-RPC cross-checks (WASM-hash divergence) | per command |
@@ -208,7 +208,7 @@ stellar-agent balances --account GABC...WXYZ \
 | `--from <G_STRKEY>` (required) | Account that will hold the trustline | — |
 | `--asset <ASSET>` (required) | `USDC` (bare, pin table), `CODE:ISSUER`, or a `C...` SAC address (deferred, typed error) | — |
 | `--limit-stroops <I64>` | Explicit limit; `0` removes the trustline | unlimited (`i64::MAX`) |
-| `--profile <NAME>` | Profile to load | `default` |
+| `--profile <NAME>` | Profile to load | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--chain-id <CAIP2>` | CAIP-2 chain id, e.g. `stellar:testnet` | profile value |
 | `--fee` | shared | profile `classic_fee_per_op_stroops` |
 
@@ -295,7 +295,7 @@ Manages the per-profile cache of `stellar.toml` bindings backing the counterpart
 | `warm-up` | `counterparty warm-up [--profile NAME]` | Refreshes every domain in the profile's policy allowlist; exits `1` if any fails. |
 | `rotate-hmac-key` | `counterparty rotate-hmac-key [--profile NAME]` | Rotates the per-profile cache HMAC key; existing files then fail verification and need refresh. |
 
-`--profile` defaults to `default` for this group.
+`--profile` resolves `--profile` → `STELLAR_AGENT_PROFILE` → `default` for this group.
 
 ```bash
 stellar-agent counterparty refresh circle.com --profile default
@@ -364,7 +364,7 @@ Flags for every verb: see [`defi.md`](defi.md).
 
 ## pool
 
-The channel pool is a set of channel accounts derived from a single pool master seed at `m/44'/148'/<index>'`, used to submit transactions concurrently (not a DeFi venue). The master seed lives only in the OS keyring; channel private keys are re-derived on demand. Subcommands: `init`, `list`, `status`. All accept `--profile` (default `default`) and `--output` (`json` default or `table`).
+The channel pool is a set of channel accounts derived from a single pool master seed at `m/44'/148'/<index>'`, used to submit transactions concurrently (not a DeFi venue). The master seed lives only in the OS keyring; channel private keys are re-derived on demand. Subcommands: `init`, `list`, `status`. All accept `--profile` (resolves `--profile` → `STELLAR_AGENT_PROFILE` → `default`) and `--output` (`json` default or `table`).
 
 | Verb | Purpose | Extra flags |
 |---|---|---|
@@ -382,15 +382,15 @@ stellar-agent pool init --size 5 --profile default
 
 ## profile
 
-Creates, lists, shows, and migrates profiles, and rotates the keyring-backed keys a profile names. A profile is a per-environment TOML config (schema version 2) holding no secrets. Every subcommand accepts a `--profile <NAME>` flag: `init`, `enroll-signer`, `enroll-owner-key`, and `sign-policy` take only that flag (default `default`), while `show`, `migrate`, the `rotate-*` subcommands, and `reset-window-state` accept it as an exactly-one-of alternative to their positional `<NAME>` (supply one; both or neither is a usage error), with no default. No subcommand has a confirmation flag. All operate on local state — no network, no mainnet gate (`init`'s `--network mainnet` guard is a configuration-time refusal, not the mainnet-write gate). Uses the `{ok, data, request_id}` envelope.
+Creates, lists, shows, and migrates profiles, and rotates the keyring-backed keys a profile names. A profile is a per-environment TOML config (schema version 2) holding no secrets. Every subcommand accepts a `--profile <NAME>` flag: `init`, `enroll-signer`, `enroll-owner-key`, and `sign-policy` take only that flag (resolves `--profile` → `STELLAR_AGENT_PROFILE` → `default`), while `show`, `migrate`, the `rotate-*` subcommands, and `reset-window-state` accept it as an exactly-one-of alternative to their positional `<NAME>` (supply one; both or neither is a usage error), with no default. No subcommand has a confirmation flag. All operate on local state — no network, no mainnet gate (`init`'s `--network mainnet` guard is a configuration-time refusal, not the mainnet-write gate). Uses the `{ok, data, request_id}` envelope.
 
 | Verb | Form | Notes |
 |---|---|---|
-| `init` | `profile init --profile default --network testnet` | State-changing (writes the profile file). Creates a new profile TOML with per-profile-derived keyring refs (placeholder `"default"` signer/nonce accounts) and reports enrollment next steps. Mints no key material, emits no audit row. `--profile <NAME>` (default `default`), `--network <testnet\|mainnet>` (default `testnet`), `--rpc-url <URL>` (optional for testnet; required for mainnet, and must be `https://`), `--engine <v1\|noop>` (default `v1`; v1 needs the key ceremony before the MCP server starts — `next_steps` lists it — while `noop` works immediately once the audit key is minted, via `rotate-audit-key`, required on every engine). Refuses if `<name>.toml` already exists, or if mainnet is selected without an `https://` `--rpc-url`. |
+| `init` | `profile init --profile default --network testnet` | State-changing (writes the profile file). Creates a new profile TOML with per-profile-derived keyring refs (placeholder `"default"` signer/nonce accounts) and reports enrollment next steps. Mints no key material, emits no audit row. `--profile <NAME>` (resolves `--profile` → `STELLAR_AGENT_PROFILE` → `default`), `--network <testnet\|mainnet>` (default `testnet`), `--rpc-url <URL>` (optional for testnet; required for mainnet, and must be `https://`), `--engine <v1\|noop>` (default `v1`; v1 needs the key ceremony before the MCP server starts — `next_steps` lists it — while `noop` works immediately once the audit key is minted, via `rotate-audit-key`, required on every engine). Refuses if `<name>.toml` already exists, or if mainnet is selected without an `https://` `--rpc-url`. |
 | `list` | `profile list` | Read-only. Returns known profile names sorted as a JSON array. No flags. |
 | `show <NAME>` | `profile show default` | Read-only. Resolved config; keyring refs appear as opaque `{service, account}`, secrets never read. Exits `1` with `ProfileNotFound` or an unsupported-version error. |
 | `migrate <NAME>` | `profile migrate default` | State-changing (atomic temp+rename). No-op if already current (`status:"no_op"`); else `status:"migrated"` with `from_version`/`to_version`/`path`. |
-| `enroll-signer` | `profile enroll-signer --profile default --secret-env WALLET_SK` | State-changing (keyring, and the profile TOML when the account is still a placeholder). Imports the operator's `S...` ed25519 seed from the named env var and stores it verbatim at the profile's `mcp_signer_default` coordinate (the signer every MCP fund-movement tool and keyring-signing CLI verb resolves). Classification uses the raw on-disk value: the literal placeholder `"default"` is pinned to the derived G-strkey (only that key is patched); a pinned G-strkey mismatch refuses; any other value refuses as malformed (`enroll_signer.account_malformed`). `--secret-env <VAR>` (required, the variable name), `--profile <NAME>` (default `default`), `--expected-address <G_STRKEY>`, `--force`. |
+| `enroll-signer` | `profile enroll-signer --profile default --secret-env WALLET_SK` | State-changing (keyring, and the profile TOML when the account is still a placeholder). Imports the operator's `S...` ed25519 seed from the named env var and stores it verbatim at the profile's `mcp_signer_default` coordinate (the signer every MCP fund-movement tool and keyring-signing CLI verb resolves). Classification uses the raw on-disk value: the literal placeholder `"default"` is pinned to the derived G-strkey (only that key is patched); a pinned G-strkey mismatch refuses; any other value refuses as malformed (`enroll_signer.account_malformed`). `--secret-env <VAR>` (required, the variable name), `--profile <NAME>` (resolves `--profile` → `STELLAR_AGENT_PROFILE` → `default`), `--expected-address <G_STRKEY>`, `--force`. |
 | `enroll-owner-key` | `profile enroll-owner-key --profile default --secret-env WALLET_OWNER_SK` | State-changing (keyring). Derives the owner ed25519 PUBLIC key from an operator `S...` seed and stores it at `policy_owner_key_id` (the key the V1 engine verifies against). The seed is never stored. `--expected-address`, `--force`. |
 | `sign-policy` | `profile sign-policy --profile default --secret-env WALLET_OWNER_SK` | State-changing (writes the policy file, atomic). Signs `<state_dir>/policies/<profile>.toml` (or `--file`) with the owner seed and writes the `[signature]` table. Refuses if the seed does not match the enrolled owner key. |
 

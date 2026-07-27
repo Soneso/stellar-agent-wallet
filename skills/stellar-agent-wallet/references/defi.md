@@ -32,8 +32,9 @@ The MCP tool catalog and envelope details are in `./mcp-tools.md`.
 `lend`, `vault deposit`, `vault withdraw`, and `trade` are signing commands.
 Before signing, each one:
 
-1. Loads the named profile (`--profile`, default `default`) and resolves the
-   CAIP-2 chain id, RPC endpoint, and network passphrase from it.
+1. Loads the named profile (`--profile`, else `STELLAR_AGENT_PROFILE`, else
+   `default`) and resolves the CAIP-2 chain id, RPC endpoint, and network
+   passphrase from it.
 2. Pins the target contract by WASM hash (a two-RPC cross-check when
    `--secondary-rpc-url` is supplied) so the named address actually runs the code
    the wallet expects.
@@ -85,7 +86,7 @@ health factor is display-only and never gates signing.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--profile <NAME>` | Profile to load | Optional | `default` |
+| `--profile <NAME>` | Profile to load | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--pool <C-strkey>` | Blend pool contract address | Required | — |
 | `--from <C-strkey>` | Wallet smart-account address submitting the request | Required | — |
 | `--op <OP>` | One of `supply`, `withdraw`, `supply-collateral`, `withdraw-collateral`, `borrow`, `repay` | Required | — |
@@ -138,7 +139,7 @@ protection on that asset, opted into explicitly.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--profile <NAME>` | Profile to load | Optional | `default` |
+| `--profile <NAME>` | Profile to load | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--vault <C-strkey>` | DeFindex vault contract address | Required | — |
 | `--from <C-strkey>` | Wallet smart-account address submitting the deposit | Required | — |
 | `--amounts-desired <i128>...` | Desired deposit amount per asset, in declaration order (one or more) | Required | — |
@@ -164,7 +165,7 @@ pre-sign refusal.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--profile <NAME>` | Profile to load | Optional | `default` |
+| `--profile <NAME>` | Profile to load | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--vault <C-strkey>` | DeFindex vault contract address | Required | — |
 | `--from <C-strkey>` | Wallet smart-account address submitting the withdrawal | Required | — |
 | `--shares <i128>` | Number of vault shares to redeem (raw on-chain value) | Required | — |
@@ -204,7 +205,7 @@ explicit address vector and is never auto-routed.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--profile <NAME>` | Profile to load | Optional | `default` |
+| `--profile <NAME>` | Profile to load | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--from <C-strkey>` | Wallet smart-account address submitting the swap | Required | — |
 | `--amount-in <i128>` | Exact input token amount in base units | Required | — |
 | `--amount-out-min <i128>` | Minimum output amount, as an absolute floor (not a percent) | Required | — |
@@ -268,7 +269,7 @@ master orphans all previously funded channels.
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
 | `--size <N>` | Number of channel accounts to create (`1..=19`) | Required | — |
-| `--profile <NAME>` | Profile for the funder key and RPC endpoint | Optional | `default` |
+| `--profile <NAME>` | Profile for the funder key and RPC endpoint | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--force` | Overwrite an existing pool master key (orphans previously funded channels) | Optional | `false` |
 | `--output <FORMAT>` | `json` or `table` | Optional | `json` |
 
@@ -292,7 +293,7 @@ command.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--profile <NAME>` | Profile to load | Optional | `default` |
+| `--profile <NAME>` | Profile to load | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--output <FORMAT>` | `json` or `table` | Optional | `json` |
 
 ```bash
@@ -310,7 +311,7 @@ flood".
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--profile <NAME>` | Profile to load | Optional | `default` |
+| `--profile <NAME>` | Profile to load | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--output <FORMAT>` | `json` or `table` | Optional | `json` |
 
 ```bash

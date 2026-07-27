@@ -84,6 +84,7 @@ use stellar_agent_network::{
 };
 
 use crate::common::render::render_json;
+use crate::common::resolve_profile_name;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Argument types
@@ -120,9 +121,9 @@ pub enum VaultAction {
 /// ```
 #[derive(Debug, Args)]
 pub struct VaultDepositCliArgs {
-    /// Profile name to load (default: "default").
-    #[arg(long, default_value = "default")]
-    pub profile: String,
+    /// Profile name to load (default: `STELLAR_AGENT_PROFILE` env var, then `"default"`).
+    #[arg(long = "profile", value_name = "NAME")]
+    pub profile: Option<String>,
 
     /// The DeFindex vault contract address (C-strkey).
     #[arg(long)]
@@ -173,9 +174,9 @@ pub struct VaultDepositCliArgs {
 /// ```
 #[derive(Debug, Args)]
 pub struct VaultWithdrawCliArgs {
-    /// Profile name to load (default: "default").
-    #[arg(long, default_value = "default")]
-    pub profile: String,
+    /// Profile name to load (default: `STELLAR_AGENT_PROFILE` env var, then `"default"`).
+    #[arg(long = "profile", value_name = "NAME")]
+    pub profile: Option<String>,
 
     /// The DeFindex vault contract address (C-strkey).
     #[arg(long)]
@@ -246,8 +247,12 @@ where
     LoadProfile: Fn(&str) -> Result<Profile, profile_loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
+    // ── Resolve the profile name ──────────────────────────────────────────────
+    // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+
     // ── Load profile ──────────────────────────────────────────────────────────
-    let profile = match load_profile(&args.profile) {
+    let profile = match load_profile(&profile_name) {
         Ok(p) => p,
         Err(e) => {
             render_json(&Envelope::<()>::err_raw(
@@ -459,7 +464,7 @@ where
     // signer is loaded (below) or the deposit is submitted. Reused (not
     // re-acquired) for `DefiAdapterCtx::audit_writer`.
     let audit_writer =
-        match crate::commands::value_audit::require_value_audit_writer(&profile, &args.profile) {
+        match crate::commands::value_audit::require_value_audit_writer(&profile, &profile_name) {
             Ok(w) => w,
             Err(e) => {
                 render_json(&Envelope::<()>::err(&e));
@@ -579,8 +584,12 @@ where
     LoadProfile: Fn(&str) -> Result<Profile, profile_loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
+    // ── Resolve the profile name ──────────────────────────────────────────────
+    // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+
     // ── Load profile ──────────────────────────────────────────────────────────
-    let profile = match load_profile(&args.profile) {
+    let profile = match load_profile(&profile_name) {
         Ok(p) => p,
         Err(e) => {
             render_json(&Envelope::<()>::err_raw(
@@ -785,7 +794,7 @@ where
     // signer is loaded (below) or the withdrawal is submitted. Reused (not
     // re-acquired) for `DefiAdapterCtx::audit_writer`.
     let audit_writer =
-        match crate::commands::value_audit::require_value_audit_writer(&profile, &args.profile) {
+        match crate::commands::value_audit::require_value_audit_writer(&profile, &profile_name) {
             Ok(w) => w,
             Err(e) => {
                 render_json(&Envelope::<()>::err(&e));
@@ -880,6 +889,23 @@ where
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
+impl VaultArgs {
+    /// The profile name this invocation operates on, as the selected subcommand
+    /// resolves it.
+    ///
+    /// `None` means the subcommand supplied no name, so
+    /// [`resolve_profile_name`](crate::common::resolve_profile_name) falls through
+    /// to `STELLAR_AGENT_PROFILE` and then `"default"` — the same fall-through the
+    /// subcommand itself performs. The startup advisory consumes this so it scans
+    /// the audit log of the profile the command uses.
+    pub(crate) fn profile_flag(&self) -> Option<&str> {
+        match &self.action {
+            VaultAction::Deposit(a) => a.profile.as_deref(),
+            VaultAction::Withdraw(a) => a.profile.as_deref(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -928,7 +954,7 @@ mod tests {
         let init_writer = Arc::clone(&init_invoked);
 
         let args = VaultDepositCliArgs {
-            profile: "keyring-order-test".to_owned(),
+            profile: Some("keyring-order-test".to_owned()),
             vault: String::new(),
             from: String::new(),
             amounts_desired: Vec::new(),
@@ -979,7 +1005,7 @@ mod tests {
         let init_writer = Arc::clone(&init_invoked);
 
         let args = VaultWithdrawCliArgs {
-            profile: "keyring-order-test".to_owned(),
+            profile: Some("keyring-order-test".to_owned()),
             vault: String::new(),
             from: String::new(),
             shares: 0,
@@ -1228,7 +1254,7 @@ mod tests {
         let rpc_url = server.uri();
 
         let args = VaultDepositCliArgs {
-            profile: "vault-deposit-audit-preflight-test".to_owned(),
+            profile: Some("vault-deposit-audit-preflight-test".to_owned()),
             vault: vault_c.to_owned(),
             from: asset_c.to_owned(),
             amounts_desired: vec![1_000_000],
@@ -1302,7 +1328,7 @@ mod tests {
         let rpc_url = server.uri();
 
         let args = VaultWithdrawCliArgs {
-            profile: "vault-withdraw-audit-preflight-test".to_owned(),
+            profile: Some("vault-withdraw-audit-preflight-test".to_owned()),
             vault: vault_c.to_owned(),
             from: asset_c.to_owned(),
             shares: 1_000_000,

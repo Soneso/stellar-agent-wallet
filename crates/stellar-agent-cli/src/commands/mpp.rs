@@ -33,6 +33,7 @@ use stellar_agent_network::{
 use crate::commands::{
     policy_engine::build_v1_policy_engine, value_audit::emit_value_audit_row_strict,
 };
+use crate::common::resolve_profile_name;
 
 const MAX_INPUT_BYTES: usize = 128 * 1024;
 const MAX_REASON_BYTES: usize = 4 * 1024;
@@ -79,9 +80,9 @@ enum MppChargeCommand {
         .args(["input_stdin", "input_file", "approval_id"])
 ))]
 struct MppAuthorizeArgs {
-    /// Wallet profile.
-    #[arg(long, default_value = "default")]
-    profile: String,
+    /// Wallet profile (default: `STELLAR_AGENT_PROFILE` env var, then `"default"`).
+    #[arg(long = "profile", value_name = "NAME")]
+    profile: Option<String>,
     /// Read a tagged ChallengeInput JSON object from stdin.
     #[arg(long, conflicts_with_all = ["input_file", "approval_id"])]
     input_stdin: bool,
@@ -107,8 +108,9 @@ enum MppAuthorizationCommand {
 
 #[derive(Debug, Args)]
 struct MppStatusArgs {
-    #[arg(long, default_value = "default")]
-    profile: String,
+    /// Wallet profile (default: `STELLAR_AGENT_PROFILE` env var, then `"default"`).
+    #[arg(long = "profile", value_name = "NAME")]
+    profile: Option<String>,
     #[arg(long)]
     authorization_id: String,
 }
@@ -138,8 +140,9 @@ enum ReceiptTransport {
         .args(["receipt_stdin", "receipt_file"])
 ))]
 struct MppReceiptArgs {
-    #[arg(long, default_value = "default")]
-    profile: String,
+    /// Wallet profile (default: `STELLAR_AGENT_PROFILE` env var, then `"default"`).
+    #[arg(long = "profile", value_name = "NAME")]
+    profile: Option<String>,
     #[arg(long)]
     authorization_id: String,
     #[arg(long)]
@@ -169,8 +172,9 @@ enum MppSettlementCommand {
         .args(["reference_stdin", "reference_file"])
 ))]
 struct MppReconcileArgs {
-    #[arg(long, default_value = "default")]
-    profile: String,
+    /// Wallet profile (default: `STELLAR_AGENT_PROFILE` env var, then `"default"`).
+    #[arg(long = "profile", value_name = "NAME")]
+    profile: Option<String>,
     #[arg(long)]
     authorization_id: String,
     #[arg(long, conflicts_with = "reference_file")]
@@ -228,7 +232,8 @@ pub async fn run(args: MppArgs) -> i32 {
 }
 
 async fn authorize(args: MppAuthorizeArgs) -> i32 {
-    let profile = match load_testnet_profile(&args.profile) {
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+    let profile = match load_testnet_profile(&profile_name) {
         Ok(profile) => profile,
         Err(error) => return render_error(&error),
     };
@@ -241,7 +246,7 @@ async fn authorize(args: MppAuthorizeArgs) -> i32 {
     };
     let now_unix = i64::try_from(now_ms / 1_000).unwrap_or(i64::MAX);
     if let Some(approval_id) = args.approval_id.as_deref() {
-        let state = match MppAuthorizationStore::from_profile_keyring(&args.profile, false) {
+        let state = match MppAuthorizationStore::from_profile_keyring(&profile_name, false) {
             Ok(state) => state,
             Err(error) => return render_error(&error),
         };
@@ -249,18 +254,19 @@ async fn authorize(args: MppAuthorizeArgs) -> i32 {
             Ok(record) => record,
             Err(error) => return render_error(&error),
         };
-        return commit_cli(&args.profile, &profile, &state, &record, now_unix).await;
+        return commit_cli(&profile_name, &profile, &state, &record, now_unix).await;
     }
     // First-use key material is created only after validation and successful simulation.
-    prepare_and_authorize_without_state(args, profile, now_unix).await
+    prepare_and_authorize_without_state(&args, &profile_name, profile, now_unix).await
 }
 
 async fn prepare_and_authorize_without_state(
-    args: MppAuthorizeArgs,
+    args: &MppAuthorizeArgs,
+    profile_name: &str,
     profile: stellar_agent_core::profile::schema::Profile,
     now_unix: i64,
 ) -> i32 {
-    let input = match read_authorize_input(&args) {
+    let input = match read_authorize_input(args) {
         Ok(input) => input,
         Err(error) => return render_error(&error),
     };
@@ -283,11 +289,11 @@ async fn prepare_and_authorize_without_state(
         Ok(prepared) => prepared,
         Err(error) => return render_error(&error),
     };
-    let state = match MppAuthorizationStore::from_profile_keyring(&args.profile, true) {
+    let state = match MppAuthorizationStore::from_profile_keyring(profile_name, true) {
         Ok(state) => state,
         Err(error) => return render_error(&error),
     };
-    persist_and_maybe_commit(&args.profile, &profile, &state, prepared, now_unix).await
+    persist_and_maybe_commit(profile_name, &profile, &state, prepared, now_unix).await
 }
 
 async fn persist_and_maybe_commit(
@@ -485,13 +491,14 @@ async fn commit_cli(
 }
 
 fn status(args: &MppStatusArgs) -> i32 {
-    if let Err(error) = load_testnet_profile(&args.profile) {
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+    if let Err(error) = load_testnet_profile(&profile_name) {
         return render_error(&error);
     }
     if init_platform_keyring_store().is_err() {
         return render_error(&state_error());
     }
-    let state = match MppAuthorizationStore::from_profile_keyring(&args.profile, false) {
+    let state = match MppAuthorizationStore::from_profile_keyring(&profile_name, false) {
         Ok(state) => state,
         Err(error) => return render_error(&error),
     };
@@ -505,7 +512,8 @@ fn status(args: &MppStatusArgs) -> i32 {
 }
 
 fn record_receipt(args: &MppReceiptArgs) -> i32 {
-    let profile = match load_testnet_profile(&args.profile) {
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+    let profile = match load_testnet_profile(&profile_name) {
         Ok(profile) => profile,
         Err(error) => return render_error(&error),
     };
@@ -536,7 +544,7 @@ fn record_receipt(args: &MppReceiptArgs) -> i32 {
         Ok(receipt) => receipt,
         Err(error) => return render_error(&error),
     };
-    let state = match MppAuthorizationStore::from_profile_keyring(&args.profile, false) {
+    let state = match MppAuthorizationStore::from_profile_keyring(&profile_name, false) {
         Ok(state) => state,
         Err(error) => return render_error(&error),
     };
@@ -556,7 +564,7 @@ fn record_receipt(args: &MppReceiptArgs) -> i32 {
         receipt.status(),
         uuid::Uuid::new_v4().to_string(),
     );
-    if emit_value_audit_row_strict(&profile, &args.profile, entry).is_err() {
+    if emit_value_audit_row_strict(&profile, &profile_name, entry).is_err() {
         return render_error(&state_error());
     }
     print_success(json!({
@@ -569,7 +577,8 @@ fn record_receipt(args: &MppReceiptArgs) -> i32 {
 }
 
 async fn reconcile(args: MppReconcileArgs) -> i32 {
-    let profile = match load_testnet_profile(&args.profile) {
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+    let profile = match load_testnet_profile(&profile_name) {
         Ok(profile) => profile,
         Err(error) => return render_error(&error),
     };
@@ -584,7 +593,7 @@ async fn reconcile(args: MppReconcileArgs) -> i32 {
             },
             Err(error) => return render_error(&error),
         };
-    let state = match MppAuthorizationStore::from_profile_keyring(&args.profile, false) {
+    let state = match MppAuthorizationStore::from_profile_keyring(&profile_name, false) {
         Ok(state) => state,
         Err(error) => return render_error(&error),
     };
@@ -606,7 +615,7 @@ async fn reconcile(args: MppReconcileArgs) -> i32 {
         result.outcome.clone(),
         uuid::Uuid::new_v4().to_string(),
     );
-    if emit_value_audit_row_strict(&profile, &args.profile, entry).is_err() {
+    if emit_value_audit_row_strict(&profile, &profile_name, entry).is_err() {
         return render_error(&state_error());
     }
     print_success(result);
@@ -843,6 +852,39 @@ const fn reconciliation_error() -> MppError {
         MppErrorCode::ReconciliationUnavailable,
         "ledger reconciliation could not verify the MPP transaction",
     )
+}
+
+impl MppArgs {
+    /// The profile name this invocation operates on, as the selected subcommand
+    /// resolves it.
+    ///
+    /// `None` means the subcommand supplied no name, so
+    /// [`resolve_profile_name`](crate::common::resolve_profile_name) falls through
+    /// to `STELLAR_AGENT_PROFILE` and then `"default"` — the same fall-through the
+    /// subcommand itself performs. The startup advisory consumes this so it scans
+    /// the audit log of the profile the command uses.
+    ///
+    /// `mpp state prune` takes a required `--profile`, so its arm is always
+    /// `Some`.
+    pub(crate) fn profile_flag(&self) -> Option<&str> {
+        match &self.command {
+            MppCommand::Charge(g) => match &g.command {
+                MppChargeCommand::Authorize(a) => a.profile.as_deref(),
+            },
+            MppCommand::Authorization(g) => match &g.command {
+                MppAuthorizationCommand::Status(a) => a.profile.as_deref(),
+            },
+            MppCommand::Receipt(g) => match &g.command {
+                MppReceiptCommand::Record(a) => a.profile.as_deref(),
+            },
+            MppCommand::Settlement(g) => match &g.command {
+                MppSettlementCommand::Reconcile(a) => a.profile.as_deref(),
+            },
+            MppCommand::State(g) => match &g.command {
+                MppStateCommand::Prune(a) => Some(a.profile.as_str()),
+            },
+        }
+    }
 }
 
 #[cfg(test)]

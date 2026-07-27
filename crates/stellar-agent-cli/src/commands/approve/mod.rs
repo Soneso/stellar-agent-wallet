@@ -130,3 +130,23 @@ pub async fn dispatch(args: ApproveArgs) -> i32 {
         None => run::run(args.run).await,
     }
 }
+
+impl ApproveArgs {
+    /// The profile name this invocation operates on, as the selected subcommand
+    /// resolves it.
+    ///
+    /// `None` means the subcommand supplied no name, so
+    /// [`resolve_profile_name`](crate::common::resolve_profile_name) falls through
+    /// to `STELLAR_AGENT_PROFILE` and then `"default"` — the same fall-through the
+    /// subcommand itself performs. The startup advisory consumes this so it scans
+    /// the audit log of the profile the command uses.
+    pub(crate) fn profile_flag(&self) -> Option<&str> {
+        match &self.subcommand {
+            Some(ApproveSubcommand::Gc(a)) => a.profile.as_deref(),
+            Some(ApproveSubcommand::List(a)) => a.profile.as_deref(),
+            Some(ApproveSubcommand::Serve(a)) => a.profile.as_deref(),
+            Some(ApproveSubcommand::Operator(a)) => a.profile_flag(),
+            None => self.run.profile.as_deref(),
+        }
+    }
+}

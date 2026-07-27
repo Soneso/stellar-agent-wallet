@@ -3365,6 +3365,34 @@ fn emit_error_sa(err: &SaError, output: OutputFormat, request_id: &str) -> i32 {
     emit_error(&wrapped, output, request_id)
 }
 
+impl RulesArgs {
+    /// The profile name this invocation operates on, as the selected subcommand
+    /// resolves it.
+    ///
+    /// `None` means the subcommand supplied no name, so
+    /// [`resolve_profile_name`](crate::common::resolve_profile_name) falls through
+    /// to `STELLAR_AGENT_PROFILE` and then `"default"` — the same fall-through the
+    /// subcommand itself performs. The startup advisory consumes this so it scans
+    /// the audit log of the profile the command uses.
+    pub(crate) fn profile_flag(&self) -> Option<&str> {
+        match &self.subcommand {
+            RulesSubcommand::Create(a) => a.common.profile.as_deref(),
+            // `CommonRulesReadArgs` carries no `--profile`; these two read
+            // subcommands resolve from the environment and `"default"` alone.
+            RulesSubcommand::Get(_) => None,
+            RulesSubcommand::SetName(a) => a.common.profile.as_deref(),
+            RulesSubcommand::SetValidUntil(a) => a.common.profile.as_deref(),
+            RulesSubcommand::Delete(a) => a.common.profile.as_deref(),
+            RulesSubcommand::VerifyPins(a) => a.profile.as_deref(),
+            RulesSubcommand::AddPolicy(a) => a.profile.as_deref(),
+            RulesSubcommand::RemovePolicy(a) => a.profile.as_deref(),
+            RulesSubcommand::GetSpendingLimit(_) => None,
+            RulesSubcommand::SetSpendingLimit(a) => a.profile.as_deref(),
+            RulesSubcommand::List(a) => a.profile.as_deref(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(

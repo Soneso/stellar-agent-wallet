@@ -2299,6 +2299,29 @@ fn emit_error_sa(err: &SaError, request_id: &str) -> i32 {
     emit_error(&wrap_sa_error(err), request_id)
 }
 
+impl SignersArgs {
+    /// The profile name this invocation operates on, as the selected subcommand
+    /// resolves it.
+    ///
+    /// `None` means the subcommand supplied no name, so
+    /// [`resolve_profile_name`](crate::common::resolve_profile_name) falls through
+    /// to `STELLAR_AGENT_PROFILE` and then `"default"` — the same fall-through the
+    /// subcommand itself performs. The startup advisory consumes this so it scans
+    /// the audit log of the profile the command uses.
+    pub(crate) fn profile_flag(&self) -> Option<&str> {
+        match &self.subcommand {
+            SignersSubcommand::List(a) => a.profile.as_deref(),
+            SignersSubcommand::Refresh(a) => a.profile.as_deref(),
+            SignersSubcommand::Add(a) => a.profile.as_deref(),
+            SignersSubcommand::Remove(a) => a.profile.as_deref(),
+            SignersSubcommand::SetThreshold(a) => a.profile.as_deref(),
+            SignersSubcommand::SetWeightedThreshold(a) => a.profile.as_deref(),
+            SignersSubcommand::SetSignerWeight(a) => a.profile.as_deref(),
+            SignersSubcommand::BatchAdd(a) => a.profile.as_deref(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(

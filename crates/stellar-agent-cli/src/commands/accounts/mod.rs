@@ -78,3 +78,23 @@ pub async fn run(args: &AccountsArgs) -> i32 {
         AccountsSubcommand::DeployC(args) => deploy_c::run(args).await,
     }
 }
+
+impl AccountsArgs {
+    /// The profile name this invocation operates on, as the selected subcommand
+    /// resolves it.
+    ///
+    /// `None` means the subcommand supplied no name, so
+    /// [`resolve_profile_name`](crate::common::resolve_profile_name) falls through
+    /// to `STELLAR_AGENT_PROFILE` and then `"default"` — the same fall-through the
+    /// subcommand itself performs. The startup advisory consumes this so it scans
+    /// the audit log of the profile the command uses.
+    ///
+    /// `accounts create` carries a clap default on its own `--profile`, so its
+    /// arm returns that value rather than `None`.
+    pub(crate) fn profile_flag(&self) -> Option<&str> {
+        match &self.subcommand {
+            AccountsSubcommand::Create(a) => Some(a.profile.as_str()),
+            AccountsSubcommand::DeployC(a) => a.profile.as_deref(),
+        }
+    }
+}

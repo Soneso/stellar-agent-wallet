@@ -222,8 +222,19 @@ pub struct DeployCArgs {
 
     /// Profile whose audit-log writer should receive deployment entries.
     ///
-    /// When omitted, deployment preserves the legacy profile-agnostic behavior
-    /// and does not emit deploy-c audit entries from the CLI handler.
+    /// This flag is read two different ways, and the split is deliberate:
+    ///
+    /// - **Audit writer** (`resolve_audit_writer`): absence means "no audit
+    ///   writer". The command deploys without emitting deploy-c audit entries
+    ///   from the CLI handler, and neither `STELLAR_AGENT_PROFILE` nor the
+    ///   `"default"` fallback substitutes a profile — opting out of audit
+    ///   emission must stay an explicit, local decision.
+    /// - **Every other consumer** (the `mlock`-degradation row, the passkey
+    ///   registry lookup behind `--signer-webauthn`, and the signer ceremony's
+    ///   profile context) resolves the name through `resolve_profile_name`:
+    ///   this flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. Those
+    ///   consumers need a name for a path or a log field, and have no
+    ///   "no profile" mode.
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
 

@@ -24,33 +24,7 @@ use clap::{Parser, Subcommand};
 use stellar_agent_core::observability;
 use stellar_agent_core::profile::schema::default_audit_log_path_for;
 
-/// Extracts the effective profile name from raw CLI arguments before clap parsing.
-///
-/// Scans `std::env::args()` for `--profile <NAME>` and returns `NAME` when
-/// found. Falls back to `"default"` when absent. This mirrors the per-subcommand
-/// `resolve_profile_name` logic without re-parsing the full command tree.
-///
-/// Used exclusively by the startup advisory pre-dispatch hook to resolve the
-/// audit-log path before clap consumes the argument vector.
-fn extract_profile_name_from_env_args() -> String {
-    let args: Vec<String> = std::env::args().collect();
-    let mut iter = args.iter().peekable();
-    while let Some(arg) = iter.next() {
-        if arg == "--profile"
-            && let Some(name) = iter.peek()
-            && !name.starts_with('-')
-        {
-            return (*name).clone();
-        }
-        // Handle `--profile=NAME` form.
-        if let Some(name) = arg.strip_prefix("--profile=")
-            && !name.is_empty()
-        {
-            return name.to_owned();
-        }
-    }
-    "default".to_owned()
-}
+use crate::common::resolve_profile_name;
 
 /// Stellar agent wallet command-line interface.
 ///
@@ -266,6 +240,45 @@ enum Commands {
     SmartAccount(commands::smart_account::SmartAccountArgs),
 }
 
+impl Commands {
+    /// The profile name the selected subcommand operates on, before the
+    /// environment-variable and `"default"` fall-through.
+    ///
+    /// `Some(name)` is a name the subcommand itself will use — an explicit
+    /// `--profile`, a positional `<NAME>`, or a clap default the subcommand
+    /// carries. `None` means the subcommand supplied nothing, so
+    /// [`resolve_profile_name`] falls through exactly as the subcommand does.
+    ///
+    /// Feeding this to [`resolve_profile_name`] is what makes the startup
+    /// advisory's profile equal the command's own: both sides consume the same
+    /// parsed value through the same resolver, including for the verbs that
+    /// carry a clap default and therefore never consult the environment.
+    fn profile_flag(&self) -> Option<&str> {
+        match self {
+            Self::Approve(a) => a.profile_flag(),
+            Self::Audit(a) => a.profile_flag(),
+            Self::Accounts(a) => a.profile_flag(),
+            Self::Counterparty(a) => a.profile_flag(),
+            Self::Fees(a) => a.profile_flag(),
+            Self::Pay(a) => Some(a.profile.as_str()),
+            Self::Mpp(a) => a.profile_flag(),
+            Self::Pool(a) => a.profile_flag(),
+            Self::Profile(a) => a.profile_flag(),
+            Self::Credentials(a) => a.profile_flag(),
+            Self::Lend(a) => a.profile.as_deref(),
+            Self::Vault(a) => a.profile_flag(),
+            Self::Trade(a) => a.profile.as_deref(),
+            Self::Trustline(a) => a.profile.as_deref(),
+            Self::Claim(a) => Some(a.profile.as_str()),
+            Self::Toolsets(a) => a.profile_flag(),
+            Self::SmartAccount(a) => a.profile_flag(),
+            // No profile selector: `balances` targets an account through
+            // `--rpc-url`, `friendbot` funds one through a funding endpoint.
+            Self::Balances(_) | Self::Friendbot(_) => None,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Install the subscriber first so any subsequent `tracing::*` call
@@ -291,17 +304,17 @@ async fn main() {
     // verifier wasm hashes (VERIFIER_ALLOWLIST). Non-fatal — errors are logged
     // at warn level; CLI startup is never aborted.
     //
-    // Profile name: extracted from the first `--profile <NAME>` occurrence in
-    // the raw CLI args, or "default" when absent. This mirrors the per-subcommand
-    // `resolve_profile_name` logic without re-parsing the full command tree.
+    // Profile name: the name the parsed subcommand itself operates on, run
+    // through the same resolver the subcommand uses. The advisory therefore
+    // scans the audit log of the profile the command uses — including for the
+    // verbs that carry a clap default and never consult the environment.
     //
     // `run_startup_advisory` accepts no `StellarRpcClient`: the advisory scan is
     // strictly local and issues no network calls.
     {
-        let profile_name = extract_profile_name_from_env_args();
-        // Reads the per-profile DEFAULT location without loading the profile
-        // (the advisory runs before any command parses its arguments). A
-        // profile with an explicit non-default audit_log_path is outside the
+        let profile_name = resolve_profile_name(cli.command.profile_flag()).name;
+        // Reads the per-profile DEFAULT location without loading the profile.
+        // A profile with an explicit non-default audit_log_path is outside the
         // advisory's scan; the per-command audit machinery always uses the
         // loaded profile's configured path.
         let audit_log_path = default_audit_log_path_for(&profile_name);
@@ -331,4 +344,112 @@ async fn main() {
     };
 
     std::process::exit(exit_code);
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, reason = "test-only")]
+
+    use super::*;
+
+    /// Parses an argument vector the way `main` does and returns the profile
+    /// the startup advisory would scan.
+    fn advisory_profile_flag(argv: &[&str]) -> Option<String> {
+        let cli = Cli::try_parse_from(argv).expect("argv must parse");
+        cli.command.profile_flag().map(str::to_owned)
+    }
+
+    /// A verb that resolves the environment variable reports no flag when none
+    /// was given, so the advisory falls through exactly as the command does.
+    #[test]
+    fn a_resolving_verb_reports_its_flag_or_nothing() {
+        assert_eq!(
+            advisory_profile_flag(&[
+                "stellar-agent",
+                "trustline",
+                "--from",
+                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+                "--asset",
+                "USDC",
+            ]),
+            None,
+            "no flag means fall through to STELLAR_AGENT_PROFILE, then \"default\""
+        );
+        assert_eq!(
+            advisory_profile_flag(&[
+                "stellar-agent",
+                "trustline",
+                "--from",
+                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+                "--asset",
+                "USDC",
+                "--profile",
+                "alice",
+            ]),
+            Some("alice".to_owned())
+        );
+    }
+
+    /// A verb carrying a clap default reports that default, so the advisory
+    /// scans the log the command writes rather than the one the environment
+    /// variable names.
+    #[test]
+    fn a_defaulted_verb_reports_its_clap_default_not_an_absent_flag() {
+        assert_eq!(
+            advisory_profile_flag(&[
+                "stellar-agent",
+                "pay",
+                "--source",
+                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+                "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+                "1",
+            ]),
+            Some("default".to_owned()),
+            "`pay` audits under its clap default, so the advisory must scan that \
+             profile's log even when STELLAR_AGENT_PROFILE names another"
+        );
+    }
+
+    /// A positional-or-flag verb reports the name it was given in either form.
+    #[test]
+    fn a_positional_verb_reports_its_effective_name() {
+        assert_eq!(
+            advisory_profile_flag(&["stellar-agent", "profile", "show", "alice"]),
+            Some("alice".to_owned())
+        );
+        assert_eq!(
+            advisory_profile_flag(&["stellar-agent", "profile", "show", "--profile", "alice"]),
+            Some("alice".to_owned())
+        );
+    }
+
+    /// A verb with no profile selector reports none rather than a literal.
+    #[test]
+    fn a_profile_less_verb_reports_nothing() {
+        assert_eq!(
+            advisory_profile_flag(&[
+                "stellar-agent",
+                "balances",
+                "--account",
+                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+            ]),
+            None
+        );
+    }
+
+    /// A trailing `--` guards its operands: a value after it is a positional of
+    /// the subcommand, never the advisory's profile.
+    #[test]
+    fn an_operand_after_the_separator_is_not_a_profile_name() {
+        assert_eq!(
+            advisory_profile_flag(&["stellar-agent", "profile", "show", "--", "alice"]),
+            Some("alice".to_owned()),
+            "`alice` here is the positional NAME, which IS the profile"
+        );
+        assert_eq!(
+            advisory_profile_flag(&["stellar-agent", "counterparty", "evict", "--", "circle.com",]),
+            None,
+            "an operand that is not a profile selector must not be read as one"
+        );
+    }
 }

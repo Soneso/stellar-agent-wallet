@@ -75,6 +75,7 @@ use stellar_agent_defi::pins::DefiContractPin;
 use stellar_agent_network::{StellarRpcClient, init_platform_keyring_store, signer_from_keyring};
 
 use crate::common::render::render_json;
+use crate::common::resolve_profile_name;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -143,9 +144,9 @@ pub struct LendResult {
 /// ```
 #[derive(Debug, Args)]
 pub struct LendArgs {
-    /// Profile name to load (default: "default").
-    #[arg(long, default_value = "default")]
-    pub profile: String,
+    /// Profile name to load (default: `STELLAR_AGENT_PROFILE` env var, then `"default"`).
+    #[arg(long = "profile", value_name = "NAME")]
+    pub profile: Option<String>,
 
     /// The Blend pool contract address (C-strkey).
     #[arg(long)]
@@ -214,8 +215,12 @@ where
     LoadProfile: Fn(&str) -> Result<Profile, profile_loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
+    // ── Resolve the profile name ──────────────────────────────────────────────
+    // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+
     // ── Load profile ──────────────────────────────────────────────────────────
-    let profile = match load_profile(&args.profile) {
+    let profile = match load_profile(&profile_name) {
         Ok(p) => p,
         Err(e) => {
             render_json(&Envelope::<()>::err_raw(
@@ -420,7 +425,7 @@ where
     // signer is loaded (below) or the lend is submitted. Reused (not
     // re-acquired) for `DefiAdapterCtx::audit_writer`.
     let audit_writer =
-        match crate::commands::value_audit::require_value_audit_writer(&profile, &args.profile) {
+        match crate::commands::value_audit::require_value_audit_writer(&profile, &profile_name) {
             Ok(w) => w,
             Err(e) => {
                 render_json(&Envelope::<()>::err(&e));
@@ -556,7 +561,7 @@ mod tests {
         let init_writer = Arc::clone(&init_invoked);
 
         let args = LendArgs {
-            profile: "keyring-order-test".to_owned(),
+            profile: Some("keyring-order-test".to_owned()),
             pool: String::new(),
             from: String::new(),
             op: LendOp::Supply,
@@ -828,7 +833,7 @@ mod tests {
         let rpc_url = server.uri();
 
         let args = LendArgs {
-            profile: "lend-audit-preflight-test".to_owned(),
+            profile: Some("lend-audit-preflight-test".to_owned()),
             pool: pool_c.to_owned(),
             from: pool_c.to_owned(),
             op: LendOp::Supply,

@@ -56,6 +56,7 @@ use stellar_agent_dex::{
 use stellar_agent_network::{StellarRpcClient, init_platform_keyring_store, signer_from_keyring};
 
 use crate::common::render::render_json;
+use crate::common::resolve_profile_name;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Argument types
@@ -85,9 +86,9 @@ pub struct TradeResult {
 /// ```
 #[derive(Debug, Args)]
 pub struct TradeArgs {
-    /// Profile name to load (default: "default").
-    #[arg(long, default_value = "default")]
-    pub profile: String,
+    /// Profile name to load (default: `STELLAR_AGENT_PROFILE` env var, then `"default"`).
+    #[arg(long = "profile", value_name = "NAME")]
+    pub profile: Option<String>,
 
     /// Wallet smart-account address submitting the swap (C-strkey).
     #[arg(long)]
@@ -151,8 +152,12 @@ where
     LoadProfile: Fn(&str) -> Result<Profile, profile_loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
+    // ── Resolve the profile name ──────────────────────────────────────────────
+    // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
+    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+
     // ── Load profile ──────────────────────────────────────────────────────────
-    let profile = match load_profile(&args.profile) {
+    let profile = match load_profile(&profile_name) {
         Ok(p) => p,
         Err(e) => {
             render_json(&Envelope::<()>::err_raw(
@@ -282,7 +287,7 @@ where
     // signer is loaded (below) or the transaction is submitted. Reused (not
     // re-acquired) for `DefiAdapterCtx::audit_writer`.
     let audit_writer =
-        match crate::commands::value_audit::require_value_audit_writer(&profile, &args.profile) {
+        match crate::commands::value_audit::require_value_audit_writer(&profile, &profile_name) {
             Ok(w) => w,
             Err(e) => {
                 render_json(&Envelope::<()>::err(&e));
@@ -418,7 +423,7 @@ mod tests {
         let init_writer = Arc::clone(&init_invoked);
 
         let args = TradeArgs {
-            profile: "keyring-order-test".to_owned(),
+            profile: Some("keyring-order-test".to_owned()),
             from: String::new(),
             amount_in: 0,
             amount_out_min: 0,
