@@ -1,0 +1,109 @@
+# Maintenance smoke test for the macOS Developer ID signing + notarization
+# path in release.yml: builds one darwin target and runs the SAME sign and
+# notarize sequence, without creating any release or uploading any artifact.
+# Run it after rotating the certificate or the App Store Connect API key,
+# and before the first release that relies on either. Keep the signing block
+# aligned with release.yml when either changes.
+name: Notarization smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  notarize-smoke:
+    name: sign + notarize smoke (aarch64-apple-darwin)
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: aarch64-apple-darwin
+
+      - name: Build binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --target aarch64-apple-darwin --bin stellar-agent --bin stellar-agent-mcp
+
+      # Developer ID signing + notarization (macOS legs): both binaries are
+      # signed with the hardened runtime and a secure timestamp, then
+      # submitted to Apple's notary service and accepted before packaging,
+      # so Gatekeeper passes quarantined downloads. Bare executables cannot
+      # carry a stapled ticket; Gatekeeper validates notarization online on
+      # first run.
+      - name: Sign and notarize (macOS)
+        shell: bash
+        env:
+          P12_B64: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
+          P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          ASC_KEY_B64: ${{ secrets.APPLE_ASC_API_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APPLE_ASC_ISSUER_ID }}
+          TARGET: aarch64-apple-darwin
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/notary.keychain-db"
+          KEYCHAIN_PW="$(openssl rand -hex 24)"
+          P12="$RUNNER_TEMP/developer_id.p12"
+          ASC_KEY="$RUNNER_TEMP/asc_api_key.p8"
+          printf '%s' "$P12_B64" | base64 -d > "$P12"
+          printf '%s' "$ASC_KEY_B64" | base64 -d > "$ASC_KEY"
+
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 1800 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security import "$P12" -k "$KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain
+          rm -f "$P12"
+
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F'"' '/Developer ID Application/{print $2; exit}')"
+          if [ -z "$IDENTITY" ]; then
+            echo "no Developer ID Application identity in the imported keychain" >&2
+            exit 1
+          fi
+
+          RELEASE_DIR="target/${TARGET}/release"
+          for bin in stellar-agent stellar-agent-mcp; do
+            codesign --force --options runtime --timestamp \
+              --keychain "$KEYCHAIN" --sign "$IDENTITY" "$RELEASE_DIR/$bin"
+            codesign --verify --strict --verbose=2 "$RELEASE_DIR/$bin"
+          done
+
+          SUBMIT_ZIP="$RUNNER_TEMP/notarize-$TARGET.zip"
+          zip -j "$SUBMIT_ZIP" "$RELEASE_DIR/stellar-agent" "$RELEASE_DIR/stellar-agent-mcp"
+          OUT="$(xcrun notarytool submit "$SUBMIT_ZIP" \
+            --key "$ASC_KEY" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" \
+            --wait --timeout 30m --output-format json)"
+          printf '%s\n' "$OUT"
+          STATUS="$(printf '%s' "$OUT" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')"
+          SUBMISSION_ID="$(printf '%s' "$OUT" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+          if [ "$STATUS" != "Accepted" ]; then
+            xcrun notarytool log "$SUBMISSION_ID" \
+              --key "$ASC_KEY" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" || true
+            exit 1
+          fi
+          rm -f "$ASC_KEY" "$SUBMIT_ZIP"
+
+      - name: Remove the signing keychain (macOS)
+        if: always()
+        shell: bash
+        run: security delete-keychain "$RUNNER_TEMP/notary.keychain-db" 2>/dev/null || true
+
+      - name: Confirm signature identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          for bin in stellar-agent stellar-agent-mcp; do
+            codesign -dvv "target/aarch64-apple-darwin/release/$bin" 2>&1 | grep -E "Authority=Developer ID Application|TeamIdentifier="
+          done
