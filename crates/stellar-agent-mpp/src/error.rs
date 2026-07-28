@@ -27,6 +27,8 @@ pub enum MppErrorCode {
     ApprovalRequired,
     /// Approval was invalid or expired.
     ApprovalInvalid,
+    /// No authorization matches the supplied identifier.
+    AuthorizationNotFound,
     /// This authorization has already been consumed.
     AuthorizationReplayed,
     /// Authorization outcome cannot safely be retried.
@@ -63,6 +65,7 @@ impl MppErrorCode {
             Self::NetworkForbidden => "mpp.network_forbidden",
             Self::ApprovalRequired => "mpp.approval_required",
             Self::ApprovalInvalid => "mpp.approval_invalid",
+            Self::AuthorizationNotFound => "mpp.authorization_not_found",
             Self::AuthorizationReplayed => "mpp.authorization_replayed",
             Self::AuthorizationIndeterminate => "mpp.authorization_indeterminate",
             Self::StateUnavailable => "mpp.state_unavailable",
@@ -105,6 +108,23 @@ impl MppError {
     pub const fn message(&self) -> &'static str {
         self.message
     }
+
+    /// The uniform refusal for an identifier the profile holds no
+    /// authorization for.
+    ///
+    /// Every surface that answers an identifier lookup returns this exact
+    /// value: the store's own not-found arms and the adapters' first-run path,
+    /// where the profile has never minted MPP state. An unknown authorization
+    /// is the same answer whether the store is absent, empty, or simply lacks
+    /// the identifier, so the caller cannot use the refusal to probe which of
+    /// those it is.
+    #[must_use]
+    pub const fn authorization_not_found() -> Self {
+        Self::new(
+            MppErrorCode::AuthorizationNotFound,
+            "no MPP authorization matches the supplied identifier",
+        )
+    }
 }
 
 #[cfg(test)]
@@ -125,6 +145,10 @@ mod tests {
             (MppErrorCode::NetworkForbidden, "mpp.network_forbidden"),
             (MppErrorCode::ApprovalRequired, "mpp.approval_required"),
             (MppErrorCode::ApprovalInvalid, "mpp.approval_invalid"),
+            (
+                MppErrorCode::AuthorizationNotFound,
+                "mpp.authorization_not_found",
+            ),
             (
                 MppErrorCode::AuthorizationReplayed,
                 "mpp.authorization_replayed",
@@ -151,5 +175,20 @@ mod tests {
         assert_eq!(error.code(), "mpp.signing_failed");
         assert_eq!(error.message(), "redacted");
         assert_eq!(error.to_string(), "mpp.signing_failed: redacted");
+    }
+
+    /// The shared constructor is the single source of the identifier-lookup
+    /// refusal: every surface returns these exact bytes, so a caller cannot
+    /// tell a store that lacks the identifier from a profile that has no
+    /// store yet.
+    #[test]
+    fn the_not_found_constructor_carries_the_authorization_not_found_code() {
+        let error = MppError::authorization_not_found();
+        assert_eq!(error.code(), MppErrorCode::AuthorizationNotFound.as_str());
+        assert_eq!(error.code(), "mpp.authorization_not_found");
+        assert_eq!(
+            error.message(),
+            "no MPP authorization matches the supplied identifier"
+        );
     }
 }

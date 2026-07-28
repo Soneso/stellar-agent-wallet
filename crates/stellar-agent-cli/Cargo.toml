@@ -132,6 +132,14 @@ async-trait = { workspace = true }
 serial_test = { workspace = true }
 # keyring_mock::install for the mock store setup (key_ops.rs tests).
 stellar-agent-test-support = { path = "../stellar-agent-test-support" }
+# test-helpers enables the STELLAR_AGENT_HOME override on the headless store's
+# file path. The profile and MPP process suites force the headless backend on
+# their children so no run can reach the OS login keychain; without this feature
+# those children would still resolve the store file under the operator's REAL
+# data root, and a child that writes a key would land there. Also lets a test
+# seed a credential the child then reads, by constructing the same store over
+# the same temp path.
+stellar-agent-headless-keyring = { path = "../stellar-agent-headless-keyring", features = ["test-helpers"] }
 # Temp audit-log path in the value-audit end-to-end emission test.
 tempfile = { workspace = true }
 # request_id generation in audit/verify.rs tests.

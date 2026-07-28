@@ -88,6 +88,13 @@ the SHA-256 of the profile name. A dedicated 32-byte HMAC key is stored in the
 platform keyring. Missing key plus existing file fails closed. The file format
 is versioned JSON prefixed by HMAC-SHA256 over a domain and body.
 
+Opening is split by intent: `open_for_prepare` mints the key for a genuinely new
+store and is the only entry point that writes key material, while
+`open_for_read` returns `Ok(None)` for a profile that has never minted MPP state
+— proven by the key not loading AND the state path provably holding nothing.
+Read verbs answer `Ok(None)` as `mpp.authorization_not_found`, so a new profile
+is never reported as a broken store.
+
 Every read checks non-symlink regular-file shape, size, HMAC in constant time,
 schema version, record count, reconstructed prepared-artifact semantics,
 lifecycle invariants, and uniqueness of authorization IDs, fingerprints and

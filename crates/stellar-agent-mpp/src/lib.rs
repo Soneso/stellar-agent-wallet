@@ -42,7 +42,9 @@ pub use state::{
     AuthorizationRecord, AuthorizationStatus, HostObservation, LedgerOutcome,
     authorization_fingerprint,
 };
-pub use store::MppAuthorizationStore;
+pub use store::{
+    MppAuthorizationStore, absent_state_approval_lookup_error, absent_state_lookup_error,
+};
 
 /// Supported MPP payment method.
 pub const STELLAR_METHOD: &str = "stellar";

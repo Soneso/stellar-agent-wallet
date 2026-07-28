@@ -21,7 +21,8 @@ use stellar_agent_core::{
 };
 use stellar_agent_mpp::{
     ApprovalDisposition, ChallengeInput, MppAuthorizationStore, MppError, MppErrorCode,
-    ReceiptInput, StellarReconciliationRpc, StellarSponsoredRpc, authorization_status,
+    ReceiptInput, StellarReconciliationRpc, StellarSponsoredRpc,
+    absent_state_approval_lookup_error, absent_state_lookup_error, authorization_status,
     commit_authorization, mpp_value_effects, parse_receipt, persist_prepared_authorization,
     prepare_sponsored, reconcile_transaction, select_and_validate, verify_pending_approval,
 };
@@ -249,8 +250,11 @@ async fn authorize(args: MppAuthorizeArgs) -> i32 {
     };
     let now_unix = i64::try_from(now_ms / 1_000).unwrap_or(i64::MAX);
     if let Some(approval_id) = args.approval_id.as_deref() {
-        let state = match MppAuthorizationStore::from_profile_keyring(&profile_name, false) {
-            Ok(state) => state,
+        let state = match MppAuthorizationStore::open_for_read(&profile_name) {
+            Ok(Some(state)) => state,
+            // A profile with no MPP state holds no authorization under any
+            // approval, which is the same answer as a store that holds none.
+            Ok(None) => return render_error(&absent_state_approval_lookup_error(approval_id)),
             Err(error) => return render_error(&error),
         };
         let record = match state.load_by_approval_nonce(approval_id) {
@@ -292,7 +296,7 @@ async fn prepare_and_authorize_without_state(
         Ok(prepared) => prepared,
         Err(error) => return render_error(&error),
     };
-    let state = match MppAuthorizationStore::from_profile_keyring(profile_name, true) {
+    let state = match MppAuthorizationStore::open_for_prepare(profile_name) {
         Ok(state) => state,
         Err(error) => return render_error(&error),
     };
@@ -503,8 +507,11 @@ fn status(args: &MppStatusArgs) -> i32 {
     if init_platform_keyring_store().is_err() {
         return render_error(&state_error());
     }
-    let state = match MppAuthorizationStore::from_profile_keyring(&profile_name, false) {
-        Ok(state) => state,
+    let state = match MppAuthorizationStore::open_for_read(&profile_name) {
+        Ok(Some(state)) => state,
+        // A profile that has never prepared a charge holds no authorization
+        // under any identifier — the store's own answer for an unknown one.
+        Ok(None) => return render_error(&absent_state_lookup_error(&args.authorization_id)),
         Err(error) => return render_error(&error),
     };
     match authorization_status(&state, &args.authorization_id, now_unix()) {
@@ -549,8 +556,9 @@ fn record_receipt(args: &MppReceiptArgs) -> i32 {
         Ok(receipt) => receipt,
         Err(error) => return render_error(&error),
     };
-    let state = match MppAuthorizationStore::from_profile_keyring(&profile_name, false) {
-        Ok(state) => state,
+    let state = match MppAuthorizationStore::open_for_read(&profile_name) {
+        Ok(Some(state)) => state,
+        Ok(None) => return render_error(&absent_state_lookup_error(&args.authorization_id)),
         Err(error) => return render_error(&error),
     };
     let now = now_unix();
@@ -598,8 +606,9 @@ async fn reconcile(args: MppReconcileArgs) -> i32 {
             },
             Err(error) => return render_error(&error),
         };
-    let state = match MppAuthorizationStore::from_profile_keyring(&profile_name, false) {
-        Ok(state) => state,
+    let state = match MppAuthorizationStore::open_for_read(&profile_name) {
+        Ok(Some(state)) => state,
+        Ok(None) => return render_error(&absent_state_lookup_error(&args.authorization_id)),
         Err(error) => return render_error(&error),
     };
     let rpc = match StellarReconciliationRpc::new(&profile.rpc_url) {
@@ -643,7 +652,7 @@ fn prune(args: &MppPruneArgs) -> i32 {
     if init_platform_keyring_store().is_err() {
         return render_error(&state_error());
     }
-    let state = match MppAuthorizationStore::from_profile_keyring(&args.profile, false) {
+    let state = match MppAuthorizationStore::open_for_read(&args.profile) {
         Ok(state) => state,
         Err(error) => return render_error(&error),
     };
@@ -665,17 +674,23 @@ fn prune(args: &MppPruneArgs) -> i32 {
     {
         return render_error(&state_error());
     }
-    match state.prune(now_unix()) {
-        Ok(pruned) => {
-            print_success(json!({
-                "profile": args.profile,
-                "pruned": pruned,
-                "reason_sha256": reason_sha256,
-            }));
-            0
-        }
-        Err(error) => render_error(&error),
-    }
+    // The maintenance request is recorded before the outcome is known, so the
+    // audit trail carries the operator's reason whether or not there was
+    // anything to prune. A profile with no MPP state prunes nothing, which is
+    // the same result as pruning a store holding no removable record.
+    let pruned = match state {
+        Some(state) => match state.prune(now_unix()) {
+            Ok(pruned) => pruned,
+            Err(error) => return render_error(&error),
+        },
+        None => 0,
+    };
+    print_success(json!({
+        "profile": args.profile,
+        "pruned": pruned,
+        "reason_sha256": reason_sha256,
+    }));
+    0
 }
 
 fn evaluate_policy(
@@ -850,6 +865,12 @@ fn redact_reference(value: &str) -> String {
     format!("{}...{}", &value[..8], &value[value.len() - 8..])
 }
 
+/// The uniform state refusal.
+///
+/// Byte-identical to `stellar_agent_mpp::store`'s definition and to
+/// `stellar-agent-mcp`'s MPP adapter: the three exist because this code is
+/// raised on paths that hold no store handle, and one refusal must not be
+/// distinguishable from another by its text.
 const fn state_error() -> MppError {
     MppError::new(
         MppErrorCode::StateUnavailable,

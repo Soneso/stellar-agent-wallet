@@ -66,6 +66,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- An MPP identifier lookup that matches no stored authorization now returns
+  `mpp.authorization_not_found` instead of `mpp.state_unavailable`, on both
+  binaries. This covers `mpp authorization status`, `mpp receipt record`,
+  `mpp settlement reconcile`, `mpp charge authorize --approval-id`, and their
+  `stellar_mpp_*` tool counterparts, whether the identifier is simply unknown
+  or the profile has no MPP state at all. A malformed identifier stays
+  `mpp.state_unavailable` on every store state, so the answer cannot be used to
+  probe whether a profile has MPP state. `mpp.state_unavailable` now means the
+  durable state, or a prerequisite of it, exists and cannot be used. Agents
+  routing on `mpp.state_unavailable` to detect an unknown authorization must
+  route on the new code.
+- `stellar-agent-mpp` API: `MppAuthorizationStore::from_profile_keyring` is
+  removed in favour of `open_for_prepare` (its minting form) and
+  `open_for_read`, which returns `Ok(None)` for a profile that has never minted
+  MPP state. `MppError::authorization_not_found` and the
+  `absent_state_lookup_error` / `absent_state_approval_lookup_error`
+  classifiers are added for adapters that must answer a lookup without a store
+  handle. `MppErrorCode` gains an `AuthorizationNotFound` variant; the enum is
+  not `#[non_exhaustive]` and is not being made so, since that would itself be
+  breaking — an exhaustive `match` on it downstream needs one new arm.
 - The operator-facing web pages now render the project's visual identity: the
   WebAuthn bridge's registration and approval pages, the approval inbox and
   detail pages, the operator-enrollment page, and the remote-approval sign-in,
@@ -134,6 +154,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- MPP read verbs no longer report a profile with no MPP history as a broken
+  store. `mpp authorization status` on a profile that has never prepared a
+  charge answers `mpp.authorization_not_found`, and `mpp state prune` succeeds
+  with `pruned: 0` while still recording the maintenance request and its reason
+  digest in the audit log. The state key is minted only on the prepare path, so
+  every read verb refused with `mpp.state_unavailable` until the first charge —
+  indistinguishable from a genuinely unreadable store. A store that exists
+  without a usable key still fails closed: only the provable never-minted state
+  (no key and no state file) reads as first run, so deleting or rotating the
+  key cannot reset replay protection. Closes #106.
+- An MPP read against a store whose key is minted but whose first record was
+  never written — the state a prepare denied by policy leaves behind — reported
+  `mpp.state_unavailable` because the store directory did not exist yet. Lock
+  acquisition now establishes the directory on every path, so the read answers
+  from the empty store it actually has.
+- A symlink whose target does not exist at the MPP store's state or lock path
+  no longer escapes the store's symlink refusal. Existence tests follow links,
+  so a dangling one read as absent: the state path answered from an empty store
+  instead of refusing, and the lock path skipped its check and then created and
+  locked the file the link pointed at, because opening with `O_CREAT` follows
+  symlinks. Both paths now treat only a proven absence as absent. The store
+  directory is inspected before it is created for the same reason, though a
+  symlinked directory path was already refused.
 - The operator-enrollment page keeps the accurate status line when an
   authenticator returns no usable public key. That branch skips the POST, and
   the response handler then replaced its message with the generic "Passkey
