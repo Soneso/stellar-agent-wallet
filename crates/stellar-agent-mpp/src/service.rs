@@ -224,7 +224,9 @@ fn new_pending_approval(
 ///
 /// # Errors
 ///
-/// Returns `mpp.state_unavailable` for an unknown or unverifiable record.
+/// Returns `mpp.authorization_not_found` when the store holds no record under
+/// `authorization_id`, and `mpp.state_unavailable` when the identifier is
+/// malformed or the store cannot be read and verified.
 pub fn authorization_status(
     state_store: &MppAuthorizationStore,
     authorization_id: &str,

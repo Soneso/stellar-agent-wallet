@@ -83,20 +83,21 @@ impl MppAuthorizationStore {
         ))
     }
 
-    /// Opens the canonical per-profile store using its dedicated keyring key.
+    /// Opens the canonical per-profile store for the prepare path, minting the
+    /// state key when the profile has none.
     ///
-    /// When `mint_if_absent` is true, a key is minted only for a genuinely new
-    /// store. A missing key for an existing state file fails closed so state
-    /// deletion/key rotation cannot silently reset replay protection.
+    /// A key is minted only for a genuinely new store: a missing key for an
+    /// existing state file fails closed so state deletion or key rotation
+    /// cannot silently reset replay protection. This is the only entry point
+    /// that writes key material, and it is reached only after validation and
+    /// successful simulation.
     ///
     /// # Errors
     ///
-    /// Returns `mpp.state_unavailable` when the keyring, data root, or existing
-    /// key is unavailable.
-    pub fn from_profile_keyring(
-        profile_name: &str,
-        mint_if_absent: bool,
-    ) -> Result<Self, MppError> {
+    /// Returns `mpp.state_unavailable` when the keyring, the data root, or an
+    /// existing key is unavailable, or when a state file exists without its
+    /// key.
+    pub fn open_for_prepare(profile_name: &str) -> Result<Self, MppError> {
         use stellar_agent_core::profile::schema::KeyringEntryRef;
         use stellar_agent_network::keyring::{load_hmac_key_32, rotate_keyring_secret_32};
 
@@ -104,7 +105,7 @@ impl MppAuthorizationStore {
         let entry_ref = KeyringEntryRef::default_mpp_state_key(profile_name);
         let key = match load_hmac_key_32(&entry_ref) {
             Ok(key) => key,
-            Err(_) if mint_if_absent && !placeholder.path.exists() => {
+            Err(_) if provably_absent(&placeholder.path) => {
                 // The outward contract is the uniform `mpp.state_unavailable`;
                 // the already-classified `WalletError` is preserved at debug
                 // for operator forensics only.
@@ -128,6 +129,60 @@ impl MppAuthorizationStore {
             path: placeholder.path,
             key,
         })
+    }
+
+    /// Opens the canonical per-profile store for a read-only verb, reporting a
+    /// profile that has never minted MPP state as `Ok(None)` rather than as a
+    /// failure.
+    ///
+    /// `Ok(None)` requires proof of both halves of the never-minted state: the
+    /// keyring key does not load AND the state path provably holds nothing. A
+    /// key that does not load while a state file exists is a store that exists
+    /// and cannot be used, and fails closed — so state deletion or key rotation
+    /// can never be answered as "nothing was ever here".
+    ///
+    /// # Errors
+    ///
+    /// Returns `mpp.state_unavailable` when the data root is unavailable, or
+    /// when the state key cannot be loaded while a state file exists.
+    pub fn open_for_read(profile_name: &str) -> Result<Option<Self>, MppError> {
+        use stellar_agent_core::profile::schema::KeyringEntryRef;
+
+        let placeholder = Self::for_profile(profile_name, [0; 32])?;
+        let entry_ref = KeyringEntryRef::default_mpp_state_key(profile_name);
+        Self::open_for_read_at(placeholder.path, &entry_ref)
+    }
+
+    /// Path-injectable seam behind [`Self::open_for_read`].
+    ///
+    /// The public entry point supplies the canonical per-profile path; unit
+    /// tests supply a temporary one. Tests must drive this seam rather than
+    /// [`Self::open_for_read`]: under `cargo test -p stellar-agent-mpp --lib`
+    /// — how CI runs them — `stellar-agent-core` is built as a plain
+    /// dependency, so [`canonical_data_root`]'s `STELLAR_AGENT_HOME` override
+    /// is compiled out and a test going through the public entry point would
+    /// read and write the operator's real data root.
+    fn open_for_read_at(
+        path: PathBuf,
+        entry_ref: &stellar_agent_core::profile::schema::KeyringEntryRef,
+    ) -> Result<Option<Self>, MppError> {
+        use stellar_agent_network::keyring::load_hmac_key_32;
+
+        match load_hmac_key_32(entry_ref) {
+            Ok(key) => Ok(Some(Self { path, key })),
+            Err(error) if provably_absent(&path) => {
+                // The classified `WalletError` is preserved at debug only: the
+                // outward answer is "this profile has no MPP state", which is
+                // true of every cause a failed key load can have while no
+                // state file exists.
+                tracing::debug!(error = %error, "mpp state key absent; reporting first run");
+                Ok(None)
+            }
+            Err(error) => {
+                tracing::debug!(error = %error, "mpp state key load failed");
+                Err(state_error())
+            }
+        }
     }
 
     /// Inserts a newly prepared record or returns the existing identical record.
@@ -177,7 +232,9 @@ impl MppAuthorizationStore {
     ///
     /// # Errors
     ///
-    /// Fails closed if the store or record is unavailable.
+    /// Returns `mpp.authorization_not_found` when the store holds no record
+    /// under `authorization_id`. Fails closed with `mpp.state_unavailable` for
+    /// a malformed identifier or a store that cannot be read and verified.
     pub fn load(&self, authorization_id: &str) -> Result<AuthorizationRecord, MppError> {
         validate_authorization_id(authorization_id)?;
         let _lock = self.acquire_lock()?;
@@ -185,32 +242,31 @@ impl MppAuthorizationStore {
         wire.records
             .into_iter()
             .find(|record| record.authorization_id() == authorization_id)
-            .ok_or_else(state_error)
+            .ok_or_else(MppError::authorization_not_found)
     }
 
     /// Loads the unique authorization attached to a pending approval nonce.
     ///
     /// # Errors
     ///
-    /// Fails closed if the store is unavailable or no unique record matches.
+    /// Returns `mpp.authorization_not_found` when no record carries the nonce.
+    /// Fails closed with `mpp.state_unavailable` for a malformed nonce, a store
+    /// that cannot be read and verified, or a nonce carried by more than one
+    /// record.
     pub fn load_by_approval_nonce(
         &self,
         approval_nonce: &str,
     ) -> Result<AuthorizationRecord, MppError> {
-        if approval_nonce.len() != 22
-            || !approval_nonce
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        {
-            return Err(state_error());
-        }
+        validate_approval_nonce(approval_nonce)?;
         let _lock = self.acquire_lock()?;
         let wire = self.read_verified()?;
         let mut matching = wire
             .records
             .into_iter()
             .filter(|record| record.approval_nonce() == Some(approval_nonce));
-        let record = matching.next().ok_or_else(state_error)?;
+        let record = matching
+            .next()
+            .ok_or_else(MppError::authorization_not_found)?;
         if matching.next().is_some() {
             return Err(state_error());
         }
@@ -241,7 +297,7 @@ impl MppAuthorizationStore {
         approval_nonce: String,
         now_unix: i64,
     ) -> Result<AuthorizationRecord, MppError> {
-        self.update_record(authorization_id, |record| {
+        self.update_record(authorization_id, state_error, |record| {
             record.set_approval_nonce(approval_nonce);
             record.transition(AuthorizationStatus::ApprovalPending, now_unix)
         })
@@ -257,7 +313,7 @@ impl MppAuthorizationStore {
         authorization_id: &str,
         now_unix: i64,
     ) -> Result<AuthorizationRecord, MppError> {
-        self.update_record(authorization_id, |record| {
+        self.update_record(authorization_id, state_error, |record| {
             if record.expires_at().saturating_sub(now_unix)
                 < crate::limits::MIN_CHALLENGE_LIFETIME_SECS
             {
@@ -279,7 +335,7 @@ impl MppAuthorizationStore {
         &self,
         authorization_id: &str,
     ) -> Result<AuthorizationRecord, MppError> {
-        self.update_record(authorization_id, |record| {
+        self.update_record(authorization_id, state_error, |record| {
             if record.status() != AuthorizationStatus::Authorizing {
                 return Err(replay_error());
             }
@@ -299,7 +355,7 @@ impl MppAuthorizationStore {
         credential_digest: [u8; 32],
         now_unix: i64,
     ) -> Result<AuthorizationRecord, MppError> {
-        self.update_record(authorization_id, |record| {
+        self.update_record(authorization_id, state_error, |record| {
             record.set_credential_digest(credential_digest);
             record.transition(AuthorizationStatus::DeliveryPending, now_unix)
         })
@@ -369,42 +425,50 @@ impl MppAuthorizationStore {
     ///
     /// # Errors
     ///
-    /// Returns `mpp.receipt_conflict` if a different receipt was already stored.
+    /// Returns `mpp.receipt_conflict` if a different receipt was already stored,
+    /// and `mpp.authorization_not_found` when the store holds no record under
+    /// `authorization_id` — the same answer [`Self::load`] gives, because this
+    /// is the one mutating entry point whose identifier comes straight from the
+    /// caller rather than from a record this store just loaded.
     pub fn record_receipt(
         &self,
         authorization_id: &str,
         receipt: &PaymentReceipt,
         now_unix: i64,
     ) -> Result<AuthorizationRecord, MppError> {
-        self.update_record(authorization_id, |record| {
-            if let Some(existing) = record.host_observation() {
-                if existing.receipt_digest == *receipt.digest() {
-                    return Ok(());
+        self.update_record(
+            authorization_id,
+            MppError::authorization_not_found,
+            |record| {
+                if let Some(existing) = record.host_observation() {
+                    if existing.receipt_digest == *receipt.digest() {
+                        return Ok(());
+                    }
+                    return Err(MppError::new(
+                        MppErrorCode::ReceiptConflict,
+                        "receipt conflicts with the recorded observation",
+                    ));
                 }
-                return Err(MppError::new(
-                    MppErrorCode::ReceiptConflict,
-                    "receipt conflicts with the recorded observation",
-                ));
-            }
-            if record.status() != AuthorizationStatus::Authorized {
-                return Err(replay_error());
-            }
-            let prepared = record.prepared_charge()?;
-            if let Some(receipt_challenge_id) = receipt.challenge_id()
-                && prepared.selected().echo().id() != Some(receipt_challenge_id)
-            {
-                return Err(MppError::new(
-                    MppErrorCode::ReceiptConflict,
-                    "receipt challenge identifier does not match the authorization",
-                ));
-            }
-            record.set_host_observation(HostObservation {
-                receipt_digest: *receipt.digest(),
-                reference_digest: Sha256::digest(receipt.reference().as_bytes()).into(),
-                observed_at: now_unix,
-            });
-            record.transition(AuthorizationStatus::ReceiptObserved, now_unix)
-        })
+                if record.status() != AuthorizationStatus::Authorized {
+                    return Err(replay_error());
+                }
+                let prepared = record.prepared_charge()?;
+                if let Some(receipt_challenge_id) = receipt.challenge_id()
+                    && prepared.selected().echo().id() != Some(receipt_challenge_id)
+                {
+                    return Err(MppError::new(
+                        MppErrorCode::ReceiptConflict,
+                        "receipt challenge identifier does not match the authorization",
+                    ));
+                }
+                record.set_host_observation(HostObservation {
+                    receipt_digest: *receipt.digest(),
+                    reference_digest: Sha256::digest(receipt.reference().as_bytes()).into(),
+                    observed_at: now_unix,
+                });
+                record.transition(AuthorizationStatus::ReceiptObserved, now_unix)
+            },
+        )
     }
 
     /// Records a verified ledger outcome.
@@ -418,7 +482,7 @@ impl MppAuthorizationStore {
         outcome: LedgerOutcome,
         now_unix: i64,
     ) -> Result<AuthorizationRecord, MppError> {
-        self.update_record(authorization_id, |record| {
+        self.update_record(authorization_id, state_error, |record| {
             if !matches!(record.ledger_outcome(), LedgerOutcome::Unknown) {
                 let same = matches!(
                     (record.ledger_outcome(), &outcome),
@@ -486,14 +550,25 @@ impl MppAuthorizationStore {
         status: AuthorizationStatus,
         now_unix: i64,
     ) -> Result<AuthorizationRecord, MppError> {
-        self.update_record(authorization_id, |record| {
+        self.update_record(authorization_id, state_error, |record| {
             record.transition(status, now_unix)
         })
     }
 
+    /// Applies `update` to the record under `authorization_id`, refusing with
+    /// `on_missing` when the store holds no such record.
+    ///
+    /// The refusal is a parameter because the two caller families mean
+    /// different things by a missing record. A caller acting on an identifier
+    /// its user supplied — [`Self::record_receipt`] — is answering a lookup,
+    /// and must answer it the same way every other lookup does. The internal
+    /// lifecycle transitions loaded the record under this same lock moments
+    /// earlier, so a record missing there is corruption, not a caller mistake,
+    /// and stays `mpp.state_unavailable`.
     fn update_record<F>(
         &self,
         authorization_id: &str,
+        on_missing: fn() -> MppError,
         update: F,
     ) -> Result<AuthorizationRecord, MppError>
     where
@@ -505,7 +580,7 @@ impl MppAuthorizationStore {
                 .records
                 .iter_mut()
                 .find(|record| record.authorization_id() == authorization_id)
-                .ok_or_else(state_error)?;
+                .ok_or_else(on_missing)?;
             update(record)?;
             Ok(record.clone())
         })
@@ -515,7 +590,8 @@ impl MppAuthorizationStore {
     where
         F: FnOnce(&mut WireStore) -> Result<T, MppError>,
     {
-        self.ensure_parent()?;
+        // The store directory is established by lock acquisition, which every
+        // path — read and write — goes through first.
         let _lock = self.acquire_lock()?;
         let mut wire = self.read_verified()?;
         let result = update(&mut wire)?;
@@ -523,16 +599,45 @@ impl MppAuthorizationStore {
         Ok(result)
     }
 
+    /// Establishes the store directory, refusing anything at that path that is
+    /// not already a real directory.
+    ///
+    /// The inspection precedes the creation so the refusal is stated here
+    /// rather than inherited from `create_dir_all` reporting `EEXIST` for a
+    /// path that is a symlink or a regular file. Every read verb reaches this
+    /// function, so what it refuses and why should not depend on a platform's
+    /// `mkdir` semantics.
     fn ensure_parent(&self) -> Result<(), MppError> {
         let parent = self.path.parent().ok_or_else(state_error)?;
-        fs::create_dir_all(parent).map_err(|_error| state_error())?;
-        reject_symlink(parent)?;
+        match fs::symlink_metadata(parent) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(state_error());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(parent).map_err(|_error| state_error())?;
+                reject_symlink(parent)?;
+            }
+            Err(_error) => return Err(state_error()),
+        }
         Ok(())
     }
 
+    /// Takes the exclusive store lock, establishing the store directory first.
+    ///
+    /// Reads lock too, so the directory has to exist on a read as well: a key
+    /// is minted before the first record is written, and a prepare that is
+    /// denied after minting leaves exactly that state. Refusing a read there
+    /// would report a profile with nothing stored as a store that cannot be
+    /// used, which is the distinction this store owes its callers.
     fn acquire_lock(&self) -> Result<StoreLock, MppError> {
+        self.ensure_parent()?;
         let path = sibling_path(&self.path, ".lock");
-        if path.exists() {
+        // Anything but a proven absence is inspected before the open: `create`
+        // follows a symlink at the lock path and would otherwise create and
+        // lock the file it points at.
+        if !provably_absent(&path) {
             reject_symlink(&path)?;
         }
         #[cfg(unix)]
@@ -558,7 +663,10 @@ impl MppAuthorizationStore {
     }
 
     fn read_verified(&self) -> Result<WireStore, MppError> {
-        if !self.path.exists() {
+        // Only a proven absence reads as an empty store. Any other outcome —
+        // a dangling symlink at the state path included — falls through to the
+        // symlink and metadata checks and fails closed there.
+        if provably_absent(&self.path) {
             return Ok(WireStore {
                 version: STORE_VERSION,
                 records: Vec::new(),
@@ -646,6 +754,20 @@ fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
     result
 }
 
+/// Whether `path` provably holds nothing.
+///
+/// True only when the path lookup itself reports `NotFound`. A dangling
+/// symlink, a permission failure, or any other I/O error is not proof of
+/// absence, so every caller treats it as present: reads refuse rather than
+/// report first run or an empty store, and the prepare path refuses to mint a
+/// second key over state it cannot see.
+fn provably_absent(path: &Path) -> bool {
+    matches!(
+        fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 fn reject_symlink(path: &Path) -> Result<(), MppError> {
     let metadata = fs::symlink_metadata(path).map_err(|_error| state_error())?;
     if metadata.file_type().is_symlink() {
@@ -666,6 +788,49 @@ fn validate_authorization_id(value: &str) -> Result<(), MppError> {
     Ok(())
 }
 
+fn validate_approval_nonce(value: &str) -> Result<(), MppError> {
+    if value.len() != 22
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(state_error());
+    }
+    Ok(())
+}
+
+/// Classifies an authorization-identifier lookup against a profile that has no
+/// MPP state, for the adapters that must answer without a store handle.
+///
+/// The identifier is validated first, so a malformed one is refused with the
+/// same code it would get from a store that exists. Answering
+/// `mpp.authorization_not_found` for input a real store refuses with
+/// `mpp.state_unavailable` would turn the refusal into a probe for whether the
+/// profile has ever minted MPP state.
+#[must_use]
+pub fn absent_state_lookup_error(authorization_id: &str) -> MppError {
+    validate_authorization_id(authorization_id)
+        .err()
+        .unwrap_or_else(MppError::authorization_not_found)
+}
+
+/// The approval-nonce counterpart of [`absent_state_lookup_error`].
+#[must_use]
+pub fn absent_state_approval_lookup_error(approval_nonce: &str) -> MppError {
+    validate_approval_nonce(approval_nonce)
+        .err()
+        .unwrap_or_else(MppError::authorization_not_found)
+}
+
+/// The uniform state refusal.
+///
+/// The message stays generic because the code is raised well beyond the store:
+/// oversize or non-regular input files, an unusable clock, approval-store
+/// failures, capacity ceilings, and malformed identifiers all reach it. The
+/// same two lines are defined in `stellar-agent-cli`'s and `stellar-agent-mcp`'s
+/// MPP adapters, where the code is raised without a store handle in hand; the
+/// three definitions MUST stay byte-identical so one refusal cannot be told
+/// from another by its text.
 const fn state_error() -> MppError {
     MppError::new(
         MppErrorCode::StateUnavailable,
@@ -680,6 +845,25 @@ const fn replay_error() -> MppError {
     )
 }
 
+/// Store tests.
+///
+/// # Keyring serialisation
+///
+/// Every test that installs the mock keyring store mutates process-global
+/// state, so all of them are `#[serial_test::serial]`: two running
+/// concurrently would decide each other's quadrant by replacing the store
+/// mid-test.
+///
+/// # Why the quadrant tests drive the seam
+///
+/// They call [`MppAuthorizationStore::open_for_read_at`] with a `TempDir`
+/// path rather than [`MppAuthorizationStore::open_for_read`]. Under
+/// `cargo test -p stellar-agent-mpp --lib store::tests::` — which is exactly
+/// how the `windows-storage` CI job runs them — `stellar-agent-core` is built
+/// as a plain dependency, so `canonical_data_root`'s `STELLAR_AGENT_HOME`
+/// override is compiled out and the public entry point would read and write
+/// the operator's real data root. No feature unification in that invocation
+/// changes it.
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -692,29 +876,269 @@ mod tests {
     use crate::{ReceiptInput, parse_receipt};
     use serde_json::Value;
     use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+    use stellar_agent_core::profile::schema::KeyringEntryRef;
+    use stellar_agent_network::keyring::{load_hmac_key_32, rotate_keyring_secret_32};
     use tempfile::TempDir;
 
-    /// A keyring failure while reading the per-profile state key surfaces as the
-    /// uniform `mpp.state_unavailable`, regardless of the classified cause: the
-    /// caller must not be able to distinguish a missing store from an
-    /// environmental keyring failure.
+    /// A well-formed identifier no store in this suite holds.
+    const UNKNOWN_ID: &str = "mpp_00000000000000000000000000000000";
+
+    const NOT_FOUND_CODE: &str = "mpp.authorization_not_found";
+    const STATE_CODE: &str = "mpp.state_unavailable";
+
+    fn state_key_coordinates(profile_name: &str) -> KeyringEntryRef {
+        KeyringEntryRef::default_mpp_state_key(profile_name)
+    }
+
+    /// A malformed identifier classifies the same way with and without a store.
+    ///
+    /// The adapters answer an identifier lookup on a profile with no MPP state
+    /// without ever constructing a store, so they must apply the same input
+    /// validation the store applies. If they did not, a caller could learn
+    /// whether a profile has ever minted MPP state by sending one malformed
+    /// identifier and reading which code came back.
+    #[test]
+    fn a_malformed_identifier_classifies_identically_with_and_without_a_store() {
+        let directory = TempDir::new().expect("tempdir");
+        let store = MppAuthorizationStore::at_path(directory.path().join("state"), [7; 32]);
+
+        for malformed in ["", "mpp_short", "mpp_G0000000000000000000000000000000"] {
+            assert_eq!(
+                absent_state_lookup_error(malformed).code(),
+                store
+                    .load(malformed)
+                    .expect_err("a malformed identifier is refused")
+                    .code(),
+                "the storeless answer for {malformed:?} must match the store's"
+            );
+            assert_eq!(absent_state_lookup_error(malformed).code(), STATE_CODE);
+        }
+        for malformed in [
+            "",
+            "short",
+            "way_too_long_approval_nonce",
+            "bad nonce value 12345!",
+        ] {
+            assert_eq!(
+                absent_state_approval_lookup_error(malformed).code(),
+                store
+                    .load_by_approval_nonce(malformed)
+                    .expect_err("a malformed nonce is refused")
+                    .code(),
+                "the storeless answer for {malformed:?} must match the store's"
+            );
+            assert_eq!(
+                absent_state_approval_lookup_error(malformed).code(),
+                STATE_CODE
+            );
+        }
+
+        assert_eq!(absent_state_lookup_error(UNKNOWN_ID).code(), NOT_FOUND_CODE);
+        assert_eq!(
+            absent_state_approval_lookup_error("approval_nonce_value12").code(),
+            NOT_FOUND_CODE
+        );
+    }
+
+    /// No key and no file is the profile's first run, not a failure: the read
+    /// surface answers `Ok(None)` and leaves the path untouched.
     #[test]
     #[serial_test::serial]
-    fn from_profile_keyring_maps_keyring_failure_to_state_unavailable() {
-        stellar_agent_test_support::keyring_mock::install().ok();
-        let profile_name = "mpp-state-key-no-logon-test";
-        let entry_ref = stellar_agent_core::profile::schema::KeyringEntryRef::default_mpp_state_key(
-            profile_name,
-        );
+    fn open_for_read_reports_first_run_when_neither_key_nor_file_exists() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let path = directory.path().join("state");
+        let entry_ref = state_key_coordinates("mpp-quadrant-first-run");
+
+        let opened = MppAuthorizationStore::open_for_read_at(path.clone(), &entry_ref)
+            .expect("a never-minted profile is not a state failure");
+
+        assert!(opened.is_none(), "no key and no file is first run");
+        assert!(!path.exists(), "a read must not create the state file");
+    }
+
+    /// A state file whose key does not load fails closed, and does so for EVERY
+    /// cause a failed key load can have.
+    ///
+    /// The read surface distinguishes exactly one thing: the provable
+    /// never-minted state, no key AND no file. Once a file exists, an absent
+    /// key and an environmental keyring failure are indistinguishable — both
+    /// are `mpp.state_unavailable` — so deleting the key, rotating it, or
+    /// running without an interactive keyring session can never be answered as
+    /// "nothing was ever here" and reset replay protection.
+    #[test]
+    #[serial_test::serial]
+    fn open_for_read_fails_closed_when_a_state_file_exists_without_its_key() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let path = directory.path().join("state");
+        fs::write(&path, [0_u8; HMAC_TAG_BYTES]).expect("fabricate a state file");
+        let entry_ref = state_key_coordinates("mpp-quadrant-orphan-file");
+
+        let absent_key = MppAuthorizationStore::open_for_read_at(path.clone(), &entry_ref)
+            .expect_err("a state file without its key must refuse");
+        assert_eq!(absent_key.code(), "mpp.state_unavailable");
+
         stellar_agent_test_support::keyring_mock::inject_no_logon_session(
             &entry_ref.service,
             &entry_ref.account,
         )
         .expect("inject the no-logon-session failure at the state-key coordinates");
+        let environmental = MppAuthorizationStore::open_for_read_at(path, &entry_ref)
+            .expect_err("an environmental keyring failure must refuse");
+        assert_eq!(
+            environmental.code(),
+            absent_key.code(),
+            "an environmental failure must not be distinguishable from an absent key"
+        );
+    }
 
-        let err = MppAuthorizationStore::from_profile_keyring(profile_name, false)
-            .expect_err("a keyring read failure must surface an MppError");
-        assert_eq!(err.code(), "mpp.state_unavailable");
+    /// A minted key with no file yet is a normal open that reads empty.
+    ///
+    /// This is the legitimate post-mint, pre-first-write state: the prepare
+    /// path mints the key before the first `insert_prepared` creates the file
+    /// and its directory, and a prepare denied after minting leaves exactly
+    /// this state — so the store directory is deliberately absent here. This
+    /// quadrant can never be treated as an error. It is also the state an
+    /// operator reaches by deleting the file alone, which this store cannot
+    /// detect — an anti-rollback guard would need a generation counter carried
+    /// outside the file, in the `PersistedWindowStore` style, and is not
+    /// attempted here.
+    #[test]
+    #[serial_test::serial]
+    fn open_for_read_opens_a_minted_store_before_its_first_write() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let path = directory.path().join("mpp").join("state");
+        let entry_ref = state_key_coordinates("mpp-quadrant-minted-no-file");
+        rotate_keyring_secret_32(&entry_ref.service, &entry_ref.account).expect("mint the key");
+
+        let store = MppAuthorizationStore::open_for_read_at(path.clone(), &entry_ref)
+            .expect("a minted key opens the store")
+            .expect("a minted key is not first run");
+
+        assert_eq!(
+            store
+                .load(UNKNOWN_ID)
+                .expect_err("an empty store holds no record")
+                .code(),
+            "mpp.authorization_not_found",
+            "a store whose first record was never written holds no authorization; \
+             it is not a store that cannot be used"
+        );
+        assert!(!path.exists(), "a read must not create the state file");
+    }
+
+    /// The negative control: a minted key over an existing file opens normally
+    /// and returns its records.
+    ///
+    /// Without it every assertion above would also hold for a build that
+    /// reported first run for everything.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn open_for_read_opens_a_populated_store_and_returns_its_records() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let path = directory.path().join("state");
+        let entry_ref = state_key_coordinates("mpp-quadrant-populated");
+        rotate_keyring_secret_32(&entry_ref.service, &entry_ref.account).expect("mint the key");
+        let key = load_hmac_key_32(&entry_ref).expect("read the minted key");
+
+        let now = 1_700_000_000;
+        let (prepared, _signer, _rpc) = prepared_fixture(now).await;
+        let record = AuthorizationRecord::new("quadrant", TESTNET_PASSPHRASE, &prepared, now)
+            .expect("record");
+        let id = record.authorization_id().to_owned();
+        MppAuthorizationStore::at_path(path.clone(), *key)
+            .insert_prepared(record, now)
+            .expect("seed one prepared record");
+        assert!(path.exists(), "the fixture must have written the file");
+
+        let store = MppAuthorizationStore::open_for_read_at(path, &entry_ref)
+            .expect("a populated store opens")
+            .expect("a populated store is not first run");
+
+        assert_eq!(
+            store.load(&id).expect("stored record").authorization_id(),
+            id
+        );
+        assert_eq!(
+            store
+                .load(UNKNOWN_ID)
+                .expect_err("an identifier the store does not hold")
+                .code(),
+            "mpp.authorization_not_found",
+            "the narrowed contract holds on a populated store too"
+        );
+    }
+
+    /// `record_receipt` answers an identifier its caller supplied, so a store
+    /// holding no such record answers exactly as `load` does — the verb cannot
+    /// return two different codes for one user error depending on store state
+    /// the caller cannot see.
+    ///
+    /// The internal lifecycle transitions keep the state refusal: each acts on
+    /// a record loaded under this same lock moments earlier, so a record
+    /// missing there is corruption, not a caller mistake.
+    #[test]
+    fn a_caller_supplied_identifier_is_not_found_while_a_lifecycle_transition_is_a_state_failure() {
+        let directory = TempDir::new().expect("tempdir");
+        let store = MppAuthorizationStore::at_path(directory.path().join("state"), [7; 32]);
+        let now = 1_700_000_000;
+        let receipt = parse_receipt(&ReceiptInput::Mcp {
+            receipt: serde_json::json!({
+                "method": "stellar",
+                "reference": "a".repeat(64),
+                "status": "success",
+                "timestamp": "2026-07-16T12:00:00Z",
+            }),
+        })
+        .expect("receipt");
+
+        assert_eq!(
+            store
+                .record_receipt(UNKNOWN_ID, &receipt, now)
+                .expect_err("an identifier the store does not hold")
+                .code(),
+            NOT_FOUND_CODE
+        );
+        assert_eq!(
+            store
+                .record_receipt(UNKNOWN_ID, &receipt, now)
+                .expect_err("same verb, same answer")
+                .code(),
+            store
+                .load(UNKNOWN_ID)
+                .expect_err("the lookup answer")
+                .code(),
+        );
+
+        for (label, outcome) in [
+            ("mark_ready", store.mark_ready(UNKNOWN_ID, now)),
+            ("claim_ready", store.claim_ready(UNKNOWN_ID, now)),
+            ("mark_authorized", store.mark_authorized(UNKNOWN_ID, now)),
+            (
+                "mark_policy_accounted",
+                store.mark_policy_accounted(UNKNOWN_ID),
+            ),
+            (
+                "record_ledger_outcome",
+                store.record_ledger_outcome(
+                    UNKNOWN_ID,
+                    LedgerOutcome::Settled {
+                        ledger: 1,
+                        reconciled_at: now,
+                    },
+                    now,
+                ),
+            ),
+        ] {
+            assert_eq!(
+                outcome.expect_err("no record to transition").code(),
+                STATE_CODE,
+                "{label} acts on a record it loaded under this lock; a vanished one is corruption"
+            );
+        }
     }
 
     #[test]
@@ -722,7 +1146,13 @@ mod tests {
         let directory = TempDir::new().expect("tempdir");
         let path = directory.path().join("state");
         let store = MppAuthorizationStore::at_path(path.clone(), [7; 32]);
-        assert!(store.load("mpp_00000000000000000000000000000000").is_err());
+        assert_eq!(
+            store
+                .load(UNKNOWN_ID)
+                .expect_err("an empty store holds no record")
+                .code(),
+            "mpp.authorization_not_found"
+        );
         assert!(!path.exists());
     }
 
@@ -797,6 +1227,76 @@ mod tests {
         assert!(store.read_verified().is_err());
     }
 
+    /// A symlink whose target does not exist refuses on every store path, and
+    /// the refusal creates nothing at that target.
+    ///
+    /// A dangling link is invisible to an existence test that follows links.
+    /// Treating "does not resolve" as "is not there" reads the state path as an
+    /// empty store, and skips the lock path's symlink check — after which the
+    /// open creates and locks the file the link points at, since `O_CREAT`
+    /// follows symlinks. Read verbs reach both paths.
+    ///
+    /// The store-directory case is here as an invariant rather than as the
+    /// discriminator for a particular implementation: `mkdir` refuses a
+    /// symlinked path with `EEXIST` and never materialises its target, so the
+    /// directory can only ever be refused, whether the inspection runs before
+    /// the creation or after it.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_refuses_without_creating_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TempDir::new().expect("tempdir");
+
+        let file_target = directory.path().join("state-target");
+        let path = directory.path().join("state");
+        symlink(&file_target, &path).expect("dangling state symlink");
+        let store = MppAuthorizationStore::at_path(path, [7; 32]);
+        assert_eq!(
+            store
+                .load(UNKNOWN_ID)
+                .expect_err("a dangling state link is not an empty store")
+                .code(),
+            STATE_CODE
+        );
+        assert!(
+            !file_target.exists(),
+            "the refusal must not create the state file at the link target"
+        );
+
+        let lock_target = directory.path().join("lock-target");
+        let locked_path = directory.path().join("locked");
+        symlink(&lock_target, sibling_path(&locked_path, ".lock")).expect("dangling lock symlink");
+        let store = MppAuthorizationStore::at_path(locked_path, [7; 32]);
+        assert_eq!(
+            store
+                .load(UNKNOWN_ID)
+                .expect_err("a symlinked lock path is refused")
+                .code(),
+            STATE_CODE
+        );
+        assert!(
+            !lock_target.exists(),
+            "the refusal must not create and lock the file the link points at"
+        );
+
+        let directory_target = directory.path().join("store-dir-target");
+        let store_directory = directory.path().join("mpp");
+        symlink(&directory_target, &store_directory).expect("dangling directory symlink");
+        let store = MppAuthorizationStore::at_path(store_directory.join("state"), [7; 32]);
+        assert_eq!(
+            store
+                .load(UNKNOWN_ID)
+                .expect_err("a store directory that is a symlink is refused")
+                .code(),
+            STATE_CODE
+        );
+        assert!(
+            !directory_target.exists(),
+            "the refusal must not materialise the store directory at the link target"
+        );
+    }
+
     #[tokio::test]
     async fn duplicate_authenticated_records_fail_closed() {
         let directory = TempDir::new().expect("tempdir");
@@ -840,7 +1340,13 @@ mod tests {
                 .expect("remove old terminal marker"),
             1
         );
-        assert!(store.load(&id).is_err());
+        assert_eq!(
+            store
+                .load(&id)
+                .expect_err("the pruned record is gone")
+                .code(),
+            "mpp.authorization_not_found"
+        );
     }
 
     #[tokio::test]
@@ -872,8 +1378,16 @@ mod tests {
         assert!(debug.contains("key: \"[redacted]\""));
         assert!(!debug.contains("07070707"));
         assert!(MppAuthorizationStore::for_profile("../hostile/profile", [8; 32]).is_ok());
+        // A malformed identifier is refused before any lookup: it is an input
+        // fault, not an authorization the store happens not to hold.
         for invalid in ["", "mpp_short", "mpp_G0000000000000000000000000000000"] {
-            assert!(store.load(invalid).is_err());
+            assert_eq!(
+                store
+                    .load(invalid)
+                    .expect_err("a malformed identifier is refused")
+                    .code(),
+                "mpp.state_unavailable"
+            );
         }
 
         let pending = make_record("pending");
@@ -903,11 +1417,19 @@ mod tests {
                 .authorization_id(),
             pending_id
         );
-        assert!(store.load_by_approval_nonce("short").is_err());
-        assert!(
+        assert_eq!(
+            store
+                .load_by_approval_nonce("short")
+                .expect_err("a malformed nonce is refused")
+                .code(),
+            "mpp.state_unavailable"
+        );
+        assert_eq!(
             store
                 .load_by_approval_nonce("missing_nonce_value_12")
-                .is_err()
+                .expect_err("a well-formed nonce no record carries")
+                .code(),
+            "mpp.authorization_not_found"
         );
         store.mark_ready(&pending_id, now + 2).expect("approved");
         authorize(&pending_id);

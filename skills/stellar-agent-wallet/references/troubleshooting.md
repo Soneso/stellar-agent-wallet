@@ -190,10 +190,27 @@ MPP codes are closed and redacted. Input/selection failures include
 `mpp.unsupported_intent`, `mpp.unsupported_mode`, `mpp.network_forbidden`, and
 `mpp.input_too_large`. Approval/state/signing failures include
 `mpp.approval_required`, `mpp.approval_invalid`,
-`mpp.authorization_replayed`, `mpp.authorization_indeterminate`,
-`mpp.state_unavailable`, `mpp.simulation_failed`, `mpp.signing_failed`, and
+`mpp.authorization_not_found`, `mpp.authorization_replayed`,
+`mpp.authorization_indeterminate`, `mpp.state_unavailable`,
+`mpp.simulation_failed`, `mpp.signing_failed`, and
 `mpp.credential_too_large`. Observation failures are `mpp.receipt_invalid`,
 `mpp.receipt_conflict`, and `mpp.reconciliation_unavailable`.
+
+`mpp.authorization_not_found` means no authorization matches the identifier
+you supplied, including on a profile that has never prepared a charge. It is a
+normal answer: correct the identifier or prepare a charge. Do not report it as
+a wallet fault. `mpp.state_unavailable` means the durable state or a
+prerequisite of it exists and cannot be used. Its store causes (unreadable or
+unverifiable store, unreadable state key, unusable clock, capacity ceiling) are
+operator problems that retrying will not clear; its call causes (malformed
+identifier, an input file that is not a bounded regular file) mean the call was
+wrong — correct it and retry. A malformed identifier answers this way on every
+store state, so it never reveals whether a profile has MPP state.
+
+`mpp state prune` on a profile with no MPP history succeeds with `pruned: 0`
+once the profile's audit key is minted (`stellar-agent profile
+rotate-audit-key <profile>`); like every audited verb it refuses without one,
+here with `mpp.state_unavailable`.
 
 For `mpp.approval_required`, wait for the operator and resume the exact stored
 authorization. For replayed, indeterminate, withheld, signing, state, receipt,

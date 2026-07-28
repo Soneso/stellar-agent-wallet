@@ -145,7 +145,7 @@ impl WalletServer {
         };
 
         // Successful simulation precedes lazy MPP key creation.
-        let state = match MppAuthorizationStore::from_profile_keyring(&args.profile, true) {
+        let state = match MppAuthorizationStore::open_for_prepare(&args.profile) {
             Ok(state) => state,
             Err(error) => return Ok(mpp_error_result(&error)),
         };
@@ -248,8 +248,11 @@ impl WalletServer {
             return error.into_result();
         }
         let profile_name = self.profile_name_for_approval();
-        let state = match MppAuthorizationStore::from_profile_keyring(&profile_name, false) {
-            Ok(state) => state,
+        let state = match MppAuthorizationStore::open_for_read(&profile_name) {
+            Ok(Some(state)) => state,
+            // A profile that has never prepared a charge holds no
+            // authorization under any identifier.
+            Ok(None) => return Ok(mpp_absent_state_lookup_error(&args.authorization_id)),
             Err(error) => return Ok(mpp_error_result(&error)),
         };
         let record = match state.load(&args.authorization_id) {
@@ -423,8 +426,9 @@ impl WalletServer {
             Err(error) => return Ok(mpp_error_result(&error)),
         };
         let profile_name = self.profile_name_for_approval();
-        let state = match MppAuthorizationStore::from_profile_keyring(&profile_name, false) {
-            Ok(state) => state,
+        let state = match MppAuthorizationStore::open_for_read(&profile_name) {
+            Ok(Some(state)) => state,
+            Ok(None) => return Ok(mpp_absent_state_lookup_error(&args.authorization_id)),
             Err(error) => return Ok(mpp_error_result(&error)),
         };
         let now = stellar_agent_core::timefmt::now_unix_ms()
@@ -477,8 +481,9 @@ impl WalletServer {
             return Ok(result);
         }
         let profile_name = self.profile_name_for_approval();
-        let state = match MppAuthorizationStore::from_profile_keyring(&profile_name, false) {
-            Ok(state) => state,
+        let state = match MppAuthorizationStore::open_for_read(&profile_name) {
+            Ok(Some(state)) => state,
+            Ok(None) => return Ok(mpp_absent_state_lookup_error(&args.authorization_id)),
             Err(error) => return Ok(mpp_error_result(&error)),
         };
         let rpc = match StellarReconciliationRpc::new(&self.profile.rpc_url) {
@@ -533,8 +538,9 @@ impl WalletServer {
             return Ok(result);
         }
         let profile_name = self.profile_name_for_approval();
-        let state = match MppAuthorizationStore::from_profile_keyring(&profile_name, false) {
-            Ok(state) => state,
+        let state = match MppAuthorizationStore::open_for_read(&profile_name) {
+            Ok(Some(state)) => state,
+            Ok(None) => return Ok(mpp_absent_state_lookup_error(&args.authorization_id)),
             Err(error) => return Ok(mpp_error_result(&error)),
         };
         let now_unix = stellar_agent_core::timefmt::now_unix_ms()
@@ -580,6 +586,16 @@ fn mpp_state_error() -> CallToolResult {
     mpp_error_result(&state_error())
 }
 
+/// The identifier-lookup refusal for a profile with no MPP state, rendered
+/// from the shared classifier so this surface cannot drift from the store's own
+/// not-found arms or from the CLI — including on a malformed identifier, which
+/// must classify the same way whether or not the profile has ever minted state.
+fn mpp_absent_state_lookup_error(authorization_id: &str) -> CallToolResult {
+    mpp_error_result(&stellar_agent_mpp::absent_state_lookup_error(
+        authorization_id,
+    ))
+}
+
 fn mpp_approval_error() -> CallToolResult {
     mpp_error_result(&MppError::new(
         MppErrorCode::ApprovalInvalid,
@@ -594,6 +610,12 @@ fn mpp_signing_error() -> CallToolResult {
     ))
 }
 
+/// The uniform state refusal.
+///
+/// Byte-identical to `stellar_agent_mpp::store`'s definition and to
+/// `stellar-agent-cli`'s MPP command module: the three exist because this code
+/// is raised on paths that hold no store handle, and one refusal must not be
+/// distinguishable from another by its text.
 fn state_error() -> MppError {
     MppError::new(
         MppErrorCode::StateUnavailable,
@@ -612,7 +634,13 @@ mod tests {
         reason = "test fixtures use expect for concise setup"
     )]
 
-    use stellar_agent_core::{policy::ToolValueKind, profile::schema::Profile};
+    use std::path::{Path, PathBuf};
+
+    use stellar_agent_core::{
+        policy::ToolValueKind,
+        profile::schema::{KeyringEntryRef, Profile},
+    };
+    use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
 
     use super::*;
 
@@ -774,5 +802,230 @@ mod tests {
             assert_eq!(code, "mpp.network_forbidden");
             assert!(!message.contains("keyring") && !message.contains("state"));
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // First run vs a store that exists and cannot be used
+    //
+    // `stellar_mpp_charge_commit` is the one identifier-lookup tool these pins
+    // do not cover: it reaches its store only behind a minted, unexpired
+    // process-bound nonce, which no fixture here can supply. Its behaviour
+    // follows from the shared classifier the other three sites use, pinned
+    // directly in `stellar-agent-mpp`.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// The profile every test below serves under.
+    const FIRST_RUN_PROFILE: &str = "mpp-first-run";
+
+    /// A well-formed identifier no store in this suite holds.
+    const UNKNOWN_ID: &str = "mpp_00000000000000000000000000000000";
+
+    /// An identifier of the wrong shape, refused before any lookup.
+    const MALFORMED_ID: &str = "mpp_not-a-valid-identifier";
+
+    /// A receipt that parses, so `stellar_mpp_record_receipt` reaches its store
+    /// open instead of refusing on its input.
+    fn parseable_receipt() -> ReceiptInput {
+        ReceiptInput::Mcp {
+            receipt: serde_json::json!({
+                "method": "stellar",
+                "reference": "a".repeat(64),
+                "status": "success",
+                "timestamp": "2026-07-16T12:00:00Z",
+            }),
+        }
+    }
+
+    fn first_run_server() -> WalletServer {
+        WalletServer::new(
+            Profile::builder_testnet_named(
+                FIRST_RUN_PROFILE,
+                "svc",
+                "acct",
+                "nonce-svc",
+                "nonce-acct",
+            )
+            .with_noop_engine()
+            .build(),
+        )
+        .expect("server")
+    }
+
+    /// The canonical state path for [`FIRST_RUN_PROFILE`] under `home`.
+    ///
+    /// Derived here the way `MppAuthorizationStore::for_profile` derives it. A
+    /// drift in that convention makes the fabricated-file test fail — the file
+    /// would land somewhere the store never looks and the run would report
+    /// first run instead of the refusal asserted below — so this duplication
+    /// cannot go quietly stale.
+    fn state_path(home: &Path) -> PathBuf {
+        let stem = hex::encode(Sha256::digest(FIRST_RUN_PROFILE.as_bytes()));
+        home.join("mpp").join(format!("{stem}.state"))
+    }
+
+    /// Every identifier-lookup tool answers a profile that has never prepared a
+    /// charge with `mpp.authorization_not_found`, not with the state refusal.
+    ///
+    /// The mock keyring store is installed and empty, so the state key is
+    /// provably absent rather than unreadable for an environmental reason —
+    /// a keyring-less runner cannot make this pass for the wrong cause.
+    ///
+    /// The code is asserted against `MppErrorCode`'s own wire string, which is
+    /// the same source `stellar-agent`'s process-level pin asserts against, so
+    /// the two surfaces answer this case identically by construction.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn every_id_lookup_reports_not_found_on_a_profile_with_no_mpp_state() {
+        let home = tempfile::tempdir().expect("temp home");
+        let _home_guard = StellarAgentHomeGuard::new(home.path());
+        keyring_mock::install().expect("mock keyring store");
+        let server = first_run_server();
+
+        let results = [
+            (
+                "stellar_mpp_authorization_status",
+                server
+                    .stellar_mpp_authorization_status(Parameters(MppStatusArgs {
+                        authorization_id: UNKNOWN_ID.to_owned(),
+                    }))
+                    .await
+                    .expect("business error"),
+            ),
+            (
+                "stellar_mpp_record_receipt",
+                server
+                    .stellar_mpp_record_receipt(Parameters(MppReceiptArgs {
+                        authorization_id: UNKNOWN_ID.to_owned(),
+                        receipt: parseable_receipt(),
+                    }))
+                    .await
+                    .expect("business error"),
+            ),
+            (
+                "stellar_mpp_reconcile_transaction",
+                server
+                    .stellar_mpp_reconcile_transaction(Parameters(MppReconcileArgs {
+                        authorization_id: UNKNOWN_ID.to_owned(),
+                        transaction_hash: "b".repeat(64),
+                    }))
+                    .await
+                    .expect("business error"),
+            ),
+        ];
+
+        for (tool, result) in results {
+            let (code, message, _text) = crate::tools::common::assert_business_envelope(&result);
+            assert_eq!(
+                code,
+                MppErrorCode::AuthorizationNotFound.as_str(),
+                "{tool} must report an unknown authorization, not a broken store"
+            );
+            assert_eq!(code, "mpp.authorization_not_found", "{tool}");
+            assert_eq!(
+                message,
+                MppError::authorization_not_found().message(),
+                "{tool} must carry the shared refusal text"
+            );
+        }
+        assert!(
+            !state_path(home.path()).exists(),
+            "a read must not create the state file"
+        );
+    }
+
+    /// An identifier a minted but still empty store does not hold gets the same
+    /// refusal as a profile with no store at all.
+    ///
+    /// The key is minted and no file has been written yet — the legitimate
+    /// post-mint, pre-first-write state — so these runs reach the store's own
+    /// not-found arms rather than the first-run path. `record_receipt` is
+    /// included because its lookup is a mutation rather than a `load`: one user
+    /// error must not read two ways depending on store state the caller cannot
+    /// see.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn an_unknown_id_on_a_minted_empty_store_reports_not_found() {
+        let home = tempfile::tempdir().expect("temp home");
+        let _home_guard = StellarAgentHomeGuard::new(home.path());
+        keyring_mock::install().expect("mock keyring store");
+        let entry_ref = KeyringEntryRef::default_mpp_state_key(FIRST_RUN_PROFILE);
+        stellar_agent_network::keyring::rotate_keyring_secret_32(
+            &entry_ref.service,
+            &entry_ref.account,
+        )
+        .expect("mint the state key");
+        let server = first_run_server();
+
+        let status = server
+            .stellar_mpp_authorization_status(Parameters(MppStatusArgs {
+                authorization_id: UNKNOWN_ID.to_owned(),
+            }))
+            .await
+            .expect("business error");
+        let (code, _message, _text) = crate::tools::common::assert_business_envelope(&status);
+        assert_eq!(code, "mpp.authorization_not_found");
+
+        let receipt = server
+            .stellar_mpp_record_receipt(Parameters(MppReceiptArgs {
+                authorization_id: UNKNOWN_ID.to_owned(),
+                receipt: parseable_receipt(),
+            }))
+            .await
+            .expect("business error");
+        let (code, message, _text) = crate::tools::common::assert_business_envelope(&receipt);
+        assert_eq!(code, "mpp.authorization_not_found");
+        assert_eq!(message, MppError::authorization_not_found().message());
+
+        // A malformed identifier stays an input fault on every store state; a
+        // different answer here would let a caller probe for MPP state.
+        let malformed = server
+            .stellar_mpp_authorization_status(Parameters(MppStatusArgs {
+                authorization_id: MALFORMED_ID.to_owned(),
+            }))
+            .await
+            .expect("business error");
+        let (code, _message, _text) = crate::tools::common::assert_business_envelope(&malformed);
+        assert_eq!(code, "mpp.state_unavailable");
+
+        // Proof the minted key was actually used: a lookup through a real
+        // store takes the store lock, which establishes the store directory,
+        // while the first-run path — which answers the same code — touches
+        // nothing. Without this the mint could be a no-op and the assertions
+        // above would still pass.
+        assert!(
+            home.path().join("mpp").is_dir(),
+            "the lookup must have gone through a real store"
+        );
+        assert!(
+            !state_path(home.path()).exists(),
+            "a read must not create the state file"
+        );
+    }
+
+    /// A state file present without its key still refuses with the state code.
+    ///
+    /// This is the fail-closed half of the contract: only the provable
+    /// never-minted state reads as first run, so deleting or rotating the key
+    /// under an existing store cannot be answered as "nothing was ever here".
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn a_state_file_without_its_key_still_refuses() {
+        let home = tempfile::tempdir().expect("temp home");
+        let _home_guard = StellarAgentHomeGuard::new(home.path());
+        keyring_mock::install().expect("mock keyring store");
+        let path = state_path(home.path());
+        std::fs::create_dir_all(path.parent().expect("state parent")).expect("state directory");
+        std::fs::write(&path, [0_u8; 32]).expect("fabricate a state file");
+        let server = first_run_server();
+
+        let result = server
+            .stellar_mpp_authorization_status(Parameters(MppStatusArgs {
+                authorization_id: UNKNOWN_ID.to_owned(),
+            }))
+            .await
+            .expect("business error");
+
+        let (code, _message, _text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "mpp.state_unavailable");
     }
 }

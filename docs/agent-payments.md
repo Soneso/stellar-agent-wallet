@@ -171,6 +171,30 @@ Stable errors use the `mpp.*` namespace, including `mpp.challenge_invalid`,
 `mpp.challenge_ambiguous`, `mpp.challenge_mismatch`, `mpp.challenge_expired`,
 `mpp.unsupported_method`, `mpp.unsupported_intent`, `mpp.unsupported_mode`,
 `mpp.input_too_large`, `mpp.approval_invalid`, `mpp.network_forbidden`,
-`mpp.authorization_replayed`, `mpp.state_unavailable`, `mpp.simulation_failed`,
-`mpp.signing_failed`, `mpp.credential_too_large`, `mpp.receipt_invalid`,
-`mpp.receipt_conflict`, and `mpp.reconciliation_unavailable`.
+`mpp.authorization_not_found`, `mpp.authorization_replayed`,
+`mpp.state_unavailable`, `mpp.simulation_failed`, `mpp.signing_failed`,
+`mpp.credential_too_large`, `mpp.receipt_invalid`, `mpp.receipt_conflict`, and
+`mpp.reconciliation_unavailable`.
+
+Two of those are easy to confuse, and an agent should route on them
+differently. `mpp.authorization_not_found` means no authorization matches the
+identifier you supplied — including on a profile that has never prepared a
+charge, where nothing is stored yet. It is a normal answer, not a fault:
+correct the identifier or prepare a charge.
+
+`mpp.state_unavailable` means the durable state, or a prerequisite of it,
+exists and cannot be used. Its causes fall into two groups with different
+remedies. Store causes — an unreadable or unverifiable store, an unreadable
+state key over an existing store, an unusable clock, a capacity ceiling — are
+operator problems, and retrying will not clear them. Call causes — a malformed
+identifier, an input file that is not a bounded regular file — mean the call
+was wrong: correct it and retry. A malformed identifier answers this way on
+every store state, including a profile with no MPP state, so the answer never
+reveals whether a profile has one.
+
+`mpp state prune` on a profile with no MPP history succeeds with `pruned: 0`
+and records the maintenance request in the audit log, the same as pruning a
+store that holds no removable record. Like every audited verb it first needs
+the profile's audit chain-root key (`stellar-agent profile rotate-audit-key
+<profile>`); a profile without one refuses with `mpp.state_unavailable`,
+because the row the operation must record is a prerequisite it cannot meet.
