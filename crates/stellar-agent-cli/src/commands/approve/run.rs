@@ -170,7 +170,8 @@ pub async fn run(args: RunArgs) -> i32 {
     };
 
     // ── 2. Resolve profile name ───────────────────────────────────────────────
-    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+    let resolved_profile = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolved_profile.name.clone();
 
     // ── 3. Load the profile for keyring entry ref ─────────────────────────────
     let profile = match loader::load(&profile_name, None) {
@@ -265,7 +266,7 @@ pub async fn run(args: RunArgs) -> i32 {
 
     // ── 7b. Open the audit log (non-fatal: proceed without emission on failure) ──
     let audit_writer_arc: Option<Arc<Mutex<AuditWriter>>> =
-        match open_profile_audit_writer(&profile_name) {
+        match open_profile_audit_writer(&resolved_profile) {
             Ok((_profile, writer, _path)) => Some(writer),
             Err(e) => {
                 tracing::warn!(

@@ -370,15 +370,16 @@ where
     // or a permissive NoopPolicyEngine (if Noop), then evaluate before submit.
     // The legs are built from the SAME `blend_requests` vector later placed
     // into `BlendLendArgs` (single-decode invariant).
-    let policy_engine = match build_v1_policy_engine("lend", &profile.policy.engine, &profile) {
-        Ok(pe) => pe,
-        Err(msg) => {
-            // Fail-closed: a configured-but-unbuildable policy refuses the
-            // value-moving lend op rather than silently running permissive.
-            render_json(&Envelope::<()>::err_raw("policy.engine_unavailable", msg));
-            return 1;
-        }
-    };
+    let policy_engine =
+        match build_v1_policy_engine("lend", &profile.policy.engine, &profile, &profile_name) {
+            Ok(pe) => pe,
+            Err(msg) => {
+                // Fail-closed: a configured-but-unbuildable policy refuses the
+                // value-moving lend op rather than silently running permissive.
+                render_json(&Envelope::<()>::err_raw("policy.engine_unavailable", msg));
+                return 1;
+            }
+        };
     let value_legs = blend_value_legs(&blend_requests, &args.pool);
     // Capture the gate-derived legs as audit records before the descriptor
     // moves into the gate, so the emitted row carries exactly what the gate

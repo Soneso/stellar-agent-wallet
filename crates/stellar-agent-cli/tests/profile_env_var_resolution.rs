@@ -26,6 +26,15 @@
 //! - The startup advisory (pre-dispatch, in `main.rs`) resolves an audit-log
 //!   path per profile; an unreadable log at that path makes it name the path
 //!   in a `warn!` on stderr.
+//! - `pay`, `claim`, and `accounts create` take their endpoint from
+//!   `--rpc-url` and never read `profile.rpc_url`, so the endpoint
+//!   discriminator is void for them. They are pinned on the per-profile
+//!   audit-log path the startup advisory opens. That is the advisory's
+//!   resolution of the verb's own parsed `--profile` value
+//!   (`main.rs`'s `profile_flag`), not the verb's own load, so it observes
+//!   the same clap field and the same resolver one step earlier. The verb's
+//!   own resolution is pinned separately, on the refusal it emits, in
+//!   `profile_provenance_refusal.rs`.
 //!
 //! # Hermetic fixtures
 //!
@@ -72,6 +81,12 @@ const HEADLESS_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 /// call, and the account is never fetched successfully because every fixture
 /// endpoint is unreachable.
 const SOURCE_G: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+
+/// Endpoint for the verbs that take it from `--rpc-url` rather than the
+/// profile. Unreachable on purpose: this suite runs in the offline gate, and
+/// `pay` / `claim` / `accounts create` default `--rpc-url` to the live testnet
+/// endpoint, so omitting it would put real outbound calls in an offline job.
+const UNREACHABLE_RPC: &str = "http://127.0.0.1:9";
 
 /// Writes a `noop`-engine testnet profile fixture into `<home>/profiles`.
 ///
@@ -477,43 +492,136 @@ fn startup_advisory_profile_flag_beats_the_environment_variable() {
     );
 }
 
-/// The advisory scans the log the COMMAND writes, not the one the environment
-/// variable names, for a verb whose `--profile` carries a clap default.
-///
-/// `pay` audits under the literal `"default"` regardless of the variable
-/// (`pay.rs`'s field is a `String` with `default_value = "default"`, and its
-/// value-audit rows are keyed on that name). An advisory that resolved the
-/// variable independently would open — and append advisory rows to — an
-/// unrelated profile's audit log.
-#[test]
-fn startup_advisory_follows_a_defaulted_verb_rather_than_the_environment_variable() {
-    let home = tempfile::tempdir().expect("temp home");
-    write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC);
-    write_unreadable_audit_log(home.path(), ENV_PROFILE);
-    write_unreadable_audit_log(home.path(), "default");
+// ─────────────────────────────────────────────────────────────────────────────
+// pay / claim / accounts create — the audit-log path is the observation
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// These three take their endpoint from `--rpc-url` and never read
+// `profile.rpc_url`, so the endpoint discriminator used above is void for them.
+// Their audit surface is keyed on the resolved profile name
+// (`commands/value_audit.rs`), and the startup advisory opens that same
+// per-profile audit-log path by running the verb's own parsed `--profile`
+// value through the same resolver (`main.rs`'s `profile_flag`) — so an
+// unreadable log at `<name>.jsonl` names the profile that field resolves to.
+// What this pins is the clap field plus the resolver; the verb's own load of
+// that name is pinned on its refusal in `profile_provenance_refusal.rs`.
 
-    let run = run_cli(
-        home.path(),
-        Some(ENV_PROFILE),
+/// The argument vector for each moved verb, minus any profile selector.
+///
+/// Every one is refused or fails on the endpoint long after the advisory has
+/// run; the advisory's `warn!` is the observation, not the exit code.
+const MOVED_VERB_ARGS: &[(&str, &[&str])] = &[
+    (
+        "pay",
         &[
             "pay",
             "--source",
             SOURCE_G,
             "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
-            "1",
+            "1 XLM",
             "--build-only",
+            "--rpc-url",
+            UNREACHABLE_RPC,
         ],
-    );
+    ),
+    (
+        "claim",
+        &[
+            "claim",
+            "000000000000000000000000000000000000000000000000000000000000000000000000",
+            "--source",
+            SOURCE_G,
+            "--build-only",
+            "--rpc-url",
+            UNREACHABLE_RPC,
+        ],
+    ),
+    (
+        "accounts create",
+        &[
+            "accounts",
+            "create",
+            "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+            "--sponsor",
+            SOURCE_G,
+            "--starting-balance",
+            "1 XLM",
+            "--rpc-url",
+            UNREACHABLE_RPC,
+        ],
+    ),
+];
 
-    assert!(
-        run.stderr.contains("default.jsonl"),
-        "the advisory must scan the log `pay` itself uses; stderr={}",
-        run.stderr
+/// Asserts the child failed on the loopback endpoint it was given, which is
+/// also the proof that it issued no call to the live testnet default.
+///
+/// `pay`, `claim`, and `accounts create` default `--rpc-url` to the SDF
+/// testnet endpoint, so a future edit that drops `--rpc-url` from
+/// [`MOVED_VERB_ARGS`] would silently put real outbound calls in the offline
+/// gate. This assertion fails instead.
+fn assert_reached_only_the_unreachable_endpoint(run: &Run, verb: &str) {
+    let json = run.json();
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+    assert_eq!(
+        json["error"]["code"], "network.rpc_unreachable",
+        "`{verb}` must fail on the endpoint it was handed, not reach a live one: {json}"
     );
     assert!(
-        !run.stderr.contains(&format!("{ENV_PROFILE}.jsonl")),
-        "the advisory must not resolve the variable independently of the verb; \
-         stderr={}",
-        run.stderr
+        message.contains("127.0.0.1:9"),
+        "`{verb}` must contact only the unreachable loopback endpoint: {message}"
     );
+}
+
+#[test]
+fn the_moved_verbs_audit_under_the_profile_named_by_the_environment_variable() {
+    for (verb, argv) in MOVED_VERB_ARGS {
+        let home = tempfile::tempdir().expect("temp home");
+        write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC);
+        write_profile(home.path(), "default", DEFAULT_PROFILE_RPC);
+        write_unreadable_audit_log(home.path(), ENV_PROFILE);
+        write_unreadable_audit_log(home.path(), "default");
+
+        let run = run_cli(home.path(), Some(ENV_PROFILE), argv);
+
+        assert_reached_only_the_unreachable_endpoint(&run, verb);
+        assert!(
+            run.stderr.contains(&format!("{ENV_PROFILE}.jsonl")),
+            "`{verb}` must audit under the profile the variable names; stderr={}",
+            run.stderr
+        );
+        assert!(
+            !run.stderr.contains("default.jsonl"),
+            "`{verb}` must not fall back to `default` when the variable names a \
+             profile; stderr={}",
+            run.stderr
+        );
+    }
+}
+
+#[test]
+fn the_moved_verbs_let_the_profile_flag_beat_the_environment_variable() {
+    for (verb, argv) in MOVED_VERB_ARGS {
+        let home = tempfile::tempdir().expect("temp home");
+        write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC);
+        write_profile(home.path(), FLAG_PROFILE, FLAG_PROFILE_RPC);
+        write_unreadable_audit_log(home.path(), ENV_PROFILE);
+        write_unreadable_audit_log(home.path(), FLAG_PROFILE);
+
+        let mut args = argv.to_vec();
+        args.extend_from_slice(&["--profile", FLAG_PROFILE]);
+        let run = run_cli(home.path(), Some(ENV_PROFILE), &args);
+
+        assert_reached_only_the_unreachable_endpoint(&run, verb);
+        assert!(
+            run.stderr.contains(&format!("{FLAG_PROFILE}.jsonl")),
+            "`{verb}`: `--profile` must win over the variable; stderr={}",
+            run.stderr
+        );
+        assert!(
+            !run.stderr.contains(&format!("{ENV_PROFILE}.jsonl")),
+            "`{verb}`: the variable's profile must not be audited when the flag names \
+             one; stderr={}",
+            run.stderr
+        );
+    }
 }

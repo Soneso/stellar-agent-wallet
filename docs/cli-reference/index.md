@@ -40,8 +40,6 @@ The effective profile name is resolved in this order:
 2. The `STELLAR_AGENT_PROFILE` environment variable.
 3. The literal `"default"`.
 
-Three commands are the exception: `accounts create`, `pay`, and `claim` take `--profile` with the literal default `"default"` and never consult `STELLAR_AGENT_PROFILE`. Their pages state this in their flag tables.
-
 Some commands take the profile as a positional argument instead of a flag (the `profile` group itself); those cases are noted on their page.
 
 ### Network
@@ -101,11 +99,11 @@ This is a testnet-first alpha. `testnet` is the default network and Friendbot fu
 
 ## Audit-key pre-flight refusal
 
-Every value-moving signing verb (`pay`, `claim`, `accounts create` sponsored mode, `trustline`, `trade`, `lend`, `vault`) proves the active profile's audit chain-root key is acquirable BEFORE any signing key is touched or transaction submitted. A profile fresh from `profile init` has the audit-log keyring COORDINATE but no key material — `profile rotate-audit-key <name>` mints it. Until that runs, these verbs refuse with the wire code `audit.chain_key_unavailable` rather than signing unaudited. Build-only/simulate stages are unaffected: they neither sign nor submit, so they never reach this pre-flight. This pre-flight fails closed only for a persisted `<name>.toml` profile: `pay`, `claim`, and `accounts create` keep their zero-config posture — the in-memory profile synthesized when no profile file exists stays fail-open on this specific check. See [Key-rotation subcommands](profile-and-governance.md#key-rotation-subcommands) and [Concepts: fail-closed on an unminted audit key](../concepts.md#fail-closed-on-an-unminted-audit-key).
+Every value-moving signing verb (`pay`, `claim`, `accounts create` sponsored mode, `trustline`, `trade`, `lend`, `vault`) proves the active profile's audit chain-root key is acquirable BEFORE any signing key is touched or transaction submitted. A profile fresh from `profile init` has the audit-log keyring COORDINATE but no key material — `profile rotate-audit-key <name>` mints it. Until that runs, these verbs refuse with the wire code `audit.chain_key_unavailable` rather than signing unaudited. Build-only/simulate stages are unaffected: they neither sign nor submit, so they never reach this pre-flight. This pre-flight fails closed only for a persisted `<name>.toml` profile: `pay`, `claim`, and `accounts create` keep their zero-config posture — the in-memory profile synthesized when no profile was named and no `default.toml` exists stays fail-open on this specific check. See [Key-rotation subcommands](profile-and-governance.md#key-rotation-subcommands) and [Concepts: fail-closed on an unminted audit key](../concepts.md#fail-closed-on-an-unminted-audit-key).
 
 ## Startup advisory
 
-Before dispatching any command, the CLI runs a local-only startup advisory: it scans the profile's audit log for context rules that reference revoked or retired verifier WASM hashes. The scan issues no network calls and is non-fatal. If it cannot run, the error is logged at warn level and the command proceeds. The advisory reads the audit log of the profile the command it precedes operates on: it takes the profile the parsed subcommand resolved and applies the same resolution order as that subcommand, including for the three commands above that do not consult `STELLAR_AGENT_PROFILE`. The advisory therefore never opens — or appends to — a different profile's log than the command itself uses.
+Before dispatching any command, the CLI runs a local-only startup advisory: it scans the profile's audit log for context rules that reference revoked or retired verifier WASM hashes. The scan issues no network calls and is non-fatal. If it cannot run, the error is logged at warn level and the command proceeds. The advisory reads the audit log of the profile the command it precedes operates on: it takes the profile the parsed subcommand resolved and applies the same resolution order as that subcommand. The advisory therefore never opens — or appends to — a different profile's log than the command itself uses.
 
 ## Command index
 

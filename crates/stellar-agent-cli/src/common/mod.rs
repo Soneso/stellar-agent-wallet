@@ -5,6 +5,9 @@
 //! - [`network`] — `TargetNetwork` enum unifying the network selector across
 //!   write subcommands.  Carries passphrase constants and implements
 //!   `FromStr` / `Display` for clap.
+//! - [`profile_access`] — the profile-access choke point: the one place that
+//!   decides whether a missing profile file may be replaced by the synthesised
+//!   zero-config profile, keyed on the resolved name's provenance.
 //! - [`render`] — `render_json` and `sanitize_for_table` output helpers
 //!   shared by `pay` and `accounts create`.
 //! - [`signer_ceremony`] — `resolve_software_signer_from_env`, the single
@@ -25,6 +28,7 @@
 //!   to use as a path component (no path traversal, no special characters).
 
 pub mod network;
+pub mod profile_access;
 pub mod render;
 pub mod signer_ceremony;
 
@@ -54,7 +58,9 @@ pub fn display_available() -> bool {
 /// either rule.
 ///
 /// [`resolve_profile_name`] returns the name together with its provenance;
-/// CLI call sites that treat every profile name alike take `.name`.
+/// CLI call sites that treat every profile name alike take `.name`. Sites
+/// that decide whether a missing profile file may be synthesised take the
+/// whole [`ResolvedProfileName`] — see [`profile_access`].
 pub use stellar_agent_core::profile::name::{
-    resolve_profile_name, validate_path_component_ascii_safe,
+    ResolvedProfileName, resolve_profile_name, validate_path_component_ascii_safe,
 };

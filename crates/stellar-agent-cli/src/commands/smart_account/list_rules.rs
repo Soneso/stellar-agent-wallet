@@ -326,7 +326,8 @@ pub struct ListRulesResult {
 ///
 /// Never panics.
 pub async fn run(args: &ListRulesArgs) -> i32 {
-    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+    let resolved_profile = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolved_profile.name.clone();
 
     // ── Parse --account C-strkey ──────────────────────────────────────────────
     let smart_account = match parse_c_strkey_to_smart_account(&args.account) {
@@ -347,7 +348,7 @@ pub async fn run(args: &ListRulesArgs) -> i32 {
 
     // ── Open audit writer for audit-log cross-check ───────────────────────────
     let (_audit_profile, audit_writer, _audit_log_path): (_, Arc<Mutex<AuditWriter>>, _) =
-        match open_profile_audit_writer_read_only(&profile_name) {
+        match open_profile_audit_writer_read_only(&resolved_profile) {
             Ok(triple) => triple,
             Err(e) => return emit_error(&e),
         };

@@ -158,7 +158,10 @@ Profiles live in the OS-conventional directory, one TOML file per profile name:
 The default profile name is `default`. The `balances` and `pay` commands below
 take an explicit `--account`/`--source` and `--rpc-url` (defaulting to the
 testnet RPC), so they work without authoring a profile file. Profile-aware
-commands synthesise an in-memory testnet profile when no `default.toml` exists.
+commands synthesise an in-memory testnet profile when no profile was *named*
+and no `default.toml` exists. A profile you name — with `--profile` or
+`STELLAR_AGENT_PROFILE` — is never replaced by that fallback: if its file does
+not exist, the command refuses.
 
 To create a persistent profile, run `profile init`:
 

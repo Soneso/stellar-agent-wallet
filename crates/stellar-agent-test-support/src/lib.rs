@@ -18,6 +18,9 @@
 //! - [`env_guard::StellarAgentHomeGuard`] — RAII guard overriding
 //!   `STELLAR_AGENT_HOME` for tests that exercise the wallet's
 //!   home-directory resolution; callers serialise with `#[serial]`.
+//! - [`env_guard::ProfileEnvVarGuard`] — RAII guard clearing
+//!   `STELLAR_AGENT_PROFILE` for in-process tests that exercise the
+//!   "no profile was named" branch; callers serialise with `#[serial]`.
 //!
 //! This crate is consumed only as a `[dev-dependencies]` entry
 //! (`publish = false`); it is never a runtime dependency, so its `pub` helpers
@@ -48,6 +51,6 @@ mod bip39_english;
 
 #[cfg(feature = "wiremock-helpers")]
 pub use echo_id_responder::EchoIdResponder;
-pub use env_guard::StellarAgentHomeGuard;
+pub use env_guard::{ProfileEnvVarGuard, StellarAgentHomeGuard};
 pub use log_capture::{CaptureWriter, RedactionStrictSubscriber, with_captured_logs};
 pub use secret_patterns::assert_no_secret_bytes;

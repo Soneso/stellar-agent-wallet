@@ -23,11 +23,15 @@
 //!
 //! `claim` reads its secret straight from the named environment variable
 //! (`std::env::var`) and never touches the wallet keyring system, so no
-//! keyring seeding is needed here. The `--profile` flag defaults to
-//! `"default"`; with no `default.toml` file present, the command synthesizes
-//! an in-memory `Noop`-engine testnet profile for its policy gate (see
-//! `crate::commands::policy_engine::load_profile_or_synthesize_testnet`), so
+//! keyring seeding is needed here. No profile is NAMED — neither `--profile`
+//! nor `STELLAR_AGENT_PROFILE`, which is explicitly cleared on the child — so
+//! with no `default.toml` file present the command synthesizes an in-memory
+//! `Noop`-engine testnet profile for its policy gate (see
+//! `crate::common::profile_access::load_profile_or_synthesize_testnet`), and
 //! no profile setup is needed either — the gate is a permissive no-op here.
+//! Clearing the variable is load-bearing: a name inherited from the developer's
+//! environment would be an explicitly-named profile, and the run would refuse
+//! rather than synthesize.
 //!
 //! Gated behind the `testnet-acceptance` feature flag:
 //!
@@ -239,6 +243,9 @@ async fn t3_cli_single_shot_happy_path() {
             TESTNET_RPC_URL,
         ])
         .env(CLAIM_SECRET_ENV_VAR, &claimant_s_strkey)
+        // No profile is named: the zero-config synthesis this test relies on
+        // fires only when neither `--profile` nor the variable supplied one.
+        .env_remove("STELLAR_AGENT_PROFILE")
         .output()
         .expect("stellar-agent claim subprocess must spawn");
 

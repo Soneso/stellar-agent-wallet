@@ -31,10 +31,10 @@ use uuid::Uuid;
 
 use crate::common::network::TargetNetwork;
 use crate::common::render::render_json;
-use crate::common::resolve_profile_name;
 use crate::common::signer_ceremony::{
     SignerCeremonyOutcome, record_mlock_degradation, resolve_software_signer_from_env,
 };
+use crate::common::{ResolvedProfileName, resolve_profile_name};
 
 /// Mutually-exclusive signer source flags shared by wallet write/read handlers.
 #[derive(Debug, Args)]
@@ -113,7 +113,8 @@ impl CommonHandlerContext {
     /// Returns a wallet error when signer resolution, smart-account parsing,
     /// audit-log opening, or path setup fails.
     pub async fn new(args: &impl CommonArgsView) -> Result<Self, WalletError> {
-        let profile_name = resolve_profile_name(args.profile()).name;
+        let resolved = resolve_profile_name(args.profile());
+        let profile_name = resolved.name.clone();
         let (signer, mlock_degradation) =
             resolve_signer(args.signer_source(), Some(&profile_name)).await?;
         let smart_account = parse_c_strkey_to_smart_account(args.account()).map_err(|e| {
@@ -130,8 +131,7 @@ impl CommonHandlerContext {
         let timeout = Duration::from_secs(args.timeout_seconds());
         let chain_id = network_to_chain_id(args.network()).to_owned();
 
-        let (_audit_profile, audit_writer, audit_log_path) =
-            open_profile_audit_writer(&profile_name)?;
+        let (_audit_profile, audit_writer, audit_log_path) = open_profile_audit_writer(&resolved)?;
         record_mlock_degradation(
             &audit_writer,
             mlock_degradation.as_ref(),
@@ -402,10 +402,16 @@ pub(crate) fn emit_multicall_registry_error(e: &SaError, source: IoSource) -> i3
     }
 }
 
-/// Resolves the profile for `profile_name` (or synthesizes the zero-config
-/// testnet fallback when no profile file exists) and opens the audit-log
-/// writer under the profile's configured `audit_log_path` and audit
-/// chain-root HMAC key.
+/// Resolves the profile for `resolved` (or synthesizes the zero-config
+/// testnet fallback when NO profile was named and no profile file exists) and
+/// opens the audit-log writer under the profile's configured `audit_log_path`
+/// and audit chain-root HMAC key.
+///
+/// Takes the whole [`ResolvedProfileName`], not the bare name, because
+/// [`load_profile_or_synthesize_testnet`](crate::common::profile_access::load_profile_or_synthesize_testnet)
+/// keys the synthesis fallback on the name's provenance: a profile the
+/// operator named through `--profile` or `STELLAR_AGENT_PROFILE` but never
+/// authored refuses instead of resolving to the permissive fallback.
 ///
 /// Origin-aware, mirroring the value-verb discipline:
 ///
@@ -425,11 +431,12 @@ pub(crate) fn emit_multicall_registry_error(e: &SaError, source: IoSource) -> i3
 /// Returns the resolved profile alongside the writer so callers stop
 /// re-deriving paths from the bare name.
 pub(crate) fn open_profile_audit_writer(
-    profile_name: &str,
+    resolved: &ResolvedProfileName,
 ) -> Result<(Profile, Arc<Mutex<AuditWriter>>, PathBuf), WalletError> {
-    use crate::commands::policy_engine::{ProfileOrigin, load_profile_or_synthesize_testnet};
+    use crate::common::profile_access::{ProfileOrigin, load_profile_or_synthesize_testnet};
 
-    let (profile, origin) = load_profile_or_synthesize_testnet(profile_name).map_err(|detail| {
+    let profile_name = resolved.name.as_str();
+    let (profile, origin) = load_profile_or_synthesize_testnet(resolved).map_err(|detail| {
         wallet_io_error(
             IoSource::AuditWriterSetup,
             format!("profile resolution failed: {detail}"),
@@ -470,17 +477,17 @@ pub(crate) fn open_profile_audit_writer(
 /// Returns [`WalletError`] on profile-resolution failure or when even the
 /// unkeyed open fails (I/O).
 pub(crate) fn open_profile_audit_writer_read_only(
-    profile_name: &str,
+    resolved: &ResolvedProfileName,
 ) -> Result<(Profile, Arc<Mutex<AuditWriter>>, PathBuf), WalletError> {
-    use crate::commands::policy_engine::load_profile_or_synthesize_testnet;
+    use crate::common::profile_access::load_profile_or_synthesize_testnet;
 
-    let (profile, _origin) =
-        load_profile_or_synthesize_testnet(profile_name).map_err(|detail| {
-            wallet_io_error(
-                IoSource::AuditWriterSetup,
-                format!("profile resolution failed: {detail}"),
-            )
-        })?;
+    let profile_name = resolved.name.as_str();
+    let (profile, _origin) = load_profile_or_synthesize_testnet(resolved).map_err(|detail| {
+        wallet_io_error(
+            IoSource::AuditWriterSetup,
+            format!("profile resolution failed: {detail}"),
+        )
+    })?;
     let log_path = profile.audit_log_path.clone();
 
     if let Some(parent) = log_path.parent() {
@@ -498,13 +505,22 @@ pub(crate) fn open_profile_audit_writer_read_only(
 mod tests {
     #![allow(clippy::expect_used, clippy::panic, reason = "test-only assertions")]
 
+    use stellar_agent_core::profile::name::ProfileNameSource;
+
     use super::*;
+
+    /// A resolved name with an explicit source, as `--profile <name>` produces.
+    fn named(name: &str) -> ResolvedProfileName {
+        ResolvedProfileName {
+            name: name.to_owned(),
+            source: ProfileNameSource::Flag,
+        }
+    }
 
     /// The origin-aware writer gate every smart-account, approve, and
     /// timelock command shares: a PERSISTED profile without a minted audit
-    /// chain key refuses (`audit.chain_key_unavailable`), with the key
-    /// minted it opens the writer at the profile's configured path, and the
-    /// SYNTHESIZED zero-config path (no profile file) still yields a writer.
+    /// chain key refuses (`audit.chain_key_unavailable`), and with the key
+    /// minted it opens the writer at the profile's configured path.
     #[test]
     #[serial_test::serial]
     fn open_profile_audit_writer_is_origin_aware() {
@@ -519,7 +535,7 @@ mod tests {
         profile_loader::save_to_dir("gate-test", &profile, &dir.path().join("profiles"))
             .expect("persist profile");
 
-        let err = open_profile_audit_writer("gate-test")
+        let err = open_profile_audit_writer(&named("gate-test"))
             .expect_err("a persisted profile without a minted audit key must refuse");
         assert_eq!(err.code(), "audit.chain_key_unavailable");
 
@@ -528,11 +544,46 @@ mod tests {
             &profile.audit_log_hash_chain_key_id.account,
         )
         .expect("mint audit key");
-        let (loaded, _writer, path) =
-            open_profile_audit_writer("gate-test").expect("minted key must open the writer");
+        let (loaded, _writer, path) = open_profile_audit_writer(&named("gate-test"))
+            .expect("minted key must open the writer");
         assert_eq!(path, loaded.audit_log_path);
+    }
 
-        let (_synth, _writer2, _path2) = open_profile_audit_writer("gate-absent")
+    /// A profile NAMED through `--profile` but never authored refuses: the
+    /// smart-account surface must not open a writer under the synthesized
+    /// permissive fallback for a name the operator chose.
+    #[test]
+    #[serial_test::serial]
+    fn open_profile_audit_writer_refuses_a_named_absent_profile() {
+        use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let _home = StellarAgentHomeGuard::new(dir.path());
+        keyring_mock::install().expect("mock store");
+
+        let err = open_profile_audit_writer(&named("gate-absent"))
+            .expect_err("a named profile with no file must refuse, not synthesize");
+        assert!(
+            err.to_string().contains("gate-absent"),
+            "the refusal must name the profile the operator asked for: {err}"
+        );
+    }
+
+    /// With NO profile named and no `default.toml`, the zero-config path
+    /// still yields a writer — the sibling of the refusal above, and the
+    /// invariant that keeps the smart-account quickstart working.
+    #[test]
+    #[serial_test::serial]
+    fn open_profile_audit_writer_synthesizes_when_no_profile_was_named() {
+        use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let _home = StellarAgentHomeGuard::new(dir.path());
+        keyring_mock::install().expect("mock store");
+
+        let unnamed = ResolvedProfileName {
+            name: "default".to_owned(),
+            source: ProfileNameSource::Default,
+        };
+        let (_synth, _writer, _path) = open_profile_audit_writer(&unnamed)
             .expect("the synthesized zero-config path must still yield a writer");
     }
 

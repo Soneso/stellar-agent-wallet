@@ -249,13 +249,14 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         return 1;
     }
 
-    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+    let resolved_profile = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolved_profile.name.clone();
 
     // ── Audit pre-flight: prove the writer is acquirable BEFORE any signing ──
     // key is touched or the bundle is submitted. A persisted profile whose
     // audit chain key is unminted refuses here (audit.chain_key_unavailable);
     // the SAME writer is reused for the post-confirm rows.
-    let audit_writer = match open_profile_audit_writer(&profile_name) {
+    let audit_writer = match open_profile_audit_writer(&resolved_profile) {
         Ok((_profile, writer, _path)) => Some(writer),
         Err(e) => {
             render_json(&Envelope::<()>::err(&e));

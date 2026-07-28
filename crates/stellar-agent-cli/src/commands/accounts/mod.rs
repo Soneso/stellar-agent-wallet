@@ -93,7 +93,7 @@ impl AccountsArgs {
     /// arm returns that value rather than `None`.
     pub(crate) fn profile_flag(&self) -> Option<&str> {
         match &self.subcommand {
-            AccountsSubcommand::Create(a) => Some(a.profile.as_str()),
+            AccountsSubcommand::Create(a) => a.profile.as_deref(),
             AccountsSubcommand::DeployC(a) => a.profile.as_deref(),
         }
     }

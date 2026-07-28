@@ -31,7 +31,7 @@ These recur with the same meaning across groups:
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--profile <NAME>` | Selects the per-environment TOML profile (binds CAIP-2 chain, RPC, keyring entry references, thresholds, policy engine). Holds no secrets. | resolves `--profile` → `STELLAR_AGENT_PROFILE` → `"default"`; `pay`, `claim`, and `accounts create` instead default to the literal `default` and skip the environment variable |
+| `--profile <NAME>` | Selects the per-environment TOML profile (binds CAIP-2 chain, RPC, keyring entry references, thresholds, policy engine). Holds no secrets. | resolves `--profile` → `STELLAR_AGENT_PROFILE` → `"default"` on every command that loads a profile (`accounts deploy-c` and `fees stats` default to no profile) |
 | `--network <NETWORK>` | `testnet` (default) or `mainnet`, case-insensitive | `testnet` |
 | `--rpc-url <URL>` | Primary Soroban RPC endpoint (allow-list validated) | `https://soroban-testnet.stellar.org` |
 | `--secondary-rpc-url <URL>` | Second RPC for two-RPC cross-checks (WASM-hash divergence) | per command |
@@ -136,7 +136,7 @@ Staged pipeline (mutually exclusive): `--build-only` emits unsigned envelope XDR
 | `--secret-env <VAR>` | Env-var name holding source S-strkey | — |
 | `--sign-with-ledger` / `--account-index <INDEX>` | Ledger signer / BIP index | `false` / `0` |
 | `--build-only` / `--sign-only <XDR>` / `--submit-only <XDR>` | Stage selection (at most one) | — |
-| `--profile <NAME>` | Profile whose policy engine, keys, and audit writer to use | `default` |
+| `--profile <NAME>` | Profile whose policy engine, keys, and audit writer to use | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--fee` / `--network` / `--timeout-seconds` / `--rpc-url` / `--output` | shared | as above |
 
 Memo flags are a mutually exclusive group (at most one).
@@ -230,7 +230,7 @@ stellar-agent trustline --from GABC...WXYZ --asset USDC --profile default
 | `--secret-env <VAR>` | Env-var name holding source S-strkey | — |
 | `--sign-with-ledger` / `--account-index <INDEX>` | Ledger signer / BIP index | `false` / `0` |
 | `--build-only` / `--sign-only <XDR>` / `--submit-only <XDR>` | Stage selection (at most one) | — |
-| `--profile <NAME>` | Profile whose policy engine, keys, and audit writer to use | `default` |
+| `--profile <NAME>` | Profile whose policy engine, keys, and audit writer to use | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--network` | `testnet` or `mainnet` (`mainnet` structurally refused for writes) | `testnet` |
 | `--timeout-seconds` / `--rpc-url` / `--output` | shared | as above |
 
@@ -471,7 +471,7 @@ Read-only. Enumerates pending approvals from the profile's store: opens it, rend
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--profile <NAME>` | Profile whose store to read | `default` |
+| `--profile <NAME>` | Profile whose store to read | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--output <FORMAT>` | `json` (default) or `table` | `json` |
 | `--include-expired` | Include already-expired entries instead of omitting them | `false` |
 
@@ -487,7 +487,7 @@ Binds a loopback-only HTTP server with a local web UI for the pending-approval q
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--profile <NAME>` | Profile whose store and attestation key to use | `default` |
+| `--profile <NAME>` | Profile whose store and attestation key to use | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--port <PORT>` | TCP port to bind on `127.0.0.1`; `0` picks an OS-assigned port | `0` |
 | `--no-open` | Print the bootstrap URL instead of opening a browser | `false` |
 | `--notify <on\|off>` | Best-effort OS toast notification when the queue grows | `on` |

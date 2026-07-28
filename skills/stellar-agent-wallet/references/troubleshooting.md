@@ -148,12 +148,18 @@ approval path cannot be probed. Recovery is the same as for any
 
 | Code | Meaning | Agent action |
 |---|---|---|
-| `audit.chain_key_unavailable` | A value-moving signing verb (`pay`, `claim`, `accounts create` sponsored mode, `trustline`, `trade`, `lend`, `vault`, and their MCP equivalents, plus the x402 payment tools and `stellar_sep43_sign_and_submit_transaction`) proved the profile's audit chain-root key is NOT acquirable, before touching the signer or submitting anything. `profile init` mints the audit-log keyring coordinate only, no key material. This pre-flight fails closed only for a persisted profile — the zero-config synthesized profile `pay`/`claim`/`accounts create` fall back to when no profile file exists stays fail-open here. The SEP-43 sign-only pair (`signTransaction`, `signAuthEntry`) is not yet covered. | Not agent-recoverable. The operator must run `stellar-agent profile rotate-audit-key <name>`, then retry. |
+| `audit.chain_key_unavailable` | A value-moving signing verb (`pay`, `claim`, `accounts create` sponsored mode, `trustline`, `trade`, `lend`, `vault`, and their MCP equivalents, plus the x402 payment tools and `stellar_sep43_sign_and_submit_transaction`) proved the profile's audit chain-root key is NOT acquirable, before touching the signer or submitting anything. `profile init` mints the audit-log keyring coordinate only, no key material. This pre-flight fails closed only for a persisted profile — the zero-config synthesized profile `pay`/`claim`/`accounts create` fall back to when no profile was NAMED and no `default.toml` exists stays fail-open here. A profile named through `--profile` or `STELLAR_AGENT_PROFILE` whose file does not exist is refused with `profile.load_failed` instead. The SEP-43 sign-only pair (`signTransaction`, `signAuthEntry`) is not yet covered. | Not agent-recoverable. The operator must run `stellar-agent profile rotate-audit-key <name>`, then retry. |
 
 Distinct from `io.audit_writer_setup` above, which covers smart-account
 governance writes (rule changes, timelock, multicall) failing to open their
 own audit writer (unwritable directory, lock contention) — a narrower,
 unrelated check that does not depend on the profile's audit chain-root key.
+
+## Profile-selection code
+
+| Code | Meaning | Agent action |
+|---|---|---|
+| `profile.load_failed` | The profile the operator NAMED — through `--profile` or `STELLAR_AGENT_PROFILE` — could not be loaded. Most often no such file exists; a malformed TOML or an unsupported schema version produces the same code with a different cause in the message. `pay`, `claim`, and `accounts create` substitute the in-memory zero-config profile ONLY when no name was given at all, so a named profile is never silently replaced by it — including `--profile default` on a host with no `default.toml`. | Not agent-recoverable by retry. Report the name in the message to the operator: either it is a typo (or a stale `STELLAR_AGENT_PROFILE`) and the correct name should be used, or the profile has not been created yet and the operator must run `stellar-agent profile init --profile <name>`. Do not re-run without a name to make the error go away — that silently switches which policy engine governs the call. |
 
 ## SEP-24 interactive POST contract
 

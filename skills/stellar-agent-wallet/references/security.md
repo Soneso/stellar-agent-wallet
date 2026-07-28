@@ -278,7 +278,10 @@ is submitted, refusing `audit.chain_key_unavailable` if the profile's audit
 chain-root key was never minted (`profile init` mints the keyring coordinate
 only; run `profile rotate-audit-key <name>` to mint the key). The zero-config
 synthesized profile `pay`/`claim`/`accounts create` fall back to when no
-profile file exists stays fail-open for this specific check. The SEP-43
+profile was NAMED and no `default.toml` exists stays fail-open for this
+specific check. A profile named through `--profile` or `STELLAR_AGENT_PROFILE`
+whose file does not exist is refused outright (`profile.load_failed`), not
+replaced by that fallback. The SEP-43
 sign-only pair (`signTransaction`, `signAuthEntry`) is not yet covered by this
 pre-flight. See [Troubleshooting](troubleshooting.md#audit-key-code).
 

@@ -303,10 +303,11 @@ async fn persist_and_maybe_commit(
     prepared: stellar_agent_mpp::PreparedSponsoredCharge,
     now_unix: i64,
 ) -> i32 {
-    let engine = match build_v1_policy_engine("mpp charge", &profile.policy.engine, profile) {
-        Ok(engine) => engine,
-        Err(_) => return render_error(&state_error()),
-    };
+    let engine =
+        match build_v1_policy_engine("mpp charge", &profile.policy.engine, profile, profile_name) {
+            Ok(engine) => engine,
+            Err(_) => return render_error(&state_error()),
+        };
     let disposition = match evaluate_policy(
         engine.as_ref(),
         profile,
@@ -370,10 +371,11 @@ async fn commit_cli(
     record: &stellar_agent_mpp::AuthorizationRecord,
     now_unix: i64,
 ) -> i32 {
-    let engine = match build_v1_policy_engine("mpp charge", &profile.policy.engine, profile) {
-        Ok(engine) => engine,
-        Err(_) => return render_error(&state_error()),
-    };
+    let engine =
+        match build_v1_policy_engine("mpp charge", &profile.policy.engine, profile, profile_name) {
+            Ok(engine) => engine,
+            Err(_) => return render_error(&state_error()),
+        };
     let prepared = match record.prepared_charge() {
         Ok(prepared) => prepared,
         Err(error) => return render_error(&error),

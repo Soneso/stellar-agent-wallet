@@ -57,33 +57,18 @@ struct AllowEntry {
 
 /// The exhaustive allow-set.
 ///
-/// These three verbs load through `load_profile_or_synthesize_testnet`, which
-/// synthesises a `PolicyEngineKind::Noop` profile when the named file does not
-/// exist, and nothing on their signing path refuses a synthesised origin.
-/// Honouring `STELLAR_AGENT_PROFILE` before that refusal exists would turn a
-/// stale variable in a shell profile or a CI job into a silent policy-engine
-/// bypass on the strongest-consequence path: the run would resolve the stale
-/// name, miss the file, synthesise a `Noop` engine, and sign.
+/// EMPTY, and asserted empty below. Every CLI verb resolves its profile
+/// through `resolve_profile_name`, and the synthesis-backed verbs (`pay`,
+/// `claim`, `accounts create`) refuse a named-but-missing profile rather than
+/// substituting the permissive zero-config fallback, so no clap profile
+/// selector has a reason to carry a `default_value`.
 ///
-/// PR 2 (issues #112 / #114) converts all three in the same commit that makes
-/// an explicitly-named, missing profile refuse, and empties this allow-set.
-/// Every entry is asserted to be LIVE below, so the exemption cannot outlive
-/// the reason for it: once a listed field is converted, this test fails until
-/// its entry is removed.
-const ALLOW_SET: &[AllowEntry] = &[
-    AllowEntry {
-        file: "commands/pay.rs",
-        justification: "synthesis-backed loader; converted in PR 2 with the provenance refusal",
-    },
-    AllowEntry {
-        file: "commands/claim.rs",
-        justification: "synthesis-backed loader; converted in PR 2 with the provenance refusal",
-    },
-    AllowEntry {
-        file: "commands/accounts/create.rs",
-        justification: "synthesis-backed loader; converted in PR 2 with the provenance refusal",
-    },
-];
+/// An entry added here re-creates the defect for that command: clap
+/// substitutes the literal before the command runs, `resolve_profile_name`
+/// never observes an absent name, and `STELLAR_AGENT_PROFILE` becomes
+/// unreadable. Adding one therefore requires justifying — in the entry itself
+/// — why that command must ignore the documented resolution order.
+const ALLOW_SET: &[AllowEntry] = &[];
 
 /// Exact number of clap profile selectors in production code.
 ///
@@ -108,6 +93,14 @@ const MANUAL_DEFAULT_WINDOW: usize = 4;
 
 #[test]
 fn no_clap_profile_field_carries_a_default_value() {
+    // The allow-set is empty and stays empty. A non-empty set means some
+    // command was exempted from the documented resolution order; the
+    // exemption has to be argued in the PR that adds it, not absorbed here.
+    assert!(
+        ALLOW_SET.is_empty(),
+        "the profile-flag allow-set must stay empty: {:?}",
+        ALLOW_SET.iter().map(|a| a.file).collect::<Vec<_>>()
+    );
     for allow in ALLOW_SET {
         assert!(
             !allow.justification.trim().is_empty(),

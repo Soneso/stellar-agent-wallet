@@ -21,13 +21,13 @@ Profile files live one-per-name in the OS-conventional data directory:
 
 A profile is selected by name (the file stem): an explicit `--profile <NAME>`,
 then the `STELLAR_AGENT_PROFILE` environment variable, then `default`. Both the
-CLI and the MCP server resolve it that way, except for three CLI verbs —
-`pay`, `claim`, and `accounts create` — whose `--profile` carries the literal
-default `default` and never consults the environment variable. When no name was given and no
-`default.toml` exists yet, the MCP server falls back to an in-memory testnet
-configuration so it can still serve read-only requests. This fallback is never
-written to disk, and a profile that WAS named but has no file is refused rather
-than replaced by it.
+CLI and the MCP server resolve it that way, with no exceptions. When no name
+was given and no `default.toml` exists yet, both fall back to an in-memory
+testnet configuration — the MCP server so it can still serve read-only
+requests, the CLI so `pay`, `claim`, and `accounts create` work before any
+profile is authored. This fallback is never written to disk, and a profile that
+WAS named but has no file is refused by both binaries rather than replaced by
+it.
 
 A profile file is bound to its name by its keyring coordinates. Renaming or
 copying `<a>.toml` to `<b>.toml` does not create profile `b`; the MCP server

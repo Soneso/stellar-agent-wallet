@@ -31,7 +31,7 @@
 //! `pay`, `claim`, and `accounts create` accept a profile that is either
 //! persisted (an authored `<name>.toml` file) or synthesized in-memory when no
 //! such file exists (see
-//! [`crate::commands::policy_engine::load_profile_or_synthesize_testnet`]).
+//! [`crate::common::profile_access::load_profile_or_synthesize_testnet`]).
 //! [`require_value_audit_writer_for_origin`] applies the pre-flight only to
 //! the persisted case; the synthesized zero-config profile keeps the
 //! pre-existing warn-only emission path so the documented zero-config
@@ -116,7 +116,7 @@ fn audit_writer_open_failed(profile_name: &str) -> WalletError {
 /// Origin-aware fail-closed pre-flight for `pay`, `claim`, and
 /// `accounts create`, whose resolved profile may be either persisted or the
 /// in-memory zero-config synthesized profile (see
-/// [`crate::commands::policy_engine::load_profile_or_synthesize_testnet`]).
+/// [`crate::common::profile_access::load_profile_or_synthesize_testnet`]).
 ///
 /// - [`ProfileOrigin::Persisted`] delegates to [`require_value_audit_writer`]:
 ///   fails closed with `audit.chain_key_unavailable` when the writer cannot be
@@ -138,9 +138,9 @@ fn audit_writer_open_failed(profile_name: &str) -> WalletError {
 pub(crate) fn require_value_audit_writer_for_origin(
     profile: &Profile,
     profile_name: &str,
-    origin: crate::commands::policy_engine::ProfileOrigin,
+    origin: crate::common::profile_access::ProfileOrigin,
 ) -> Result<Option<Arc<Mutex<AuditWriter>>>, WalletError> {
-    use crate::commands::policy_engine::ProfileOrigin;
+    use crate::common::profile_access::ProfileOrigin;
     match origin {
         ProfileOrigin::Persisted => require_value_audit_writer(profile, profile_name).map(Some),
         ProfileOrigin::Synthesized => Ok(acquire_value_audit_writer(profile, profile_name)),
@@ -194,7 +194,7 @@ fn audit_writer_open_failed_io(profile_name: &str, e: &impl std::fmt::Display) -
 /// writer cannot be opened. Private: the callers are [`emit_value_audit_row`]
 /// (the one exempt, non-signing call site),
 /// [`require_value_audit_writer_for_origin`]'s
-/// [`ProfileOrigin::Synthesized`](crate::commands::policy_engine::ProfileOrigin::Synthesized)
+/// [`ProfileOrigin::Synthesized`](crate::common::profile_access::ProfileOrigin::Synthesized)
 /// arm (the zero-config quickstart's warn-only path), and
 /// [`acquire_best_effort_audit_writer`]'s keyed attempt. Every
 /// persisted-profile signing verb uses [`require_value_audit_writer`]
@@ -470,7 +470,7 @@ mod tests {
 
     // ── require_value_audit_writer_for_origin — origin-aware dispatch ───────
 
-    use crate::commands::policy_engine::ProfileOrigin;
+    use crate::common::profile_access::ProfileOrigin;
 
     /// A [`ProfileOrigin::Persisted`] profile with no audit key seeded fails
     /// closed exactly like [`require_value_audit_writer`] — the origin-aware

@@ -2766,9 +2766,10 @@ async fn get_spending_limit_run(args: &GetSpendingLimitArgs) -> i32 {
     // both methods take `source_account_strkey: Option<&str>`, not a `Signer`.
     // `CommonRulesReadArgs` has no `--profile` flag; resolve the default profile
     // (matches the read-only precedent set by `smart-account rules get`).
-    let profile_name = resolve_profile_name(None).name;
+    let resolved_profile = resolve_profile_name(None);
+    let profile_name = resolved_profile.name.clone();
     let (_audit_profile, audit_writer, audit_log_path) =
-        match open_profile_audit_writer_read_only(&profile_name) {
+        match open_profile_audit_writer_read_only(&resolved_profile) {
             Ok(triple) => triple,
             Err(e) => return emit_error(&e, args.common.output, &request_id),
         };

@@ -344,8 +344,10 @@ both policy engines. It is distinct from the writer's post-confirm emission
 transaction has already committed by then, so refusing helps nobody.
 Read-only tools and the build/simulate stages of two-phase verbs never reach
 this pre-flight. The zero-config synthesized profile `pay`/`claim`/
-`accounts create` fall back to when no profile file exists stays fail-open for
-this specific check, matching its documented no-profile-required posture. The
+`accounts create` fall back to when no profile was NAMED and no `default.toml`
+exists stays fail-open for this specific check, matching its documented
+no-profile-required posture; a profile named through `--profile` or
+`STELLAR_AGENT_PROFILE` whose file does not exist is refused outright. The
 SEP-43 sign-only pair (`signTransaction`, `signAuthEntry`) runs the same
 pre-flight and records an `opaque_payload_signed` row when the signature is
 produced.

@@ -172,11 +172,11 @@ fn pending_op_to_entry(op: PendingTimelockOperation) -> PendingOperationEntry {
 ///
 /// Never panics.
 pub async fn run(args: &ListPendingArgs) -> i32 {
-    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+    let resolved_profile = resolve_profile_name(args.profile.as_deref());
     let request_id = Uuid::new_v4().to_string();
 
     let (_audit_profile, audit_writer, _audit_log_path) =
-        match open_profile_audit_writer_read_only(&profile_name) {
+        match open_profile_audit_writer_read_only(&resolved_profile) {
             Ok(triple) => triple,
             Err(e) => {
                 let envelope: Envelope<()> = Envelope::err(&e);

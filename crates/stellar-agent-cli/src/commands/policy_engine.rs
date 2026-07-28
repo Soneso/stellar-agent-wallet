@@ -7,12 +7,13 @@
 //! `trade`, `bridge`, and `trustline` CLI subcommands, as well as `pay`,
 //! `claim`, and `accounts create` (sponsored mode).
 //!
-//! Also provides [`load_profile_or_synthesize_testnet`] (the zero-config
-//! profile resolution `pay`/`claim`/`accounts create` use instead of a hard
-//! `--profile` requirement), [`caip2_chain_id_for_network`] (chain-id
-//! derivation for verbs that select their network via `--network` rather than
-//! a profile's `chain_id`), and [`evaluate_value_moving_policy`] (the shared
-//! `PolicyEngine::evaluate` call plus refusal-envelope construction).
+//! Also provides [`caip2_chain_id_for_network`] (chain-id derivation for verbs
+//! that select their network via `--network` rather than a profile's
+//! `chain_id`) and [`evaluate_value_moving_policy`] (the shared
+//! `PolicyEngine::evaluate` call plus refusal-envelope construction). The
+//! zero-config profile resolution `pay`/`claim`/`accounts create` use instead
+//! of a hard `--profile` requirement lives in
+//! [`crate::common::profile_access`].
 //!
 //! # Fail-closed invariant
 //!
@@ -48,7 +49,6 @@ use stellar_agent_core::policy::v1::{
 use stellar_agent_core::policy::{
     Decision, McpToolRegistration, NoopPolicyEngine, PolicyEngine, ToolDescriptor, ToolValueKind,
 };
-use stellar_agent_core::profile::loader as profile_loader;
 use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile, default_policy_dir};
 use stellar_agent_network::policy_state::PersistedWindowStore;
 
@@ -67,6 +67,11 @@ pub(crate) const OWNER_KEY_SERVICE_PREFIX: &str = "stellar-agent-owner-";
 /// `"bridge"`, `"trustline"`) — it appears in every error message to
 /// attribute the failure.
 ///
+/// `requested_profile_name` is the name the operator selected (`--profile`,
+/// `STELLAR_AGENT_PROFILE`, or the fallback), already resolved. It selects the
+/// policy-window-state FILE, and nothing else — see the window-state section
+/// below.
+///
 /// - [`PolicyEngineKind::Noop`] → [`NoopPolicyEngine`].
 /// - [`PolicyEngineKind::V1`] → derives the profile name from the owner-key
 ///   service entry (stripping [`OWNER_KEY_SERVICE_PREFIX`]), fetches the owner
@@ -77,6 +82,48 @@ pub(crate) const OWNER_KEY_SERVICE_PREFIX: &str = "stellar-agent-owner-";
 ///   It MUST NOT fall back to a permissive engine.
 /// - Unknown engine kinds → `Err` (fail-closed), matching the MCP server.
 ///
+/// # Which name keys the window state
+///
+/// The rolling-window store is READ from the file for
+/// `requested_profile_name`, because that is the name every CLI writer of this
+/// store already uses: `record_confirmed_window_state` and
+/// `record_authorized_window_state` take the caller's resolved name,
+/// `profile reset-window-state` resets that file, and
+/// `profile rotate-policy-state-key` re-signs it. Reading under the derived
+/// name would hydrate caps from a file no CLI writer ever appends to.
+///
+/// The MCP server keys the same store on the DERIVED name, on both its read
+/// and its write. The two surfaces cannot disagree in practice: the server
+/// refuses at startup to serve a profile whose owner coordinate names another
+/// profile (`stellar-agent-mcp`'s startup reconciliation), so for any profile
+/// it does serve, derived and selected are the same string. Settling that
+/// keying difference as one decision across both binaries is recorded as the
+/// surface-parity note on issue #114 and is not made here.
+///
+/// Only the FILE moves. The name attached to each hydrated entry
+/// (`load_into`) and the engine's own `StateKey` namespace (`new_with_store`)
+/// stay derived and stay EQUAL TO EACH OTHER: the wire format does not persist
+/// the name, so the load re-attaches it, and an entry hydrated under a
+/// namespace the engine never queries would read as a permanently empty
+/// window with every cap silently unbound.
+///
+/// ## What a copied profile file does to the window
+///
+/// The store's HMAC and anti-rollback generation keys come from the loaded
+/// profile's `policy_window_state_key_id`, and the loader derives that
+/// coordinate from the name the file was LOADED BY when the TOML omits the
+/// field. Copying `<a>.toml` to `<b>.toml` therefore has two outcomes:
+///
+/// - The copy carries the field (everything `profile init` writes does): the
+///   coordinate still names `a`, so `b` shares `a`'s generation counter while
+///   reading a `<b>.window` file that does not exist. That is a rollback by
+///   the store's own definition and every value-moving command fails closed
+///   with `GenerationMismatch` until `profile reset-window-state b` runs.
+/// - The copy omits the field: the coordinate is derived as `b`'s, so `b`
+///   starts a FRESH window with no accumulated history — `a`'s spend does not
+///   carry over. Copying a profile file is not a way to inherit a spend
+///   window, and `docs/profiles.md` says so.
+///
 /// # Errors
 ///
 /// Returns `Err(human-readable message)` on any V1 build failure or unknown
@@ -86,6 +133,7 @@ pub(crate) fn build_v1_policy_engine(
     verb: &str,
     kind: &PolicyEngineKind,
     profile: &stellar_agent_core::profile::schema::Profile,
+    requested_profile_name: &str,
 ) -> Result<Box<dyn PolicyEngine>, String> {
     use base64::Engine as _;
     use ed25519_dalek::PUBLIC_KEY_LENGTH;
@@ -164,14 +212,20 @@ pub(crate) fn build_v1_policy_engine(
             // error (tampered/unparseable store file): the caller MUST NOT
             // fall back to an unhydrated engine, which would silently
             // under-count and defeat the operator's configured caps.
+            // The FILE is selected by the requested name — the same file every
+            // write path appends to and `profile reset-window-state` resets.
+            // `load_into` and `new_with_store` below keep the DERIVED name and
+            // must stay equal to each other: the wire format carries no name,
+            // so the load re-attaches one, and the engine looks entries up
+            // under its own namespace.
             let state_store = PolicyStateStore::new();
-            let window_store = PersistedWindowStore::for_profile(&profile_name);
+            let window_store = PersistedWindowStore::for_profile(requested_profile_name);
             if let Err(e) = window_store.load_into(&profile_name, profile, &state_store) {
                 return Err(format!(
                     "policy.engine is 'v1' but the policy-window-state store for profile \
-                     '{profile_name}' failed to load ({e}); {verb} refuses (fail-closed); \
-                     run `stellar-agent profile reset-window-state {profile_name} --reason \
-                     <reason>` to recover"
+                     '{requested_profile_name}' failed to load ({e}); {verb} refuses \
+                     (fail-closed); run `stellar-agent profile reset-window-state \
+                     {requested_profile_name} --reason <reason>` to recover"
                 ));
             }
 
@@ -251,82 +305,6 @@ fn owner_pubkey_b64(profile_name: &str, verb: &str) -> Result<String, String> {
                  be read from the keyring ({e}); {verb} refuses (fail-closed)"
             )
         })
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Zero-config profile resolution for the value-moving classic verbs
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Origin of a profile resolved by [`load_profile_or_synthesize_testnet`].
-///
-/// Two origin-aware behaviors key off this distinction, neither engine-aware:
-/// - Platform keyring store initialisation (e.g. `pay::resolve_profile_and_keyring`,
-///   the analogous helper in `claim`, and the inline attempt in `accounts
-///   create`'s sponsored path) logs a `tracing::warn!` and continues past a
-///   failed attempt for a [`Self::Synthesized`] profile, so a host with no
-///   platform keyring store (e.g. a container without a Secret Service) never
-///   blocks the zero-config quickstart's signing.
-/// - The audit pre-flight (see
-///   [`crate::commands::value_audit::require_value_audit_writer_for_origin`])
-///   stays fail-open (warn-only) for a [`Self::Synthesized`] profile when the
-///   audit chain-root key is unavailable.
-///
-/// A [`Self::Persisted`] profile fails closed on both conditions instead: an
-/// operator who authored a profile file — under either policy engine — is
-/// expected to have a working platform keyring and to have run
-/// `stellar-agent profile rotate-audit-key <name>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProfileOrigin {
-    /// Loaded from an operator-authored `<name>.toml` file.
-    Persisted,
-    /// No profile file exists; an in-memory `Noop`-engine testnet profile was
-    /// synthesized so `pay` / `claim` / `accounts create` keep working without
-    /// an authored profile.
-    Synthesized,
-}
-
-/// Loads the named profile, falling back to an in-memory `Noop`-engine
-/// testnet profile when no `<name>.toml` file exists.
-///
-/// `pay`, `claim`, and `accounts create` operate against testnet without
-/// requiring an authored profile file (see the "Set up a profile" section of
-/// the getting-started guide). This preserves that zero-config invariant: the
-/// permissive fallback fires ONLY on [`profile_loader::ProfileLoadError::NotFound`],
-/// and is forced to [`PolicyEngineKind::Noop`] regardless of
-/// [`Profile::builder_testnet`]'s own default (`V1`), so an unauthored profile
-/// never triggers an owner-key/policy-file requirement the operator never
-/// opted into. Once an operator persists a real profile — `V1` or `Noop` — that
-/// file's configured engine governs instead.
-///
-/// Returns the resolved profile alongside its [`ProfileOrigin`], so callers
-/// can apply origin-aware policy to the audit pre-flight (see
-/// [`crate::commands::value_audit::require_value_audit_writer_for_origin`])
-/// without re-deriving which branch fired.
-///
-/// # Errors
-///
-/// Returns `Err(message)` for any profile-load failure OTHER than `NotFound`
-/// (a malformed TOML file, an unsupported schema version, etc.) — those are
-/// genuine configuration errors the synthesis fallback must not mask.
-pub(crate) fn load_profile_or_synthesize_testnet(
-    name: &str,
-) -> Result<(Profile, ProfileOrigin), String> {
-    match profile_loader::load(name, None) {
-        Ok(p) => Ok((p, ProfileOrigin::Persisted)),
-        Err(profile_loader::ProfileLoadError::NotFound { .. }) => {
-            let profile = Profile::builder_testnet_named(
-                name,
-                "stellar-agent-signer",
-                name,
-                "stellar-agent-nonce",
-                name,
-            )
-            .policy_engine(PolicyEngineKind::Noop)
-            .build();
-            Ok((profile, ProfileOrigin::Synthesized))
-        }
-        Err(e) => Err(format!("profile '{name}' failed to load: {e}")),
-    }
 }
 
 /// Maps a CLI [`TargetNetwork`] selector to its CAIP-2 chain-id string.
@@ -523,6 +501,10 @@ pub(crate) fn evaluate_value_moving_policy(
 /// the gate sized (single-derivation invariant) — the same value already
 /// passed to `emit_value_action_submitted_row_with_writer` at this call site.
 ///
+/// `profile_name` is the operator's resolved name. It selects the same
+/// window-state file on both halves of the round trip: the rebuild hydrates
+/// from it and [`record_confirmed_value_moving_with_engine`] appends to it.
+///
 /// Non-fatal: mirrors the `value_action_submitted` audit-row emission
 /// discipline (the on-chain action already committed). A rebuild failure or a
 /// record/persist failure logs a `tracing::warn!` and returns without
@@ -535,20 +517,21 @@ pub(crate) fn record_confirmed_value_moving(
     chain_id: &str,
     effects: Option<&stellar_agent_core::policy::v1::ValueEffects>,
 ) {
-    let policy_engine = match build_v1_policy_engine(verb, &profile.policy.engine, profile) {
-        Ok(pe) => pe,
-        Err(e) => {
-            tracing::warn!(
-                profile = %profile_name,
-                verb,
-                error = %e,
-                "policy window-state record: could not rebuild the policy engine; \
-                 record skipped (the next call's accumulated window total under-counts \
-                 this one)"
-            );
-            return;
-        }
-    };
+    let policy_engine =
+        match build_v1_policy_engine(verb, &profile.policy.engine, profile, profile_name) {
+            Ok(pe) => pe,
+            Err(e) => {
+                tracing::warn!(
+                    profile = %profile_name,
+                    verb,
+                    error = %e,
+                    "policy window-state record: could not rebuild the policy engine; \
+                     record skipped (the next call's accumulated window total under-counts \
+                     this one)"
+                );
+                return;
+            }
+        };
     record_confirmed_value_moving_with_engine(
         policy_engine.as_ref(),
         profile,
@@ -829,7 +812,7 @@ mod tests {
                 &format!("{OWNER_KEY_SERVICE_PREFIX}default"),
             );
             assert!(
-                build_v1_policy_engine(verb, &PolicyEngineKind::Noop, &profile).is_ok(),
+                build_v1_policy_engine(verb, &PolicyEngineKind::Noop, &profile, "default").is_ok(),
                 "Noop engine must succeed for verb '{verb}'"
             );
         }
@@ -843,7 +826,7 @@ mod tests {
     fn v1_wrong_prefix_returns_err_naming_verb() {
         for verb in ["lend", "vault", "trade", "bridge", "trustline"] {
             let profile = make_profile(PolicyEngineKind::V1, "wrong-prefix-default");
-            let result = build_v1_policy_engine(verb, &PolicyEngineKind::V1, &profile);
+            let result = build_v1_policy_engine(verb, &PolicyEngineKind::V1, &profile, "default");
             assert!(
                 result.is_err(),
                 "wrong prefix must return Err for verb '{verb}'"
@@ -877,7 +860,8 @@ mod tests {
         for verb in ["lend", "vault", "trade", "bridge", "trustline"] {
             let service = format!("{OWNER_KEY_SERVICE_PREFIX}{profile_name}");
             let profile = make_profile(PolicyEngineKind::V1, &service);
-            let result = build_v1_policy_engine(verb, &PolicyEngineKind::V1, &profile);
+            let result =
+                build_v1_policy_engine(verb, &PolicyEngineKind::V1, &profile, profile_name);
             assert!(
                 result.is_err(),
                 "missing keyring entry must return Err for verb '{verb}'"
@@ -909,6 +893,7 @@ mod tests {
             "lend",
             &PolicyEngineKind::V1,
             &profile,
+            "default",
         ));
         // The error must not echo any strkey-shaped token (56-char base32 run,
         // the shape of S/G secret and account keys).
@@ -1648,11 +1633,11 @@ mod tests {
 
     // ── Decision-1 hazard: fail-closed on corruption ─────────────────────────
     //
-    // `load_profile_or_synthesize_testnet` must synthesize the permissive
-    // `Noop` engine ONLY on `ProfileLoadError::NotFound`. A malformed profile
-    // file, or a policy file with a forged/corrupted signature, must refuse
-    // (`Err`) rather than silently falling through to an allow-everything
-    // engine. These tests use the `STELLAR_AGENT_HOME` env-var override
+    // A policy file with a forged/corrupted signature must refuse (`Err`)
+    // rather than silently falling through to an allow-everything engine.
+    // (The synthesis rule itself — permissive `Noop` only for an unnamed,
+    // absent profile — is pinned in `crate::common::profile_access`.) These
+    // tests use the `STELLAR_AGENT_HOME` env-var override
     // (`stellar-agent-core`'s `default_profile_dir` / `default_policy_dir`,
     // active here via that crate's `test-helpers` dev-dependency feature) to
     // isolate `default_profile_dir` / `default_policy_dir` in a tempdir, and
@@ -1691,6 +1676,13 @@ mod tests {
     /// Writes a minimal, valid v2 profile TOML for `name` with
     /// `policy.engine = "v1"` into `<home>/profiles/<name>.toml`.
     fn write_v1_profile_toml(home: &std::path::Path, name: &str) {
+        write_v1_profile_toml_owned_by(home, name, name);
+    }
+
+    /// [`write_v1_profile_toml`] with the owner coordinate pointed at a
+    /// DIFFERENT profile, so `build_v1_policy_engine`'s derived name and the
+    /// requested name diverge — the #114 condition.
+    fn write_v1_profile_toml_owned_by(home: &std::path::Path, name: &str, owner_profile: &str) {
         let dir = home.join("profiles");
         std::fs::create_dir_all(&dir).expect("create profiles dir");
         let toml = format!(
@@ -1706,7 +1698,7 @@ mod tests {
              service = \"stellar-agent-audit-{name}\"\n\
              account = \"default\"\n\n\
              [policy_owner_key_id]\n\
-             service = \"{OWNER_KEY_SERVICE_PREFIX}{name}\"\n\
+             service = \"{OWNER_KEY_SERVICE_PREFIX}{owner_profile}\"\n\
              account = \"default\"\n\n\
              [attestation_key_id]\n\
              service = \"stellar-agent-attestation-{name}\"\n\
@@ -1718,54 +1710,6 @@ mod tests {
              engine = \"v1\"\n"
         );
         std::fs::write(dir.join(format!("{name}.toml")), toml).expect("write profile toml");
-    }
-
-    /// A malformed profile TOML file must return `Err` from
-    /// `load_profile_or_synthesize_testnet` — NOT the permissive `Noop`
-    /// synthesis, which is reserved for the file-absent case only.
-    #[test]
-    #[serial_test::serial]
-    fn malformed_profile_toml_returns_err_not_noop_synthesis() {
-        let home = tempfile::TempDir::new().expect("tempdir");
-        let profiles_dir = home.path().join("profiles");
-        std::fs::create_dir_all(&profiles_dir).expect("create profiles dir");
-        std::fs::write(
-            profiles_dir.join("malformed-hazard.toml"),
-            "this is not { valid toml [[[",
-        )
-        .expect("write malformed profile");
-
-        let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
-
-        let result = load_profile_or_synthesize_testnet("malformed-hazard");
-        assert!(
-            result.is_err(),
-            "a malformed profile TOML must return Err, not synthesize Noop"
-        );
-    }
-
-    /// With no `<name>.toml` file at all, `load_profile_or_synthesize_testnet`
-    /// returns the synthesized in-memory `Noop`-engine profile tagged
-    /// [`ProfileOrigin::Synthesized`] — the tag the audit pre-flight relies on
-    /// to stay fail-open for the zero-config quickstart.
-    #[test]
-    #[serial_test::serial]
-    fn absent_profile_file_synthesizes_noop_tagged_synthesized() {
-        let home = tempfile::TempDir::new().expect("tempdir");
-        let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
-
-        let (profile, origin) = load_profile_or_synthesize_testnet("never-authored")
-            .expect("an absent profile file must synthesize, not error");
-        assert_eq!(
-            origin,
-            ProfileOrigin::Synthesized,
-            "an absent profile file must resolve as Synthesized"
-        );
-        assert!(
-            matches!(profile.policy.engine, PolicyEngineKind::Noop),
-            "the synthesized profile must force the Noop engine regardless of \
-             Profile::builder_testnet's own default"
-        );
     }
 
     /// A v1 profile whose policy file carries a signature that does not
@@ -1826,14 +1770,9 @@ mod tests {
             pubkey_file.as_os_str(),
         );
 
-        let (profile, origin) =
-            load_profile_or_synthesize_testnet(name).expect("v1 profile file must load");
-        assert_eq!(
-            origin,
-            ProfileOrigin::Persisted,
-            "a written <name>.toml file must resolve as Persisted, not Synthesized"
-        );
-        let result = build_v1_policy_engine("pay", &profile.policy.engine, &profile);
+        let profile = stellar_agent_core::profile::loader::load(name, None)
+            .expect("v1 profile file must load");
+        let result = build_v1_policy_engine("pay", &profile.policy.engine, &profile, name);
         assert!(
             result.is_err(),
             "a forged/corrupted policy signature must fail closed, not silently disable \
@@ -1918,13 +1857,8 @@ mod tests {
             pubkey_file.as_os_str(),
         );
 
-        let (profile, origin) =
-            load_profile_or_synthesize_testnet(name).expect("v1 profile file must load");
-        assert_eq!(
-            origin,
-            ProfileOrigin::Persisted,
-            "a written <name>.toml file must resolve as Persisted, not Synthesized"
-        );
+        let profile = stellar_agent_core::profile::loader::load(name, None)
+            .expect("v1 profile file must load");
         let effects = ValueEffects::single(ValueLeg {
             kind: ActionKind::Payment,
             amount: Some(600_000_000), // 60 XLM
@@ -1933,7 +1867,7 @@ mod tests {
         });
 
         // ── "Invocation 1": build -> evaluate (Allow) -> record (persists) ────
-        let engine1 = build_v1_policy_engine("pay", &profile.policy.engine, &profile)
+        let engine1 = build_v1_policy_engine("pay", &profile.policy.engine, &profile, name)
             .expect("build_v1_policy_engine must succeed for a valid signed policy");
         let result1 = evaluate_value_moving_policy_with_value(
             engine1.as_ref(),
@@ -1960,7 +1894,7 @@ mod tests {
         // ── "Invocation 2": a FRESH build_v1_policy_engine call, over the
         // SAME file, must see invocation 1's recorded 60 XLM and deny this
         // identical payment (60 + 60 = 120 XLM > 100 XLM cap).
-        let engine2 = build_v1_policy_engine("pay", &profile.policy.engine, &profile)
+        let engine2 = build_v1_policy_engine("pay", &profile.policy.engine, &profile, name)
             .expect("second build_v1_policy_engine call must also succeed");
         let result2 = evaluate_value_moving_policy_with_value(
             engine2.as_ref(),
@@ -1978,6 +1912,254 @@ mod tests {
             err.error.as_ref().map(|e| e.code.as_str()),
             Some("policy.deny.per_period_cap_exceeded"),
             "second invocation must be denied specifically by per_period_cap, got: {err:?}"
+        );
+    }
+
+    // ── #114: one name keys the window state, on both halves ─────────────────
+
+    /// The requested profile name in the divergent-name fixture below.
+    const I114_REQUESTED: &str = "i114-requested";
+    /// The name derived from that fixture's owner coordinate — deliberately a
+    /// DIFFERENT profile, which is the condition #114 is about.
+    const I114_DERIVED: &str = "i114-derived";
+
+    /// A loaded v1 profile whose owner coordinate names another profile, with
+    /// every guard the build path needs held for the caller's lifetime.
+    struct DivergentNameFixture {
+        profile: Profile,
+        requested_store: std::path::PathBuf,
+        derived_store: std::path::PathBuf,
+        _home: tempfile::TempDir,
+        _home_guard: stellar_agent_test_support::StellarAgentHomeGuard,
+        _pubkey_guard: TestEnvVarGuard,
+    }
+
+    /// Builds the fixture: a v1 profile at `<home>/profiles/i114-requested.toml`
+    /// whose `policy_owner_key_id.service` names `i114-derived`, the signed
+    /// policy the DERIVED name addresses, and the gated owner-pubkey file so
+    /// no OS keyring is touched.
+    ///
+    /// Callers MUST be `#[serial]`: the home, owner-pubkey, and keyring-store
+    /// overrides are all process-global.
+    fn divergent_name_fixture() -> DivergentNameFixture {
+        use base64::Engine as _;
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store init");
+
+        let home = tempfile::TempDir::new().expect("tempdir");
+        write_v1_profile_toml_owned_by(home.path(), I114_REQUESTED, I114_DERIVED);
+
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_pk = owner_sk.verifying_key().to_bytes();
+
+        // The policy document is addressed by the DERIVED name: its path and
+        // its `scope` both follow the owner coordinate, which this fix leaves
+        // alone.
+        let policy_body = format!(
+            "version = 1\nscope = \"profile:{I114_DERIVED}\"\n\n\
+             [[rules]]\n\
+             match = {{ tool = \"pay\", chain = \"*\" }}\n\
+             criteria = [{{ kind = \"per_period_cap\", asset = \"native\", window = \"1d\", max_stroops = 1000000000 }}]\n\
+             decision = \"allow\"\n"
+        );
+        let canon = stellar_agent_core::policy::v1::canonical::canonical_bytes(&policy_body)
+            .expect("canonical_bytes");
+        let policy_digest = stellar_agent_core::policy::v1::signature::digest(&canon);
+        let sig = stellar_agent_core::policy::v1::signature::sign(&policy_digest, &owner_sk);
+        let sig_hex: String = sig.iter().map(|b| format!("{b:02x}")).collect();
+        let owner_g = stellar_strkey::ed25519::PublicKey(owner_pk).to_string();
+        let signed_policy =
+            format!("{policy_body}\n[signature]\nowner_id = \"{owner_g}\"\nsig = \"{sig_hex}\"\n");
+
+        let policies_dir = home.path().join("policies");
+        std::fs::create_dir_all(&policies_dir).expect("create policies dir");
+        std::fs::write(
+            policies_dir.join(format!("{I114_DERIVED}.toml")),
+            signed_policy,
+        )
+        .expect("write policy toml");
+
+        let pubkey_file = home.path().join("owner_pubkey.txt");
+        std::fs::write(
+            &pubkey_file,
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(owner_pk),
+        )
+        .expect("write owner pubkey file");
+
+        let home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let pubkey_guard = TestEnvVarGuard::set(
+            "STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE",
+            pubkey_file.as_os_str(),
+        );
+
+        let profile = stellar_agent_core::profile::loader::load(I114_REQUESTED, None)
+            .expect("the v1 profile file must load");
+        assert_ne!(
+            profile
+                .policy_owner_key_id
+                .service
+                .strip_prefix(OWNER_KEY_SERVICE_PREFIX),
+            Some(I114_REQUESTED),
+            "the fixture must actually diverge: the owner coordinate names another profile"
+        );
+
+        let requested_store = home
+            .path()
+            .join("policy")
+            .join(format!("{I114_REQUESTED}.window"));
+        let derived_store = home
+            .path()
+            .join("policy")
+            .join(format!("{I114_DERIVED}.window"));
+
+        DivergentNameFixture {
+            profile,
+            requested_store,
+            derived_store,
+            _home: home,
+            _home_guard: home_guard,
+            _pubkey_guard: pubkey_guard,
+        }
+    }
+
+    /// A confirmed value-moving record lands in the SAME store FILE the next
+    /// engine build hydrates from, for a v1 profile whose
+    /// `policy_owner_key_id.service` names a DIFFERENT profile.
+    ///
+    /// That divergence is the whole point: the requested name is
+    /// [`I114_REQUESTED`], the name derived from the owner coordinate is
+    /// [`I114_DERIVED`], and the store file must be the requested one on both
+    /// halves. The assertion is on the FILES — the requested store exists and
+    /// the derived store does not — plus the round trip that proves the read
+    /// side reaches the written bytes: the second, independent engine build
+    /// denies the identical payment because it sees the first one's 60 XLM.
+    ///
+    /// Read the file assertion and the deny assertion together. The file
+    /// assertion alone would still hold if the read path used the derived
+    /// name (nothing writes there either); the deny is what proves the read
+    /// and the write meet. A read that selected the derived name fails this
+    /// test at the second build rather than at the deny: the store's
+    /// generation counter is one per profile, so once the write has advanced
+    /// it, a read pointed at a file that does not exist is a rollback and
+    /// refuses. The hint that refusal carries is pinned separately by
+    /// [`the_window_state_recovery_hint_names_the_store_that_failed`].
+    #[test]
+    #[serial_test::serial]
+    fn window_state_read_and_write_share_one_file_when_the_derived_name_differs() {
+        use stellar_agent_core::policy::v1::{ActionKind, ValueClass, ValueEffects, ValueLeg};
+
+        let fixture = divergent_name_fixture();
+        let profile = &fixture.profile;
+
+        let effects = ValueEffects::single(ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(600_000_000), // 60 XLM
+            asset: Some("native".to_owned()),
+            destination: Some("GAAA".to_owned()),
+        });
+
+        let engine1 =
+            build_v1_policy_engine("pay", &profile.policy.engine, profile, I114_REQUESTED)
+                .expect("build must succeed for a valid signed policy");
+        evaluate_value_moving_policy_with_value(
+            engine1.as_ref(),
+            profile,
+            "pay",
+            "stellar:testnet",
+            &serde_json::Value::Null,
+            ValueClass::Value(effects.clone()),
+            "pay",
+        )
+        .expect("60 XLM under the 100 XLM cap must be allowed");
+        record_confirmed_value_moving(
+            "pay",
+            profile,
+            I114_REQUESTED,
+            "pay",
+            "stellar:testnet",
+            Some(&effects),
+        );
+
+        assert!(
+            fixture.requested_store.is_file(),
+            "the confirmed record must land in the requested profile's store at {}",
+            fixture.requested_store.display()
+        );
+        assert!(
+            !fixture.derived_store.exists(),
+            "no store may be created under the derived name at {}",
+            fixture.derived_store.display()
+        );
+
+        let engine2 =
+            build_v1_policy_engine("pay", &profile.policy.engine, profile, I114_REQUESTED)
+                .expect("a second, independent build must also succeed");
+        let err = evaluate_value_moving_policy_with_value(
+            engine2.as_ref(),
+            profile,
+            "pay",
+            "stellar:testnet",
+            &serde_json::Value::Null,
+            ValueClass::Value(effects),
+            "pay",
+        )
+        .expect_err("the second 60 XLM payment must exceed the 100 XLM rolling cap");
+        assert_eq!(
+            err.error.as_ref().map(|e| e.code.as_str()),
+            Some("policy.deny.per_period_cap_exceeded"),
+            "the engine must hydrate from the file the record was written to, so the \
+             accumulated 60 XLM binds the cap; got: {err:?}"
+        );
+    }
+
+    /// The hydration-failure hint names the store that actually failed.
+    ///
+    /// `profile reset-window-state <name>` resets the store for the REQUESTED
+    /// name (`profile/reset_window_state.rs`). A hint naming the derived
+    /// profile would send the operator to reset a file that is not the one
+    /// they cannot get past, and the refusal would survive the documented
+    /// recovery — an uncompletable flow.
+    ///
+    /// The fixture writes garbage at the REQUESTED store and mints no
+    /// generation counter, so the error branch can only fire if the read
+    /// selects that file: a read pointed at the derived name would find no
+    /// file and no counter, treat it as a genuine first run, and BUILD
+    /// SUCCESSFULLY. This test therefore pins the selector and the hint text
+    /// together.
+    #[test]
+    #[serial_test::serial]
+    fn the_window_state_recovery_hint_names_the_store_that_failed() {
+        let fixture = divergent_name_fixture();
+
+        std::fs::create_dir_all(
+            fixture
+                .requested_store
+                .parent()
+                .expect("the store path has a parent"),
+        )
+        .expect("create the policy dir");
+        std::fs::write(&fixture.requested_store, b"not a signed window-state file")
+            .expect("corrupt the requested store");
+
+        // `err_msg` rather than `expect_err`: the Ok arm is `Box<dyn
+        // PolicyEngine>`, which is not `Debug`.
+        let hint = err_msg(build_v1_policy_engine(
+            "pay",
+            &fixture.profile.policy.engine,
+            &fixture.profile,
+            I114_REQUESTED,
+        ));
+        assert!(
+            hint.contains(&format!("reset-window-state {I114_REQUESTED}")),
+            "the recovery hint must name the store that failed ({I114_REQUESTED}); \
+             got: {hint}"
+        );
+        assert!(
+            !hint.contains(I114_DERIVED),
+            "the hint must not send the operator to reset the derived profile's store \
+             ({I114_DERIVED}), which is not the one that failed; got: {hint}"
         );
     }
 }
