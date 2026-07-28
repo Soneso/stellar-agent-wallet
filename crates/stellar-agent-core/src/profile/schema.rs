@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use super::caip2::Caip2;
-use super::name::OWNER_KEY_SERVICE_PREFIX;
+use super::name::{OWNER_KEY_SERVICE_PREFIX, windows_reserved_device_refusal};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MINIMUM_FLOOR
@@ -1689,6 +1689,19 @@ fn default_policy_window_state_dir() -> Option<PathBuf> {
     canonical_data_root().ok().map(|root| root.join("policy"))
 }
 
+/// Reduces `profile_name` to a file stem that is safe on every platform.
+///
+/// Characters outside `[A-Za-z0-9_-]` become `_`, an empty result becomes
+/// `default`, and a stem naming a Windows reserved device is prefixed with `_`.
+///
+/// This sanitises where
+/// [`crate::profile::name::validate_path_component_ascii_safe`] refuses: these
+/// paths are derived for whatever name a profile was loaded under, including
+/// names read from a serialized field, so they must always yield a usable path.
+/// Both consult one reserved-name table, so the two answers can differ in
+/// disposition but never in what counts as reserved. The stem handed to the
+/// table carries no `.` and no trailing space, so the extension split and the
+/// trailing-trim inside it never fire here.
 fn audit_log_file_stem(profile_name: &str) -> String {
     let mut stem: String = profile_name
         .chars()
@@ -1705,37 +1718,11 @@ fn audit_log_file_stem(profile_name: &str) -> String {
         stem = "default".to_owned();
     }
 
-    if is_windows_reserved_file_stem(&stem) {
+    if windows_reserved_device_refusal(&stem).is_some() {
         stem.insert(0, '_');
     }
 
     stem
-}
-
-fn is_windows_reserved_file_stem(stem: &str) -> bool {
-    let upper = stem.to_ascii_uppercase();
-    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || matches!(
-            upper.as_str(),
-            "COM1"
-                | "COM2"
-                | "COM3"
-                | "COM4"
-                | "COM5"
-                | "COM6"
-                | "COM7"
-                | "COM8"
-                | "COM9"
-                | "LPT1"
-                | "LPT2"
-                | "LPT3"
-                | "LPT4"
-                | "LPT5"
-                | "LPT6"
-                | "LPT7"
-                | "LPT8"
-                | "LPT9"
-        )
 }
 
 /// Returns the OS-conventional profile directory.
@@ -3124,6 +3111,23 @@ mod tests {
             assert!(
                 stem.starts_with('_'),
                 "Lowercase reserved name {name} must be prefixed with '_'; got stem: {stem}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_log_file_stem_reduces_the_console_device_names_to_ordinary_stems() {
+        // `$` is outside `[A-Za-z0-9_-]`, so `CONIN$` sanitises to `CONIN_`,
+        // which names no device on any platform. The validator's exact-match
+        // console refusal therefore has nothing to answer on this path, and
+        // this pins that the sanitiser — not that refusal — is what makes it so.
+        for (name, expected) in [("CONIN$", "CONIN_"), ("CONOUT$", "CONOUT_")] {
+            let path = default_audit_log_path_for(name);
+            let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+            assert_eq!(stem, expected, "'{name}' must sanitise to '{expected}'");
+            assert!(
+                !stem.starts_with('_'),
+                "a sanitised console name is not reserved and must not be prefixed: {stem}"
             );
         }
     }

@@ -70,6 +70,46 @@ Create a new profile file with `stellar-agent profile init`; see
 [cli-reference/profile-and-governance.md](cli-reference/profile-and-governance.md#profile-init)
 for flags and defaults.
 
+## Profile names
+
+A profile name becomes a path component — the profile file itself, and the
+per-profile audit log and policy-window state files derived from it — so both
+binaries validate it before building any path. A name must be:
+
+- 1 to 64 printable ASCII characters (`0x20`-`0x7E`), no control characters;
+- free of `/`, `\`, `:`, and `..`, and not `.` or `..` itself;
+- not beginning with `-`;
+- not a Windows reserved device name — `CON`, `PRN`, `AUX`, `NUL`,
+  `COM1`-`COM9`, `LPT1`-`LPT9` — in any letter case. Windows reduces a name to
+  the device it names by cutting it at the first `.` and then dropping trailing
+  spaces, so `NUL.toml`, `nul `, and `nul .toml` all name the NUL device and are
+  all refused. `COM0`, `COM10`, and `LPT0` are not reserved and stay valid names.
+- not exactly `CONIN$` or `CONOUT$`, in any letter case. Windows resolves these
+  two console devices on the whole name only, so `conin$.toml` and `myconin$`
+  stay valid names.
+
+The last three rules refuse names that work on one host and not on another.
+`<profile_dir>/NUL.toml` opens the NUL device on Windows rather than a file, so
+a write to that path is discarded and a read returns nothing, while the path
+itself still reports as present. A name beginning with `-` is read as the next
+flag by every argument parser that has to take it, so `--profile -x` selects no
+profile at all.
+
+An unusable name is refused before the profile path is built: the CLI exits `1`
+with a typed refusal quoting the name and the rule it broke, and
+`stellar-agent-mcp` exits `2` before serving anything.
+
+A profile file that already carries such a name — possible on Unix, where both
+classes are legal file names — can no longer be selected. The clean recovery is
+`stellar-agent profile init --profile <new-name>` followed by the enrollment
+steps that command prints. Renaming the file works too, but the name is part of
+the profile's identity: correct `policy_owner_key_id.service` to
+`stellar-agent-owner-<new-name>`, and on a `v1` profile also re-run `profile
+enroll-owner-key` and `profile sign-policy` under the new name — the owner key
+is stored under `stellar-agent-owner-<old-name>` and the signed policy file
+carries the old name in its signed scope, so neither is usable under the new
+one.
+
 ## Loader source order
 
 A profile is assembled from three layered sources. Higher-priority sources

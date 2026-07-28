@@ -29,6 +29,24 @@ profile is authored. This fallback is never written to disk, and a profile that
 WAS named but has no file is refused by both binaries rather than replaced by
 it.
 
+A profile name becomes a path component, so both binaries validate it before the
+path is built: 1 to 64 printable ASCII characters; no `/`, `\`, `:`, or `..`; no
+leading `-`; and not a Windows reserved device name (`CON`, `PRN`, `AUX`, `NUL`,
+`COM1`-`COM9`, `LPT1`-`LPT9`, in any letter case). Windows cuts a name at the
+first `.` and then drops trailing spaces before resolving it, so `NUL.toml`,
+`nul `, and `nul .toml` all name the device and are all refused; `COM0`, `COM10`,
+and `LPT0` are not reserved. The names `CONIN$` and `CONOUT$` are refused as
+whole names only — Windows resolves those two console devices on an exact match,
+so `conin$.toml` and `myconin$` stay valid. The last rules refuse names usable on
+one host and not on another: a write to `NUL.toml` on Windows goes to the null
+device, so the file never has content, and a name beginning with `-` is read as
+the next flag by every argument parser that has to take it. The CLI exits `1`
+with a typed refusal; `stellar-agent-mcp` exits `2` before serving. A profile
+file already carrying such a name can no longer be selected — run `profile init`
+under a valid name, or rename the file, correct its
+`policy_owner_key_id.service`, and, on a `v1` profile, re-run
+`profile enroll-owner-key` and `profile sign-policy` under the new name.
+
 A profile file is bound to its name by its keyring coordinates. Renaming or
 copying `<a>.toml` to `<b>.toml` does not create profile `b`; both binaries
 refuse it under the new name with `profile.name_mismatch` — the MCP server at
