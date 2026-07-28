@@ -30,8 +30,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each point at `profile enroll-owner-key` or `profile sign-policy`, rather than
   reporting only the wall that was hit.
 
+### Changed
+
+- **Behaviour change.** `pay`, `claim`, and `accounts create` now refuse a
+  profile that was named but has no file, where they previously ran under a
+  synthesised permissive profile. Naming a profile that does not exist — a
+  mistyped `--profile`, or a stale `STELLAR_AGENT_PROFILE` in a shell rc or a
+  CI job — used to substitute the in-memory zero-config profile, which is a
+  testnet, `noop`-engine configuration with no policy gate, and the run signed
+  and submitted under it. The substitution is now keyed on where the name came
+  from, not on the name: it fires only when no profile was named at all, so the
+  documented zero-config quickstart is unchanged, and `--profile default` on a
+  host with no `default.toml` refuses like any other named profile. The same
+  rule governs the smart-account audit-writer surface. These three verbs also
+  gained `STELLAR_AGENT_PROFILE` resolution in this change — deliberately in
+  the same commit as the refusal, since honouring the variable without it would
+  have widened the substitution rather than closing it. Closes #112.
+
 ### Fixed
 
+- CLI policy-window state is read and written under one profile name. The
+  rolling-window store was hydrated from the file for the name derived from
+  `policy_owner_key_id.service` and appended to the file for the name the
+  operator requested. On a `v1` profile whose owner coordinate names a
+  different profile the two never met: the first value-moving command evaluated
+  its caps against an empty window and recorded into a file the engine would
+  not read, and every command after it refused to build the engine at all,
+  because the store's anti-rollback generation counter had advanced while the
+  file the read selects still did not exist. The refusal named the derived
+  profile in its `profile reset-window-state` hint while the reset resets the
+  requested profile's store, so following it did not clear the condition. The
+  read now selects the requested name's file — the one both write paths
+  (`record_confirmed_window_state`, `record_authorized_window_state`) already
+  use and the one `profile reset-window-state` resets — and the hint names that
+  same profile. Only the file selector moved: the name attached to hydrated
+  entries and the engine's lookup namespace stay derived and stay equal to each
+  other, so hydration still lands in the namespace the engine queries. Closes
+  #114.
 - `STELLAR_AGENT_PROFILE` selects the profile for the CLI verbs that
   substituted the literal `"default"` for an absent `--profile`.
   `trustline`, `lend`, `trade`, `vault deposit`, `vault withdraw`, the four
@@ -43,11 +78,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   command runs (the DeFi, `mpp`, `counterparty`, and `profile` verbs), and a
   handler-side `.unwrap_or("default")` on an optional flag (the three `pool`
   verbs). A source-scan test refuses both, for any field named `profile` or
-  declaring `long = "profile"`. `pay`, `claim`, and `accounts create` keep
-  their literal default for now: they load through a helper that synthesises a
-  `noop`-engine profile when the named file is absent, so honouring the
-  variable before that synthesis refuses a named-but-missing profile would let
-  a stale variable disable the policy engine on the signing path. Closes #113.
+  declaring `long = "profile"`; its allow-set, which carried `pay`, `claim`,
+  and `accounts create` while their synthesis fallback still accepted any
+  absent profile, is now empty and asserted empty. Closes #113.
 - The CLI's startup advisory scans the audit log of the profile the command
   itself uses, taking the name from the parsed subcommand and resolving it the
   way that subcommand does. It resolved the profile through a private argv scan

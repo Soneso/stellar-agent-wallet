@@ -122,7 +122,8 @@ pub struct ServeArgs {
 ///
 /// Never panics.
 pub async fn run(args: ServeArgs) -> i32 {
-    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+    let resolved_profile = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolved_profile.name.clone();
 
     // Resolve the profile for the attestation-key reference.
     let profile = match loader::load(&profile_name, None) {
@@ -160,14 +161,14 @@ pub async fn run(args: ServeArgs) -> i32 {
         return 1;
     }
 
-    let (_audit_profile, audit_writer, _audit_path) = match open_profile_audit_writer(&profile_name)
-    {
-        Ok(triple) => triple,
-        Err(e) => {
-            render_json(&Envelope::<()>::err(&e));
-            return 1;
-        }
-    };
+    let (_audit_profile, audit_writer, _audit_path) =
+        match open_profile_audit_writer(&resolved_profile) {
+            Ok(triple) => triple,
+            Err(e) => {
+                render_json(&Envelope::<()>::err(&e));
+                return 1;
+            }
+        };
 
     let context = DecisionContext::new(
         profile_name.clone(),

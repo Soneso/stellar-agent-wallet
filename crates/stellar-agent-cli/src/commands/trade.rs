@@ -236,13 +236,14 @@ where
     // `stellar_dex_trade` twin's `dispatch_gate_with_value` mechanism) ───────
     // The debit leg is built from the SAME `amount_in` / `canonical_path`
     // used to construct `trade_args` below (single-decode invariant).
-    let policy_engine = match build_v1_policy_engine("trade", &profile.policy.engine, &profile) {
-        Ok(pe) => pe,
-        Err(msg) => {
-            render_json(&Envelope::<()>::err_raw("policy.engine_unavailable", msg));
-            return 1;
-        }
-    };
+    let policy_engine =
+        match build_v1_policy_engine("trade", &profile.policy.engine, &profile, &profile_name) {
+            Ok(pe) => pe,
+            Err(msg) => {
+                render_json(&Envelope::<()>::err_raw("policy.engine_unavailable", msg));
+                return 1;
+            }
+        };
     let value_leg = dex_trade_value_leg(args.amount_in, &canonical_path, router_address);
     // Capture the gate-derived leg as an audit record before the descriptor
     // moves into the gate (single-derivation invariant).

@@ -56,10 +56,12 @@
 //! Every stage evaluates against the operator-signed `PolicyEngineV1` (V1
 //! profiles) or the permissive `NoopPolicyEngine` (`Noop` profiles), mirroring
 //! the `stellar_claim` / `stellar_claim_commit` MCP tools' dispatch gates.
-//! When `--profile` names no persisted `<name>.toml` file, an in-memory
-//! `Noop`-engine testnet profile is synthesized (tagged
-//! [`crate::commands::policy_engine::ProfileOrigin::Synthesized`]) so the
-//! command keeps working without an authored profile file.
+//! When NO profile was named and no persisted `default.toml` file exists, an
+//! in-memory `Noop`-engine testnet profile is synthesized (tagged
+//! [`crate::common::profile_access::ProfileOrigin::Synthesized`]) so the
+//! command keeps working without an authored profile file. A profile the
+//! operator NAMED — through `--profile` or `STELLAR_AGENT_PROFILE` — but never
+//! authored is refused instead.
 //!
 //! # Audit pre-flight (fail-closed for a persisted profile; fail-open for the
 //! synthesized zero-config profile)
@@ -106,13 +108,14 @@ use stellar_agent_network::{
 };
 
 use crate::commands::policy_engine::{
-    ProfileOrigin, build_v1_policy_engine, caip2_chain_id_for_network, claim_policy_args,
+    build_v1_policy_engine, caip2_chain_id_for_network, claim_policy_args,
     evaluate_opaque_signing_policy, evaluate_value_moving_policy,
-    load_profile_or_synthesize_testnet,
 };
 use crate::common::network::TargetNetwork;
+use crate::common::profile_access::{ProfileOrigin, load_profile_or_synthesize_testnet_with};
 use crate::common::render::{render_json, sanitize_for_table};
 use crate::common::signer_ceremony::{SignerCeremonyOutcome, resolve_software_signer_from_env};
+use crate::common::{ResolvedProfileName, resolve_profile_name};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -186,13 +189,16 @@ struct BuiltClaimEnvelope {
     group(ArgGroup::new("signer_group").args(["secret_env", "sign_with_ledger"]).required(false)),
 )]
 pub struct ClaimArgs {
-    /// Profile name to evaluate operator policy against (default: "default").
+    /// Profile name to evaluate operator policy against.
     ///
-    /// When no `<name>.toml` profile file exists, an in-memory `Noop`-engine
-    /// testnet profile is synthesized so the command keeps working without an
-    /// authored profile file; see [`crate::commands::policy_engine::load_profile_or_synthesize_testnet`].
-    #[arg(long, default_value = "default")]
-    pub profile: String,
+    /// Resolution order: this flag, then `STELLAR_AGENT_PROFILE`, then the
+    /// literal `"default"`. When NO profile was named and no `default.toml`
+    /// file exists, an in-memory `Noop`-engine testnet profile is synthesized
+    /// so the command keeps working without an authored profile file; a named
+    /// profile with no file is refused. See
+    /// [`crate::common::profile_access::load_profile_or_synthesize_testnet`].
+    #[arg(long = "profile", value_name = "NAME")]
+    pub profile: Option<String>,
 
     /// Claimable-balance id: a `B...` strkey, canonical 72-hex id, or bare
     /// 64-hex hash.
@@ -271,7 +277,7 @@ pub struct ClaimArgs {
 pub async fn run(args: &ClaimArgs) -> i32 {
     run_with_dependencies(
         args,
-        load_profile_or_synthesize_testnet,
+        |name| stellar_agent_core::profile::loader::load(name, None),
         init_platform_keyring_store,
     )
     .await
@@ -280,21 +286,40 @@ pub async fn run(args: &ClaimArgs) -> i32 {
 /// Testable core of [`run`] with the profile loader and the platform-keyring
 /// initialiser injected.
 ///
-/// Production callers use [`run`], which supplies
-/// [`load_profile_or_synthesize_testnet`] and [`init_platform_keyring_store`].
-/// Tests substitute an in-memory profile and a spy initialiser to assert the
-/// keyring store is registered before the V1 policy gate's owner-key read
-/// (see `run_build_only` / `run_full_pipeline`) without touching the OS
-/// keychain.
+/// Production callers use [`run`], which supplies the real profile loader and
+/// [`init_platform_keyring_store`]. Tests substitute an in-memory profile and
+/// a spy initialiser to assert the keyring store is registered before the V1
+/// policy gate's owner-key read (see `run_build_only` / `run_full_pipeline`)
+/// without touching the OS keychain.
+///
+/// # The injected closure LOADS ONLY
+///
+/// `load_profile` performs the load and nothing else. Whether a `NotFound`
+/// may be replaced by the synthesized zero-config profile is decided by
+/// [`load_profile_or_synthesize_testnet_with`], which every stage below calls
+/// with the resolved name — so the refusal for a named-but-missing profile
+/// runs on the injected path exactly as it does in production. A check placed
+/// inside the closure would be bypassed by every test that supplies its own.
 async fn run_with_dependencies<LoadProfile, InitKeyring>(
     args: &ClaimArgs,
     load_profile: LoadProfile,
     init_keyring: InitKeyring,
 ) -> i32
 where
-    LoadProfile: Fn(&str) -> Result<(Profile, ProfileOrigin), String>,
+    LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
+    let resolved = resolve_profile_name(args.profile.as_deref());
+    // The resolved name and the input that supplied it are logged together:
+    // a report of a run signing against the wrong profile is diagnosable only
+    // if the log says which name was used and where it came from. Mirrors the
+    // MCP server's startup line.
+    tracing::debug!(
+        profile = %resolved.name,
+        profile_source = resolved.source.as_str(),
+        "claim: profile resolved"
+    );
+
     // ── Mainnet structural rejection (first layer) ────────────────────────────
     if args.network == TargetNetwork::Mainnet {
         let err = WalletError::Network(NetworkError::MainnetWriteForbidden);
@@ -308,13 +333,13 @@ where
     // before signing/broadcasting — so all four stages receive the
     // injected profile-loader/keyring-initialiser pair.
     if args.build_only {
-        run_build_only(args, load_profile, init_keyring).await
+        run_build_only(args, &resolved, load_profile, init_keyring).await
     } else if let Some(ref xdr) = args.sign_only {
-        run_sign_only(args, xdr, load_profile, init_keyring).await
+        run_sign_only(args, &resolved, xdr, load_profile, init_keyring).await
     } else if let Some(ref xdr) = args.submit_only {
-        run_submit_only(args, xdr, load_profile, init_keyring).await
+        run_submit_only(args, &resolved, xdr, load_profile, init_keyring).await
     } else {
-        run_full_pipeline(args, load_profile, init_keyring).await
+        run_full_pipeline(args, &resolved, load_profile, init_keyring).await
     }
 }
 
@@ -324,11 +349,12 @@ where
 
 async fn run_build_only<LoadProfile, InitKeyring>(
     args: &ClaimArgs,
+    resolved: &ResolvedProfileName,
     load_profile: LoadProfile,
     init_keyring: InitKeyring,
 ) -> i32
 where
-    LoadProfile: Fn(&str) -> Result<(Profile, ProfileOrigin), String>,
+    LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
     // ── Resolve profile & conditionally initialise the platform keyring ──────
@@ -339,7 +365,7 @@ where
     // `--build-only` never calls the audit pre-flight (it neither signs nor
     // submits), so the Noop-engine path genuinely never touches the keyring
     // on this stage, unlike the signing/submitting stages below.
-    let (profile, _origin) = match load_profile(&args.profile) {
+    let (profile, _origin) = match load_profile_or_synthesize_testnet_with(resolved, load_profile) {
         Ok(p) => p,
         Err(msg) => {
             print_error(
@@ -367,7 +393,9 @@ where
             let chain_id = caip2_chain_id_for_network(args.network);
             // Build-only: gate but do not submit, so the gate-sized effects are
             // not recorded (no confirmed on-chain action to attest).
-            if let Err(code) = evaluate_claim_policy(args, &built, chain_id, &profile) {
+            if let Err(code) =
+                evaluate_claim_policy(args, &built, chain_id, &profile, &resolved.name)
+            {
                 return code;
             }
             let result = ClaimResult {
@@ -389,20 +417,24 @@ where
 
 async fn run_sign_only<LoadProfile, InitKeyring>(
     args: &ClaimArgs,
+    resolved: &ResolvedProfileName,
     unsigned_xdr: &str,
     load_profile: LoadProfile,
     init_keyring: InitKeyring,
 ) -> i32
 where
-    LoadProfile: Fn(&str) -> Result<(Profile, ProfileOrigin), String>,
+    LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
-    let (profile, origin) = match resolve_profile_and_keyring(args, load_profile, init_keyring) {
-        Ok(p) => p,
-        Err(code) => return code,
-    };
+    let (profile, origin) =
+        match resolve_profile_and_keyring(args, resolved, load_profile, init_keyring) {
+            Ok(p) => p,
+            Err(code) => return code,
+        };
     let chain_id = caip2_chain_id_for_network(args.network);
-    if let Err(code) = evaluate_staged_claim_policy(args, unsigned_xdr, chain_id, &profile).await {
+    if let Err(code) =
+        evaluate_staged_claim_policy(args, unsigned_xdr, chain_id, &profile, &resolved.name).await
+    {
         return code;
     }
     // Origin-aware pre-flight: prove the audit writer is acquirable AFTER the
@@ -414,7 +446,7 @@ where
     // is the refusal.
     if let Err(e) = crate::commands::value_audit::require_value_audit_writer_for_origin(
         &profile,
-        &args.profile,
+        &resolved.name,
         origin,
     ) {
         print_error(&Envelope::<()>::err(&e), args.output);
@@ -442,23 +474,27 @@ where
 
 async fn run_submit_only<LoadProfile, InitKeyring>(
     args: &ClaimArgs,
+    resolved: &ResolvedProfileName,
     signed_xdr: &str,
     load_profile: LoadProfile,
     init_keyring: InitKeyring,
 ) -> i32
 where
-    LoadProfile: Fn(&str) -> Result<(Profile, ProfileOrigin), String>,
+    LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
-    let (profile, origin) = match resolve_profile_and_keyring(args, load_profile, init_keyring) {
-        Ok(p) => p,
-        Err(code) => return code,
-    };
+    let (profile, origin) =
+        match resolve_profile_and_keyring(args, resolved, load_profile, init_keyring) {
+            Ok(p) => p,
+            Err(code) => return code,
+        };
     let chain_id = caip2_chain_id_for_network(args.network);
     // The envelope arrives pre-signed, but broadcasting it still spends
     // funds — gate here even though signing already happened elsewhere.
     let claim_effects =
-        match evaluate_staged_claim_policy(args, signed_xdr, chain_id, &profile).await {
+        match evaluate_staged_claim_policy(args, signed_xdr, chain_id, &profile, &resolved.name)
+            .await
+        {
             Ok(effects) => effects,
             Err(code) => return code,
         };
@@ -471,7 +507,7 @@ where
     // post-confirm emission.
     let audit_writer = match crate::commands::value_audit::require_value_audit_writer_for_origin(
         &profile,
-        &args.profile,
+        &resolved.name,
         origin,
     ) {
         Ok(w) => w,
@@ -490,7 +526,7 @@ where
             if let Some(writer) = &audit_writer {
                 crate::commands::value_audit::emit_value_action_submitted_row_with_writer(
                     writer,
-                    &args.profile,
+                    &resolved.name,
                     "stellar_claim_commit",
                     chain_id,
                     claim_effects.as_ref(),
@@ -501,7 +537,7 @@ where
             crate::commands::policy_engine::record_confirmed_value_moving(
                 "claim",
                 &profile,
-                &args.profile,
+                &resolved.name,
                 "stellar_claim_commit",
                 chain_id,
                 claim_effects.as_ref(),
@@ -547,20 +583,22 @@ where
 /// Secret Service) never blocks the documented no-setup quickstart.
 fn resolve_profile_and_keyring<LoadProfile, InitKeyring>(
     args: &ClaimArgs,
+    resolved: &ResolvedProfileName,
     load_profile: LoadProfile,
     init_keyring: InitKeyring,
 ) -> Result<(Profile, ProfileOrigin), i32>
 where
-    LoadProfile: Fn(&str) -> Result<(Profile, ProfileOrigin), String>,
+    LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
-    let (profile, origin) = load_profile(&args.profile).map_err(|msg| {
-        print_error(
-            &Envelope::<()>::err_raw("profile.load_failed", msg),
-            args.output,
-        );
-        1
-    })?;
+    let (profile, origin) = load_profile_or_synthesize_testnet_with(resolved, load_profile)
+        .map_err(|msg| {
+            print_error(
+                &Envelope::<()>::err_raw("profile.load_failed", msg),
+                args.output,
+            );
+            1
+        })?;
     if let Err(e) = init_keyring() {
         match origin {
             ProfileOrigin::Persisted => {
@@ -569,7 +607,7 @@ where
             }
             ProfileOrigin::Synthesized => {
                 tracing::warn!(
-                    profile = %args.profile,
+                    profile = %resolved.name,
                     error = %e,
                     "platform keyring store unavailable for the synthesized zero-config \
                      profile; continuing warn-only — the audit pre-flight below already \
@@ -595,17 +633,19 @@ async fn evaluate_staged_claim_policy(
     envelope_xdr: &str,
     chain_id: &str,
     profile: &Profile,
+    profile_name: &str,
 ) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, i32> {
-    let policy_engine = match build_v1_policy_engine("claim", &profile.policy.engine, profile) {
-        Ok(pe) => pe,
-        Err(msg) => {
-            print_error(
-                &Envelope::<()>::err_raw("policy.engine_unavailable", msg),
-                args.output,
-            );
-            return Err(1);
-        }
-    };
+    let policy_engine =
+        match build_v1_policy_engine("claim", &profile.policy.engine, profile, profile_name) {
+            Ok(pe) => pe,
+            Err(msg) => {
+                print_error(
+                    &Envelope::<()>::err_raw("policy.engine_unavailable", msg),
+                    args.output,
+                );
+                return Err(1);
+            }
+        };
 
     let decode_result = stellar_agent_core::envelope_decode::decode_authoritative_args(
         envelope_xdr,
@@ -705,11 +745,12 @@ fn dispatch_staged_claim_gate(
 
 async fn run_full_pipeline<LoadProfile, InitKeyring>(
     args: &ClaimArgs,
+    resolved: &ResolvedProfileName,
     load_profile: LoadProfile,
     init_keyring: InitKeyring,
 ) -> i32
 where
-    LoadProfile: Fn(&str) -> Result<(Profile, ProfileOrigin), String>,
+    LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
     // ── Resolve profile & unconditionally attempt to initialise the platform
@@ -722,7 +763,7 @@ where
     // persisted profile; warn-only for the synthesized zero-config profile,
     // matching the audit pre-flight's fail-open posture for that origin (see
     // `resolve_profile_and_keyring`'s rustdoc for the full rationale).
-    let (profile, origin) = match load_profile(&args.profile) {
+    let (profile, origin) = match load_profile_or_synthesize_testnet_with(resolved, load_profile) {
         Ok(p) => p,
         Err(msg) => {
             print_error(
@@ -740,7 +781,7 @@ where
             }
             ProfileOrigin::Synthesized => {
                 tracing::warn!(
-                    profile = %args.profile,
+                    profile = %resolved.name,
                     error = %e,
                     "platform keyring store unavailable for the synthesized zero-config \
                      profile; continuing warn-only — the audit pre-flight below already \
@@ -762,10 +803,11 @@ where
 
     // ── Operator policy evaluation (before signing) ───────────────────────────
     let chain_id = caip2_chain_id_for_network(args.network);
-    let claim_effects = match evaluate_claim_policy(args, &built, chain_id, &profile) {
-        Ok(effects) => effects,
-        Err(code) => return code,
-    };
+    let claim_effects =
+        match evaluate_claim_policy(args, &built, chain_id, &profile, &resolved.name) {
+            Ok(effects) => effects,
+            Err(code) => return code,
+        };
 
     // Origin-aware pre-flight: prove the audit writer is acquirable AFTER the
     // policy gate (a denial is a clean refusal that signs nothing and needs
@@ -777,7 +819,7 @@ where
     // emission.
     let audit_writer = match crate::commands::value_audit::require_value_audit_writer_for_origin(
         &profile,
-        &args.profile,
+        &resolved.name,
         origin,
     ) {
         Ok(w) => w,
@@ -806,7 +848,7 @@ where
             if let Some(writer) = &audit_writer {
                 crate::commands::value_audit::emit_value_action_submitted_row_with_writer(
                     writer,
-                    &args.profile,
+                    &resolved.name,
                     "stellar_claim",
                     chain_id,
                     claim_effects.as_ref(),
@@ -817,7 +859,7 @@ where
             crate::commands::policy_engine::record_confirmed_value_moving(
                 "claim",
                 &profile,
-                &args.profile,
+                &resolved.name,
                 "stellar_claim",
                 chain_id,
                 claim_effects.as_ref(),
@@ -961,17 +1003,19 @@ fn evaluate_claim_policy(
     built: &BuiltClaimEnvelope,
     chain_id: &str,
     profile: &Profile,
+    profile_name: &str,
 ) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, i32> {
-    let policy_engine = match build_v1_policy_engine("claim", &profile.policy.engine, profile) {
-        Ok(pe) => pe,
-        Err(msg) => {
-            print_error(
-                &Envelope::<()>::err_raw("policy.engine_unavailable", msg),
-                args.output,
-            );
-            return Err(1);
-        }
-    };
+    let policy_engine =
+        match build_v1_policy_engine("claim", &profile.policy.engine, profile, profile_name) {
+            Ok(pe) => pe,
+            Err(msg) => {
+                print_error(
+                    &Envelope::<()>::err_raw("policy.engine_unavailable", msg),
+                    args.output,
+                );
+                return Err(1);
+            }
+        };
     // `derive_value_class` ignores args for `stellar_claim` (a non-debit
     // Claim leg is always emitted); `balance_id` is carried for audit parity
     // with the MCP tool's dispatch args and for any future criterion that
@@ -1221,7 +1265,10 @@ mod tests {
 
     fn minimal_args() -> ClaimArgs {
         ClaimArgs {
-            profile: "default".to_owned(),
+            // Zero-config group: `None` is "no profile named", the path that
+            // still synthesizes. `Some("default")` would be an explicitly
+            // named profile and would refuse instead.
+            profile: None,
             balance_id: HEX64.to_owned(),
             source: SOURCE_G.to_owned(),
             fee: None,
@@ -1423,7 +1470,7 @@ mod tests {
                 )
                 .policy_engine(PolicyEngineKind::V1)
                 .build();
-                Ok((profile, ProfileOrigin::Persisted))
+                Ok(profile)
             },
             move || {
                 assert!(
@@ -1478,7 +1525,7 @@ mod tests {
                 )
                 .policy_engine(PolicyEngineKind::Noop)
                 .build();
-                Ok((profile, ProfileOrigin::Persisted))
+                Ok(profile)
             },
             move || {
                 init_writer.store(true, Ordering::SeqCst);
@@ -1505,29 +1552,35 @@ mod tests {
     // direct call pins it precisely without the extra RPC-mocked surface a
     // full `--sign-only` run would add.
 
-    /// A [`ProfileOrigin::Synthesized`] profile must tolerate a platform
-    /// keyring-init failure and return `Ok` — not refuse — matching the
-    /// zero-config quickstart's fail-open posture. Catches the regression
-    /// where this failure was unconditionally fatal regardless of origin,
-    /// which would break `claim --secret-env ...` with no profile file on any
-    /// host without a platform keyring (e.g. a container without a Secret
-    /// Service).
+    /// A synthesized profile must tolerate a platform keyring-init failure
+    /// and return `Ok` — not refuse — matching the zero-config quickstart's
+    /// fail-open posture. The tolerance is origin-scoped, not unconditional:
+    /// making it fatal for every origin would break `claim --secret-env ...`
+    /// with no profile file on any host without a platform keyring (e.g. a
+    /// container without a Secret Service).
+    ///
+    /// The origin is produced by the real choke point, not injected: the
+    /// loader reports the file is absent and `minimal_args` names no profile
+    /// (zero-config group), so the synthesis decision under test actually runs.
     #[test]
+    #[serial_test::serial]
     fn resolve_profile_and_keyring_synthesized_tolerates_init_failure() {
+        // `resolve_profile_name` reads the ambient `STELLAR_AGENT_PROFILE`; an
+        // exported value would make the name explicit and turn the synthesis
+        // branch under test into a refusal. Process-global, hence `#[serial]`.
+        let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let args = minimal_args();
+        let resolved = resolve_profile_name(args.profile.as_deref());
         let result = resolve_profile_and_keyring(
             &args,
+            &resolved,
             |name| {
-                let profile = Profile::builder_testnet_named(
-                    name,
-                    "stellar-agent-signer",
-                    name,
-                    "stellar-agent-nonce",
-                    name,
+                Err(
+                    stellar_agent_core::profile::loader::ProfileLoadError::NotFound {
+                        name: name.to_owned(),
+                        path: std::path::PathBuf::from("/nonexistent"),
+                    },
                 )
-                .policy_engine(PolicyEngineKind::Noop)
-                .build();
-                Ok((profile, ProfileOrigin::Synthesized))
             },
             || {
                 Err(WalletError::Auth(AuthError::KeyringNotFound {
@@ -1540,18 +1593,66 @@ mod tests {
         assert_eq!(origin, ProfileOrigin::Synthesized);
     }
 
+    /// The same absent profile file, but NAMED through `--profile`, refuses
+    /// before the keyring-init step is ever reached. The injected loader is
+    /// byte-identical to the test above: only the provenance of the resolved
+    /// name differs, which is exactly what the choke point keys on.
+    #[test]
+    #[serial_test::serial]
+    fn resolve_profile_and_keyring_named_absent_profile_refuses() {
+        // Serialised with its sibling above: both mutate/read the same
+        // process-global `STELLAR_AGENT_PROFILE`.
+        let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let mut args = minimal_args();
+        args.profile = Some("claim-named-never-authored".to_owned());
+        let resolved = resolve_profile_name(args.profile.as_deref());
+        let init_invoked = std::cell::Cell::new(false);
+        let result = resolve_profile_and_keyring(
+            &args,
+            &resolved,
+            |name| {
+                Err(
+                    stellar_agent_core::profile::loader::ProfileLoadError::NotFound {
+                        name: name.to_owned(),
+                        path: std::path::PathBuf::from("/nonexistent"),
+                    },
+                )
+            },
+            || {
+                init_invoked.set(true);
+                Ok(())
+            },
+        );
+        match result {
+            Err(code) => assert_eq!(code, 1, "a named-but-missing profile must refuse"),
+            Ok(_) => panic!(
+                "a profile named through --profile but never authored must refuse, not \
+                 resolve to the synthesized permissive fallback"
+            ),
+        }
+        assert!(
+            !init_invoked.get(),
+            "the refusal must precede the keyring-init step"
+        );
+    }
+
     /// A [`ProfileOrigin::Persisted`] profile must refuse (`Err(1)`) when the
     /// platform keyring store fails to initialise: an operator who authored a
     /// profile file is expected to have a working platform keyring for both
     /// the fail-closed audit pre-flight and the keyring-backed owner-key
     /// read, so this failure stays fatal.
     #[test]
+    #[serial_test::serial]
     fn resolve_profile_and_keyring_persisted_fails_on_init_failure() {
+        // Serialised with its siblings above for the same reason.
+        let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let args = minimal_args();
+        let resolved = resolve_profile_name(args.profile.as_deref());
         let result = resolve_profile_and_keyring(
             &args,
+            &resolved,
             |name| {
-                let profile = Profile::builder_testnet_named(
+                Ok(Profile::builder_testnet_named(
                     name,
                     "stellar-agent-signer",
                     name,
@@ -1559,8 +1660,7 @@ mod tests {
                     name,
                 )
                 .policy_engine(PolicyEngineKind::Noop)
-                .build();
-                Ok((profile, ProfileOrigin::Persisted))
+                .build())
             },
             || {
                 Err(WalletError::Auth(AuthError::KeyringNotFound {

@@ -411,13 +411,14 @@ where
     // used to validate the amounts length above, and zips 1:1 against the
     // SAME `vault_args.amounts_desired` vector later placed into
     // `VaultDepositArgs` (single-decode invariant).
-    let policy_engine = match build_v1_policy_engine("vault", &profile.policy.engine, &profile) {
-        Ok(pe) => pe,
-        Err(msg) => {
-            render_json(&Envelope::<()>::err_raw("policy.engine_unavailable", msg));
-            return 1;
-        }
-    };
+    let policy_engine =
+        match build_v1_policy_engine("vault", &profile.policy.engine, &profile, &profile_name) {
+            Ok(pe) => pe,
+            Err(msg) => {
+                render_json(&Envelope::<()>::err_raw("policy.engine_unavailable", msg));
+                return 1;
+            }
+        };
     let asset_addresses: Vec<String> = assets.iter().map(|a| a.address.clone()).collect();
     let value_legs =
         vault_deposit_value_legs(&vault_args.amounts_desired, &asset_addresses, &args.vault);
@@ -742,13 +743,14 @@ where
     // ── Operator policy evaluation (value-carrying; mirrors the MCP
     // `stellar_defindex_vault_withdraw` twin's `dispatch_gate_with_value`
     // mechanism) ──────────────────────────────────────────────────────────
-    let policy_engine = match build_v1_policy_engine("vault", &profile.policy.engine, &profile) {
-        Ok(pe) => pe,
-        Err(msg) => {
-            render_json(&Envelope::<()>::err_raw("policy.engine_unavailable", msg));
-            return 1;
-        }
-    };
+    let policy_engine =
+        match build_v1_policy_engine("vault", &profile.policy.engine, &profile, &profile_name) {
+            Ok(pe) => pe,
+            Err(msg) => {
+                render_json(&Envelope::<()>::err_raw("policy.engine_unavailable", msg));
+                return 1;
+            }
+        };
     let value_leg = vault_withdraw_value_leg(vault_args.withdraw_shares, &args.vault);
     // Capture the gate-derived leg as an audit record before the descriptor
     // moves into the gate, so the emitted row carries exactly what the gate

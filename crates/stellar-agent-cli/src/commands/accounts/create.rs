@@ -56,11 +56,13 @@
 //! any network request, signs, or submits. The sponsored `CreateAccount` is
 //! then evaluated against the operator-signed `PolicyEngineV1` (V1 profiles)
 //! or the permissive `NoopPolicyEngine` (`Noop` profiles), mirroring the
-//! `stellar_create_account` MCP tool's dispatch gate. When `--profile` names
-//! no persisted `<name>.toml` file, an in-memory `Noop`-engine testnet
-//! profile is synthesized (tagged
-//! [`crate::commands::policy_engine::ProfileOrigin::Synthesized`]) so
-//! sponsored mode keeps working without an authored profile file. Friendbot
+//! `stellar_create_account` MCP tool's dispatch gate. When NO profile was
+//! named and no persisted `default.toml` file exists, an in-memory
+//! `Noop`-engine testnet profile is synthesized (tagged
+//! [`crate::common::profile_access::ProfileOrigin::Synthesized`]) so
+//! sponsored mode keeps working without an authored profile file; a profile
+//! the operator NAMED — through `--profile` or `STELLAR_AGENT_PROFILE` — but
+//! never authored is refused instead. Friendbot
 //! mode is not gated: it funds the new account from the external Friendbot
 //! faucet and debits no wallet-held funds, and touches no keyring.
 //!
@@ -109,12 +111,14 @@ use stellar_agent_network::{
 use stellar_agent_network::{FriendbotResult, fund_with_friendbot};
 
 use crate::commands::policy_engine::{
-    ProfileOrigin, build_v1_policy_engine, caip2_chain_id_for_network, create_policy_args,
-    evaluate_value_moving_policy, load_profile_or_synthesize_testnet,
+    build_v1_policy_engine, caip2_chain_id_for_network, create_policy_args,
+    evaluate_value_moving_policy,
 };
 use crate::common::network::TargetNetwork;
+use crate::common::profile_access::{ProfileOrigin, load_profile_or_synthesize_testnet_with};
 use crate::common::render::{render_json, sanitize_for_table};
 use crate::common::signer_ceremony::{SignerCeremonyOutcome, resolve_software_signer_from_env};
+use crate::common::{ResolvedProfileName, resolve_profile_name};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -283,14 +287,17 @@ struct SponsoredCreateResult {
     ),
 )]
 pub struct CreateArgs {
-    /// Profile name to evaluate operator policy against in sponsored mode
-    /// (default: "default"). Ignored in Friendbot mode.
+    /// Profile name to evaluate operator policy against in sponsored mode.
+    /// Ignored in Friendbot mode.
     ///
-    /// When no `<name>.toml` profile file exists, an in-memory `Noop`-engine
-    /// testnet profile is synthesized so sponsored mode keeps working without
-    /// an authored profile file; see [`crate::commands::policy_engine::load_profile_or_synthesize_testnet`].
-    #[arg(long, default_value = "default")]
-    pub profile: String,
+    /// Resolution order: this flag, then `STELLAR_AGENT_PROFILE`, then the
+    /// literal `"default"`. When NO profile was named and no `default.toml`
+    /// file exists, an in-memory `Noop`-engine testnet profile is synthesized
+    /// so sponsored mode keeps working without an authored profile file; a
+    /// named profile with no file is refused. See
+    /// [`crate::common::profile_access::load_profile_or_synthesize_testnet`].
+    #[arg(long = "profile", value_name = "NAME")]
+    pub profile: Option<String>,
 
     /// New account G-strkey. Mutually exclusive with `--generate`.
     #[arg(value_name = "NEW_G_STRKEY", group = "account_group")]
@@ -394,7 +401,7 @@ pub struct CreateArgs {
 pub async fn run(args: &CreateArgs) -> i32 {
     run_with_dependencies(
         args,
-        load_profile_or_synthesize_testnet,
+        |name| stellar_agent_core::profile::loader::load(name, None),
         init_platform_keyring_store,
     )
     .await
@@ -403,26 +410,46 @@ pub async fn run(args: &CreateArgs) -> i32 {
 /// Testable core of [`run`] with the profile loader and the platform-keyring
 /// initialiser injected.
 ///
-/// Production callers use [`run`], which supplies
-/// [`load_profile_or_synthesize_testnet`] and [`init_platform_keyring_store`].
-/// Tests substitute an in-memory profile and a spy initialiser to assert the
-/// keyring store is registered before the V1 policy gate's owner-key read
-/// (see `run_sponsored`) without touching the OS keychain. Only the sponsored
-/// path receives the injected pair — Friendbot mode is not gated (see the
-/// module-level doc comment) and touches no keyring.
+/// Production callers use [`run`], which supplies the real profile loader and
+/// [`init_platform_keyring_store`]. Tests substitute an in-memory profile and
+/// a spy initialiser to assert the keyring store is registered before the V1
+/// policy gate's owner-key read (see `run_sponsored`) without touching the OS
+/// keychain. Only the sponsored path receives the injected pair — Friendbot
+/// mode is not gated (see the module-level doc comment) and touches no
+/// keyring.
+///
+/// # The injected closure LOADS ONLY
+///
+/// `load_profile` performs the load and nothing else. Whether a `NotFound`
+/// may be replaced by the synthesized zero-config profile is decided by
+/// [`load_profile_or_synthesize_testnet_with`], which `run_sponsored` calls
+/// with the resolved name — so the refusal for a named-but-missing profile
+/// runs on the injected path exactly as it does in production. A check placed
+/// inside the closure would be bypassed by every test that supplies its own.
 async fn run_with_dependencies<LoadProfile, InitKeyring>(
     args: &CreateArgs,
     load_profile: LoadProfile,
     init_keyring: InitKeyring,
 ) -> i32
 where
-    LoadProfile: Fn(&str) -> Result<(Profile, ProfileOrigin), String>,
+    LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
     if args.fund_with_friendbot {
         run_friendbot(args).await
     } else {
-        run_sponsored(args, load_profile, init_keyring).await
+        let resolved = resolve_profile_name(args.profile.as_deref());
+        // The resolved name and the input that supplied it are logged
+        // together: a report of a run signing against the wrong profile is
+        // diagnosable only if the log says which name was used and where it
+        // came from. Mirrors the MCP server's startup line. Friendbot mode
+        // resolves no profile, so the line belongs on this arm only.
+        tracing::debug!(
+            profile = %resolved.name,
+            profile_source = resolved.source.as_str(),
+            "accounts create: profile resolved"
+        );
+        run_sponsored(args, &resolved, load_profile, init_keyring).await
     }
 }
 
@@ -595,22 +622,27 @@ fn build_friendbot_result(new_account: &NewAccount, fb: &FriendbotResult) -> Cre
 fn evaluate_create_policy(
     args: &CreateArgs,
     profile: &Profile,
+    profile_name: &str,
     starting_balance_stroops: i64,
     new_account_g_strkey: &str,
     chain_id: &str,
     sponsor_account_view: &stellar_agent_network::AccountView,
 ) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, i32> {
-    let policy_engine =
-        match build_v1_policy_engine("accounts create", &profile.policy.engine, profile) {
-            Ok(pe) => pe,
-            Err(msg) => {
-                print_error(
-                    &Envelope::<()>::err_raw("policy.engine_unavailable", msg),
-                    args.output,
-                );
-                return Err(1);
-            }
-        };
+    let policy_engine = match build_v1_policy_engine(
+        "accounts create",
+        &profile.policy.engine,
+        profile,
+        profile_name,
+    ) {
+        Ok(pe) => pe,
+        Err(msg) => {
+            print_error(
+                &Envelope::<()>::err_raw("policy.engine_unavailable", msg),
+                args.output,
+            );
+            return Err(1);
+        }
+    };
     // `derive_value_class` forces the asset to native for `stellar_create_account`
     // — no "asset" key is needed here.
     let policy_args = create_policy_args(starting_balance_stroops, new_account_g_strkey);
@@ -646,11 +678,12 @@ fn evaluate_create_policy(
 
 async fn run_sponsored<LoadProfile, InitKeyring>(
     args: &CreateArgs,
+    resolved: &ResolvedProfileName,
     load_profile: LoadProfile,
     init_keyring: InitKeyring,
 ) -> i32
 where
-    LoadProfile: Fn(&str) -> Result<(Profile, ProfileOrigin), String>,
+    LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
     // Sponsored mode — mainnet write forbidden.
@@ -732,7 +765,7 @@ where
     // profile, so a host with no platform keyring store (e.g. a container
     // without a Secret Service) never blocks the documented no-setup
     // quickstart.
-    let (profile, origin) = match load_profile(&args.profile) {
+    let (profile, origin) = match load_profile_or_synthesize_testnet_with(resolved, load_profile) {
         Ok(p) => p,
         Err(msg) => {
             print_error(
@@ -750,7 +783,7 @@ where
             }
             ProfileOrigin::Synthesized => {
                 tracing::warn!(
-                    profile = %args.profile,
+                    profile = %resolved.name,
                     error = %e,
                     "platform keyring store unavailable for the synthesized zero-config \
                      profile; continuing warn-only — the audit pre-flight below already \
@@ -789,6 +822,7 @@ where
     let create_effects = match evaluate_create_policy(
         args,
         &profile,
+        &resolved.name,
         starting_balance_stroops,
         &new_account.g_strkey,
         chain_id,
@@ -808,7 +842,7 @@ where
     // post-confirm `value_action_submitted` row.
     let audit_writer = match crate::commands::value_audit::require_value_audit_writer_for_origin(
         &profile,
-        &args.profile,
+        &resolved.name,
         origin,
     ) {
         Ok(w) => w,
@@ -850,14 +884,14 @@ where
             if let Some(writer) = &audit_writer {
                 crate::commands::value_audit::emit_value_audit_row_with_writer(
                     writer,
-                    &args.profile,
+                    &resolved.name,
                     audit_entry,
                 );
             }
             crate::commands::policy_engine::record_confirmed_value_moving(
                 "accounts create",
                 &profile,
-                &args.profile,
+                &resolved.name,
                 "stellar_create_account",
                 chain_id,
                 create_effects.as_ref(),
@@ -1395,7 +1429,10 @@ mod tests {
     #[tokio::test]
     async fn friendbot_mainnet_rejected_before_http_call() {
         let args = CreateArgs {
-            profile: "default".to_owned(),
+            // Zero-config group: `None` is "no profile named", the path that
+            // still synthesizes. `Some("default")` would be an explicitly
+            // named profile and would refuse instead.
+            profile: None,
             new_account: Some(
                 "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL".to_owned(),
             ),
@@ -1422,7 +1459,10 @@ mod tests {
     #[tokio::test]
     async fn sponsored_mainnet_rejected_before_rpc_call() {
         let args = CreateArgs {
-            profile: "default".to_owned(),
+            // Zero-config group: `None` is "no profile named", the path that
+            // still synthesizes. `Some("default")` would be an explicitly
+            // named profile and would refuse instead.
+            profile: None,
             new_account: Some(
                 "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL".to_owned(),
             ),
@@ -1571,7 +1611,10 @@ mod tests {
     #[test]
     fn resolve_new_account_generate_produces_valid_strkeys() {
         let args = CreateArgs {
-            profile: "default".to_owned(),
+            // Zero-config group: `None` is "no profile named", the path that
+            // still synthesizes. `Some("default")` would be an explicitly
+            // named profile and would refuse instead.
+            profile: None,
             new_account: None,
             generate: true,
             starting_balance: None,
@@ -1614,7 +1657,10 @@ mod tests {
     #[test]
     fn resolve_new_account_positional_invalid_returns_error() {
         let args = CreateArgs {
-            profile: "default".to_owned(),
+            // Zero-config group: `None` is "no profile named", the path that
+            // still synthesizes. `Some("default")` would be an explicitly
+            // named profile and would refuse instead.
+            profile: None,
             new_account: Some("NOTASTRKEY".to_owned()),
             generate: false,
             starting_balance: None,
@@ -1647,7 +1693,10 @@ mod tests {
     #[test]
     fn secret_key_absent_when_not_generating() {
         let args = CreateArgs {
-            profile: "default".to_owned(),
+            // Zero-config group: `None` is "no profile named", the path that
+            // still synthesizes. `Some("default")` would be an explicitly
+            // named profile and would refuse instead.
+            profile: None,
             new_account: Some(
                 "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL".to_owned(),
             ),
@@ -1680,7 +1729,10 @@ mod tests {
     #[test]
     fn secret_key_present_when_generating() {
         let args = CreateArgs {
-            profile: "default".to_owned(),
+            // Zero-config group: `None` is "no profile named", the path that
+            // still synthesizes. `Some("default")` would be an explicitly
+            // named profile and would refuse instead.
+            profile: None,
             new_account: None,
             generate: true,
             starting_balance: None,
@@ -1753,7 +1805,10 @@ mod tests {
 
     fn minimal_sponsored_args() -> CreateArgs {
         CreateArgs {
-            profile: "default".to_owned(),
+            // Zero-config group: `None` is "no profile named", the path that
+            // still synthesizes. `Some("default")` would be an explicitly
+            // named profile and would refuse instead.
+            profile: None,
             new_account: Some(DEST_G.to_owned()),
             generate: false,
             starting_balance: Some("1 XLM".to_owned()),
@@ -1808,7 +1863,7 @@ mod tests {
                 )
                 .policy_engine(PolicyEngineKind::V1)
                 .build();
-                Ok((profile, ProfileOrigin::Persisted))
+                Ok(profile)
             },
             move || {
                 assert!(
@@ -1860,7 +1915,7 @@ mod tests {
                 )
                 .policy_engine(PolicyEngineKind::Noop)
                 .build();
-                Ok((profile, ProfileOrigin::Persisted))
+                Ok(profile)
             },
             move || {
                 init_writer.store(true, Ordering::SeqCst);
@@ -1882,7 +1937,7 @@ mod tests {
         );
     }
 
-    /// A [`ProfileOrigin::Synthesized`] profile's sponsored run must NOT exit
+    /// A synthesized profile's sponsored run must NOT exit
     /// fatally at the keyring-init step: it warns and continues past both the
     /// keyring-init failure and the origin-aware audit pre-flight, reaching
     /// the sponsor-account RPC fetch and the later "no signer configured"
@@ -1897,24 +1952,36 @@ mod tests {
     /// would break the zero-config quickstart on any host without a platform
     /// keyring (e.g. a container without a Secret Service).
     #[tokio::test]
+    #[serial_test::serial]
     async fn run_synthesized_profile_tolerates_keyring_init_failure() {
+        // The synthesized profile is named by the RESOLVED name, which with no
+        // flag and no variable is the literal `default` — so its
+        // `audit_log_path` and audit chain-root keyring coordinate are the
+        // real `default` profile's. Redirect the data root and the keyring
+        // store, and clear the variable the resolver reads, so the run touches
+        // neither the operator's audit log nor a host key that would let the
+        // pre-flight succeed instead of exercising its fail-open branch.
+        // Process-global, hence `#[serial]`.
+        let _dir = tempfile::TempDir::new().expect("tempdir");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(_dir.path());
+        let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+
         let server = mount_create_build_rpc("333").await;
         let mut args = minimal_sponsored_args();
         args.rpc_url = server.uri();
 
+        // The loader reports the profile file is absent; `minimal_sponsored_args`
+        // names no profile, so the choke point synthesizes (zero-config group).
         let code = run_with_dependencies(
             &args,
             |name| {
-                let profile = Profile::builder_testnet_named(
-                    name,
-                    "stellar-agent-signer",
-                    name,
-                    "stellar-agent-nonce",
-                    name,
+                Err(
+                    stellar_agent_core::profile::loader::ProfileLoadError::NotFound {
+                        name: name.to_owned(),
+                        path: std::path::PathBuf::from("/nonexistent"),
+                    },
                 )
-                .policy_engine(PolicyEngineKind::Noop)
-                .build();
-                Ok((profile, ProfileOrigin::Synthesized))
             },
             || {
                 Err(WalletError::Auth(AuthError::KeyringNotFound {

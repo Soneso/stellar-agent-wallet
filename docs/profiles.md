@@ -28,18 +28,31 @@ Profile files live one-per-name in the OS-conventional data directory:
 
 A profile is selected by name (the file stem). Both binaries resolve the name
 the same way: an explicit `--profile <NAME>`, then the `STELLAR_AGENT_PROFILE`
-environment variable, then `default`. Three CLI verbs are the exception —
-`pay`, `claim`, and `accounts create` carry the literal default `default` on
-`--profile` and do not consult the environment variable. When no name was given and no
-`default.toml` exists yet, the MCP server falls back to an in-memory testnet
-configuration so it can still serve read-only requests (this fallback is never
-written to disk). A profile that WAS named but has no file is refused rather
-than replaced by that fallback.
+environment variable, then `default`. When no name was given and no
+`default.toml` exists yet, both fall back to an in-memory testnet
+configuration — the MCP server so it can still serve read-only requests, and
+the CLI so `pay`, `claim`, and `accounts create` work before any profile is
+authored. This fallback is never written to disk. A profile that WAS named but
+has no file is refused by both binaries rather than replaced by that fallback:
+the fallback is a testnet, no-policy-engine configuration, so substituting it
+for a profile you named would answer on the wrong network under a governance
+setting you did not choose.
 
 A profile file is bound to its name by its keyring coordinates: renaming or
 copying `<a>.toml` to `<b>.toml` does not make it profile `b`, and the MCP
 server refuses to serve it under the new name. Create the second profile with
 `profile init` instead.
+
+The policy spend window does not travel with a copied file either. Rolling
+caps (`per_period_cap`, `rate_limit`, and their bundle forms) accumulate in a
+per-profile store keyed on the profile's `policy_window_state_key_id`. A copy
+that keeps that field shares the original's anti-rollback counter while
+pointing at a store file that does not exist, so every value-moving command
+refuses until `profile reset-window-state <name>` re-baselines it; a copy
+without the field starts a fresh, empty window and the original's spend does
+not count against it. Neither is a way to inherit or reset a spend window on
+purpose — use `profile init` for a new profile and `profile reset-window-state`
+for a deliberate reset.
 
 Every `profile` subcommand accepts a `--profile <NAME>` flag to name the
 profile it operates on; the subcommands that also take a positional `<NAME>`

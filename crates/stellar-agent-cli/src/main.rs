@@ -245,14 +245,13 @@ impl Commands {
     /// environment-variable and `"default"` fall-through.
     ///
     /// `Some(name)` is a name the subcommand itself will use — an explicit
-    /// `--profile`, a positional `<NAME>`, or a clap default the subcommand
-    /// carries. `None` means the subcommand supplied nothing, so
-    /// [`resolve_profile_name`] falls through exactly as the subcommand does.
+    /// `--profile` or a positional `<NAME>`. `None` means the subcommand
+    /// supplied nothing, so [`resolve_profile_name`] falls through exactly as
+    /// the subcommand does.
     ///
     /// Feeding this to [`resolve_profile_name`] is what makes the startup
     /// advisory's profile equal the command's own: both sides consume the same
-    /// parsed value through the same resolver, including for the verbs that
-    /// carry a clap default and therefore never consult the environment.
+    /// parsed value through the same resolver.
     fn profile_flag(&self) -> Option<&str> {
         match self {
             Self::Approve(a) => a.profile_flag(),
@@ -260,7 +259,7 @@ impl Commands {
             Self::Accounts(a) => a.profile_flag(),
             Self::Counterparty(a) => a.profile_flag(),
             Self::Fees(a) => a.profile_flag(),
-            Self::Pay(a) => Some(a.profile.as_str()),
+            Self::Pay(a) => a.profile.as_deref(),
             Self::Mpp(a) => a.profile_flag(),
             Self::Pool(a) => a.profile_flag(),
             Self::Profile(a) => a.profile_flag(),
@@ -269,7 +268,7 @@ impl Commands {
             Self::Vault(a) => a.profile_flag(),
             Self::Trade(a) => a.profile.as_deref(),
             Self::Trustline(a) => a.profile.as_deref(),
-            Self::Claim(a) => Some(a.profile.as_str()),
+            Self::Claim(a) => a.profile.as_deref(),
             Self::Toolsets(a) => a.profile_flag(),
             Self::SmartAccount(a) => a.profile_flag(),
             // No profile selector: `balances` targets an account through
@@ -306,8 +305,7 @@ async fn main() {
     //
     // Profile name: the name the parsed subcommand itself operates on, run
     // through the same resolver the subcommand uses. The advisory therefore
-    // scans the audit log of the profile the command uses — including for the
-    // verbs that carry a clap default and never consult the environment.
+    // scans the audit log of the profile the command uses.
     //
     // `run_startup_advisory` accepts no `StellarRpcClient`: the advisory scan is
     // strictly local and issues no network calls.
@@ -390,23 +388,63 @@ mod tests {
         );
     }
 
-    /// A verb carrying a clap default reports that default, so the advisory
-    /// scans the log the command writes rather than the one the environment
-    /// variable names.
+    /// The value-moving verbs report no flag when none was given, so the
+    /// advisory falls through to `STELLAR_AGENT_PROFILE` exactly as they do.
+    ///
+    /// No CLI verb carries a clap default on its profile selector
+    /// (`tests/profile_flag_discipline.rs` enforces that), so a `Some(..)`
+    /// here would mean the advisory scans a different profile's audit log
+    /// than the command it precedes.
     #[test]
-    fn a_defaulted_verb_reports_its_clap_default_not_an_absent_flag() {
+    fn the_value_moving_verbs_report_their_flag_or_nothing() {
+        let pay_without_flag = &[
+            "stellar-agent",
+            "pay",
+            "--source",
+            "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+            "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+            "1",
+        ];
+        assert_eq!(
+            advisory_profile_flag(pay_without_flag),
+            None,
+            "`pay` resolves the environment variable, so an absent flag must fall through"
+        );
         assert_eq!(
             advisory_profile_flag(&[
                 "stellar-agent",
                 "pay",
+                "--profile",
+                "alice",
                 "--source",
                 "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
                 "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
                 "1",
             ]),
-            Some("default".to_owned()),
-            "`pay` audits under its clap default, so the advisory must scan that \
-             profile's log even when STELLAR_AGENT_PROFILE names another"
+            Some("alice".to_owned())
+        );
+        assert_eq!(
+            advisory_profile_flag(&[
+                "stellar-agent",
+                "claim",
+                "--source",
+                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+                &"0".repeat(72),
+            ]),
+            None,
+            "`claim` resolves the environment variable, so an absent flag must fall through"
+        );
+        assert_eq!(
+            advisory_profile_flag(&[
+                "stellar-agent",
+                "accounts",
+                "create",
+                "--fund-with-friendbot",
+                "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+            ]),
+            None,
+            "`accounts create` resolves the environment variable, so an absent flag must \
+             fall through"
         );
     }
 

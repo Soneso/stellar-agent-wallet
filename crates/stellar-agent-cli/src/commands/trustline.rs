@@ -340,8 +340,12 @@ where
     // ── GATE 4: Operator policy evaluation (args-path; mirrors the MCP
     // `stellar_trustline` twin, which derives its `Trustline` leg from the
     // dispatch args via `derive_value_class` rather than a typed builder) ────
-    let policy_engine = match build_v1_policy_engine("trustline", &profile.policy.engine, &profile)
-    {
+    let policy_engine = match build_v1_policy_engine(
+        "trustline",
+        &profile.policy.engine,
+        &profile,
+        &profile_name,
+    ) {
         Ok(pe) => pe,
         Err(msg) => {
             render_json(&Envelope::<()>::err_raw(

@@ -138,14 +138,14 @@ pub struct UnregisterMulticallArgs {
 ///
 /// Never panics.
 pub async fn run(args: &UnregisterMulticallArgs) -> i32 {
-    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+    let resolved_profile = resolve_profile_name(args.profile.as_deref());
     let network_passphrase = args.network.passphrase().to_owned();
     let network_safename = network_safename_from_passphrase(&network_passphrase);
     let request_id = Uuid::new_v4().to_string();
     let chain_id: Option<String> = None;
 
     // Open audit writer (non-fatal: log warning and continue on failure).
-    let audit_writer = open_profile_audit_writer(&profile_name)
+    let audit_writer = open_profile_audit_writer(&resolved_profile)
         .map(|(_, w, p)| (w, p))
         .ok();
 

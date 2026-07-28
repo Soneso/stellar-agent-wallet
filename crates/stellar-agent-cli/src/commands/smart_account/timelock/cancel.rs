@@ -151,7 +151,8 @@ pub async fn run(args: &CancelArgs) -> i32 {
         return 1;
     }
 
-    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+    let resolved_profile = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolved_profile.name.clone();
     let request_id = Uuid::new_v4().to_string();
 
     // Decode operation_id before hitting the network.
@@ -185,7 +186,7 @@ pub async fn run(args: &CancelArgs) -> i32 {
         };
 
     let (_audit_profile, audit_writer, _audit_log_path) =
-        match open_profile_audit_writer(&profile_name) {
+        match open_profile_audit_writer(&resolved_profile) {
             Ok(triple) => triple,
             Err(e) => {
                 let envelope: Envelope<()> = Envelope::err(&e);
