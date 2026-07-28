@@ -30,9 +30,12 @@ WAS named but has no file is refused by both binaries rather than replaced by
 it.
 
 A profile file is bound to its name by its keyring coordinates. Renaming or
-copying `<a>.toml` to `<b>.toml` does not create profile `b`; the MCP server
-refuses to serve it under the new name. Use `profile init` for a second
-profile.
+copying `<a>.toml` to `<b>.toml` does not create profile `b`; both binaries
+refuse it under the new name with `profile.name_mismatch` — the MCP server at
+startup, the CLI at every command that loads a profile. Use `profile init` for
+a second profile, or correct the file's `policy_owner_key_id.service` to
+`stellar-agent-owner-<name>`. `profile show <name>` still displays a
+mismatched profile, so the offending field can be read.
 
 Create a new profile file with `stellar-agent profile init` (name resolves
 `--profile` -> `STELLAR_AGENT_PROFILE` -> `default`; testnet,

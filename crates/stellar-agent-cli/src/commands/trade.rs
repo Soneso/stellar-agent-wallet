@@ -55,6 +55,7 @@ use stellar_agent_dex::{
 };
 use stellar_agent_network::{StellarRpcClient, init_platform_keyring_store, signer_from_keyring};
 
+use crate::common::profile_access::{injected_profile_load, reconcile_loaded_profile};
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
 
@@ -128,12 +129,7 @@ pub struct TradeArgs {
 ///
 /// Returns `0` on success, `1` on error.
 pub async fn run(args: &TradeArgs) -> i32 {
-    run_with_dependencies(
-        args,
-        |name| profile_loader::load(name, None),
-        init_platform_keyring_store,
-    )
-    .await
+    run_with_dependencies(args, injected_profile_load, init_platform_keyring_store).await
 }
 
 /// Testable core of [`run`] with the profile loader and the platform-keyring
@@ -157,13 +153,12 @@ where
     let profile_name = resolve_profile_name(args.profile.as_deref()).name;
 
     // ── Load profile ──────────────────────────────────────────────────────────
-    let profile = match load_profile(&profile_name) {
+    // Reconciled in the CALLER of the injected loader: a check placed inside
+    // the closure would be bypassed by every test that supplies its own.
+    let profile = match reconcile_loaded_profile(load_profile(&profile_name), &profile_name) {
         Ok(p) => p,
         Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                "profile.load_failed",
-                format!("{e}"),
-            ));
+            render_json(&Envelope::<()>::err_raw(e.code(), e.message(&profile_name)));
             return 1;
         }
     };

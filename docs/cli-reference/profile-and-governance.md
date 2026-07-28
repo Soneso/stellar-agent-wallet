@@ -14,6 +14,8 @@ The seven key-writing commands — `enroll-signer`, `enroll-owner-key`, and the 
 
 Every `profile` subcommand accepts a `--profile <NAME>` flag. For `init`, `enroll-signer`, `enroll-owner-key`, and `sign-policy` it is the only form and resolves in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `show`, `migrate`, the `rotate-*` subcommands, and `reset-window-state` it is an alternative to the positional `<NAME>`: supply exactly one of the positional `<NAME>` or `--profile <NAME>` (supplying both, or neither, is a usage error), with no default. None of them has a confirmation flag.
 
+Every subcommand except `init`, `list`, `migrate`, and `show` also reconciles the selected name against the one the loaded file carries, refusing with `profile.name_mismatch` when the two disagree (see the [index](index.md#profile)). The key-writing commands are not exempt: `sign-policy` writes `<policy_dir>/<derived>.toml` and `enroll-owner-key` writes the `stellar-agent-owner-<derived>` keyring entry, so running either against a copied profile file would replace a DIFFERENT profile's root of trust. Neither is needed to repair a mismatch — the refusal names the recovery path, and `profile show <name>` still displays the file so the offending field can be read. `init` and `list` load no profile at all, and `migrate` rewrites the raw TOML document without constructing a `Profile` or deriving any per-profile path from its contents.
+
 ### `profile init`
 
 ```bash

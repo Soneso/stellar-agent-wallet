@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `stellar_agent_core::profile::name` gained the profile-name reconciliation
+  both binaries apply: `OWNER_KEY_SERVICE_PREFIX` (previously duplicated in each
+  binary), `derive_profile_name_from_owner_key`,
+  `profile_name_mismatch_refusal`, and the `ProfileNameMismatch` refusal with
+  `requested()` / `derived()` / `service()` accessors and a `message()` renderer
+  taking a `ProfileStateLayout`. `stellar-agent-mcp`'s `transport` module
+  re-exports `ProfileNameMismatch` and `profile_name_mismatch_refusal`, so its
+  public surface keeps both names, and adds
+  `pub const STARTUP_STATE_LAYOUT: ProfileStateLayout` naming the layout that
+  server renders under. `ValidationError::ProfileNameMismatch` carries the
+  refusal on the wire as `profile.name_mismatch`. `ProfileStateLayout` is
+  `#[non_exhaustive]`, so a third surface's layout stays additive.
+- **API note on the re-exported `ProfileNameMismatch`.** Its `Display` is now
+  layout-independent: it renders which profile was selected, the offending
+  `policy_owner_key_id.service`, and which profile that names — but NOT the
+  per-profile-state consequence or the recovery text, because both differ
+  between the two binaries. Callers that relied on `to_string()` for the full
+  refusal, including the recovery sentence, call
+  `message(ProfileStateLayout::DerivedThroughout)` to get the previous
+  `stellar-agent-mcp` wording.
 - `stellar-agent-mcp` now selects its profile per invocation. It accepts
   `--profile <NAME>` and `--profile=<NAME>`, and honours `STELLAR_AGENT_PROFILE`
   when the flag is absent, resolving flag > environment > `default` — the order
@@ -32,6 +52,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Behaviour change.** Every `stellar-agent` command that loads a profile now
+  refuses a profile file whose `policy_owner_key_id.service` names a different
+  profile than the one selected, with the wire code `profile.name_mismatch`.
+  A `<name>.toml` copied or renamed from another profile used to load: the
+  signed policy file and the owner-key keyring entry resolve through the name
+  the FILE carries, while the pending-approval store, the audit log, and the
+  policy-window state key on the name the operator ASKED for, so the run was
+  governed by one profile's policy and accounted against another's state — and
+  every message named the profile that was asked for. `profile sign-policy` and
+  `profile enroll-owner-key` were the sharpest edge: run against such a file
+  they overwrote a DIFFERENT profile's signed policy or owner-key entry. The
+  reconciliation is engine-independent, so `noop` profiles are checked too, and
+  it applies to a file selected by `--profile`, by `STELLAR_AGENT_PROFILE`, or
+  by the `default` fallback. A file that exists and mismatches is refused rather
+  than replaced by the zero-config synthesised profile. `stellar-agent profile
+  show <name>` is the one exemption: it displays the offending field, which is
+  what the recovery needs. `stellar-agent-mcp` already refused the same input at
+  startup; the check is now one implementation in `stellar-agent-core`, shared
+  by both binaries, with a per-surface message because the two lay their
+  per-profile state out differently. Closes #107.
 - **Behaviour change.** `pay`, `claim`, and `accounts create` now refuse a
   profile that was named but has no file, where they previously ran under a
   synthesised permissive profile. Naming a profile that does not exist — a
@@ -49,6 +89,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `profile enroll-owner-key`, `profile enroll-signer`, `profile sign-policy`,
+  and `profile rotate-nonce-key` no longer report an unloadable profile as
+  `internal.unexpected_state`. `internal.*` means the wallet is broken; an
+  absent or malformed profile is operator-correctable input, and an agent that
+  routes on the code family treated these as unrecoverable. An absent profile
+  is now `validation.profile_not_found`, matching their sibling commands, and a
+  malformed one is `validation.config_invalid` with the parse cause carried in
+  the message rather than flattened into "not found". Closes #109.
 - CLI policy-window state is read and written under one profile name. The
   rolling-window store was hydrated from the file for the name derived from
   `policy_owner_key_id.service` and appended to the file for the name the

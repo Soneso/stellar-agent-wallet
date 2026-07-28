@@ -38,44 +38,19 @@ fn mcp_binary() -> std::path::PathBuf {
 
 /// A minimal, valid version-2 profile TOML with the Noop policy engine.
 ///
+/// Delegates to `stellar_agent_test_support::profile_fixtures`, the single
+/// generator `stellar-agent`'s reconciliation pins write too, so the parity
+/// claim between the two binaries compares one file rather than two literals.
+///
 /// `owner_profile` is the profile name the keyring coordinates are derived
 /// from. It equals `name` for every profile `stellar-agent profile init`
 /// writes; the reconciliation test passes a different value to reproduce a
 /// profile file copied from another profile.
 fn noop_profile_toml(owner_profile: &str, chain_id: &str, rpc_url: &str) -> String {
-    format!(
-        r#"
-version = 2
-chain_id = "{chain_id}"
-rpc_url = "{rpc_url}"
-
-[mcp_signer_default]
-service = "stellar-agent-signer-{owner_profile}"
-account = "init"
-
-[mcp_nonce_key_alias]
-service = "stellar-agent-nonce-{owner_profile}"
-account = "default"
-
-[audit_log_hash_chain_key_id]
-service = "stellar-agent-audit-{owner_profile}"
-account = "default"
-
-[policy_owner_key_id]
-service = "stellar-agent-owner-{owner_profile}"
-account = "default"
-
-[attestation_key_id]
-service = "stellar-agent-attestation-{owner_profile}"
-account = "default"
-
-[counterparty_cache_key_id]
-service = "stellar-agent-counterparty-{owner_profile}"
-account = "default"
-
-[policy]
-engine = "noop"
-"#
+    stellar_agent_test_support::profile_fixtures::noop_profile_toml(
+        owner_profile,
+        chain_id,
+        rpc_url,
     )
 }
 

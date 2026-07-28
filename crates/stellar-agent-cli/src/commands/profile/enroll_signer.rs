@@ -92,8 +92,12 @@ use stellar_agent_network::Signer as _;
 use stellar_agent_network::keyring::{init_platform_keyring_store, signer_from_keyring};
 use uuid::Uuid;
 
+use crate::common::profile_access::{
+    injected_profile_load, profile_access_envelope, reconcile_loaded_profile,
+};
 use crate::common::signer_ceremony::resolve_software_signer_from_env;
 use crate::common::{render, resolve_profile_name};
+use stellar_agent_core::observability::redact_path_in_message;
 
 use super::audit_emit::emit_keyring_key_written;
 
@@ -175,7 +179,7 @@ struct EnrollSignerData {
 pub(crate) async fn run(args: &EnrollSignerArgs) -> i32 {
     run_with_dependencies(
         args,
-        |name| loader::load(name, None),
+        injected_profile_load,
         loader::read_signer_ref,
         loader::pin_signer_account,
         init_platform_keyring_store,
@@ -217,18 +221,14 @@ where
     // The env-merged load supplies the audit-emission context at the end of
     // the flow; every enrollment DECISION below uses the raw on-disk signer
     // reference instead, so environment overlays stay load-time-only.
-    let profile = match load_profile(&profile_name) {
+    // Reconciled in the CALLER of the injected loader: several test closures
+    // ignore the name they are handed, so a check placed inside one would be
+    // bypassed by every test that supplies it.
+    let profile = match reconcile_loaded_profile(load_profile(&profile_name), &profile_name) {
         Ok(p) => p,
-        Err(loader::ProfileLoadError::NotFound { name, .. }) => {
-            let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
-            render::render_json(&Envelope::<()>::err(&err));
-            return 1;
-        }
         Err(e) => {
-            let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("failed to load profile '{profile_name}': {e}"),
-            });
-            render::render_json(&Envelope::<()>::err(&err));
+            tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
+            render::render_json(&profile_access_envelope(&e, &profile_name));
             return 1;
         }
     };
@@ -249,12 +249,16 @@ where
             render::render_json(&Envelope::<()>::err(&err));
             return 1;
         }
+        // An unreadable or malformed stored document is operator-correctable
+        // input, not a wallet defect, so it stays in the validation class with
+        // its cause carried — the same rule the profile load above follows.
         Err(e) => {
-            let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!(
+            let err = WalletError::Validation(ValidationError::ConfigInvalid {
+                component: "profile",
+                reason: redact_path_in_message(&format!(
                     "failed to read the on-disk signer reference for profile \
                      '{profile_name}': {e}"
-                ),
+                )),
             });
             render::render_json(&Envelope::<()>::err(&err));
             return 1;

@@ -84,6 +84,23 @@ impl ShowArgs {
 ///
 /// Never panics.
 pub async fn run(args: &ShowArgs) -> i32 {
+    // RECONCILIATION-EXEMPT, and the only exemption in this crate.
+    //
+    // Every other production load routes through `common::profile_access`,
+    // which refuses a profile whose `policy_owner_key_id.service` names a
+    // different profile. This command exists to DISPLAY that field: the
+    // envelope below serialises the whole `Profile`, `policy_owner_key_id`
+    // included, and it is what an operator reads to repair the mismatch.
+    // Reconciling here would make a mismatched profile impossible to inspect
+    // and leave the refusal's own recovery advice — "correct
+    // policy_owner_key_id.service" — uncompletable.
+    //
+    // The exemption is safe because `show` performs no keyed operation: it
+    // opens no store, mints no key, signs nothing, and derives no per-profile
+    // path from the loaded contents.
+    //
+    // `crates/stellar-agent-cli/tests/profile_reconciliation_discipline.rs`
+    // pins this file as the sole allowlist entry.
     match loader::load(args.profile_name(), None) {
         Ok(profile) => {
             render::render_json(&Envelope::ok(profile));

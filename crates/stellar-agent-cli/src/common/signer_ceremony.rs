@@ -34,29 +34,49 @@ use std::sync::{Arc, Mutex};
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::error::{ValidationError, WalletError, WalletStateError};
-use stellar_agent_core::profile::loader as profile_loader;
 use stellar_agent_core::wallet::{DEFAULT_TTL_SECONDS, MlockDegradation, MlockRequired, Wallet};
 use stellar_agent_network::SoftwareSigningKey;
 use stellar_agent_network::signing::wallet::signer_from_wallet;
 use zeroize::Zeroizing;
 
+use crate::common::profile_access::{
+    ProfileAccessError, load_profile_reconciled_by_requested_name,
+};
+
 /// Resolves the effective `mlock_required` posture and unlock TTL from
 /// `profile_name`'s `[wallet]` profile section.
 ///
-/// Falls back to `(MlockRequired::Warn, DEFAULT_TTL_SECONDS)` when no profile
-/// name is supplied, or when the named profile fails to load — consistent
-/// with how other optional profile-derived controls degrade elsewhere in the
-/// CLI rather than turning a missing/malformed profile into a hard failure
-/// of the signing ceremony itself.
-fn resolve_wallet_unlock_controls(profile_name: Option<&str>) -> (MlockRequired, u32) {
+/// Two failures, two dispositions, and the distinction is the point:
+///
+/// - **No profile name, or the named profile does not LOAD** — falls back to
+///   `(MlockRequired::Warn, DEFAULT_TTL_SECONDS)`. There is no posture to read,
+///   and refusing here would make every signing verb require an authored
+///   profile file. This is the documented degradation other optional
+///   profile-derived controls share.
+/// - **The profile loads but names ANOTHER profile** — refuses. The posture is
+///   readable, it just belongs to a profile the operator did not select, and
+///   `mlock_required` is a security control on the signing path: silently
+///   taking `false` from a foreign profile would unpin the seed page for a
+///   profile that asked for it to be pinned. A control read from the wrong
+///   profile is worse than no control read at all, because the caller cannot
+///   tell the difference.
+///
+/// # Errors
+///
+/// Returns the profile-name-mismatch refusal as
+/// [`WalletError::Validation`] carrying `profile.name_mismatch`.
+fn resolve_wallet_unlock_controls(
+    profile_name: Option<&str>,
+) -> Result<(MlockRequired, u32), WalletError> {
     let Some(name) = profile_name else {
-        return (MlockRequired::Warn, DEFAULT_TTL_SECONDS);
+        return Ok((MlockRequired::Warn, DEFAULT_TTL_SECONDS));
     };
-    match profile_loader::load(name, None) {
-        Ok(profile) => (
+    match load_profile_reconciled_by_requested_name(name, None) {
+        Ok(profile) => Ok((
             profile.wallet.mlock_required,
             profile.wallet.unlock_ttl_seconds,
-        ),
+        )),
+        Err(e @ ProfileAccessError::NameMismatch(_)) => Err(e.to_wallet_error(name)),
         Err(e) => {
             tracing::debug!(
                 profile = name,
@@ -64,7 +84,7 @@ fn resolve_wallet_unlock_controls(profile_name: Option<&str>) -> (MlockRequired,
                 "resolve_software_signer_from_env: profile load failed; \
                  falling back to MlockRequired::Warn and the default unlock TTL"
             );
-            (MlockRequired::Warn, DEFAULT_TTL_SECONDS)
+            Ok((MlockRequired::Warn, DEFAULT_TTL_SECONDS))
         }
     }
 }
@@ -99,6 +119,10 @@ pub(crate) struct SignerCeremonyOutcome {
 ///   when `var_name` is not set in the environment, or
 ///   [`ValidationError::SecretEnvInvalid`] when its value is not a valid
 ///   `S...` ed25519 strkey. Both name only the variable, never its value.
+/// - [`WalletError::Validation`] carrying `profile.name_mismatch` when
+///   `profile_name`'s file names a different profile. The `[wallet]` posture
+///   that governs this unlock would otherwise be taken from a profile the
+///   operator did not select.
 /// - [`WalletError::WalletState`] wrapping [`WalletStateError::UnlockFailed`]
 ///   when `Wallet::unlock` fails — including a profile `unlock_ttl_seconds`
 ///   outside `Wallet::unlock`'s `(0, MAX_TTL_SECONDS]` range, which is refused
@@ -109,7 +133,7 @@ pub(crate) async fn resolve_software_signer_from_env(
     wallet_label: &str,
     profile_name: Option<&str>,
 ) -> Result<SignerCeremonyOutcome, WalletError> {
-    let (mlock_required, ttl_seconds) = resolve_wallet_unlock_controls(profile_name);
+    let (mlock_required, ttl_seconds) = resolve_wallet_unlock_controls(profile_name)?;
 
     let s_strkey: Zeroizing<String> = Zeroizing::new(std::env::var(var_name).map_err(|_| {
         WalletError::Validation(ValidationError::SecretEnvNotSet {
@@ -300,12 +324,15 @@ mod tests {
         std::fs::create_dir_all(&profiles_dir).expect("create profiles dir");
 
         let profile_name = "signer-ceremony-over-max-ttl";
+        // Named so the file reconciles against the name the ceremony resolves
+        // it by; this test drives the TTL refusal, not the name refusal.
         let mut profile = Profile::builder_testnet(
             "signer-ceremony-svc",
             "signer-ceremony-acct",
             "signer-ceremony-nonce-svc",
             "signer-ceremony-nonce-acct",
         )
+        .with_profile_name(profile_name)
         .audit_log_path(dir.path().join("audit.log"))
         .build();
         profile.wallet.mlock_required = MlockRequired::Warn;
@@ -369,8 +396,9 @@ mod tests {
         std::fs::write(dir.path().join(format!("{profile_name}.toml")), toml_bytes)
             .expect("write profile");
 
-        let loaded = profile_loader::load_from_dir(profile_name, dir.path(), None)
-            .expect("profile must load");
+        let loaded =
+            stellar_agent_core::profile::loader::load_from_dir(profile_name, dir.path(), None)
+                .expect("profile must load");
         assert_eq!(loaded.wallet.mlock_required, MlockRequired::False);
         assert_eq!(loaded.wallet.unlock_ttl_seconds, 45);
 
@@ -533,5 +561,117 @@ mod tests {
             contents.is_empty(),
             "no row must be written when degradation is None; got: {contents}"
         );
+    }
+
+    // ── The profile-name reconciliation on the signing path ──────────────────
+
+    /// A profile whose owner-key coordinate names ANOTHER profile makes the
+    /// ceremony refuse, instead of taking that profile's `[wallet]` posture.
+    ///
+    /// `mlock_required` decides whether the seed page is pinned for the
+    /// duration of the unlock window. Reading it from a profile the operator
+    /// did not select would silently apply a different security posture on the
+    /// signing path, and the caller could not tell that had happened.
+    ///
+    /// `#[serial]`: `STELLAR_AGENT_HOME` is process-global.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    #[allow(
+        unsafe_code,
+        reason = "test-only process environment mutation; the S-strkey variable name is unique to this test"
+    )]
+    async fn a_mismatched_profile_refuses_instead_of_taking_its_posture() {
+        use stellar_agent_test_support::StellarAgentHomeGuard;
+        use stellar_agent_test_support::profile_fixtures::noop_profile_toml;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = StellarAgentHomeGuard::new(dir.path());
+        let profiles_dir = dir.path().join("profiles");
+        std::fs::create_dir_all(&profiles_dir).expect("create profiles dir");
+
+        // `i107-ceremony.toml` whose coordinates name `i107-other`: what
+        // copying another profile's file produces.
+        let requested = "i107-ceremony";
+        std::fs::write(
+            profiles_dir.join(format!("{requested}.toml")),
+            noop_profile_toml("i107-other", "stellar:testnet", "http://127.0.0.1:29/i107"),
+        )
+        .expect("write mismatched profile");
+
+        let seed = [0x77u8; 32];
+        let s_strkey = stellar_strkey::ed25519::PrivateKey(seed)
+            .as_unredacted()
+            .to_string()
+            .to_string();
+        let var = unique_var("MISMATCHED_PROFILE");
+        unsafe {
+            std::env::set_var(&var, &s_strkey);
+        }
+
+        let err = match resolve_software_signer_from_env(&var, "unit-test", Some(requested)).await {
+            Ok(_) => panic!("a mismatched profile must not supply the unlock posture"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code(), "profile.name_mismatch");
+        assert!(
+            err.to_string().contains("stellar-agent-owner-i107-other"),
+            "the refusal must quote the offending field: {err}"
+        );
+
+        unsafe {
+            std::env::remove_var(&var);
+        }
+    }
+
+    /// A profile that is simply ABSENT keeps the documented warn-fallback: the
+    /// ceremony proceeds on `(MlockRequired::Warn, DEFAULT_TTL_SECONDS)`.
+    ///
+    /// The control that keeps the refusal above from becoming "any profile
+    /// problem blocks signing", which would make every signing verb require an
+    /// authored profile file.
+    ///
+    /// `#[serial]`: `STELLAR_AGENT_HOME` is process-global.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    #[allow(
+        unsafe_code,
+        reason = "test-only process environment mutation; the S-strkey variable name is unique to this test"
+    )]
+    async fn an_absent_profile_keeps_the_documented_warn_fallback() {
+        use stellar_agent_test_support::StellarAgentHomeGuard;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = StellarAgentHomeGuard::new(dir.path());
+
+        let seed = [0x78u8; 32];
+        let s_strkey = stellar_strkey::ed25519::PrivateKey(seed)
+            .as_unredacted()
+            .to_string()
+            .to_string();
+        let var = unique_var("ABSENT_PROFILE");
+        unsafe {
+            std::env::set_var(&var, &s_strkey);
+        }
+
+        let outcome =
+            resolve_software_signer_from_env(&var, "unit-test", Some("i107-never-authored"))
+                .await
+                .expect("an absent profile must degrade, not refuse");
+        let expected_g = {
+            let vk = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+            stellar_strkey::ed25519::PublicKey(vk.to_bytes())
+                .to_string()
+                .to_string()
+        };
+        let derived = outcome
+            .signer
+            .public_key()
+            .await
+            .expect("public key must derive");
+        assert_eq!(derived.to_string().to_string(), expected_g);
+
+        unsafe {
+            std::env::remove_var(&var);
+        }
     }
 }

@@ -18,6 +18,9 @@
 //! - [`env_guard::StellarAgentHomeGuard`] — RAII guard overriding
 //!   `STELLAR_AGENT_HOME` for tests that exercise the wallet's
 //!   home-directory resolution; callers serialise with `#[serial]`.
+//! - [`profile_fixtures`] — profile-TOML bytes shared by both binaries'
+//!   process-level tests, so a parity assertion compares one file rather than
+//!   two hand-copied literals.
 //! - [`env_guard::ProfileEnvVarGuard`] — RAII guard clearing
 //!   `STELLAR_AGENT_PROFILE` for in-process tests that exercise the
 //!   "no profile was named" branch; callers serialise with `#[serial]`.
@@ -38,6 +41,7 @@ pub mod echo_id_responder;
 pub mod env_guard;
 pub mod keyring_mock;
 pub mod log_capture;
+pub mod profile_fixtures;
 pub mod secret_patterns;
 #[cfg(feature = "testnet-helpers")]
 pub mod testnet_helpers;

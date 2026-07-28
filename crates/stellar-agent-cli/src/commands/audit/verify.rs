@@ -34,11 +34,13 @@ use stellar_agent_core::{
         verify::{FileVerifyResult, VerifyError, VerifyWarning, verify_log_with_health},
     },
     envelope::{Envelope, OutputFormat},
-    error::{InternalError, ValidationError, WalletError},
-    profile::{loader, schema::Profile},
+    error::{InternalError, WalletError},
+    profile::schema::Profile,
 };
 use stellar_agent_network::keyring::{init_platform_keyring_store, map_keyring_error};
 use zeroize::Zeroizing;
+
+use crate::common::profile_access::load_profile_reconciled_by_requested_name;
 
 /// Arguments for the `audit verify` subcommand.
 #[derive(Debug, Args)]
@@ -191,18 +193,21 @@ fn resolve_hmac_key(
     load_audit_hmac_key(&profile).map(Some)
 }
 
-/// Loads the named profile and maps loader errors into the CLI envelope model.
+/// Loads the named profile, reconciled, and maps the failure into the CLI
+/// envelope model.
+///
+/// The cause is carried through rather than flattened: the HMAC key this
+/// profile supplies decides whether the log verifies, so "the file names
+/// another profile" and "the file is malformed" must be distinguishable in the
+/// refusal.
 fn load_profile_for_verify(profile_name: &str) -> Result<Profile, WalletError> {
-    loader::load(profile_name, None).map_err(|e| match e {
-        loader::ProfileLoadError::NotFound { name, .. } => {
-            WalletError::Validation(ValidationError::ProfileNotFound { name })
-        }
-        _ => {
-            tracing::debug!(profile = %profile_name, error = %e, "profile load failed for audit verify");
-            WalletError::Validation(ValidationError::ProfileNotFound {
-                name: profile_name.to_owned(),
-            })
-        }
+    load_profile_reconciled_by_requested_name(profile_name, None).map_err(|e| {
+        tracing::debug!(
+            profile = %profile_name,
+            error = %e,
+            "profile access refused for audit verify"
+        );
+        e.to_wallet_error(profile_name)
     })
 }
 

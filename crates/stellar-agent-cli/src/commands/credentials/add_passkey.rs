@@ -52,7 +52,6 @@ use stellar_agent_core::approval::retry::{
 };
 use stellar_agent_core::audit_log::writer::{AuditWriter, AuditWriterRegistry};
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::profile::loader;
 use stellar_agent_core::redact_first5_last5;
 use stellar_agent_smart_account::managers::credentials::{AddPasskeyOutcome, CredentialsManager};
 use stellar_agent_webauthn_bridge::start_bridge_register_only;
@@ -60,6 +59,9 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::commands::credentials::credentials_error_code;
+use crate::common::profile_access::{
+    ProfileAccessError, load_profile_reconciled_by_requested_name, profile_access_envelope,
+};
 use crate::common::render::render_json;
 use crate::common::{resolve_profile_name, validate_path_component_ascii_safe};
 
@@ -141,6 +143,24 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
             "credentials.invalid_profile_name",
             format!("invalid profile name '{profile}': {reason}"),
         );
+    }
+
+    // ── Reconcile the profile BEFORE any side effect ─────────────────────────
+    // This runs ahead of the approval-store open, the bridge listener, the
+    // PendingApproval write, and the browser launch, because a profile file
+    // that names another profile must not leave any of them behind: the
+    // approval store and the passkey registry are keyed on the REQUESTED name
+    // while the audit rows follow the FILE, so a registration under a
+    // mismatched profile would split the credential from its own trail.
+    //
+    // A profile that merely fails to LOAD is tolerated here: registration
+    // predates a fully-configured profile, and the audit-writer open below
+    // already degrades for that case.
+    if let Err(e @ ProfileAccessError::NameMismatch(_)) =
+        load_profile_reconciled_by_requested_name(&profile, None)
+    {
+        render_json(&profile_access_envelope(&e, &profile));
+        return 1;
     }
 
     // ── Open the approval store ONCE; wrap in Arc<Mutex<>> ───────────────────
@@ -399,12 +419,16 @@ fn launch_browser(url: &str) -> bool {
 /// keyring miss, IO error), warns via `tracing::warn!` and returns `None`. The
 /// registration flow continues without an audit entry.
 ///
+/// A name mismatch cannot reach here: [`run`] reconciles before it opens the
+/// approval store, so this helper only ever sees a profile that already
+/// belongs to the requested name.
+///
 /// Uses [`AuditWriterRegistry::get_or_open`] instead of `AuditWriter::open`
 /// directly so the single-writer invariant is enforced — if another call site
 /// in the same process holds the writer for this profile the same `Arc` is
 /// returned rather than a second open attempt that would receive `FileLocked`.
 ///
-/// Steps: (1) `loader::load(profile_name)`, (2) load HMAC key from keyring,
+/// Steps: (1) reconciled profile load, (2) load HMAC key from keyring,
 /// (3) `AuditWriterRegistry::get_or_open(profile_name, path, key)`.
 /// Each step is non-fatal — returns `None` on the first failure.
 async fn open_profile_audit_writer_non_fatal(
@@ -416,7 +440,7 @@ async fn open_profile_audit_writer_non_fatal(
     use stellar_agent_network::keyring::classify_keyring_error;
     use zeroize::Zeroizing;
 
-    let profile = match loader::load(profile_name, None) {
+    let profile = match load_profile_reconciled_by_requested_name(profile_name, None) {
         Ok(p) => p,
         Err(e) => {
             warn!(
@@ -517,7 +541,7 @@ mod tests {
         // Must return None, not panic.
         assert!(
             result.is_none(),
-            "audit writer must return None for unconfigured profile"
+            "audit writer must return None for an unconfigured profile"
         );
     }
 }

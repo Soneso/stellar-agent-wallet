@@ -49,16 +49,17 @@ use stellar_agent_core::policy::v1::{
 use stellar_agent_core::policy::{
     Decision, McpToolRegistration, NoopPolicyEngine, PolicyEngine, ToolDescriptor, ToolValueKind,
 };
+// `OWNER_KEY_SERVICE_PREFIX` and the strip that inverts it are owned by
+// `stellar-agent-core`, beside `KeyringEntryRef::default_owner_key`, which is
+// the only writer of the coordinate. Both binaries import them, so the
+// construction and its inverse cannot drift apart.
+use stellar_agent_core::profile::name::{
+    OWNER_KEY_SERVICE_PREFIX, derive_profile_name_from_owner_key,
+};
 use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile, default_policy_dir};
 use stellar_agent_network::policy_state::PersistedWindowStore;
 
 use crate::common::network::TargetNetwork;
-
-/// The service-name prefix used by
-/// [`stellar_agent_core::profile::schema::KeyringEntryRef::default_owner_key`].
-///
-/// Must match `crates/stellar-agent-mcp/src/server.rs` `OWNER_KEY_SERVICE_PREFIX`.
-pub(crate) const OWNER_KEY_SERVICE_PREFIX: &str = "stellar-agent-owner-";
 
 /// Constructs the [`PolicyEngine`] for a value-moving CLI verb from the
 /// profile's `policy.engine` kind.
@@ -93,12 +94,15 @@ pub(crate) const OWNER_KEY_SERVICE_PREFIX: &str = "stellar-agent-owner-";
 /// name would hydrate caps from a file no CLI writer ever appends to.
 ///
 /// The MCP server keys the same store on the DERIVED name, on both its read
-/// and its write. The two surfaces cannot disagree in practice: the server
-/// refuses at startup to serve a profile whose owner coordinate names another
-/// profile (`stellar-agent-mcp`'s startup reconciliation), so for any profile
-/// it does serve, derived and selected are the same string. Settling that
-/// keying difference as one decision across both binaries is recorded as the
-/// surface-parity note on issue #114 and is not made here.
+/// and its write. The two surfaces cannot disagree in practice, because
+/// neither one operates on a profile whose derived and requested names differ:
+/// both reconcile the selected name against
+/// `policy_owner_key_id.service` before any state path is built — the server at
+/// startup, this binary at `crate::common::profile_access`. For every profile
+/// either surface acts on, the two names are the same string, so which of them
+/// keys the store is unobservable. Settling the keying difference as one
+/// decision across both binaries is recorded as the surface-parity note on
+/// issue #114 and is not made here.
 ///
 /// Only the FILE moves. The name attached to each hydrated entry
 /// (`load_into`) and the engine's own `StateKey` namespace (`new_with_store`)
@@ -145,7 +149,7 @@ pub(crate) fn build_v1_policy_engine(
             // Derive profile name from the service field (strips prefix).
             // `account` is always the literal "default", so we MUST use `service`.
             let service = &profile.policy_owner_key_id.service;
-            let profile_name = match service.strip_prefix(OWNER_KEY_SERVICE_PREFIX) {
+            let profile_name = match derive_profile_name_from_owner_key(profile) {
                 Some(n) => n.to_owned(),
                 None => {
                     return Err(format!(
@@ -1938,6 +1942,20 @@ mod tests {
     /// whose `policy_owner_key_id.service` names `i114-derived`, the signed
     /// policy the DERIVED name addresses, and the gated owner-pubkey file so
     /// no OS keyring is touched.
+    ///
+    /// # The divergence is constructed BELOW the reconciliation, deliberately
+    ///
+    /// `crate::common::profile_access` refuses this profile: a file whose owner
+    /// coordinate names another profile never reaches a command. What is pinned
+    /// here is one level down — that the window store's read and write select
+    /// the SAME file when the two names differ — and that keying rule has to
+    /// hold on its own terms, not because a caller above it happens to have
+    /// eliminated the case.
+    ///
+    /// So the load is the raw loader and the engine is built directly, with no
+    /// command in between. `tests/profile_reconciliation_discipline.rs` scans
+    /// production code only, and this module's `#[cfg(test)]` block is excluded
+    /// from that scan.
     ///
     /// Callers MUST be `#[serial]`: the home, owner-pubkey, and keyring-store
     /// overrides are all process-global.

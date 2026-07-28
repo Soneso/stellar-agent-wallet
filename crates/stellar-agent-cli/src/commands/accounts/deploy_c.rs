@@ -46,7 +46,7 @@ use rand_core::{OsRng, RngCore};
 use stellar_agent_core::audit_log::writer::{AuditWriter, AuditWriterRegistry};
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{InternalError, NetworkError, ValidationError, WalletError};
-use stellar_agent_core::profile::{loader, schema::Profile};
+use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::wallet::MlockDegradation;
 use stellar_agent_network::keyring::{init_platform_keyring_store, map_keyring_error};
 use stellar_agent_network::{
@@ -64,6 +64,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::common::network::TargetNetwork;
+use crate::common::profile_access::{injected_profile_load, reconcile_loaded_profile};
 use crate::common::render::{render_json, sanitize_for_table};
 use crate::common::signer_ceremony::{
     SignerCeremonyOutcome, record_mlock_degradation, resolve_software_signer_from_env,
@@ -313,7 +314,7 @@ pub struct DeployCArgs {
 ///
 /// Never panics.
 pub async fn run(args: &DeployCArgs) -> i32 {
-    run_with_dependencies(args, load_profile_for_deploy, init_platform_keyring_store).await
+    run_with_dependencies(args, injected_profile_load, init_platform_keyring_store).await
 }
 
 async fn run_with_dependencies<LoadProfile, InitKeyring>(
@@ -322,7 +323,7 @@ async fn run_with_dependencies<LoadProfile, InitKeyring>(
     init_keyring: InitKeyring,
 ) -> i32
 where
-    LoadProfile: Fn(&str) -> Result<Profile, WalletError>,
+    LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
     // First layer: structural mainnet rejection before any key access.
@@ -535,31 +536,27 @@ fn resolve_audit_writer<LoadProfile, InitKeyring>(
     init_keyring: InitKeyring,
 ) -> Result<Option<Arc<Mutex<AuditWriter>>>, WalletError>
 where
-    LoadProfile: Fn(&str) -> Result<Profile, WalletError>,
+    LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
     let Some(profile_name) = profile_name else {
         return Ok(None);
     };
 
-    let profile = load_profile(profile_name)?;
+    // Reconciled in the CALLER of the injected loader. A check inside the
+    // closure would be bypassed by every test that supplies its own, which is
+    // the placement `crate::common::profile_access`'s module docs call out.
+    let profile =
+        reconcile_loaded_profile(load_profile(profile_name), profile_name).map_err(|e| {
+            tracing::debug!(
+                profile = %profile_name,
+                error = %e,
+                "profile access refused for deploy-c"
+            );
+            e.to_wallet_error(profile_name)
+        })?;
     init_keyring()?;
     open_profile_audit_writer_via_registry(profile_name, &profile).map(Some)
-}
-
-/// Loads the named profile and maps loader errors into the CLI envelope model.
-fn load_profile_for_deploy(profile_name: &str) -> Result<Profile, WalletError> {
-    loader::load(profile_name, None).map_err(|e| match e {
-        loader::ProfileLoadError::NotFound { name, .. } => {
-            WalletError::Validation(ValidationError::ProfileNotFound { name })
-        }
-        _ => {
-            tracing::debug!(profile = %profile_name, error = %e, "profile load failed for deploy-c");
-            WalletError::Validation(ValidationError::ProfileNotFound {
-                name: profile_name.to_owned(),
-            })
-        }
-    })
 }
 
 /// Opens or retrieves the cached audit writer for `profile_name` via the

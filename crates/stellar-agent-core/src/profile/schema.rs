@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use super::caip2::Caip2;
+use super::name::OWNER_KEY_SERVICE_PREFIX;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MINIMUM_FLOOR
@@ -188,6 +189,13 @@ impl KeyringEntryRef {
     ///
     /// Entry name: `stellar-agent-owner-<profile>` / `default`.
     ///
+    /// This is the only writer of the coordinate both binaries invert to
+    /// recover a profile's own name, so the prefix comes from
+    /// [`OWNER_KEY_SERVICE_PREFIX`](crate::profile::name::OWNER_KEY_SERVICE_PREFIX)
+    /// rather than a local literal. The example below pins the resulting value,
+    /// so a change to the constant surfaces here as a failing doctest rather
+    /// than as profiles the reconciliation refuses.
+    ///
     /// # Examples
     ///
     /// ```
@@ -199,7 +207,10 @@ impl KeyringEntryRef {
     /// ```
     #[must_use]
     pub fn default_owner_key(profile_name: &str) -> Self {
-        Self::new(format!("stellar-agent-owner-{profile_name}"), "default")
+        Self::new(
+            format!("{OWNER_KEY_SERVICE_PREFIX}{profile_name}"),
+            "default",
+        )
     }
 
     /// Constructs the default attestation-key keyring entry reference for a

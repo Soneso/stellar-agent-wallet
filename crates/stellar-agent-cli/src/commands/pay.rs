@@ -121,7 +121,9 @@ use crate::commands::policy_engine::{
     evaluate_value_moving_policy, pay_policy_args,
 };
 use crate::common::network::TargetNetwork;
-use crate::common::profile_access::{ProfileOrigin, load_profile_or_synthesize_testnet_with};
+use crate::common::profile_access::{
+    ProfileOrigin, injected_profile_load, load_profile_or_synthesize_testnet_with,
+};
 use crate::common::render::{render_json, sanitize_for_table};
 use crate::common::signer_ceremony::{SignerCeremonyOutcome, resolve_software_signer_from_env};
 use crate::common::{ResolvedProfileName, resolve_profile_name};
@@ -366,12 +368,7 @@ pub struct PayArgs {
 ///
 /// Never panics.
 pub async fn run(args: &PayArgs) -> i32 {
-    run_with_dependencies(
-        args,
-        |name| stellar_agent_core::profile::loader::load(name, None),
-        init_platform_keyring_store,
-    )
-    .await
+    run_with_dependencies(args, injected_profile_load, init_platform_keyring_store).await
 }
 
 /// Testable core of [`run`] with the profile loader and the platform-keyring
@@ -469,9 +466,9 @@ where
     // on this stage, unlike the signing/submitting stages below.
     let (profile, _origin) = match load_profile_or_synthesize_testnet_with(resolved, load_profile) {
         Ok(p) => p,
-        Err(msg) => {
+        Err(e) => {
             print_error(
-                &Envelope::<()>::err_raw("profile.load_failed", msg),
+                &Envelope::<()>::err_raw(e.code(), e.message(&resolved.name)),
                 args.output,
             );
             return 1;
@@ -707,9 +704,9 @@ where
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
     let (profile, origin) = load_profile_or_synthesize_testnet_with(resolved, load_profile)
-        .map_err(|msg| {
+        .map_err(|e| {
             print_error(
-                &Envelope::<()>::err_raw("profile.load_failed", msg),
+                &Envelope::<()>::err_raw(e.code(), e.message(&resolved.name)),
                 args.output,
             );
             1
@@ -921,9 +918,9 @@ where
     // `resolve_profile_and_keyring`'s rustdoc for the full rationale).
     let (profile, origin) = match load_profile_or_synthesize_testnet_with(resolved, load_profile) {
         Ok(p) => p,
-        Err(msg) => {
+        Err(e) => {
             print_error(
-                &Envelope::<()>::err_raw("profile.load_failed", msg),
+                &Envelope::<()>::err_raw(e.code(), e.message(&resolved.name)),
                 args.output,
             );
             return 1;
@@ -2116,14 +2113,18 @@ mod tests {
 
         let code = run_with_dependencies(
             &args,
-            move |_name| {
+            move |name| {
                 loaded_writer.store(true, Ordering::SeqCst);
+                // Built under the name it is LOADED BY, as `profile init`
+                // writes it: the profile-access choke point refuses a file
+                // whose owner coordinate names a different profile, and this
+                // test is about the keyring-init ordering, not that refusal.
                 let profile = Profile::builder_testnet_named(
-                    "keyring-order-test",
+                    name,
                     "stellar-agent-signer",
-                    "keyring-order-test",
+                    name,
                     "stellar-agent-nonce",
-                    "keyring-order-test",
+                    name,
                 )
                 .policy_engine(PolicyEngineKind::V1)
                 .build();
@@ -2171,13 +2172,17 @@ mod tests {
 
         let code = run_with_dependencies(
             &args,
-            |_name| {
+            |name| {
+                // Built under the name it is LOADED BY: the profile-access
+                // choke point refuses a file whose owner coordinate names a
+                // different profile, and this test is about the keyring-init
+                // ordering under a Noop engine, not that refusal.
                 let profile = Profile::builder_testnet_named(
-                    "keyring-order-test-noop",
+                    name,
                     "stellar-agent-signer",
-                    "keyring-order-test-noop",
+                    name,
                     "stellar-agent-nonce",
-                    "keyring-order-test-noop",
+                    name,
                 )
                 .policy_engine(PolicyEngineKind::Noop)
                 .build();

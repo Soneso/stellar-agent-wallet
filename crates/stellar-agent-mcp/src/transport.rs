@@ -8,7 +8,9 @@
 //! It also holds the startup refusals that are decided from the loaded profile
 //! alone: [`mcp_disabled_refusal`] for the per-profile kill-switch and
 //! [`profile_name_mismatch_refusal`] for a profile file whose owner-key
-//! coordinate names a different profile than the one selected.
+//! coordinate names a different profile than the one selected. The latter is
+//! re-exported from `stellar-agent-core`, where it is shared with the CLI so
+//! both surfaces reconcile a profile against its own name identically.
 
 use futures::{SinkExt, StreamExt};
 use rmcp::{
@@ -24,9 +26,25 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use crate::STELLAR_AGENT_MCP_MAX_LINE_BYTES;
-use crate::server::{OWNER_KEY_SERVICE_PREFIX, WalletServer};
+use crate::server::WalletServer;
 use stellar_agent_core::policy::BuildRegistryError;
 use stellar_agent_core::profile::schema::Profile;
+
+/// The selected-name reconciliation both binaries apply, re-exported from
+/// `stellar-agent-core`.
+///
+/// The implementation is shared so the MCP server and the CLI cannot reach
+/// different verdicts on the same profile file. This module keeps the names
+/// exported because they are part of this crate's published surface, and
+/// because the startup refusal below is the server's only caller.
+///
+/// Render [`ProfileNameMismatch`] with
+/// [`ProfileNameMismatch::message`] and [`ProfileStateLayout::DerivedThroughout`]:
+/// this server keys every per-profile store — signed policy, approval store,
+/// window state, audit log, counterparty cache — on the derived name.
+pub use stellar_agent_core::profile::name::{
+    ProfileNameMismatch, ProfileStateLayout, profile_name_mismatch_refusal,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Type aliases for BoundedStdioTransport internals
@@ -219,92 +237,16 @@ pub fn mcp_disabled_refusal(profile: &Profile) -> Option<&'static str> {
     profile.mcp_disabled.then_some("mcp.disabled_per_profile")
 }
 
-/// A loaded profile whose owner-key coordinate names a different profile than
-/// the one the operator selected.
+/// The state layout a [`ProfileNameMismatch`] refusal must be rendered under on
+/// this surface.
 ///
-/// Carries both names and the offending field so the refusal can be acted on
-/// without opening the TOML.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProfileNameMismatch {
-    /// The profile name the operator selected.
-    requested: String,
-    /// The name derived from `policy_owner_key_id.service`, or `None` when the
-    /// field does not carry the expected prefix at all.
-    derived: Option<String>,
-    /// The `policy_owner_key_id.service` value as stored in the profile.
-    service: String,
-}
-
-impl std::fmt::Display for ProfileNameMismatch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self {
-            requested,
-            derived,
-            service,
-        } = self;
-        match derived {
-            Some(derived) => write!(
-                f,
-                "profile '{requested}' was selected, but its \
-                 policy_owner_key_id.service is '{service}', which names profile \
-                 '{derived}'"
-            )?,
-            None => write!(
-                f,
-                "profile '{requested}' was selected, but its \
-                 policy_owner_key_id.service is '{service}', which does not carry \
-                 the '{OWNER_KEY_SERVICE_PREFIX}' prefix a profile name is derived \
-                 from"
-            )?,
-        }
-        write!(
-            f,
-            "; the signed policy file, pending-approval store, and policy-window \
-             state would be read and written under the derived name, not \
-             '{requested}'. A profile file renamed or copied from another profile \
-             must be re-created with `stellar-agent profile init --profile \
-             {requested}`, or its policy_owner_key_id.service corrected to \
-             '{OWNER_KEY_SERVICE_PREFIX}{requested}'"
-        )
-    }
-}
-
-/// Returns a refusal when the selected profile name disagrees with the name
-/// derived from the loaded profile's `policy_owner_key_id.service`, or `None`
-/// when the two agree.
-///
-/// The server derives the name it uses for per-profile state — the signed
-/// policy file, the pending-approval store, the policy-window state — from the
-/// profile's *contents* rather than from the name it was loaded under. When
-/// those two disagree, a profile loaded as `alice` silently reads `default`'s
-/// signed policy and writes `default`'s approvals. Reconciling them at startup
-/// is what keeps the selected name and the state it governs the same profile.
-///
-/// An absent prefix is a mismatch, not a fallback: the approval-store derivation
-/// resolves a prefix-less `service` to the literal `"default"`, which is the
-/// same silent cross-profile write under a different guise.
-///
-/// The check is independent of `profile.policy.engine`. The name derivation it
-/// guards runs for every engine kind, so attaching it to the V1 policy-engine
-/// path would skip Noop profiles — the zero-ceremony configuration the
-/// getting-started flow recommends, and precisely the case that reaches the
-/// approval-store derivation with no other guard in front of it.
-#[must_use]
-pub fn profile_name_mismatch_refusal(
-    profile: &Profile,
-    requested_name: &str,
-) -> Option<ProfileNameMismatch> {
-    let service = &profile.policy_owner_key_id.service;
-    let derived = service.strip_prefix(OWNER_KEY_SERVICE_PREFIX);
-    if derived == Some(requested_name) {
-        return None;
-    }
-    Some(ProfileNameMismatch {
-        requested: requested_name.to_owned(),
-        derived: derived.map(ToOwned::to_owned),
-        service: service.clone(),
-    })
-}
+/// This server resolves every per-profile store through the name derived from
+/// `policy_owner_key_id.service`: the signed policy file, the pending-approval
+/// store (`server.rs` `profile_name_for_approval`), the policy-window state
+/// (read and write), the audit log, and the counterparty cache. A refusal
+/// rendered under any other layout would tell the operator something untrue
+/// about their own files.
+pub const STARTUP_STATE_LAYOUT: ProfileStateLayout = ProfileStateLayout::DerivedThroughout;
 
 #[cfg(test)]
 mod tests {
@@ -313,7 +255,10 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
 
-    use super::{mcp_disabled_refusal, profile_name_mismatch_refusal};
+    use super::{
+        ProfileStateLayout, STARTUP_STATE_LAYOUT, mcp_disabled_refusal,
+        profile_name_mismatch_refusal,
+    };
     use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile};
 
     fn testnet_profile() -> Profile {
@@ -360,7 +305,7 @@ mod tests {
         let profile = named_profile("default");
         let refusal = profile_name_mismatch_refusal(&profile, "alice")
             .expect("a profile naming 'default' must not serve as 'alice'");
-        let message = refusal.to_string();
+        let message = refusal.message(STARTUP_STATE_LAYOUT);
         assert!(
             message.contains("'alice'") && message.contains("'default'"),
             "refusal must name both profiles: {message}"
@@ -384,7 +329,7 @@ mod tests {
         profile.policy.engine = PolicyEngineKind::Noop;
         let refusal = profile_name_mismatch_refusal(&profile, "alice")
             .expect("a Noop-engine profile must be reconciled exactly like a V1 one");
-        assert!(refusal.to_string().contains("'alice'"));
+        assert!(refusal.message(STARTUP_STATE_LAYOUT).contains("'alice'"));
     }
 
     #[test]
@@ -394,7 +339,7 @@ mod tests {
             stellar_agent_core::profile::schema::KeyringEntryRef::new("hand-written", "default");
         let refusal = profile_name_mismatch_refusal(&profile, "alice")
             .expect("a service field without the owner-key prefix must refuse");
-        let message = refusal.to_string();
+        let message = refusal.message(STARTUP_STATE_LAYOUT);
         assert!(
             message.contains("does not carry the 'stellar-agent-owner-' prefix"),
             "refusal must explain the absent prefix: {message}"
@@ -411,5 +356,14 @@ mod tests {
         // that profile must pass the reconciliation check unchanged.
         let profile = named_profile("default");
         assert_eq!(profile_name_mismatch_refusal(&profile, "default"), None);
+    }
+
+    #[test]
+    fn the_startup_layout_is_the_derived_throughout_one() {
+        // This server keys signed policy, approval store, window state, audit
+        // log, and counterparty cache on the derived name; a refusal rendered
+        // under any other layout would misdescribe where the operator's state
+        // lives.
+        assert_eq!(STARTUP_STATE_LAYOUT, ProfileStateLayout::DerivedThroughout);
     }
 }

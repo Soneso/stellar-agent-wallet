@@ -39,9 +39,16 @@ for a profile you named would answer on the wrong network under a governance
 setting you did not choose.
 
 A profile file is bound to its name by its keyring coordinates: renaming or
-copying `<a>.toml` to `<b>.toml` does not make it profile `b`, and the MCP
-server refuses to serve it under the new name. Create the second profile with
-`profile init` instead.
+copying `<a>.toml` to `<b>.toml` does not make it profile `b`. Both binaries
+refuse it under the new name — the MCP server at startup, the CLI at every
+command that loads a profile — with the wire code `profile.name_mismatch`. The
+refusal names both profiles and quotes the offending
+`policy_owner_key_id.service`. Recover by creating the second profile with
+`profile init --profile <name>`, or by correcting that field to
+`stellar-agent-owner-<name>`.
+
+`profile show <name>` is the one command that still displays a mismatched
+profile: it is what you read to find the offending field.
 
 The policy spend window does not travel with a copied file either. Rolling
 caps (`per_period_cap`, `rate_limit`, and their bundle forms) accumulate in a

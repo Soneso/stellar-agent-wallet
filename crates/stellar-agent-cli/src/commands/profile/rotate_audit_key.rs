@@ -49,12 +49,15 @@ use clap::{ArgGroup, Args};
 use serde::Serialize;
 use stellar_agent_core::audit_log::{KeyPurpose, SidecarResignError, resign_chain_root_sidecars};
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
+use stellar_agent_core::error::{InternalError, WalletError};
 use stellar_agent_core::profile::loader;
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 use uuid::Uuid;
 
+use crate::common::profile_access::{
+    injected_profile_load, profile_access_envelope, reconcile_loaded_profile,
+};
 use crate::common::render;
 
 use super::audit_emit::{emit_keyring_key_written, load_audit_hmac_key};
@@ -133,12 +136,7 @@ fn resign_failure_error(e: &SidecarResignError) -> WalletError {
 ///
 /// Never panics.
 pub async fn run(args: &RotateAuditKeyArgs) -> i32 {
-    run_with_dependencies(
-        args,
-        |name| loader::load(name, None),
-        init_platform_keyring_store,
-    )
-    .await
+    run_with_dependencies(args, injected_profile_load, init_platform_keyring_store).await
 }
 
 /// Testable core of [`run`] with the profile loader and the platform-keyring
@@ -160,19 +158,16 @@ where
 {
     // ── Setup A: load the profile FIRST so a nonexistent profile never reaches
     // the keyring init.  Eliminates the process-global keyring-store race.
-    let profile = match load_profile(args.profile_name()) {
+    // Reconciled in the CALLER of the injected loader: a check inside the
+    // closure would be bypassed by every test that supplies its own.
+    let profile = match reconcile_loaded_profile(
+        load_profile(args.profile_name()),
+        args.profile_name(),
+    ) {
         Ok(p) => p,
-        Err(loader::ProfileLoadError::NotFound { name, .. }) => {
-            let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
-            render::render_json(&Envelope::err(&err));
-            return 1;
-        }
         Err(e) => {
-            tracing::debug!(profile = %args.profile_name(), error = %e, "profile load failed");
-            let err = WalletError::Validation(ValidationError::ProfileNotFound {
-                name: args.profile_name().to_owned(),
-            });
-            render::render_json(&Envelope::err(&err));
+            tracing::debug!(profile = %args.profile_name(), error = %e, "profile access refused");
+            render::render_json(&profile_access_envelope(&e, args.profile_name()));
             return 1;
         }
     };
@@ -333,8 +328,12 @@ mod tests {
         keyring_mock::install().expect("mock keyring store");
 
         let dir = tempfile::tempdir().expect("tmp dir");
-        let mut profile =
-            Profile::builder_testnet("rotate-run-e2e", "acct", "n-svc", "n-acct").build();
+        // Named so the profile's own keyring coordinates match the name it is
+        // rotated under: `run_with_dependencies` reconciles the loaded profile
+        // against the requested name before rotating anything.
+        let mut profile = Profile::builder_testnet("rotate-run-e2e", "acct", "n-svc", "n-acct")
+            .with_profile_name("rotate-run-e2e")
+            .build();
         profile.audit_log_path = dir.path().join("audit.jsonl");
         let entry_ref = profile.audit_log_hash_chain_key_id.clone();
 

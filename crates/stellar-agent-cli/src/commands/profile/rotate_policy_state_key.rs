@@ -68,12 +68,14 @@ use clap::{ArgGroup, Args};
 use serde::Serialize;
 use stellar_agent_core::audit_log::KeyPurpose;
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{ValidationError, WalletError};
-use stellar_agent_core::profile::loader;
+use stellar_agent_core::error::WalletError;
 use stellar_agent_network::keyring::{init_platform_keyring_store, load_hmac_key_32};
 use stellar_agent_network::policy_state::PersistedWindowStore;
 use uuid::Uuid;
 
+use crate::common::profile_access::{
+    load_profile_reconciled_by_requested_name, profile_access_envelope,
+};
 use crate::common::render;
 
 use super::audit_emit::emit_keyring_key_written;
@@ -141,19 +143,11 @@ struct RotatePolicyStateKeyData {
 pub async fn run(args: &RotatePolicyStateKeyArgs) -> i32 {
     // ── Step 0: load the profile FIRST so a nonexistent profile never
     // reaches the keyring init.
-    let profile = match loader::load(args.profile_name(), None) {
+    let profile = match load_profile_reconciled_by_requested_name(args.profile_name(), None) {
         Ok(p) => p,
-        Err(loader::ProfileLoadError::NotFound { name, .. }) => {
-            let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
-            render::render_json(&Envelope::err(&err));
-            return 1;
-        }
         Err(e) => {
-            tracing::debug!(profile = %args.profile_name(), error = %e, "profile load failed");
-            let err = WalletError::Validation(ValidationError::ProfileNotFound {
-                name: args.profile_name().to_owned(),
-            });
-            render::render_json(&Envelope::err(&err));
+            tracing::debug!(profile = %args.profile_name(), error = %e, "profile access refused");
+            render::render_json(&profile_access_envelope(&e, args.profile_name()));
             return 1;
         }
     };
