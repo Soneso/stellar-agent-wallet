@@ -8,10 +8,9 @@
 use clap::Args;
 use serde::Serialize;
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{ValidationError, WalletError};
-use stellar_agent_core::profile::loader;
 use stellar_agent_network::keyring::{init_platform_keyring_store, rotate_keyring_secret_32};
 
+use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
 use crate::common::{render, resolve_profile_name};
 
 /// Arguments for `stellar-agent counterparty rotate-hmac-key`.
@@ -50,21 +49,16 @@ fn rotate_hmac_key_envelope(profile: &str) -> Envelope<RotateHmacKeyData> {
 /// keyring cannot be initialized, or the keyring write fails.
 pub async fn run(args: &RotateHmacKeyArgs) -> i32 {
     // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
-    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+    let resolved_profile = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolved_profile.name.clone();
 
-    let profile = match loader::load(&profile_name, None) {
+    // Reconciled: a profile file whose owner-key coordinate names a
+    // different profile is refused rather than used under this name.
+    let profile = match load_profile_reconciled(&resolved_profile, None) {
         Ok(p) => p,
-        Err(loader::ProfileLoadError::NotFound { name, .. }) => {
-            let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
-            render::render_json(&Envelope::err(&err));
-            return 1;
-        }
         Err(e) => {
-            tracing::debug!(profile = %profile_name, error = %e, "profile load failed");
-            let err = WalletError::Validation(ValidationError::ProfileNotFound {
-                name: profile_name.clone(),
-            });
-            render::render_json(&Envelope::err(&err));
+            tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
+            render::render_json(&profile_access_envelope(&e, &profile_name));
             return 1;
         }
     };

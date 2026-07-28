@@ -829,6 +829,34 @@ pub enum ValidationError {
         path: String,
     },
 
+    /// The selected profile's `policy_owner_key_id.service` names a different
+    /// profile than the one that was requested.
+    ///
+    /// Both binaries derive per-profile state paths — the signed policy file,
+    /// the owner-key keyring entry, and on the MCP surface the approval store
+    /// and window state — from the loaded profile's own contents. A file
+    /// copied or renamed from another profile therefore governs that other
+    /// profile's state while every message names the requested one. The
+    /// refusal is produced by
+    /// [`profile_name_mismatch_refusal`](crate::profile::name::profile_name_mismatch_refusal);
+    /// `detail` carries its rendered message, which names both profiles,
+    /// quotes the offending field, and states the recovery.
+    ///
+    /// # Wire code
+    ///
+    /// `"profile.name_mismatch"` — a `profile.*` taxonomy code on a
+    /// validation-class variant, matching `AuditLogNotFound`'s precedent. It
+    /// is deliberately NOT `validation.config_invalid`: that code already
+    /// carries "the profile NAME is not a usable path component", and an agent
+    /// must be able to tell that apart from "the profile FILE belongs to
+    /// another profile". The two have unrelated recovery.
+    #[error("{detail}")]
+    ProfileNameMismatch {
+        /// The rendered refusal: both names, the offending field, and the
+        /// recovery path.
+        detail: String,
+    },
+
     /// A value-moving signing verb refused because the profile's audit
     /// chain-root HMAC key could not be loaded from the platform keyring.
     ///
@@ -986,6 +1014,10 @@ impl ValidationError {
             Self::AuditLogNotFound { .. } => "audit.log_not_found",
             Self::MainnetRpcUrlRequired { .. } => "validation.mainnet_rpc_url_required",
             Self::ProfileAlreadyExists { .. } => "validation.profile_already_exists",
+            // Profile taxonomy code on a validation-class variant: the code
+            // names the subsystem (profile.*) while the category stays
+            // Validation, as `AuditLogNotFound` does for audit.*.
+            Self::ProfileNameMismatch { .. } => "profile.name_mismatch",
             // Audit taxonomy code on a validation-class variant: see
             // `AuditLogNotFound` above for the same rationale.
             Self::AuditChainKeyUnavailable { .. } => "audit.chain_key_unavailable",
@@ -2110,6 +2142,15 @@ mod tests {
                 "validation.profile_already_exists",
             ),
             (
+                ValidationError::ProfileNameMismatch {
+                    detail: "profile 'alice' was selected, but its \
+                             policy_owner_key_id.service is \
+                             'stellar-agent-owner-default'"
+                        .to_owned(),
+                },
+                "profile.name_mismatch",
+            ),
+            (
                 ValidationError::AuditChainKeyUnavailable {
                     profile: "default".to_owned(),
                 },
@@ -2253,6 +2294,11 @@ mod tests {
                     ValidationError::ProfileAlreadyExists {
                         name: name.clone(),
                         path: path.clone(),
+                    }
+                }
+                ValidationError::ProfileNameMismatch { detail } => {
+                    ValidationError::ProfileNameMismatch {
+                        detail: detail.clone(),
                     }
                 }
                 ValidationError::AuditChainKeyUnavailable { profile } => {

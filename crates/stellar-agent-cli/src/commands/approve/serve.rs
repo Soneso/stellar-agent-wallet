@@ -34,12 +34,12 @@ use clap::{Args, ValueEnum};
 
 use stellar_agent_approval_ui::{DecisionContext, ServeConfig, ServeStartError, start_serve};
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
-use stellar_agent_core::profile::loader;
+use stellar_agent_core::error::{InternalError, WalletError};
 use stellar_agent_core::profile::schema::default_approval_dir;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 
 use crate::commands::smart_account::common::open_profile_audit_writer;
+use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
 
@@ -126,19 +126,14 @@ pub async fn run(args: ServeArgs) -> i32 {
     let profile_name = resolved_profile.name.clone();
 
     // Resolve the profile for the attestation-key reference.
-    let profile = match loader::load(&profile_name, None) {
+    // Reconciled: the attestation-key reference and the approval-store path
+    // below both come from this file, so a file that names another profile is
+    // refused here rather than used to serve approvals under this name.
+    let profile = match load_profile_reconciled(&resolved_profile, None) {
         Ok(p) => p,
-        Err(loader::ProfileLoadError::NotFound { name, .. }) => {
-            let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
-            render_json(&Envelope::<()>::err(&err));
-            return 1;
-        }
         Err(e) => {
-            tracing::debug!(profile = %profile_name, error = %e, "profile load failed");
-            let err = WalletError::Validation(ValidationError::ProfileNotFound {
-                name: profile_name.clone(),
-            });
-            render_json(&Envelope::<()>::err(&err));
+            tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
+            render_json(&profile_access_envelope(&e, &profile_name));
             return 1;
         }
     };

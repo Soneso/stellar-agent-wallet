@@ -69,6 +69,9 @@ use crate::commands::smart_account::common::{
     open_profile_audit_writer,
 };
 use crate::common::network::TargetNetwork;
+use crate::common::profile_access::{
+    ProfileAccessError, load_profile_reconciled, profile_access_envelope,
+};
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
 use crate::common::signer_ceremony::{
@@ -312,12 +315,18 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         // other variants (e.g. VersionUnsupported, MissingPolicySection — warn but still
         // fall through to the flag, since multicall does not hard-require the profile).
         // Non-NotFound ProfileLoadError is not silently swallowed; it is logged.
-        let from_profile = match stellar_agent_core::profile::loader::load(
-            &profile_name,
-            Some(&registry),
-        ) {
+        //
+        // A name mismatch is the one failure this tolerance does not extend to:
+        // the file exists and is readable, it simply belongs to a different
+        // profile, and taking a submission endpoint from it would route this
+        // run through a profile the operator did not select.
+        let from_profile = match load_profile_reconciled(&resolved_profile, Some(&registry)) {
             Ok(p) => p.secondary_rpc_url,
-            Err(stellar_agent_core::profile::loader::ProfileLoadError::NotFound { .. }) => None,
+            Err(ref e @ ProfileAccessError::NameMismatch(_)) => {
+                render_json(&profile_access_envelope(e, &profile_name));
+                return 1;
+            }
+            Err(e) if e.is_not_found() => None,
             Err(e) => {
                 warn!(
                     profile_name = %profile_name,

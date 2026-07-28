@@ -17,7 +17,7 @@ use stellar_agent_core::{
     observability::RedactedStrkey,
     policy::v1::ValueClass,
     policy::{Decision, McpToolRegistration, PolicyEngine, ToolDescriptor, ToolValueKind},
-    profile::{caip2::TESTNET_PASSPHRASE, loader, schema::default_approval_dir},
+    profile::{caip2::TESTNET_PASSPHRASE, schema::default_approval_dir},
 };
 use stellar_agent_mpp::{
     ApprovalDisposition, ChallengeInput, MppAuthorizationStore, MppError, MppErrorCode,
@@ -32,6 +32,9 @@ use stellar_agent_network::{
 
 use crate::commands::{
     policy_engine::build_v1_policy_engine, value_audit::emit_value_audit_row_strict,
+};
+use crate::common::profile_access::{
+    ProfileAccessError, load_profile_reconciled_by_requested_name, profile_access_envelope,
 };
 use crate::common::resolve_profile_name;
 
@@ -235,7 +238,7 @@ async fn authorize(args: MppAuthorizeArgs) -> i32 {
     let profile_name = resolve_profile_name(args.profile.as_deref()).name;
     let profile = match load_testnet_profile(&profile_name) {
         Ok(profile) => profile,
-        Err(error) => return render_error(&error),
+        Err(error) => return render_profile_error(&error, &profile_name),
     };
     if init_platform_keyring_store().is_err() {
         return render_error(&state_error());
@@ -495,7 +498,7 @@ async fn commit_cli(
 fn status(args: &MppStatusArgs) -> i32 {
     let profile_name = resolve_profile_name(args.profile.as_deref()).name;
     if let Err(error) = load_testnet_profile(&profile_name) {
-        return render_error(&error);
+        return render_profile_error(&error, &profile_name);
     }
     if init_platform_keyring_store().is_err() {
         return render_error(&state_error());
@@ -517,7 +520,7 @@ fn record_receipt(args: &MppReceiptArgs) -> i32 {
     let profile_name = resolve_profile_name(args.profile.as_deref()).name;
     let profile = match load_testnet_profile(&profile_name) {
         Ok(profile) => profile,
-        Err(error) => return render_error(&error),
+        Err(error) => return render_profile_error(&error, &profile_name),
     };
     if init_platform_keyring_store().is_err() {
         return render_error(&state_error());
@@ -582,7 +585,7 @@ async fn reconcile(args: MppReconcileArgs) -> i32 {
     let profile_name = resolve_profile_name(args.profile.as_deref()).name;
     let profile = match load_testnet_profile(&profile_name) {
         Ok(profile) => profile,
-        Err(error) => return render_error(&error),
+        Err(error) => return render_profile_error(&error, &profile_name),
     };
     if init_platform_keyring_store().is_err() {
         return render_error(&state_error());
@@ -627,7 +630,7 @@ async fn reconcile(args: MppReconcileArgs) -> i32 {
 fn prune(args: &MppPruneArgs) -> i32 {
     let profile = match load_testnet_profile(&args.profile) {
         Ok(profile) => profile,
-        Err(error) => return render_error(&error),
+        Err(error) => return render_profile_error(&error, &args.profile),
     };
     let reason = match read_selected_input(
         args.reason_stdin,
@@ -719,14 +722,44 @@ fn policy_descriptor(tool_name: &'static str) -> ToolDescriptor {
     descriptor
 }
 
+/// Why MPP could not obtain a usable profile.
+///
+/// The profile step is the one place in this command where a failure is about
+/// the operator's configuration rather than about MPP state, so it carries its
+/// own cause instead of collapsing into `state_error()`. "The profile file is a
+/// copy of another profile" and "MPP authorization state is unavailable" have
+/// nothing in common and are not recoverable by the same action.
+enum MppProfileError {
+    /// The profile could not be loaded, or names a different profile.
+    Access(ProfileAccessError),
+    /// The profile loaded but does not target testnet.
+    Network(MppError),
+}
+
 fn load_testnet_profile(
     profile_name: &str,
-) -> Result<stellar_agent_core::profile::schema::Profile, MppError> {
-    let profile = loader::load(profile_name, None).map_err(|_| state_error())?;
+) -> Result<stellar_agent_core::profile::schema::Profile, MppProfileError> {
+    let profile = load_profile_reconciled_by_requested_name(profile_name, None)
+        .map_err(MppProfileError::Access)?;
     if profile.network_passphrase != TESTNET_PASSPHRASE {
-        return Err(network_error());
+        return Err(MppProfileError::Network(network_error()));
     }
     Ok(profile)
+}
+
+/// Renders an [`MppProfileError`] and returns the CLI exit code.
+///
+/// The access arm keeps the profile subsystem's own wire code — including
+/// `profile.name_mismatch` — so an agent can tell a mistyped or copied profile
+/// apart from an MPP state failure.
+fn render_profile_error(error: &MppProfileError, profile_name: &str) -> i32 {
+    match error {
+        MppProfileError::Access(e) => {
+            print_json(&profile_access_envelope(e, profile_name));
+            1
+        }
+        MppProfileError::Network(e) => render_error(e),
+    }
 }
 
 fn approval_store(profile_name: &str) -> Result<PendingApprovalStore, MppError> {

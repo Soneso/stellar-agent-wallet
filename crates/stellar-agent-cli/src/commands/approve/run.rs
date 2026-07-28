@@ -74,12 +74,12 @@ use stellar_agent_core::approval::{
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
-use stellar_agent_core::profile::loader;
 use stellar_agent_core::profile::schema::default_approval_dir;
 use stellar_agent_core::timefmt;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 
 use crate::commands::smart_account::common::open_profile_audit_writer;
+use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
 use crate::common::{render, resolve_profile_name};
 
 /// Arguments for `stellar-agent approve --id <nonce>`.
@@ -174,19 +174,14 @@ pub async fn run(args: RunArgs) -> i32 {
     let profile_name = resolved_profile.name.clone();
 
     // ── 3. Load the profile for keyring entry ref ─────────────────────────────
-    let profile = match loader::load(&profile_name, None) {
+    // Reconciled: the attestation and approval-store coordinates below come
+    // from this file, so a file that names another profile is refused here
+    // rather than used to attest under a name it does not own.
+    let profile = match load_profile_reconciled(&resolved_profile, None) {
         Ok(p) => p,
-        Err(loader::ProfileLoadError::NotFound { name, .. }) => {
-            let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
-            render::render_json(&Envelope::<()>::err(&err));
-            return 1;
-        }
         Err(e) => {
-            tracing::debug!(profile = %profile_name, error = %e, "profile load failed");
-            let err = WalletError::Validation(ValidationError::ProfileNotFound {
-                name: profile_name.clone(),
-            });
-            render::render_json(&Envelope::<()>::err(&err));
+            tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
+            render::render_json(&profile_access_envelope(&e, &profile_name));
             return 1;
         }
     };
@@ -265,9 +260,18 @@ pub async fn run(args: RunArgs) -> i32 {
     };
 
     // ── 7b. Open the audit log (non-fatal: proceed without emission on failure) ──
+    // The tolerance covers writer acquisition only. A profile-name mismatch is
+    // not a writer failure: it means the file governing this attestation
+    // belongs to another profile, and continuing would attest under a name the
+    // file does not own. Step 3 already refuses it; this arm keeps the
+    // tolerance from widening to cover it.
     let audit_writer_arc: Option<Arc<Mutex<AuditWriter>>> =
         match open_profile_audit_writer(&resolved_profile) {
             Ok((_profile, writer, _path)) => Some(writer),
+            Err(e @ WalletError::Validation(ValidationError::ProfileNameMismatch { .. })) => {
+                render::render_json(&Envelope::<()>::err(&e));
+                return 1;
+            }
             Err(e) => {
                 tracing::warn!(
                     error = %e,

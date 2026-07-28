@@ -14,9 +14,8 @@
 use clap::Args;
 use serde::{Deserialize, Serialize};
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
-use stellar_agent_core::error::{ValidationError, WalletError};
-use stellar_agent_core::profile::loader::{self, ProfileLoadError};
 
+use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
 
@@ -78,19 +77,15 @@ pub struct PoolStatusResult {
 /// Never panics.
 pub async fn run(args: &PoolStatusArgs) -> i32 {
     // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
-    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
-    let profile = match loader::load(&profile_name, None) {
+    let resolved_profile = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolved_profile.name.clone();
+    // Reconciled: a profile file whose owner-key coordinate names a different
+    // profile is refused rather than used under this name.
+    let profile = match load_profile_reconciled(&resolved_profile, None) {
         Ok(p) => p,
         Err(e) => {
-            let err = match e {
-                ProfileLoadError::NotFound { name, .. } => {
-                    WalletError::Validation(ValidationError::ProfileNotFound { name })
-                }
-                _ => WalletError::Validation(ValidationError::ProfileNotFound {
-                    name: profile_name.to_owned(),
-                }),
-            };
-            render_json(&Envelope::<()>::err(&err));
+            tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
+            render_json(&profile_access_envelope(&e, &profile_name));
             return 1;
         }
     };

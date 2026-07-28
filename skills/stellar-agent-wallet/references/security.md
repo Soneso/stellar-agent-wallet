@@ -281,7 +281,9 @@ synthesized profile `pay`/`claim`/`accounts create` fall back to when no
 profile was NAMED and no `default.toml` exists stays fail-open for this
 specific check. A profile named through `--profile` or `STELLAR_AGENT_PROFILE`
 whose file does not exist is refused outright (`profile.load_failed`), not
-replaced by that fallback. The SEP-43
+replaced by that fallback, and a profile file whose owner-key coordinate names
+a DIFFERENT profile is refused with `profile.name_mismatch` rather than used to
+sign under a name it does not own. The SEP-43
 sign-only pair (`signTransaction`, `signAuthEntry`) is not yet covered by this
 pre-flight. See [Troubleshooting](troubleshooting.md#audit-key-code).
 

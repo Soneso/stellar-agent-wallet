@@ -441,9 +441,12 @@ async fn main() {
     if let Some(mismatch) =
         transport::profile_name_mismatch_refusal(&profile, &resolved_profile.name)
     {
+        // Rendered under this surface's own state layout: every per-profile
+        // store here keys on the derived name, which is not the CLI's layout.
         tracing::error!(
             profile = %resolved_profile.name,
-            "stellar-agent-mcp: refusing to start: {mismatch}"
+            "stellar-agent-mcp: refusing to start: {}",
+            mismatch.message(transport::STARTUP_STATE_LAYOUT)
         );
         std::process::exit(1);
     }

@@ -3,9 +3,9 @@
 use clap::Args;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{ValidationError, WalletError};
-use stellar_agent_core::profile::loader;
 use stellar_agent_network::{FeeStatsView, StellarRpcClient, fetch_fee_stats, validate_rpc_url};
 
+use crate::common::profile_access::load_profile_reconciled_by_requested_name;
 use crate::common::render::{render_json, sanitize_for_table};
 use crate::render::table::render_fee_stats_table;
 
@@ -75,13 +75,14 @@ fn resolve_rpc_url(args: &FeesStatsArgs) -> Result<String, WalletError> {
         return Ok(url.clone());
     }
     if let Some(profile_name) = &args.profile {
-        return loader::load(profile_name, None)
+        // `--profile` here is always explicit: `None` means "use the testnet
+        // default endpoint", never "use the default profile", so the name is
+        // not routed through the resolver. It is still reconciled — an endpoint
+        // taken from a file that names another profile would send the query to
+        // a network the operator did not select.
+        return load_profile_reconciled_by_requested_name(profile_name, None)
             .map(|profile| profile.rpc_url)
-            .map_err(|_| {
-                WalletError::Validation(ValidationError::ProfileNotFound {
-                    name: profile_name.clone(),
-                })
-            });
+            .map_err(|e| e.to_wallet_error(profile_name));
     }
     Ok(TESTNET_RPC_URL.to_owned())
 }

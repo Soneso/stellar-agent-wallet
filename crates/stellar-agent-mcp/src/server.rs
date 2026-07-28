@@ -72,6 +72,11 @@ use rmcp::{
 };
 use serde_json::json;
 use stellar_agent_core::policy::v1::{PolicyEngineV1, PolicyStateStore};
+// `OWNER_KEY_SERVICE_PREFIX` is owned by `stellar-agent-core` beside
+// `KeyringEntryRef::default_owner_key`, the only writer of the coordinate this
+// module strips it from. Importing it keeps the strip and the construction on
+// one definition across both binaries.
+use stellar_agent_core::profile::name::OWNER_KEY_SERVICE_PREFIX;
 use stellar_agent_core::{
     policy::{BuildRegistryError, NoopPolicyEngine, PolicyEngine, ToolDescriptor},
     profile::loader,
@@ -90,23 +95,6 @@ use crate::tools::common::{ToolCatalogueAdapter, build_tool_registry};
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Prefix used by [`KeyringEntryRef::default_owner_key`] for the `service`
-/// field of owner-key keyring entries.
-///
-/// `KeyringEntryRef::default_owner_key(name)` sets:
-///
-/// - `service = "stellar-agent-owner-<name>"`
-/// - `account = "default"`
-///
-/// `build_policy_engine` derives the profile name by stripping this prefix
-/// from `policy_owner_key_id.service` rather than using `account` (which is
-/// always `"default"`, making it useless as a discriminator).
-///
-/// `pub(crate)` because the startup name-reconciliation check in
-/// [`crate::transport`] strips the same prefix to compare the profile the
-/// operator selected against the one the loaded file's owner-key coordinate
-/// names.
-pub(crate) const OWNER_KEY_SERVICE_PREFIX: &str = "stellar-agent-owner-";
 const USAGE_RESOURCE_URI: &str = "mcp-resource://usage.md";
 const PROFILE_RESOURCE_PREFIX: &str = "mcp-resource://profiles/";
 const ACCOUNT_RESOURCE_PREFIX: &str = "mcp-resource://accounts/";
@@ -408,8 +396,7 @@ fn fetch_owner_pubkey_from_keyring(
 /// profile was constructed without using `KeyringEntryRef::default_owner_key`.
 fn profile_name_from_key_ref(profile: &Profile) -> Result<String, BuildRegistryError> {
     let service = &profile.policy_owner_key_id.service;
-    service
-        .strip_prefix(OWNER_KEY_SERVICE_PREFIX)
+    stellar_agent_core::profile::name::derive_profile_name_from_owner_key(profile)
         .map(ToOwned::to_owned)
         .ok_or_else(|| BuildRegistryError::PolicyEngineError {
             detail: format!(
@@ -853,11 +840,16 @@ impl WalletServer {
 impl WalletServer {
     /// Derives the profile name string for approval-store path construction.
     ///
-    /// Uses the same `OWNER_KEY_SERVICE_PREFIX`-strip logic as
-    /// `profile_name_from_key_ref`.  Falls back to `"default"` if the
-    /// service field does not start with the expected prefix so that approval-store
-    /// paths are always well-formed even when called on a profile built without
-    /// `KeyringEntryRef::default_owner_key`.
+    /// Uses `stellar_agent_core::profile::name::derive_profile_name_from_owner_key`,
+    /// the same derivation `profile_name_from_key_ref` applies.  Falls back to
+    /// `"default"` if the service field does not start with the expected prefix
+    /// so that approval-store paths are always well-formed even when called on
+    /// a profile built without `KeyringEntryRef::default_owner_key`.
+    ///
+    /// That fallback is why an absent prefix is a startup REFUSAL rather than a
+    /// tolerated shape (`transport::profile_name_mismatch_refusal`): a profile
+    /// that reached this method with no derivable name would write its
+    /// approvals into the `default` profile's store.
     ///
     /// The returned string is used to construct the pending-approval store path:
     /// `~/.local/share/stellar-agent/approvals/<profile_name>.toml`.
@@ -867,9 +859,7 @@ impl WalletServer {
     /// logic.  The method derives only a non-secret string (the profile name);
     /// there is no security concern with public visibility.
     pub fn profile_name_for_approval(&self) -> String {
-        let service = &self.profile.policy_owner_key_id.service;
-        service
-            .strip_prefix(OWNER_KEY_SERVICE_PREFIX)
+        stellar_agent_core::profile::name::derive_profile_name_from_owner_key(&self.profile)
             .unwrap_or("default")
             .to_owned()
     }

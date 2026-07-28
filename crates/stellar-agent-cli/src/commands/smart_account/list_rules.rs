@@ -59,7 +59,6 @@ use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{ValidationError, WalletError};
 use stellar_agent_core::observability::redact_strkey_first5_last5;
-use stellar_agent_core::profile::loader;
 /// Well-known interop deployer G-strkey derived from the publicly-documented
 /// SHA256("openzeppelin-smart-account-kit") seed.  Used as a funded testnet
 /// simulation source when `--source-account` is not supplied.
@@ -77,6 +76,9 @@ use crate::commands::smart_account::common::{
     network_to_chain_id, open_profile_audit_writer_read_only,
 };
 use crate::common::network::TargetNetwork;
+use crate::common::profile_access::{
+    ProfileAccessError, load_profile_reconciled_by_requested_name, profile_access_envelope,
+};
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
 
@@ -344,7 +346,13 @@ pub async fn run(args: &ListRulesArgs) -> i32 {
     //   1. --max-scan-id CLI flag (already range-validated by clap value-parser).
     //   2. profile.smart_account_max_context_rule_scan_id (validated at profile-load).
     //   3. DEFAULT_MAX_SCAN_ID (50).
-    let max_scan_id = resolve_max_scan_id(args, &profile_name);
+    let max_scan_id = match resolve_max_scan_id(args, &profile_name) {
+        Ok(n) => n,
+        Err(e) => {
+            render_json(&profile_access_envelope(&e, &profile_name));
+            return 1;
+        }
+    };
 
     // ── Open audit writer for audit-log cross-check ───────────────────────────
     let (_audit_profile, audit_writer, _audit_log_path): (_, Arc<Mutex<AuditWriter>>, _) =
@@ -499,20 +507,32 @@ pub async fn run(args: &ListRulesArgs) -> i32 {
 /// 3. [`DEFAULT_MAX_SCAN_ID`] (50).
 ///
 /// Profile load errors are logged and the default is used; this keeps the
-/// command usable when no profile exists (e.g. CI/testnet-only usage).
-fn resolve_max_scan_id(args: &ListRulesArgs, profile_name: &str) -> u32 {
+/// command usable when no profile exists (e.g. CI/testnet-only usage). A
+/// profile whose owner-key coordinate names ANOTHER profile is refused instead:
+/// the field it would supply is a DoS-defence bound, and taking it from a
+/// profile the operator did not select is not a degraded default.
+///
+/// # Errors
+///
+/// Returns [`ProfileAccessError::NameMismatch`] only; every loader failure
+/// falls back to [`DEFAULT_MAX_SCAN_ID`].
+fn resolve_max_scan_id(
+    args: &ListRulesArgs,
+    profile_name: &str,
+) -> Result<u32, ProfileAccessError> {
     // Priority 1: explicit CLI flag.
     if let Some(n) = args.max_scan_id {
-        return n;
+        return Ok(n);
     }
 
     // Priority 2: profile field (validated at profile-load time).
-    match loader::load(profile_name, None) {
+    match load_profile_reconciled_by_requested_name(profile_name, None) {
         Ok(profile) => {
             if let Some(n) = profile.smart_account_max_context_rule_scan_id {
-                return n;
+                return Ok(n);
             }
         }
+        Err(e @ ProfileAccessError::NameMismatch(_)) => return Err(e),
         Err(e) => {
             tracing::debug!(
                 profile = %profile_name,
@@ -524,7 +544,7 @@ fn resolve_max_scan_id(args: &ListRulesArgs, profile_name: &str) -> u32 {
     }
 
     // Priority 3: compiled-in default.
-    DEFAULT_MAX_SCAN_ID
+    Ok(DEFAULT_MAX_SCAN_ID)
 }
 
 // ── Error emission helpers ─────────────────────────────────────────────────────

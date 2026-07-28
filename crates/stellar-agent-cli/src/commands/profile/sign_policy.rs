@@ -59,7 +59,7 @@ use serde::Serialize;
 use zeroize::Zeroizing;
 
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
+use stellar_agent_core::error::WalletError;
 use stellar_agent_core::policy::v1::canonical::canonical_bytes;
 use stellar_agent_core::policy::v1::signature::{digest, sign};
 use stellar_agent_core::profile::loader;
@@ -67,8 +67,13 @@ use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile, default_poli
 use stellar_agent_core::wallet::{MlockRequired, Wallet};
 use stellar_agent_network::keyring::map_keyring_error;
 
-use crate::commands::policy_engine::OWNER_KEY_SERVICE_PREFIX;
+use crate::common::profile_access::{
+    injected_profile_load, profile_access_envelope, reconcile_loaded_profile,
+};
 use crate::common::{render, resolve_profile_name};
+use stellar_agent_core::profile::name::{
+    OWNER_KEY_SERVICE_PREFIX, derive_profile_name_from_owner_key,
+};
 
 /// Arguments for `stellar-agent profile sign-policy`.
 #[derive(Debug, Args)]
@@ -132,7 +137,7 @@ struct SignPolicyData {
 pub(crate) async fn run(args: &SignPolicyArgs) -> i32 {
     run_with_dependencies(
         args,
-        |name| loader::load(name, None),
+        injected_profile_load,
         stellar_agent_network::keyring::init_platform_keyring_store,
     )
     .await
@@ -153,18 +158,14 @@ where
     let profile_name = resolve_profile_name(args.profile.as_deref()).name;
 
     // ── Load profile first, then initialise the keyring store ─────────────────
-    let profile = match load_profile(&profile_name) {
+    // Reconciled in the CALLER of the injected loader: several test closures
+    // ignore the name they are handed, so a check placed inside one would be
+    // bypassed by every test that supplies it.
+    let profile = match reconcile_loaded_profile(load_profile(&profile_name), &profile_name) {
         Ok(p) => p,
-        Err(loader::ProfileLoadError::NotFound { name, .. }) => {
-            let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
-            render::render_json(&Envelope::<()>::err(&err));
-            return 1;
-        }
         Err(e) => {
-            let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("failed to load profile '{profile_name}': {e}"),
-            });
-            render::render_json(&Envelope::<()>::err(&err));
+            tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
+            render::render_json(&profile_access_envelope(&e, &profile_name));
             return 1;
         }
     };
@@ -340,19 +341,19 @@ where
     0
 }
 
-/// Derives the engine's profile name by stripping [`OWNER_KEY_SERVICE_PREFIX`]
-/// from `policy_owner_key_id.service`, matching the engine's own derivation.
+/// Derives the engine's profile name from `policy_owner_key_id.service`,
+/// matching the engine's own derivation.
 ///
-/// Binding: this is the same prefix-strip the engine performs in
-/// `commands::policy_engine::build_v1_policy_engine` (policy_engine.rs:74) and
-/// `profile_name_from_key_ref` in `stellar-agent-mcp/src/server.rs:386`. The
-/// shared [`OWNER_KEY_SERVICE_PREFIX`] constant is the single source of truth;
-/// signing must derive the same name so it targets the owner coordinate and
-/// policy path the engine will read.
+/// Binding: [`derive_profile_name_from_owner_key`] is the single implementation
+/// of this strip, shared with `build_v1_policy_engine` and with
+/// `stellar-agent-mcp`. Signing must derive the same name so it targets the
+/// owner coordinate and policy path the engine will read.
+///
+/// The profile reaching this point has already been reconciled against the
+/// requested name, so the derived name equals the name the operator selected.
 fn engine_profile_name(profile: &Profile) -> Result<String, String> {
     let service = &profile.policy_owner_key_id.service;
-    service
-        .strip_prefix(OWNER_KEY_SERVICE_PREFIX)
+    derive_profile_name_from_owner_key(profile)
         .map(ToOwned::to_owned)
         .ok_or_else(|| {
             format!(

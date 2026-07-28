@@ -50,7 +50,7 @@ use zeroize::Zeroizing;
 
 use stellar_agent_core::audit_log::KeyPurpose;
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
+use stellar_agent_core::error::WalletError;
 use stellar_agent_core::observability::RedactedStrkey;
 use stellar_agent_core::profile::loader;
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
@@ -58,9 +58,14 @@ use stellar_agent_network::Signer as _;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 use uuid::Uuid;
 
-use crate::commands::policy_engine::OWNER_KEY_SERVICE_PREFIX;
+use crate::common::profile_access::{
+    injected_profile_load, profile_access_envelope, reconcile_loaded_profile,
+};
 use crate::common::signer_ceremony::resolve_software_signer_from_env;
 use crate::common::{render, resolve_profile_name};
+use stellar_agent_core::profile::name::{
+    OWNER_KEY_SERVICE_PREFIX, derive_profile_name_from_owner_key,
+};
 
 use super::audit_emit::emit_keyring_key_written;
 
@@ -130,12 +135,7 @@ struct EnrollOwnerKeyData {
 ///
 /// Never panics.
 pub(crate) async fn run(args: &EnrollOwnerKeyArgs) -> i32 {
-    run_with_dependencies(
-        args,
-        |name| loader::load(name, None),
-        init_platform_keyring_store,
-    )
-    .await
+    run_with_dependencies(args, injected_profile_load, init_platform_keyring_store).await
 }
 
 /// Testable core of [`run`] with the profile loader and platform-keyring
@@ -157,18 +157,14 @@ where
     let profile_name = resolve_profile_name(args.profile.as_deref()).name;
 
     // ── Load profile first, then initialise the keyring store ─────────────────
-    let profile = match load_profile(&profile_name) {
+    // Reconciled in the CALLER of the injected loader: several test closures
+    // ignore the name they are handed, so a check placed inside one would be
+    // bypassed by every test that supplies it.
+    let profile = match reconcile_loaded_profile(load_profile(&profile_name), &profile_name) {
         Ok(p) => p,
-        Err(loader::ProfileLoadError::NotFound { name, .. }) => {
-            let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
-            render::render_json(&Envelope::<()>::err(&err));
-            return 1;
-        }
         Err(e) => {
-            let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("failed to load profile '{profile_name}': {e}"),
-            });
-            render::render_json(&Envelope::<()>::err(&err));
+            tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
+            render::render_json(&profile_access_envelope(&e, &profile_name));
             return 1;
         }
     };
@@ -325,28 +321,28 @@ where
 
 /// Resolves the owner keyring coordinate the V1 engine reads for `profile`.
 ///
-/// Mirrors the engine: strip [`OWNER_KEY_SERVICE_PREFIX`] from
-/// `policy_owner_key_id.service` to recover the profile name, then rebuild
+/// Mirrors the engine: recover the profile name from
+/// `policy_owner_key_id.service`, then rebuild
 /// `default_owner_key(profile_name)` so the account is the literal `"default"`
 /// the engine uses.
 ///
-/// Binding: the same prefix-strip + `default_owner_key` reconstruction the
-/// engine performs in `commands::policy_engine::build_v1_policy_engine`
-/// (policy_engine.rs:74/86) and `fetch_owner_pubkey_from_keyring` in
-/// `stellar-agent-mcp/src/server.rs:331`. The shared [`OWNER_KEY_SERVICE_PREFIX`]
-/// constant is the single source of truth; enrolment must target the exact
-/// coordinate the engine reads.
+/// Binding: [`derive_profile_name_from_owner_key`] is the single
+/// implementation of the strip, and `default_owner_key` is the single
+/// implementation of its inverse. Enrolment must target the exact coordinate
+/// the engine reads.
+///
+/// The profile reaching this point has already been reconciled against the
+/// requested name, so the key is enrolled under the name the operator
+/// selected — never under another profile's trust anchor.
 fn owner_coordinate(profile: &Profile) -> Result<KeyringEntryRef, String> {
     let service = &profile.policy_owner_key_id.service;
-    let profile_name = service
-        .strip_prefix(OWNER_KEY_SERVICE_PREFIX)
-        .ok_or_else(|| {
-            format!(
-                "the profile's owner-key service '{service}' does not start with the expected \
+    let profile_name = derive_profile_name_from_owner_key(profile).ok_or_else(|| {
+        format!(
+            "the profile's owner-key service '{service}' does not start with the expected \
              prefix '{OWNER_KEY_SERVICE_PREFIX}'; the profile was not constructed with the \
              standard owner coordinate and cannot be enrolled"
-            )
-        })?;
+        )
+    })?;
     Ok(KeyringEntryRef::default_owner_key(profile_name))
 }
 

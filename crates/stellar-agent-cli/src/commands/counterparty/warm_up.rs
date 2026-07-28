@@ -11,8 +11,7 @@ use std::time::Duration;
 use clap::Args;
 use serde::Serialize;
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
-use stellar_agent_core::profile::loader;
+use stellar_agent_core::error::{InternalError, WalletError};
 use stellar_agent_core::profile::schema::default_policy_dir;
 use stellar_agent_network::StellarTomlResolver;
 use stellar_agent_network::counterparty::CounterpartyResolver as _;
@@ -20,6 +19,7 @@ use toml_edit::{DocumentMut, Item, Value};
 
 use crate::commands::counterparty::envelope::to_counterparty_envelope;
 use crate::commands::counterparty::list::{counterparty_cache_dir, format_system_time};
+use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
 use crate::common::{render, resolve_profile_name};
 
 /// Arguments for `stellar-agent counterparty warm-up`.
@@ -127,21 +127,16 @@ fn extract_home_domain_allowlist_from_policy_toml(body: &str) -> Result<Vec<Stri
 /// profile loading, policy parsing, resolver construction, or any refresh fails.
 pub async fn run(args: &WarmUpArgs) -> i32 {
     // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
-    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+    let resolved_profile = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolved_profile.name.clone();
 
-    let _profile = match loader::load(&profile_name, None) {
+    // Reconciled: a profile file whose owner-key coordinate names a
+    // different profile is refused rather than used under this name.
+    let _profile = match load_profile_reconciled(&resolved_profile, None) {
         Ok(p) => p,
-        Err(loader::ProfileLoadError::NotFound { name, .. }) => {
-            let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
-            render::render_json(&Envelope::err(&err));
-            return 1;
-        }
         Err(e) => {
-            tracing::debug!(profile = %profile_name, error = %e, "profile load failed");
-            let err = WalletError::Validation(ValidationError::ProfileNotFound {
-                name: profile_name.clone(),
-            });
-            render::render_json(&Envelope::err(&err));
+            tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
+            render::render_json(&profile_access_envelope(&e, &profile_name));
             return 1;
         }
     };

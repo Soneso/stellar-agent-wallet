@@ -17,7 +17,6 @@ use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{IoSource, ValidationError, WalletError};
 use stellar_agent_core::observability::redact_path_in_message;
-use stellar_agent_core::profile::loader as profile_loader;
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::wallet::MlockDegradation;
 use stellar_agent_network::Signer;
@@ -30,6 +29,9 @@ use stellar_agent_smart_account::managers::signers::{SignersManager, SignersMana
 use uuid::Uuid;
 
 use crate::common::network::TargetNetwork;
+use crate::common::profile_access::{
+    ProfileAccessError, load_profile_reconciled_by_requested_name,
+};
 use crate::common::render::render_json;
 use crate::common::signer_ceremony::{
     SignerCeremonyOutcome, record_mlock_degradation, resolve_software_signer_from_env,
@@ -180,14 +182,18 @@ impl CommonHandlerContext {
     /// Resolves `session_rule_max_horizon_ledgers` from the profile at
     /// construction time and threads it into the config via
     /// [`ContextRuleManagerConfig::with_session_rule_max_horizon_ledgers`].
-    /// Profile load failure is non-fatal for
-    /// the horizon cap: the manager uses
-    /// `DEFAULT_SESSION_RULE_HORIZON_LEDGERS` (1000 ledgers ≈ 80 min) when
-    /// the profile cannot be loaded or the field is absent.
+    ///
+    /// A profile that does not load leaves the cap at
+    /// `DEFAULT_SESSION_RULE_HORIZON_LEDGERS` (1000 ledgers ≈ 80 min), so the
+    /// command stays usable with no authored profile. A profile whose owner-key
+    /// coordinate names ANOTHER profile is refused instead: reading a foreign
+    /// profile's in-flight-envelope horizon is not a degraded default, it is a
+    /// control taken from a profile the operator did not select.
     ///
     /// # Errors
     ///
-    /// Returns a wallet validation error if manager construction fails.
+    /// Returns a wallet validation error if manager construction fails, and
+    /// `profile.name_mismatch` when the loaded profile names another profile.
     pub fn context_rule_manager(&self) -> Result<ContextRuleManager, WalletError> {
         let signers_manager = self.signers_manager().map_err(|e| {
             WalletError::Validation(ValidationError::ConfigInvalid {
@@ -197,12 +203,23 @@ impl CommonHandlerContext {
         })?;
 
         // Resolve the effective horizon cap from the profile's
-        // `session_rule_max_horizon_ledgers`.  Profile load failure is
-        // non-fatal; the manager falls back to
-        // `DEFAULT_SESSION_RULE_HORIZON_LEDGERS`.
-        let horizon_override = profile_loader::load(&self.profile_name, None)
-            .ok()
-            .and_then(|p| p.session_rule_max_horizon_ledgers);
+        // `session_rule_max_horizon_ledgers`.
+        let horizon_override =
+            match load_profile_reconciled_by_requested_name(&self.profile_name, None) {
+                Ok(profile) => profile.session_rule_max_horizon_ledgers,
+                Err(e @ ProfileAccessError::NameMismatch(_)) => {
+                    return Err(e.to_wallet_error(&self.profile_name));
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        profile = %self.profile_name,
+                        error = %e,
+                        "smart-account: profile load for the session-rule horizon cap failed; \
+                         using DEFAULT_SESSION_RULE_HORIZON_LEDGERS"
+                    );
+                    None
+                }
+            };
 
         let mut config = ContextRuleManagerConfig::new(
             self.rpc_url.clone(),
@@ -436,12 +453,8 @@ pub(crate) fn open_profile_audit_writer(
     use crate::common::profile_access::{ProfileOrigin, load_profile_or_synthesize_testnet};
 
     let profile_name = resolved.name.as_str();
-    let (profile, origin) = load_profile_or_synthesize_testnet(resolved).map_err(|detail| {
-        wallet_io_error(
-            IoSource::AuditWriterSetup,
-            format!("profile resolution failed: {detail}"),
-        )
-    })?;
+    let (profile, origin) = load_profile_or_synthesize_testnet(resolved)
+        .map_err(|e| map_access_error(&e, profile_name))?;
     let log_path = profile.audit_log_path.clone();
 
     if let Some(parent) = log_path.parent() {
@@ -459,6 +472,27 @@ pub(crate) fn open_profile_audit_writer(
         }
     };
     Ok((profile, writer, log_path))
+}
+
+/// Maps a profile-access failure onto the typed error the audit-writer helpers
+/// return.
+///
+/// A name mismatch keeps its own `profile.name_mismatch` wire code rather than
+/// being flattened into an I/O failure: it is the refusal every caller of these
+/// helpers must be able to recognise, and several of them treat a writer-open
+/// I/O failure as non-fatal.
+fn map_access_error(
+    err: &crate::common::profile_access::ProfileAccessError,
+    profile_name: &str,
+) -> WalletError {
+    use crate::common::profile_access::ProfileAccessError;
+    match err {
+        ProfileAccessError::NameMismatch(_) => err.to_wallet_error(profile_name),
+        ProfileAccessError::Load(_) => wallet_io_error(
+            IoSource::AuditWriterSetup,
+            format!("profile resolution failed: {}", err.message(profile_name)),
+        ),
+    }
 }
 
 /// Best-effort sibling of [`open_profile_audit_writer`] for READ-ONLY
@@ -482,12 +516,8 @@ pub(crate) fn open_profile_audit_writer_read_only(
     use crate::common::profile_access::load_profile_or_synthesize_testnet;
 
     let profile_name = resolved.name.as_str();
-    let (profile, _origin) = load_profile_or_synthesize_testnet(resolved).map_err(|detail| {
-        wallet_io_error(
-            IoSource::AuditWriterSetup,
-            format!("profile resolution failed: {detail}"),
-        )
-    })?;
+    let (profile, _origin) = load_profile_or_synthesize_testnet(resolved)
+        .map_err(|e| map_access_error(&e, profile_name))?;
     let log_path = profile.audit_log_path.clone();
 
     if let Some(parent) = log_path.parent() {
@@ -524,6 +554,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn open_profile_audit_writer_is_origin_aware() {
+        use stellar_agent_core::profile::loader as profile_loader;
         use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
         let dir = tempfile::TempDir::new().expect("tempdir");
         let _home = StellarAgentHomeGuard::new(dir.path());
