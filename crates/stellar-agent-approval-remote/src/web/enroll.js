@@ -69,11 +69,16 @@
     );
   }
 
-  function setStatus(text) {
+  // Sets the operator-visible status line and the page's ceremony state.
+  // `state` is one of "busy", "ok", "error"; the stylesheet turns it into the
+  // pill's colour and the brand mark's face. Writes are textContent only.
+  function setStatus(text, state) {
     var el = document.getElementById("status");
     if (el) {
       el.textContent = text;
+      el.setAttribute("data-state", state);
     }
+    document.documentElement.setAttribute("data-state", state);
   }
 
   function labeledOutput(container, label, value, outputId) {
@@ -82,6 +87,7 @@
     lbl.textContent = label;
     wrap.appendChild(lbl);
     var area = document.createElement("textarea");
+    area.className = "output";
     area.readOnly = true;
     area.rows = 2;
     area.id = outputId;
@@ -102,6 +108,7 @@
     container.appendChild(cmdLabel);
 
     var cmd = document.createElement("textarea");
+    cmd.className = "output";
     cmd.readOnly = true;
     cmd.rows = 6;
     cmd.id = "enroll-command-output";
@@ -116,7 +123,7 @@
   }
 
   function enroll(island) {
-    setStatus("Creating passkey...");
+    setStatus("Creating passkey\u2026", "busy");
     var challenge = crypto.getRandomValues(new Uint8Array(32));
     var userId = crypto.getRandomValues(new Uint8Array(16));
     return navigator.credentials
@@ -136,11 +143,11 @@
         var credentialId = b64urlFromBytes(credential.rawId);
         var pubkey = b64urlFromBytes(sec1FromSpki(credential.response.getPublicKey()));
         var signCount = extractSignCount(credential.response);
-        setStatus("Passkey created. Copy the values below.");
+        setStatus("Passkey created. Copy the values below.", "ok");
         renderResult(document.getElementById("result"), island.rp_id, credentialId, pubkey, signCount);
       })
       .catch(function () {
-        setStatus("Passkey creation failed. Try again.");
+        setStatus("Passkey creation failed. Try again.", "error");
       });
   }
 

@@ -41,15 +41,20 @@
     };
   }
 
-  function setStatus(text) {
+  // Sets the operator-visible status line and the page's ceremony state.
+  // `state` is one of "busy", "ok", "error"; the stylesheet turns it into the
+  // pill's colour and the brand mark's face. Writes are textContent only.
+  function setStatus(text, state) {
     var el = document.getElementById("status");
     if (el) {
       el.textContent = text;
+      el.setAttribute("data-state", state);
     }
+    document.documentElement.setAttribute("data-state", state);
   }
 
   function login() {
-    setStatus("Requesting challenge...");
+    setStatus("Requesting challenge\u2026", "busy");
     return fetch("/login/challenge", { method: "POST" })
       .then(function (resp) {
         if (!resp.ok) {
@@ -67,7 +72,7 @@
         });
       })
       .then(function (assertion) {
-        setStatus("Verifying...");
+        setStatus("Verifying\u2026", "busy");
         return fetch("/login/assertion", {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -78,11 +83,11 @@
         if (!resp.ok) {
           throw new Error("login_failed");
         }
-        setStatus("Signed in.");
+        setStatus("Signed in.", "ok");
         window.location.href = "/inbox";
       })
       .catch(function () {
-        setStatus("Sign-in failed. Try again.");
+        setStatus("Sign-in failed. Try again.", "error");
       });
   }
 

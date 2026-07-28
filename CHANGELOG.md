@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- The approval pages neutralise bidirectional and invisible-format code points
+  in every rendered value: U+061C, U+200B-200F, U+202A-202E, U+2066-2069, and
+  U+FEFF become U+FFFD before HTML escaping. A memo or asset code carrying
+  U+202E reverses the rendering of everything after it, so an operator could
+  read a different destination or amount than the one being signed while the
+  page stayed well-formed.
+- Both approval surfaces branch on the decision response's HTTP status. A
+  refused decision — a rejected passkey assertion, a stale CSRF value, an entry
+  already resolved — rendered as "Status: unknown" and could be read as
+  success; it now renders in its own refusal treatment and states that nothing
+  was recorded.
+
 ### Added
 
 - `stellar_agent_core::profile::name` gained the profile-name reconciliation
@@ -52,6 +66,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The operator-facing web pages now render the project's visual identity: the
+  WebAuthn bridge's registration and approval pages, the approval inbox and
+  detail pages, the operator-enrollment page, and the remote-approval sign-in,
+  enrollment, inbox, detail, and message pages. `stellar-agent-loopback-http`
+  gained a `brand` module carrying what the pages emit inline: `BRAND_STYLE`,
+  `BUDDY_MARK_SVG`, `CARD_BRAND_HEADER`, `TRUST_LINE_LOOPBACK`, and
+  `TRUST_LINE_SELF_HOSTED`. The pages fetch no external font, stylesheet, or
+  image; the Content-Security-Policy and the data-island escaping are
+  unchanged, and no status or result write reaches an HTML-interpreting sink.
+- The approval inbox lists each request as a row carrying its kind, a readable
+  headline, its identifying detail, and a countdown that turns red under ten
+  minutes. All nine approval kinds have a headline and a kind label, with a
+  plain fallback for a kind a future build adds. An inbox with nothing pending
+  shows an empty state rather than an empty page.
+- Both approval servers now serve the row-and-decision rendering from one file,
+  `stellar-agent-approval-ui`'s `APP_SHARED_JS`, at `GET /static/app-shared.js`,
+  and render the decision card through that crate's `render_summary_html`,
+  `kind_pill`, `approve_button_label`, and `html_escape`. The remote surface
+  previously carried its own copies. Pages load the shared script before their
+  own; both remain same-origin under `script-src 'self'`.
+- The approval detail pages render a payment's or claim's amount in its human
+  denomination alongside the stroop count, and the destination in full rather
+  than inside a label/value row. An MPP charge stays in the token contract's
+  own base units, whose decimal scale the wallet does not have at render time.
+- The approval pages render the created and expiry timestamps as readable text
+  ("today 12:41", "in 4 minutes (12:52)") instead of raw unix milliseconds, and
+  the inbox shows a per-entry countdown. The absolute values remain on the page
+  in `data-` attributes, so a page whose script does not run still shows them.
+- The WebAuthn bridge reports a request that could not reach the wallet as
+  "could not reach the wallet. The link has likely expired." rather than the
+  browser's transport error; the raw reason goes to the browser console.
 - **Behaviour change.** Every `stellar-agent` command that loads a profile now
   refuses a profile file whose `policy_owner_key_id.service` names a different
   profile than the one selected, with the wire code `profile.name_mismatch`.
@@ -89,6 +134,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The operator-enrollment page keeps the accurate status line when an
+  authenticator returns no usable public key. That branch skips the POST, and
+  the response handler then replaced its message with the generic "Passkey
+  creation failed. Try again." A request that cannot reach the wallet now says
+  so, rather than reporting a passkey-creation failure for a passkey that was
+  already created.
 - `profile enroll-owner-key`, `profile enroll-signer`, `profile sign-policy`,
   and `profile rotate-nonce-key` no longer report an unloadable profile as
   `internal.unexpected_state`. `internal.*` means the wallet is broken; an

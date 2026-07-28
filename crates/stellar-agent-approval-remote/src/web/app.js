@@ -1,9 +1,12 @@
 // Stellar Agent Wallet — remote-approval post-authentication browser glue.
 //
 // Same-origin, no build step. Served behind the session cookie at
-// GET /static/app.js. Loaded on both the inbox shell and the per-approval
-// detail page; detects which page it is on by the presence of the
-// corresponding JSON data island (#pending-data or #approval-data).
+// GET /static/app.js, and loaded AFTER /static/app-shared.js, which carries the
+// rendering both approval surfaces share; this file holds only what is specific
+// to the remote server: its CSRF header and the per-action passkey ceremony.
+// Loaded on both the inbox shell and the per-approval detail page; detects
+// which page it is on by the presence of the corresponding JSON data island
+// (#pending-data or #approval-data).
 //
 // Inbox: reads #pending-data, renders one row per pending approval (each a
 // link to /approval/<nonce>), then re-fetches /pending.json every two
@@ -15,10 +18,17 @@
 // navigator.credentials.get over it, then POST the resulting assertion to
 // /approval/<nonce>/decision. A fresh passkey assertion is required for
 // every approve or reject, not just for login.
+//
+// # DOM discipline
+//
+// Every node is built with createElement and filled with textContent. Nothing
+// here assigns innerHTML or inserts markup, so no server-supplied value can
+// become an element regardless of what it contains.
 
 (function () {
   "use strict";
 
+  var shared = stellarAgentApproval;
   var CSRF_HEADER = "x-stellar-remote-approval-csrf";
 
   function b64urlToBytes(b64url) {
@@ -52,42 +62,7 @@
     };
   }
 
-  function readIsland(id) {
-    var el = document.getElementById(id);
-    if (!el) {
-      return null;
-    }
-    try {
-      return JSON.parse(el.textContent);
-    } catch (e) {
-      return null;
-    }
-  }
-
   // ── Inbox ──────────────────────────────────────────────────────────────
-
-  function renderInbox(container, pending) {
-    container.textContent = "";
-    if (!pending || pending.length === 0) {
-      var empty = document.createElement("p");
-      empty.className = "muted";
-      empty.textContent = "No pending approvals.";
-      container.appendChild(empty);
-      return;
-    }
-    pending.forEach(function (view) {
-      var row = document.createElement("div");
-      row.className = "row";
-      var link = document.createElement("a");
-      link.href = "/approval/" + encodeURIComponent(view.approval_nonce);
-      link.textContent = view.kind_name;
-      row.appendChild(link);
-      var span = document.createElement("span");
-      span.textContent = " — expires at " + view.expires_at_unix_ms;
-      row.appendChild(span);
-      container.appendChild(row);
-    });
-  }
 
   function updateBadge(count) {
     var base = "Stellar Agent Wallet — Remote Approval";
@@ -100,11 +75,10 @@
 
     function apply(data) {
       var pending = data.pending || [];
-      renderInbox(container, pending);
+      shared.renderInbox(container, pending);
       updateBadge(pending.length);
       if (status) {
-        status.textContent =
-          pending.length + " pending — updated " + new Date().toLocaleTimeString();
+        status.textContent = shared.subtitleText(pending.length, 0);
       }
     }
 
@@ -130,48 +104,15 @@
 
   // ── Detail / per-action ceremony ──────────────────────────────────────
 
-  function renderResult(result, data) {
-    result.textContent = "";
-    var line = document.createElement("p");
-    line.textContent = "Status: " + (data.status || "unknown");
-    result.appendChild(line);
-
-    var blob = data.attestation;
-    if (blob) {
-      var note = document.createElement("p");
-      note.textContent = "Present this attestation to the matching commit tool:";
-      result.appendChild(note);
-
-      var area = document.createElement("textarea");
-      area.readOnly = true;
-      area.rows = 3;
-      area.style.width = "100%";
-      area.value = blob;
-      result.appendChild(area);
-
-      var copy = document.createElement("button");
-      copy.type = "button";
-      copy.textContent = "Copy attestation";
-      copy.addEventListener("click", function () {
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(blob).then(
-            function () {
-              copy.textContent = "Copied";
-            },
-            function () {
-              area.select();
-            }
-          );
-        } else {
-          area.select();
-        }
-      });
-      result.appendChild(copy);
-    }
-  }
-
+  // Mints a challenge bound to THIS approval, signs it with the operator's
+  // passkey, then posts the decision. Both POSTs are status-checked: a refused
+  // decision (rejected assertion, stale CSRF value, entry already resolved)
+  // means nothing was signed, and renders in the refusal treatment rather than
+  // as a status line the operator could read as success.
   function decide(nonce, csrf, decision, result) {
-    result.textContent = "Requesting challenge...";
+    result.className = "result";
+    result.textContent = "Requesting challenge…";
+    shared.setPageState("busy");
     var encodedNonce = encodeURIComponent(nonce);
     return fetch("/approval/" + encodedNonce + "/challenge", {
       method: "POST",
@@ -188,7 +129,7 @@
         return resp.json();
       })
       .then(function (body) {
-        result.textContent = "Waiting for passkey...";
+        result.textContent = "Waiting for passkey…";
         return navigator.credentials.get({
           publicKey: {
             challenge: b64urlToBytes(body.challenge),
@@ -198,7 +139,7 @@
         });
       })
       .then(function (assertion) {
-        result.textContent = "Working...";
+        result.textContent = "Working…";
         var headers = { "content-type": "application/json" };
         headers[CSRF_HEADER] = csrf;
         return fetch("/approval/" + encodedNonce + "/decision", {
@@ -211,13 +152,29 @@
         });
       })
       .then(function (resp) {
-        return resp.json();
+        return resp
+          .json()
+          .catch(function () {
+            return {};
+          })
+          .then(function (data) {
+            return { ok: resp.ok, status: resp.status, data: data };
+          });
       })
-      .then(function (data) {
-        renderResult(result, data);
+      .then(function (res) {
+        if (res.ok) {
+          shared.renderResult(result, res.data);
+          shared.setPageState("ok");
+          return;
+        }
+        shared.renderRefusal(result, res.data, "HTTP " + res.status);
+        shared.setPageState("error");
       })
-      .catch(function () {
-        result.textContent = "Request failed. Try again.";
+      .catch(function (e) {
+        console.error("stellar-agent approval: decision ceremony failed", e);
+        result.className = "result refused";
+        result.textContent = "Not recorded: the request failed. Reload this page and try again.";
+        shared.setPageState("error");
       });
   }
 
@@ -225,6 +182,9 @@
     var result = document.getElementById("result");
     var nonce = island.nonce;
     var csrf = island.csrf;
+
+    shared.refreshTimestamps();
+    setInterval(shared.refreshTimestamps, 1000);
 
     var approveBtn = document.getElementById("approve-btn");
     if (approveBtn) {
@@ -240,11 +200,11 @@
     }
   }
 
-  var inboxIsland = readIsland("pending-data");
+  var inboxIsland = shared.readIsland("pending-data");
   if (inboxIsland) {
     startInbox(inboxIsland);
   } else {
-    var detailIsland = readIsland("approval-data");
+    var detailIsland = shared.readIsland("approval-data");
     if (detailIsland) {
       startDetail(detailIsland);
     }

@@ -35,6 +35,14 @@
  *
  * The challenge is server-rendered into the page; error rendering is generic
  * (the bridge collapses error details before they reach the browser).
+ *
+ * # Presentation
+ *
+ * Every visible update goes through `setStatus`, which writes `textContent`
+ * (never `innerHTML`) and mirrors the ceremony state onto two `data-state`
+ * attributes: the status pill's, which selects the pill's colour, and the
+ * document element's, which selects the brand mark's face. The stylesheet owns
+ * both mappings; this file never touches styles or geometry.
  */
 
 (function () {
@@ -42,15 +50,20 @@
 
   // Wallet-authored glue runs as an IIFE; no globals exposed.
 
-  function setStatus(msg) {
+  // Sets the operator-visible status line and the page's ceremony state.
+  // `state` is one of "busy", "ok", "error"; the stylesheet turns it into the
+  // pill's colour and the brand mark's face.
+  function setStatus(msg, state) {
     var el = document.getElementById("status");
     if (el) {
       el.textContent = msg;
+      el.setAttribute("data-state", state);
     }
+    document.documentElement.setAttribute("data-state", state);
   }
 
   function setStatusError(msg) {
-    setStatus("Error: " + msg);
+    setStatus("Error: " + msg, "error");
   }
 
   // ───── Encoding helpers ─────────────────────────────────────────────
@@ -119,6 +132,12 @@
   // POST `payload` (a plain object) as JSON to `path` with the CSRF header.
   // Returns the parsed response on 2xx; throws on non-2xx with a generic
   // message (the bridge collapses error details before responding).
+  //
+  // A rejected fetch means the transport never completed — in practice the
+  // bridge has already shut down because its one-shot link expired. That is
+  // the operator's actual situation, so it is reported as such; the raw
+  // reason (a browser-specific TypeError) goes to the console instead, where
+  // it is available for diagnosis without being the headline.
   function postJson(path, csrfToken, payload) {
     return fetch(path, {
       method: "POST",
@@ -131,20 +150,27 @@
         "X-Stellar-Approval-CSRF": csrfToken,
       },
       body: JSON.stringify(payload),
-    }).then(function (resp) {
-      if (!resp.ok) {
-        throw new Error("HTTP " + resp.status);
-      }
-      return resp.json().catch(function () {
-        return {};
+    })
+      .catch(function (e) {
+        console.error("stellar-agent bridge: request transport failed", e);
+        throw new Error(
+          "could not reach the wallet. The link has likely expired."
+        );
+      })
+      .then(function (resp) {
+        if (!resp.ok) {
+          throw new Error("HTTP " + resp.status);
+        }
+        return resp.json().catch(function () {
+          return {};
+        });
       });
-    });
   }
 
   // ───── Registration flow ────────────────────────────────────────────
 
   function doRegister(opts) {
-    setStatus("Tap your authenticator to register a new passkey...");
+    setStatus("Tap your authenticator to register a new passkey\u2026", "busy");
 
     // 32 bytes of CSPRNG — bridge does not bind this; the approval nonce is
     // the actual one-shot guard.
@@ -195,7 +221,7 @@
           },
         };
 
-        setStatus("Submitting credential to the wallet...");
+        setStatus("Submitting credential to the wallet\u2026", "busy");
         return postJson(
           "/register/" + encodeURIComponent(opts.nonce) + "/credential",
           opts.csrfToken,
@@ -203,14 +229,14 @@
         );
       })
       .then(function () {
-        setStatus("Passkey registered. You can close this window.");
+        setStatus("Passkey registered. You can close this window.", "ok");
       });
   }
 
   // ───── Authentication flow ──────────────────────────────────────────
 
   function doApprove(opts) {
-    setStatus("Tap your authenticator to authorise the transaction...");
+    setStatus("Tap your authenticator to authorise the transaction\u2026", "busy");
 
     var challengeBytes = hexToBytes(opts.authDigest);
     var challengeB64 = bytesToBase64url(challengeBytes);
@@ -245,7 +271,7 @@
           },
         };
 
-        setStatus("Submitting authorisation to the wallet...");
+        setStatus("Submitting authorisation to the wallet\u2026", "busy");
         return postJson(
           "/approve/" + encodeURIComponent(opts.nonce) + "/assertion",
           opts.csrfToken,
@@ -253,7 +279,7 @@
         );
       })
       .then(function () {
-        setStatus("Authorisation complete. You can close this window.");
+        setStatus("Authorisation complete. You can close this window.", "ok");
       });
   }
 

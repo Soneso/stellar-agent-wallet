@@ -7,6 +7,53 @@
 //! content, so the embedded values cannot escalate to script execution. All
 //! executable logic lives in the same-origin `/static/operator-enroll.js`,
 //! keeping the CSP at `script-src 'self'` with no `'unsafe-inline'`.
+//!
+//! # Presentation
+//!
+//! The centred-card layout from [`stellar_agent_loopback_http::brand`], the
+//! same one the WebAuthn bridge's ceremony pages use — this page is also a
+//! single one-shot ceremony the operator either completes or abandons.
+
+use stellar_agent_loopback_http::brand::{
+    BRAND_STYLE, BUDDY_MARK_SVG, CARD_BRAND_HEADER, TRUST_LINE_LOOPBACK,
+};
+
+/// Enrollment-only rules: the label field and its caption.
+const ENROLL_STYLE: &str = r"
+.field { text-align: left; margin-bottom: 18px; }
+.field label {
+  display: block;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .8px;
+  text-transform: uppercase;
+  color: var(--muted-blue);
+  margin-bottom: 6px;
+}
+.field input[type='text'] {
+  width: 100%;
+  font-family: inherit;
+  font-size: 15px;
+  color: var(--ink-navy);
+  background: #ffffff;
+  border: 2px solid var(--field-border);
+  border-radius: 10px;
+  padding: 11px 13px;
+}
+.enroll-btn {
+  width: 100%;
+  border-radius: 10px;
+  padding: 13px 0;
+  font-size: 15px;
+  font-weight: 700;
+  border: none;
+  cursor: pointer;
+  font-family: inherit;
+  background: var(--ink-navy);
+  color: #ffffff;
+  margin-top: 16px;
+}
+";
 
 /// Serialise `value` to JSON safe to embed inside a
 /// `<script type="application/json">` element.
@@ -75,24 +122,30 @@ pub(super) fn render_enroll_page(
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Enroll operator passkey — Stellar Agent Wallet</title>
-  <style>
-    body {{ font-family: system-ui, sans-serif; margin: 2rem; max-width: 40rem; }}
-    .muted {{ color: #666; }}
-    label {{ display: block; margin-top: 1rem; }}
-    input[type="text"] {{ width: 100%; font-family: inherit; font-size: 1rem; padding: 0.4rem; box-sizing: border-box; }}
-  </style>
+  <style>{BRAND_STYLE}{ENROLL_STYLE}</style>
 </head>
 <body>
-  <h1>Enroll operator passkey</h1>
-  <p class="muted">Profile: <code>{profile_escaped}</code> — registering against <code>localhost</code></p>
-  <p>This credential will be able to consent to remote-approval requests for
-     this profile only after its id is added to this profile's
-     <code>[remote_approval] allowed_credentials</code> list. Enrolling here
-     does not grant that by itself.</p>
-  <label for="label-input">Label (e.g. "laptop")</label>
-  <input type="text" id="label-input" maxlength="64" autocomplete="off"{label_prefill_attr}>
-  <p id="status">Enter a label and click below to create a passkey.</p>
-  <button id="enroll-btn" type="button">Create passkey</button>
+  <main class="page">
+    <div class="card">
+      {BUDDY_MARK_SVG}
+{CARD_BRAND_HEADER}
+      <h1>Enroll operator passkey</h1>
+      <p class="lead">Profile <code class="chip">{profile_escaped}</code>, registering
+         against <code class="chip">localhost</code>. Name this device, then
+         confirm with Touch&nbsp;ID, Windows&nbsp;Hello, or your security key.</p>
+      <div class="field">
+        <label for="label-input">Label (e.g. "laptop")</label>
+        <input type="text" id="label-input" maxlength="64" autocomplete="off"{label_prefill_attr}>
+      </div>
+      <div class="status" id="status">Enter a label and create the passkey.</div>
+      <button class="enroll-btn" id="enroll-btn" type="button">Create passkey</button>
+      <p class="help">This credential will be able to consent to remote-approval
+         requests for this profile only after its id is added to this profile's
+         <code>[remote_approval] allowed_credentials</code> list. Enrolling here
+         does not grant that by itself.</p>
+{TRUST_LINE_LOOPBACK}
+    </div>
+  </main>
   <script type="application/json" id="enroll-data">{data_island}</script>
   <script src="/static/operator-enroll.js"></script>
 </body>
@@ -185,5 +238,47 @@ mod tests {
         let html = render_enroll_page("default", &"h".repeat(64), Some("<b>x</b>"));
         assert!(!html.contains("<b>x</b>"));
         assert!(html.contains("&lt;b&gt;x&lt;/b&gt;"));
+    }
+
+    // ── Brand surface ────────────────────────────────────────────────────
+
+    /// A duplicated stylesheet would silently double every rule; a missing one
+    /// would render the page unstyled.
+    #[test]
+    fn page_embeds_the_brand_style_exactly_once_and_the_mark() {
+        let html = render_enroll_page("default", &"i".repeat(64), None);
+        assert_eq!(html.matches(BRAND_STYLE).count(), 1);
+        assert!(html.contains(BUDDY_MARK_SVG));
+    }
+
+    /// `img-src 'self'` blocks every remote origin, so a page referencing one
+    /// would render a hole rather than fail loudly.
+    #[test]
+    fn page_references_no_external_origin() {
+        let html = render_enroll_page("default", &"j".repeat(64), None);
+        assert!(!html.contains("http://"));
+        assert!(!html.contains("https://"));
+    }
+
+    /// The enrollment server binds loopback only, so the trust line is a
+    /// property of the listener rather than a claim about it. It names the
+    /// interface, not one address: the bind guard is
+    /// `SocketAddr::ip().is_loopback()`, which admits `::1` too.
+    #[test]
+    fn page_carries_the_loopback_trust_line() {
+        let html = render_enroll_page("default", &"k".repeat(64), None);
+        assert!(html.contains(TRUST_LINE_LOOPBACK));
+        assert!(
+            !html.contains("127.0.0.1"),
+            "the trust line must not name an address the guard does not require"
+        );
+    }
+
+    /// Enrolling grants nothing on its own; the page has to say so.
+    #[test]
+    fn page_states_that_enrollment_alone_grants_nothing() {
+        let html = render_enroll_page("default", &"l".repeat(64), None);
+        assert!(html.contains("allowed_credentials"));
+        assert!(html.contains("does not grant that by itself"));
     }
 }

@@ -68,10 +68,15 @@ pub use error::{ServeShutdownError, ServeStartError};
 pub use stellar_agent_loopback_http::host_header::HostHeaderAllowlistLayer;
 pub use stellar_agent_loopback_http::origin_header::OriginHeaderAllowlistLayer;
 pub use stellar_agent_loopback_http::security_headers::SecurityHeadersLayer;
-// Shared `RuleProposalSimulated` full-definition HTML renderer — reused
-// as-is by `stellar-agent-approval-remote` so both approval surfaces render
-// the identical markup for the same entry kind.
-pub use templates::render_rule_proposal_definition_html;
+// Approval rendering reused as-is by `stellar-agent-approval-remote`, so both
+// approval surfaces render an entry identically instead of drifting apart as
+// two copies. The browser-side half is served by both servers at
+// `/static/app-shared.js`; the server-side half renders the decision card.
+pub use templates::{
+    DETAIL_STYLE, INBOX_STYLE, approve_button_label, asset_code, html_escape, kind_pill,
+    render_rule_proposal_definition_html, render_summary_html,
+};
+pub use web::APP_SHARED_JS;
 
 use auth::{AuthState, OpaqueToken};
 
