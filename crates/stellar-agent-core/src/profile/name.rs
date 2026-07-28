@@ -167,6 +167,30 @@ fn resolve_from_parts(arg: Option<&str>, env_value: Option<String>) -> ResolvedP
 /// - Only printable ASCII (0x20–0x7E), no control characters.
 /// - No `/`, `\`, `:`, `..` (path separator or traversal characters).
 /// - Not equal to `.` or `..`.
+/// - Does not begin with `-`.
+/// - Does not name a Windows reserved device.
+/// - Is not exactly `CONIN$` or `CONOUT$`.
+///
+/// A leading `-` is refused because the name has to be typed back into the
+/// commands that operate on the profile, where an argument parser reads it as
+/// the next flag rather than as the value: `stellar-agent profile init
+/// --profile -x` is an unexpected-argument error from clap, and the MCP
+/// server's parser reports the same token as a missing value. A name the wallet
+/// accepted here could not be used to select the profile it created.
+///
+/// A Windows reserved device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`,
+/// `LPT1`-`LPT9`, in any letter case, with or without an extension, and with
+/// trailing spaces) is refused on every platform. `<profile_dir>/NUL.toml` opens
+/// the NUL device on Windows rather than a file, so a write to that path is
+/// discarded and a read returns nothing while the path itself still reports as
+/// present; refusing the name everywhere keeps a profile authored on one
+/// platform usable on the others.
+///
+/// `CONIN$` and `CONOUT$` are refused as whole names, and only as whole names.
+/// Windows resolves them through the console layer on an exact match, so
+/// `CONIN$.toml` is an ordinary file and stays a valid profile name, while a
+/// bare `CONIN$` reaches the filesystem unprefixed as the per-profile
+/// counterparty-cache directory component.
 ///
 /// # Errors
 ///
@@ -180,6 +204,9 @@ fn resolve_from_parts(arg: Option<&str>, env_value: Option<String>) -> ResolvedP
 /// validate_path_component_ascii_safe("../etc")    // Err — path traversal
 /// validate_path_component_ascii_safe("..")        // Err — reserved name
 /// validate_path_component_ascii_safe("")          // Err — empty
+/// validate_path_component_ascii_safe("-x")        // Err — leading '-'
+/// validate_path_component_ascii_safe("nul.toml")  // Err — Windows device
+/// validate_path_component_ascii_safe("CONIN$")    // Err — console device
 /// ```
 pub fn validate_path_component_ascii_safe(s: &str) -> Result<(), &'static str> {
     if s.is_empty() {
@@ -203,7 +230,121 @@ pub fn validate_path_component_ascii_safe(s: &str) -> Result<(), &'static str> {
     if s.contains("..") {
         return Err("must not contain '..' (path traversal)");
     }
+    if s.starts_with('-') {
+        return Err("must not begin with '-'");
+    }
+    if let Some(refusal) = windows_reserved_device_refusal(s) {
+        return Err(refusal);
+    }
+    if let Some(refusal) = windows_console_device_refusal(s) {
+        return Err(refusal);
+    }
     Ok(())
+}
+
+/// Expands to a device table, pairing each device with the refusal that names
+/// it. `$kind` is the adjective the refusal uses for that family.
+///
+/// The pairing is generated rather than written out so a row's refusal cannot
+/// name a device other than the one that row matches.
+macro_rules! windows_device_table {
+    ($kind:literal; $($device:literal),+ $(,)?) => {
+        [$((
+            $device,
+            concat!("must not be the Windows ", $kind, " device name '", $device, "'"),
+        )),+]
+    };
+}
+
+/// Every name NT resolves to a DOS device, paired with the refusal naming it.
+///
+/// `COM0`, `COM10`, and `LPT0` are absent because NT does not reserve them. The
+/// superscript `COM¹` / `COM²` / `COM³` forms are absent because both consumers
+/// of this table exclude non-ASCII input before reaching it — the validator by
+/// its printable-ASCII rule, the path builders by mapping every character
+/// outside `[A-Za-z0-9_-]` to `_`.
+///
+/// `CONIN$` and `CONOUT$` are not here. NT's DOS-device rule does not name them:
+/// the console layer resolves them on an exact, unprefixed name, with no
+/// truncation at `.` and no trailing-space trim, so matching them by stem would
+/// refuse `CONIN$.toml` — a name Windows treats as an ordinary file.
+/// [`WINDOWS_CONSOLE_DEVICES`] carries them under the rule they actually follow.
+const WINDOWS_RESERVED_DEVICES: [(&str, &str); 22] = windows_device_table![
+    "reserved";
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// The console device names, paired with the refusal naming each one.
+///
+/// Separate from [`WINDOWS_RESERVED_DEVICES`] because they resolve under a
+/// different rule — exact name, no truncation, no trimming — not because they
+/// are a lesser class of device.
+const WINDOWS_CONSOLE_DEVICES: [(&str, &str); 2] =
+    windows_device_table!["console"; "CONIN$", "CONOUT$"];
+
+/// Returns the refusal for the Windows reserved device `name` resolves to, or
+/// `None` when it resolves to none.
+///
+/// Windows resolves a reserved name to a device in any letter case and wherever
+/// the name sits in a path. NT reduces the name to the device it names by
+/// truncating at the first `.` or `:` and then stripping trailing spaces from
+/// what is left, and this comparison applies the two steps in that order.
+///
+/// The order is the whole point. `"nul .toml"` ends in `l`, so trimming first
+/// would change nothing and the split would then yield `"nul "`, which matches
+/// no device — yet NT truncates it to `"nul "`, strips the space, and opens the
+/// device. Splitting first and trimming second answers every case a
+/// trim-then-split reading catches, plus that one.
+///
+/// `:` is in the split set for the same parity reason. The validator refuses `:`
+/// earlier under its path-separator rule, so it can only be reached through the
+/// path builders, but a predicate that claims to answer "does NT resolve this to
+/// a device" has to truncate where NT truncates.
+///
+/// This is the crate's single reserved-name table, and its two consumers answer
+/// differently: [`validate_path_component_ascii_safe`] refuses the name, while
+/// the audit-log and policy-window path builders in
+/// [`crate::profile::schema`] sanitise it by prefixing `_`. Reading one table is
+/// what keeps the two from disagreeing about what is reserved. The path builders
+/// pass a stem in which every character outside `[A-Za-z0-9_-]` has already
+/// become `_`, so for them neither the split nor the trim can fire.
+#[must_use]
+pub(crate) fn windows_reserved_device_refusal(name: &str) -> Option<&'static str> {
+    let truncated = name
+        .split_once(['.', ':'])
+        .map_or(name, |(head, _)| head)
+        .trim_end_matches(' ');
+    WINDOWS_RESERVED_DEVICES
+        .iter()
+        .find(|(device, _)| truncated.eq_ignore_ascii_case(device))
+        .map(|&(_, refusal)| refusal)
+}
+
+/// Returns the refusal for the Windows console device `name` IS, or `None` when
+/// it is neither.
+///
+/// The whole name is compared, in any letter case, with no truncation at `.` or
+/// `:` and no trailing-space trim: that is how the console layer resolves
+/// `CONIN$` and `CONOUT$`, and it is the difference from
+/// [`windows_reserved_device_refusal`]. `CONIN$.toml`, `CONIN$ `, and `myconin$`
+/// are ordinary files on Windows and stay valid profile names.
+///
+/// The shape this guards is `<data_root>/counterparty/<profile>`, the one path a
+/// profile name reaches as a bare component. Every other derived path appends an
+/// extension — `<name>.toml`, `<stem>.jsonl`, `<stem>.window`,
+/// `<profile>-cert.pem` — which is exactly why a stem match would be the wrong
+/// rule here: it would refuse names that are unreachable as devices.
+///
+/// The path builders in [`crate::profile::schema`] do not consult this and do
+/// not need to: they map every character outside `[A-Za-z0-9_-]` to `_`, so
+/// `CONIN$` reaches them as `CONIN_`, which names no device.
+#[must_use]
+pub(crate) fn windows_console_device_refusal(name: &str) -> Option<&'static str> {
+    WINDOWS_CONSOLE_DEVICES
+        .iter()
+        .find(|(device, _)| name.eq_ignore_ascii_case(device))
+        .map(|&(_, refusal)| refusal)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -517,6 +658,259 @@ mod tests {
     fn validate_path_component_rejects_over_64_chars() {
         let long = "a".repeat(65);
         assert!(validate_path_component_ascii_safe(&long).is_err());
+    }
+
+    // ── validate_path_component_ascii_safe: Windows reserved device names ────
+
+    /// Returns `name` with every second character lower-cased, so a validator
+    /// that compared case-sensitively passes neither the upper nor the lower
+    /// form by accident.
+    fn alternating_case(name: &str) -> String {
+        name.char_indices()
+            .map(|(index, ch)| {
+                if index % 2 == 0 {
+                    ch.to_ascii_uppercase()
+                } else {
+                    ch.to_ascii_lowercase()
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_windows_reserved_device_is_rejected_in_any_letter_case() {
+        for (device, _) in WINDOWS_RESERVED_DEVICES {
+            for form in [
+                device.to_ascii_uppercase(),
+                device.to_ascii_lowercase(),
+                alternating_case(device),
+            ] {
+                let reason = validate_path_component_ascii_safe(&form).expect_err(
+                    "a Windows reserved device name must be refused in any letter case",
+                );
+                assert!(
+                    reason.contains(device),
+                    "the refusal for '{form}' must name the device it matched: {reason}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_windows_reserved_device_is_rejected_with_an_extension() {
+        // Windows resolves `NUL.toml` to the device, not to a file, so an
+        // extension does not make a reserved name usable.
+        for (device, _) in WINDOWS_RESERVED_DEVICES {
+            for suffix in [".toml", ".jsonl", ".a.b"] {
+                let name = format!("{}{suffix}", device.to_ascii_lowercase());
+                let reason = validate_path_component_ascii_safe(&name)
+                    .expect_err("a reserved device name with an extension must be refused");
+                assert!(
+                    reason.contains(device),
+                    "the refusal for '{name}' must name the device it matched: {reason}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_windows_reserved_device_is_rejected_with_trailing_spaces_and_dots() {
+        // NT truncates at the first `.` and strips trailing spaces from what is
+        // left, in that order. `"nul .toml"` is the case that separates the two
+        // orders: it ends in `l`, so a trim-then-split reading leaves the stem
+        // `"nul "` and accepts the name, while NT opens the device.
+        for name in [
+            "nul ",
+            "nul.",
+            "NUL  ",
+            "nul. ",
+            "nul .",
+            "nul .toml",
+            "con .cfg",
+            "com1 .x",
+            "LPT9   .jsonl",
+            "nul.toml ",
+            "COM1.",
+            "lpt9 .",
+        ] {
+            let reason = validate_path_component_ascii_safe(name).expect_err(
+                "trailing spaces and dots must not smuggle a reserved device name through",
+            );
+            assert!(
+                reason.contains("Windows reserved device name"),
+                "'{name}' must be refused as a device, not for another reason: {reason}"
+            );
+        }
+
+        // A doubled dot is refused earlier, by the traversal rule, whatever the
+        // stem in front of it: the two refusals overlap here and traversal is
+        // the stronger claim about the name.
+        assert_eq!(
+            validate_path_component_ascii_safe("NUL..")
+                .expect_err("a name carrying '..' must be refused"),
+            "must not contain '..' (path traversal)"
+        );
+    }
+
+    #[test]
+    fn names_that_only_resemble_a_reserved_device_are_accepted() {
+        // `COM0`, `COM10`, and `LPT0` are not devices on Windows, and neither
+        // is any name that merely starts with a device name.
+        for name in [
+            "COM0",
+            "com0",
+            "COM10",
+            "com10",
+            "LPT0",
+            "lpt0",
+            "connect",
+            "prolog",
+            "auxiliary",
+            "nullify",
+            "combo",
+            "laptop",
+            "com1x",
+            "nul-1",
+            "console.toml",
+            "nul x",
+            "x nul",
+        ] {
+            assert!(
+                validate_path_component_ascii_safe(name).is_ok(),
+                "'{name}' is not a Windows device and must stay a valid profile name"
+            );
+        }
+    }
+
+    // ── validate_path_component_ascii_safe: console device names ─────────────
+
+    #[test]
+    fn the_console_device_names_are_rejected_in_any_letter_case() {
+        // A profile name reaches the filesystem unprefixed as the
+        // counterparty-cache directory component, which is the shape the
+        // console layer resolves.
+        for (name, device) in [
+            ("CONIN$", "CONIN$"),
+            ("conin$", "CONIN$"),
+            ("CoNiN$", "CONIN$"),
+            ("CONOUT$", "CONOUT$"),
+            ("conout$", "CONOUT$"),
+        ] {
+            let reason = validate_path_component_ascii_safe(name)
+                .expect_err("a console device name must be refused in any letter case");
+            assert_eq!(
+                reason,
+                format!("must not be the Windows console device name '{device}'")
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_exact_console_device_name_is_rejected() {
+        // The console layer matches the whole name — no truncation at `.`, no
+        // trailing-space trim — so each of these is an ordinary file on Windows.
+        // They pass only if the console check is exact rather than stem-matched.
+        for name in ["conin$.toml", "conin$ ", "myconin$", "conin$x", "conout$.x"] {
+            assert!(
+                validate_path_component_ascii_safe(name).is_ok(),
+                "'{name}' is not the console device and must stay a valid profile name"
+            );
+        }
+    }
+
+    #[test]
+    fn a_leading_dot_does_not_make_the_extension_the_stem() {
+        // NT truncates at the first `.`, so `.nul` reduces to the empty name and
+        // resolves to no device: the device has to be what precedes the dot.
+        assert!(validate_path_component_ascii_safe(".nul").is_ok());
+    }
+
+    // ── validate_path_component_ascii_safe: leading '-' ──────────────────────
+
+    #[test]
+    fn a_leading_dash_is_rejected() {
+        for name in ["-x", "-", "--profile", "-rf"] {
+            let reason = validate_path_component_ascii_safe(name)
+                .expect_err("a name beginning with '-' must be refused");
+            assert_eq!(reason, "must not begin with '-'");
+        }
+    }
+
+    #[test]
+    fn dashes_anywhere_but_the_first_character_are_accepted() {
+        for name in ["x-", "a-b", "smoke-fp2", "alice-prod", "a--b"] {
+            assert!(
+                validate_path_component_ascii_safe(name).is_ok(),
+                "'{name}' carries a dash away from the first character and must be accepted"
+            );
+        }
+    }
+
+    // ── windows_reserved_device_refusal / windows_console_device_refusal ─────
+
+    #[test]
+    fn the_console_device_table_holds_exactly_the_two_console_names() {
+        let devices: Vec<&str> = WINDOWS_CONSOLE_DEVICES
+            .iter()
+            .map(|&(device, _)| device)
+            .collect();
+        assert_eq!(devices, vec!["CONIN$", "CONOUT$"]);
+    }
+
+    #[test]
+    fn the_path_builders_never_see_a_console_device_name() {
+        // `audit_log_file_stem` maps `$` to `_`, so `CONIN$` reaches the path
+        // builders as `CONIN_`. The console check is therefore the validator's
+        // alone, and the sanitising consumers cannot be affected by it.
+        assert!(windows_console_device_refusal("CONIN$").is_some());
+        assert!(windows_console_device_refusal("CONIN_").is_none());
+        assert!(windows_reserved_device_refusal("CONIN$").is_none());
+        assert!(windows_reserved_device_refusal("CONIN_").is_none());
+    }
+
+    #[test]
+    fn the_reserved_device_table_holds_exactly_the_windows_devices() {
+        let devices: Vec<&str> = WINDOWS_RESERVED_DEVICES
+            .iter()
+            .map(|&(device, _)| device)
+            .collect();
+        assert_eq!(
+            devices,
+            vec![
+                "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+                "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8",
+                "LPT9",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_sanitised_stem_shape_the_path_builders_pass_is_answered_identically() {
+        // `audit_log_file_stem` maps every character outside `[A-Za-z0-9_-]` to
+        // `_` before consulting this table, so its input can carry neither a
+        // `.` nor a trailing space. Pinning both shapes keeps the shared table
+        // from changing the path builders' answers.
+        assert!(windows_reserved_device_refusal("CON").is_some());
+        assert!(windows_reserved_device_refusal("_CON").is_none());
+        assert!(windows_reserved_device_refusal("CON_toml").is_none());
+        assert!(windows_reserved_device_refusal("connect").is_none());
+    }
+
+    #[test]
+    fn the_predicate_truncates_at_a_colon_the_way_nt_does() {
+        // NT truncates at `:` as well as `.`, so an alternate-data-stream name
+        // resolves to the device in front of it. The validator refuses `:` under
+        // its path-separator rule before this runs, so the parity is pinned on
+        // the predicate itself — the surface the path builders share.
+        assert!(windows_reserved_device_refusal("nul:stream").is_some());
+        assert!(windows_reserved_device_refusal("nul :stream").is_some());
+        assert!(windows_reserved_device_refusal("connect:stream").is_none());
+        assert!(
+            validate_path_component_ascii_safe("nul:stream")
+                .expect_err("a name carrying ':' must be refused")
+                .contains("':'"),
+            "the validator refuses ':' before the device table is reached"
+        );
     }
 
     // ── resolve_profile_name ─────────────────────────────────────────────────

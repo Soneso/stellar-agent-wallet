@@ -452,6 +452,52 @@ fn traversal_profile_name_is_refused() {
     );
 }
 
+/// A Windows reserved device name is refused at step 0, on every platform.
+///
+/// `<profile_dir>/NUL.toml` names the NUL device on Windows rather than a file,
+/// so a server started on that name would read an empty configuration from the
+/// null device. The refusal is unconditional so the same profile name is refused
+/// wherever the server runs.
+///
+/// `nul .toml` is in the set because NT truncates at the first `.` before it
+/// strips trailing spaces: the name ends in a letter, yet it still opens the
+/// device.
+#[test]
+fn windows_reserved_device_profile_name_is_refused() {
+    let home = ProfileHome::new();
+    for (name, device) in [
+        ("--profile=NUL", "NUL"),
+        ("--profile=com1", "COM1"),
+        ("--profile=nul.toml", "NUL"),
+        ("--profile=nul ", "NUL"),
+        ("--profile=nul .toml", "NUL"),
+    ] {
+        let stderr = assert_refused_with(&run_with_initialize(home.command(&[name])), 2);
+        assert!(
+            stderr.contains(&format!(
+                "must not be the Windows reserved device name '{device}'"
+            )),
+            "the refusal for '{name}' must name the device it matched: {stderr}"
+        );
+    }
+}
+
+/// A profile name beginning with `-` is refused at step 0.
+///
+/// The two-token form never reaches this check: `--profile -x` is a missing
+/// value to the parser (`ProfileValueMissing`), which is pinned beside the
+/// parser. Only the `=` form carries such a value through to the validator, so
+/// that is the form pinned here.
+#[test]
+fn leading_dash_profile_name_is_refused() {
+    let home = ProfileHome::new();
+    let stderr = assert_refused_with(&run_with_initialize(home.command(&["--profile=-x"])), 2);
+    assert!(
+        stderr.contains("must not begin with '-'"),
+        "the refusal must state why the name is unusable: {stderr}"
+    );
+}
+
 /// An unrecognised flag is refused rather than ignored.
 #[test]
 fn unknown_flag_is_refused() {

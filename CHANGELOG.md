@@ -256,6 +256,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend; it warns and continues, with signing tools refusing at call time.
   `docs/profiles.md` no longer refers to a `stellar-agent mcp` subcommand, which
   does not exist.
+- A profile name that names a Windows reserved device (`CON`, `PRN`, `AUX`,
+  `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`) or begins with `-` is refused by both
+  binaries. `<profile_dir>/NUL.toml` opens the NUL device on Windows rather than
+  a file, so a write to that path is discarded and a read returns nothing while
+  the path itself still reports as present; a name beginning with `-` is read as
+  the next flag by every argument parser that has to take it, so `--profile -x`
+  selects no profile at all. The device comparison is case-insensitive and
+  reduces the name the way Windows does — cut at the first `.`, then drop
+  trailing spaces — so `NUL.toml`, `nul `, and `nul .toml` are all refused, while
+  `COM0`, `COM10`, and `LPT0` are not reserved and remain valid names. The
+  audit-log and policy-window path builders, which sanitise such a stem rather
+  than refusing it, now read the same reserved-name table, so the two surfaces
+  cannot disagree about what is reserved. The console devices `CONIN$` and
+  `CONOUT$` are refused as whole names only, matching the exact-name rule
+  Windows resolves them under: a profile name reaches the filesystem unprefixed
+  as the per-profile counterparty-cache directory, while `conin$.toml` and
+  `myconin$` are ordinary files and remain valid names. Closes #110.
+- **Behaviour change.** A profile literally named e.g. `con` or `-x` stops
+  working after the change above. On Unix both are legal file names and such a
+  profile may exist; on Windows a `-x` profile can exist, while a reserved-name
+  profile never had a file. Recover with `stellar-agent profile init --profile
+  <new-name>` and the enrollment steps it prints, or by renaming the file and
+  correcting its `policy_owner_key_id.service` to
+  `stellar-agent-owner-<new-name>` — a `v1` profile then also needs `profile
+  enroll-owner-key` and `profile sign-policy` re-run under the new name, because
+  the owner key is stored under the old name's coordinate and the signed policy
+  file carries the old name in its signed scope.
 
 ## [0.1.0-alpha.5] - 2026-07-26
 
