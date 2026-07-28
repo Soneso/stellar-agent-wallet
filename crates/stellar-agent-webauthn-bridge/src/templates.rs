@@ -24,6 +24,29 @@
 //! The `Content-Security-Policy` header (injected by `SecurityHeadersLayer`)
 //! prevents any inline script execution; `script-src 'self'` allows only the
 //! same-origin `/static/webauthn.js` bundle.
+//!
+//! # Presentation
+//!
+//! Both pages are the shared centred-card layout from
+//! [`stellar_agent_loopback_http::brand`]: the stylesheet and the brand mark
+//! are emitted inline, which the CSP permits (`style-src` allows
+//! `'unsafe-inline'`; inline SVG is markup, not a resource). No page here
+//! fetches an external font, image, or stylesheet.
+//!
+//! The card's trust line states that the page is served on this machine's
+//! loopback interface. That is a property of the listener, not copy: the bind
+//! guard in [`crate::start_serve`] refuses any address for which
+//! `SocketAddr::ip().is_loopback()` is false, which admits `::1` as well as
+//! `127.0.0.1` — hence the interface rather than one literal address.
+//!
+//! The card's face and status pill both reflect a single ceremony state
+//! (`busy` / `ok` / `error`). The server renders `busy`; `/static/glue.js`
+//! moves it as the ceremony resolves, writing only `textContent` and
+//! `dataset.state`.
+
+use stellar_agent_loopback_http::brand::{
+    BRAND_STYLE, BUDDY_MARK_SVG, CARD_BRAND_HEADER, TRUST_LINE_LOOPBACK,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Data island
@@ -87,15 +110,29 @@ pub(crate) fn render_register_page(
 
     format!(
         r#"<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-state="busy">
 <head>
   <meta charset="utf-8">
-  <title>Register Passkey — Stellar Agent Wallet</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Register a passkey — Stellar Agent Wallet</title>
+  <style>{BRAND_STYLE}</style>
 </head>
 <body>
-  <h1>Register Passkey</h1>
-  <p>Wallet is requesting a new passkey registration.</p>
-  <div id="status">Initialising…</div>
+  <main class="page">
+    <div class="card">
+      {BUDDY_MARK_SVG}
+{CARD_BRAND_HEADER}
+      <h1>Register a passkey</h1>
+      <p class="lead">Your wallet asked to add a new passkey for approving
+         transactions. Your browser will prompt you next &mdash; confirm with
+         Touch&nbsp;ID, Windows&nbsp;Hello, or your security key.</p>
+      <div class="status" id="status" data-state="busy">Initialising&hellip;</div>
+      <p class="help">Nothing happening? The prompt may be behind this window.
+         If this page reports an error, the link has expired &mdash; close this
+         tab and run <code>stellar-agent credentials add-passkey</code> again.</p>
+{TRUST_LINE_LOOPBACK}
+    </div>
+  </main>
   <script type="application/json" id="webauthn-options">{data_island}</script>
   <script src="/static/webauthn.js"></script>
   <script src="/static/glue.js"></script>
@@ -151,15 +188,28 @@ pub(crate) fn render_approve_page(
 
     format!(
         r#"<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-state="busy">
 <head>
   <meta charset="utf-8">
-  <title>Approve Transaction — Stellar Agent Wallet</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Approve a transaction — Stellar Agent Wallet</title>
+  <style>{BRAND_STYLE}</style>
 </head>
 <body>
-  <h1>Approve Transaction</h1>
-  <p>Wallet is requesting passkey authentication for a pending transaction.</p>
-  <div id="status">Initialising…</div>
+  <main class="page">
+    <div class="card">
+      {BUDDY_MARK_SVG}
+{CARD_BRAND_HEADER}
+      <h1>Approve a transaction</h1>
+      <p class="lead">Your wallet is asking you to authorise a pending
+         transaction. Review the details in your terminal, then confirm here
+         with your passkey.</p>
+      <div class="status" id="status" data-state="busy">Initialising&hellip;</div>
+      <p class="help">Only approve if you initiated this. If you did not, close
+         this tab &mdash; nothing is signed without your passkey.</p>
+{TRUST_LINE_LOOPBACK}
+    </div>
+  </main>
   <script type="application/json" id="webauthn-options">{data_island}</script>
   <script src="/static/webauthn.js"></script>
   <script src="/static/glue.js"></script>
@@ -298,5 +348,83 @@ mod tests {
             html.contains(r#"type="application/json" id="webauthn-options""#),
             "page must include the JSON data-island script tag"
         );
+    }
+
+    // ── Brand surface ────────────────────────────────────────────────────────
+
+    fn both_pages() -> [String; 2] {
+        [
+            render_register_page("n", &"c".repeat(64), "localhost", "dXNlcmhhbmRsZQ"),
+            render_approve_page("n", &"c".repeat(64), &"a".repeat(64), "cid", "localhost"),
+        ]
+    }
+
+    /// A duplicated stylesheet would silently double every rule; a missing one
+    /// would render the page unstyled.
+    #[test]
+    fn both_pages_embed_the_brand_style_exactly_once() {
+        for html in both_pages() {
+            assert_eq!(
+                html.matches(BRAND_STYLE).count(),
+                1,
+                "the brand style must appear exactly once per page"
+            );
+        }
+    }
+
+    #[test]
+    fn both_pages_embed_the_brand_mark() {
+        for html in both_pages() {
+            assert!(
+                html.contains(BUDDY_MARK_SVG),
+                "the brand mark must be present on the page"
+            );
+        }
+    }
+
+    /// `img-src 'self'` blocks every remote origin, so a page referencing one
+    /// would render a hole rather than fail loudly.
+    #[test]
+    fn both_pages_reference_no_external_origin() {
+        for html in both_pages() {
+            assert!(!html.contains("http://"));
+            assert!(!html.contains("https://"));
+        }
+    }
+
+    /// The face and the pill are driven from one state value; the server hands
+    /// the page the `busy` state the ceremony starts in.
+    #[test]
+    fn both_pages_start_in_the_busy_state() {
+        for html in both_pages() {
+            assert!(html.contains(r#"<html lang="en" data-state="busy">"#));
+            assert!(html.contains(r#"<div class="status" id="status" data-state="busy">"#));
+        }
+    }
+
+    #[test]
+    fn register_page_names_the_command_that_mints_a_fresh_link() {
+        let html = render_register_page("n", &"c".repeat(64), "localhost", "dXNlcmhhbmRsZQ");
+        assert!(html.contains("<code>stellar-agent credentials add-passkey</code>"));
+    }
+
+    #[test]
+    fn approve_page_warns_against_approving_an_uninitiated_request() {
+        let html = render_approve_page("n", &"c".repeat(64), &"a".repeat(64), "cid", "localhost");
+        assert!(html.contains("Only approve if you initiated this"));
+        assert!(html.contains("nothing is signed without your passkey"));
+    }
+
+    /// The bridge is loopback-bound; the trust line states the interface, not
+    /// one literal address, because the bind guard admits `::1` too.
+    #[test]
+    fn both_pages_carry_the_loopback_trust_line() {
+        for html in both_pages() {
+            assert!(html.contains(TRUST_LINE_LOOPBACK));
+            assert!(
+                !html.contains("127.0.0.1"),
+                "the trust line must not name an address the guard does not require"
+            );
+        }
     }
 }

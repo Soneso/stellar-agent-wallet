@@ -75,13 +75,24 @@
     }
   }
 
-  function setStatus(text) {
+  // Sets the operator-visible status line and the page's ceremony state.
+  // `state` is one of "busy", "ok", "error"; the stylesheet turns it into the
+  // pill's colour and the brand mark's face. Writes are textContent only.
+  function setStatus(text, state) {
     var el = document.getElementById("status");
     if (el) {
       el.textContent = text;
+      el.setAttribute("data-state", state);
     }
+    document.documentElement.setAttribute("data-state", state);
   }
 
+  // A rejected fetch means the transport never completed — in practice the
+  // enrollment server has already shut down, because its window is one-shot.
+  // The passkey itself WAS created by then, so reporting "passkey creation
+  // failed" would be false; the operator's actual situation is a link that no
+  // longer resolves. The raw reason (a browser-specific TypeError) goes to the
+  // console instead, where it is available for diagnosis.
   function postCredential(island, credentialIdB64url, pubkeyB64url, label, signCount) {
     return fetch("/enroll/credential", {
       method: "POST",
@@ -96,6 +107,16 @@
         label: label,
         sign_count: signCount,
       }),
+    }).catch(function (e) {
+      console.error("stellar-agent enrollment: request transport failed", e);
+      var err = new Error(
+        "Error: could not reach the wallet. The link has likely expired."
+      );
+      // Tagged so the outer handler can tell a dead link from a passkey the
+      // operator declined; a DOMException from credentials.create() also
+      // carries a message, so the message alone cannot distinguish them.
+      err.walletTransport = true;
+      throw err;
     });
   }
 
@@ -103,11 +124,11 @@
     var labelInput = document.getElementById("label-input");
     var label = labelInput ? labelInput.value.trim() : "";
     if (!label) {
-      setStatus("Enter a label first.");
+      setStatus("Enter a label first.", "error");
       return;
     }
 
-    setStatus("Creating passkey...");
+    setStatus("Creating passkey\u2026", "busy");
     var challenge = crypto.getRandomValues(new Uint8Array(32));
     var userId = crypto.getRandomValues(new Uint8Array(16));
     navigator.credentials
@@ -126,40 +147,54 @@
       })
       .then(function (credential) {
         if (typeof credential.response.getPublicKey !== "function") {
-          setStatus("Your authenticator did not return a usable public key. Try a different authenticator.");
+          setStatus("Your authenticator did not return a usable public key. Try a different authenticator.", "error");
           return;
         }
         var spki = credential.response.getPublicKey();
         if (!spki) {
-          setStatus("Your authenticator did not return a usable public key. Try a different authenticator.");
+          setStatus("Your authenticator did not return a usable public key. Try a different authenticator.", "error");
           return;
         }
         var credentialId = b64urlFromBytes(credential.rawId);
         var pubkey = b64urlFromBytes(sec1FromSpki(spki));
         var signCount = extractSignCount(credential.response);
-        setStatus("Passkey created. Finishing enrollment...");
+        setStatus("Passkey created. Finishing enrollment\u2026", "busy");
         return postCredential(island, credentialId, pubkey, label, signCount);
       })
       .then(function (resp) {
+        // An unusable-public-key branch above returns without posting; its
+        // status line is the accurate one, so it stands.
+        if (!resp) {
+          return;
+        }
         if (resp.ok) {
           setStatus(
             "Enrolled. This credential must still be added to this profile's " +
               "[remote_approval] allowed_credentials list before it can approve anything. " +
-              "You may close this tab."
+              "You may close this tab.",
+            "ok"
           );
           return;
         }
         return resp
           .json()
           .then(function (body) {
-            setStatus("Enrollment failed: " + (body && body.error ? body.error : "unknown error"));
+            setStatus("Enrollment failed: " + (body && body.error ? body.error : "unknown error"), "error");
           })
           .catch(function () {
-            setStatus("Enrollment failed.");
+            setStatus("Enrollment failed.", "error");
           });
       })
-      .catch(function () {
-        setStatus("Passkey creation failed. Try again.");
+      .catch(function (e) {
+        // The passkey-creation rejection and the transport rejection land here
+        // together. The passkey was already created by the time a transport
+        // failure can happen, so reporting creation failure would be false.
+        setStatus(
+          e && e.walletTransport
+            ? e.message
+            : "Passkey creation failed. Try again.",
+          "error"
+        );
       });
   }
 

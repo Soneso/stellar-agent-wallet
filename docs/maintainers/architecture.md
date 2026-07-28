@@ -81,7 +81,7 @@ Both binaries share a single release archive. The `[package.metadata.binstall]` 
 | `stellar-agent-nonce` | HMAC-SHA256 wallet-issued nonce, in-memory TTL replay window, `ToolCatalogue` trait, and nonce-key rotation. |
 | `stellar-agent-smart-account` | Off-chain orchestration over OpenZeppelin `stellar-accounts`: deployment, context-rule install, WebAuthn passkey signer, threshold updates, wasm-hash pinning, verifier migration, multicall, upgrade timelock. |
 | `stellar-agent-webauthn-bridge` | Loopback-only HTTP listener ferrying browser WebAuthn ceremony bytes into the core approval store, behind a host/origin/CSP/body-limit middleware stack. |
-| `stellar-agent-loopback-http` | Shared tower/axum defence-in-depth middleware for the wallet's loopback-only HTTP listeners: Host and Origin allowlists and hardened security headers. |
+| `stellar-agent-loopback-http` | Shared tower/axum defence-in-depth middleware for the wallet's browser-facing HTTP listeners (Host and Origin allowlists, hardened security headers), plus the `brand` module holding the stylesheet and inline mark those listeners' pages render. |
 | `stellar-agent-approval-ui` | Localhost approval-inbox web UI: a loopback HTTP server surfacing the pending-approval queue for browser approve/reject (`approve serve`). |
 | `stellar-agent-approval-remote` | TLS-protected, passkey-authenticated remote approval surface: approve or reject pending actions from a device other than the wallet host (`approve serve --remote`). |
 | `stellar-agent-windows-identity` | Windows-only safe wrapper reading the process token user SID to bind approval attestations to the OS user, plus DPAPI protect/unprotect wrappers for the headless keyring store. Absent off Windows; uses `unsafe` for its Win32 FFI. |

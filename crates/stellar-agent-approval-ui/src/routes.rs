@@ -8,6 +8,7 @@
 //! | `GET`  | `/approval/{nonce}` | [`approval_detail_get`] | session cookie |
 //! | `POST` | `/approval/{nonce}/approve` | [`approve_post`] | session + CSRF |
 //! | `POST` | `/approval/{nonce}/reject` | [`reject_post`] | session + CSRF |
+//! | `GET`  | `/static/app-shared.js` | [`app_shared_js`] | session cookie |
 //! | `GET`  | `/static/app.js` | [`app_js`] | session cookie |
 //!
 //! The Host / Origin / security-header / body-limit / trace layers are applied
@@ -48,6 +49,7 @@ pub(crate) fn build_router() -> Router<ServeState> {
         .route("/approval/{nonce}", get(approval_detail_get))
         .route("/approval/{nonce}/approve", post(approve_post))
         .route("/approval/{nonce}/reject", post(reject_post))
+        .route("/static/app-shared.js", get(app_shared_js))
         .route("/static/app.js", get(app_js))
 }
 
@@ -377,6 +379,23 @@ async fn reject_post(
         &RequestIdentity::Local,
     );
     outcome_to_response(outcome)
+}
+
+/// `GET /static/app-shared.js` — the approval rendering both approval
+/// surfaces share (see [`crate::web::APP_SHARED_JS`]).
+async fn app_shared_js(State(state): State<ServeState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = require_session(&state, &headers) {
+        return resp;
+    }
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        web::APP_SHARED_JS,
+    )
+        .into_response()
 }
 
 /// `GET /static/app.js` — the same-origin browser glue.

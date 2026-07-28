@@ -13,6 +13,7 @@
 //! | `GET`  | `/approval/{nonce}` | [`approval_detail_get`] | session cookie |
 //! | `POST` | `/approval/{nonce}/challenge` | [`action_challenge_post`] | session + CSRF |
 //! | `POST` | `/approval/{nonce}/decision` | [`action_decision_post`] | session + CSRF |
+//! | `GET`  | `/static/app-shared.js` | [`app_shared_js_get`] | session cookie |
 //! | `GET`  | `/static/app.js` | [`app_js_get`] | session cookie |
 //!
 //! Session and CSRF checks happen at the top of each handler, mirroring the
@@ -79,6 +80,7 @@ pub(crate) fn build_router() -> Router<RemoteServeState> {
         .route("/approval/{nonce}", get(approval_detail_get))
         .route("/approval/{nonce}/challenge", post(action_challenge_post))
         .route("/approval/{nonce}/decision", post(action_decision_post))
+        .route("/static/app-shared.js", get(app_shared_js_get))
         .route("/static/app.js", get(app_js_get))
 }
 
@@ -567,8 +569,28 @@ async fn approval_detail_get(
     .into_response()
 }
 
-/// `GET /static/app.js` — post-authentication browser glue (inbox listing,
-/// detail rendering, per-action ceremony). Session-gated.
+/// `GET /static/app-shared.js` — the approval rendering both approval
+/// surfaces share. Session-gated.
+///
+/// Serves `stellar-agent-approval-ui`'s bytes verbatim: one definition of how
+/// an approval renders, so this surface cannot show an entry differently from
+/// the loopback one.
+async fn app_shared_js_get(State(state): State<RemoteServeState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = require_session(&state, &headers) {
+        return resp;
+    }
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        stellar_agent_approval_ui::APP_SHARED_JS,
+    )
+        .into_response()
+}
+
+/// `GET /static/app.js` — the remote-specific browser glue.
 async fn app_js_get(State(state): State<RemoteServeState>, headers: HeaderMap) -> Response {
     if let Err(resp) = require_session(&state, &headers) {
         return resp;
@@ -989,6 +1011,62 @@ mod tests {
             .to_owned();
         // Extract just "name=value" from the full Set-Cookie header.
         cookie.split(';').next().unwrap().to_owned()
+    }
+
+    /// The shared rendering this surface serves must be the loopback crate's
+    /// bytes, unmodified.
+    ///
+    /// Pinned at the HTTP response, not at the import: a vendored or edited
+    /// copy would let the two approval surfaces present the same entry
+    /// differently, which is the whole reason the file is shared. The failure
+    /// mode it guards is silent — a drifted copy still parses, still loads,
+    /// and only renders differently.
+    #[tokio::test]
+    #[serial]
+    async fn served_shared_app_js_is_the_approval_ui_bytes_verbatim() {
+        let f = fixture("shared-js");
+        let router = build_router();
+        let cookie = login(&router, &f.state, &f.authenticator).await;
+
+        let resp = router
+            .clone()
+            .with_state(f.state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/static/app-shared.js")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let served = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(
+            served.as_ref(),
+            stellar_agent_approval_ui::APP_SHARED_JS,
+            "the bytes served at /static/app-shared.js must be \
+             stellar_agent_approval_ui::APP_SHARED_JS, byte for byte"
+        );
+    }
+
+    /// The shared asset is behind the session cookie like the rest of the
+    /// post-authentication surface.
+    #[tokio::test]
+    #[serial]
+    async fn shared_app_js_without_cookie_is_not_found() {
+        let f = fixture("shared-js-nocookie");
+        let resp = build_router()
+            .with_state(f.state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/static/app-shared.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     /// Extracts a named string field out of a `<script type="application/json"
