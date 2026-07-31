@@ -853,6 +853,18 @@ pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_approval: Option<RemoteApprovalConfig>,
 
+    /// Served-page identity for this deployment's operator-facing web pages.
+    ///
+    /// `None` (the default) means the pages carry no identity: a plain title,
+    /// no display name, and no project mark. The wallet is a self-hosted
+    /// runtime, so an identity default would put the project's name and mark
+    /// inside a third party's deployment.
+    ///
+    /// This block cannot change what a page SAYS about a transaction — see
+    /// [`ServedPagesConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_pages: Option<ServedPagesConfig>,
+
     /// Keyring entry for the persisted policy-window-state HMAC key.
     ///
     /// A per-profile 32-byte HMAC key authenticating the on-disk sliding-window
@@ -1043,6 +1055,93 @@ impl std::fmt::Debug for RemoteApprovalConfig {
     }
 }
 
+/// Identity for the operator-facing pages this deployment serves.
+///
+/// Stored as `[served_pages]` in the profile TOML via
+/// `Profile.served_pages: Option<ServedPagesConfig>`. Absent by default, and
+/// absent means neutral pages — never a fallback to the project's own name or
+/// mark.
+///
+/// ```toml
+/// [served_pages]
+/// display_name = "Acme Ops"
+/// show_project_mark = false
+/// ```
+///
+/// # What this can and cannot change
+///
+/// It changes the identity block only: the page title, the name above a card's
+/// heading, and the header bar's left-hand cell. It cannot change the page
+/// design, and it cannot reach the transaction-detail block — the amount, the
+/// destination, the facts grid, the approve and reject controls, the caution
+/// line, and the expiry sentence are rendered from the approval entry alone.
+///
+/// That boundary is deliberate. The approval page is a consent surface: its
+/// purpose is the faithful display of what is about to be signed. Configured
+/// CSS, markup, or asset URLs would let anything able to write this file make
+/// the page misstate the transaction without touching a signing key, which is
+/// a strictly easier bar than patching the binary. So the configurable surface
+/// is a name and a boolean, and the name is escaped and length-bounded before
+/// it renders.
+///
+/// # Bounds
+///
+/// `display_name` is limited to
+/// [`MAX_SERVED_PAGE_DISPLAY_NAME_CHARS`] characters; a longer value is
+/// refused at profile load with
+/// [`crate::profile::loader::ProfileLoadError::InvalidServedPageDisplayName`].
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ServedPagesConfig {
+    /// The name the served pages announce.
+    ///
+    /// Absent, empty, or whitespace-only means the pages carry no name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+
+    /// Renders the project mark on the served pages when `true`.
+    ///
+    /// Defaults to `false`. The project's own demo and documentation captures
+    /// set it; a third-party deployment has no reason to.
+    #[serde(default)]
+    pub show_project_mark: bool,
+}
+
+impl ServedPagesConfig {
+    /// Constructs a served-page identity block.
+    ///
+    /// `#[non_exhaustive]` blocks external struct-literal construction; this
+    /// is the entry point for callers outside this crate.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::profile::schema::ServedPagesConfig;
+    ///
+    /// let cfg = ServedPagesConfig::new(Some("Acme Ops".to_owned()), false);
+    /// assert_eq!(cfg.display_name.as_deref(), Some("Acme Ops"));
+    /// assert!(!cfg.show_project_mark);
+    /// ```
+    #[must_use]
+    pub const fn new(display_name: Option<String>, show_project_mark: bool) -> Self {
+        Self {
+            display_name,
+            show_project_mark,
+        }
+    }
+}
+
+/// Maximum length, in characters, of
+/// [`ServedPagesConfig::display_name`].
+///
+/// Mirrors `stellar_agent_loopback_http::brand::MAX_DISPLAY_NAME_CHARS`, which
+/// is where the bound is enforced at render time. The value is duplicated
+/// rather than imported because this crate does not depend on the HTTP-surface
+/// crate; `stellar-agent-cli`'s
+/// `served_page_display_name_bound_matches_the_renderer` test asserts the two
+/// stay equal.
+pub const MAX_SERVED_PAGE_DISPLAY_NAME_CHARS: usize = 64;
+
 impl std::fmt::Debug for Profile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // `rpc_url` and `secondary_rpc_url` are redacted because they may
@@ -1098,6 +1197,7 @@ impl std::fmt::Debug for Profile {
                 &self.policy_window_state_key_id,
             )
             .field("remote_approval", &self.remote_approval)
+            .field("served_pages", &self.served_pages)
             .finish()
     }
 }
@@ -1568,6 +1668,9 @@ impl ProfileBuilder {
             // Remote approval is off by default; the operator opts in by
             // writing a `[remote_approval]` block to the profile TOML.
             remote_approval: None,
+            // Served pages are neutral by default; the operator opts in by
+            // writing a `[served_pages]` block to the profile TOML.
+            served_pages: None,
             policy_window_state_key_id: self.policy_window_state_key_id,
         }
     }
@@ -2924,6 +3027,46 @@ mod tests {
         assert!(
             cfg.allowed_credentials.is_empty(),
             "allowed_credentials must default to empty when omitted"
+        );
+    }
+
+    // ── served_pages defaults to absent, and round-trips when set ────────────
+
+    /// A newly built profile serves neutral pages, and writes no
+    /// `[served_pages]` block: a deployment that asked for nothing gets no
+    /// identity rather than the project's own.
+    #[test]
+    fn served_pages_none_in_new_profile() {
+        let p = make_testnet_profile();
+        assert!(
+            p.served_pages.is_none(),
+            "served_pages must be None in a newly built profile"
+        );
+        let toml_str = toml::to_string(&p).unwrap();
+        assert!(
+            !toml_str.contains("served_pages"),
+            "absent served_pages must be omitted from serialised TOML: {toml_str}"
+        );
+    }
+
+    #[test]
+    fn served_pages_serde_round_trip_when_set() {
+        let mut p = make_testnet_profile();
+        p.served_pages = Some(ServedPagesConfig::new(Some("Acme Ops".to_owned()), true));
+        let toml_str = toml::to_string(&p).unwrap();
+        let restored: Profile = toml::from_str(&toml_str).unwrap();
+        let cfg = restored.served_pages.expect("served_pages must round-trip");
+        assert_eq!(cfg.display_name.as_deref(), Some("Acme Ops"));
+        assert!(cfg.show_project_mark);
+    }
+
+    #[test]
+    fn served_pages_fields_default_to_neutral_when_omitted() {
+        let cfg: ServedPagesConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.display_name, None, "no name unless one is written");
+        assert!(
+            !cfg.show_project_mark,
+            "the project mark must be off unless the deployment asks for it"
         );
     }
 

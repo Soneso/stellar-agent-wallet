@@ -8,11 +8,11 @@
 //!
 //! The refusal is asserted on the wire code, not only on the exit code. A
 //! refused `init` and a failed one both exit 1; only the code says the name was
-//! rejected before any filesystem access. The code asserted here is the one
-//! `init` emits for every unsafe name (`validation.address_invalid`,
-//! `init.rs`'s first-stage refusal) — aligning that code with the rest of the
-//! configuration family is tracked separately as #119, so this pins what the
-//! binary emits today rather than what it should emit.
+//! rejected before any filesystem access. Every unsafe name refuses as
+//! `validation.config_invalid` with the `profile` component — the code the
+//! whole profile-configuration family uses, and the one `profile show` reports
+//! for the same input class. `validation.address_invalid` is reserved for
+//! Stellar account addresses.
 //!
 //! The `=` form of the flag is used throughout: clap refuses `--profile -x`
 //! with `unexpected argument '-x' found` before the command runs, so only
@@ -72,12 +72,16 @@ fn assert_refused(profile: &str, expected_reason: &str) {
 
     assert_eq!(code, 1, "an unusable profile name must exit 1: {json}");
     assert_eq!(
-        json["error"]["code"], "validation.address_invalid",
-        "an unusable profile name must be refused as an invalid name: {json}"
+        json["error"]["code"], "validation.config_invalid",
+        "an unusable profile name must be refused as invalid profile configuration: {json}"
     );
     let message = json["error"]["message"]
         .as_str()
         .expect("the envelope must carry an error message");
+    assert!(
+        message.contains("configuration invalid for 'profile'"),
+        "the refusal must name the profile component: {message}"
+    );
     assert!(
         message.contains(expected_reason),
         "the refusal must state why the name is unusable: {message}"

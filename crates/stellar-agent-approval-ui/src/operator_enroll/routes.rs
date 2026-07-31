@@ -208,6 +208,7 @@ async fn enroll_page_get(
         &state.profile,
         &csrf,
         state.label_prefill.as_deref(),
+        &state.identity,
     ))
     .into_response()
 }

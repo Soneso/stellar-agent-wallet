@@ -114,6 +114,7 @@ pub(crate) mod web;
 // Re-export public API surface.
 pub use csrf::{CsrfToken, CsrfTokenParseError};
 pub use error::{BridgeShutdownError, BridgeStartError};
+pub use stellar_agent_loopback_http::brand::PageIdentity;
 pub use stellar_agent_loopback_http::host_header::HostHeaderAllowlistLayer;
 pub use stellar_agent_loopback_http::origin_header::OriginHeaderAllowlistLayer;
 pub use stellar_agent_loopback_http::security_headers::SecurityHeadersLayer;
@@ -225,6 +226,9 @@ impl ApprovalPubkeyLookup for PasskeysRegistryPubkeyLookup {
 pub(crate) struct BridgeState {
     pub(crate) approval_store: Arc<Mutex<PendingApprovalStore>>,
     pub(crate) pubkey_lookup: Arc<dyn ApprovalPubkeyLookup>,
+    /// The identity the two ceremony pages render, neutral unless the
+    /// deployment configured one.
+    pub(crate) identity: Arc<PageIdentity>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -331,14 +335,14 @@ impl BridgeHandle {
 /// use std::{net::{IpAddr, Ipv4Addr, SocketAddr}, path::PathBuf, sync::Arc};
 /// use tokio::sync::Mutex;
 /// use stellar_agent_core::approval::store::PendingApprovalStore;
-/// use stellar_agent_webauthn_bridge::start_bridge_register_only;
+/// use stellar_agent_webauthn_bridge::{PageIdentity, start_bridge_register_only};
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let store = Arc::new(Mutex::new(PendingApprovalStore::open(
 ///     PathBuf::from("/tmp/approvals/default.toml"),
 /// )?));
 /// let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-/// let handle = start_bridge_register_only(store, addr).await?;
+/// let handle = start_bridge_register_only(store, addr, PageIdentity::neutral()).await?;
 /// println!("bridge listening on {}", handle.local_addr());
 /// handle.shutdown().await?;
 /// # Ok(())
@@ -358,11 +362,13 @@ impl BridgeHandle {
 pub async fn start_bridge_register_only(
     approval_store: Arc<Mutex<PendingApprovalStore>>,
     bind_addr: SocketAddr,
+    page_identity: PageIdentity,
 ) -> Result<BridgeHandle, BridgeStartError> {
     start_bridge_with_pubkey_lookup(
         approval_store,
         bind_addr,
         Arc::new(MissingApprovalPubkeyLookup),
+        page_identity,
     )
     .await
 }
@@ -382,6 +388,7 @@ pub async fn start_bridge_with_pubkey_lookup(
     approval_store: Arc<Mutex<PendingApprovalStore>>,
     bind_addr: SocketAddr,
     pubkey_lookup: Arc<dyn ApprovalPubkeyLookup>,
+    page_identity: PageIdentity,
 ) -> Result<BridgeHandle, BridgeStartError> {
     // Runtime loopback enforcement: reject any non-loopback bind address.
     if !bind_addr.ip().is_loopback() {
@@ -399,7 +406,7 @@ pub async fn start_bridge_with_pubkey_lookup(
         .map_err(|source| BridgeStartError::Bind { source })?;
 
     // Build the router with all Clone-capable middleware layers applied.
-    let router = build_router(approval_store, pubkey_lookup, local_addr);
+    let router = build_router(approval_store, pubkey_lookup, local_addr, page_identity);
 
     // Global concurrency / request-rate limiting is intentionally not applied
     // here: tower's `ConcurrencyLimit` / `RateLimit` services are not `Clone`
@@ -468,6 +475,7 @@ fn build_router(
     approval_store: Arc<Mutex<PendingApprovalStore>>,
     pubkey_lookup: Arc<dyn ApprovalPubkeyLookup>,
     local_addr: SocketAddr,
+    page_identity: PageIdentity,
 ) -> Router {
     // TraceLayer: path-only logging (never full URI), so query strings and body
     // bytes are never emitted.
@@ -495,6 +503,7 @@ fn build_router(
     let state = BridgeState {
         approval_store,
         pubkey_lookup,
+        identity: Arc::new(page_identity),
     };
 
     routes::build_router()
@@ -540,7 +549,9 @@ mod tests {
     async fn start_bridge_rejects_non_loopback_v4() {
         let (store, _dir) = test_store();
         let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-        let err = start_bridge_register_only(store, addr).await.unwrap_err();
+        let err = start_bridge_register_only(store, addr, PageIdentity::neutral())
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, BridgeStartError::NonLoopbackBind { .. }),
             "expected NonLoopbackBind, got: {err}"
@@ -551,7 +562,9 @@ mod tests {
     async fn start_bridge_rejects_non_loopback_external_ipv4() {
         let (store, _dir) = test_store();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 0);
-        let err = start_bridge_register_only(store, addr).await.unwrap_err();
+        let err = start_bridge_register_only(store, addr, PageIdentity::neutral())
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, BridgeStartError::NonLoopbackBind { .. }),
             "expected NonLoopbackBind for 8.8.8.8, got: {err}"
@@ -562,7 +575,7 @@ mod tests {
     async fn start_bridge_binds_loopback_and_returns_local_addr() {
         let (store, _dir) = test_store();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let handle = start_bridge_register_only(store, addr)
+        let handle = start_bridge_register_only(store, addr, PageIdentity::neutral())
             .await
             .expect("start_bridge_register_only should succeed");
         let local = handle.local_addr();
@@ -578,7 +591,7 @@ mod tests {
     async fn healthz_route_responds_200() {
         let (store, _dir) = test_store();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let handle = start_bridge_register_only(store, addr)
+        let handle = start_bridge_register_only(store, addr, PageIdentity::neutral())
             .await
             .expect("start_bridge_register_only should succeed");
         let local = handle.local_addr();
@@ -615,7 +628,7 @@ mod tests {
     async fn shutdown_completes_within_5s() {
         let (store, _dir) = test_store();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let handle = start_bridge_register_only(store, addr)
+        let handle = start_bridge_register_only(store, addr, PageIdentity::neutral())
             .await
             .expect("start_bridge_register_only should succeed");
 
@@ -629,7 +642,7 @@ mod tests {
     async fn ipv6_loopback_is_accepted_if_available() {
         let (store, _dir) = test_store();
         let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
-        match start_bridge_register_only(store, addr).await {
+        match start_bridge_register_only(store, addr, PageIdentity::neutral()).await {
             Ok(handle) => {
                 // IPv6 available: verify it is loopback.
                 assert!(handle.local_addr().ip().is_loopback());

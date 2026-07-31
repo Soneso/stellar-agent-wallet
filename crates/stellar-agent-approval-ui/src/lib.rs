@@ -65,6 +65,7 @@ pub use decision::{
     Decision, DecisionContext, Outcome, REJECT_TOMBSTONE_TTL_MS, RequestIdentity, apply_decision,
 };
 pub use error::{ServeShutdownError, ServeStartError};
+pub use stellar_agent_loopback_http::brand::PageIdentity;
 pub use stellar_agent_loopback_http::host_header::HostHeaderAllowlistLayer;
 pub use stellar_agent_loopback_http::origin_header::OriginHeaderAllowlistLayer;
 pub use stellar_agent_loopback_http::security_headers::SecurityHeadersLayer;
@@ -95,6 +96,9 @@ const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 pub(crate) struct ServeState {
     pub(crate) auth: Arc<StdMutex<AuthState>>,
     pub(crate) ctx: Arc<DecisionContext>,
+    /// The identity every served page renders, neutral unless the deployment
+    /// configured one.
+    pub(crate) identity: Arc<PageIdentity>,
 }
 
 /// Configuration for [`start_serve`].
@@ -109,10 +113,16 @@ pub struct ServeConfig {
     pub on_pending_count_changed: UnboundedSender<usize>,
     /// Whether to attempt a best-effort OS toast on a count increase.
     pub notify_enabled: bool,
+    /// The identity the served pages announce.
+    ///
+    /// [`PageIdentity::neutral`] unless [`ServeConfig::with_page_identity`]
+    /// supplies one: a deployment that configured nothing serves pages with a
+    /// plain title, no name, and no mark.
+    pub page_identity: PageIdentity,
 }
 
 impl ServeConfig {
-    /// Construct a server configuration.
+    /// Construct a server configuration with the neutral page identity.
     #[must_use]
     pub fn new(
         bind_addr: SocketAddr,
@@ -125,7 +135,15 @@ impl ServeConfig {
             context,
             on_pending_count_changed,
             notify_enabled,
+            page_identity: PageIdentity::neutral(),
         }
+    }
+
+    /// Sets the identity the served pages announce.
+    #[must_use = "builder setters return the updated configuration by value"]
+    pub fn with_page_identity(mut self, page_identity: PageIdentity) -> Self {
+        self.page_identity = page_identity;
+        self
     }
 }
 
@@ -247,6 +265,7 @@ pub async fn start_serve(config: ServeConfig) -> Result<ServeHandle, ServeStartE
     let state = ServeState {
         auth,
         ctx: Arc::new(config.context),
+        identity: Arc::new(config.page_identity),
     };
 
     let router = build_router(state, local_addr);

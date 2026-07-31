@@ -4816,6 +4816,7 @@ dependencies = [
  "stellar-agent-defindex",
  "stellar-agent-dex",
  "stellar-agent-headless-keyring",
+ "stellar-agent-loopback-http",
  "stellar-agent-mpp",
  "stellar-agent-network",
  "stellar-agent-nonce",

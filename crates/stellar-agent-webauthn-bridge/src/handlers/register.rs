@@ -123,7 +123,13 @@ pub(crate) async fn register_get(
     let csrf_hex = hex::encode(csrf_bytes);
     let user_handle_b64 = URL_SAFE_NO_PAD.encode(user_handle);
 
-    let html = templates::render_register_page(&nonce, &csrf_hex, &rp_id, &user_handle_b64);
+    let html = templates::render_register_page(
+        &nonce,
+        &csrf_hex,
+        &rp_id,
+        &user_handle_b64,
+        &state.identity,
+    );
     axum::response::Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/html; charset=utf-8")

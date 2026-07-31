@@ -1,13 +1,28 @@
-//! Shared visual identity for the wallet's server-rendered operator pages.
+//! Shared visual design for the wallet's server-rendered operator pages, and
+//! the per-deployment identity rendered inside it.
 //!
 //! [`BRAND_STYLE`] is the stylesheet fragment carrying the design tokens and
-//! the components every page shares; [`BUDDY_MARK_SVG`] is the inline brand
-//! mark; [`CARD_BRAND_HEADER`], [`TRUST_LINE_LOOPBACK`], and
-//! [`TRUST_LINE_SELF_HOSTED`] are the markup fragments the single-card pages
-//! repeat. Each serving crate emits them into its own page markup, so the
-//! WebAuthn bridge, the loopback approval inbox, the operator-enrollment page,
-//! and the remote-approval surface cannot drift apart the way independently
-//! hand-written copies would.
+//! the components every page shares; [`BUDDY_MARK_SVG`] is the inline project
+//! mark; [`TRUST_LINE_LOOPBACK`] and [`TRUST_LINE_SELF_HOSTED`] are the markup
+//! fragments the single-card pages repeat. Each serving crate emits them into
+//! its own page markup, so the WebAuthn bridge, the loopback approval inbox,
+//! the operator-enrollment page, and the remote-approval surface cannot drift
+//! apart the way independently hand-written copies would.
+//!
+//! # Design is shared; identity is per-deployment
+//!
+//! The design ([`BRAND_STYLE`]) is the same on every deployment and is not
+//! configurable. It carries the security value of the decision surface —
+//! amount-first hierarchy, an untruncated destination, an approve control that
+//! cannot be mistaken for the reject control — so a deployment cannot restyle
+//! what an operator is consenting to.
+//!
+//! The IDENTITY — the name a page announces and whether the project mark is
+//! shown — is [`PageIdentity`], and it defaults to
+//! [`neutral`](PageIdentity::neutral): a page whose deployment configured
+//! nothing carries a plain title, no mark, and no wordmark. This wallet is a
+//! self-hosted runtime that third parties deploy, so an identity default would
+//! put the project's identity inside somebody else's deployment.
 //!
 //! # Why this lives here
 //!
@@ -37,6 +52,8 @@
 //! attribute from the flow it is in — the server renders the initial value and
 //! the page's own script updates `document.documentElement.dataset.state` when
 //! the ceremony resolves. The face is never drawn or animated from script.
+
+use crate::escape::html_escape;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Stylesheet
@@ -429,18 +446,8 @@ body {
 pub const BUDDY_MARK_SVG: &str = r##"<svg class="buddy" viewBox="0 0 120 138" aria-hidden="true" focusable="false"><line x1="60" y1="14" x2="60" y2="30" stroke="#5b8cc9" stroke-width="7" stroke-linecap="round"/><circle cx="60" cy="10" r="9" fill="#ffb35c"/><rect x="12" y="30" width="96" height="78" rx="24" fill="#ffffff" stroke="#5b8cc9" stroke-width="7"/><circle cx="44" cy="64" r="9" fill="#2f5382"/><circle class="buddy-eye-right" cx="76" cy="64" r="9" fill="#2f5382"/><ellipse class="buddy-wink" cx="76" cy="64" rx="9" ry="0.8" fill="#2f5382"/><path class="buddy-mouth" d="M40 84 Q60 100 80 84" fill="none" stroke="#2f5382" stroke-width="7" stroke-linecap="round"/><path class="buddy-mouth-ok" d="M40 84 Q60 99 80 82" fill="none" stroke="#2f5382" stroke-width="7" stroke-linecap="round"/><path class="buddy-mouth-error" d="M42 90 Q60 80 78 90" fill="none" stroke="#2f5382" stroke-width="7" stroke-linecap="round"/></svg>"##;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Card fragments
+// Trust lines
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// The single-card pages' identity block: overline, wordmark, accent bar.
-///
-/// Goes directly after [`BUDDY_MARK_SVG`] inside a `.card`. Emitted by the
-/// bridge's two ceremony pages, the operator-enrollment page, and every card
-/// on the remote-approval surface, so the identity block cannot differ between
-/// them.
-pub const CARD_BRAND_HEADER: &str = r#"      <div class="overline">STELLAR</div>
-      <div class="wordmark">Agent Wallet</div>
-      <div class="bar"></div>"#;
 
 /// The trust line for a page served by a listener bound to the loopback
 /// interface.
@@ -457,6 +464,186 @@ pub const TRUST_LINE_LOOPBACK: &str = r#"      <div class="foot">Served locally 
 /// it does make is self-hosting: the operator's own wallet serves the page and
 /// no third party sits in the path.
 pub const TRUST_LINE_SELF_HOSTED: &str = r#"      <div class="foot">Served by your own wallet &mdash; self-hosted, no third-party service.</div>"#;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-deployment identity
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Maximum number of characters a [`PageIdentity`] display name renders.
+///
+/// A name longer than this is truncated at construction. The bound exists so
+/// no configured value can grow a page without limit or push the page's own
+/// headings out of view; 64 characters is longer than any deployment name that
+/// still reads as one.
+pub const MAX_DISPLAY_NAME_CHARS: usize = 64;
+
+/// The identity a served page announces: an optional display name and whether
+/// the project mark is shown.
+///
+/// [`PageIdentity::neutral`] is the default and renders neither. A deployment
+/// opts into a name, into the mark, or into both.
+///
+/// # What this can and cannot reach
+///
+/// This type renders the identity block only: the page title suffix, the card
+/// header above a page's `<h1>`, and the header bar's left-hand cell. It can
+/// reach no part of the transaction-detail block — the amount, the
+/// destination, the facts grid, the approve and reject controls, the caution
+/// line, and the expiry sentence are rendered from the approval entry alone
+/// and take no configured input.
+///
+/// That boundary is the point. The decision page is a consent surface: its
+/// purpose is the faithful display of what is about to be signed. Configured
+/// styling that could reach it would let anything able to write the
+/// configuration make the page lie about the transaction without touching a
+/// signing key. So the configurable surface is a name and a boolean — never
+/// CSS, never markup, never an asset URL.
+///
+/// # Escaping
+///
+/// The display name is escaped with [`html_escape`] at every render, inside
+/// this type. No caller supplies pre-escaped text, so no call site can route a
+/// name around the escaper. The name reaches element text only; it never
+/// reaches an unquoted attribute, a script, or a style context.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_loopback_http::brand::PageIdentity;
+///
+/// let neutral = PageIdentity::neutral();
+/// assert_eq!(neutral.page_title("Approvals"), "Approvals");
+/// assert!(!neutral.card_header_html().contains("wordmark"));
+///
+/// let named = PageIdentity::new(Some("Acme Ops"), false);
+/// assert_eq!(named.page_title("Approvals"), "Approvals — Acme Ops");
+/// assert!(named.card_header_html().contains("Acme Ops"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PageIdentity {
+    /// The display name, already truncated to [`MAX_DISPLAY_NAME_CHARS`] and
+    /// never empty. `None` means the pages carry no name.
+    display_name: Option<String>,
+    /// Whether the project mark ([`BUDDY_MARK_SVG`]) is rendered.
+    show_project_mark: bool,
+}
+
+impl PageIdentity {
+    /// The identity every unconfigured deployment serves: no name, no mark.
+    #[must_use]
+    pub const fn neutral() -> Self {
+        Self {
+            display_name: None,
+            show_project_mark: false,
+        }
+    }
+
+    /// Constructs an identity from a deployment's configuration.
+    ///
+    /// A `display_name` that is `None`, empty, or whitespace-only yields no
+    /// name — absent configuration never falls back to a built-in name.
+    /// Surrounding whitespace is trimmed and the remainder is truncated to
+    /// [`MAX_DISPLAY_NAME_CHARS`] characters.
+    #[must_use]
+    pub fn new(display_name: Option<&str>, show_project_mark: bool) -> Self {
+        let display_name = display_name
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(|name| name.chars().take(MAX_DISPLAY_NAME_CHARS).collect());
+        Self {
+            display_name,
+            show_project_mark,
+        }
+    }
+
+    /// The configured display name, if any, unescaped.
+    #[must_use]
+    pub fn display_name(&self) -> Option<&str> {
+        self.display_name.as_deref()
+    }
+
+    /// Whether this identity renders the project mark.
+    #[must_use]
+    pub const fn shows_project_mark(&self) -> bool {
+        self.show_project_mark
+    }
+
+    /// The contents of a page's `<title>` element.
+    ///
+    /// `page` names the page itself ("Approvals", "Approve a transaction") and
+    /// is what an unconfigured deployment shows on its own. A configured name
+    /// is appended after an em dash.
+    #[must_use]
+    pub fn page_title(&self, page: &str) -> String {
+        match &self.display_name {
+            Some(name) => format!("{} \u{2014} {}", html_escape(page), html_escape(name)),
+            None => html_escape(page),
+        }
+    }
+
+    /// The identity block for a single-card page, emitted as the first child
+    /// of the `.card` element, above the page's `<h1>`.
+    ///
+    /// Renders the mark when enabled, the display name as the wordmark when
+    /// set, and always the accent bar — the bar is design, not identity, and
+    /// carries the card's vertical rhythm on every deployment.
+    #[must_use]
+    pub fn card_header_html(&self) -> String {
+        let mut out = String::new();
+        if self.show_project_mark {
+            out.push_str("      ");
+            out.push_str(BUDDY_MARK_SVG);
+            out.push('\n');
+        }
+        if let Some(name) = &self.display_name {
+            out.push_str(&format!(
+                "      <div class=\"wordmark\">{}</div>\n",
+                html_escape(name)
+            ));
+        }
+        out.push_str(r#"      <div class="bar"></div>"#);
+        out
+    }
+
+    /// The header bar carried by the list and detail pages.
+    ///
+    /// `right_label` is the page's own right-hand caption and is escaped like
+    /// every other dynamic value. A neutral identity renders the bar with an
+    /// empty left-hand cell rather than announcing a name the deployment did
+    /// not configure.
+    #[must_use]
+    pub fn topbar_html(&self, right_label: &str) -> String {
+        let mut identity = String::new();
+        if self.show_project_mark {
+            identity.push_str("    ");
+            identity.push_str(BUDDY_MARK_SVG);
+            identity.push('\n');
+        }
+        if let Some(name) = &self.display_name {
+            identity.push_str(&format!(
+                "    <div><div class=\"tb-word\">{}</div></div>\n",
+                html_escape(name)
+            ));
+        }
+        format!(
+            "  <header class=\"topbar\">\n{identity}    <div class=\"tb-right\">{right}</div>\n  </header>",
+            right = html_escape(right_label)
+        )
+    }
+
+    /// The mark shown beside an inbox's "nothing pending" message, in its own
+    /// `ok` face state.
+    ///
+    /// Empty unless the deployment enabled the mark.
+    #[must_use]
+    pub fn empty_state_mark_html(&self) -> String {
+        if self.show_project_mark {
+            format!(r#"<span class="buddy-face" data-state="ok">{BUDDY_MARK_SVG}</span>"#)
+        } else {
+            String::new()
+        }
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
@@ -558,5 +745,142 @@ mod tests {
     fn brand_style_spinner_is_a_pseudo_element() {
         assert!(BRAND_STYLE.contains(r#".status[data-state="busy"]::before"#));
         assert!(BRAND_STYLE.contains("prefers-reduced-motion"));
+    }
+
+    // ── PageIdentity ────────────────────────────────────────────────────────
+
+    /// The default is neutral, so a deployment that configures nothing serves
+    /// no name and no mark.
+    #[test]
+    fn default_identity_is_neutral() {
+        let default = PageIdentity::default();
+        assert_eq!(default, PageIdentity::neutral());
+        assert_eq!(default.display_name(), None);
+        assert!(!default.shows_project_mark());
+    }
+
+    #[test]
+    fn a_neutral_identity_renders_no_name_and_no_mark() {
+        let id = PageIdentity::neutral();
+        assert_eq!(id.page_title("Approvals"), "Approvals");
+        assert_eq!(id.card_header_html(), r#"      <div class="bar"></div>"#);
+        assert!(!id.card_header_html().contains("wordmark"));
+        assert!(!id.card_header_html().contains("<svg"));
+        assert!(!id.topbar_html("Approvals").contains("tb-word"));
+        assert!(!id.topbar_html("Approvals").contains("<svg"));
+        assert!(id.empty_state_mark_html().is_empty());
+    }
+
+    #[test]
+    fn a_configured_name_renders_in_the_title_card_and_topbar() {
+        let id = PageIdentity::new(Some("Acme Ops"), false);
+        assert_eq!(id.display_name(), Some("Acme Ops"));
+        assert_eq!(id.page_title("Approvals"), "Approvals \u{2014} Acme Ops");
+        assert!(
+            id.card_header_html()
+                .contains(r#"<div class="wordmark">Acme Ops</div>"#)
+        );
+        assert!(
+            id.topbar_html("Approvals")
+                .contains(r#"<div class="tb-word">Acme Ops</div>"#)
+        );
+        // A name alone must not pull in the mark.
+        assert!(!id.card_header_html().contains("<svg"));
+    }
+
+    #[test]
+    fn the_mark_renders_only_when_enabled() {
+        let with_mark = PageIdentity::new(None, true);
+        assert!(with_mark.shows_project_mark());
+        assert!(with_mark.card_header_html().contains(BUDDY_MARK_SVG));
+        assert!(with_mark.topbar_html("Approvals").contains(BUDDY_MARK_SVG));
+        assert!(
+            with_mark
+                .empty_state_mark_html()
+                .contains(r#"data-state="ok""#)
+        );
+        // The mark alone must not invent a name.
+        assert!(!with_mark.card_header_html().contains("wordmark"));
+        assert_eq!(with_mark.page_title("Approvals"), "Approvals");
+    }
+
+    /// An absent, empty, or whitespace-only name means no name; it never falls
+    /// back to a built-in one.
+    #[test]
+    fn an_empty_name_is_no_name() {
+        for candidate in [None, Some(""), Some("   "), Some("\t\n")] {
+            let id = PageIdentity::new(candidate, false);
+            assert_eq!(id.display_name(), None, "candidate: {candidate:?}");
+            assert_eq!(id.page_title("Approvals"), "Approvals");
+        }
+    }
+
+    #[test]
+    fn a_name_is_trimmed_and_truncated_to_the_bound() {
+        assert_eq!(
+            PageIdentity::new(Some("  Acme Ops  "), false).display_name(),
+            Some("Acme Ops")
+        );
+        let long = "n".repeat(MAX_DISPLAY_NAME_CHARS + 40);
+        let id = PageIdentity::new(Some(&long), false);
+        assert_eq!(
+            id.display_name().map(str::len),
+            Some(MAX_DISPLAY_NAME_CHARS)
+        );
+    }
+
+    /// Truncation counts characters, so a multi-byte name cannot be cut
+    /// mid-code-point.
+    #[test]
+    fn truncation_is_character_wise() {
+        let long = "\u{4E2D}".repeat(MAX_DISPLAY_NAME_CHARS + 10);
+        let id = PageIdentity::new(Some(&long), false);
+        assert_eq!(
+            id.display_name().map(|n| n.chars().count()),
+            Some(MAX_DISPLAY_NAME_CHARS)
+        );
+    }
+
+    /// Every rendered surface routes the name through the escaper, so a name
+    /// carrying markup renders as inert text.
+    #[test]
+    fn a_markup_payload_in_the_name_renders_inert() {
+        let id = PageIdentity::new(Some(r#"<img src=x onerror="alert(1)">"#), true);
+        for rendered in [
+            id.page_title("Approvals"),
+            id.card_header_html(),
+            id.topbar_html("Approvals"),
+        ] {
+            assert!(
+                !rendered.contains("<img"),
+                "unescaped tag reached the page: {rendered}"
+            );
+            assert!(
+                !rendered.contains("onerror=\""),
+                "unescaped event handler reached the page: {rendered}"
+            );
+            assert!(
+                rendered.contains("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;"),
+                "the payload must render as escaped text: {rendered}"
+            );
+        }
+    }
+
+    /// A bidirectional override in the name cannot reverse the rendering of
+    /// the page furniture that follows it.
+    #[test]
+    fn a_bidi_override_in_the_name_is_neutralised() {
+        let id = PageIdentity::new(Some("Acme\u{202E}Ops"), false);
+        assert!(id.card_header_html().contains("Acme\u{FFFD}Ops"));
+        assert!(!id.card_header_html().contains('\u{202E}'));
+    }
+
+    /// The right-hand caption is dynamic text on the same bar; it escapes
+    /// through the same path.
+    #[test]
+    fn the_topbar_right_label_is_escaped() {
+        let bar = PageIdentity::neutral().topbar_html("<b>x</b>");
+        assert!(bar.contains("&lt;b&gt;x&lt;/b&gt;"));
+        assert!(!bar.contains("<b>"));
     }
 }

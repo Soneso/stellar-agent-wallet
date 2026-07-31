@@ -158,6 +158,7 @@ pub(crate) async fn approve_get(
         &auth_digest_hex,
         &credential_id_b64,
         rp_id,
+        &state.identity,
     );
     axum::response::Response::builder()
         .status(StatusCode::OK)

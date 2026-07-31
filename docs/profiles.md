@@ -238,6 +238,33 @@ Optional; absent by default. Enables `approve serve --remote` — see
 | `rp_id` | string | yes (if block present) | — | The WebAuthn Relying Party ID — a DNS hostname that resolves to this host from the approving device. Must NOT be an IP literal (WebAuthn Level 2 §5.1.2 forbids IP-literal Relying Party IDs); rejected fail-closed if it is one. |
 | `allowed_credentials` | array of strings | no | `[]` | Base64url WebAuthn credential IDs authorized to approve or reject. A credential enrolled via `approve operator enroll` but absent from this list is refused identically to an unknown credential. |
 
+### `[served_pages]` block
+
+Optional; absent by default. Names this deployment on the operator-facing web
+pages the wallet serves — the approval inbox and detail pages, the local and
+remote approval surfaces, the passkey ceremony pages, and the
+operator-enrollment page.
+
+**Absent means neutral, not "the project's identity".** A deployment that
+writes no `[served_pages]` block serves pages with a plain title, no name, and
+no mark. The wallet is a self-hosted runtime that third parties deploy, so a
+default identity would put this project's name and mark inside somebody else's
+deployment.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `display_name` | string | no | unset (no name) | The name the served pages announce, in the page title and above each page's heading. At most 64 characters; a longer value is refused at load. An empty or whitespace-only value means no name. HTML-escaped wherever it renders. |
+| `show_project_mark` | bool | no | `false` | Renders the project mark on the served pages. Set by the project's own demo and documentation captures; a third-party deployment has no reason to. |
+
+The page DESIGN — layout, palette, typography, and the decision page's
+hierarchy — is not configurable, and neither is anything the approval page says
+about a transaction. The approval page is a consent surface: its purpose is the
+faithful display of what is about to be signed, so the amount, the destination,
+the facts grid, the approve and reject controls, the caution line, and the
+expiry sentence are rendered from the approval entry alone. Configured CSS,
+markup, or asset URLs would let anything able to write this file make the page
+misstate the transaction without touching a signing key.
+
 ## Secret discipline
 
 No profile field holds a secret. The signer seed, nonce key, and every HMAC and

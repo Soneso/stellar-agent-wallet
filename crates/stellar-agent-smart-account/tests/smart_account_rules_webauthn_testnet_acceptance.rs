@@ -590,6 +590,7 @@ async fn webauthn_passkey_signing_testnet_acceptance() {
         Arc::clone(&store),
         bridge_bind,
         pubkey_lookup,
+        stellar_agent_webauthn_bridge::PageIdentity::neutral(),
     )
     .await
     .expect("bridge must start");

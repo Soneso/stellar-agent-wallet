@@ -63,7 +63,9 @@ use crate::common::profile_access::{
     ProfileAccessError, load_profile_reconciled_by_requested_name, profile_access_envelope,
 };
 use crate::common::render::render_json;
+use crate::common::served_pages::page_identity_for;
 use crate::common::{resolve_profile_name, validate_path_component_ascii_safe};
+use stellar_agent_loopback_http::brand::PageIdentity;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Wire types
@@ -155,13 +157,16 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
     //
     // A profile that merely fails to LOAD is tolerated here: registration
     // predates a fully-configured profile, and the audit-writer open below
-    // already degrades for that case.
-    if let Err(e @ ProfileAccessError::NameMismatch(_)) =
-        load_profile_reconciled_by_requested_name(&profile, None)
-    {
-        render_json(&profile_access_envelope(&e, &profile));
-        return 1;
-    }
+    // already degrades for that case. The bridge pages then carry the neutral
+    // identity, which is what an unconfigured profile would have given anyway.
+    let loaded_profile = match load_profile_reconciled_by_requested_name(&profile, None) {
+        Ok(loaded) => Some(loaded),
+        Err(e @ ProfileAccessError::NameMismatch(_)) => {
+            render_json(&profile_access_envelope(&e, &profile));
+            return 1;
+        }
+        Err(_) => None,
+    };
 
     // ── Open the approval store ONCE; wrap in Arc<Mutex<>> ───────────────────
     // This single Arc is shared between the bridge and the manager.
@@ -223,7 +228,15 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
 
     // ── Start the bridge with the shared store Arc ─────────────────────────
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let bridge = match start_bridge_register_only(Arc::clone(&shared_store), bind_addr).await {
+    let bridge = match start_bridge_register_only(
+        Arc::clone(&shared_store),
+        bind_addr,
+        loaded_profile
+            .as_ref()
+            .map_or_else(PageIdentity::neutral, page_identity_for),
+    )
+    .await
+    {
         Ok(h) => h,
         Err(e) => {
             return emit_error(

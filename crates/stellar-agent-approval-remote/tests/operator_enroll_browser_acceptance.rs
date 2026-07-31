@@ -253,9 +253,15 @@ async fn operator_enroll_browser_creates_and_persists_credential() {
     let store_path = dir.path().join("default.toml");
 
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let handle = start_operator_enroll_server(store_path.clone(), "default", bind_addr, None)
-        .await
-        .expect("start_operator_enroll_server must succeed");
+    let handle = start_operator_enroll_server(
+        store_path.clone(),
+        "default",
+        bind_addr,
+        None,
+        stellar_agent_approval_ui::PageIdentity::neutral(),
+    )
+    .await
+    .expect("start_operator_enroll_server must succeed");
     let url = handle.enroll_url();
     let mut enroll_guard = OperatorEnrollGuard(Some(handle));
 
@@ -508,9 +514,15 @@ async fn post_wrong_csrf_is_refused_over_real_server() {
     let dir = TempDir::new().expect("tempdir");
     let store_path = dir.path().join("default.toml");
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let handle = start_operator_enroll_server(store_path, "default", bind_addr, None)
-        .await
-        .expect("start must succeed");
+    let handle = start_operator_enroll_server(
+        store_path,
+        "default",
+        bind_addr,
+        None,
+        stellar_agent_approval_ui::PageIdentity::neutral(),
+    )
+    .await
+    .expect("start must succeed");
     let port = handle.local_addr().port();
     let base = format!("http://127.0.0.1:{port}");
 
@@ -558,9 +570,15 @@ async fn post_duplicate_credential_id_is_refused_over_real_server() {
         .expect("pre-seed must succeed");
 
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let handle = start_operator_enroll_server(store_path.clone(), "default", bind_addr, None)
-        .await
-        .expect("start must succeed");
+    let handle = start_operator_enroll_server(
+        store_path.clone(),
+        "default",
+        bind_addr,
+        None,
+        stellar_agent_approval_ui::PageIdentity::neutral(),
+    )
+    .await
+    .expect("start must succeed");
     let port = handle.local_addr().port();
     let base = format!("http://127.0.0.1:{port}");
 

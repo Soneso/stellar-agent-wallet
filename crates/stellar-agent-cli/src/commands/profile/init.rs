@@ -195,19 +195,24 @@ pub async fn run(args: &InitArgs) -> i32 {
 /// First-stage typed refusals, evaluated before any build or write work.
 ///
 /// Pinned by unit tests via the wire codes:
-/// `validation.address_invalid` (unsafe profile name),
-/// `validation.mainnet_rpc_url_required` (mainnet without `--rpc-url`),
-/// `validation.config_invalid` (mainnet with a non-HTTPS `--rpc-url` — the
-/// whole point of requiring an explicit endpoint is endpoint trust, so a
-/// plaintext scheme is refused), and
+/// `validation.config_invalid` (unsafe profile name, and mainnet with a
+/// non-HTTPS `--rpc-url` — the whole point of requiring an explicit endpoint
+/// is endpoint trust, so a plaintext scheme is refused),
+/// `validation.mainnet_rpc_url_required` (mainnet without `--rpc-url`), and
 /// `validation.profile_already_exists` (destination file present; the
 /// no-clobber persist repeats this refusal atomically at write time).
 fn init_refusal(args: &InitArgs, profile_name: &str, profile_dir: &Path) -> Option<WalletError> {
     // The name becomes a path component (`<profile_dir>/<name>.toml`);
     // reject path traversal / control characters before any filesystem access.
+    //
+    // `ConfigInvalid` is the variant whose contract covers profile resolution;
+    // `AddressInvalid` is reserved for Stellar account addresses and would
+    // render the refusal as an address-parse failure. `profile show` reports
+    // the same input class under the same code.
     if let Err(reason) = validate_path_component_ascii_safe(profile_name) {
-        return Some(WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("invalid profile name '{profile_name}': {reason}"),
+        return Some(WalletError::Validation(ValidationError::ConfigInvalid {
+            component: "profile",
+            reason: format!("invalid profile name '{profile_name}': {reason}"),
         }));
     }
 
@@ -610,8 +615,10 @@ mod tests {
         assert_eq!(err.code(), "validation.profile_already_exists");
     }
 
-    /// An unsafe profile name refuses with its exact wire code, and no
-    /// refusal fires for a clean state (the gate passes through).
+    /// An unsafe profile name refuses with its exact wire code, naming the
+    /// `profile` component so it is distinguishable from the other
+    /// `validation.config_invalid` refusal this command emits, and no refusal
+    /// fires for a clean state (the gate passes through).
     #[test]
     fn refusal_unsafe_name_yields_typed_code_and_clean_state_passes() {
         let dir = tempfile::tempdir().unwrap();
@@ -622,7 +629,16 @@ mod tests {
             dir.path(),
         )
         .expect("must refuse");
-        assert_eq!(err.code(), "validation.address_invalid");
+        assert_eq!(err.code(), "validation.config_invalid");
+        let message = err.to_string();
+        assert!(
+            message.contains("configuration invalid for 'profile'"),
+            "the refusal must name the profile component: {message}"
+        );
+        assert!(
+            message.contains("invalid profile name '../escape'"),
+            "the refusal must quote the offending name: {message}"
+        );
         let clean = args("clean-name");
         assert!(
             init_refusal(&clean, resolved_name(&clean).as_str(), dir.path()).is_none(),

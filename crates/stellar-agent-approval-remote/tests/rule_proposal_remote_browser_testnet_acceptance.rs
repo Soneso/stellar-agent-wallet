@@ -660,6 +660,7 @@ async fn register_cosigner_credential_via_bridge(
     let bridge_handle = stellar_agent_webauthn_bridge::start_bridge_register_only(
         Arc::clone(&bridge_store),
         bridge_bind,
+        stellar_agent_webauthn_bridge::PageIdentity::neutral(),
     )
     .await
     .expect("bridge must start");

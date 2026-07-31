@@ -223,7 +223,7 @@ fn entry_envelope_sha256(entry: &PendingApproval) -> [u8; 32] {
 /// `GET /` — the login page. No session required; this IS the
 /// pre-authentication surface. Loads the ungated `/static/login.js`.
 async fn login_page_get(State(state): State<RemoteServeState>) -> Response {
-    Html(render_login_page(&state.rp_id)).into_response()
+    Html(render_login_page(&state.rp_id, &state.identity)).into_response()
 }
 
 /// `GET /static/login.js` — the pre-authentication login-ceremony browser
@@ -434,11 +434,12 @@ async fn enroll_page_get(State(state): State<RemoteServeState>) -> Response {
             Html(render_message_page(
                 "Too many requests",
                 "Too many requests. Wait a moment and try again.",
+                &state.identity,
             )),
         )
             .into_response();
     }
-    Html(render_enroll_page(&state.rp_id)).into_response()
+    Html(render_enroll_page(&state.rp_id, &state.identity)).into_response()
 }
 
 /// `GET /static/enroll.js` — the enrollment-page browser glue. Ungated, like
@@ -490,12 +491,14 @@ async fn inbox_get(State(state): State<RemoteServeState>, headers: HeaderMap) ->
         return resp;
     }
     match take_snapshot(&state.ctx.store_path) {
-        SnapshotResult::Ok(pending) => Html(render_inbox_page(&pending)).into_response(),
+        SnapshotResult::Ok(pending) => {
+            Html(render_inbox_page(&pending, &state.identity)).into_response()
+        }
         // The shell still renders on a transient store failure; the
         // client-side poll of /pending.json recovers the rows once the lock
         // clears.
         SnapshotResult::Busy | SnapshotResult::Unavailable => {
-            Html(render_inbox_page(&[])).into_response()
+            Html(render_inbox_page(&[], &state.identity)).into_response()
         }
     }
 }
@@ -546,7 +549,7 @@ async fn approval_detail_get(
 
     let Some(view) = view else {
         drop(store);
-        return Html(render_not_found_page(&nonce)).into_response();
+        return Html(render_not_found_page(&nonce, &state.identity)).into_response();
     };
 
     // For an already-attested payment-style entry, surface the stored blob
@@ -565,6 +568,7 @@ async fn approval_detail_get(
         &view,
         &csrf,
         attestation_blob.as_deref(),
+        &state.identity,
     ))
     .into_response()
 }
@@ -844,10 +848,10 @@ mod tests {
     use stellar_agent_core::audit_log::writer::AuditWriter;
     use stellar_agent_core::profile::schema::KeyringEntryRef;
 
-    use crate::RemoteServeState;
     use crate::challenge_store::{ActionChallengeStore, LoginChallengeStore};
     use crate::rate_limit::TokenBucket;
     use crate::test_helpers::SoftwareAuthenticator;
+    use crate::{PageIdentity, RemoteServeState};
 
     const RP_ID: &str = "wallet.test.internal";
     const ORIGIN: &str = "https://wallet.test.internal:8443";
@@ -914,6 +918,7 @@ mod tests {
             action_challenges: Arc::new(StdMutex::new(ActionChallengeStore::new())),
             login_rate_limiter: Arc::new(StdMutex::new(TokenBucket::default())),
             session: Arc::new(StdMutex::new(None)),
+            identity: Arc::new(PageIdentity::neutral()),
         };
 
         Fixture {

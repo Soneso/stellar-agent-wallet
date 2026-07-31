@@ -14,9 +14,8 @@
 //! same one the WebAuthn bridge's ceremony pages use — this page is also a
 //! single one-shot ceremony the operator either completes or abandons.
 
-use stellar_agent_loopback_http::brand::{
-    BRAND_STYLE, BUDDY_MARK_SVG, CARD_BRAND_HEADER, TRUST_LINE_LOOPBACK,
-};
+use stellar_agent_loopback_http::brand::{BRAND_STYLE, PageIdentity, TRUST_LINE_LOOPBACK};
+use stellar_agent_loopback_http::escape::html_escape;
 
 /// Enrollment-only rules: the label field and its caption.
 const ENROLL_STYLE: &str = r"
@@ -69,15 +68,6 @@ fn json_data_island(value: &serde_json::Value) -> String {
         .replace('&', "\\u0026")
 }
 
-/// HTML-escapes a string for safe interpolation into element text.
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#x27;")
-}
-
 /// Renders the interactive operator-enrollment page (`GET /enroll`).
 ///
 /// # Parameters
@@ -104,8 +94,11 @@ pub(super) fn render_enroll_page(
     profile: &str,
     csrf_hex: &str,
     label_prefill: Option<&str>,
+    identity: &PageIdentity,
 ) -> String {
     let profile_escaped = html_escape(profile);
+    let title = identity.page_title("Enroll operator passkey");
+    let card_header = identity.card_header_html();
     let label_prefill_attr = label_prefill
         .map(|l| format!(r#" value="{}""#, html_escape(l)))
         .unwrap_or_default();
@@ -121,14 +114,13 @@ pub(super) fn render_enroll_page(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Enroll operator passkey — Stellar Agent Wallet</title>
+  <title>{title}</title>
   <style>{BRAND_STYLE}{ENROLL_STYLE}</style>
 </head>
 <body>
   <main class="page">
     <div class="card">
-      {BUDDY_MARK_SVG}
-{CARD_BRAND_HEADER}
+{card_header}
       <h1>Enroll operator passkey</h1>
       <p class="lead">Profile <code class="chip">{profile_escaped}</code>, registering
          against <code class="chip">localhost</code>. Name this device, then
@@ -167,6 +159,15 @@ mod tests {
     )]
     use super::*;
 
+    /// The identity a deployment that configured nothing serves.
+    fn neutral() -> PageIdentity {
+        PageIdentity::neutral()
+    }
+
+    /// The mark's neutral-mouth path data, which appears in no other markup on
+    /// the page.
+    const MARK_PATH_DATA: &str = r##"d="M40 84 Q60 100 80 84""##;
+
     fn data_island(html: &str) -> &str {
         let open = r#"<script type="application/json" id="enroll-data">"#;
         let start = html.find(open).expect("data island opening tag") + open.len();
@@ -181,7 +182,7 @@ mod tests {
 
     #[test]
     fn page_data_island_carries_localhost_rp_id_profile_and_csrf() {
-        let html = render_enroll_page("default", &"a".repeat(64), None);
+        let html = render_enroll_page("default", &"a".repeat(64), None, &neutral());
         let parsed = parse_island(&html);
         assert_eq!(parsed["rpId"], "localhost");
         assert_eq!(parsed["profile"], "default");
@@ -190,7 +191,7 @@ mod tests {
 
     #[test]
     fn page_has_no_inline_event_handler_attributes() {
-        let html = render_enroll_page("default", &"b".repeat(64), None);
+        let html = render_enroll_page("default", &"b".repeat(64), None, &neutral());
         assert!(
             !html.to_lowercase().contains("onclick="),
             "page must not use inline event handler attributes"
@@ -199,7 +200,7 @@ mod tests {
 
     #[test]
     fn page_loads_only_the_same_origin_script() {
-        let html = render_enroll_page("default", &"c".repeat(64), None);
+        let html = render_enroll_page("default", &"c".repeat(64), None, &neutral());
         assert!(html.contains(r#"src="/static/operator-enroll.js""#));
         // No other <script src=...> beyond the one same-origin file and the
         // JSON data island (which carries no `src` attribute).
@@ -209,53 +210,90 @@ mod tests {
 
     #[test]
     fn page_neutralises_angle_brackets_in_profile() {
-        let html = render_enroll_page("<script>x</script>", &"d".repeat(64), None);
+        let html = render_enroll_page("<script>x</script>", &"d".repeat(64), None, &neutral());
         assert!(!html.contains("<script>x</script>"));
         assert_eq!(parse_island(&html)["profile"], "<script>x</script>");
     }
 
     #[test]
     fn page_contains_label_input_and_button() {
-        let html = render_enroll_page("default", &"e".repeat(64), None);
+        let html = render_enroll_page("default", &"e".repeat(64), None, &neutral());
         assert!(html.contains(r#"id="label-input""#));
         assert!(html.contains(r#"id="enroll-btn""#));
     }
 
     #[test]
     fn page_without_prefill_has_no_value_attribute() {
-        let html = render_enroll_page("default", &"f".repeat(64), None);
+        let html = render_enroll_page("default", &"f".repeat(64), None, &neutral());
         assert!(!html.contains(r#"id="label-input" maxlength="64" autocomplete="off" value"#));
     }
 
     #[test]
     fn page_with_prefill_populates_label_input_value() {
-        let html = render_enroll_page("default", &"g".repeat(64), Some("my-laptop"));
+        let html = render_enroll_page("default", &"g".repeat(64), Some("my-laptop"), &neutral());
         assert!(html.contains(r#"value="my-laptop""#));
     }
 
     #[test]
     fn page_prefill_html_escapes_the_label() {
-        let html = render_enroll_page("default", &"h".repeat(64), Some("<b>x</b>"));
+        let html = render_enroll_page("default", &"h".repeat(64), Some("<b>x</b>"), &neutral());
         assert!(!html.contains("<b>x</b>"));
         assert!(html.contains("&lt;b&gt;x&lt;/b&gt;"));
     }
 
-    // ── Brand surface ────────────────────────────────────────────────────
+    // ── Design surface and per-deployment identity ───────────────────────
 
     /// A duplicated stylesheet would silently double every rule; a missing one
-    /// would render the page unstyled.
+    /// would render the page unstyled. The design holds under every identity.
     #[test]
-    fn page_embeds_the_brand_style_exactly_once_and_the_mark() {
-        let html = render_enroll_page("default", &"i".repeat(64), None);
-        assert_eq!(html.matches(BRAND_STYLE).count(), 1);
-        assert!(html.contains(BUDDY_MARK_SVG));
+    fn page_embeds_the_brand_style_exactly_once_under_every_identity() {
+        for identity in [
+            PageIdentity::neutral(),
+            PageIdentity::new(Some("Acme Ops"), false),
+            PageIdentity::new(Some("Acme Ops"), true),
+        ] {
+            let html = render_enroll_page("default", &"i".repeat(64), None, &identity);
+            assert_eq!(html.matches(BRAND_STYLE).count(), 1);
+        }
+    }
+
+    /// An unconfigured deployment serves no project identity.
+    #[test]
+    fn an_unconfigured_deployment_serves_no_mark_and_no_wordmark() {
+        let html = render_enroll_page("default", &"i".repeat(64), None, &neutral());
+        assert!(!html.contains(MARK_PATH_DATA), "{html}");
+        assert!(!html.contains(">STELLAR<"), "{html}");
+        assert!(!html.contains("Agent Wallet"), "{html}");
+    }
+
+    /// A configured display name renders escaped; the mark renders only when
+    /// the deployment asked for it.
+    #[test]
+    fn a_configured_identity_renders_the_name_and_the_mark() {
+        let named = render_enroll_page(
+            "default",
+            &"i".repeat(64),
+            None,
+            &PageIdentity::new(Some("<b>Acme</b>"), false),
+        );
+        assert!(named.contains("&lt;b&gt;Acme&lt;/b&gt;"), "{named}");
+        assert!(!named.contains("<b>Acme</b>"), "{named}");
+        assert!(!named.contains(MARK_PATH_DATA), "{named}");
+
+        let marked = render_enroll_page(
+            "default",
+            &"i".repeat(64),
+            None,
+            &PageIdentity::new(Some("Acme Ops"), true),
+        );
+        assert!(marked.contains(MARK_PATH_DATA), "{marked}");
     }
 
     /// `img-src 'self'` blocks every remote origin, so a page referencing one
     /// would render a hole rather than fail loudly.
     #[test]
     fn page_references_no_external_origin() {
-        let html = render_enroll_page("default", &"j".repeat(64), None);
+        let html = render_enroll_page("default", &"j".repeat(64), None, &neutral());
         assert!(!html.contains("http://"));
         assert!(!html.contains("https://"));
     }
@@ -266,7 +304,7 @@ mod tests {
     /// `SocketAddr::ip().is_loopback()`, which admits `::1` too.
     #[test]
     fn page_carries_the_loopback_trust_line() {
-        let html = render_enroll_page("default", &"k".repeat(64), None);
+        let html = render_enroll_page("default", &"k".repeat(64), None, &neutral());
         assert!(html.contains(TRUST_LINE_LOOPBACK));
         assert!(
             !html.contains("127.0.0.1"),
@@ -277,7 +315,7 @@ mod tests {
     /// Enrolling grants nothing on its own; the page has to say so.
     #[test]
     fn page_states_that_enrollment_alone_grants_nothing() {
-        let html = render_enroll_page("default", &"l".repeat(64), None);
+        let html = render_enroll_page("default", &"l".repeat(64), None, &neutral());
         assert!(html.contains("allowed_credentials"));
         assert!(html.contains("does not grant that by itself"));
     }

@@ -248,11 +248,17 @@ async fn inbox_get(
         SnapshotResult::Ok {
             pending,
             expired_count,
-        } => Html(render_inbox_page(&pending, expired_count, include_expired)).into_response(),
+        } => Html(render_inbox_page(
+            &pending,
+            expired_count,
+            include_expired,
+            &state.identity,
+        ))
+        .into_response(),
         // The shell still renders on a transient store failure; the client-side
         // poll of /pending.json recovers the rows once the lock clears.
         SnapshotResult::Busy | SnapshotResult::Unavailable => {
-            Html(render_inbox_page(&[], 0, include_expired)).into_response()
+            Html(render_inbox_page(&[], 0, include_expired, &state.identity)).into_response()
         }
     }
 }
@@ -316,7 +322,7 @@ async fn approval_detail_get(
         .find(|v| v.approval_nonce == nonce);
 
     let Some(view) = view else {
-        return Html(render_not_found_page(&nonce)).into_response();
+        return Html(render_not_found_page(&nonce, &state.identity)).into_response();
     };
 
     // For an already-attested payment-style entry, surface the stored blob so a
@@ -335,6 +341,7 @@ async fn approval_detail_get(
         &view,
         &csrf,
         attestation_blob.as_deref(),
+        &state.identity,
     ))
     .into_response()
 }

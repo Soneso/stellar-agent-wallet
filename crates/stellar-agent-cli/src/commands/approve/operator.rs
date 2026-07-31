@@ -51,10 +51,13 @@ use stellar_agent_core::approval::operator_credentials::{
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{InternalError, WalletError};
 use stellar_agent_core::timefmt;
+use stellar_agent_loopback_http::brand::PageIdentity;
 
 use crate::common::display_available;
+use crate::common::profile_access::load_profile_reconciled_by_requested_name;
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
+use crate::common::served_pages::page_identity_for;
 
 /// Reminder attached to every successful enrollment, in both modes:
 /// enrollment writes to the credential store only — it never touches the
@@ -333,20 +336,32 @@ async fn run_enroll_interactive(profile_name: String, args: EnrollArgs) -> i32 {
         }
     };
 
+    // The identity the page announces is presentation only, so a profile that
+    // cannot be loaded yields the neutral identity rather than blocking the
+    // ceremony: this command creates a credential and needs no profile file.
+    let page_identity = load_profile_reconciled_by_requested_name(&profile_name, None)
+        .as_ref()
+        .map_or_else(|_| PageIdentity::neutral(), page_identity_for);
+
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let mut handle =
-        match start_operator_enroll_server(store_path, profile_name, bind_addr, args.label.clone())
-            .await
-        {
-            Ok(h) => h,
-            Err(e) => {
-                let err = WalletError::Internal(InternalError::UnexpectedState {
-                    detail: format!("approve.operator_enroll_interactive_start_failed: {e}"),
-                });
-                render_json(&Envelope::<()>::err(&err));
-                return 1;
-            }
-        };
+    let mut handle = match start_operator_enroll_server(
+        store_path,
+        profile_name,
+        bind_addr,
+        args.label.clone(),
+        page_identity,
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            let err = WalletError::Internal(InternalError::UnexpectedState {
+                detail: format!("approve.operator_enroll_interactive_start_failed: {e}"),
+            });
+            render_json(&Envelope::<()>::err(&err));
+            return 1;
+        }
+    };
 
     let url = handle.enroll_url();
     print_interactive_startup(&url);

@@ -49,6 +49,7 @@ use stellar_agent_smart_account::managers::credentials::{AddPasskeyOutcome, Cred
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 
+use stellar_agent_webauthn_bridge::PageIdentity;
 use stellar_agent_webauthn_bridge::start_bridge_register_only;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -106,9 +107,13 @@ async fn bridge_registration_happy_path() {
 
     // ── 2. Start real bridge (port 0 loopback) ────────────────────────────
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let bridge_handle = start_bridge_register_only(Arc::clone(&shared_store), bind_addr)
-        .await
-        .expect("start_bridge_register_only must succeed on loopback port 0");
+    let bridge_handle = start_bridge_register_only(
+        Arc::clone(&shared_store),
+        bind_addr,
+        PageIdentity::neutral(),
+    )
+    .await
+    .expect("start_bridge_register_only must succeed on loopback port 0");
     let local_addr = bridge_handle.local_addr();
 
     // ── 3. CredentialsManager with the SAME shared store ─────────────────
@@ -340,9 +345,13 @@ async fn bridge_get_hex_encoded_nonce_returns_404() {
     let shared_store = open_shared_store(&dir);
 
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let bridge_handle = start_bridge_register_only(Arc::clone(&shared_store), bind_addr)
-        .await
-        .expect("start_bridge_register_only");
+    let bridge_handle = start_bridge_register_only(
+        Arc::clone(&shared_store),
+        bind_addr,
+        PageIdentity::neutral(),
+    )
+    .await
+    .expect("start_bridge_register_only");
     let local_addr = bridge_handle.local_addr();
 
     let passkeys_dir = dir.path().join("passkeys");
