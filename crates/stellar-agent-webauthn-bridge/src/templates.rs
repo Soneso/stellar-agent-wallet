@@ -44,9 +44,7 @@
 //! moves it as the ceremony resolves, writing only `textContent` and
 //! `dataset.state`.
 
-use stellar_agent_loopback_http::brand::{
-    BRAND_STYLE, BUDDY_MARK_SVG, CARD_BRAND_HEADER, TRUST_LINE_LOOPBACK,
-};
+use stellar_agent_loopback_http::brand::{BRAND_STYLE, PageIdentity, TRUST_LINE_LOOPBACK};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Data island
@@ -99,7 +97,10 @@ pub(crate) fn render_register_page(
     csrf_hex: &str,
     rp_id: &str,
     user_handle_b64: &str,
+    identity: &PageIdentity,
 ) -> String {
+    let title = identity.page_title("Register a passkey");
+    let card_header = identity.card_header_html();
     let data_island = json_data_island(&serde_json::json!({
         "flow": "register",
         "nonce": nonce,
@@ -114,14 +115,13 @@ pub(crate) fn render_register_page(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Register a passkey — Stellar Agent Wallet</title>
+  <title>{title}</title>
   <style>{BRAND_STYLE}</style>
 </head>
 <body>
   <main class="page">
     <div class="card">
-      {BUDDY_MARK_SVG}
-{CARD_BRAND_HEADER}
+{card_header}
       <h1>Register a passkey</h1>
       <p class="lead">Your wallet asked to add a new passkey for approving
          transactions. Your browser will prompt you next &mdash; confirm with
@@ -176,7 +176,10 @@ pub(crate) fn render_approve_page(
     auth_digest_hex: &str,
     credential_id_b64: &str,
     rp_id: &str,
+    identity: &PageIdentity,
 ) -> String {
+    let title = identity.page_title("Approve a transaction");
+    let card_header = identity.card_header_html();
     let data_island = json_data_island(&serde_json::json!({
         "flow": "approve",
         "nonce": nonce,
@@ -192,14 +195,13 @@ pub(crate) fn render_approve_page(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Approve a transaction — Stellar Agent Wallet</title>
+  <title>{title}</title>
   <style>{BRAND_STYLE}</style>
 </head>
 <body>
   <main class="page">
     <div class="card">
-      {BUDDY_MARK_SVG}
-{CARD_BRAND_HEADER}
+{card_header}
       <h1>Approve a transaction</h1>
       <p class="lead">Your wallet is asking you to authorise a pending
          transaction. Review the details in your terminal, then confirm here
@@ -242,6 +244,25 @@ mod tests {
         &rest[..end]
     }
 
+    /// The identity a deployment that configured nothing serves.
+    fn neutral() -> PageIdentity {
+        PageIdentity::neutral()
+    }
+
+    /// A deployment that configured a display name and left the mark off.
+    fn named() -> PageIdentity {
+        PageIdentity::new(Some("Acme Ops"), false)
+    }
+
+    /// A deployment that turned the project mark on as well.
+    fn marked() -> PageIdentity {
+        PageIdentity::new(Some("Acme Ops"), true)
+    }
+
+    /// The mark's neutral-mouth path data, which appears in no other markup on
+    /// either page.
+    const MARK_PATH_DATA: &str = r##"d="M40 84 Q60 100 80 84""##;
+
     /// Parse a rendered page's data island back into a JSON value.
     fn parse_island(html: &str) -> serde_json::Value {
         serde_json::from_str(data_island(html)).expect("data island must be valid JSON")
@@ -276,6 +297,7 @@ mod tests {
             &"d".repeat(64),
             "localhost",
             "dXNlcmhhbmRsZQ",
+            &neutral(),
         );
         let parsed = parse_island(&html);
         assert_eq!(parsed["flow"], "register");
@@ -292,6 +314,7 @@ mod tests {
             &"aabbccdd".repeat(8),
             "credid_b64",
             "localhost",
+            &neutral(),
         );
         let parsed = parse_island(&html);
         assert_eq!(parsed["flow"], "approve");
@@ -306,7 +329,8 @@ mod tests {
         // A value containing `<`/`>` must not appear literally (which could form
         // `</script>`); it is JSON-unicode-escaped, and the island still parses
         // back to the original value.
-        let html = render_register_page("n", &"c".repeat(64), "a<b>c", "dXNlcmhhbmRsZQ");
+        let html =
+            render_register_page("n", &"c".repeat(64), "a<b>c", "dXNlcmhhbmRsZQ", &neutral());
         assert!(
             !html.contains("a<b>c"),
             "raw angle brackets must not appear in the page"
@@ -317,7 +341,13 @@ mod tests {
 
     #[test]
     fn render_register_page_contains_script_src() {
-        let html = render_register_page("n", &"c".repeat(64), "localhost", "dXNlcmhhbmRsZQ");
+        let html = render_register_page(
+            "n",
+            &"c".repeat(64),
+            "localhost",
+            "dXNlcmhhbmRsZQ",
+            &neutral(),
+        );
         assert!(
             html.contains(r#"src="/static/webauthn.js""#),
             "page must include the webauthn.js bundle script tag"
@@ -330,7 +360,14 @@ mod tests {
 
     #[test]
     fn render_approve_page_contains_script_src() {
-        let html = render_approve_page("n", &"c".repeat(64), &"a".repeat(64), "cid", "localhost");
+        let html = render_approve_page(
+            "n",
+            &"c".repeat(64),
+            &"a".repeat(64),
+            "cid",
+            "localhost",
+            &neutral(),
+        );
         assert!(
             html.contains(r#"src="/static/webauthn.js""#),
             "page must include the webauthn.js bundle script tag"
@@ -343,42 +380,93 @@ mod tests {
 
     #[test]
     fn render_register_page_contains_json_data_island_tag() {
-        let html = render_register_page("n", &"c".repeat(64), "localhost", "dXNlcmhhbmRsZQ");
+        let html = render_register_page(
+            "n",
+            &"c".repeat(64),
+            "localhost",
+            "dXNlcmhhbmRsZQ",
+            &neutral(),
+        );
         assert!(
             html.contains(r#"type="application/json" id="webauthn-options""#),
             "page must include the JSON data-island script tag"
         );
     }
 
-    // ── Brand surface ────────────────────────────────────────────────────────
+    // ── Design surface and per-deployment identity ──────────────────────────
 
-    fn both_pages() -> [String; 2] {
+    fn both_pages_with(identity: &PageIdentity) -> [String; 2] {
         [
-            render_register_page("n", &"c".repeat(64), "localhost", "dXNlcmhhbmRsZQ"),
-            render_approve_page("n", &"c".repeat(64), &"a".repeat(64), "cid", "localhost"),
+            render_register_page(
+                "n",
+                &"c".repeat(64),
+                "localhost",
+                "dXNlcmhhbmRsZQ",
+                identity,
+            ),
+            render_approve_page(
+                "n",
+                &"c".repeat(64),
+                &"a".repeat(64),
+                "cid",
+                "localhost",
+                identity,
+            ),
         ]
     }
 
+    fn both_pages() -> [String; 2] {
+        both_pages_with(&neutral())
+    }
+
     /// A duplicated stylesheet would silently double every rule; a missing one
-    /// would render the page unstyled.
+    /// would render the page unstyled. The design is the same on every
+    /// deployment, so it holds under each identity.
     #[test]
     fn both_pages_embed_the_brand_style_exactly_once() {
-        for html in both_pages() {
-            assert_eq!(
-                html.matches(BRAND_STYLE).count(),
-                1,
-                "the brand style must appear exactly once per page"
+        for identity in [neutral(), named(), marked()] {
+            for html in both_pages_with(&identity) {
+                assert_eq!(
+                    html.matches(BRAND_STYLE).count(),
+                    1,
+                    "the brand style must appear exactly once per page"
+                );
+            }
+        }
+    }
+
+    /// An unconfigured deployment serves no project identity.
+    #[test]
+    fn an_unconfigured_deployment_serves_no_mark_and_no_wordmark() {
+        for html in both_pages_with(&neutral()) {
+            assert!(!html.contains(MARK_PATH_DATA), "{html}");
+            assert!(!html.contains(">STELLAR<"), "{html}");
+            assert!(!html.contains("Agent Wallet"), "{html}");
+        }
+    }
+
+    /// A configured display name renders; a name carrying markup is inert.
+    #[test]
+    fn a_configured_display_name_renders_escaped() {
+        for html in both_pages_with(&named()) {
+            assert!(html.contains("Acme Ops"), "{html}");
+            assert!(!html.contains(MARK_PATH_DATA), "{html}");
+        }
+        let hostile = PageIdentity::new(Some("</title><script>alert(1)</script>"), false);
+        for html in both_pages_with(&hostile) {
+            assert!(!html.contains("<script>alert(1)</script>"), "{html}");
+            assert!(
+                html.contains("&lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;"),
+                "{html}"
             );
         }
     }
 
+    /// The mark renders when the deployment asks for it.
     #[test]
-    fn both_pages_embed_the_brand_mark() {
-        for html in both_pages() {
-            assert!(
-                html.contains(BUDDY_MARK_SVG),
-                "the brand mark must be present on the page"
-            );
+    fn the_project_mark_renders_when_enabled() {
+        for html in both_pages_with(&marked()) {
+            assert!(html.contains(MARK_PATH_DATA), "{html}");
         }
     }
 
@@ -404,13 +492,26 @@ mod tests {
 
     #[test]
     fn register_page_names_the_command_that_mints_a_fresh_link() {
-        let html = render_register_page("n", &"c".repeat(64), "localhost", "dXNlcmhhbmRsZQ");
+        let html = render_register_page(
+            "n",
+            &"c".repeat(64),
+            "localhost",
+            "dXNlcmhhbmRsZQ",
+            &neutral(),
+        );
         assert!(html.contains("<code>stellar-agent credentials add-passkey</code>"));
     }
 
     #[test]
     fn approve_page_warns_against_approving_an_uninitiated_request() {
-        let html = render_approve_page("n", &"c".repeat(64), &"a".repeat(64), "cid", "localhost");
+        let html = render_approve_page(
+            "n",
+            &"c".repeat(64),
+            &"a".repeat(64),
+            "cid",
+            "localhost",
+            &neutral(),
+        );
         assert!(html.contains("Only approve if you initiated this"));
         assert!(html.contains("nothing is signed without your passkey"));
     }

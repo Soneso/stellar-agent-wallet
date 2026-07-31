@@ -39,9 +39,7 @@ use stellar_agent_approval_ui::{
     DETAIL_STYLE, INBOX_STYLE, approve_button_label, html_escape, kind_pill,
     render_rule_proposal_definition_html, render_summary_html,
 };
-use stellar_agent_loopback_http::brand::{
-    BRAND_STYLE, BUDDY_MARK_SVG, CARD_BRAND_HEADER, TRUST_LINE_SELF_HOSTED,
-};
+use stellar_agent_loopback_http::brand::{BRAND_STYLE, PageIdentity, TRUST_LINE_SELF_HOSTED};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Page-local styling and shared fragments
@@ -66,18 +64,6 @@ const CARD_STYLE: &str = r"
 .outputs p { font-size: 11px; font-weight: 700; letter-spacing: .8px; text-transform: uppercase; color: var(--muted-blue); margin: 12px 0 4px; }
 .outputs textarea { width: 100%; }
 ";
-
-/// Renders the header bar carried by the inbox and detail pages.
-fn topbar_html(right_label: &str) -> String {
-    format!(
-        r#"  <header class="topbar">
-    {BUDDY_MARK_SVG}
-    <div><div class="tb-over">STELLAR</div><div class="tb-word">Agent Wallet</div></div>
-    <div class="tb-right">{right}</div>
-  </header>"#,
-        right = html_escape(right_label)
-    )
-}
 
 /// Serialise `value` to JSON safe to embed inside a
 /// `<script type="application/json">` element.
@@ -111,22 +97,23 @@ fn kind_is_approvable(summary: &ApprovalSummaryView) -> bool {
 /// Renders the login page (`GET /`) — no session required; this IS the
 /// pre-authentication surface. Loads the ungated `/static/login.js`.
 #[must_use]
-pub(crate) fn render_login_page(rp_id: &str) -> String {
+pub(crate) fn render_login_page(rp_id: &str, identity: &PageIdentity) -> String {
     let rp_id = html_escape(rp_id);
+    let title = identity.page_title("Sign in to approve");
+    let card_header = identity.card_header_html();
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Stellar Agent Wallet — Remote Approval</title>
+  <title>{title}</title>
   <style>{BRAND_STYLE}{CARD_STYLE}</style>
 </head>
 <body>
   <main class="page">
     <div class="card">
-      {BUDDY_MARK_SVG}
-{CARD_BRAND_HEADER}
+{card_header}
       <h1>Sign in to approve</h1>
       <p class="lead">Connecting to <code class="chip">{rp_id}</code>. Confirm with
          the passkey you enrolled for this wallet to see the requests waiting for
@@ -162,8 +149,10 @@ pub(crate) fn render_login_page(rp_id: &str) -> String {
 /// "Enrollment stays loopback-only" note). There is no corresponding write
 /// endpoint on this surface.
 #[must_use]
-pub(crate) fn render_enroll_page(rp_id: &str) -> String {
+pub(crate) fn render_enroll_page(rp_id: &str, identity: &PageIdentity) -> String {
     let rp_id_escaped = html_escape(rp_id);
+    let title = identity.page_title("Enroll a passkey");
+    let card_header = identity.card_header_html();
     let data_island = json_data_island(&serde_json::json!({ "rp_id": rp_id }));
 
     format!(
@@ -172,14 +161,13 @@ pub(crate) fn render_enroll_page(rp_id: &str) -> String {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Enroll a passkey — Stellar Agent Wallet</title>
+  <title>{title}</title>
   <style>{BRAND_STYLE}{CARD_STYLE}</style>
 </head>
 <body>
   <main class="page">
     <div class="card">
-      {BUDDY_MARK_SVG}
-{CARD_BRAND_HEADER}
+{card_header}
       <h1>Enroll a passkey</h1>
       <p class="lead">Registering against <code class="chip">{rp_id_escaped}</code>.
          This page creates a new passkey and shows the values needed to enroll
@@ -205,23 +193,24 @@ pub(crate) fn render_enroll_page(rp_id: &str) -> String {
 /// discipline as every other server-rendered page in this crate, so a
 /// refusal never looks different from a normal page to the operator.
 #[must_use]
-pub(crate) fn render_message_page(title: &str, message: &str) -> String {
+pub(crate) fn render_message_page(title: &str, message: &str, identity: &PageIdentity) -> String {
     let title_escaped = html_escape(title);
     let message_escaped = html_escape(message);
+    let page_title = identity.page_title(title);
+    let card_header = identity.card_header_html();
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{title_escaped} — Stellar Agent Wallet</title>
+  <title>{page_title}</title>
   <style>{BRAND_STYLE}</style>
 </head>
 <body>
   <main class="page">
     <div class="card">
-      {BUDDY_MARK_SVG}
-{CARD_BRAND_HEADER}
+{card_header}
       <h1>{title_escaped}</h1>
       <p class="lead">{message_escaped}</p>
 {TRUST_LINE_SELF_HOSTED}
@@ -243,9 +232,14 @@ pub(crate) fn render_message_page(title: &str, message: &str) -> String {
 /// itself. It carries the `hidden` attribute when the seeded snapshot has
 /// entries; the script toggles that attribute on every refresh.
 #[must_use]
-pub(crate) fn render_inbox_page(pending: &[PendingApprovalView]) -> String {
+pub(crate) fn render_inbox_page(
+    pending: &[PendingApprovalView],
+    identity: &PageIdentity,
+) -> String {
     let data_island = json_data_island(&serde_json::json!({ "pending": pending }));
-    let topbar = topbar_html("Approvals");
+    let title = identity.page_title("Approvals");
+    let topbar = identity.topbar_html("Approvals");
+    let empty_mark = identity.empty_state_mark_html();
     let empty_hidden = if pending.is_empty() { "" } else { " hidden" };
 
     format!(
@@ -254,7 +248,7 @@ pub(crate) fn render_inbox_page(pending: &[PendingApprovalView]) -> String {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Stellar Agent Wallet — Remote Approval</title>
+  <title>{title}</title>
   <style>{BRAND_STYLE}{INBOX_STYLE}</style>
 </head>
 <body>
@@ -264,7 +258,7 @@ pub(crate) fn render_inbox_page(pending: &[PendingApprovalView]) -> String {
     <p class="sub" id="status">Loading&hellip;</p>
     <div id="inbox"></div>
     <div class="empty" id="empty-state"{empty_hidden}>
-      <span class="buddy-face" data-state="ok">{BUDDY_MARK_SVG}</span>
+      {empty_mark}
       <p>All caught up &mdash; no approvals waiting.</p>
     </div>
   </main>
@@ -279,22 +273,23 @@ pub(crate) fn render_inbox_page(pending: &[PendingApprovalView]) -> String {
 /// Renders a clean "not found in queue" page (HTTP 200, authenticated UX
 /// case).
 #[must_use]
-pub(crate) fn render_not_found_page(nonce: &str) -> String {
+pub(crate) fn render_not_found_page(nonce: &str, identity: &PageIdentity) -> String {
     let nonce = html_escape(nonce);
+    let title = identity.page_title("Approval not found");
+    let card_header = identity.card_header_html();
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Approval not found — Stellar Agent Wallet</title>
+  <title>{title}</title>
   <style>{BRAND_STYLE}</style>
 </head>
 <body>
   <main class="page">
     <div class="card">
-      {BUDDY_MARK_SVG}
-{CARD_BRAND_HEADER}
+{card_header}
       <h1>Approval not found</h1>
       <p class="lead">No pending approval with nonce <code class="chip">{nonce}</code>
          is in the queue. It may have been approved, rejected, or expired
@@ -328,6 +323,7 @@ pub(crate) fn render_detail_page(
     view: &PendingApprovalView,
     csrf_hex: &str,
     attestation_blob: Option<&str>,
+    identity: &PageIdentity,
 ) -> String {
     let approvable = kind_is_approvable(&view.summary) && !view.expired && !view.attested;
     let summary_html = render_summary_html(view);
@@ -426,7 +422,8 @@ pub(crate) fn render_detail_page(
         "csrf": csrf_hex,
         "approvable": approvable,
     }));
-    let topbar = topbar_html("Approvals");
+    let title = identity.page_title("Approval detail");
+    let topbar = identity.topbar_html("Approvals");
 
     format!(
         r#"<!DOCTYPE html>
@@ -434,7 +431,7 @@ pub(crate) fn render_detail_page(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Approval detail — Stellar Agent Wallet</title>
+  <title>{title}</title>
   <style>{BRAND_STYLE}{DETAIL_STYLE}</style>
 </head>
 <body>
@@ -487,6 +484,25 @@ mod tests {
     use tempfile::TempDir;
 
     const NOW_MS: u64 = 1_700_000_000_000;
+
+    /// The identity a deployment that configured nothing serves.
+    fn neutral() -> PageIdentity {
+        PageIdentity::neutral()
+    }
+
+    /// A deployment that configured a display name and left the mark off.
+    fn named() -> PageIdentity {
+        PageIdentity::new(Some("Acme Ops"), false)
+    }
+
+    /// A deployment that turned the project mark on as well.
+    fn marked() -> PageIdentity {
+        PageIdentity::new(Some("Acme Ops"), true)
+    }
+
+    /// The mark's neutral-mouth path data, which appears in no other markup on
+    /// any page.
+    const MARK_PATH_DATA: &str = r##"d="M40 84 Q60 100 80 84""##;
 
     /// Build a payment view via a real store snapshot, with a memo carrying
     /// a `<script>` breakout attempt to exercise HTML escaping.
@@ -566,7 +582,7 @@ mod tests {
         store.insert(entry, NOW_MS).unwrap();
         let view = store.snapshot(NOW_MS).into_iter().next().unwrap();
 
-        let html = render_detail_page(&view, &"c".repeat(64), None);
+        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
         assert!(
             !html.contains('\u{202E}'),
             "no raw right-to-left override may reach the page"
@@ -584,7 +600,7 @@ mod tests {
 
     #[test]
     fn login_page_has_rp_id_and_login_js() {
-        let html = render_login_page("wallet.internal");
+        let html = render_login_page("wallet.internal", &neutral());
         assert!(html.contains("wallet.internal"));
         assert!(html.contains(r#"src="/static/login.js""#));
         assert!(!html.contains("<script>"), "no inline script allowed");
@@ -592,14 +608,14 @@ mod tests {
 
     #[test]
     fn login_page_escapes_rp_id() {
-        let html = render_login_page("<script>x</script>");
+        let html = render_login_page("<script>x</script>", &neutral());
         assert!(!html.contains("<script>x</script>"));
         assert!(html.contains("&lt;script&gt;"));
     }
 
     #[test]
     fn enroll_page_has_rp_id_and_enroll_js() {
-        let html = render_enroll_page("wallet.internal");
+        let html = render_enroll_page("wallet.internal", &neutral());
         assert!(html.contains("wallet.internal"));
         assert!(html.contains(r#""rp_id":"wallet.internal""#));
         assert!(html.contains(r#"src="/static/enroll.js""#));
@@ -609,7 +625,7 @@ mod tests {
 
     #[test]
     fn enroll_page_escapes_rp_id_in_html_and_neutralises_it_in_json_island() {
-        let html = render_enroll_page("<script>x</script>");
+        let html = render_enroll_page("<script>x</script>", &neutral());
         // The visible <code>{rp_id}</code> text must be HTML-escaped.
         assert!(html.contains("&lt;script&gt;x&lt;/script&gt;"));
         // The JSON data island independently neutralises `<` and `>` via
@@ -621,7 +637,7 @@ mod tests {
 
     #[test]
     fn message_page_escapes_title_and_message() {
-        let html = render_message_page("Too <b>many</b>", "Wait & retry");
+        let html = render_message_page("Too <b>many</b>", "Wait & retry", &neutral());
         assert!(html.contains("Too &lt;b&gt;many&lt;/b&gt;"));
         assert!(html.contains("Wait &amp; retry"));
         assert!(!html.contains("<b>many</b>"));
@@ -630,7 +646,7 @@ mod tests {
     #[test]
     fn inbox_page_has_data_island_and_app_js() {
         let dir = TempDir::new().unwrap();
-        let html = render_inbox_page(&[payment_view(&dir, false, NOW_MS)]);
+        let html = render_inbox_page(&[payment_view(&dir, false, NOW_MS)], &neutral());
         assert!(html.contains(r#"id="pending-data""#));
         assert!(html.contains(r#"src="/static/app.js""#));
     }
@@ -639,7 +655,7 @@ mod tests {
     fn detail_page_escapes_summary_and_offers_approve() {
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, NOW_MS);
-        let html = render_detail_page(&view, &"c".repeat(64), None);
+        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
         assert!(html.contains("Approve"));
         assert!(html.contains("Reject"));
         // The raw `<script>` memo must be escaped, never literal.
@@ -653,7 +669,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, u64::MAX);
         assert!(view.expired);
-        let html = render_detail_page(&view, &"c".repeat(64), None);
+        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
         assert!(html.contains("expired"));
         assert!(!html.contains("id=\"approve-btn\""));
         assert!(html.contains("id=\"reject-btn\""));
@@ -664,7 +680,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, true, NOW_MS);
         assert!(view.attested);
-        let html = render_detail_page(&view, &"c".repeat(64), Some("BLOB123"));
+        let html = render_detail_page(&view, &"c".repeat(64), Some("BLOB123"), &neutral());
         assert!(html.contains("BLOB123"));
         assert!(!html.contains("id=\"approve-btn\""));
     }
@@ -855,7 +871,7 @@ mod tests {
         assert!(!view.expired);
         assert!(!view.attested);
         assert!(!kind_is_approvable(&view.summary));
-        let html = render_detail_page(&view, &"c".repeat(64), None);
+        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
         assert!(html.contains(r#"id="reject-btn""#));
         assert!(!html.contains(r#"id="approve-btn""#));
     }
@@ -865,58 +881,153 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let view = rejected_view(&dir);
         assert!(matches!(view.summary, ApprovalSummaryView::Rejected { .. }));
-        let html = render_detail_page(&view, &"c".repeat(64), None);
+        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
         assert!(!html.contains(r#"id="approve-btn""#));
         assert!(!html.contains(r#"id="reject-btn""#));
     }
 
     #[test]
     fn render_not_found_page_escapes_nonce_and_links_inbox() {
-        let html = render_not_found_page("<script>x</script>");
+        let html = render_not_found_page("<script>x</script>", &neutral());
         assert!(!html.contains("<script>x</script>"));
         assert!(html.contains("&lt;script&gt;"));
         assert!(html.contains(r#"href="/inbox""#));
         assert!(html.contains("Approval not found"));
     }
 
-    // ── Brand surface ────────────────────────────────────────────────────
+    // ── Design surface and per-deployment identity ───────────────────────
 
-    fn every_page(dir: &TempDir) -> Vec<String> {
+    fn every_page(dir: &TempDir, identity: &PageIdentity) -> Vec<String> {
         let view = payment_view(dir, false, NOW_MS);
         vec![
-            render_login_page("wallet.internal"),
-            render_enroll_page("wallet.internal"),
-            render_message_page("Too many requests", "Wait and retry."),
-            render_inbox_page(std::slice::from_ref(&view)),
-            render_inbox_page(&[]),
-            render_detail_page(&view, &"c".repeat(64), None),
-            render_not_found_page("nonce"),
+            render_login_page("wallet.internal", identity),
+            render_enroll_page("wallet.internal", identity),
+            render_message_page("Too many requests", "Wait and retry.", identity),
+            render_inbox_page(std::slice::from_ref(&view), identity),
+            render_inbox_page(&[], identity),
+            render_detail_page(&view, &"c".repeat(64), None, identity),
+            render_not_found_page("nonce", identity),
         ]
     }
 
     /// A duplicated stylesheet would silently double every rule; a missing one
-    /// would render the page unstyled.
+    /// would render the page unstyled. The design is the same on every
+    /// deployment, so it holds under each identity.
     #[test]
     fn every_page_embeds_the_brand_style_exactly_once() {
         let dir = TempDir::new().unwrap();
-        for html in every_page(&dir) {
-            assert_eq!(
-                html.matches(BRAND_STYLE).count(),
-                1,
-                "the brand style must appear exactly once per page"
+        for identity in [neutral(), named(), marked()] {
+            for html in every_page(&dir, &identity) {
+                assert_eq!(
+                    html.matches(BRAND_STYLE).count(),
+                    1,
+                    "the brand style must appear exactly once per page"
+                );
+            }
+        }
+    }
+
+    /// An unconfigured deployment serves no project identity. The remote
+    /// surface is the one an operator reaches from a phone on someone else's
+    /// deployment, so the default matters most here.
+    #[test]
+    fn an_unconfigured_deployment_serves_no_mark_and_no_wordmark() {
+        let dir = TempDir::new().unwrap();
+        for html in every_page(&dir, &neutral()) {
+            assert!(
+                !html.contains(MARK_PATH_DATA),
+                "the project mark must be absent from an unconfigured page: {html}"
+            );
+            assert!(
+                !html.contains(">STELLAR<"),
+                "the STELLAR overline must be absent from an unconfigured page: {html}"
+            );
+            assert!(
+                !html.contains("Agent Wallet"),
+                "the project wordmark must be absent from an unconfigured page: {html}"
             );
         }
     }
 
+    /// A configured display name renders, and does not turn the mark on.
     #[test]
-    fn every_page_embeds_the_brand_mark() {
+    fn a_configured_display_name_renders_on_every_page() {
         let dir = TempDir::new().unwrap();
-        for html in every_page(&dir) {
+        for html in every_page(&dir, &named()) {
+            assert!(html.contains("Acme Ops"), "{html}");
+            assert!(!html.contains(MARK_PATH_DATA), "{html}");
+        }
+    }
+
+    /// A name carrying markup renders as inert text on every page.
+    #[test]
+    fn an_injection_payload_in_the_display_name_renders_inert() {
+        let dir = TempDir::new().unwrap();
+        let hostile = PageIdentity::new(Some(r#"</title><script>alert(1)</script>"#), false);
+        for html in every_page(&dir, &hostile) {
             assert!(
-                html.contains(BUDDY_MARK_SVG),
-                "the brand mark must be present on the page"
+                !html.contains("<script>alert(1)</script>"),
+                "the payload must not reach the page as markup: {html}"
+            );
+            assert!(
+                html.contains("&lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;"),
+                "the payload must render as escaped text: {html}"
             );
         }
+    }
+
+    /// The mark renders when the deployment asks for it.
+    #[test]
+    fn the_project_mark_renders_when_enabled() {
+        let dir = TempDir::new().unwrap();
+        for html in every_page(&dir, &marked()) {
+            assert!(html.contains(MARK_PATH_DATA), "{html}");
+        }
+    }
+
+    /// The consent surface is not themeable. The decision card must render
+    /// byte-identically no matter what a deployment configured, or
+    /// configuration would be a channel for making the page misstate what is
+    /// being signed.
+    #[test]
+    fn the_transaction_detail_block_is_identical_under_every_identity() {
+        let dir = TempDir::new().unwrap();
+        let view = payment_view(&dir, false, NOW_MS);
+        let csrf = "c".repeat(64);
+
+        let blocks: Vec<String> = [neutral(), named(), marked()]
+            .iter()
+            .map(|identity| {
+                decision_block(&render_detail_page(&view, &csrf, None, identity)).to_owned()
+            })
+            .collect();
+
+        assert!(
+            blocks[0].contains("0.2500000 XLM") && blocks[0].contains("btn reject"),
+            "the extracted block must be the decision card: {}",
+            blocks[0]
+        );
+        assert_eq!(
+            blocks[0], blocks[1],
+            "a configured display name must not change the decision card"
+        );
+        assert_eq!(
+            blocks[0], blocks[2],
+            "enabling the project mark must not change the decision card"
+        );
+    }
+
+    /// The `<div class="decision">` region of a detail page: everything the
+    /// operator consents to.
+    fn decision_block(html: &str) -> &str {
+        let open = r#"<div class="decision">"#;
+        let start = html
+            .find(open)
+            .expect("detail page must carry a decision card");
+        let end = html
+            .find("</main>")
+            .expect("detail page must close its main");
+        &html[start..end]
     }
 
     /// `img-src 'self'` blocks every remote origin, so a page referencing one
@@ -924,9 +1035,11 @@ mod tests {
     #[test]
     fn every_page_references_no_external_origin() {
         let dir = TempDir::new().unwrap();
-        for html in every_page(&dir) {
-            assert!(!html.contains("http://"));
-            assert!(!html.contains("https://"));
+        for identity in [neutral(), named(), marked()] {
+            for html in every_page(&dir, &identity) {
+                assert!(!html.contains("http://"));
+                assert!(!html.contains("https://"));
+            }
         }
     }
 
@@ -935,10 +1048,10 @@ mod tests {
     #[test]
     fn card_pages_claim_self_hosting_and_never_loopback() {
         for html in [
-            render_login_page("wallet.internal"),
-            render_enroll_page("wallet.internal"),
-            render_message_page("Too many requests", "Wait and retry."),
-            render_not_found_page("nonce"),
+            render_login_page("wallet.internal", &neutral()),
+            render_enroll_page("wallet.internal", &neutral()),
+            render_message_page("Too many requests", "Wait and retry.", &neutral()),
+            render_not_found_page("nonce", &neutral()),
         ] {
             assert!(
                 html.contains(
@@ -962,7 +1075,7 @@ mod tests {
     fn detail_page_renders_payment_amount_in_both_denominations_and_the_full_destination() {
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, NOW_MS);
-        let html = render_detail_page(&view, &"c".repeat(64), None);
+        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
 
         // The fixture is 2_500_000 stroops of XLM.
         assert!(html.contains("0.2500000 XLM"), "{html}");
@@ -977,7 +1090,12 @@ mod tests {
     #[test]
     fn detail_page_approve_button_names_the_kind() {
         let dir = TempDir::new().unwrap();
-        let html = render_detail_page(&payment_view(&dir, false, NOW_MS), &"c".repeat(64), None);
+        let html = render_detail_page(
+            &payment_view(&dir, false, NOW_MS),
+            &"c".repeat(64),
+            None,
+            &neutral(),
+        );
         assert!(html.contains(">Approve payment</button>"), "{html}");
         assert!(html.contains(r#"class="btn reject""#), "{html}");
         assert!(
@@ -993,13 +1111,22 @@ mod tests {
     #[test]
     fn detail_page_expiry_sentence_is_selected_by_state() {
         let dir = TempDir::new().unwrap();
-        let live = render_detail_page(&payment_view(&dir, false, NOW_MS), &"c".repeat(64), None);
+        let live = render_detail_page(
+            &payment_view(&dir, false, NOW_MS),
+            &"c".repeat(64),
+            None,
+            &neutral(),
+        );
         assert!(live.contains(r#"data-expiry-form="remaining""#), "{live}");
         assert!(live.contains("After that this request can"), "{live}");
 
         let dir = TempDir::new().unwrap();
-        let expired =
-            render_detail_page(&payment_view(&dir, false, u64::MAX), &"c".repeat(64), None);
+        let expired = render_detail_page(
+            &payment_view(&dir, false, u64::MAX),
+            &"c".repeat(64),
+            None,
+            &neutral(),
+        );
         assert!(
             expired.contains(r#"data-expiry-form="absolute""#),
             "{expired}"
@@ -1014,6 +1141,7 @@ mod tests {
             &payment_view(&dir, true, NOW_MS),
             &"c".repeat(64),
             Some("BLOB123"),
+            &neutral(),
         );
         assert!(
             attested.contains(r#"data-expiry-form="absolute""#),
@@ -1025,7 +1153,7 @@ mod tests {
         );
 
         let dir = TempDir::new().unwrap();
-        let rejected = render_detail_page(&rejected_view(&dir), &"c".repeat(64), None);
+        let rejected = render_detail_page(&rejected_view(&dir), &"c".repeat(64), None, &neutral());
         assert!(
             rejected.contains(r#"data-expiry-form="absolute""#),
             "{rejected}"
@@ -1042,7 +1170,7 @@ mod tests {
     fn detail_page_renders_the_nonce_as_a_visible_field() {
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, NOW_MS);
-        let html = render_detail_page(&view, &"c".repeat(64), None);
+        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
         assert!(
             html.contains(&format!(
                 "<dt>Nonce</dt><dd>{}</dd>",
@@ -1058,7 +1186,7 @@ mod tests {
     fn detail_page_carries_absolute_timestamps_in_data_attributes() {
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, NOW_MS);
-        let html = render_detail_page(&view, &"c".repeat(64), None);
+        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
         assert!(
             html.contains(&format!(
                 r#"data-created-ms="{}" data-expires-ms="{}""#,
@@ -1132,7 +1260,7 @@ mod tests {
         store.insert(entry, NOW_MS).unwrap();
         let view = store.snapshot(NOW_MS).into_iter().next().unwrap();
 
-        let html = render_detail_page(&view, &"c".repeat(64), None);
+        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
         assert!(html.contains("900719925.4740993 XLM"), "{html}");
         assert!(html.contains("9007199254740993 stroops"), "{html}");
     }
@@ -1160,7 +1288,7 @@ mod tests {
         store.insert(entry, NOW_MS).unwrap();
         let view = store.snapshot(NOW_MS).into_iter().next().unwrap();
 
-        let html = render_detail_page(&view, &"c".repeat(64), None);
+        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
         assert!(html.contains("1.2500000 USDC"), "{html}");
         assert!(
             html.contains(&format!("USDC:{issuer}")),
@@ -1175,7 +1303,7 @@ mod tests {
     fn detail_page_mpp_charge_keeps_the_amount_in_base_units() {
         let dir = TempDir::new().unwrap();
         let view = mpp_charge_view(&dir);
-        let html = render_detail_page(&view, &"c".repeat(64), None);
+        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
         assert!(
             html.contains("1000000 <small>base units of the token contract</small>"),
             "the charge must stay in the token's own base units: {html}"
@@ -1193,7 +1321,7 @@ mod tests {
     fn detail_page_expired_states_the_reason_as_a_warning() {
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, u64::MAX);
-        let html = render_detail_page(&view, &"c".repeat(64), None);
+        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
         assert!(html.contains(r#"<div class="notice warn">"#), "{html}");
         assert!(html.contains("This request has expired"), "{html}");
         assert!(!html.contains(r#"id="approve-btn""#), "{html}");
@@ -1206,14 +1334,14 @@ mod tests {
     fn inbox_empty_state_is_visible_only_when_the_island_is_empty() {
         let dir = TempDir::new().unwrap();
 
-        let empty = render_inbox_page(&[]);
+        let empty = render_inbox_page(&[], &neutral());
         assert!(
             empty.contains(r#"<div class="empty" id="empty-state">"#),
             "{empty}"
         );
         assert!(empty.contains("All caught up &mdash; no approvals waiting."));
 
-        let seeded = render_inbox_page(&[payment_view(&dir, false, NOW_MS)]);
+        let seeded = render_inbox_page(&[payment_view(&dir, false, NOW_MS)], &neutral());
         assert!(
             seeded.contains(r#"<div class="empty" id="empty-state" hidden>"#),
             "{seeded}"

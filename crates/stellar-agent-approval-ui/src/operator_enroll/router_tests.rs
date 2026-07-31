@@ -20,6 +20,7 @@ use axum::http::{Request, StatusCode, header};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::json;
+use stellar_agent_loopback_http::brand::PageIdentity;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tower::ServiceExt as _;
@@ -55,6 +56,7 @@ impl Harness {
             auth: StdMutex::new(AuthState::new(bootstrap)),
             store: OperatorApprovalCredentialStore::new(store_path.clone()),
             label_prefill,
+            identity: PageIdentity::neutral(),
             completion: StdMutex::new(Some(tx)),
         });
         let local_addr: SocketAddr = HOST.parse().unwrap();

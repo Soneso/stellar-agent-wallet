@@ -78,6 +78,7 @@ mod web;
 pub mod test_helpers;
 
 pub use config_validate::{RemoteConfigValidationError, validate_remote_config};
+pub use stellar_agent_loopback_http::brand::PageIdentity;
 pub use tls::{ProvisionedTls, TlsProvisionError, provision_or_load};
 
 use std::net::SocketAddr;
@@ -127,6 +128,13 @@ pub struct RemoteServeConfig {
     pub operator_credentials_path: std::path::PathBuf,
     /// Provisioned TLS certificate and key (see [`provision_or_load`]).
     pub tls: ProvisionedTls,
+    /// The identity the served pages announce.
+    ///
+    /// [`PageIdentity::neutral`] unless
+    /// [`RemoteServeConfig::with_page_identity`] supplies one: a deployment
+    /// that configured nothing serves pages with a plain title, no name, and
+    /// no mark.
+    pub page_identity: PageIdentity,
 }
 
 impl RemoteServeConfig {
@@ -150,7 +158,15 @@ impl RemoteServeConfig {
             decision_context,
             operator_credentials_path,
             tls,
+            page_identity: PageIdentity::neutral(),
         }
+    }
+
+    /// Sets the identity the served pages announce.
+    #[must_use = "builder setters return the updated configuration by value"]
+    pub fn with_page_identity(mut self, page_identity: PageIdentity) -> Self {
+        self.page_identity = page_identity;
+        self
     }
 }
 
@@ -172,6 +188,9 @@ pub(crate) struct RemoteServeState {
     /// Single live session — remote approval is single-operator-sufficient;
     /// a fresh login replaces any prior session.
     pub(crate) session: std::sync::Arc<StdMutex<Option<SessionState>>>,
+    /// The identity every served page renders, neutral unless the deployment
+    /// configured one.
+    pub(crate) identity: std::sync::Arc<PageIdentity>,
 }
 
 /// Handle to a running remote-approval server.
@@ -280,6 +299,7 @@ pub async fn start_remote_serve(
         action_challenges: std::sync::Arc::new(StdMutex::new(ActionChallengeStore::new())),
         login_rate_limiter: std::sync::Arc::new(StdMutex::new(TokenBucket::default())),
         session: std::sync::Arc::new(StdMutex::new(None)),
+        identity: std::sync::Arc::new(config.page_identity),
     };
 
     let router = build_router(state, &config.rp_id, local_addr.port());

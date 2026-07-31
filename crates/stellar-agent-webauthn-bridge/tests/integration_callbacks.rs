@@ -44,6 +44,7 @@ use stellar_agent_core::approval::{
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 
+use stellar_agent_webauthn_bridge::PageIdentity;
 use stellar_agent_webauthn_bridge::{
     ApprovalPubkeyLookup, ApprovalPubkeyLookupError, BridgeHandle, start_bridge_with_pubkey_lookup,
 };
@@ -80,9 +81,14 @@ async fn start_test_bridge_with_lookup(
     let store = Arc::new(Mutex::new(store));
 
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let handle = start_bridge_with_pubkey_lookup(Arc::clone(&store), addr, pubkey_lookup)
-        .await
-        .expect("start_bridge_register_only");
+    let handle = start_bridge_with_pubkey_lookup(
+        Arc::clone(&store),
+        addr,
+        pubkey_lookup,
+        PageIdentity::neutral(),
+    )
+    .await
+    .expect("start_bridge_register_only");
 
     (handle, store, dir)
 }

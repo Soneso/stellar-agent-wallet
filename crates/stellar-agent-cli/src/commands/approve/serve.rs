@@ -42,6 +42,8 @@ use crate::commands::smart_account::common::open_profile_audit_writer;
 use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
+use crate::common::served_pages::page_identity_for;
+use stellar_agent_loopback_http::brand::PageIdentity;
 
 /// Whether the server attempts a best-effort OS toast when the queue grows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -173,12 +175,15 @@ pub async fn run(args: ServeArgs) -> i32 {
         None,
     );
 
+    let page_identity = page_identity_for(&profile);
+
     if args.remote {
         return run_remote(
             &args,
             &profile_name,
             profile.remote_approval.as_ref(),
             context,
+            page_identity,
         )
         .await;
     }
@@ -186,7 +191,8 @@ pub async fn run(args: ServeArgs) -> i32 {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), args.port);
     let notify_enabled = matches!(args.notify, NotifyMode::On);
-    let config = ServeConfig::new(bind_addr, context, tx, notify_enabled);
+    let config =
+        ServeConfig::new(bind_addr, context, tx, notify_enabled).with_page_identity(page_identity);
 
     let handle = match start_serve(config).await {
         Ok(h) => h,
@@ -248,6 +254,7 @@ async fn run_remote(
     profile_name: &str,
     remote_config: Option<&stellar_agent_core::profile::schema::RemoteApprovalConfig>,
     context: DecisionContext,
+    page_identity: PageIdentity,
 ) -> i32 {
     let Some(remote_config) = remote_config.filter(|c| c.enabled) else {
         let err = WalletError::Internal(InternalError::UnexpectedState {
@@ -318,7 +325,8 @@ async fn run_remote(
         context,
         operator_credentials_path,
         tls,
-    );
+    )
+    .with_page_identity(page_identity);
 
     let handle = match stellar_agent_approval_remote::start_remote_serve(config).await {
         Ok(h) => h,

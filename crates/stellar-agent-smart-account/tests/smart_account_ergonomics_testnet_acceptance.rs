@@ -1987,10 +1987,13 @@ async fn deploy_c_webauthn_genesis_and_batch_add_testnet_acceptance() {
         PendingApprovalStore::open(approval_path).expect("approval store must open"),
     ));
     let bridge_bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let bridge_handle =
-        stellar_agent_webauthn_bridge::start_bridge_register_only(Arc::clone(&store), bridge_bind)
-            .await
-            .expect("bridge must start");
+    let bridge_handle = stellar_agent_webauthn_bridge::start_bridge_register_only(
+        Arc::clone(&store),
+        bridge_bind,
+        stellar_agent_webauthn_bridge::PageIdentity::neutral(),
+    )
+    .await
+    .expect("bridge must start");
     let bridge_addr = bridge_handle.local_addr();
     let _bridge_guard = BridgeGuard(Some(bridge_handle));
 

@@ -72,6 +72,8 @@ use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 
 use stellar_agent_core::approval::operator_credentials::OperatorApprovalCredentialStore;
 
+use stellar_agent_loopback_http::brand::PageIdentity;
+
 use crate::auth::{AuthState, OpaqueToken};
 use crate::{HostHeaderAllowlistLayer, OriginHeaderAllowlistLayer, SecurityHeadersLayer};
 
@@ -107,6 +109,9 @@ struct OperatorEnrollState {
     /// (from `--label` in interactive mode). `None` leaves the field empty
     /// for the operator to fill in.
     label_prefill: Option<String>,
+    /// The identity the enrollment page renders, neutral unless the
+    /// deployment configured one.
+    identity: PageIdentity,
     /// Single-use completion latch: `Some` until the first successful
     /// enrollment consumes it. Guarded by a `std::sync::Mutex` so the
     /// check-then-persist-then-consume sequence in
@@ -250,7 +255,9 @@ impl OperatorEnrollHandle {
 /// credential, which is always recorded with `rp_id: "localhost"`.
 /// `label_prefill` pre-populates the page's label input (from
 /// `--label <L>` in interactive mode); the operator can still edit it, and
-/// `None` leaves the field empty.
+/// `None` leaves the field empty. `page_identity` is the identity the page
+/// announces; pass [`PageIdentity::neutral`] for a deployment that configured
+/// none.
 ///
 /// # Errors
 ///
@@ -266,6 +273,7 @@ pub async fn start_operator_enroll_server(
     profile: impl Into<String>,
     bind_addr: SocketAddr,
     label_prefill: Option<String>,
+    page_identity: PageIdentity,
 ) -> Result<OperatorEnrollHandle, OperatorEnrollStartError> {
     if !bind_addr.ip().is_loopback() {
         return Err(OperatorEnrollStartError::NonLoopbackBind { addr: bind_addr });
@@ -294,6 +302,7 @@ pub async fn start_operator_enroll_server(
         auth: StdMutex::new(AuthState::new(bootstrap)),
         store: OperatorApprovalCredentialStore::new(store_path),
         label_prefill,
+        identity: page_identity,
         completion: StdMutex::new(Some(completion_tx)),
     });
 
@@ -384,9 +393,15 @@ mod tests {
     async fn enroll_url_uses_localhost_not_bind_ip_and_carries_the_bootstrap_token() {
         let dir = tempfile::tempdir().unwrap();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let handle = start_operator_enroll_server(store_path(&dir), "default", addr, None)
-            .await
-            .expect("start should succeed");
+        let handle = start_operator_enroll_server(
+            store_path(&dir),
+            "default",
+            addr,
+            None,
+            PageIdentity::neutral(),
+        )
+        .await
+        .expect("start should succeed");
         let url = handle.enroll_url();
         assert_eq!(
             url,
@@ -405,9 +420,15 @@ mod tests {
     async fn start_rejects_non_loopback_v4() {
         let dir = tempfile::tempdir().unwrap();
         let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-        let err = start_operator_enroll_server(store_path(&dir), "default", addr, None)
-            .await
-            .unwrap_err();
+        let err = start_operator_enroll_server(
+            store_path(&dir),
+            "default",
+            addr,
+            None,
+            PageIdentity::neutral(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(
             err,
             OperatorEnrollStartError::NonLoopbackBind { .. }
@@ -418,9 +439,15 @@ mod tests {
     async fn start_rejects_non_loopback_external_ipv4() {
         let dir = tempfile::tempdir().unwrap();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 0);
-        let err = start_operator_enroll_server(store_path(&dir), "default", addr, None)
-            .await
-            .unwrap_err();
+        let err = start_operator_enroll_server(
+            store_path(&dir),
+            "default",
+            addr,
+            None,
+            PageIdentity::neutral(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(
             err,
             OperatorEnrollStartError::NonLoopbackBind { .. }
@@ -431,9 +458,15 @@ mod tests {
     async fn start_binds_loopback_and_returns_local_addr() {
         let dir = tempfile::tempdir().unwrap();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let handle = start_operator_enroll_server(store_path(&dir), "default", addr, None)
-            .await
-            .expect("start should succeed");
+        let handle = start_operator_enroll_server(
+            store_path(&dir),
+            "default",
+            addr,
+            None,
+            PageIdentity::neutral(),
+        )
+        .await
+        .expect("start should succeed");
         let local = handle.local_addr();
         assert!(local.ip().is_loopback());
         assert_ne!(local.port(), 0);
@@ -444,7 +477,15 @@ mod tests {
     async fn ipv6_loopback_is_accepted_if_available() {
         let dir = tempfile::tempdir().unwrap();
         let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
-        match start_operator_enroll_server(store_path(&dir), "default", addr, None).await {
+        match start_operator_enroll_server(
+            store_path(&dir),
+            "default",
+            addr,
+            None,
+            PageIdentity::neutral(),
+        )
+        .await
+        {
             Ok(handle) => {
                 assert!(handle.local_addr().ip().is_loopback());
                 handle.shutdown().await.expect("clean shutdown");
@@ -460,9 +501,15 @@ mod tests {
     async fn shutdown_completes_within_5s() {
         let dir = tempfile::tempdir().unwrap();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let handle = start_operator_enroll_server(store_path(&dir), "default", addr, None)
-            .await
-            .expect("start should succeed");
+        let handle = start_operator_enroll_server(
+            store_path(&dir),
+            "default",
+            addr,
+            None,
+            PageIdentity::neutral(),
+        )
+        .await
+        .expect("start should succeed");
         handle.shutdown().await.expect("shutdown should succeed");
     }
 
@@ -470,9 +517,15 @@ mod tests {
     async fn await_completion_times_out_when_nothing_enrolls() {
         let dir = tempfile::tempdir().unwrap();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let mut handle = start_operator_enroll_server(store_path(&dir), "default", addr, None)
-            .await
-            .expect("start should succeed");
+        let mut handle = start_operator_enroll_server(
+            store_path(&dir),
+            "default",
+            addr,
+            None,
+            PageIdentity::neutral(),
+        )
+        .await
+        .expect("start should succeed");
         let err = handle
             .await_completion(Duration::from_millis(50))
             .await
@@ -485,9 +538,15 @@ mod tests {
     async fn await_completion_twice_returns_already_awaited() {
         let dir = tempfile::tempdir().unwrap();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let mut handle = start_operator_enroll_server(store_path(&dir), "default", addr, None)
-            .await
-            .expect("start should succeed");
+        let mut handle = start_operator_enroll_server(
+            store_path(&dir),
+            "default",
+            addr,
+            None,
+            PageIdentity::neutral(),
+        )
+        .await
+        .expect("start should succeed");
         let _ = handle.await_completion(Duration::from_millis(10)).await;
         let err = handle
             .await_completion(Duration::from_millis(10))
@@ -501,9 +560,15 @@ mod tests {
     async fn await_completion_reports_sender_dropped_after_shutdown() {
         let dir = tempfile::tempdir().unwrap();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let handle = start_operator_enroll_server(store_path(&dir), "default", addr, None)
-            .await
-            .expect("start should succeed");
+        let handle = start_operator_enroll_server(
+            store_path(&dir),
+            "default",
+            addr,
+            None,
+            PageIdentity::neutral(),
+        )
+        .await
+        .expect("start should succeed");
         // Partial-move the receiver out before consuming the rest of the
         // handle, so it can be awaited after the server task (and the
         // OperatorEnrollState holding the sender) has been dropped.

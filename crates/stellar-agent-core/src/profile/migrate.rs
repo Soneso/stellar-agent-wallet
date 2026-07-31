@@ -352,6 +352,8 @@ fn migrate_v1_to_v2(profile_name: &str, v1: PartialV1Profile) -> Profile {
         pool_config: None,
         // Remote approval is off by default for migrated profiles.
         remote_approval: None,
+        // Served pages stay neutral for migrated profiles.
+        served_pages: None,
     }
 }
 

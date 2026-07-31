@@ -10,6 +10,8 @@
 //!   zero-config profile, keyed on the resolved name's provenance.
 //! - [`render`] — `render_json` and `sanitize_for_table` output helpers
 //!   shared by `pay` and `accounts create`.
+//! - [`served_pages`] — the profile's `[served_pages]` block turned into the
+//!   identity every operator-facing HTTP listener renders.
 //! - [`signer_ceremony`] — `resolve_software_signer_from_env`, the single
 //!   mlock-protected secret-env signer ceremony shared by every write
 //!   subcommand that accepts a `--*-secret-env <VAR>` flag.
@@ -30,6 +32,7 @@
 pub mod network;
 pub mod profile_access;
 pub mod render;
+pub mod served_pages;
 pub mod signer_ceremony;
 
 /// Returns `true` when a graphical display is available for a browser launch.

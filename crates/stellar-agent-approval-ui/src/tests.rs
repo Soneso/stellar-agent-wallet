@@ -36,7 +36,7 @@ use stellar_agent_core::timefmt;
 
 use crate::auth::{AuthState, OpaqueToken, compute_csrf};
 use crate::decision::DecisionContext;
-use crate::{ServeConfig, ServeStartError, ServeState, build_router, start_serve};
+use crate::{PageIdentity, ServeConfig, ServeStartError, ServeState, build_router, start_serve};
 
 const BOUND: &str = "127.0.0.1:8080";
 const HOST: &str = "127.0.0.1:8080";
@@ -79,6 +79,7 @@ impl Harness {
         let state = ServeState {
             auth: Arc::new(StdMutex::new(AuthState::new(bootstrap))),
             ctx: Arc::new(ctx),
+            identity: Arc::new(PageIdentity::neutral()),
         };
         Self {
             _dir: dir,
@@ -1120,6 +1121,7 @@ async fn approve_with_unseeded_keyring_returns_unavailable_status() {
     let state = ServeState {
         auth: Arc::new(StdMutex::new(AuthState::new(bootstrap))),
         ctx: Arc::new(ctx),
+        identity: Arc::new(PageIdentity::neutral()),
     };
     let bound: SocketAddr = BOUND.parse().unwrap();
     let router = build_router(state.clone(), bound);

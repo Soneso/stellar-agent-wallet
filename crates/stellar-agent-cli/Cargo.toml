@@ -60,6 +60,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "signal", "sync"] }
 tracing = { workspace = true }
 # Localhost approval-inbox web UI for `approve serve`.
 stellar-agent-approval-ui = { workspace = true }
+# PageIdentity: the served-page identity every HTTP listener this binary starts
+# renders, resolved from the profile's `[served_pages]` block.
+stellar-agent-loopback-http = { workspace = true }
 # TLS-protected, passkey-authenticated remote approval for `approve serve --remote`.
 stellar-agent-approval-remote = { workspace = true }
 # Secret-key parsing from --secret-env (pay.rs).

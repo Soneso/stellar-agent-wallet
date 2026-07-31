@@ -51,7 +51,7 @@ use figment::{
 };
 
 use super::name::validate_path_component_ascii_safe;
-use super::schema::{Profile, default_audit_log_path_for};
+use super::schema::{MAX_SERVED_PAGE_DISPLAY_NAME_CHARS, Profile, default_audit_log_path_for};
 pub use super::schema::{default_approval_dir, default_policy_dir, default_profile_dir};
 use crate::profile::caip2::Caip2;
 
@@ -296,6 +296,30 @@ pub enum ProfileLoadError {
         upper_bound: u32,
     },
 
+    /// `[served_pages] display_name` is longer than the render bound.
+    ///
+    /// The served pages truncate a name to
+    /// [`MAX_SERVED_PAGE_DISPLAY_NAME_CHARS`] characters, so a longer value
+    /// would render as a prefix of what the operator wrote without saying so.
+    ///
+    /// # Fix
+    ///
+    /// Shorten `display_name` to at most
+    /// [`MAX_SERVED_PAGE_DISPLAY_NAME_CHARS`] characters, or remove the field
+    /// to serve pages with no name.
+    #[error(
+        "profile '{name}': [served_pages] display_name is {chars} characters, \
+         exceeding the {upper_bound}-character bound the served pages render"
+    )]
+    InvalidServedPageDisplayName {
+        /// The profile name as supplied by the caller.
+        name: String,
+        /// The rejected value's length in characters.
+        chars: usize,
+        /// The render bound (`MAX_SERVED_PAGE_DISPLAY_NAME_CHARS`).
+        upper_bound: usize,
+    },
+
     /// A multicall router is registered for this profile's network but the profile
     /// does not supply a `secondary_rpc_url`.
     ///
@@ -508,6 +532,24 @@ pub fn load_from_path(
         });
     }
 
+    // Validate the served-page display name's length bound. The renderer
+    // truncates, so an over-long value would silently render as a prefix of
+    // what the operator wrote; refusing at load says so instead.
+    if let Some(name_value) = partial
+        .served_pages
+        .as_ref()
+        .and_then(|cfg| cfg.display_name.as_deref())
+    {
+        let chars = name_value.chars().count();
+        if chars > MAX_SERVED_PAGE_DISPLAY_NAME_CHARS {
+            return Err(ProfileLoadError::InvalidServedPageDisplayName {
+                name: name.to_owned(),
+                chars,
+                upper_bound: MAX_SERVED_PAGE_DISPLAY_NAME_CHARS,
+            });
+        }
+    }
+
     let profile = Profile {
         version: partial.version,
         chain_id,
@@ -534,6 +576,7 @@ pub fn load_from_path(
         pool_master_key_id: partial.pool_master_key_id,
         pool_config: partial.pool_config,
         remote_approval: partial.remote_approval,
+        served_pages: partial.served_pages,
         policy_window_state_key_id,
     };
 
@@ -1118,6 +1161,24 @@ pub fn load_with_overlay_from_dir(
         });
     }
 
+    // Validate the served-page display name's length bound. The renderer
+    // truncates, so an over-long value would silently render as a prefix of
+    // what the operator wrote; refusing at load says so instead.
+    if let Some(name_value) = partial
+        .served_pages
+        .as_ref()
+        .and_then(|cfg| cfg.display_name.as_deref())
+    {
+        let chars = name_value.chars().count();
+        if chars > MAX_SERVED_PAGE_DISPLAY_NAME_CHARS {
+            return Err(ProfileLoadError::InvalidServedPageDisplayName {
+                name: name.to_owned(),
+                chars,
+                upper_bound: MAX_SERVED_PAGE_DISPLAY_NAME_CHARS,
+            });
+        }
+    }
+
     let profile = Profile {
         version: partial.version,
         chain_id,
@@ -1144,6 +1205,7 @@ pub fn load_with_overlay_from_dir(
         pool_master_key_id: partial.pool_master_key_id,
         pool_config: partial.pool_config,
         remote_approval: partial.remote_approval,
+        served_pages: partial.served_pages,
         policy_window_state_key_id,
     };
 
@@ -1307,6 +1369,9 @@ struct PartialProfile {
     /// predating remote approval; defaults to `None` (off).
     #[serde(default)]
     remote_approval: Option<super::schema::RemoteApprovalConfig>,
+    /// Served-page identity. Absent means the pages carry no identity.
+    #[serde(default)]
+    served_pages: Option<super::schema::ServedPagesConfig>,
     /// Keyring entry for the persisted policy-window-state HMAC key. Absent
     /// from profiles predating this field; the loader derives the
     /// conventional per-profile coordinate when `None`.
@@ -2073,6 +2138,89 @@ engine = "v1"
         assert!(
             matches!(err, ProfileLoadError::InvalidHorizonBound { .. }),
             "expected InvalidHorizonBound for u32::MAX, got: {err}"
+        );
+    }
+
+    // ── [served_pages] ───────────────────────────────────────────────────────
+
+    /// A profile with no `[served_pages]` block loads with no served-page
+    /// identity: the pages render neutral rather than falling back to the
+    /// project's own name and mark.
+    #[test]
+    fn load_without_served_pages_block_yields_no_identity() {
+        let (dir, name) = write_profile(minimal_toml());
+        let p = load_from_dir(&name, dir.path(), None).unwrap();
+        assert!(p.served_pages.is_none());
+    }
+
+    #[test]
+    fn load_served_pages_block_carries_the_name_and_the_mark_flag() {
+        let toml = minimal_toml_with_extra(
+            "[served_pages]\ndisplay_name = \"Acme Ops\"\nshow_project_mark = true",
+        );
+        let (dir, name) = write_profile(&toml);
+        let p = load_from_dir(&name, dir.path(), None).unwrap();
+        let cfg = p.served_pages.expect("[served_pages] must load");
+        assert_eq!(cfg.display_name.as_deref(), Some("Acme Ops"));
+        assert!(cfg.show_project_mark);
+    }
+
+    /// A `display_name` at exactly the render bound is accepted.
+    #[test]
+    fn load_served_page_display_name_at_bound_is_accepted() {
+        let toml = minimal_toml_with_extra(&format!(
+            "[served_pages]\ndisplay_name = \"{}\"",
+            "n".repeat(MAX_SERVED_PAGE_DISPLAY_NAME_CHARS)
+        ));
+        let (dir, name) = write_profile(&toml);
+        let p = load_from_dir(&name, dir.path(), None).unwrap();
+        assert_eq!(
+            p.served_pages
+                .and_then(|cfg| cfg.display_name)
+                .map(|n| n.chars().count()),
+            Some(MAX_SERVED_PAGE_DISPLAY_NAME_CHARS)
+        );
+    }
+
+    /// A `display_name` past the render bound is refused rather than silently
+    /// rendered as a prefix of what the operator wrote.
+    #[test]
+    fn load_served_page_display_name_above_bound_is_rejected() {
+        let toml = minimal_toml_with_extra(&format!(
+            "[served_pages]\ndisplay_name = \"{}\"",
+            "n".repeat(MAX_SERVED_PAGE_DISPLAY_NAME_CHARS + 1)
+        ));
+        let (dir, name) = write_profile(&toml);
+        let err = load_from_dir(&name, dir.path(), None).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ProfileLoadError::InvalidServedPageDisplayName {
+                    chars: 65,
+                    upper_bound: 64,
+                    ..
+                }
+            ),
+            "expected InvalidServedPageDisplayName(65), got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("65"), "{msg}");
+        assert!(msg.contains("64"), "{msg}");
+    }
+
+    /// The bound counts characters, so a multi-byte name is measured the way
+    /// the renderer truncates it.
+    #[test]
+    fn load_served_page_display_name_bound_counts_characters() {
+        let toml = minimal_toml_with_extra(&format!(
+            "[served_pages]\ndisplay_name = \"{}\"",
+            "\u{4E2D}".repeat(MAX_SERVED_PAGE_DISPLAY_NAME_CHARS)
+        ));
+        let (dir, name) = write_profile(&toml);
+        let p = load_from_dir(&name, dir.path(), None).unwrap();
+        assert!(
+            p.served_pages.is_some(),
+            "a 64-character name must load regardless of its byte length"
         );
     }
 

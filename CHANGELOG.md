@@ -86,15 +86,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handle. `MppErrorCode` gains an `AuthorizationNotFound` variant; the enum is
   not `#[non_exhaustive]` and is not being made so, since that would itself be
   breaking — an exhaustive `match` on it downstream needs one new arm.
-- The operator-facing web pages now render the project's visual identity: the
+- The operator-facing web pages now render the project's visual design: the
   WebAuthn bridge's registration and approval pages, the approval inbox and
   detail pages, the operator-enrollment page, and the remote-approval sign-in,
   enrollment, inbox, detail, and message pages. `stellar-agent-loopback-http`
   gained a `brand` module carrying what the pages emit inline: `BRAND_STYLE`,
-  `BUDDY_MARK_SVG`, `CARD_BRAND_HEADER`, `TRUST_LINE_LOOPBACK`, and
-  `TRUST_LINE_SELF_HOSTED`. The pages fetch no external font, stylesheet, or
-  image; the Content-Security-Policy and the data-island escaping are
-  unchanged, and no status or result write reaches an HTML-interpreting sink.
+  `BUDDY_MARK_SVG`, `TRUST_LINE_LOOPBACK`, and `TRUST_LINE_SELF_HOSTED`. The
+  pages fetch no external font, stylesheet, or image; the
+  Content-Security-Policy and the data-island escaping are unchanged, and no
+  status or result write reaches an HTML-interpreting sink.
+- The served pages carry no identity unless the deployment configures one. An
+  unconfigured wallet serves every page with a plain title, no display name,
+  and no project mark; the design is unchanged in every case. The wallet is a
+  self-hosted runtime that third parties deploy, so an identity default put
+  this project's name and mark inside somebody else's deployment. The new
+  optional profile block names the deployment instead:
+
+  ```toml
+  [served_pages]
+  display_name = "Acme Ops"
+  show_project_mark = false
+  ```
+
+  `display_name` renders in the page title and above each page's heading; it is
+  HTML-escaped wherever it appears and is refused at profile load past 64
+  characters (`ProfileLoadError::InvalidServedPageDisplayName`). Absent or
+  empty means no name, never a fallback to the project's own.
+  `show_project_mark` renders the project mark and defaults to `false`.
+
+  Page styling is NOT configurable, and neither is anything the approval page
+  says about a transaction: the amount, the destination, the facts grid, the
+  approve and reject controls, the caution line, and the expiry sentence render
+  from the approval entry alone, identically under every identity. The approval
+  page is a consent surface, and configured CSS, markup, or asset URLs would
+  let anything able to write the profile make it misstate what is being signed
+  without touching a signing key.
+
+  API: `stellar-agent-loopback-http` gains `brand::PageIdentity`,
+  `brand::MAX_DISPLAY_NAME_CHARS`, and an `escape` module holding
+  `html_escape` — the one escaping definition every served page now applies,
+  re-exported unchanged as `stellar_agent_approval_ui::html_escape`. The
+  `brand::CARD_BRAND_HEADER` constant is removed in favour of
+  `PageIdentity::card_header_html`. `ServeConfig` and `RemoteServeConfig` gain
+  a `page_identity` field with a `with_page_identity` setter, defaulting to
+  `PageIdentity::neutral`; `start_bridge_register_only`,
+  `start_bridge_with_pubkey_lookup`, and `start_operator_enroll_server` take
+  the identity as a new trailing argument. `stellar-agent-core` gains
+  `profile::schema::ServedPagesConfig`,
+  `profile::schema::MAX_SERVED_PAGE_DISPLAY_NAME_CHARS`, and the
+  `Profile::served_pages` field.
 - The approval inbox lists each request as a row carrying its kind, a readable
   headline, its identifying detail, and a countdown that turns red under ten
   minutes. All nine approval kinds have a headline and a kind label, with a
@@ -117,6 +157,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The WebAuthn bridge reports a request that could not reach the wallet as
   "could not reach the wallet. The link has likely expired." rather than the
   browser's transport error; the raw reason goes to the browser console.
+- **Wire-contract change.** `stellar-agent profile init` refuses an unusable
+  `--profile` name with `validation.config_invalid` and the component
+  `profile`, instead of `validation.address_invalid`. The refusal is about
+  profile configuration, not a Stellar account address, and `profile show`
+  already reports the same input class under the same code. An agent routing on
+  `error.code` saw an address-parse failure for a name-validation refusal.
+  Closes #119.
 - **Behaviour change.** Every `stellar-agent` command that loads a profile now
   refuses a profile file whose `policy_owner_key_id.service` names a different
   profile than the one selected, with the wire code `profile.name_mismatch`.
