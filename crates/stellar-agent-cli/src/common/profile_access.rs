@@ -129,13 +129,25 @@ impl ProfileAccessError {
     /// keeps its own wire code through their existing rendering.
     pub(crate) fn to_wallet_error(&self, requested_name: &str) -> WalletError {
         match self {
-            Self::Load(profile_loader::ProfileLoadError::NotFound { name, .. }) => {
-                WalletError::Validation(ValidationError::ProfileNotFound { name: name.clone() })
-            }
-            Self::Load(_) => WalletError::Validation(ValidationError::ConfigInvalid {
-                component: "profile",
-                reason: self.message(requested_name),
-            }),
+            // Dispositions come from `ProfileLoadError::disposition`, whose
+            // match is exhaustive in the crate owning the enum, so this surface
+            // and `profile show` cannot drift apart as variants are added.
+            Self::Load(load_err) => match load_err.disposition() {
+                profile_loader::ProfileLoadDisposition::NotFound => {
+                    // The loader's own `name` is kept rather than
+                    // `requested_name`: they agree today, and the error's field
+                    // is the one that names the profile actually looked up.
+                    let name = match load_err {
+                        profile_loader::ProfileLoadError::NotFound { name, .. } => name.clone(),
+                        _ => requested_name.to_owned(),
+                    };
+                    WalletError::Validation(ValidationError::ProfileNotFound { name })
+                }
+                _ => WalletError::Validation(ValidationError::ConfigInvalid {
+                    component: "profile",
+                    reason: self.message(requested_name),
+                }),
+            },
             Self::NameMismatch(_) => {
                 WalletError::Validation(ValidationError::ProfileNameMismatch {
                     detail: self.message(requested_name),

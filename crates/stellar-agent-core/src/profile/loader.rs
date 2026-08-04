@@ -345,6 +345,60 @@ pub enum ProfileLoadError {
     },
 }
 
+/// How an operator-facing surface must report a [`ProfileLoadError`].
+///
+/// Surfaces render their own wording — one embeds a path it must redact,
+/// another names the verb that refused — but the disposition they render it
+/// under is decided here, once, so a single malformed profile cannot draw one
+/// wire code from `profile show` and a different one from every other verb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProfileLoadDisposition {
+    /// No profile of that name exists.
+    NotFound,
+    /// The operator can repair this without a code change, by editing the
+    /// profile file, choosing a different name, or fixing the environment that
+    /// supplies the state directory.
+    OperatorCorrectable,
+}
+
+impl ProfileLoadError {
+    /// The disposition an operator-facing surface reports this failure under.
+    ///
+    /// The match is exhaustive and lives in the crate that owns the enum, so a
+    /// new variant fails to compile here until it is classified. That is the
+    /// point: [`ProfileLoadError`] is `#[non_exhaustive]`, so a consumer crate
+    /// cannot match it exhaustively and a variant added without a matching arm
+    /// would silently fall into whatever that consumer's catch-all reports.
+    ///
+    /// No variant is a wallet defect. Every way a profile load can fail is
+    /// either a missing file or something the operator controls, so none of
+    /// them may be reported as an internal error.
+    #[must_use]
+    pub fn disposition(&self) -> ProfileLoadDisposition {
+        match self {
+            Self::NotFound { .. } => ProfileLoadDisposition::NotFound,
+            // Operator-authored input: the name, the file's syntax, its
+            // version, or a field whose value is out of bounds.
+            Self::InvalidName { .. }
+            | Self::VersionUnsupported { .. }
+            | Self::InvalidRpcUrl { .. }
+            | Self::MissingPolicySection { .. }
+            | Self::SignerRefUnreadable { .. }
+            | Self::Figment { .. }
+            | Self::InvalidScanIdBound { .. }
+            | Self::InvalidHorizonBound { .. }
+            | Self::InvalidServedPageDisplayName { .. }
+            | Self::MulticallRequiresSecondaryRpc { .. } => {
+                ProfileLoadDisposition::OperatorCorrectable
+            }
+            // The environment supplies no state directory. Not the profile's
+            // contents, but still the operator's to fix and still not a defect.
+            Self::NoStateDir(_) => ProfileLoadDisposition::OperatorCorrectable,
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Path-component guards
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1403,6 +1457,144 @@ mod tests {
 
     use super::*;
     use crate::profile::schema::MINIMUM_FLOOR;
+
+    /// One constructed value per [`ProfileLoadError`] variant.
+    ///
+    /// Adding a variant without extending this list leaves it unpinned, so the
+    /// count assertion in [`every_variant_is_pinned`] is what makes the
+    /// disposition tests below exhaustive in practice — `disposition`'s own
+    /// match already forces the classification decision at compile time.
+    fn one_of_every_variant() -> Vec<ProfileLoadError> {
+        vec![
+            ProfileLoadError::NotFound {
+                name: "p".to_owned(),
+                path: PathBuf::from("/tmp/p.toml"),
+            },
+            ProfileLoadError::InvalidName {
+                name: "..".to_owned(),
+                reason: "must not contain '..'",
+            },
+            ProfileLoadError::NoStateDir(crate::profile::schema::StateDirError),
+            ProfileLoadError::InvalidRpcUrl {
+                name: "p".to_owned(),
+                source: crate::profile::schema::RpcUrlParseError {
+                    raw: "not a url".to_owned(),
+                    source: url::ParseError::RelativeUrlWithoutBase,
+                },
+            },
+            ProfileLoadError::Figment {
+                name: "p".to_owned(),
+                source: Box::new(figment::Error::from("bad toml".to_owned())),
+            },
+            ProfileLoadError::VersionUnsupported {
+                name: "p".to_owned(),
+                found: 99,
+                supported: 2,
+            },
+            ProfileLoadError::MissingPolicySection {
+                path: PathBuf::from("/tmp/p.toml"),
+            },
+            ProfileLoadError::SignerRefUnreadable {
+                detail: "missing [mcp_signer_default]".to_owned(),
+            },
+            ProfileLoadError::InvalidScanIdBound {
+                name: "p".to_owned(),
+                value: 1,
+                upper_bound: 0,
+            },
+            ProfileLoadError::InvalidHorizonBound {
+                name: "p".to_owned(),
+                value: 1,
+                upper_bound: 0,
+            },
+            ProfileLoadError::InvalidServedPageDisplayName {
+                name: "p".to_owned(),
+                chars: 200,
+                upper_bound: 64,
+            },
+            ProfileLoadError::MulticallRequiresSecondaryRpc {
+                profile_name: "p".to_owned(),
+                network_safename: "testnet".to_owned(),
+            },
+        ]
+    }
+
+    /// No profile-load failure may be reported as a wallet defect.
+    ///
+    /// Every variant is either a missing file or something the operator
+    /// controls. `internal.unexpected_state` claims the wallet is broken, which
+    /// sends an operator to the issue tracker over a file they could have
+    /// edited — and it is what `profile show` did for nine of these before the
+    /// disposition moved into this crate.
+    #[test]
+    fn no_variant_is_a_wallet_defect() {
+        for err in one_of_every_variant() {
+            let disposition = err.disposition();
+            assert!(
+                matches!(
+                    disposition,
+                    ProfileLoadDisposition::NotFound | ProfileLoadDisposition::OperatorCorrectable
+                ),
+                "{err:?} reports {disposition:?}, which no load failure may do"
+            );
+        }
+    }
+
+    /// Only an absent file is `NotFound`; everything else is the operator's to
+    /// repair. A variant drifting into `NotFound` would make a malformed
+    /// profile indistinguishable from a missing one.
+    #[test]
+    fn only_a_missing_file_is_not_found() {
+        for err in one_of_every_variant() {
+            let expected = match err {
+                ProfileLoadError::NotFound { .. } => ProfileLoadDisposition::NotFound,
+                _ => ProfileLoadDisposition::OperatorCorrectable,
+            };
+            assert_eq!(err.disposition(), expected, "wrong disposition for {err:?}");
+        }
+    }
+
+    /// Guards the fixture list against a variant added without a pin.
+    ///
+    /// Counting the list against itself would prove nothing — it would still
+    /// pass with a variant added and unpinned. So the count comes from the enum
+    /// declaration in this file's own source. `disposition`'s match already
+    /// fails to compile on an unclassified variant; this catches the other
+    /// half, a variant classified but never exercised by the tests above.
+    #[test]
+    fn every_variant_is_pinned() {
+        let source = include_str!("loader.rs");
+        let enum_body = source
+            .split_once("pub enum ProfileLoadError {")
+            .expect("the enum declaration is in this file")
+            .1
+            .split_once("\n}")
+            .expect("the enum declaration terminates")
+            .0;
+
+        // Variant declarations are the only lines at exactly four-space indent
+        // that start with an uppercase letter; doc comments and attributes at
+        // that indent start with `/` or `#`, and field lines sit deeper.
+        let declared = enum_body
+            .lines()
+            .filter(|line| {
+                line.strip_prefix("    ")
+                    .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_uppercase()))
+            })
+            .count();
+
+        assert!(
+            declared > 0,
+            "variant scan matched nothing; the pattern broke"
+        );
+        assert_eq!(
+            one_of_every_variant().len(),
+            declared,
+            "one_of_every_variant covers {} of {declared} ProfileLoadError variants; \
+             classify the new one in `disposition` and add it to the fixture list",
+            one_of_every_variant().len()
+        );
+    }
 
     /// Writes a minimal valid profile TOML to a temp directory and returns the
     /// directory handle (keeps the temp dir alive).

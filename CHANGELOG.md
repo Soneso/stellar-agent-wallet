@@ -201,6 +201,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `profile show` no longer reports an operator-correctable profile fault as
+  `internal.unexpected_state`. An out-of-bounds cap, an unparseable `rpc_url`, a
+  missing `[policy]` section, an over-long served-page display name, or a
+  malformed TOML file now answer `validation.config_invalid` with the cause, and
+  the path in a path-bearing message is redacted as it already was on every
+  other verb. `show` loads directly rather than through the profile-access choke
+  point — it exists to display a profile the other verbs refuse — so the same
+  malformed profile answered `internal.unexpected_state` from `show` and
+  `validation.config_invalid` from everything else, sending an operator to the
+  issue tracker over a file they could have edited. The disposition now lives
+  beside `ProfileLoadError` in `stellar-agent-core`, where the match is
+  exhaustive: because the enum is `#[non_exhaustive]`, no consumer crate can
+  match it exhaustively, so a variant added without a classification previously
+  fell into whichever catch-all the consumer had. Closes #124.
 - MPP read verbs no longer report a profile with no MPP history as a broken
   store. `mpp authorization status` on a profile that has never prepared a
   charge answers `mpp.authorization_not_found`, and `mpp state prune` succeeds
