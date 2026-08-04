@@ -33,6 +33,7 @@
 use clap::{ArgGroup, Args};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
+use stellar_agent_core::observability::redact_path_in_message;
 use stellar_agent_core::profile::loader;
 
 use crate::common::render;
@@ -106,42 +107,43 @@ pub async fn run(args: &ShowArgs) -> i32 {
             render::render_json(&Envelope::ok(profile));
             0
         }
-        Err(loader::ProfileLoadError::NotFound { name, .. }) => {
-            let wallet_err = WalletError::Validation(ValidationError::ProfileNotFound { name });
-            render::render_json(&Envelope::err(&wallet_err));
-            1
-        }
-        // A name that cannot be a path component is an input error, not a
-        // missing profile: the loader refuses it before the path is built.
-        // `ConfigInvalid` is the variant whose contract covers profile
-        // resolution; `AddressInvalid` is reserved for Stellar account
-        // addresses and would render the refusal as an address-parse failure.
-        Err(loader::ProfileLoadError::InvalidName { name, reason }) => {
-            let wallet_err = WalletError::Validation(ValidationError::ConfigInvalid {
-                component: "profile",
-                reason: format!("invalid profile name '{name}': {reason}"),
-            });
-            render::render_json(&Envelope::err(&wallet_err));
-            1
-        }
-        Err(loader::ProfileLoadError::VersionUnsupported {
-            name,
-            found,
-            supported,
-        }) => {
-            let wallet_err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!(
-                    "profile '{name}' has unsupported version {found}; \
-                     this wallet supports version {supported}"
-                ),
-            });
-            render::render_json(&Envelope::err(&wallet_err));
-            1
-        }
         Err(err) => {
-            let wallet_err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("failed to load profile '{}': {err}", args.profile_name()),
-            });
+            // The disposition is decided by `ProfileLoadError::disposition`,
+            // whose match is exhaustive in the crate that owns the enum. This
+            // command reads a profile that other verbs refuse, so it must
+            // report the same wire code they do: an operator holding one
+            // malformed profile gets one answer, not one per verb.
+            //
+            // `ConfigInvalid` is the variant whose contract covers profile
+            // resolution; `AddressInvalid` is reserved for Stellar account
+            // addresses and would render the refusal as an address-parse
+            // failure. `UnexpectedState` claims a wallet defect, which no load
+            // failure is.
+            let wallet_err = match err.disposition() {
+                loader::ProfileLoadDisposition::NotFound => {
+                    WalletError::Validation(ValidationError::ProfileNotFound {
+                        name: args.profile_name().to_owned(),
+                    })
+                }
+                loader::ProfileLoadDisposition::OperatorCorrectable => {
+                    WalletError::Validation(ValidationError::ConfigInvalid {
+                        component: "profile",
+                        reason: redact_path_in_message(&format!(
+                            "profile '{}' failed to load: {err}",
+                            args.profile_name()
+                        )),
+                    })
+                }
+                // `ProfileLoadDisposition` is `#[non_exhaustive]`; a disposition
+                // this binary does not know how to render is a wallet defect
+                // here even though no load failure is one today.
+                _ => WalletError::Internal(InternalError::UnexpectedState {
+                    detail: format!(
+                        "profile '{}' failed to load under an unhandled disposition",
+                        args.profile_name()
+                    ),
+                }),
+            };
             render::render_json(&Envelope::err(&wallet_err));
             1
         }
