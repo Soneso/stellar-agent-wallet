@@ -102,7 +102,7 @@ stable versions only.
 release archive for your target from the tagged release assets:
 
 ```bash
-cargo binstall stellar-agent-cli@0.1.0-alpha.5 stellar-agent-mcp@0.1.0-alpha.5
+cargo binstall stellar-agent-cli@0.1.0-alpha.6 stellar-agent-mcp@0.1.0-alpha.6
 ```
 
 The CLI and MCP binaries ship in one release archive
@@ -112,8 +112,8 @@ archive directly, without any Rust tooling (substitute your target, e.g.
 `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`):
 
 ```bash
-curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.5/stellar-agent-0.1.0-alpha.5-aarch64-apple-darwin.tar.xz
-tar -xJf stellar-agent-0.1.0-alpha.5-aarch64-apple-darwin.tar.xz
+curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.6/stellar-agent-0.1.0-alpha.6-aarch64-apple-darwin.tar.xz
+tar -xJf stellar-agent-0.1.0-alpha.6-aarch64-apple-darwin.tar.xz
 ```
 
 then move the two binaries onto your `PATH`. On macOS, prefer this terminal
@@ -128,7 +128,7 @@ and the reasoning are documented in the
 Builds the binaries from the published sources:
 
 ```bash
-cargo install stellar-agent-cli@0.1.0-alpha.5 stellar-agent-mcp@0.1.0-alpha.5
+cargo install stellar-agent-cli@0.1.0-alpha.6 stellar-agent-mcp@0.1.0-alpha.6
 ```
 
 This installs the `stellar-agent` and `stellar-agent-mcp` executables. Building

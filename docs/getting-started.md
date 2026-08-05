@@ -47,7 +47,7 @@ from GitHub release archives. A single release archive carries both binaries:
 - Binaries inside: `stellar-agent` and `stellar-agent-mcp`.
 
 ```bash
-cargo binstall stellar-agent-cli@0.1.0-alpha.5 stellar-agent-mcp@0.1.0-alpha.5
+cargo binstall stellar-agent-cli@0.1.0-alpha.6 stellar-agent-mcp@0.1.0-alpha.6
 ```
 
 While only prerelease (alpha) versions are published on crates.io, the version
@@ -59,8 +59,8 @@ Without any Rust tooling, fetch and extract the archive directly (substitute
 your target):
 
 ```bash
-curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.5/stellar-agent-0.1.0-alpha.5-aarch64-apple-darwin.tar.xz
-tar -xJf stellar-agent-0.1.0-alpha.5-aarch64-apple-darwin.tar.xz
+curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.6/stellar-agent-0.1.0-alpha.6-aarch64-apple-darwin.tar.xz
+tar -xJf stellar-agent-0.1.0-alpha.6-aarch64-apple-darwin.tar.xz
 ```
 
 Every release ships supply-chain verification artifacts alongside the
@@ -92,7 +92,7 @@ your `PATH`; the `stellar-agent-cli` crate installs the binary named
 `stellar-agent`:
 
 ```bash
-cargo install stellar-agent-cli@0.1.0-alpha.5 stellar-agent-mcp@0.1.0-alpha.5
+cargo install stellar-agent-cli@0.1.0-alpha.6 stellar-agent-mcp@0.1.0-alpha.6
 ```
 
 ### Build from source
