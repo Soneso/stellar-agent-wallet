@@ -22,8 +22,8 @@ Run `stellar-agent --help` for the live subcommand list, or `stellar-agent <comm
 
 The wallet is a public alpha; prebuilt binaries are published on the GitHub releases page for each tagged release, and all crates are published on crates.io. While only prerelease versions are published, the version must be spelled out — a bare crate name matches stable versions only. The ways to install are:
 
-- `cargo binstall stellar-agent-cli@0.1.0-alpha.5` — downloads the prebuilt GitHub release archive for your target, resolved via crates.io (`stellar-agent-<version>-<target>.tar.xz`, or `.zip` on Windows; the `stellar-agent` CLI and the `stellar-agent-mcp` server ship in one archive).
-- `cargo install stellar-agent-cli@0.1.0-alpha.5` — builds from the published sources; the installed binary is named `stellar-agent`.
+- `cargo binstall stellar-agent-cli@0.1.0-alpha.6` — downloads the prebuilt GitHub release archive for your target, resolved via crates.io (`stellar-agent-<version>-<target>.tar.xz`, or `.zip` on Windows; the `stellar-agent` CLI and the `stellar-agent-mcp` server ship in one archive).
+- `cargo install stellar-agent-cli@0.1.0-alpha.6` — builds from the published sources; the installed binary is named `stellar-agent`.
 - Building from a clone with `cargo build --release`.
 
 ## Global conventions
