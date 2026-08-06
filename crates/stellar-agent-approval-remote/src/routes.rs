@@ -148,16 +148,49 @@ fn require_session(
 
     let expired = guard.as_ref().is_some_and(SessionState::is_expired);
     if expired {
+        // DEBUG BRANCH ONLY.
+        eprintln!("DEBUG require_session: slot EXPIRED, clearing");
         *guard = None;
     }
 
-    let session = guard.as_ref().ok_or_else(not_found)?;
+    // DEBUG BRANCH ONLY: name which refusal branch fires, with enough of
+    // each value to correlate against the mint log line (test-scoped
+    // ephemeral secrets; never merged).
+    let raw_cookie_header = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("<none>");
+    let slot_prefix = guard
+        .as_ref()
+        .map(|s| s.session_id.to_hex().chars().take(8).collect::<String>());
 
-    let cookie = session_cookie_value(headers).ok_or_else(not_found)?;
-    let submitted = crate::session::OpaqueToken::from_hex(&cookie).ok_or_else(not_found)?;
+    let Some(session) = guard.as_ref() else {
+        eprintln!(
+            "DEBUG require_session: 404 EMPTY-SLOT (expired={expired}); cookie header: {raw_cookie_header}"
+        );
+        return Err(not_found());
+    };
+
+    let Some(cookie) = session_cookie_value(headers) else {
+        eprintln!(
+            "DEBUG require_session: 404 NO-COOKIE; slot={slot_prefix:?}; cookie header: {raw_cookie_header}"
+        );
+        return Err(not_found());
+    };
+    let Some(submitted) = crate::session::OpaqueToken::from_hex(&cookie) else {
+        eprintln!(
+            "DEBUG require_session: 404 NON-HEX cookie ({} chars); slot={slot_prefix:?}",
+            cookie.len()
+        );
+        return Err(not_found());
+    };
     if session.session_id.ct_eq(&submitted) {
         Ok(session.clone())
     } else {
+        eprintln!(
+            "DEBUG require_session: 404 MISMATCH; slot={slot_prefix:?} submitted={}; full cookie header: {raw_cookie_header}",
+            cookie.chars().take(8).collect::<String>()
+        );
         Err(not_found())
     }
 }
@@ -370,6 +403,11 @@ async fn login_assertion_post(
 
     let session = SessionState::generate(credential_id);
     let cookie_value = session.session_id.to_hex();
+    // DEBUG BRANCH ONLY.
+    eprintln!(
+        "DEBUG login_assertion: session MINTED {}",
+        cookie_value.chars().take(8).collect::<String>()
+    );
     {
         let mut guard = match state.session.lock() {
             Ok(g) => g,
