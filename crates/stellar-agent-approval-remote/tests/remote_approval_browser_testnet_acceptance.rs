@@ -507,6 +507,21 @@ async fn wait_for_url_ending(page: &chromiumoxide::Page, suffix: &str, deadline:
                 .await
                 .ok()
                 .and_then(|r| r.into_value::<String>().ok());
+            // DEBUG BRANCH ONLY: a chrome-error:// page embeds its own net
+            // error code (e.g. ERR_CONNECTION_REFUSED vs ERR_CONNECTION_RESET
+            // vs a renderer-crash page) in its HTML — dump it so the job log
+            // names the actual failure instead of discarding it.
+            let dump: Option<String> = page
+                .evaluate(evaluate_by_value(
+                    "(function(){return document.documentElement.outerHTML;})()",
+                ))
+                .await
+                .ok()
+                .and_then(|r| r.into_value::<String>().ok());
+            if let Some(html) = dump {
+                let head: String = html.chars().take(6000).collect();
+                eprintln!("==== DEBUG current document (truncated) ====\n{head}\n==== END DEBUG ====");
+            }
             panic!(
                 "navigation to a URL ending in {suffix:?} did not occur within the deadline; \
                  last seen URL: {url:?}; #status text: {status:?}"

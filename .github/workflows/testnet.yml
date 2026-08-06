@@ -100,6 +100,9 @@ jobs:
       - name: Run testnet acceptance suites
         env:
           FILTER: ${{ inputs.filter }}
+          # DEBUG BRANCH ONLY: surface chromiumoxide's CDP handler activity and
+          # the Chrome process's own stderr in the job log.
+          RUST_LOG: chromiumoxide=debug
         run: |
           dbus-run-session -- bash -c '
             gnome-keyring-daemon --components=secrets --daemonize --unlock <<< "ci-headless-keyring-password"
