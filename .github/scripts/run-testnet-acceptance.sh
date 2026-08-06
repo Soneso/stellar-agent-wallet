@@ -203,6 +203,9 @@ for line in "${SUITES[@]}"; do
     sleep "$PACE"
   fi
   ran=$((ran + 1))
+  # DEBUG BRANCH ONLY: per-suite resource snapshot — disk, memory, and any
+  # chrome processes surviving from earlier browser suites.
+  echo "DEBUG resources before $suite: $(df -h /home 2>/dev/null | tail -1 | awk '{print "disk_avail="$4}') $(free -m 2>/dev/null | awk '/^Mem:/{print "mem_avail_mb="$7}') chrome_procs=$(pgrep -c -f chrome 2>/dev/null || echo 0)"
   echo "::group::$suite"
   if run_suite "$crate" "$feature" "$target"; then
     result="pass"
