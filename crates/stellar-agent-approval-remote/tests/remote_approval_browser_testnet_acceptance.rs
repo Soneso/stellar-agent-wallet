@@ -507,21 +507,29 @@ async fn wait_for_url_ending(page: &chromiumoxide::Page, suffix: &str, deadline:
                 .await
                 .ok()
                 .and_then(|r| r.into_value::<String>().ok());
-            // DEBUG BRANCH ONLY: a chrome-error:// page embeds its own net
-            // error code (e.g. ERR_CONNECTION_REFUSED vs ERR_CONNECTION_RESET
-            // vs a renderer-crash page) in its HTML — dump it so the job log
-            // names the actual failure instead of discarding it.
+            // DEBUG BRANCH ONLY: extract the net error code directly from the
+            // chrome-error page rather than dumping raw HTML (whose CSS
+            // preamble exceeds any sane truncation). `.error-code` holds the
+            // ERR_* string; loadTimeData carries the numeric code and
+            // summary; both are absent on a non-error page.
             let dump: Option<String> = page
                 .evaluate(evaluate_by_value(
-                    "(function(){return document.documentElement.outerHTML;})()",
+                    "(function(){\
+                       var ec = document.querySelector('.error-code');\
+                       var ltd = window.loadTimeData && window.loadTimeData.data_;\
+                       return JSON.stringify({\
+                         title: document.title,\
+                         error_code_text: ec ? ec.textContent : null,\
+                         ltd_error_code: ltd ? ltd.errorCode : null,\
+                         ltd_summary: ltd && ltd.summary ? ltd.summary.msg : null,\
+                         body_head: document.body ? document.body.innerText.slice(0, 400) : null\
+                       });\
+                     })()",
                 ))
                 .await
                 .ok()
                 .and_then(|r| r.into_value::<String>().ok());
-            if let Some(html) = dump {
-                let head: String = html.chars().take(6000).collect();
-                eprintln!("==== DEBUG current document (truncated) ====\n{head}\n==== END DEBUG ====");
-            }
+            eprintln!("==== DEBUG error-page extraction ====\n{dump:?}\n==== END DEBUG ====");
             panic!(
                 "navigation to a URL ending in {suffix:?} did not occur within the deadline; \
                  last seen URL: {url:?}; #status text: {status:?}"

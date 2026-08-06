@@ -598,6 +598,26 @@ async fn wait_for_url_ending(page: &chromiumoxide::Page, suffix: &str, deadline:
                 .await
                 .ok()
                 .and_then(|r| r.into_value::<String>().ok());
+            // DEBUG BRANCH ONLY: extract the chrome-error page's own error
+            // code (mirrors the sibling remote_approval suite's probe).
+            let dump: Option<String> = page
+                .evaluate(evaluate_by_value(
+                    "(function(){\
+                       var ec = document.querySelector('.error-code');\
+                       var ltd = window.loadTimeData && window.loadTimeData.data_;\
+                       return JSON.stringify({\
+                         title: document.title,\
+                         error_code_text: ec ? ec.textContent : null,\
+                         ltd_error_code: ltd ? ltd.errorCode : null,\
+                         ltd_summary: ltd && ltd.summary ? ltd.summary.msg : null,\
+                         body_head: document.body ? document.body.innerText.slice(0, 400) : null\
+                       });\
+                     })()",
+                ))
+                .await
+                .ok()
+                .and_then(|r| r.into_value::<String>().ok());
+            eprintln!("==== DEBUG error-page extraction ====\n{dump:?}\n==== END DEBUG ====");
             panic!(
                 "navigation to a URL ending in {suffix:?} did not occur within the deadline; \
                  last seen URL: {url:?}; #status text: {status:?}"
