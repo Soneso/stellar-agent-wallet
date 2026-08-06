@@ -530,6 +530,20 @@ async fn wait_for_url_ending(page: &chromiumoxide::Page, suffix: &str, deadline:
                 .ok()
                 .and_then(|r| r.into_value::<String>().ok());
             eprintln!("==== DEBUG error-page extraction ====\n{dump:?}\n==== END DEBUG ====");
+            // DEBUG BRANCH ONLY: the browser's actual cookie jar via CDP —
+            // the only way to observe an HttpOnly cookie's storage fate.
+            match page.get_cookies().await {
+                Ok(cookies) => {
+                    for c in cookies {
+                        let value_prefix: String = c.value.chars().take(8).collect();
+                        eprintln!(
+                            "DEBUG cookie-jar: name={} value_prefix={} domain={:?} path={} secure={} http_only={} same_site={:?} session={:?}",
+                            c.name, value_prefix, c.domain, c.path, c.secure, c.http_only, c.same_site, c.session
+                        );
+                    }
+                }
+                Err(e) => eprintln!("DEBUG cookie-jar: unavailable: {e}"),
+            }
             panic!(
                 "navigation to a URL ending in {suffix:?} did not occur within the deadline; \
                  last seen URL: {url:?}; #status text: {status:?}"
