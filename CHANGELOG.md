@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- `webbrowser` is bumped `1.2.1` to `1.2.4` (RUSTSEC advisory
+  GHSA-2ph8-5cr8-hr33: a URL could smuggle extra arguments — such as
+  `--remote-debugging-port` or `--proxy-server` — into the browser named by a
+  `BROWSER` environment-variable template). The crate's `hardened` feature is
+  also enabled: the passkey-registration handoff URL is the only thing this
+  workspace ever opens, and it is always http(s), so launches of any other
+  scheme are now refused by the dependency itself.
+
 - The approval pages neutralise bidirectional and invisible-format code points
   in every rendered value: U+061C, U+200B-200F, U+202A-202E, U+2066-2069, and
   U+FEFF become U+FFFD before HTML escaping. A memo or asset code carrying
