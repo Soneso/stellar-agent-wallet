@@ -149,7 +149,11 @@ stellar-agent-mcp = { path = "crates/stellar-agent-mcp", version = "0.1.0-alpha.
 # CLI binary (stellar-agent) deps.
 clap = { version = "=4.6.1", default-features = false, features = ["std", "derive", "help", "usage"] }
 # webbrowser: launches the system browser for the passkey-registration handoff.
-webbrowser = { version = "=1.2.1", default-features = false }
+# `hardened` restricts launchable URLs to http(s) — the loopback handoff URL is
+# the only thing this workspace ever opens, and it closes the whole class the
+# GHSA-2ph8-5cr8-hr33 argument-injection advisory belongs to, beyond the >=1.2.2
+# tokenization fix itself.
+webbrowser = { version = "=1.2.4", default-features = false, features = ["hardened"] }
 stellar-agent-pool = { path = "crates/stellar-agent-pool", version = "0.1.0-alpha.6" }
 stellar-agent-cli = { path = "crates/stellar-agent-cli", version = "0.1.0-alpha.6" }
 stellar-agent-claimable = { path = "crates/stellar-agent-claimable", version = "0.1.0-alpha.6" }
