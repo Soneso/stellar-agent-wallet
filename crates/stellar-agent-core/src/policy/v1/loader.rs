@@ -2047,7 +2047,7 @@ garbage = "not-a-number"
     ) -> Option<DenyReason> {
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
-        let tool = test_tool("stellar_blend_lend");
+        let tool = test_tool("stellar_dex_trade");
         let profile = test_profile();
         let args = serde_json::json!({});
         let store = PolicyStateStore::new();

@@ -31,12 +31,11 @@
 //! - `sep24_interactive_url` — `stellar_sep24_interactive_url` tool (SEP-24 hand-off).
 //! - `x402_authenticated_payment` — `stellar_x402_authenticated_payment` tool (x402 + SEP-10 gate).
 //! - `toolsets` — `stellar_toolset_list` and `stellar_toolset_invoke` tools (generic dispatcher).
-//! - `blend_lend` — `stellar_blend_lend` tool (Blend lending adapter).
 //! - `dex_trade` — `stellar_dex_trade` + `stellar_dex_quote` tools (Soroswap swap adapter).
 //! - `trustline` — `stellar_trustline` + `stellar_trustline_commit` tools (stablecoin trustline verb).
 
 // Shared decimal-string <-> i128 parse helpers for the DeFi tool args (dex,
-// blend, vault) and other i128-carrying wire fields.
+// vault, dex) and other i128-carrying wire fields.
 pub(crate) mod amount_wire;
 pub(crate) mod balances;
 pub(crate) mod common;
@@ -70,8 +69,6 @@ pub(crate) mod sep24_interactive_url;
 pub(crate) mod sep6_deposit_info;
 // Generic toolset-invocation surface (list + invoke).
 pub(crate) mod toolsets;
-// Blend lending adapter — live DeFi verb.
-pub(crate) mod blend_lend;
 // DeFindex vault adapter — vault deposit/withdraw verbs.
 pub(crate) mod vault;
 // Soroswap DEX swap adapter — trade + quote verbs.

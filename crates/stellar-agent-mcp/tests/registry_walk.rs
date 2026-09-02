@@ -276,12 +276,12 @@ fn instructions_string_names_every_registered_tool() {
 /// The count assertion guards against a tool being accidentally added or dropped.
 /// When the tool set changes, update the expected count and the name list below.
 #[test]
-fn registry_contains_forty_three_tools() {
+fn registry_contains_forty_two_tools() {
     let registry = collect_registry_names();
     assert_eq!(
         registry.len(),
-        43,
-        "registry must contain exactly 43 tools \
+        42,
+        "registry must contain exactly 42 tools \
          (stellar_balances + stellar_friendbot + stellar_create_account \
          + stellar_create_account_commit + stellar_pay + stellar_pay_commit \
          + stellar_fee_stats + stellar_sep43_get_address + stellar_sep43_get_network \
@@ -292,7 +292,7 @@ fn registry_contains_forty_three_tools() {
          + stellar_sep53_sign_message + stellar_sep53_verify_message \
          + stellar_sep7_parse_uri + stellar_sep6_deposit_info \
          + stellar_sep24_interactive_url + stellar_x402_authenticated_payment \
-         + stellar_toolset_list + stellar_toolset_invoke + stellar_blend_lend \
+         + stellar_toolset_list + stellar_toolset_invoke \
          + stellar_defindex_vault_deposit + stellar_defindex_vault_withdraw \
          + stellar_dex_trade + stellar_dex_quote \
          + stellar_trustline + stellar_trustline_commit \
@@ -404,11 +404,6 @@ fn registry_contains_forty_three_tools() {
     assert!(
         registry.contains("stellar_toolset_invoke"),
         "registry must contain stellar_toolset_invoke; got: {registry:?}"
-    );
-    // Blend lending adapter.
-    assert!(
-        registry.contains("stellar_blend_lend"),
-        "registry must contain stellar_blend_lend; got: {registry:?}"
     );
     // DeFindex vault adapter — deposit and withdraw.
     assert!(
@@ -1493,7 +1488,6 @@ fn value_kind_classification_matches_design() {
         "stellar_claim_commit",
         "stellar_trustline",
         "stellar_trustline_commit",
-        "stellar_blend_lend",
         "stellar_dex_trade",
         "stellar_defindex_vault_deposit",
         "stellar_defindex_vault_withdraw",
@@ -1578,10 +1572,6 @@ const MOVES_VALUE_COMMIT_HANDLER_SOURCES: &[(&str, &str)] = &[
     (
         "stellar_trustline_commit",
         include_str!("../src/tools/trustline.rs"),
-    ),
-    (
-        "stellar_blend_lend",
-        include_str!("../src/tools/blend_lend.rs"),
     ),
     (
         "stellar_dex_trade",

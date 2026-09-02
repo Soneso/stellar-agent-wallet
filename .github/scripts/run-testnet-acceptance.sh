@@ -103,8 +103,6 @@ SUITES=(
   "stellar-agent-x402 testnet-acceptance x402_exact_testnet_acceptance"
   "stellar-agent-mpp testnet-acceptance sponsored_testnet_acceptance"
   "stellar-agent-dex testnet-acceptance dex_swap_testnet_acceptance"
-  "stellar-agent-blend testnet-acceptance blend_lend_testnet_acceptance"
-  "stellar-agent-blend testnet-acceptance blend_supply_submit_testnet_acceptance"
   "stellar-agent-defindex testnet-acceptance defindex_vault_testnet_acceptance"
   "stellar-agent-defindex testnet-acceptance defindex_deposit_submit_testnet_acceptance"
   "stellar-agent-mcp testnet-acceptance pay_commit_testnet_acceptance"

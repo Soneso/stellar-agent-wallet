@@ -52,7 +52,7 @@ In plain terms, an agent connected to the wallet can:
 - **Pay other agents and services** — the x402 payment scheme lets an agent
   pay for API access machine-to-machine, optionally verifying who it is
   paying first.
-- **Use DeFi, carefully** — lend on Blend, swap on Soroswap, and use DeFindex
+- **Use DeFi, carefully** — swap on Soroswap, and use DeFindex
   vaults through typed, simulation-checked verbs. The wallet refuses raw or
   opaque contract calls outright; only recognized, decoded operations reach
   signing.

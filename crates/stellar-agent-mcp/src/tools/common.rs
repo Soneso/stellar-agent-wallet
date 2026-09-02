@@ -357,7 +357,7 @@ pub(crate) fn ledger_err_result(
 /// `{code,message}` and JSON-RPC error shapes lacked.
 ///
 /// `code` is the stable wire code (e.g. `"policy.approval_required"`,
-/// `"nonce.expired"`, `"blend.pool_wasm_pin_failed"`); `message` is the
+/// `"nonce.expired"`, `"vault.wasm_pin_failed"`); `message` is the
 /// human-readable, redaction-clean detail.  Callers that move public identifiers
 /// into `message` MUST redact them first (the envelope applies no redaction).
 ///
@@ -2518,8 +2518,8 @@ mod tests {
     // ── dispatch_gate: DeFi-shaped tool + minimum_reserve, no account_view → fails closed ──
 
     /// Pins the terminal posture: the smart-account-fronted DeFi
-    /// tools (`stellar_blend_lend`, `stellar_dex_trade`,
-    /// `stellar_defindex_vault_deposit`, `stellar_defindex_vault_withdraw`)
+    /// tools (`stellar_dex_trade`, `stellar_defindex_vault_deposit`,
+    /// `stellar_defindex_vault_withdraw`)
     /// always call `dispatch_gate_with_value` with `account_view = None` —
     /// `from_address` on these tools is a smart-account contract (C-strkey)
     /// with no classic `AccountEntry`, so there is no account state to fetch.
@@ -2536,16 +2536,15 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(keyring)]
     async fn dispatch_gate_defi_tool_minimum_reserve_fails_closed_with_no_account_view() {
-        use stellar_agent_blend::abi::{BlendRequest, RequestType};
-        use stellar_agent_blend::value::blend_value_legs;
         use stellar_agent_core::policy::v1::criteria::MinimumReserveCriterion;
         use stellar_agent_core::policy::v1::{ValueClass, ValueEffects};
         use stellar_agent_core::{PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId};
 
         stellar_agent_test_support::keyring_mock::install().ok();
 
-        const POOL: &str = "CCEBVDYM32YNYCVNRXQKDFFPISJJCV557CDZEIRBEE4NCV4KHPQ44HGF";
-        const ASSET: &str = "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU";
+        const ROUTER: &str = "CCEBVDYM32YNYCVNRXQKDFFPISJJCV557CDZEIRBEE4NCV4KHPQ44HGF";
+        const ASSET_A: &str = "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU";
+        const ASSET_B: &str = "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD";
         const FROM: &str = "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD";
 
         let doc = PolicyDocument {
@@ -2553,7 +2552,7 @@ mod tests {
             scope: ScopeId::AllProfiles,
             rules: vec![PolicyRule {
                 r#match: RuleMatch {
-                    tool: "stellar_blend_lend".into(),
+                    tool: "stellar_dex_trade".into(),
                     chain: "*".into(),
                 },
                 criteria: vec![Box::new(MinimumReserveCriterion::new(0))],
@@ -2565,23 +2564,23 @@ mod tests {
         let engine = PolicyEngineV1::new(doc, "svc".into());
         let server = make_server_with_engine(engine);
 
-        let reqs = vec![BlendRequest::new(
-            RequestType::Supply,
-            ASSET,
+        let canonical_path = vec![ASSET_A.to_owned(), ASSET_B.to_owned()];
+        let legs = vec![stellar_agent_dex::value::dex_trade_value_leg(
             500_000_000_i128,
+            &canonical_path,
+            ROUTER,
         )];
-        let legs = blend_value_legs(&reqs, POOL);
         let args_value = serde_json::json!({
             "chain_id": "stellar:testnet",
-            "pool_address": POOL,
+            "router_address": ROUTER,
             "from_address": FROM,
         });
 
         // Mirrors the real dispatch site exactly: account_view and
-        // identity_view are both None (see blend_lend.rs's dispatch call).
+        // identity_view are both None (see dex_trade.rs's dispatch call).
         let result = server
             .dispatch_gate_with_value(
-                "stellar_blend_lend",
+                "stellar_dex_trade",
                 &args_value,
                 "stellar:testnet",
                 ValueClass::Value(ValueEffects::new(legs)),
@@ -3496,7 +3495,7 @@ mod tests {
 ///   `stellar-agent-core`) specifically so it can also reach family (b).
 /// - **Family (b) — handler-supplied.** Single-shot DeFi/DEX/x402 handlers
 ///   decode their operation once and build [`stellar_agent_core::policy::v1::ValueLeg`]s
-///   directly via a shared per-domain builder (`blend_value_legs`,
+///   directly via a shared per-domain builder (
 ///   `dex_trade_value_leg`, `vault_deposit_value_legs`,
 ///   `vault_withdraw_value_leg`, [`x402_value_leg`]), then wrap them in
 ///   `ValueClass::Value(ValueEffects::new(legs))` for
@@ -3531,8 +3530,6 @@ mod value_descriptor_enumeration {
 
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use serde_json::json;
-    use stellar_agent_blend::abi::{BlendRequest, RequestType};
-    use stellar_agent_blend::value::blend_value_legs;
     use stellar_agent_core::policy::v1::value::derive_value_class;
     use stellar_agent_core::policy::v1::{ActionKind, ValueClass};
     use stellar_agent_core::policy::{McpToolRegistration, ToolValueKind};
@@ -3550,7 +3547,6 @@ mod value_descriptor_enumeration {
     // parse paths rather than short-circuiting on malformed input.
     const DESTINATION: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
     const USDC_ASSET: &str = "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
-    const POOL: &str = "CCEBVDYM32YNYCVNRXQKDFFPISJJCV557CDZEIRBEE4NCV4KHPQ44HGF";
     const RESERVE_ASSET_A: &str = "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU";
     const RESERVE_ASSET_B: &str = "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD";
     const ROUTER: &str = "CCJUD55AG6W5HAI5LRVNKAE5WDP5XGZBUDS5WNTIVDU7O264UZZE7BRD";
@@ -3572,10 +3568,9 @@ mod value_descriptor_enumeration {
 
     /// Family-(b) tool names: the handler decodes once and builds legs via a
     /// shared builder before calling `dispatch_gate_with_value`. Mirrors the
-    /// `value_kind = "moves_value"` handlers in `blend_lend.rs`, `dex_trade.rs`,
+    /// `value_kind = "moves_value"` handlers in `dex_trade.rs`,
     /// `vault.rs`, `x402_create_payment.rs`, `x402_authenticated_payment.rs`.
     const FAMILY_B_TOOLS: &[&str] = &[
-        "stellar_blend_lend",
         "stellar_dex_trade",
         "stellar_defindex_vault_deposit",
         "stellar_defindex_vault_withdraw",
@@ -3635,13 +3630,6 @@ mod value_descriptor_enumeration {
     /// that set.
     fn family_b_legs_for(tool_name: &str) -> Vec<stellar_agent_core::policy::v1::ValueLeg> {
         match tool_name {
-            "stellar_blend_lend" => {
-                let reqs = vec![
-                    BlendRequest::new(RequestType::Supply, RESERVE_ASSET_A, 500_000_000_i128),
-                    BlendRequest::new(RequestType::FillUserLiquidationAuction, DESTINATION, 25),
-                ];
-                blend_value_legs(&reqs, POOL)
-            }
             "stellar_dex_trade" => {
                 let canonical_path = vec![RESERVE_ASSET_A.to_owned(), RESERVE_ASSET_B.to_owned()];
                 vec![dex_trade_value_leg(
@@ -3854,30 +3842,6 @@ mod value_descriptor_enumeration {
     /// the documented asset/destination shape.
     #[test]
     fn family_b_builders_produce_expected_action_kind_and_debit() {
-        // Blend: Supply-side outflow leg (debit) …
-        let blend_legs = family_b_legs_for("stellar_blend_lend");
-        assert_eq!(blend_legs.len(), 2);
-        assert_eq!(blend_legs[0].kind, ActionKind::Lend);
-        assert!(
-            blend_legs[0].kind.carries_debit(),
-            "Blend Supply must be a debit"
-        );
-        assert_eq!(blend_legs[0].amount, Some(500_000_000_i128));
-        assert_eq!(blend_legs[0].asset.as_deref(), Some(RESERVE_ASSET_A));
-        // … and an auction leg (non-debit; amount collapses to None, not the
-        // fill-percentage `req.amount`, per `blend_value_legs`'s documented
-        // mapping for the four liquidation discriminants).
-        assert_eq!(blend_legs[1].kind, ActionKind::LendWithdraw);
-        assert!(
-            !blend_legs[1].kind.carries_debit(),
-            "a Blend auction-fill leg must not be a spendable-balance debit"
-        );
-        assert_eq!(blend_legs[1].amount, None);
-        assert_eq!(
-            blend_legs[1].asset, None,
-            "an auction's `address` field is a liquidatee, not a reserve asset"
-        );
-
         // DEX: single send-side debit leg.
         let dex_legs = family_b_legs_for("stellar_dex_trade");
         assert_eq!(dex_legs.len(), 1);

@@ -57,8 +57,8 @@
 //! `→ stellar-agent-smart-account` (submit path),
 //! `→ stellar-agent-core` (ContextRuleId / observability redaction).
 //!
-//! NEVER `stellar-agent-dex → stellar-agent-blend` or
-//! `stellar-agent-dex → stellar-agent-defindex`.
+//! NEVER `stellar-agent-dex → stellar-agent-defindex` or any other sibling
+//! protocol adapter.
 //!
 //! # ABI provenance
 //!

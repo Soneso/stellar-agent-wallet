@@ -59,7 +59,7 @@ stellar-agent-wallet/
     profiles-and-keys.md         # Profiles, the keyring, and key rotation
     approvals-and-audit.md       # Policy engine, the approval spine, the audit log
     smart-accounts.md            # OpenZeppelin smart-account governance
-    defi.md                      # Blend, Soroswap, DeFindex, and the channel pool
+    defi.md                      # Soroswap, DeFindex, and the channel pool
     protocols.md                 # SEP support and x402 agent payments
     toolsets-feature.md          # The wallet's capability-isolation feature
     troubleshooting.md           # Wire and error codes

@@ -28,7 +28,6 @@ FLOORS = {
     "stellar-agent-headless-keyring": 84,
     "stellar-agent-approval-remote": 83,
     "stellar-agent-approval-ui": 93,
-    "stellar-agent-blend": 76,
     "stellar-agent-claimable": 94,
     "stellar-agent-cli": 42,
     "stellar-agent-core": 91,

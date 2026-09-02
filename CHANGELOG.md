@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- The Blend lending integration: the `stellar-agent-blend` crate, the CLI
+  `lend` command, the MCP `stellar_blend_lend` tool, and the two Blend testnet
+  acceptance suites. The wallet's lending verb depended on Blend's backstop for
+  depositor protection; the August 2026 Comet pool exploit drained that
+  backstop and the protocol's pools are winding down, so the integration does
+  not ship while the insurance layer is unavailable. DeFindex vault Blend-
+  strategy disclosure is unaffected, as are the DeFindex and Soroswap
+  integrations. Published `stellar-agent-blend` crate versions remain on
+  crates.io; no new versions are published.
+
 ## [0.1.0-alpha.6] - 2026-08-12
 
 ### Security

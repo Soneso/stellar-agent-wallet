@@ -32,7 +32,7 @@ TIER0="stellar-agent-loopback-http stellar-agent-mcp-macros stellar-agent-sep5 s
 TIER1="stellar-agent-core stellar-agent-headless-keyring stellar-agent-sep10 stellar-agent-sep45"
 TIER2="stellar-agent-network stellar-agent-toolsets-install"
 TIER3="stellar-agent-anchor stellar-agent-claimable stellar-agent-defi stellar-agent-nonce stellar-agent-pool stellar-agent-sep48 stellar-agent-sep53 stellar-agent-sep7 stellar-agent-smart-account stellar-agent-stablecoin stellar-agent-toolsets-runtime stellar-agent-x402-identity"
-TIER4="stellar-agent-approval-ui stellar-agent-blend stellar-agent-defindex stellar-agent-dex stellar-agent-sep43 stellar-agent-webauthn-bridge"
+TIER4="stellar-agent-approval-ui stellar-agent-defindex stellar-agent-dex stellar-agent-sep43 stellar-agent-webauthn-bridge"
 TIER5="stellar-agent-approval-remote stellar-agent-mpp stellar-agent-x402"
 TIER6="stellar-agent-cli stellar-agent-mcp"
 

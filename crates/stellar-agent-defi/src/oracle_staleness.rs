@@ -8,9 +8,9 @@
 //!
 //! ## Protocol-agnostic contract
 //!
-//! None of these types mention Blend in their signatures.  The
-//! Blend-specific pieces (Reflector allowlist, `read_pool_oracle_address`,
-//! `query_oracle_lastprice_timestamps`) remain in `stellar-agent-blend`.
+//! None of these types mention any protocol in their signatures; adapters
+//! keep their own oracle allowlists and lookup helpers and consume this
+//! substrate for the staleness decision alone.
 //!
 //! # Ordered trust invariant
 //!

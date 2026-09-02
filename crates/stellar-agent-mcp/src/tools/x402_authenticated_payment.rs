@@ -466,7 +466,7 @@ impl WalletServer {
                 Ok(h) => h,
                 Err(_) => {
                     // Static message aligned with the DeFi signer-load surfaces
-                    // (blend / dex / vault) for cross-surface uniformity; the
+                    // (dex / vault) for cross-surface uniformity; the
                     // wire code stays `x402.keyring_load_failed`, consistent with
                     // `stellar_x402_create_payment`.
                     return Ok(crate::tools::common::business_error_result(

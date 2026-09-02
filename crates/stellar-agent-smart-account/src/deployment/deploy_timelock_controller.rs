@@ -778,7 +778,7 @@ async fn deploy_timelock_controller_body(
 mod tests {
     #![allow(clippy::unwrap_used, reason = "test-only")]
 
-    use sha2::{Digest as _, Sha256};
+    use sha2::Sha256;
 
     use super::*;
 

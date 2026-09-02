@@ -815,7 +815,7 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test-only")]
     #![allow(clippy::expect_used, reason = "test-only")]
 
-    use sha2::{Digest as _, Sha256};
+    use sha2::Sha256;
 
     use super::*;
     use crate::spending_limit_policy::{

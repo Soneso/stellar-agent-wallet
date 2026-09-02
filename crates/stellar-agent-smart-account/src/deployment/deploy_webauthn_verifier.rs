@@ -799,7 +799,7 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test-only")]
     #![allow(clippy::expect_used, reason = "test-only")]
 
-    use sha2::{Digest as _, Sha256};
+    use sha2::Sha256;
 
     use super::*;
     use crate::webauthn_verifier::{WEBAUTHN_VERIFIER_WASM, WEBAUTHN_VERIFIER_WASM_SHA256};

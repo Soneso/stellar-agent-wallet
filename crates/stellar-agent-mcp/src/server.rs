@@ -815,8 +815,6 @@ impl WalletServer {
         router.merge(Self::x402_authenticated_payment_tool_router());
         // Generic toolset-invocation surface (list + invoke).
         router.merge(Self::toolsets_tool_router());
-        // Blend lending adapter — deposit/withdraw verbs.
-        router.merge(Self::blend_lend_tool_router());
         // DeFindex vault adapter — vault deposit/withdraw.
         router.merge(Self::vault_tool_router());
         // Soroswap DEX swap adapter — trade + quote verbs.
@@ -1056,9 +1054,6 @@ impl ServerHandler for WalletServer {
              accounting, and ledger-outcome state); \
              stellar_fee_stats (fetch network fee statistics for fee estimation, \
              read-only); \
-             stellar_blend_lend (Blend lending pool supply/withdraw/borrow/repay \
-             via an ordered trust gate — pool WASM-hash pin, oracle allowlist, \
-             oracle-staleness — then smart-account submit, destructive); \
              stellar_defindex_vault_deposit (DeFindex vault deposit via \
              smart-account submit, destructive); \
              stellar_defindex_vault_withdraw (DeFindex vault withdraw via \

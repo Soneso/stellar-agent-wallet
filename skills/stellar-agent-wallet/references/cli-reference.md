@@ -353,7 +353,6 @@ Every venue's flags, trust gate, refusal codes, and examples live in [`defi.md`]
 
 | Verb | Venue | Purpose |
 |---|---|---|
-| `lend` | Blend | Supply/borrow/repay/withdraw against a Blend pool; oracle-allowlist and staleness gates |
 | `vault deposit` | DeFindex | Deposit into a DeFindex vault; `--amounts-min` required; upgradable-vault refusal |
 | `vault withdraw` | DeFindex | Redeem shares from a DeFindex vault; `--min-amounts-out` required |
 | `trade` | Soroswap | Swap via the Soroswap router; price discovery is inside `trade` (no separate `quote`) |

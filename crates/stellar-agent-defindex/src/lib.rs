@@ -38,8 +38,9 @@
 //! `→ stellar-agent-smart-account` (submit path),
 //! `→ stellar-agent-core` (Criterion/EvalContext/redaction).
 //!
-//! NEVER `stellar-agent-defindex → stellar-agent-blend`.  The oracle-staleness
-//! substrate is consumed from `stellar-agent-defi::oracle_staleness` directly.
+//! The oracle-staleness
+//! substrate is consumed from `stellar-agent-defi::oracle_staleness` directly,
+//! never from a sibling protocol adapter.
 //!
 //! # ABI provenance
 //!

@@ -1373,7 +1373,7 @@ mod tests {
     // crate version used at runtime, ensuring the post-deploy verification gate
     // operates on consistent XDR encoding.
     use serde_json::json;
-    use sha2::{Digest as _, Sha256};
+    use sha2::Sha256;
     use stellar_xdr::{
         ContractDataDurability, ContractDataEntry, ExtensionPoint,
         LedgerEntryData as SorobanLedgerEntryData,

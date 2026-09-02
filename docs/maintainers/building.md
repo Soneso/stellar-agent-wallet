@@ -227,7 +227,7 @@ cargo test -p stellar-agent-network --features testnet-acceptance
 
 The `testnet-acceptance` feature is dev- and CI-only and must not be enabled in any
 release-artifact feature set. The crates that submit on-chain (for example
-`stellar-agent-blend`, `stellar-agent-defindex`, `stellar-agent-dex`,
+`stellar-agent-defindex`, `stellar-agent-dex`,
 `stellar-agent-stablecoin`) pull `stellar-agent-test-support/testnet-helpers` in
 through their own `testnet-acceptance` feature. A sibling `testnet-integration`
 feature on `stellar-agent-sep10`, `stellar-agent-sep45`, and

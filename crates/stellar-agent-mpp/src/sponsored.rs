@@ -715,8 +715,8 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-    use stellar_agent_network::signing::{Signer as _, SoftwareSigningKey};
-    use stellar_xdr::{SorobanAddressCredentials, SorobanAuthorizedInvocation, WriteXdr as _};
+    use stellar_agent_network::signing::SoftwareSigningKey;
+    use stellar_xdr::{SorobanAddressCredentials, SorobanAuthorizedInvocation};
 
     use super::*;
     use crate::{ChallengeInput, HttpRequestContext, select_and_validate};

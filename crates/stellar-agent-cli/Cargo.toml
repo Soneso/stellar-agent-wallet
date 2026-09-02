@@ -32,8 +32,6 @@ pkg-fmt = "zip"
 stellar-agent-core = { workspace = true }
 stellar-agent-network = { workspace = true }
 stellar-agent-mpp = { workspace = true }
-# Blend lending adapter — `lend` subcommand.
-stellar-agent-blend = { workspace = true }
 # DeFindex vault adapter — `vault` subcommand.
 stellar-agent-defindex = { workspace = true }
 # Soroswap DEX swap adapter — `trade` subcommand.

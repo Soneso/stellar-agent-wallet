@@ -217,7 +217,7 @@ pub enum DefindexPinError {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Const hex decoder (shared with blend/pins.rs; internal copy)
+// Const hex decoder (internal copy; no shared-crate home warrants extracting it)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[allow(clippy::panic)]

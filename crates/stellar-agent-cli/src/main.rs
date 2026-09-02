@@ -152,13 +152,6 @@ enum Commands {
     ///   material).
     Credentials(commands::credentials::CredentialsArgs),
 
-    /// Supply, borrow, repay, or withdraw from a Blend lending pool.
-    ///
-    /// Enforces the ordered trust gate: pool WASM-hash pin, Reflector oracle
-    /// allowlist, oracle staleness check.  Signs and submits via the wallet's
-    /// smart-account.
-    Lend(commands::lend::LendArgs),
-
     /// Deposit or withdraw from a DeFindex vault.
     ///
     /// Enforces the ordered trust gate: vault WASM-hash pin, upgradable-flag
@@ -264,7 +257,6 @@ impl Commands {
             Self::Pool(a) => a.profile_flag(),
             Self::Profile(a) => a.profile_flag(),
             Self::Credentials(a) => a.profile_flag(),
-            Self::Lend(a) => a.profile.as_deref(),
             Self::Vault(a) => a.profile_flag(),
             Self::Trade(a) => a.profile.as_deref(),
             Self::Trustline(a) => a.profile.as_deref(),
@@ -320,7 +312,6 @@ async fn main() {
     }
 
     let exit_code = match cli.command {
-        Commands::Lend(args) => commands::lend::run(&args).await,
         Commands::Vault(args) => commands::vault::run(&args).await,
         Commands::Trade(args) => commands::trade::run(&args).await,
         Commands::Trustline(args) => commands::trustline::run(&args).await,

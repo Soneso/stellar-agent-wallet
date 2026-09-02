@@ -57,16 +57,16 @@ use crate::network::WasmHashFetch;
 /// use stellar_agent_defi::pins::DefiContractPin;
 ///
 /// let pin = DefiContractPin::new(
-///     "blend", "v2", "default", "stellar:testnet",
+///     "defindex", "v1", "default", "stellar:testnet",
 ///     "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
 ///     [0u8; 32], "895845f",
 /// );
-/// assert_eq!(pin.protocol, "blend");
+/// assert_eq!(pin.protocol, "defindex");
 /// ```
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct DefiContractPin {
-    /// Protocol identifier (e.g. `"blend"`, `"defindex"`, `"axelar"`).
+    /// Protocol identifier (e.g. `"defindex"`, `"soroswap"`, `"axelar"`).
     pub protocol: String,
     /// Protocol version (e.g. `"v1"`, `"v2"`).
     pub version: String,
@@ -87,7 +87,7 @@ pub struct DefiContractPin {
     /// ABI source-provenance: the git commit SHA (or other identifier) of the
     /// clone from which the ABI was bound (distinct from the deployed WASM hash).
     ///
-    /// Example: `"895845f"` for Blend `blend-contracts@895845f`.
+    /// Example: a short git revision of the bound contract source, such as `"895845f"`.
     pub abi_source_provenance: String,
 }
 
@@ -103,11 +103,11 @@ impl DefiContractPin {
     /// use stellar_agent_defi::pins::DefiContractPin;
     ///
     /// let pin = DefiContractPin::new(
-    ///     "blend", "v2", "default", "stellar:testnet",
+    ///     "defindex", "v1", "default", "stellar:testnet",
     ///     "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
     ///     [0u8; 32], "895845f",
     /// );
-    /// assert_eq!(pin.protocol, "blend");
+    /// assert_eq!(pin.protocol, "defindex");
     /// ```
     #[must_use]
     pub fn new(

@@ -120,7 +120,6 @@ Before dispatching any command, the CLI runs a local-only startup advisory: it s
 | `friendbot` | Fund a testnet or futurenet account via the Friendbot endpoint (read-only; mainnet refused). | [stellar-ops](stellar-ops.md) |
 | `fees` | Fetch Stellar RPC fee statistics for classic fee selection (read-only). | [stellar-ops](stellar-ops.md) |
 | `counterparty` | Manage the cached `stellar.toml` bindings that back the counterparty allowlist policy. | [profile-and-governance](profile-and-governance.md) |
-| `lend` | Supply, borrow, repay, or withdraw against a Blend lending pool via the smart-account (signing). | [defi-and-pool](defi-and-pool.md) |
 | `vault` | Deposit into or withdraw from a DeFindex vault via the smart-account (signing). | [defi-and-pool](defi-and-pool.md) |
 | `trade` | Swap tokens via the Soroswap router-direct path via the smart-account (signing). | [defi-and-pool](defi-and-pool.md) |
 | `pool` | Initialise and inspect a channel-account pool for parallel transaction submission. | [defi-and-pool](defi-and-pool.md) |
