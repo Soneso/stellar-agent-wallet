@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `docs/maintainers/stability-tiers.md`: per-crate support tiers (stable
+  core, supported optional, experimental, internal, removed), the mainnet
+  posture of each surface, and the intended-but-unimplemented feature groups
+  and facades. The four internal crates' descriptions now state that they
+  carry no API stability promise.
+
 ### Removed
 
 - The Blend lending integration: the `stellar-agent-blend` crate, the CLI

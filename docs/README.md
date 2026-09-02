@@ -42,6 +42,8 @@ from the capability-restriction toolsets feature above.
 
 - [Architecture](maintainers/architecture.md) — the crate map and dependency
   layering.
+- [Stability tiers](maintainers/stability-tiers.md) — per-crate support intent,
+  maturity, and mainnet posture.
 - [Building and testing](maintainers/building.md) — the build, the gate suite,
   and the test tiers.
 - [Security internals](maintainers/security-internals.md) — the cryptographic
