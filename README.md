@@ -52,7 +52,7 @@ each tagged release, and the workspace crates are published to
 - Payments, balances, trustlines, and claimable-balance claims on Stellar.
 - Operator approval loop with a terminal command and a loopback web inbox
   (list, notify, approve or reject pending agent actions).
-- DeFi adapters: Blend lending (`lend`), Soroswap swaps (CLI `trade`; MCP
+- DeFi adapters: Soroswap swaps (CLI `trade`; MCP
   `stellar_dex_trade` plus read-only `stellar_dex_quote`), DeFindex vaults
   (`vault`). Each verb is typed, simulate-checked, and
   fail-closed; raw or opaque calldata is refused before signing.

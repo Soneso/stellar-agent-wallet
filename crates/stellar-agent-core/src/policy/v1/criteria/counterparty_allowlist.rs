@@ -50,7 +50,7 @@
 //! ## Debit-only scoping (default) and the `gate_inflows` opt-in
 //!
 //! By default `KNOWN_ISSUER` checks only DEBIT legs (an outflow leaving the
-//! wallet) — an inflow leg (e.g. a Blend withdraw/borrow or a vault
+//! wallet) — an inflow leg (e.g. a vault withdraw or a DEX trade's receive
 //! withdrawal, [`ActionKind::carries_debit`](crate::policy::v1::value::ActionKind::carries_debit)
 //! `== false`) is never scrutinised, so tokens received from an
 //! un-allowlisted issuer are not gated. Setting the criterion's `gate_inflows`
@@ -1057,7 +1057,7 @@ mod tests {
     fn known_issuer_debit_leg_with_no_asset_denies() {
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
-        let tool = make_tool("stellar_blend_lend");
+        let tool = make_tool("stellar_dex_trade");
         let profile = make_profile();
         let store = PolicyStateStore::new();
         let criterion = CounterpartyAllowlistCriterion::new(
@@ -1102,7 +1102,7 @@ mod tests {
     fn gate_inflows_default_false_allows_unknown_issuer_inflow() {
         use crate::policy::v1::value::{ValueClass, ValueEffects};
 
-        let tool = make_tool("stellar_blend_lend");
+        let tool = make_tool("stellar_dex_trade");
         let profile = make_profile();
         let store = PolicyStateStore::new();
         // Allowlist does NOT include this issuer; with gate_inflows unset
@@ -1128,7 +1128,7 @@ mod tests {
     fn gate_inflows_true_denies_unknown_issuer_inflow() {
         use crate::policy::v1::value::{ValueClass, ValueEffects};
 
-        let tool = make_tool("stellar_blend_lend");
+        let tool = make_tool("stellar_dex_trade");
         let profile = make_profile();
         let store = PolicyStateStore::new();
         let criterion = CounterpartyAllowlistCriterion::new(
@@ -1161,7 +1161,7 @@ mod tests {
     fn gate_inflows_true_allows_allowlisted_issuer_inflow() {
         use crate::policy::v1::value::{ValueClass, ValueEffects};
 
-        let tool = make_tool("stellar_blend_lend");
+        let tool = make_tool("stellar_dex_trade");
         let profile = make_profile();
         let store = PolicyStateStore::new();
         let criterion = CounterpartyAllowlistCriterion::new(
@@ -1187,7 +1187,7 @@ mod tests {
     fn gate_inflows_true_asset_none_inflow_denies_fail_closed() {
         use crate::policy::v1::value::{ValueClass, ValueEffects};
 
-        let tool = make_tool("stellar_blend_lend");
+        let tool = make_tool("stellar_dex_trade");
         let profile = make_profile();
         let store = PolicyStateStore::new();
         let criterion = CounterpartyAllowlistCriterion::new(
@@ -1223,7 +1223,7 @@ mod tests {
     fn gate_inflows_true_debit_leg_behavior_unchanged() {
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
-        let tool = make_tool("stellar_blend_lend");
+        let tool = make_tool("stellar_dex_trade");
         let profile = make_profile();
         let store = PolicyStateStore::new();
         let criterion = CounterpartyAllowlistCriterion::new(
@@ -1789,7 +1789,7 @@ mod tests {
     #[test]
     fn moves_value_tool_with_unpopulated_effects_denies_unsizable() {
         let tool = make_tool_with_kind(
-            "stellar_blend_lend",
+            "stellar_dex_trade",
             crate::policy::ToolValueKind::MovesValue,
         );
         let profile = make_profile();

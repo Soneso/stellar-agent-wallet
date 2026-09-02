@@ -285,7 +285,7 @@ pub struct SubmitInvokeArgs<'a> {
     /// C-strkey of the contract to invoke.
     ///
     /// For DeFi adapters and other external-contract callers this is the
-    /// external contract address (e.g. a Blend pool, DeFindex vault, or
+    /// external contract address (e.g. a DeFindex vault, Soroswap router, or
     /// Soroswap router).  For wallet self-calls (OZ entrypoints) this is the
     /// wallet contract itself.  The wallet credential address is `auth_address`,
     /// which defaults to `target_contract` when `None`.

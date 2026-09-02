@@ -1,6 +1,6 @@
 # CLI reference: DeFi and the channel pool
 
-This page documents the `stellar-agent` commands for DeFi venues — `lend` (Blend), `vault` (DeFindex), `trade` (Soroswap) — and the channel-account pool subcommands `pool init`, `pool list`, and `pool status`.
+This page documents the `stellar-agent` commands for DeFi venues — `vault` (DeFindex), `trade` (Soroswap) — and the channel-account pool subcommands `pool init`, `pool list`, and `pool status`.
 
 The binary is `stellar-agent`. Under the `stellar-cli` external-binary plugin convention it is also reachable as `stellar agent ...`. See [the CLI reference index](index.md) for installation, the JSON envelope shape, and the global flags referenced below.
 
@@ -19,39 +19,7 @@ These commands do not accept `--output`; they always emit JSON. Only the `pool` 
 
 ### Network constraint
 
-The default network is testnet (`stellar:testnet`). These DeFi commands and the `pool` commands carry no command-level mainnet refusal — they are constrained instead by per-network contract pins (Blend and Soroswap resolve different pinned addresses or WASM sets per network; the DeFindex vault WASM hash is identical on testnet and mainnet). `trade` rejects a network it has no pinned router for with `dex.unrecognised_network`. Friendbot funding remains testnet-only. For the contract-pinning and venue model, see [Protocols and venues](../protocols.md).
-
-## `stellar-agent lend`
-
-Supply, withdraw, borrow, or repay against a Blend lending pool through the wallet smart-account. Venue: Blend.
-
-Before submitting, `lend` runs an ordered trust gate: (1) verify the pool WASM hash against the per-network Blend pool WASM set; (2) read the pool's oracle address and require it to be in the Reflector allowlist (else `blend.oracle_not_allowlisted`); (3) check oracle price staleness against the threshold (else `oracle.staleness_exceeded`). Only then does the operator-policy evaluation and submit proceed. Passing `--override-oracle-staleness` bypasses the staleness block and unconditionally emits an `oracle.staleness_overridden` audit event, parallel to the vault upgradable override.
-
-Only the six supply/borrow/repay/withdraw operations below are accepted by `--op`. Blend liquidation operations are not exposed by this command.
-
-| Flag | Meaning | Required | Default |
-|---|---|---|---|
-| `--profile <NAME>` | Profile to load | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
-| `--pool <C-strkey>` | Blend pool contract address | Required | — |
-| `--from <C-strkey>` | Wallet smart-account address submitting the request | Required | — |
-| `--op <OP>` | Operation: `supply`, `withdraw`, `supply-collateral`, `withdraw-collateral`, `borrow`, `repay` | Required | — |
-| `--asset <C-strkey>` | Asset contract address for the operation | Required | — |
-| `--amount <i128>` | Amount in the asset's base unit (integer, no decimals) | Required | — |
-| `--override-oracle-staleness` | Bypass the oracle staleness block | Optional | `false` |
-| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC pool WASM-hash cross-check | Optional | none |
-| `--max-staleness-secs <SECS>` | Maximum accepted oracle staleness; `0` forces a staleness block | Optional | `600` |
-
-Example:
-
-```bash
-stellar-agent lend \
-  --pool CABC...WXYZ \
-  --from CABC...WXYZ \
-  --op supply \
-  --asset CABC...WXYZ \
-  --amount 500000000 \
-  --profile default
-```
+The default network is testnet (`stellar:testnet`). These DeFi commands and the `pool` commands carry no command-level mainnet refusal — they are constrained instead by per-network contract pins (Soroswap resolves a different pinned router per network; the DeFindex vault WASM hash is identical on testnet and mainnet). `trade` rejects a network it has no pinned router for with `dex.unrecognised_network`. Friendbot funding remains testnet-only. For the contract-pinning and venue model, see [Protocols and venues](../protocols.md).
 
 ## `stellar-agent vault deposit`
 

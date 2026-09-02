@@ -1117,7 +1117,7 @@ async fn policy_observability_full_flow_testnet_acceptance() {
         "stellar_rules_get must not be an error result: {get_json}"
     );
     // i128 budget fields ride the wire as DECIMAL STRINGS — the MCP i128
-    // convention (blend_lend `qty`, dex_trade `qty_in`, vault
+    // convention (dex_trade `qty_in`, vault
     // `amounts_desired`) and the CLI envelope's shape alike: a raw JSON
     // number above 2^53 cannot be represented exactly by an f64-backed
     // parser.

@@ -266,7 +266,7 @@ value or signs (`stellar_pay_commit`, `stellar_claim_commit`,
 `stellar_create_account_commit`, `stellar_trustline_commit`,
 `stellar_sep43_sign_and_submit_transaction`, `stellar_x402_create_payment`,
 `stellar_x402_authenticated_payment`, `stellar_dex_trade`,
-`stellar_blend_lend`, `stellar_defindex_vault_deposit`,
+`stellar_defindex_vault_deposit`,
 `stellar_defindex_vault_withdraw`) proves the active profile's audit
 chain-root key is acquirable BEFORE the signer is loaded or anything is
 submitted. `profile init` mints the audit-log keyring COORDINATE only, no key
@@ -366,7 +366,6 @@ terms.
 
 | Tool | Purpose | Gating |
 | --- | --- | --- |
-| `stellar_blend_lend` | Supply, withdraw, borrow, or repay on a Blend pool, behind an ordered trust gate (pool WASM-hash pin, oracle allowlist, oracle staleness), then a smart-account submit. | Signs via the smart account and submits; policy gate. |
 | `stellar_defindex_vault_deposit` | Deposit into a DeFindex vault behind an ordered trust gate (vault WASM-hash pin, upgradable-flag check, role and asset disclosure), then a smart-account submit. | Signs via the smart account and submits; policy gate. |
 | `stellar_defindex_vault_withdraw` | Withdraw from a DeFindex vault by redeeming shares, behind the same trust gate. | Signs via the smart account and submits; policy gate. |
 | `stellar_dex_trade` | Soroswap router-direct swap, behind a venue allowlist, router WASM-hash pin, and on-chain slippage re-verify, then a smart-account submit. | Signs via the smart account and submits; policy gate. |

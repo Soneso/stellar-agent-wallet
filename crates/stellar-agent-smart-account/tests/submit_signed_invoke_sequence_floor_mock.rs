@@ -1,16 +1,15 @@
 //! `submit_signed_invoke`'s `SubmitInvokeArgs::sequence_floor` threading.
 //!
 //! `submit_signed_invoke` is the SHARED free function every DeFi adapter
-//! family (`stellar-agent-blend`, `stellar-agent-dex`, `stellar-agent-defindex`)
+//! family (`stellar-agent-dex`, `stellar-agent-defindex`)
 //! calls to submit its signed `InvokeHostFunction`. Proving the hook is wired
 //! correctly HERE — once, at the shared substrate — covers all adapter
 //! families without duplicating a full per-protocol simulate/auth/submit mock
 //! harness that does not exist anywhere else in this codebase (every adapter
 //! crate's OWN full-submit success path is validated by a LIVE testnet
-//! acceptance test, never wiremock; see `stellar-agent-blend`'s
-//! `blend_lend_testnet_acceptance.rs` module doc). A live confirmed submit
-//! recording into the hook is covered by
-//! `stellar-agent-blend/tests/blend_supply_submit_testnet_acceptance.rs`.
+//! acceptance test, never wiremock; see
+//! `stellar-agent-defindex/tests/defindex_deposit_submit_testnet_acceptance.rs`,
+//! which also covers a live confirmed submit recording into the hook).
 //!
 //! # Coverage map
 //!

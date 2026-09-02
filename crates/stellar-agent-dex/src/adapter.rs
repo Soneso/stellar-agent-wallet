@@ -444,7 +444,7 @@ impl DefiAdapter for DexSwapAdapter {
         // `to = wallet_c`.  The router calls `to.require_auth()`,
         // producing exactly 1 wallet-credentialled root auth entry.  The SAC
         // `transfer(from=wallet)` is a sub-invocation covered by
-        // that single root entry.  This mirrors the Blend adapter
+        // that single root entry.  This mirrors the DeFindex adapter
         // pattern exactly.
         //
         // Cited: soroswap-core contracts/router/src/lib.rs.

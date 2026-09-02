@@ -4,7 +4,7 @@ description: Operate the Stellar Agent Wallet — a self-custodial Stellar walle
 license: Apache-2.0
 compatibility: Requires the stellar-agent CLI and stellar-agent-mcp server (v0.1.0-alpha.6 public alpha; install from crates.io with a pinned version, e.g. cargo binstall stellar-agent-cli@0.1.0-alpha.6 stellar-agent-mcp@0.1.0-alpha.6, or build from source). Targets Stellar testnet (default) and mainnet.
 metadata:
-  version: "0.3.6"
+  version: "0.4.0"
   wallet_version: "0.1.0-alpha.6"
 ---
 
@@ -218,7 +218,7 @@ operator attests to the exact definition you proposed. See
 
 ## 6. DeFi
 
-`stellar_blend_lend` (supply/withdraw/borrow/repay), `stellar_dex_trade`
+`stellar_dex_trade`
 (Soroswap swaps) with `stellar_dex_quote`, and `stellar_defindex_vault_deposit` /
 `_withdraw` each run behind an ordered trust gate (WASM-hash pin, oracle/venue
 allowlist, slippage re-verify) and submit through the smart account. See
@@ -268,7 +268,7 @@ See `references/security.md` and `references/approvals-and-audit.md`.
 - [Profiles and keys](./references/profiles-and-keys.md) — profile schema, the keyring, key rotation
 - [Approvals and audit](./references/approvals-and-audit.md) — policy engine, the approval spine, the audit log
 - [Smart accounts](./references/smart-accounts.md) — OpenZeppelin governance: rules, signers, passkeys, timelock, multicall
-- [DeFi](./references/defi.md) — Blend, Soroswap, DeFindex, and the channel pool
+- [DeFi](./references/defi.md) — Soroswap, DeFindex, and the channel pool
 - [Protocols](./references/protocols.md) — SEP coverage and x402 agent payments
 - [Toolsets feature](./references/toolsets-feature.md) — the wallet's capability-isolation packages
 - [Troubleshooting](./references/troubleshooting.md) — wire and error codes

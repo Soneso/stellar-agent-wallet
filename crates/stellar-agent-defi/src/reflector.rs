@@ -7,11 +7,10 @@
 //! `(price: i128, timestamp: u64)`.
 //!
 //! This function is the protocol-agnostic Reflector oracle query.
-//! `stellar-agent-blend::oracle_fetch::query_single_lastprice` is the
-//! Blend-specific layer; it delegates to this function for the raw
-//! price/timestamp query.
+//! Protocol adapters layer their own oracle lookups on top of this
+//! function for the raw price/timestamp query.
 //!
-//! No Blend-specific logic is present here.  The `Asset::Stellar(Address)`
+//! No protocol-specific logic is present here.  The `Asset::Stellar(Address)`
 //! encoding is the SEP-40 standard used by Reflector.
 //!
 //! # ABI provenance

@@ -671,7 +671,7 @@ mod tests {
     #[test]
     fn moves_value_tool_with_unpopulated_effects_denies_unsizable() {
         let tool = make_tool_with_kind(
-            "stellar_blend_lend",
+            "stellar_dex_trade",
             crate::policy::ToolValueKind::MovesValue,
         );
         let profile = make_profile();
@@ -776,7 +776,7 @@ mod tests {
     fn cap_aggregates_only_debit_legs_not_inflow_legs() {
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
-        let tool = make_tool("stellar_blend_lend");
+        let tool = make_tool("stellar_dex_trade");
         let profile = make_profile();
         let store = PolicyStateStore::new();
         // Cap 100 XLM. One 60 XLM outflow (Lend) + one 60 XLM inflow

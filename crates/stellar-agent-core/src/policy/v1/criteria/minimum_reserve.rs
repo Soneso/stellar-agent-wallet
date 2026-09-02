@@ -769,7 +769,7 @@ mod tests {
         };
         let args = json!({});
         let tool = make_tool_with_kind(
-            "stellar_blend_lend",
+            "stellar_dex_trade",
             crate::policy::ToolValueKind::MovesValue,
         );
         let profile = make_profile();

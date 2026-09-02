@@ -14,7 +14,7 @@
 //! to=wallet, deadline])`.  The router calls `to.require_auth()` in
 //! `soroswap-core contracts/router/src/lib.rs`.  The SAC
 //! `transfer(from=wallet, to=pair, amount_in)` is a sub-invocation
-//! COVERED by that single root entry — identical to the Blend / DeFindex auth
+//! COVERED by that single root entry — identical to the DeFindex auth
 //! model.  This guard verifies the expected 1-entry shape before signing:
 //!
 //! - 0 entries → `Err(AuthGuardError::NoWalletEntry)` (cannot sign).
@@ -110,7 +110,7 @@ pub enum AuthGuardError {
 /// `soroswap-core contracts/router/src/lib.rs`.  The SAC
 /// `transfer(from=wallet, to=pair, amount_in)` is a sub-invocation
 /// COVERED by that single root entry.  This produces exactly 1
-/// wallet-credentialled root auth entry in simulate — same as Blend/DeFindex.
+/// wallet-credentialled root auth entry in simulate — same as DeFindex.
 ///
 /// Returns `Ok(1)` when exactly one wallet-credentialled root entry is present.
 ///

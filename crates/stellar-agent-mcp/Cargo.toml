@@ -38,8 +38,6 @@ stellar-agent-mpp        = { workspace = true }
 # the stellar_rules_list / stellar_rules_get read-only tools.
 stellar-agent-smart-account = { workspace = true }
 
-# Blend lending adapter — `lend` verb.
-stellar-agent-blend      = { workspace = true }
 # DeFindex vault adapter — `vault` verb.
 stellar-agent-defindex   = { workspace = true }
 # Soroswap DEX swap adapter — `trade` verb.

@@ -1,6 +1,6 @@
 # DeFi and the channel pool
 
-This reference covers the wallet's DeFi venues — Blend lending (`lend`), Soroswap
+This reference covers the wallet's DeFi venues — Soroswap
 swaps (`trade`) and quotes (`quote`), and DeFindex vaults (`vault`) — and the
 SEP-5-derived channel-account pool (`pool`). It lists the CLI commands of the
 `stellar-agent` binary and the matching tool names on the `stellar-agent-mcp`
@@ -54,62 +54,17 @@ Shared guardrails: no raw-vector or opaque-calldata signing; a venue/WASM pin is
 verified before any signing; predicted post-op figures are display-only and never
 gate signing. `trade` rejects a network with no pinned router via
 `dex.unrecognised_network`. The DeFindex vault WASM hash is identical on testnet
-and mainnet; Blend and Soroswap resolve different pinned addresses or WASM sets
+and mainnet; Soroswap resolves different pinned addresses
 per network.
 
 ## Command and tool map
 
 | Venue | Verb | CLI | MCP tool | Signs? |
 |---|---|---|---|---|
-| Blend | lend | `stellar-agent lend` | `stellar_blend_lend` | signs + submits |
 | DeFindex | vault deposit | `stellar-agent vault deposit` | `stellar_defindex_vault_deposit` | signs + submits |
 | DeFindex | vault withdraw | `stellar-agent vault withdraw` | `stellar_defindex_vault_withdraw` | signs + submits |
 | Soroswap | trade | `stellar-agent trade` | `stellar_dex_trade` | signs + submits |
 | Soroswap | quote | (no CLI subcommand) | `stellar_dex_quote` | read-only |
-
-## Blend — `stellar-agent lend` / `stellar_blend_lend`
-
-Supply, withdraw, borrow, or repay against a Blend lending pool (Blend v1 and v2)
-through the wallet smart-account.
-
-Ordered trust gate before policy evaluation and submit:
-
-1. Verify the pool WASM hash against the per-network Blend pool WASM set.
-2. Read the pool's oracle address and require it to be in the Reflector
-   allowlist, else `blend.oracle_not_allowlisted`.
-3. Check oracle price staleness against the threshold, else
-   `oracle.staleness_exceeded`.
-
-Only the six operations below are accepted by `--op`. Liquidation, flash-loan,
-and `submit_with_allowance` (v2-only) are not exposed. The predicted post-op
-health factor is display-only and never gates signing.
-
-| Flag | Meaning | Required | Default |
-|---|---|---|---|
-| `--profile <NAME>` | Profile to load | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
-| `--pool <C-strkey>` | Blend pool contract address | Required | — |
-| `--from <C-strkey>` | Wallet smart-account address submitting the request | Required | — |
-| `--op <OP>` | One of `supply`, `withdraw`, `supply-collateral`, `withdraw-collateral`, `borrow`, `repay` | Required | — |
-| `--asset <C-strkey>` | Asset contract address for the operation | Required | — |
-| `--amount <i128>` | Amount in the asset's base unit (integer, no decimals) | Required | — |
-| `--override-oracle-staleness` | Bypass the oracle staleness block | Optional | `false` |
-| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC pool WASM-hash cross-check | Optional | none |
-| `--max-staleness-secs <SECS>` | Maximum accepted oracle staleness; `0` forces a staleness block | Optional | `600` |
-
-Example:
-
-```bash
-stellar-agent lend \
-  --pool CABC...WXYZ \
-  --from CABC...WXYZ \
-  --op supply \
-  --asset CABC...WXYZ \
-  --amount 500000000 \
-  --profile default
-```
-
-Refusal codes: `blend.oracle_not_allowlisted`, `oracle.staleness_exceeded`,
-plus the shared policy codes.
 
 ## DeFindex — `stellar-agent vault` / `stellar_defindex_vault_*`
 
@@ -325,7 +280,6 @@ stellar-agent pool status --profile default
 | `policy.deny.<code>` | all signing verbs | Operator policy denied the operation |
 | `policy.approval_required` | all signing verbs | Needs two-phase approval via the MCP server |
 | `policy.engine_unavailable` | all signing verbs | Policy engine configured but unbuildable (fail-closed) |
-| `blend.oracle_not_allowlisted` | `lend` | Pool oracle is not in the Reflector allowlist |
 | `oracle.staleness_exceeded` | `lend` | Oracle price older than the staleness threshold |
 | `vault.upgradable_refused` | `vault` | Vault `upgradable:true`; not overridden |
 | `vault.asset_count_mismatch` | `vault` | Slippage-vector length differs from pinned asset count |

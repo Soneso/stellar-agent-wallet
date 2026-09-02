@@ -427,27 +427,10 @@ the policy verdict.
 
 | Tool | Purpose | Gating |
 | --- | --- | --- |
-| `stellar_blend_lend` | Supply/withdraw/borrow/repay on a Blend pool behind an ordered trust gate (pool WASM-hash pin, oracle allowlist, oracle staleness), then a smart-account submit. | Signs via the smart account and submits; policy gate. |
 | `stellar_defindex_vault_deposit` | Deposit into a DeFindex vault behind an ordered trust gate (vault WASM-hash pin, upgradable-flag check, role and asset disclosure), then a smart-account submit. | Signs via the smart account and submits; policy gate. |
 | `stellar_defindex_vault_withdraw` | Withdraw from a DeFindex vault by redeeming shares, behind the same trust gate. | Signs via the smart account and submits; policy gate. |
 | `stellar_dex_trade` | Soroswap router-direct swap behind a venue allowlist, router WASM-hash pin, and on-chain slippage re-verify, then a smart-account submit. | Signs via the smart account and submits; policy gate. |
 | `stellar_dex_quote` | On-chain Soroswap `router_get_amounts_out` quote for a token path. | Read-only. |
-
-### stellar_blend_lend arguments
-
-| Field | Type | Required | Notes |
-| --- | --- | --- | --- |
-| `chain_id` | string | yes | |
-| `pool_address` | string | yes | Blend pool contract C-strkey. |
-| `from_address` | string | yes | Wallet smart-account address (C-strkey). |
-| `requests` | array | yes | Each `{ "request_type": <u32>, "address": "<C-strkey>", "qty": "<decimal i128 string>" }`. |
-| `override_oracle_staleness` | bool | no | Default `false`; overridable staleness only — pin-verify and oracle-allowlist refusals are non-overridable. |
-| `secondary_rpc_url` | string | no | Second RPC for the two-RPC WASM-hash cross-check. |
-| `max_staleness_secs` | integer (u64) | no | Default 600. |
-
-`request_type`: 0 Supply, 1 Withdraw, 2 SupplyCollateral, 3 WithdrawCollateral,
-4 Borrow, 5 Repay. `qty` is a raw 7-decimal i128 as a decimal string (e.g.
-`"250000000"`), no unit label; a raw JSON number is rejected.
 
 ### stellar_defindex_vault_deposit arguments
 

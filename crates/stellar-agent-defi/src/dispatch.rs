@@ -204,7 +204,7 @@ pub fn require_approval_error() -> String {
 /// Returns the set of live verb identifiers registered by `stellar-agent-defi`.
 ///
 /// The registry contains exactly `{"lend", "vault", "trade", "bridge"}`,
-/// representing the Blend lending adapter, the DeFindex vault adapter, the
+/// representing the DeFindex vault adapter, the
 /// Soroswap DEX swap adapter, and the Axelar ITS bridge adapter respectively.
 #[must_use]
 pub fn live_verb_registry() -> &'static [&'static str] {

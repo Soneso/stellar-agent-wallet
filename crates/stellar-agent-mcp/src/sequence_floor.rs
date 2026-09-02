@@ -28,7 +28,7 @@
 //! # DeFi adapter submit paths
 //!
 //! The classic commit verbs below thread [`SequenceFloorTracker`] directly.
-//! The DeFi adapter submit paths (`stellar_dex_trade`, `stellar_blend_lend`,
+//! The DeFi adapter submit paths (`stellar_dex_trade`,
 //! `stellar_defindex_vault_*`) delegate build and submit to their adapter
 //! crates via `DefiAdapterCtx`, which never sees this tracker's concrete
 //! type. Those call sites instead thread [`hook`]'s
@@ -203,7 +203,7 @@ impl stellar_agent_network::SequenceFloorHook for TrackerHook<'_> {
 
 /// Builds a [`SequenceFloorHook`](stellar_agent_network::SequenceFloorHook)
 /// borrowing `tracker`, for threading into `DefiAdapterCtx::sequence_floor`
-/// at the DeFi MCP tool call sites (`dex_trade`, `blend_lend`, `vault`).
+/// at the DeFi MCP tool call sites (`dex_trade`, `vault`).
 pub(crate) fn hook(
     tracker: &TokioMutex<SequenceFloorTracker>,
 ) -> impl stellar_agent_network::SequenceFloorHook + '_ {

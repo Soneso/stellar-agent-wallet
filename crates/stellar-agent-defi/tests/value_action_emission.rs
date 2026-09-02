@@ -69,7 +69,7 @@ fn payment_legs() -> Vec<ValueLegRecord> {
 
 fn testnet_pin() -> DefiContractPin {
     DefiContractPin::new(
-        "blend", "v2", "default", CHAIN_ID, CONTRACT, [0u8; 32], "895845f",
+        "defindex", "v1", "default", CHAIN_ID, CONTRACT, [0u8; 32], "895845f",
     )
 }
 
@@ -83,7 +83,7 @@ fn emit_value_action_submitted_writes_a_value_action_row() {
     let mut ctx = DefiAdapterCtx::new("default", &pin, &rpc);
     ctx.audit_writer = Some(Arc::clone(&writer));
     ctx.audit_legs = Some(&legs);
-    ctx.audit_tool = Some("stellar_blend_lend");
+    ctx.audit_tool = Some("stellar_defindex_vault_deposit");
     ctx.chain_id = Some(CHAIN_ID);
 
     ctx.emit_value_action_submitted("abcd1234…wxyz5678", 42, "req-defi-1");
@@ -92,7 +92,10 @@ fn emit_value_action_submitted_writes_a_value_action_row() {
     assert_eq!(rows.len(), 1, "exactly one row must be written");
     let row = &rows[0];
     assert_eq!(row["kind"], "value_action_submitted", "row kind");
-    assert_eq!(row["tool"], "stellar_blend_lend", "outer tool identity");
+    assert_eq!(
+        row["tool"], "stellar_defindex_vault_deposit",
+        "outer tool identity"
+    );
     assert_eq!(row["chain_id"], CHAIN_ID, "chain id");
     assert_eq!(row["ledger"], 42, "confirmed ledger");
     assert_eq!(row["policy_decision"], "allow", "allow-path decision");

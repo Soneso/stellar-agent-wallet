@@ -75,7 +75,7 @@ impl ValueClass {
     ///
     /// Single-shot classic tools (`stellar_pay` / `stellar_create_account`)
     /// carry exactly one leg; their value criteria read it through this
-    /// accessor. Multi-leg effects (Blend / vault) are aggregated per-asset by
+    /// accessor. Multi-leg effects (vault deposits, batched requests) are aggregated per-asset by
     /// the criteria that consume them and do not use this accessor.
     #[must_use]
     pub fn sole_value_leg(&self) -> Option<&ValueLeg> {
@@ -92,8 +92,8 @@ impl ValueClass {
 
 /// The concrete value effect(s) of a single tool call.
 ///
-/// One tool call may move value on several legs (a Blend `lend` carries a
-/// `Vec<BlendRequest>`; a vault deposit carries `Vec<amounts_desired>` per
+/// One tool call may move value on several legs (a lending request batch
+/// carries several entries; a vault deposit carries `Vec<amounts_desired>` per
 /// asset). Value criteria aggregate per-asset across legs.
 ///
 /// # Invariant
@@ -185,8 +185,8 @@ pub enum ActionKind {
     /// A DEX path-payment / manage-offer trade. The debit leg carries the
     /// send asset (the value leaving the wallet).
     DexTrade,
-    /// A Blend supply / repay — value leaving the wallet into the pool
-    /// (Blend `Supply`, `SupplyCollateral`, `Repay`).
+    /// A lending-pool supply / repay — value leaving the wallet into a pool
+    /// (a lending protocol's `Supply`, `SupplyCollateral`, `Repay`).
     Lend,
     /// A Blend withdrawal or borrow — inbound funds returning to (or advanced
     /// to) the wallet (Blend `Withdraw`, `WithdrawCollateral`, `Borrow`).

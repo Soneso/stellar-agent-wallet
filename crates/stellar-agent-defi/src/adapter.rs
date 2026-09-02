@@ -65,17 +65,17 @@ use stellar_agent_network::{Signer, StellarRpcClient};
 /// use stellar_agent_defi::adapter::DefiPreview;
 ///
 /// let preview = DefiPreview::new(
-///     "blend", "supply", "stellar:testnet",
-///     "CAAAA\u{2026}AAAAB", "Supply 100 USDC to Blend pool",
+///     "defindex", "deposit", "stellar:testnet",
+///     "CAAAA\u{2026}AAAAB", "Deposit 100 USDC into a DeFindex vault",
 /// );
-/// assert_eq!(preview.verb, "supply");
+/// assert_eq!(preview.verb, "deposit");
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct DefiPreview {
-    /// Protocol identifier (e.g. `"blend"`, `"defindex"`, `"axelar"`).
+    /// Protocol identifier (e.g. `"defindex"`, `"soroswap"`, `"axelar"`).
     pub protocol: String,
-    /// Verb identifier (e.g. `"supply"`, `"borrow"`, `"trade"`).
+    /// Verb identifier (e.g. `"deposit"`, `"withdraw"`, `"trade"`).
     pub verb: String,
     /// Network (e.g. `"stellar:testnet"`, `"stellar:pubnet"`).
     pub network: String,
@@ -100,13 +100,13 @@ impl DefiPreview {
     /// use stellar_agent_defi::adapter::DefiPreview;
     ///
     /// let p = DefiPreview::new(
-    ///     "blend",
-    ///     "supply",
+    ///     "defindex",
+    ///     "deposit",
     ///     "stellar:testnet",
     ///     "CAAAA\u{2026}AAAAB",
-    ///     "Supply 100 USDC",
+    ///     "Deposit 100 USDC",
     /// );
-    /// assert_eq!(p.protocol, "blend");
+    /// assert_eq!(p.protocol, "defindex");
     /// ```
     #[must_use]
     pub fn new(

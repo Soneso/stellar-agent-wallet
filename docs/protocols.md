@@ -143,16 +143,16 @@ to a Payment challenge. See [Agent payments with MPP](agent-payments.md).
 
 Each DeFi venue is a signing adapter behind a common interface. They share a posture: no raw-vector or opaque-calldata signing, a venue/WASM pin verified before any signing, and predicted post-op figures shown for display only — never as a signing gate. See [DeFi and pool commands](cli-reference/defi-and-pool.md) for the CLI surface.
 
-### Blend — lending (`lend`)
+### Blend — removed
 
-- **Protocol:** Blend lending, v1 and v2.
-- **Capability:** Typed lend preview and submit over a typed request vector. The `lend` verb is dispatched through MCP and the CLI.
-- **Refusals and constraints:**
-  - No raw-vector or opaque-calldata signing; unknown request discriminants are refused before signing.
-  - The pool WASM is verified against a version-pinned hash set before any oracle read or signing.
-  - Simulate-authoritative, fail-closed health guard. The predicted post-op health factor is display-only and never gates signing.
-  - Oracle allowlist is Reflector-only. Oracle staleness is bounded (600s default); a per-invocation override emits a distinct audit event.
-  - The `liquidate` verb is deferred; flash-loan and `submit_with_allowance` (v2-only) are out of scope.
+The Blend lending integration was removed after the August 2026 incident in
+which the Comet pool holding Blend's backstop insurance capital was drained.
+The wallet's lending verb depended on that backstop for depositor protection,
+so the integration does not ship while the protocol's insurance layer is
+unavailable. Existing published `stellar-agent-blend` crate versions remain on
+crates.io; no new versions are published. Re-integration would require a
+published post-mortem, a backstop rebuilt on an audited AMM, and a fresh
+integration review of the rebuilt protocol.
 
 ### Soroswap — trade (`trade`, `stellar_dex_quote`)
 
@@ -193,7 +193,7 @@ Each DeFi venue is a signing adapter behind a common interface. They share a pos
 | x402 v2 Exact Stellar | Payer-side `PAYMENT-SIGNATURE` construction and signing (Stellar-only, `exact`-only) | MCP |
 | x402 identity gate | SEP-10 counterparty-identity gate returning a Bearer JWT companion (never in the XDR) | MCP |
 | MPP sponsored Stellar charge | Testnet G-account payer authorization; returns one HTTP/native-MCP credential, records a host receipt, and independently reconciles settlement | CLI, MCP |
-| Blend | `lend` preview and submit; Reflector-only oracle, WASM-pinned, fail-closed health guard | CLI, MCP |
+| Blend | removed (see above) | — |
 | Soroswap | `trade` (signing, CLI + MCP) and the read-only `stellar_dex_quote` (MCP only); absolute slippage floor, pre-sign re-verify, WASM-pinned | CLI, MCP |
 | DeFindex | `vault` deposit/withdraw; `min_out` required, role disclosure, `Upgradable:true` refused by default | CLI, MCP |
 

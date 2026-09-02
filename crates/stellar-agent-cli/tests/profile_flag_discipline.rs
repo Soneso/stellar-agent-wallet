@@ -76,7 +76,7 @@ const ALLOW_SET: &[AllowEntry] = &[];
 /// visibility class (say every `pub(crate)` field) would still clear a loose
 /// floor and report a clean tree. Adding or removing a profile-selecting
 /// subcommand is expected to move this number — update it in the same commit.
-const PROFILE_FIELDS: usize = 68;
+const PROFILE_FIELDS: usize = 67;
 
 /// Call-site shapes that substitute the literal `"default"` for an absent
 /// profile name, discarding the environment variable the flag left `None` for.

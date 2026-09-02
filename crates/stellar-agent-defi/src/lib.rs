@@ -2,8 +2,8 @@
 //!
 //! # What this crate does
 //!
-//! Provides the substrate that the five protocol adapter crates
-//! (Blend, DeFindex, swaps, bridges, stablecoins) build on:
+//! Provides the substrate that the protocol adapter crates
+//! (DeFindex, swaps, bridges, stablecoins) build on:
 //!
 //! 1. **Contract-pin framework** (`pins`) — per-profile, per-network, versioned
 //!    `DefiContractPin` model with a fail-closed sign-time gate and a report-only
@@ -27,7 +27,7 @@
 //!
 //! # Primary consumers
 //!
-//! - `stellar-agent-blend`, `stellar-agent-defindex`,
+//! - `stellar-agent-defindex`,
 //!   `stellar-agent-dex`, `stellar-agent-bridge` — the protocol crates that
 //!   implement `DefiAdapter` and register verbs.
 //! - `stellar-agent-mcp` / `stellar-agent-cli` — the binary crates that depend

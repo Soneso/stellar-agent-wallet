@@ -1,6 +1,6 @@
 //! Shared `ScVal`-encoding primitives for the DeFi protocol adapter crates.
 //!
-//! Blend, DeFindex, and the DEX adapter each build Soroban `InvokeContractArgs`
+//! The DeFindex and DEX adapters each build Soroban `InvokeContractArgs`
 //! for their own protocol's contract calls. The two primitives below are the
 //! encoding steps that do not vary by protocol — contract-address resolution
 //! and `i128` encoding — so one implementation backs all three call sites
