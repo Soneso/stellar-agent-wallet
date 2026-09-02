@@ -360,7 +360,7 @@ pub mod mock {
             GateOutcome::RequireApproval
         } else {
             // Should not happen in the negative test, but handle gracefully.
-            dispatch_gate(adapter.verb(), request_id).map_or(GateOutcome::RequireApproval, |o| o)
+            dispatch_gate(adapter.verb(), request_id).unwrap_or(GateOutcome::RequireApproval)
         };
 
         match outcome {

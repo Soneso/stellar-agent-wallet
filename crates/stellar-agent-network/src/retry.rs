@@ -542,6 +542,12 @@ fn jitter_delay(attempt: u32, base_delay: Duration, max_delay: Duration) -> Dura
 /// assert_eq!(result, 42);
 /// # Ok(result) }
 /// ```
+#[expect(
+    clippy::result_large_err,
+    reason = "the error type is stellar_rpc_client's own; this combinator passes it \
+              through unchanged, and boxing here would force the wrapper onto every \
+              RPC call site for an error path whose size does not matter"
+)]
 pub async fn retry_with_backoff<F, Fut, T>(
     policy: &RetryPolicy,
     overall_deadline: Instant,

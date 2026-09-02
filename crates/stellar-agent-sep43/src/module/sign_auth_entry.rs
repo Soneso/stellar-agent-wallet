@@ -109,7 +109,6 @@ mod tests {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use stellar_agent_core::profile::schema::Profile;
-    use stellar_agent_network::signing::Signer as _;
     use stellar_agent_network::signing::SoftwareSigningKey;
 
     use super::*;

@@ -2376,11 +2376,8 @@ impl ContextRuleManager {
         let mut unavailable_wire_code: Option<&'static str> = None;
 
         // Verify each verifier address.
-        let verifier_pin_status;
-        let observed_verifier_first8;
-        if verifier_addrs.is_empty() {
-            verifier_pin_status = PinStatus::NoContracts;
-            observed_verifier_first8 = vec![];
+        let (verifier_pin_status, observed_verifier_first8) = if verifier_addrs.is_empty() {
+            (PinStatus::NoContracts, vec![])
         } else {
             let mut status = PinStatus::Match;
             let mut observed: Vec<String> = Vec::new();
@@ -2417,16 +2414,12 @@ impl ContextRuleManager {
                     }
                 }
             }
-            verifier_pin_status = status;
-            observed_verifier_first8 = observed;
-        }
+            (status, observed)
+        };
 
         // Verify each policy address.
-        let policy_pin_status;
-        let observed_policy_first8;
-        if policy_addrs.is_empty() {
-            policy_pin_status = PinStatus::NoContracts;
-            observed_policy_first8 = vec![];
+        let (policy_pin_status, observed_policy_first8) = if policy_addrs.is_empty() {
+            (PinStatus::NoContracts, vec![])
         } else {
             let mut status = PinStatus::Match;
             let mut observed: Vec<String> = Vec::new();
@@ -2462,9 +2455,8 @@ impl ContextRuleManager {
                     }
                 }
             }
-            policy_pin_status = status;
-            observed_policy_first8 = observed;
-        }
+            (status, observed)
+        };
 
         // Only emit unavailable_wire_code when at least one status is Unavailable.
         let wire_code = if verifier_pin_status == PinStatus::Unavailable

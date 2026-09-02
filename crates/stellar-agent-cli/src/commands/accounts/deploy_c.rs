@@ -1042,7 +1042,6 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use keyring_core::Entry as KeyringEntry;
     use serde_json::Value;

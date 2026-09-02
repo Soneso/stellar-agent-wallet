@@ -801,7 +801,7 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test-only")]
     #![allow(clippy::expect_used, reason = "test-only")]
 
-    use sha2::{Digest as _, Sha256};
+    use sha2::Sha256;
 
     use super::*;
     use crate::ed25519_verifier::{ED25519_VERIFIER_WASM, ED25519_VERIFIER_WASM_SHA256};

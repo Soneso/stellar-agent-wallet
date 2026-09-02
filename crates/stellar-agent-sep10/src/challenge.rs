@@ -644,7 +644,7 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
 
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use ed25519_dalek::SigningKey;
     use sha2::{Digest, Sha256};
     use stellar_xdr::{
