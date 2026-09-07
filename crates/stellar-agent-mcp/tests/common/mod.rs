@@ -1,9 +1,64 @@
 pub mod policy_mock;
 pub mod v1_engine_mock;
 
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rmcp::model::CallToolResult;
+use stellar_agent_test_support::signed_envelope::{TESTNET_PASSPHRASE, get_network_result};
+
+/// Passphrase of a third Stellar network — neither testnet nor mainnet.
+///
+/// An endpoint reporting it under a testnet profile is the plain
+/// wrong-endpoint case: the mismatch refusal fires, and the mainnet guard
+/// (which has a refusal of its own) does not.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub const FUTURENET_PASSPHRASE: &str = "Test SDF Future Network ; October 2022";
+
+/// The network passphrase a mocked RPC endpoint reports from `getNetwork`.
+///
+/// Every commit tool probes endpoint identity on the client it will submit
+/// with, so any mock serving a commit path has to answer `getNetwork`. The
+/// passphrase sits behind a lock so one running mock server can report two
+/// different identities across two calls, which is how a test observes the
+/// state a refused commit left behind.
+#[derive(Clone)]
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub struct EndpointNetwork(Arc<Mutex<String>>);
+
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+impl EndpointNetwork {
+    /// Reports the canonical testnet passphrase.
+    #[must_use]
+    pub fn testnet() -> Self {
+        Self::reporting(TESTNET_PASSPHRASE)
+    }
+
+    /// Reports `passphrase`.
+    #[must_use]
+    pub fn reporting(passphrase: &str) -> Self {
+        Self(Arc::new(Mutex::new(passphrase.to_owned())))
+    }
+
+    /// Changes the passphrase every subsequent `getNetwork` answers with.
+    pub fn set(&self, passphrase: &str) {
+        *self.0.lock().expect("endpoint network lock") = passphrase.to_owned();
+    }
+
+    /// The `getNetwork` JSON-RPC result body for the current passphrase.
+    #[must_use]
+    pub fn result(&self) -> serde_json::Value {
+        get_network_result(&self.0.lock().expect("endpoint network lock"))
+    }
+}
 
 /// Fixed non-secret 32-byte value used as the audit chain-root HMAC key by
 /// every test in a binary that calls [`install_test_audit_key`].

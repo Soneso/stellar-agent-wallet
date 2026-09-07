@@ -51,7 +51,7 @@ Simulate step: builds a CreateAccount transaction envelope and mints a single-us
 
 ## stellar_create_account_commit
 
-Commit step: verifies the nonce, re-builds the envelope for divergence check, signs via the profile keyring, and submits the transaction. Testnet-only — mainnet profiles are rejected by the policy gate.
+Commit step: verifies the nonce, re-builds the envelope for divergence check, signs via the profile keyring, and submits the transaction. Testnet-only — mainnet profiles are rejected by the policy gate. Before the nonce is burned, the tool establishes which network the RPC endpoint actually serves and refuses a mismatch, so a wrongly-configured endpoint does not consume the nonce. The submit layer then verifies every signature on the envelope against the network the endpoint reported.
 
 **Arguments:**
 - `chain_id` (string, required): CAIP-2 chain identifier.
@@ -66,7 +66,7 @@ Commit step: verifies the nonce, re-builds the envelope for divergence check, si
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=true`.
 
-**Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`, `policy.engine_required`.
+**Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`, `policy.engine_required`, `network.endpoint_network_mismatch`, `network.endpoint_identity_unavailable`, `network.envelope_signed_for_mainnet`, `network.envelope_signature_unverifiable`, `network.envelope_unsigned`.
 
 ## stellar_pay
 
@@ -93,7 +93,7 @@ Simulate step: builds a Payment transaction envelope for a native XLM or non-nat
 
 ## stellar_pay_commit
 
-Commit step: verifies the nonce, re-builds the Payment envelope for divergence check, signs via the profile keyring, and submits the transaction. Testnet-only — mainnet profiles are rejected by the policy gate.
+Commit step: verifies the nonce, re-builds the Payment envelope for divergence check, signs via the profile keyring, and submits the transaction. Testnet-only — mainnet profiles are rejected by the policy gate. Before the nonce is burned, the tool establishes which network the RPC endpoint actually serves and refuses a mismatch, so a wrongly-configured endpoint does not consume the nonce. The submit layer then verifies every signature on the envelope against the network the endpoint reported.
 
 **Arguments:**
 - `chain_id` (string, required): CAIP-2 chain identifier.
@@ -113,4 +113,4 @@ Commit step: verifies the nonce, re-builds the Payment envelope for divergence c
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=true`.
 
-**Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`, `policy.engine_required`, `validation.memo_required`, `validation.memo_mutually_exclusive`.
+**Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`, `policy.engine_required`, `validation.memo_required`, `validation.memo_mutually_exclusive`, `network.endpoint_network_mismatch`, `network.endpoint_identity_unavailable`, `network.envelope_signed_for_mainnet`, `network.envelope_signature_unverifiable`, `network.envelope_unsigned`.

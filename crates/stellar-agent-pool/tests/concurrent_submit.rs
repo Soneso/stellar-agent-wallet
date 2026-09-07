@@ -51,23 +51,46 @@ use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 use stellar_agent_network::StellarRpcClient;
+use stellar_agent_network::signing::Signer as _;
+use stellar_agent_pool::derive::derive_channel_signer;
 use stellar_agent_pool::pool::{ChannelPool, TerminalOutcome};
 use stellar_agent_pool::submit::submit_pooled;
 use stellar_agent_pool::{ChannelRecord, PoolError};
 use stellar_agent_test_support::EchoIdResponder;
+use stellar_agent_test_support::signed_envelope::{get_network_result, ledger_entries_result_for};
 use zeroize::Zeroizing;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixtures
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// 4 known-valid G-strkeys (from builder.rs TEST_SOURCE / TEST_DEST fixtures).
-const CHANNEL_KEYS: [&str; 4] = [
-    "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
-    "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
-    "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6",
-    "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7",
-];
+/// The number of channels in the fixture pool.
+const CHANNEL_COUNT: u32 = 4;
+
+/// The G-strkeys of the fixture pool's channels, in index order 1..=4.
+///
+/// Each is the account whose master key `submit_pooled` derives from
+/// [`mock_seed`] for that channel index, so every submitted envelope is signed
+/// by a key its own source account reports — the binding the submit path
+/// verifies against the endpoint's signer sets before sending.
+async fn channel_keys() -> Vec<String> {
+    let mut keys = Vec::with_capacity(CHANNEL_COUNT as usize);
+    for index in 1..=CHANNEL_COUNT {
+        keys.push(channel_key(index).await);
+    }
+    keys
+}
+
+/// The G-strkey of the channel at `index` under [`mock_seed`].
+async fn channel_key(index: u32) -> String {
+    let signer = derive_channel_signer(Zeroizing::new(*mock_seed()), index)
+        .expect("channel derivation must succeed for an in-range index");
+    let public_key = signer
+        .public_key()
+        .await
+        .expect("software signer must expose its public key");
+    format!("{public_key}")
+}
 
 /// Payment destination (must differ from channel keys).
 ///
@@ -88,19 +111,16 @@ const INITIAL_SEQ: i64 = 100;
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Verifies that `DEST_KEY` parses as a valid G-strkey and is distinct from
-/// all `CHANNEL_KEYS` entries.
-#[test]
-fn dest_key_is_valid_and_distinct_from_channel_keys() {
+/// every channel key.
+#[tokio::test]
+async fn dest_key_is_valid_and_distinct_from_channel_keys() {
     // Must parse without error.
     stellar_strkey::ed25519::PublicKey::from_string(DEST_KEY)
         .expect("DEST_KEY must be a valid G-strkey");
 
     // Must not collide with any channel key.
-    for ck in &CHANNEL_KEYS {
-        assert_ne!(
-            DEST_KEY, *ck,
-            "DEST_KEY must differ from CHANNEL_KEYS entry {ck}"
-        );
+    for ck in &channel_keys().await {
+        assert_ne!(DEST_KEY, ck, "DEST_KEY must differ from channel key {ck}");
     }
 }
 
@@ -108,14 +128,37 @@ fn dest_key_is_valid_and_distinct_from_channel_keys() {
 // Pool factory
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn make_pool_k4() -> Arc<ChannelPool> {
-    let channels: Vec<ChannelRecord> = CHANNEL_KEYS
+async fn make_pool_k4() -> Arc<ChannelPool> {
+    let channels: Vec<ChannelRecord> = channel_keys()
+        .await
         .iter()
         .enumerate()
-        .map(|(i, &key)| ChannelRecord::new((i + 1) as u32, key))
+        .map(|(i, key)| ChannelRecord::new((i + 1) as u32, key))
         .collect();
     let seqs = vec![INITIAL_SEQ; 4];
     Arc::new(ChannelPool::from_records(channels, seqs).expect("pool construction must succeed"))
+}
+
+/// Mounts the endpoint-identity probe and the signer-set fetch that the submit
+/// path performs before every send: the endpoint serves testnet and the ledger
+/// reports each channel account with its own master key as sole signer.
+async fn mount_pre_send_surface(server: &MockServer) {
+    let keys = channel_keys().await;
+    let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({ "method": "getNetwork" })))
+        .respond_with(EchoIdResponder::new(get_network_result(TESTNET_PASSPHRASE)))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({ "method": "getLedgerEntries" })))
+        .respond_with(EchoIdResponder::new(ledger_entries_result_for(&key_refs)))
+        .mount(server)
+        .await;
 }
 
 /// An ephemeral mock seed (not real; mock RPC does not verify signatures).
@@ -224,6 +267,8 @@ async fn concurrent_submit_k4_distinct_channels_correct_seq_nums() {
     // the body method is deterministic under concurrency.
     let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
 
+    mount_pre_send_surface(&mock_server).await;
+
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({ "method": "sendTransaction" })))
@@ -252,7 +297,7 @@ async fn concurrent_submit_k4_distinct_channels_correct_seq_nums() {
         .await;
 
     // ── Build pool ───────────────────────────────────────────────────────────
-    let pool = make_pool_k4();
+    let pool = make_pool_k4().await;
     let seed = mock_seed();
     let client =
         Arc::new(StellarRpcClient::new(&mock_server.uri()).expect("mock server URL must be valid"));
@@ -390,6 +435,8 @@ async fn single_submit_mock_rpc_seq_num_correct() {
 
     let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
 
+    mount_pre_send_surface(&mock_server).await;
+
     // Body-method-matched mocks: disambiguating sendTransaction vs getTransaction
     // by the JSON-RPC body method means the getTransaction poll can never consume
     // the sendTransaction PENDING response regardless of arrival order.
@@ -419,7 +466,7 @@ async fn single_submit_mock_rpc_seq_num_correct() {
         .mount(&mock_server)
         .await;
 
-    let pool = make_pool_k4();
+    let pool = make_pool_k4().await;
     let seed = mock_seed();
     let client = Arc::new(StellarRpcClient::new(&mock_server.uri()).expect("valid URL"));
 
@@ -474,7 +521,7 @@ async fn single_submit_mock_rpc_seq_num_correct() {
 /// wall-time bound — no blocking, no queuing.
 #[tokio::test]
 async fn submit_pooled_pool_exhausted_immediate() {
-    let pool = make_pool_k4();
+    let pool = make_pool_k4().await;
     // Drain the pool manually.
     let leases: Vec<_> = (0..4)
         .map(|_| pool.acquire().expect("must succeed"))

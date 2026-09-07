@@ -1,9 +1,11 @@
 //! Offline tests for `init_pool`.
 //!
 //! Uses a `wiremock` mock RPC server to avoid any live network dependency.
-//! The mock returns a JSON-RPC `sendTransaction` PENDING response followed by a
-//! `getTransaction` SUCCESS response, reproducing the minimal submit-and-confirm
-//! flow that `init_pool` calls via `submit_transaction_and_wait`.
+//! The mock answers the endpoint-identity probe (`getNetwork`) and the
+//! signer-set fetch (`getLedgerEntries`) that precede the send, then returns a
+//! JSON-RPC `sendTransaction` PENDING response followed by a `getTransaction`
+//! SUCCESS response, reproducing the submit-and-confirm flow that `init_pool`
+//! calls via `submit_transaction_and_wait`.
 //!
 //! Validation-error paths (N=0, N>MAX, mismatched signers/indices) return
 //! before any RPC call, so no mock server is needed for those cases.
@@ -16,6 +18,8 @@
     reason = "test-only; panics and unwraps acceptable in integration tests"
 )]
 
+use std::sync::LazyLock;
+
 use serde_json::json;
 use stellar_agent_network::signing::Signer;
 use stellar_agent_network::{SoftwareSigningKey, StellarRpcClient};
@@ -23,6 +27,9 @@ use stellar_agent_pool::PoolError;
 use stellar_agent_pool::init::{InitParams, assert_sandwich_structure, init_pool};
 use stellar_agent_pool::pool::ChannelPool;
 use stellar_agent_test_support::EchoIdResponder;
+use stellar_agent_test_support::signed_envelope::{
+    account_id_for_seed, get_network_result, ledger_entries_result_for,
+};
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -30,15 +37,17 @@ const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
 const FEE_PER_OP: u32 = 100;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Known-valid G-strkeys for the funder and channels.
-// Derived from fixed seeds, verified against stellar-agent-network builder.rs.
-// seed=[1u8;32] → GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY
-// seed=[2u8;32] → GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL
-// seed=[3u8;32] → GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6
-// ─────────────────────────────────────────────────────────────────────────────
-const FUNDER_KEY: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
-const CHANNEL_KEY_1: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
-const CHANNEL_KEY_2: &str = "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6";
+// The funder and channel accounts, each derived from the seed of the key that
+// signs for it. The submit layer verifies every signature against the signer
+// set of the account it answers for, so an account and its signing key must be
+// the same key; a strkey chosen independently of the seed cannot satisfy that.
+const FUNDER_SEED: [u8; 32] = [1u8; 32];
+const CHANNEL_SEED_1: [u8; 32] = [2u8; 32];
+const CHANNEL_SEED_2: [u8; 32] = [3u8; 32];
+
+static FUNDER_KEY: LazyLock<String> = LazyLock::new(|| account_id_for_seed(FUNDER_SEED));
+static CHANNEL_KEY_1: LazyLock<String> = LazyLock::new(|| account_id_for_seed(CHANNEL_SEED_1));
+static CHANNEL_KEY_2: LazyLock<String> = LazyLock::new(|| account_id_for_seed(CHANNEL_SEED_2));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Validation errors — no RPC needed
@@ -49,10 +58,10 @@ const CHANNEL_KEY_2: &str = "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHS
 async fn init_pool_n0_returns_size_out_of_range() {
     // Use a dummy URL: init_pool must return before touching the network.
     let client = StellarRpcClient::new("http://127.0.0.1:1").expect("URL parses");
-    let funder_key = SoftwareSigningKey::new_from_bytes([1u8; 32]);
+    let funder_key = SoftwareSigningKey::new_from_bytes(FUNDER_SEED);
 
     let params = InitParams {
-        funder_strkey: FUNDER_KEY,
+        funder_strkey: FUNDER_KEY.as_str(),
         funder_sequence: 100,
         funder_signer: &funder_key as &dyn Signer,
         channel_signers: vec![],
@@ -73,10 +82,10 @@ async fn init_pool_n0_returns_size_out_of_range() {
 #[tokio::test]
 async fn init_pool_n_exceeds_max_returns_size_out_of_range() {
     let client = StellarRpcClient::new("http://127.0.0.1:1").expect("URL parses");
-    let funder_key = SoftwareSigningKey::new_from_bytes([1u8; 32]);
+    let funder_key = SoftwareSigningKey::new_from_bytes(FUNDER_SEED);
 
     let n = ChannelPool::MAX_SIZE + 1; // 20
-    let channel_strkeys: Vec<String> = (0..n).map(|_| CHANNEL_KEY_1.to_owned()).collect();
+    let channel_strkeys: Vec<String> = (0..n).map(|_| CHANNEL_KEY_1.clone()).collect();
     let channel_signers: Vec<SoftwareSigningKey> = (0..n as u8)
         .map(|i| {
             let mut seed = [0u8; 32];
@@ -87,7 +96,7 @@ async fn init_pool_n_exceeds_max_returns_size_out_of_range() {
     let channel_indices: Vec<u32> = (1..=n as u32).collect();
 
     let params = InitParams {
-        funder_strkey: FUNDER_KEY,
+        funder_strkey: FUNDER_KEY.as_str(),
         funder_sequence: 100,
         funder_signer: &funder_key as &dyn Signer,
         channel_signers,
@@ -108,15 +117,15 @@ async fn init_pool_n_exceeds_max_returns_size_out_of_range() {
 #[tokio::test]
 async fn init_pool_signers_len_mismatch_returns_init_failed() {
     let client = StellarRpcClient::new("http://127.0.0.1:1").expect("URL parses");
-    let funder_key = SoftwareSigningKey::new_from_bytes([1u8; 32]);
+    let funder_key = SoftwareSigningKey::new_from_bytes(FUNDER_SEED);
 
     let params = InitParams {
-        funder_strkey: FUNDER_KEY,
+        funder_strkey: FUNDER_KEY.as_str(),
         funder_sequence: 100,
         funder_signer: &funder_key as &dyn Signer,
         // 2 strkeys, only 1 signer.
-        channel_strkeys: vec![CHANNEL_KEY_1.to_owned(), CHANNEL_KEY_2.to_owned()],
-        channel_signers: vec![SoftwareSigningKey::new_from_bytes([2u8; 32])],
+        channel_strkeys: vec![CHANNEL_KEY_1.clone(), CHANNEL_KEY_2.clone()],
+        channel_signers: vec![SoftwareSigningKey::new_from_bytes(CHANNEL_SEED_1)],
         channel_indices: vec![1, 2],
         network_passphrase: TESTNET_PASSPHRASE,
         fee_per_op: FEE_PER_OP,
@@ -133,17 +142,17 @@ async fn init_pool_signers_len_mismatch_returns_init_failed() {
 #[tokio::test]
 async fn init_pool_indices_len_mismatch_returns_init_failed() {
     let client = StellarRpcClient::new("http://127.0.0.1:1").expect("URL parses");
-    let funder_key = SoftwareSigningKey::new_from_bytes([1u8; 32]);
+    let funder_key = SoftwareSigningKey::new_from_bytes(FUNDER_SEED);
 
     let params = InitParams {
-        funder_strkey: FUNDER_KEY,
+        funder_strkey: FUNDER_KEY.as_str(),
         funder_sequence: 100,
         funder_signer: &funder_key as &dyn Signer,
         // 2 strkeys + 2 signers, but only 1 index.
-        channel_strkeys: vec![CHANNEL_KEY_1.to_owned(), CHANNEL_KEY_2.to_owned()],
+        channel_strkeys: vec![CHANNEL_KEY_1.clone(), CHANNEL_KEY_2.clone()],
         channel_signers: vec![
-            SoftwareSigningKey::new_from_bytes([2u8; 32]),
-            SoftwareSigningKey::new_from_bytes([3u8; 32]),
+            SoftwareSigningKey::new_from_bytes(CHANNEL_SEED_1),
+            SoftwareSigningKey::new_from_bytes(CHANNEL_SEED_2),
         ],
         channel_indices: vec![1], // too few
         network_passphrase: TESTNET_PASSPHRASE,
@@ -205,6 +214,25 @@ async fn init_pool_n2_success_submits_valid_sandwich() {
 
     Mock::given(method("POST"))
         .and(path("/"))
+        .and(body_partial_json(json!({"method": "getNetwork"})))
+        .respond_with(EchoIdResponder::new(get_network_result(TESTNET_PASSPHRASE)))
+        .mount(&server)
+        .await;
+
+    // The ledger as it stands before the sandwich is applied: the funder is
+    // the only account that exists, each with its own master key as sole
+    // signer. The channel accounts are created by this very transaction.
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getLedgerEntries"})))
+        .respond_with(EchoIdResponder::new(ledger_entries_result_for(&[
+            FUNDER_KEY.as_str(),
+        ])))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
         .respond_with(CapturingResponder {
             result: json!({
@@ -231,15 +259,15 @@ async fn init_pool_n2_success_submits_valid_sandwich() {
 
     let client = StellarRpcClient::new(&server.uri()).expect("mock URL must be valid");
 
-    let funder_signer = SoftwareSigningKey::new_from_bytes([1u8; 32]);
-    let ch1_signer = SoftwareSigningKey::new_from_bytes([2u8; 32]);
-    let ch2_signer = SoftwareSigningKey::new_from_bytes([3u8; 32]);
+    let funder_signer = SoftwareSigningKey::new_from_bytes(FUNDER_SEED);
+    let ch1_signer = SoftwareSigningKey::new_from_bytes(CHANNEL_SEED_1);
+    let ch2_signer = SoftwareSigningKey::new_from_bytes(CHANNEL_SEED_2);
 
-    let channel_strkeys = vec![CHANNEL_KEY_1.to_owned(), CHANNEL_KEY_2.to_owned()];
+    let channel_strkeys = vec![CHANNEL_KEY_1.clone(), CHANNEL_KEY_2.clone()];
     let channel_indices = vec![1u32, 2u32];
 
     let params = InitParams {
-        funder_strkey: FUNDER_KEY,
+        funder_strkey: FUNDER_KEY.as_str(),
         funder_sequence: 500,
         funder_signer: &funder_signer as &dyn Signer,
         channel_signers: vec![ch1_signer, ch2_signer],
@@ -264,7 +292,7 @@ async fn init_pool_n2_success_submits_valid_sandwich() {
         "first channel record index must be 1"
     );
     assert_eq!(
-        result.channel_records[0].public_key, CHANNEL_KEY_1,
+        result.channel_records[0].public_key, *CHANNEL_KEY_1,
         "first channel public key must match"
     );
     assert_eq!(
@@ -272,7 +300,7 @@ async fn init_pool_n2_success_submits_valid_sandwich() {
         "second channel record index must be 2"
     );
     assert_eq!(
-        result.channel_records[1].public_key, CHANNEL_KEY_2,
+        result.channel_records[1].public_key, *CHANNEL_KEY_2,
         "second channel public key must match"
     );
     assert!(!result.tx_hash.is_empty(), "tx_hash must be non-empty");
@@ -293,7 +321,7 @@ async fn init_pool_n2_success_submits_valid_sandwich() {
         .as_str()
         .expect("params.transaction must be a base64-XDR string");
 
-    assert_sandwich_structure(envelope_xdr, FUNDER_KEY, &channel_strkeys)
+    assert_sandwich_structure(envelope_xdr, FUNDER_KEY.as_str(), &channel_strkeys)
         .expect("submitted envelope must have valid N=2 CAP-33 sandwich structure");
 }
 
@@ -303,6 +331,25 @@ async fn init_pool_n2_success_submits_valid_sandwich() {
 async fn init_pool_n1_success_single_channel() {
     let server = MockServer::start().await;
     let tx_hash = "c".repeat(64);
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getNetwork"})))
+        .respond_with(EchoIdResponder::new(get_network_result(TESTNET_PASSPHRASE)))
+        .mount(&server)
+        .await;
+
+    // The ledger as it stands before the sandwich is applied: the funder is
+    // the only account that exists, each with its own master key as sole
+    // signer. The channel accounts are created by this very transaction.
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getLedgerEntries"})))
+        .respond_with(EchoIdResponder::new(ledger_entries_result_for(&[
+            FUNDER_KEY.as_str(),
+        ])))
+        .mount(&server)
+        .await;
 
     Mock::given(method("POST"))
         .and(path("/"))
@@ -329,15 +376,15 @@ async fn init_pool_n1_success_single_channel() {
 
     let client = StellarRpcClient::new(&server.uri()).expect("mock URL must be valid");
 
-    let funder_signer = SoftwareSigningKey::new_from_bytes([1u8; 32]);
-    let ch_signer = SoftwareSigningKey::new_from_bytes([2u8; 32]);
+    let funder_signer = SoftwareSigningKey::new_from_bytes(FUNDER_SEED);
+    let ch_signer = SoftwareSigningKey::new_from_bytes(CHANNEL_SEED_1);
 
     let params = InitParams {
-        funder_strkey: FUNDER_KEY,
+        funder_strkey: FUNDER_KEY.as_str(),
         funder_sequence: 200,
         funder_signer: &funder_signer as &dyn Signer,
         channel_signers: vec![ch_signer],
-        channel_strkeys: vec![CHANNEL_KEY_1.to_owned()],
+        channel_strkeys: vec![CHANNEL_KEY_1.clone()],
         channel_indices: vec![1],
         network_passphrase: TESTNET_PASSPHRASE,
         fee_per_op: FEE_PER_OP,
@@ -349,7 +396,7 @@ async fn init_pool_n1_success_single_channel() {
 
     assert_eq!(result.channel_records.len(), 1);
     assert_eq!(result.channel_records[0].index, 1);
-    assert_eq!(result.channel_records[0].public_key, CHANNEL_KEY_1);
+    assert_eq!(result.channel_records[0].public_key, *CHANNEL_KEY_1);
     assert_eq!(result.ledger, 2000);
 }
 
@@ -357,30 +404,49 @@ async fn init_pool_n1_success_single_channel() {
 // RPC error → InitFailed
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// When the mock RPC returns HTTP 500, `init_pool` must return `InitFailed`.
+/// When the RPC rejects the send, `init_pool` must return `InitFailed`.
 ///
-/// The 500 simulates a network or RPC rejection that causes
-/// `submit_transaction_and_wait` to fail, which `init_pool` maps to `InitFailed`.
+/// The endpoint answers the identity probe and the signer-set fetch so the
+/// submission reaches the send step; the 500 lands only on `sendTransaction`,
+/// which is the network rejection this test is about. A blanket 500 would be
+/// consumed by the probe and never exercise the send path at all.
 #[tokio::test]
 async fn init_pool_rpc_error_returns_init_failed() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/"))
+        .and(body_partial_json(json!({"method": "getNetwork"})))
+        .respond_with(EchoIdResponder::new(get_network_result(TESTNET_PASSPHRASE)))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getLedgerEntries"})))
+        .respond_with(EchoIdResponder::new(ledger_entries_result_for(&[
+            FUNDER_KEY.as_str(),
+        ])))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "sendTransaction"})))
         .respond_with(ResponseTemplate::new(500))
         .mount(&server)
         .await;
 
     let client = StellarRpcClient::new(&server.uri()).expect("mock URL must be valid");
-    let funder_signer = SoftwareSigningKey::new_from_bytes([1u8; 32]);
-    let ch_signer = SoftwareSigningKey::new_from_bytes([2u8; 32]);
+    let funder_signer = SoftwareSigningKey::new_from_bytes(FUNDER_SEED);
+    let ch_signer = SoftwareSigningKey::new_from_bytes(CHANNEL_SEED_1);
 
     let params = InitParams {
-        funder_strkey: FUNDER_KEY,
+        funder_strkey: FUNDER_KEY.as_str(),
         funder_sequence: 100,
         funder_signer: &funder_signer as &dyn Signer,
         channel_signers: vec![ch_signer],
-        channel_strkeys: vec![CHANNEL_KEY_1.to_owned()],
+        channel_strkeys: vec![CHANNEL_KEY_1.clone()],
         channel_indices: vec![1],
         network_passphrase: TESTNET_PASSPHRASE,
         fee_per_op: FEE_PER_OP,
@@ -408,11 +474,11 @@ async fn init_pool_rpc_error_returns_init_failed() {
 async fn init_pool_invalid_channel_strkey_returns_init_failed() {
     // Use a loopback URL: init_pool must return before any network call.
     let client = StellarRpcClient::new("http://127.0.0.1:1").expect("URL parses");
-    let funder_signer = SoftwareSigningKey::new_from_bytes([1u8; 32]);
-    let ch_signer = SoftwareSigningKey::new_from_bytes([2u8; 32]);
+    let funder_signer = SoftwareSigningKey::new_from_bytes(FUNDER_SEED);
+    let ch_signer = SoftwareSigningKey::new_from_bytes(CHANNEL_SEED_1);
 
     let params = InitParams {
-        funder_strkey: FUNDER_KEY,
+        funder_strkey: FUNDER_KEY.as_str(),
         funder_sequence: 100,
         funder_signer: &funder_signer as &dyn Signer,
         channel_signers: vec![ch_signer],

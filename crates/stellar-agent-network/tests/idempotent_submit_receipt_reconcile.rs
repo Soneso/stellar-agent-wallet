@@ -25,42 +25,54 @@
 use std::time::Duration;
 
 use serde_json::json;
-use stellar_agent_core::StellarAmount;
 use stellar_agent_core::error::{ErrorCategory, ProtocolError, WalletError};
 use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore};
 use stellar_agent_network::StellarRpcClient;
-use stellar_agent_network::builder::{Asset, ClassicOpBuilder};
 use stellar_agent_network::idempotent_submit::{reconcile_receipt, submit_transaction_idempotent};
-use stellar_agent_network::signing::software::SoftwareSigningKey;
 use stellar_agent_test_support::EchoIdResponder;
-use wiremock::matchers::{method, path};
+use stellar_agent_test_support::signed_envelope::{SignedTestEnvelope, get_network_result};
+use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixtures
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SRC_ACCOUNT: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
-const DST_ACCOUNT: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
 const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
 const MAINNET_PASSPHRASE: &str = "Public Global Stellar Network ; September 2015";
 const FAKE_TX_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const FAKE_LEDGER: u32 = 1234;
 const RECORDED_AT_LEDGER: u32 = 100;
 
-/// Builds and signs a test V1 envelope using seed `[3u8; 32]`.  Distinct from
-/// seeds used in other test files to avoid hash collisions between test stores.
-async fn build_signed_envelope() -> String {
-    let key = SoftwareSigningKey::new_from_bytes([3u8; 32]);
-    let mut builder = ClassicOpBuilder::new(SRC_ACCOUNT, 300, TESTNET_PASSPHRASE, 300);
-    builder
-        .payment(
-            DST_ACCOUNT,
-            StellarAmount::from_stroops(7_000_000),
-            &Asset::Native,
-        )
-        .unwrap();
-    builder.build_and_sign(&key).await.unwrap()
+/// Seed for the transaction source account.  A public test fixture, not a
+/// production key.
+const SOURCE_SEED: [u8; 32] = [3u8; 32];
+
+/// Builds a signed test V1 envelope whose source account is the signing key's
+/// own account, so the account the ledger reports is the one that signed.
+fn build_signed_envelope() -> SignedTestEnvelope {
+    SignedTestEnvelope::builder(SOURCE_SEED)
+        .sequence(300)
+        .amount_stroops(7_000_000)
+        .build()
+}
+
+/// Mounts the two reads every submit performs before it sends: the endpoint
+/// identity probe and the signer-set fetch for the envelope's source accounts.
+async fn mount_probe_and_signers(server: &MockServer, envelope: &SignedTestEnvelope) {
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getNetwork"})))
+        .respond_with(EchoIdResponder::new(get_network_result(TESTNET_PASSPHRASE)))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getLedgerEntries"})))
+        .respond_with(EchoIdResponder::new(envelope.ledger_entries_result()))
+        .mount(server)
+        .await;
 }
 
 /// Computes the SHA-256 envelope hash (the idempotency key) for a signed XDR.
@@ -99,7 +111,8 @@ fn open_store(dir: &tempfile::TempDir, name: &str) -> ReceiptStore {
 /// refused.
 #[tokio::test]
 async fn mainnet_passphrase_rejected_mainnet_write_forbidden() {
-    let signed_xdr = build_signed_envelope().await;
+    let envelope = build_signed_envelope();
+    let signed_xdr = envelope.envelope_xdr();
     let dir = tempfile::tempdir().unwrap();
     let store = open_store(&dir, "mainnet-guard-test");
 
@@ -108,7 +121,7 @@ async fn mainnet_passphrase_rejected_mainnet_write_forbidden() {
 
     let result = submit_transaction_idempotent(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(5),
         MAINNET_PASSPHRASE,
         &store,
@@ -130,7 +143,7 @@ async fn mainnet_passphrase_rejected_mainnet_write_forbidden() {
         0,
         "no RPC call must occur when the mainnet guard fires"
     );
-    let envelope_hash = envelope_hash_for(&signed_xdr);
+    let envelope_hash = envelope_hash_for(signed_xdr);
     assert!(
         store.get(&envelope_hash).unwrap().is_none(),
         "no receipt must be written when the entry-point mainnet guard fires"
@@ -223,8 +236,9 @@ async fn valid_base64_of_invalid_xdr_rejected() {
 /// Exercises the `ReceiptStatus::Failed { code }` arm of `receipt_to_result`.
 #[tokio::test]
 async fn cached_failed_receipt_returned_without_rpc_call() {
-    let signed_xdr = build_signed_envelope().await;
-    let envelope_hash = envelope_hash_for(&signed_xdr);
+    let envelope = build_signed_envelope();
+    let signed_xdr = envelope.envelope_xdr();
+    let envelope_hash = envelope_hash_for(signed_xdr);
 
     let dir = tempfile::tempdir().unwrap();
     let store = open_store(&dir, "cached-failed-test");
@@ -247,7 +261,7 @@ async fn cached_failed_receipt_returned_without_rpc_call() {
 
     let result = submit_transaction_idempotent(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(5),
         TESTNET_PASSPHRASE,
         &store,
@@ -283,8 +297,9 @@ async fn cached_failed_receipt_returned_without_rpc_call() {
 /// Exercises the `ReceiptStatus::Ambiguous` arm of `receipt_to_result`.
 #[tokio::test]
 async fn cached_ambiguous_receipt_returned_without_rpc_call() {
-    let signed_xdr = build_signed_envelope().await;
-    let envelope_hash = envelope_hash_for(&signed_xdr);
+    let envelope = build_signed_envelope();
+    let signed_xdr = envelope.envelope_xdr();
+    let envelope_hash = envelope_hash_for(signed_xdr);
 
     let dir = tempfile::tempdir().unwrap();
     let store = open_store(&dir, "cached-ambiguous-test");
@@ -301,7 +316,7 @@ async fn cached_ambiguous_receipt_returned_without_rpc_call() {
 
     let result = submit_transaction_idempotent(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(5),
         TESTNET_PASSPHRASE,
         &store,
@@ -331,8 +346,9 @@ async fn cached_ambiguous_receipt_returned_without_rpc_call() {
 /// Exercises the `ReceiptStatus::Reorged` arm of `receipt_to_result`.
 #[tokio::test]
 async fn cached_reorged_receipt_returned_without_rpc_call() {
-    let signed_xdr = build_signed_envelope().await;
-    let envelope_hash = envelope_hash_for(&signed_xdr);
+    let envelope = build_signed_envelope();
+    let signed_xdr = envelope.envelope_xdr();
+    let envelope_hash = envelope_hash_for(signed_xdr);
 
     let dir = tempfile::tempdir().unwrap();
     let store = open_store(&dir, "cached-reorged-test");
@@ -354,7 +370,7 @@ async fn cached_reorged_receipt_returned_without_rpc_call() {
 
     let result = submit_transaction_idempotent(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(5),
         TESTNET_PASSPHRASE,
         &store,
@@ -539,9 +555,7 @@ async fn reconcile_receipt_impossible_prior_ledger_returns_ambiguous() {
 
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(
-            json!({"method": "getTransaction"}),
-        ))
+        .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "NOT_FOUND",
             "latestLedger": 500,
@@ -556,9 +570,7 @@ async fn reconcile_receipt_impossible_prior_ledger_returns_ambiguous() {
     // getHealth: latest_ledger=500 < prior_ledger=9000 (impossible state).
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(
-            json!({"method": "getHealth"}),
-        ))
+        .and(body_partial_json(json!({"method": "getHealth"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "healthy",
             "latestLedger": 500,
@@ -621,9 +633,7 @@ async fn reconcile_receipt_second_not_found_no_ledger_advance_returns_success() 
 
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(
-            json!({"method": "getTransaction"}),
-        ))
+        .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "NOT_FOUND",
             "latestLedger": 3000,
@@ -637,9 +647,7 @@ async fn reconcile_receipt_second_not_found_no_ledger_advance_returns_success() 
 
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(
-            json!({"method": "getHealth"}),
-        ))
+        .and(body_partial_json(json!({"method": "getHealth"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "healthy",
             "latestLedger": 3000,
@@ -693,9 +701,7 @@ async fn reconcile_receipt_health_error_on_not_found_returns_ambiguous() {
 
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(
-            json!({"method": "getTransaction"}),
-        ))
+        .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "NOT_FOUND",
             "latestLedger": 600,
@@ -712,9 +718,7 @@ async fn reconcile_receipt_health_error_on_not_found_returns_ambiguous() {
     // surfaces as a parse error, triggering the Err branch in reconcile_receipt.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(
-            json!({"method": "getHealth"}),
-        ))
+        .and(body_partial_json(json!({"method": "getHealth"})))
         .respond_with(EchoIdResponder::new(json!({
             "not_a_health_response": true
         })))
@@ -766,9 +770,7 @@ async fn reconcile_receipt_unexpected_get_transaction_status_returns_success_unc
     // "PROCESSING" is not a real Stellar getTransaction status; exercises the `other` arm.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(
-            json!({"method": "getTransaction"}),
-        ))
+        .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "PROCESSING",
             "latestLedger": 600,
@@ -807,19 +809,19 @@ async fn reconcile_receipt_unexpected_get_transaction_status_returns_success_unc
 /// Exercises the `other =>` arm in `submit_with_retention_poll`'s poll loop.
 #[tokio::test]
 async fn winner_path_unexpected_get_transaction_status_returns_rpc_error() {
-    let signed_xdr = build_signed_envelope().await;
+    let envelope = build_signed_envelope();
+    let signed_xdr = envelope.envelope_xdr();
     let dir = tempfile::tempdir().unwrap();
     let store = open_store(&dir, "winner-unexpected-status");
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(
-            json!({"method": "sendTransaction"}),
-        ))
+        .and(body_partial_json(json!({"method": "sendTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
-            "hash": FAKE_TX_HASH,
+            "hash": envelope.tx_hash_hex(),
             "status": "PENDING",
             "latestLedger": 1001,
             "latestLedgerCloseTime": "1699999999"
@@ -831,9 +833,7 @@ async fn winner_path_unexpected_get_transaction_status_returns_rpc_error() {
     // "DUPLICATE" is not a real poll status and exercises the `other` arm.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(
-            json!({"method": "getTransaction"}),
-        ))
+        .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "DUPLICATE",
             "latestLedger": 1002,
@@ -849,9 +849,7 @@ async fn winner_path_unexpected_get_transaction_status_returns_rpc_error() {
     // if the poll loop happens to call getHealth before hitting the unexpected status.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(
-            json!({"method": "getHealth"}),
-        ))
+        .and(body_partial_json(json!({"method": "getHealth"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "healthy",
             "latestLedger": 1002,
@@ -866,7 +864,7 @@ async fn winner_path_unexpected_get_transaction_status_returns_rpc_error() {
 
     let result = submit_transaction_idempotent(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         &store,

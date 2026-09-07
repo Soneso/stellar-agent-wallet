@@ -239,7 +239,12 @@ fn simulate_args() -> StellarClaimArgs {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Serves a fixed claimable-balance entry (or an empty result when
-/// `entry_xdr` is `None`) and a fixed source account for `getLedgerEntries`.
+/// `entry_xdr` is `None`) and a fixed source account for `getLedgerEntries`,
+/// plus the endpoint's network identity.
+///
+/// The reported identity is testnet, matching the profile every consumer
+/// builds, so a commit reaching the endpoint probe passes it and is refused,
+/// if at all, by the gate the test is about.
 struct ClaimRpcResponder {
     cb_key_xdr: String,
     entry_xdr: Option<String>,
@@ -287,20 +292,22 @@ fn request_id_and_method(request: &Request) -> (serde_json::Value, String) {
 impl Respond for ClaimRpcResponder {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let (req_id, method) = request_id_and_method(request);
-        let result = if method == "getLedgerEntries" {
-            let body = String::from_utf8_lossy(&request.body);
-            if body.contains(&self.cb_key_xdr) {
-                match &self.entry_xdr {
-                    Some(xdr) => ledger_entries_result(&self.cb_key_xdr, xdr),
-                    None => empty_ledger_entries_result(),
+        let result = match method.as_str() {
+            "getNetwork" => common::EndpointNetwork::testnet().result(),
+            "getLedgerEntries" => {
+                let body = String::from_utf8_lossy(&request.body);
+                if body.contains(&self.cb_key_xdr) {
+                    match &self.entry_xdr {
+                        Some(xdr) => ledger_entries_result(&self.cb_key_xdr, xdr),
+                        None => empty_ledger_entries_result(),
+                    }
+                } else if body.contains(&self.account_key_xdr) {
+                    ledger_entries_result(&self.account_key_xdr, &self.account_xdr)
+                } else {
+                    empty_ledger_entries_result()
                 }
-            } else if body.contains(&self.account_key_xdr) {
-                ledger_entries_result(&self.account_key_xdr, &self.account_xdr)
-            } else {
-                empty_ledger_entries_result()
             }
-        } else {
-            serde_json::json!({})
+            _ => serde_json::json!({}),
         };
         json_rpc_response(&req_id, &result)
     }
@@ -903,15 +910,18 @@ fn sstrkey_for_seed(seed: [u8; 32]) -> String {
 }
 
 /// RPC responder serving the claimable-balance entry and the claimant's
-/// source account identically on both the simulate fetch and the commit
-/// re-fetch (so the rebuilt envelope is byte-identical — the divergence
-/// check passes), followed by `sendTransaction` (PENDING) and
-/// `getTransaction` (SUCCESS).
+/// source account identically on the simulate fetch, the commit re-fetch,
+/// and the submit-path signer fetch (so the rebuilt envelope is
+/// byte-identical — the divergence check passes — and the claimant reports
+/// the signing key as its own master key), plus the endpoint's network
+/// identity, followed by `sendTransaction` (PENDING) and `getTransaction`
+/// (SUCCESS).
 struct ClaimSubmitSuccessRpcResponder {
     cb_key_xdr: String,
     entry_xdr: String,
     account_key_xdr: String,
     account_xdr: String,
+    network: common::EndpointNetwork,
 }
 
 #[async_trait]
@@ -919,6 +929,7 @@ impl Respond for ClaimSubmitSuccessRpcResponder {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let (req_id, method) = request_id_and_method(request);
         let result = match method.as_str() {
+            "getNetwork" => self.network.result(),
             "getLedgerEntries" => {
                 let body = String::from_utf8_lossy(&request.body);
                 if body.contains(&self.cb_key_xdr) {
@@ -988,6 +999,7 @@ async fn claim_commit_full_round_trip_succeeds_with_string_encoded_amount() {
             entry_xdr,
             account_key_xdr,
             account_xdr,
+            network: common::EndpointNetwork::testnet(),
         })
         .mount(&mock_server)
         .await;
@@ -1103,6 +1115,7 @@ async fn claim_two_phase_round_trip_succeeds_under_satisfied_minimum_reserve_rul
             entry_xdr,
             account_key_xdr,
             account_xdr,
+            network: common::EndpointNetwork::testnet(),
         })
         .mount(&mock_server)
         .await;
@@ -1197,6 +1210,7 @@ async fn claim_commit_denies_under_unsatisfied_minimum_reserve_rule() {
             entry_xdr,
             account_key_xdr,
             account_xdr,
+            network: common::EndpointNetwork::testnet(),
         })
         .mount(&mock_server)
         .await;
@@ -1298,5 +1312,118 @@ async fn simulate_nonce_mint_failed_envelope_shape() {
     assert_eq!(
         code, "nonce.mint_failed",
         "an absent nonce-key keyring entry must surface nonce.mint_failed"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Endpoint-identity probe at the commit boundary
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `stellar_claim_commit` refuses with `network.endpoint_network_mismatch`
+/// when the endpoint serves a network other than the profile's, and the nonce
+/// it was handed survives that refusal.
+///
+/// The survival proof is the second commit: the endpoint's reported identity
+/// is swapped to the profile's network and the SAME nonce is committed again,
+/// which submits. A nonce recorded in the replay window by the first call
+/// would instead return `nonce.replayed` there. Repeating the refused call and
+/// asserting the mismatch code again would discriminate nothing, because the
+/// probe precedes the nonce gate and answers identically whether or not the
+/// nonce was consumed.
+#[tokio::test]
+#[serial]
+async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key();
+
+    let seed = [0x56_u8; 32];
+    let claimant_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+
+    let id = test_balance_id();
+    let cb_key_xdr = claim_key_xdr(&id);
+    let entry_xdr = claim_entry_xdr(
+        &id,
+        &claimant_g,
+        stellar_xdr::ClaimPredicate::Unconditional,
+        CLAIM_AMOUNT_STROOPS,
+    );
+    let account_key_xdr = account_ledger_key_xdr(&claimant_g);
+    let account_xdr =
+        account_entry_xdr_with_seq(&claimant_g, SOURCE_BALANCE_STROOPS, 0, SOURCE_SEQ);
+
+    // The endpoint starts out serving a third network while the profile below
+    // declares testnet.
+    let network = common::EndpointNetwork::reporting(common::FUTURENET_PASSPHRASE);
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ClaimSubmitSuccessRpcResponder {
+            cb_key_xdr,
+            entry_xdr,
+            account_key_xdr,
+            account_xdr,
+            network: network.clone(),
+        })
+        .mount(&mock_server)
+        .await;
+
+    let profile = testnet_profile_with_rpc(&mock_server.uri());
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    // ── Simulate: mints a real nonce over a real envelope ──────────────────
+    let sim_result = server
+        .call_stellar_claim(StellarClaimArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            balance_id: "ab".repeat(32),
+            source_account: Some(claimant_g.clone()),
+        })
+        .await
+        .expect("simulate must not error");
+    assert_ne!(sim_result.is_error, Some(true), "simulate must succeed");
+    let (nonce, expires_at_unix_ms, envelope_xdr) = extract_commit_triple(&sim_result);
+
+    let commit_args = StellarClaimCommitArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        balance_id: "ab".repeat(32),
+        source_account: Some(claimant_g),
+        nonce,
+        expires_at_unix_ms,
+        envelope_xdr,
+        approval_nonce: None,
+        approval_attestation: None,
+    };
+
+    // ── Commit against the wrong network ───────────────────────────────────
+    let refused = server
+        .call_stellar_claim_commit(commit_args.clone())
+        .await
+        .expect("the refusal must surface as an is_error envelope, not a protocol error");
+    let (code, _message, _text) = common::assert_business_envelope(&refused);
+    assert_eq!(
+        code, "network.endpoint_network_mismatch",
+        "a commit whose endpoint serves a different network must carry the \
+         mismatch code, got: {code}"
+    );
+
+    // ── Commit again once the endpoint serves the profile's network ────────
+    network.set(stellar_agent_test_support::signed_envelope::TESTNET_PASSPHRASE);
+    let committed = server
+        .call_stellar_claim_commit(commit_args)
+        .await
+        .expect("the retry must not error");
+    let committed_json = call_result_json(&committed);
+    assert_ne!(
+        committed.is_error,
+        Some(true),
+        "the same nonce must still commit after the endpoint is corrected, \
+         which it can only do if the refused call left the replay window \
+         empty; got: {committed_json}"
+    );
+    assert!(
+        committed_json["data"]["tx_hash"].as_str().is_some(),
+        "the retry must report an on-chain tx_hash: {committed_json}"
     );
 }

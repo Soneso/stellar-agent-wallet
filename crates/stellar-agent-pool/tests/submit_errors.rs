@@ -49,35 +49,71 @@ use stellar_xdr::{
     TransactionResultResult, Uint256, VecM, WriteXdr,
 };
 use wiremock::matchers::{body_partial_json, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer};
 
 use stellar_agent_core::WalletError;
 use stellar_agent_core::error::SubmissionError;
 use stellar_agent_network::StellarRpcClient;
+use stellar_agent_network::signing::Signer as _;
+use stellar_agent_pool::derive::derive_channel_signer;
 use stellar_agent_pool::pool::{ChannelPool, TerminalOutcome};
 use stellar_agent_pool::submit::submit_pooled;
 use stellar_agent_pool::{ChannelRecord, PoolError};
 use stellar_agent_test_support::EchoIdResponder;
+use stellar_agent_test_support::signed_envelope::{get_network_result, ledger_entries_result_for};
 use zeroize::Zeroizing;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixtures
 // ─────────────────────────────────────────────────────────────────────────────
 
-const CHANNEL_KEY: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
 const DEST_KEY: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
 const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
 const FEE_PER_OP: u32 = 100;
 const TIMEOUT: Duration = Duration::from_secs(10);
 const INITIAL_SEQ: i64 = 100;
 
-fn make_pool_1() -> ChannelPool {
-    ChannelPool::from_records(vec![ChannelRecord::new(1, CHANNEL_KEY)], vec![INITIAL_SEQ])
-        .expect("pool construction must succeed")
-}
+/// The single channel's index in the fixture pool.
+const CHANNEL_INDEX: u32 = 1;
 
 fn mock_seed() -> Zeroizing<[u8; 64]> {
     Zeroizing::new([7u8; 64])
+}
+
+/// The G-strkey of the fixture pool's channel.
+///
+/// It is the account whose master key `submit_pooled` derives from
+/// [`mock_seed`] for [`CHANNEL_INDEX`], so the submitted envelope is signed by
+/// a key its own source account reports — the binding the submit path verifies
+/// against the endpoint's signer sets before sending.
+async fn channel_key() -> String {
+    let signer = derive_channel_signer(Zeroizing::new(*mock_seed()), CHANNEL_INDEX)
+        .expect("channel derivation must succeed for an in-range index");
+    let public_key = signer
+        .public_key()
+        .await
+        .expect("software signer must expose its public key");
+    format!("{public_key}")
+}
+
+async fn make_pool_1() -> ChannelPool {
+    ChannelPool::from_records(
+        vec![ChannelRecord::new(CHANNEL_INDEX, &channel_key().await)],
+        vec![INITIAL_SEQ],
+    )
+    .expect("pool construction must succeed")
+}
+
+/// Mounts the endpoint-identity probe the submit path performs before every
+/// send: the endpoint serves testnet, matching the passphrase every caller
+/// here declares.
+async fn mount_network_probe(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getNetwork"})))
+        .respond_with(EchoIdResponder::new(get_network_result(TESTNET_PASSPHRASE)))
+        .mount(server)
+        .await;
 }
 
 /// Builds a `TransactionResult` with `TxBadSeq` and encodes it to base64 XDR.
@@ -112,9 +148,9 @@ fn tx_failed_result_xdr() -> String {
 /// FAILED+TxBadSeq result XDR.
 ///
 /// The allocator's `tx_bad_seq` branch attempts a sequence re-fetch via
-/// `fetch_account` after the channel is freed.  Because the mock server has
-/// no `getAccount` handler registered (it will respond with a 500 on
-/// the getAccount call), the re-fetch fails and `submit_pooled` surfaces
+/// `fetch_account` after the channel is freed.  The mock answers the
+/// pre-send signer fetch and then reports the account as absent, so the
+/// re-fetch fails and `submit_pooled` surfaces
 /// `PoolError::SequenceFetchFailed` (the allocator::release error from
 /// the re-fetch, which propagates through `submit_pooled`).
 ///
@@ -125,6 +161,9 @@ async fn submit_pooled_tx_bad_seq_triggers_refetch_path() {
     let server = MockServer::start().await;
     let tx_hash = "d".repeat(64);
     let result_xdr = tx_bad_seq_result_xdr();
+    let channel = channel_key().await;
+
+    mount_network_probe(&server).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
@@ -151,16 +190,29 @@ async fn submit_pooled_tx_bad_seq_triggers_refetch_path() {
         .mount(&server)
         .await;
 
-    // The getAccount call triggered by the TxBadSeq re-fetch path will get an
-    // HTTP 500 because no mock for it is registered here.
+    // The pre-send signer fetch is answered once. The sequence re-fetch that
+    // follows the TxBadSeq rejection queries the same account and finds
+    // nothing, which is the re-fetch failure this test is about.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(body_partial_json(json!({"method": "getAccount"})))
-        .respond_with(ResponseTemplate::new(500))
+        .and(body_partial_json(json!({"method": "getLedgerEntries"})))
+        .respond_with(EchoIdResponder::new(ledger_entries_result_for(&[
+            channel.as_str()
+        ])))
+        .up_to_n_times(1)
         .mount(&server)
         .await;
 
-    let pool = make_pool_1();
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getLedgerEntries"})))
+        .respond_with(EchoIdResponder::new(
+            json!({ "entries": [], "latestLedger": 1001 }),
+        ))
+        .mount(&server)
+        .await;
+
+    let pool = make_pool_1().await;
     let seed = mock_seed();
     let client = StellarRpcClient::new(&server.uri()).expect("mock URL must be valid");
 
@@ -209,6 +261,20 @@ async fn submit_pooled_generic_failed_returns_wallet_error() {
     let server = MockServer::start().await;
     let tx_hash = "e".repeat(64);
     let result_xdr = tx_failed_result_xdr();
+    let channel = channel_key().await;
+
+    mount_network_probe(&server).await;
+
+    // The pre-send signer fetch: the channel account reports its own master
+    // key, which is the key that signed the envelope.
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getLedgerEntries"})))
+        .respond_with(EchoIdResponder::new(ledger_entries_result_for(&[
+            channel.as_str()
+        ])))
+        .mount(&server)
+        .await;
 
     Mock::given(method("POST"))
         .and(path("/"))
@@ -235,7 +301,7 @@ async fn submit_pooled_generic_failed_returns_wallet_error() {
         .mount(&server)
         .await;
 
-    let pool = make_pool_1();
+    let pool = make_pool_1().await;
     let seed = mock_seed();
     let client = StellarRpcClient::new(&server.uri()).expect("mock URL must be valid");
 
@@ -283,7 +349,7 @@ async fn submit_pooled_generic_failed_returns_wallet_error() {
 async fn submit_pooled_pool_exhausted_no_rpc_call() {
     // Use a loopback port that would refuse connections if contacted.
     let client = StellarRpcClient::new("http://127.0.0.1:1").expect("URL parses");
-    let pool = make_pool_1();
+    let pool = make_pool_1().await;
     let seed = mock_seed();
 
     // Drain the pool manually.
@@ -431,10 +497,15 @@ async fn submit_pooled_tx_bad_seq_with_successful_refetch_updates_sequence() {
     let server = MockServer::start().await;
     let tx_hash = "f".repeat(64);
     let result_xdr = tx_bad_seq_result_xdr();
+    let channel = channel_key().await;
 
-    // Build the getLedgerEntries response for the CHANNEL_KEY account with seq=999.
-    let key_xdr = account_ledger_key_xdr(CHANNEL_KEY);
-    let entry_xdr = account_entry_data_xdr(CHANNEL_KEY, 999);
+    // The channel account with seq=999: the same body answers the pre-send
+    // signer fetch (the account's own master key is its sole signer) and the
+    // sequence re-fetch that follows the TxBadSeq rejection.
+    let key_xdr = account_ledger_key_xdr(&channel);
+    let entry_xdr = account_entry_data_xdr(&channel, 999);
+
+    mount_network_probe(&server).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
@@ -479,7 +550,7 @@ async fn submit_pooled_tx_bad_seq_with_successful_refetch_updates_sequence() {
         .mount(&server)
         .await;
 
-    let pool = Arc::new(make_pool_1());
+    let pool = Arc::new(make_pool_1().await);
     let seed = mock_seed();
     let client = Arc::new(StellarRpcClient::new(&server.uri()).expect("mock URL must be valid"));
 
@@ -542,7 +613,7 @@ async fn submit_pooled_derive_failed_releases_channel() {
     // before build_and_sign.
     let client = StellarRpcClient::new("http://127.0.0.1:1").expect("URL parses");
     let pool = ChannelPool::from_records(
-        vec![ChannelRecord::new(OUT_OF_RANGE_INDEX, CHANNEL_KEY)],
+        vec![ChannelRecord::new(OUT_OF_RANGE_INDEX, &channel_key().await)],
         vec![INITIAL_SEQ],
     )
     .expect("pool with out-of-range index must construct (index is stored, not validated here)");
@@ -602,7 +673,7 @@ async fn submit_pooled_build_and_sign_failure_releases_channel() {
     // Use a loopback URL: no network I/O should occur because build_and_sign
     // fails before the submit.
     let client = StellarRpcClient::new("http://127.0.0.1:1").expect("URL parses");
-    let pool = make_pool_1();
+    let pool = make_pool_1().await;
     let seed = mock_seed();
 
     let initial_seq = pool.channel_snapshot()[0].sequence_number;

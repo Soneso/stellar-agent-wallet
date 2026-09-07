@@ -4,7 +4,7 @@ description: Operate the Stellar Agent Wallet — a self-custodial Stellar walle
 license: Apache-2.0
 compatibility: Requires the stellar-agent CLI and stellar-agent-mcp server (v0.1.0-alpha.6 public alpha; install from crates.io with a pinned version, e.g. cargo binstall stellar-agent-cli@0.1.0-alpha.6 stellar-agent-mcp@0.1.0-alpha.6, or build from source). Targets Stellar testnet (default) and mainnet.
 metadata:
-  version: "0.4.0"
+  version: "0.4.1"
   wallet_version: "0.1.0-alpha.6"
 ---
 
@@ -251,6 +251,14 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
   call. Below the policy layer, the network layer structurally refuses every
   mainnet write with `network.mainnet_write_forbidden` regardless of engine or
   keys — no configuration unlocks mainnet writes in this alpha.
+- The submit layer does not trust the declared network. It asks the RPC endpoint
+  which network it serves and binds the submission to that answer, then verifies
+  every signature on the envelope against it. Five codes carry those refusals:
+  `network.endpoint_network_mismatch` (endpoint serves a different network than
+  declared), `network.endpoint_identity_unavailable` (endpoint identity could
+  not be established in time), `network.envelope_signed_for_mainnet`,
+  `network.envelope_signature_unverifiable`, and `network.envelope_unsigned`.
+  See references/troubleshooting.md.
 - The sign-only tools (the SEP-43 sign verbs, SEP-53 `sign_message`, and the two
   x402 payment tools), plus every MPP tool, refuse `stellar:mainnet`
   structurally with
@@ -316,6 +324,20 @@ writes. The sign-only tools (SEP-43 sign verbs, SEP-53 `sign_message`, x402
 payment tools) refuse mainnet at handler entry with
 `network.mainnet_write_forbidden`, before the policy gate — branch on both codes
 for mainnet refusals.
+
+**The endpoint decides which network you are on, not `chain_id`.** The submit
+layer asks the RPC endpoint which network it serves and binds the submission to
+that answer. An endpoint serving a different network than the profile declares
+is `network.endpoint_network_mismatch`; an endpoint whose identity cannot be
+established in time is `network.endpoint_identity_unavailable`. Signatures are
+then checked against the network the endpoint reported: an envelope signed for
+mainnet is `network.envelope_signed_for_mainnet`, one whose signatures verify
+under neither that network nor mainnet is
+`network.envelope_signature_unverifiable`, and an
+envelope with no signature, or a fee-bump whose outer or inner transaction
+has none, is `network.envelope_unsigned`. On the
+four two-phase commit tools this runs before the single-use nonce is burned, so
+a refusal here leaves the nonce usable.
 
 **Branch on `ok` and the error `code`, not the message.** The human message text
 is not a stable contract; the wire `code` is.

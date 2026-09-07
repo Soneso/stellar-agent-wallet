@@ -53,7 +53,13 @@ stellar-agent pay GDEST...WXYZ "10 XLM" --source GSRC...WXYZ --secret-env WALLET
 
 ### Mainnet-write refusal
 
-This is a testnet-first alpha. `mainnet` is accepted for read-only commands but every write or signing command structurally refuses `mainnet`: commands that take `--network` refuse before any RPC call and before any signing key is touched, and profile-driven flows are refused at the network submit layer before any transaction is sent. The refusal surfaces as `network.mainnet_write_forbidden` (the `friendbot` command and `accounts create --fund-with-friendbot` use `network.friendbot_mainnet_forbidden`).
+This is a testnet-first alpha. `mainnet` is accepted for read-only commands but every write or signing command structurally refuses `mainnet`, surfacing `network.mainnet_write_forbidden` (the `friendbot` command and `accounts create --fund-with-friendbot` use `network.friendbot_mainnet_forbidden`). Commands that take `--network` refuse before any RPC call and before any signing key is touched. At the submit layer, which every write goes through including the profile-driven ones, a declared mainnet passphrase and a known mainnet RPC URL are each refused with no RPC call at all.
+
+### Submit-layer network binding
+
+The submit layer does not take the declared network on trust. Before sending it asks the endpoint which network it serves, on the client that will send, and treats that answer as authoritative: an endpoint reporting mainnet is refused with `network.mainnet_write_forbidden`, one reporting a different network than declared with `network.endpoint_network_mismatch`, and one whose identity cannot be established within the submission timeout with `network.endpoint_identity_unavailable`. The probe is retried with bounded backoff inside the caller's timeout and never falls back to the declaration.
+
+It then verifies every decorated signature on the envelope against the network id the endpoint reported, using the ed25519 signer sets of the transaction source and every operation source (an account absent from the ledger is `network.account_not_found`). A signature that verifies only under the mainnet network id is `network.envelope_signed_for_mainnet`, one that verifies under neither is `network.envelope_signature_unverifiable`, and an envelope with no signature, or a fee-bump whose outer or inner transaction has none, is `network.envelope_unsigned`. Every signature must pass and each signature set must have at least one, so an envelope signed for one network cannot be submitted under another network's passphrase.
 
 ---
 
@@ -142,6 +148,8 @@ Staged pipeline (mutually exclusive): `--build-only` emits unsigned envelope XDR
 Memo flags are a mutually exclusive group (at most one).
 
 Under `policy.engine = "v1"` `pay` evaluates operator policy before signing. The staged `--sign-only` / `--submit-only` stages gate too: they decode the supplied envelope and match rules under the `stellar_pay_commit` tool name, and deny `policy.deny.unsizable_value_effect` on an envelope the decoder cannot size unless the matched rule sets `allow_opaque_signing = true`.
+
+`--submit-only` runs the endpoint identity probe on its own client before the policy gate and before the audit-key pre-flight, so an `--rpc-url` pointing at a different network than `--network` is refused early. It also requires an already-signed envelope: handing it the unsigned XDR that `--build-only` emitted is refused with `network.envelope_unsigned` before anything is sent. `claim --submit-only` behaves the same way.
 
 ```bash
 export WALLET_SK="S..."

@@ -247,6 +247,10 @@ security-key reference names but mints no key material; the rotation commands
 below mint the actual keys. The engine choice governs the policy layer only:
 every mainnet write is additionally refused at the network layer
 (`network.mainnet_write_forbidden`) in this alpha, on `noop` and `v1` alike.
+That layer binds each submission to the network the RPC endpoint reports it
+serves, not to the profile's declared `network_passphrase`, so a profile whose
+`rpc_url` and network do not name the same chain is refused before anything is
+sent (`network.endpoint_network_mismatch`).
 
 ### Migrate first
 

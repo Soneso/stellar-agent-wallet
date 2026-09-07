@@ -1327,7 +1327,12 @@ async fn commit_indistinguishability_expired_vs_hmac_mismatch() {
 // Cross-check integration tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Simple wiremock responder for `getLedgerEntries` only.
+/// Wiremock responder serving the account state and the endpoint's network
+/// identity, and nothing else.
+///
+/// The reported identity is testnet, matching the profile every consumer
+/// builds, so a commit reaching the endpoint probe passes it and is refused,
+/// if at all, by the gate the test is about.
 struct AccountOnlyResponder {
     account_key_xdr: String,
     account_xdr: String,
@@ -1347,22 +1352,24 @@ impl wiremock::Respond for AccountOnlyResponder {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
 
-        let result = if method == "getLedgerEntries" {
-            let body = String::from_utf8_lossy(&request.body);
-            if body.contains(&self.account_key_xdr) {
-                serde_json::json!({
-                    "entries": [{
-                        "key": &self.account_key_xdr,
-                        "xdr": &self.account_xdr,
-                        "lastModifiedLedgerSeq": 1000
-                    }],
-                    "latestLedger": 1001
-                })
-            } else {
-                serde_json::json!({ "entries": [], "latestLedger": 1001 })
+        let result = match method {
+            "getNetwork" => common::EndpointNetwork::testnet().result(),
+            "getLedgerEntries" => {
+                let body = String::from_utf8_lossy(&request.body);
+                if body.contains(&self.account_key_xdr) {
+                    serde_json::json!({
+                        "entries": [{
+                            "key": &self.account_key_xdr,
+                            "xdr": &self.account_xdr,
+                            "lastModifiedLedgerSeq": 1000
+                        }],
+                        "latestLedger": 1001
+                    })
+                } else {
+                    serde_json::json!({ "entries": [], "latestLedger": 1001 })
+                }
             }
-        } else {
-            serde_json::json!({})
+            _ => serde_json::json!({}),
         };
 
         wiremock::ResponseTemplate::new(200)
@@ -1743,13 +1750,16 @@ fn sstrkey_for_seed(seed: [u8; 32]) -> String {
 
 /// RPC responder for a full simulate → commit → submit round trip.
 ///
-/// Serves the SAME funded-account `getLedgerEntries` response on both the
-/// simulate fetch and the commit re-fetch, so the rebuilt envelope is
-/// byte-identical to the presented one (the divergence check passes), then
-/// `sendTransaction` (PENDING) followed by `getTransaction` (SUCCESS).
+/// Serves the SAME funded-account `getLedgerEntries` response on the simulate
+/// fetch, the commit re-fetch, and the submit-path signer fetch, so the
+/// rebuilt envelope is byte-identical to the presented one (the divergence
+/// check passes) and the source account reports the signing key as its own
+/// master key. `getNetwork` answers the endpoint-identity probe, then
+/// `sendTransaction` (PENDING) is followed by `getTransaction` (SUCCESS).
 struct CreateAccountSubmitSuccessRpcResponder {
     account_key_xdr: String,
     account_xdr: String,
+    network: common::EndpointNetwork,
 }
 
 #[async_trait]
@@ -1767,6 +1777,7 @@ impl Respond for CreateAccountSubmitSuccessRpcResponder {
             .unwrap_or("");
 
         let result = match method {
+            "getNetwork" => self.network.result(),
             "getLedgerEntries" => {
                 let body = String::from_utf8_lossy(&request.body);
                 if body.contains(&self.account_key_xdr) {
@@ -1839,6 +1850,7 @@ async fn create_account_commit_full_round_trip_succeeds_with_string_encoded_amou
         .respond_with(CreateAccountSubmitSuccessRpcResponder {
             account_key_xdr,
             account_xdr,
+            network: common::EndpointNetwork::testnet(),
         })
         .mount(&mock_server)
         .await;
@@ -1961,6 +1973,7 @@ async fn create_account_two_phase_round_trip_succeeds_under_satisfied_minimum_re
         .respond_with(CreateAccountSubmitSuccessRpcResponder {
             account_key_xdr,
             account_xdr,
+            network: common::EndpointNetwork::testnet(),
         })
         .mount(&mock_server)
         .await;
@@ -2062,6 +2075,7 @@ async fn create_account_commit_denies_under_unsatisfied_minimum_reserve_rule() {
         .respond_with(CreateAccountSubmitSuccessRpcResponder {
             account_key_xdr,
             account_xdr,
+            network: common::EndpointNetwork::testnet(),
         })
         .mount(&mock_server)
         .await;
@@ -2179,4 +2193,131 @@ mod helpers {
     pub(super) fn mint_for(profile: &Profile) -> NonceMint {
         NonceMint::from_profile(profile).expect("NonceMint::from_profile")
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Endpoint-identity probe at the commit boundary
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `stellar_create_account_commit` refuses with
+/// `network.endpoint_network_mismatch` when the endpoint serves a network
+/// other than the profile's, and the nonce it was handed survives that
+/// refusal.
+///
+/// The survival proof is the second commit: the endpoint's reported identity
+/// is swapped to the profile's network and the SAME nonce is committed again,
+/// which submits. A nonce recorded in the replay window by the first call
+/// would instead return `nonce.replayed` there. Repeating the refused call and
+/// asserting the mismatch code again would discriminate nothing, because the
+/// probe precedes the nonce gate and answers identically whether or not the
+/// nonce was consumed.
+#[tokio::test]
+#[serial]
+async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(202);
+
+    let seed = [0x58_u8; 32];
+    let source_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+
+    let account_key_xdr = account_ledger_key_xdr(&source_g);
+    let account_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
+
+    // The endpoint starts out serving a third network while the profile below
+    // declares testnet.
+    let network = common::EndpointNetwork::reporting(common::FUTURENET_PASSPHRASE);
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(CreateAccountSubmitSuccessRpcResponder {
+            account_key_xdr,
+            account_xdr,
+            network: network.clone(),
+        })
+        .mount(&mock_server)
+        .await;
+
+    let profile = testnet_profile_with_rpc(&mock_server.uri());
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    // ── Simulate: mints a real nonce over a real envelope ──────────────────
+    let simulate_args = StellarCreateAccountArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        source: source_g.clone(),
+        destination: DEST_G.to_owned(),
+        starting_balance: serde_json::from_str(r#""100 XLM""#).expect("parse amount"),
+        classic_base: None,
+    };
+    let sim_result = server
+        .call_stellar_create_account(simulate_args.clone())
+        .await
+        .expect("simulate must not error");
+    assert_ne!(
+        sim_result.is_error,
+        Some(true),
+        "simulate must succeed: {}",
+        call_result_text(&sim_result)
+    );
+    let sim_json = call_result_json(&sim_result);
+    let sim_data = sim_json.get("data").expect("simulate success carries data");
+    let nonce = sim_data
+        .get("nonce")
+        .and_then(serde_json::Value::as_str)
+        .expect("nonce present")
+        .to_owned();
+    let expires_at_unix_ms = sim_data
+        .get("expires_at_unix_ms")
+        .and_then(serde_json::Value::as_u64)
+        .expect("expires_at_unix_ms present");
+    let envelope_xdr = sim_data
+        .get("envelope_xdr")
+        .and_then(serde_json::Value::as_str)
+        .expect("envelope_xdr present")
+        .to_owned();
+
+    let commit_args = StellarCreateAccountCommitArgs {
+        chain_id: simulate_args.chain_id.clone(),
+        source: simulate_args.source.clone(),
+        destination: simulate_args.destination.clone(),
+        starting_balance: simulate_args.starting_balance.clone(),
+        nonce,
+        expires_at_unix_ms,
+        envelope_xdr,
+        approval_nonce: None,
+        approval_attestation: None,
+    };
+
+    // ── Commit against the wrong network ───────────────────────────────────
+    let refused = server
+        .call_stellar_create_account_commit(commit_args.clone())
+        .await
+        .expect("the refusal must surface as an is_error envelope, not a protocol error");
+    let (code, _message, _text) = common::assert_business_envelope(&refused);
+    assert_eq!(
+        code, "network.endpoint_network_mismatch",
+        "a commit whose endpoint serves a different network must carry the \
+         mismatch code, got: {code}"
+    );
+
+    // ── Commit again once the endpoint serves the profile's network ────────
+    network.set(stellar_agent_test_support::signed_envelope::TESTNET_PASSPHRASE);
+    let committed = server
+        .call_stellar_create_account_commit(commit_args)
+        .await
+        .expect("the retry must not error");
+    let committed_json = call_result_json(&committed);
+    assert_ne!(
+        committed.is_error,
+        Some(true),
+        "the same nonce must still commit after the endpoint is corrected, \
+         which it can only do if the refused call left the replay window \
+         empty; got: {committed_json}"
+    );
+    assert!(
+        committed_json["data"]["tx_hash"].as_str().is_some(),
+        "the retry must report an on-chain tx_hash: {committed_json}"
+    );
 }

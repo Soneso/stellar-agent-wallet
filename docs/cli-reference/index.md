@@ -97,11 +97,32 @@ fi
 
 This is a testnet-first alpha. `testnet` is the default network and Friendbot funding is testnet-only.
 
-`mainnet` is accepted for read-only commands (for example reading a context rule or listing rules). Every write or signing command structurally refuses `mainnet` before any RPC call is made and before any signing key is touched. The refusal surfaces as the wire code `network.mainnet_write_forbidden` (the `friendbot` command uses `network.friendbot_mainnet_forbidden`). Because the check runs ahead of network and key access, a mistaken `--network mainnet` on a write command cannot reach the chain or unlock a seed.
+`mainnet` is accepted for read-only commands (for example reading a context rule or listing rules). Every write or signing command structurally refuses `mainnet` with the wire code `network.mainnet_write_forbidden` (the `friendbot` command uses `network.friendbot_mainnet_forbidden`). A command that names `--network mainnet` is refused ahead of network and key access, so it cannot reach the chain or unlock a seed.
+
+The submit layer applies the same refusal in a fixed order. A declared mainnet network passphrase is refused first, then an `--rpc-url` matching a known mainnet host; both cost zero RPC calls. The envelope is then decoded locally, so a malformed or legacy V0 envelope is refused without a round trip.
+
+## Submit-layer network binding
+
+The submit layer does not take the declared network on trust. Before sending, it asks the endpoint which network it serves (`getNetwork`), on the same client instance that will send, and treats that answer, not the declaration, as authoritative:
+
+- the endpoint reports mainnet: `network.mainnet_write_forbidden`;
+- the endpoint reports a different network than the one declared: `network.endpoint_network_mismatch`;
+- the endpoint's identity cannot be established within the submission timeout: `network.endpoint_identity_unavailable`.
+
+The probe is retried with bounded exponential backoff inside the caller's own timeout and is fail-closed: it never falls back to the declared network. This is the one mainnet refusal that costs a round trip.
+
+The layer then verifies the envelope's signatures against that network. It fetches the ed25519 signer sets of the transaction source account and of every distinct operation-level source account in one `getLedgerEntries` call (for a fee-bump, the fee source answers for the outer signatures and the inner transaction's sources for the inner ones); an account absent from the ledger is refused with `network.account_not_found` before anything is sent, unless the transaction itself creates it, in which case its own master key is the signer it will have at apply time and no ledger entry is needed. Every decorated signature must then verify: the SEP-23 signing payload is rebuilt under the network id the endpoint reported and checked against the gathered signers whose key hint matches.
+
+- verifies under the endpoint's network id: accepted;
+- verifies under the mainnet network id: `network.envelope_signed_for_mainnet`;
+- verifies under neither: `network.envelope_signature_unverifiable`;
+- the envelope carries no signature, or on a fee-bump the outer or the inner transaction carries none: `network.envelope_unsigned`.
+
+Every signature must pass, and each signature set must have at least one: on a fee-bump the outer and the inner transaction are checked separately, so an outer signature cannot stand in for a missing inner one. Hash-x and pre-auth-tx signers contribute no ed25519 key, so a signature only such a signer could account for is refused. Two consequences follow. An envelope signed for one network cannot be submitted under another network's passphrase at either submit entry point, including from a library consumer of the published crate with no CLI involved. And the submit path performs two reads before it sends, so every submission makes two round trips before the send.
 
 ## Audit-key pre-flight refusal
 
-Every value-moving signing verb (`pay`, `claim`, `accounts create` sponsored mode, `trustline`, `trade`, `lend`, `vault`) proves the active profile's audit chain-root key is acquirable BEFORE any signing key is touched or transaction submitted. A profile fresh from `profile init` has the audit-log keyring COORDINATE but no key material — `profile rotate-audit-key <name>` mints it. Until that runs, these verbs refuse with the wire code `audit.chain_key_unavailable` rather than signing unaudited. Build-only/simulate stages are unaffected: they neither sign nor submit, so they never reach this pre-flight. This pre-flight fails closed only for a persisted `<name>.toml` profile: `pay`, `claim`, and `accounts create` keep their zero-config posture — the in-memory profile synthesized when no profile was named and no `default.toml` exists stays fail-open on this specific check. See [Key-rotation subcommands](profile-and-governance.md#key-rotation-subcommands) and [Concepts: fail-closed on an unminted audit key](../concepts.md#fail-closed-on-an-unminted-audit-key).
+Every value-moving signing verb (`pay`, `claim`, `accounts create` sponsored mode, `trustline`, `trade`, `lend`, `vault`) proves the active profile's audit chain-root key is acquirable BEFORE any signing key is touched or transaction submitted. A profile fresh from `profile init` has the audit-log keyring COORDINATE but no key material — `profile rotate-audit-key <name>` mints it. Until that runs, these verbs refuse with the wire code `audit.chain_key_unavailable` rather than signing unaudited. Build-only/simulate stages are unaffected: they neither sign nor submit, so they never reach this pre-flight. On `pay --submit-only` and `claim --submit-only` the endpoint identity probe runs on the command's own client ahead of the policy gate and ahead of this pre-flight, so an `--rpc-url` pointing at a different network than `--network` is refused before either one runs. This pre-flight fails closed only for a persisted `<name>.toml` profile: `pay`, `claim`, and `accounts create` keep their zero-config posture — the in-memory profile synthesized when no profile was named and no `default.toml` exists stays fail-open on this specific check. See [Key-rotation subcommands](profile-and-governance.md#key-rotation-subcommands) and [Concepts: fail-closed on an unminted audit key](../concepts.md#fail-closed-on-an-unminted-audit-key).
 
 ## Startup advisory
 

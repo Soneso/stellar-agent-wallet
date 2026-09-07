@@ -452,13 +452,21 @@ for the full flag set.
 ### Mainnet is refused for writes
 
 Targeting mainnet on a `--network` write command is refused before any RPC call
-or signing (profile-driven flows are refused at the network submit layer):
+or signing:
 
 ```bash
 stellar-agent pay GDEST...WXYZ "10 XLM" \
   --source GABC...WXYZ --secret-env WALLET_SK --network mainnet
 # exit code 1; error.code = network.mainnet_write_forbidden
 ```
+
+Flows that take their network from the profile rather than a flag go through the
+same submit layer and are refused there. A mainnet network passphrase and a known
+mainnet RPC URL each cost zero RPC calls; beyond those two the wallet asks the
+endpoint which network it serves and refuses when the answer is mainnet. That
+same answer, not the network you declared, is what the wallet checks the
+envelope's signatures against, so an envelope signed for one network cannot be
+submitted under another network's passphrase.
 
 ## Next steps
 

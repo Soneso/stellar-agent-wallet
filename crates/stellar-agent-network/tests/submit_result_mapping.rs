@@ -42,13 +42,11 @@
 use std::time::Duration;
 
 use serde_json::json;
-use stellar_agent_core::StellarAmount;
 use stellar_agent_core::error::{LedgerError, NetworkError, SubmissionError, WalletError};
 use stellar_agent_network::StellarRpcClient;
-use stellar_agent_network::builder::{Asset, ClassicOpBuilder};
-use stellar_agent_network::signing::software::SoftwareSigningKey;
 use stellar_agent_network::submit::{SubmissionSignerKind, submit_transaction_and_wait};
 use stellar_agent_test_support::EchoIdResponder;
+use stellar_agent_test_support::signed_envelope::{SignedTestEnvelope, get_network_result};
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer};
 
@@ -56,29 +54,40 @@ use wiremock::{Mock, MockServer};
 // Fixtures
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SRC_ACCOUNT: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
-const DST_ACCOUNT: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
 const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
-const FAKE_TX_HASH: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
-/// Builds a signed test envelope. `seq` disambiguates per-test sequence numbers.
-/// Seed `[9u8; 32]` is a public test fixture, not a production key.
-async fn build_signed_envelope(seq: i64) -> String {
-    let key = SoftwareSigningKey::new_from_bytes([9u8; 32]);
-    let mut builder = ClassicOpBuilder::new(SRC_ACCOUNT, seq, TESTNET_PASSPHRASE, 100);
-    builder
-        .payment(
-            DST_ACCOUNT,
-            StellarAmount::from_stroops(1_000_000),
-            &Asset::Native,
-        )
-        .unwrap();
-    builder.build_and_sign(&key).await.unwrap()
+/// Seed for the transaction source account. A public test fixture, never a
+/// production key.
+const SOURCE_SEED: [u8; 32] = [9u8; 32];
+
+/// Builds a signed test envelope whose source account is the signing key's own
+/// account, so the account the ledger reports is the one that signed. `seq`
+/// disambiguates per-test sequence numbers.
+fn build_signed_envelope(seq: i64) -> SignedTestEnvelope {
+    SignedTestEnvelope::for_source_with_sequence(SOURCE_SEED, seq)
 }
 
-fn send_pending_response() -> serde_json::Value {
+/// Mounts the two reads every submit performs before it sends: the endpoint
+/// identity probe and the signer-set fetch for the envelope's source accounts.
+async fn mount_probe_and_signers(server: &MockServer, envelope: &SignedTestEnvelope) {
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getNetwork"})))
+        .respond_with(EchoIdResponder::new(get_network_result(TESTNET_PASSPHRASE)))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getLedgerEntries"})))
+        .respond_with(EchoIdResponder::new(envelope.ledger_entries_result()))
+        .mount(server)
+        .await;
+}
+
+fn send_pending_response(envelope: &SignedTestEnvelope) -> serde_json::Value {
     json!({
-        "hash": FAKE_TX_HASH,
+        "hash": envelope.tx_hash_hex(),
         "status": "PENDING",
         "latestLedger": 2000,
         "latestLedgerCloseTime": "1700000000"
@@ -91,13 +100,17 @@ fn send_pending_response() -> serde_json::Value {
 
 /// Helper: mounts a FAILED getTransaction response carrying a given
 /// TransactionResultResult XDR body, submits, and returns the error.
-async fn failed_result_error(signed_xdr: &str, tx_result_xdr_b64: String) -> WalletError {
+async fn failed_result_error(
+    envelope: &SignedTestEnvelope,
+    tx_result_xdr_b64: String,
+) -> WalletError {
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, envelope).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(EchoIdResponder::new(send_pending_response(envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -107,7 +120,7 @@ async fn failed_result_error(signed_xdr: &str, tx_result_xdr_b64: String) -> Wal
         .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "FAILED",
-            "txHash": FAKE_TX_HASH,
+            "txHash": envelope.tx_hash_hex(),
             "ledger": null,
             "createdAt": "1700000000",
             "envelopeXdr": null,
@@ -122,7 +135,7 @@ async fn failed_result_error(signed_xdr: &str, tx_result_xdr_b64: String) -> Wal
 
     submit_transaction_and_wait(
         &client,
-        signed_xdr,
+        envelope.envelope_xdr(),
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
@@ -148,10 +161,10 @@ fn encode_unit_tx_result(result: stellar_xdr::TransactionResultResult) -> String
 async fn get_failed_tx_too_early_maps_to_op_failed() {
     use stellar_xdr::TransactionResultResult;
 
-    let signed_xdr = build_signed_envelope(2010).await;
+    let envelope = build_signed_envelope(2010);
     let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxTooEarly);
 
-    let err = failed_result_error(&signed_xdr, xdr_b64).await;
+    let err = failed_result_error(&envelope, xdr_b64).await;
 
     assert!(
         matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
@@ -170,10 +183,10 @@ async fn get_failed_tx_too_early_maps_to_op_failed() {
 async fn get_failed_tx_too_late_maps_to_op_failed() {
     use stellar_xdr::TransactionResultResult;
 
-    let signed_xdr = build_signed_envelope(2011).await;
+    let envelope = build_signed_envelope(2011);
     let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxTooLate);
 
-    let err = failed_result_error(&signed_xdr, xdr_b64).await;
+    let err = failed_result_error(&envelope, xdr_b64).await;
 
     assert!(
         matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
@@ -187,10 +200,10 @@ async fn get_failed_tx_too_late_maps_to_op_failed() {
 async fn get_failed_tx_missing_operation_maps_to_op_failed() {
     use stellar_xdr::TransactionResultResult;
 
-    let signed_xdr = build_signed_envelope(2012).await;
+    let envelope = build_signed_envelope(2012);
     let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxMissingOperation);
 
-    let err = failed_result_error(&signed_xdr, xdr_b64).await;
+    let err = failed_result_error(&envelope, xdr_b64).await;
 
     assert!(
         matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
@@ -205,10 +218,10 @@ async fn get_failed_tx_missing_operation_maps_to_op_failed() {
 async fn get_failed_tx_bad_auth_outer_maps_to_op_failed() {
     use stellar_xdr::TransactionResultResult;
 
-    let signed_xdr = build_signed_envelope(2013).await;
+    let envelope = build_signed_envelope(2013);
     let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxBadAuth);
 
-    let err = failed_result_error(&signed_xdr, xdr_b64).await;
+    let err = failed_result_error(&envelope, xdr_b64).await;
 
     assert!(
         matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
@@ -232,10 +245,10 @@ async fn get_failed_tx_bad_auth_outer_maps_to_op_failed() {
 async fn get_failed_tx_insufficient_balance_outer_maps_to_op_failed() {
     use stellar_xdr::TransactionResultResult;
 
-    let signed_xdr = build_signed_envelope(2014).await;
+    let envelope = build_signed_envelope(2014);
     let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxInsufficientBalance);
 
-    let err = failed_result_error(&signed_xdr, xdr_b64).await;
+    let err = failed_result_error(&envelope, xdr_b64).await;
 
     // Outer TxInsufficientBalance falls into the catch-all `other` arm.
     // The typed InsufficientBalance mapping is ONLY for TxFailed(Payment(Underfunded)).
@@ -251,10 +264,10 @@ async fn get_failed_tx_insufficient_balance_outer_maps_to_op_failed() {
 async fn get_failed_tx_no_account_outer_maps_to_op_failed() {
     use stellar_xdr::TransactionResultResult;
 
-    let signed_xdr = build_signed_envelope(2015).await;
+    let envelope = build_signed_envelope(2015);
     let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxNoAccount);
 
-    let err = failed_result_error(&signed_xdr, xdr_b64).await;
+    let err = failed_result_error(&envelope, xdr_b64).await;
 
     assert!(
         matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
@@ -268,10 +281,10 @@ async fn get_failed_tx_no_account_outer_maps_to_op_failed() {
 async fn get_failed_tx_insufficient_fee_maps_to_op_failed() {
     use stellar_xdr::TransactionResultResult;
 
-    let signed_xdr = build_signed_envelope(2016).await;
+    let envelope = build_signed_envelope(2016);
     let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxInsufficientFee);
 
-    let err = failed_result_error(&signed_xdr, xdr_b64).await;
+    let err = failed_result_error(&envelope, xdr_b64).await;
 
     assert!(
         matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
@@ -285,10 +298,10 @@ async fn get_failed_tx_insufficient_fee_maps_to_op_failed() {
 async fn get_failed_tx_bad_auth_extra_maps_to_op_failed() {
     use stellar_xdr::TransactionResultResult;
 
-    let signed_xdr = build_signed_envelope(2017).await;
+    let envelope = build_signed_envelope(2017);
     let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxBadAuthExtra);
 
-    let err = failed_result_error(&signed_xdr, xdr_b64).await;
+    let err = failed_result_error(&envelope, xdr_b64).await;
 
     assert!(
         matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
@@ -302,10 +315,10 @@ async fn get_failed_tx_bad_auth_extra_maps_to_op_failed() {
 async fn get_failed_tx_internal_error_maps_to_op_failed() {
     use stellar_xdr::TransactionResultResult;
 
-    let signed_xdr = build_signed_envelope(2018).await;
+    let envelope = build_signed_envelope(2018);
     let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxInternalError);
 
-    let err = failed_result_error(&signed_xdr, xdr_b64).await;
+    let err = failed_result_error(&envelope, xdr_b64).await;
 
     assert!(
         matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
@@ -319,10 +332,10 @@ async fn get_failed_tx_internal_error_maps_to_op_failed() {
 async fn get_failed_tx_not_supported_maps_to_op_failed() {
     use stellar_xdr::TransactionResultResult;
 
-    let signed_xdr = build_signed_envelope(2019).await;
+    let envelope = build_signed_envelope(2019);
     let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxNotSupported);
 
-    let err = failed_result_error(&signed_xdr, xdr_b64).await;
+    let err = failed_result_error(&envelope, xdr_b64).await;
 
     assert!(
         matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
@@ -336,10 +349,10 @@ async fn get_failed_tx_not_supported_maps_to_op_failed() {
 async fn get_failed_tx_bad_sponsorship_maps_to_op_failed() {
     use stellar_xdr::TransactionResultResult;
 
-    let signed_xdr = build_signed_envelope(2020).await;
+    let envelope = build_signed_envelope(2020);
     let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxBadSponsorship);
 
-    let err = failed_result_error(&signed_xdr, xdr_b64).await;
+    let err = failed_result_error(&envelope, xdr_b64).await;
 
     assert!(
         matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
@@ -353,10 +366,10 @@ async fn get_failed_tx_bad_sponsorship_maps_to_op_failed() {
 async fn get_failed_tx_bad_min_seq_age_or_gap_maps_to_op_failed() {
     use stellar_xdr::TransactionResultResult;
 
-    let signed_xdr = build_signed_envelope(2021).await;
+    let envelope = build_signed_envelope(2021);
     let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxBadMinSeqAgeOrGap);
 
-    let err = failed_result_error(&signed_xdr, xdr_b64).await;
+    let err = failed_result_error(&envelope, xdr_b64).await;
 
     assert!(
         matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
@@ -372,10 +385,10 @@ async fn get_failed_tx_bad_min_seq_age_or_gap_maps_to_op_failed() {
 async fn get_failed_tx_malformed_outer_maps_to_op_failed_not_tx_malformed() {
     use stellar_xdr::TransactionResultResult;
 
-    let signed_xdr = build_signed_envelope(2022).await;
+    let envelope = build_signed_envelope(2022);
     let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxMalformed);
 
-    let err = failed_result_error(&signed_xdr, xdr_b64).await;
+    let err = failed_result_error(&envelope, xdr_b64).await;
 
     // Outer TxMalformed falls to catch-all in map_failed_result → OpFailed.
     // The TxMalformed arm in map_send_error (for sendTransaction rejection) is distinct.
@@ -398,10 +411,10 @@ async fn get_failed_tx_malformed_outer_maps_to_op_failed_not_tx_malformed() {
 async fn get_failed_tx_soroban_invalid_maps_to_op_failed() {
     use stellar_xdr::TransactionResultResult;
 
-    let signed_xdr = build_signed_envelope(2023).await;
+    let envelope = build_signed_envelope(2023);
     let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxSorobanInvalid);
 
-    let err = failed_result_error(&signed_xdr, xdr_b64).await;
+    let err = failed_result_error(&envelope, xdr_b64).await;
 
     assert!(
         matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
@@ -415,10 +428,10 @@ async fn get_failed_tx_soroban_invalid_maps_to_op_failed() {
 async fn get_failed_tx_frozen_key_accessed_maps_to_op_failed() {
     use stellar_xdr::TransactionResultResult;
 
-    let signed_xdr = build_signed_envelope(2024).await;
+    let envelope = build_signed_envelope(2024);
     let xdr_b64 = encode_unit_tx_result(TransactionResultResult::TxFrozenKeyAccessed);
 
-    let err = failed_result_error(&signed_xdr, xdr_b64).await;
+    let err = failed_result_error(&envelope, xdr_b64).await;
 
     assert!(
         matches!(err, WalletError::Ledger(LedgerError::OpFailed { .. })),
@@ -458,17 +471,18 @@ fn encode_feebump_inner_failed(inner_result: stellar_xdr::InnerTransactionResult
 /// Helper: submit against a mocked FAILED response and extract the
 /// FeeBumpInnerRejected inner_result_code.
 async fn inner_code_for(
-    signed_xdr: &str,
+    envelope: &SignedTestEnvelope,
     inner_result: stellar_xdr::InnerTransactionResultResult,
 ) -> String {
     let xdr_b64 = encode_feebump_inner_failed(inner_result);
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, envelope).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(EchoIdResponder::new(send_pending_response(envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -478,7 +492,7 @@ async fn inner_code_for(
         .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "FAILED",
-            "txHash": FAKE_TX_HASH,
+            "txHash": envelope.tx_hash_hex(),
             "ledger": null,
             "createdAt": "1700000000",
             "envelopeXdr": null,
@@ -493,7 +507,7 @@ async fn inner_code_for(
 
     let err = submit_transaction_and_wait(
         &client,
-        signed_xdr,
+        envelope.envelope_xdr(),
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
@@ -548,9 +562,9 @@ async fn inner_result_code_name_all_18_variants_produce_correct_strings() {
     // Each case gets a unique sequence number to avoid XDR conflicts.
     for (idx, (expected_name, ctor)) in cases.iter().enumerate() {
         let seq = 3000 + idx as i64;
-        let signed_xdr = build_signed_envelope(seq).await;
+        let envelope = build_signed_envelope(seq);
 
-        let code = inner_code_for(&signed_xdr, ctor()).await;
+        let code = inner_code_for(&envelope, ctor()).await;
 
         assert_eq!(
             code.as_str(),
@@ -653,14 +667,15 @@ fn map_rpc_error_generic_submission_timeout_produces_rpc_timeout() {
 /// Verifies ledger=0 fallback when the SUCCESS response omits the "ledger" field.
 #[tokio::test]
 async fn success_with_missing_ledger_field_falls_back_to_zero() {
-    let signed_xdr = build_signed_envelope(5001).await;
+    let envelope = build_signed_envelope(5001);
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(EchoIdResponder::new(send_pending_response(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -671,7 +686,7 @@ async fn success_with_missing_ledger_field_falls_back_to_zero() {
         .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "SUCCESS",
-            "txHash": FAKE_TX_HASH,
+            "txHash": envelope.tx_hash_hex(),
             "createdAt": "1700000000",
             "envelopeXdr": null,
             "resultXdr": null,
@@ -685,7 +700,7 @@ async fn success_with_missing_ledger_field_falls_back_to_zero() {
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        envelope.envelope_xdr(),
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         Some(SubmissionSignerKind::Keyring),
@@ -721,14 +736,15 @@ async fn success_with_missing_ledger_field_falls_back_to_zero() {
 /// Hardware signer_kind is forwarded correctly through the success path.
 #[tokio::test]
 async fn success_with_hardware_signer_kind_forwarded() {
-    let signed_xdr = build_signed_envelope(5002).await;
+    let envelope = build_signed_envelope(5002);
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(EchoIdResponder::new(send_pending_response(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -738,7 +754,7 @@ async fn success_with_hardware_signer_kind_forwarded() {
         .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "SUCCESS",
-            "txHash": FAKE_TX_HASH,
+            "txHash": envelope.tx_hash_hex(),
             "ledger": 9999,
             "createdAt": "1700000000",
             "envelopeXdr": null,
@@ -753,7 +769,7 @@ async fn success_with_hardware_signer_kind_forwarded() {
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        envelope.envelope_xdr(),
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         Some(SubmissionSignerKind::Hardware),
@@ -773,14 +789,15 @@ async fn success_with_hardware_signer_kind_forwarded() {
 /// None signer_kind is forwarded correctly through the success path.
 #[tokio::test]
 async fn success_with_none_signer_kind_forwarded() {
-    let signed_xdr = build_signed_envelope(5003).await;
+    let envelope = build_signed_envelope(5003);
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(EchoIdResponder::new(send_pending_response(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -790,7 +807,7 @@ async fn success_with_none_signer_kind_forwarded() {
         .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "SUCCESS",
-            "txHash": FAKE_TX_HASH,
+            "txHash": envelope.tx_hash_hex(),
             "ledger": 1,
             "createdAt": "1700000000",
             "envelopeXdr": null,
@@ -805,7 +822,7 @@ async fn success_with_none_signer_kind_forwarded() {
 
     let sub = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        envelope.envelope_xdr(),
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
@@ -835,7 +852,7 @@ async fn get_failed_payment_line_full_maps_to_op_failed_payment() {
         TransactionResultExt, TransactionResultResult, VecM, WriteXdr,
     };
 
-    let signed_xdr = build_signed_envelope(6001).await;
+    let envelope = build_signed_envelope(6001);
 
     let ops: VecM<OperationResult> = vec![OperationResult::OpInner(OperationResultTr::Payment(
         PaymentResult::LineFull,
@@ -850,7 +867,7 @@ async fn get_failed_payment_line_full_maps_to_op_failed_payment() {
     .to_xdr_base64(Limits::none())
     .unwrap();
 
-    let err = failed_result_error(&signed_xdr, xdr_b64).await;
+    let err = failed_result_error(&envelope, xdr_b64).await;
 
     assert!(
         matches!(
@@ -870,7 +887,7 @@ async fn get_failed_payment_no_issuer_maps_to_op_failed_payment() {
         TransactionResultExt, TransactionResultResult, VecM, WriteXdr,
     };
 
-    let signed_xdr = build_signed_envelope(6002).await;
+    let envelope = build_signed_envelope(6002);
 
     let ops: VecM<OperationResult> = vec![OperationResult::OpInner(OperationResultTr::Payment(
         PaymentResult::NoIssuer,
@@ -885,7 +902,7 @@ async fn get_failed_payment_no_issuer_maps_to_op_failed_payment() {
     .to_xdr_base64(Limits::none())
     .unwrap();
 
-    let err = failed_result_error(&signed_xdr, xdr_b64).await;
+    let err = failed_result_error(&envelope, xdr_b64).await;
 
     assert!(
         matches!(
@@ -905,7 +922,7 @@ async fn get_failed_payment_src_not_authorized_maps_to_op_failed_payment() {
         TransactionResultExt, TransactionResultResult, VecM, WriteXdr,
     };
 
-    let signed_xdr = build_signed_envelope(6003).await;
+    let envelope = build_signed_envelope(6003);
 
     let ops: VecM<OperationResult> = vec![OperationResult::OpInner(OperationResultTr::Payment(
         PaymentResult::SrcNotAuthorized,
@@ -920,7 +937,7 @@ async fn get_failed_payment_src_not_authorized_maps_to_op_failed_payment() {
     .to_xdr_base64(Limits::none())
     .unwrap();
 
-    let err = failed_result_error(&signed_xdr, xdr_b64).await;
+    let err = failed_result_error(&envelope, xdr_b64).await;
 
     assert!(
         matches!(
@@ -942,7 +959,7 @@ async fn get_failed_non_payment_op_inner_maps_to_op_failed_unknown() {
         TransactionResultExt, TransactionResultResult, VecM, WriteXdr,
     };
 
-    let signed_xdr = build_signed_envelope(6004).await;
+    let envelope = build_signed_envelope(6004);
 
     // ChangeTrust is a non-Payment OpInner variant; falls into the catch-all
     // `other` arm of map_operation_result.
@@ -959,7 +976,7 @@ async fn get_failed_non_payment_op_inner_maps_to_op_failed_unknown() {
     .to_xdr_base64(Limits::none())
     .unwrap();
 
-    let err = failed_result_error(&signed_xdr, xdr_b64).await;
+    let err = failed_result_error(&envelope, xdr_b64).await;
 
     assert!(
         matches!(

@@ -190,6 +190,51 @@ pub(crate) fn submit_timeout(profile: &Profile) -> std::time::Duration {
         .unwrap_or(SUBMIT_TIMEOUT)
 }
 
+/// Asks the RPC endpoint which network it serves and requires it to be the
+/// profile's.
+///
+/// Every commit tool runs this on the client it will submit with, before the
+/// nonce is consumed. A commit whose endpoint serves a different network is
+/// refused outright, and refusing it before the nonce burn means the caller
+/// can correct the endpoint and retry with the same approval rather than
+/// having spent a single-use nonce on an unreachable target.
+///
+/// The submit layer runs the same probe on the same client; this one exists to
+/// place the refusal ahead of state the submit layer never sees.
+///
+/// # Errors
+///
+/// Returns the probe's own refusal:
+/// [`stellar_agent_core::error::NetworkError::MainnetWriteForbidden`],
+/// [`stellar_agent_core::error::NetworkError::EndpointNetworkMismatch`] or
+/// [`stellar_agent_core::error::NetworkError::EndpointIdentityUnavailable`].
+pub(crate) async fn probe_endpoint_network(
+    client: &stellar_agent_network::StellarRpcClient,
+    profile: &Profile,
+) -> Result<(), stellar_agent_core::error::WalletError> {
+    let deadline = tokio::time::Instant::now() + submit_timeout(profile);
+    client
+        .verify_network_passphrase(&profile.network_passphrase, deadline)
+        .await
+}
+
+/// Renders a commit-path refusal as an error tool result.
+///
+/// The refusal carries its own wire code rather than being collapsed into the
+/// nonce taxonomy: the caller has to be able to tell "your endpoint serves the
+/// wrong network" from "your nonce expired", because only the first is fixed
+/// by changing configuration.
+pub(crate) fn commit_refusal_result(
+    err: &stellar_agent_core::error::WalletError,
+) -> rmcp::model::CallToolResult {
+    let json = stellar_agent_core::envelope::Envelope::<()>::err(err)
+        .to_json_pretty()
+        .unwrap_or_else(|_| String::from("{}"));
+    let mut result = rmcp::model::CallToolResult::success(vec![rmcp::model::Content::text(json)]);
+    result.is_error = Some(true);
+    result
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // APPROVAL_TTL_MS — 24-hour pending-approval TTL
 // ─────────────────────────────────────────────────────────────────────────────

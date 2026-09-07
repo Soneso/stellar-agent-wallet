@@ -1160,6 +1160,95 @@ pub enum NetworkError {
         /// Seconds spent polling before giving up.
         waited_secs: u64,
     },
+
+    /// The RPC endpoint reports a network passphrase that differs from the one
+    /// the caller declared, and is not mainnet.
+    ///
+    /// The submit layer derives the target network from the endpoint, so a
+    /// disagreement means the transaction would land on a network other than
+    /// the one the caller reasoned about.
+    ///
+    /// Both passphrases are redacted on the way to `Display`: only the two
+    /// canonical public constants are shown verbatim; any other value renders
+    /// as `<other network>`, so a private or custom-network passphrase never
+    /// reaches an error surface.
+    #[error(
+        "the RPC endpoint serves network '{}' but '{}' was declared; refusing to submit",
+        render_network_passphrase(.server),
+        render_network_passphrase(.expected)
+    )]
+    EndpointNetworkMismatch {
+        /// The network passphrase the caller declared.
+        expected: String,
+        /// The network passphrase the endpoint reported.
+        server: String,
+    },
+
+    /// The RPC endpoint's network identity could not be determined within the
+    /// submission deadline.
+    ///
+    /// The endpoint identity probe is fail-closed: without a confirmed network
+    /// passphrase the submit layer cannot establish which network the envelope
+    /// would land on, so the submission is refused rather than sent blind.
+    ///
+    /// `url` is authority-only (scheme://host\[:port\]).
+    #[error("the network identity of RPC endpoint '{url}' could not be determined; not submitting")]
+    EndpointIdentityUnavailable {
+        /// The RPC endpoint URL, redacted to authority-only form.
+        url: String,
+    },
+
+    /// A signature on the envelope was produced under the mainnet network id.
+    ///
+    /// Every mainnet write is structurally refused, including one reaching a
+    /// non-mainnet endpoint: an envelope signed for mainnet is a mainnet
+    /// authorisation regardless of where it is relayed.
+    #[error(
+        "the envelope carries a signature produced for mainnet; \
+         mainnet writes are structurally refused in this alpha"
+    )]
+    EnvelopeSignedForMainnet,
+
+    /// A signature on the envelope verifies under neither the endpoint's
+    /// network id nor mainnet's, for any ed25519 signer of the transaction's
+    /// source accounts.
+    ///
+    /// `hint` is the `DecoratedSignature` hint as 8 lowercase hex characters —
+    /// the last four bytes of a public key, which is public material.
+    #[error(
+        "the envelope signature with hint {hint} does not verify under the network \
+         the endpoint serves, for any signer of the transaction's source accounts"
+    )]
+    EnvelopeSignatureUnverifiable {
+        /// The `DecoratedSignature` hint, 8 lowercase hex characters.
+        hint: String,
+    },
+
+    /// The envelope carries no signatures at all.
+    ///
+    /// Signature-network binding has nothing to verify, and the network would
+    /// reject the transaction after the round trip; the submit layer refuses
+    /// before sending.
+    #[error("the envelope carries no signatures; sign it before submitting")]
+    EnvelopeUnsigned,
+}
+
+/// Renders a network passphrase for inclusion in an error message.
+///
+/// The two canonical Stellar passphrases are public protocol constants and
+/// render verbatim, so an operator can read a mismatch directly. Any other
+/// value — a private network, a staging chain, an operator's own passphrase —
+/// renders as `<other network>`: the identity of a non-public network is not
+/// this crate's to disclose through an error surface that may be logged or
+/// forwarded to an agent.
+fn render_network_passphrase(passphrase: &str) -> &'static str {
+    if passphrase == crate::profile::caip2::TESTNET_PASSPHRASE {
+        crate::profile::caip2::TESTNET_PASSPHRASE
+    } else if passphrase == crate::profile::caip2::MAINNET_PASSPHRASE {
+        crate::profile::caip2::MAINNET_PASSPHRASE
+    } else {
+        "<other network>"
+    }
 }
 
 impl NetworkError {
@@ -1176,6 +1265,11 @@ impl NetworkError {
             Self::RpcResponseMalformed { .. } => "network.rpc_response_malformed",
             Self::RpcDivergence { .. } => "network.rpc_divergence",
             Self::FriendbotFundingNotConfirmed { .. } => "network.friendbot_funding_not_confirmed",
+            Self::EndpointNetworkMismatch { .. } => "network.endpoint_network_mismatch",
+            Self::EndpointIdentityUnavailable { .. } => "network.endpoint_identity_unavailable",
+            Self::EnvelopeSignedForMainnet => "network.envelope_signed_for_mainnet",
+            Self::EnvelopeSignatureUnverifiable { .. } => "network.envelope_signature_unverifiable",
+            Self::EnvelopeUnsigned => "network.envelope_unsigned",
         }
     }
 }
@@ -2370,6 +2464,30 @@ mod tests {
                 NetworkError::HorizonUnavailable { status: 503 },
                 "network.horizon_unavailable",
             ),
+            (
+                NetworkError::EndpointNetworkMismatch {
+                    expected: crate::profile::caip2::TESTNET_PASSPHRASE.to_owned(),
+                    server: "Some Private Network ; 2026".to_owned(),
+                },
+                "network.endpoint_network_mismatch",
+            ),
+            (
+                NetworkError::EndpointIdentityUnavailable {
+                    url: "https://rpc.example.com".to_owned(),
+                },
+                "network.endpoint_identity_unavailable",
+            ),
+            (
+                NetworkError::EnvelopeSignedForMainnet,
+                "network.envelope_signed_for_mainnet",
+            ),
+            (
+                NetworkError::EnvelopeSignatureUnverifiable {
+                    hint: "0a1b2c3d".to_owned(),
+                },
+                "network.envelope_signature_unverifiable",
+            ),
+            (NetworkError::EnvelopeUnsigned, "network.envelope_unsigned"),
         ];
 
         assert_code_round_trips!(cases);
@@ -2845,12 +2963,70 @@ mod tests {
             }),
             WalletError::Network(NetworkError::MainnetWriteForbidden),
             WalletError::Network(NetworkError::HorizonUnavailable { status: 503 }),
+            WalletError::Network(NetworkError::EndpointNetworkMismatch {
+                expected: crate::profile::caip2::TESTNET_PASSPHRASE.to_owned(),
+                server: "Some Private Network ; 2026".to_owned(),
+            }),
+            WalletError::Network(NetworkError::EndpointIdentityUnavailable {
+                url: "https://rpc.example.com".to_owned(),
+            }),
+            WalletError::Network(NetworkError::EnvelopeSignedForMainnet),
+            WalletError::Network(NetworkError::EnvelopeSignatureUnverifiable {
+                hint: "0a1b2c3d".to_owned(),
+            }),
+            WalletError::Network(NetworkError::EnvelopeUnsigned),
         ];
         for err in &cases {
             let msg = err.message();
             assert_no_compile_time_secret_markers(&msg);
             assert_no_secret_bytes(msg.as_bytes());
         }
+    }
+
+    /// A non-public network passphrase never reaches the `Display` surface of
+    /// [`NetworkError::EndpointNetworkMismatch`]; the two canonical public
+    /// constants do.
+    ///
+    /// The discriminating assertion is the absence of the private passphrase
+    /// substring: rendering it verbatim would disclose the identity of an
+    /// operator's own network through an error that is logged and forwarded.
+    #[test]
+    fn endpoint_network_mismatch_redacts_non_public_passphrases() {
+        const PRIVATE: &str = "Operator Private Chain ; March 2026";
+
+        let err = WalletError::Network(NetworkError::EndpointNetworkMismatch {
+            expected: crate::profile::caip2::TESTNET_PASSPHRASE.to_owned(),
+            server: PRIVATE.to_owned(),
+        });
+        let msg = err.message();
+        assert!(
+            !msg.contains(PRIVATE),
+            "a non-public passphrase must not render verbatim: {msg}"
+        );
+        assert!(
+            msg.contains("<other network>"),
+            "a non-public passphrase must render as the placeholder: {msg}"
+        );
+        assert!(
+            msg.contains(crate::profile::caip2::TESTNET_PASSPHRASE),
+            "the canonical testnet passphrase must render verbatim: {msg}"
+        );
+
+        // Mainnet on the server side renders verbatim as well: an operator
+        // reading this message needs to see which public network answered.
+        let err = WalletError::Network(NetworkError::EndpointNetworkMismatch {
+            expected: PRIVATE.to_owned(),
+            server: crate::profile::caip2::MAINNET_PASSPHRASE.to_owned(),
+        });
+        let msg = err.message();
+        assert!(
+            msg.contains(crate::profile::caip2::MAINNET_PASSPHRASE),
+            "the canonical mainnet passphrase must render verbatim: {msg}"
+        );
+        assert!(
+            !msg.contains(PRIVATE),
+            "a non-public declared passphrase must not render verbatim: {msg}"
+        );
     }
 
     #[test]

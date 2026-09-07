@@ -44,6 +44,7 @@ pub mod envelope_signing;
 pub mod hardware;
 pub mod software;
 pub mod source;
+pub(crate) mod verify_binding;
 pub mod wallet;
 
 pub use hardware::HardwareSigningKey;

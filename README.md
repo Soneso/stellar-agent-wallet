@@ -36,9 +36,16 @@ Public alpha, under active development.
   via `--network` where the command exposes it or via `--rpc-url` for
   `balances` (which has no `--network` flag). Every write or signing command
   structurally refuses mainnet in this alpha (wire code
-  `network.mainnet_write_forbidden`): `--network` commands refuse before any
-  RPC call or signing, and profile-driven flows are refused at the network
-  submit layer before any transaction is sent.
+  `network.mainnet_write_forbidden`). At the submit layer a declared mainnet
+  passphrase and a known mainnet RPC URL are each refused with no RPC call at
+  all; beyond those two, the layer asks the endpoint which network it serves
+  and refuses when the answer is mainnet.
+- The submit layer does not take the caller's word for the network. It treats
+  the endpoint's own answer as authoritative, refuses when that answer
+  disagrees with the declared network or cannot be established, and verifies
+  every signature on the envelope against the network the endpoint reported.
+  An envelope signed for one network cannot be relayed under another network's
+  passphrase.
 - Friendbot funding is testnet/futurenet only; mainnet is structurally refused.
 
 Release archives are published on the

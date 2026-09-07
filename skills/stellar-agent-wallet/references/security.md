@@ -137,10 +137,27 @@ There are no consent-gated mainnet write exceptions: every write surface refuses
 mainnet structurally. Friendbot funding is scoped to `testnet` and `futurenet`
 and refuses `mainnet` with `network.friendbot_mainnet_forbidden`.
 
-Agent rule: if you receive `network.mainnet_write_forbidden` or
-`policy.engine_required`, the action is structurally blocked on that chain.
-Switching `chain_id` to mainnet to retry a write will not work and is not a valid
-path; surface the block to the operator.
+The gate does not rest on the declared network alone. Before it sends, the
+submit layer asks the RPC endpoint which network it serves and treats that
+answer as authoritative: an endpoint reporting mainnet is refused with
+`network.mainnet_write_forbidden` even when the caller declared testnet, an
+endpoint reporting a different network than declared with
+`network.endpoint_network_mismatch`, and an endpoint whose identity cannot be
+established within the submission timeout with
+`network.endpoint_identity_unavailable`. It then verifies every signature on the
+envelope against the network the endpoint reported:
+`network.envelope_signed_for_mainnet` when a signature was made for mainnet,
+`network.envelope_signature_unverifiable` when it verifies under neither
+network, and `network.envelope_unsigned` when the envelope, or on a fee-bump
+either the outer or the inner transaction, carries no signature. An envelope
+signed for one network therefore cannot be relayed onto another.
+
+Agent rule: if you receive `network.mainnet_write_forbidden`,
+`policy.engine_required`, or any of the network-binding codes above, the action
+is structurally blocked on that chain and nothing was sent. Switching `chain_id`
+to mainnet to retry a write will not work and is not a valid path; neither will
+pointing at a different RPC endpoint to get past a binding refusal. Surface the
+block to the operator.
 
 ## Arguments are never logged: only key names
 

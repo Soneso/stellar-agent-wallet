@@ -360,17 +360,14 @@ pub async fn submit_fee_bump_idempotent(
                 "submit_fee_bump_idempotent: fee-bump signed; driving submit_with_retention_poll"
             );
 
-            // Mark the receipt as submitted BEFORE the send step.
-            // submit_with_retention_poll also calls mark_submitted internally;
-            // calling it here first ensures the flag is set even if the send
-            // returns an error (belt-and-braces against a stale Pending entry).
-            if let Err(e) = store.mark_submitted(&inner_key) {
-                tracing::warn!(
-                    inner_key = %redacted_inner,
-                    error = %e,
-                    "submit_fee_bump_idempotent: mark_submitted failed (non-fatal)"
-                );
-            }
+            // The receipt is marked submitted by `submit_with_retention_poll`
+            // itself, immediately before `sendTransaction` and after every
+            // refusal that precedes it. Marking it here instead would pin the
+            // receipt as submitted for a fee-bump that a pre-send refusal
+            // stops, and `abandon_pre_submit` will not withdraw such a
+            // receipt: every later attempt on the same inner key would then
+            // wait out the loser poll and fail, for a transaction that was
+            // never sent.
 
             // Drive the send+poll via submit_with_retention_poll.
             // envelope_hash = inner_key (idempotency identity stored in envelope_hash field).

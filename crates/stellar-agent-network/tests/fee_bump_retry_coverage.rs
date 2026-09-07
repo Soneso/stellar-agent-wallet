@@ -35,6 +35,9 @@ use stellar_agent_network::builder::{Asset, ClassicOpBuilder};
 use stellar_agent_network::fee_bump_retry::submit_fee_bump_idempotent;
 use stellar_agent_network::signing::SoftwareSigningKey;
 use stellar_agent_test_support::EchoIdResponder;
+use stellar_agent_test_support::signed_envelope::{
+    account_id_for_seed, get_network_result, ledger_entries_result_for,
+};
 use stellar_xdr::{
     Hash, Limits, ReadXdr, TransactionEnvelope, TransactionSignaturePayload,
     TransactionSignaturePayloadTaggedTransaction, WriteXdr,
@@ -58,9 +61,36 @@ const FEE_PAYER_SEED: [u8; 32] = [0x21u8; 32];
 const WRONG_PAYER_SEED: [u8; 32] = [0x22u8; 32];
 
 fn fee_payer_gstrkey() -> String {
-    use stellar_strkey::ed25519::PublicKey as StrPk;
-    let sk = ed25519_dalek::SigningKey::from_bytes(&FEE_PAYER_SEED);
-    StrPk(sk.verifying_key().to_bytes()).to_string().to_string()
+    account_id_for_seed(FEE_PAYER_SEED)
+}
+
+/// Mounts the two reads every submit performs before it sends: the endpoint
+/// identity probe and the signer-set fetch.
+///
+/// A fee-bump envelope names two source accounts: the fee source answers for
+/// the outer signature and the inner transaction's source for the inner one.
+/// Each signs with its own key, so reporting both with their master keys
+/// accounts for every signature on the envelope.
+async fn mount_probe_and_signers(server: &MockServer) {
+    let inner_source = account_id_for_seed(INNER_SOURCE_SEED);
+    let fee_payer = account_id_for_seed(FEE_PAYER_SEED);
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getNetwork"})))
+        .respond_with(EchoIdResponder::new(get_network_result(TESTNET_PASSPHRASE)))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getLedgerEntries"})))
+        .respond_with(EchoIdResponder::new(ledger_entries_result_for(&[
+            &inner_source,
+            &fee_payer,
+        ])))
+        .mount(server)
+        .await;
 }
 
 fn open_temp_store(label: &str) -> (tempfile::TempDir, ReceiptStore) {
@@ -76,15 +106,8 @@ async fn build_signed_inner(
     seq: i64,
     max_time: Option<u64>,
 ) -> (String, String, SoftwareSigningKey) {
-    use stellar_strkey::ed25519::PublicKey as StrPk;
-
-    let inner_sk = ed25519_dalek::SigningKey::from_bytes(&INNER_SOURCE_SEED);
-    let inner_pk: [u8; 32] = inner_sk.verifying_key().to_bytes();
-    let inner_gstrkey = StrPk(inner_pk).to_string().to_string();
-
-    let fee_payer_sk = ed25519_dalek::SigningKey::from_bytes(&FEE_PAYER_SEED);
-    let fee_payer_pk: [u8; 32] = fee_payer_sk.verifying_key().to_bytes();
-    let fee_payer_gstrkey = StrPk(fee_payer_pk).to_string().to_string();
+    let inner_gstrkey = account_id_for_seed(INNER_SOURCE_SEED);
+    let fee_payer_gstrkey = account_id_for_seed(FEE_PAYER_SEED);
 
     let inner_signer = SoftwareSigningKey::new_from_bytes(INNER_SOURCE_SEED);
     let fee_payer_signer = SoftwareSigningKey::new_from_bytes(FEE_PAYER_SEED);
@@ -178,6 +201,7 @@ async fn winner_path_rpc_failed_stores_failed_receipt_and_returns_error() {
 
     let (dir, store) = open_temp_store("fb-winner-failed");
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server).await;
 
     // sendTransaction → PENDING.
     Mock::given(method("POST"))
@@ -415,6 +439,7 @@ async fn receipt_tx_hash_equals_outer_hash_and_differs_from_inner_key() {
 
     let (dir, store) = open_temp_store("fb-outer-hash-check");
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
@@ -585,6 +610,7 @@ async fn fee_source_signer_mismatch_abandons_pending_receipt_allowing_retry() {
     // A retry with the correct signer must be the winner (no AlreadyPresent).
     let correct_signer = SoftwareSigningKey::new_from_bytes(FEE_PAYER_SEED);
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
@@ -860,6 +886,7 @@ async fn receipt_max_time_is_zero_when_inner_has_no_time_bounds() {
 
     let (dir, store) = open_temp_store("fb-maxtime-zero");
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
@@ -933,6 +960,7 @@ async fn winner_path_feebump_inner_failed_stores_failed_receipt() {
 
     let (dir, store) = open_temp_store("fb-inner-failed");
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server).await;
 
     Mock::given(method("POST"))
         .and(path("/"))

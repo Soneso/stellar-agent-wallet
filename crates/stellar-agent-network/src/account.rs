@@ -30,6 +30,8 @@
 //!
 //! All account lookups route through `getLedgerEntries`, not the Horizon REST API.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 pub use stellar_agent_core::BASE_RESERVE_STROOPS;
 use stellar_agent_core::amount::StellarAmount;
@@ -750,6 +752,122 @@ pub async fn fetch_account(
     }
 
     Ok(view)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Signer-set query
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Fetches the ed25519 signer set of each account in `account_ids` in a single
+/// bounded, retried `getLedgerEntries` call.
+///
+/// The set for one account is its own account-id key (the master key, which
+/// the XDR `signers` list never contains) plus every `SignerKey::Ed25519` in
+/// that list. Signer weights are not consulted: this set answers "which
+/// ed25519 keys can this account be signed by", which is what a signature's
+/// network binding is checked against; whether those signatures reach the
+/// account's thresholds is the ledger's decision, taken at apply time.
+///
+/// Hash-x and pre-auth-tx signer keys contribute nothing — no ed25519
+/// verification is possible against them — so an envelope authorised solely by
+/// one of those cannot be bound to a network here and is refused by the
+/// caller.
+///
+/// Keys are returned as raw 32-byte ed25519 public keys, taken from the XDR
+/// `AccountEntry` directly rather than round-tripping through strkeys.
+///
+/// Duplicate entries in `account_ids` are requested once.
+///
+/// # Errors
+///
+/// - [`WalletError::Protocol`] wrapping [`ProtocolError::XdrCodecFailed`] if an
+///   account ID is not a valid G-strkey or the RPC response cannot be decoded.
+/// - [`WalletError::Network`] wrapping [`NetworkError::AccountNotFound`] if any
+///   requested account has no entry in the ledger. An account that does not
+///   exist has no signer set, so its signatures cannot be bound to a network.
+/// - [`WalletError::Network`] wrapping [`NetworkError::RpcUnreachable`] if the
+///   query does not complete before `deadline`.
+pub(crate) async fn fetch_account_signers(
+    client: &StellarRpcClient,
+    account_ids: &[String],
+    deadline: tokio::time::Instant,
+) -> Result<BTreeMap<String, Vec<[u8; 32]>>, WalletError> {
+    use std::collections::BTreeSet;
+
+    use stellar_xdr::SignerKey;
+
+    use crate::retry::{RetryPolicy, is_retryable_send_error, retry_with_backoff};
+
+    // Request each distinct account once; the caller may name the same account
+    // as both the transaction source and an operation source.
+    let distinct: BTreeSet<&str> = account_ids.iter().map(String::as_str).collect();
+
+    let mut keys: Vec<LedgerKey> = Vec::with_capacity(distinct.len());
+    for account_id in &distinct {
+        let pk_bytes =
+            stellar_strkey::ed25519::PublicKey::from_string(account_id).map_err(|e| {
+                WalletError::Protocol(ProtocolError::XdrCodecFailed {
+                    detail: format!("invalid account_id for fetch_account_signers: {e}"),
+                })
+            })?;
+        keys.push(LedgerKey::Account(LedgerKeyAccount {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(pk_bytes.0))),
+        }));
+    }
+
+    let policy = RetryPolicy::default();
+    let response = retry_with_backoff(&policy, deadline, is_retryable_send_error, || async {
+        client.inner.get_ledger_entries(&keys).await
+    })
+    .await
+    .map_err(|e| {
+        WalletError::Network(NetworkError::RpcUnreachable {
+            url: redact_url_authority(&client.url),
+            reason: format!("getLedgerEntries failed: {e}"),
+        })
+    })?;
+
+    let entries = response.entries.unwrap_or_default();
+    let mut signers_by_account: BTreeMap<String, Vec<[u8; 32]>> = BTreeMap::new();
+
+    for entry in &entries {
+        // Entry data comes from an untrusted RPC response; bounded limits
+        // prevent a malformed nested structure from exhausting the stack.
+        let data = LedgerEntryData::from_xdr_base64(
+            &entry.xdr,
+            stellar_agent_xdr_limits::untrusted_decode_limits(entry.xdr.len()),
+        )
+        .map_err(|e| {
+            WalletError::Protocol(ProtocolError::XdrCodecFailed {
+                detail: format!("failed to decode account entry data XDR: {e}"),
+            })
+        })?;
+
+        let LedgerEntryData::Account(account_entry) = data else {
+            continue;
+        };
+
+        let PublicKey::PublicKeyTypeEd25519(master) = &account_entry.account_id.0;
+        let mut keys_for_account: Vec<[u8; 32]> = vec![master.0];
+        for signer in account_entry.signers.iter() {
+            if let SignerKey::Ed25519(bytes) = &signer.key {
+                keys_for_account.push(bytes.0);
+            }
+        }
+
+        let strkey = format!("{}", stellar_strkey::ed25519::PublicKey(master.0));
+        signers_by_account.insert(strkey, keys_for_account);
+    }
+
+    for account_id in &distinct {
+        if !signers_by_account.contains_key(*account_id) {
+            return Err(WalletError::Network(NetworkError::AccountNotFound {
+                account_id: (*account_id).to_owned(),
+            }));
+        }
+    }
+
+    Ok(signers_by_account)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

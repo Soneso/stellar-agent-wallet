@@ -44,40 +44,52 @@
 use std::time::Duration;
 
 use serde_json::json;
-use stellar_agent_core::StellarAmount;
 use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore};
 use stellar_agent_network::StellarRpcClient;
-use stellar_agent_network::builder::{Asset, ClassicOpBuilder};
 use stellar_agent_network::idempotent_submit::submit_transaction_idempotent;
-use stellar_agent_network::signing::software::SoftwareSigningKey;
 use stellar_agent_network::submit::submit_transaction_and_wait;
 use stellar_agent_test_support::EchoIdResponder;
-use wiremock::matchers::{method, path};
+use stellar_agent_test_support::signed_envelope::{SignedTestEnvelope, get_network_result};
+use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixtures
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SRC_ACCOUNT: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
-const DST_ACCOUNT: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
 const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
-const FAKE_TX_HASH: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const FAKE_LEDGER: u32 = 5678;
 
-/// Builds and signs a test envelope.  Key `[3u8; 32]` is a public test fixture,
-/// not a production key.  (Different seed from Blocks A/B to avoid hash collision.)
-async fn build_signed_envelope() -> String {
-    let key = SoftwareSigningKey::new_from_bytes([3u8; 32]);
-    let mut builder = ClassicOpBuilder::new(SRC_ACCOUNT, 300, TESTNET_PASSPHRASE, 300);
-    builder
-        .payment(
-            DST_ACCOUNT,
-            StellarAmount::from_stroops(7_000_000),
-            &Asset::Native,
-        )
-        .unwrap();
-    builder.build_and_sign(&key).await.unwrap()
+/// Seed for the transaction source account.  A public test fixture, not a
+/// production key.  Distinct from the seeds used in the other integration test
+/// files so receipt stores never alias.
+const SOURCE_SEED: [u8; 32] = [3u8; 32];
+
+/// Builds a signed test envelope whose source account is the signing key's own
+/// account, so the account the ledger reports is the one that signed.
+fn build_signed_envelope() -> SignedTestEnvelope {
+    SignedTestEnvelope::builder(SOURCE_SEED)
+        .sequence(300)
+        .amount_stroops(7_000_000)
+        .build()
+}
+
+/// Mounts the two reads every submit performs before it sends: the endpoint
+/// identity probe and the signer-set fetch for the envelope's source accounts.
+async fn mount_probe_and_signers(server: &MockServer, envelope: &SignedTestEnvelope) {
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getNetwork"})))
+        .respond_with(EchoIdResponder::new(get_network_result(TESTNET_PASSPHRASE)))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getLedgerEntries"})))
+        .respond_with(EchoIdResponder::new(envelope.ledger_entries_result()))
+        .mount(server)
+        .await;
 }
 
 fn envelope_hash_for(signed_xdr: &str) -> String {
@@ -96,9 +108,9 @@ fn envelope_hash_for(signed_xdr: &str) -> String {
 }
 
 /// JSON-RPC `sendTransaction` response for a PENDING submission.
-fn send_pending() -> serde_json::Value {
+fn send_pending(envelope: &SignedTestEnvelope) -> serde_json::Value {
     json!({
-        "hash": FAKE_TX_HASH,
+        "hash": envelope.tx_hash_hex(),
         "status": "PENDING",
         "latestLedger": 2001,
         "latestLedgerCloseTime": "1700000000"
@@ -106,10 +118,10 @@ fn send_pending() -> serde_json::Value {
 }
 
 /// JSON-RPC `getTransaction` response for SUCCESS.
-fn get_tx_success() -> serde_json::Value {
+fn get_tx_success(envelope: &SignedTestEnvelope) -> serde_json::Value {
     json!({
         "status": "SUCCESS",
-        "txHash": FAKE_TX_HASH,
+        "txHash": envelope.tx_hash_hex(),
         "ledger": FAKE_LEDGER,
         "createdAt": "1700000001",
         "envelopeXdr": null,
@@ -173,18 +185,20 @@ fn jsonrpc_error_body(id: Option<&serde_json::Value>) -> serde_json::Value {
 /// `retry::tests::retry_then_success_returns_ok`).
 #[tokio::test]
 async fn submit_and_wait_success_path_no_regression() {
-    let signed_xdr = build_signed_envelope().await;
+    let envelope = build_signed_envelope();
+    let signed_xdr = envelope.envelope_xdr();
 
     let server = MockServer::start().await;
     let server_url = server.uri();
+    mount_probe_and_signers(&server, &envelope).await;
 
     // sendTransaction → PENDING.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "sendTransaction"
         })))
-        .respond_with(EchoIdResponder::new(send_pending()))
+        .respond_with(EchoIdResponder::new(send_pending(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -192,17 +206,17 @@ async fn submit_and_wait_success_path_no_regression() {
     // getTransaction → SUCCESS immediately.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getTransaction"
         })))
-        .respond_with(EchoIdResponder::new(get_tx_success()))
+        .respond_with(EchoIdResponder::new(get_tx_success(&envelope)))
         .mount(&server)
         .await;
 
     let client = StellarRpcClient::new(&server_url).unwrap();
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
@@ -230,10 +244,12 @@ async fn submit_and_wait_success_path_no_regression() {
 /// `TransactionSubmissionFailed`.
 #[tokio::test]
 async fn send_submission_failed_is_not_retried() {
-    let signed_xdr = build_signed_envelope().await;
+    let envelope = build_signed_envelope();
+    let signed_xdr = envelope.envelope_xdr();
 
     let server = MockServer::start().await;
     let server_url = server.uri();
+    mount_probe_and_signers(&server, &envelope).await;
 
     // sendTransaction: always returns a JSON-RPC error body.
     // stellar-rpc-client wraps this as TransactionSubmissionFailed.
@@ -241,7 +257,7 @@ async fn send_submission_failed_is_not_retried() {
     // more than 1.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "sendTransaction"
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(jsonrpc_error_body(None)))
@@ -252,7 +268,7 @@ async fn send_submission_failed_is_not_retried() {
     let client = StellarRpcClient::new(&server_url).unwrap();
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(10),
         TESTNET_PASSPHRASE,
         None,
@@ -277,18 +293,20 @@ async fn send_submission_failed_is_not_retried() {
 /// like NOT_FOUND and continues polling rather than aborting.
 #[tokio::test]
 async fn poll_transient_error_treated_as_not_found_then_succeeds() {
-    let signed_xdr = build_signed_envelope().await;
+    let envelope = build_signed_envelope();
+    let signed_xdr = envelope.envelope_xdr();
 
     let server = MockServer::start().await;
     let server_url = server.uri();
+    mount_probe_and_signers(&server, &envelope).await;
 
     // sendTransaction → PENDING.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "sendTransaction"
         })))
-        .respond_with(EchoIdResponder::new(send_pending()))
+        .respond_with(EchoIdResponder::new(send_pending(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -296,7 +314,7 @@ async fn poll_transient_error_treated_as_not_found_then_succeeds() {
     // getTransaction: first call returns a JSON-RPC error; second returns SUCCESS.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getTransaction"
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(jsonrpc_error_body(None)))
@@ -306,17 +324,17 @@ async fn poll_transient_error_treated_as_not_found_then_succeeds() {
 
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getTransaction"
         })))
-        .respond_with(EchoIdResponder::new(get_tx_success()))
+        .respond_with(EchoIdResponder::new(get_tx_success(&envelope)))
         .mount(&server)
         .await;
 
     let client = StellarRpcClient::new(&server_url).unwrap();
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
@@ -348,22 +366,24 @@ async fn poll_transient_error_treated_as_not_found_then_succeeds() {
 /// NOT `Ambiguous`.
 #[tokio::test]
 async fn block_b_non_regression_health_error_keeps_polling_not_ambiguous() {
-    let signed_xdr = build_signed_envelope().await;
-    let envelope_hash = envelope_hash_for(&signed_xdr);
+    let envelope = build_signed_envelope();
+    let signed_xdr = envelope.envelope_xdr();
+    let envelope_hash = envelope_hash_for(signed_xdr);
 
     let dir = tempfile::tempdir().unwrap();
     let store = ReceiptStore::open_at(dir.path(), "block-c-health-regression").unwrap();
 
     let server = MockServer::start().await;
     let server_url = server.uri();
+    mount_probe_and_signers(&server, &envelope).await;
 
     // sendTransaction → PENDING.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "sendTransaction"
         })))
-        .respond_with(EchoIdResponder::new(send_pending()))
+        .respond_with(EchoIdResponder::new(send_pending(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -371,7 +391,7 @@ async fn block_b_non_regression_health_error_keeps_polling_not_ambiguous() {
     // getTransaction: first call → NOT_FOUND; second → SUCCESS.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getTransaction"
         })))
         .respond_with(EchoIdResponder::new(get_tx_not_found()))
@@ -381,17 +401,17 @@ async fn block_b_non_regression_health_error_keeps_polling_not_ambiguous() {
 
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getTransaction"
         })))
-        .respond_with(EchoIdResponder::new(get_tx_success()))
+        .respond_with(EchoIdResponder::new(get_tx_success(&envelope)))
         .mount(&server)
         .await;
 
     // getHealth → JSON-RPC error (blip).
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getHealth"
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(jsonrpc_error_body(None)))
@@ -401,7 +421,7 @@ async fn block_b_non_regression_health_error_keeps_polling_not_ambiguous() {
     let client = StellarRpcClient::new(&server_url).unwrap();
     let result = submit_transaction_idempotent(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         &store,
@@ -434,21 +454,23 @@ async fn block_b_non_regression_health_error_keeps_polling_not_ambiguous() {
 /// The send-path retry integration limitation is documented in (a) above.
 #[tokio::test]
 async fn idempotent_submit_success_path_no_regression() {
-    let signed_xdr = build_signed_envelope().await;
+    let envelope = build_signed_envelope();
+    let signed_xdr = envelope.envelope_xdr();
 
     let dir = tempfile::tempdir().unwrap();
     let store = ReceiptStore::open_at(dir.path(), "block-c-idempotent-success").unwrap();
 
     let server = MockServer::start().await;
     let server_url = server.uri();
+    mount_probe_and_signers(&server, &envelope).await;
 
     // sendTransaction → PENDING.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "sendTransaction"
         })))
-        .respond_with(EchoIdResponder::new(send_pending()))
+        .respond_with(EchoIdResponder::new(send_pending(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -456,10 +478,10 @@ async fn idempotent_submit_success_path_no_regression() {
     // getTransaction → SUCCESS.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getTransaction"
         })))
-        .respond_with(EchoIdResponder::new(get_tx_success()))
+        .respond_with(EchoIdResponder::new(get_tx_success(&envelope)))
         .mount(&server)
         .await;
 
@@ -467,7 +489,7 @@ async fn idempotent_submit_success_path_no_regression() {
     // here since we go straight to SUCCESS, but mount defensively).
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getHealth"
         })))
         .respond_with(EchoIdResponder::new(get_health_within_window()))
@@ -477,7 +499,7 @@ async fn idempotent_submit_success_path_no_regression() {
     let client = StellarRpcClient::new(&server_url).unwrap();
     let result = submit_transaction_idempotent(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         &store,

@@ -29,56 +29,64 @@
 use std::time::Duration;
 
 use serde_json::json;
-use stellar_agent_core::StellarAmount;
 use stellar_agent_core::error::{LedgerError, NetworkError, SubmissionError, WalletError};
 use stellar_agent_network::StellarRpcClient;
-use stellar_agent_network::builder::{Asset, ClassicOpBuilder};
-use stellar_agent_network::signing::software::SoftwareSigningKey;
 use stellar_agent_network::submit::{
     SubmissionSignerKind, redact_tx_hash, submit_transaction_and_wait,
 };
 use stellar_agent_test_support::EchoIdResponder;
+use stellar_agent_test_support::signed_envelope::{SignedTestEnvelope, get_network_result};
 use wiremock::matchers::{body_partial_json, method, path};
-use wiremock::{Mock, MockServer};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixtures
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SRC_ACCOUNT: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
-const DST_ACCOUNT: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
 const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
-const FAKE_TX_HASH: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const FAKE_LEDGER: u32 = 4567;
 
-/// Builds and signs a test envelope using a fixed byte seed.
-/// `[7u8; 32]` is a public test fixture, not a production key.
-async fn build_signed_envelope(seq: i64) -> String {
-    let key = SoftwareSigningKey::new_from_bytes([7u8; 32]);
-    let mut builder = ClassicOpBuilder::new(SRC_ACCOUNT, seq, TESTNET_PASSPHRASE, 100);
-    builder
-        .payment(
-            DST_ACCOUNT,
-            StellarAmount::from_stroops(1_000_000),
-            &Asset::Native,
-        )
-        .unwrap();
-    builder.build_and_sign(&key).await.unwrap()
+/// Seed for the transaction source account. A public test fixture, never a
+/// production key.
+const SOURCE_SEED: [u8; 32] = [7u8; 32];
+
+/// Builds a signed test envelope whose source account is the signing key's own
+/// account, so the account the ledger reports is the one that signed.
+fn build_envelope(seq: i64) -> SignedTestEnvelope {
+    SignedTestEnvelope::for_source_with_sequence(SOURCE_SEED, seq)
 }
 
-fn send_pending_response() -> serde_json::Value {
+/// Mounts the two reads every submit performs before it sends: the endpoint
+/// identity probe and the signer-set fetch for the envelope's source accounts.
+async fn mount_probe_and_signers(server: &MockServer, envelope: &SignedTestEnvelope) {
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getNetwork"})))
+        .respond_with(EchoIdResponder::new(get_network_result(TESTNET_PASSPHRASE)))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getLedgerEntries"})))
+        .respond_with(EchoIdResponder::new(envelope.ledger_entries_result()))
+        .mount(server)
+        .await;
+}
+
+fn send_pending_response(envelope: &SignedTestEnvelope) -> serde_json::Value {
     json!({
-        "hash": FAKE_TX_HASH,
+        "hash": envelope.tx_hash_hex(),
         "status": "PENDING",
         "latestLedger": 1000,
         "latestLedgerCloseTime": "1699999999"
     })
 }
 
-fn get_success_response() -> serde_json::Value {
+fn get_success_response(envelope: &SignedTestEnvelope) -> serde_json::Value {
     json!({
         "status": "SUCCESS",
-        "txHash": FAKE_TX_HASH,
+        "txHash": envelope.tx_hash_hex(),
         "ledger": FAKE_LEDGER,
         "createdAt": "1700000000",
         "envelopeXdr": null,
@@ -105,14 +113,16 @@ fn get_not_found_response() -> serde_json::Value {
 /// with the correct ledger and the signer_kind forwarded unchanged.
 #[tokio::test]
 async fn send_pending_then_get_success_returns_ok_with_correct_ledger() {
-    let signed_xdr = build_signed_envelope(1001).await;
+    let envelope = build_envelope(1001);
+    let signed_xdr = envelope.envelope_xdr();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(EchoIdResponder::new(send_pending_response(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -120,7 +130,7 @@ async fn send_pending_then_get_success_returns_ok_with_correct_ledger() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "getTransaction"})))
-        .respond_with(EchoIdResponder::new(get_success_response()))
+        .respond_with(EchoIdResponder::new(get_success_response(&envelope)))
         .up_to_n_times(10)
         .mount(&server)
         .await;
@@ -129,7 +139,7 @@ async fn send_pending_then_get_success_returns_ok_with_correct_ledger() {
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         Some(SubmissionSignerKind::Software),
@@ -163,14 +173,16 @@ async fn send_pending_then_get_success_returns_ok_with_correct_ledger() {
 /// Verifies the poll loop continues past NOT_FOUND and eventually confirms.
 #[tokio::test]
 async fn not_found_then_success_confirms_on_subsequent_poll() {
-    let signed_xdr = build_signed_envelope(1002).await;
+    let envelope = build_envelope(1002);
+    let signed_xdr = envelope.envelope_xdr();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(EchoIdResponder::new(send_pending_response(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -188,7 +200,7 @@ async fn not_found_then_success_confirms_on_subsequent_poll() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "getTransaction"})))
-        .respond_with(EchoIdResponder::new(get_success_response()))
+        .respond_with(EchoIdResponder::new(get_success_response(&envelope)))
         .up_to_n_times(10)
         .mount(&server)
         .await;
@@ -197,7 +209,7 @@ async fn not_found_then_success_confirms_on_subsequent_poll() {
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
@@ -224,7 +236,8 @@ async fn get_failed_with_underfunded_xdr_returns_insufficient_balance() {
         TransactionResultExt, TransactionResultResult, VecM, WriteXdr,
     };
 
-    let signed_xdr = build_signed_envelope(1003).await;
+    let envelope = build_envelope(1003);
+    let signed_xdr = envelope.envelope_xdr();
 
     let ops: VecM<OperationResult> = vec![OperationResult::OpInner(OperationResultTr::Payment(
         PaymentResult::Underfunded,
@@ -239,11 +252,12 @@ async fn get_failed_with_underfunded_xdr_returns_insufficient_balance() {
     let result_xdr_b64 = tx_result.to_xdr_base64(Limits::none()).unwrap();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(EchoIdResponder::new(send_pending_response(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -253,7 +267,7 @@ async fn get_failed_with_underfunded_xdr_returns_insufficient_balance() {
         .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "FAILED",
-            "txHash": FAKE_TX_HASH,
+            "txHash": envelope.tx_hash_hex(),
             "ledger": null,
             "createdAt": "1700000000",
             "envelopeXdr": null,
@@ -268,7 +282,7 @@ async fn get_failed_with_underfunded_xdr_returns_insufficient_balance() {
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
@@ -304,7 +318,8 @@ async fn get_failed_with_no_trust_xdr_returns_trustline_missing_destination() {
         TransactionResultExt, TransactionResultResult, VecM, WriteXdr,
     };
 
-    let signed_xdr = build_signed_envelope(1004).await;
+    let envelope = build_envelope(1004);
+    let signed_xdr = envelope.envelope_xdr();
 
     let ops: VecM<OperationResult> = vec![OperationResult::OpInner(OperationResultTr::Payment(
         PaymentResult::NoTrust,
@@ -319,11 +334,12 @@ async fn get_failed_with_no_trust_xdr_returns_trustline_missing_destination() {
     let result_xdr_b64 = tx_result.to_xdr_base64(Limits::none()).unwrap();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(EchoIdResponder::new(send_pending_response(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -333,7 +349,7 @@ async fn get_failed_with_no_trust_xdr_returns_trustline_missing_destination() {
         .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "FAILED",
-            "txHash": FAKE_TX_HASH,
+            "txHash": envelope.tx_hash_hex(),
             "ledger": null,
             "createdAt": "1700000000",
             "envelopeXdr": null,
@@ -348,7 +364,7 @@ async fn get_failed_with_no_trust_xdr_returns_trustline_missing_destination() {
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
@@ -375,7 +391,8 @@ async fn get_failed_with_src_no_trust_xdr_returns_trustline_missing_source() {
         TransactionResultExt, TransactionResultResult, VecM, WriteXdr,
     };
 
-    let signed_xdr = build_signed_envelope(1005).await;
+    let envelope = build_envelope(1005);
+    let signed_xdr = envelope.envelope_xdr();
 
     let ops: VecM<OperationResult> = vec![OperationResult::OpInner(OperationResultTr::Payment(
         PaymentResult::SrcNoTrust,
@@ -390,11 +407,12 @@ async fn get_failed_with_src_no_trust_xdr_returns_trustline_missing_source() {
     let result_xdr_b64 = tx_result.to_xdr_base64(Limits::none()).unwrap();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(EchoIdResponder::new(send_pending_response(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -404,7 +422,7 @@ async fn get_failed_with_src_no_trust_xdr_returns_trustline_missing_source() {
         .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "FAILED",
-            "txHash": FAKE_TX_HASH,
+            "txHash": envelope.tx_hash_hex(),
             "ledger": null,
             "createdAt": "1700000000",
             "envelopeXdr": null,
@@ -419,7 +437,7 @@ async fn get_failed_with_src_no_trust_xdr_returns_trustline_missing_source() {
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
@@ -445,7 +463,8 @@ async fn get_failed_with_no_destination_yields_destination_invalid() {
         TransactionResultExt, TransactionResultResult, VecM, WriteXdr,
     };
 
-    let signed_xdr = build_signed_envelope(1006).await;
+    let envelope = build_envelope(1006);
+    let signed_xdr = envelope.envelope_xdr();
 
     let ops: VecM<OperationResult> = vec![OperationResult::OpInner(OperationResultTr::Payment(
         PaymentResult::NoDestination,
@@ -460,11 +479,12 @@ async fn get_failed_with_no_destination_yields_destination_invalid() {
     let result_xdr_b64 = tx_result.to_xdr_base64(Limits::none()).unwrap();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(EchoIdResponder::new(send_pending_response(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -474,7 +494,7 @@ async fn get_failed_with_no_destination_yields_destination_invalid() {
         .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "FAILED",
-            "txHash": FAKE_TX_HASH,
+            "txHash": envelope.tx_hash_hex(),
             "ledger": null,
             "createdAt": "1700000000",
             "envelopeXdr": null,
@@ -489,7 +509,7 @@ async fn get_failed_with_no_destination_yields_destination_invalid() {
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
@@ -515,7 +535,8 @@ async fn get_failed_with_op_bad_auth_yields_op_failed_bad_auth() {
         VecM, WriteXdr,
     };
 
-    let signed_xdr = build_signed_envelope(1007).await;
+    let envelope = build_envelope(1007);
+    let signed_xdr = envelope.envelope_xdr();
 
     let ops: VecM<OperationResult> = vec![OperationResult::OpBadAuth].try_into().unwrap();
     let tx_result = TransactionResult {
@@ -526,11 +547,12 @@ async fn get_failed_with_op_bad_auth_yields_op_failed_bad_auth() {
     let result_xdr_b64 = tx_result.to_xdr_base64(Limits::none()).unwrap();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(EchoIdResponder::new(send_pending_response(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -540,7 +562,7 @@ async fn get_failed_with_op_bad_auth_yields_op_failed_bad_auth() {
         .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "FAILED",
-            "txHash": FAKE_TX_HASH,
+            "txHash": envelope.tx_hash_hex(),
             "ledger": null,
             "createdAt": "1700000000",
             "envelopeXdr": null,
@@ -555,7 +577,7 @@ async fn get_failed_with_op_bad_auth_yields_op_failed_bad_auth() {
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
@@ -582,7 +604,8 @@ async fn get_failed_with_op_no_account_yields_op_failed_no_account() {
         VecM, WriteXdr,
     };
 
-    let signed_xdr = build_signed_envelope(1008).await;
+    let envelope = build_envelope(1008);
+    let signed_xdr = envelope.envelope_xdr();
 
     let ops: VecM<OperationResult> = vec![OperationResult::OpNoAccount].try_into().unwrap();
     let tx_result = TransactionResult {
@@ -593,11 +616,12 @@ async fn get_failed_with_op_no_account_yields_op_failed_no_account() {
     let result_xdr_b64 = tx_result.to_xdr_base64(Limits::none()).unwrap();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(EchoIdResponder::new(send_pending_response(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -607,7 +631,7 @@ async fn get_failed_with_op_no_account_yields_op_failed_no_account() {
         .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "FAILED",
-            "txHash": FAKE_TX_HASH,
+            "txHash": envelope.tx_hash_hex(),
             "ledger": null,
             "createdAt": "1700000000",
             "envelopeXdr": null,
@@ -622,7 +646,7 @@ async fn get_failed_with_op_no_account_yields_op_failed_no_account() {
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
@@ -649,7 +673,8 @@ async fn get_failed_with_empty_ops_yields_op_failed_no_ops() {
         VecM, WriteXdr,
     };
 
-    let signed_xdr = build_signed_envelope(1009).await;
+    let envelope = build_envelope(1009);
+    let signed_xdr = envelope.envelope_xdr();
 
     let ops: VecM<OperationResult> = vec![].try_into().unwrap();
     let tx_result = TransactionResult {
@@ -660,11 +685,12 @@ async fn get_failed_with_empty_ops_yields_op_failed_no_ops() {
     let result_xdr_b64 = tx_result.to_xdr_base64(Limits::none()).unwrap();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(EchoIdResponder::new(send_pending_response(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -674,7 +700,7 @@ async fn get_failed_with_empty_ops_yields_op_failed_no_ops() {
         .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "FAILED",
-            "txHash": FAKE_TX_HASH,
+            "txHash": envelope.tx_hash_hex(),
             "ledger": null,
             "createdAt": "1700000000",
             "envelopeXdr": null,
@@ -689,7 +715,7 @@ async fn get_failed_with_empty_ops_yields_op_failed_no_ops() {
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
@@ -716,7 +742,8 @@ async fn get_failed_with_tx_success_result_maps_to_defensive_op_failed() {
         VecM, WriteXdr,
     };
 
-    let signed_xdr = build_signed_envelope(1010).await;
+    let envelope = build_envelope(1010);
+    let signed_xdr = envelope.envelope_xdr();
 
     let ops: VecM<OperationResult> = vec![].try_into().unwrap();
     let tx_result = TransactionResult {
@@ -727,11 +754,12 @@ async fn get_failed_with_tx_success_result_maps_to_defensive_op_failed() {
     let result_xdr_b64 = tx_result.to_xdr_base64(Limits::none()).unwrap();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(EchoIdResponder::new(send_pending_response(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -741,7 +769,7 @@ async fn get_failed_with_tx_success_result_maps_to_defensive_op_failed() {
         .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "FAILED",
-            "txHash": FAKE_TX_HASH,
+            "txHash": envelope.tx_hash_hex(),
             "ledger": null,
             "createdAt": "1700000000",
             "envelopeXdr": null,
@@ -756,7 +784,7 @@ async fn get_failed_with_tx_success_result_maps_to_defensive_op_failed() {
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
@@ -787,14 +815,16 @@ async fn get_failed_with_tx_success_result_maps_to_defensive_op_failed() {
 /// error but a protocol anomaly that cannot be retried.
 #[tokio::test]
 async fn unexpected_get_transaction_status_returns_rpc_unreachable() {
-    let signed_xdr = build_signed_envelope(1011).await;
+    let envelope = build_envelope(1011);
+    let signed_xdr = envelope.envelope_xdr();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(EchoIdResponder::new(send_pending_response(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -805,7 +835,7 @@ async fn unexpected_get_transaction_status_returns_rpc_unreachable() {
         .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "UNKNOWN_FUTURE_STATUS",
-            "txHash": FAKE_TX_HASH,
+            "txHash": envelope.tx_hash_hex(),
             "ledger": null,
             "createdAt": "1700000000",
             "envelopeXdr": null,
@@ -820,7 +850,7 @@ async fn unexpected_get_transaction_status_returns_rpc_unreachable() {
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
@@ -861,14 +891,16 @@ async fn unexpected_get_transaction_status_returns_rpc_unreachable() {
 async fn transient_poll_error_falls_through_to_not_found_then_success() {
     use wiremock::ResponseTemplate;
 
-    let signed_xdr = build_signed_envelope(1012).await;
+    let envelope = build_envelope(1012);
+    let signed_xdr = envelope.envelope_xdr();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(EchoIdResponder::new(send_pending_response(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -887,7 +919,7 @@ async fn transient_poll_error_falls_through_to_not_found_then_success() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "getTransaction"})))
-        .respond_with(EchoIdResponder::new(get_success_response()))
+        .respond_with(EchoIdResponder::new(get_success_response(&envelope)))
         .up_to_n_times(10)
         .mount(&server)
         .await;
@@ -896,7 +928,7 @@ async fn transient_poll_error_falls_through_to_not_found_then_success() {
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
@@ -926,11 +958,12 @@ async fn mainnet_url_pattern_rejected_at_submit() {
     // fires before any XDR decode or RPC call.
     let client = StellarRpcClient::new("https://mainnet.stellar.org:8001/rpc").unwrap();
 
-    let signed_xdr = build_signed_envelope(9999).await;
+    let envelope = build_envelope(9999);
+    let signed_xdr = envelope.envelope_xdr();
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(5),
         TESTNET_PASSPHRASE,
         None,
@@ -951,11 +984,12 @@ async fn mainnet_url_pattern_rejected_at_submit() {
 async fn pubnet_url_pattern_rejected_at_submit() {
     let client = StellarRpcClient::new("https://pubnet.example.com/rpc").unwrap();
 
-    let signed_xdr = build_signed_envelope(9998).await;
+    let envelope = build_envelope(9998);
+    let signed_xdr = envelope.envelope_xdr();
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(5),
         TESTNET_PASSPHRASE,
         None,
@@ -978,9 +1012,11 @@ async fn pubnet_url_pattern_rejected_at_submit() {
 /// sendTransaction returns TransactionSubmissionFailed → TxMalformed (not retried).
 #[tokio::test]
 async fn send_transaction_submission_failed_returns_tx_malformed() {
-    let signed_xdr = build_signed_envelope(1013).await;
+    let envelope = build_envelope(1013);
+    let signed_xdr = envelope.envelope_xdr();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     // Serve an empty JSON body — jsonrpsee will produce a deserialization error
     // that maps to a JsonRpc client error, but we actually want to simulate
@@ -991,7 +1027,7 @@ async fn send_transaction_submission_failed_returns_tx_malformed() {
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
-            "hash": FAKE_TX_HASH,
+            "hash": envelope.tx_hash_hex(),
             "status": "ERROR",
             "latestLedger": 1001,
             "latestLedgerCloseTime": "1699999999",
@@ -1005,7 +1041,7 @@ async fn send_transaction_submission_failed_returns_tx_malformed() {
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
@@ -1046,7 +1082,8 @@ async fn get_failed_fee_bump_inner_rejected_carries_inner_result_code() {
         TransactionResultResult, WriteXdr,
     };
 
-    let signed_xdr = build_signed_envelope(1015).await;
+    let envelope = build_envelope(1015);
+    let signed_xdr = envelope.envelope_xdr();
 
     let pair = InnerTransactionResultPair {
         transaction_hash: Hash([0xabu8; 32]),
@@ -1064,11 +1101,12 @@ async fn get_failed_fee_bump_inner_rejected_carries_inner_result_code() {
     let result_xdr_b64 = tx_result.to_xdr_base64(Limits::none()).unwrap();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(EchoIdResponder::new(send_pending_response(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -1078,7 +1116,7 @@ async fn get_failed_fee_bump_inner_rejected_carries_inner_result_code() {
         .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "FAILED",
-            "txHash": FAKE_TX_HASH,
+            "txHash": envelope.tx_hash_hex(),
             "ledger": null,
             "createdAt": "1700000000",
             "envelopeXdr": null,
@@ -1093,7 +1131,7 @@ async fn get_failed_fee_bump_inner_rejected_carries_inner_result_code() {
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
@@ -1139,7 +1177,8 @@ async fn get_failed_fee_bump_inner_bad_seq_is_feebump_inner_rejected_not_stale()
         TransactionResultResult, WriteXdr,
     };
 
-    let signed_xdr = build_signed_envelope(1016).await;
+    let envelope = build_envelope(1016);
+    let signed_xdr = envelope.envelope_xdr();
 
     let pair = InnerTransactionResultPair {
         transaction_hash: Hash([0xccu8; 32]),
@@ -1157,11 +1196,12 @@ async fn get_failed_fee_bump_inner_bad_seq_is_feebump_inner_rejected_not_stale()
     let result_xdr_b64 = tx_result.to_xdr_base64(Limits::none()).unwrap();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(EchoIdResponder::new(send_pending_response(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -1171,7 +1211,7 @@ async fn get_failed_fee_bump_inner_bad_seq_is_feebump_inner_rejected_not_stale()
         .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "FAILED",
-            "txHash": FAKE_TX_HASH,
+            "txHash": envelope.tx_hash_hex(),
             "ledger": null,
             "createdAt": "1700000000",
             "envelopeXdr": null,
@@ -1186,7 +1226,7 @@ async fn get_failed_fee_bump_inner_bad_seq_is_feebump_inner_rejected_not_stale()
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
@@ -1289,7 +1329,8 @@ async fn get_failed_outer_tx_bad_seq_yields_sequence_number_stale() {
         Limits, TransactionResult, TransactionResultExt, TransactionResultResult, WriteXdr,
     };
 
-    let signed_xdr = build_signed_envelope(1017).await;
+    let envelope = build_envelope(1017);
+    let signed_xdr = envelope.envelope_xdr();
 
     let tx_result = TransactionResult {
         fee_charged: 100,
@@ -1299,11 +1340,12 @@ async fn get_failed_outer_tx_bad_seq_yields_sequence_number_stale() {
     let result_xdr_b64 = tx_result.to_xdr_base64(Limits::none()).unwrap();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(EchoIdResponder::new(send_pending_response(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -1313,7 +1355,7 @@ async fn get_failed_outer_tx_bad_seq_yields_sequence_number_stale() {
         .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "FAILED",
-            "txHash": FAKE_TX_HASH,
+            "txHash": envelope.tx_hash_hex(),
             "ledger": null,
             "createdAt": "1700000000",
             "envelopeXdr": null,
@@ -1328,7 +1370,7 @@ async fn get_failed_outer_tx_bad_seq_yields_sequence_number_stale() {
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
@@ -1355,14 +1397,16 @@ async fn get_failed_outer_tx_bad_seq_yields_sequence_number_stale() {
 /// and does NOT panic.
 #[tokio::test]
 async fn get_failed_with_null_result_xdr_returns_typed_error_no_panic() {
-    let signed_xdr = build_signed_envelope(1018).await;
+    let envelope = build_envelope(1018);
+    let signed_xdr = envelope.envelope_xdr();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(EchoIdResponder::new(send_pending_response(&envelope)))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -1372,7 +1416,7 @@ async fn get_failed_with_null_result_xdr_returns_typed_error_no_panic() {
         .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(json!({
             "status": "FAILED",
-            "txHash": FAKE_TX_HASH,
+            "txHash": envelope.tx_hash_hex(),
             "ledger": null,
             "createdAt": "1700000000",
             "envelopeXdr": null,
@@ -1387,7 +1431,7 @@ async fn get_failed_with_null_result_xdr_returns_typed_error_no_panic() {
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
@@ -1445,4 +1489,219 @@ fn submission_signer_kind_serde_round_trip_all_variants() {
             );
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Endpoint identity probe
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Counts the requests the server received for one JSON-RPC method.
+async fn method_count(server: &MockServer, rpc_method: &str) -> usize {
+    server
+        .received_requests()
+        .await
+        .expect("wiremock records requests")
+        .iter()
+        .filter(|req| {
+            serde_json::from_slice::<serde_json::Value>(&req.body)
+                .ok()
+                .and_then(|body| body["method"].as_str().map(|m| m == rpc_method))
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+/// Counts the `sendTransaction` requests the server received.
+async fn send_transaction_count(server: &MockServer) -> usize {
+    method_count(server, "sendTransaction").await
+}
+
+/// Mounts a `getNetwork` arm reporting `passphrase`.
+async fn mount_get_network(server: &MockServer, passphrase: &str) {
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getNetwork"})))
+        .respond_with(EchoIdResponder::new(get_network_result(passphrase)))
+        .mount(server)
+        .await;
+}
+
+/// Mounts the send and confirm arms for `envelope`.
+async fn mount_send_and_confirm(server: &MockServer, envelope: &SignedTestEnvelope) {
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "sendTransaction"})))
+        .respond_with(EchoIdResponder::new(send_pending_response(envelope)))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getTransaction"})))
+        .respond_with(EchoIdResponder::new(get_success_response(envelope)))
+        .mount(server)
+        .await;
+}
+
+/// Mounts the signer-set arm for `envelope`.
+async fn mount_get_ledger_entries(server: &MockServer, envelope: &SignedTestEnvelope) {
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getLedgerEntries"})))
+        .respond_with(EchoIdResponder::new(envelope.ledger_entries_result()))
+        .mount(server)
+        .await;
+}
+
+/// An endpoint that answers with the mainnet passphrase is refused, even
+/// though the caller declared testnet, and nothing is sent.
+///
+/// The declaration is a claim about the endpoint, not authority over it.
+#[tokio::test]
+async fn endpoint_serving_mainnet_refuses_with_no_send() {
+    let envelope = build_envelope(2001);
+    let server = MockServer::start().await;
+    mount_get_network(&server, "Public Global Stellar Network ; September 2015").await;
+    mount_get_ledger_entries(&server, &envelope).await;
+    mount_send_and_confirm(&server, &envelope).await;
+
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let result = submit_transaction_and_wait(
+        &client,
+        envelope.envelope_xdr(),
+        Duration::from_secs(10),
+        TESTNET_PASSPHRASE,
+        None,
+    )
+    .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(WalletError::Network(NetworkError::MainnetWriteForbidden))
+        ),
+        "an endpoint serving mainnet must be refused: {result:?}"
+    );
+    assert_eq!(
+        send_transaction_count(&server).await,
+        0,
+        "nothing may be sent to an endpoint serving mainnet"
+    );
+}
+
+/// An endpoint serving a network that is neither the declared one nor mainnet
+/// is refused with its own code, and nothing is sent.
+#[tokio::test]
+async fn endpoint_serving_third_network_refuses_endpoint_network_mismatch() {
+    let envelope = build_envelope(2002);
+    let server = MockServer::start().await;
+    mount_get_network(&server, "Test SDF Future Network ; October 2022").await;
+    mount_get_ledger_entries(&server, &envelope).await;
+    mount_send_and_confirm(&server, &envelope).await;
+
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let err = submit_transaction_and_wait(
+        &client,
+        envelope.envelope_xdr(),
+        Duration::from_secs(10),
+        TESTNET_PASSPHRASE,
+        None,
+    )
+    .await
+    .expect_err("a foreign network must be refused");
+
+    assert_eq!(err.code(), "network.endpoint_network_mismatch", "{err:?}");
+    assert_eq!(
+        send_transaction_count(&server).await,
+        0,
+        "nothing may be sent to an endpoint serving another network"
+    );
+    // A passphrase mismatch is a verdict, not a transport fault. Retrying it
+    // would delay the refusal by the whole backoff schedule and ask an
+    // endpoint that has already answered to answer again.
+    assert_eq!(
+        method_count(&server, "getNetwork").await,
+        1,
+        "a passphrase mismatch must not be retried"
+    );
+}
+
+/// A probe that never succeeds refuses the submission rather than falling back
+/// to the caller's declaration, and does so well inside the deadline.
+#[tokio::test]
+async fn probe_failing_throughout_refuses_endpoint_identity_unavailable() {
+    let envelope = build_envelope(2003);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getNetwork"})))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    mount_get_ledger_entries(&server, &envelope).await;
+    mount_send_and_confirm(&server, &envelope).await;
+
+    let timeout = Duration::from_secs(60);
+    let started = std::time::Instant::now();
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let err = submit_transaction_and_wait(
+        &client,
+        envelope.envelope_xdr(),
+        timeout,
+        TESTNET_PASSPHRASE,
+        None,
+    )
+    .await
+    .expect_err("an endpoint of unknown identity must be refused");
+
+    assert_eq!(
+        err.code(),
+        "network.endpoint_identity_unavailable",
+        "{err:?}"
+    );
+    assert!(
+        started.elapsed() < timeout,
+        "the refusal must come from exhausted probe attempts, not from the deadline"
+    );
+    assert_eq!(
+        send_transaction_count(&server).await,
+        0,
+        "nothing may be sent to an endpoint whose identity is unknown"
+    );
+}
+
+/// A probe that fails once and then answers proceeds to the send: the probe is
+/// retried like any other transport call.
+#[tokio::test]
+async fn probe_transient_failure_then_answer_proceeds_to_send() {
+    let envelope = build_envelope(2004);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getNetwork"})))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount_get_network(&server, TESTNET_PASSPHRASE).await;
+    mount_get_ledger_entries(&server, &envelope).await;
+    mount_send_and_confirm(&server, &envelope).await;
+
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let result = submit_transaction_and_wait(
+        &client,
+        envelope.envelope_xdr(),
+        Duration::from_secs(30),
+        TESTNET_PASSPHRASE,
+        None,
+    )
+    .await
+    .expect("a retried probe that answers must not block the submission");
+
+    assert_eq!(result.ledger, FAKE_LEDGER);
+    assert_eq!(
+        send_transaction_count(&server).await,
+        1,
+        "the send happens once, after the probe answers"
+    );
 }

@@ -140,9 +140,9 @@ stellar-agent accounts deploy-c \
 
 Sends a payment from a source account to a destination, enforcing SEP-29 memo-required before signing (see [protocols](../protocols.md)).
 
-- **Signing.** By default the command builds, signs, and submits atomically. Three staged flags split the pipeline: `--build-only` emits the unsigned envelope XDR and exits (no signing); `--sign-only <XDR>` signs a prebuilt envelope and emits signed XDR; `--submit-only <XDR>` submits a pre-signed envelope. The stage flags are mutually exclusive.
-- **Policy.** After the envelope is built and before signing (in both the full pipeline and `--build-only`), the amount/asset/destination are evaluated against `--profile`'s policy engine — the same evaluation the `stellar_pay` MCP tool runs. When no profile was named and no `default.toml` exists, an in-memory `Noop`-engine testnet profile is synthesized, so the command works without an authored profile file until an operator opts into `policy.engine = "v1"`; a profile named through `--profile` or `STELLAR_AGENT_PROFILE` whose file does not exist is refused (`profile.load_failed`), and a profile file whose owner-key coordinate names a DIFFERENT profile is refused (`profile.name_mismatch`). The staged `--sign-only` and `--submit-only` flows are gated too: each decodes the supplied envelope through the same decoder the MCP `stellar_pay_commit` path uses and evaluates the decoded amount/asset/destination before signing (`--sign-only`) or before broadcasting (`--submit-only` — the envelope arrives pre-signed, but broadcasting still spends funds). An envelope the decoder cannot classify into a sized shape follows the opaque-signing posture: under a matched value rule it denies `policy.deny.unsizable_value_effect` unless the rule sets `allow_opaque_signing = true`. The staged flows match policy rules under the `stellar_pay_commit` tool name (the same name the MCP commit phase matches); a ruleset that names only `stellar_pay` default-denies them, so author rules for both names, or `tool = "*"`, for uniform behavior. Under `policy.engine = "noop"` the staged flows are ungated, matching the rest of the command.
-- **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` returns `network.mainnet_write_forbidden` before any RPC call, with a submit-layer URL rejection as defence in depth.
+- **Signing.** By default the command builds, signs, and submits atomically. Three staged flags split the pipeline: `--build-only` emits the unsigned envelope XDR and exits (no signing); `--sign-only <XDR>` signs a prebuilt envelope and emits signed XDR; `--submit-only <XDR>` submits a pre-signed envelope. The stage flags are mutually exclusive. `--submit-only` requires an envelope that is already signed: handing it the unsigned XDR that `--build-only` emitted is refused with `network.envelope_unsigned` before anything is sent.
+- **Policy.** After the envelope is built and before signing (in both the full pipeline and `--build-only`), the amount/asset/destination are evaluated against `--profile`'s policy engine — the same evaluation the `stellar_pay` MCP tool runs. When no profile was named and no `default.toml` exists, an in-memory `Noop`-engine testnet profile is synthesized, so the command works without an authored profile file until an operator opts into `policy.engine = "v1"`; a profile named through `--profile` or `STELLAR_AGENT_PROFILE` whose file does not exist is refused (`profile.load_failed`), and a profile file whose owner-key coordinate names a DIFFERENT profile is refused (`profile.name_mismatch`). The staged `--sign-only` and `--submit-only` flows are gated too: each decodes the supplied envelope through the same decoder the MCP `stellar_pay_commit` path uses and evaluates the decoded amount/asset/destination before signing (`--sign-only`) or before broadcasting (`--submit-only` — the envelope arrives pre-signed, but broadcasting still spends funds). An envelope the decoder cannot classify into a sized shape follows the opaque-signing posture: under a matched value rule it denies `policy.deny.unsizable_value_effect` unless the rule sets `allow_opaque_signing = true`. The staged flows match policy rules under the `stellar_pay_commit` tool name (the same name the MCP commit phase matches); a ruleset that names only `stellar_pay` default-denies them, so author rules for both names, or `tool = "*"`, for uniform behavior. Under `policy.engine = "noop"` the staged flows are ungated, matching the rest of the command. `--submit-only` additionally runs the endpoint identity probe on its own client before the policy gate and before the audit-key pre-flight, so an `--rpc-url` pointing at a different network than `--network` is refused early.
+- **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` returns `network.mainnet_write_forbidden` before any RPC call, with a submit-layer URL rejection as defence in depth. Beyond those two zero-RPC refusals, the submit layer asks the endpoint which network it serves and binds the submission to that answer rather than to `--network`, refusing a mainnet endpoint, a mismatch, an unestablishable endpoint identity, and any signature that was not made for the network the endpoint reported. See [Submit-layer network binding](index.md#submit-layer-network-binding) for the wire codes.
 - **Relayer.** `--use-oz-relayer` is not implemented in this build. Passing it emits an AGPL-3.0 disclosure to stderr and declines the operation rather than submitting.
 
 Argument groups (enforced by the parser):
@@ -205,6 +205,9 @@ asset — an authorized trustline with enough limit headroom exists
   response, or the creating transaction's result).
 - **Signing.** Same staged pipeline as `pay`: atomic by default;
   `--build-only` / `--sign-only <XDR>` / `--submit-only <XDR>` split it.
+  `--submit-only` requires an already-signed envelope: handing it the unsigned
+  XDR that `--build-only` emitted is refused with `network.envelope_unsigned`
+  before anything is sent.
 - **Policy.** After the build stage (guards, preview, envelope construction)
   and before signing (in both the full pipeline and `--build-only`), the claim
   is evaluated against `--profile`'s policy engine — the same evaluation the
@@ -227,9 +230,18 @@ asset — an authorized trustline with enough limit headroom exists
   matches); a ruleset that names only `stellar_claim` default-denies them, so
   author rules for both names, or `tool = "*"`, for uniform behavior. Under
   `policy.engine = "noop"` the staged flows are ungated, matching the rest of
-  the command.
+  the command. `--submit-only` additionally runs the endpoint identity probe on
+  its own client before the policy gate and before the audit-key pre-flight, so
+  an `--rpc-url` pointing at a different network than `--network` is refused
+  early.
 - **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` returns
-  `network.mainnet_write_forbidden` before any RPC call.
+  `network.mainnet_write_forbidden` before any RPC call. Beyond that zero-RPC
+  refusal, the submit layer asks the endpoint which network it serves and binds
+  the submission to that answer rather than to `--network`, refusing a mainnet
+  endpoint, a mismatch, an unestablishable endpoint identity, and any signature
+  that was not made for the network the endpoint reported. See
+  [Submit-layer network binding](index.md#submit-layer-network-binding) for the
+  wire codes.
 - **Timing.** The predicate is evaluated against the local clock; on-chain
   validation uses the apply-ledger close time, so a claim previewed near a
   time-bound boundary can still fail on submit.
@@ -289,7 +301,7 @@ stellar-agent balances \
 Creates or removes a classic trustline (`ChangeTrust`) behind an ordered trust gate: operator policy evaluation, denomination resolution (USDT hard-refusal plus a known-lookalike denylist and pinned-issuer checks), a live issuer-flag fetch that fail-closes on error, a clawback gate, and a typed preview, before the envelope is built, signed, and submitted.
 
 - **Signing.** Signs via the profile's keyring signer; builds, signs, submits, and waits atomically. There is no staged pipeline.
-- **Network.** Derived from the loaded profile (`rpc_url`, `network_passphrase`, `chain_id`). `--chain-id` overrides the CAIP-2 value. There is no `--network` flag and no built-in mainnet refusal here; the network is governed by the profile configuration.
+- **Network.** Derived from the loaded profile (`rpc_url`, `network_passphrase`, `chain_id`). `--chain-id` overrides the CAIP-2 value. There is no `--network` flag: the network comes from the profile configuration. The command goes through the same submit layer as every other verb, so it gets the same binding — a mainnet passphrase or a known mainnet RPC URL is refused with `network.mainnet_write_forbidden` and no RPC call, the endpoint is then asked which network it serves and that answer is authoritative, and the envelope's signatures are verified against it. See [Submit-layer network binding](index.md#submit-layer-network-binding) for the wire codes.
 - **USDT is hard-refused.** The denomination resolver rejects USDT outright; the command cannot create a USDT trustline.
 - **Limit.** `--limit-stroops 0` removes the trustline. When absent the Stellar default (`i64::MAX`, unlimited) applies.
 - **Asset grammar.** A bare code such as `USDC` resolves through the pin table; `CODE:ISSUER` names an explicit issuer; a 56-char `C...` SAC address is deferred and returns a typed error.

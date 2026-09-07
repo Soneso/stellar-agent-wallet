@@ -38,16 +38,21 @@ use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::signing::software::SoftwareSigningKey;
 use stellar_agent_network::{StellarRpcClient, fund_with_friendbot, submit_transaction_and_wait};
 use stellar_agent_test_support::EchoIdResponder;
+use stellar_agent_test_support::signed_envelope::{
+    account_id_for_seed, get_network_result, ledger_entries_result_for,
+};
 use stellar_xdr::{Limits, OperationBody, ReadXdr, TransactionEnvelope};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixtures
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Sponsor source account (seed [1u8;32] via ed25519-dalek).
-const SPONSOR_ACCOUNT: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+/// Seed for the sponsor source account. A public test fixture, never a
+/// production key. The sponsor signs its own transaction, so the account the
+/// ledger reports as signer is the one the seed derives.
+const SPONSOR_SEED: [u8; 32] = [1u8; 32];
 
 /// New account destination (arbitrary valid G-strkey).
 const NEW_ACCOUNT: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
@@ -84,7 +89,8 @@ async fn mount_account_present(mock_server: &MockServer, address: &str) {
 /// with a `CreateAccount` operation body.
 #[test]
 fn create_account_op_xdr_round_trip() {
-    let mut builder = ClassicOpBuilder::new(SPONSOR_ACCOUNT, 201, TESTNET_PASSPHRASE, 100);
+    let sponsor = account_id_for_seed(SPONSOR_SEED);
+    let mut builder = ClassicOpBuilder::new(&sponsor, 201, TESTNET_PASSPHRASE, 100);
     builder
         .create_account(NEW_ACCOUNT, StellarAmount::from_stroops(50_000_000))
         .expect("create_account must succeed");
@@ -111,7 +117,8 @@ fn create_account_op_xdr_round_trip() {
 /// `create_account` with an invalid destination returns an `AddressInvalid` error.
 #[test]
 fn create_account_invalid_destination_returns_error() {
-    let mut builder = ClassicOpBuilder::new(SPONSOR_ACCOUNT, 201, TESTNET_PASSPHRASE, 100);
+    let sponsor = account_id_for_seed(SPONSOR_SEED);
+    let mut builder = ClassicOpBuilder::new(&sponsor, 201, TESTNET_PASSPHRASE, 100);
     let result = builder.create_account("NOTASTRKEY", StellarAmount::from_stroops(50_000_000));
     assert!(result.is_err(), "invalid destination must fail");
 }
@@ -198,31 +205,49 @@ async fn friendbot_mainnet_rejected_zero_http_requests() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Sponsored mode: `ClassicOpBuilder::create_account` → sign →
-/// `submit_transaction_and_wait` with mocked `sendTransaction` and
-/// `getTransaction SUCCESS` responses.
+/// `submit_transaction_and_wait` with mocked `getNetwork`,
+/// `getLedgerEntries`, `sendTransaction`, and `getTransaction SUCCESS`
+/// responses.
 ///
-/// The sponsor account sequence number is set statically (201) to avoid a
-/// `getLedgerEntries` mock round-trip in this integration test.
-/// A full end-to-end test including `fetch_account` is in the
-/// `#[ignore]`-gated live testnet suite.
+/// The sponsor account sequence number is set statically (201) so the build
+/// step needs no sequence lookup. A full end-to-end test including
+/// `fetch_account` is in the `#[ignore]`-gated live testnet suite.
 #[tokio::test]
 async fn sponsored_create_account_mock_pipeline() {
     let mock_server = MockServer::start().await;
 
     // Build and sign the CreateAccount transaction offline (no RPC needed).
-    let mut builder = ClassicOpBuilder::new(SPONSOR_ACCOUNT, 201, TESTNET_PASSPHRASE, 100);
+    let sponsor = account_id_for_seed(SPONSOR_SEED);
+    let mut builder = ClassicOpBuilder::new(&sponsor, 201, TESTNET_PASSPHRASE, 100);
     builder
         .create_account(NEW_ACCOUNT, StellarAmount::from_stroops(50_000_000))
         .expect("create_account must succeed");
     let unsigned_xdr = builder.build().expect("build must succeed");
 
-    // Sign with software key (seed [1u8; 32] matches SPONSOR_ACCOUNT G-strkey).
-    let signer = SoftwareSigningKey::new_from_bytes([1u8; 32]);
+    // The sponsor account signs with its own key, so the signer set the ledger
+    // reports for it accounts for the envelope's only signature.
+    let signer = SoftwareSigningKey::new_from_bytes(SPONSOR_SEED);
     let signed_xdr = attach_signature(&unsigned_xdr, &signer, TESTNET_PASSPHRASE)
         .await
         .expect("attach_signature must succeed");
 
-    // Mock 1: sendTransaction — `hash` field per soroban-client schema.
+    // Mock 1: getNetwork — the endpoint identity probe that precedes the send.
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getNetwork"})))
+        .respond_with(EchoIdResponder::new(get_network_result(TESTNET_PASSPHRASE)))
+        .mount(&mock_server)
+        .await;
+
+    // Mock 2: getLedgerEntries — the signer set of the transaction's source.
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getLedgerEntries"})))
+        .respond_with(EchoIdResponder::new(ledger_entries_result_for(&[&sponsor])))
+        .mount(&mock_server)
+        .await;
+
+    // Mock 3: sendTransaction — `hash` field per soroban-client schema.
     let tx_hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
     let send_result = json!({
         "hash": tx_hash,
@@ -232,12 +257,13 @@ async fn sponsored_create_account_mock_pipeline() {
     });
     Mock::given(method("POST"))
         .and(path("/"))
+        .and(body_partial_json(json!({"method": "sendTransaction"})))
         .respond_with(EchoIdResponder::new(send_result))
         .up_to_n_times(1)
         .mount(&mock_server)
         .await;
 
-    // Mock 2: getTransaction SUCCESS (minimal fields matching soroban-client schema).
+    // Mock 4: getTransaction SUCCESS (minimal fields matching soroban-client schema).
     let get_result = json!({
         "status": "SUCCESS",
         "txHash": tx_hash,
@@ -245,6 +271,7 @@ async fn sponsored_create_account_mock_pipeline() {
     });
     Mock::given(method("POST"))
         .and(path("/"))
+        .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(get_result))
         .up_to_n_times(1)
         .mount(&mock_server)

@@ -443,6 +443,12 @@ impl Respond for SorobanRpcResponder {
         };
 
         let result = match method {
+            // The submit layer establishes the endpoint's network identity
+            // before it sends; the mock serves the network these deployments
+            // declare.
+            "getNetwork" => {
+                stellar_agent_test_support::signed_envelope::get_network_result(TESTNET_PASSPHRASE)
+            }
             "getLedgerEntries" => self.ledger_entries_result.clone(),
             "simulateTransaction" => self.simulate_result.clone(),
             "sendTransaction" => serde_json::json!({
@@ -1320,6 +1326,12 @@ impl Respond for StatefulSorobanRpcResponder {
         }
 
         let result = match method {
+            // The submit layer establishes the endpoint's network identity
+            // before it sends; the mock serves the network these deployments
+            // declare.
+            "getNetwork" => {
+                stellar_agent_test_support::signed_envelope::get_network_result(TESTNET_PASSPHRASE)
+            }
             "getLedgerEntries" => self.respond_get_ledger_entries(&body),
             "simulateTransaction" => self.respond_simulate(&body),
             "sendTransaction" => self.respond_send(&body),
