@@ -27,6 +27,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   integrations. Published `stellar-agent-blend` crate versions remain on
   crates.io; no new versions are published.
 
+### Fixed
+
+- Submit derives the target network from the RPC endpoint instead of the
+  caller's declaration, and verifies which network the envelope's signatures
+  were made for. It previously trusted the declared passphrase and checked
+  nothing about the signatures it was sending, so `pay --submit-only` and
+  `claim --submit-only` would relay an envelope signed for one network onto
+  whatever chain `--rpc-url` pointed at, and a consumer of the published crate
+  could do the same with no CLI involved.
+
+  Before sending, the layer asks the endpoint which network it serves, on the
+  client instance that will send, and treats that answer as authoritative. The
+  probe is retried under the caller's own timeout and is fail-closed: it never
+  falls back to the declaration. It then fetches the ed25519 signer sets of the
+  transaction source and every distinct operation-level source in one
+  `getLedgerEntries` call, rebuilds the SEP-23 signing payload under the
+  endpoint's network id, and requires every decorated signature to verify
+  against it. On a fee-bump the fee source answers for the outer signatures and
+  the inner transaction's sources for the inner ones. An operation source that
+  the same transaction creates is verified against its own master key, so a
+  sponsored-creation sandwich still submits.
+
+  New wire codes: `network.endpoint_network_mismatch`,
+  `network.endpoint_identity_unavailable`,
+  `network.envelope_signed_for_mainnet`,
+  `network.envelope_signature_unverifiable` and `network.envelope_unsigned`. An
+  endpoint reporting mainnet still answers `network.mainnet_write_forbidden`,
+  and a source account absent from the ledger `network.account_not_found`.
+
+  A declared mainnet passphrase and a known mainnet RPC URL are still refused
+  with zero RPC calls; every other submission costs two reads before the send.
+  `pay --submit-only` and `claim --submit-only` probe ahead of the policy gate
+  and the audit pre-flight. `stellar_pay_commit`, `stellar_claim_commit`,
+  `stellar_trustline_commit` and `stellar_create_account_commit` probe before
+  the nonce is burned, so a mismatch does not consume it. Handing an unsigned
+  envelope to `--submit-only`, the natural mistake after `--build-only`, is
+  refused with `network.envelope_unsigned` before anything is sent.
+
 ## [0.1.0-alpha.6] - 2026-08-12
 
 ### Security

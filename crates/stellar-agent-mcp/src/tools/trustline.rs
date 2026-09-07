@@ -1179,6 +1179,14 @@ impl WalletServer {
             }
         };
 
+        // Establish which network the endpoint serves before the nonce is
+        // consumed. A commit aimed at the wrong network is a configuration
+        // error the caller can correct and retry; burning the nonce first
+        // would cost them the approval as well.
+        if let Err(e) = crate::tools::common::probe_endpoint_network(&client, &self.profile).await {
+            return Ok(crate::tools::common::commit_refusal_result(&e));
+        }
+
         // ── Nonce verification + replay window ────────────────────────────────
         let now_ms = now_unix_ms()
             .map_err(|e| rmcp::ErrorData::internal_error(format!("clock_error: {e}"), None))?;

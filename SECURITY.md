@@ -52,8 +52,12 @@ Keep the following properties of the current alpha in mind when assessing impact
   `stellar:testnet` and `stellar:mainnet`, but every write and signing surface
   structurally refuses `stellar:mainnet` (wire code `network.mainnet_write_forbidden`);
   there are no consent-gated mainnet write exceptions. Commands that take `--network`
-  refuse before any RPC call or signing; profile-driven flows are refused at the
-  network submit layer before any transaction is sent. Friendbot funding is scoped to
+  refuse before any RPC call or signing. At the submit layer, which every write goes
+  through including the profile-driven flows, a declared mainnet network passphrase and
+  a known mainnet RPC URL are each refused at zero RPC cost; beyond those two the
+  endpoint is asked which network it serves, that answer is authoritative over the
+  declaration, and every signature on the envelope must verify under that network's id.
+  Friendbot funding is scoped to
   `testnet` and `futurenet` and structurally refuses `mainnet`
   (`network.friendbot_mainnet_forbidden`).
 - The threat model centers on an autonomous agent transacting under wallet guardrails:

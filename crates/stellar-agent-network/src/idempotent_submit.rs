@@ -834,8 +834,88 @@ fn current_unix_secs() -> u64 {
 /// identically under normal conditions.
 const RETENTION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Runs every refusal that must precede the send, and returns the decoded
+/// envelope when all of them pass.
+///
+/// The endpoint identity probe and the signer-set fetch are bounded by
+/// `send_deadline`, the caller's own submission deadline, so the timeout
+/// covers these two reads as well as the send and the confirmation poll.
+///
+/// Grouped into one fallible step so the caller has a single place to withdraw
+/// the receipt it was reached with: each of these refusals means nothing was
+/// sent.
+///
+/// The order matches `submit_transaction_and_wait`: the declared-mainnet
+/// passphrase and the mainnet URL heuristic first, at no network cost, then
+/// the local decode, then the legacy-V0 rejection, then the endpoint identity
+/// probe, then signature-network binding.
+async fn pre_send_checks(
+    client: &StellarRpcClient,
+    envelope_xdr: &str,
+    network_passphrase: &str,
+    send_deadline: tokio::time::Instant,
+) -> Result<TransactionEnvelope, WalletError> {
+    // Mainnet guard (shared with `submit_transaction_and_wait`): the
+    // passphrase comparison is the primary check; the URL heuristic is the
+    // defence-in-depth layer. Every write path carries both, before the
+    // envelope decode and before any RPC call.
+    if network_passphrase == crate::submit::MAINNET_PASSPHRASE {
+        return Err(WalletError::Network(NetworkError::MainnetWriteForbidden));
+    }
+    if crate::submit::is_mainnet_url(&client.url) {
+        return Err(WalletError::Network(NetworkError::MainnetWriteForbidden));
+    }
+
+    // The envelope is caller-supplied and untrusted; bounded limits prevent a
+    // deeply nested auth-invocation tree from exhausting the stack.
+    let envelope = {
+        use base64::Engine as _;
+        let xdr_bytes = base64::engine::general_purpose::STANDARD
+            .decode(envelope_xdr.trim())
+            .map_err(|e| {
+                WalletError::Protocol(ProtocolError::XdrCodecFailed {
+                    detail: format!("base64 decode failed: {e}"),
+                })
+            })?;
+        TransactionEnvelope::from_xdr(
+            &xdr_bytes,
+            stellar_agent_xdr_limits::untrusted_decode_limits(xdr_bytes.len()),
+        )
+        .map_err(|e| {
+            WalletError::Protocol(ProtocolError::XdrCodecFailed {
+                detail: format!("failed to decode TransactionEnvelope XDR: {e}"),
+            })
+        })?
+    };
+
+    // A legacy V0 envelope has no SEP-23 tagged-transaction form; refused
+    // before any round trip.
+    crate::signing::verify_binding::reject_v0_envelope(&envelope)?;
+
+    // The endpoint decides which network this lands on, so it is asked, on the
+    // client instance that will send.
+    client
+        .verify_network_passphrase(network_passphrase, send_deadline)
+        .await?;
+
+    // Every signature must have been produced for that network.
+    crate::signing::verify_binding::verify_signature_network_binding(
+        client,
+        &envelope,
+        network_passphrase,
+        send_deadline,
+    )
+    .await?;
+
+    Ok(envelope)
+}
+
 /// Submits `envelope_xdr` via `sendTransaction`, then polls `getTransaction`
 /// with retention awareness, finalising the receipt on completion.
+///
+/// `timeout` is one budget for the whole submission: the endpoint identity
+/// probe and the signer-set fetch that precede the send are bounded by the
+/// same deadline as the send and the confirmation poll.
 ///
 /// Owns the poll loop directly — the upstream poller does not provide
 /// retention/reorg/Ambiguous semantics — and calls `get_health()` on every
@@ -875,46 +955,41 @@ pub(crate) async fn submit_with_retention_poll(
 
     let redacted = redact_envelope_hash(envelope_hash);
 
-    // Mainnet guard (shared with `submit_transaction_and_wait`): the
-    // passphrase comparison is the primary check; the URL heuristic is the
-    // defence-in-depth layer. Every write path carries both, before the
-    // envelope decode and before any state write or RPC call.
-    if network_passphrase == crate::submit::MAINNET_PASSPHRASE {
-        return Err(WalletError::Network(NetworkError::MainnetWriteForbidden));
-    }
-    if crate::submit::is_mainnet_url(&client.url) {
-        return Err(WalletError::Network(NetworkError::MainnetWriteForbidden));
-    }
-
-    // Decode envelope to submit via send_transaction (same as submit.rs path).
-    // The envelope is caller-supplied and untrusted; bounded limits prevent a
-    // deeply nested auth-invocation tree from exhausting the stack.
-    let envelope = {
-        use base64::Engine as _;
-        let xdr_bytes = base64::engine::general_purpose::STANDARD
-            .decode(envelope_xdr.trim())
-            .map_err(|e| {
-                WalletError::Protocol(ProtocolError::XdrCodecFailed {
-                    detail: format!("base64 decode failed: {e}"),
-                })
-            })?;
-        TransactionEnvelope::from_xdr(
-            &xdr_bytes,
-            stellar_agent_xdr_limits::untrusted_decode_limits(xdr_bytes.len()),
-        )
-        .map_err(|e| {
-            WalletError::Protocol(ProtocolError::XdrCodecFailed {
-                detail: format!("failed to decode TransactionEnvelope XDR: {e}"),
-            })
-        })?
-    };
-
     // This function sends via send_transaction directly (rather than through
     // submit_transaction_and_wait) because it owns a retention-aware poll
     // loop: NOT_FOUND iterations are intercepted to call get_health so ledger
     // retention can be checked, which submit_transaction_and_wait's poll does
-    // not do. Owning the send step is why both mainnet guard layers are
-    // enforced explicitly above.
+    // not do. Owning the send step is why both mainnet guard layers, the
+    // endpoint identity probe, and signature-network binding are enforced
+    // explicitly here.
+
+    let started = tokio::time::Instant::now();
+    let send_deadline = started + timeout;
+
+    // Callers reach this function with a Pending receipt already written for
+    // `envelope_hash`. Nothing below has touched the network yet, so a refusal
+    // here means the transaction was never sent and the receipt must be
+    // withdrawn: leaving it would make every later attempt on the same
+    // envelope wait out the loser poll and then fail, for a transaction that
+    // does not exist. `abandon_pre_submit` is a no-op when no receipt exists,
+    // which is how a direct caller with no store entry stays unaffected, and
+    // it refuses to withdraw a receipt already marked submitted, so it can
+    // never drop one for a transaction that may have reached the network.
+    let envelope =
+        match pre_send_checks(client, envelope_xdr, network_passphrase, send_deadline).await {
+            Ok(envelope) => envelope,
+            Err(refusal) => {
+                if let Err(e) = store.abandon_pre_submit(envelope_hash) {
+                    tracing::warn!(
+                        envelope_hash = %redacted,
+                        error = %e,
+                        "submit_with_retention_poll: abandon_pre_submit failed after a \
+                         pre-send refusal; a stale Pending receipt may remain"
+                    );
+                }
+                return Err(refusal);
+            }
+        };
 
     // Mark the receipt as submitted BEFORE calling send_transaction.
     //
@@ -948,8 +1023,6 @@ pub(crate) async fn submit_with_retention_poll(
     // idempotent at the network level (DUPLICATE).
     //
     // TransactionSubmissionFailed is NOT retried.
-    let started = tokio::time::Instant::now();
-    let send_deadline = started + timeout;
     let retry_policy = RetryPolicy::default();
 
     let tx_hash_bytes = {

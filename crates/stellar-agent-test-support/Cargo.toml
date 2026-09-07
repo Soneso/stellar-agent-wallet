@@ -47,7 +47,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 [features]
 test-helpers = [
     "dep:async-trait",
+    "dep:ed25519-dalek",
     "dep:serde_json",
+    "dep:sha2",
     "dep:stellar-strkey",
     "dep:stellar-xdr",
     "dep:tokio",

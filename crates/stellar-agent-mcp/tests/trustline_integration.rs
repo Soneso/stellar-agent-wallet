@@ -98,15 +98,18 @@ fn sstrkey_for_seed(seed: [u8; 32]) -> String {
 ///
 /// Serves the funded wallet-source account, the pinned USDC issuer account
 /// (flags = 0: no clawback, no auth-required — the clawback gate proceeds
-/// unconditionally), and the classic-transaction submit path. The SAME
-/// source-account response is served on both the simulate fetch and the
-/// commit re-fetch, so the rebuilt envelope is byte-identical to the
-/// presented one (the divergence check passes).
+/// unconditionally), the endpoint's network identity, and the
+/// classic-transaction submit path. The SAME source-account response is served
+/// on the simulate fetch, the commit re-fetch, and the submit-path signer
+/// fetch, so the rebuilt envelope is byte-identical to the presented one (the
+/// divergence check passes) and the source account reports the signing key as
+/// its own master key.
 struct TrustlineSubmitSuccessRpcResponder {
     source_key_xdr: String,
     source_xdr: String,
     issuer_key_xdr: String,
     issuer_xdr: String,
+    network: common::EndpointNetwork,
 }
 
 #[async_trait::async_trait]
@@ -124,6 +127,7 @@ impl Respond for TrustlineSubmitSuccessRpcResponder {
             .unwrap_or("");
 
         let result = match method {
+            "getNetwork" => self.network.result(),
             "getLedgerEntries" => {
                 let body = String::from_utf8_lossy(&request.body);
                 if body.contains(&self.source_key_xdr) {
@@ -214,6 +218,7 @@ async fn trustline_commit_full_round_trip_succeeds_with_string_encoded_limit() {
             source_xdr,
             issuer_key_xdr,
             issuer_xdr,
+            network: common::EndpointNetwork::testnet(),
         })
         .mount(&mock_server)
         .await;
@@ -329,6 +334,7 @@ async fn trustline_simulate_echoes_canonical_limit_stroops_not_raw_caller_string
             source_xdr,
             issuer_key_xdr,
             issuer_xdr,
+            network: common::EndpointNetwork::testnet(),
         })
         .mount(&mock_server)
         .await;
@@ -404,6 +410,7 @@ async fn simulate_nonce_mint_failed_envelope_shape() {
             source_xdr,
             issuer_key_xdr,
             issuer_xdr,
+            network: common::EndpointNetwork::testnet(),
         })
         .mount(&mock_server)
         .await;
@@ -475,6 +482,7 @@ async fn commit_rejects_invalid_from_strkey_before_any_rpc_call() {
             source_xdr,
             issuer_key_xdr,
             issuer_xdr,
+            network: common::EndpointNetwork::testnet(),
         })
         .mount(&mock_server)
         .await;
@@ -535,5 +543,133 @@ async fn commit_rejects_invalid_from_strkey_before_any_rpc_call() {
     assert!(
         err.message.contains("invalid from"),
         "error message must name the invalid `from` field: {err:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Endpoint-identity probe at the commit boundary
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `stellar_trustline_commit` refuses with
+/// `network.endpoint_network_mismatch` when the endpoint serves a network
+/// other than the profile's, and the nonce it was handed survives that
+/// refusal.
+///
+/// The survival proof is the second commit: the endpoint's reported identity
+/// is swapped to the profile's network and the SAME nonce is committed again,
+/// which submits. A nonce recorded in the replay window by the first call
+/// would instead return `nonce.replayed` there. Repeating the refused call and
+/// asserting the mismatch code again would discriminate nothing, because the
+/// probe precedes the nonce gate and answers identically whether or not the
+/// nonce was consumed.
+#[tokio::test]
+#[serial]
+async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(212);
+
+    let seed = [0x57_u8; 32];
+    let source_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+
+    let source_key_xdr = account_ledger_key_xdr(&source_g);
+    let source_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
+    let issuer_key_xdr = account_ledger_key_xdr(USDC_TESTNET_ISSUER);
+    let issuer_xdr = account_entry_xdr_with_balance(USDC_TESTNET_ISSUER, 100_000_000_000_000);
+
+    // The endpoint starts out serving a third network while the profile below
+    // declares testnet.
+    let network = common::EndpointNetwork::reporting(common::FUTURENET_PASSPHRASE);
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(TrustlineSubmitSuccessRpcResponder {
+            source_key_xdr,
+            source_xdr,
+            issuer_key_xdr,
+            issuer_xdr,
+            network: network.clone(),
+        })
+        .mount(&mock_server)
+        .await;
+
+    let profile = testnet_profile_with_rpc(&mock_server.uri());
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    // ── Simulate: mints a real nonce over a real envelope ──────────────────
+    let sim_result = server
+        .call_stellar_trustline(StellarTrustlineArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            from: source_g.clone(),
+            asset: "USDC".to_owned(),
+            limit_stroops: Some("1000000000".to_owned()),
+            classic_base: None,
+        })
+        .await
+        .expect("simulate must not error");
+    assert_ne!(
+        sim_result.is_error,
+        Some(true),
+        "simulate must succeed: {}",
+        call_result_text(&sim_result)
+    );
+    let sim_json = call_result_json(&sim_result);
+    let sim_data = sim_json.get("data").expect("simulate success carries data");
+    let nonce = sim_data
+        .get("nonce")
+        .and_then(serde_json::Value::as_str)
+        .expect("nonce present")
+        .to_owned();
+    let expires_at_unix_ms = sim_data
+        .get("expires_at_unix_ms")
+        .and_then(serde_json::Value::as_u64)
+        .expect("expires_at_unix_ms present");
+    let envelope_xdr = sim_data
+        .get("envelope_xdr")
+        .and_then(serde_json::Value::as_str)
+        .expect("envelope_xdr present")
+        .to_owned();
+
+    let commit_args = StellarTrustlineCommitArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        from: source_g,
+        nonce,
+        expires_at_unix_ms,
+        envelope_xdr,
+        approval_nonce: None,
+        approval_attestation: None,
+    };
+
+    // ── Commit against the wrong network ───────────────────────────────────
+    let refused = server
+        .call_stellar_trustline_commit(commit_args.clone())
+        .await
+        .expect("the refusal must surface as an is_error envelope, not a protocol error");
+    let (code, _message, _text) = common::assert_business_envelope(&refused);
+    assert_eq!(
+        code, "network.endpoint_network_mismatch",
+        "a commit whose endpoint serves a different network must carry the \
+         mismatch code, got: {code}"
+    );
+
+    // ── Commit again once the endpoint serves the profile's network ────────
+    network.set(stellar_agent_test_support::signed_envelope::TESTNET_PASSPHRASE);
+    let committed = server
+        .call_stellar_trustline_commit(commit_args)
+        .await
+        .expect("the retry must not error");
+    let committed_json = call_result_json(&committed);
+    assert_ne!(
+        committed.is_error,
+        Some(true),
+        "the same nonce must still commit after the endpoint is corrected, \
+         which it can only do if the refused call left the replay window \
+         empty; got: {committed_json}"
+    );
+    assert!(
+        committed_json["data"]["tx_hash"].as_str().is_some(),
+        "the retry must report an on-chain tx_hash: {committed_json}"
     );
 }

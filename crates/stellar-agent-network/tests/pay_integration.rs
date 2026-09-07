@@ -37,8 +37,9 @@ use stellar_agent_core::error::{
 use stellar_agent_network::builder::{Asset, ClassicOpBuilder};
 use stellar_agent_network::{StellarRpcClient, submit_transaction_and_wait};
 use stellar_agent_test_support::EchoIdResponder;
-use stellar_xdr::{Limits, ReadXdr, TransactionEnvelope, WriteXdr};
-use wiremock::matchers::{method, path};
+use stellar_agent_test_support::signed_envelope::{SignedTestEnvelope, get_network_result};
+use stellar_xdr::{Limits, ReadXdr, TransactionEnvelope};
+use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -49,24 +50,28 @@ const SRC_ACCOUNT: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQS
 const DST_ACCOUNT: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
 const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
 
+/// Seed for the source account of submit-path envelopes. A public test
+/// fixture, never a production key.
+const SOURCE_SEED: [u8; 32] = [4u8; 32];
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Response fixtures
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn send_transaction_result() -> serde_json::Value {
+fn send_transaction_result(envelope: &SignedTestEnvelope) -> serde_json::Value {
     json!({
-        "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hash": envelope.tx_hash_hex(),
         "status": "PENDING",
         "latestLedger": 1001,
         "latestLedgerCloseTime": "1234567890"
     })
 }
 
-fn get_transaction_success_result(ledger: u32) -> serde_json::Value {
+fn get_transaction_success_result(envelope: &SignedTestEnvelope, ledger: u32) -> serde_json::Value {
     json!({
         "status": "SUCCESS",
         "ledger": ledger,
-        "txHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        "txHash": envelope.tx_hash_hex()
     })
 }
 
@@ -75,6 +80,24 @@ fn get_transaction_not_found_result() -> serde_json::Value {
         "status": "NOT_FOUND",
         "latestLedger": 1001
     })
+}
+
+/// Mounts the two reads every submit performs before it sends: the endpoint
+/// identity probe and the signer-set fetch for the envelope's source accounts.
+async fn mount_probe_and_signers(server: &MockServer, envelope: &SignedTestEnvelope) {
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getNetwork"})))
+        .respond_with(EchoIdResponder::new(get_network_result(TESTNET_PASSPHRASE)))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getLedgerEntries"})))
+        .respond_with(EchoIdResponder::new(envelope.ledger_entries_result()))
+        .mount(server)
+        .await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -93,26 +116,11 @@ fn build_test_unsigned_xdr() -> String {
     builder.build().expect("build")
 }
 
-/// Builds a signed envelope by adding a placeholder signature.
-///
-/// For submit-only tests we need a structurally valid signed envelope; the
-/// signature bytes are placeholder zeros (the mock RPC does not validate them).
-fn build_test_signed_xdr() -> String {
-    use stellar_xdr::{DecoratedSignature, Signature, SignatureHint};
-    let unsigned = build_test_unsigned_xdr();
-    let mut env =
-        TransactionEnvelope::from_xdr_base64(&unsigned, Limits::none()).expect("decode unsigned");
-
-    if let TransactionEnvelope::Tx(ref mut v1) = env {
-        v1.signatures = vec![DecoratedSignature {
-            hint: SignatureHint([0u8; 4]),
-            signature: Signature([0u8; 64].to_vec().try_into().expect("64 bytes")),
-        }]
-        .try_into()
-        .expect("single sig fits VecM<_, 20>");
-    }
-
-    env.to_xdr_base64(Limits::none()).expect("encode signed")
+/// Builds a signed envelope whose source account is the signing key's own
+/// account, so the signer set the ledger reports for it accounts for the
+/// envelope's signature.
+fn build_test_signed_envelope(seq: i64) -> SignedTestEnvelope {
+    SignedTestEnvelope::for_source_with_sequence(SOURCE_SEED, seq)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -245,11 +253,14 @@ async fn sep29_memo_present_fast_path_no_rpc() {
 #[tokio::test]
 async fn submit_and_poll_success_with_mock() {
     let mock_server = MockServer::start().await;
+    let envelope = build_test_signed_envelope(1101);
+    mount_probe_and_signers(&mock_server, &envelope).await;
 
     // sendTransaction response.
     Mock::given(method("POST"))
         .and(path("/"))
-        .respond_with(EchoIdResponder::new(send_transaction_result()))
+        .and(body_partial_json(json!({"method": "sendTransaction"})))
+        .respond_with(EchoIdResponder::new(send_transaction_result(&envelope)))
         .up_to_n_times(1)
         .mount(&mock_server)
         .await;
@@ -257,16 +268,18 @@ async fn submit_and_poll_success_with_mock() {
     // getTransaction SUCCESS response (for all subsequent calls).
     Mock::given(method("POST"))
         .and(path("/"))
-        .respond_with(EchoIdResponder::new(get_transaction_success_result(1005)))
+        .and(body_partial_json(json!({"method": "getTransaction"})))
+        .respond_with(EchoIdResponder::new(get_transaction_success_result(
+            &envelope, 1005,
+        )))
         .mount(&mock_server)
         .await;
 
     let client = StellarRpcClient::new(&mock_server.uri()).expect("valid URL");
-    let signed_xdr = build_test_signed_xdr();
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        envelope.envelope_xdr(),
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
@@ -286,11 +299,14 @@ async fn submit_and_poll_success_with_mock() {
 #[tokio::test]
 async fn submit_and_poll_not_found_then_success() {
     let mock_server = MockServer::start().await;
+    let envelope = build_test_signed_envelope(1102);
+    mount_probe_and_signers(&mock_server, &envelope).await;
 
     // sendTransaction.
     Mock::given(method("POST"))
         .and(path("/"))
-        .respond_with(EchoIdResponder::new(send_transaction_result()))
+        .and(body_partial_json(json!({"method": "sendTransaction"})))
+        .respond_with(EchoIdResponder::new(send_transaction_result(&envelope)))
         .up_to_n_times(1)
         .mount(&mock_server)
         .await;
@@ -298,6 +314,7 @@ async fn submit_and_poll_not_found_then_success() {
     // First getTransaction → NOT_FOUND.
     Mock::given(method("POST"))
         .and(path("/"))
+        .and(body_partial_json(json!({"method": "getTransaction"})))
         .respond_with(EchoIdResponder::new(get_transaction_not_found_result()))
         .up_to_n_times(1)
         .mount(&mock_server)
@@ -306,16 +323,18 @@ async fn submit_and_poll_not_found_then_success() {
     // Second getTransaction → SUCCESS.
     Mock::given(method("POST"))
         .and(path("/"))
-        .respond_with(EchoIdResponder::new(get_transaction_success_result(1010)))
+        .and(body_partial_json(json!({"method": "getTransaction"})))
+        .respond_with(EchoIdResponder::new(get_transaction_success_result(
+            &envelope, 1010,
+        )))
         .mount(&mock_server)
         .await;
 
     let client = StellarRpcClient::new(&mock_server.uri()).expect("valid URL");
-    let signed_xdr = build_test_signed_xdr();
 
     let result = submit_transaction_and_wait(
         &client,
-        &signed_xdr,
+        envelope.envelope_xdr(),
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,

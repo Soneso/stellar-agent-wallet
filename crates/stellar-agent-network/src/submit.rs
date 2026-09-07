@@ -52,6 +52,7 @@ use crate::retry::{
     RetryPolicy, is_retryable_poll_error, is_retryable_send_error, retry_with_backoff,
     truncate_error_display,
 };
+use crate::signing::verify_binding::{reject_v0_envelope, verify_signature_network_binding};
 
 // Mainnet network passphrase (canonical; same constant used by friendbot.rs).
 // `pub(crate)` so every in-crate write path (idempotent_submit's retention
@@ -111,19 +112,41 @@ pub enum SubmissionSignerKind {
 /// then polls `getTransaction` every 2 seconds until the status is
 /// `"SUCCESS"` or the `timeout` has elapsed.
 ///
-/// `network_passphrase` is compared against the canonical mainnet passphrase
-/// as the primary mainnet-write guard. The URL heuristic `is_mainnet_url`
-/// is retained as a defence-in-depth layer.
+/// `timeout` is one budget for the whole submission, not for the send alone:
+/// the endpoint identity probe and the signer-set fetch that precede the send
+/// are bounded by the same deadline, and each of their retries is cut off by
+/// it. A caller sizing this value has to allow for two reads ahead of the
+/// send.
+///
+/// # Which network the transaction reaches
+///
+/// `network_passphrase` is the caller's declaration, not the authority. A
+/// declared mainnet passphrase, and a URL matching a known mainnet host, are
+/// refused immediately at no network cost. Otherwise the endpoint is asked
+/// which network it serves and must agree with the declaration, and every
+/// signature on the envelope must verify under that network's id. An envelope
+/// signed for one network therefore cannot be submitted under another's
+/// passphrase, and an endpoint that turns out to serve mainnet is refused
+/// however the call was declared.
 ///
 /// # Errors
 ///
 /// - [`WalletError::Protocol`] wrapping [`ProtocolError::XdrCodecFailed`] if
-///   `envelope_xdr` cannot be decoded.
+///   `envelope_xdr` cannot be decoded or is a legacy `TxV0` envelope.
 /// - [`WalletError::Network`] wrapping [`NetworkError::RpcUnreachable`] or
 ///   [`NetworkError::RpcTimeout`] on transport errors.
 /// - [`WalletError::Network`] wrapping [`NetworkError::MainnetWriteForbidden`]
-///   if `network_passphrase` matches the mainnet passphrase or the URL appears
-///   to target mainnet.
+///   if `network_passphrase` matches the mainnet passphrase, the URL appears
+///   to target mainnet, or the endpoint reports the mainnet passphrase.
+/// - [`WalletError::Network`] wrapping
+///   [`NetworkError::EndpointNetworkMismatch`] if the endpoint serves a
+///   different network, or [`NetworkError::EndpointIdentityUnavailable`] if
+///   its identity cannot be established within `timeout`.
+/// - [`WalletError::Network`] wrapping
+///   [`NetworkError::EnvelopeSignedForMainnet`],
+///   [`NetworkError::EnvelopeSignatureUnverifiable`] or
+///   [`NetworkError::EnvelopeUnsigned`] if the envelope's signatures are not
+///   bound to the network the endpoint serves.
 /// - [`WalletError::Submission`] wrapping [`SubmissionError::TxMalformed`]
 ///   if the network rejects the transaction immediately.
 /// - [`WalletError::Submission`] wrapping [`SubmissionError::TxTimeout`] if the
@@ -187,6 +210,28 @@ pub async fn submit_transaction_and_wait(
         })
     })?;
 
+    let started = tokio::time::Instant::now();
+    let send_deadline = started + timeout;
+    let retry_policy = RetryPolicy::default();
+
+    // A legacy V0 envelope has no SEP-23 tagged-transaction form, so neither
+    // the signing path nor binding verification can construct a payload for
+    // it. Refused here so it costs no round trip.
+    reject_v0_envelope(&envelope)?;
+
+    // Ask the endpoint which network it serves, on the client instance that
+    // will send. The target network is a property of the endpoint; the
+    // caller's declaration is only a claim about it, and the two must be shown
+    // to agree before anything is sent. Bounded by the caller's own deadline.
+    client
+        .verify_network_passphrase(network_passphrase, send_deadline)
+        .await?;
+
+    // With the endpoint's network established, verify that the envelope's
+    // signatures were produced for that network. This is what stops an
+    // envelope signed for one network from being relayed to another.
+    verify_signature_network_binding(client, &envelope, network_passphrase, send_deadline).await?;
+
     // Submit via `sendTransaction`, with bounded exponential-backoff retry for
     // transient transport errors.
     //
@@ -199,9 +244,6 @@ pub async fn submit_transaction_and_wait(
     // on-chain rejections AND transport-429-on-send, and those are
     // indistinguishable here without fragile Display-string matching.
     // Retry-After / transport-429-on-send is not currently honoured; blind backoff is used instead.
-    let started = tokio::time::Instant::now();
-    let send_deadline = started + timeout;
-    let retry_policy = RetryPolicy::default();
 
     let tx_hash = {
         let inner = &client.inner;

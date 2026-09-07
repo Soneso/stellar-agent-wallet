@@ -42,22 +42,18 @@
 use std::time::Duration;
 
 use serde_json::json;
-use stellar_agent_core::StellarAmount;
 use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore};
 use stellar_agent_network::StellarRpcClient;
-use stellar_agent_network::builder::{Asset, ClassicOpBuilder};
 use stellar_agent_network::idempotent_submit::{reconcile_receipt, submit_transaction_idempotent};
-use stellar_agent_network::signing::software::SoftwareSigningKey;
 use stellar_agent_test_support::EchoIdResponder;
-use wiremock::matchers::{method, path};
+use stellar_agent_test_support::signed_envelope::{SignedTestEnvelope, get_network_result};
+use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixtures
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SRC_ACCOUNT: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
-const DST_ACCOUNT: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
 const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
 const FAKE_TX_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const FAKE_LEDGER: u32 = 1234;
@@ -74,21 +70,37 @@ const OLDEST_LEDGER_PAST: u32 = 500;
 /// the submission is still within the retention window.
 const OLDEST_LEDGER_WITHIN: u32 = 50;
 
-/// Builds and signs a test envelope.  Key is derived from a fixed byte seed so
-/// there is no committed S-strkey seed — `[2u8; 32]` is a public test fixture,
-/// not a production key.  Uses a different seed from other test fixtures to
-/// avoid cross-fixture hash collision.
-async fn build_signed_envelope() -> String {
-    let key = SoftwareSigningKey::new_from_bytes([2u8; 32]);
-    let mut builder = ClassicOpBuilder::new(SRC_ACCOUNT, 200, TESTNET_PASSPHRASE, 200);
-    builder
-        .payment(
-            DST_ACCOUNT,
-            StellarAmount::from_stroops(5_000_000),
-            &Asset::Native,
-        )
-        .unwrap();
-    builder.build_and_sign(&key).await.unwrap()
+/// Seed for the transaction source account.  A fixed byte seed so there is no
+/// committed S-strkey — `[2u8; 32]` is a public test fixture, not a production
+/// key.  Distinct from the seeds used in the other test files so receipt-store
+/// keys never alias.
+const SOURCE_SEED: [u8; 32] = [2u8; 32];
+
+/// Builds a signed test envelope whose source account is the signing key's own
+/// account, so the account the ledger reports is the one that signed.
+fn build_signed_envelope() -> SignedTestEnvelope {
+    SignedTestEnvelope::builder(SOURCE_SEED)
+        .sequence(200)
+        .amount_stroops(5_000_000)
+        .build()
+}
+
+/// Mounts the two reads every submit performs before it sends: the endpoint
+/// identity probe and the signer-set fetch for the envelope's source accounts.
+async fn mount_probe_and_signers(server: &MockServer, envelope: &SignedTestEnvelope) {
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getNetwork"})))
+        .respond_with(EchoIdResponder::new(get_network_result(TESTNET_PASSPHRASE)))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getLedgerEntries"})))
+        .respond_with(EchoIdResponder::new(envelope.ledger_entries_result()))
+        .mount(server)
+        .await;
 }
 
 /// Computes the envelope hash for a base64-encoded signed envelope XDR.
@@ -107,10 +119,10 @@ fn envelope_hash_for(signed_xdr: &str) -> String {
         })
 }
 
-/// JSON-RPC `sendTransaction` response for a PENDING submission.
-fn send_transaction_pending_response() -> serde_json::Value {
+/// JSON-RPC `sendTransaction` response for a PENDING submission of `tx_hash`.
+fn send_transaction_pending_response(tx_hash: &str) -> serde_json::Value {
     json!({
-        "hash": FAKE_TX_HASH,
+        "hash": tx_hash,
         "status": "PENDING",
         "latestLedger": 1001,
         "latestLedgerCloseTime": "1699999999"
@@ -128,11 +140,11 @@ fn get_transaction_not_found_response() -> serde_json::Value {
     })
 }
 
-/// JSON-RPC `getTransaction` response for SUCCESS.
-fn get_transaction_success_response() -> serde_json::Value {
+/// JSON-RPC `getTransaction` response for a SUCCESS confirmation of `tx_hash`.
+fn get_transaction_success_response(tx_hash: &str) -> serde_json::Value {
     json!({
         "status": "SUCCESS",
-        "txHash": FAKE_TX_HASH,
+        "txHash": tx_hash,
         "ledger": FAKE_LEDGER,
         "createdAt": "1700000000",
         "envelopeXdr": null,
@@ -181,21 +193,25 @@ fn get_health_within_window_response() -> serde_json::Value {
 ///   `oldest_ledger > recorded_at_ledger`.
 #[tokio::test]
 async fn retention_outside_window_returns_ambiguous() {
-    let signed_xdr = build_signed_envelope().await;
-    let envelope_hash = envelope_hash_for(&signed_xdr);
+    let envelope = build_signed_envelope();
+    let signed_xdr = envelope.envelope_xdr();
+    let envelope_hash = envelope_hash_for(signed_xdr);
 
     let dir = tempfile::tempdir().unwrap();
     let store = ReceiptStore::open_at(dir.path(), "block-b-retention-test").unwrap();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     // sendTransaction → PENDING.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "sendTransaction"
         })))
-        .respond_with(EchoIdResponder::new(send_transaction_pending_response()))
+        .respond_with(EchoIdResponder::new(send_transaction_pending_response(
+            envelope.tx_hash_hex(),
+        )))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -205,7 +221,7 @@ async fn retention_outside_window_returns_ambiguous() {
     // retention fields from getTransaction — we also serve getHealth below).
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getTransaction"
         })))
         .respond_with(EchoIdResponder::new(get_transaction_not_found_response()))
@@ -216,7 +232,7 @@ async fn retention_outside_window_returns_ambiguous() {
     // getHealth → oldest_ledger > RECORDED_AT_LEDGER (outside window).
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getHealth"
         })))
         .respond_with(EchoIdResponder::new(get_health_outside_window_response()))
@@ -230,7 +246,7 @@ async fn retention_outside_window_returns_ambiguous() {
     // clock (the test must finish in <<30s).
     let result = submit_transaction_idempotent(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         &store,
@@ -274,21 +290,25 @@ async fn retention_outside_window_returns_ambiguous() {
 /// returns SUCCESS, the receipt is finalised as Success — NOT Ambiguous.
 #[tokio::test]
 async fn within_retention_success_not_ambiguous() {
-    let signed_xdr = build_signed_envelope().await;
-    let envelope_hash = envelope_hash_for(&signed_xdr);
+    let envelope = build_signed_envelope();
+    let signed_xdr = envelope.envelope_xdr();
+    let envelope_hash = envelope_hash_for(signed_xdr);
 
     let dir = tempfile::tempdir().unwrap();
     let store = ReceiptStore::open_at(dir.path(), "block-b-within-retention-test").unwrap();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     // sendTransaction → PENDING.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "sendTransaction"
         })))
-        .respond_with(EchoIdResponder::new(send_transaction_pending_response()))
+        .respond_with(EchoIdResponder::new(send_transaction_pending_response(
+            envelope.tx_hash_hex(),
+        )))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -296,10 +316,12 @@ async fn within_retention_success_not_ambiguous() {
     // getTransaction → SUCCESS immediately.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getTransaction"
         })))
-        .respond_with(EchoIdResponder::new(get_transaction_success_response()))
+        .respond_with(EchoIdResponder::new(get_transaction_success_response(
+            envelope.tx_hash_hex(),
+        )))
         .up_to_n_times(10)
         .mount(&server)
         .await;
@@ -309,7 +331,7 @@ async fn within_retention_success_not_ambiguous() {
     // on the first poll (no NOT_FOUND iteration to trigger health check).
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getHealth"
         })))
         .respond_with(EchoIdResponder::new(get_health_within_window_response()))
@@ -321,7 +343,7 @@ async fn within_retention_success_not_ambiguous() {
 
     let result = submit_transaction_idempotent(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         &store,
@@ -354,21 +376,25 @@ async fn within_retention_success_not_ambiguous() {
 /// Asserts the final outcome is Success, not Ambiguous.
 #[tokio::test]
 async fn not_found_within_retention_keeps_polling_then_success() {
-    let signed_xdr = build_signed_envelope().await;
-    let envelope_hash = envelope_hash_for(&signed_xdr);
+    let envelope = build_signed_envelope();
+    let signed_xdr = envelope.envelope_xdr();
+    let envelope_hash = envelope_hash_for(signed_xdr);
 
     let dir = tempfile::tempdir().unwrap();
     let store = ReceiptStore::open_at(dir.path(), "block-b-notfound-within-test").unwrap();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     // sendTransaction → PENDING.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "sendTransaction"
         })))
-        .respond_with(EchoIdResponder::new(send_transaction_pending_response()))
+        .respond_with(EchoIdResponder::new(send_transaction_pending_response(
+            envelope.tx_hash_hex(),
+        )))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -376,7 +402,7 @@ async fn not_found_within_retention_keeps_polling_then_success() {
     // getTransaction → NOT_FOUND once, then SUCCESS.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getTransaction"
         })))
         .respond_with(EchoIdResponder::new(json!({
@@ -392,10 +418,12 @@ async fn not_found_within_retention_keeps_polling_then_success() {
 
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getTransaction"
         })))
-        .respond_with(EchoIdResponder::new(get_transaction_success_response()))
+        .respond_with(EchoIdResponder::new(get_transaction_success_response(
+            envelope.tx_hash_hex(),
+        )))
         .up_to_n_times(10)
         .mount(&server)
         .await;
@@ -403,7 +431,7 @@ async fn not_found_within_retention_keeps_polling_then_success() {
     // getHealth → within window (oldest_ledger=50 < recorded_at_ledger=100).
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getHealth"
         })))
         .respond_with(EchoIdResponder::new(get_health_within_window_response()))
@@ -415,7 +443,7 @@ async fn not_found_within_retention_keeps_polling_then_success() {
 
     let result = submit_transaction_idempotent(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         &store,
@@ -485,7 +513,7 @@ async fn reorg_demotes_success_to_reorged_with_prior_ledger() {
 
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getTransaction"
         })))
         .respond_with(EchoIdResponder::new(json!({
@@ -502,7 +530,7 @@ async fn reorg_demotes_success_to_reorged_with_prior_ledger() {
     // First getHealth returns latest_ledger=2000 (first miss anchored here).
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getHealth"
         })))
         .respond_with(EchoIdResponder::new(json!({
@@ -547,7 +575,7 @@ async fn reorg_demotes_success_to_reorged_with_prior_ledger() {
 
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getTransaction"
         })))
         .respond_with(EchoIdResponder::new(json!({
@@ -564,7 +592,7 @@ async fn reorg_demotes_success_to_reorged_with_prior_ledger() {
     // Second getHealth returns latest_ledger=2001 (one ledger closed).
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getHealth"
         })))
         .respond_with(EchoIdResponder::new(json!({
@@ -691,10 +719,12 @@ async fn reconcile_receipt_success_still_success_no_reorg() {
     // getTransaction returns SUCCESS (transaction still confirmed).
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getTransaction"
         })))
-        .respond_with(EchoIdResponder::new(get_transaction_success_response()))
+        .respond_with(EchoIdResponder::new(get_transaction_success_response(
+            tx_hash,
+        )))
         .up_to_n_times(5)
         .mount(&server)
         .await;
@@ -771,8 +801,9 @@ async fn winner_path_failed_with_decodable_xdr_finalises_failed_code() {
         TransactionResultExt, TransactionResultResult, VecM, WriteXdr,
     };
 
-    let signed_xdr = build_signed_envelope().await;
-    let envelope_hash = envelope_hash_for(&signed_xdr);
+    let envelope = build_signed_envelope();
+    let signed_xdr = envelope.envelope_xdr();
+    let envelope_hash = envelope_hash_for(signed_xdr);
 
     // Build TxFailed([Payment(Underfunded)]) result XDR.
     let ops: VecM<OperationResult> = vec![OperationResult::OpInner(OperationResultTr::Payment(
@@ -788,16 +819,17 @@ async fn winner_path_failed_with_decodable_xdr_finalises_failed_code() {
     let result_xdr_b64 = tx_result.to_xdr_base64(Limits::none()).unwrap();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     // getTransaction → FAILED with real XDR.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getTransaction"
         })))
         .respond_with(EchoIdResponder::new(json!({
             "status": "FAILED",
-            "txHash": FAKE_TX_HASH,
+            "txHash": envelope.tx_hash_hex(),
             "ledger": null,
             "createdAt": "1700000000",
             "envelopeXdr": null,
@@ -811,7 +843,7 @@ async fn winner_path_failed_with_decodable_xdr_finalises_failed_code() {
     // getHealth — not expected on FAILED but register to avoid empty responses.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getHealth"
         })))
         .respond_with(EchoIdResponder::new(json!({
@@ -829,11 +861,11 @@ async fn winner_path_failed_with_decodable_xdr_finalises_failed_code() {
     // Mock sendTransaction for the fresh winner path.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "sendTransaction"
         })))
         .respond_with(EchoIdResponder::new(json!({
-            "hash": FAKE_TX_HASH,
+            "hash": envelope.tx_hash_hex(),
             "status": "PENDING",
             "latestLedger": 1001,
             "latestLedgerCloseTime": "1699999999"
@@ -849,7 +881,7 @@ async fn winner_path_failed_with_decodable_xdr_finalises_failed_code() {
 
     let result = submit_transaction_idempotent(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         &store2,
@@ -883,21 +915,24 @@ async fn winner_path_failed_with_decodable_xdr_finalises_failed_code() {
 /// absent-XDR shape.
 #[tokio::test]
 async fn winner_path_failed_with_no_xdr_is_typed_error_no_panic() {
-    let signed_xdr = build_signed_envelope().await;
+    let envelope = build_signed_envelope();
+    let signed_xdr = envelope.envelope_xdr();
 
     let dir = tempfile::tempdir().unwrap();
     let store = ReceiptStore::open_at(dir.path(), "stale-pending-failed-no-xdr").unwrap();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     // sendTransaction → PENDING.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "sendTransaction"
         })))
         .respond_with(EchoIdResponder::new(json!({
-            "hash": FAKE_TX_HASH,
+            "hash": envelope.tx_hash_hex(),
             "status": "PENDING",
             "latestLedger": 1001,
             "latestLedgerCloseTime": "1699999999"
@@ -909,12 +944,12 @@ async fn winner_path_failed_with_no_xdr_is_typed_error_no_panic() {
     // getTransaction → FAILED with null resultXdr.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getTransaction"
         })))
         .respond_with(EchoIdResponder::new(json!({
             "status": "FAILED",
-            "txHash": FAKE_TX_HASH,
+            "txHash": envelope.tx_hash_hex(),
             "ledger": null,
             "createdAt": "1700000000",
             "envelopeXdr": null,
@@ -927,7 +962,7 @@ async fn winner_path_failed_with_no_xdr_is_typed_error_no_panic() {
 
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getHealth"
         })))
         .respond_with(EchoIdResponder::new(json!({
@@ -944,7 +979,7 @@ async fn winner_path_failed_with_no_xdr_is_typed_error_no_panic() {
 
     let result = submit_transaction_idempotent(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         &store,
@@ -1000,7 +1035,7 @@ async fn not_found_then_success_clears_anchor_no_reorged() {
 
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getTransaction"
         })))
         .respond_with(EchoIdResponder::new(json!({
@@ -1016,7 +1051,7 @@ async fn not_found_then_success_clears_anchor_no_reorged() {
 
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getHealth"
         })))
         .respond_with(EchoIdResponder::new(json!({
@@ -1051,7 +1086,7 @@ async fn not_found_then_success_clears_anchor_no_reorged() {
 
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getTransaction"
         })))
         .respond_with(EchoIdResponder::new(json!({
@@ -1121,9 +1156,7 @@ async fn success_reappear_then_miss_requires_fresh_two_poll_window() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/"))
-            .and(wiremock::matchers::body_partial_json(
-                json!({"method": "getTransaction"}),
-            ))
+            .and(body_partial_json(json!({"method": "getTransaction"})))
             .respond_with(EchoIdResponder::new(json!({
                 "status": "NOT_FOUND",
                 "latestLedger": 5000,
@@ -1136,9 +1169,7 @@ async fn success_reappear_then_miss_requires_fresh_two_poll_window() {
             .await;
         Mock::given(method("POST"))
             .and(path("/"))
-            .and(wiremock::matchers::body_partial_json(
-                json!({"method": "getHealth"}),
-            ))
+            .and(body_partial_json(json!({"method": "getHealth"})))
             .respond_with(EchoIdResponder::new(json!({
                 "status": "healthy",
                 "latestLedger": 5000,
@@ -1162,9 +1193,7 @@ async fn success_reappear_then_miss_requires_fresh_two_poll_window() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/"))
-            .and(wiremock::matchers::body_partial_json(
-                json!({"method": "getTransaction"}),
-            ))
+            .and(body_partial_json(json!({"method": "getTransaction"})))
             .respond_with(EchoIdResponder::new(json!({
                 "status": "SUCCESS",
                 "txHash": FAKE_TX_HASH,
@@ -1196,9 +1225,7 @@ async fn success_reappear_then_miss_requires_fresh_two_poll_window() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/"))
-            .and(wiremock::matchers::body_partial_json(
-                json!({"method": "getTransaction"}),
-            ))
+            .and(body_partial_json(json!({"method": "getTransaction"})))
             .respond_with(EchoIdResponder::new(json!({
                 "status": "NOT_FOUND",
                 "latestLedger": 6000,
@@ -1211,9 +1238,7 @@ async fn success_reappear_then_miss_requires_fresh_two_poll_window() {
             .await;
         Mock::given(method("POST"))
             .and(path("/"))
-            .and(wiremock::matchers::body_partial_json(
-                json!({"method": "getHealth"}),
-            ))
+            .and(body_partial_json(json!({"method": "getHealth"})))
             .respond_with(EchoIdResponder::new(json!({
                 "status": "healthy",
                 "latestLedger": 6000,
@@ -1269,9 +1294,7 @@ async fn two_consecutive_not_found_still_demotes_to_reorged() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/"))
-            .and(wiremock::matchers::body_partial_json(
-                json!({"method": "getTransaction"}),
-            ))
+            .and(body_partial_json(json!({"method": "getTransaction"})))
             .respond_with(EchoIdResponder::new(json!({
                 "status": "NOT_FOUND",
                 "latestLedger": 7000,
@@ -1284,9 +1307,7 @@ async fn two_consecutive_not_found_still_demotes_to_reorged() {
             .await;
         Mock::given(method("POST"))
             .and(path("/"))
-            .and(wiremock::matchers::body_partial_json(
-                json!({"method": "getHealth"}),
-            ))
+            .and(body_partial_json(json!({"method": "getHealth"})))
             .respond_with(EchoIdResponder::new(json!({
                 "status": "healthy",
                 "latestLedger": 7000,
@@ -1310,9 +1331,7 @@ async fn two_consecutive_not_found_still_demotes_to_reorged() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/"))
-            .and(wiremock::matchers::body_partial_json(
-                json!({"method": "getTransaction"}),
-            ))
+            .and(body_partial_json(json!({"method": "getTransaction"})))
             .respond_with(EchoIdResponder::new(json!({
                 "status": "NOT_FOUND",
                 "latestLedger": 7001,
@@ -1325,9 +1344,7 @@ async fn two_consecutive_not_found_still_demotes_to_reorged() {
             .await;
         Mock::given(method("POST"))
             .and(path("/"))
-            .and(wiremock::matchers::body_partial_json(
-                json!({"method": "getHealth"}),
-            ))
+            .and(body_partial_json(json!({"method": "getHealth"})))
             .respond_with(EchoIdResponder::new(json!({
                 "status": "healthy",
                 "latestLedger": 7001,
@@ -1384,7 +1401,7 @@ async fn retention_drop_returns_ambiguous_not_reorged() {
     // getTransaction → NOT_FOUND.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getTransaction"
         })))
         .respond_with(EchoIdResponder::new(json!({
@@ -1401,7 +1418,7 @@ async fn retention_drop_returns_ambiguous_not_reorged() {
     // getHealth → oldest_ledger=3000 > FAKE_LEDGER=1234 (retention-drop, not re-org).
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getHealth"
         })))
         .respond_with(EchoIdResponder::new(json!({
@@ -1470,7 +1487,7 @@ async fn reconcile_receipt_degraded_health_returns_ambiguous() {
     // getTransaction → NOT_FOUND.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getTransaction"
         })))
         .respond_with(EchoIdResponder::new(json!({
@@ -1487,7 +1504,7 @@ async fn reconcile_receipt_degraded_health_returns_ambiguous() {
     // getHealth → IMPLAUSIBLE: oldest_ledger (9999) > latest_ledger (100).
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getHealth"
         })))
         .respond_with(EchoIdResponder::new(json!({
@@ -1545,8 +1562,9 @@ async fn failed_arm_records_real_typed_code_not_op_failed() {
         TransactionResultExt, TransactionResultResult, VecM, WriteXdr,
     };
 
-    let signed_xdr = build_signed_envelope().await;
-    let envelope_hash = envelope_hash_for(&signed_xdr);
+    let envelope = build_signed_envelope();
+    let signed_xdr = envelope.envelope_xdr();
+    let envelope_hash = envelope_hash_for(signed_xdr);
 
     let dir = tempfile::tempdir().unwrap();
     let store = ReceiptStore::open_at(dir.path(), "block-b-failed-typed-code-test").unwrap();
@@ -1565,15 +1583,16 @@ async fn failed_arm_records_real_typed_code_not_op_failed() {
     let result_xdr_b64 = tx_result.to_xdr_base64(Limits::none()).unwrap();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
     // sendTransaction → PENDING.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "sendTransaction"
         })))
         .respond_with(EchoIdResponder::new(json!({
-            "hash": FAKE_TX_HASH,
+            "hash": envelope.tx_hash_hex(),
             "status": "PENDING",
             "latestLedger": 1001,
             "latestLedgerCloseTime": "1699999999"
@@ -1585,12 +1604,12 @@ async fn failed_arm_records_real_typed_code_not_op_failed() {
     // getTransaction → FAILED with real txInsufficientBalance XDR.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getTransaction"
         })))
         .respond_with(EchoIdResponder::new(json!({
             "status": "FAILED",
-            "txHash": FAKE_TX_HASH,
+            "txHash": envelope.tx_hash_hex(),
             "ledger": null,
             "createdAt": "1700000000",
             "envelopeXdr": null,
@@ -1605,7 +1624,7 @@ async fn failed_arm_records_real_typed_code_not_op_failed() {
     // in case of unexpected calls so the server doesn't return empty responses.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getHealth"
         })))
         .respond_with(EchoIdResponder::new(json!({
@@ -1622,7 +1641,7 @@ async fn failed_arm_records_real_typed_code_not_op_failed() {
 
     let result = submit_transaction_idempotent(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         &store,

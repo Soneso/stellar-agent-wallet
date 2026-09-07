@@ -86,6 +86,15 @@ evaluation and regardless of engine. This crosses the wire as the standard
 business-error envelope on every one of these tools, including the SEP-43
 family.
 
+Below both layers, the submit layer binds each submission to the network the RPC
+endpoint reports it serves rather than to the declared `chain_id`, and verifies
+every signature on the envelope against that network. `stellar_pay_commit`,
+`stellar_claim_commit`, `stellar_trustline_commit`, and
+`stellar_create_account_commit` run that probe before the single-use nonce is
+burned, so a refusal there leaves the nonce usable. See
+[Troubleshooting](troubleshooting.md#network-binding-codes-submit-layer) for the
+wire codes.
+
 How `RequireApproval` is satisfied depends on tool shape:
 
 - Two-phase signing verbs (`stellar_pay`, `stellar_create_account`,

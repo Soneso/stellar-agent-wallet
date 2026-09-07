@@ -12,6 +12,9 @@
 //! - [`xdr_fixtures`], [`testnet_strkeys`], [`verifier_registry`],
 //!   [`echo_id_responder`] — Stellar XDR / strkey fixtures and HTTP/contract
 //!   test doubles for consumer crates' tests.
+//! - [`signed_envelope`] — envelopes whose signatures are real and whose
+//!   source accounts are answerable by a mocked `getLedgerEntries`, for tests
+//!   that exercise a submit path.
 //! - [`testnet_helpers`] — live-network helpers (Friendbot funding, RPC) for
 //!   consumer crates' testnet-acceptance tests; behind the `testnet-helpers`
 //!   feature and exercised only by those live tests.
@@ -43,6 +46,8 @@ pub mod keyring_mock;
 pub mod log_capture;
 pub mod profile_fixtures;
 pub mod secret_patterns;
+#[cfg(feature = "test-helpers")]
+pub mod signed_envelope;
 #[cfg(feature = "testnet-helpers")]
 pub mod testnet_helpers;
 pub mod testnet_strkeys;
@@ -58,3 +63,5 @@ pub use echo_id_responder::EchoIdResponder;
 pub use env_guard::{ProfileEnvVarGuard, StellarAgentHomeGuard};
 pub use log_capture::{CaptureWriter, RedactionStrictSubscriber, with_captured_logs};
 pub use secret_patterns::assert_no_secret_bytes;
+#[cfg(feature = "test-helpers")]
+pub use signed_envelope::{SignedTestEnvelope, SignedTestEnvelopeBuilder};

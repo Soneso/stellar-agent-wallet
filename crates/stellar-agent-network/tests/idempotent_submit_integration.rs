@@ -33,40 +33,52 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
-use stellar_agent_core::StellarAmount;
 use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore};
 use stellar_agent_network::StellarRpcClient;
-use stellar_agent_network::builder::{Asset, ClassicOpBuilder};
 use stellar_agent_network::idempotent_submit::submit_transaction_idempotent;
-use stellar_agent_network::signing::software::SoftwareSigningKey;
 use stellar_agent_test_support::EchoIdResponder;
-use wiremock::matchers::{method, path};
+use stellar_agent_test_support::signed_envelope::{SignedTestEnvelope, get_network_result};
+use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixtures
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SRC_ACCOUNT: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
-const DST_ACCOUNT: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
 const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
 const FAKE_TX_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const FAKE_LEDGER: u32 = 1234;
 
-/// Builds and signs a test envelope.  Key is derived from a fixed byte seed so
-/// there is no committed S-strkey seed — the 32-byte array `[1u8; 32]` is a
-/// public test fixture, not a production key.
-async fn build_signed_envelope() -> String {
-    let key = SoftwareSigningKey::new_from_bytes([1u8; 32]);
-    let mut builder = ClassicOpBuilder::new(SRC_ACCOUNT, 100, TESTNET_PASSPHRASE, 100);
-    builder
-        .payment(
-            DST_ACCOUNT,
-            StellarAmount::from_stroops(10_000_000),
-            &Asset::Native,
-        )
-        .unwrap();
-    builder.build_and_sign(&key).await.unwrap()
+/// Seed for the transaction source account.  A fixed byte seed so there is no
+/// committed S-strkey — `[1u8; 32]` is a public test fixture, not a production
+/// key.
+const SOURCE_SEED: [u8; 32] = [1u8; 32];
+
+/// Builds a signed test envelope whose source account is the signing key's own
+/// account, so the account the ledger reports is the one that signed.
+fn build_signed_envelope() -> SignedTestEnvelope {
+    SignedTestEnvelope::builder(SOURCE_SEED)
+        .sequence(100)
+        .amount_stroops(10_000_000)
+        .build()
+}
+
+/// Mounts the two reads every submit performs before it sends: the endpoint
+/// identity probe and the signer-set fetch for the envelope's source accounts.
+async fn mount_probe_and_signers(server: &MockServer, envelope: &SignedTestEnvelope) {
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getNetwork"})))
+        .respond_with(EchoIdResponder::new(get_network_result(TESTNET_PASSPHRASE)))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getLedgerEntries"})))
+        .respond_with(EchoIdResponder::new(envelope.ledger_entries_result()))
+        .mount(server)
+        .await;
 }
 
 /// Computes the envelope hash for a base64-encoded signed envelope XDR.
@@ -85,9 +97,9 @@ fn envelope_hash_for(signed_xdr: &str) -> String {
 }
 
 /// JSON-RPC `sendTransaction` response for a PENDING submission.
-fn send_transaction_pending_response() -> serde_json::Value {
+fn send_transaction_pending_response(envelope: &SignedTestEnvelope) -> serde_json::Value {
     json!({
-        "hash": FAKE_TX_HASH,
+        "hash": envelope.tx_hash_hex(),
         "status": "PENDING",
         "latestLedger": 1001,
         "latestLedgerCloseTime": "1699999999"
@@ -95,10 +107,10 @@ fn send_transaction_pending_response() -> serde_json::Value {
 }
 
 /// JSON-RPC `getTransaction` response for a SUCCESS confirmation.
-fn get_transaction_success_response() -> serde_json::Value {
+fn get_transaction_success_response(envelope: &SignedTestEnvelope) -> serde_json::Value {
     json!({
         "status": "SUCCESS",
-        "txHash": FAKE_TX_HASH,
+        "txHash": envelope.tx_hash_hex(),
         "ledger": FAKE_LEDGER,
         "createdAt": "1700000000",
         "envelopeXdr": null,
@@ -120,8 +132,9 @@ fn get_transaction_success_response() -> serde_json::Value {
 /// expected ledger from the cached receipt.
 #[tokio::test]
 async fn terminal_cached_receipt_no_send_transaction() {
-    let signed_xdr = build_signed_envelope().await;
-    let envelope_hash = envelope_hash_for(&signed_xdr);
+    let envelope = build_signed_envelope();
+    let signed_xdr = envelope.envelope_xdr();
+    let envelope_hash = envelope_hash_for(signed_xdr);
 
     // Open a temp receipt store and pre-seed a terminal Success receipt.
     let dir = tempfile::tempdir().unwrap();
@@ -139,7 +152,7 @@ async fn terminal_cached_receipt_no_send_transaction() {
 
     let result = submit_transaction_idempotent(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(5),
         TESTNET_PASSPHRASE,
         &store,
@@ -176,25 +189,33 @@ async fn terminal_cached_receipt_no_send_transaction() {
 /// polls until SUCCESS and finalises the receipt.
 #[tokio::test]
 async fn send_pending_then_get_success_finalises_receipt() {
-    let signed_xdr = build_signed_envelope().await;
+    let envelope = build_signed_envelope();
+    let signed_xdr = envelope.envelope_xdr();
     let dir = tempfile::tempdir().unwrap();
     let store = ReceiptStore::open_at(dir.path(), "test").unwrap();
-    let envelope_hash = envelope_hash_for(&signed_xdr);
+    let envelope_hash = envelope_hash_for(signed_xdr);
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server, &envelope).await;
 
-    // First POST (sendTransaction) → PENDING.
+    // sendTransaction → PENDING.
     Mock::given(method("POST"))
         .and(path("/"))
-        .respond_with(EchoIdResponder::new(send_transaction_pending_response()))
+        .and(body_partial_json(json!({"method": "sendTransaction"})))
+        .respond_with(EchoIdResponder::new(send_transaction_pending_response(
+            &envelope,
+        )))
         .up_to_n_times(1)
         .mount(&server)
         .await;
 
-    // Subsequent POSTs (getTransaction polls) → SUCCESS.
+    // getTransaction polls → SUCCESS.
     Mock::given(method("POST"))
         .and(path("/"))
-        .respond_with(EchoIdResponder::new(get_transaction_success_response()))
+        .and(body_partial_json(json!({"method": "getTransaction"})))
+        .respond_with(EchoIdResponder::new(get_transaction_success_response(
+            &envelope,
+        )))
         .up_to_n_times(10)
         .mount(&server)
         .await;
@@ -203,7 +224,7 @@ async fn send_pending_then_get_success_finalises_receipt() {
 
     let result = submit_transaction_idempotent(
         &client,
-        &signed_xdr,
+        signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         &store,
@@ -244,19 +265,23 @@ async fn send_pending_then_get_success_finalises_receipt() {
 /// until the winner finalises, then returns the same receipt.
 #[tokio::test]
 async fn concurrent_same_envelope_exactly_one_send_transaction() {
-    let signed_xdr = Arc::new(build_signed_envelope().await);
+    let envelope = build_signed_envelope();
+    let signed_xdr = Arc::new(envelope.envelope_xdr().to_owned());
     let dir = Arc::new(tempfile::tempdir().unwrap());
 
     let server = MockServer::start().await;
     let server_uri = server.uri();
+    mount_probe_and_signers(&server, &envelope).await;
 
     // sendTransaction → PENDING (first call; loser must not hit this).
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "sendTransaction"
         })))
-        .respond_with(EchoIdResponder::new(send_transaction_pending_response()))
+        .respond_with(EchoIdResponder::new(send_transaction_pending_response(
+            &envelope,
+        )))
         .up_to_n_times(10)
         .mount(&server)
         .await;
@@ -264,7 +289,7 @@ async fn concurrent_same_envelope_exactly_one_send_transaction() {
     // getTransaction → NOT_FOUND once, then SUCCESS.
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getTransaction"
         })))
         .respond_with(EchoIdResponder::new(json!({
@@ -280,10 +305,12 @@ async fn concurrent_same_envelope_exactly_one_send_transaction() {
 
     Mock::given(method("POST"))
         .and(path("/"))
-        .and(wiremock::matchers::body_partial_json(json!({
+        .and(body_partial_json(json!({
             "method": "getTransaction"
         })))
-        .respond_with(EchoIdResponder::new(get_transaction_success_response()))
+        .respond_with(EchoIdResponder::new(get_transaction_success_response(
+            &envelope,
+        )))
         .up_to_n_times(10)
         .mount(&server)
         .await;
@@ -373,5 +400,109 @@ async fn concurrent_same_envelope_exactly_one_send_transaction() {
         send_calls, 1,
         "exactly ONE sendTransaction call must be made for concurrent identical \
          envelopes; got {send_calls}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (d) Pre-send refusal withdraws the receipt
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A refusal that happens before `sendTransaction` leaves no receipt behind,
+/// and the next attempt on the same envelope proceeds straight to the send.
+///
+/// The idempotency gate writes a Pending receipt before the submit layer runs
+/// its pre-send checks. A refusal there means nothing reached the network, so
+/// the receipt has to go: a Pending entry for a transaction that does not
+/// exist turns every later attempt into a loser that polls the store for
+/// `LOSER_MAX_POLLS x 500 ms` and then fails.
+///
+/// Two assertions discriminate. The store holds no entry for the envelope
+/// after the refusal, and the second call reaches `sendTransaction` and
+/// confirms well inside the loser poll window.
+#[tokio::test]
+async fn pre_send_refusal_leaves_no_receipt_and_the_retry_sends() {
+    let envelope = build_signed_envelope();
+    let signed_xdr = envelope.envelope_xdr();
+    let envelope_hash = envelope_hash_for(signed_xdr);
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = ReceiptStore::open_at(dir.path(), "acceptance").unwrap();
+
+    let server = MockServer::start().await;
+
+    // The endpoint answers with a third network for the first probe, then with
+    // the declared one.
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getNetwork"})))
+        .respond_with(EchoIdResponder::new(get_network_result(
+            "Test SDF Future Network ; October 2022",
+        )))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount_probe_and_signers(&server, &envelope).await;
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "sendTransaction"})))
+        .respond_with(EchoIdResponder::new(send_transaction_pending_response(
+            &envelope,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getTransaction"})))
+        .respond_with(EchoIdResponder::new(get_transaction_success_response(
+            &envelope,
+        )))
+        .mount(&server)
+        .await;
+
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+
+    let refused = submit_transaction_idempotent(
+        &client,
+        signed_xdr,
+        Duration::from_secs(30),
+        TESTNET_PASSPHRASE,
+        &store,
+        100,
+    )
+    .await
+    .expect_err("an endpoint serving another network must be refused");
+    assert_eq!(
+        refused.code(),
+        "network.endpoint_network_mismatch",
+        "{refused:?}"
+    );
+    assert!(
+        store.get(&envelope_hash).unwrap().is_none(),
+        "a transaction that was never sent must leave no receipt"
+    );
+
+    let started = std::time::Instant::now();
+    let result = submit_transaction_idempotent(
+        &client,
+        signed_xdr,
+        Duration::from_secs(30),
+        TESTNET_PASSPHRASE,
+        &store,
+        100,
+    )
+    .await
+    .expect("the retry must reach the send once the endpoint answers");
+
+    assert_eq!(result.ledger, FAKE_LEDGER);
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the retry must submit rather than wait out the loser poll; took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        store.get(&envelope_hash).unwrap().unwrap().status,
+        ReceiptStatus::Success,
+        "the retry's receipt must be finalised"
     );
 }

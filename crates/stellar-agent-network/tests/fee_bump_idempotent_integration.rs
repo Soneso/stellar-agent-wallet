@@ -44,6 +44,9 @@ use stellar_agent_network::builder::{Asset, ClassicOpBuilder};
 use stellar_agent_network::fee_bump_retry::submit_fee_bump_idempotent;
 use stellar_agent_network::signing::software::SoftwareSigningKey;
 use stellar_agent_test_support::EchoIdResponder;
+use stellar_agent_test_support::signed_envelope::{
+    account_id_for_seed, get_network_result, ledger_entries_result_for,
+};
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer};
 
@@ -67,15 +70,8 @@ async fn build_signed_inner(
     seq: i64,
     max_time_opt: Option<u64>,
 ) -> (String, String, SoftwareSigningKey) {
-    use stellar_strkey::ed25519::PublicKey as StrPublicKey;
-
-    let inner_sk = ed25519_dalek::SigningKey::from_bytes(&INNER_SOURCE_SEED);
-    let inner_pk: [u8; 32] = inner_sk.verifying_key().to_bytes();
-    let inner_gstrkey = StrPublicKey(inner_pk).to_string().as_str().to_owned();
-
-    let fee_payer_sk = ed25519_dalek::SigningKey::from_bytes(&FEE_PAYER_SEED);
-    let fee_payer_pk: [u8; 32] = fee_payer_sk.verifying_key().to_bytes();
-    let fee_payer_gstrkey = StrPublicKey(fee_payer_pk).to_string().as_str().to_owned();
+    let inner_gstrkey = account_id_for_seed(INNER_SOURCE_SEED);
+    let fee_payer_gstrkey = account_id_for_seed(FEE_PAYER_SEED);
 
     let inner_signer = SoftwareSigningKey::new_from_bytes(INNER_SOURCE_SEED);
     let fee_payer_signer = SoftwareSigningKey::new_from_bytes(FEE_PAYER_SEED);
@@ -160,6 +156,35 @@ fn get_health_ok_response() -> serde_json::Value {
     })
 }
 
+/// Mounts the two reads every submit performs before it sends: the endpoint
+/// identity probe and the signer-set fetch.
+///
+/// A fee-bump envelope names two source accounts: the fee source answers for
+/// the outer signature and the inner transaction's source for the inner one.
+/// Each signs with its own key, so reporting both with their master keys
+/// accounts for every signature on the envelope.
+async fn mount_probe_and_signers(server: &MockServer) {
+    let inner_source = account_id_for_seed(INNER_SOURCE_SEED);
+    let fee_payer = account_id_for_seed(FEE_PAYER_SEED);
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getNetwork"})))
+        .respond_with(EchoIdResponder::new(get_network_result(TESTNET_PASSPHRASE)))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getLedgerEntries"})))
+        .respond_with(EchoIdResponder::new(ledger_entries_result_for(&[
+            &inner_source,
+            &fee_payer,
+        ])))
+        .mount(server)
+        .await;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // (a) Inner-key idempotency: second call with SAME inner returns cached receipt
 //     with NO second sendTransaction.
@@ -181,6 +206,7 @@ async fn inner_key_idempotency_no_second_send_transaction() {
     let store = ReceiptStore::open_at(dir.path(), "fb-idempotency-test").unwrap();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server).await;
 
     // sendTransaction — MUST be called exactly once.
     Mock::given(method("POST"))
@@ -304,6 +330,7 @@ async fn higher_fee_inner_already_applied_returns_cached_no_rebump() {
     let store = ReceiptStore::open_at(dir.path(), "fb-higher-fee-applied-test").unwrap();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server).await;
 
     // sendTransaction — exactly once for the first call.
     Mock::given(method("POST"))
@@ -474,6 +501,7 @@ async fn higher_fee_same_inner_key_regardless_of_outer_fee() {
     let store = ReceiptStore::open_at(dir.path(), "fb-higher-fee-test").unwrap();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server).await;
 
     // sendTransaction — MUST be called exactly once (both calls share inner key).
     Mock::given(method("POST"))
@@ -584,6 +612,7 @@ async fn inner_max_time_stored_in_receipt() {
     let store = ReceiptStore::open_at(dir.path(), "fb-max-time-test").unwrap();
 
     let server = MockServer::start().await;
+    mount_probe_and_signers(&server).await;
 
     Mock::given(method("POST"))
         .and(path("/"))
@@ -700,5 +729,116 @@ async fn txfeebumpinnersuccess_routes_to_success_receipt_via_fast_path() {
         server.received_requests().await.unwrap().len(),
         0,
         "no RPC calls must be made when a Success receipt is cached"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (e) Pre-send refusal withdraws the receipt on the fee-bump path
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A transient probe failure leaves no receipt for the inner key, and a retry
+/// submits once the endpoint answers.
+///
+/// The fee-bump path writes a Pending receipt for the inner key before the
+/// submit layer runs. A refusal before `sendTransaction` means nothing reached
+/// the network, so the receipt has to go: a receipt pinned as submitted would
+/// be one `abandon_pre_submit` refuses to withdraw, and every later attempt on
+/// the same inner key would wait out the loser poll and then fail, for a
+/// fee-bump that was never sent.
+///
+/// The discriminating assertions are the absent receipt after the refusal and
+/// the retry reaching `sendTransaction` well inside the loser poll window.
+#[tokio::test]
+async fn probe_failure_leaves_no_receipt_and_the_retry_sends() {
+    let (inner_xdr, fp_gstrkey, fp_signer) = build_signed_inner(140, None).await;
+    let inner_key = inner_key_for(&inner_xdr);
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = ReceiptStore::open_at(dir.path(), "fb-probe-refusal-test").unwrap();
+
+    let server = MockServer::start().await;
+
+    // The probe fails transiently for the whole first submission, then the
+    // endpoint answers normally.
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getNetwork"})))
+        .respond_with(wiremock::ResponseTemplate::new(500))
+        .up_to_n_times(5)
+        .mount(&server)
+        .await;
+    mount_probe_and_signers(&server).await;
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "sendTransaction"})))
+        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getTransaction"})))
+        .respond_with(EchoIdResponder::new(get_success_response()))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getHealth"})))
+        .respond_with(EchoIdResponder::new(get_health_ok_response()))
+        .mount(&server)
+        .await;
+
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+
+    let refused = submit_fee_bump_idempotent(
+        &client,
+        &inner_xdr,
+        &fp_gstrkey,
+        500,
+        10_000,
+        TESTNET_PASSPHRASE,
+        &fp_signer,
+        &store,
+        100,
+        Duration::from_secs(60),
+    )
+    .await
+    .expect_err("an endpoint of unknown identity must be refused");
+    assert_eq!(
+        refused.code(),
+        "network.endpoint_identity_unavailable",
+        "{refused:?}"
+    );
+    assert!(
+        store.get(&inner_key).unwrap().is_none(),
+        "a fee-bump that was never sent must leave no receipt"
+    );
+
+    let started = std::time::Instant::now();
+    let result = submit_fee_bump_idempotent(
+        &client,
+        &inner_xdr,
+        &fp_gstrkey,
+        500,
+        10_000,
+        TESTNET_PASSPHRASE,
+        &fp_signer,
+        &store,
+        100,
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("the retry must reach the send once the endpoint answers");
+
+    assert_eq!(result.ledger, FAKE_LEDGER);
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the retry must submit rather than wait out the loser poll; took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        store.get(&inner_key).unwrap().unwrap().status,
+        ReceiptStatus::Success,
+        "the retry's receipt must be finalised"
     );
 }

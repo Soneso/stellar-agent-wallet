@@ -47,9 +47,12 @@ The engine that runs is selected per profile in `[policy]`. Two structural rules
 apply on every surface: the default network is `stellar:testnet`, and every
 write or signing command structurally refuses `stellar:mainnet`
 (`network.mainnet_write_forbidden`) — `--network` commands before any RPC call
-or signature, profile-driven flows at the network submit layer before any
-transaction is sent — while `stellar:mainnet` stays accepted for read-only
-commands.
+or signature, and at the submit layer both a declared mainnet passphrase and a
+known mainnet RPC URL, each with no RPC call at all — while `stellar:mainnet`
+stays accepted for read-only commands. The submit layer additionally asks the
+endpoint which network it serves and binds the submission to that answer rather
+than to the declared network, verifying every signature on the envelope against
+it; see references/troubleshooting.md for those wire codes.
 
 ### Noop engine
 

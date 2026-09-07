@@ -1086,6 +1086,14 @@ impl WalletServer {
             }
         };
 
+        // Establish which network the endpoint serves before the nonce is
+        // consumed. A commit aimed at the wrong network is a configuration
+        // error the caller can correct and retry; burning the nonce first
+        // would cost them the approval as well.
+        if let Err(e) = crate::tools::common::probe_endpoint_network(&client, &self.profile).await {
+            return Ok(crate::tools::common::commit_refusal_result(&e));
+        }
+
         // Delegates to `commit_envelope_and_verify_nonce` in `tools/common.rs`.
         // That helper encapsulates the HMAC + spawn_blocking + replay-window
         // pattern shared by every *_commit tool.  All wire codes, error-code

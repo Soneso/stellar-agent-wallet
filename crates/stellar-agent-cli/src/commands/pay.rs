@@ -592,6 +592,16 @@ where
             Ok(p) => p,
             Err(code) => return code,
         };
+    // Establish which network `--rpc-url` actually serves before anything
+    // else runs. The staged gate evaluates under the chain id derived from
+    // `--network`, so that flag has to describe the endpoint the envelope will
+    // reach; the probe is what makes it so, and a mismatch refuses here rather
+    // than after a policy decision taken for the wrong chain.
+    if let Err(e) = probe_endpoint_network(args).await {
+        print_error(&Envelope::<()>::err(&e), args.output);
+        return 1;
+    }
+
     let chain_id = caip2_chain_id_for_network(args.network);
     // The envelope arrives pre-signed, but broadcasting it still spends
     // funds — gate here even though signing already happened elsewhere.
@@ -1289,6 +1299,19 @@ async fn sign_envelope(args: &PayArgs, unsigned_xdr: &str) -> Result<String, Wal
 // ─────────────────────────────────────────────────────────────────────────────
 // Submit helper
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Asks `--rpc-url` which network it serves and requires it to be the one
+/// `--network` names.
+///
+/// `--sign-only` does not call this: it sends nothing, so no endpoint answers
+/// for it.
+async fn probe_endpoint_network(args: &PayArgs) -> Result<(), WalletError> {
+    let client = StellarRpcClient::new(&args.rpc_url)?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout_seconds);
+    client
+        .verify_network_passphrase(args.network.passphrase(), deadline)
+        .await
+}
 
 async fn submit_envelope(
     args: &PayArgs,

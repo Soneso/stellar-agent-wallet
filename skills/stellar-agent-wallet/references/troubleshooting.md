@@ -62,6 +62,23 @@ RPC call or signing with `network.mainnet_write_forbidden`. Read-only commands
 accept mainnet. Action: run write and signing operations on `stellar:testnet` in
 this alpha.
 
+## Network-binding codes (submit layer)
+
+Before it sends, the submit layer asks the RPC endpoint which network it serves
+and binds the submission to that answer, not to the declared network or
+`chain_id`. It then verifies every signature on the envelope against the network
+the endpoint reported. On the two-phase commit tools this runs before the
+single-use nonce is burned, so a refusal here leaves the nonce usable.
+
+| Code | Meaning | Agent action |
+|---|---|---|
+| `network.endpoint_network_mismatch` | The endpoint serves a different network than the one declared (an RPC URL and a `chain_id` / network passphrase that disagree). | Do not retry as-is. Report to the operator: the profile's `rpc_url` and its network do not name the same chain. |
+| `network.endpoint_identity_unavailable` | The endpoint's network identity could not be established within the submission timeout. The probe is retried with bounded backoff and never falls back to the declared network. | Nothing was sent. Treat the endpoint as unusable and surface it to the operator; do not switch to a different endpoint on your own. |
+| `network.envelope_signed_for_mainnet` | A signature on the envelope was made for mainnet, not for the network the endpoint serves. | Do not retry; the envelope cannot be relayed onto this chain. Re-run the simulate step for the intended network. |
+| `network.envelope_signature_unverifiable` | A signature verifies under neither the endpoint's network nor mainnet, or no eligible ed25519 signer accounts for it (hash-x and pre-auth-tx signers contribute no ed25519 key). | Do not retry the same envelope. Re-run the simulate step and sign with a key the source account lists as a signer. |
+| `network.envelope_unsigned` | The envelope carries no signature, or on a fee-bump the outer or the inner transaction carries none; typically a build-only envelope handed straight to a submit step. | Sign the envelope first, then submit. On a fee-bump, both the inner transaction and the fee source must sign. |
+| `network.account_not_found` | A transaction-source or operation-source account on the envelope is absent from the ledger, so its signer set cannot be read. | Nothing was sent. Confirm the account exists and is funded on the target network. |
+
 ## Nonce codes (two-phase signing verbs)
 
 A simulate step (`stellar_pay`, `stellar_create_account`, `stellar_trustline`,
@@ -228,6 +245,11 @@ query authorization status and reconcile any known server transaction.
 - Hard policy refusal (`policy.deny.*`, `policy.engine_required`,
   `network.mainnet_write_forbidden`): do not retry; only the operator can change
   policy or network posture.
+- Network binding refusal (`network.endpoint_network_mismatch`,
+  `network.endpoint_identity_unavailable`, `network.envelope_signed_for_mainnet`,
+  `network.envelope_signature_unverifiable`, `network.envelope_unsigned`,
+  `network.account_not_found`): nothing was sent. Do not resubmit the same
+  envelope against the same endpoint; report the mismatch to the operator.
 - Environment or key problems (`keyring.*`, `mcp.disabled_per_profile`,
   `audit.chain_key_unavailable`, other non-zero startup exits): operator-side;
   not agent-recoverable at runtime.

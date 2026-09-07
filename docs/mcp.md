@@ -123,9 +123,11 @@ The loaded profile therefore determines:
 
 - which network the server operates on (`stellar:testnet` by default;
   `stellar:mainnet` is accepted for read-only tools while every write is
-  structurally refused — see
+  structurally refused). The profile's declared network is what the server
+  asks for, not what it trusts: the network layer establishes the endpoint's
+  own identity before it sends and binds the submission to that. See
   [How gating applies to every tool call](#how-gating-applies-to-every-tool-call)
-  for the two refusal layers);
+  for the refusal layers and their wire codes;
 - which keyring entries the signing tools resolve their seed from;
 - which policy engine evaluates each tool call.
 
@@ -201,7 +203,29 @@ producing a verdict, so every write is refused before any RPC call or signing.
 Below the policy layer, the network layer structurally refuses every mainnet
 write with `network.mainnet_write_forbidden` regardless of the configured
 engine or enrolled keys — no profile configuration unlocks mainnet writes in
-this alpha.
+this alpha. A profile whose network passphrase is the mainnet passphrase, and
+one whose `rpc_url` names a known mainnet host, are each refused there with no
+RPC call at all.
+
+The network layer does not take the profile's declared network on trust either.
+Before sending, it asks the endpoint which network it serves (`getNetwork`), on
+the same client instance that will send, and that answer is authoritative: an
+endpoint reporting mainnet is refused with `network.mainnet_write_forbidden`,
+an endpoint reporting a different network than the profile declares with
+`network.endpoint_network_mismatch`, and an endpoint whose identity cannot be
+established within the submission timeout with
+`network.endpoint_identity_unavailable`. The probe is retried with bounded
+exponential backoff inside the caller's timeout and never falls back to the
+declaration. It then verifies every decorated signature on the envelope against
+the network id the endpoint reported, after fetching the relevant accounts'
+ed25519 signer sets (an account absent from the ledger is
+`network.account_not_found`): a signature that verifies only under the mainnet
+network id is `network.envelope_signed_for_mainnet`, one that verifies under
+neither is `network.envelope_signature_unverifiable`, and an envelope carrying
+no signature, or on a fee-bump either the outer or the inner transaction, is `network.envelope_unsigned`. The four commit tools
+`stellar_pay_commit`, `stellar_claim_commit`, `stellar_trustline_commit`, and
+`stellar_create_account_commit` run this probe before the single-use nonce is
+burned, so a mismatch does not consume the nonce.
 
 The two [policy engines](./concepts.md) are Noop (testnet allow-all; mainnet
 read-only allow, mainnet destructive refused) and V1 (signature-verified typed

@@ -2,7 +2,7 @@
 
 This document describes the cryptographic primitives behind the Stellar Agent Wallet guardrail spine: the approval attestation, the hash-chained audit log, the wallet unlock window, the nonce scheme, the V1 policy evaluator, and the smart-account auth digest. It is written for a maintainer or security reviewer who needs the byte-level detail, not the operator-facing model. For the model itself see [Concepts](../concepts.md); for how the crates fit together see [Architecture](architecture.md).
 
-Both surfaces — the `stellar-agent` CLI and the `stellar-agent-mcp` server — share the attestation, audit hash-chain, nonce, policy-evaluator, and auth-digest primitives below. The wallet unlock window (mlock plus TTL) is the exception: it protects the CLI's `--secret-env` signing path, where the seed is loaded into pinned memory. The MCP server does not call `Wallet::unlock`; its signing goes through keyring signer handles, so the [Wallet unlock lifecycle](#wallet-unlock-lifecycle) section below applies to the CLI surface only. testnet (`stellar:testnet`) is the default; every write or signing command structurally refuses mainnet (`stellar:mainnet`) with wire code `network.mainnet_write_forbidden` — `--network` commands before any RPC call or signing, profile-driven flows at the network submit layer before any transaction is sent.
+Both surfaces — the `stellar-agent` CLI and the `stellar-agent-mcp` server — share the attestation, audit hash-chain, nonce, policy-evaluator, and auth-digest primitives below. The wallet unlock window (mlock plus TTL) is the exception: it protects the CLI's `--secret-env` signing path, where the seed is loaded into pinned memory. The MCP server does not call `Wallet::unlock`; its signing goes through keyring signer handles, so the [Wallet unlock lifecycle](#wallet-unlock-lifecycle) section below applies to the CLI surface only. testnet (`stellar:testnet`) is the default; every write or signing command structurally refuses mainnet (`stellar:mainnet`) with wire code `network.mainnet_write_forbidden` — `--network` commands before any RPC call or signing, and at the submit layer both a declared mainnet network passphrase and a known mainnet RPC URL, each at zero RPC cost. The submit layer additionally establishes the endpoint's own network identity and binds every signature on the envelope to it; see [Submit-layer network binding](#submit-layer-network-binding).
 
 ## Attestation primitive
 
@@ -217,6 +217,49 @@ The length prefixes on `tool_name` and `chain_id` prevent boundary collisions be
 ### Key residency and rotation
 
 The HMAC key is the profile's `mcp_nonce_key_alias` keyring entry, stored as URL-safe-no-pad base64 (platform keyrings accept UTF-8 passwords; raw bytes can fail on some backends). `NonceMint` holds no key bytes: every `mint` / `verify` lazy-loads the key into a `Zeroizing` guard for a single stack frame, copies the first 32 bytes into a `Zeroizing<[u8; 32]>`, and drops the intermediates immediately. `rotate_nonce_key` generates 32 fresh `OsRng` bytes, base64-encodes them, and atomically swaps the keyring entry; the CLI exposes this as `profile rotate-nonce-key`.
+
+## Submit-layer network binding
+
+A Stellar signature commits to a network: the SEP-23 `TransactionSignaturePayload` the signer hashes carries `network_id = SHA-256(network_passphrase)`, so the same transaction signed for two networks produces two different signatures. Nothing in the wire format records which network a signature was made for; it can only be recovered by re-deriving the payload under a candidate network id and checking the signature against it. The check lives in `crates/stellar-agent-network/src/signing/verify_binding.rs`; the endpoint probe it rests on is `StellarRpcClient::verify_network_passphrase`.
+
+### Order of operations at every submit entry point
+
+1. A caller-declared mainnet network passphrase is refused with `network.mainnet_write_forbidden`. Zero RPC calls.
+2. An RPC URL matching a known mainnet host is refused the same way. Zero RPC calls.
+3. The envelope is decoded locally. A malformed envelope, or a legacy `TxV0` envelope, is refused with no round trip: V0 is not part of the SEP-23 tagged-transaction set, so neither the signing path nor this one can construct a payload for it.
+4. The endpoint is asked which network it serves (`getNetwork`), on the same client instance that will send.
+5. The ed25519 signer sets of the accounts whose authority the transaction invokes are fetched in one `getLedgerEntries` call.
+6. Every decorated signature is verified under the network id the endpoint reported.
+7. `sendTransaction`, then poll `getTransaction`.
+
+Steps 4 and 5 are two reads ahead of the send, so every submission makes two round trips before the send.
+
+### Endpoint identity is authoritative
+
+The declaration states which network the caller intends; the probe states which network the endpoint is, and the second decides. Transport failures are retried with bounded exponential backoff under the caller's own submission deadline, using the same retryability classification as `sendTransaction`; a passphrase mismatch is a verdict rather than a transport fault and is not retried. The probe is fail-closed — it never falls back to the declaration.
+
+- endpoint reports the mainnet passphrase: `network.mainnet_write_forbidden`, the one mainnet refusal that costs a round trip
+- endpoint reports a different network than the caller declared: `network.endpoint_network_mismatch`
+- identity not established within the submission timeout: `network.endpoint_identity_unavailable`
+
+The probe runs on the client instance that will carry `sendTransaction`, not on a fresh one, so the identity that was established is the identity of the connection the transaction goes out on.
+
+### Which accounts answer for which signatures
+
+For a `Tx` envelope: the transaction's own source account and every distinct operation-level source account, because an operation-level source contributes its own authority and is signed for separately. For a `TxFeeBump` envelope: the fee source answers for the outer signatures and the inner transaction's sources for the inner ones. Muxed accounts resolve to the underlying G-account, which is where the signer set lives. The distinct set is fetched in a single `getLedgerEntries` call; an account absent from the ledger is `network.account_not_found`, refused before anything is sent.
+
+One class of operation source is absent from the ledger by construction: an account that an earlier operation of the same transaction creates. It exists when the operation applies but not when the envelope is submitted, and its signer set at that point is exactly its own master key, which is the account id. Such an account is therefore not requested from the ledger and its candidate key is derived locally. The CAP-33 sponsored-creation sandwich is built this way, with the new account signing the `EndSponsoringFutureReserves` operation that names it as source. Deriving the key locally is not an escape hatch: the signature still has to verify under the endpoint's network id, and a mainnet-bound signature by that same account is refused like any other.
+
+### Per-signature verdict
+
+Each `DecoratedSignature` carries a four-byte hint, the trailing four bytes of the signer's public key. The hint narrows the gathered signers to those whose key bytes `28..32` match it; the signature must then verify against one of those candidates under the payload rebuilt for the endpoint's network id.
+
+- verifies under the endpoint's network id: accepted
+- verifies under the mainnet network id: `network.envelope_signed_for_mainnet` — a mainnet authorisation, refused whatever endpoint it was relayed to
+- verifies under neither: `network.envelope_signature_unverifiable`
+- a signature set carries no decorated signatures at all: `network.envelope_unsigned`, refused before the round trip. The sets are checked separately, so a fee-bump with a signed outer and an unsigned inner is refused here rather than on chain
+
+Every signature must pass, and each signature set must have at least one. Hash-x and pre-auth-tx signers contribute no ed25519 key, so a signature only such a signer could account for has no candidate to match against and is refused rather than waved through. The posture is closed by construction: an envelope carrying a signature this layer cannot account for is not submitted.
 
 ## Policy V1 evaluator
 

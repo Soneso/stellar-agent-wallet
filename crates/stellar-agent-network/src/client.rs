@@ -8,9 +8,12 @@
 use stellar_agent_core::error::{NetworkError, WalletError};
 use stellar_rpc_client::{Client, GetHealthResponse, GetLedgerEntriesResponse};
 use stellar_xdr::LedgerKey;
+use tokio::time::Instant;
 
 use crate::fees::FeeStatsView;
 use crate::redact::redact_url_authority;
+use crate::retry::{RetryPolicy, is_retryable_send_error, retry_with_backoff};
+use crate::submit::MAINNET_PASSPHRASE;
 
 /// A typed wrapper around the `stellar-rpc-client` JSON-RPC transport.
 ///
@@ -152,6 +155,72 @@ impl StellarRpcClient {
                 url: self.redacted_url(),
                 reason: format!("getHealth failed: {e}"),
             })
+    }
+
+    /// Asks the endpoint which network it serves and requires the answer to be
+    /// `expected`.
+    ///
+    /// This is the endpoint-identity probe every write path runs before it
+    /// sends: the target network is a property of the endpoint, not of the
+    /// caller's declaration, so the two must be shown to agree before an
+    /// envelope is submitted.  The probe runs on the same client instance that
+    /// will send, so no second connection can answer for a different endpoint.
+    ///
+    /// Transport failures are retried with bounded exponential backoff under
+    /// `deadline`, the caller's own submission deadline, using the same
+    /// retryability classification as `sendTransaction`
+    /// ([`is_retryable_send_error`]).  A passphrase mismatch is not retried.
+    ///
+    /// The probe is fail-closed: an endpoint whose identity cannot be
+    /// established refuses the submission rather than falling back to the
+    /// caller's declaration.
+    ///
+    /// # Errors
+    ///
+    /// - [`NetworkError::MainnetWriteForbidden`] if the endpoint reports the
+    ///   mainnet passphrase, whatever `expected` is.
+    /// - [`NetworkError::EndpointNetworkMismatch`] if the endpoint reports any
+    ///   other passphrase that differs from `expected`.
+    /// - [`NetworkError::EndpointIdentityUnavailable`] if the probe does not
+    ///   complete within `deadline`, or fails for any reason other than a
+    ///   passphrase mismatch.
+    pub async fn verify_network_passphrase(
+        &self,
+        expected: &str,
+        deadline: Instant,
+    ) -> Result<(), WalletError> {
+        let policy = RetryPolicy::default();
+        let outcome = retry_with_backoff(&policy, deadline, is_retryable_send_error, || async {
+            self.inner.verify_network_passphrase(Some(expected)).await
+        })
+        .await;
+
+        match outcome {
+            // The endpoint agreed with `expected`. A mainnet endpoint is
+            // refused here as well: agreement with a mainnet declaration is
+            // still a mainnet write.
+            Ok(server) => {
+                if server == MAINNET_PASSPHRASE {
+                    Err(WalletError::Network(NetworkError::MainnetWriteForbidden))
+                } else {
+                    Ok(())
+                }
+            }
+            Err(stellar_rpc_client::Error::InvalidNetworkPassphrase { expected, server }) => {
+                if server == MAINNET_PASSPHRASE {
+                    Err(WalletError::Network(NetworkError::MainnetWriteForbidden))
+                } else {
+                    Err(WalletError::Network(
+                        NetworkError::EndpointNetworkMismatch { expected, server },
+                    ))
+                }
+            }
+            Err(_) => Err(WalletError::Network(
+                NetworkError::EndpointIdentityUnavailable {
+                    url: self.redacted_url(),
+                },
+            )),
+        }
     }
 
     /// Returns the RPC endpoint URL redacted to authority-only form
