@@ -5906,6 +5906,20 @@ mod tests {
         assert_eq!(stored_value(&store), tip_of(&path).to_keyring_value());
     }
 
+    /// The production half of this file, with line endings normalized.
+    ///
+    /// `include_str!` yields the bytes as checked out, and a Windows checkout
+    /// is CRLF, so every scan below matches against `\n`-only text and stops
+    /// at the test module marker rather than reading its own assertions.
+    fn production_source() -> String {
+        let source = include_str!("writer.rs").replace("\r\n", "\n");
+        source
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("the production half precedes the test module")
+            .to_owned()
+    }
+
     /// A keyed writer cannot be opened without an anchor store.
     ///
     /// The registry's keyed entry point takes [`KeyedAuditAccess`], which cannot
@@ -5916,11 +5930,7 @@ mod tests {
     /// rows an attacker wants to remove.
     #[test]
     fn the_registry_has_no_keyed_entry_point_that_takes_a_bare_key() {
-        const SOURCE: &str = include_str!("writer.rs");
-        let production = SOURCE
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("the production half precedes the test module");
+        let production = production_source();
         assert!(
             production.contains("pub fn get_or_open_keyed"),
             "the scan must see the production half of this file"
@@ -5950,11 +5960,7 @@ mod tests {
     /// defect this pins, and it is invisible to any test that never rotates.
     #[test]
     fn no_replay_site_hardcodes_the_zero_block_seed() {
-        const SOURCE: &str = include_str!("writer.rs");
-        let production = SOURCE
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("the production half precedes the test module");
+        let production = production_source();
         assert!(
             production.contains("fn initial_chain_seed"),
             "the scan must see the production half of this file"
