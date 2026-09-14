@@ -11,6 +11,17 @@
 //! `--profile`, the CLI verifies the hash chain only and `hmac_verified`
 //! remains `false`.
 //!
+//! # Tip-anchor verification
+//!
+//! The chain walk and the chain-root signatures verify a PREFIX of the log, so
+//! an older copy of the active file, or a truncated one, passes both.  The
+//! keyring-held tip anchor is what pins the END of the chain.  It is checked
+//! only when `--profile <name>` is supplied AND the positional log path is the
+//! one that profile configures: the anchor names a PATH, and comparing it
+//! against a file it does not describe would report a mismatch that means
+//! nothing.  Every other case reports `anchor.status = "not_checked"` with the
+//! reason, and the hash chain is still fully verified.
+//!
 //! # Output
 //!
 //! With `--output json` (the default): a JSON envelope wrapping
@@ -31,13 +42,16 @@ use serde::{Deserialize, Serialize};
 use stellar_agent_core::{
     audit_log::{
         health::AuditWriterHealth,
+        tip_anchor::{TipAnchor, TipAnchorStore as _, normalize_path_lexically},
         verify::{FileVerifyResult, VerifyError, VerifyWarning, verify_log_with_health},
     },
     envelope::{Envelope, OutputFormat},
     error::{InternalError, WalletError},
     profile::schema::Profile,
 };
-use stellar_agent_network::keyring::{init_platform_keyring_store, map_keyring_error};
+use stellar_agent_network::keyring::{
+    KeyringTipAnchorStore, init_platform_keyring_store, map_keyring_error,
+};
 use zeroize::Zeroizing;
 
 use crate::common::profile_access::load_profile_reconciled_by_requested_name;
@@ -80,6 +94,11 @@ pub struct VerifyArgs {
 /// an HMAC key only when `--profile <name>` is supplied.  Without `--profile`,
 /// the field is `false` and the hash chain is still fully verified.
 ///
+/// # Tip anchor
+///
+/// `anchor` reports whether the keyring-held tip anchor was compared against
+/// the log, and when it was not, why.  See the module rustdoc.
+///
 /// # Audit writer health
 ///
 /// `audit_writer_degraded` reflects the session-level health of the audit
@@ -108,6 +127,37 @@ pub struct AuditVerifyResult {
     /// session.  Always `false` in the CLI context — health is a session
     /// property of the MCP server.  See module rustdoc for details.
     pub audit_writer_degraded: bool,
+    /// Whether the keyring-held tip anchor was checked, and if not, why.
+    pub anchor: AuditAnchorStatus,
+}
+
+/// Whether `audit verify` compared the log against its keyring-held tip anchor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AuditAnchorStatus {
+    /// `"verified"` when the anchor was loaded and matched the log's tip;
+    /// `"not_checked"` otherwise.
+    pub status: String,
+    /// Why the anchor was not checked.  `None` when it was.
+    pub reason: Option<String>,
+}
+
+impl AuditAnchorStatus {
+    /// The anchor was loaded and the walk matched it.
+    fn verified() -> Self {
+        Self {
+            status: "verified".to_owned(),
+            reason: None,
+        }
+    }
+
+    /// The anchor was not compared, for the stated reason.
+    fn not_checked(reason: impl Into<String>) -> Self {
+        Self {
+            status: "not_checked".to_owned(),
+            reason: Some(reason.into()),
+        }
+    }
 }
 
 /// Runs the `audit verify` subcommand.
@@ -140,57 +190,171 @@ pub async fn run(args: &VerifyArgs) -> i32 {
         return 1;
     }
 
-    let hmac_key = match resolve_hmac_key(args.profile.as_deref()) {
-        Ok(key) => key,
-        Err(e) => {
-            let envelope = Envelope::<()>::err(&e);
-            emit_envelope(&envelope, args.output);
-            return 1;
+    match verify_to_result(args) {
+        Ok(result) => {
+            emit_envelope(&Envelope::ok(result), args.output);
+            0
         }
-    };
+        Err(VerifyFailure::Wallet(e)) => {
+            emit_envelope(&Envelope::<()>::err(&e), args.output);
+            1
+        }
+        Err(VerifyFailure::Raw { code, message }) => {
+            emit_envelope(&Envelope::<()>::err_raw(code, message), args.output);
+            1
+        }
+    }
+}
+
+/// How `audit verify` failed.
+///
+/// Most failures map onto a typed [`WalletError`]. A tip-anchor mismatch does
+/// not: the verifier computed the anchored and the observed entry count and byte
+/// offset and the reason they disagree, and flattening that into the value-verb
+/// variant would drop all of it and substitute a sentence about signing, which
+/// this verb does not do. That one carries the verifier's own message under the
+/// same wire code, the way `counterparty.writer_locked` is emitted.
+#[derive(Debug)]
+enum VerifyFailure {
+    /// A typed error; the envelope takes its code and message.
+    Wallet(WalletError),
+    /// A code and message this verb chooses.
+    Raw {
+        /// Wire code for the envelope.
+        code: &'static str,
+        /// Operator-facing message.
+        message: String,
+    },
+}
+
+impl From<WalletError> for VerifyFailure {
+    fn from(e: WalletError) -> Self {
+        Self::Wallet(e)
+    }
+}
+
+/// Resolves the profile inputs, walks the log, and builds the result payload.
+///
+/// Split out of [`run`] so the full path from arguments to payload — including
+/// whether the tip anchor was checked and why — is reachable without capturing
+/// stdout.
+fn verify_to_result(args: &VerifyArgs) -> Result<AuditVerifyResult, VerifyFailure> {
+    let ResolvedVerifyInputs {
+        hmac_key,
+        anchor,
+        anchor_skip_reason,
+    } = resolve_profile_inputs(args.profile.as_deref(), &args.log_path)?;
+
     // Create a fresh health instance — in the CLI context the health latch is
     // never marked degraded (health is a session property of the MCP server).
     // Using `verify_log_with_health` ensures the output schema is consistent
     // with any future MCP-tool caller that has access to a live handle.
     let health = AuditWriterHealth::new();
     let handle = health.handle();
-    match verify_log_with_health(&args.log_path, hmac_key.as_deref(), &handle) {
-        Ok(ok_with_health) => {
-            let ok = ok_with_health.verify_ok;
-            let result = AuditVerifyResult {
-                entries_verified: ok.entries_verified,
-                files_walked: ok.files_walked,
-                hmac_verified: ok.hmac_verified,
-                per_file: ok.per_file,
-                warnings: ok.warnings,
-                audit_writer_degraded: ok_with_health.audit_writer_degraded,
-            };
-            let envelope = Envelope::ok(result);
-            emit_envelope(&envelope, args.output);
-            0
-        }
-        Err(err) => {
-            let wallet_err = map_verify_error(&err);
-            let envelope = Envelope::<()>::err(&wallet_err);
-            emit_envelope(&envelope, args.output);
-            1
-        }
-    }
+    let ok_with_health = verify_log_with_health(
+        &args.log_path,
+        hmac_key.as_deref(),
+        anchor.as_ref(),
+        &handle,
+    )
+    .map_err(|err| verify_failure(&err))?;
+
+    let ok = ok_with_health.verify_ok;
+    Ok(AuditVerifyResult {
+        entries_verified: ok.entries_verified,
+        files_walked: ok.files_walked,
+        hmac_verified: ok.hmac_verified,
+        per_file: ok.per_file,
+        warnings: ok.warnings,
+        audit_writer_degraded: ok_with_health.audit_writer_degraded,
+        anchor: match anchor_skip_reason {
+            Some(reason) => AuditAnchorStatus::not_checked(reason),
+            None => AuditAnchorStatus::verified(),
+        },
+    })
+}
+
+/// What `--profile` contributed to this verification.
+struct ResolvedVerifyInputs {
+    /// The profile's audit chain-root HMAC key, when `--profile` was supplied.
+    hmac_key: Option<Zeroizing<[u8; 32]>>,
+    /// The keyring-held tip anchor, when it applies to the supplied path and
+    /// has been written.
+    anchor: Option<TipAnchor>,
+    /// Why the anchor was not checked.  `None` means it was.
+    anchor_skip_reason: Option<String>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Resolves the optional audit-log HMAC key requested by `--profile`.
-fn resolve_hmac_key(
+/// Resolves the audit HMAC key and the tip anchor from `--profile`.
+///
+/// The anchor names a PATH, so it is loaded only when `log_path` is the very
+/// file the profile configures; a path that differs is verified as a plain chain
+/// walk and the reason is reported. An absent anchor is likewise a reason, not a
+/// failure: a log whose first keyed use has not happened yet has none.
+fn resolve_profile_inputs(
     profile_name: Option<&str>,
-) -> Result<Option<Zeroizing<[u8; 32]>>, WalletError> {
+    log_path: &std::path::Path,
+) -> Result<ResolvedVerifyInputs, WalletError> {
     let Some(profile_name) = profile_name else {
-        return Ok(None);
+        return Ok(ResolvedVerifyInputs {
+            hmac_key: None,
+            anchor: None,
+            anchor_skip_reason: Some(
+                "no --profile supplied; the tip anchor is held per profile".to_owned(),
+            ),
+        });
     };
 
     let profile = load_profile_for_verify(profile_name)?;
     init_platform_keyring_store()?;
-    load_audit_hmac_key(&profile).map(Some)
+    resolve_profile_inputs_with_profile(&profile, profile_name, log_path)
+}
+
+/// The half of [`resolve_profile_inputs`] that works from an already-loaded
+/// profile.
+///
+/// Split out so the path-scope rule and the absent-anchor case are reachable
+/// without a persisted profile file.
+fn resolve_profile_inputs_with_profile(
+    profile: &Profile,
+    profile_name: &str,
+    log_path: &std::path::Path,
+) -> Result<ResolvedVerifyInputs, WalletError> {
+    let hmac_key = Some(load_audit_hmac_key(profile)?);
+
+    if normalize_path_lexically(log_path) != normalize_path_lexically(&profile.audit_log_path) {
+        return Ok(ResolvedVerifyInputs {
+            hmac_key,
+            anchor: None,
+            anchor_skip_reason: Some(format!(
+                "the supplied log path is not the audit log profile '{profile_name}' \
+                 configures; the tip anchor names a path, not a profile"
+            )),
+        });
+    }
+
+    let store = KeyringTipAnchorStore::new(&profile.audit_log_hash_chain_key_id, log_path);
+    match store.load_anchor() {
+        Ok(Some(anchor)) => Ok(ResolvedVerifyInputs {
+            hmac_key,
+            anchor: Some(anchor),
+            anchor_skip_reason: None,
+        }),
+        Ok(None) => Ok(ResolvedVerifyInputs {
+            hmac_key,
+            anchor: None,
+            anchor_skip_reason: Some(
+                "no tip anchor has been written for this log path yet; it is adopted on the \
+                 next value-moving verb"
+                    .to_owned(),
+            ),
+        }),
+        Err(e) => Err(WalletError::Internal(InternalError::UnexpectedState {
+            detail: format!("audit.tip_anchor_unavailable: {e}"),
+        })),
+    }
 }
 
 /// Loads the named profile, reconciled, and maps the failure into the CLI
@@ -344,9 +508,27 @@ fn check_parent_owner(path: &std::path::Path) -> Result<(), String> {
 /// integrity violation, and surfaces the `audit.log_not_found` wire code with
 /// an actionable message.
 ///
+/// `TipAnchorMismatch` never reaches this function; [`verify_failure`] emits it
+/// with the verifier's own message.
+///
 /// The `detail` is the `VerifyError` Display string alone: every variant's
 /// Display already begins with its own wire code (e.g. `"audit.io_error: ..."`),
 /// so prefixing `wire_code()` again would double it.
+fn verify_failure(err: &VerifyError) -> VerifyFailure {
+    if matches!(err, VerifyError::TipAnchorMismatch { .. }) {
+        // Carry the verifier's own message: it states the anchored and the
+        // observed entry count and byte offset and which half of the check
+        // failed, all of which a typed variant would drop, and it says nothing
+        // about signing, which this verb does not do. The wire code is the one
+        // every other surface uses for this condition.
+        return VerifyFailure::Raw {
+            code: err.wire_code(),
+            message: err.to_string(),
+        };
+    }
+    VerifyFailure::Wallet(map_verify_error(err))
+}
+
 fn map_verify_error(err: &VerifyError) -> stellar_agent_core::WalletError {
     use stellar_agent_core::error::{InternalError, ValidationError};
 
@@ -402,7 +584,12 @@ fn emit_envelope<T: Serialize>(envelope: &Envelope<T>, _format: OutputFormat) {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, reason = "test-only")]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test-only"
+    )]
     use super::*;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use keyring_core::Entry as KeyringEntry;
@@ -414,6 +601,7 @@ mod tests {
         writer::AuditWriter,
     };
     use stellar_agent_core::profile::schema::Profile;
+    use stellar_agent_test_support::keyring_mock;
     use tempfile::TempDir;
 
     fn make_writer_and_entries(path: PathBuf, count: usize, hmac_key: Option<&[u8; 32]>) {
@@ -845,7 +1033,7 @@ mod tests {
 
         // Non-degraded path: health flag false initially.
         let handle = health.handle();
-        let ok_with_health = verify_log_with_health(&path, None, &handle).unwrap();
+        let ok_with_health = verify_log_with_health(&path, None, None, &handle).unwrap();
         assert_eq!(ok_with_health.verify_ok.entries_verified, 2);
         assert!(
             !ok_with_health.audit_writer_degraded,
@@ -855,10 +1043,119 @@ mod tests {
         // Degraded path: mark the health owner, then a fresh handle should flip.
         health.mark_degraded();
         let handle2 = health.handle();
-        let ok_degraded = verify_log_with_health(&path, None, &handle2).unwrap();
+        let ok_degraded = verify_log_with_health(&path, None, None, &handle2).unwrap();
         assert!(
             ok_degraded.audit_writer_degraded,
             "must reflect degradation from owner"
+        );
+    }
+
+    // ── Tip-anchor reporting ─────────────────────────────────────────────────
+
+    #[test]
+    fn without_a_profile_the_anchor_is_reported_as_not_checked() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        make_writer_and_entries(path.clone(), 2, None);
+
+        let args = VerifyArgs {
+            log_path: path,
+            profile: None,
+            output: OutputFormat::DEFAULT,
+        };
+        let result = verify_to_result(&args).expect("the chain walk must still succeed");
+
+        assert_eq!(result.entries_verified, 2, "the chain is still verified");
+        assert_eq!(result.anchor.status, "not_checked");
+        let reason = result.anchor.reason.expect("a skipped check must say why");
+        assert!(
+            reason.contains("--profile"),
+            "the reason must name what is missing: {reason}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_path_other_than_the_profile_log_reports_the_anchor_as_not_checked() {
+        keyring_mock::install().expect("mock keyring store");
+
+        let dir = TempDir::new().unwrap();
+        let profile_log = dir.path().join("audit.jsonl");
+        let other_log = dir.path().join("elsewhere.jsonl");
+        make_writer_and_entries(other_log.clone(), 1, None);
+
+        let mut profile =
+            Profile::builder_testnet("anchor-scope", "acct", "n-svc", "n-acct").build();
+        profile.audit_log_path = profile_log;
+        let coord = profile.audit_log_hash_chain_key_id.clone();
+        stellar_agent_network::keyring::rotate_keyring_secret_32(&coord.service, &coord.account)
+            .expect("seed audit key");
+
+        let resolved = resolve_profile_inputs_with_profile(&profile, "anchor-scope", &other_log)
+            .expect("a mismatched path is reported, not refused");
+        assert!(resolved.anchor.is_none());
+        let reason = resolved
+            .anchor_skip_reason
+            .expect("a skipped check must say why");
+        assert!(
+            reason.contains("names a path"),
+            "the reason must explain that the anchor is path-scoped: {reason}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn an_unanchored_log_reports_the_anchor_as_not_checked() {
+        keyring_mock::install().expect("mock keyring store");
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        make_writer_and_entries(path.clone(), 1, None);
+
+        let mut profile =
+            Profile::builder_testnet("anchor-absent", "acct", "n-svc", "n-acct").build();
+        profile.audit_log_path = path.clone();
+        let coord = profile.audit_log_hash_chain_key_id.clone();
+        stellar_agent_network::keyring::rotate_keyring_secret_32(&coord.service, &coord.account)
+            .expect("seed audit key");
+
+        let resolved = resolve_profile_inputs_with_profile(&profile, "anchor-absent", &path)
+            .expect("an unanchored log verifies as a plain chain walk");
+        assert!(resolved.anchor.is_none());
+        assert!(
+            resolved
+                .anchor_skip_reason
+                .expect("a skipped check must say why")
+                .contains("no tip anchor")
+        );
+    }
+
+    #[test]
+    fn a_tip_anchor_mismatch_carries_the_verifiers_own_detail() {
+        let err = VerifyError::TipAnchorMismatch {
+            expected_count: 12,
+            expected_offset: 3400,
+            actual_count: 9,
+            actual_offset: 2600,
+            reason: "the active file's tip is not the anchored tip",
+        };
+        let VerifyFailure::Raw { code, message } = verify_failure(&err) else {
+            panic!("a tip-anchor mismatch must carry the verifier's own message");
+        };
+        assert_eq!(code, "audit.tip_anchor_mismatch");
+        for expected in ["12", "3400", "9", "2600", "is not the anchored tip"] {
+            assert!(
+                message.contains(expected),
+                "the message must keep the verifier's {expected}: {message}"
+            );
+        }
+        assert!(
+            !message.contains("signing refuses"),
+            "`audit verify` does not sign; the signing sentence must not appear: {message}"
+        );
+        assert!(
+            !message.contains("sha256:"),
+            "no digest in an operator-facing refusal: {message}"
         );
     }
 }

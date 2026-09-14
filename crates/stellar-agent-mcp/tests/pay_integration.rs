@@ -3227,6 +3227,152 @@ async fn pay_simulate_unaffected_by_missing_audit_key() {
     );
 }
 
+/// `stellar_pay_commit` refuses with `audit.tip_anchor_mismatch` when the audit
+/// log is rolled back underneath the writer the server already holds.
+///
+/// The MCP writer registry caches one writer per profile for the process
+/// lifetime, so a check performed only at writer open would cover the FIRST
+/// acquisition and nothing after it. This drives two commits through the real
+/// tool: the first succeeds and leaves the anchor naming the log, the log is
+/// then truncated on disk, and the second must refuse before the nonce is
+/// consumed. The CLI twin of this test lives in the `stellar-agent-cli` crate;
+/// removing the anchor check from either surface alone must fail only that
+/// surface's test.
+#[tokio::test]
+#[serial]
+async fn pay_commit_refuses_tip_anchor_mismatch_when_the_log_is_rolled_back() {
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(222);
+
+    let seed = [0x8a_u8; 32];
+    let source_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc-anchor-rollback", "acct-anchor-rollback")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+
+    let account_key_xdr = account_ledger_key_xdr(&source_g);
+    let account_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(PaySubmitSuccessRpcResponder {
+            account_key_xdr,
+            account_xdr,
+            network: common::EndpointNetwork::testnet(),
+        })
+        .mount(&mock_server)
+        .await;
+
+    let mut profile = Profile::builder_testnet(
+        "svc-anchor-rollback",
+        "acct-anchor-rollback",
+        "n-svc",
+        "n-acct",
+    )
+    .with_noop_engine()
+    .build();
+    profile.rpc_url = mock_server.uri();
+    common::install_test_audit_key(&mut profile);
+    let audit_log_path = profile.audit_log_path.clone();
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    let pay_args = StellarPayArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        source: source_g.clone(),
+        destination: DEST_G.to_owned(),
+        amount: None,
+        amount_in_stroops: Some("1000000000".to_owned()),
+        asset: "native".to_owned(),
+        memo_text: None,
+        memo_id: None,
+        memo_hash_hex: None,
+        memo_return_hex: None,
+        classic_base: None,
+    };
+
+    // Round one: a commit that succeeds, leaving the anchor naming the log.
+    let first = commit_once(&server, &pay_args).await;
+    assert_ne!(
+        first.is_error,
+        Some(true),
+        "the first commit must succeed so the anchor names a non-empty log: {}",
+        call_result_text(&first)
+    );
+    let anchored_len = std::fs::metadata(&audit_log_path)
+        .expect("audit log exists after the first commit")
+        .len();
+    assert!(anchored_len > 0, "the first commit must have written a row");
+
+    // Roll the log back underneath the writer the server is still holding.
+    std::fs::write(&audit_log_path, b"").expect("truncate the audit log");
+
+    let second = commit_once(&server, &pay_args).await;
+    let (code, _message, _text) = common::assert_business_envelope(&second);
+    assert_eq!(
+        code, "audit.tip_anchor_mismatch",
+        "a commit must refuse on EVERY acquisition when the log no longer contains \
+         the anchored tip, not only at writer open, got: {code}"
+    );
+}
+
+/// Simulates and commits one payment through the server, returning the commit
+/// tool's result.
+///
+/// Each commit needs its own nonce, so the simulate step runs per round.
+async fn commit_once(
+    server: &WalletServer,
+    pay_args: &StellarPayArgs,
+) -> rmcp::model::CallToolResult {
+    let sim_result = server
+        .call_stellar_pay(pay_args.clone())
+        .await
+        .expect("simulate must not error");
+    assert_ne!(
+        sim_result.is_error,
+        Some(true),
+        "simulate must succeed: {}",
+        call_result_text(&sim_result)
+    );
+    let sim_data = call_result_json(&sim_result);
+    let sim_data = sim_data.get("data").expect("simulate success carries data");
+    let nonce = sim_data
+        .get("nonce")
+        .and_then(serde_json::Value::as_str)
+        .expect("nonce present")
+        .to_owned();
+    let expires_at_unix_ms = sim_data
+        .get("expires_at_unix_ms")
+        .and_then(serde_json::Value::as_u64)
+        .expect("expires_at_unix_ms present");
+    let envelope_xdr = sim_data
+        .get("envelope_xdr")
+        .and_then(serde_json::Value::as_str)
+        .expect("envelope_xdr present")
+        .to_owned();
+
+    server
+        .call_stellar_pay_commit(StellarPayCommitArgs {
+            chain_id: pay_args.chain_id.clone(),
+            source: pay_args.source.clone(),
+            destination: pay_args.destination.clone(),
+            amount: pay_args.amount.clone(),
+            amount_in_stroops: pay_args.amount_in_stroops.clone(),
+            asset: pay_args.asset.clone(),
+            memo_text: None,
+            memo_id: None,
+            memo_hash_hex: None,
+            memo_return_hex: None,
+            nonce,
+            expires_at_unix_ms,
+            envelope_xdr,
+            approval_nonce: None,
+            approval_attestation: None,
+        })
+        .await
+        .expect("commit must not error at the protocol layer")
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Endpoint-identity probe at the commit boundary
 // ─────────────────────────────────────────────────────────────────────────────

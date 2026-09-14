@@ -91,6 +91,7 @@
 //! - [`stellar_agent_core::profile::schema::KeyringEntryRef`] — the
 //!   service-name + account-name reference stored in the profile TOML.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -99,9 +100,13 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use keyring_core::Entry as KeyringEntry;
 use rand_core::{OsRng, RngCore};
 use stellar_agent_core::{
+    audit_log::tip_anchor::{
+        KeyedAuditAccess, TipAnchor, TipAnchorStore, TipAnchorStoreError, reanchor_count_account,
+        tip_anchor_account,
+    },
     error::{AuthError, InternalError, WalletError},
     observability::redact_strkey_first5_last5,
-    profile::schema::KeyringEntryRef,
+    profile::schema::{KeyringEntryRef, Profile},
 };
 use zeroize::Zeroizing;
 
@@ -307,6 +312,184 @@ pub fn load_hmac_key_32(entry_ref: &KeyringEntryRef) -> Result<Zeroizing<[u8; 32
     let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(decoded.as_slice());
     Ok(key)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audit-log tip anchor
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Writes `value` to the keyring entry `entry_ref`, replacing any current
+/// value.
+///
+/// The caller-supplied counterpart to [`rotate_keyring_secret_32`], which only
+/// ever writes fresh random bytes. Used for the non-secret bookkeeping the
+/// wallet keeps in the keyring precisely because the keyring is outside the
+/// reach of filesystem access: the audit-log tip anchor and its re-anchor
+/// counter.
+///
+/// Do NOT route secret material through this helper. Secrets are minted by
+/// [`rotate_keyring_secret_32`] and read by [`load_hmac_key_32`], both of which
+/// carry the base64 and zeroisation discipline this one deliberately does not.
+///
+/// # Errors
+///
+/// Returns [`WalletError`] when the keyring entry cannot be opened or written,
+/// mapped through the same secret-safe keyring error discipline as signing-key
+/// lookups.
+pub fn write_keyring_string(entry_ref: &KeyringEntryRef, value: &str) -> Result<(), WalletError> {
+    let entry = open_entry(entry_ref)?;
+    entry
+        .set_password(value)
+        .map_err(|e| map_keyring_error(&e, &entry_ref.service))
+}
+
+/// Reads the keyring entry `entry_ref` as a plain string.
+///
+/// `Ok(None)` means the entry has never been written — the first-run signal the
+/// tip anchor's adoption path needs, distinct from a backend failure.
+///
+/// # Errors
+///
+/// Returns [`WalletError`] when the keyring entry cannot be opened or read for
+/// any reason other than its absence.
+pub fn read_keyring_string(entry_ref: &KeyringEntryRef) -> Result<Option<String>, WalletError> {
+    let entry = open_entry(entry_ref)?;
+    match entry.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring_core::Error::NoEntry) => Ok(None),
+        Err(e) => Err(map_keyring_error(&e, &entry_ref.service)),
+    }
+}
+
+/// Loads a profile's audit chain-root key and pairs it with the anchor store
+/// for that profile's log path.
+///
+/// The single way a keyed audit writer is opened. Both halves come from the same
+/// keyring coordinate — the key from the entry itself, the anchor from an
+/// account derived from it and the log path — so producing them together removes
+/// the shape where a caller loads the key and forgets the anchor. A keyed writer
+/// whose appends do not advance the anchor writes rows the rollback guard never
+/// covers, which is precisely the class of rows an attacker wants to remove.
+///
+/// # Errors
+///
+/// - [`WalletError::Auth`] if the keyring entry is unavailable.
+/// - [`WalletError::Internal`] if the stored key is not valid base64 or not
+///   exactly 32 bytes.
+pub fn keyed_audit_access(profile: &Profile) -> Result<KeyedAuditAccess, WalletError> {
+    let hmac_key = load_hmac_key_32(&profile.audit_log_hash_chain_key_id)?;
+    let tip_anchor = KeyringTipAnchorStore::shared(
+        &profile.audit_log_hash_chain_key_id,
+        &profile.audit_log_path,
+    );
+    Ok(KeyedAuditAccess::new(hmac_key, tip_anchor))
+}
+
+/// The platform-keyring implementation of the audit log's tip anchor.
+///
+/// Holds the two keyring coordinates the anchor for one log PATH occupies: the
+/// anchor value itself, and the monotonic counter of operator-acknowledged
+/// re-anchors beside it. Both are derived from the profile's audit-key
+/// coordinate plus the lexically normalized log path, so repointing a profile's
+/// `audit_log_path` starts a fresh anchor rather than carrying the old file's
+/// tip onto a new file.
+///
+/// Neither value is secret: the anchor is a count, a public chain hash, and a
+/// byte offset. They live in the keyring because that is the one store on the
+/// host an attacker with filesystem access alone cannot rewind.
+#[derive(Debug, Clone)]
+pub struct KeyringTipAnchorStore {
+    anchor_ref: KeyringEntryRef,
+    counter_ref: KeyringEntryRef,
+}
+
+impl KeyringTipAnchorStore {
+    /// Derives the anchor coordinates for `log_path` from the profile's
+    /// audit-key entry reference.
+    ///
+    /// The service is the audit key's own service, so an operator-overridden
+    /// audit coordinate keeps its anchor associated with it; the account is the
+    /// audit key's account suffixed with the path digest.
+    #[must_use]
+    pub fn new(audit_key_ref: &KeyringEntryRef, log_path: &Path) -> Self {
+        Self {
+            anchor_ref: KeyringEntryRef::new(
+                audit_key_ref.service.clone(),
+                tip_anchor_account(&audit_key_ref.account, log_path),
+            ),
+            counter_ref: KeyringEntryRef::new(
+                audit_key_ref.service.clone(),
+                reanchor_count_account(&audit_key_ref.account, log_path),
+            ),
+        }
+    }
+
+    /// Returns the anchor store for `log_path` as a shared trait object, ready
+    /// to hand to [`stellar_agent_core::audit_log::AuditWriter`].
+    #[must_use]
+    pub fn shared(audit_key_ref: &KeyringEntryRef, log_path: &Path) -> Arc<dyn TipAnchorStore> {
+        Arc::new(Self::new(audit_key_ref, log_path))
+    }
+
+    /// The keyring coordinate holding the anchor value.
+    #[must_use]
+    pub fn anchor_entry_ref(&self) -> &KeyringEntryRef {
+        &self.anchor_ref
+    }
+}
+
+/// Maps a keyring failure into the anchor store's error type.
+///
+/// The wallet error's `Display` already carries only non-secret coordinates and
+/// fixed labels, and the anchor itself is not secret, so the text is forwarded
+/// as the detail.
+fn anchor_store_error(op: &str, e: &WalletError) -> TipAnchorStoreError {
+    TipAnchorStoreError::new(format!("{op}: {e}"))
+}
+
+impl TipAnchorStore for KeyringTipAnchorStore {
+    fn load_anchor(&self) -> Result<Option<TipAnchor>, TipAnchorStoreError> {
+        let raw = read_keyring_string(&self.anchor_ref)
+            .map_err(|e| anchor_store_error("anchor read failed", &e))?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        TipAnchor::parse(raw.trim())
+            .map(Some)
+            .map_err(|e| TipAnchorStoreError::new(format!("anchor value is unusable: {e}")))
+    }
+
+    fn load_raw(&self) -> Result<Option<String>, TipAnchorStoreError> {
+        read_keyring_string(&self.anchor_ref)
+            .map_err(|e| anchor_store_error("anchor read failed", &e))
+    }
+
+    fn store_anchor(&self, anchor: &TipAnchor) -> Result<(), TipAnchorStoreError> {
+        write_keyring_string(&self.anchor_ref, &anchor.to_keyring_value())
+            .map_err(|e| anchor_store_error("anchor write failed", &e))
+    }
+
+    fn bump_reanchor_count(&self) -> Result<u64, TipAnchorStoreError> {
+        let current = self.reanchor_count()?.unwrap_or(0);
+        let next = current.checked_add(1).ok_or_else(|| {
+            TipAnchorStoreError::new("audit re-anchor counter overflow".to_owned())
+        })?;
+        write_keyring_string(&self.counter_ref, &next.to_string())
+            .map_err(|e| anchor_store_error("re-anchor counter write failed", &e))?;
+        Ok(next)
+    }
+
+    fn reanchor_count(&self) -> Result<Option<u64>, TipAnchorStoreError> {
+        let raw = read_keyring_string(&self.counter_ref)
+            .map_err(|e| anchor_store_error("re-anchor counter read failed", &e))?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        raw.trim()
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|e| TipAnchorStoreError::new(format!("re-anchor counter is unusable: {e}")))
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1207,5 +1390,102 @@ mod tests {
             .expect_err("first signature call must open the missing keyring");
         assert_eq!(error.code(), "auth.keyring_not_found");
         assert!(lazy_signer_from_keyring(&entry_ref, "not-a-g-strkey").is_err());
+    }
+
+    // ── Audit-log tip anchor ─────────────────────────────────────────────────
+
+    fn audit_ref() -> KeyringEntryRef {
+        KeyringEntryRef::new("stellar-agent-audit-anchor-test", "default")
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn tip_anchor_round_trips_through_the_keyring() {
+        keyring_mock::install().expect("mock keyring store");
+        let store = KeyringTipAnchorStore::new(&audit_ref(), Path::new("/data/audit/one.jsonl"));
+
+        assert_eq!(
+            store.load_anchor().unwrap(),
+            None,
+            "an unwritten anchor reads as absent, which is the adoption signal"
+        );
+
+        let anchor = TipAnchor::new(4, format!("sha256:{}", "ab".repeat(32)), 900);
+        store.store_anchor(&anchor).unwrap();
+        assert_eq!(store.load_anchor().unwrap(), Some(anchor.clone()));
+
+        // The raw keyring value is the documented wire form, not a debug dump.
+        let raw = read_keyring_string(store.anchor_entry_ref())
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw, anchor.to_keyring_value());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn tip_anchor_follows_the_log_path_not_the_profile() {
+        keyring_mock::install().expect("mock keyring store");
+        let audit_ref = audit_ref();
+        let first = KeyringTipAnchorStore::new(&audit_ref, Path::new("/data/audit/one.jsonl"));
+        let second = KeyringTipAnchorStore::new(&audit_ref, Path::new("/data/audit/two.jsonl"));
+
+        let anchor = TipAnchor::new(2, format!("sha256:{}", "cd".repeat(32)), 400);
+        first.store_anchor(&anchor).unwrap();
+
+        assert_eq!(first.load_anchor().unwrap(), Some(anchor));
+        assert_eq!(
+            second.load_anchor().unwrap(),
+            None,
+            "repointing the log path must start a fresh anchor, which then adopts"
+        );
+        assert_ne!(
+            first.anchor_entry_ref().account,
+            second.anchor_entry_ref().account
+        );
+        assert_eq!(
+            first.anchor_entry_ref().service,
+            audit_ref.service,
+            "the anchor stays on the profile's own audit service"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn tip_anchor_lexically_equal_paths_share_one_anchor() {
+        keyring_mock::install().expect("mock keyring store");
+        let audit_ref = audit_ref();
+        let plain = KeyringTipAnchorStore::new(&audit_ref, Path::new("/data/audit/one.jsonl"));
+        let dotted =
+            KeyringTipAnchorStore::new(&audit_ref, Path::new("/data/audit/x/../one.jsonl"));
+
+        let anchor = TipAnchor::new(1, format!("sha256:{}", "ef".repeat(32)), 120);
+        plain.store_anchor(&anchor).unwrap();
+        assert_eq!(dotted.load_anchor().unwrap(), Some(anchor));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reanchor_counter_is_monotonic_and_starts_absent() {
+        keyring_mock::install().expect("mock keyring store");
+        let store = KeyringTipAnchorStore::new(&audit_ref(), Path::new("/data/audit/one.jsonl"));
+
+        assert_eq!(store.reanchor_count().unwrap(), None);
+        assert_eq!(store.bump_reanchor_count().unwrap(), 1);
+        assert_eq!(store.bump_reanchor_count().unwrap(), 2);
+        assert_eq!(store.reanchor_count().unwrap(), Some(2));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_unparseable_anchor_is_an_error_not_an_adoption() {
+        keyring_mock::install().expect("mock keyring store");
+        let store = KeyringTipAnchorStore::new(&audit_ref(), Path::new("/data/audit/one.jsonl"));
+        write_keyring_string(store.anchor_entry_ref(), "not-an-anchor").unwrap();
+
+        assert!(
+            store.load_anchor().is_err(),
+            "a corrupted anchor must refuse, not read as never-written: \
+             adopting over it would erase the rollback guard"
+        );
     }
 }

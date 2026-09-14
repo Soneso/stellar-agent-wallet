@@ -32,11 +32,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use zeroize::Zeroizing;
-
-use stellar_agent_core::audit_log::{AuditEntry, AuditWriter, AuditWriterRegistry};
+use stellar_agent_core::audit_log::{
+    AuditEntry, AuditWriter, AuditWriterRegistry, WriterError, audit_log_unusable_detail,
+};
 use stellar_agent_core::error::{ValidationError, WalletError};
 use stellar_agent_core::profile::schema::Profile;
+use stellar_agent_network::keyring::keyed_audit_access;
 
 /// Requires the per-profile audit writer to be acquirable under the profile's
 /// audit chain-root HMAC key — the fail-closed pre-flight for value-moving
@@ -69,11 +70,17 @@ use stellar_agent_core::profile::schema::Profile;
 ///   audit writer could not be opened at `profile.audit_log_path` (e.g. a
 ///   registry path/key mismatch against an earlier open in this process) —
 ///   rotating the audit key does not fix this.
+/// - [`ValidationError::AuditTipAnchorMismatch`] when the writer was acquired
+///   but the log's chain tip is not the one its keyring-held anchor names — the
+///   log was rolled back, truncated, or replaced. Checked on EVERY acquisition,
+///   not only the first: the writer registry caches one writer per profile for
+///   the process lifetime, so a check at open alone would miss a file swapped
+///   underneath a live writer.
 pub(crate) fn require_value_audit_writer(
     profile: &Profile,
     profile_name: &str,
 ) -> Result<Arc<Mutex<AuditWriter>>, WalletError> {
-    let hmac_key = load_audit_hmac_key(profile).map_err(|e| {
+    let access = keyed_audit_access(profile).map_err(|e| {
         tracing::warn!(
             profile = %profile_name,
             error = %e,
@@ -81,16 +88,72 @@ pub(crate) fn require_value_audit_writer(
         );
         audit_chain_key_unavailable(profile_name)
     })?;
-    AuditWriterRegistry::get_or_open(profile_name, &profile.audit_log_path, Some(hmac_key)).map_err(
-        |e| {
+    let writer =
+        AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access)
+            .map_err(|e| audit_writer_acquisition_error(profile_name, &e))?;
+
+    // Re-check the anchor on THIS acquisition. The registry caches a writer for
+    // the process lifetime, so the open-time check covers only the first
+    // acquisition; a log replaced underneath a live writer would otherwise go
+    // unnoticed until the process restarts.
+    {
+        let mut guard = writer.lock().map_err(|_| {
             tracing::warn!(
                 profile = %profile_name,
-                error = %e,
-                "value audit: could not open audit writer; refusing before signing/submit"
+                "value audit: audit writer mutex poisoned; refusing before signing/submit"
             );
             audit_writer_open_failed(profile_name)
-        },
-    )
+        })?;
+        guard
+            .verify_tip_anchor()
+            .map_err(|e| audit_writer_acquisition_error(profile_name, &e))?;
+    }
+
+    Ok(writer)
+}
+
+/// Maps a writer-acquisition failure to the wire code that names it.
+///
+/// Three outcomes, because three different things are wrong and three different
+/// things fix them:
+///
+/// - A tip-anchor mismatch carries `audit.tip_anchor_mismatch`: the log may have
+///   been rolled back, and only `audit reanchor` addresses that.
+/// - A condition about the LOG — a held writer lock, an unusable rotation
+///   bridge, a broken chain, an unreadable anchor — carries
+///   `ValidationError::AuditLogUnusable`, whose message names the condition by
+///   its `audit.*` sub-code and points at the recovery runbook. Telling the
+///   operator to rotate a key here would send them somewhere useless.
+/// - Everything left is a registry path or key registration conflict, which is
+///   what `AuditWriterOpenFailed`'s wording describes.
+fn audit_writer_acquisition_error(profile_name: &str, e: &WriterError) -> WalletError {
+    if matches!(e, WriterError::TipAnchorMismatch { .. }) {
+        tracing::warn!(
+            profile = %profile_name,
+            error = %e,
+            "value audit: audit log tip anchor mismatch; refusing before signing/submit"
+        );
+        return WalletError::Validation(ValidationError::AuditTipAnchorMismatch {
+            profile: profile_name.to_owned(),
+        });
+    }
+    if let Some(detail) = audit_log_unusable_detail(e) {
+        tracing::warn!(
+            profile = %profile_name,
+            error = %e,
+            "value audit: audit log unusable; refusing before signing/submit"
+        );
+        return WalletError::Validation(ValidationError::AuditLogUnusable {
+            profile: profile_name.to_owned(),
+            detail,
+        });
+    }
+    tracing::warn!(
+        profile = %profile_name,
+        error = %e,
+        "value audit: could not open audit writer; refusing before signing/submit"
+    );
+    audit_writer_open_failed(profile_name)
 }
 
 fn audit_chain_key_unavailable(profile_name: &str) -> WalletError {
@@ -149,26 +212,10 @@ pub(crate) fn emit_value_audit_row_strict(
     profile_name: &str,
     entry: AuditEntry,
 ) -> Result<(), ()> {
-    let key = load_audit_hmac_key(profile).map_err(|_| ())?;
-    let writer = AuditWriterRegistry::get_or_open(profile_name, &profile.audit_log_path, Some(key))
-        .map_err(|_| ())?;
+    let access = keyed_audit_access(profile).map_err(|_| ())?;
+    let writer =
+        AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access)
+            .map_err(|_| ())?;
     let mut guard = writer.lock().map_err(|_| ())?;
     guard.write_entry(entry).map_err(|_| ())
-}
-
-/// Loads and decodes the profile's audit-log chain-root HMAC key from the
-/// platform keyring.
-///
-/// Thin profile adapter over [`stellar_agent_network::keyring::load_hmac_key_32`]
-/// — the single source for chain-root HMAC key loading, shared with the CLI
-/// audit-emit path (same keyring coordinate and fingerprint discipline). Value
-/// rows are signed under this key so `audit verify` covers them.
-///
-/// # Errors
-///
-/// - [`WalletError::Auth`] if the keyring entry is unavailable.
-/// - [`WalletError::Internal`] if the stored value is not valid base64 or not
-///   exactly 32 bytes.
-fn load_audit_hmac_key(profile: &Profile) -> Result<Zeroizing<[u8; 32]>, WalletError> {
-    stellar_agent_network::keyring::load_hmac_key_32(&profile.audit_log_hash_chain_key_id)
 }

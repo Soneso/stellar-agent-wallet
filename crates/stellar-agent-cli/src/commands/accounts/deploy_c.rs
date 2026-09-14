@@ -41,14 +41,13 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::{ArgGroup, Args};
-use keyring_core::Entry as KeyringEntry;
 use rand_core::{OsRng, RngCore};
 use stellar_agent_core::audit_log::writer::{AuditWriter, AuditWriterRegistry};
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{InternalError, NetworkError, ValidationError, WalletError};
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::wallet::MlockDegradation;
-use stellar_agent_network::keyring::{init_platform_keyring_store, map_keyring_error};
+use stellar_agent_network::keyring::init_platform_keyring_store;
 use stellar_agent_network::{
     StellarRpcClient, parse_classic_fee_choice, resolve_classic_fee_selection,
 };
@@ -61,7 +60,6 @@ use stellar_agent_smart_account::managers::signers::build_external_signer_scval;
 use stellar_agent_smart_account::verifiers::VerifierRegistry;
 use tracing::info;
 use uuid::Uuid;
-use zeroize::Zeroizing;
 
 use crate::common::network::TargetNetwork;
 use crate::common::profile_access::{injected_profile_load, reconcile_loaded_profile};
@@ -571,8 +569,8 @@ fn open_profile_audit_writer_via_registry(
     profile_name: &str,
     profile: &Profile,
 ) -> Result<Arc<Mutex<AuditWriter>>, WalletError> {
-    let hmac_key = load_audit_hmac_key(profile)?;
-    AuditWriterRegistry::get_or_open(profile_name, &profile.audit_log_path, Some(hmac_key)).map_err(
+    let access = stellar_agent_network::keyring::keyed_audit_access(profile)?;
+    AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access).map_err(
         |e| {
             tracing::debug!(
                 error = %e,
@@ -584,48 +582,6 @@ fn open_profile_audit_writer_via_registry(
             })
         },
     )
-}
-
-/// Loads and decodes the profile's audit-log HMAC key from keyring.
-fn load_audit_hmac_key(profile: &Profile) -> Result<Zeroizing<[u8; 32]>, WalletError> {
-    let entry_ref = &profile.audit_log_hash_chain_key_id;
-    let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).map_err(|e| {
-        tracing::debug!(
-            error = %e,
-            service = %entry_ref.service,
-            "keyring Entry::new failed for deploy-c audit HMAC key"
-        );
-        map_keyring_error(&e, &entry_ref.service)
-    })?;
-
-    let secret_b64 = Zeroizing::new(entry.get_password().map_err(|e| {
-        tracing::debug!(
-            error = %e,
-            service = %entry_ref.service,
-            "get_password failed for deploy-c audit HMAC key"
-        );
-        map_keyring_error(&e, &entry_ref.service)
-    })?);
-
-    let decoded = Zeroizing::new(URL_SAFE_NO_PAD.decode(secret_b64.as_bytes()).map_err(|e| {
-        tracing::debug!(error = %e, "deploy-c audit HMAC key base64 decode failed");
-        WalletError::Internal(InternalError::UnexpectedState {
-            detail: "audit.key_decode_failed: audit HMAC key is not valid base64".to_owned(),
-        })
-    })?);
-
-    if decoded.len() != 32 {
-        return Err(WalletError::Internal(InternalError::UnexpectedState {
-            detail: format!(
-                "audit.key_length_error: audit HMAC key must be 32 bytes, got {}",
-                decoded.len()
-            ),
-        }));
-    }
-
-    let mut key = Zeroizing::new([0u8; 32]);
-    key.copy_from_slice(decoded.as_slice());
-    Ok(key)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1043,7 +999,6 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use keyring_core::Entry as KeyringEntry;
     use serde_json::Value;
     use serial_test::serial;
     use stellar_agent_core::profile::schema::Profile;
@@ -1067,7 +1022,7 @@ mod tests {
 
     fn install_audit_key(profile: &Profile) {
         let entry_ref = &profile.audit_log_hash_chain_key_id;
-        let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).unwrap();
+        let entry = keyring_core::Entry::new(&entry_ref.service, &entry_ref.account).unwrap();
         entry
             .set_password(&URL_SAFE_NO_PAD.encode([0x42u8; 32]))
             .unwrap();
@@ -1099,7 +1054,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = load_audit_hmac_key(&profile).unwrap_err();
+        let err = stellar_agent_network::keyring::keyed_audit_access(&profile).unwrap_err();
         assert_eq!(err.code(), "auth.keyring_interactive_session_required");
     }
 
@@ -1120,7 +1075,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = load_audit_hmac_key(&profile).unwrap_err();
+        let err = stellar_agent_network::keyring::keyed_audit_access(&profile).unwrap_err();
         assert_eq!(err.code(), "auth.keyring_platform_error");
     }
 

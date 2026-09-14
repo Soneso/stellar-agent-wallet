@@ -115,6 +115,7 @@ pub(crate) mod redact;
 pub mod rotation;
 pub mod schema;
 pub mod signer_set;
+pub mod tip_anchor;
 pub mod verify;
 pub mod writer;
 
@@ -122,13 +123,24 @@ pub use entry::{AuditEntry, NewToolInvocation};
 pub use health::{AuditWriterHealth, AuditWriterHealthHandle};
 pub use reader::{AuditLogIntegrityError, AuditReader, PinnedHashesRecord};
 pub use rotation::{SidecarResignError, resign_chain_root_sidecars};
-pub use schema::{EventKind, KeyPurpose, PolicyDecision, ValueActionKind, ValueLegRecord};
+pub use schema::{
+    EVENT_KIND_VARIANT_COUNT, EventKind, KeyPurpose, PolicyDecision, TipAnchorReason,
+    ValueActionKind, ValueLegRecord,
+};
 pub use signer_set::{
     BaselineReason, DOMAIN_SA_SIGNER_SET_V1, ObservedSignerSet, SignerPubkey,
     SignerSetStatePayload, compute_signer_set_digest, format_digest_first8_last8,
     signer_pubkey_canonical_body,
 };
-pub use verify::{
-    FileVerifyResult, PartialRotationState, VerifyError, VerifyOk, VerifyWarning, verify_log,
+pub use tip_anchor::{
+    KeyedAuditAccess, TipAnchor, TipAnchorParseError, TipAnchorStore, TipAnchorStoreError,
+    reanchor_count_account, tip_anchor_account,
 };
-pub use writer::{AuditWriter, AuditWriterRegistry, WriterError};
+pub use verify::{
+    FileVerifyResult, PartialRotationState, VerifiedTip, VerifyError, VerifyOk, VerifyWarning,
+    verify_log,
+};
+pub use writer::{
+    AuditWriter, AuditWriterRegistry, ReanchorReport, StoredTipAnchor, WriterError,
+    audit_log_unusable_detail,
+};

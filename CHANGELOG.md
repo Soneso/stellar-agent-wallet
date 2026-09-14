@@ -65,6 +65,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   envelope to `--submit-only`, the natural mistake after `--build-only`, is
   refused with `network.envelope_unsigned` before anything is sent.
 
+- The audit log's chain tip is anchored in the platform keyring, so restoring an
+  older copy of the active log file, or truncating it, no longer verifies clean.
+  The chain linkage and the per-file `.root_hmac` signature both verify a PREFIX
+  and the tip lived only in the writer's memory, so an older copy passed
+  `audit verify` and every value-verb pre-flight.
+
+  For each log path the keyring now holds the active file's entry count,
+  last-entry hash, and byte offset, advanced on every append. Writer open, the
+  value-verb pre-flight on every acquisition, and `audit verify --profile` all
+  check the file against it and refuse with the new wire code
+  `audit.tip_anchor_mismatch`. A log that moved forward past its anchor is
+  absorbed and re-anchored, so writers opened without the audit key keep
+  appending as before. Upgrading needs no operator action: an unanchored log is
+  adopted once its chain verifies, recording an `audit_tip_anchored` row.
+
+  Recovery is the new `stellar-agent audit reanchor --profile <name>
+  --acknowledge-rollback`; without the flag it reports both anchors and exits 1.
+  `audit verify` gained an `anchor` field. A rotation leaves the anchor on the
+  outgoing file's handoff entry until the new file's first append, so a restore
+  of the whole audit directory is refused rather than absorbed. The anchor
+  detects rollback, truncation, and substitution of a log at rest, not forgery.
+  It is also not continuous in time: it lags between an entry's fsync and its
+  anchor write, and it is inactive on a log path nothing has anchored yet and on
+  a freshly rotated file until its first append. See
+  `docs/maintainers/audit-log-recovery.md`.
+
+- `profile rotate-audit-key` takes the audit writer's exclusive lock for the
+  whole rotation. It re-signed every per-file chain-root sidecar without holding
+  it, so a concurrent writer could append or rotate between the file walk and the
+  rewrite and leave a sidecar signed with the destroyed key.
+
+- Reopening an audit log whose active file was created by a rotation no longer
+  refuses. The writer seeded its chain replay from the zero-block hash
+  unconditionally, while such a file's first entry chains off the outgoing file's
+  handoff entry, so any restart after a rotation reported a broken chain and the
+  writer would not open. The replay now seeds from the newest archive's handoff,
+  the same cross-file bridge `audit verify` walks.
+
 ## [0.1.0-alpha.6] - 2026-08-12
 
 ### Security

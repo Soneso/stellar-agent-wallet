@@ -305,6 +305,20 @@ already fails closed on the same underlying condition through its own
 stricter authorization-withholding mechanism (see
 [Agent payments with MPP](agent-payments.md)).
 
+The same pre-flight also proves the audit log still contains the chain tip its
+keyring-held anchor names, and it does so on EVERY acquisition rather than only
+at server start: the writer is cached for the server's lifetime, so a log
+replaced underneath it would otherwise go unnoticed until a restart. A log that
+was restored from an older copy, truncated, or substituted refuses with
+`audit.tip_anchor_mismatch`. A log that simply moved FORWARD past its anchor is
+not a refusal — unkeyed writers append without moving it, and the next
+acquisition absorbs the gap and re-anchors. A log with no anchor at all is
+adopted on first use with no operator action, which is what happens on the first
+run after upgrading a wallet whose audit log predates the anchor. Recovery from a
+mismatch is `stellar-agent audit reanchor --profile <name>
+--acknowledge-rollback`, and it requires stopping this server first, since the
+server holds the audit writer's exclusive lock.
+
 ## Tool catalog
 
 The server registers 38 tools. For each tool below: the exact registered name,

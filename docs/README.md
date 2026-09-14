@@ -50,6 +50,8 @@ from the capability-restriction toolsets feature above.
   detail behind the model.
 - [MPP internals](maintainers/mpp.md) — protocol pins, module ownership, durable
   lifecycle, fixtures, and release gates.
+- [Audit-log recovery](maintainers/audit-log-recovery.md) — the states that block
+  the audit writer, and how to get out of each.
 - [Review checklist](maintainers/review-checklist.md) — the production-readiness
   gate every change passes.
 

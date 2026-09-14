@@ -8,9 +8,10 @@
 //! the two enroll commands — a redacted public address. It NEVER carries a key
 //! value, seed, base64 key material, or any derived secret.
 
+use stellar_agent_network::keyring::keyed_audit_access;
 use zeroize::Zeroizing;
 
-use stellar_agent_core::audit_log::{AuditEntry, AuditWriterRegistry, KeyPurpose};
+use stellar_agent_core::audit_log::{AuditEntry, AuditWriter, AuditWriterRegistry, KeyPurpose};
 use stellar_agent_core::error::WalletError;
 use stellar_agent_core::observability::RedactedStrkey;
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
@@ -36,8 +37,8 @@ pub(super) fn emit_keyring_key_written(
     public_address: Option<RedactedStrkey>,
     request_id: &str,
 ) {
-    let hmac_key = match load_audit_hmac_key(profile) {
-        Ok(k) => Some(k),
+    let access = match keyed_audit_access(profile) {
+        Ok(access) => access,
         Err(e) => {
             tracing::warn!(
                 profile = %profile_name,
@@ -50,7 +51,8 @@ pub(super) fn emit_keyring_key_written(
     };
 
     let writer_arc =
-        match AuditWriterRegistry::get_or_open(profile_name, &profile.audit_log_path, hmac_key) {
+        match AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access)
+        {
             Ok(arc) => arc,
             Err(e) => {
                 tracing::warn!(
@@ -63,6 +65,43 @@ pub(super) fn emit_keyring_key_written(
             }
         };
 
+    match writer_arc.lock() {
+        Ok(mut guard) => emit_keyring_key_written_with_writer(
+            &mut guard,
+            profile_name,
+            tool,
+            key_purpose,
+            written_entry,
+            public_address,
+            request_id,
+        ),
+        Err(_) => {
+            tracing::warn!(
+                profile = %profile_name,
+                "key write audit: audit writer mutex poisoned; KeyringKeyWritten NOT emitted"
+            );
+        }
+    }
+}
+
+/// Emits the `KeyringKeyWritten` row through a writer the caller already holds.
+///
+/// `rotate-audit-key` holds the audit writer across its whole sequence so no
+/// other process can append or rotate while the per-file chain-root sidecars are
+/// being re-signed. It appends the row through this function rather than through
+/// [`emit_keyring_key_written`], which would try to acquire the same writer and
+/// deadlock on the lock the caller is holding.
+///
+/// Non-fatal, like its acquiring twin: the key write has already committed.
+pub(super) fn emit_keyring_key_written_with_writer(
+    writer: &mut AuditWriter,
+    profile_name: &str,
+    tool: &str,
+    key_purpose: KeyPurpose,
+    written_entry: &KeyringEntryRef,
+    public_address: Option<RedactedStrkey>,
+    request_id: &str,
+) {
     let entry = AuditEntry::new_keyring_key_written(
         tool,
         key_purpose,
@@ -71,23 +110,12 @@ pub(super) fn emit_keyring_key_written(
         public_address,
         request_id,
     );
-
-    match writer_arc.lock() {
-        Ok(mut guard) => {
-            if let Err(e) = guard.write_entry(entry) {
-                tracing::warn!(
-                    profile = %profile_name,
-                    error = %e,
-                    "key write audit: write_entry failed; KeyringKeyWritten NOT emitted"
-                );
-            }
-        }
-        Err(_) => {
-            tracing::warn!(
-                profile = %profile_name,
-                "key write audit: audit writer mutex poisoned; KeyringKeyWritten NOT emitted"
-            );
-        }
+    if let Err(e) = writer.write_entry(entry) {
+        tracing::warn!(
+            profile = %profile_name,
+            error = %e,
+            "key write audit: write_entry failed; KeyringKeyWritten NOT emitted"
+        );
     }
 }
 
@@ -125,6 +153,60 @@ mod tests {
     use stellar_agent_test_support::keyring_mock;
 
     use super::*;
+
+    /// A key-write row advances the tip anchor.
+    ///
+    /// This surface opens its writer KEYED, so its rows are ones `audit verify`
+    /// covers — and, before the keyed open was made to carry the anchor store,
+    /// ones the anchor never counted. Removing such a row left the file back at
+    /// the anchored tip and every later check read Current, so the removal was
+    /// undetectable.
+    #[test]
+    #[serial]
+    fn a_key_write_row_advances_the_tip_anchor() {
+        use stellar_agent_core::audit_log::TipAnchorStore as _;
+        use stellar_agent_network::keyring::KeyringTipAnchorStore;
+
+        keyring_mock::install().expect("mock keyring store");
+
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let mut profile =
+            Profile::builder_testnet("anchor-keywrite", "acct", "n-svc", "n-acct").build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let coord = profile.audit_log_hash_chain_key_id.clone();
+        stellar_agent_network::keyring::rotate_keyring_secret_32(&coord.service, &coord.account)
+            .expect("seed audit key");
+
+        let store = KeyringTipAnchorStore::new(&coord, &profile.audit_log_path);
+        assert_eq!(
+            store.load_anchor().expect("read anchor"),
+            None,
+            "nothing is anchored before the first row"
+        );
+
+        emit_keyring_key_written(
+            &profile,
+            "anchor-keywrite",
+            "profile_rotate_attestation_key",
+            KeyPurpose::AttestationHmac,
+            &coord,
+            None,
+            "req-anchor-keywrite",
+        );
+
+        let anchored = store
+            .load_anchor()
+            .expect("read anchor")
+            .expect("the row must be anchored");
+        assert_eq!(anchored.entry_count, 1, "the row advanced the anchor");
+        assert_eq!(
+            anchored.end_offset,
+            std::fs::metadata(&profile.audit_log_path)
+                .expect("log exists")
+                .len(),
+            "the anchor names the end of the row just written"
+        );
+    }
 
     /// `emit_keyring_key_written` writes exactly one `keyring_key_written` row
     /// through the real acquisition path (keyring loader → writer registry →

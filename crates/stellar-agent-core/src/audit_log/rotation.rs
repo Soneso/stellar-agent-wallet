@@ -97,13 +97,16 @@ impl std::error::Error for SidecarResignError {}
 ///
 /// The chain-root sidecar's security property is that an attacker who
 /// wholesale-replaces a file cannot forge the root tag without the CURRENT key.
-/// This primitive MUST run AFTER the new key is persisted to the keyring and
-/// BEFORE emitting the key-write row. Re-signing before the new key is
-/// persisted is forbidden: a crash between signing and persistence would leave
-/// sidecars signed by a key that exists nowhere, permanently unverifiable.
-/// Under the required order, a crash after persistence but before (or during)
-/// re-signing is recoverable — re-running rotate-audit-key re-signs with the
-/// already-persisted key and converges.
+/// This primitive MUST run AFTER the new key is persisted to the keyring.
+/// Re-signing before the new key is persisted is forbidden: a crash between
+/// signing and persistence would leave sidecars signed by a key that exists
+/// nowhere, permanently unverifiable. Under the required order, a crash after
+/// persistence but before (or during) re-signing is recoverable — re-running
+/// rotate-audit-key re-signs with the already-persisted key and converges.
+///
+/// It runs LAST in `rotate-audit-key`, after the key-write row has been
+/// appended, so a row that happens to open a new file has that file's chain
+/// root brought onto the new key by the same pass.
 ///
 /// Returns the number of sidecars re-signed.
 ///

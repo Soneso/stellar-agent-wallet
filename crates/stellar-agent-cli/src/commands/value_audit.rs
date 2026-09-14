@@ -40,11 +40,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use stellar_agent_core::audit_log::{AuditEntry, AuditWriter, AuditWriterRegistry};
+use stellar_agent_core::audit_log::{
+    AuditEntry, AuditWriter, AuditWriterRegistry, WriterError, audit_log_unusable_detail,
+};
 use stellar_agent_core::error::{ValidationError, WalletError};
 use stellar_agent_core::profile::schema::Profile;
-
-use crate::commands::profile::audit_emit::load_audit_hmac_key;
+use stellar_agent_network::keyring::keyed_audit_access;
 
 /// Requires the per-profile audit writer to be acquirable under the profile's
 /// audit chain-root HMAC key — the fail-closed pre-flight for value-moving
@@ -77,11 +78,17 @@ use crate::commands::profile::audit_emit::load_audit_hmac_key;
 ///   audit writer could not be opened at `profile.audit_log_path` (e.g. a
 ///   registry path/key mismatch against an earlier open in this process) —
 ///   rotating the audit key does not fix this.
+/// - [`ValidationError::AuditTipAnchorMismatch`] when the writer was acquired
+///   but the log's chain tip is not the one its keyring-held anchor names — the
+///   log was rolled back, truncated, or replaced. Checked on EVERY acquisition,
+///   not only the first: the writer registry caches one writer per profile for
+///   the process lifetime, so a check at open alone would miss a file swapped
+///   underneath a live writer.
 pub(crate) fn require_value_audit_writer(
     profile: &Profile,
     profile_name: &str,
 ) -> Result<Arc<Mutex<AuditWriter>>, WalletError> {
-    let hmac_key = load_audit_hmac_key(profile).map_err(|e| {
+    let access = keyed_audit_access(profile).map_err(|e| {
         tracing::warn!(
             profile = %profile_name,
             error = %e,
@@ -89,16 +96,72 @@ pub(crate) fn require_value_audit_writer(
         );
         audit_chain_key_unavailable(profile_name)
     })?;
-    AuditWriterRegistry::get_or_open(profile_name, &profile.audit_log_path, Some(hmac_key)).map_err(
-        |e| {
+    let writer =
+        AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access)
+            .map_err(|e| audit_writer_acquisition_error(profile_name, &e))?;
+
+    // Re-check the anchor on THIS acquisition. The registry caches a writer for
+    // the process lifetime, so the open-time check covers only the first
+    // acquisition; a log replaced underneath a live writer would otherwise go
+    // unnoticed until the process restarts.
+    {
+        let mut guard = writer.lock().map_err(|_| {
             tracing::warn!(
                 profile = %profile_name,
-                error = %e,
-                "value audit: could not open audit writer; refusing before signing/submit"
+                "value audit: audit writer mutex poisoned; refusing before signing/submit"
             );
             audit_writer_open_failed(profile_name)
-        },
-    )
+        })?;
+        guard
+            .verify_tip_anchor()
+            .map_err(|e| audit_writer_acquisition_error(profile_name, &e))?;
+    }
+
+    Ok(writer)
+}
+
+/// Maps a writer-acquisition failure to the wire code that names it.
+///
+/// Three outcomes, because three different things are wrong and three different
+/// things fix them:
+///
+/// - A tip-anchor mismatch carries `audit.tip_anchor_mismatch`: the log may have
+///   been rolled back, and only `audit reanchor` addresses that.
+/// - A condition about the LOG — a held writer lock, an unusable rotation
+///   bridge, a broken chain, an unreadable anchor — carries
+///   `ValidationError::AuditLogUnusable`, whose message names the condition by
+///   its `audit.*` sub-code and points at the recovery runbook. Telling the
+///   operator to rotate a key here would send them somewhere useless.
+/// - Everything left is a registry path or key registration conflict, which is
+///   what `AuditWriterOpenFailed`'s wording describes.
+fn audit_writer_acquisition_error(profile_name: &str, e: &WriterError) -> WalletError {
+    if matches!(e, WriterError::TipAnchorMismatch { .. }) {
+        tracing::warn!(
+            profile = %profile_name,
+            error = %e,
+            "value audit: audit log tip anchor mismatch; refusing before signing/submit"
+        );
+        return WalletError::Validation(ValidationError::AuditTipAnchorMismatch {
+            profile: profile_name.to_owned(),
+        });
+    }
+    if let Some(detail) = audit_log_unusable_detail(e) {
+        tracing::warn!(
+            profile = %profile_name,
+            error = %e,
+            "value audit: audit log unusable; refusing before signing/submit"
+        );
+        return WalletError::Validation(ValidationError::AuditLogUnusable {
+            profile: profile_name.to_owned(),
+            detail,
+        });
+    }
+    tracing::warn!(
+        profile = %profile_name,
+        error = %e,
+        "value audit: could not open audit writer; refusing before signing/submit"
+    );
+    audit_writer_open_failed(profile_name)
 }
 
 fn audit_chain_key_unavailable(profile_name: &str) -> WalletError {
@@ -174,7 +237,7 @@ pub(crate) fn acquire_best_effort_audit_writer(
         "value audit: keyed acquisition unavailable; \
          opening the audit writer unkeyed (rows not covered by audit verify)"
     );
-    AuditWriterRegistry::get_or_open(profile_name, &profile.audit_log_path, None)
+    AuditWriterRegistry::get_or_open_unkeyed(profile_name, &profile.audit_log_path)
         .map_err(|e| audit_writer_open_failed_io(profile_name, &e))
 }
 
@@ -203,8 +266,8 @@ fn acquire_value_audit_writer(
     profile: &Profile,
     profile_name: &str,
 ) -> Option<Arc<Mutex<AuditWriter>>> {
-    let hmac_key = match load_audit_hmac_key(profile) {
-        Ok(k) => Some(k),
+    let access = match keyed_audit_access(profile) {
+        Ok(access) => access,
         Err(e) => {
             tracing::warn!(
                 profile = %profile_name,
@@ -214,7 +277,7 @@ fn acquire_value_audit_writer(
             return None;
         }
     };
-    match AuditWriterRegistry::get_or_open(profile_name, &profile.audit_log_path, hmac_key) {
+    match AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access) {
         Ok(arc) => Some(arc),
         Err(e) => {
             tracing::warn!(
@@ -318,9 +381,10 @@ pub(crate) fn emit_value_audit_row_strict(
     profile_name: &str,
     entry: AuditEntry,
 ) -> Result<(), ()> {
-    let key = load_audit_hmac_key(profile).map_err(|_| ())?;
-    let writer = AuditWriterRegistry::get_or_open(profile_name, &profile.audit_log_path, Some(key))
-        .map_err(|_| ())?;
+    let access = keyed_audit_access(profile).map_err(|_| ())?;
+    let writer =
+        AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access)
+            .map_err(|_| ())?;
     let mut guard = writer.lock().map_err(|_| ())?;
     guard.write_entry(entry).map_err(|_| ())
 }
@@ -574,5 +638,228 @@ mod tests {
             1,
             "the writer returned on the synthesized path must write through"
         );
+    }
+
+    // ── The pre-flight's failure mapping ─────────────────────────────────────
+
+    /// Every acquisition failure class maps to an operator-facing message that
+    /// names the actual condition.
+    ///
+    /// The pre-flight is fail-closed for all of them; what differs is what the
+    /// operator is told to do. Folding a held writer lock, an unusable rotation
+    /// bridge or a broken chain into "the chain key is unavailable" sends them
+    /// to mint or rotate a key that is not the problem, so each class carries
+    /// its own `audit.*` sub-code in the detail, which is what the skill's
+    /// troubleshooting table keys on.
+    #[test]
+    fn the_pre_flight_names_the_condition_it_refused_on() {
+        let cases: &[(WriterError, &str, &str)] = &[
+            (
+                WriterError::FileLocked,
+                "audit.chain_key_unavailable",
+                "audit.writer_locked",
+            ),
+            (
+                WriterError::RotationBridgeUnusable {
+                    archive_name: "audit.jsonl.20260913T120000000".to_owned(),
+                    reason: "the archive does not end with a rotation handoff entry",
+                },
+                "audit.chain_key_unavailable",
+                "audit.rotation_bridge_unusable",
+            ),
+            (
+                WriterError::ChainBrokenAtOpen {
+                    entry_idx: 7,
+                    expected_hex: "sha256:aa".to_owned(),
+                    got_hex: "sha256:bb".to_owned(),
+                },
+                "audit.chain_key_unavailable",
+                "audit.chain_broken",
+            ),
+            (
+                WriterError::TipAnchorStore(
+                    stellar_agent_core::audit_log::TipAnchorStoreError::new("keyring locked"),
+                ),
+                "audit.chain_key_unavailable",
+                "audit.tip_anchor_unavailable",
+            ),
+            (
+                WriterError::TipAnchorMismatch {
+                    expected_count: 3,
+                    expected_offset: 900,
+                    actual_len: 600,
+                    reason: "file is shorter than the anchor",
+                },
+                "audit.tip_anchor_mismatch",
+                "audit reanchor",
+            ),
+        ];
+
+        for (error, expected_code, expected_in_message) in cases {
+            let mapped = audit_writer_acquisition_error("default", error);
+            assert_eq!(
+                mapped.code(),
+                *expected_code,
+                "wire code for {error:?}: {}",
+                mapped.message()
+            );
+            assert!(
+                mapped.message().contains(expected_in_message),
+                "the refusal for {error:?} must name {expected_in_message}: {}",
+                mapped.message()
+            );
+            assert!(
+                !mapped.message().contains("rotate-audit-key"),
+                "none of these is fixed by rotating the audit key: {}",
+                mapped.message()
+            );
+        }
+    }
+
+    /// A registry path or key registration conflict keeps the wording that
+    /// describes it, which is the one class `AuditWriterOpenFailed` is about.
+    #[test]
+    fn a_registration_conflict_keeps_its_own_wording() {
+        let mapped = audit_writer_acquisition_error(
+            "default",
+            &WriterError::HmacKeyMismatch {
+                profile_name: "default".to_owned(),
+            },
+        );
+        assert_eq!(mapped.code(), "audit.chain_key_unavailable");
+        assert!(
+            mapped
+                .message()
+                .contains("conflicting audit-log path or key registration"),
+            "message: {}",
+            mapped.message()
+        );
+    }
+
+    // ── require_value_audit_writer — the tip-anchor pre-flight ───────────────
+
+    /// Seeds a chain-root key at the profile's audit coordinate and returns the
+    /// profile, so the pre-flight has a key to acquire.
+    fn keyed_profile(name: &'static str, dir: &std::path::Path) -> Profile {
+        let mut profile = Profile::builder_testnet(name, "acct", "n-svc", "n-acct").build();
+        profile.audit_log_path = dir.join("audit.jsonl");
+        let coord = &profile.audit_log_hash_chain_key_id;
+        stellar_agent_network::keyring::rotate_keyring_secret_32(&coord.service, &coord.account)
+            .expect("seed audit key");
+        profile
+    }
+
+    /// The pre-flight runs on EVERY acquisition, not only the first. The writer
+    /// registry caches one writer per profile for the process lifetime, so a log
+    /// replaced underneath a live writer must still be caught — this is the case
+    /// an open-time-only check would miss.
+    #[test]
+    #[serial]
+    fn require_value_audit_writer_refuses_after_the_log_is_replaced_underneath_it() {
+        keyring_mock::install().expect("mock keyring store");
+
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let profile = keyed_profile("anchor-live-swap", dir.path());
+
+        // First acquisition: adopts (empty log), then rows are appended through
+        // the writer the pre-flight returned.
+        let writer = require_value_audit_writer(&profile, "anchor-live-swap")
+            .expect("first acquisition must succeed");
+        {
+            let mut guard = writer.lock().expect("writer lock");
+            guard
+                .write_entry(AuditEntry::new_value_action_submitted(
+                    "stellar_pay",
+                    "stellar:testnet",
+                    Vec::new(),
+                    "abcd1234…wxyz5678",
+                    7,
+                    stellar_agent_core::audit_log::PolicyDecision::Allow,
+                    None,
+                    None,
+                    "req-anchor-1",
+                ))
+                .expect("append");
+        }
+        let snapshot = std::fs::read(&profile.audit_log_path).expect("read log");
+        {
+            let mut guard = writer.lock().expect("writer lock");
+            guard
+                .write_entry(AuditEntry::new_value_action_submitted(
+                    "stellar_pay",
+                    "stellar:testnet",
+                    Vec::new(),
+                    "abcd1234…wxyz5678",
+                    8,
+                    stellar_agent_core::audit_log::PolicyDecision::Allow,
+                    None,
+                    None,
+                    "req-anchor-2",
+                ))
+                .expect("append");
+        }
+
+        require_value_audit_writer(&profile, "anchor-live-swap")
+            .expect("an untouched log must still acquire");
+
+        // Roll the log back underneath the cached writer.
+        std::fs::write(&profile.audit_log_path, &snapshot).expect("restore older copy");
+
+        let err = require_value_audit_writer(&profile, "anchor-live-swap")
+            .expect_err("a rolled-back log must refuse");
+        assert_eq!(
+            err.code(),
+            "audit.tip_anchor_mismatch",
+            "the refusal must name the tip-anchor check, not the chain key: {err}"
+        );
+    }
+
+    /// A log with no anchor is adopted on first use with no operator action —
+    /// the upgrade path for every profile that predates the anchor — and the
+    /// adoption is recorded in the log itself.
+    #[test]
+    #[serial]
+    fn require_value_audit_writer_adopts_an_existing_unanchored_log() {
+        keyring_mock::install().expect("mock keyring store");
+
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let profile = keyed_profile("anchor-adopt", dir.path());
+
+        // A log written before the anchor existed: rows present, no anchor.
+        {
+            let key = crate::commands::profile::audit_emit::load_audit_hmac_key(&profile)
+                .expect("load key");
+            let mut writer = stellar_agent_core::audit_log::AuditWriter::open(
+                profile.audit_log_path.clone(),
+                Some(key),
+            )
+            .expect("open unanchored writer");
+            writer
+                .write_entry(AuditEntry::new_value_action_submitted(
+                    "stellar_pay",
+                    "stellar:testnet",
+                    Vec::new(),
+                    "abcd1234…wxyz5678",
+                    1,
+                    stellar_agent_core::audit_log::PolicyDecision::Allow,
+                    None,
+                    None,
+                    "req-pre-anchor",
+                ))
+                .expect("append");
+        }
+
+        require_value_audit_writer(&profile, "anchor-adopt")
+            .expect("adoption must need no operator action");
+
+        let file = std::fs::File::open(&profile.audit_log_path).expect("audit.jsonl exists");
+        let adopted = std::io::BufReader::new(file)
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(&l.expect("line")).expect("JSON row")
+            })
+            .filter(|row| row["kind"] == "audit_tip_anchored" && row["reason"] == "adopted")
+            .count();
+        assert_eq!(adopted, 1, "adoption must leave exactly one row in the log");
     }
 }

@@ -2464,6 +2464,78 @@ pub enum EventKind {
         /// [`RECORDED_STR_MAX`] characters at construction).
         reason: String,
     },
+
+    /// The audit log's keyring-held tip anchor was established for the active
+    /// file.
+    ///
+    /// Emitted on the two occasions the anchor is set to a tip the writer did
+    /// not itself append: adoption of a log that predates the anchor, and an
+    /// operator-acknowledged rollback repair. Ordinary per-append anchor
+    /// advances are silent — they are implied by the rows themselves.
+    ///
+    /// The row carries no digest: the tip hash is already the chain state of
+    /// the entry preceding this one, and `previous_anchor` reports the
+    /// superseded anchor as `<entry count>:<end offset>` so a forensic reader
+    /// can see how far the anchor moved without a hash appearing in the log
+    /// twice.
+    AuditTipAnchored {
+        /// Why the anchor was established.
+        reason: TipAnchorReason,
+        /// Number of entries in the active file at the moment the anchor was
+        /// written, before this row was appended.
+        entry_count: u64,
+        /// The superseded anchor as `<entry count>:<end offset>`, or `None`
+        /// when no anchor existed.
+        previous_anchor: Option<String>,
+        /// Value of the path's monotonic re-anchor counter after this repair.
+        /// `None` for adoption, which does not touch the counter.
+        reanchor_count: Option<u64>,
+    },
+}
+
+/// Total number of [`EventKind`] variants.
+///
+/// `EventKind` is matched exhaustively by the verifier, so the compiler forces
+/// a new variant to gain a match arm — but nothing forces it to gain a wire-tag
+/// fixture. This constant narrows that gap. Update it in the same change that
+/// adds a variant.
+///
+/// Precisely what the constant plus the verifier's tag-coverage test catch:
+///
+/// - A variant added with a fixture but without bumping this constant: the
+///   fixture list is one longer than the constant, and the test fails.
+/// - This constant bumped without adding a fixture: the fixture list is one
+///   short, and the test fails.
+/// - Two variants mapped to the same wire tag: the uniqueness assertion fails.
+///
+/// What they do NOT catch: a variant added with its compiler-forced match arms
+/// and NEITHER a fixture NOR a bump. The counts still agree at the old value and
+/// the test stays green, leaving the new variant unpinned by any tag assertion.
+/// Closing that would need the count derived from the enum itself, which needs a
+/// derive macro this workspace does not carry.
+pub const EVENT_KIND_VARIANT_COUNT: usize = 59;
+
+/// Why an [`EventKind::AuditTipAnchored`] row was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TipAnchorReason {
+    /// An audit log with no anchor was taken under anchor protection at its
+    /// current tip, after its chain verified. No operator action is involved.
+    Adopted,
+    /// An operator ran `audit reanchor --acknowledge-rollback`, moving the
+    /// anchor to the current tip of a file the check had refused.
+    RollbackAcknowledged,
+}
+
+impl std::fmt::Display for TipAnchorReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Adopted => "adopted",
+            Self::RollbackAcknowledged => "rollback_acknowledged",
+        };
+        f.write_str(s)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
