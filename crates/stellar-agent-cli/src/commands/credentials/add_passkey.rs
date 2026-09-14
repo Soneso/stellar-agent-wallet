@@ -441,18 +441,13 @@ fn launch_browser(url: &str) -> bool {
 /// in the same process holds the writer for this profile the same `Arc` is
 /// returned rather than a second open attempt that would receive `FileLocked`.
 ///
-/// Steps: (1) reconciled profile load, (2) load HMAC key from keyring,
-/// (3) `AuditWriterRegistry::get_or_open(profile_name, path, key)`.
-/// Each step is non-fatal — returns `None` on the first failure.
+/// Steps: (1) reconciled profile load, (2) `keyed_audit_access`, the one helper
+/// that pairs the chain-root key with the log's tip-anchor store, (3)
+/// `AuditWriterRegistry::get_or_open_keyed`. Each step is non-fatal — returns
+/// `None` on the first failure.
 async fn open_profile_audit_writer_non_fatal(
     profile_name: &str,
 ) -> Option<Arc<StdMutex<AuditWriter>>> {
-    use base64::Engine as _;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use keyring_core::Entry as KeyringEntry;
-    use stellar_agent_network::keyring::classify_keyring_error;
-    use zeroize::Zeroizing;
-
     let profile = match load_profile_reconciled_by_requested_name(profile_name, None) {
         Ok(p) => p,
         Err(e) => {
@@ -465,62 +460,25 @@ async fn open_profile_audit_writer_non_fatal(
         }
     };
 
-    let entry_ref = &profile.audit_log_hash_chain_key_id;
-    let keyring_entry = match KeyringEntry::new(&entry_ref.service, &entry_ref.account) {
-        Ok(e) => e,
+    let access = match stellar_agent_network::keyring::keyed_audit_access(&profile) {
+        Ok(access) => access,
         Err(e) => {
             warn!(
-                service = %entry_ref.service,
+                profile = %profile_name,
                 error = %e,
-                cause = ?classify_keyring_error(&e, &entry_ref.service),
-                "credentials add-passkey: keyring Entry::new failed for audit HMAC key; audit entry will be skipped"
+                "credentials add-passkey: audit chain key unavailable; audit entry will be skipped"
             );
             return None;
         }
     };
 
-    let secret_b64 = match keyring_entry.get_password() {
-        Ok(s) => Zeroizing::new(s),
-        Err(e) => {
-            warn!(
-                service = %entry_ref.service,
-                error = %e,
-                cause = ?classify_keyring_error(&e, &entry_ref.service),
-                "credentials add-passkey: keyring get_password failed; audit entry will be skipped"
-            );
-            return None;
-        }
-    };
-
-    let decoded = match URL_SAFE_NO_PAD.decode(secret_b64.as_bytes()) {
-        Ok(b) => Zeroizing::new(b),
-        Err(e) => {
-            warn!(
-                error = %e,
-                "credentials add-passkey: audit HMAC key is not valid base64; audit entry will be skipped"
-            );
-            return None;
-        }
-    };
-
-    if decoded.len() != 32 {
-        warn!(
-            len = decoded.len(),
-            "credentials add-passkey: audit HMAC key has wrong length (expected 32); audit entry will be skipped"
-        );
-        return None;
-    }
-
-    let mut key = Zeroizing::new([0u8; 32]);
-    key.copy_from_slice(decoded.as_slice());
-
-    match AuditWriterRegistry::get_or_open(profile_name, &profile.audit_log_path, Some(key)) {
+    match AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access) {
         Ok(arc) => Some(arc),
         Err(e) => {
             warn!(
                 path = %profile.audit_log_path.display(),
                 error = %e,
-                "credentials add-passkey: AuditWriterRegistry::get_or_open failed; audit entry will be skipped"
+                "credentials add-passkey: keyed audit writer open failed; audit entry will be skipped"
             );
             None
         }

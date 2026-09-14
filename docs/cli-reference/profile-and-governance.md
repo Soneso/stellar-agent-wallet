@@ -1,6 +1,6 @@
 # CLI reference: profiles, credentials, approvals, and audit
 
-This page documents four `stellar-agent` command groups: `profile`, `credentials`, `approve`, and `audit`. Together they configure a profile, manage its WebAuthn passkeys, and operate the operator-side governance loop: recording out-of-band approvals and verifying the tamper-evident audit log.
+This page documents four `stellar-agent` command groups: `profile`, `credentials`, `approve`, and `audit`. Together they configure a profile, manage its WebAuthn passkeys, and operate the operator-side governance loop: recording out-of-band approvals, verifying the tamper-evident audit log, and repairing its tip anchor.
 
 For the conventions shared by every command (profile and network resolution, the signer-source flags, the JSON output envelope, exit codes, and the mainnet-write refusal), see the [CLI reference index](index.md). For the underlying concepts (the policy engine, the approval spine, attestations, the audit log, and toolset gating), see [concepts](../concepts.md). For profile file structure, see [profiles](../profiles.md), and for toolset gating see [toolsets](../toolsets.md).
 
@@ -159,7 +159,7 @@ Each rotation subcommand generates a fresh 32-byte secret from the OS CSPRNG, en
 | Subcommand | Keyring entry rotated | Key kind | Effect on outstanding material |
 |---|---|---|---|
 | `rotate-attestation-key` | approval-spine attestation HMAC key (`attestation_key_id`) | 32-byte HMAC | All pending approvals are invalidated; the simulate-and-approve round trip must be re-run. |
-| `rotate-audit-key` | audit-log chain-root HMAC key (`audit_log_hash_chain_key_id`) | 32-byte HMAC | Rotation re-signs every existing per-file chain-root sidecar with the new key; `audit verify` passes under the new key and the old key stops verifying. |
+| `rotate-audit-key` | audit-log chain-root HMAC key (`audit_log_hash_chain_key_id`) | 32-byte HMAC | Rotation re-signs every existing per-file chain-root sidecar with the new key; `audit verify` passes under the new key and the old key stops verifying. Takes the audit writer's exclusive lock, so it refuses while an MCP server is running, and checks the tip anchor before touching the key. |
 | `rotate-nonce-key` | HMAC nonce key (`mcp_nonce_key_alias`) | 32-byte HMAC | All outstanding nonces minted with the old key are invalidated. |
 | `rotate-policy-state-key` | policy-window-state HMAC key (`policy_window_state_key_id`) | 32-byte HMAC | The persisted window-state store is re-signed under the new key, so accumulated `per_period_cap` / `rate_limit` history is preserved, not invalidated. Rotation is refused if the store file does not verify under the current key (run `reset-window-state` instead). |
 
@@ -452,25 +452,53 @@ stellar-agent approve operator enroll \
 
 ## `audit`
 
-The `audit` group verifies the per-profile audit log, an append-only, hash-chained JSONL record of every tool invocation and lifecycle event. Argument values are never logged; only argument key names are recorded. The chain links each entry to the SHA-256 of the prior entry's canonical body, so any external modification breaks verification.
+The `audit` group verifies the per-profile audit log, an append-only, hash-chained JSONL record of every tool invocation and lifecycle event, and repairs its tip anchor. Argument values are never logged; only argument key names are recorded. The chain links each entry to the SHA-256 of the prior entry's canonical body, so any external modification breaks verification.
+
+The chain and the per-file chain-root signatures verify a PREFIX of the log, so an older copy of the active file, or a truncated one, passes both. What pins the END of the chain is the tip anchor: the active file's entry count, last-entry hash, and byte offset, held in the platform keyring per log path. Every value-moving verb checks it before signing, and `audit verify --profile` checks it too.
 
 ### `audit verify <LOG_PATH>`
 
 Read-only. Walks the log at `<LOG_PATH>`, following rotation manifests across rotated files, and verifies that the hash chain is intact end to end. When `--profile` is supplied, it additionally loads that profile's audit chain-root HMAC key and verifies the chain-root sidecars; without `--profile`, only the hash chain is checked and `hmac_verified` is reported as `false`.
 
+The tip anchor is checked only when `--profile` is supplied AND `<LOG_PATH>` is the log that profile configures. The anchor names a path, not a profile, so comparing it against a file it does not describe would report a mismatch that means nothing. Every other case reports `anchor.status` as `"not_checked"` with the reason and still verifies the chain in full. A log that moved forward past its anchor passes; a log behind it, or one whose tip is not the anchored tip, fails with `audit.tip_anchor_mismatch`.
+
 - `<LOG_PATH>` (positional, required) — path to the audit log file. By default this is `~/.local/share/stellar-agent/audit/<profile>.jsonl` on Linux, `~/Library/Application Support/Soneso.stellar-agent/audit/<profile>.jsonl` on macOS, and `%LOCALAPPDATA%\Soneso\stellar-agent\data\audit\<profile>.jsonl` on Windows.
 - `--profile <NAME>` — the profile whose chain-root HMAC key verifies the sidecars. Optional; when omitted, only the hash chain is verified.
 - `--output <FORMAT>` — output format. `json` is the default and only stable format.
 
-On Unix, the command refuses to verify a log whose parent directory is owned by a different user, since such a directory could be used to substitute log files or sidecars. It exits `0` when the chain is intact and `1` on any integrity violation (a broken chain, a rotation gap, an HMAC mismatch, a missing sidecar, or an unparseable line), a path-contract failure, or an I/O error.
+On Unix, the command refuses to verify a log whose parent directory is owned by a different user, since such a directory could be used to substitute log files or sidecars. It exits `0` when the chain is intact and `1` on any integrity violation (a broken chain, a rotation gap, an HMAC mismatch, a missing sidecar, an unparseable line, or a tip-anchor mismatch), a path-contract failure, or an I/O error.
 
 ```bash
 stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --profile default
 ```
 
 ```json
-{"ok":true,"data":{"entries_verified":42,"files_walked":2,"hmac_verified":true,"per_file":[],"warnings":[],"audit_writer_degraded":false},"request_id":"..."}
+{"ok":true,"data":{"entries_verified":42,"files_walked":2,"hmac_verified":true,"per_file":[],"warnings":[],"audit_writer_degraded":false,"anchor":{"status":"verified","reason":null}},"request_id":"..."}
 ```
+
+### `audit reanchor --profile <NAME> --acknowledge-rollback`
+
+State-changing (writes the keyring anchor and appends one audit row; no network). The only way out of an `audit.tip_anchor_mismatch` refusal.
+
+- `--profile <NAME>` (required) — the profile whose configured `audit_log_path` and audit keyring coordinate identify the anchor.
+- `--acknowledge-rollback` (required to act) — accept the log's current tip as authoritative.
+
+Without `--acknowledge-rollback` the command reports the anchor in force and the anchor it would write, both as `<entry count>:<byte offset>`, changes nothing, and exits `1` with `validation.acknowledgement_required`. Moving the anchor forgives whatever made the log disagree with it, and the command cannot tell a restored backup from tampering — that judgement is the operator's, and it wants to be made before the evidence moves.
+
+With the flag, the command replays the whole log first (a log whose own chain is broken is refused, not blessed), writes the current tip as the anchor, increments a monotonic per-path re-anchor counter held in the keyring, and appends an `audit_tip_anchored` row naming the superseded anchor. That row is permanent: the log carries its own record that a rollback was accepted and how far back it went.
+
+The command takes the audit writer's exclusive lock. A running MCP server holds that lock for its lifetime, so stop the server before repairing.
+
+```bash
+stellar-agent audit reanchor --profile default                          # report only, exits 1
+stellar-agent audit reanchor --profile default --acknowledge-rollback
+```
+
+```json
+{"ok":true,"data":{"profile":"default","previous_anchor":"42:18104","current_anchor":"39:16820","reanchor_count":1},"request_id":"..."}
+```
+
+For the causes worth ruling out before acknowledging, see [Audit-log recovery](../maintainers/audit-log-recovery.md).
 
 ## The governance loop
 
@@ -479,6 +507,6 @@ stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --pr
 1. The agent surface evaluates an action against the policy engine. An action that needs operator consent records a pending approval and returns its nonce instead of executing.
 2. The wallet owner runs `approve --id <NONCE>` in a trusted context, reads the wallet-controlled summary, and consents. The command writes an HMAC attestation (or a toolset grant) bound to the approval nonce, the executed envelope's hash, and the local user.
 3. The agent surface verifies the attestation and executes. Every invocation and lifecycle event is appended to the hash-chained audit log.
-4. The operator periodically runs `audit verify` to confirm the log has not been tampered with, supplying `--profile` to check the chain-root HMAC sidecars as well as the hash chain.
+4. The operator periodically runs `audit verify` to confirm the log has not been tampered with, supplying `--profile` to check the chain-root HMAC sidecars and the tip anchor as well as the hash chain.
 
 Key rotation backs this loop: `rotate-attestation-key` invalidates outstanding approvals, and `rotate-audit-key` re-keys the chain root and re-signs every existing per-file sidecar. See [concepts](../concepts.md) for the full model.

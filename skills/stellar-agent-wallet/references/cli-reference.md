@@ -410,7 +410,7 @@ The policy-file owner key is NOT rotated here — it is an ed25519 key enrolled 
 | Subcommand | Keyring entry | Effect |
 |---|---|---|
 | `rotate-attestation-key` | approval-spine attestation HMAC (`attestation_key_id`) | Invalidates all pending approvals; the simulate-and-approve round trip must be re-run. `key_kind:"hmac_32_bytes"`. |
-| `rotate-audit-key` | audit-log chain-root HMAC (`audit_log_hash_chain_key_id`) | Re-signs every existing per-file chain-root sidecar with the new key, so `audit verify --profile <NAME>` stays green and the old key stops verifying. Adds `key_kind:"hmac_32_bytes"` and `sidecars_resigned`. |
+| `rotate-audit-key` | audit-log chain-root HMAC (`audit_log_hash_chain_key_id`) | Re-signs every existing per-file chain-root sidecar with the new key, so `audit verify --profile <NAME>` stays green and the old key stops verifying. Adds `key_kind:"hmac_32_bytes"` and `sidecars_resigned`. Takes the audit writer's exclusive lock, so it refuses while an MCP server is running. |
 | `rotate-nonce-key` | HMAC nonce key (`mcp_nonce_key_alias`) | Invalidates outstanding nonces. Returns only `profile` + `rotated`. |
 | `rotate-counterparty-key` | `stellar.toml` cache-integrity HMAC (`counterparty_cache_key_id`) | Invalidates every cached counterparty binding (re-fetched on next check). Adds `key_kind:"hmac_32_bytes"` and `cache_invalidated:true`. |
 | `rotate-policy-state-key` | policy-window-state HMAC (`policy_window_state_key_id`) | Re-signs the persisted window-state store under the new key, so accumulated `per_period_cap` / `rate_limit` history is preserved, not invalidated. Refused if the store does not verify under the current key (use `reset-window-state` instead). Adds `key_kind:"hmac_32_bytes"` and `sidecars_resigned`. |
@@ -556,7 +556,9 @@ stellar-agent approve operator enroll --credential-id <B64URL> \
 
 ## audit
 
-Verifies the per-profile audit log, an append-only hash-chained JSONL record of every tool invocation and lifecycle event. Argument values are never logged; only argument key names. The chain links each entry to the SHA-256 of the prior entry's canonical body. Uses the `{ok, data, request_id}` envelope.
+Verifies the per-profile audit log, an append-only hash-chained JSONL record of every tool invocation and lifecycle event, and repairs its tip anchor. Argument values are never logged; only argument key names. The chain links each entry to the SHA-256 of the prior entry's canonical body. Uses the `{ok, data, request_id}` envelope.
+
+The chain and the per-file chain-root signatures verify a PREFIX, so an older copy of the active log, or a truncated one, passes both. The tip anchor pins the END of the chain: the active file's entry count, last-entry hash, and byte offset, held in the platform keyring per log path.
 
 ### `audit verify <LOG_PATH>`
 
@@ -568,14 +570,35 @@ Read-only. Walks the log at `<LOG_PATH>`, following rotation manifests, and veri
 | `--profile <NAME>` | Profile whose chain-root HMAC key verifies sidecars |
 | `--output <FORMAT>` | `json` is the default and only stable format |
 
-On Unix, refuses to verify a log whose parent directory is owned by a different user. Exits `0` when the chain is intact, `1` on any integrity violation (broken chain, rotation gap, HMAC mismatch, missing sidecar, unparseable line), path-contract failure, or I/O error.
+The tip anchor is checked only when `--profile` is supplied AND `<LOG_PATH>` is the log that profile configures, since the anchor names a path. Every other case reports `anchor.status` as `"not_checked"` with the reason and still verifies the chain in full. The check proves the anchored entry is still at the anchored offset, so a longer internally consistent log that does not contain it refuses rather than passing on length alone.
+
+On Unix, refuses to verify a log whose parent directory is owned by a different user. Exits `0` when the chain is intact, `1` on any integrity violation (broken chain, rotation gap, HMAC mismatch, missing sidecar, unparseable line, tip-anchor mismatch), path-contract failure, or I/O error.
 
 ```bash
 stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --profile default
 ```
 
 ```json
-{"ok":true,"data":{"entries_verified":42,"files_walked":2,"hmac_verified":true,"per_file":[],"warnings":[],"audit_writer_degraded":false},"request_id":"..."}
+{"ok":true,"data":{"entries_verified":42,"files_walked":2,"hmac_verified":true,"per_file":[],"warnings":[],"audit_writer_degraded":false,"anchor":{"status":"verified","reason":null}},"request_id":"..."}
+```
+
+### `audit reanchor --profile <NAME> --acknowledge-rollback`
+
+State-changing (writes the keyring anchor and appends one audit row; no network). The only way out of an `audit.tip_anchor_mismatch` refusal. Operator-only: an agent must never run it on its own initiative, because it accepts a log that may have been tampered with.
+
+| Flag / arg | Meaning |
+|---|---|
+| `--profile <NAME>` (required) | Profile whose configured `audit_log_path` and audit keyring coordinate identify the anchor |
+| `--acknowledge-rollback` (required to act) | Accept the log's current tip as authoritative |
+
+Without `--acknowledge-rollback` it reports the anchor in force and the anchor it would write, both as `<entry count>:<byte offset>`, changes nothing, and exits `1` with `validation.acknowledgement_required`. With the flag it replays the whole log (a broken chain is refused, not blessed), writes the current tip, increments a monotonic per-path re-anchor counter in the keyring, and appends an `audit_tip_anchored` row naming the superseded anchor. It takes the audit writer's exclusive lock, so a running MCP server must be stopped first; with one running it refuses `audit.writer_locked`.
+
+```bash
+stellar-agent audit reanchor --profile default --acknowledge-rollback
+```
+
+```json
+{"ok":true,"data":{"profile":"default","previous_anchor":"42:18104","current_anchor":"39:16820","reanchor_count":1},"request_id":"..."}
 ```
 
 ### Governance loop
@@ -583,7 +606,7 @@ stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --pr
 1. The agent surface evaluates an action against the policy engine; an action needing consent records a pending approval and returns its nonce instead of executing.
 2. The wallet owner runs `approve --id <NONCE>`, reads the wallet-controlled summary, and consents; an HMAC attestation (or toolset grant) is written, bound to the nonce, the executed envelope's hash, and the local user.
 3. The agent surface verifies the attestation and executes; every invocation is appended to the hash-chained log.
-4. The operator periodically runs `audit verify --profile <NAME>` to confirm the chain (and chain-root HMAC sidecars) are intact.
+4. The operator periodically runs `audit verify --profile <NAME>` to confirm the chain, the chain-root HMAC sidecars, and the tip anchor are intact.
 
 ---
 

@@ -2254,6 +2254,48 @@ impl AuditEntry {
         }
     }
 
+    /// Constructs an `AuditTipAnchored` audit entry.
+    ///
+    /// Written by the audit writer itself, not by a tool: the `tool` field
+    /// carries the fixed label `audit.tip_anchored` so the row is attributable
+    /// to the substrate rather than to whatever verb happened to trigger the
+    /// open.
+    ///
+    /// `previous_anchor` is the superseded anchor's `<entry count>:<end
+    /// offset>` coordinates, never a digest. `reanchor_count` is set only for
+    /// an operator-acknowledged rollback repair.
+    #[must_use]
+    pub fn new_audit_tip_anchored(
+        reason: crate::audit_log::schema::TipAnchorReason,
+        entry_count: u64,
+        previous_anchor: Option<String>,
+        reanchor_count: Option<u64>,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "audit.tip_anchored".to_owned(),
+            chain_id: None,
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::AuditTipAnchored {
+                reason,
+                entry_count,
+                previous_anchor,
+                reanchor_count,
+            },
+            // The writer populates this field on append; this constructor
+            // leaves it as empty string.  See AuditWriter::write_entry.
+            previous_entry_hash: String::new(),
+        }
+    }
+
     /// Constructs a `SaMulticallInnerExecuted` audit entry.
     ///
     /// Emitted once per inner invocation, immediately after

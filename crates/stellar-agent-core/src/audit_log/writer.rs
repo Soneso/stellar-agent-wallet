@@ -112,8 +112,10 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use super::{
-    chain::{ZERO_BLOCK_HASH, decode_hash, sign_chain_root},
+    chain::{ZERO_BLOCK_HASH, decode_hash, sign_chain_root, verify_chain_root},
     entry::AuditEntry,
+    schema::TipAnchorReason,
+    tip_anchor::{KeyedAuditAccess, TipAnchor, TipAnchorStore, TipAnchorStoreError},
 };
 use crate::timefmt::current_iso8601_utc;
 
@@ -191,14 +193,142 @@ pub struct AuditWriter {
     /// `Zeroizing<[u8; 32]>` ensures the key material is zeroed when the
     /// `AuditWriter` is dropped.
     hmac_key: Option<Zeroizing<[u8; 32]>>,
+    /// Number of entries in the active file.
+    ///
+    /// Tracked whether or not an anchor store is attached, so attaching one to
+    /// an already-open writer needs no rescan.
+    entry_count: u64,
+    /// Byte offset just past the active file's last entry — the file length
+    /// when the file ends on an entry boundary, which it always does after a
+    /// successful [`AuditWriter::write_entry`].
+    end_offset: u64,
+    /// Set when a tip-anchor write failed, cleared when one succeeds.
+    ///
+    /// The append path writes the anchor best-effort, because the entry is
+    /// already durable and a keyring failure must not be reported as a failed
+    /// append. Left alone, one transient failure would leave the anchor behind
+    /// the file for every subsequent append, widening the window in which a
+    /// rollback to a state at or ahead of the stale anchor is absorbed. The next
+    /// append therefore re-writes the anchor for the writer's CURRENT state
+    /// before it appends anything, which repairs any number of missed writes in
+    /// one go.
+    anchor_behind: bool,
+    /// Keyring-held tip anchor for the active PATH, when the opener supplied
+    /// one.
+    ///
+    /// `None` leaves every anchor behaviour off: the writer neither checks nor
+    /// advances an anchor. Unkeyed writers (the startup advisory, the
+    /// zero-config best-effort path, read-only smart-account verbs) are opened
+    /// this way, so their appends land ahead of the anchor and the next keyed
+    /// acquisition absorbs them.
+    tip_anchor: Option<Arc<dyn TipAnchorStore>>,
     /// Test-only fault seam for the write-entry durability invariant.
     #[cfg(test)]
     fail_after_entry_before_sidecar: bool,
+    /// Test-only fault seam that skips the anchor write while still appending
+    /// and fsyncing the entry — the crash window between the entry's
+    /// `sync_data` and the anchor write.
+    #[cfg(test)]
+    skip_tip_anchor_write: bool,
     /// Archive name produced by a failed mid-rotation active-lock acquisition.
     ///
     /// Once set, the writer refuses all future writes. The caller must discard
     /// the instance and reopen after operator inspection.
     partial_rotation_archive: Option<PathBuf>,
+}
+
+/// How [`AuditWriter::open`] treats an attached tip-anchor store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TipAnchorOpenMode {
+    /// Run the check, adopting an absent anchor and absorbing appends made
+    /// ahead of it. A rolled-back or truncated file is refused.
+    Check,
+    /// Skip the check so a refused file can be opened for repair. Only
+    /// [`AuditWriter::open_for_reanchor`] uses this; the caller must follow it
+    /// with [`AuditWriter::reanchor`].
+    Repair,
+}
+
+/// What reconciling the anchor against the active file did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorOutcome {
+    /// No anchor store is attached; nothing was checked.
+    NotAnchored,
+    /// No anchor existed and the active file is empty; the empty-file anchor
+    /// was written. No row is emitted — there is no tip to record.
+    AdoptedEmpty,
+    /// No anchor existed and the active file carried entries; its tip was
+    /// adopted. The caller emits the `audit_tip_anchored` row.
+    AdoptedExisting,
+    /// The anchor already named the file's tip exactly.
+    Current,
+    /// The file had moved forward past the anchor with the anchored entry
+    /// intact; the anchor was advanced to the new tip.
+    Advanced,
+    /// The anchor named the newest archive's rotation handoff and the path held
+    /// the file that rotation created; the anchor was moved onto that file.
+    RotationCompleted,
+}
+
+/// What the anchor store holds for a path, from the repair verb's point of view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StoredTipAnchor {
+    /// Nothing has ever been anchored at this path.
+    Absent,
+    /// A usable anchor.
+    Usable(TipAnchor),
+    /// A value is stored and cannot be parsed. Every ordinary caller refuses on
+    /// it; the repair verb replaces it.
+    Unusable {
+        /// Structural description of the stored bytes, carrying no digest.
+        shape: String,
+        /// Why the value could not be parsed.
+        reason: String,
+    },
+}
+
+impl StoredTipAnchor {
+    /// Renders the stored value for an operator-facing report.
+    ///
+    /// A usable anchor gives its `<entry count>:<end offset>` coordinates; the
+    /// other two say what they are. No digest appears in any of them.
+    #[must_use]
+    pub fn coordinates(&self) -> Option<String> {
+        match self {
+            Self::Absent => None,
+            Self::Usable(anchor) => Some(anchor.coordinates()),
+            Self::Unusable { shape, .. } => Some(format!("unusable ({shape})")),
+        }
+    }
+}
+
+/// Describes a stored anchor value structurally, without echoing it.
+///
+/// A value that failed to parse is of unknown provenance, so it is reported by
+/// field count and length rather than quoted back to the operator.
+fn describe_anchor_shape(raw: Option<&str>) -> String {
+    match raw {
+        None => "the value disappeared between the two reads".to_owned(),
+        Some(raw) => format!(
+            "{} colon-separated fields, {} bytes",
+            raw.split(':').count(),
+            raw.len()
+        ),
+    }
+}
+
+/// The outcome of an operator-acknowledged re-anchor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReanchorReport {
+    /// The anchor that was replaced.
+    pub previous: StoredTipAnchor,
+    /// The anchor now in force, or `None` when the repair left the file with no
+    /// entries to anchor.
+    pub current: Option<TipAnchor>,
+    /// Value of the path's monotonic re-anchor counter after this repair.
+    pub reanchor_count: u64,
 }
 
 impl std::fmt::Debug for AuditWriter {
@@ -258,6 +388,63 @@ impl AuditWriter {
     /// - [`WriterError::FileLocked`] if another process holds the exclusive
     ///   lock on the log file.
     pub fn open(path: PathBuf, hmac_key: Option<Zeroizing<[u8; 32]>>) -> Result<Self, WriterError> {
+        Self::open_inner(path, hmac_key, None, TipAnchorOpenMode::Check)
+    }
+
+    /// Opens the audit log as [`AuditWriter::open`] does and binds it to
+    /// `tip_anchor`, the keyring-held high-water mark for this PATH.
+    ///
+    /// The anchor is reconciled against the file before the writer is returned:
+    /// an absent anchor is adopted (writing an `audit_tip_anchored` row when the
+    /// file already carried entries), a file that moved forward past the anchor
+    /// with the anchored entry intact is absorbed and the anchor advanced, and a
+    /// file that was rolled back, truncated, or replaced is refused with
+    /// [`WriterError::TipAnchorMismatch`]. From then on every
+    /// [`AuditWriter::write_entry`] advances the anchor.
+    ///
+    /// Supply a store only for writers whose appends should move the anchor.
+    /// See [`crate::audit_log::tip_anchor`] for the full check semantics and for
+    /// what the anchor does not protect.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`AuditWriter::open`] returns, plus:
+    /// - [`WriterError::TipAnchorMismatch`] when the file no longer contains the
+    ///   anchored tip.
+    /// - [`WriterError::TipAnchorStore`] when the anchor cannot be read or
+    ///   written.
+    pub fn open_with_tip_anchor(
+        path: PathBuf,
+        hmac_key: Option<Zeroizing<[u8; 32]>>,
+        tip_anchor: Arc<dyn TipAnchorStore>,
+    ) -> Result<Self, WriterError> {
+        Self::open_inner(path, hmac_key, Some(tip_anchor), TipAnchorOpenMode::Check)
+    }
+
+    /// Opens the audit log for anchor repair, skipping the tip-anchor check so
+    /// a refused file can be inspected and re-anchored.
+    ///
+    /// The only caller is the `audit reanchor` verb, which follows this with
+    /// [`AuditWriter::reanchor`]. Opening this way does not by itself change the
+    /// anchor.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`AuditWriter::open`] returns.
+    pub fn open_for_reanchor(
+        path: PathBuf,
+        hmac_key: Option<Zeroizing<[u8; 32]>>,
+        tip_anchor: Arc<dyn TipAnchorStore>,
+    ) -> Result<Self, WriterError> {
+        Self::open_inner(path, hmac_key, Some(tip_anchor), TipAnchorOpenMode::Repair)
+    }
+
+    fn open_inner(
+        path: PathBuf,
+        hmac_key: Option<Zeroizing<[u8; 32]>>,
+        tip_anchor: Option<Arc<dyn TipAnchorStore>>,
+        anchor_mode: TipAnchorOpenMode,
+    ) -> Result<Self, WriterError> {
         // Enforce parent-component contract: a bare filename has no known
         // parent directory, making rotated-sibling placement and directory-mode
         // enforcement impossible.  Callers must supply an explicit parent, e.g.
@@ -305,26 +492,50 @@ impl AuditWriter {
         detect_partial_rotation(&path, &file)?;
 
         // Check if the file is empty (determines chain root vs continuation).
-        let is_new_file = file.metadata()?.len() == 0;
+        let len = file.metadata()?.len();
+        let is_new_file = len == 0;
 
-        // Determine initial last_hash.
-        let last_hash = if is_new_file {
-            ZERO_BLOCK_HASH.to_owned()
+        // Determine initial last_hash, entry count, and end offset by replaying
+        // the whole active file.  The counters are tracked whether or not an
+        // anchor store is attached, so `attach_tip_anchor_store` on an
+        // already-open writer needs no rescan.
+        //
+        // The replay seeds from the cross-file bridge, not unconditionally from
+        // the zero block: the first entry of a file created by a rotation chains
+        // off the outgoing file's handoff entry (see the module-level
+        // "First-entry-per-file rule"), so a zero-block seed would read every
+        // post-rotation active file as a broken chain.
+        let seed = initial_chain_seed(&path)?;
+        let scan = if is_new_file {
+            ChainScan::empty(seed)
         } else {
-            read_and_verify_entry_chain_at_open(&file)?
+            read_and_verify_entry_chain(&file, 0, &seed)?
         };
 
-        Ok(Self {
+        let mut writer = Self {
             path,
             _lock: lock,
             file,
-            last_hash,
+            last_hash: scan.last_hash,
             is_new_file,
             hmac_key,
+            entry_count: scan.entry_count,
+            end_offset: scan.end_offset,
+            anchor_behind: false,
+            tip_anchor,
             #[cfg(test)]
             fail_after_entry_before_sidecar: false,
+            #[cfg(test)]
+            skip_tip_anchor_write: false,
             partial_rotation_archive: None,
-        })
+        };
+
+        if writer.tip_anchor.is_some() && anchor_mode == TipAnchorOpenMode::Check {
+            let outcome = writer.reconcile_tip_anchor(Some(len))?;
+            writer.emit_adoption_row_if_needed(outcome);
+        }
+
+        Ok(writer)
     }
 
     /// Returns the SHA-256 hash of the last entry written to the current file.
@@ -393,6 +604,12 @@ impl AuditWriter {
             });
         }
 
+        // Repair an anchor left behind by an earlier failed write, before this
+        // append moves the tip again. The value written names the entry most
+        // recently fsynced, so it is safe at any point and subsumes however many
+        // writes were missed.
+        self.retry_tip_anchor_if_behind();
+
         // Rotate if needed before writing.
         if self.needs_rotation()? {
             self.rotate()?;
@@ -439,7 +656,23 @@ impl AuditWriter {
             self.is_new_file = false;
         }
 
+        // Advance the keyring-held tip anchor to the entry just fsynced, before
+        // the in-memory tip moves.  Best-effort by contract: the entry is
+        // already durable, so failing the append here would tell the caller the
+        // row was not written when it was.  A missed advance leaves the anchor
+        // behind the file, which the next reconciliation absorbs as an
+        // ahead-of-anchor file.
+        let advanced_count = self.entry_count.saturating_add(1);
+        let advanced_end = self.entry_end_offset()?;
+        self.store_tip_anchor_best_effort(&TipAnchor::new(
+            advanced_count,
+            current_hash.clone(),
+            advanced_end,
+        ));
+
         // Advance the chain.
+        self.entry_count = advanced_count;
+        self.end_offset = advanced_end;
         self.last_hash = current_hash;
         Ok(())
     }
@@ -449,6 +682,14 @@ impl AuditWriter {
     #[cfg(test)]
     pub(crate) fn set_fail_after_entry_before_sidecar(&mut self, enabled: bool) {
         self.fail_after_entry_before_sidecar = enabled;
+    }
+
+    /// Enables a test-only fault seam in the crash window between an entry's
+    /// `sync_data` and the tip-anchor write: the entry lands durably, the
+    /// anchor does not move.
+    #[cfg(test)]
+    pub(crate) fn set_skip_tip_anchor_write(&mut self, enabled: bool) {
+        self.skip_tip_anchor_write = enabled;
     }
 
     /// Forces a log rotation without waiting for the size threshold.
@@ -466,10 +707,531 @@ impl AuditWriter {
         self.rotate()
     }
 
+    /// Performs only the first half of a rotation: appends the handoff entry to
+    /// the outgoing file and advances the anchor onto it, stopping before the
+    /// renames.
+    ///
+    /// `pub(crate)` and `#[cfg(test)]` — lets a test observe the rotation
+    /// window, where the path still holds the whole outgoing file and the
+    /// rollback guard must still be armed. The writer is left mid-rotation and
+    /// must be discarded afterwards.
+    #[cfg(test)]
+    pub(crate) fn write_rotation_handoff_for_test(&mut self) -> Result<String, WriterError> {
+        let stem = self
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("audit.jsonl");
+        let rotated_name = format!("{stem}.{}", compact_timestamp());
+        self.append_rotation_handoff(&rotated_name)
+    }
+
     /// Returns the path to the active log file.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    // ── Tip anchor ───────────────────────────────────────────────────────────
+
+    /// Attaches a tip-anchor store to an already-open writer.
+    ///
+    /// The writer-registry cache hands out one writer per profile for the
+    /// process lifetime, so a writer first opened without an anchor (a
+    /// read-only verb, the best-effort zero-config path) must be able to take
+    /// one on when a value verb later acquires it. Attaching does not itself
+    /// reconcile; the caller follows with [`AuditWriter::verify_tip_anchor`].
+    ///
+    /// A store already attached is left in place: the anchor for a path is the
+    /// same wherever it is derived from, and replacing a live handle mid-process
+    /// would only add a way for two callers to disagree.
+    pub fn attach_tip_anchor_store(&mut self, store: Arc<dyn TipAnchorStore>) {
+        if self.tip_anchor.is_none() {
+            self.tip_anchor = Some(store);
+        }
+    }
+
+    /// Returns `true` when this writer maintains a tip anchor.
+    #[must_use]
+    pub fn has_tip_anchor(&self) -> bool {
+        self.tip_anchor.is_some()
+    }
+
+    /// Reconciles the anchor against the active file — the pre-flight every
+    /// value-moving verb runs on EVERY acquisition of the writer.
+    ///
+    /// The writer registry caches writers for the process lifetime, so a check
+    /// performed only at open would miss a file replaced underneath a live
+    /// writer. This re-reads the file each time: cheap when the anchor is
+    /// current (one seek and one entry hash), a replay of the appended tail when
+    /// the file has moved forward.
+    ///
+    /// A writer with no anchor store returns `Ok(())` unchanged.
+    ///
+    /// # Errors
+    ///
+    /// - [`WriterError::TipAnchorMismatch`] when the file no longer contains the
+    ///   anchored tip — it was rolled back, truncated, or replaced.
+    /// - [`WriterError::TipAnchorStore`] when the anchor cannot be read or
+    ///   written.
+    /// - [`WriterError::Io`] / [`WriterError::Serialise`] /
+    ///   [`WriterError::ChainBrokenAtOpen`] when the file cannot be replayed.
+    pub fn verify_tip_anchor(&mut self) -> Result<(), WriterError> {
+        let outcome = self.reconcile_tip_anchor(None)?;
+        self.emit_adoption_row_if_needed(outcome);
+        Ok(())
+    }
+
+    /// Moves the anchor to the active file's current tip and records the
+    /// repair — the operator-acknowledged way out of a
+    /// [`WriterError::TipAnchorMismatch`].
+    ///
+    /// Replays the whole active file first, so a file whose internal chain is
+    /// broken is refused rather than blessed. On success the path's monotonic
+    /// re-anchor counter is incremented and an `audit_tip_anchored` row naming
+    /// the superseded anchor is appended, which advances the anchor once more
+    /// to cover that row.
+    ///
+    /// Open the writer with [`AuditWriter::open_for_reanchor`]: an ordinary open
+    /// would refuse before reaching this method.
+    ///
+    /// # Errors
+    ///
+    /// - [`WriterError::TipAnchorUnavailable`] when no anchor store is attached.
+    /// - [`WriterError::TipAnchorStore`] when the anchor or the counter cannot be
+    ///   read or written.
+    /// - [`WriterError::ChainBrokenAtOpen`] when the file's own chain does not
+    ///   verify.
+    /// - [`WriterError::Io`] / [`WriterError::Serialise`] on failure to append
+    ///   the row.
+    pub fn reanchor(&mut self) -> Result<ReanchorReport, WriterError> {
+        let store = self
+            .tip_anchor
+            .clone()
+            .ok_or(WriterError::TipAnchorUnavailable)?;
+        let previous = self.stored_tip_anchor()?;
+
+        let scan = self.replay_active_file()?;
+        self.adopt_scan_state(&scan);
+        let repaired_count = scan.entry_count;
+        if scan.entry_count > 0 {
+            let repaired =
+                TipAnchor::new(scan.entry_count, scan.last_hash.clone(), scan.end_offset);
+            store
+                .store_anchor(&repaired)
+                .map_err(WriterError::TipAnchorStore)?;
+        }
+        let reanchor_count = store
+            .bump_reanchor_count()
+            .map_err(WriterError::TipAnchorStore)?;
+
+        // The row itself advances the anchor past `repaired`; the report names
+        // the anchor the operator asked for, which is what the refusal was
+        // about.
+        self.write_entry(AuditEntry::new_audit_tip_anchored(
+            TipAnchorReason::RollbackAcknowledged,
+            repaired_count,
+            previous.coordinates(),
+            Some(reanchor_count),
+            uuid::Uuid::new_v4().to_string(),
+        ))?;
+
+        // The row itself advanced the anchor past the repaired tip; report the
+        // anchor as it now stands rather than the intermediate value.
+        let current = store.load_anchor().map_err(WriterError::TipAnchorStore)?;
+        Ok(ReanchorReport {
+            previous,
+            current,
+            reanchor_count,
+        })
+    }
+
+    /// Returns the anchor currently held in the store, without comparing it
+    /// against the file.
+    ///
+    /// Used by the repair verb to report what it is about to replace. A value
+    /// that is present but does not parse is reported as
+    /// [`StoredTipAnchor::Unusable`] rather than failing, so the repair can
+    /// replace it; every other caller goes through
+    /// [`TipAnchorStore::load_anchor`] and refuses on it.
+    ///
+    /// # Errors
+    ///
+    /// - [`WriterError::TipAnchorUnavailable`] when no anchor store is attached.
+    /// - [`WriterError::TipAnchorStore`] when the backend is unavailable.
+    pub fn stored_tip_anchor(&self) -> Result<StoredTipAnchor, WriterError> {
+        let store = self
+            .tip_anchor
+            .as_ref()
+            .ok_or(WriterError::TipAnchorUnavailable)?;
+        match store.load_anchor() {
+            Ok(Some(anchor)) => Ok(StoredTipAnchor::Usable(anchor)),
+            Ok(None) => Ok(StoredTipAnchor::Absent),
+            Err(parse_error) => {
+                // The value is there and cannot be read. Ordinary opens refuse on
+                // it, which is what keeps a corrupted anchor from reading as
+                // "nothing anchored"; the repair verb is the one caller that has
+                // to be able to replace it, so it needs to see the shape.
+                let raw = store.load_raw().map_err(WriterError::TipAnchorStore)?;
+                Ok(StoredTipAnchor::Unusable {
+                    shape: describe_anchor_shape(raw.as_deref()),
+                    reason: parse_error.detail,
+                })
+            }
+        }
+    }
+
+    /// Replays the active file and returns the anchor that describes its
+    /// current tip, WITHOUT storing it.
+    ///
+    /// Used by the repair verb to report what it would write before the
+    /// operator acknowledges it. `None` when the file has no entries, so there
+    /// is nothing to anchor.
+    ///
+    /// # Errors
+    ///
+    /// [`WriterError::Io`] / [`WriterError::Serialise`] /
+    /// [`WriterError::ChainBrokenAtOpen`] when the file cannot be replayed.
+    pub fn current_tip_anchor(&self) -> Result<Option<TipAnchor>, WriterError> {
+        let scan = self.replay_active_file()?;
+        if scan.entry_count == 0 {
+            return Ok(None);
+        }
+        Ok(Some(TipAnchor::new(
+            scan.entry_count,
+            scan.last_hash,
+            scan.end_offset,
+        )))
+    }
+
+    /// Returns the hash the active file's FIRST entry must chain from.
+    ///
+    /// The single source of the replay seed for this writer: every full-file
+    /// replay, and the tail replay whose anchor names an empty file, goes
+    /// through here rather than naming [`ZERO_BLOCK_HASH`] directly. The zero
+    /// block is correct only for the first file of a chain; a file a rotation
+    /// created chains off the outgoing file's handoff entry, so a hardcoded
+    /// zero-block seed reads every post-rotation active file as a broken chain.
+    fn chain_seed(&self) -> Result<String, WriterError> {
+        initial_chain_seed(&self.path)
+    }
+
+    /// Replays the whole active file from its chain seed.
+    ///
+    /// Validates linkage end to end and yields the file's entry count, tip hash,
+    /// and end offset — the three values a [`TipAnchor`] records.
+    fn replay_active_file(&self) -> Result<ChainScan, WriterError> {
+        let seed = self.chain_seed()?;
+        read_and_verify_entry_chain(&self.file, 0, &seed)
+    }
+
+    /// Compares the anchor with the active file and brings the two into
+    /// agreement, or refuses.
+    ///
+    /// `known_len` lets `open` reuse the length it already read; `None` reads it
+    /// fresh, which is what the per-acquisition pre-flight needs.
+    fn reconcile_tip_anchor(
+        &mut self,
+        known_len: Option<u64>,
+    ) -> Result<AnchorOutcome, WriterError> {
+        let Some(store) = self.tip_anchor.clone() else {
+            return Ok(AnchorOutcome::NotAnchored);
+        };
+        let len = match known_len {
+            Some(len) => len,
+            None => self.file.metadata()?.len(),
+        };
+        let anchor = store.load_anchor().map_err(WriterError::TipAnchorStore)?;
+
+        let Some(anchor) = anchor else {
+            return self.adopt_tip_anchor(store.as_ref(), len);
+        };
+
+        // Cheap path first: prove the anchored entry is still the entry ending
+        // at the anchored offset, without replaying the file and without
+        // touching the audit directory.
+        let intact = self.anchored_entry_is_intact(&anchor)?;
+        if intact && len == anchor.end_offset {
+            self.entry_count = anchor.entry_count;
+            self.end_offset = anchor.end_offset;
+            self.is_new_file = false;
+            self.last_hash.clone_from(&anchor.tip_hash);
+            return Ok(AnchorOutcome::Current);
+        }
+
+        // The anchor may name the PREVIOUS file generation: a rotation leaves it
+        // on the outgoing file's handoff entry, and it stays there until the new
+        // file's first append advances it. That state is provable, not guessed —
+        // the anchored tip must equal the hash of the newest archive's last
+        // entry, which `chain_seed` already reads and already requires to be a
+        // rotation handoff naming that archive. An attacker cannot manufacture
+        // the match: appending a handoff to a copy of the log produces a NEW tip
+        // hash, which the anchor does not name.
+        //
+        // Checked before the length comparison because such an anchor's count
+        // and offset describe the ARCHIVE, so comparing them against the file
+        // now at the path is meaningless in either direction.
+        if self.anchor_names_the_rotation_handoff(&anchor)? {
+            return self.adopt_rotated_file(store.as_ref());
+        }
+
+        if len < anchor.end_offset {
+            return Err(self.tip_anchor_mismatch(&anchor, len, "file is shorter than the anchor"));
+        }
+        if !intact {
+            return Err(self.tip_anchor_mismatch(
+                &anchor,
+                len,
+                "the entry at the anchored offset is not the anchored entry",
+            ));
+        }
+
+        // The file moved forward past the anchor. Replay only the appended tail,
+        // which validates that it chains off the anchored tip.
+        let tail = read_and_verify_entry_chain(&self.file, anchor.end_offset, &anchor.tip_hash)?;
+        let advanced = TipAnchor::new(
+            anchor.entry_count.saturating_add(tail.entry_count),
+            tail.last_hash.clone(),
+            tail.end_offset,
+        );
+        self.entry_count = advanced.entry_count;
+        self.end_offset = advanced.end_offset;
+        self.is_new_file = false;
+        self.last_hash.clone_from(&advanced.tip_hash);
+        store
+            .store_anchor(&advanced)
+            .map_err(WriterError::TipAnchorStore)?;
+        Ok(AnchorOutcome::Advanced)
+    }
+
+    /// Returns `true` when the anchor names exactly the newest rotated
+    /// archive's handoff entry — the fingerprint of a rotation whose renames
+    /// completed while the new file's anchor write was lost.
+    ///
+    /// Compares hashes, not counts or offsets: the hash identifies one entry,
+    /// and the counts in such an anchor describe the archive rather than the
+    /// file now at the path. A log that has never rotated has no archive, so
+    /// [`AuditWriter::chain_seed`] returns the zero block, which is never an
+    /// entry hash and therefore never matches an anchor with entries.
+    fn anchor_names_the_rotation_handoff(&self, anchor: &TipAnchor) -> Result<bool, WriterError> {
+        Ok(self.chain_seed()? == anchor.tip_hash)
+    }
+
+    /// Re-derives the anchor from the file a completed rotation left at this
+    /// path.
+    ///
+    /// No `audit_tip_anchored` row is written: the rotation handoff entry in the
+    /// archive is already the durable record that the rotation happened, and the
+    /// anchor is being moved onto the same chain it already covered rather than
+    /// forgiving a divergence.
+    fn adopt_rotated_file(
+        &mut self,
+        store: &dyn TipAnchorStore,
+    ) -> Result<AnchorOutcome, WriterError> {
+        let scan = self.replay_active_file()?;
+        self.adopt_scan_state(&scan);
+        if scan.entry_count > 0 {
+            let rotated = TipAnchor::new(scan.entry_count, scan.last_hash.clone(), scan.end_offset);
+            store
+                .store_anchor(&rotated)
+                .map_err(WriterError::TipAnchorStore)?;
+        }
+        // A file the rotation created but nothing has appended to yet stays
+        // unanchored in its own right: the anchor keeps naming the archive's
+        // handoff, which is what proves this generation on the next open.
+        Ok(AnchorOutcome::RotationCompleted)
+    }
+
+    /// Takes an unanchored file under anchor protection at its current tip.
+    ///
+    /// The whole file is replayed first, so a broken chain is refused rather
+    /// than adopted. When the writer is keyed AND the file carries a chain-root
+    /// sidecar, that sidecar must verify: a log whose root signature is wrong is
+    /// not a log worth anchoring. A keyed writer facing a file with NO sidecar
+    /// still adopts — that is a log written only by unkeyed writers, which is
+    /// exactly the state the zero-config quickstart leaves behind, and refusing
+    /// it would make minting an audit key a one-way door.
+    fn adopt_tip_anchor(
+        &mut self,
+        store: &dyn TipAnchorStore,
+        len: u64,
+    ) -> Result<AnchorOutcome, WriterError> {
+        if len == 0 {
+            // Nothing to anchor. Leaving the store empty says exactly that, and
+            // the first append writes the first real anchor.
+            self.entry_count = 0;
+            self.end_offset = 0;
+            return Ok(AnchorOutcome::AdoptedEmpty);
+        }
+
+        let scan = self.replay_active_file()?;
+        self.verify_chain_root_for_adoption()?;
+        let adopted = TipAnchor::new(scan.entry_count, scan.last_hash.clone(), scan.end_offset);
+        self.adopt_scan_state(&scan);
+        store
+            .store_anchor(&adopted)
+            .map_err(WriterError::TipAnchorStore)?;
+        Ok(if adopted.entry_count == 0 {
+            AnchorOutcome::AdoptedEmpty
+        } else {
+            AnchorOutcome::AdoptedExisting
+        })
+    }
+
+    /// Verifies the active file's chain-root sidecar before adoption.
+    ///
+    /// A missing sidecar is accepted; see [`AuditWriter::adopt_tip_anchor`].
+    fn verify_chain_root_for_adoption(&self) -> Result<(), WriterError> {
+        let Some(key) = self.hmac_key.as_ref() else {
+            return Ok(());
+        };
+        let sidecar = hmac_sidecar_path(&self.path);
+        if !sidecar.exists() {
+            return Ok(());
+        }
+        let tag = fs::read_to_string(&sidecar)?;
+        let first = read_first_entry_of(&self.file)?;
+        let body = first
+            .canonical_json_body()
+            .map_err(WriterError::Serialise)?;
+        verify_chain_root(key.as_ref(), &body, tag.trim()).map_err(|_| {
+            WriterError::IntegrityViolation(super::verify::VerifyError::HmacMismatch {
+                file: basename_lossy_path(&self.path),
+            })
+        })
+    }
+
+    /// Returns `true` when the last entry ending at or before the anchored
+    /// offset still hashes to the anchored tip.
+    ///
+    /// At a zero entry count there is no entry to hash; the offset comparison in
+    /// the caller is the whole check.
+    fn anchored_entry_is_intact(&mut self, anchor: &TipAnchor) -> Result<bool, WriterError> {
+        let Some(line) = read_last_line_before(&self.file, anchor.end_offset)? else {
+            return Ok(false);
+        };
+        let Ok(entry) = serde_json::from_slice::<AuditEntry>(&line) else {
+            return Ok(false);
+        };
+        let hash = compute_entry_hash_streamed(&entry, &entry.previous_entry_hash)?;
+        Ok(hash == anchor.tip_hash)
+    }
+
+    /// Adopts a full-file replay result as the writer's in-memory state.
+    fn adopt_scan_state(&mut self, scan: &ChainScan) {
+        self.entry_count = scan.entry_count;
+        self.end_offset = scan.end_offset;
+        self.is_new_file = scan.entry_count == 0;
+        if scan.entry_count > 0 {
+            self.last_hash.clone_from(&scan.last_hash);
+        }
+    }
+
+    /// Builds the refusal for a file that no longer contains the anchored tip.
+    fn tip_anchor_mismatch(
+        &self,
+        anchor: &TipAnchor,
+        actual_len: u64,
+        reason: &'static str,
+    ) -> WriterError {
+        tracing::warn!(
+            log = %basename_lossy_path(&self.path),
+            expected_count = anchor.entry_count,
+            expected_offset = anchor.end_offset,
+            actual_len,
+            reason,
+            "audit tip anchor mismatch; refusing"
+        );
+        WriterError::TipAnchorMismatch {
+            expected_count: anchor.entry_count,
+            expected_offset: anchor.end_offset,
+            actual_len,
+            reason,
+        }
+    }
+
+    /// Writes `anchor` without failing the caller.
+    ///
+    /// Used on the append and rotation paths, where the log entry is already
+    /// durable and an anchor-write failure must not be reported as a failed
+    /// append. A failure latches [`AuditWriter::anchor_behind`] so the next
+    /// append retries before it appends.
+    fn store_tip_anchor_best_effort(&mut self, anchor: &TipAnchor) {
+        #[cfg(test)]
+        if self.skip_tip_anchor_write {
+            return;
+        }
+        let Some(store) = self.tip_anchor.clone() else {
+            return;
+        };
+        match store.store_anchor(anchor) {
+            Ok(()) => self.anchor_behind = false,
+            Err(e) => {
+                self.anchor_behind = true;
+                tracing::warn!(
+                    log = %basename_lossy_path(&self.path),
+                    error = %e,
+                    "audit tip anchor write failed; the next append retries it, and \
+                     the next acquisition absorbs whatever gap remains"
+                );
+            }
+        }
+    }
+
+    /// Returns the byte offset just past the entry this writer has only now
+    /// appended and fsynced.
+    ///
+    /// Read from the file rather than computed as "previous offset plus the
+    /// bytes written". The writer's idea of where the previous entry ended can
+    /// be short of where it actually ended: every reader in this subsystem
+    /// tolerates blank lines between entries and at end of file, so a log that
+    /// picked any up outside this writer has more bytes than the writer
+    /// accounted for. An arithmetic offset then names a position inside an
+    /// entry, and the next open reports a rollback on an untouched log.
+    ///
+    /// The file is opened `O_APPEND` and the writer holds the exclusive lock, so
+    /// after `sync_data` the entry just written ends at end of file, which is
+    /// also where the reader's replay ends: the entry is the last one and its
+    /// trailing newline is the file's last byte.
+    fn entry_end_offset(&self) -> Result<u64, WriterError> {
+        Ok(self.file.metadata()?.len())
+    }
+
+    /// Re-writes the anchor for the writer's current state when an earlier
+    /// write failed.
+    ///
+    /// A no-op when no write has failed, so the ordinary append pays nothing.
+    fn retry_tip_anchor_if_behind(&mut self) {
+        if !self.anchor_behind || self.entry_count == 0 {
+            return;
+        }
+        let current = TipAnchor::new(self.entry_count, self.last_hash.clone(), self.end_offset);
+        self.store_tip_anchor_best_effort(&current);
+    }
+
+    /// Appends the adoption row when reconciliation adopted a non-empty file.
+    ///
+    /// Non-fatal: the anchor is already in force, and refusing the acquisition
+    /// because a forensic row could not be appended would take the log offline
+    /// for a reason the anchor itself has already handled.
+    fn emit_adoption_row_if_needed(&mut self, outcome: AnchorOutcome) {
+        if outcome != AnchorOutcome::AdoptedExisting {
+            return;
+        }
+        let entry_count = self.entry_count;
+        if let Err(e) = self.write_entry(AuditEntry::new_audit_tip_anchored(
+            TipAnchorReason::Adopted,
+            entry_count,
+            None,
+            None,
+            uuid::Uuid::new_v4().to_string(),
+        )) {
+            tracing::warn!(
+                log = %basename_lossy_path(&self.path),
+                error = %e,
+                "audit tip anchor adopted but the adoption row could not be appended"
+            );
+        }
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────
@@ -528,13 +1290,34 @@ impl AuditWriter {
             .map(|p| p.join(&rotated_name))
             .unwrap_or_else(|| PathBuf::from(&rotated_name));
 
+        let handoff_hash = self.append_rotation_handoff(&rotated_name)?;
+
+        // Rename the HMAC sidecar before renaming the log file so both
+        // renames are co-located in time.
+        let active_hmac_sidecar = hmac_sidecar_path(&self.path);
+        let rotated_hmac_sidecar = hmac_sidecar_path(&rotated_path);
+        if active_hmac_sidecar.exists() {
+            fs::rename(&active_hmac_sidecar, &rotated_hmac_sidecar)?;
+        }
+
+        self.finish_rotation(&rotated_path, &rotated_name, handoff_hash)
+    }
+
+    /// Appends the rotation handoff entry to the outgoing file and advances the
+    /// anchor onto it.
+    ///
+    /// The first half of [`AuditWriter::rotate`], split out so a test can stop
+    /// inside the rotation window and observe that the rollback guard is still
+    /// armed there. Returns the handoff entry's hash, which the new file's first
+    /// entry chains from.
+    fn append_rotation_handoff(&mut self, rotated_name: &str) -> Result<String, WriterError> {
         // Write the rotation handoff entry to the current file.
         let mut handoff = AuditEntry::new_rotation_handoff(
             // NOTE: handoff names the *rotated* file — i.e. the archive file,
             // not the new active file.  `verify_log` uses this to locate the
             // archived file by name.  The name here must match the basename
             // of `rotated_path`.
-            &rotated_name,
+            rotated_name,
             uuid::Uuid::new_v4().to_string(),
         );
         handoff.previous_entry_hash = self.last_hash.clone();
@@ -552,17 +1335,41 @@ impl AuditWriter {
         self.file.write_all(&line)?;
         self.file.flush()?;
         self.file.sync_data()?;
+        self.entry_count = self.entry_count.saturating_add(1);
+        self.end_offset = self.entry_end_offset()?;
 
-        // Rename the HMAC sidecar before renaming the log file so both
-        // renames are co-located in time.
-        let active_hmac_sidecar = hmac_sidecar_path(&self.path);
-        let rotated_hmac_sidecar = hmac_sidecar_path(&rotated_path);
-        if active_hmac_sidecar.exists() {
-            fs::rename(&active_hmac_sidecar, &rotated_hmac_sidecar)?;
-        }
+        // Advance the anchor onto the handoff entry — the outgoing file's true
+        // tip — BEFORE the renames.
+        //
+        // Ordering is load-bearing, and the empty-file anchor is deliberately
+        // NOT written here.  The empty-file anchor is offset 0, which is a
+        // prefix of every file, so while it stands every file reads as
+        // ahead-of-anchor and a rollback is absorbed instead of refused.
+        // Writing it before the renames would leave that window open across the
+        // whole rotation, with the path still holding the full outgoing file.
+        // Holding the outgoing tip instead keeps the rollback guard armed
+        // throughout, and the crash window it opens — the renames complete but
+        // the new file's anchor write does not — is closed on the next open by
+        // the rotation-completed rule in `reconcile_tip_anchor`, which
+        // recognises an anchor naming exactly the newest archive's handoff.
+        self.store_tip_anchor_best_effort(&TipAnchor::new(
+            self.entry_count,
+            handoff_hash.clone(),
+            self.end_offset,
+        ));
+        Ok(handoff_hash)
+    }
 
+    /// Performs the renames, the prune, and the new-file create — the second
+    /// half of [`AuditWriter::rotate`].
+    fn finish_rotation(
+        &mut self,
+        rotated_path: &Path,
+        rotated_name: &str,
+        handoff_hash: String,
+    ) -> Result<(), WriterError> {
         // Rename the current log file to the rotated name.
-        fs::rename(&self.path, &rotated_path)?;
+        fs::rename(&self.path, rotated_path)?;
 
         // Prune excess rotated files.
         self.prune_rotated_files()?;
@@ -600,7 +1407,16 @@ impl AuditWriter {
         self.file = new_file;
         self.last_hash = handoff_hash;
         self.is_new_file = true;
+        self.entry_count = 0;
+        self.end_offset = 0;
 
+        // The anchor is deliberately left naming the archive's handoff entry.
+        // There is no anchor value for a file with no entries: offset 0 is a
+        // prefix of every file, so such an anchor classifies every file at this
+        // path as ahead of it and a directory-level restore would be absorbed
+        // instead of refused.  Until this file's first append advances the
+        // anchor, `reconcile_tip_anchor`'s rotation-completed rule carries every
+        // open and pre-flight, and it proves the generation by hash.
         Ok(())
     }
 
@@ -1167,26 +1983,74 @@ fn read_last_entry_hash(path: &Path) -> Result<String, WriterError> {
     }
 }
 
-fn read_and_verify_entry_chain_at_open(file: &File) -> Result<String, WriterError> {
+/// The result of replaying a byte range of the active log file.
+struct ChainScan {
+    /// Entry hash of the last entry in the replayed range, or the seed hash
+    /// when the range held no entries.
+    last_hash: String,
+    /// Number of entries in the replayed range.
+    entry_count: u64,
+    /// Byte offset just past the replayed range — the file length when the
+    /// range ran to end of file.
+    end_offset: u64,
+}
+
+impl ChainScan {
+    /// The result of replaying an empty range.
+    fn empty(seed: String) -> Self {
+        Self {
+            last_hash: seed,
+            entry_count: 0,
+            end_offset: 0,
+        }
+    }
+}
+
+/// Replays the log file from `start_offset`, verifying that each entry chains
+/// off the previous one and that the first chains off `seed_hash`.
+///
+/// Reads through `read_until` rather than `BufRead::lines` so the byte offset
+/// stays exact: the tip anchor records where the chain ends, and a line-based
+/// reader cannot report that. Entry indices in
+/// [`WriterError::ChainBrokenAtOpen`] count non-empty entries from the start of
+/// the replayed range.
+fn read_and_verify_entry_chain(
+    file: &File,
+    start_offset: u64,
+    seed_hash: &str,
+) -> Result<ChainScan, WriterError> {
     // Reuse the caller's already-open (and already-locked) handle rather than
     // opening a second one — see the module-level "Single-handle requirement
     // (Windows)" section.
     let mut cursor = file;
-    cursor.seek(SeekFrom::Start(0))?;
-    let reader = BufReader::new(cursor);
+    cursor.seek(SeekFrom::Start(start_offset))?;
+    let mut reader = BufReader::new(cursor);
 
-    let mut expected_previous_hash = ZERO_BLOCK_HASH.to_owned();
-    let mut last_hash = ZERO_BLOCK_HASH.to_owned();
+    let mut expected_previous_hash = seed_hash.to_owned();
+    let mut last_hash = seed_hash.to_owned();
     let mut entry_idx = 0usize;
+    let mut consumed = start_offset;
+    // Offset just past the last ENTRY, which is what the anchor records: bytes
+    // after it that hold no entry (trailing blank lines) are not part of the
+    // verified prefix.
+    let mut end_offset = start_offset;
+    let mut raw = Vec::new();
 
-    for line_result in reader.lines() {
-        let line = line_result?;
-        if line.trim().is_empty() {
+    loop {
+        raw.clear();
+        let read = reader.read_until(b'\n', &mut raw)?;
+        if read == 0 {
+            break;
+        }
+        consumed = consumed.saturating_add(read as u64);
+
+        let line = strip_line_terminator(&raw);
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
 
         entry_idx += 1;
-        let entry: AuditEntry = serde_json::from_str(&line).map_err(WriterError::Serialise)?;
+        let entry: AuditEntry = serde_json::from_slice(line).map_err(WriterError::Serialise)?;
         if entry.previous_entry_hash != expected_previous_hash {
             return Err(WriterError::ChainBrokenAtOpen {
                 entry_idx,
@@ -1198,9 +2062,175 @@ fn read_and_verify_entry_chain_at_open(file: &File) -> Result<String, WriterErro
         let hash = compute_entry_hash_streamed(&entry, &entry.previous_entry_hash)?;
         expected_previous_hash = hash.clone();
         last_hash = hash;
+        end_offset = consumed;
     }
 
-    Ok(last_hash)
+    Ok(ChainScan {
+        last_hash,
+        entry_count: entry_idx as u64,
+        end_offset,
+    })
+}
+
+/// Returns the hash the active file's first entry must chain from.
+///
+/// [`ZERO_BLOCK_HASH`] for the very first file of a chain; the hash of the
+/// newest rotated sibling's last entry — the rotation handoff — once the log has
+/// rotated at least once. This is the writer-side counterpart of the cross-file
+/// bridge `verify_log` validates when it walks from one file into the next.
+///
+/// Only the newest archive's LAST line is read, so the cost is one seek and one
+/// entry hash rather than a walk of every retained archive.
+///
+/// # What this does and does not establish
+///
+/// The line is required to BE a rotation handoff naming this archive — the
+/// shape [`AuditWriter::rotate`] always writes last, and the only shape whose
+/// hash a following file legitimately chains from. Anything else is refused
+/// with [`WriterError::RotationBridgeUnusable`] rather than silently used as a
+/// seed, so a file dropped into the audit directory under a later timestamp
+/// cannot redirect the bridge by looking vaguely like a log.
+///
+/// That check is structural, not cryptographic. It does not walk the archive's
+/// chain and does not verify its root signature, so it establishes only that the
+/// seed came from a well-formed handoff for this stem. The bridge's integrity is
+/// established by `audit verify`, which walks every file, threads the tip from
+/// one into the next, and requires each file's chain-root signature under the
+/// profile's key. Open-time failure here is fail-closed: the writer refuses.
+///
+/// An archive with no readable last entry falls back to the zero block, so the
+/// caller's replay reports the bridge failure against the active file's own
+/// first entry, which is the more useful diagnostic.
+pub(super) fn initial_chain_seed(log_path: &Path) -> Result<String, WriterError> {
+    let chain = super::verify::collect_file_chain(log_path)?;
+    // `collect_file_chain` returns rotated siblings oldest-first with the active
+    // path last, so the newest archive is the second-to-last element.
+    let Some(newest_archive) = chain.len().checked_sub(2).and_then(|idx| chain.get(idx)) else {
+        return Ok(ZERO_BLOCK_HASH.to_owned());
+    };
+    let archive_name = basename_lossy_path(newest_archive);
+    let file = match File::open(newest_archive) {
+        Ok(file) => file,
+        Err(_) => return Ok(ZERO_BLOCK_HASH.to_owned()),
+    };
+    let len = file.metadata()?.len();
+    let Some(line) = read_last_line_before(&file, len)? else {
+        return Ok(ZERO_BLOCK_HASH.to_owned());
+    };
+    let entry: AuditEntry =
+        serde_json::from_slice(&line).map_err(|_| WriterError::RotationBridgeUnusable {
+            archive_name: archive_name.clone(),
+            reason: "the archive's last line is not a parseable audit entry",
+        })?;
+    match &entry.event_kind {
+        super::schema::EventKind::AuditRotationHandoff { next_file_name }
+            if *next_file_name == archive_name => {}
+        super::schema::EventKind::AuditRotationHandoff { .. } => {
+            return Err(WriterError::RotationBridgeUnusable {
+                archive_name,
+                reason: "the archive's handoff entry names a different archive",
+            });
+        }
+        _ => {
+            return Err(WriterError::RotationBridgeUnusable {
+                archive_name,
+                reason: "the archive does not end with a rotation handoff entry",
+            });
+        }
+    }
+    compute_entry_hash_streamed(&entry, &entry.previous_entry_hash)
+}
+
+/// Strips a trailing `\n`, and a `\r` before it, from a raw line.
+fn strip_line_terminator(raw: &[u8]) -> &[u8] {
+    let mut line = raw;
+    if line.last() == Some(&b'\n') {
+        line = &line[..line.len() - 1];
+    }
+    if line.last() == Some(&b'\r') {
+        line = &line[..line.len() - 1];
+    }
+    line
+}
+
+/// Reads the last non-empty line that ends at or before `end_offset`.
+///
+/// Walks backward in 4 KiB windows so the common case touches only the tail of
+/// the file, matching [`detect_partial_last_entry`]'s scan discipline: a single
+/// audit entry may legally exceed one window, so the scan keeps accumulating
+/// until it finds the newline that starts the last line, or reaches the file
+/// start.
+///
+/// Returns `Ok(None)` when the range holds nothing but whitespace.
+///
+/// `pub(super)` so the verifier proves the anchored entry intact with the same
+/// scan the writer uses, rather than a second implementation that could drift
+/// from it.
+pub(super) fn read_last_line_before(file: &File, end_offset: u64) -> io::Result<Option<Vec<u8>>> {
+    const SCAN_CHUNK: u64 = 4096;
+
+    let mut cursor = file;
+    let file_len = cursor.metadata()?.len();
+    let mut scan_end = std::cmp::min(end_offset, file_len);
+    if scan_end == 0 {
+        return Ok(None);
+    }
+
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let chunk_size = std::cmp::min(SCAN_CHUNK, scan_end);
+        let chunk_start = scan_end - chunk_size;
+        cursor.seek(SeekFrom::Start(chunk_start))?;
+        let mut chunk = vec![
+            0u8;
+            usize::try_from(chunk_size)
+                .map_err(|_| io::Error::other("audit log chunk size overflow"))?
+        ];
+        cursor.read_exact(&mut chunk)?;
+        chunk.extend_from_slice(&buf);
+        buf = chunk;
+
+        while buf.last().is_some_and(u8::is_ascii_whitespace) {
+            buf.pop();
+        }
+        if buf.is_empty() {
+            if chunk_start == 0 {
+                return Ok(None);
+            }
+            scan_end = chunk_start;
+            continue;
+        }
+        if let Some(idx) = buf.iter().rposition(|&byte| byte == b'\n') {
+            return Ok(Some(strip_line_terminator(&buf[idx + 1..]).to_vec()));
+        }
+        if chunk_start == 0 {
+            return Ok(Some(strip_line_terminator(&buf).to_vec()));
+        }
+        scan_end = chunk_start;
+    }
+}
+
+/// Reads and parses the first entry of the active file through the writer's own
+/// handle.
+fn read_first_entry_of(file: &File) -> Result<AuditEntry, WriterError> {
+    let mut cursor = file;
+    cursor.seek(SeekFrom::Start(0))?;
+    let mut reader = BufReader::new(cursor);
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        let read = reader.read_until(b'\n', &mut raw)?;
+        if read == 0 {
+            return Err(WriterError::Io(io::Error::other(
+                "audit log has no first entry to verify the chain root against",
+            )));
+        }
+        let line = strip_line_terminator(&raw);
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        return serde_json::from_slice(line).map_err(WriterError::Serialise);
+    }
 }
 
 #[cfg(test)]
@@ -1402,6 +2432,127 @@ pub enum WriterError {
     /// directory, follow the audit-log recovery runbook, and then retry the open.
     #[error("audit log integrity violation on open: {0}")]
     IntegrityViolation(#[from] super::verify::VerifyError),
+
+    /// The active log file no longer contains the anchored chain tip.
+    ///
+    /// The keyring-held anchor names an entry count, a tip hash, and a byte
+    /// offset for this log PATH. This variant means the file at that path is
+    /// shorter than the anchor, or the entry ending at the anchored offset is
+    /// not the anchored entry: the file was rolled back to an older copy,
+    /// truncated, or replaced.
+    ///
+    /// No digest appears in the message. Counts and offsets are enough to tell
+    /// an operator how far the file moved, and repeating a chain hash in a
+    /// refusal only widens where it can be observed.
+    ///
+    /// Wire code: `audit.tip_anchor_mismatch`. Recovery:
+    /// `stellar-agent audit reanchor --profile <name> --acknowledge-rollback`
+    /// after establishing why the file changed. See
+    /// `docs/maintainers/audit-log-recovery.md`.
+    #[error(
+        "audit.tip_anchor_mismatch: {reason}; anchored at {expected_count} entries / \
+         {expected_offset} bytes, file is {actual_len} bytes"
+    )]
+    TipAnchorMismatch {
+        /// Entry count the anchor names.
+        expected_count: u64,
+        /// Byte offset the anchor names.
+        expected_offset: u64,
+        /// Current length of the log file.
+        actual_len: u64,
+        /// Stable diagnostic for which half of the check failed.
+        reason: &'static str,
+    },
+
+    /// The tip anchor could not be read from, or written to, its backing store.
+    ///
+    /// The anchor lives in the platform keyring. An unreadable anchor cannot be
+    /// distinguished from a rolled-back one, so every caller that requires the
+    /// anchor treats this as fail-closed.
+    #[error("audit log tip anchor unavailable: {0}")]
+    TipAnchorStore(#[from] TipAnchorStoreError),
+
+    /// A tip-anchor operation was requested on a writer that has no anchor
+    /// store attached.
+    ///
+    /// Produced only by [`AuditWriter::reanchor`], whose caller is expected to
+    /// have opened the writer through [`AuditWriter::open_for_reanchor`].
+    #[error("audit log tip anchor repair requested on a writer with no anchor store")]
+    TipAnchorUnavailable,
+
+    /// The newest rotated archive cannot supply the cross-file chain seed.
+    ///
+    /// A file created by a rotation chains its first entry off the outgoing
+    /// file's rotation-handoff entry, so opening the active file means reading
+    /// that handoff out of the newest archive. This variant means the archive's
+    /// last entry is not a handoff naming that archive: the file was truncated
+    /// mid-entry, or something that is not a rotated sibling of this log was
+    /// placed in the audit directory under a rotated sibling's name.
+    ///
+    /// Fail-closed: the writer refuses rather than seeding the replay from an
+    /// unverified hash. Recovery is to move the offending file out of the audit
+    /// directory; see `docs/maintainers/audit-log-recovery.md`.
+    #[error("audit.rotation_bridge_unusable: {reason} (archive {archive_name})")]
+    RotationBridgeUnusable {
+        /// Basename of the archive that cannot supply the seed.
+        archive_name: String,
+        /// Stable diagnostic for which structural check failed.
+        reason: &'static str,
+    },
+}
+
+/// Returns the condition an audit-writer acquisition failure describes, led by
+/// its `audit.*` sub-code, for callers that surface it to an operator.
+///
+/// `None` means the failure is a registry path or key registration conflict,
+/// which the caller's own "writer open failed" wording already covers. Every
+/// other variant names a condition about the LOG, whose remedy is neither
+/// minting a key nor resolving a registration, so the caller must not tell the
+/// operator to do either.
+///
+/// The sub-codes are the ones already documented for these conditions; the
+/// detail-carried convention matches `approval.writer_locked`.
+#[must_use]
+pub fn audit_log_unusable_detail(e: &WriterError) -> Option<String> {
+    match e {
+        WriterError::FileLocked => Some(
+            "audit.writer_locked: the audit log's writer lock is held by another process; \
+             stop the running stellar-agent-mcp server and retry"
+                .to_owned(),
+        ),
+        // These carry their own `audit.*` code at the head of their Display.
+        WriterError::RotationBridgeUnusable { .. } | WriterError::IntegrityViolation(_) => {
+            Some(e.to_string())
+        }
+        WriterError::ChainBrokenAtOpen { entry_idx, .. } => Some(format!(
+            "audit.chain_broken: the log's own hash chain is broken at entry {entry_idx}; \
+             the file was modified outside the writer"
+        )),
+        WriterError::TipAnchorStore(detail) => Some(format!(
+            "audit.tip_anchor_unavailable: the tip anchor could not be read or written \
+             ({detail}); the keyring must be reachable before a value-moving verb can prove \
+             the log has not been rolled back"
+        )),
+        WriterError::PathContract { detail } => Some(format!("audit.path_contract: {detail}")),
+        WriterError::Io(err) => Some(format!(
+            "audit.io_error: the audit log could not be read or written ({})",
+            err.kind()
+        )),
+        WriterError::Serialise(_) | WriterError::Hash(_) => Some(
+            "audit.parse_error: the audit log could not be parsed or hashed; the file was \
+             modified outside the writer"
+                .to_owned(),
+        ),
+        WriterError::PartialRotation { .. } => Some(
+            "audit.partial_rotation: the audit directory holds evidence of a crash \
+             mid-rotation and needs operator inspection"
+                .to_owned(),
+        ),
+        WriterError::TipAnchorUnavailable => None,
+        WriterError::TipAnchorMismatch { .. }
+        | WriterError::PathMismatch { .. }
+        | WriterError::HmacKeyMismatch { .. } => None,
+    }
 }
 
 // ── Partial-rotation detection ────────────────────────────────────────────────
@@ -1508,7 +2659,7 @@ fn detect_partial_rotation(log_path: &Path, active_file: &File) -> Result<(), Wr
                     let sidecar_name = basename_lossy_path(&entry_path);
                     let log_name_display = basename_lossy_path(&expected_log);
                     let recovery = format!(
-                        "orphan sidecar detected — see docs/runbooks/audit-log-recovery.md §2.1. \
+                        "orphan sidecar detected — see docs/maintainers/audit-log-recovery.md §2.1. \
                          Sidecar: {sidecar_name}. Expected log: {log_name_display}.",
                     );
                     return Err(WriterError::IntegrityViolation(
@@ -1541,7 +2692,7 @@ fn detect_partial_rotation(log_path: &Path, active_file: &File) -> Result<(), Wr
             // Basename only in the human-readable hint; full path in structured fields.
             let tmp_name = basename_lossy_path(&entry_path);
             let recovery = format!(
-                "tmp file found — see docs/runbooks/audit-log-recovery.md §2.2. \
+                "tmp file found — see docs/maintainers/audit-log-recovery.md §2.2. \
                  Tmp file: {tmp_name} ({size_bytes} bytes).",
             );
             return Err(WriterError::IntegrityViolation(
@@ -1568,7 +2719,7 @@ fn detect_partial_rotation(log_path: &Path, active_file: &File) -> Result<(), Wr
         // Basename only in the human-readable hint; full path in structured fields.
         let log_name = basename_lossy_path(log_path);
         let recovery = format!(
-            "truncated entry detected — see docs/runbooks/audit-log-recovery.md §2.3. \
+            "truncated entry detected — see docs/maintainers/audit-log-recovery.md §2.3. \
              Log: {log_name}.",
         );
         return Err(WriterError::IntegrityViolation(
@@ -1832,6 +2983,10 @@ impl AuditWriterRegistry {
     /// `stellar_agent_core::profile::schema::default_audit_log_path_for` for
     /// the canonical path derivation.
     ///
+    /// A keyed writer is opened through
+    /// [`AuditWriterRegistry::get_or_open_keyed`] instead: a key without an
+    /// anchor store would write rows the anchor never covers.
+    ///
     /// # Errors
     ///
     /// - [`WriterError::FileLocked`] if another *process* holds the exclusive
@@ -1839,8 +2994,8 @@ impl AuditWriterRegistry {
     ///   prevents this by reusing the same handle.)
     /// - [`WriterError::PathMismatch`] if a subsequent caller supplies a
     ///   different `log_path` for the same `profile_name`.
-    /// - [`WriterError::HmacKeyMismatch`] if a subsequent caller supplies a
-    ///   different `hmac_key` for the same `profile_name`.
+    /// - [`WriterError::HmacKeyMismatch`] if a subsequent caller presents a key
+    ///   for the same `profile_name` this writer was not opened with.
     /// - [`WriterError::PathContract`] if `log_path` has no parent directory
     ///   component.
     /// - [`WriterError::Io`] on I/O failure during `AuditWriter::open`, or if
@@ -1852,10 +3007,43 @@ impl AuditWriterRegistry {
     /// Does not panic.  Registry-mutex poison is converted to
     /// [`WriterError::Io`] so the caller receives a typed error rather than an
     /// unwound panic.
-    pub fn get_or_open(
+    pub fn get_or_open_unkeyed(
+        profile_name: &str,
+        log_path: &Path,
+    ) -> Result<Arc<Mutex<AuditWriter>>, WriterError> {
+        Self::get_or_open_inner(profile_name, log_path, None, None)
+    }
+
+    /// Returns the shared writer for `profile_name`, opened KEYED and bound to
+    /// the anchor store `access` carries.
+    ///
+    /// On a cache miss the writer is opened through
+    /// [`AuditWriter::open_with_tip_anchor`], so the anchor is reconciled before
+    /// the handle is published. On a cache HIT the store is attached to the
+    /// existing writer if it does not have one — the registry hands out one
+    /// writer per profile for the process lifetime, so a writer first opened by
+    /// a read-only or best-effort caller must be able to take the anchor on when
+    /// a value verb later acquires it. A cache hit does not itself reconcile;
+    /// the caller runs [`AuditWriter::verify_tip_anchor`] on every acquisition.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`AuditWriterRegistry::get_or_open_unkeyed`] returns, plus the
+    /// tip-anchor failures of [`AuditWriter::open_with_tip_anchor`].
+    pub fn get_or_open_keyed(
+        profile_name: &str,
+        log_path: &Path,
+        access: KeyedAuditAccess,
+    ) -> Result<Arc<Mutex<AuditWriter>>, WriterError> {
+        let (hmac_key, tip_anchor) = access.into_parts();
+        Self::get_or_open_inner(profile_name, log_path, Some(hmac_key), Some(&tip_anchor))
+    }
+
+    fn get_or_open_inner(
         profile_name: &str,
         log_path: &Path,
         hmac_key: Option<Zeroizing<[u8; 32]>>,
+        tip_anchor: Option<&Arc<dyn TipAnchorStore>>,
     ) -> Result<Arc<Mutex<AuditWriter>>, WriterError> {
         let incoming_fingerprint = hmac_key.as_deref().map(hmac_key_fingerprint);
 
@@ -1883,7 +3071,10 @@ impl AuditWriterRegistry {
                         profile_name: profile_name.to_owned(),
                     });
                 }
-                return Ok(Arc::clone(&entry.handle));
+                let handle = Arc::clone(&entry.handle);
+                drop(map);
+                attach_tip_anchor_to_cached(&handle, tip_anchor)?;
+                return Ok(handle);
             }
             // Cache miss — release the lock before doing I/O.
         }
@@ -1892,7 +3083,14 @@ impl AuditWriterRegistry {
         // Perform the I/O (directory creation, advisory lock, chain recovery)
         // without holding the registry lock so concurrent opens for different
         // profiles do not serialise behind each other's I/O.
-        let writer = AuditWriter::open(log_path.to_path_buf(), hmac_key)?;
+        let writer = match tip_anchor {
+            Some(store) => AuditWriter::open_with_tip_anchor(
+                log_path.to_path_buf(),
+                hmac_key,
+                Arc::clone(store),
+            )?,
+            None => AuditWriter::open(log_path.to_path_buf(), hmac_key)?,
+        };
         let handle = Arc::new(Mutex::new(writer));
 
         // ── Phase 3: re-acquire lock and insert (double-checked) ────────────
@@ -1923,7 +3121,11 @@ impl AuditWriterRegistry {
             }
             // `handle` (our freshly-opened writer) is dropped here, releasing
             // the advisory lock we held as the race loser.
-            return Ok(Arc::clone(&entry.handle));
+            let winner = Arc::clone(&entry.handle);
+            drop(map);
+            drop(handle);
+            attach_tip_anchor_to_cached(&winner, tip_anchor)?;
+            return Ok(winner);
         }
 
         // We are the first (or the only) opener for this profile — insert.
@@ -1937,6 +3139,27 @@ impl AuditWriterRegistry {
         );
         Ok(handle)
     }
+}
+
+/// Attaches `tip_anchor` to a writer already held in the registry.
+///
+/// A poisoned writer mutex is surfaced as an I/O error rather than unwound, the
+/// same discipline [`AuditWriterRegistry::get_or_open`] applies to the registry
+/// mutex.
+fn attach_tip_anchor_to_cached(
+    handle: &Arc<Mutex<AuditWriter>>,
+    tip_anchor: Option<&Arc<dyn TipAnchorStore>>,
+) -> Result<(), WriterError> {
+    let Some(store) = tip_anchor else {
+        return Ok(());
+    };
+    let mut writer = handle.lock().map_err(|_| {
+        WriterError::Io(io::Error::other(
+            "audit writer mutex poisoned; cannot attach the tip anchor",
+        ))
+    })?;
+    writer.attach_tip_anchor_store(Arc::clone(store));
+    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -2865,8 +4088,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let profile = format!("reg-same-{}", uuid::Uuid::new_v4().simple());
         let log_path = dir.path().join(format!("{profile}.jsonl"));
-        let a = AuditWriterRegistry::get_or_open(&profile, &log_path, None).unwrap();
-        let b = AuditWriterRegistry::get_or_open(&profile, &log_path, None).unwrap();
+        let a = AuditWriterRegistry::get_or_open_unkeyed(&profile, &log_path).unwrap();
+        let b = AuditWriterRegistry::get_or_open_unkeyed(&profile, &log_path).unwrap();
         assert!(
             Arc::ptr_eq(&a, &b),
             "same profile must return the same Arc pointer"
@@ -2881,8 +4104,8 @@ mod tests {
         let p2 = format!("reg-diff-2-{}", uuid::Uuid::new_v4().simple());
         let path1 = dir.path().join(format!("{p1}.jsonl"));
         let path2 = dir.path().join(format!("{p2}.jsonl"));
-        let a = AuditWriterRegistry::get_or_open(&p1, &path1, None).unwrap();
-        let b = AuditWriterRegistry::get_or_open(&p2, &path2, None).unwrap();
+        let a = AuditWriterRegistry::get_or_open_unkeyed(&p1, &path1).unwrap();
+        let b = AuditWriterRegistry::get_or_open_unkeyed(&p2, &path2).unwrap();
         assert!(
             !Arc::ptr_eq(&a, &b),
             "different profiles must return different Arc pointers"
@@ -2926,7 +4149,7 @@ mod tests {
                 let log_path = log_path.clone();
                 thread::spawn(move || {
                     barrier.wait();
-                    if let Ok(arc) = AuditWriterRegistry::get_or_open(&profile, &log_path, None) {
+                    if let Ok(arc) = AuditWriterRegistry::get_or_open_unkeyed(&profile, &log_path) {
                         // Safety: the pointer value is only compared, never dereferenced.
                         ptrs.lock().unwrap().push(Arc::as_ptr(&arc) as usize);
                     }
@@ -2968,7 +4191,7 @@ mod tests {
         let log_path = dir.path().join(format!("{profile}.jsonl"));
 
         // Warm up: open once before the threads start so the cache is populated.
-        let first = AuditWriterRegistry::get_or_open(&profile, &log_path, None).unwrap();
+        let first = AuditWriterRegistry::get_or_open_unkeyed(&profile, &log_path).unwrap();
         let first_ptr = Arc::as_ptr(&first);
 
         const THREADS: usize = 8;
@@ -2980,7 +4203,7 @@ mod tests {
                 let log_path = log_path.clone();
                 thread::spawn(move || {
                     barrier.wait();
-                    AuditWriterRegistry::get_or_open(&profile, &log_path, None).unwrap()
+                    AuditWriterRegistry::get_or_open_unkeyed(&profile, &log_path).unwrap()
                 })
             })
             .collect();
@@ -3012,7 +4235,7 @@ mod tests {
         let _direct_writer = AuditWriter::open(log_path.clone(), None).unwrap();
 
         // The registry must surface FileLocked.
-        let result = AuditWriterRegistry::get_or_open(&profile, &log_path, None);
+        let result = AuditWriterRegistry::get_or_open_unkeyed(&profile, &log_path);
         assert!(
             matches!(result, Err(WriterError::FileLocked)),
             "registry must propagate FileLocked when file is held by another opener, got: {result:?}"
@@ -3029,10 +4252,10 @@ mod tests {
         let path2 = dir.path().join(format!("{profile}-other.jsonl"));
 
         // First open succeeds.
-        let _a = AuditWriterRegistry::get_or_open(&profile, &path1, None).unwrap();
+        let _a = AuditWriterRegistry::get_or_open_unkeyed(&profile, &path1).unwrap();
 
         // Second open with a different path must return PathMismatch.
-        let result = AuditWriterRegistry::get_or_open(&profile, &path2, None);
+        let result = AuditWriterRegistry::get_or_open_unkeyed(&profile, &path2);
         assert!(
             matches!(result, Err(WriterError::PathMismatch { .. })),
             "registry must return PathMismatch when a different path is supplied, got: {result:?}"
@@ -3051,10 +4274,13 @@ mod tests {
         let key_b = Zeroizing::new([0x22u8; 32]);
 
         // First open with key_a.
-        let _a = AuditWriterRegistry::get_or_open(&profile, &log_path, Some(key_a)).unwrap();
+        let _a =
+            AuditWriterRegistry::get_or_open_keyed(&profile, &log_path, test_keyed_access(key_a))
+                .unwrap();
 
         // Second open with key_b must return HmacKeyMismatch.
-        let result = AuditWriterRegistry::get_or_open(&profile, &log_path, Some(key_b));
+        let result =
+            AuditWriterRegistry::get_or_open_keyed(&profile, &log_path, test_keyed_access(key_b));
         assert!(
             matches!(result, Err(WriterError::HmacKeyMismatch { .. })),
             "registry must return HmacKeyMismatch when a different HMAC key is supplied, got: {result:?}"
@@ -3072,10 +4298,12 @@ mod tests {
         let key = Zeroizing::new([0xAAu8; 32]);
 
         // First open with a key.
-        let _a = AuditWriterRegistry::get_or_open(&profile, &log_path, Some(key)).unwrap();
+        let _a =
+            AuditWriterRegistry::get_or_open_keyed(&profile, &log_path, test_keyed_access(key))
+                .unwrap();
 
         // Second open with no key must return HmacKeyMismatch.
-        let result = AuditWriterRegistry::get_or_open(&profile, &log_path, None);
+        let result = AuditWriterRegistry::get_or_open_unkeyed(&profile, &log_path);
         assert!(
             matches!(result, Err(WriterError::HmacKeyMismatch { .. })),
             "registry must return HmacKeyMismatch when None supplied after Some(key), got: {result:?}"
@@ -3384,5 +4612,1374 @@ mod tests {
             truncated_pattern_present,
             "debug output must contain `sha256:XXXXXXXX...XXXXXXXX` pattern: {debug_str}"
         );
+    }
+
+    // ── Tip anchor ───────────────────────────────────────────────────────────
+
+    use crate::audit_log::tip_anchor::InMemoryTipAnchorStore;
+
+    /// Pairs a test key with a throwaway in-memory anchor store, so a keyed
+    /// registry open in a test carries a handle exactly as production does.
+    fn test_keyed_access(key: Zeroizing<[u8; 32]>) -> KeyedAuditAccess {
+        KeyedAuditAccess::new(
+            key,
+            Arc::new(InMemoryTipAnchorStore::new()) as Arc<dyn TipAnchorStore>,
+        )
+    }
+
+    /// Opens an anchored writer over a shared in-memory store.
+    fn open_anchored(
+        path: &Path,
+        store: &Arc<InMemoryTipAnchorStore>,
+    ) -> Result<AuditWriter, WriterError> {
+        AuditWriter::open_with_tip_anchor(
+            path.to_path_buf(),
+            None,
+            Arc::clone(store) as Arc<dyn TipAnchorStore>,
+        )
+    }
+
+    /// Reads back the anchor as the string the keyring would hold, so the
+    /// assertions pin the stored VALUE rather than an in-memory struct the
+    /// writer could have left stale.
+    fn stored_value(store: &Arc<InMemoryTipAnchorStore>) -> String {
+        store
+            .peek()
+            .expect("an anchor must be stored")
+            .to_keyring_value()
+    }
+
+    /// The anchor that describes `path` exactly as it stands on disk.
+    ///
+    /// Computed independently of the writer's own replay — it counts lines and
+    /// hashes the last one — so it is an oracle rather than a restatement of
+    /// the code under test, and it holds for a rotation-created file whose
+    /// chain seeds from the handoff hash rather than the zero block.
+    fn tip_of(path: &Path) -> TipAnchor {
+        let content = fs::read(path).unwrap();
+        let mut entry_count = 0u64;
+        let mut end_offset = 0u64;
+        let mut last_line: Option<Vec<u8>> = None;
+        let mut consumed = 0u64;
+        for raw in content.split_inclusive(|&b| b == b'\n') {
+            consumed += raw.len() as u64;
+            let line = strip_line_terminator(raw);
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            entry_count += 1;
+            end_offset = consumed;
+            last_line = Some(line.to_vec());
+        }
+        match last_line {
+            None => panic!("tip_of called on a file with no entries"),
+            Some(line) => {
+                let entry: AuditEntry = serde_json::from_slice(&line).unwrap();
+                let hash = compute_entry_hash_streamed(&entry, &entry.previous_entry_hash).unwrap();
+                TipAnchor::new(entry_count, hash, end_offset)
+            }
+        }
+    }
+
+    /// Counts `audit_tip_anchored` rows carrying `reason` in the log at `path`.
+    fn count_tip_anchored_rows(path: &Path, reason: &str) -> usize {
+        let content = fs::read_to_string(path).unwrap();
+        content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter(|line| {
+                let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                value["kind"] == "audit_tip_anchored" && value["reason"] == reason
+            })
+            .count()
+    }
+
+    #[test]
+    fn append_advances_the_anchor_to_the_new_tip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        let mut writer = open_anchored(&path, &store).unwrap();
+        assert!(
+            store.peek().is_none(),
+            "an empty log is left unanchored: there is no entry to name"
+        );
+
+        for expected_count in 1..=3u64 {
+            writer.write_entry(make_entry("")).unwrap();
+            let anchor = store.peek().unwrap();
+            assert_eq!(
+                anchor.entry_count, expected_count,
+                "the anchor must count every appended entry"
+            );
+            assert_eq!(
+                stored_value(&store),
+                tip_of(&path).to_keyring_value(),
+                "the stored anchor value must name the file's current tip"
+            );
+        }
+        drop(writer);
+
+        assert_eq!(
+            stored_value(&store),
+            tip_of(&path).to_keyring_value(),
+            "the anchor survives the writer"
+        );
+    }
+
+    #[test]
+    fn reopen_absorbs_appends_made_without_the_anchor() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        {
+            let mut writer = open_anchored(&path, &store).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+        }
+        let anchored_after_first = store.peek().unwrap();
+
+        // An unanchored writer appends two entries; the anchor does not move.
+        {
+            let mut writer = open_no_key(path.clone());
+            writer.write_entry(make_entry("")).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+        }
+        assert_eq!(
+            store.peek().unwrap(),
+            anchored_after_first,
+            "an unanchored writer must not move the anchor"
+        );
+
+        // The next anchored open absorbs them and re-anchors on the new tip.
+        let writer = open_anchored(&path, &store).unwrap();
+        drop(writer);
+        assert_eq!(
+            stored_value(&store),
+            tip_of(&path).to_keyring_value(),
+            "reopening must re-anchor on the tip the unkeyed appends left"
+        );
+        assert_eq!(store.peek().unwrap().entry_count, 3);
+        assert_eq!(
+            count_tip_anchored_rows(&path, "adopted"),
+            0,
+            "absorbing appends ahead of the anchor is not an adoption"
+        );
+    }
+
+    #[test]
+    fn crash_between_entry_fsync_and_anchor_write_self_heals_on_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        let anchor_before = {
+            let mut writer = open_anchored(&path, &store).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            let anchor_before = store.peek().unwrap();
+
+            // The crash window: the entry is appended and fsynced, the anchor
+            // write never happens.
+            writer.set_skip_tip_anchor_write(true);
+            writer.write_entry(make_entry("")).unwrap();
+            anchor_before
+        };
+        assert_eq!(
+            store.peek().unwrap(),
+            anchor_before,
+            "the failpoint must leave the anchor one entry behind the file"
+        );
+        assert_eq!(tip_of(&path).entry_count, 2, "the entry is on disk");
+
+        let writer = open_anchored(&path, &store).unwrap();
+        drop(writer);
+        assert_eq!(
+            stored_value(&store),
+            tip_of(&path).to_keyring_value(),
+            "reopening must advance the anchor onto the fsynced entry"
+        );
+    }
+
+    #[test]
+    fn truncating_one_entry_refuses_with_a_tip_anchor_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        let truncate_to = {
+            let mut writer = open_anchored(&path, &store).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            let after_two = store.peek().unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            after_two.end_offset
+        };
+        let anchored = store.peek().unwrap();
+        assert_eq!(anchored.entry_count, 3);
+
+        // Drop the last entry, leaving a log whose chain and root signature are
+        // both still intact — exactly what the anchor exists to catch.
+        let content = fs::read(&path).unwrap();
+        fs::write(&path, &content[..truncate_to as usize]).unwrap();
+        assert!(
+            verify_log_is_clean(&path),
+            "the truncated log must still pass the chain walk"
+        );
+
+        let err = open_anchored(&path, &store).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WriterError::TipAnchorMismatch {
+                    expected_count: 3,
+                    actual_len,
+                    ..
+                } if actual_len == truncate_to
+            ),
+            "expected a tip-anchor mismatch naming the anchored count, got {err:?}"
+        );
+        assert_eq!(
+            store.peek().unwrap(),
+            anchored,
+            "a refusal must not move the anchor"
+        );
+    }
+
+    #[test]
+    fn restoring_an_older_copy_refuses() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        let older_copy = {
+            let mut writer = open_anchored(&path, &store).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            let snapshot = fs::read(&path).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            snapshot
+        };
+
+        fs::write(&path, &older_copy).unwrap();
+        assert!(
+            verify_log_is_clean(&path),
+            "the restored copy must still pass the chain walk"
+        );
+
+        let err = open_anchored(&path, &store).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WriterError::TipAnchorMismatch {
+                    expected_count: 4,
+                    ..
+                }
+            ),
+            "expected a tip-anchor mismatch against the four-entry anchor, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rotation_anchors_the_new_file_then_its_first_entry() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        let mut writer = open_anchored(&path, &store).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        writer.force_rotate_for_test().unwrap();
+
+        let archive_handoff = tip_of(&newest_archive(&path));
+        assert_eq!(
+            store.peek().unwrap(),
+            archive_handoff,
+            "rotation leaves the anchor on the outgoing file's handoff, never on \
+             an empty-file value that would classify every file as ahead"
+        );
+
+        writer.write_entry(make_entry("")).unwrap();
+        let anchor = store.peek().unwrap();
+        assert_eq!(
+            anchor.entry_count, 1,
+            "the anchor names the NEW file's first entry, not the archive's tip"
+        );
+        assert_eq!(stored_value(&store), tip_of(&path).to_keyring_value());
+        drop(writer);
+
+        // Reopening the rotation-created active file must not read as a
+        // rollback: its chain seed is the handoff hash, not the zero block.
+        let writer = open_anchored(&path, &store).unwrap();
+        drop(writer);
+        assert_eq!(stored_value(&store), tip_of(&path).to_keyring_value());
+    }
+
+    #[test]
+    fn reopening_an_empty_rotation_created_file_is_not_a_rollback() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        {
+            let mut writer = open_anchored(&path, &store).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            writer.force_rotate_for_test().unwrap();
+        }
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+
+        let mut writer =
+            open_anchored(&path, &store).expect("an empty post-rotation file must open cleanly");
+        writer.write_entry(make_entry("")).unwrap();
+        assert_eq!(store.peek().unwrap().entry_count, 1);
+    }
+
+    #[test]
+    fn a_log_with_no_anchor_is_adopted_and_records_the_adoption() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+
+        // A log written with no anchor at all — the state every profile is in
+        // before the anchor exists.
+        {
+            let mut writer = open_no_key(path.clone());
+            writer.write_entry(make_entry("")).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+        }
+        let tip_before_adoption = tip_of(&path);
+
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let writer = open_anchored(&path, &store).expect("adoption needs no operator action");
+        drop(writer);
+
+        assert_eq!(
+            count_tip_anchored_rows(&path, "adopted"),
+            1,
+            "adoption must leave exactly one adopted row in the log"
+        );
+        let anchor = store.peek().unwrap();
+        assert_eq!(
+            anchor.entry_count,
+            tip_before_adoption.entry_count + 1,
+            "the adoption row itself advances the anchor"
+        );
+        assert_eq!(stored_value(&store), tip_of(&path).to_keyring_value());
+    }
+
+    #[test]
+    fn an_anchored_open_refuses_a_broken_chain_instead_of_adopting_it() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+
+        {
+            let mut writer = open_no_key(path.clone());
+            writer.write_entry(make_entry("")).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+        }
+        // Break the second entry's link to the first.
+        let content = fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = content.lines().map(str::to_owned).collect();
+        lines[1] = lines[1].replace(
+            "\"previous_entry_hash\":\"sha256:",
+            "\"previous_entry_hash\":\"sha256:0",
+        );
+        let corrupted = format!("{}\n", lines.join("\n"));
+        fs::write(&path, corrupted).unwrap();
+
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let err = open_anchored(&path, &store).unwrap_err();
+        assert!(
+            matches!(err, WriterError::ChainBrokenAtOpen { .. }),
+            "a broken chain must be refused, not adopted: {err:?}"
+        );
+        assert!(
+            store.peek().is_none(),
+            "a refused adoption must not write an anchor"
+        );
+    }
+
+    #[test]
+    fn a_replaced_file_is_refused_on_the_next_acquisition_of_a_live_writer() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        let mut writer = open_anchored(&path, &store).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        let snapshot = fs::read(&path).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+
+        writer
+            .verify_tip_anchor()
+            .expect("an untouched file passes the per-acquisition check");
+
+        // Replace the file underneath the live writer with an older copy.
+        fs::write(&path, &snapshot).unwrap();
+
+        let err = writer.verify_tip_anchor().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WriterError::TipAnchorMismatch {
+                    expected_count: 3,
+                    ..
+                }
+            ),
+            "the per-acquisition check must catch a file replaced underneath a \
+             live writer: {err:?}"
+        );
+    }
+
+    #[test]
+    fn reanchor_recovers_a_refused_log_and_records_the_repair() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        let snapshot = {
+            let mut writer = open_anchored(&path, &store).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            let snapshot = fs::read(&path).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            snapshot
+        };
+        let superseded = store.peek().unwrap();
+        fs::write(&path, &snapshot).unwrap();
+        assert!(
+            open_anchored(&path, &store).is_err(),
+            "the rolled-back log must refuse before the repair"
+        );
+        assert_eq!(store.reanchor_count().unwrap(), None);
+
+        let report = {
+            let mut writer = AuditWriter::open_for_reanchor(
+                path.clone(),
+                None,
+                Arc::clone(&store) as Arc<dyn TipAnchorStore>,
+            )
+            .expect("repair opens a log an ordinary open refuses");
+            writer.reanchor().expect("repair must succeed")
+        };
+
+        assert_eq!(report.previous, StoredTipAnchor::Usable(superseded.clone()));
+        assert_eq!(report.reanchor_count, 1);
+        assert_eq!(store.reanchor_count().unwrap(), Some(1));
+        assert_eq!(
+            count_tip_anchored_rows(&path, "rollback_acknowledged"),
+            1,
+            "the repair must leave a permanent record in the log"
+        );
+        assert_eq!(
+            stored_value(&store),
+            tip_of(&path).to_keyring_value(),
+            "the repair row itself advances the anchor"
+        );
+
+        open_anchored(&path, &store).expect("the repaired log must open cleanly");
+    }
+
+    #[test]
+    fn reanchor_refuses_a_log_whose_chain_is_broken() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        {
+            let mut writer = open_anchored(&path, &store).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+        }
+        let content = fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = content.lines().map(str::to_owned).collect();
+        lines[1] = lines[1].replace(
+            "\"previous_entry_hash\":\"sha256:",
+            "\"previous_entry_hash\":\"sha256:0",
+        );
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        // Repair skips the ANCHOR check, never the chain replay: a log whose own
+        // linkage is broken has no tip worth anchoring, so it is refused before
+        // the repair path is reachable at all.
+        let err = AuditWriter::open_for_reanchor(
+            path.clone(),
+            None,
+            Arc::clone(&store) as Arc<dyn TipAnchorStore>,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, WriterError::ChainBrokenAtOpen { .. }),
+            "repair must not bless a log whose own chain is broken: {err:?}"
+        );
+        assert_eq!(
+            store.reanchor_count().unwrap(),
+            None,
+            "a refused repair must not touch the counter"
+        );
+    }
+
+    #[test]
+    fn adoption_refuses_a_chain_root_signed_by_another_key() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let one = Zeroizing::new([7u8; 32]);
+        let other = Zeroizing::new([9u8; 32]);
+
+        // A log whose chain root is signed under one key.
+        {
+            let mut writer = AuditWriter::open(path.clone(), Some(one)).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+        }
+
+        // Adoption under a different key must refuse: a log whose root signature
+        // does not verify is not a log worth taking under anchor protection.
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let err = AuditWriter::open_with_tip_anchor(
+            path.clone(),
+            Some(other.clone()),
+            Arc::clone(&store) as Arc<dyn TipAnchorStore>,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WriterError::IntegrityViolation(
+                    super::super::verify::VerifyError::HmacMismatch { .. }
+                )
+            ),
+            "adoption must refuse a chain root signed by another key: {err:?}"
+        );
+        assert!(
+            store.peek().is_none(),
+            "a refused adoption must not write an anchor"
+        );
+    }
+
+    #[test]
+    fn adoption_accepts_a_log_with_no_chain_root_sidecar() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+
+        // A log written entirely by unkeyed writers has no `.root_hmac`
+        // sidecar. Minting an audit key later must not be a one-way door.
+        {
+            let mut writer = open_no_key(path.clone());
+            writer.write_entry(make_entry("")).unwrap();
+        }
+        assert!(!hmac_sidecar_path(&path).exists());
+
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let writer = AuditWriter::open_with_tip_anchor(
+            path.clone(),
+            Some(Zeroizing::new([3u8; 32])),
+            Arc::clone(&store) as Arc<dyn TipAnchorStore>,
+        )
+        .expect("a sidecar-less log must still adopt");
+        drop(writer);
+        assert_eq!(count_tip_anchored_rows(&path, "adopted"), 1);
+    }
+
+    #[test]
+    fn repair_replaces_a_stored_anchor_that_cannot_be_parsed() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        {
+            let mut writer = open_anchored(&path, &store).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+        }
+
+        // A value an earlier build of this code could have written, and which
+        // `load_anchor` now refuses. Failing closed is right; being unable to
+        // clear it through the repair verb is not, because the only remedy left
+        // would be deleting the keyring entry by hand.
+        store.set_raw("0:0000000000000000000000000000000000000000000000000000000000000000:0");
+
+        // An ordinary open still refuses: the guard must not read a corrupted
+        // value as "nothing anchored".
+        let err = open_anchored(&path, &store).unwrap_err();
+        assert!(
+            matches!(err, WriterError::TipAnchorStore(_)),
+            "an unparseable anchor must fail an ordinary open: {err:?}"
+        );
+
+        let mut writer = AuditWriter::open_for_reanchor(
+            path.clone(),
+            None,
+            Arc::clone(&store) as Arc<dyn TipAnchorStore>,
+        )
+        .expect("repair opens regardless of the anchor's state");
+
+        // The repair reports it as present-but-unusable, by shape, without
+        // echoing the value.
+        let stored = writer.stored_tip_anchor().expect("repair can read it");
+        let StoredTipAnchor::Unusable { shape, reason } = &stored else {
+            panic!("expected an unusable stored anchor, got {stored:?}");
+        };
+        assert!(shape.contains("3 colon-separated fields"), "shape: {shape}");
+        assert!(!reason.is_empty());
+        assert!(
+            stored
+                .coordinates()
+                .is_some_and(|c| c.starts_with("unusable (")),
+            "the report names it as unusable: {:?}",
+            stored.coordinates()
+        );
+
+        let report = writer.reanchor().expect("repair must replace it");
+        assert_eq!(report.previous, stored);
+        assert_eq!(report.reanchor_count, 1);
+        drop(writer);
+
+        // And the log opens cleanly afterwards.
+        open_anchored(&path, &store).expect("the repaired log must open cleanly");
+        assert_eq!(stored_value(&store), tip_of(&path).to_keyring_value());
+    }
+
+    #[test]
+    fn an_unreadable_anchor_fails_closed() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        {
+            let mut writer = open_anchored(&path, &store).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+        }
+
+        store.set_failing(true);
+        let err = open_anchored(&path, &store).unwrap_err();
+        assert!(
+            matches!(err, WriterError::TipAnchorStore(_)),
+            "an anchor that cannot be read must refuse, not adopt: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_writer_with_no_anchor_store_neither_checks_nor_writes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        {
+            let mut writer = open_anchored(&path, &store).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+        }
+        let anchored = store.peek().unwrap();
+
+        // Truncate to nothing, then open unanchored: the unkeyed paths keep
+        // their existing behaviour and are not gated on the anchor.
+        fs::write(&path, b"").unwrap();
+        let mut writer = open_no_key(path.clone());
+        assert!(!writer.has_tip_anchor());
+        writer
+            .verify_tip_anchor()
+            .expect("a writer with no anchor store checks nothing");
+        writer.write_entry(make_entry("")).unwrap();
+        assert_eq!(
+            store.peek().unwrap(),
+            anchored,
+            "an unanchored writer must not move the anchor"
+        );
+    }
+
+    #[test]
+    fn attaching_a_store_to_an_open_writer_lets_the_next_check_adopt() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+
+        let mut writer = open_no_key(path.clone());
+        writer.write_entry(make_entry("")).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        assert!(!writer.has_tip_anchor());
+
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        writer.attach_tip_anchor_store(Arc::clone(&store) as Arc<dyn TipAnchorStore>);
+        assert!(writer.has_tip_anchor());
+        writer.verify_tip_anchor().unwrap();
+
+        assert_eq!(
+            count_tip_anchored_rows(&path, "adopted"),
+            1,
+            "attaching then checking must adopt the log in place"
+        );
+        assert_eq!(stored_value(&store), tip_of(&path).to_keyring_value());
+    }
+
+    #[test]
+    fn reopening_a_rotation_created_active_file_resumes_the_chain() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+
+        {
+            let mut writer = open_no_key(path.clone());
+            writer.write_entry(make_entry("")).unwrap();
+            writer.force_rotate_for_test().unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+        }
+
+        // The active file's first entry chains off the archive's handoff entry,
+        // not the zero block. Reopening must seed from that bridge.
+        let mut writer = open_no_key(path.clone());
+        writer.write_entry(make_entry("")).unwrap();
+        drop(writer);
+
+        crate::audit_log::verify::verify_log(&path, None)
+            .expect("the whole chain must verify across the reopen");
+    }
+
+    #[test]
+    fn writing_into_an_empty_rotation_created_file_after_a_restart_bridges() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+
+        {
+            let mut writer = open_no_key(path.clone());
+            writer.write_entry(make_entry("")).unwrap();
+            writer.force_rotate_for_test().unwrap();
+        }
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+
+        // A restart between the rotation and the first append must still write
+        // an entry that chains off the handoff.
+        let mut writer = open_no_key(path.clone());
+        writer.write_entry(make_entry("")).unwrap();
+        drop(writer);
+
+        crate::audit_log::verify::verify_log(&path, None)
+            .expect("the first entry after a restart must bridge to the archive");
+    }
+
+    // ── Tip anchor across a rotation ─────────────────────────────────────────
+    //
+    // A file a rotation created chains its first entry off the outgoing file's
+    // handoff entry, not off the zero block. Every replay the anchor performs —
+    // full-file and tail alike — has to seed from that bridge. These four pin
+    // the branches that a log which has rotated at least once actually reaches;
+    // the anchor-current tests above never leave the first file of a chain.
+
+    /// Builds an alpha.6-shaped log: entries, one rotation, more entries, and
+    /// no anchor. Returns nothing in the store.
+    fn rotated_log_without_anchor(path: &Path) {
+        let mut writer = open_no_key(path.to_path_buf());
+        writer.write_entry(make_entry("")).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        writer.force_rotate_for_test().unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+    }
+
+    #[test]
+    fn adoption_succeeds_on_a_rotation_created_active_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        rotated_log_without_anchor(&path);
+        let tip_before = tip_of(&path);
+        assert_eq!(
+            tip_before.entry_count, 2,
+            "the active file is post-rotation"
+        );
+
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let writer = open_anchored(&path, &store)
+            .expect("the upgrade path must adopt a log that has rotated");
+        drop(writer);
+
+        assert_eq!(
+            count_tip_anchored_rows(&path, "adopted"),
+            1,
+            "adoption must record itself even on a rotated log"
+        );
+        assert_eq!(
+            stored_value(&store),
+            tip_of(&path).to_keyring_value(),
+            "the anchor must name the post-rotation file's tip"
+        );
+        assert_eq!(
+            store.peek().unwrap().entry_count,
+            tip_before.entry_count + 1
+        );
+    }
+
+    #[test]
+    fn crash_after_the_first_post_rotation_append_self_heals_on_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        {
+            let mut writer = open_anchored(&path, &store).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            writer.force_rotate_for_test().unwrap();
+            // The rotation left the anchor on the archive's handoff. The first
+            // append into the new file lands in the crash window: entry fsynced,
+            // anchor not written, so the anchor still names the PREVIOUS
+            // generation while the file holds one entry.
+            writer.set_skip_tip_anchor_write(true);
+            writer.write_entry(make_entry("")).unwrap();
+        }
+        assert_eq!(
+            store.peek().unwrap(),
+            tip_of(&newest_archive(&path)),
+            "the failpoint must leave the anchor on the archive's handoff"
+        );
+        assert_eq!(tip_of(&path).entry_count, 1, "the entry is on disk");
+
+        let writer = open_anchored(&path, &store)
+            .expect("a post-rotation file must open, not read as a rollback");
+        drop(writer);
+        assert_eq!(
+            stored_value(&store),
+            tip_of(&path).to_keyring_value(),
+            "reopening must advance the anchor onto the fsynced entry"
+        );
+        assert_eq!(
+            count_tip_anchored_rows(&path, "adopted"),
+            0,
+            "absorbing an append ahead of the anchor is not an adoption"
+        );
+    }
+
+    #[test]
+    fn repair_works_on_a_rotation_created_active_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        let snapshot = {
+            let mut writer = open_anchored(&path, &store).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            writer.force_rotate_for_test().unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            let snapshot = fs::read(&path).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            snapshot
+        };
+        fs::write(&path, &snapshot).unwrap();
+        assert!(
+            open_anchored(&path, &store).is_err(),
+            "the rolled-back post-rotation log must refuse before the repair"
+        );
+
+        let mut writer = AuditWriter::open_for_reanchor(
+            path.clone(),
+            None,
+            Arc::clone(&store) as Arc<dyn TipAnchorStore>,
+        )
+        .expect("repair must open a rotated log");
+        let proposed = writer
+            .current_tip_anchor()
+            .expect("the repair verb reports the tip before the acknowledgement");
+        assert_eq!(
+            proposed
+                .expect("a post-rotation file with entries has a tip")
+                .entry_count,
+            2
+        );
+        let report = writer
+            .reanchor()
+            .expect("repair must succeed on a rotated log");
+        assert_eq!(report.reanchor_count, 1);
+        drop(writer);
+
+        assert_eq!(count_tip_anchored_rows(&path, "rollback_acknowledged"), 1);
+        open_anchored(&path, &store).expect("the repaired rotated log must open cleanly");
+    }
+
+    #[test]
+    fn a_truncation_is_a_tip_anchor_mismatch_and_a_broken_chain_is_a_chain_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        let mut writer = open_anchored(&path, &store).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        drop(writer);
+        let anchored = store.peek().unwrap();
+        assert_eq!(anchored.entry_count, 2);
+
+        // Roll the file back to empty. The anchor names two entries at a
+        // non-zero offset, so this is a truncation, and the operator must get
+        // the code whose runbook covers it rather than a chain-break code that
+        // would send them to the wrong section.
+        //
+        // Scope: this pins the code the two conditions produce, nothing about
+        // the rotation window. The rotation-window claims are pinned by
+        // `a_rollback_during_the_rotation_window_is_refused` and its siblings.
+        fs::write(&path, b"").unwrap();
+        let err = open_anchored(&path, &store).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WriterError::TipAnchorMismatch {
+                    expected_count: 2,
+                    actual_len: 0,
+                    ..
+                }
+            ),
+            "a rollback must report the tip-anchor code, not a chain break: {err:?}"
+        );
+
+        // The mirror case: the file is replaced by one whose own linkage is
+        // broken, which is a chain error rather than a rollback.
+        store.set(None);
+        let mut foreign = Vec::new();
+        {
+            let other = dir.path().join("other.jsonl");
+            let mut w = open_no_key(other.clone());
+            w.write_entry(make_entry("")).unwrap();
+            drop(w);
+            let content = fs::read(&other).unwrap();
+            // Break the first entry's link so the file cannot chain from any
+            // seed this path could produce.
+            let text = String::from_utf8(content).unwrap();
+            foreign.extend_from_slice(
+                text.replace(
+                    "\"previous_entry_hash\":\"sha256:",
+                    "\"previous_entry_hash\":\"sha256:0",
+                )
+                .as_bytes(),
+            );
+        }
+        fs::write(&path, &foreign).unwrap();
+        let err = open_anchored(&path, &store).unwrap_err();
+        assert!(
+            matches!(err, WriterError::ChainBrokenAtOpen { .. }),
+            "a file whose own linkage is broken is a chain break, not a rollback: {err:?}"
+        );
+    }
+
+    #[test]
+    fn rotation_bridge_refuses_an_archive_that_is_not_a_handoff() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        rotated_log_without_anchor(&path);
+
+        // Replace the archive's trailing handoff with an ordinary entry: the
+        // shape a planted sibling would have.
+        let archive = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| is_rotated_sibling("test.jsonl", n))
+            })
+            .expect("one archive exists");
+        let content = fs::read_to_string(&archive).unwrap();
+        let kept: Vec<&str> = content
+            .lines()
+            .filter(|l| !l.contains("audit_rotation_handoff"))
+            .collect();
+        fs::write(&archive, format!("{}\n", kept.join("\n"))).unwrap();
+
+        let err = open_no_key_result(path.clone()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WriterError::RotationBridgeUnusable {
+                    reason: "the archive does not end with a rotation handoff entry",
+                    ..
+                }
+            ),
+            "an archive that cannot supply the bridge must refuse: {err:?}"
+        );
+    }
+
+    fn open_no_key_result(path: PathBuf) -> Result<AuditWriter, WriterError> {
+        AuditWriter::open(path, None)
+    }
+
+    // ── The rotation window ──────────────────────────────────────────────────
+    //
+    // The empty-file anchor is offset 0, a prefix of every file, so while it
+    // stands every file classifies as ahead-of-anchor and a rollback is
+    // absorbed rather than refused. Rotation therefore never leaves it standing
+    // while the path holds entries: the anchor is advanced onto the outgoing
+    // file's handoff before the renames and handed to the new file only after
+    // them. These pin both halves of that window.
+
+    #[test]
+    fn a_rollback_during_the_rotation_window_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        let mut writer = open_anchored(&path, &store).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        let one_entry = fs::read(&path).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+
+        // The instant before the renames: the handoff is appended and the
+        // anchor names it. The rollback guard has to be armed here, not
+        // suspended, because the path still holds the whole outgoing file.
+        writer.write_rotation_handoff_for_test().unwrap();
+        let during_rotation = store.peek().unwrap();
+        assert_eq!(
+            during_rotation.entry_count, 4,
+            "the anchor must name the outgoing file's tip during the rotation, \
+             not the empty-file value: {during_rotation:?}"
+        );
+        drop(writer);
+
+        fs::write(&path, &one_entry).unwrap();
+        let err = open_anchored(&path, &store).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WriterError::TipAnchorMismatch {
+                    expected_count: 4,
+                    ..
+                }
+            ),
+            "a rollback inside the rotation window must be refused, not absorbed: {err:?}"
+        );
+    }
+
+    /// Returns the newest rotated sibling of `path`.
+    fn newest_archive(path: &Path) -> PathBuf {
+        let stem = path.file_name().and_then(|s| s.to_str()).unwrap();
+        let mut archives: Vec<PathBuf> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| is_rotated_sibling(stem, n))
+            })
+            .collect();
+        archives.sort();
+        archives.pop().expect("at least one archive")
+    }
+
+    #[test]
+    fn a_rotation_whose_new_file_anchor_write_was_lost_opens_and_re_anchors() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        {
+            let mut writer = open_anchored(&path, &store).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            writer.force_rotate_for_test().unwrap();
+        }
+
+        // Simulate the post-rename anchor write being lost: put the anchor back
+        // to the value the rotation left just before the renames, which names
+        // the archive's handoff entry.
+        let stranded = tip_of(&newest_archive(&path));
+        assert_eq!(
+            stranded.entry_count, 3,
+            "the stranded anchor names the archive's handoff: {stranded:?}"
+        );
+        let stranded_check = stranded.clone();
+        store.set(Some(stranded));
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            0,
+            "the new file is empty"
+        );
+
+        // Shorter than the anchor, but provably a completed rotation: the
+        // anchored tip IS the newest archive's handoff.
+        let writer =
+            open_anchored(&path, &store).expect("a completed rotation must not read as a rollback");
+        drop(writer);
+        assert_eq!(
+            store.peek().unwrap(),
+            stranded_check,
+            "an empty post-rotation file stays on the archive's handoff: there is \
+             no entry of its own to anchor yet"
+        );
+        assert_eq!(
+            count_tip_anchored_rows(&path, "adopted"),
+            0,
+            "a rotation handover is not an adoption"
+        );
+
+        // The first append moves the anchor onto this file's own first entry.
+        let mut writer = open_anchored(&path, &store).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        assert_eq!(store.peek().unwrap().entry_count, 1);
+        assert_eq!(stored_value(&store), tip_of(&path).to_keyring_value());
+    }
+
+    #[test]
+    fn a_rollback_onto_a_foreign_shorter_file_is_still_refused_after_a_rotation() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        let one_entry = {
+            let mut writer = open_anchored(&path, &store).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            let one_entry = fs::read(&path).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            writer.force_rotate_for_test().unwrap();
+            one_entry
+        };
+        // The anchor names the archive's handoff, so the rotation-completed rule
+        // is live — but the path holds a rolled-back prefix of the OLD file, not
+        // the file the rotation created. The rule re-derives the anchor from the
+        // file, and the file's first entry does not chain from the archive's
+        // handoff, so the replay refuses.
+        store.set(Some(tip_of(&newest_archive(&path))));
+        fs::write(&path, &one_entry).unwrap();
+        let err = open_anchored(&path, &store).unwrap_err();
+        assert!(
+            matches!(err, WriterError::ChainBrokenAtOpen { .. }),
+            "a rolled-back prefix of the pre-rotation file must not be blessed \
+             by the rotation-completed rule: {err:?}"
+        );
+    }
+    #[test]
+    fn restoring_the_pre_rotation_directory_state_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        let pre_rotation = {
+            let mut writer = open_anchored(&path, &store).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            let pre_rotation = fs::read(&path).unwrap();
+            // Rotate and stop. Nothing has appended to the new file, which is
+            // the moment an anchor meaning "this file is empty" would leave the
+            // guard disarmed: offset 0 is a prefix of every file.
+            writer.force_rotate_for_test().unwrap();
+            pre_rotation
+        };
+        let archive = newest_archive(&path);
+
+        // Roll the whole directory back to before the rotation: the archive is
+        // gone and the path holds the file as it was. Every entry in it is
+        // genuine and its chain verifies, which is exactly why the chain walk
+        // cannot catch this.
+        fs::remove_file(&archive).unwrap();
+        fs::write(&path, &pre_rotation).unwrap();
+        assert!(
+            verify_log_is_clean(&path),
+            "the restored state chains cleanly"
+        );
+
+        let err = open_anchored(&path, &store).unwrap_err();
+        assert!(
+            matches!(err, WriterError::TipAnchorMismatch { .. }),
+            "a directory-level rollback to before the rotation must be refused: {err:?}"
+        );
+    }
+
+    #[test]
+    fn restoring_an_older_archive_and_active_pair_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        // Rotate twice. The snapshot is the directory as it stood right after
+        // the FIRST rotation: one archive and an empty active file.
+        let mut writer = open_anchored(&path, &store).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        writer.force_rotate_for_test().unwrap();
+        let first_archive = newest_archive(&path);
+        let first_archive_bytes = fs::read(&first_archive).unwrap();
+        let empty_active = fs::read(&path).unwrap();
+
+        writer.write_entry(make_entry("")).unwrap();
+        writer.force_rotate_for_test().unwrap();
+        drop(writer);
+        let second_archive = newest_archive(&path);
+        assert_ne!(first_archive, second_archive, "two archives exist");
+
+        // Restore the pair to its earlier state. Both files are internally
+        // consistent and bridge to each other; only the anchor knows the pair is
+        // stale.
+        fs::remove_file(&second_archive).unwrap();
+        fs::write(&first_archive, &first_archive_bytes).unwrap();
+        fs::write(&path, &empty_active).unwrap();
+        assert!(
+            verify_log_is_clean(&path),
+            "the restored pair chains cleanly"
+        );
+
+        let err = open_anchored(&path, &store).unwrap_err();
+        assert!(
+            matches!(err, WriterError::TipAnchorMismatch { .. }),
+            "restoring an older archive-and-active pair must be refused: {err:?}"
+        );
+    }
+
+    #[test]
+    fn trailing_blank_lines_do_not_make_an_untouched_log_read_as_rolled_back() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        {
+            let mut writer = open_anchored(&path, &store).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+        }
+
+        // Bytes every reader in this subsystem tolerates but no writer here
+        // produces: the replay, `verify_log` and the partial-entry scan all skip
+        // blank lines. The anchor has to tolerate them identically, or an
+        // untouched log reports a rollback the operator would have to
+        // acknowledge.
+        {
+            use std::io::Write as _;
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(b"\n\n").unwrap();
+            f.sync_data().unwrap();
+        }
+
+        let mut writer =
+            open_anchored(&path, &store).expect("trailing blank lines are not a rollback");
+        writer
+            .verify_tip_anchor()
+            .expect("nor do they fail the per-acquisition check");
+
+        // The next append lands after the blanks, and the anchor names where it
+        // actually ends rather than where arithmetic on the writer's own bytes
+        // would have put it.
+        writer.write_entry(make_entry("")).unwrap();
+        let anchored = store.peek().unwrap();
+        assert_eq!(anchored.entry_count, 3);
+        assert_eq!(
+            anchored.end_offset,
+            fs::metadata(&path).unwrap().len(),
+            "the anchored offset must be the real end of the appended entry"
+        );
+        drop(writer);
+
+        open_anchored(&path, &store).expect("and the reopen agrees");
+        assert!(verify_log_is_clean(&path));
+    }
+
+    #[test]
+    fn a_failed_anchor_write_is_retried_on_the_next_append() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        let mut writer = open_anchored(&path, &store).unwrap();
+        let writes_at_open = store.writes().len();
+
+        // The first append's anchor write fails: the entry is durable, the
+        // anchor is not moved.
+        store.set_failing(true);
+        writer.write_entry(make_entry("")).unwrap();
+        assert_eq!(
+            store.writes().len(),
+            writes_at_open,
+            "a failed write must record nothing"
+        );
+        assert!(store.peek().is_none(), "the anchor is left behind the file");
+
+        // The next append repairs it BEFORE appending, then records its own.
+        store.set_failing(false);
+        writer.write_entry(make_entry("")).unwrap();
+
+        let recorded: Vec<u64> = store
+            .writes()
+            .into_iter()
+            .skip(writes_at_open)
+            .map(|a| a.entry_count)
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![1, 2],
+            "the append must first re-write the anchor for the entry already on \
+             disk, then write its own; without the repair only the second \
+             would appear"
+        );
+        assert_eq!(stored_value(&store), tip_of(&path).to_keyring_value());
+    }
+
+    /// A keyed writer cannot be opened without an anchor store.
+    ///
+    /// The registry's keyed entry point takes [`KeyedAuditAccess`], which cannot
+    /// be built without both halves, so the guarantee is structural rather than
+    /// a convention. This pins that no second keyed entry point grows back: a
+    /// registry function that accepts a bare key would let a caller open a keyed
+    /// writer whose rows the anchor never covers, which is exactly the class of
+    /// rows an attacker wants to remove.
+    #[test]
+    fn the_registry_has_no_keyed_entry_point_that_takes_a_bare_key() {
+        const SOURCE: &str = include_str!("writer.rs");
+        let production = SOURCE
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("the production half precedes the test module");
+        assert!(
+            production.contains("pub fn get_or_open_keyed"),
+            "the scan must see the production half of this file"
+        );
+
+        let keyed_entry_points = production.matches("pub fn get_or_open").count();
+        assert_eq!(
+            keyed_entry_points, 2,
+            "the registry exposes exactly two entry points, `get_or_open_unkeyed` \\
+             and `get_or_open_keyed`; a third would need its own argument for the \\
+             anchor store and is how a bare-key open grows back"
+        );
+        assert!(
+            !production.contains(
+                "hmac_key: Option<Zeroizing<[u8; 32]>>,\n    ) -> Result<Arc<Mutex<AuditWriter>>"
+            ),
+            "no public registry entry point may take a bare optional key"
+        );
+    }
+
+    /// No replay site may hardcode the zero block as its seed.
+    ///
+    /// The zero block is correct only for the first file of a chain. Every
+    /// replay goes through `AuditWriter::chain_seed` / `initial_chain_seed`,
+    /// which is the one place that decides between the zero block and the
+    /// cross-file bridge; a call that names `ZERO_BLOCK_HASH` directly is the
+    /// defect this pins, and it is invisible to any test that never rotates.
+    #[test]
+    fn no_replay_site_hardcodes_the_zero_block_seed() {
+        const SOURCE: &str = include_str!("writer.rs");
+        let production = SOURCE
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("the production half precedes the test module");
+        assert!(
+            production.contains("fn initial_chain_seed"),
+            "the scan must see the production half of this file"
+        );
+
+        let mut offenders = Vec::new();
+        for (idx, _) in production.match_indices("read_and_verify_entry_chain(") {
+            let call = &production[idx..];
+            let end = call.find(")?").unwrap_or(call.len().min(240));
+            let call = &call[..end];
+            if call.contains("ZERO_BLOCK_HASH") {
+                let line = production[..idx].lines().count();
+                offenders.push(format!("line {line}: {}", call.replace('\n', " ")));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "replay sites must seed through chain_seed()/initial_chain_seed, \
+             never the zero block directly:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// Runs the verifier's chain walk and reports whether it passes.
+    fn verify_log_is_clean(path: &Path) -> bool {
+        crate::audit_log::verify::verify_log(path, None).is_ok()
     }
 }

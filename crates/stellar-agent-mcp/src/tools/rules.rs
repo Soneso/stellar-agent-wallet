@@ -124,7 +124,7 @@ fn build_signers_manager(
         })?;
     }
     let writer: Arc<Mutex<AuditWriter>> =
-        AuditWriterRegistry::get_or_open(RULES_OBSERVABILITY_PROFILE, &log_path, None).map_err(
+        AuditWriterRegistry::get_or_open_unkeyed(RULES_OBSERVABILITY_PROFILE, &log_path).map_err(
             |e| SaError::AuditWriterIo {
                 detail: e.to_string(),
                 path: log_path.clone(),

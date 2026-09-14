@@ -21,7 +21,8 @@
 //! `audit.rotation_gap`, `audit.hmac_mismatch`, `audit.hmac_sidecar_missing`,
 //! `audit.too_many_rotated_files`, `audit.non_regular_file_log_path`,
 //! `audit.parse_error`, `audit.path_contract`, `audit.io_error`,
-//! `audit.signer_set_canonical_body`.  The line number / file basename is in
+//! `audit.signer_set_canonical_body`, `audit.tip_anchor_mismatch`.  The line
+//! number / file basename is in
 //! the envelope `detail` field, not the wire code itself, ensuring cardinality
 //! stays bounded.
 //!
@@ -43,6 +44,7 @@ use super::{
     chain::{ZERO_BLOCK_HASH, compute_entry_hash, verify_chain_root},
     entry::AuditEntry,
     schema::EventKind,
+    tip_anchor::TipAnchor,
     writer::{
         MAX_ROTATED_FILES, hmac_sidecar_path, is_rotated_sibling,
         wait_out_transient_rotation_window,
@@ -79,6 +81,27 @@ pub struct VerifyOk {
     /// `true` only when the caller supplied an HMAC key and each file in the
     /// walked chain had a sidecar that verified successfully.
     pub hmac_verified: bool,
+    /// Coordinates of the last file's chain tip, for comparison against a
+    /// keyring-held [`TipAnchor`].
+    ///
+    /// `None` only when no file was walked at all.
+    pub active_tip: Option<VerifiedTip>,
+}
+
+/// The verified chain tip of the last file in a walk.
+///
+/// The three values a [`TipAnchor`] records, computed from the file rather than
+/// read from the keyring, so the two can be compared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct VerifiedTip {
+    /// Number of entries in the active file.
+    pub entry_count: u64,
+    /// Entry hash of the active file's last entry, or the hash the file chains
+    /// from when it is empty.
+    pub tip_hash: String,
+    /// Byte offset just past the active file's last entry.
+    pub end_offset: u64,
 }
 
 /// Verification metadata for one walked audit-log file.
@@ -196,6 +219,8 @@ pub fn verify_log(log_path: &Path, hmac_key: Option<&[u8; 32]>) -> Result<Verify
     // Tracks whether every per-file `SingleFileResult.sidecar_verified` was
     // true. AND-combined into `VerifyOk.hmac_verified` on success.
     let mut all_sidecars_verified = true;
+    // Chain tip of the last file walked, for tip-anchor comparison.
+    let mut active_tip: Option<VerifiedTip> = None;
 
     for (file_idx, path) in file_chain.iter().enumerate() {
         if !path.exists() {
@@ -247,7 +272,16 @@ pub fn verify_log(log_path: &Path, hmac_key: Option<&[u8; 32]>) -> Result<Verify
             last_timestamp,
             warnings: file_warnings,
             sidecar_verified,
+            end_offset,
         } = result;
+
+        if is_last_file {
+            active_tip = Some(VerifiedTip {
+                entry_count: entries as u64,
+                tip_hash: last_hash.clone(),
+                end_offset,
+            });
+        }
 
         total_entries += entries;
         files_walked += 1;
@@ -274,6 +308,7 @@ pub fn verify_log(log_path: &Path, hmac_key: Option<&[u8; 32]>) -> Result<Verify
         per_file,
         warnings,
         hmac_verified: hmac_key.is_some() && all_sidecars_verified,
+        active_tip,
     })
 }
 
@@ -292,6 +327,13 @@ pub fn verify_log(log_path: &Path, hmac_key: Option<&[u8; 32]>) -> Result<Verify
 ///
 /// - `log_path` — same as [`verify_log`].
 /// - `hmac_key` — same as [`verify_log`].
+/// - `anchor` — the keyring-held [`TipAnchor`] for this log PATH, when the
+///   caller could establish that the path it was asked to verify is the one the
+///   anchor names. `Some` makes the walk fail with
+///   [`VerifyError::TipAnchorMismatch`] unless the last file's tip is exactly
+///   the anchored tip, which is what catches a restored older copy or a
+///   truncation that the chain walk alone accepts. `None` verifies the chain
+///   only, exactly as before.
 /// - `health` — a live handle to the session-level
 ///   [`crate::audit_log::health::AuditWriterHealthHandle`].
 ///
@@ -311,7 +353,7 @@ pub fn verify_log(log_path: &Path, hmac_key: Option<&[u8; 32]>) -> Result<Verify
 /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let health = AuditWriterHealth::new();
 /// let handle = health.handle();
-/// let ok = verify_log_with_health(&PathBuf::from("/tmp/test.jsonl"), None, &handle)?;
+/// let ok = verify_log_with_health(&PathBuf::from("/tmp/test.jsonl"), None, None, &handle)?;
 /// println!(
 ///     "verified {} entries; degraded: {}",
 ///     ok.verify_ok.entries_verified, ok.audit_writer_degraded
@@ -322,14 +364,126 @@ pub fn verify_log(log_path: &Path, hmac_key: Option<&[u8; 32]>) -> Result<Verify
 pub fn verify_log_with_health(
     log_path: &Path,
     hmac_key: Option<&[u8; 32]>,
+    anchor: Option<&TipAnchor>,
     health: &crate::audit_log::health::AuditWriterHealthHandle,
 ) -> Result<VerifyOkWithHealth, VerifyError> {
     let verify_ok = verify_log(log_path, hmac_key)?;
+    if let Some(anchor) = anchor {
+        check_anchor_against_walk(log_path, anchor, verify_ok.active_tip.as_ref())?;
+    }
     let audit_writer_degraded = health.is_degraded();
     Ok(VerifyOkWithHealth {
         verify_ok,
         audit_writer_degraded,
     })
+}
+
+/// Compares the keyring-held anchor with the tip the walk actually found.
+///
+/// Applies the same three-way rule the writer applies, and in the same order, so
+/// the two surfaces cannot disagree about a given file:
+///
+/// 1. A verified prefix shorter than the anchor is a rollback or a truncation.
+/// 2. The entry ending at the anchored offset must still hash to the anchored
+///    tip. Length alone proves nothing: a longer, internally consistent chain
+///    that does not contain the anchored entry is a wholesale substitution, and
+///    it passes the chain walk exactly as an honest log does.
+/// 3. At the anchored offset the counts and the tip must match as well, which
+///    catches a prefix rewritten to a different entry count.
+///
+/// Before any of that, an anchor naming the newest archive's rotation handoff is
+/// accepted: it describes the generation this file succeeded, not this file.
+///
+/// A file that moved FORWARD past an intact anchored entry is not an error:
+/// unkeyed writers append without touching the anchor, and the next keyed
+/// acquisition absorbs the gap.
+fn check_anchor_against_walk(
+    log_path: &Path,
+    anchor: &TipAnchor,
+    active_tip: Option<&VerifiedTip>,
+) -> Result<(), VerifyError> {
+    let Some(tip) = active_tip else {
+        return Err(VerifyError::TipAnchorMismatch {
+            expected_count: anchor.entry_count,
+            expected_offset: anchor.end_offset,
+            actual_count: 0,
+            actual_offset: 0,
+            reason: "no active file was walked",
+        });
+    };
+
+    let mismatch = |reason: &'static str| VerifyError::TipAnchorMismatch {
+        expected_count: anchor.entry_count,
+        expected_offset: anchor.end_offset,
+        actual_count: tip.entry_count,
+        actual_offset: tip.end_offset,
+        reason,
+    };
+
+    if anchor.matches_tip(tip.entry_count, &tip.tip_hash, tip.end_offset) {
+        return Ok(());
+    }
+
+    // The anchor may name the PREVIOUS file generation. A rotation leaves it on
+    // the outgoing file's handoff entry and it stays there until the new file's
+    // first append advances it, so its count and offset describe the archive,
+    // not the file the walk just ended on. The same proof the writer applies:
+    // the anchored tip must be the hash of the newest archive's last entry.
+    if anchor_names_the_rotation_handoff(log_path, anchor) {
+        return Ok(());
+    }
+
+    if tip.end_offset < anchor.end_offset {
+        return Err(mismatch(
+            "the active file's verified prefix is shorter than the anchor",
+        ));
+    }
+    if !anchored_entry_is_intact(log_path, anchor)? {
+        return Err(mismatch(
+            "the entry at the anchored offset is not the anchored entry",
+        ));
+    }
+    if tip.end_offset == anchor.end_offset {
+        return Err(mismatch("the active file's tip is not the anchored tip"));
+    }
+    Ok(())
+}
+
+/// Returns `true` when the anchor names exactly the newest rotated archive's
+/// handoff entry.
+///
+/// The verifier's half of the writer's rotation-completed rule, computed from
+/// the same helper so the two cannot disagree about which archive is newest or
+/// what its handoff hashes to. A failure to derive the seed returns `false`,
+/// which leaves the caller's remaining checks to refuse: the walk has already
+/// validated the cross-file bridge by this point, so a seed that cannot be read
+/// here is a reason to distrust the file, not to accept it.
+fn anchor_names_the_rotation_handoff(log_path: &Path, anchor: &TipAnchor) -> bool {
+    crate::audit_log::writer::initial_chain_seed(log_path).is_ok_and(|seed| seed == anchor.tip_hash)
+}
+
+/// Returns `true` when the last entry ending at or before the anchored offset
+/// still hashes to the anchored tip.
+///
+/// Reads through the writer's own backward scan, so the verifier and the writer
+/// prove intactness from the same bytes in the same way.
+fn anchored_entry_is_intact(log_path: &Path, anchor: &TipAnchor) -> Result<bool, VerifyError> {
+    let file = open_regular_file(log_path)?;
+    let Some(line) = crate::audit_log::writer::read_last_line_before(&file, anchor.end_offset)
+        .map_err(VerifyError::Io)?
+    else {
+        return Ok(false);
+    };
+    let Ok(entry) = serde_json::from_slice::<AuditEntry>(&line) else {
+        return Ok(false);
+    };
+    let Ok(body) = entry.canonical_json_body() else {
+        return Ok(false);
+    };
+    match compute_entry_hash(&body, &entry.previous_entry_hash) {
+        Ok(hash) => Ok(hash == anchor.tip_hash),
+        Err(_) => Ok(false),
+    }
 }
 
 /// The outcome of a successful [`verify_log_with_health`] call.
@@ -357,6 +511,9 @@ struct SingleFileResult {
     entries: usize,
     /// Hash of the last entry in this file (used for cross-file chain bridging).
     last_hash: String,
+    /// Byte offset just past the last entry in this file — the length of the
+    /// verified prefix, which the tip anchor records.
+    end_offset: u64,
     /// Last parsed timestamp in this file, if the file contained any entries.
     last_timestamp: Option<(String, u64)>,
     warnings: Vec<VerifyWarning>,
@@ -468,7 +625,7 @@ pub(super) fn collect_file_chain(log_path: &Path) -> Result<Vec<PathBuf>, Verify
 fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResult, VerifyError> {
     let path = ctx.path;
     let file = open_regular_file(path)?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
 
     // For the very first file, the initial expected prev hash is ZERO_BLOCK_HASH.
     // For subsequent files, it is the last_hash of the preceding file.
@@ -476,14 +633,36 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
     let mut prev_hash = initial_prev_hash.to_owned();
 
     let mut entries = 0usize;
+    let mut end_offset = 0u64;
     let mut is_first_entry = true;
     let mut last_handoff_next_file: Option<String> = None;
     let mut previous_timestamp = ctx.previous_timestamp.cloned();
     let mut warnings = Vec::new();
 
-    for (line_index, line_result) in reader.lines().enumerate() {
-        let line = line_result.map_err(VerifyError::Io)?;
+    // Read through `read_until` rather than `BufRead::lines` so the byte offset
+    // of the verified prefix stays exact: the tip anchor records where the chain
+    // ends, and a line-based reader cannot report that.
+    let mut raw = Vec::new();
+    let mut consumed = 0u64;
+    let mut line_index = 0usize;
+    loop {
+        raw.clear();
+        let read = reader
+            .read_until(b'\n', &mut raw)
+            .map_err(VerifyError::Io)?;
+        if read == 0 {
+            break;
+        }
+        consumed = consumed.saturating_add(read as u64);
         let line_number = line_index + 1;
+        line_index += 1;
+
+        let line = std::str::from_utf8(strip_line_terminator(&raw)).map_err(|e| {
+            VerifyError::ParseError {
+                line: line_number,
+                detail: format!("line is not valid UTF-8: {e}"),
+            }
+        })?;
 
         if line.trim().is_empty() {
             continue;
@@ -491,7 +670,7 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
 
         // Parse the entry.
         let entry: AuditEntry =
-            serde_json::from_str(&line).map_err(|e| VerifyError::ParseError {
+            serde_json::from_str(line).map_err(|e| VerifyError::ParseError {
                 line: line_number,
                 detail: e.to_string(),
             })?;
@@ -748,10 +927,11 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
             | EventKind::MppReceiptObserved { .. }
             | EventKind::MppSettlementReconciled { .. }
             | EventKind::KeyringKeyWritten { .. }
-            | EventKind::PolicyWindowStateReset { .. } => {
-                // Value-action, key-write, and window-state-reset forensic
-                // rows. No rotation-handoff tracking needed; the hash-chain is
-                // maintained by the surrounding hash check.
+            | EventKind::PolicyWindowStateReset { .. }
+            | EventKind::AuditTipAnchored { .. } => {
+                // Value-action, key-write, window-state-reset, and tip-anchor
+                // forensic rows. No rotation-handoff tracking needed; the
+                // hash-chain is maintained by the surrounding hash check.
             }
             EventKind::AuditRotationHandoff { next_file_name } => {
                 if ctx.is_last_file {
@@ -771,6 +951,7 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
 
         prev_hash = current_hash;
         entries += 1;
+        end_offset = consumed;
     }
 
     // Validate the rotation handoff's `next_file_name` against the current
@@ -806,6 +987,7 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
     Ok(SingleFileResult {
         entries,
         last_hash: prev_hash,
+        end_offset,
         last_timestamp: previous_timestamp,
         warnings,
         // Reaching this point with `ctx.hmac_key.is_some()` implies every
@@ -834,6 +1016,18 @@ fn read_regular_file_to_string(path: &Path) -> Result<String, VerifyError> {
     file.read_to_string(&mut contents)
         .map_err(VerifyError::Io)?;
     Ok(contents)
+}
+
+/// Strips a trailing `\n`, and a `\r` before it, from a raw line.
+fn strip_line_terminator(raw: &[u8]) -> &[u8] {
+    let mut line = raw;
+    if line.last() == Some(&b'\n') {
+        line = &line[..line.len() - 1];
+    }
+    if line.last() == Some(&b'\r') {
+        line = &line[..line.len() - 1];
+    }
+    line
 }
 
 fn basename_lossy(path: &Path) -> String {
@@ -1188,13 +1382,44 @@ pub enum VerifyError {
     /// field always points to the same runbook section.
     #[error(
         "audit.partial_rotation: {state}; \
-         recovery runbook: docs/runbooks/audit-log-recovery.md"
+         recovery runbook: docs/maintainers/audit-log-recovery.md"
     )]
     PartialRotation {
         /// Detected partial-rotation state with associated file metadata.
         state: PartialRotationState,
         /// Human-readable hint pointing to the recovery runbook.
         recovery_hint: String,
+    },
+
+    /// The active log file's chain tip is not the one the keyring-held anchor
+    /// names.
+    ///
+    /// The chain walk itself succeeded: linkage, per-entry hashes, and the
+    /// chain-root signatures are all intact. They verify a PREFIX, so an older
+    /// copy of the active file, or a truncated one, passes them. The anchor is
+    /// what pins the END of the chain, and it does not agree with the file.
+    ///
+    /// Counts and offsets only: no digest appears in the message.
+    ///
+    /// Wire code: `audit.tip_anchor_mismatch`. Recovery:
+    /// `stellar-agent audit reanchor --profile <name> --acknowledge-rollback`
+    /// after establishing why the file changed. See
+    /// `docs/maintainers/audit-log-recovery.md`.
+    #[error(
+        "audit.tip_anchor_mismatch: {reason}; anchored at {expected_count} entries / \
+         {expected_offset} bytes, file holds {actual_count} entries / {actual_offset} bytes"
+    )]
+    TipAnchorMismatch {
+        /// Entry count the anchor names for the active file.
+        expected_count: u64,
+        /// Byte offset the anchor names for the active file.
+        expected_offset: u64,
+        /// Entry count the walk found in the active file.
+        actual_count: u64,
+        /// Byte offset the walk found for the active file's last entry.
+        actual_offset: u64,
+        /// Stable diagnostic for which half of the check failed.
+        reason: &'static str,
     },
 }
 
@@ -1217,6 +1442,7 @@ impl VerifyError {
             Self::Io(_) => "audit.io_error",
             Self::SignerSetCanonicalBody(_) => "audit.signer_set_canonical_body",
             Self::PartialRotation { .. } => "audit.partial_rotation",
+            Self::TipAnchorMismatch { .. } => "audit.tip_anchor_mismatch",
         }
     }
 }
@@ -1235,8 +1461,8 @@ mod tests {
     use crate::audit_log::{
         entry::{AuditEntry, IntoOptionalChainId, NewToolInvocation},
         schema::{
-            ContractKind, KeyPurpose, PolicyDecision, ValueActionKind, ValueLegRecord,
-            VerifierAdvisoryKind,
+            ContractKind, EVENT_KIND_VARIANT_COUNT, KeyPurpose, PolicyDecision, TipAnchorReason,
+            ValueActionKind, ValueLegRecord, VerifierAdvisoryKind,
         },
         writer::{
             AuditWriter, ROTATION_THRESHOLD_BYTES, ROTATION_WINDOW_RETRY_ATTEMPTS,
@@ -1316,6 +1542,7 @@ mod tests {
             EventKind::MppSettlementReconciled { .. } => "mpp_settlement_reconciled",
             EventKind::KeyringKeyWritten { .. } => "keyring_key_written",
             EventKind::PolicyWindowStateReset { .. } => "policy_window_state_reset",
+            EventKind::AuditTipAnchored { .. } => "audit_tip_anchored",
         }
     }
 
@@ -1745,6 +1972,31 @@ mod tests {
                 keyring_entry: "default".to_owned(),
                 public_address: None,
             },
+            EventKind::ChannelPoolInitialised {
+                funder_redacted: "GABCD...12345".to_owned(),
+                channel_count: 4,
+                tx_hash_redacted: "abcd1234...5678wxyz".to_owned(),
+                ledger: 7,
+            },
+            EventKind::ChannelAcquired {
+                channel_redacted: "GCHAN...00001".to_owned(),
+                index: 0,
+            },
+            EventKind::ChannelReleased {
+                channel_redacted: "GCHAN...00001".to_owned(),
+                index: 0,
+                outcome: "success".to_owned(),
+            },
+            EventKind::PolicyWindowStateReset {
+                profile: "default".to_owned(),
+                reason: "corrupt-file recovery".to_owned(),
+            },
+            EventKind::AuditTipAnchored {
+                reason: TipAnchorReason::Adopted,
+                entry_count: 12,
+                previous_anchor: None,
+                reanchor_count: None,
+            },
         ]
     }
 
@@ -1987,7 +2239,329 @@ mod tests {
                 "mpp_receipt_observed",
                 "mpp_settlement_reconciled",
                 "keyring_key_written",
+                "channel_pool_initialised",
+                "channel_acquired",
+                "channel_released",
+                "policy_window_state_reset",
+                "audit_tip_anchored",
             ]
+        );
+        assert_eq!(
+            labels.len(),
+            EVENT_KIND_VARIANT_COUNT,
+            "every EventKind variant needs a fixture here; adding one without a \
+             fixture, or bumping EVENT_KIND_VARIANT_COUNT without adding one, \
+             leaves the wire-tag list incomplete"
+        );
+        let mut unique: Vec<&'static str> = labels.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "each variant must map to a distinct wire tag"
+        );
+    }
+
+    /// Builds the anchor that describes `path`'s active file as the writer
+    /// would have left it.
+    fn anchor_for(path: &std::path::Path) -> TipAnchor {
+        let ok = verify_log(path, None).unwrap();
+        let tip = ok.active_tip.unwrap();
+        TipAnchor::new(tip.entry_count, tip.tip_hash, tip.end_offset)
+    }
+
+    #[test]
+    fn verify_with_an_anchor_passes_on_the_anchored_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        write_entries(&path, 3);
+        let anchor = anchor_for(&path);
+
+        let health = crate::audit_log::health::AuditWriterHealth::new();
+        let ok = verify_log_with_health(&path, None, Some(&anchor), &health.handle()).unwrap();
+        assert_eq!(ok.verify_ok.entries_verified, 3);
+    }
+
+    #[test]
+    fn verify_with_an_anchor_fails_on_a_truncated_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        write_entries(&path, 3);
+        let anchor = anchor_for(&path);
+
+        // Drop the last entry. The chain walk alone still passes, because it
+        // verifies a prefix; the anchor is the only thing that pins the end.
+        let content = fs::read_to_string(&path).unwrap();
+        let kept: Vec<&str> = content.lines().take(2).collect();
+        fs::write(&path, format!("{}\n", kept.join("\n"))).unwrap();
+        verify_log(&path, None).expect("the truncated log still passes the chain walk");
+
+        let health = crate::audit_log::health::AuditWriterHealth::new();
+        let err = verify_log_with_health(&path, None, Some(&anchor), &health.handle()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VerifyError::TipAnchorMismatch {
+                    expected_count: 3,
+                    actual_count: 2,
+                    ..
+                }
+            ),
+            "expected a tip-anchor mismatch naming both counts, got {err:?}"
+        );
+        assert_eq!(err.wire_code(), "audit.tip_anchor_mismatch");
+        assert!(
+            !err.to_string().contains("sha256:"),
+            "the refusal must not carry a digest: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_with_an_anchor_passes_on_a_file_ahead_of_it() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        write_entries(&path, 2);
+        let anchor = anchor_for(&path);
+
+        // Unkeyed writers append without moving the anchor; a log that is ahead
+        // of its anchor is the ordinary state, not an integrity failure.
+        write_entries(&path, 2);
+
+        let health = crate::audit_log::health::AuditWriterHealth::new();
+        let ok = verify_log_with_health(&path, None, Some(&anchor), &health.handle()).unwrap();
+        assert_eq!(ok.verify_ok.entries_verified, 4);
+    }
+
+    #[test]
+    fn verify_with_an_anchor_fails_on_a_same_length_substitution() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        write_entries(&path, 3);
+        let anchor = anchor_for(&path);
+
+        // A different log of the same entry count and byte length: the chain
+        // walk passes, the anchored tip hash does not match.
+        let other = dir.path().join("other.jsonl");
+        write_entries(&other, 3);
+        fs::copy(&other, &path).unwrap();
+        fs::remove_file(&other).unwrap();
+        verify_log(&path, None).expect("the substituted log still passes the chain walk");
+
+        let health = crate::audit_log::health::AuditWriterHealth::new();
+        let err = verify_log_with_health(&path, None, Some(&anchor), &health.handle()).unwrap_err();
+        assert!(
+            matches!(err, VerifyError::TipAnchorMismatch { .. }),
+            "expected a tip-anchor mismatch for a substituted file, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_with_an_anchor_fails_on_a_longer_substitution() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        write_entries(&path, 3);
+        let anchor = anchor_for(&path);
+
+        // A different log that is LONGER than the anchor in both entry count and
+        // byte offset, and internally consistent end to end. Entry count and
+        // length alone cannot tell it from an honest log that simply had more
+        // rows appended; only the anchored entry can.
+        let other = dir.path().join("other.jsonl");
+        write_entries(&other, 6);
+        fs::copy(&other, &path).unwrap();
+        fs::remove_file(&other).unwrap();
+        verify_log(&path, None).expect("the substituted log still passes the chain walk");
+
+        let tip = verify_log(&path, None).unwrap().active_tip.unwrap();
+        assert!(
+            tip.entry_count > anchor.entry_count && tip.end_offset > anchor.end_offset,
+            "the substitution must be ahead of the anchor on both axes, or the \
+             test is not exercising the ahead rule"
+        );
+
+        let health = crate::audit_log::health::AuditWriterHealth::new();
+        let err = verify_log_with_health(&path, None, Some(&anchor), &health.handle()).unwrap_err();
+        assert!(
+            matches!(err, VerifyError::TipAnchorMismatch { .. }),
+            "a longer substitution that does not contain the anchored entry must \
+             refuse, got {err:?}"
+        );
+        assert_eq!(err.wire_code(), "audit.tip_anchor_mismatch");
+    }
+
+    /// Runs the walk with an anchor through the same entry point
+    /// `audit verify --profile` uses.
+    fn verify_with_anchor(
+        path: &std::path::Path,
+        anchor: &TipAnchor,
+    ) -> Result<VerifyOkWithHealth, VerifyError> {
+        let health = crate::audit_log::health::AuditWriterHealth::new();
+        verify_log_with_health(path, None, Some(anchor), &health.handle())
+    }
+
+    /// Builds a log that has rotated once, leaving the anchor on the archive's
+    /// handoff entry — the state every completed rotation leaves behind until
+    /// the new file's first append.
+    fn rotated_log(dir: &std::path::Path) -> (std::path::PathBuf, TipAnchor) {
+        let path = dir.join("test.jsonl");
+        let mut writer = AuditWriter::open(path.clone(), None).unwrap();
+        writer.write_entry(sample_tool_entry()).unwrap();
+        writer.write_entry(sample_tool_entry()).unwrap();
+        writer.force_rotate_for_test().unwrap();
+        drop(writer);
+        let handoff = last_entry_anchor(&newest_archive_of(dir));
+        (path, handoff)
+    }
+
+    /// Returns the newest rotated sibling of `test.jsonl` in `dir`.
+    ///
+    /// Matches through `is_rotated_sibling` so the `.lock` and `.root_hmac`
+    /// sidecars, which share the prefix, are not mistaken for archives.
+    fn newest_archive_of(dir: &std::path::Path) -> std::path::PathBuf {
+        let mut archives: Vec<std::path::PathBuf> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| is_rotated_sibling("test.jsonl", n))
+            })
+            .collect();
+        archives.sort();
+        archives.pop().expect("one archive")
+    }
+
+    fn sample_tool_entry() -> AuditEntry {
+        new_tool_invocation(
+            "stellar_pay_commit",
+            "stellar:testnet",
+            vec!["destination".to_owned()],
+            None,
+            None,
+            PolicyDecision::Allow,
+            None,
+            uuid::Uuid::new_v4().to_string(),
+        )
+    }
+
+    /// The anchor describing `file`'s last entry, computed independently of the
+    /// code under test.
+    fn last_entry_anchor(file: &std::path::Path) -> TipAnchor {
+        let content = fs::read_to_string(file).unwrap();
+        let mut count = 0u64;
+        let mut end = 0u64;
+        let mut last = String::new();
+        let mut consumed = 0u64;
+        for raw in content.split_inclusive('\n') {
+            consumed += raw.len() as u64;
+            let line = raw.trim_end_matches(['\n', '\r']);
+            if line.trim().is_empty() {
+                continue;
+            }
+            count += 1;
+            end = consumed;
+            last = line.to_owned();
+        }
+        let entry: AuditEntry = serde_json::from_str(&last).unwrap();
+        let body = entry.canonical_json_body().unwrap();
+        let hash = compute_entry_hash(&body, &entry.previous_entry_hash).unwrap();
+        TipAnchor::new(count, hash, end)
+    }
+
+    #[test]
+    fn verify_accepts_an_anchor_naming_the_archive_handoff_after_a_rotation() {
+        let dir = TempDir::new().unwrap();
+        let (path, handoff) = rotated_log(dir.path());
+
+        // The active file is empty and the anchor names the previous
+        // generation. Refusing here would make `audit verify --profile` report a
+        // rollback on every freshly rotated log.
+        let ok = verify_with_anchor(&path, &handoff).expect("a rotated log verifies");
+        assert_eq!(ok.verify_ok.files_walked, 2);
+    }
+
+    #[test]
+    fn verify_refuses_a_restore_of_the_pre_rotation_directory_state() {
+        let dir = TempDir::new().unwrap();
+        let (path, handoff) = rotated_log(dir.path());
+        let archive = newest_archive_of(dir.path());
+        let pre_rotation: String = fs::read_to_string(&archive)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.contains("audit_rotation_handoff"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+
+        // Roll the directory back to before the rotation.
+        fs::remove_file(&archive).unwrap();
+        fs::write(&path, pre_rotation).unwrap();
+        verify_log(&path, None).expect("the restored state still passes the chain walk");
+
+        let err = verify_with_anchor(&path, &handoff).unwrap_err();
+        assert!(
+            matches!(err, VerifyError::TipAnchorMismatch { .. }),
+            "a directory-level rollback must be refused: {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_refuses_a_restore_of_an_older_archive_and_active_pair() {
+        let dir = TempDir::new().unwrap();
+        let (path, handoff) = rotated_log(dir.path());
+
+        // Append to the post-rotation file so the anchor legitimately moves onto
+        // it, then restore the pair to the moment the rotation finished.
+        let empty_active = fs::read(&path).unwrap();
+        {
+            let mut writer = AuditWriter::open(path.clone(), None).unwrap();
+            writer.write_entry(sample_tool_entry()).unwrap();
+            writer.write_entry(sample_tool_entry()).unwrap();
+        }
+        let current = last_entry_anchor(&path);
+        assert!(verify_with_anchor(&path, &current).is_ok());
+
+        fs::write(&path, &empty_active).unwrap();
+        verify_log(&path, None).expect("the restored pair still passes the chain walk");
+
+        let err = verify_with_anchor(&path, &current).unwrap_err();
+        assert!(
+            matches!(err, VerifyError::TipAnchorMismatch { .. }),
+            "restoring the pair to an earlier moment must be refused: {err:?}"
+        );
+        // And the pre-rotation-generation anchor is not a way back in either:
+        // it names the archive's handoff, which is the legitimate freshly
+        // rotated state, so it is accepted — the guard that matters is that the
+        // anchor cannot go BACKWARD once it has moved on.
+        assert!(verify_with_anchor(&path, &handoff).is_ok());
+    }
+
+    #[test]
+    fn verify_tolerates_trailing_blank_lines() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        write_entries(&path, 2);
+        let anchor = anchor_for(&path);
+        fs::write(&path, [fs::read(&path).unwrap(), b"\n\n".to_vec()].concat()).unwrap();
+
+        verify_with_anchor(&path, &anchor)
+            .expect("blank lines after the tip entry are not a rollback");
+    }
+
+    #[test]
+    fn verify_reports_the_active_file_tip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        write_entries(&path, 2);
+
+        let ok = verify_log(&path, None).unwrap();
+        let tip = ok.active_tip.expect("a walked file must report a tip");
+        assert_eq!(tip.entry_count, 2);
+        assert_eq!(
+            tip.end_offset,
+            fs::metadata(&path).unwrap().len(),
+            "the tip offset must be the end of the last entry"
         );
     }
 
@@ -2973,7 +3547,7 @@ mod tests {
         let health = AuditWriterHealth::new();
         let handle = health.handle();
 
-        let result = super::verify_log_with_health(&path, None, &handle)
+        let result = super::verify_log_with_health(&path, None, None, &handle)
             .expect("verify_log_with_health failed");
 
         // The verify_ok sub-field must agree with a plain verify_log call.
@@ -2995,7 +3569,7 @@ mod tests {
         let handle = health.handle();
         handle.mark_degraded();
 
-        let result = super::verify_log_with_health(&path, None, &handle)
+        let result = super::verify_log_with_health(&path, None, None, &handle)
             .expect("verify_log_with_health failed");
 
         assert_eq!(result.verify_ok.entries_verified, 1);
@@ -3020,7 +3594,7 @@ mod tests {
         let health = AuditWriterHealth::new();
         let handle = health.handle();
 
-        let result = super::verify_log_with_health(&path, None, &handle);
+        let result = super::verify_log_with_health(&path, None, None, &handle);
         assert!(
             matches!(result, Err(VerifyError::ChainBroken { .. })),
             "expected ChainBroken propagated through verify_log_with_health, got {result:?}"
@@ -3038,6 +3612,7 @@ mod tests {
                 per_file: vec![],
                 warnings: vec![],
                 hmac_verified: false,
+                active_tip: None,
             },
             audit_writer_degraded: false,
         };
@@ -3383,7 +3958,7 @@ mod tests {
                 sidecar_path: PathBuf::from("/tmp/audit.jsonl.root_hmac"),
                 expected_log_path: PathBuf::from("/tmp/audit.jsonl"),
             },
-            recovery_hint: "docs/runbooks/audit-log-recovery.md".to_owned(),
+            recovery_hint: "docs/maintainers/audit-log-recovery.md".to_owned(),
         };
         let display = err.to_string();
         assert!(
@@ -3391,7 +3966,7 @@ mod tests {
             "display must include wire code prefix: {display}"
         );
         assert!(
-            display.contains("docs/runbooks/audit-log-recovery.md"),
+            display.contains("docs/maintainers/audit-log-recovery.md"),
             "display must include recovery hint: {display}"
         );
     }

@@ -14,12 +14,20 @@
 //! log — pre-rotation entries and the new `KeyringKeyWritten` row alike.  The
 //! old key is destroyed by the rotation; only the new key verifies afterward.
 //!
-//! Ordering is load-bearing: the new key is persisted to the keyring FIRST, the
-//! sidecars are re-signed SECOND, and the audit row is emitted THIRD.  Re-signing
-//! before persisting would leave sidecars signed by a key the keyring no longer
-//! holds.  If re-signing fails partway (some sidecars carry the new key, some the
-//! old), re-running the command converges: the re-sign step recomputes every
-//! sidecar deterministically.
+//! Ordering is load-bearing.  The audit writer's exclusive sidecar lock is taken
+//! FIRST and held throughout, so no other process can append or rotate while the
+//! per-file sidecars are being rewritten; a live MCP server holding that lock
+//! makes this verb refuse rather than race it.  The new key is then persisted to
+//! the keyring, the audit row is appended, and the sidecars are re-signed LAST,
+//! so a row that happens to open a new file has its chain root brought onto the
+//! new key by the same pass.  Re-signing before persisting would leave sidecars
+//! signed by a key the keyring no longer holds.  If re-signing fails partway
+//! (some sidecars carry the new key, some the old), re-running the command
+//! converges: the re-sign step recomputes every sidecar deterministically.
+//!
+//! The lock acquisition also runs the audit log's tip-anchor check, before the
+//! key is touched: a log that was rolled back or truncated is refused with
+//! `audit.tip_anchor_mismatch` and the profile's key is left alone.
 //!
 //! See `docs/runbooks/profile-migration.md` for operator guidance on key
 //! rotation scheduling.
@@ -47,12 +55,14 @@
 
 use clap::{ArgGroup, Args};
 use serde::Serialize;
-use stellar_agent_core::audit_log::{KeyPurpose, SidecarResignError, resign_chain_root_sidecars};
+use stellar_agent_core::audit_log::{
+    AuditWriter, KeyPurpose, SidecarResignError, resign_chain_root_sidecars,
+};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{InternalError, WalletError};
 use stellar_agent_core::profile::loader;
 use stellar_agent_core::profile::schema::Profile;
-use stellar_agent_network::keyring::init_platform_keyring_store;
+use stellar_agent_network::keyring::{KeyringTipAnchorStore, init_platform_keyring_store};
 use uuid::Uuid;
 
 use crate::common::profile_access::{
@@ -60,8 +70,37 @@ use crate::common::profile_access::{
 };
 use crate::common::render;
 
-use super::audit_emit::{emit_keyring_key_written, load_audit_hmac_key};
+use super::audit_emit::{emit_keyring_key_written_with_writer, load_audit_hmac_key};
 use super::key_ops::rotate_hmac_like_key;
+
+/// Opens the profile's audit writer under its current chain-root key, taking the
+/// exclusive sidecar lock and running the tip-anchor check.
+///
+/// Opened directly rather than through `AuditWriterRegistry` because the
+/// registry pins one `(path, key)` pair per profile name for the process
+/// lifetime: rotation changes the key mid-process, and a cached registration
+/// made under the old key would refuse every later acquisition.  This verb is
+/// the sole audit-writer user in its own process, so there is nothing for a
+/// registry entry to share with.
+///
+/// A profile with no chain-root key yet opens unkeyed: a first rotation on an
+/// `init`-minted profile has no key to read, and refusing here would make
+/// minting one impossible.
+fn open_locked_audit_writer(
+    profile: &Profile,
+    profile_name: &str,
+) -> Result<AuditWriter, WalletError> {
+    let hmac_key = load_audit_hmac_key(profile).ok();
+    let tip_anchor = KeyringTipAnchorStore::shared(
+        &profile.audit_log_hash_chain_key_id,
+        &profile.audit_log_path,
+    );
+    AuditWriter::open_with_tip_anchor(profile.audit_log_path.clone(), hmac_key, tip_anchor).map_err(
+        |e| {
+            crate::commands::audit::audit_writer_error(&e, "audit.writer_unavailable", profile_name)
+        },
+    )
+}
 
 /// Arguments for `stellar-agent profile rotate-audit-key`.
 #[derive(Debug, Args)]
@@ -180,13 +219,50 @@ where
 
     let entry_ref = &profile.audit_log_hash_chain_key_id;
 
+    // ── Step 0: take the audit writer's sidecar lock and hold it for the whole
+    // rotation.  Re-signing walks the file chain and rewrites every `.root_hmac`
+    // sidecar; a writer running concurrently could append to a file, or rotate
+    // and create a NEW file, between the walk and the rewrite, leaving that
+    // file's sidecar signed with the destroyed key.  The lock is exclusive
+    // across processes, so a live MCP server holding it makes this verb refuse
+    // rather than race it.
+    //
+    // Opening also runs the tip-anchor check, BEFORE the key is touched: a log
+    // that was rolled back or truncated is refused here, leaving the profile's
+    // key untouched and the operator free to investigate and run
+    // `audit reanchor`.
+    let mut writer = match open_locked_audit_writer(&profile, args.profile_name()) {
+        Ok(writer) => writer,
+        Err(e) => {
+            tracing::warn!(error = %e, "rotate-audit-key: audit writer unavailable");
+            render::render_json(&Envelope::err(&e));
+            return 1;
+        }
+    };
+
     // ── Step 1: persist the new chain-root key (destroys the old key).
     if let Err(e) = rotate_hmac_like_key(entry_ref, "rotate_audit_key") {
         render::render_json(&Envelope::err(&e));
         return 1;
     }
 
-    // ── Step 2: re-sign every existing per-file chain-root sidecar with the new
+    // ── Step 2: emit the KeyringKeyWritten row through the held writer
+    // (non-fatal), BEFORE re-signing.  The row may be the first entry of a file,
+    // in which case the writer signs that file's chain root with the key it was
+    // opened under; running the re-sign afterwards brings that sidecar — and
+    // every other — onto the new key in one pass.
+    let request_id = Uuid::new_v4().to_string();
+    emit_keyring_key_written_with_writer(
+        &mut writer,
+        args.profile_name(),
+        "profile_rotate_audit_key",
+        KeyPurpose::AuditHashChainHmac,
+        entry_ref,
+        None,
+        &request_id,
+    );
+
+    // ── Step 3: re-sign every existing per-file chain-root sidecar with the new
     // key so `audit verify` under the new key stays green.  Rotation does not
     // surface the generated bytes, so read the new key back from the keyring.
     let new_key = match load_audit_hmac_key(&profile) {
@@ -214,17 +290,18 @@ where
         }
     };
 
-    // ── Step 3: emit the KeyringKeyWritten row under the new key (non-fatal).
-    let request_id = Uuid::new_v4().to_string();
-    emit_keyring_key_written(
-        &profile,
-        args.profile_name(),
-        "profile_rotate_audit_key",
-        KeyPurpose::AuditHashChainHmac,
-        entry_ref,
-        None,
-        &request_id,
-    );
+    // ── Step 4: bring the tip anchor onto the file as it now stands, so the
+    // rotation leaves the anchor exactly current rather than one row behind if
+    // the append-path anchor write did not land.  Non-fatal for the same reason
+    // the row is: the key has rotated and the sidecars are re-signed, and the
+    // next acquisition reconciles anyway.
+    if let Err(e) = writer.verify_tip_anchor() {
+        tracing::warn!(
+            error = %e,
+            "audit key rotated but the tip anchor could not be brought current"
+        );
+    }
+    drop(writer);
 
     // Info-level log omits the keyring service name to avoid leaking it.
     tracing::info!("audit-log chain-root key rotated; chain-root sidecars re-signed under new key");

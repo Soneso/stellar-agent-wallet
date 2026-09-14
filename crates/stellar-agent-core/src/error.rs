@@ -920,6 +920,100 @@ pub enum ValidationError {
         profile: String,
     },
 
+    /// A value-moving signing verb refused because the profile's audit log no
+    /// longer contains the chain tip its keyring-held anchor names.
+    ///
+    /// The hash chain links each entry to its predecessor and the per-file
+    /// chain-root signature covers each file's first entry. Both verify a
+    /// PREFIX, so restoring an older copy of the active log, or truncating it,
+    /// leaves a log that still verifies. The anchor keeps the tip's entry count,
+    /// hash, and byte offset in the platform keyring, outside the reach of
+    /// filesystem access alone, and this refusal is what a rolled-back,
+    /// truncated, or substituted log produces.
+    ///
+    /// A log that moved FORWARD past the anchor is not this: unkeyed writers
+    /// append without moving the anchor, and the next keyed acquisition absorbs
+    /// the gap and re-anchors.
+    ///
+    /// Recovery requires establishing why the file changed, then
+    /// `stellar-agent audit reanchor --profile <name> --acknowledge-rollback`.
+    /// Rotating the audit key does not fix it.
+    ///
+    /// # Wire code
+    ///
+    /// `"audit.tip_anchor_mismatch"`.
+    #[error(
+        "profile '{profile}' has an audit log whose chain tip is not the one its anchor \
+         names; signing refuses to proceed against a log that may have been rolled back or \
+         truncated — investigate, then run \
+         `stellar-agent audit reanchor --profile {profile} --acknowledge-rollback` to accept \
+         the current tip"
+    )]
+    AuditTipAnchorMismatch {
+        /// The profile name whose audit log failed the tip-anchor check.
+        profile: String,
+    },
+
+    /// A value-moving signing verb refused because the profile's audit log
+    /// could not be used, for a reason that is about the LOG rather than about
+    /// the chain-root key or its registration.
+    ///
+    /// A held writer lock, an archive that cannot supply the cross-file chain
+    /// seed, a log whose own linkage is broken, an unreadable tip anchor. None
+    /// of these is fixed by minting or rotating a key, and none of them is a
+    /// path or key registration conflict, so neither
+    /// [`ValidationError::AuditChainKeyUnavailable`]'s remedy nor
+    /// [`ValidationError::AuditWriterOpenFailed`]'s applies.
+    ///
+    /// `detail` leads with the `audit.*` sub-code for the specific condition —
+    /// the same detail-carried convention `approval.writer_locked` uses — so an
+    /// agent matching on the sub-code reaches the right troubleshooting row and
+    /// the right runbook section.
+    ///
+    /// # Wire code
+    ///
+    /// `"audit.chain_key_unavailable"`, shared with the two variants above
+    /// because all three mean the same thing to a caller deciding whether to
+    /// proceed: the action is unauditable, so it is refused. The remedy is what
+    /// differs, and that is in the message.
+    #[error(
+        "profile '{profile}' cannot be audited: {detail}; signing refuses to proceed \
+         unaudited — see docs/maintainers/audit-log-recovery.md"
+    )]
+    AuditLogUnusable {
+        /// The profile whose audit log could not be used.
+        profile: String,
+        /// The condition, leading with its `audit.*` sub-code.
+        detail: String,
+    },
+
+    /// `audit reanchor` was run without `--acknowledge-rollback`.
+    ///
+    /// Moving the anchor forgives whatever made the log disagree with it, which
+    /// may have been a restore from backup or may have been tampering. The verb
+    /// therefore reports what it would do and refuses until the operator says
+    /// explicitly that the current tip is the one to trust.
+    ///
+    /// Both anchors are reported as `<entry count>:<end offset>` coordinates;
+    /// `current` is `none` when the log has never been anchored.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.acknowledgement_required"`.
+    #[error(
+        "profile '{profile}' audit log would be re-anchored from {current} to {proposed} \
+         (entries:bytes); this accepts the current log as authoritative and cannot be undone — \
+         re-run with --acknowledge-rollback once you have established why the log changed"
+    )]
+    AuditReanchorNotAcknowledged {
+        /// The profile whose audit log would be re-anchored.
+        profile: String,
+        /// Coordinates of the anchor in force, or `none`.
+        current: String,
+        /// Coordinates the anchor would move to.
+        proposed: String,
+    },
+
     /// A signing verb was asked to read a secret from a named environment
     /// variable, but that variable is not set in this process's environment.
     ///
@@ -1025,6 +1119,14 @@ impl ValidationError {
             // that variant's doc comment for why the `Display` text differs
             // while the code stays unified.
             Self::AuditWriterOpenFailed { .. } => "audit.chain_key_unavailable",
+            // Audit taxonomy code on a validation-class variant: see
+            // `AuditLogNotFound` above for the same rationale.
+            Self::AuditTipAnchorMismatch { .. } => "audit.tip_anchor_mismatch",
+            // Same wire code as the two variants above by design — see this
+            // variant's doc comment for why the code stays unified while the
+            // remedy in the message differs.
+            Self::AuditLogUnusable { .. } => "audit.chain_key_unavailable",
+            Self::AuditReanchorNotAcknowledged { .. } => "validation.acknowledgement_required",
             Self::SecretEnvNotSet { .. } => "validation.secret_env_not_set",
             Self::SecretEnvInvalid { .. } => "validation.secret_env_invalid",
             Self::SignerSourceRequired { .. } => "validation.signer_source_required",
@@ -2257,6 +2359,27 @@ mod tests {
                 "audit.chain_key_unavailable",
             ),
             (
+                ValidationError::AuditTipAnchorMismatch {
+                    profile: "default".to_owned(),
+                },
+                "audit.tip_anchor_mismatch",
+            ),
+            (
+                ValidationError::AuditLogUnusable {
+                    profile: "default".to_owned(),
+                    detail: "audit.writer_locked: the lock is held".to_owned(),
+                },
+                "audit.chain_key_unavailable",
+            ),
+            (
+                ValidationError::AuditReanchorNotAcknowledged {
+                    profile: "default".to_owned(),
+                    current: "12:3400".to_owned(),
+                    proposed: "9:2600".to_owned(),
+                },
+                "validation.acknowledgement_required",
+            ),
+            (
                 ValidationError::SecretEnvNotSet {
                     var: "DEPLOYER_SECRET".to_owned(),
                 },
@@ -2405,6 +2528,26 @@ mod tests {
                         profile: profile.clone(),
                     }
                 }
+                ValidationError::AuditTipAnchorMismatch { profile } => {
+                    ValidationError::AuditTipAnchorMismatch {
+                        profile: profile.clone(),
+                    }
+                }
+                ValidationError::AuditLogUnusable { profile, detail } => {
+                    ValidationError::AuditLogUnusable {
+                        profile: profile.clone(),
+                        detail: detail.clone(),
+                    }
+                }
+                ValidationError::AuditReanchorNotAcknowledged {
+                    profile,
+                    current,
+                    proposed,
+                } => ValidationError::AuditReanchorNotAcknowledged {
+                    profile: profile.clone(),
+                    current: current.clone(),
+                    proposed: proposed.clone(),
+                },
                 ValidationError::SecretEnvNotSet { var } => {
                     ValidationError::SecretEnvNotSet { var: var.clone() }
                 }

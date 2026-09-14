@@ -334,6 +334,61 @@ off a fixed zero block; the first entry of each later file chains off the prior
 file's rotation-handoff entry. Each file also carries a `root_hmac` sidecar
 signing the chain root with the profile's audit key.
 
+### The tip anchor
+
+The chain and the per-file `root_hmac` sidecars verify a PREFIX of the log, so
+restoring an older copy of the active file, or truncating it, leaves a log that
+still verifies. The tip anchor closes that: for each log PATH the platform
+keyring holds the active file's entry count, last-entry hash, and byte offset,
+where filesystem access alone cannot rewind them.
+
+Every value-moving verb checks the anchor before signing, on every acquisition.
+Four outcomes:
+
+| Log versus anchor | Result |
+|---|---|
+| Exactly the anchored tip | Proceeds |
+| Ahead of the anchor, anchored entry intact | Proceeds; the tail is absorbed and the anchor advances |
+| Behind the anchor, or the anchored entry is not at the anchored offset | Refuses `audit.tip_anchor_mismatch` |
+| No anchor, chain verifies | Adopts the current tip and records `audit_tip_anchored { reason: adopted }` |
+
+The ahead-of-anchor case is ordinary, not an exception: writers opened without
+the audit key (the CLI startup advisory, the zero-config best-effort path, the
+read-only smart-account verbs) append without moving the anchor. Adoption needs
+no operator action and is what happens on the first run after upgrading a wallet
+whose audit log predates the anchor.
+
+The anchor names a PATH, not a profile: repointing a profile's `audit_log_path`
+starts a fresh anchor at the new file, which then adopts.
+
+A rotation leaves the anchor on the outgoing file's handoff entry until the new
+file's first append, so restoring the whole audit directory to an earlier
+snapshot is refused rather than absorbed.
+
+The anchor is written after the entry it covers is fsynced, so it is not
+continuous in time. Three states, differing in kind:
+
+- **Lagging** — between an entry's fsync and its anchor write, the anchor names
+  the previous entry of this file. A rollback to that entry or later is
+  absorbed; anything earlier is still refused. Retried on the next append.
+- **Off, nothing anchored yet** — until the first keyed append on a log path (a
+  new profile, a changed `audit_log_path`, a log written before the anchor
+  existed). Adoption takes the file as it finds it.
+- **Off, freshly rotated file** — from a rotation until the first append into
+  the new file is anchored. Any prefix of that file is accepted if it chains
+  from the archive's handoff.
+
+Entries already in an archive stay guarded in all three.
+
+What it does NOT do is detect forgery. The entry-to-entry chain hash is unkeyed,
+so an appended well-formed entry moves the tip forward and is accepted, exactly
+as an honest append is. The anchor detects rollback, truncation, and
+substitution.
+
+Recovery from a mismatch is `stellar-agent audit reanchor --profile <NAME>
+--acknowledge-rollback`. Not agent-recoverable: the operator has to establish
+why the log changed before accepting it.
+
 ### Fail-closed on an unminted audit key
 
 `profile init` mints the audit chain-root key's keyring coordinate only, no key
@@ -365,6 +420,14 @@ each rotation handoff names the actual next file (defeating file-substitution).
 When `--profile` is supplied it also verifies the chain-root HMAC sidecars;
 without it, only the hash chain is checked and `hmac_verified` is `false`.
 
+The tip anchor is checked only when `--profile` is supplied AND `<LOG_PATH>` is
+the log that profile configures, since the anchor names a path. Every other case
+reports `anchor.status` as `"not_checked"` with the reason and still verifies the
+chain in full. The check applies the same rule the writer applies, including
+proving the anchored entry is still at the anchored offset, so a longer
+internally consistent log that does not contain it refuses rather than passing on
+length alone.
+
 | Argument | Required | Meaning |
 |---|---|---|
 | `<LOG_PATH>` (positional) | yes | Path to the audit log file. |
@@ -384,13 +447,39 @@ a different user (such a directory could be used to substitute files or
 sidecars). Exits `0` when the chain is intact, `1` on any integrity violation, a
 path-contract failure, or an I/O error. Verification failures use a closed set
 of wire codes, for example `audit.chain_broken`, `audit.rotation_gap`,
-`audit.hmac_mismatch`, with line and file detail kept out of the code.
+`audit.hmac_mismatch`, `audit.tip_anchor_mismatch`, with line and file detail
+kept out of the code.
 
 ```bash
 stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --profile default
 ```
 ```json
-{"ok":true,"data":{"entries_verified":42,"files_walked":2,"hmac_verified":true,"per_file":[],"warnings":[],"audit_writer_degraded":false},"request_id":"..."}
+{"ok":true,"data":{"entries_verified":42,"files_walked":2,"hmac_verified":true,"per_file":[],"warnings":[],"audit_writer_degraded":false,"anchor":{"status":"verified","reason":null}},"request_id":"..."}
+```
+
+### `audit reanchor` command reference
+
+`stellar-agent audit reanchor --profile <NAME> --acknowledge-rollback` — the only
+way out of an `audit.tip_anchor_mismatch` refusal. Operator-only; an agent must
+never run it on its own initiative, because it accepts a log that may have been
+tampered with.
+
+| Argument | Required | Meaning |
+|---|---|---|
+| `--profile <NAME>` | yes | Profile whose configured log path identifies the anchor. |
+| `--acknowledge-rollback` | yes, to act | Accept the log's current tip as authoritative. |
+
+Without `--acknowledge-rollback` it reports the anchor in force and the anchor it
+would write, changes nothing, and exits `1` with
+`validation.acknowledgement_required`. With the flag it replays the whole log (a
+broken chain is refused, not blessed), writes the current tip, increments a
+monotonic per-path re-anchor counter, and appends an `audit_tip_anchored` row
+naming the superseded anchor. It takes the audit writer's exclusive lock, so a
+running MCP server must be stopped first; with one running it refuses
+`audit.writer_locked`.
+
+```json
+{"ok":true,"data":{"profile":"default","previous_anchor":"42:18104","current_anchor":"39:16820","reanchor_count":1},"request_id":"..."}
 ```
 
 ## The governance loop end to end
@@ -404,8 +493,8 @@ stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --pr
    hash, and the local user.
 3. The agent surface verifies the attestation and executes. Every invocation and
    lifecycle event is appended to the hash-chained audit log.
-4. The operator periodically runs `audit verify` with `--profile` to confirm
-   both the hash chain and the chain-root HMAC sidecars are intact.
+4. The operator periodically runs `audit verify` with `--profile` to confirm the
+   hash chain, the chain-root HMAC sidecars, and the tip anchor are all intact.
 
 ## Key rotation that backs the loop
 
@@ -421,7 +510,7 @@ The policy-file owner key is not rotated here — it is enrolled with `profile e
 | Subcommand | Key kind | Effect on outstanding material |
 |---|---|---|
 | `profile rotate-attestation-key <NAME>` | 32-byte HMAC | All pending approvals invalidated; re-run the simulate-and-approve round trip. |
-| `profile rotate-audit-key <NAME>` | 32-byte HMAC | Re-signs every existing per-file chain-root sidecar with the new key; `audit verify --profile <p>` stays green across the rotation and the old key stops verifying; the response carries `sidecars_resigned`. |
+| `profile rotate-audit-key <NAME>` | 32-byte HMAC | Re-signs every existing per-file chain-root sidecar with the new key; `audit verify --profile <p>` stays green across the rotation and the old key stops verifying; the response carries `sidecars_resigned`. Takes the audit writer's exclusive lock, so it refuses while an MCP server is running. |
 | `profile rotate-nonce-key <NAME>` | 32-byte HMAC | All outstanding nonces minted with the old key are invalidated. |
 | `profile rotate-counterparty-key <NAME>` | 32-byte HMAC | Invalidates every cached counterparty binding; the wallet re-fetches on the next counterparty-allowlist check. |
 

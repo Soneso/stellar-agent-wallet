@@ -83,16 +83,75 @@ Each log file gets a `<file>.root_hmac` sidecar holding an HMAC-SHA256 tag (`sha
 2. The first entry of each non-first file chains off the preceding file's last entry (the cross-file bridge).
 3. Each rotated file's `AuditRotationHandoff.next_file_name` matches that file's actual basename, defeating file-substitution attacks; a mismatch, a missing handoff in a rotated file, or a handoff appearing in the active file is `RotationGap` / `ChainBroken`.
 4. When `hmac_key` is supplied, each file's `.root_hmac` sidecar verifies on its first entry; a wrong tag is `HmacMismatch` and a missing sidecar is `HmacSidecarMissing` (with a key configured, a sidecar must exist for every file).
+5. When an anchor is supplied, the active file's tip is the anchored tip, or ahead of it; anything else is `TipAnchorMismatch`. The CLI supplies one only when `--profile` is given AND the positional path is the log that profile configures, since the anchor names a path; every other case reports `anchor.status = "not_checked"` with the reason and verifies the chain alone.
 
 The `EventKind` match in the verifier is exhaustive with no wildcard arm, so adding an event variant forces a compile error until the verifier is updated.
 
 A backward timestamp jump larger than `BACKWARD_TS_WARN_THRESHOLD_MS` (60000 ms) is reported as a warning, not a failure, because NTP corrections can move wall-clock time backward.
 
+### Keyring-held tip anchor
+
+The chain walk and the per-file root signature both verify a PREFIX. An older copy of the active log, or a truncated one, satisfies them. The tip anchor closes that gap by holding the tip's coordinates outside the file.
+
+For each log PATH the platform keyring holds `<entry count>:<tip hash hex>:<end offset>` — the number of entries in the active file, the SHA-256 entry hash of its last entry, and the byte offset just past that entry. The writer advances all three inside `write_entry`, after the entry's `sync_data` and before the in-memory tip moves, under the sidecar lock the writer already holds. The advance is best-effort by contract: the entry is already durable, so an anchor-write failure must not be reported as a failed append.
+
+Check semantics, applied at writer open and again on every acquisition by the value-verb pre-flight (the writer registry caches one writer per profile for the process lifetime, so a check only at open would miss a file replaced underneath a live writer):
+
+| Observed | Verdict |
+| --- | --- |
+| File length equals the anchored offset and the entry ending there hashes to the anchored tip | Current; accept |
+| File length exceeds the anchored offset, anchored entry intact | Accept, replay the appended tail, re-anchor on the new tip |
+| File length exceeds the anchored offset, anchored entry absent | `audit.tip_anchor_mismatch`; refuse — a longer internally consistent chain that does not contain the anchored entry is a substitution, and it passes the chain walk exactly as an honest log does |
+| The anchored tip is the newest archive's rotation handoff | Accept: the anchor names the generation this file succeeded. Re-derive from the file, which must chain from that handoff |
+| File length below the anchored offset, or the entry at the anchored offset is not the anchored one | `audit.tip_anchor_mismatch`; refuse |
+| No anchor, chain verifies | Adopt the current tip, write the anchor, append `audit_tip_anchored { reason: adopted }` |
+| No anchor, chain broken | Refuse |
+
+The ahead-of-anchor case is the ordinary one, not an exception: unkeyed writers (the CLI startup advisory, the zero-config best-effort path, the read-only smart-account verbs) receive no anchor handle and append freely, and the crash window between an entry's `fsync` and the anchor write lands in the same place. Adoption with no operator action is the upgrade path for every log written before the anchor existed.
+
+**Only a file with entries is ever anchored.** There is no anchor value meaning "this file is empty". Offset 0 is a prefix of every file, so such a value would classify every file at the path as ahead of it and a rollback — including a restore of the whole audit directory to an earlier snapshot — would be absorbed rather than refused. An absent anchor says the same thing honestly, and the adoption rule already covers it. A stored zero entry count is rejected on read rather than treated as "nothing anchored", so a corrupted value cannot disarm the guard.
+
+**Rotation.** The anchor is advanced onto the outgoing file's handoff entry before the renames and is then left there. The file the rotation creates has no entry of its own to name, so it inherits nothing: until its first append the anchor still names the previous generation, and the rollback guard is armed on that value throughout.
+
+That state is recognised rather than guessed. An anchor whose tip hash equals the newest archive's last entry — which `initial_chain_seed` already reads and already requires to be a rotation handoff naming that archive — describes the generation this file succeeded. Only the rotation itself writes that value: an attacker who appends a handoff to a copy of the log produces a new tip hash the anchor does not name, so the match cannot be manufactured from filesystem access. On the match the anchor is re-derived from the file at the path, which must chain from that handoff or the replay refuses. Restoring the pre-rotation directory state, or an older archive-and-active pair, therefore refuses: neither contains an archive whose handoff is the anchored one. The check runs before the length comparison, because such an anchor's count and offset describe the archive and comparing them against the file now at the path is meaningless in either direction.
+
+**Anchored offset.** The offset is read from the file after the entry's `sync_data`, not computed as "previous offset plus bytes written". Every reader here tolerates blank lines between entries and at end of file, so a log that picked any up outside this writer has more bytes than the writer accounted for; an arithmetic offset would then name a position inside an entry and the next open would report a rollback on an untouched log. `O_APPEND` plus the exclusive lock make end of file the entry's end, which is where the reader's replay ends too.
+
+**Scope.** The anchor names a path, not a profile: its keyring account is `<audit key account>-tip-<first 16 hex of SHA-256 of the lexically normalized path>`, on the profile's own audit service. Repointing `audit_log_path` therefore starts a fresh anchor, which adopts. Normalization is lexical, never `canonicalize`, because the coordinate must be derivable before the log file exists; paths differing only by `.` or `..` share an anchor, paths differing through a symlink do not.
+
+**Keyed opens always carry the anchor.** A keyed writer's rows are the ones `audit verify` covers and the ones worth removing, so a keyed open that did not advance the anchor would leave its rows unguarded. The registry's keyed entry point takes a type that pairs the chain-root key with the anchor store and cannot be built without both, and one helper in the network crate produces the pair from the profile's audit keyring coordinate. The unkeyed entry point takes neither. There is no way to present a key without a handle.
+
+**Residual: the best-effort append window.** The anchor write inside `write_entry` is best-effort by contract — the entry is already fsynced, so failing the append would misreport a row that was written. A failed write latches a flag, and the NEXT append re-writes the anchor for the writer's current state before appending anything, so one transient keyring failure costs one entry of lag rather than every append thereafter.
+
+The residual has two shapes, and they are not equally weak. Stated precisely:
+
+| State | What is accepted |
+| --- | --- |
+| The anchor names an entry of this file but is behind it — between an entry's fsync and its anchor write landing | Any state at or ahead of the anchored entry. The guard LAGS: everything before the anchored entry is still refused. One entry per transient failure; a keyring outage widens it to the appends made during the outage, bounded by the next successful write |
+| No anchor has ever been written for this path — a new log, a repointed `audit_log_path`, or the first keyed use of a log that predates the anchor | Anything at the path whose chain verifies. The guard is OFF: adoption takes the file as it finds it, so a rollback performed before that first acquisition becomes the baseline. There is no earlier anchored state to compare against, which is why this cannot be closed rather than why it is harmless |
+| A file a rotation created, until its first append's anchor write lands — the anchor still names the archive's handoff | Any prefix of that file, down to empty, provided it chains from the handoff. The guard is OFF for that file: the rotation-completed rule re-derives from whatever is at the path. Normally one append wide, since the first append moves the anchor onto this file; a keyring outage spanning that append holds it open for the outage |
+
+The two OFF states share a shape: the anchor names nothing in the file at the path, so there is no tip to compare a candidate against. Entries in an ARCHIVE stay guarded throughout — a rolled-back prefix of the pre-rotation file cannot chain from the archive's handoff, so it is refused, and `audit verify` walks every file regardless.
+
+Closing all three would need the anchor written BEFORE the entry it covers — an upper-bound reservation stored in the keyring ahead of each append. That is one keyring round trip per audit row and makes a keyring outage block or unaudit appends, which is a worse failure than the window it removes. The entry stays durable first.
+
+**Non-goal: forgery.** The anchor detects rollback, truncation, and substitution. It does not detect appended forgeries. The entry-to-entry chain hash is unkeyed, so anyone who can write the file can append a well-formed entry chaining off the current tip; the tip moves forward, which is indistinguishable from an honest append. Only each file's first entry carries a keyed tag. Detecting appended forgeries would need a per-entry keyed tag, which this substrate does not have.
+
+`audit verify --profile` applies the same three-way rule in the same order as the writer — shorter than the anchor, then the anchored entry's intactness, then the tip at the anchored offset — reading through the writer's own backward scan rather than a second implementation, so the two surfaces cannot disagree about a given file.
+
+**Cross-file seed.** Opening the active file needs the hash its first entry chains from: the zero block for the first file of a chain, the outgoing file's handoff entry once the log has rotated. `initial_chain_seed` reads only the newest archive's last line and requires it to BE a rotation handoff naming that archive, refusing with `audit.rotation_bridge_unusable` otherwise, so a file dropped into the audit directory under a later timestamp cannot redirect the bridge. That check is structural, not cryptographic: it does not walk the archive's chain or verify its root signature. The bridge's integrity is established by `audit verify`, which walks every file, threads the tip from one into the next, and requires each file's chain-root signature under the profile's key. Every replay inside the writer seeds through this one function; none names the zero block directly.
+
+**Repair.** `stellar-agent audit reanchor --profile <name> --acknowledge-rollback` is the only way out of a mismatch. It replays the whole log first (a broken chain is refused, not blessed), writes the current tip as the anchor, increments a monotonic per-path re-anchor counter in the keyring, and appends an `audit_tip_anchored { reason: rollback_acknowledged, previous_anchor }` row. Without the flag it reports both anchors and exits 1 with `validation.acknowledgement_required`, changing nothing. See [Audit-log recovery](audit-log-recovery.md).
+
 ### Closed wire-code set
 
 Every `VerifyError` maps to one code from a fixed set; the line number and file basename go in the envelope `detail`, never the code, keeping cardinality bounded:
 
-`audit.chain_broken`, `audit.rotation_gap`, `audit.hmac_mismatch`, `audit.hmac_sidecar_missing`, `audit.too_many_rotated_files`, `audit.non_regular_file_log_path`, `audit.parse_error`, `audit.path_contract`, `audit.log_not_found`, `audit.io_error`, `audit.signer_set_canonical_body`, `audit.partial_rotation`.
+`audit.chain_broken`, `audit.rotation_gap`, `audit.hmac_mismatch`, `audit.hmac_sidecar_missing`, `audit.too_many_rotated_files`, `audit.non_regular_file_log_path`, `audit.parse_error`, `audit.path_contract`, `audit.log_not_found`, `audit.io_error`, `audit.signer_set_canonical_body`, `audit.partial_rotation`, `audit.tip_anchor_mismatch`.
+
+The writer adds two of its own outside that set, carried in the envelope detail rather than as `VerifyError` codes: `audit.writer_locked` when another process holds the writer lock, and `audit.rotation_bridge_unusable` when the newest archive cannot supply the cross-file chain seed.
+
+The value-verb pre-flight surfaces those and the rest of the writer's failure classes the same way. It stays fail-closed for all of them; what it does not do is tell the operator to rotate a key that is not the problem. A tip-anchor mismatch carries `audit.tip_anchor_mismatch` and names the repair verb; a condition about the LOG — held lock, unusable bridge, broken chain, unreadable anchor, I/O — carries `audit.chain_key_unavailable` with the specific `audit.*` sub-code at the head of the detail and a pointer to the recovery runbook; only a registry path or key registration conflict keeps the wording about a conflicting registration. `audit verify`'s tip-anchor refusal carries the verifier's own message under `audit.tip_anchor_mismatch`, with the anchored and observed counts and offsets, rather than the signing-path wording.
 
 A missing primary log surfaces `audit.log_not_found` and is classified validation-class (user-actionable: nothing has been written yet, or the path is wrong), distinct from an integrity violation.
 
@@ -127,7 +186,7 @@ Each profile command that writes long-lived key material to the keyring records 
 | `profile rotate-counterparty-key` | `counterparty_cache_hmac` | none |
 | `profile rotate-audit-key` | `audit_hash_chain_hmac` | none |
 
-`rotate-audit-key` is ordered persist-before-resign: it (1) writes the new key, (2) re-signs every per-file chain-root sidecar with the new key so `audit verify` stays green across the rotation, then (3) emits the `keyring_key_written` row under the new key. Emitting the row before the re-sign would append a row the freshly rotated key cannot verify.
+`rotate-audit-key` takes the audit writer's exclusive sidecar lock first and holds it throughout, so no other process can append or rotate while the per-file sidecars are being rewritten; a running MCP server holds that lock for its lifetime, making the verb refuse with `audit.writer_locked` rather than race it (the envelope carries that code in its detail, as the `approval.*` and `counterparty.*` lock codes do). Acquiring the writer also runs the tip-anchor check before the key is touched, so a rolled-back log is refused with the profile's key left alone. It then (1) persists the new key, (2) appends the `keyring_key_written` row, and (3) re-signs every per-file chain-root sidecar with the new key. Re-signing last is what covers a row that happened to open a new file: its chain root is brought onto the new key by the same pass. Re-signing before persisting would leave sidecars signed by a key the keyring no longer holds.
 
 ## Wallet unlock lifecycle
 

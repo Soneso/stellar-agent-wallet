@@ -2015,6 +2015,7 @@ mod tests {
                     "audit.signer_set_canonical_body"
                 }
                 AuditLogIntegrityError::PartialRotation { .. } => "audit.partial_rotation",
+                AuditLogIntegrityError::TipAnchorMismatch { .. } => "audit.tip_anchor_mismatch",
             }
         }
 
@@ -2059,6 +2060,13 @@ mod tests {
                     size_bytes: 42,
                 },
                 recovery_hint: "see runbook".to_owned(),
+            },
+            AuditLogIntegrityError::TipAnchorMismatch {
+                expected_count: 12,
+                expected_offset: 3400,
+                actual_count: 9,
+                actual_offset: 2600,
+                reason: "test",
             },
         ];
 
