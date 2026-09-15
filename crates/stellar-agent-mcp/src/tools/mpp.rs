@@ -1,5 +1,7 @@
 //! Testnet-only sponsored MPP charge tools.
 
+use std::sync::{Arc, Mutex};
+
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{CallToolResult, Content},
@@ -10,6 +12,7 @@ use sha2::{Digest as _, Sha256};
 use stellar_agent_core::{
     approval::{store::PendingApprovalStore, user_id::process_uid_for_attestation},
     audit_log::{AuditEntry, PolicyDecision, ValueLegRecord},
+    error::WalletError,
     policy::v1::ValueClass,
     profile::caip2::TESTNET_PASSPHRASE,
 };
@@ -331,6 +334,13 @@ impl WalletServer {
         let audit_profile_name = profile_name.clone();
         let withheld_audit_profile = self.profile.clone();
         let withheld_audit_profile_name = profile_name.clone();
+        // The delivery gate withholds the credential by returning an `MppError`,
+        // whose codes are all `mpp.*`. An audit refusal is not one of those: it
+        // names a log an operator has to repair, and folding it into the uniform
+        // state refusal sends them after the MPP state file instead. The gate
+        // records the wallet error here and the result below renders it.
+        let audit_refusal: Arc<Mutex<Option<WalletError>>> = Arc::new(Mutex::new(None));
+        let delivery_refusal = Arc::clone(&audit_refusal);
         let credential = commit_authorization(
             &state,
             approval_store.as_ref(),
@@ -371,8 +381,14 @@ impl WalletServer {
                     PolicyDecision::Allow,
                     uuid::Uuid::new_v4().to_string(),
                 );
-                emit_value_audit_row_strict(&audit_profile, &audit_profile_name, entry)
-                    .map_err(|()| state_error())
+                emit_value_audit_row_strict(&audit_profile, &audit_profile_name, entry).map_err(
+                    |error| {
+                        if let Ok(mut slot) = delivery_refusal.lock() {
+                            *slot = Some(error);
+                        }
+                        state_error()
+                    },
+                )
             },
             move |withheld| {
                 let entry = AuditEntry::new_mpp_authorization_withheld(
@@ -398,7 +414,13 @@ impl WalletServer {
                 "authorization_id": args.authorization_id,
                 "credential": credential,
             }))),
-            Err(error) => Ok(mpp_error_result(&error)),
+            Err(error) => match audit_refusal.lock().ok().and_then(|mut slot| slot.take()) {
+                Some(audit_error) => Ok(business_error_result(
+                    audit_error.code(),
+                    audit_error.message(),
+                )),
+                None => Ok(mpp_error_result(&error)),
+            },
         }
     }
 
@@ -450,8 +472,8 @@ impl WalletServer {
             receipt.status(),
             uuid::Uuid::new_v4().to_string(),
         );
-        if emit_value_audit_row_strict(&self.profile, &profile_name, entry).is_err() {
-            return Ok(mpp_state_error());
+        if let Err(error) = emit_value_audit_row_strict(&self.profile, &profile_name, entry) {
+            return Ok(business_error_result(error.code(), error.message()));
         }
         Ok(success(json!({
             "authorization_id": record.authorization_id(),
@@ -512,8 +534,8 @@ impl WalletServer {
             result.outcome.clone(),
             uuid::Uuid::new_v4().to_string(),
         );
-        if emit_value_audit_row_strict(&self.profile, &profile_name, entry).is_err() {
-            return Ok(mpp_state_error());
+        if let Err(error) = emit_value_audit_row_strict(&self.profile, &profile_name, entry) {
+            return Ok(business_error_result(error.code(), error.message()));
         }
         Ok(success(result))
     }
@@ -566,6 +588,51 @@ impl WalletServer {
             )));
         }
         Ok(())
+    }
+}
+
+/// Handler-level entry points for the MPP tools, bypassing the rmcp transport.
+///
+/// The argument types are crate-private, so an integration test outside this
+/// crate cannot name them; these take the fields instead. Gated on the
+/// `test-helpers` feature or `#[cfg(test)]`, so no shipped binary carries them.
+#[cfg(any(test, feature = "test-helpers"))]
+impl WalletServer {
+    /// Invokes `stellar_mpp_charge_prepare`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the tool returns at the protocol layer; a business refusal is an
+    /// `Ok` result carrying the error envelope.
+    #[doc(hidden)]
+    pub async fn call_stellar_mpp_charge_prepare(
+        &self,
+        profile: String,
+        challenge: ChallengeInput,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.stellar_mpp_charge_prepare(Parameters(MppPrepareArgs { profile, challenge }))
+            .await
+    }
+
+    /// Invokes `stellar_mpp_charge_commit`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the tool returns at the protocol layer; a business refusal is an
+    /// `Ok` result carrying the error envelope.
+    #[doc(hidden)]
+    pub async fn call_stellar_mpp_charge_commit(
+        &self,
+        authorization_id: String,
+        nonce: String,
+        expires_at_unix_ms: u64,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.stellar_mpp_charge_commit(Parameters(MppCommitArgs {
+            authorization_id,
+            nonce,
+            expires_at_unix_ms,
+        }))
+        .await
     }
 }
 

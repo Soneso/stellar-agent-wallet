@@ -301,17 +301,23 @@ simulate/build phases of the two-phase verbs above are unaffected — they
 never sign or submit, so they never reach this pre-flight; the MCP server's
 synthesized first-run fallback profile continues to serve them.
 `stellar_mpp_charge_commit` is exempt from this specific pre-flight: it
-already fails closed on the same underlying condition through its own
-stricter authorization-withholding mechanism (see
+already fails closed on the same underlying conditions, under the same wire
+codes, through its own authorization-withholding mechanism — the audit row it
+writes before releasing a credential is acquired the same way, so the same
+refusals reach the caller and nothing is released (see
 [Agent payments with MPP](agent-payments.md)).
 
-The same pre-flight also proves the audit log still contains the chain tip its
+Acquiring the writer also proves the audit log still contains the chain tip its
 keyring-held anchor names, and it does so on EVERY acquisition rather than only
 at server start: the writer is cached for the server's lifetime, so a log
 replaced underneath it would otherwise go unnoticed until a restart. A log that
 was restored from an older copy, truncated, or substituted refuses with
-`audit.tip_anchor_mismatch`. A log that simply moved FORWARD past its anchor is
-not a refusal — unkeyed writers append without moving it, and the next
+`audit.tip_anchor_mismatch`, whether it was overwritten in place or replaced by
+a rename: the file at the path is compared by identity against the handle the
+server holds, not only by its contents. Every row the server appends is checked
+again, for identity and for the file still ending where the server left it, and
+a refused row is anchored so the refusal survives a restart. A log that simply moved FORWARD past its anchor
+is not a refusal — unkeyed writers append without moving it, and the next
 acquisition absorbs the gap and re-anchors. A log with no anchor at all is
 adopted on first use with no operator action, which is what happens on the first
 run after upgrading a wallet whose audit log predates the anchor. Recovery from a

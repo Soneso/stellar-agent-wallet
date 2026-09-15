@@ -176,6 +176,14 @@ Stable errors use the `mpp.*` namespace, including `mpp.challenge_invalid`,
 `mpp.credential_too_large`, `mpp.receipt_invalid`, `mpp.receipt_conflict`, and
 `mpp.reconciliation_unavailable`.
 
+The verbs that record an audit row before they return — charge commit, record
+receipt, reconcile, prune — answer a problem with the audit LOG under its own
+`audit.*` code instead: `audit.chain_key_unavailable` when the profile's
+chain-root key is not acquirable, `audit.tip_anchor_mismatch` when the log no
+longer holds the chain tip its keyring-held anchor names. Those name a different
+thing to fix from the MPP state file, and each has its own recovery in
+[Audit-log recovery](maintainers/audit-log-recovery.md).
+
 Two of those are easy to confuse, and an agent should route on them
 differently. `mpp.authorization_not_found` means no authorization matches the
 identifier you supplied — including on a profile that has never prepared a
@@ -196,5 +204,6 @@ reveals whether a profile has one.
 and records the maintenance request in the audit log, the same as pruning a
 store that holds no removable record. Like every audited verb it first needs
 the profile's audit chain-root key (`stellar-agent profile rotate-audit-key
-<profile>`); a profile without one refuses with `mpp.state_unavailable`,
-because the row the operation must record is a prerequisite it cannot meet.
+<profile>`); a profile without one refuses with
+`audit.chain_key_unavailable`, because the row the operation must record is a
+prerequisite it cannot meet.

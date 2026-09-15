@@ -4,6 +4,7 @@ use std::{
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use clap::{ArgGroup, Args, Subcommand, ValueEnum};
@@ -14,6 +15,7 @@ use stellar_agent_core::{
     approval::{store::PendingApprovalStore, user_id::process_uid_for_attestation},
     audit_log::{AuditEntry, NewToolInvocation, PolicyDecision, ValueLegRecord},
     envelope::Envelope,
+    error::WalletError,
     observability::RedactedStrkey,
     policy::v1::ValueClass,
     policy::{Decision, McpToolRegistration, PolicyEngine, ToolDescriptor, ToolValueKind},
@@ -432,6 +434,13 @@ async fn commit_cli(
         Err(error) => return render_error(&error),
     };
     let descriptor = policy_descriptor("stellar_mpp_charge_commit");
+    // The delivery gate withholds the credential by returning an `MppError`,
+    // whose codes are all `mpp.*`. An audit refusal is not one of those: it names
+    // a log an operator has to repair, and folding it into the uniform state
+    // refusal sends them after the MPP state file instead. The gate records the
+    // wallet error here and the result below renders it.
+    let audit_refusal: Arc<Mutex<Option<WalletError>>> = Arc::new(Mutex::new(None));
+    let delivery_refusal = Arc::clone(&audit_refusal);
     let result = commit_authorization(
         state,
         approvals.as_ref(),
@@ -470,7 +479,12 @@ async fn commit_cli(
                 PolicyDecision::Allow,
                 uuid::Uuid::new_v4().to_string(),
             );
-            emit_value_audit_row_strict(profile, profile_name, entry).map_err(|()| state_error())
+            emit_value_audit_row_strict(profile, profile_name, entry).map_err(|error| {
+                if let Ok(mut slot) = delivery_refusal.lock() {
+                    *slot = Some(error);
+                }
+                state_error()
+            })
         },
         |withheld| {
             let entry = AuditEntry::new_mpp_authorization_withheld(
@@ -495,7 +509,10 @@ async fn commit_cli(
             }));
             0
         }
-        Err(error) => render_error(&error),
+        Err(error) => match audit_refusal.lock().ok().and_then(|mut slot| slot.take()) {
+            Some(audit_error) => render_wallet_error(&audit_error),
+            None => render_error(&error),
+        },
     }
 }
 
@@ -577,8 +594,8 @@ fn record_receipt(args: &MppReceiptArgs) -> i32 {
         receipt.status(),
         uuid::Uuid::new_v4().to_string(),
     );
-    if emit_value_audit_row_strict(&profile, &profile_name, entry).is_err() {
-        return render_error(&state_error());
+    if let Err(error) = emit_value_audit_row_strict(&profile, &profile_name, entry) {
+        return render_wallet_error(&error);
     }
     print_success(json!({
         "authorization_id": record.authorization_id(),
@@ -629,8 +646,8 @@ async fn reconcile(args: MppReconcileArgs) -> i32 {
         result.outcome.clone(),
         uuid::Uuid::new_v4().to_string(),
     );
-    if emit_value_audit_row_strict(&profile, &profile_name, entry).is_err() {
-        return render_error(&state_error());
+    if let Err(error) = emit_value_audit_row_strict(&profile, &profile_name, entry) {
+        return render_wallet_error(&error);
     }
     print_success(result);
     0
@@ -665,14 +682,12 @@ fn prune(args: &MppPruneArgs) -> i32 {
         uuid::Uuid::new_v4().to_string(),
     );
     audit.decision_reason = Some(format!("reason_sha256={reason_sha256}"));
-    if emit_value_audit_row_strict(
+    if let Err(error) = emit_value_audit_row_strict(
         &profile,
         &args.profile,
         AuditEntry::new_tool_invocation(audit),
-    )
-    .is_err()
-    {
-        return render_error(&state_error());
+    ) {
+        return render_wallet_error(&error);
     }
     // The maintenance request is recorded before the outcome is known, so the
     // audit trail carries the operator's reason whether or not there was
@@ -852,6 +867,17 @@ fn print_json(value: &impl Serialize) {
 
 fn render_error(error: &MppError) -> i32 {
     print_json(&Envelope::<()>::err_raw(error.code(), error.message()));
+    1
+}
+
+/// Renders a wallet-level refusal under its own wire code.
+///
+/// The audit refusals the strict emission raises carry `audit.*` codes whose
+/// remedies have nothing to do with the MPP state file. Rendering them as the
+/// uniform state refusal would tell an operator to look at a store that is
+/// intact and leave the log that needs `audit reanchor` unnamed.
+fn render_wallet_error(error: &WalletError) -> i32 {
+    print_json(&Envelope::<()>::err(error));
     1
 }
 

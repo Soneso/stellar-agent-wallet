@@ -78,12 +78,12 @@ use stellar_agent_network::keyring::keyed_audit_access;
 ///   audit writer could not be opened at `profile.audit_log_path` (e.g. a
 ///   registry path/key mismatch against an earlier open in this process) —
 ///   rotating the audit key does not fix this.
-/// - [`ValidationError::AuditTipAnchorMismatch`] when the writer was acquired
-///   but the log's chain tip is not the one its keyring-held anchor names — the
-///   log was rolled back, truncated, or replaced. Checked on EVERY acquisition,
-///   not only the first: the writer registry caches one writer per profile for
-///   the process lifetime, so a check at open alone would miss a file swapped
-///   underneath a live writer.
+/// - [`ValidationError::AuditTipAnchorMismatch`] when the log's chain tip is not
+///   the one its keyring-held anchor names — the log was rolled back,
+///   truncated, or replaced. The registry runs that check on EVERY keyed
+///   acquisition, not only the first, because it caches one writer per profile
+///   for the process lifetime and a check at open alone would miss a file
+///   swapped underneath a live writer.
 pub(crate) fn require_value_audit_writer(
     profile: &Profile,
     profile_name: &str,
@@ -96,28 +96,8 @@ pub(crate) fn require_value_audit_writer(
         );
         audit_chain_key_unavailable(profile_name)
     })?;
-    let writer =
-        AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access)
-            .map_err(|e| audit_writer_acquisition_error(profile_name, &e))?;
-
-    // Re-check the anchor on THIS acquisition. The registry caches a writer for
-    // the process lifetime, so the open-time check covers only the first
-    // acquisition; a log replaced underneath a live writer would otherwise go
-    // unnoticed until the process restarts.
-    {
-        let mut guard = writer.lock().map_err(|_| {
-            tracing::warn!(
-                profile = %profile_name,
-                "value audit: audit writer mutex poisoned; refusing before signing/submit"
-            );
-            audit_writer_open_failed(profile_name)
-        })?;
-        guard
-            .verify_tip_anchor()
-            .map_err(|e| audit_writer_acquisition_error(profile_name, &e))?;
-    }
-
-    Ok(writer)
+    AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access)
+        .map_err(|e| audit_writer_acquisition_error(profile_name, &e))
 }
 
 /// Maps a writer-acquisition failure to the wire code that names it.
@@ -135,7 +115,7 @@ pub(crate) fn require_value_audit_writer(
 /// - Everything left is a registry path or key registration conflict, which is
 ///   what `AuditWriterOpenFailed`'s wording describes.
 fn audit_writer_acquisition_error(profile_name: &str, e: &WriterError) -> WalletError {
-    if matches!(e, WriterError::TipAnchorMismatch { .. }) {
+    if let WriterError::TipAnchorMismatch { reason, .. } = e {
         tracing::warn!(
             profile = %profile_name,
             error = %e,
@@ -143,6 +123,7 @@ fn audit_writer_acquisition_error(profile_name: &str, e: &WriterError) -> Wallet
         );
         return WalletError::Validation(ValidationError::AuditTipAnchorMismatch {
             profile: profile_name.to_owned(),
+            reason: (*reason).to_owned(),
         });
     }
     if let Some(detail) = audit_log_unusable_detail(e) {
@@ -376,17 +357,50 @@ pub(crate) fn emit_value_audit_row(profile: &Profile, profile_name: &str, entry:
 
 /// Writes an authorization row and propagates failures while the caller can
 /// still withhold the credential.
+///
+/// Acquiring the writer runs the anchor check, so a log rolled back, truncated,
+/// or replaced under a live process refuses HERE and the credential is withheld.
+/// The error carries the wire code that names the condition, because the caller
+/// renders it to the agent and "the state is unavailable" would send an operator
+/// looking in the wrong place for a log that needs `audit reanchor`.
+///
+/// # Errors
+///
+/// [`WalletError::Validation`], with the same variants and wire codes
+/// [`require_value_audit_writer`] produces, plus
+/// [`ValidationError::AuditWriterOpenFailed`] when the row itself cannot be
+/// appended.
 pub(crate) fn emit_value_audit_row_strict(
     profile: &Profile,
     profile_name: &str,
     entry: AuditEntry,
-) -> Result<(), ()> {
-    let access = keyed_audit_access(profile).map_err(|_| ())?;
+) -> Result<(), WalletError> {
+    let access = keyed_audit_access(profile).map_err(|e| {
+        tracing::warn!(
+            profile = %profile_name,
+            error = %e,
+            "value audit: could not load audit chain key; withholding the authorization"
+        );
+        audit_chain_key_unavailable(profile_name)
+    })?;
     let writer =
         AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access)
-            .map_err(|_| ())?;
-    let mut guard = writer.lock().map_err(|_| ())?;
-    guard.write_entry(entry).map_err(|_| ())
+            .map_err(|e| audit_writer_acquisition_error(profile_name, &e))?;
+    let mut guard = writer.lock().map_err(|_| {
+        tracing::warn!(
+            profile = %profile_name,
+            "value audit: audit writer mutex poisoned; withholding the authorization"
+        );
+        audit_writer_open_failed(profile_name)
+    })?;
+    guard.write_entry(entry).map_err(|e| {
+        tracing::warn!(
+            profile = %profile_name,
+            error = %e,
+            "value audit: authorization row NOT emitted; withholding the authorization"
+        );
+        audit_writer_open_failed(profile_name)
+    })
 }
 
 #[cfg(test)]
@@ -693,6 +707,16 @@ mod tests {
                 "audit.tip_anchor_mismatch",
                 "audit reanchor",
             ),
+            (
+                WriterError::TipAnchorMismatch {
+                    expected_count: 3,
+                    expected_offset: 900,
+                    actual_len: 900,
+                    reason: "the log at the path was replaced underneath the writer",
+                },
+                "audit.tip_anchor_mismatch",
+                "audit reanchor",
+            ),
         ];
 
         for (error, expected_code, expected_in_message) in cases {
@@ -714,6 +738,32 @@ mod tests {
                 mapped.message()
             );
         }
+
+        // The two mismatch reasons must reach the operator distinguishably: the
+        // remedy is the same verb, but what to look at before running it is not.
+        let shorter = audit_writer_acquisition_error(
+            "default",
+            &WriterError::TipAnchorMismatch {
+                expected_count: 3,
+                expected_offset: 900,
+                actual_len: 600,
+                reason: "file is shorter than the anchor",
+            },
+        );
+        let replaced = audit_writer_acquisition_error(
+            "default",
+            &WriterError::TipAnchorMismatch {
+                expected_count: 3,
+                expected_offset: 900,
+                actual_len: 900,
+                reason: "the log at the path was replaced underneath the writer",
+            },
+        );
+        assert_ne!(
+            shorter.message(),
+            replaced.message(),
+            "the reason must survive into the envelope, not only the server log"
+        );
     }
 
     /// A registry path or key registration conflict keeps the wording that
@@ -829,11 +879,12 @@ mod tests {
         {
             let key = crate::commands::profile::audit_emit::load_audit_hmac_key(&profile)
                 .expect("load key");
-            let mut writer = stellar_agent_core::audit_log::AuditWriter::open(
-                profile.audit_log_path.clone(),
-                Some(key),
-            )
-            .expect("open unanchored writer");
+            let mut writer =
+                stellar_agent_core::audit_log::AuditWriter::open_keyed_unanchored_for_test(
+                    profile.audit_log_path.clone(),
+                    key,
+                )
+                .expect("open unanchored writer");
             writer
                 .write_entry(AuditEntry::new_value_action_submitted(
                     "stellar_pay",

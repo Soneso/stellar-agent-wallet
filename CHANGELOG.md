@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   integrations. Published `stellar-agent-blend` crate versions remain on
   crates.io; no new versions are published.
 
+### Security
+
+- `rustls` 0.23.41 to 0.23.45 and `rustls-webpki` 0.103.13 to 0.103.15
+  (RUSTSEC-2026-0285: TLS 1.3 handshake messages were accepted across
+  encryption level boundaries). The remote approval server is the only
+  consumer.
+
 ### Fixed
 
 - Submit derives the target network from the RPC endpoint instead of the
@@ -64,6 +71,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the nonce is burned, so a mismatch does not consume it. Handing an unsigned
   envelope to `--submit-only`, the natural mistake after `--build-only`, is
   refused with `network.envelope_unsigned` before anything is sent.
+
+- The audit log's tip anchor is now checked on every keyed acquisition and on
+  every append. Two paths skipped it: the MPP commit tools appended through a
+  helper that took the cached writer without checking the anchor, so a running
+  server kept writing to a log truncated or restored in place; and the check
+  read the file through the writer's own handle, so a log replaced by rename
+  under a live writer passed as current while later rows went to the unlinked
+  file. The registry now reconciles the anchor before handing out a keyed
+  writer, and the append verifies that the file at the path is the one the
+  writer holds, is no shorter than its last append, and still ends with that
+  entry. A refusal is `audit.tip_anchor_mismatch` with the reason named, evicts
+  the writer, and anchors the row it owed, so every later open refuses until
+  `stellar-agent audit reanchor --acknowledge-rollback`, whose report shows one
+  more anchored entry than the log holds. The MPP verbs surface these refusals
+  under their own `audit.*` codes. A keyed writer cannot be constructed without
+  an anchor store. `docs/maintainers/audit-log-recovery.md` now states that two
+  profiles on one log path hold one anchor each and that the configuration is
+  unsupported.
 
 - The audit log's chain tip is anchored in the platform keyring, so restoring an
   older copy of the active log file, or truncating it, no longer verifies clean.
