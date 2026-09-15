@@ -62,13 +62,19 @@
 //! requires a per-entry keyed tag, which this substrate does not have. See
 //! `docs/maintainers/security-internals.md`.
 //!
-//! # Scope: one path, not one profile
+//! # Scope: one path inside one profile's keyring namespace
 //!
-//! The anchor names a PATH. Its keyring account is derived from the lexically
-//! normalized log path, so pointing a profile's `audit_log_path` at a different
-//! file starts a fresh anchor, which then adopts that file's tip. Normalization
-//! is lexical rather than [`std::fs::canonicalize`] because the log file may not
-//! exist yet at the moment the coordinate is derived.
+//! The anchor's keyring SERVICE is the profile's own audit-key service and its
+//! ACCOUNT is derived from the lexically normalized log path, so pointing a
+//! profile's `audit_log_path` at a different file starts a fresh anchor, which
+//! then adopts that file's tip. Normalization is lexical rather than
+//! [`std::fs::canonicalize`] because the log file may not exist yet at the
+//! moment the coordinate is derived.
+//!
+//! Two profiles pointed at ONE log path therefore hold TWO anchors rather than
+//! sharing one, each advancing only on its own appends, and a rollback to the
+//! lagging one is absorbed there while the other refuses it. That configuration
+//! is unsupported; see `docs/maintainers/audit-log-recovery.md`.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -371,6 +377,23 @@ impl KeyedAuditAccess {
     #[must_use]
     pub fn into_parts(self) -> (Zeroizing<[u8; 32]>, Arc<dyn TipAnchorStore>) {
         (self.hmac_key, self.tip_anchor)
+    }
+
+    /// SHA-256 of the chain-root key.
+    ///
+    /// The writer registry pins one key per profile name for the process
+    /// lifetime and refuses a later acquisition presenting a different one. It
+    /// compares fingerprints rather than keys so nothing outside this type ever
+    /// holds the key material, and so the registry entry that outlives the
+    /// acquisition carries no secret.
+    ///
+    /// Crate-visible: the registry is its only caller, and the audit log's
+    /// published API commits to nothing here.
+    #[must_use]
+    pub(crate) fn key_fingerprint(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(self.hmac_key.as_ref());
+        hasher.finalize().into()
     }
 }
 

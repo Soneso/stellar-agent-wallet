@@ -26,9 +26,9 @@
 //! returned writer into [`emit_value_audit_row_with_writer`] for the
 //! post-confirm row — no second acquisition, no re-acquisition race.
 //! `stellar_mpp_charge_commit` is exempt: it already fails closed via
-//! [`emit_value_audit_row_strict`], with its own withheld-authorization
-//! telemetry on the same failure — the pre-flight here would only duplicate
-//! (and change the wire code of) an already-fail-closed path.
+//! [`emit_value_audit_row_strict`], which refuses on the same conditions under
+//! the same wire codes and carries its own withheld-authorization telemetry, so
+//! a second gate would only re-check what the credential already hangs on.
 
 use std::sync::{Arc, Mutex};
 
@@ -70,12 +70,12 @@ use stellar_agent_network::keyring::keyed_audit_access;
 ///   audit writer could not be opened at `profile.audit_log_path` (e.g. a
 ///   registry path/key mismatch against an earlier open in this process) —
 ///   rotating the audit key does not fix this.
-/// - [`ValidationError::AuditTipAnchorMismatch`] when the writer was acquired
-///   but the log's chain tip is not the one its keyring-held anchor names — the
-///   log was rolled back, truncated, or replaced. Checked on EVERY acquisition,
-///   not only the first: the writer registry caches one writer per profile for
-///   the process lifetime, so a check at open alone would miss a file swapped
-///   underneath a live writer.
+/// - [`ValidationError::AuditTipAnchorMismatch`] when the log's chain tip is not
+///   the one its keyring-held anchor names — the log was rolled back,
+///   truncated, or replaced. The registry runs that check on EVERY keyed
+///   acquisition, not only the first, because it caches one writer per profile
+///   for the process lifetime and a check at open alone would miss a file
+///   swapped underneath a live writer.
 pub(crate) fn require_value_audit_writer(
     profile: &Profile,
     profile_name: &str,
@@ -88,28 +88,8 @@ pub(crate) fn require_value_audit_writer(
         );
         audit_chain_key_unavailable(profile_name)
     })?;
-    let writer =
-        AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access)
-            .map_err(|e| audit_writer_acquisition_error(profile_name, &e))?;
-
-    // Re-check the anchor on THIS acquisition. The registry caches a writer for
-    // the process lifetime, so the open-time check covers only the first
-    // acquisition; a log replaced underneath a live writer would otherwise go
-    // unnoticed until the process restarts.
-    {
-        let mut guard = writer.lock().map_err(|_| {
-            tracing::warn!(
-                profile = %profile_name,
-                "value audit: audit writer mutex poisoned; refusing before signing/submit"
-            );
-            audit_writer_open_failed(profile_name)
-        })?;
-        guard
-            .verify_tip_anchor()
-            .map_err(|e| audit_writer_acquisition_error(profile_name, &e))?;
-    }
-
-    Ok(writer)
+    AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access)
+        .map_err(|e| audit_writer_acquisition_error(profile_name, &e))
 }
 
 /// Maps a writer-acquisition failure to the wire code that names it.
@@ -127,7 +107,7 @@ pub(crate) fn require_value_audit_writer(
 /// - Everything left is a registry path or key registration conflict, which is
 ///   what `AuditWriterOpenFailed`'s wording describes.
 fn audit_writer_acquisition_error(profile_name: &str, e: &WriterError) -> WalletError {
-    if matches!(e, WriterError::TipAnchorMismatch { .. }) {
+    if let WriterError::TipAnchorMismatch { reason, .. } = e {
         tracing::warn!(
             profile = %profile_name,
             error = %e,
@@ -135,6 +115,7 @@ fn audit_writer_acquisition_error(profile_name: &str, e: &WriterError) -> Wallet
         );
         return WalletError::Validation(ValidationError::AuditTipAnchorMismatch {
             profile: profile_name.to_owned(),
+            reason: (*reason).to_owned(),
         });
     }
     if let Some(detail) = audit_log_unusable_detail(e) {
@@ -207,15 +188,162 @@ pub(crate) fn emit_value_audit_row_with_writer(
 /// helper above (which writes after an action already committed and
 /// therefore cannot withhold anything), failure here can and must withhold
 /// the artifact.
+///
+/// Acquiring the writer runs the anchor check, so a log rolled back, truncated,
+/// or replaced under the running server refuses HERE and nothing is released.
+/// The error carries the wire code that names the condition rather than the
+/// uniform state refusal: an agent told the MPP state is unavailable retries,
+/// and an operator sent after the state file never finds the rolled-back log.
+///
+/// # Errors
+///
+/// [`WalletError::Validation`], with the same variants and wire codes
+/// [`require_value_audit_writer`] produces, plus
+/// [`ValidationError::AuditWriterOpenFailed`] when the row itself cannot be
+/// appended.
 pub(crate) fn emit_value_audit_row_strict(
     profile: &Profile,
     profile_name: &str,
     entry: AuditEntry,
-) -> Result<(), ()> {
-    let access = keyed_audit_access(profile).map_err(|_| ())?;
+) -> Result<(), WalletError> {
+    let access = keyed_audit_access(profile).map_err(|e| {
+        tracing::warn!(
+            profile = %profile_name,
+            error = %e,
+            "value audit: could not load audit chain key; withholding the authorization"
+        );
+        audit_chain_key_unavailable(profile_name)
+    })?;
     let writer =
         AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access)
-            .map_err(|_| ())?;
-    let mut guard = writer.lock().map_err(|_| ())?;
-    guard.write_entry(entry).map_err(|_| ())
+            .map_err(|e| audit_writer_acquisition_error(profile_name, &e))?;
+    let mut guard = writer.lock().map_err(|_| {
+        tracing::warn!(
+            profile = %profile_name,
+            "value audit: audit writer mutex poisoned; withholding the authorization"
+        );
+        audit_writer_open_failed(profile_name)
+    })?;
+    guard.write_entry(entry).map_err(|e| {
+        tracing::warn!(
+            profile = %profile_name,
+            error = %e,
+            "value audit: authorization row NOT emitted; withholding the authorization"
+        );
+        audit_writer_open_failed(profile_name)
+    })
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test-only"
+)]
+mod tests {
+    use super::*;
+
+    /// Every acquisition failure class maps to an operator-facing message that
+    /// names the actual condition.
+    ///
+    /// The CLI twin of this module pins the same table. The two surfaces are
+    /// required to answer the same underlying failure with the same wire code
+    /// and the same remedy, so the pin has to exist on both sides: a change to
+    /// one mapping that is not made to the other fails here or there, never
+    /// silently in production.
+    #[test]
+    fn the_pre_flight_names_the_condition_it_refused_on() {
+        let cases: &[(WriterError, &str, &str)] = &[
+            (
+                WriterError::FileLocked,
+                "audit.chain_key_unavailable",
+                "audit.writer_locked",
+            ),
+            (
+                WriterError::RotationBridgeUnusable {
+                    archive_name: "audit.jsonl.20260913T120000000".to_owned(),
+                    reason: "the archive does not end with a rotation handoff entry",
+                },
+                "audit.chain_key_unavailable",
+                "audit.rotation_bridge_unusable",
+            ),
+            (
+                WriterError::ChainBrokenAtOpen {
+                    entry_idx: 7,
+                    expected_hex: "sha256:aa".to_owned(),
+                    got_hex: "sha256:bb".to_owned(),
+                },
+                "audit.chain_key_unavailable",
+                "audit.chain_broken",
+            ),
+            (
+                WriterError::TipAnchorStore(
+                    stellar_agent_core::audit_log::TipAnchorStoreError::new("keyring locked"),
+                ),
+                "audit.chain_key_unavailable",
+                "audit.tip_anchor_unavailable",
+            ),
+            (
+                WriterError::TipAnchorMismatch {
+                    expected_count: 3,
+                    expected_offset: 900,
+                    actual_len: 600,
+                    reason: "file is shorter than the anchor",
+                },
+                "audit.tip_anchor_mismatch",
+                "audit reanchor",
+            ),
+            (
+                WriterError::TipAnchorMismatch {
+                    expected_count: 3,
+                    expected_offset: 900,
+                    actual_len: 900,
+                    reason: "the log at the path was replaced underneath the writer",
+                },
+                "audit.tip_anchor_mismatch",
+                "audit reanchor",
+            ),
+        ];
+
+        for (error, expected_code, expected_in_message) in cases {
+            let mapped = audit_writer_acquisition_error("default", error);
+            assert_eq!(
+                mapped.code(),
+                *expected_code,
+                "wire code for {error:?}: {}",
+                mapped.message()
+            );
+            assert!(
+                mapped.message().contains(expected_in_message),
+                "the refusal for {error:?} must name {expected_in_message}: {}",
+                mapped.message()
+            );
+            assert!(
+                !mapped.message().contains("rotate-audit-key"),
+                "none of these is fixed by rotating the audit key: {}",
+                mapped.message()
+            );
+        }
+    }
+
+    /// A registry path or key registration conflict keeps the wording that
+    /// describes it, which is the one class `AuditWriterOpenFailed` is about.
+    #[test]
+    fn a_registration_conflict_keeps_its_own_wording() {
+        let mapped = audit_writer_acquisition_error(
+            "default",
+            &WriterError::HmacKeyMismatch {
+                profile_name: "default".to_owned(),
+            },
+        );
+        assert_eq!(mapped.code(), "audit.chain_key_unavailable");
+        assert!(
+            mapped
+                .message()
+                .contains("conflicting audit-log path or key registration"),
+            "message: {}",
+            mapped.message()
+        );
+    }
 }

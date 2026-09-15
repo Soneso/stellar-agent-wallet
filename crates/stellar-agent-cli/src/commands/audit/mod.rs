@@ -52,9 +52,10 @@ pub(crate) fn audit_writer_error(
                      process; stop the running stellar-agent-mcp server and retry"
                 .to_owned(),
         }),
-        WriterError::TipAnchorMismatch { .. } => {
+        WriterError::TipAnchorMismatch { reason, .. } => {
             WalletError::Validation(ValidationError::AuditTipAnchorMismatch {
                 profile: profile_name.to_owned(),
+                reason: (*reason).to_owned(),
             })
         }
         // Variants whose own Display already leads with an `audit.*` code carry

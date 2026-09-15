@@ -37,6 +37,14 @@ stellar-agent audit reanchor --profile <name> --acknowledge-rollback
 
 The reporting form prints the anchor in force and the anchor it would write, both as `<entry count>:<byte offset>`, and exits 1. A stored anchor that cannot be parsed at all — a corrupted value, or one written by a build that predates the current format — is reported as `unusable (<field count> colon-separated fields, <n> bytes)` rather than echoed, and the acknowledging form replaces it. Every other verb refuses on such a value: reading it as "nothing is anchored" would turn a corrupted anchor into a silently disarmed guard. Nothing is written. The acknowledging form replays the whole log first (a log whose own chain is broken is refused here, not blessed), writes the current tip as the anchor, increments a monotonic per-path re-anchor counter in the keyring, and appends an `audit_tip_anchored` row naming the superseded anchor. That row is permanent: the log carries its own record that a rollback was accepted, including how far back it went.
 
+**A log replaced underneath a live writer** is the fourth cause in a different shape. A long-lived process — the MCP server — holds one file handle for its lifetime, so replacing the log by `mv` leaves that handle on the previous file: it still exists, unnamed, until the process exits. The identity of the file at the path is compared against that handle on every acquisition and again on every row appended, so this refuses with the same code and the refusal's message names the log as replaced underneath the writer rather than as shorter than the anchor. Overwriting the log in place (`cp`, `>`, a restore that writes through) never changes the file's identity and is caught by the ordinary tip comparison instead.
+
+The process then stops using that writer: the caller holding it is refused on its next row, and every later request is refused with the same message until nothing references it, at which point the next value verb opens whatever is now at the path and checks THAT file against the anchor.
+
+**A row refused on a replaced log leaves the anchor one entry ahead.** An append that is refused still records, in the keyring, the row it was obliged to write — its count, its hash, and where it would have ended. The action that row was going to prove has already committed, so the obligation outlives the process that failed to meet it: no file at the path satisfies the anchor afterwards, including a byte-identical copy of the log as it stood a moment earlier. An anchor exactly one entry ahead of a log whose own chain verifies cleanly is that signature, and `audit verify <log-path>` will report the chain intact while the anchored count exceeds the entry count by one. Treat it as a row that was owed and not written, establish what happened to the file, and recover with the acknowledging repair below; the `audit_tip_anchored` row it writes names the superseded anchor, which is the permanent record that a row went missing.
+
+The same durability applies to a log truncated or overwritten in place inside that span: the append refuses on the file's length or on the entry at its own last append, and anchors the owed row identically. One row can still be lost, in the adjacent syscalls between an append's check and its write; the anchor then describes the displaced file, which is what turns the loss into a refusal rather than into silence.
+
 **While the MCP server is running**, it holds the audit writer's exclusive lock for its lifetime, so the repair refuses with `audit.writer_locked` in the envelope's error detail. Stop the server, repair, start it again. The same applies to `profile rotate-audit-key`.
 
 ## 2. Partial rotation
@@ -103,11 +111,14 @@ Entries already in an ARCHIVE are guarded throughout all three: a rolled-back pr
 
 ## 4. Scope of the anchor
 
-The anchor names a PATH, not a profile. Its keyring account is derived from the profile's audit-key coordinate plus a digest of the lexically normalized log path, so:
+The anchor names one PATH inside one profile's keyring namespace. Its keyring service is the profile's audit-key service (`stellar-agent-audit-<profile>` by default) and its account is that key's account plus a digest of the lexically normalized log path, so:
 
 - Changing a profile's `audit_log_path` starts a fresh anchor at the new path. The first value-moving verb after the change adopts the new file's tip and records an `audit_tip_anchored` row with reason `adopted`. This is deliberate: the old anchor describes the old file, which still has it.
-- Two profiles configured to the same log path share one anchor.
 - Paths that differ only by `.` or `..` components resolve to the same anchor. Paths that differ through a symlink do not: normalization is lexical, never `canonicalize`, because the coordinate has to be derivable before the log file exists.
+
+**Two profiles must not share a log path.** Each holds its own anchor for that file, under its own audit service, and each advances only on its own appends. The profile that appended last is ahead; the other lags by everything the first wrote. A rollback to the lagging anchor is then refused by one profile and absorbed by the other, and whichever runs first decides which answer the operator sees. The configuration is unsupported; give each profile its own log file.
+
+To check for it, run `stellar-agent profile show <name>` on every profile on the host and compare the `audit_log_path` values. Two profiles reporting the same path are in this state, whether or not either has refused anything yet.
 
 ## 5. Adoption
 

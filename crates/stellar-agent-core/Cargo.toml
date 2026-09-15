@@ -43,6 +43,11 @@ toml_edit = { workspace = true }
 blake3 = { workspace = true }
 ed25519-dalek = { workspace = true }
 region = { workspace = true }
+# File identity for the audit writer's replaced-underneath-the-handle check:
+# `Handle` compares device+inode on Unix and the volume serial plus file index
+# from `GetFileInformationByHandle` on Windows, which std exposes on neither
+# platform through a portable API.
+same-file = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
 proptest = { workspace = true, optional = true }
 stellar-agent-test-support = { workspace = true, optional = true }

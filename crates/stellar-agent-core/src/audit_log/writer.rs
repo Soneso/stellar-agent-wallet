@@ -129,6 +129,30 @@ static FORCE_NEXT_ROTATION_CREATE_FAILURE_PATH: Mutex<Option<PathBuf>> = Mutex::
 static LAST_ROTATION_TIMESTAMP_MS: AtomicU64 = AtomicU64::new(0);
 static ROTATION_COLLISION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Reason carried by the tip-anchor refusal for a log replaced underneath the
+/// writer's own handle.
+///
+/// The registry keys its eviction on this exact value: a cached writer that
+/// holds a file the path no longer resolves to can never be brought back into
+/// agreement by re-checking it, so the entry has to be dropped rather than
+/// re-checked. Every other mismatch describes the file at the path, which the
+/// cached writer still holds and an operator repairs in place.
+const LOG_REPLACED_REASON: &str = "the log at the path was replaced underneath the writer";
+
+/// Reason for a log that shrank below where this writer last appended.
+///
+/// An in-place truncation keeps the file's identity, so only the length says it
+/// happened. Appending anyway would chain the new row off a tip the file no
+/// longer holds and then anchor over the splice.
+const LOG_TRUNCATED_REASON: &str = "the log is shorter than the writer's last append";
+
+/// Reason for a log whose last entry is no longer the one this writer wrote.
+///
+/// An in-place overwrite that keeps the length passes both the identity and the
+/// length check; the entry at the writer's own end offset is what discriminates.
+const LOG_TIP_REWRITTEN_REASON: &str =
+    "the entry at the writer's last append is not the one it wrote";
+
 // ── AuditWriter ───────────────────────────────────────────────────────────────
 
 /// Single-writer append-only audit log with hash-chained entries.
@@ -217,10 +241,11 @@ pub struct AuditWriter {
     /// one.
     ///
     /// `None` leaves every anchor behaviour off: the writer neither checks nor
-    /// advances an anchor. Unkeyed writers (the startup advisory, the
-    /// zero-config best-effort path, read-only smart-account verbs) are opened
-    /// this way, so their appends land ahead of the anchor and the next keyed
-    /// acquisition absorbs them.
+    /// advances an anchor, and its appends are not gated on the file's identity
+    /// either. Unkeyed writers (the startup advisory, the zero-config
+    /// best-effort path, read-only smart-account verbs) are opened this way, so
+    /// their appends land ahead of the anchor and the next keyed acquisition
+    /// absorbs them.
     tip_anchor: Option<Arc<dyn TipAnchorStore>>,
     /// Test-only fault seam for the write-entry durability invariant.
     #[cfg(test)]
@@ -235,6 +260,24 @@ pub struct AuditWriter {
     /// Once set, the writer refuses all future writes. The caller must discard
     /// the instance and reopen after operator inspection.
     partial_rotation_archive: Option<PathBuf>,
+    /// Latched, with the reason, when the file at the path stopped being the
+    /// file this writer holds or stopped ending where this writer left it.
+    ///
+    /// Once set, every acquisition and every append through this instance
+    /// refuses, whatever the path holds afterwards. A writer that has been lied
+    /// to about its own file can never be brought back into agreement on its
+    /// own: the rows it would append are unreachable or would chain over a
+    /// splice, and a caller still holding it from an earlier acquisition must
+    /// not get to write one. Recovery is an operator's, through
+    /// `audit reanchor`; the registry's part is to stop handing this writer out.
+    log_diverged: Option<&'static str>,
+    /// Set once the anchor names a row a refused append was obliged to write.
+    ///
+    /// One such anchor is enough: it already puts every file at this path short
+    /// of the anchor, and a second would describe a chain of rows none of which
+    /// exist. Left unset when the keyring rejected the write, so the next
+    /// refused append retries it.
+    owed_row_anchored: bool,
 }
 
 /// How [`AuditWriter::open`] treats an attached tip-anchor store.
@@ -376,9 +419,12 @@ impl AuditWriter {
     /// If the file is already locked by another process,
     /// [`WriterError::FileLocked`] is returned immediately (non-blocking).
     ///
-    /// `hmac_key` is the optional 32-byte chain-root HMAC key wrapped in a
-    /// [`Zeroizing`] guard.  If `None`, the chain root is not HMAC-signed (the
-    /// hash chain is still intact).
+    /// `access` pairs the 32-byte chain-root HMAC key with the anchor store for
+    /// this path, and the two cannot be separated: a keyed writer's rows are the
+    /// ones `audit verify` covers and the ones worth removing, so a key with no
+    /// anchor store would leave exactly those rows unguarded. `None` opens
+    /// unkeyed — the chain root is not HMAC-signed (the hash chain is still
+    /// intact) and no anchor is checked or advanced. There is no third shape.
     ///
     /// # Errors
     ///
@@ -387,12 +433,47 @@ impl AuditWriter {
     /// - [`WriterError::Io`] on I/O failure.
     /// - [`WriterError::FileLocked`] if another process holds the exclusive
     ///   lock on the log file.
-    pub fn open(path: PathBuf, hmac_key: Option<Zeroizing<[u8; 32]>>) -> Result<Self, WriterError> {
-        Self::open_inner(path, hmac_key, None, TipAnchorOpenMode::Check)
+    /// - [`WriterError::TipAnchorMismatch`] / [`WriterError::TipAnchorStore`]
+    ///   from the anchor reconciliation when `access` is supplied; see
+    ///   [`AuditWriter::open_with_tip_anchor`].
+    pub fn open(path: PathBuf, access: Option<KeyedAuditAccess>) -> Result<Self, WriterError> {
+        let (hmac_key, tip_anchor) = match access {
+            Some(access) => {
+                let (key, store) = access.into_parts();
+                (Some(key), Some(store))
+            }
+            None => (None, None),
+        };
+        Self::open_inner(path, hmac_key, tip_anchor, TipAnchorOpenMode::Check)
+    }
+
+    /// Opens a KEYED writer with no anchor store — the shape a production
+    /// caller cannot construct.
+    ///
+    /// Reproduces a log written by a build whose keyed writers maintained no
+    /// anchor, which is what the adoption path has to handle on first keyed use.
+    /// Feature-gated: never reachable from a shipped binary.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`AuditWriter::open`] returns for an unkeyed open.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn open_keyed_unanchored_for_test(
+        path: PathBuf,
+        hmac_key: Zeroizing<[u8; 32]>,
+    ) -> Result<Self, WriterError> {
+        Self::open_inner(path, Some(hmac_key), None, TipAnchorOpenMode::Check)
     }
 
     /// Opens the audit log as [`AuditWriter::open`] does and binds it to
-    /// `tip_anchor`, the keyring-held high-water mark for this PATH.
+    /// `tip_anchor`, the keyring-held high-water mark for this PATH, with the
+    /// chain-root key optional.
+    ///
+    /// The anchor is independent of the chain-root key, so a profile that has
+    /// not minted one yet still anchors. This is the constructor for that case;
+    /// [`AuditWriter::open`] is the one every keyed caller uses, and it takes
+    /// the key and the store as one inseparable value.
     ///
     /// The anchor is reconciled against the file before the writer is returned:
     /// an absent anchor is adopted (writing an `audit_tip_anchored` row when the
@@ -497,8 +578,8 @@ impl AuditWriter {
 
         // Determine initial last_hash, entry count, and end offset by replaying
         // the whole active file.  The counters are tracked whether or not an
-        // anchor store is attached, so `attach_tip_anchor_store` on an
-        // already-open writer needs no rescan.
+        // anchor store is attached, so the anchor check costs no rescan of its
+        // own on a writer opened unkeyed.
         //
         // The replay seeds from the cross-file bridge, not unconditionally from
         // the zero block: the first entry of a file created by a rotation chains
@@ -522,6 +603,8 @@ impl AuditWriter {
             entry_count: scan.entry_count,
             end_offset: scan.end_offset,
             anchor_behind: false,
+            log_diverged: None,
+            owed_row_anchored: false,
             tip_anchor,
             #[cfg(test)]
             fail_after_entry_before_sidecar: false,
@@ -531,7 +614,7 @@ impl AuditWriter {
         };
 
         if writer.tip_anchor.is_some() && anchor_mode == TipAnchorOpenMode::Check {
-            let outcome = writer.reconcile_tip_anchor(Some(len))?;
+            let outcome = writer.reconcile_tip_anchor()?;
             writer.emit_adoption_row_if_needed(outcome);
         }
 
@@ -602,6 +685,25 @@ impl AuditWriter {
                 archive_name: archive_name.clone(),
                 active_locked_by: None,
             });
+        }
+
+        // The log this writer holds must still be the log at its path, and must
+        // still end on the entry this writer last wrote. A caller acquires the
+        // writer, signs, submits, and only then appends, so the check at
+        // acquisition covers none of that span: a replacement or a rollback
+        // landing inside it would take the row proving a committed action, or
+        // splice it onto a chain the file no longer holds. The check runs BEFORE
+        // the rotation decision, which is the one moment the handle and the path
+        // are legitimately allowed to diverge.
+        //
+        // A refusal here is durable, not just in-process: the row the wallet owed
+        // is anchored in the keyring, so no file at this path satisfies the
+        // anchor again until an operator acknowledges what happened.
+        if let Err(e) = self.refuse_if_log_moved_on_append() {
+            if !self.owed_row_anchored {
+                self.anchor_the_refused_row(&mut entry);
+            }
+            return Err(e);
         }
 
         // Repair an anchor left behind by an earlier failed write, before this
@@ -734,37 +836,21 @@ impl AuditWriter {
 
     // ── Tip anchor ───────────────────────────────────────────────────────────
 
-    /// Attaches a tip-anchor store to an already-open writer.
-    ///
-    /// The writer-registry cache hands out one writer per profile for the
-    /// process lifetime, so a writer first opened without an anchor (a
-    /// read-only verb, the best-effort zero-config path) must be able to take
-    /// one on when a value verb later acquires it. Attaching does not itself
-    /// reconcile; the caller follows with [`AuditWriter::verify_tip_anchor`].
-    ///
-    /// A store already attached is left in place: the anchor for a path is the
-    /// same wherever it is derived from, and replacing a live handle mid-process
-    /// would only add a way for two callers to disagree.
-    pub fn attach_tip_anchor_store(&mut self, store: Arc<dyn TipAnchorStore>) {
-        if self.tip_anchor.is_none() {
-            self.tip_anchor = Some(store);
-        }
-    }
-
     /// Returns `true` when this writer maintains a tip anchor.
     #[must_use]
     pub fn has_tip_anchor(&self) -> bool {
         self.tip_anchor.is_some()
     }
 
-    /// Reconciles the anchor against the active file — the pre-flight every
-    /// value-moving verb runs on EVERY acquisition of the writer.
+    /// Reconciles the anchor against the active file — the check
+    /// [`AuditWriterRegistry::get_or_open_keyed`] runs on EVERY acquisition of a
+    /// keyed writer.
     ///
     /// The writer registry caches writers for the process lifetime, so a check
     /// performed only at open would miss a file replaced underneath a live
     /// writer. This re-reads the file each time: cheap when the anchor is
-    /// current (one seek and one entry hash), a replay of the appended tail when
-    /// the file has moved forward.
+    /// current (one file-identity comparison, one seek and one entry hash), a
+    /// replay of the appended tail when the file has moved forward.
     ///
     /// A writer with no anchor store returns `Ok(())` unchanged.
     ///
@@ -777,7 +863,7 @@ impl AuditWriter {
     /// - [`WriterError::Io`] / [`WriterError::Serialise`] /
     ///   [`WriterError::ChainBrokenAtOpen`] when the file cannot be replayed.
     pub fn verify_tip_anchor(&mut self) -> Result<(), WriterError> {
-        let outcome = self.reconcile_tip_anchor(None)?;
+        let outcome = self.reconcile_tip_anchor()?;
         self.emit_adoption_row_if_needed(outcome);
         Ok(())
     }
@@ -928,20 +1014,31 @@ impl AuditWriter {
     /// Compares the anchor with the active file and brings the two into
     /// agreement, or refuses.
     ///
-    /// `known_len` lets `open` reuse the length it already read; `None` reads it
-    /// fresh, which is what the per-acquisition pre-flight needs.
-    fn reconcile_tip_anchor(
-        &mut self,
-        known_len: Option<u64>,
-    ) -> Result<AnchorOutcome, WriterError> {
+    /// Proves first that the file at the path IS the file this writer holds,
+    /// then reads the length through the path rather than the held handle. Every
+    /// other read here goes through the handle, which is the right source for
+    /// the bytes this writer will append after; the anchor, though, guards the
+    /// file every other process and every operator sees at the path, and the two
+    /// are one file only for as long as the identity comparison says so.
+    fn reconcile_tip_anchor(&mut self) -> Result<AnchorOutcome, WriterError> {
         let Some(store) = self.tip_anchor.clone() else {
             return Ok(AnchorOutcome::NotAnchored);
         };
-        let len = match known_len {
-            Some(len) => len,
-            None => self.file.metadata()?.len(),
-        };
+        // A rotation that failed between the rename and the new file's creation
+        // leaves this writer's handle on the archive with nothing, or something
+        // stale, at the path. That is a partial rotation, which has its own code
+        // and its own runbook section; reporting it as a replacement would send
+        // the operator to `audit reanchor` for a directory state the repair verb
+        // refuses anyway.
+        if let Some(archive_name) = &self.partial_rotation_archive {
+            return Err(WriterError::PartialRotation {
+                archive_name: archive_name.clone(),
+                active_locked_by: None,
+            });
+        }
         let anchor = store.load_anchor().map_err(WriterError::TipAnchorStore)?;
+        self.refuse_if_replaced(anchor.as_ref())?;
+        let len = fs::metadata(&self.path)?.len();
 
         let Some(anchor) = anchor else {
             return self.adopt_tip_anchor(store.as_ref(), len);
@@ -950,7 +1047,7 @@ impl AuditWriter {
         // Cheap path first: prove the anchored entry is still the entry ending
         // at the anchored offset, without replaying the file and without
         // touching the audit directory.
-        let intact = self.anchored_entry_is_intact(&anchor)?;
+        let intact = self.entry_is_intact_at(anchor.end_offset, &anchor.tip_hash)?;
         if intact && len == anchor.end_offset {
             self.entry_count = anchor.entry_count;
             self.end_offset = anchor.end_offset;
@@ -1101,20 +1198,21 @@ impl AuditWriter {
         })
     }
 
-    /// Returns `true` when the last entry ending at or before the anchored
-    /// offset still hashes to the anchored tip.
+    /// Returns `true` when the last entry ending at or before `end_offset` still
+    /// hashes to `tip_hash`.
     ///
     /// At a zero entry count there is no entry to hash; the offset comparison in
-    /// the caller is the whole check.
-    fn anchored_entry_is_intact(&mut self, anchor: &TipAnchor) -> Result<bool, WriterError> {
-        let Some(line) = read_last_line_before(&self.file, anchor.end_offset)? else {
+    /// the caller is the whole check. The anchor check passes the anchor's
+    /// coordinates, the append check passes the writer's own.
+    fn entry_is_intact_at(&mut self, end_offset: u64, tip_hash: &str) -> Result<bool, WriterError> {
+        let Some(line) = read_last_line_before(&self.file, end_offset)? else {
             return Ok(false);
         };
         let Ok(entry) = serde_json::from_slice::<AuditEntry>(&line) else {
             return Ok(false);
         };
         let hash = compute_entry_hash_streamed(&entry, &entry.previous_entry_hash)?;
-        Ok(hash == anchor.tip_hash)
+        Ok(hash == tip_hash)
     }
 
     /// Adopts a full-file replay result as the writer's in-memory state.
@@ -1124,6 +1222,112 @@ impl AuditWriter {
         self.is_new_file = scan.entry_count == 0;
         if scan.entry_count > 0 {
             self.last_hash.clone_from(&scan.last_hash);
+        }
+    }
+
+    /// Refuses when the file now at the path is not the file this writer holds.
+    ///
+    /// The writer keeps ONE handle for its whole lifetime, and every other read
+    /// in the anchor check goes through it. A rename over the log path leaves
+    /// that handle on the previous inode, whose tail is exactly the anchored
+    /// one: the check would pass, the rows would be appended to a file no path
+    /// names any more and would be gone when the process exits, and the log an
+    /// operator reads would stay behind the anchor with nothing refused. File
+    /// identity is therefore resolved from the PATH and compared against the
+    /// handle, which is the only comparison a rename cannot satisfy. A path
+    /// holding no file at all is the same finding: the log this writer guards is
+    /// not there.
+    ///
+    /// Recovery is an operator's, not the writer's: the registry drops the
+    /// cached writer so the next acquisition opens the file at the path and
+    /// checks THAT file against the anchor, which refuses an older copy and
+    /// accepts the same file put back. The new file is never adopted silently.
+    fn refuse_if_replaced(&mut self, anchor: Option<&TipAnchor>) -> Result<(), WriterError> {
+        if let Some(reason) = self.log_diverged {
+            return Err(self.diverged_error(anchor, reason));
+        }
+        let held = same_file::Handle::from_file(self.file.try_clone()?)?;
+        let replaced = match same_file::Handle::from_path(&self.path) {
+            Ok(at_path) => at_path != held,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+            Err(e) => return Err(WriterError::Io(e)),
+        };
+        if !replaced {
+            return Ok(());
+        }
+        Err(self.latch(anchor, LOG_REPLACED_REASON))
+    }
+
+    /// Proves, on the append path, that the file at the path is still the file
+    /// this writer holds AND still ends on the entry this writer last wrote.
+    ///
+    /// An unkeyed writer has no anchor to protect and no rows worth removing, so
+    /// it pays nothing. For an anchored writer this is one identity comparison,
+    /// one `stat` of the path, and — only when the file carries entries — a read
+    /// of its last line and one hash. No keyring round trip: the refusal reports
+    /// the writer's own counters rather than reloading the anchor to name them.
+    ///
+    /// The three findings are distinct because the file diverged in three ways.
+    /// A rename leaves the identity behind; an in-place truncation keeps the
+    /// identity and moves the end; an in-place overwrite of the same length
+    /// keeps both and changes the bytes. All three would otherwise let this
+    /// writer chain a row off a tip the file at the path does not hold and then
+    /// anchor over the result.
+    fn refuse_if_log_moved_on_append(&mut self) -> Result<(), WriterError> {
+        if self.tip_anchor.is_none() {
+            return Ok(());
+        }
+        self.refuse_if_replaced(None)?;
+        // Identity is proven, so the held handle and the path are one file and
+        // the reads below can go through the handle.
+        if fs::metadata(&self.path)?.len() < self.end_offset {
+            return Err(self.latch(None, LOG_TRUNCATED_REASON));
+        }
+        let tip = self.last_hash.clone();
+        if self.entry_count > 0 && !self.entry_is_intact_at(self.end_offset, &tip)? {
+            return Err(self.latch(None, LOG_TIP_REWRITTEN_REASON));
+        }
+        Ok(())
+    }
+
+    /// Latches `reason` and returns the refusal it names.
+    ///
+    /// Once latched the writer refuses everything, because the condition is not
+    /// one it can re-test its way out of: the caller it refused has already been
+    /// told the row was not written, and a file that looks right again afterwards
+    /// would only hide that.
+    fn latch(&mut self, anchor: Option<&TipAnchor>, reason: &'static str) -> WriterError {
+        self.log_diverged = Some(reason);
+        self.diverged_error(anchor, reason)
+    }
+
+    /// Builds the refusal for a log that stopped being the one this writer
+    /// holds.
+    ///
+    /// The anchor's coordinates name what the log was expected to hold. On a
+    /// path nothing has anchored yet the writer's own counters say the same
+    /// thing about the file it holds, which is what the divergence departed
+    /// from. The length is the one at the path now; a path holding no file
+    /// reports zero, and the reason names which of the three it was.
+    fn diverged_error(&self, anchor: Option<&TipAnchor>, reason: &'static str) -> WriterError {
+        let (expected_count, expected_offset) = anchor
+            .map_or((self.entry_count, self.end_offset), |anchor| {
+                (anchor.entry_count, anchor.end_offset)
+            });
+        let actual_len = fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        tracing::warn!(
+            log = %basename_lossy_path(&self.path),
+            expected_count,
+            expected_offset,
+            actual_len,
+            reason,
+            "audit tip anchor mismatch; refusing"
+        );
+        WriterError::TipAnchorMismatch {
+            expected_count,
+            expected_offset,
+            actual_len,
+            reason,
         }
     }
 
@@ -1176,6 +1380,46 @@ impl AuditWriter {
                 );
             }
         }
+    }
+
+    /// Anchors the row this append was refused on, so the refusal outlives the
+    /// process.
+    ///
+    /// The action the row was going to prove has already committed. A refusal
+    /// that lives only in this writer's memory is erased by a restart, and the
+    /// file at the path — an attacker's byte-identical copy included — would
+    /// then satisfy the anchor and be accepted, leaving a committed action with
+    /// no row, no refusal and no record anywhere but a log line. Anchoring the
+    /// row that was owed puts the obligation in the one store filesystem access
+    /// cannot rewind: every file at this path is short of the anchor by exactly
+    /// that row, so every later open refuses until an operator runs
+    /// `audit reanchor --acknowledge-rollback`, whose report shows one more
+    /// anchored entry than the file holds and whose row records it permanently.
+    ///
+    /// Best-effort, like every other anchor write. If the keyring rejects it the
+    /// refusal still stands for this writer and for every caller still holding
+    /// it, but it does not survive the process — which is the state this exists
+    /// to improve on, not one it can guarantee away.
+    fn anchor_the_refused_row(&mut self, entry: &mut AuditEntry) {
+        if entry.truncate_arg_keys_if_needed().is_err() {
+            return;
+        }
+        entry.previous_entry_hash.clone_from(&self.last_hash);
+        let Ok(hash) = compute_entry_hash_streamed(entry, &self.last_hash) else {
+            return;
+        };
+        let Ok(json) = serde_json::to_vec(entry) else {
+            return;
+        };
+        // The serialised row plus its newline: where the file would have ended
+        // had the append been allowed to happen.
+        let owed_end = self
+            .end_offset
+            .saturating_add(json.len() as u64)
+            .saturating_add(1);
+        let owed = TipAnchor::new(self.entry_count.saturating_add(1), hash, owed_end);
+        self.store_tip_anchor_best_effort(&owed);
+        self.owed_row_anchored = !self.anchor_behind;
     }
 
     /// Returns the byte offset just past the entry this writer has only now
@@ -2944,20 +3188,44 @@ struct RegistryEntry {
     hmac_key_fingerprint: Option<[u8; 32]>,
     /// The cached writer handle.
     handle: Arc<Mutex<AuditWriter>>,
+    /// Set when the log at `log_path` was found replaced underneath `handle`.
+    ///
+    /// The entry stays in the map as a tombstone rather than being removed
+    /// outright, because the evicted writer keeps the sidecar lock until its
+    /// last holder drops it: opening the path in that window answers
+    /// [`WriterError::FileLocked`], whose remedy is to stop a server that is
+    /// this one. While a holder remains, the tombstone answers the replacement
+    /// instead; once it is the only holder left, it is dropped and the next
+    /// acquisition opens the file at the path.
+    evicted: Option<EvictedWriter>,
+}
+
+/// What a tombstoned [`RegistryEntry`] answers with.
+///
+/// Carries the anchor coordinates the refusal was made against; the length is
+/// read fresh, since the file at the path can keep changing while a holder
+/// keeps the evicted writer alive.
+struct EvictedWriter {
+    /// Entry count the anchor named when the replacement was found.
+    expected_count: u64,
+    /// Byte offset the anchor named when the replacement was found.
+    expected_offset: u64,
+}
+
+impl EvictedWriter {
+    /// Rebuilds the replaced-underneath refusal for `log_path`.
+    fn refusal(&self, log_path: &Path) -> WriterError {
+        WriterError::TipAnchorMismatch {
+            expected_count: self.expected_count,
+            expected_offset: self.expected_offset,
+            actual_len: fs::metadata(log_path).map(|m| m.len()).unwrap_or(0),
+            reason: LOG_REPLACED_REASON,
+        }
+    }
 }
 
 /// The process-global backing store.
 static REGISTRY: OnceLock<Mutex<HashMap<String, RegistryEntry>>> = OnceLock::new();
-
-/// Computes a SHA-256 fingerprint of an HMAC key.
-///
-/// Used to compare HMAC keys across `get_or_open` calls without retaining the
-/// raw key material in the registry.
-fn hmac_key_fingerprint(key: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(key);
-    hasher.finalize().into()
-}
 
 impl AuditWriterRegistry {
     /// Returns the shared `Arc<Mutex<AuditWriter>>` for `profile_name`,
@@ -3011,51 +3279,114 @@ impl AuditWriterRegistry {
         profile_name: &str,
         log_path: &Path,
     ) -> Result<Arc<Mutex<AuditWriter>>, WriterError> {
-        Self::get_or_open_inner(profile_name, log_path, None, None)
+        Self::get_or_open_inner(profile_name, log_path, None).map(|(handle, _opened)| handle)
     }
 
     /// Returns the shared writer for `profile_name`, opened KEYED and bound to
     /// the anchor store `access` carries.
     ///
-    /// On a cache miss the writer is opened through
-    /// [`AuditWriter::open_with_tip_anchor`], so the anchor is reconciled before
-    /// the handle is published. On a cache HIT the store is attached to the
-    /// existing writer if it does not have one — the registry hands out one
-    /// writer per profile for the process lifetime, so a writer first opened by
-    /// a read-only or best-effort caller must be able to take the anchor on when
-    /// a value verb later acquires it. A cache hit does not itself reconcile;
-    /// the caller runs [`AuditWriter::verify_tip_anchor`] on every acquisition.
+    /// # The anchor is reconciled on EVERY call
+    ///
+    /// A cache hit is reconciled before the handle is returned; a cache miss is
+    /// reconciled by [`AuditWriter::open`] and is not checked twice, since the
+    /// open just proved it. The check belongs here rather than in each caller
+    /// because the registry is the only way a keyed writer is reached: a caller
+    /// that forgot the check would append to a log this process has not proved
+    /// still contains the tip it anchored, and the row that proves an
+    /// authorization would be the row a rollback silently swallowed.
+    ///
+    /// A refusal naming a log replaced underneath the writer's own handle also
+    /// evicts the cached entry, because no re-check can bring that writer back
+    /// into agreement — the file it holds is not the file at the path any more.
+    /// The entry becomes a tombstone that answers the replacement until every
+    /// holder has dropped the writer, at which point the next acquisition opens
+    /// the file now at the path and checks THAT file against the anchor: an
+    /// older copy refuses, the same file put back is accepted.
     ///
     /// # Errors
     ///
     /// Everything [`AuditWriterRegistry::get_or_open_unkeyed`] returns, plus the
-    /// tip-anchor failures of [`AuditWriter::open_with_tip_anchor`].
+    /// tip-anchor failures of [`AuditWriter::open_with_tip_anchor`] and of
+    /// [`AuditWriter::verify_tip_anchor`].
     pub fn get_or_open_keyed(
         profile_name: &str,
         log_path: &Path,
         access: KeyedAuditAccess,
     ) -> Result<Arc<Mutex<AuditWriter>>, WriterError> {
-        let (hmac_key, tip_anchor) = access.into_parts();
-        Self::get_or_open_inner(profile_name, log_path, Some(hmac_key), Some(&tip_anchor))
+        let (handle, opened) = Self::get_or_open_inner(profile_name, log_path, Some(access))?;
+        if opened {
+            return Ok(handle);
+        }
+        if let Err(e) = reconcile_cached_tip_anchor(&handle) {
+            if let WriterError::TipAnchorMismatch {
+                expected_count,
+                expected_offset,
+                reason,
+                ..
+            } = &e
+                && *reason == LOG_REPLACED_REASON
+            {
+                Self::evict(
+                    profile_name,
+                    EvictedWriter {
+                        expected_count: *expected_count,
+                        expected_offset: *expected_offset,
+                    },
+                );
+            }
+            return Err(e);
+        }
+        Ok(handle)
     }
 
+    /// Marks the cached entry for `profile_name` as evicted.
+    ///
+    /// The entry is kept rather than removed: its writer still holds the sidecar
+    /// lock for as long as any caller references it, and a fresh open in that
+    /// window would answer [`WriterError::FileLocked`] and tell the operator to
+    /// stop a server that is the one asking. The tombstone answers the
+    /// replacement until the writer is unreferenced. A poisoned or uninitialised
+    /// registry is left alone — the acquisition is refused either way, and this
+    /// is the recovery path, not the guard.
+    fn evict(profile_name: &str, evicted: EvictedWriter) {
+        let Some(registry) = REGISTRY.get() else {
+            return;
+        };
+        let Ok(mut map) = registry.lock() else {
+            return;
+        };
+        if let Some(entry) = map.get_mut(profile_name) {
+            entry.evicted = Some(evicted);
+        }
+    }
+
+    /// Returns the cached writer for `profile_name`, opening it on a miss, and
+    /// says which of the two happened.
+    ///
+    /// `true` means this call opened the writer, so the anchor was reconciled by
+    /// the open and the caller need not repeat it.
+    ///
+    /// `access` carries the chain-root key and the anchor store together or
+    /// neither: it is the same value the public entry points take, threaded
+    /// through unsplit so the key-with-no-anchor shape has no expression here
+    /// either.
     fn get_or_open_inner(
         profile_name: &str,
         log_path: &Path,
-        hmac_key: Option<Zeroizing<[u8; 32]>>,
-        tip_anchor: Option<&Arc<dyn TipAnchorStore>>,
-    ) -> Result<Arc<Mutex<AuditWriter>>, WriterError> {
-        let incoming_fingerprint = hmac_key.as_deref().map(hmac_key_fingerprint);
+        access: Option<KeyedAuditAccess>,
+    ) -> Result<(Arc<Mutex<AuditWriter>>, bool), WriterError> {
+        let incoming_fingerprint = access.as_ref().map(KeyedAuditAccess::key_fingerprint);
 
         // ── Phase 1: cache lookup under lock ────────────────────────────────
         let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
         {
-            let map = registry.lock().map_err(|_| {
+            let mut map = registry.lock().map_err(|_| {
                 WriterError::Io(io::Error::other(
                     "audit writer registry mutex poisoned; cannot open writer",
                 ))
             })?;
 
+            let mut drop_tombstone = false;
             if let Some(entry) = map.get(profile_name) {
                 // Validate log_path matches the cached entry.
                 if entry.log_path != log_path {
@@ -3071,10 +3402,27 @@ impl AuditWriterRegistry {
                         profile_name: profile_name.to_owned(),
                     });
                 }
-                let handle = Arc::clone(&entry.handle);
-                drop(map);
-                attach_tip_anchor_to_cached(&handle, tip_anchor)?;
-                return Ok(handle);
+                match entry.evicted.as_ref() {
+                    // A holder still references the evicted writer, so the
+                    // sidecar lock is still held and opening the path would
+                    // report the wrong condition. Answer the replacement.
+                    Some(evicted) if Arc::strong_count(&entry.handle) > 1 => {
+                        let refusal = evicted.refusal(log_path);
+                        drop(map);
+                        return Err(refusal);
+                    }
+                    // The tombstone is the last holder; drop it so the open
+                    // below gets the lock.
+                    Some(_) => drop_tombstone = true,
+                    None => {
+                        let handle = Arc::clone(&entry.handle);
+                        drop(map);
+                        return Ok((handle, false));
+                    }
+                }
+            }
+            if drop_tombstone {
+                map.remove(profile_name);
             }
             // Cache miss — release the lock before doing I/O.
         }
@@ -3083,15 +3431,10 @@ impl AuditWriterRegistry {
         // Perform the I/O (directory creation, advisory lock, chain recovery)
         // without holding the registry lock so concurrent opens for different
         // profiles do not serialise behind each other's I/O.
-        let writer = match tip_anchor {
-            Some(store) => AuditWriter::open_with_tip_anchor(
-                log_path.to_path_buf(),
-                hmac_key,
-                Arc::clone(store),
-            )?,
-            None => AuditWriter::open(log_path.to_path_buf(), hmac_key)?,
-        };
-        let handle = Arc::new(Mutex::new(writer));
+        let handle = Arc::new(Mutex::new(AuditWriter::open(
+            log_path.to_path_buf(),
+            access,
+        )?));
 
         // ── Phase 3: re-acquire lock and insert (double-checked) ────────────
         // A concurrent thread may have won the race and inserted while we were
@@ -3119,13 +3462,17 @@ impl AuditWriterRegistry {
                     profile_name: profile_name.to_owned(),
                 });
             }
-            // `handle` (our freshly-opened writer) is dropped here, releasing
-            // the advisory lock we held as the race loser.
-            let winner = Arc::clone(&entry.handle);
-            drop(map);
-            drop(handle);
-            attach_tip_anchor_to_cached(&winner, tip_anchor)?;
-            return Ok(winner);
+            // A tombstone left by a concurrent eviction is superseded: this
+            // open took the sidecar lock, which proves the evicted writer is
+            // gone. Anything else is a live winner, and our freshly-opened
+            // writer is dropped here, releasing the advisory lock we held as
+            // the race loser.
+            if entry.evicted.is_none() {
+                let winner = Arc::clone(&entry.handle);
+                drop(map);
+                drop(handle);
+                return Ok((winner, false));
+            }
         }
 
         // We are the first (or the only) opener for this profile — insert.
@@ -3135,31 +3482,26 @@ impl AuditWriterRegistry {
                 log_path: log_path.to_path_buf(),
                 hmac_key_fingerprint: incoming_fingerprint,
                 handle: Arc::clone(&handle),
+                evicted: None,
             },
         );
-        Ok(handle)
+        Ok((handle, true))
     }
 }
 
-/// Attaches `tip_anchor` to a writer already held in the registry.
+/// Runs the anchor check on a writer the registry is about to hand out.
 ///
 /// A poisoned writer mutex is surfaced as an I/O error rather than unwound, the
-/// same discipline [`AuditWriterRegistry::get_or_open`] applies to the registry
-/// mutex.
-fn attach_tip_anchor_to_cached(
-    handle: &Arc<Mutex<AuditWriter>>,
-    tip_anchor: Option<&Arc<dyn TipAnchorStore>>,
-) -> Result<(), WriterError> {
-    let Some(store) = tip_anchor else {
-        return Ok(());
-    };
+/// same discipline [`AuditWriterRegistry::get_or_open_keyed`] applies to the
+/// registry mutex, and it is fail-closed for the same reason: a writer whose
+/// state cannot be read is a writer whose log cannot be proved current.
+fn reconcile_cached_tip_anchor(handle: &Arc<Mutex<AuditWriter>>) -> Result<(), WriterError> {
     let mut writer = handle.lock().map_err(|_| {
         WriterError::Io(io::Error::other(
-            "audit writer mutex poisoned; cannot attach the tip anchor",
+            "audit writer mutex poisoned; cannot reconcile the tip anchor",
         ))
     })?;
-    writer.attach_tip_anchor_store(Arc::clone(store));
-    Ok(())
+    writer.verify_tip_anchor()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -3446,7 +3788,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.jsonl");
         let key = Zeroizing::new([0x42u8; 32]);
-        let mut writer = AuditWriter::open(path.clone(), Some(key)).unwrap();
+        let mut writer = AuditWriter::open_keyed_unanchored_for_test(path.clone(), key).unwrap();
         let entry = make_entry(writer.last_entry_hash());
         writer.write_entry(entry).unwrap();
         drop(writer);
@@ -3465,7 +3807,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.jsonl");
         let key = [0x42u8; 32];
-        let mut writer = AuditWriter::open(path.clone(), Some(Zeroizing::new(key))).unwrap();
+        let mut writer =
+            AuditWriter::open_keyed_unanchored_for_test(path.clone(), Zeroizing::new(key)).unwrap();
         writer.set_fail_after_entry_before_sidecar(true);
         let entry = make_entry(writer.last_entry_hash());
 
@@ -3495,7 +3838,8 @@ mod tests {
             "sidecar must be absent at the after-entry-before-sidecar crash seam"
         );
 
-        let reopened = AuditWriter::open(path, Some(Zeroizing::new(key))).unwrap();
+        let reopened =
+            AuditWriter::open_keyed_unanchored_for_test(path, Zeroizing::new(key)).unwrap();
         assert!(
             !reopened.is_new_file,
             "reopen must recover the fsynced entry rather than starting a new file"
@@ -3702,7 +4046,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
 
         let key = Zeroizing::new([0x11u8; 32]);
-        let mut writer = AuditWriter::open(path.clone(), Some(key)).unwrap();
+        let mut writer = AuditWriter::open_keyed_unanchored_for_test(path.clone(), key).unwrap();
 
         // Write the first entry — this creates the root_hmac sidecar.
         let entry = make_entry(writer.last_entry_hash());
@@ -5128,7 +5472,8 @@ mod tests {
 
         // A log whose chain root is signed under one key.
         {
-            let mut writer = AuditWriter::open(path.clone(), Some(one)).unwrap();
+            let mut writer =
+                AuditWriter::open_keyed_unanchored_for_test(path.clone(), one).unwrap();
             writer.write_entry(make_entry("")).unwrap();
             writer.write_entry(make_entry("")).unwrap();
         }
@@ -5286,29 +5631,6 @@ mod tests {
             anchored,
             "an unanchored writer must not move the anchor"
         );
-    }
-
-    #[test]
-    fn attaching_a_store_to_an_open_writer_lets_the_next_check_adopt() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test.jsonl");
-
-        let mut writer = open_no_key(path.clone());
-        writer.write_entry(make_entry("")).unwrap();
-        writer.write_entry(make_entry("")).unwrap();
-        assert!(!writer.has_tip_anchor());
-
-        let store = Arc::new(InMemoryTipAnchorStore::new());
-        writer.attach_tip_anchor_store(Arc::clone(&store) as Arc<dyn TipAnchorStore>);
-        assert!(writer.has_tip_anchor());
-        writer.verify_tip_anchor().unwrap();
-
-        assert_eq!(
-            count_tip_anchored_rows(&path, "adopted"),
-            1,
-            "attaching then checking must adopt the log in place"
-        );
-        assert_eq!(stored_value(&store), tip_of(&path).to_keyring_value());
     }
 
     #[test]
@@ -5906,6 +6228,125 @@ mod tests {
         assert_eq!(stored_value(&store), tip_of(&path).to_keyring_value());
     }
 
+    /// A log replaced by RENAME under a live keyed writer is refused, the
+    /// registry drops the writer, and nothing lands in the file the rename
+    /// unlinked.
+    ///
+    /// The writer holds one handle for its whole lifetime, and a rename leaves
+    /// that handle on the previous inode — whose tail is exactly the anchored
+    /// one, so every content check passes. Rows would then be appended to a file
+    /// no path names, lost when the process exits, while the log an operator
+    /// reads stayed behind the anchor with nothing refused. The replacement here
+    /// carries the SAME bytes as the file it displaces, so file identity is the
+    /// only thing that can tell the two apart.
+    #[test]
+    fn a_rename_over_the_log_under_a_live_writer_is_refused_and_evicts_the_writer() {
+        let dir = TempDir::new().unwrap();
+        let profile = format!("reg-rename-{}", uuid::Uuid::new_v4().simple());
+        let path = dir.path().join(format!("{profile}.jsonl"));
+        let store: Arc<dyn TipAnchorStore> = Arc::new(InMemoryTipAnchorStore::new());
+        let key = Zeroizing::new([0x5a_u8; 32]);
+        let acquire = || {
+            AuditWriterRegistry::get_or_open_keyed(
+                &profile,
+                &path,
+                KeyedAuditAccess::new(key.clone(), Arc::clone(&store)),
+            )
+        };
+
+        let held = acquire().unwrap();
+        held.lock().unwrap().write_entry(make_entry("")).unwrap();
+        let after_one_entry = fs::read(&path).unwrap();
+        held.lock().unwrap().write_entry(make_entry("")).unwrap();
+        let anchored_bytes = fs::read(&path).unwrap();
+        acquire().expect("an untouched log must still acquire");
+
+        // A second handle on the file the rename is about to unlink, so the
+        // inode stays observable after it has no name.
+        let unlinked_inode = File::open(&path).unwrap();
+        let replacement = dir.path().join("replacement.jsonl");
+        fs::write(&replacement, &anchored_bytes).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+
+        let err = acquire().expect_err("a log replaced under a live writer must refuse");
+        assert!(
+            matches!(
+                &err,
+                WriterError::TipAnchorMismatch { reason, .. } if *reason == LOG_REPLACED_REASON
+            ),
+            "expected the replaced-underneath-the-writer refusal, got {err:?}"
+        );
+        assert_eq!(
+            unlinked_inode.metadata().unwrap().len(),
+            anchored_bytes.len() as u64,
+            "no row may be appended to the inode the rename unlinked"
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            anchored_bytes.len() as u64,
+            "no row may be appended to the file now at the path"
+        );
+
+        // The refusal evicted the cached writer, so the next acquisition opens
+        // the file at the path and checks THAT file against the anchor. The
+        // evicted writer still holds the sidecar lock until every caller has
+        // dropped it.
+        drop(held);
+
+        fs::write(&path, &after_one_entry).unwrap();
+        let err = acquire().expect_err("an older copy at the path must refuse");
+        assert!(
+            matches!(
+                &err,
+                WriterError::TipAnchorMismatch { reason, .. }
+                    if *reason == "file is shorter than the anchor"
+            ),
+            "the reopened path must be checked against the anchor on its own \
+             terms, got {err:?}"
+        );
+
+        fs::write(&path, &anchored_bytes).unwrap();
+        acquire().expect("the anchored file put back at the path must acquire");
+    }
+
+    /// Unlinking the log reads as a replacement, not as an empty log the writer
+    /// may carry on appending to.
+    ///
+    /// Unix only, because it is the unlink itself that is under test: a delete
+    /// there removes the name at once while the writer's handle keeps the file
+    /// alive. The same branch — nothing at the path — is covered on every
+    /// platform by the rename-away pins.
+    #[cfg(unix)]
+    #[test]
+    fn a_deleted_log_under_a_live_writer_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let profile = format!("reg-unlink-{}", uuid::Uuid::new_v4().simple());
+        let path = dir.path().join(format!("{profile}.jsonl"));
+        let store: Arc<dyn TipAnchorStore> = Arc::new(InMemoryTipAnchorStore::new());
+        let key = Zeroizing::new([0x5b_u8; 32]);
+        let acquire = || {
+            AuditWriterRegistry::get_or_open_keyed(
+                &profile,
+                &path,
+                KeyedAuditAccess::new(key.clone(), Arc::clone(&store)),
+            )
+        };
+
+        let held = acquire().unwrap();
+        held.lock().unwrap().write_entry(make_entry("")).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        let err = acquire().expect_err("a removed log must refuse");
+        assert!(
+            matches!(
+                &err,
+                WriterError::TipAnchorMismatch { reason, .. } if *reason == LOG_REPLACED_REASON
+            ),
+            "expected the replaced-underneath-the-writer refusal, got {err:?}"
+        );
+        drop(held);
+    }
+
     /// The production half of this file, with line endings normalized.
     ///
     /// `include_str!` yields the bytes as checked out, and a Windows checkout
@@ -5948,6 +6389,486 @@ mod tests {
                 "hmac_key: Option<Zeroizing<[u8; 32]>>,\n    ) -> Result<Arc<Mutex<AuditWriter>>"
             ),
             "no public registry entry point may take a bare optional key"
+        );
+    }
+
+    /// An append refuses when the log at the path stopped being the file the
+    /// writer holds, and the writer refuses everything afterwards.
+    ///
+    /// A caller acquires the writer, signs, submits, and only then appends, so
+    /// the check at acquisition covers none of that span. Without a check on the
+    /// append itself, the row proving a committed action lands in a file no path
+    /// names and is gone when the process exits. The latch is what makes the
+    /// refusal stick: the same file put back at the path afterwards must not
+    /// quietly re-enable a writer whose caller has already been told the append
+    /// failed.
+    #[test]
+    fn an_append_after_the_log_is_replaced_refuses_and_latches_the_writer() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        let mut writer = open_anchored(&path, &store).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        let anchored_len = fs::metadata(&path).unwrap().len();
+
+        // Move the log out from under the writer. The handle still names this
+        // file; the path names nothing.
+        let moved = dir.path().join("moved.jsonl");
+        fs::rename(&path, &moved).unwrap();
+
+        let err = writer
+            .write_entry(make_entry(""))
+            .expect_err("an append onto a path the writer no longer holds must refuse");
+        assert!(
+            matches!(
+                &err,
+                WriterError::TipAnchorMismatch { reason, .. } if *reason == LOG_REPLACED_REASON
+            ),
+            "expected the replaced-underneath-the-writer refusal, got {err:?}"
+        );
+        assert_eq!(
+            fs::metadata(&moved).unwrap().len(),
+            anchored_len,
+            "the refused append must write nothing"
+        );
+
+        // The refusal is durable: the anchor now names the row the wallet owed,
+        // so the file at the path is short of it by exactly that row.
+        let owed = store.peek().expect("the refused row must be anchored");
+        assert_eq!(
+            owed.entry_count, 2,
+            "the anchor must name the row that was refused, not the one on disk"
+        );
+        assert!(
+            owed.end_offset > anchored_len,
+            "the anchored offset must lie past the end of the file on disk"
+        );
+
+        // The very same file back at the path does not revive the writer: its
+        // caller was already told the append failed, and a row written now would
+        // sit after a gap nothing accounts for.
+        fs::rename(&moved, &path).unwrap();
+        let err = writer
+            .write_entry(make_entry(""))
+            .expect_err("a latched writer must refuse every later append");
+        assert!(
+            matches!(
+                &err,
+                WriterError::TipAnchorMismatch { reason, .. } if *reason == LOG_REPLACED_REASON
+            ),
+            "expected the latched refusal, got {err:?}"
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            anchored_len,
+            "a latched writer must write nothing either"
+        );
+        drop(writer);
+
+        // A fresh writer on the same file refuses too: the refusal outlives the
+        // process that made it.
+        let err = open_anchored(&path, &store)
+            .expect_err("the file the anchor is ahead of must not open cleanly");
+        assert!(
+            matches!(
+                &err,
+                WriterError::TipAnchorMismatch { reason, .. }
+                    if *reason == "file is shorter than the anchor"
+            ),
+            "expected a rollback refusal against the owed anchor, got {err:?}"
+        );
+
+        // Only the operator-acknowledged repair clears it, and its report names
+        // one more anchored entry than the file holds.
+        let mut repair = AuditWriter::open_for_reanchor(
+            path.clone(),
+            None,
+            Arc::clone(&store) as Arc<dyn TipAnchorStore>,
+        )
+        .unwrap();
+        let report = repair.reanchor().expect("the repair verb must recover it");
+        assert_eq!(
+            report.previous.coordinates(),
+            Some(owed.coordinates()),
+            "the repair must record the anchor that named the missing row"
+        );
+        assert_eq!(report.reanchor_count, 1);
+    }
+
+    /// An unanchored writer is not gated on the file's identity.
+    ///
+    /// The identity check exists to protect the anchor, and an unkeyed writer
+    /// has neither. Gating it too would make the startup advisory and the
+    /// zero-config path fail on states they are explicitly allowed to write
+    /// through.
+    #[test]
+    fn an_unanchored_writer_appends_through_a_replacement() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+
+        let mut writer = open_no_key(path.clone());
+        writer.write_entry(make_entry("")).unwrap();
+        let moved = dir.path().join("moved.jsonl");
+        fs::rename(&path, &moved).unwrap();
+
+        writer
+            .write_entry(make_entry(""))
+            .expect("an unanchored writer has no anchor to protect");
+    }
+
+    /// The writer's own rotation is not a replacement.
+    ///
+    /// Rotation renames the active file away and creates a new one at the same
+    /// path, which is exactly the shape the identity check refuses — so the
+    /// check has to run before the rotation decision and never inside the
+    /// rotation itself, and the handle has to be on the new file before anything
+    /// checks again.
+    #[test]
+    fn a_rotation_under_a_live_anchored_writer_is_not_a_replacement() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        let mut writer = open_anchored(&path, &store).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        writer.force_rotate_for_test().unwrap();
+
+        writer
+            .write_entry(make_entry(""))
+            .expect("the file a rotation created is the file at the path");
+        writer
+            .verify_tip_anchor()
+            .expect("and the acquisition check agrees");
+        assert_eq!(stored_value(&store), tip_of(&path).to_keyring_value());
+    }
+
+    /// A rotation that failed after the rename reports the partial rotation, not
+    /// a replacement.
+    ///
+    /// Both leave the handle on a file the path no longer names, and they need
+    /// different things looked at: a partial rotation is a directory state an
+    /// operator repairs by hand, and `audit reanchor` refuses it anyway.
+    #[test]
+    fn a_failed_rotation_reports_the_partial_rotation_not_a_replacement() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        let mut writer = open_anchored(&path, &store).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+
+        // Pad the file past the rotation threshold through a second handle,
+        // APPENDING blank lines: the log carries no lock, every reader here
+        // tolerates blanks, and the entry the writer last wrote stays where it
+        // is, so the rotation this triggers is the writer's own rather than a
+        // rewrite of its tip.
+        {
+            let mut padding = OpenOptions::new().append(true).open(&path).unwrap();
+            padding
+                .write_all(&vec![b'\n'; ROTATION_THRESHOLD_BYTES as usize])
+                .unwrap();
+            padding.sync_data().unwrap();
+        }
+        if let Ok(mut force_path) = FORCE_NEXT_ROTATION_CREATE_FAILURE_PATH.lock() {
+            *force_path = Some(path.clone());
+        }
+        let err = writer
+            .write_entry(make_entry(""))
+            .expect_err("the forced post-rename create failure must be surfaced");
+        assert!(
+            matches!(err, WriterError::PartialRotation { .. }),
+            "expected PartialRotation, got {err:?}"
+        );
+
+        let err = writer
+            .verify_tip_anchor()
+            .expect_err("the acquisition check must refuse too");
+        assert!(
+            matches!(err, WriterError::PartialRotation { .. }),
+            "a half-finished rotation is not a replacement, got {err:?}"
+        );
+    }
+
+    /// While an evicted writer is still referenced, the registry answers the
+    /// replacement rather than the sidecar lock the evicted writer still holds,
+    /// and the holder's own next append refuses.
+    ///
+    /// Removing the entry outright would make the next acquisition open the path
+    /// and collide with a lock this very process holds, which reports
+    /// `audit.writer_locked` and tells the operator to stop a server that is the
+    /// one asking — the wrong instruction at the moment a log has been replaced.
+    #[test]
+    fn an_evicted_writer_still_referenced_answers_the_replacement_not_the_lock() {
+        let dir = TempDir::new().unwrap();
+        let profile = format!("reg-tombstone-{}", uuid::Uuid::new_v4().simple());
+        let path = dir.path().join(format!("{profile}.jsonl"));
+        let store: Arc<dyn TipAnchorStore> = Arc::new(InMemoryTipAnchorStore::new());
+        let key = Zeroizing::new([0x5c_u8; 32]);
+        let acquire = || {
+            AuditWriterRegistry::get_or_open_keyed(
+                &profile,
+                &path,
+                KeyedAuditAccess::new(key.clone(), Arc::clone(&store)),
+            )
+        };
+
+        let held = acquire().unwrap();
+        held.lock().unwrap().write_entry(make_entry("")).unwrap();
+        let anchored_bytes = fs::read(&path).unwrap();
+
+        let replacement = dir.path().join("replacement.jsonl");
+        fs::write(&replacement, &anchored_bytes).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+
+        let err = acquire().expect_err("the replacement must refuse and evict");
+        assert!(
+            matches!(
+                &err,
+                WriterError::TipAnchorMismatch { reason, .. } if *reason == LOG_REPLACED_REASON
+            ),
+            "expected the replaced-underneath-the-writer refusal, got {err:?}"
+        );
+
+        // `held` is still alive, so the evicted writer's sidecar lock is too.
+        let err = acquire().expect_err("a later acquisition must still refuse");
+        assert!(
+            matches!(
+                &err,
+                WriterError::TipAnchorMismatch { reason, .. } if *reason == LOG_REPLACED_REASON
+            ),
+            "the tombstone must answer the replacement, not the lock, got {err:?}"
+        );
+
+        let err = held
+            .lock()
+            .unwrap()
+            .write_entry(make_entry(""))
+            .expect_err("the holder's own append must refuse");
+        assert!(
+            matches!(
+                &err,
+                WriterError::TipAnchorMismatch { reason, .. } if *reason == LOG_REPLACED_REASON
+            ),
+            "an evicted writer must be latched for its holder too, got {err:?}"
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            anchored_bytes.len() as u64,
+            "nothing may be appended at the path"
+        );
+
+        // Once nothing references the evicted writer the path is opened again —
+        // and refused, because the refused append anchored the row the wallet
+        // owed and no file at this path holds it.
+        drop(held);
+        let err = acquire().expect_err("the owed row must outlive the evicted writer");
+        assert!(
+            matches!(
+                &err,
+                WriterError::TipAnchorMismatch { reason, .. }
+                    if *reason == "file is shorter than the anchor"
+            ),
+            "expected a rollback refusal against the owed anchor, got {err:?}"
+        );
+    }
+
+    /// An in-place truncation landing between an acquisition and its append is
+    /// refused, durably, rather than appended onto.
+    ///
+    /// The file keeps its identity, so only its length says what happened. The
+    /// row would otherwise be written at the shortened end, chained off a tip the
+    /// file no longer holds, and the anchor would advance over the splice.
+    #[test]
+    fn an_append_after_the_log_is_truncated_in_place_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        let mut writer = open_anchored(&path, &store).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        let two_rows = fs::metadata(&path).unwrap().len();
+
+        // Same inode, fewer bytes.
+        let one_row = fs::read(&path).unwrap();
+        let first_line_end = one_row.iter().position(|&b| b == b'\n').unwrap() + 1;
+        fs::write(&path, &one_row[..first_line_end]).unwrap();
+
+        let err = writer
+            .write_entry(make_entry(""))
+            .expect_err("an append onto a truncated log must refuse");
+        assert!(
+            matches!(
+                &err,
+                WriterError::TipAnchorMismatch { reason, .. }
+                    if *reason == LOG_TRUNCATED_REASON
+            ),
+            "expected the truncated-under-the-writer refusal, got {err:?}"
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            first_line_end as u64,
+            "the refused append must write nothing"
+        );
+
+        let owed = store.peek().expect("the refused row must be anchored");
+        assert_eq!(owed.entry_count, 3, "the anchor must name the refused row");
+        assert!(
+            owed.end_offset > two_rows,
+            "the anchored offset must lie past where the untruncated file ended"
+        );
+        drop(writer);
+        assert!(
+            open_anchored(&path, &store).is_err(),
+            "the refusal must outlive the writer that made it"
+        );
+    }
+
+    /// An in-place overwrite that keeps the file's length is refused too.
+    ///
+    /// Identity and length both still agree; the entry at the writer's own end
+    /// offset is the only thing left that can tell the file apart from the one it
+    /// wrote.
+    #[test]
+    fn an_append_after_the_log_is_overwritten_at_the_same_length_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        let mut writer = open_anchored(&path, &store).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        let original = fs::read(&path).unwrap();
+
+        // A different chain of the same byte length at the same inode: the
+        // writer's own bytes with one character of the request id changed.
+        let mut forged = original.clone();
+        let idx = forged
+            .windows(2)
+            .position(|w| w == b"\"r")
+            .expect("the row carries a quoted field to alter");
+        forged[idx + 1] = b'R';
+        assert_eq!(forged.len(), original.len());
+        fs::write(&path, &forged).unwrap();
+
+        let err = writer
+            .write_entry(make_entry(""))
+            .expect_err("an append onto an overwritten log must refuse");
+        assert!(
+            matches!(
+                &err,
+                WriterError::TipAnchorMismatch { reason, .. }
+                    if *reason == LOG_TIP_REWRITTEN_REASON
+            ),
+            "expected the rewritten-tip refusal, got {err:?}"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            forged,
+            "the refused append must write nothing"
+        );
+        assert_eq!(
+            store
+                .peek()
+                .expect("the refused row must be anchored")
+                .entry_count,
+            2,
+            "the anchor must name the refused row"
+        );
+    }
+
+    /// Every `fn open*` declaration in `source` that takes a chain-root key
+    /// without an anchor handle, excluding the ones a `cfg` gate keeps out of
+    /// every shipped binary.
+    ///
+    /// Visibility is not part of the predicate: a `pub(crate)` constructor
+    /// reachable from anywhere in this crate opens exactly the same hole as a
+    /// `pub` one.
+    fn keyed_constructors_without_an_anchor(source: &str) -> Vec<String> {
+        let mut offenders = Vec::new();
+        for (idx, _) in source.match_indices("fn open") {
+            let line_start = source[..idx].rfind('\n').map_or(0, |nl| nl + 1);
+            // Only a declaration at the head of its line, so call sites and
+            // prose mentioning `fn open` are not scanned.
+            if !source[line_start..idx].split_whitespace().all(|word| {
+                matches!(
+                    word,
+                    "pub" | "pub(crate)" | "pub(super)" | "const" | "async" | "unsafe"
+                )
+            }) {
+                continue;
+            }
+            let end = source[idx..]
+                .find('{')
+                .map_or(source.len(), |offset| idx + offset);
+            let signature = &source[idx..end];
+            if !signature.contains("Zeroizing<[u8; 32]>")
+                || signature.contains("KeyedAuditAccess")
+                || signature.contains("TipAnchorStore")
+            {
+                continue;
+            }
+            if source[..line_start]
+                .trim_end()
+                .ends_with("#[cfg(any(test, feature = \"test-helpers\"))]")
+            {
+                continue;
+            }
+            offenders.push(format!(
+                "line {}: {}",
+                source[..idx].lines().count(),
+                signature.replace('\n', " ")
+            ));
+        }
+        offenders
+    }
+
+    /// No writer CONSTRUCTOR takes a chain-root key without an anchor store.
+    ///
+    /// Closing the registry's entry points alone leaves the hole open one level
+    /// down: a caller that reaches `AuditWriter` directly could still open a
+    /// keyed writer whose rows the anchor never covers, which is exactly the
+    /// class of rows an attacker wants to remove. [`KeyedAuditAccess`] pairs the
+    /// key and the store inseparably, and the anchored constructors take the
+    /// store as a required argument. The one exemption is the test seam, which
+    /// carries a `cfg` gate that keeps it out of every shipped binary.
+    ///
+    /// The scan is exercised against a synthetic offender first, so a predicate
+    /// that stopped recognising the shape fails here rather than passing
+    /// vacuously over a production half that grew one.
+    #[test]
+    fn no_writer_constructor_takes_a_key_without_an_anchor_handle() {
+        let public_offender = "    pub fn open(\n        path: PathBuf,\n        \
+             hmac_key: Option<Zeroizing<[u8; 32]>>,\n    ) -> Result<Self, WriterError> {";
+        assert_eq!(
+            keyed_constructors_without_an_anchor(public_offender).len(),
+            1,
+            "the scan must flag a public constructor taking a bare key"
+        );
+        let crate_visible_offender = "    pub(crate) fn open_keyed(\n        path: PathBuf,\n        \
+             hmac_key: Zeroizing<[u8; 32]>,\n    ) -> Result<Self, WriterError> {";
+        assert_eq!(
+            keyed_constructors_without_an_anchor(crate_visible_offender).len(),
+            1,
+            "visibility must not exempt a constructor from the scan"
+        );
+        let gated = format!("    #[cfg(any(test, feature = \"test-helpers\"))]\n{public_offender}");
+        assert!(
+            keyed_constructors_without_an_anchor(&gated).is_empty(),
+            "a cfg-gated test seam is the one exemption"
+        );
+
+        let production = production_source();
+        assert!(
+            production.contains("pub fn open("),
+            "the scan must see the production half of this file"
+        );
+        let offenders = keyed_constructors_without_an_anchor(&production);
+        assert!(
+            offenders.is_empty(),
+            "a keyed writer must not be constructible without an anchor \
+             handle:\n{}",
+            offenders.join("\n")
         );
     }
 

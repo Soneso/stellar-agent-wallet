@@ -54,6 +54,9 @@ schemars = { version = "=1.2.1", default-features = false, features = ["std"] }
 toml_edit = { version = "0.25.12", default-features = true }
 blake3 = { version = "1.8.5", default-features = false, features = ["std", "pure"] }
 region = "=3.0.2"
+# File-identity comparison (device+inode on Unix, volume serial + file index on
+# Windows) for the audit writer's replaced-underneath-the-handle check.
+same-file = "=1.0.6"
 proptest = "1.11.0"
 stellar-agent-test-support = { path = "crates/stellar-agent-test-support", version = "0.1.0-alpha.6" }
 stellar-agent-windows-identity = { path = "crates/stellar-agent-windows-identity", version = "0.1.0-alpha.6" }
@@ -113,7 +116,7 @@ stellar-agent-loopback-http = { path = "crates/stellar-agent-loopback-http", ver
 # ring/rustls stack; axum-server itself disables default features on both
 # shared deps, so this pin is authoritative.
 axum-server = { version = "=0.8.0", default-features = false }
-rustls = { version = "=0.23.41", default-features = false }
+rustls = { version = "=0.23.45", default-features = false }
 tokio-rustls = { version = "=0.26.4", default-features = false }
 rustls-pki-types = { version = "=1.15.0" }
 rcgen = { version = "=0.14.8", default-features = false }

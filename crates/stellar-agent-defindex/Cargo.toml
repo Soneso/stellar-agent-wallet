@@ -15,7 +15,15 @@ categories = ["cryptography::cryptocurrencies", "api-bindings"]
 # Never enable in production binaries.
 test-helpers = ["stellar-agent-defi/test-helpers"]
 # Gated testnet acceptance tests. Implies test-helpers.
-testnet-acceptance = ["test-helpers", "stellar-agent-test-support/testnet-helpers"]
+# Forwards core's `test-helpers` so the acceptance tests can reach
+# `AuditWriter::open_keyed_unanchored_for_test`, the seam the audit-row fixture
+# is built with. Gated here rather than on the dev-dependency, whose features
+# would otherwise be on for every plain `cargo test -p` of this crate.
+testnet-acceptance = [
+    "test-helpers",
+    "stellar-agent-core/test-helpers",
+    "stellar-agent-test-support/testnet-helpers",
+]
 
 [dependencies]
 stellar-agent-core    = { workspace = true }

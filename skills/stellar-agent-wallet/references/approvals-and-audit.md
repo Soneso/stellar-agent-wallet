@@ -342,11 +342,12 @@ still verifies. The tip anchor closes that: for each log PATH the platform
 keyring holds the active file's entry count, last-entry hash, and byte offset,
 where filesystem access alone cannot rewind them.
 
-Every value-moving verb checks the anchor before signing, on every acquisition.
-Four outcomes:
+Every value-moving verb checks the anchor before signing, on every acquisition of
+the audit writer. Five outcomes:
 
 | Log versus anchor | Result |
 |---|---|
+| The file at the log path is not the one the process already has open | Refuses `audit.tip_anchor_mismatch`; the cached writer is dropped so the next call reads the path afresh |
 | Exactly the anchored tip | Proceeds |
 | Ahead of the anchor, anchored entry intact | Proceeds; the tail is absorbed and the anchor advances |
 | Behind the anchor, or the anchored entry is not at the anchored offset | Refuses `audit.tip_anchor_mismatch` |

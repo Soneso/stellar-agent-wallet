@@ -606,7 +606,10 @@ mod tests {
 
     fn make_writer_and_entries(path: PathBuf, count: usize, hmac_key: Option<&[u8; 32]>) {
         let hmac_key = hmac_key.map(|key| Zeroizing::new(*key));
-        let mut writer = AuditWriter::open(path, hmac_key).unwrap();
+        let mut writer = match hmac_key {
+            Some(key) => AuditWriter::open_keyed_unanchored_for_test(path, key).unwrap(),
+            None => AuditWriter::open(path, None).unwrap(),
+        };
         for _ in 0..count {
             let entry = AuditEntry::new_tool_invocation(NewToolInvocation::new(
                 "stellar_pay_commit",

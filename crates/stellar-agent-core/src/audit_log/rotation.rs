@@ -251,7 +251,8 @@ mod tests {
     /// is a real entry so the re-sign can read it. Returns the active log path.
     fn build_two_file_log(dir: &std::path::Path, key: [u8; 32]) -> std::path::PathBuf {
         let path = dir.join("audit.jsonl");
-        let mut writer = AuditWriter::open(path.clone(), Some(Zeroizing::new(key))).unwrap();
+        let mut writer =
+            AuditWriter::open_keyed_unanchored_for_test(path.clone(), Zeroizing::new(key)).unwrap();
         writer.write_entry(sample_entry("first")).unwrap();
         writer.force_rotate_for_test().unwrap();
         writer.write_entry(sample_entry("second")).unwrap();

@@ -944,14 +944,20 @@ pub enum ValidationError {
     /// `"audit.tip_anchor_mismatch"`.
     #[error(
         "profile '{profile}' has an audit log whose chain tip is not the one its anchor \
-         names; signing refuses to proceed against a log that may have been rolled back or \
-         truncated — investigate, then run \
+         names ({reason}); signing refuses to proceed against a log that may have been \
+         rolled back or truncated — investigate, then run \
          `stellar-agent audit reanchor --profile {profile} --acknowledge-rollback` to accept \
          the current tip"
     )]
     AuditTipAnchorMismatch {
         /// The profile name whose audit log failed the tip-anchor check.
         profile: String,
+        /// Which half of the check the log failed, in the writer's own words.
+        ///
+        /// A log that was overwritten in place and a log that was replaced by a
+        /// rename need different things looked at, and the operator only ever
+        /// sees the envelope. The wire code stays the same for both.
+        reason: String,
     },
 
     /// A value-moving signing verb refused because the profile's audit log
@@ -2361,6 +2367,7 @@ mod tests {
             (
                 ValidationError::AuditTipAnchorMismatch {
                     profile: "default".to_owned(),
+                    reason: "file is shorter than the anchor".to_owned(),
                 },
                 "audit.tip_anchor_mismatch",
             ),
@@ -2528,9 +2535,10 @@ mod tests {
                         profile: profile.clone(),
                     }
                 }
-                ValidationError::AuditTipAnchorMismatch { profile } => {
+                ValidationError::AuditTipAnchorMismatch { profile, reason } => {
                     ValidationError::AuditTipAnchorMismatch {
                         profile: profile.clone(),
+                        reason: reason.clone(),
                     }
                 }
                 ValidationError::AuditLogUnusable { profile, detail } => {

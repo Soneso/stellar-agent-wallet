@@ -876,9 +876,9 @@ async fn acceptance_submit_and_confirm() {
     std::fs::create_dir_all(&audit_dir).expect("create audit dir");
     let audit_log_path = audit_dir.join("audit.jsonl");
     let audit_writer = std::sync::Arc::new(std::sync::Mutex::new(
-        stellar_agent_core::audit_log::AuditWriter::open(
+        stellar_agent_core::audit_log::AuditWriter::open_keyed_unanchored_for_test(
             audit_log_path.clone(),
-            Some(Zeroizing::new([0x11u8; 32])),
+            Zeroizing::new([0x11u8; 32]),
         )
         .expect("open audit writer"),
     ));

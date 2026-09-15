@@ -2816,7 +2816,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.jsonl");
         let key = Zeroizing::new([0x42u8; 32]);
-        let mut writer = AuditWriter::open(path.clone(), Some(key)).unwrap();
+        let mut writer = AuditWriter::open_keyed_unanchored_for_test(path.clone(), key).unwrap();
         let entry = new_tool_invocation(
             "test",
             "stellar:testnet",
@@ -3373,7 +3373,9 @@ mod tests {
 
         // Write entries with the HMAC key, force rotation.
         {
-            let mut writer = AuditWriter::open(path.clone(), Some(Zeroizing::new(key))).unwrap();
+            let mut writer =
+                AuditWriter::open_keyed_unanchored_for_test(path.clone(), Zeroizing::new(key))
+                    .unwrap();
             // Write a first entry — this creates the root_hmac sidecar.
             let entry = new_tool_invocation(
                 "pre_rotation",
@@ -3401,7 +3403,9 @@ mod tests {
                 f.write_all(&padding).unwrap();
             }
 
-            let mut writer2 = AuditWriter::open(path.clone(), Some(Zeroizing::new(key))).unwrap();
+            let mut writer2 =
+                AuditWriter::open_keyed_unanchored_for_test(path.clone(), Zeroizing::new(key))
+                    .unwrap();
             // Rotation happens here; a new active file + sidecar are created.
             let entry2 = new_tool_invocation(
                 "post_rotation",
@@ -4223,7 +4227,8 @@ mod tests {
         let path = dir.path().join("test.jsonl");
         let key = [0x99u8; 32];
         let mut writer =
-            AuditWriter::open(path.clone(), Some(zeroize::Zeroizing::new(key))).unwrap();
+            AuditWriter::open_keyed_unanchored_for_test(path.clone(), zeroize::Zeroizing::new(key))
+                .unwrap();
         writer
             .write_entry(new_tool_invocation(
                 "test",
@@ -4270,8 +4275,11 @@ mod tests {
         // Write with key A.
         let key_a = [0xAAu8; 32];
         let key_b = [0xBBu8; 32];
-        let mut writer =
-            AuditWriter::open(path.clone(), Some(zeroize::Zeroizing::new(key_a))).unwrap();
+        let mut writer = AuditWriter::open_keyed_unanchored_for_test(
+            path.clone(),
+            zeroize::Zeroizing::new(key_a),
+        )
+        .unwrap();
         writer
             .write_entry(new_tool_invocation(
                 "test",

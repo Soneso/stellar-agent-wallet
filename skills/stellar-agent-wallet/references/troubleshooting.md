@@ -165,7 +165,7 @@ approval path cannot be probed. Recovery is the same as for any
 
 | Code | Meaning | Agent action |
 |---|---|---|
-| `audit.tip_anchor_mismatch` | The same pre-flight proved the profile's audit log no longer contains the chain tip its keyring-held anchor names: the log was restored from an older copy, truncated, or substituted. The chain walk alone does not catch this — it verifies a prefix, which an older copy satisfies. A log that moved FORWARD past its anchor is not this code; that case is absorbed silently. | Not agent-recoverable, and do NOT retry: the refusal is stable until an operator acts. Report it. The operator must establish why the log changed, then run `stellar-agent audit reanchor --profile <name> --acknowledge-rollback` (stopping the MCP server first, since it holds the audit writer's lock). |
+| `audit.tip_anchor_mismatch` | Acquiring the audit writer proved the profile's audit log no longer contains the chain tip its keyring-held anchor names: the log was restored from an older copy, truncated, or substituted, or it was replaced, truncated or overwritten while a long-lived process held the original open. The chain walk alone does not catch this — it verifies a prefix, which an older copy satisfies. A log that moved FORWARD past its anchor is not this code; that case is absorbed silently. The message says which of the shapes it was. When a row was refused mid-flight the anchor ends up one entry ahead of an otherwise clean log, which is a row the wallet owed and did not write. The MPP verbs answer with this code too, in place of `mpp.state_unavailable`. | Not agent-recoverable, and do NOT retry: the refusal is stable until an operator acts. Report it. The operator must establish why the log changed, then run `stellar-agent audit reanchor --profile <name> --acknowledge-rollback` (stopping the MCP server first, since it holds the audit writer's lock). |
 | `audit.writer_locked` | A verb that needs the audit writer (`audit reanchor`, `profile rotate-audit-key`) found the writer's exclusive lock held by another process — normally a running `stellar-agent-mcp` server. | Not agent-recoverable. The operator must stop the MCP server, run the verb, and start the server again. |
 | `audit.rotation_bridge_unusable` | Opening the audit log needs the rotation-handoff entry from the newest archive to seed the active file's chain, and that archive's last entry is not a handoff naming it: the archive was truncated, or a foreign file sits in the audit directory under a rotated-sibling name. | Not agent-recoverable. Report it; the operator inspects the audit directory per the recovery runbook. |
 | `validation.acknowledgement_required` | `audit reanchor` was run without `--acknowledge-rollback`. It reported the anchor in force and the anchor it would write, and changed nothing. | Not an agent action at all. Accepting a rolled-back audit log is an operator judgement. |
@@ -229,10 +229,17 @@ identifier, an input file that is not a bounded regular file) mean the call was
 wrong — correct it and retry. A malformed identifier answers this way on every
 store state, so it never reveals whether a profile has MPP state.
 
+The MPP verbs that write an audit row before returning — charge commit, record
+receipt, reconcile, prune — answer an audit-log problem under its own `audit.*`
+code rather than `mpp.state_unavailable`, because the remedy is a different one:
+the MPP state file is intact and the audit log is what needs attention. Treat
+`audit.chain_key_unavailable` and `audit.tip_anchor_mismatch` from an MPP verb
+exactly as the rows above say.
+
 `mpp state prune` on a profile with no MPP history succeeds with `pruned: 0`
 once the profile's audit key is minted (`stellar-agent profile
 rotate-audit-key <profile>`); like every audited verb it refuses without one,
-here with `mpp.state_unavailable`.
+here with `audit.chain_key_unavailable`.
 
 For `mpp.approval_required`, wait for the operator and resume the exact stored
 authorization. For replayed, indeterminate, withheld, signing, state, receipt,
