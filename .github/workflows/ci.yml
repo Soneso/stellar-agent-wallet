@@ -106,6 +106,13 @@ jobs:
       # so cargo silently drops it from the --workspace --features run above
       # without erroring; run it explicitly so this job actually covers it.
       - run: cargo test -p stellar-agent-cli --features test-helpers
+      # stellar-agent-test-support is consumed with a different feature set by
+      # each crate; every set must compile on its own.
+      - run: |
+          cargo check -p stellar-agent-test-support --no-default-features
+          for feature in test-helpers testnet-helpers verifier-registry wiremock-helpers; do
+            cargo check -p stellar-agent-test-support --no-default-features --features "$feature"
+          done
 
   mpp-interop:
     name: mpp released-sdk interop

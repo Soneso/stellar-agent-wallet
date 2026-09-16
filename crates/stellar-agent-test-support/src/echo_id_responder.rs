@@ -65,11 +65,16 @@ impl Respond for EchoIdResponder {
 /// - `getTransaction`: the hash the caller asked about.
 ///
 /// Every other method is answered with the template unchanged.
+///
+/// Available with the `test-helpers` feature, which supplies the hash
+/// computation.
+#[cfg(feature = "test-helpers")]
 pub struct SubmissionEchoResponder {
     result: Arc<serde_json::Value>,
     passphrase: String,
 }
 
+#[cfg(feature = "test-helpers")]
 impl SubmissionEchoResponder {
     /// Creates a responder returning `result` with its hash fields rewritten
     /// to match the request.
@@ -82,6 +87,7 @@ impl SubmissionEchoResponder {
     }
 }
 
+#[cfg(feature = "test-helpers")]
 #[async_trait]
 impl Respond for SubmissionEchoResponder {
     fn respond(&self, request: &Request) -> ResponseTemplate {
