@@ -414,62 +414,85 @@ impl<'a> WalletSubmissionRecorder<'a> {
         }
     }
 
-    /// Replaces the spent approval entry with a tombstone.
-    ///
-    /// Best-effort: the transaction has already been sent, so a store failure
-    /// is logged and the entry expires by its own TTL.
-    fn tombstone_approval(&self, intent: &SubmissionIntent, outcome: ConsumedOutcomeKind) {
+    /// Completes the receipt's durable approval-consumption obligation.
+    fn tombstone_approval(&self, intent: &SubmissionIntent) {
         let Some(approval) = self.approval.as_ref() else {
             return;
         };
-        let store_path = approval
-            .store_dir
-            .join(format!("{}.toml", approval.profile_name));
-        match stellar_agent_core::approval::retry::open_with_retry(
-            &store_path,
-            stellar_agent_core::approval::retry::DEFAULT_RETRY_ATTEMPTS,
-            stellar_agent_core::approval::retry::DEFAULT_RETRY_BACKOFF,
+        if let Err(error) = repair_approval_consumption(
+            &self.receipts,
+            &intent.envelope_hash,
+            &approval.store_dir,
+            &approval.profile_name,
         ) {
-            Ok(mut store) => {
-                if let Err(e) =
-                    store.consume(&approval.approval_nonce, &intent.tx_hash, outcome.into())
-                {
-                    tracing::warn!(
-                        profile = %self.profile_name,
-                        tool = %self.tool,
-                        error = %e,
-                        "submission record: approval tombstone failed; the entry expires by its TTL"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    profile = %self.profile_name,
-                    tool = %self.tool,
-                    error = %e,
-                    "submission record: approval store open failed; the entry expires by its TTL"
-                );
-            }
+            tracing::warn!(
+                profile = %self.profile_name,
+                tool = %self.tool,
+                error = %error,
+                "submission record: approval consumption remains owed; status retries it"
+            );
         }
     }
 }
 
-/// Which consumed-outcome label a tombstone carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConsumedOutcomeKind {
-    /// The chain answered for the transaction.
-    Confirmed,
-    /// The transaction was sent and its outcome is still open.
-    Unknown,
-}
-
-impl From<ConsumedOutcomeKind> for stellar_agent_core::approval::store::ConsumedOutcome {
-    fn from(kind: ConsumedOutcomeKind) -> Self {
-        match kind {
-            ConsumedOutcomeKind::Confirmed => Self::Confirmed,
-            ConsumedOutcomeKind::Unknown => Self::Unknown,
-        }
+/// Completes a sent receipt's approval tombstone and acknowledges it durably.
+///
+/// The receipt holds the nonce until a definitive send refusal releases it.
+/// A failed approval write or acknowledgement leaves the obligation available
+/// to the next status call, and the commit gate continues to refuse reuse.
+///
+/// # Errors
+///
+/// Returns `submission.record_unavailable` if either store cannot be read or
+/// written, or the approval names a different transaction.
+pub fn repair_approval_consumption(
+    receipts: &ReceiptStore,
+    envelope_hash: &str,
+    approval_dir: &std::path::Path,
+    profile_name: &str,
+) -> Result<(), WalletError> {
+    use stellar_agent_core::approval::{ApprovalKind, ConsumedOutcome};
+    let receipt = receipts
+        .get(envelope_hash)
+        .map_err(|e| receipt_store_refusal(&e))?;
+    let Some(receipt) = receipt else {
+        return Ok(());
+    };
+    let Some(nonce) = receipt.approval_nonce.as_deref() else {
+        return Ok(());
+    };
+    if !receipt.submitted || receipt.approval_consumed {
+        return Ok(());
     }
+    let mut store = stellar_agent_core::approval::retry::open_with_retry(
+        &approval_dir.join(format!("{profile_name}.toml")),
+        stellar_agent_core::approval::retry::DEFAULT_RETRY_ATTEMPTS,
+        stellar_agent_core::approval::retry::DEFAULT_RETRY_BACKOFF,
+    )
+    .map_err(|e| record_unavailable(format!("approval consumption store unavailable: {e}")))?;
+    if let Some(entry) = store.get(nonce)
+        && let ApprovalKind::Consumed { tx_hash, .. } = &entry.kind
+    {
+        if tx_hash != &receipt.tx_hash {
+            return Err(record_unavailable(
+                "approval consumption names a different transaction",
+            ));
+        }
+    } else {
+        let outcome = if receipt.status.is_definitive_outcome() {
+            ConsumedOutcome::Confirmed
+        } else {
+            ConsumedOutcome::Unknown
+        };
+        store
+            .consume(nonce, &receipt.tx_hash, outcome)
+            .map_err(|e| {
+                record_unavailable(format!("approval consumption could not be written: {e}"))
+            })?;
+    }
+    receipts
+        .mark_approval_consumed(envelope_hash)
+        .map_err(|e| receipt_store_refusal(&e))
 }
 
 #[async_trait::async_trait]
@@ -479,16 +502,20 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
         // envelope-hash gate under one lock hold, in that order: the second
         // check writes this submission's own receipt, which carries this
         // submission's `(source, sequence)`.
-        match self.receipts.begin_submission(
+        match self.receipts.begin_submission_with_approval(
             &intent.envelope_hash,
             &intent.tx_hash,
             &intent.source,
             intent.sequence,
             intent.max_time,
             intent.submission_ledger,
+            self.approval.as_ref().map(|a| a.approval_nonce.as_str()),
         ) {
             Ok(BeginSubmissionOutcome::Recorded) => {}
-            Ok(BeginSubmissionOutcome::DuplicateSequence(existing)) => {
+            Ok(
+                BeginSubmissionOutcome::DuplicateSequence(existing)
+                | BeginSubmissionOutcome::DuplicateApproval(existing),
+            ) => {
                 return Err(WalletError::Submission(
                     SubmissionError::TxAlreadySubmitted {
                         hash: existing.tx_hash,
@@ -557,22 +584,24 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
                 }
                 self.settle_window(intent, WindowSettlement::Confirm);
                 self.record_floor(intent).await;
-                self.tombstone_approval(intent, ConsumedOutcomeKind::Confirmed);
+                self.tombstone_approval(intent);
             }
             SubmissionOutcome::OnChainFailed { code } => {
                 self.finalize_receipt(intent, ReceiptStatus::Failed { code: code.clone() }, None);
                 self.write_failed_row(intent, code);
                 self.settle_window(intent, WindowSettlement::Release);
                 self.record_floor(intent).await;
-                self.tombstone_approval(intent, ConsumedOutcomeKind::Confirmed);
+                self.tombstone_approval(intent);
             }
             SubmissionOutcome::Rejected { code, .. } => {
-                // The network refused the bytes: nothing was queued and no
-                // value moved, so the reservation goes back and the approval
-                // entry stands. `Consumed` has no truthful value here, and
-                // writing one would make the commit gate refuse the follow-up
-                // the agent is expected to make.
-                self.finalize_receipt(intent, ReceiptStatus::Failed { code: code.clone() }, None);
+                // A definitive refusal releases the approval hold in the same
+                // receipt write that records the failed send.
+                if let Err(error) = self
+                    .receipts
+                    .finalize_send_refusal(&intent.envelope_hash, code)
+                {
+                    tracing::warn!(error = %error, "submission record: send refusal could not be persisted");
+                }
                 self.write_failed_row(intent, code);
                 self.settle_window(intent, WindowSettlement::Release);
             }
@@ -581,7 +610,7 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
                 // audit row and the reservation all stand, and only
                 // reconciliation or an operator clears them.
                 self.record_floor(intent).await;
-                self.tombstone_approval(intent, ConsumedOutcomeKind::Unknown);
+                self.tombstone_approval(intent);
             }
         }
     }

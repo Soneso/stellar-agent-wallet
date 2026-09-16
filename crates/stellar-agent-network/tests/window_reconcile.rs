@@ -919,14 +919,8 @@ async fn a_pending_reservation_is_not_pruned_by_age() {
     );
 }
 
-/// A reservation whose receipt is gone is released once its transaction can no
-/// longer apply, and stands until then.
-///
-/// It arises when a submission that was never sent unwound and the release
-/// step failed while the receipt removal succeeded. No verb addresses it: the
-/// operator clear refuses it for want of a record, and a pending record is not
-/// pruned by age. Nothing was sent, so the release rests on the same
-/// exactness as everywhere else.
+/// A reservation without a receipt uses the chain's transaction answer and
+/// retention boundary when deciding whether a consumed sequence releases it.
 #[tokio::test]
 #[serial]
 async fn an_orphaned_reservation_is_released_once_its_sequence_is_consumed() {
@@ -936,6 +930,14 @@ async fn an_orphaned_reservation_is_released_once_its_sequence_is_consumed() {
 
     let counts = MethodCounts::default();
     let server = MockServer::start().await;
+    mount(
+        &server,
+        "getTransaction",
+        get_transaction("NOT_FOUND"),
+        &counts,
+    )
+    .await;
+    mount(&server, "getHealth", health(1), &counts).await;
     mount(
         &server,
         "getNetwork",
@@ -1025,7 +1027,7 @@ async fn an_orphaned_reservation_is_released_once_its_sequence_is_consumed() {
     );
     assert!(
         fx.receipts.get(&consumed).unwrap().is_none(),
-        "nothing was sent, so no receipt is written for it"
+        "an unknown outcome does not reconstruct a missing receipt"
     );
     assert!(
         report2.settled.is_empty(),
@@ -1036,12 +1038,8 @@ async fn an_orphaned_reservation_is_released_once_its_sequence_is_consumed() {
 /// A receipt store that cannot be read keeps every reservation, and asks the
 /// chain nothing.
 ///
-/// The orphan branch releases on a consumed sequence without a chain round
-/// trip, which is right for a reservation the store reports as having no
-/// receipt. A store that cannot be read has said no such thing, and a
-/// landed-but-timed-out submission sits at exactly the consumed sequence that
-/// branch releases on. Conflating the two would release real spend from the
-/// operator's caps on the strength of a local file error.
+/// A local read failure leaves the submission identity unresolved, so the
+/// operator's cap continues to account for the reservation.
 #[tokio::test]
 #[serial]
 async fn an_unreadable_receipt_store_keeps_every_reservation() {
@@ -1124,4 +1122,178 @@ async fn an_unreadable_receipt_store_keeps_every_reservation() {
             .any(|r| r.id == id),
         "the hold is still counted against the operator's caps"
     );
+}
+
+/// A transaction can consume its sequence between the transaction and account reads.
+#[tokio::test]
+#[serial]
+async fn transaction_landing_during_sequence_read_keeps_its_debit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let now = now_ms();
+    let fx = fixture("reconcile-sequence-race");
+    let source = account_id_for_seed([0x25; 32]);
+    let res = reservation(&"a5".repeat(32), &source, 1, due_since(now));
+    fx.take_reservation(now, &res, 500);
+    let counts = MethodCounts::default();
+    let server = MockServer::start().await;
+    let queries = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&queries);
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method": "getTransaction"})))
+        .respond_with(move |request: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let status = if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                "NOT_FOUND"
+            } else {
+                "SUCCESS"
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": body["id"], "result": get_transaction(status)
+            }))
+        })
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        "getNetwork",
+        get_network_result(TESTNET_PASSPHRASE),
+        &counts,
+    )
+    .await;
+    mount(&server, "getHealth", health(1), &counts).await;
+    mount(
+        &server,
+        "getLedgerEntries",
+        ledger_entries_result_for(&[&source]),
+        &counts,
+    )
+    .await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let report = fx
+        .window
+        .reconcile_due(
+            &fx.profile,
+            &client,
+            Some(&fx.receipts),
+            now,
+            RECONCILE_BUDGET,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.confirmed, 1);
+    assert_eq!(report.released, 0);
+    assert_eq!(fx.window_total(now), (500, 1));
+    assert_eq!(
+        fx.receipts.get(&res.id).unwrap().unwrap().status,
+        ReceiptStatus::Success
+    );
+    assert_eq!(queries.load(Ordering::SeqCst), 2);
+    assert_eq!(counts.count("getLedgerEntries"), 1);
+}
+
+/// The reservation retains enough identity to settle spend after receipt-file loss.
+#[tokio::test]
+#[serial]
+async fn lost_receipt_success_preserves_spend_and_restores_identity() {
+    let now = now_ms();
+    let fx = fixture("reconcile-lost-receipt");
+    let source = account_id_for_seed([0x26; 32]);
+    let res = reservation(&"a6".repeat(32), &source, 1, due_since(now));
+    fx.take_reservation(now, &res, 500);
+    std::fs::remove_file(&fx.receipt_file).unwrap();
+    assert!(fx.receipts.get(&res.id).unwrap().is_none());
+
+    let counts = MethodCounts::default();
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "getTransaction",
+        get_transaction("SUCCESS"),
+        &counts,
+    )
+    .await;
+    mount(
+        &server,
+        "getNetwork",
+        get_network_result(TESTNET_PASSPHRASE),
+        &counts,
+    )
+    .await;
+    mount(
+        &server,
+        "getLedgerEntries",
+        ledger_entries_result_for(&[&source]),
+        &counts,
+    )
+    .await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let report = fx
+        .window
+        .reconcile_due(
+            &fx.profile,
+            &client,
+            Some(&fx.receipts),
+            now,
+            RECONCILE_BUDGET,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.confirmed, 1);
+    assert_eq!(report.released, 0);
+    assert_eq!(fx.window_total(now), (500, 1));
+    let receipt = fx.receipts.find_by_tx_hash(&res.tx_hash).unwrap().unwrap();
+    assert_eq!(receipt.status, ReceiptStatus::Success);
+    assert_eq!(receipt.source, source);
+    assert_eq!(receipt.sequence, res.sequence);
+    assert!(receipt.submitted);
+    assert_eq!(counts.count("getTransaction"), 1);
+    assert_eq!(counts.count("getLedgerEntries"), 0);
+    assert_eq!(report.settled.len(), 1);
+}
+
+/// Receipt-file loss does not remove the endpoint retention boundary.
+#[tokio::test]
+#[serial]
+async fn lost_receipt_outside_retention_keeps_the_reservation() {
+    let now = now_ms();
+    let fx = fixture("reconcile-lost-retention");
+    let source = account_id_for_seed([0x27; 32]);
+    let mut res = reservation(&"a7".repeat(32), &source, 1, due_since(now));
+    res.max_time = now / 1_000 - 10;
+    fx.take_reservation(now, &res, 500);
+    std::fs::remove_file(&fx.receipt_file).unwrap();
+    let counts = MethodCounts::default();
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "getTransaction",
+        get_transaction("NOT_FOUND"),
+        &counts,
+    )
+    .await;
+    mount(&server, "getHealth", health(SUBMISSION_LEDGER + 1), &counts).await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let report = fx
+        .window
+        .reconcile_due(
+            &fx.profile,
+            &client,
+            Some(&fx.receipts),
+            now,
+            RECONCILE_BUDGET,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.released, 0);
+    assert_eq!(fx.window_total(now), (500, 1));
+    assert_eq!(
+        fx.window.pending_reservations(&fx.profile).unwrap().len(),
+        1
+    );
+    assert_eq!(counts.count("getTransaction"), 1);
+    assert_eq!(counts.count("getHealth"), 1);
+    assert_eq!(counts.count("getLedgerEntries"), 0);
 }

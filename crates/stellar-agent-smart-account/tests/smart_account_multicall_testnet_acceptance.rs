@@ -323,7 +323,10 @@ fn registry_with_entry(router_address: &str) -> MulticallRegistry {
 /// will succeed at the multicall layer but the SAC call itself would revert; the
 /// acceptance gate is the full on-chain confirmation path, not the SAC outcome).
 #[tokio::test]
+#[serial_test::serial]
 async fn h1_happy_path_3_transfer_bundle() {
+    let data_root = tempfile::tempdir().expect("temporary wallet data root");
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(data_root.path());
     let router_address = match std::env::var("STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS") {
         Ok(addr) => addr,
         Err(_) => {
@@ -422,7 +425,6 @@ async fn h1_happy_path_3_transfer_bundle() {
             fee: ResolvedFeePerOp::default(),
             chain_id: CHAIN_ID,
             request_id: "h1-happy-path-3-transfer",
-            submission_recorder: None,
         },
         &registry,
     )
@@ -491,7 +493,10 @@ async fn h1_happy_path_3_transfer_bundle() {
 /// at evaluation time. `is_bundle_level() = true` ensures it fires correctly
 /// under `evaluate_bundle` (bundle_per_period_cap.rs).
 #[tokio::test]
+#[serial_test::serial]
 async fn h2_per_period_cap_deny_at_inner_3() {
+    let data_root = tempfile::tempdir().expect("temporary wallet data root");
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(data_root.path());
     // 30 USDC per inner in 7-decimal SAC units = 30 * 10_000_000 = 300_000_000.
     // cap = 100 USDC = 1_000_000_000 units.
     // Per-period window: 1 hour.
@@ -547,7 +552,6 @@ async fn h2_per_period_cap_deny_at_inner_3() {
             fee: ResolvedFeePerOp::default(),
             chain_id: CHAIN_ID,
             request_id: "h2-per-period-cap-deny",
-            submission_recorder: None,
         },
         &empty_registry,
     )
@@ -593,7 +597,10 @@ async fn h2_per_period_cap_deny_at_inner_3() {
 /// the bundle view and fires before any per-inner evaluation because
 /// `is_bundle_level()` returns `true` (bundle_aggregate_cap.rs:76-).
 #[tokio::test]
+#[serial_test::serial]
 async fn h3_bundle_aggregate_cap_deny() {
+    let data_root = tempfile::tempdir().expect("temporary wallet data root");
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(data_root.path());
     // 30 USDC per inner in 7-decimal SAC units.
     let usdc_per_inner: i128 = 300_000_000; // 30 USDC
     let cap_usdc: i128 = 1_500_000_000; // 150 USDC cap
@@ -641,7 +648,6 @@ async fn h3_bundle_aggregate_cap_deny() {
             fee: ResolvedFeePerOp::default(),
             chain_id: CHAIN_ID,
             request_id: "h3-bundle-aggregate-cap-deny",
-            submission_recorder: None,
         },
         &empty_registry,
     )

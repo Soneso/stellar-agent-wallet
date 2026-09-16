@@ -176,7 +176,15 @@ Three error codes describe a submission whose outcome the wallet cannot settle o
 
 - `SUCCESS` — the payment went through. The spend is recorded and the value-action row is written. Calling again appends no second row.
 - `FAILED` — the transaction applied and failed. Nothing moved, and the reservation is released.
-- `NOT_FOUND` — the endpoint has no record of it. When the transaction can no longer apply (its sequence has been consumed, or its time bound has passed) the reservation is released and the record is marked `ambiguous`. Otherwise it can still apply, and the record stands: call again later.
+- `NOT_FOUND` — the endpoint has no record of it. Within the retention window, an expired time bound permits release. A consumed sequence requires a second transaction lookup: `SUCCESS` records the spend, `FAILED` releases it, and a second `NOT_FOUND` permits release as `ambiguous`. Otherwise the record stands: call again later.
+
+Automatic reconciliation applies the same chain and retention checks when the
+receipts file is absent. A definitive chain answer restores the receipt's
+transaction identity from its reservation.
+An approval nonce is held durably in its submission receipt before sending. If
+the approval-store consumption write fails, the commit gate still reports
+`policy.approval_consumed`; a status call completes the owed write. Repeating
+status is safe.
 
 A submission whose ledger has fallen outside the endpoint's retention window can never be settled this way. `stellar_transaction_status` reports it as `ambiguous` with `reservation_open: true`; the operator resolves it with `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge`.
 

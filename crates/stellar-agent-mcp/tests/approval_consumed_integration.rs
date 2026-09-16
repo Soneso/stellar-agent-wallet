@@ -231,6 +231,17 @@ fn commit_args(
 #[tokio::test]
 #[serial]
 async fn a_timed_out_commit_consumes_its_approval_and_the_gate_refuses_a_second() {
+    exercise_approval_consumption(false).await;
+}
+
+/// A receipt blocks approval reuse while status repairs a failed tombstone write.
+#[tokio::test]
+#[serial]
+async fn owed_approval_blocks_reuse_until_status_completes_consumption() {
+    exercise_approval_consumption(true).await;
+}
+
+async fn exercise_approval_consumption(fail_once: bool) {
     let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
 
@@ -246,14 +257,7 @@ async fn a_timed_out_commit_consumes_its_approval_and_the_gate_refuses_a_second(
         .expect("set_password");
 
     let mock_server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(TimeoutRpcResponder {
-            account_key_xdr: account_ledger_key_xdr(&source_g),
-            account_xdr: account_entry_xdr_with_seq(&source_g, 100_000_000_000_000, 0, SOURCE_SEQ),
-            refuse_send: false,
-        })
-        .mount(&mock_server)
-        .await;
+    let held_store = Arc::new(std::sync::Mutex::new(None));
 
     let mut profile = Profile::builder_testnet("svc", "acct-consumed", "n-svc", "n-acct")
         .with_noop_engine()
@@ -308,6 +312,25 @@ async fn a_timed_out_commit_consumes_its_approval_and_the_gate_refuses_a_second(
             .expect("record attestation");
     }
 
+    let lock_path = store_path.clone();
+    let hold = Arc::clone(&held_store);
+    let responder = TimeoutRpcResponder {
+        account_key_xdr: account_ledger_key_xdr(&source_g),
+        account_xdr: account_entry_xdr_with_seq(&source_g, 100_000_000_000_000, 0, SOURCE_SEQ),
+        refuse_send: false,
+    };
+    Mock::given(method("POST"))
+        .respond_with(move |request: &Request| {
+            let rpc: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            if fail_once && rpc["method"] == "sendTransaction" {
+                *hold.lock().unwrap() =
+                    Some(PendingApprovalStore::open(lock_path.clone()).unwrap());
+            }
+            responder.respond(request)
+        })
+        .mount(&mock_server)
+        .await;
+
     let nonce_mint = NonceMint::from_profile(&profile).expect("NonceMint::from_profile");
     let now_ms = stellar_agent_core::timefmt::now_unix_ms().expect("clock");
     let expiry = now_ms + 60_000;
@@ -356,34 +379,22 @@ async fn a_timed_out_commit_consumes_its_approval_and_the_gate_refuses_a_second(
         .expect("the timeout reports its hash")
         .to_owned();
 
-    // The approval is spent, not removed: the tombstone keeps the attestation
-    // and names the transaction to reconcile.
-    let store = PendingApprovalStore::open(store_path).expect("approval store");
-    let tombstone = store
-        .get(&approval_nonce)
-        .expect("the approval entry must still be in the store");
-    match &tombstone.kind {
-        ApprovalKind::Consumed {
-            original_kind_name,
-            tx_hash: recorded,
-            outcome,
-        } => {
-            assert_eq!(original_kind_name, "PaymentSimulated");
-            assert_eq!(recorded, &tx_hash);
-            assert_eq!(
-                *outcome,
-                ConsumedOutcome::Unknown,
-                "the submission's outcome is not known"
-            );
-        }
-        other => panic!("the approval must be a Consumed tombstone; got {other:?}"),
-    }
+    drop(held_store.lock().unwrap().take());
+    let receipts =
+        stellar_agent_core::profile::receipt::ReceiptStore::open("acct-consumed").unwrap();
+    let receipt = receipts.find_by_tx_hash(&tx_hash).unwrap().unwrap();
     assert_eq!(
-        tombstone.attestation_blob_b64.as_deref(),
-        Some(attestation_b64.as_str()),
-        "the attestation the submission was made under is retained, unchanged"
+        receipt.approval_nonce.as_deref(),
+        Some(approval_nonce.as_str())
     );
-    drop(store);
+    if fail_once {
+        let store = PendingApprovalStore::open(store_path.clone()).unwrap();
+        assert!(matches!(
+            store.get(&approval_nonce).unwrap().kind,
+            ApprovalKind::PaymentSimulated { .. }
+        ));
+        assert!(!receipt.approval_consumed);
+    }
 
     // A second commit under the same approval is refused, under a code that
     // tells the agent the approval was already spent.
@@ -414,6 +425,59 @@ async fn a_timed_out_commit_consumes_its_approval_and_the_gate_refuses_a_second(
         code, "policy.approval_consumed",
         "a spent approval is refused under its own code: {text}"
     );
+    if fail_once {
+        use stellar_agent_mcp::server::StellarTransactionStatusArgs;
+        for _ in 0..2 {
+            let result = server
+                .call_stellar_transaction_status(StellarTransactionStatusArgs {
+                    chain_id: "stellar:testnet".to_owned(),
+                    tx_hash: tx_hash.clone(),
+                })
+                .await
+                .unwrap();
+            assert_ne!(
+                result.is_error,
+                Some(true),
+                "status must complete the owed transition: {result:?}"
+            );
+        }
+        assert!(
+            receipts
+                .get(&receipt.envelope_hash)
+                .unwrap()
+                .unwrap()
+                .approval_consumed
+        );
+    }
+
+    // The approval is spent, not removed: the tombstone keeps the attestation
+    // and names the transaction to reconcile.
+    let store = PendingApprovalStore::open(store_path).expect("approval store");
+    let tombstone = store
+        .get(&approval_nonce)
+        .expect("the approval entry must still be in the store");
+    match &tombstone.kind {
+        ApprovalKind::Consumed {
+            original_kind_name,
+            tx_hash: recorded,
+            outcome,
+        } => {
+            assert_eq!(original_kind_name, "PaymentSimulated");
+            assert_eq!(recorded, &tx_hash);
+            assert_eq!(
+                *outcome,
+                ConsumedOutcome::Unknown,
+                "the submission's outcome is not known"
+            );
+        }
+        other => panic!("the approval must be a Consumed tombstone; got {other:?}"),
+    }
+    assert_eq!(
+        tombstone.attestation_blob_b64.as_deref(),
+        Some(attestation_b64.as_str()),
+        "the attestation the submission was made under is retained, unchanged"
+    );
+    drop(store);
 }
 
 /// A commit the network refuses outright leaves its approval untouched.

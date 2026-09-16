@@ -235,7 +235,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
             }
         };
 
-    let (_audit_profile, audit_writer, _audit_log_path) =
+    let (audit_profile, audit_writer, _audit_log_path) =
         match open_profile_audit_writer(&resolved_profile) {
             Ok(triple) => triple,
             Err(e) => {
@@ -291,6 +291,36 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     let user_supplied_op_id =
         stellar_agent_smart_account::timelock::TimelockOperationId::from_bytes(op_bytes);
 
+    let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
+        Ok(now) => now,
+        Err(e) => {
+            render_json(&Envelope::<()>::err_raw(
+                "wallet.clock_error",
+                e.to_string(),
+            ));
+            return 1;
+        }
+    };
+    let chain_id = audit_profile.chain_id.caip2_str();
+    let recorder = match crate::commands::submission_record::build_recorder(
+        crate::commands::submission_record::SubmitRecord {
+            profile: &audit_profile,
+            profile_name: profile_name.clone(),
+            verb: "timelock execute",
+            tool: "stellar_smart_account_timelock_execute",
+            chain_id,
+            effects: None,
+            audit: Some(std::sync::Arc::clone(&audit_writer)),
+            now_ms,
+        },
+    ) {
+        Ok(recorder) => recorder,
+        Err(e) => {
+            render_json(&crate::commands::submission_record::error_envelope(&e, ""));
+            return 1;
+        }
+    };
+
     let tx_hash = match stellar_agent_smart_account::timelock::execute(
         stellar_agent_smart_account::timelock::TimelockExecuteArgs::builder()
             .timelock_contract_strkey(&args.timelock)
@@ -305,6 +335,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
             .audit_writer(&audit_writer)
             .request_id(&request_id)
             .expected_operation_id(&user_supplied_op_id)
+            .submission_recorder(&recorder)
             .build(),
     )
     .await

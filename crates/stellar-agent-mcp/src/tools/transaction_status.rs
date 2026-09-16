@@ -159,6 +159,28 @@ impl WalletServer {
             }
         }
 
+        if let Some(record) = &receipt
+            && record.approval_nonce.is_some()
+        {
+            let approval_dir = match self.resolve_approval_dir() {
+                Ok(dir) => dir,
+                Err(e) => {
+                    return Ok(business_error_result(
+                        "submission.record_unavailable",
+                        e.to_string(),
+                    ));
+                }
+            };
+            if let Err(e) = stellar_agent_network::submission_record::repair_approval_consumption(
+                &receipts,
+                &record.envelope_hash,
+                &approval_dir,
+                &profile_name,
+            ) {
+                return Ok(business_error_result(e.code(), e.message()));
+            }
+        }
+
         // Report the chain's own answer alongside the settled record, so an
         // agent sees both what happened and what the wallet now holds.
         let chain = match client.get_transaction_status(&args.tx_hash).await {
