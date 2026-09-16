@@ -520,6 +520,7 @@ async fn deploy_spending_limit_policy_body(
                 args.timeout,
                 &args.network_passphrase,
                 None,
+                None,
             ),
         )
         .await
@@ -722,6 +723,7 @@ async fn deploy_spending_limit_policy_body(
             &signed_xdr,
             args.timeout,
             &args.network_passphrase,
+            None,
             None,
         ),
     )

@@ -227,6 +227,28 @@ where
         }
     };
 
+    // Settle the spending-window reservations that have stood long enough to
+    // be settleable, before the gate below counts them. A reservation the
+    // chain has since answered for should not hold the operator's cap, and one
+    // the chain has not is counted as spend.
+    let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
+        Ok(v) => v,
+        Err(e) => {
+            render_json(&Envelope::<()>::err_raw(
+                "wallet.clock_error",
+                e.to_string(),
+            ));
+            return 1;
+        }
+    };
+    crate::commands::submission_record::reconcile_open_reservations(
+        &profile,
+        &profile_name,
+        &primary_rpc,
+        now_ms,
+    )
+    .await;
+
     // ── Operator policy evaluation (value-carrying; mirrors the MCP
     // `stellar_dex_trade` twin's `dispatch_gate_with_value` mechanism) ───────
     // The debit leg is built from the SAME `amount_in` / `canonical_path`
@@ -249,13 +271,16 @@ where
         "from_address": args.from,
         "amount_in": args.amount_in.to_string(),
     });
+    // The SAME leg the gate is about to size, kept for the submission record
+    // (single-derivation invariant).
+    let value_effects = ValueEffects::new(vec![value_leg]);
     if let Err(envelope) = evaluate_value_moving_policy_with_value(
         policy_engine.as_ref(),
         &profile,
         "stellar_dex_trade",
         chain_id,
         &policy_args,
-        ValueClass::Value(ValueEffects::new(vec![value_leg])),
+        ValueClass::Value(value_effects.clone()),
         "trade",
     ) {
         render_json(&envelope);
@@ -345,6 +370,30 @@ where
     ctx.audit_legs = Some(&audit_legs);
     ctx.audit_tool = Some("stellar_dex_trade");
 
+    // Record the submission before the bytes leave: the receipt, the pending
+    // audit row and the spending-window reservation. The recorder settles all
+    // three against what the network answers, and owns the confirmed row the
+    // adapter would otherwise emit.
+    let recorder = match crate::commands::submission_record::build_recorder(
+        crate::commands::submission_record::SubmitRecord {
+            profile: &profile,
+            profile_name: profile_name.clone(),
+            verb: "trade",
+            tool: "stellar_dex_trade",
+            chain_id,
+            effects: Some(&value_effects),
+            audit: Some(std::sync::Arc::clone(&audit_writer)),
+            now_ms,
+        },
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            render_json(&crate::commands::submission_record::error_envelope(&e, ""));
+            return 1;
+        }
+    };
+    ctx.submission_recorder = Some(&recorder);
+
     // ── Delegate to DexSwapAdapter::submit (witness consumed inside) ──────────
     // NO inline HostFunction build or submit_signed_invoke here. All execution
     // logic lives in DexSwapAdapter::submit.
@@ -374,8 +423,7 @@ where
             0
         }
         Err(e) => {
-            render_json(&Envelope::<()>::err_raw("dex.submit_failed", e.to_string()));
-            1
+            crate::commands::submission_record::render_defi_submit_error(&e, "dex.submit_failed")
         }
     }
 }

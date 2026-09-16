@@ -438,9 +438,28 @@ async fn property4_all_failure_modes_produce_byte_identical_wire_error() {
     // Compare the (code, message) tuples for equality — never the full JSON
     // text or request_id, which are freshly minted per call and therefore
     // legitimately differ between cases.
-    let pair_a = (code_a, message_a);
-    let pair_b = (code_b, message_b);
-    let pair_c = (code_c, message_c);
+    // `details` is part of the comparison: an object present on one refusal
+    // and absent on another tells the caller which refusal it got.
+    let pair_a = (
+        code_a,
+        message_a,
+        common::business_envelope_details(&result_a),
+    );
+    let pair_b = (
+        code_b,
+        message_b,
+        common::business_envelope_details(&result_b),
+    );
+    let pair_c = (
+        code_c,
+        message_c,
+        common::business_envelope_details(&result_c),
+    );
+    assert!(
+        pair_a.2.is_none(),
+        "an approval refusal carries no structured detail: {:?}",
+        pair_a.2
+    );
 
     assert_eq!(
         pair_a, pair_b,

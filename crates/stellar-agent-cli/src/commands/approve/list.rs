@@ -295,6 +295,11 @@ fn render_summary_line(view: &PendingApprovalView) -> String {
         ApprovalSummaryView::Rejected { original_kind_name } => {
             format!("rejected ({original_kind_name})")
         }
+        ApprovalSummaryView::Consumed {
+            original_kind_name,
+            tx_hash_redacted,
+            outcome,
+        } => format!("spent ({original_kind_name}) on {tx_hash_redacted}, outcome {outcome}"),
         // `ApprovalSummaryView` is `#[non_exhaustive]`; a future variant
         // falls back to the entry's own kind name rather than failing to build.
         _ => format!("({} entry)", view.kind_name),

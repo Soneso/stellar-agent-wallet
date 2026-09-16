@@ -385,8 +385,8 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     // key is touched or anything is submitted. A persisted profile whose
     // audit chain key is unminted refuses here (audit.chain_key_unavailable);
     // the SAME writer is reused for every post-confirm row below.
-    let audit_writer = match open_profile_audit_writer(&resolved_profile) {
-        Ok((_profile, writer, _path)) => Some(writer),
+    let (profile, audit_writer) = match open_profile_audit_writer(&resolved_profile) {
+        Ok((profile, writer, _path)) => (profile, Some(writer)),
         Err(e) => {
             return emit_error(&e, args.output, &request_id);
         }
@@ -455,6 +455,54 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
         .map(|id| ContextRuleId::new(*id))
         .collect();
 
+    // Record the submission before the bytes leave. The invocation is an
+    // arbitrary contract call the policy engine cannot size, so the record is
+    // the receipt and the audit rows: no spending-window reservation is taken
+    // for a value nothing measured.
+    let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
+        Ok(v) => v,
+        Err(e) => {
+            drop(rule_signer);
+            return emit_error(
+                &WalletError::Internal(stellar_agent_core::error::InternalError::UnexpectedState {
+                    detail: format!("system clock unavailable: {e}"),
+                }),
+                args.output,
+                &request_id,
+            );
+        }
+    };
+    // Settle what stands open before this verb's own submission, so a
+    // reservation an earlier verb left behind stops counting against the cap.
+    if let Ok(reconcile_client) = stellar_agent_network::StellarRpcClient::new(&args.rpc_url) {
+        crate::commands::submission_record::reconcile_open_reservations(
+            &profile,
+            &profile_name,
+            &reconcile_client,
+            now_ms,
+        )
+        .await;
+    }
+
+    let recorder = match crate::commands::submission_record::build_recorder(
+        crate::commands::submission_record::SubmitRecord {
+            profile: &profile,
+            profile_name: profile_name.clone(),
+            verb: "execute",
+            tool: "stellar_smart_account_execute",
+            chain_id,
+            effects: None,
+            audit: audit_writer.clone(),
+            now_ms,
+        },
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            drop(rule_signer);
+            return emit_error(&e, args.output, &request_id);
+        }
+    };
+
     let submit_result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
             .target_contract(args.contract.as_str())
@@ -473,6 +521,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
             .timeout(Duration::from_secs(args.timeout_seconds))
             .op_label("execute")
             .emit_observability_logs(true)
+            .submission_recorder(&recorder)
             .build(),
     )
     .await;
@@ -697,6 +746,13 @@ fn emit_error(err: &WalletError, output: OutputFormat, request_id: &str) -> i32 
 }
 
 fn emit_error_sa(err: &SaError, output: OutputFormat, request_id: &str) -> i32 {
+    // A submission whose outcome is unknown keeps its own code and carries the
+    // transaction to reconcile, so the operator reads the same vocabulary a
+    // classic verb gives them.
+    if let Some(unresolved) = crate::commands::submission_record::unresolved_from_sa(err) {
+        crate::common::render::render_json(&unresolved.envelope());
+        return 1;
+    }
     emit_error(&wrap_sa_error(err), output, request_id)
 }
 

@@ -307,6 +307,7 @@ fn valid_payment_envelope_b64() -> String {
 #[tokio::test]
 #[serial]
 async fn simulate_rejects_invalid_source_strkey() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let profile = testnet_profile_with_rpc("https://soroban-testnet.stellar.org");
     let server = WalletServer::new(profile).expect("WalletServer::new");
@@ -337,6 +338,7 @@ async fn simulate_rejects_invalid_source_strkey() {
 #[tokio::test]
 #[serial]
 async fn simulate_rejects_invalid_destination_strkey() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let profile = testnet_profile_with_rpc("https://soroban-testnet.stellar.org");
     let server = WalletServer::new(profile).expect("WalletServer::new");
@@ -367,6 +369,7 @@ async fn simulate_rejects_invalid_destination_strkey() {
 #[tokio::test]
 #[serial]
 async fn simulate_rejects_chain_id_mismatch() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let profile = testnet_profile_with_rpc("https://soroban-testnet.stellar.org");
     let server = WalletServer::new(profile).expect("WalletServer::new");
@@ -397,6 +400,7 @@ async fn simulate_rejects_chain_id_mismatch() {
 #[tokio::test]
 #[serial]
 async fn simulate_rejects_bad_asset_format() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let profile = testnet_profile_with_rpc("https://soroban-testnet.stellar.org");
     let server = WalletServer::new(profile).expect("WalletServer::new");
@@ -430,6 +434,7 @@ async fn simulate_rejects_bad_asset_format() {
 #[tokio::test]
 #[serial]
 async fn simulate_rejects_multiple_memo_variants() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let profile = testnet_profile_with_rpc("https://soroban-testnet.stellar.org");
     let server = WalletServer::new(profile).expect("WalletServer::new");
@@ -479,6 +484,7 @@ async fn simulate_rejects_multiple_memo_variants() {
 #[tokio::test]
 #[serial]
 async fn simulate_invalid_memo_hash_does_not_log_memo_content() {
+    let _data_root = common::isolated_data_root();
     let invalid_hash = "not-hex-memo-content";
     let strict = RedactionStrictSubscriber::new([invalid_hash]);
 
@@ -533,6 +539,7 @@ async fn simulate_invalid_memo_hash_does_not_log_memo_content() {
 #[tokio::test]
 #[serial]
 async fn simulate_allowed_on_mainnet_profile() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let mut profile = mainnet_profile();
     profile.rpc_url = "http://127.0.0.1:1".to_owned(); // non-routable
@@ -578,6 +585,7 @@ async fn simulate_allowed_on_mainnet_profile() {
 #[tokio::test]
 #[serial]
 async fn simulate_rejects_native_payment_on_insufficient_balance() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
 
     let mock_server = MockServer::start().await;
@@ -653,6 +661,7 @@ async fn simulate_rejects_native_payment_on_insufficient_balance() {
 #[tokio::test]
 #[serial]
 async fn simulate_rejects_non_native_bad_issuer() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let profile = testnet_profile_with_rpc("https://soroban-testnet.stellar.org");
     let server = WalletServer::new(profile).expect("WalletServer::new");
@@ -690,6 +699,7 @@ async fn simulate_rejects_non_native_bad_issuer() {
 #[tokio::test]
 #[serial]
 async fn simulate_sep29_memo_required_no_memo_fails() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
 
     // Use a mock server that returns an RPC error for the source account fetch
@@ -752,6 +762,7 @@ async fn simulate_sep29_memo_required_no_memo_fails() {
 #[tokio::test]
 #[serial]
 async fn simulate_sep29_memo_present_bypasses_check() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
 
     let profile = testnet_profile_with_rpc("http://127.0.0.1:1"); // non-routable
@@ -813,6 +824,7 @@ async fn simulate_sep29_memo_present_bypasses_check() {
 #[tokio::test]
 #[serial]
 async fn simulate_reaches_rpc_with_valid_inputs() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
 
     let mock_server = MockServer::start().await;
@@ -873,6 +885,7 @@ async fn simulate_reaches_rpc_with_valid_inputs() {
 #[tokio::test]
 #[serial]
 async fn simulate_fee_auto_selects_p95_and_binds_envelope_fee() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(11);
 
@@ -928,6 +941,7 @@ async fn simulate_fee_auto_selects_p95_and_binds_envelope_fee() {
 #[tokio::test]
 #[serial]
 async fn simulate_fee_auto_p99_selects_p99() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(12);
 
@@ -981,6 +995,7 @@ async fn simulate_fee_auto_p99_selects_p99() {
 #[tokio::test]
 #[serial]
 async fn simulate_fee_explicit_above_profile_cap_fails() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(13);
 
@@ -1040,6 +1055,7 @@ async fn simulate_fee_explicit_above_profile_cap_fails() {
 #[tokio::test]
 #[serial]
 async fn policy_noop_engine_refuses_mainnet_destructive() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1095,6 +1111,7 @@ async fn policy_noop_engine_refuses_mainnet_destructive() {
 #[tokio::test]
 #[serial]
 async fn policy_v1_engine_allow_rule_passes_gate() {
+    let _data_root = common::isolated_data_root();
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(PayFeeRpcResponder::new(
@@ -1144,6 +1161,7 @@ async fn policy_v1_engine_allow_rule_passes_gate() {
 #[tokio::test]
 #[serial]
 async fn policy_v1_engine_no_matching_rule_emits_wire_code() {
+    let _data_root = common::isolated_data_root();
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(PayFeeRpcResponder::new(
@@ -1193,6 +1211,7 @@ async fn policy_v1_engine_no_matching_rule_emits_wire_code() {
 #[tokio::test]
 #[serial]
 async fn policy_v1_engine_explicit_deny_emits_wire_code() {
+    let _data_root = common::isolated_data_root();
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(PayFeeRpcResponder::new(
@@ -1244,6 +1263,7 @@ async fn policy_v1_engine_explicit_deny_emits_wire_code() {
 #[tokio::test]
 #[serial]
 async fn commit_returns_nonce_expired_on_bad_nonce() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let profile = testnet_profile_with_rpc("https://soroban-testnet.stellar.org");
     let server = WalletServer::new(profile).expect("WalletServer::new");
@@ -1282,6 +1302,7 @@ async fn commit_returns_nonce_expired_on_bad_nonce() {
 #[tokio::test]
 #[serial]
 async fn commit_returns_nonce_expired_on_wrong_length_nonce() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let profile = testnet_profile_with_rpc("https://soroban-testnet.stellar.org");
     let server = WalletServer::new(profile).expect("WalletServer::new");
@@ -1348,6 +1369,7 @@ async fn commit_returns_nonce_expired_on_wrong_length_nonce() {
 #[tokio::test]
 #[serial]
 async fn commit_handles_rpc_error_during_rebuild() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
 
     let mock_server = MockServer::start().await;
@@ -1432,6 +1454,7 @@ async fn commit_handles_rpc_error_during_rebuild() {
 #[tokio::test]
 #[serial]
 async fn indistinguishability_expired_and_parse_fail_produce_same_wire_code() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let profile = testnet_profile_with_rpc("https://soroban-testnet.stellar.org");
     let server = WalletServer::new(profile).expect("WalletServer::new");
@@ -1495,6 +1518,7 @@ async fn indistinguishability_expired_and_parse_fail_produce_same_wire_code() {
 #[tokio::test]
 #[serial]
 async fn commit_invalid_memo_parse_matches_nonce_hmac_wire_response() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(46);
 
@@ -1629,6 +1653,7 @@ async fn commit_invalid_memo_parse_matches_nonce_hmac_wire_response() {
 #[serial]
 #[ignore = "timing measurement; run on demand — use `cargo test -- --ignored timing_expired_rebuild_vs_hmac_mismatch_rebuild`"]
 async fn timing_expired_rebuild_vs_hmac_mismatch_rebuild() {
+    let _data_root = common::isolated_data_root();
     use std::time::{Duration, Instant};
 
     keyring_mock::install().expect("mock keyring store init");
@@ -1886,6 +1911,7 @@ impl Respond for AccountOnlyResponder {
 #[tokio::test]
 #[serial]
 async fn pay_commit_high_value_cross_check_passes_on_match() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(42);
 
@@ -2012,6 +2038,7 @@ async fn pay_commit_high_value_cross_check_passes_on_match() {
 #[tokio::test]
 #[serial]
 async fn pay_commit_high_value_cross_check_fails_on_mismatch() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(43);
 
@@ -2116,6 +2143,7 @@ async fn pay_commit_high_value_cross_check_fails_on_mismatch() {
 #[tokio::test]
 #[serial]
 async fn pay_commit_high_value_cross_check_skips_when_oracle_url_unset() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(44);
 
@@ -2242,6 +2270,7 @@ async fn pay_commit_high_value_cross_check_skips_when_oracle_url_unset() {
 #[tokio::test]
 #[serial]
 async fn pay_commit_below_threshold_skips_cross_check_unconditionally() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(45);
 
@@ -2431,8 +2460,12 @@ impl Respond for PaySubmitSuccessRpcResponder {
                     serde_json::json!({ "entries": [], "latestLedger": 1001 })
                 }
             }
+            // The endpoint answers with the hash of the transaction it was
+            // handed, the way a real one does: the wallet polls and records
+            // the hash it computed from the bytes it signed, and reports a
+            // disagreement as `submission.hash_mismatch`.
             "sendTransaction" => serde_json::json!({
-                "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "hash": common::submitted_tx_hash(request),
                 "status": "PENDING",
                 "latestLedger": 1001,
                 "latestLedgerCloseTime": "1234567890"
@@ -2440,7 +2473,7 @@ impl Respond for PaySubmitSuccessRpcResponder {
             "getTransaction" => serde_json::json!({
                 "status": "SUCCESS",
                 "ledger": 1005,
-                "txHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                "txHash": common::polled_tx_hash(request),
             }),
             _ => serde_json::json!({}),
         };
@@ -2465,6 +2498,7 @@ impl Respond for PaySubmitSuccessRpcResponder {
 #[tokio::test]
 #[serial]
 async fn pay_commit_full_round_trip_succeeds_with_string_encoded_amounts() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(200);
 
@@ -2602,6 +2636,7 @@ async fn pay_commit_full_round_trip_succeeds_with_string_encoded_amounts() {
 #[tokio::test]
 #[serial]
 async fn pay_two_phase_round_trip_succeeds_under_satisfied_minimum_reserve_rule() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(201);
 
@@ -2724,6 +2759,7 @@ async fn pay_two_phase_round_trip_succeeds_under_satisfied_minimum_reserve_rule(
 #[tokio::test]
 #[serial]
 async fn pay_commit_denies_under_unsatisfied_minimum_reserve_rule() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
 
     let account_key_xdr = account_ledger_key_xdr(SOURCE_G);
@@ -2796,6 +2832,7 @@ async fn pay_commit_denies_under_unsatisfied_minimum_reserve_rule() {
 #[tokio::test]
 #[serial]
 async fn simulate_nonce_mint_failed_envelope_shape() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     // Deliberately no `install_test_nonce_key(...)` call — the mock store
     // stays empty at the nonce coordinate.
@@ -2917,6 +2954,7 @@ fn per_period_cap_engine(
 #[tokio::test]
 #[serial]
 async fn pay_two_phase_per_period_cap_second_call_denied_by_persisted_window() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(210);
 
@@ -3061,6 +3099,7 @@ async fn pay_two_phase_per_period_cap_second_call_denied_by_persisted_window() {
 #[tokio::test]
 #[serial]
 async fn pay_commit_refuses_with_audit_chain_key_unavailable_when_key_unminted() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(220);
 
@@ -3173,6 +3212,7 @@ async fn pay_commit_refuses_with_audit_chain_key_unavailable_when_key_unminted()
 #[tokio::test]
 #[serial]
 async fn pay_simulate_unaffected_by_missing_audit_key() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(221);
 
@@ -3241,6 +3281,7 @@ async fn pay_simulate_unaffected_by_missing_audit_key() {
 #[tokio::test]
 #[serial]
 async fn pay_commit_refuses_tip_anchor_mismatch_when_the_log_is_rolled_back() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(222);
 
@@ -3391,6 +3432,7 @@ async fn commit_once(
 #[tokio::test]
 #[serial]
 async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(230);
 
@@ -3508,5 +3550,758 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
     assert!(
         committed_json["data"]["tx_hash"].as_str().is_some(),
         "the retry must report an on-chain tx_hash: {committed_json}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Durable submission record
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Answers a submit as accepted and then never confirms it, which is the
+/// condition a durable record exists for.
+///
+/// `getFeeStats` reports `fee_stats`, so two runs of the same intent can be
+/// made to produce different envelope bytes the way live fee stats do.
+struct PayTimeoutRpcResponder {
+    account_key_xdr: String,
+    account_xdr: String,
+    /// One body per `getFeeStats` call, in order; the last one answers every
+    /// call after it.
+    fee_stats: Arc<Vec<serde_json::Value>>,
+    fee_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl PayTimeoutRpcResponder {
+    fn new(
+        account_key_xdr: String,
+        account_xdr: String,
+        fee_stats: Vec<serde_json::Value>,
+    ) -> Self {
+        Self {
+            account_key_xdr,
+            account_xdr,
+            fee_stats: Arc::new(fee_stats),
+            fee_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl Respond for PayTimeoutRpcResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body = serde_json::from_slice::<serde_json::Value>(&request.body)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let req_id = body
+            .get("id")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(1));
+        let rpc_method = body
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+
+        let result = match rpc_method {
+            "getNetwork" => common::EndpointNetwork::testnet().result(),
+            "getFeeStats" => {
+                let index = self
+                    .fee_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                self.fee_stats[index.min(self.fee_stats.len() - 1)].clone()
+            }
+            "getLedgerEntries" => {
+                let raw = String::from_utf8_lossy(&request.body);
+                if raw.contains(&self.account_key_xdr) {
+                    serde_json::json!({
+                        "entries": [{
+                            "key": self.account_key_xdr,
+                            "xdr": self.account_xdr,
+                            "lastModifiedLedgerSeq": 1000
+                        }],
+                        "latestLedger": 1001
+                    })
+                } else {
+                    serde_json::json!({ "entries": [], "latestLedger": 1001 })
+                }
+            }
+            "sendTransaction" => serde_json::json!({
+                "hash": common::submitted_tx_hash(request),
+                "status": "PENDING",
+                "latestLedger": 1001,
+                "latestLedgerCloseTime": "1234567890"
+            }),
+            "getTransaction" => serde_json::json!({
+                "status": "NOT_FOUND",
+                "latestLedger": 1002,
+                "oldestLedger": 1,
+            }),
+            _ => serde_json::json!({}),
+        };
+
+        ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": result,
+            }))
+            .insert_header("content-type", "application/json")
+    }
+}
+
+/// A profile whose submissions time out quickly, under its own signer account
+/// so its audit log is not shared with another test in this binary.
+fn timeout_profile(rpc_url: &str, account: &str) -> Profile {
+    let mut p = Profile::builder_testnet("svc", account, "n-svc", "n-acct")
+        .with_noop_engine()
+        .build();
+    p.rpc_url = rpc_url.to_owned();
+    p.submit_timeout_seconds = Some(1);
+    common::install_test_audit_key(&mut p);
+    p
+}
+
+/// Reads every audit row the profile's log holds.
+fn audit_rows(profile: &Profile) -> Vec<serde_json::Value> {
+    let raw = std::fs::read_to_string(&profile.audit_log_path).unwrap_or_default();
+    raw.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("each audit row must be JSON"))
+        .collect()
+}
+
+fn rows_of_kind<'a>(rows: &'a [serde_json::Value], kind: &str) -> Vec<&'a serde_json::Value> {
+    rows.iter()
+        .filter(|row| row.get("kind").and_then(serde_json::Value::as_str) == Some(kind))
+        .collect()
+}
+
+/// Runs simulate then commit for one payment, returning the commit result.
+async fn simulate_then_commit(
+    server: &WalletServer,
+    args: &StellarPayArgs,
+) -> rmcp::model::CallToolResult {
+    let sim = server
+        .call_stellar_pay(args.clone())
+        .await
+        .expect("simulate must not error");
+    let sim_json = call_result_json(&sim);
+    assert_ne!(
+        sim.is_error,
+        Some(true),
+        "simulate must succeed: {sim_json}"
+    );
+    let data = sim_json.get("data").expect("simulate carries data");
+    server
+        .call_stellar_pay_commit(StellarPayCommitArgs {
+            chain_id: args.chain_id.clone(),
+            source: args.source.clone(),
+            destination: args.destination.clone(),
+            amount: args.amount.clone(),
+            amount_in_stroops: args.amount_in_stroops.clone(),
+            asset: args.asset.clone(),
+            memo_text: None,
+            memo_id: None,
+            memo_hash_hex: None,
+            memo_return_hex: None,
+            nonce: data["nonce"].as_str().expect("nonce").to_owned(),
+            expires_at_unix_ms: data["expires_at_unix_ms"].as_u64().expect("expires"),
+            envelope_xdr: data["envelope_xdr"].as_str().expect("envelope").to_owned(),
+            approval_nonce: None,
+            approval_attestation: None,
+        })
+        .await
+        .expect("commit must not error")
+}
+
+fn pay_args(source: &str, stroops: &str) -> StellarPayArgs {
+    StellarPayArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        source: source.to_owned(),
+        destination: DEST_G.to_owned(),
+        amount: None,
+        amount_in_stroops: Some(stroops.to_owned()),
+        asset: "native".to_owned(),
+        memo_text: None,
+        memo_id: None,
+        memo_hash_hex: None,
+        memo_return_hex: None,
+        classic_base: None,
+    }
+}
+
+/// The same payment with the fee taken from live fee stats, so a rebuild picks
+/// up whatever the endpoint reports at that moment.
+fn pay_args_auto_fee(source: &str, stroops: &str) -> StellarPayArgs {
+    StellarPayArgs {
+        classic_base: Some("auto".to_owned()),
+        ..pay_args(source, stroops)
+    }
+}
+
+/// A commit whose confirmation never arrives reports the transaction hash as
+/// data and leaves the record it wrote standing.
+#[tokio::test]
+#[serial]
+async fn a_timed_out_commit_records_the_submission_and_reports_the_hash() {
+    let _data_root = common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(230);
+
+    let seed = [0x61_u8; 32];
+    let source_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct-f2-timeout")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(PayTimeoutRpcResponder::new(
+            account_ledger_key_xdr(&source_g),
+            account_entry_xdr_with_balance(&source_g, 100_000_000_000_000),
+            vec![fee_stats_result("333", "999")],
+        ))
+        .mount(&mock_server)
+        .await;
+
+    let profile = timeout_profile(&mock_server.uri(), "acct-f2-timeout");
+    let audit_profile = profile.clone();
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+    let profile_name = server.profile_name_for_approval();
+
+    let commit = simulate_then_commit(&server, &pay_args(&source_g, "600000000")).await;
+    let json = call_result_json(&commit);
+    assert_eq!(
+        json["error"]["code"], "submission.tx_timeout",
+        "a submission that never confirms reports a timeout: {json}"
+    );
+
+    // The agent's recovery protocol travels as data, while the message stays
+    // redacted.
+    let details = &json["error"]["details"];
+    let tx_hash = details["tx_hash"].as_str().expect("details carry tx_hash");
+    assert_eq!(tx_hash.len(), 64, "the full hash travels as data: {json}");
+    assert_eq!(details["outcome"], "unknown");
+    assert_eq!(details["reconcile_with"], "stellar_transaction_status");
+    let envelope_hash = details["envelope_hash"]
+        .as_str()
+        .expect("details carry the envelope hash")
+        .to_owned();
+    assert!(
+        !json["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(tx_hash),
+        "the message stays redacted: {json}"
+    );
+
+    // The receipt records a sent transaction whose outcome is not known.
+    let receipts = stellar_agent_core::profile::receipt::ReceiptStore::open(&profile_name)
+        .expect("receipt store");
+    let receipt = receipts
+        .get(&envelope_hash)
+        .expect("receipt store read")
+        .expect("the submission must have left a receipt");
+    assert_eq!(receipt.tx_hash, tx_hash);
+    assert_eq!(
+        receipt.status,
+        stellar_agent_core::profile::receipt::ReceiptStatus::Pending
+    );
+    assert!(receipt.submitted, "the bytes were sent");
+    assert_eq!(receipt.source, source_g);
+
+    // The audit log holds the pending row and no submitted row.
+    let rows = audit_rows(&audit_profile);
+    let pending = rows_of_kind(&rows, "value_action_pending");
+    assert_eq!(
+        pending.len(),
+        1,
+        "exactly one pending row is written before the send: {rows:?}"
+    );
+    assert_eq!(
+        pending[0]["envelope_hash"], envelope_hash,
+        "the pending row carries the full envelope hash on the outer entry"
+    );
+    assert!(
+        rows_of_kind(&rows, "value_action_submitted").is_empty(),
+        "nothing confirmed, so no submitted row: {rows:?}"
+    );
+    assert!(
+        rows_of_kind(&rows, "value_action_failed").is_empty(),
+        "nothing failed either: {rows:?}"
+    );
+}
+
+/// A reservation holds the operator's cap while it stands: a second payment
+/// that would exceed the cap is denied even though the first never confirmed.
+#[tokio::test]
+#[serial]
+async fn a_standing_reservation_denies_a_second_payment_under_the_cap() {
+    let _data_root = common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(231);
+
+    let seed = [0x62_u8; 32];
+    let source_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct-f2-cap")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(PayTimeoutRpcResponder::new(
+            account_ledger_key_xdr(&source_g),
+            account_entry_xdr_with_balance(&source_g, 100_000_000_000_000),
+            vec![fee_stats_result("333", "999")],
+        ))
+        .mount(&mock_server)
+        .await;
+
+    let profile = timeout_profile(&mock_server.uri(), "acct-f2-cap");
+    let mut server = WalletServer::new(profile).expect("WalletServer::new");
+    let profile_name = server.profile_name_for_approval();
+    server.set_policy_engine_for_test(Arc::new(per_period_cap_engine(
+        &["stellar_pay", "stellar_pay_commit"],
+        &profile_name,
+        1_000_000_000, // 100 XLM: one 60 XLM payment fits, two do not
+        "1d",
+    )));
+
+    let commit = simulate_then_commit(&server, &pay_args(&source_g, "600000000")).await;
+    assert_eq!(
+        call_result_json(&commit)["error"]["code"],
+        "submission.tx_timeout"
+    );
+
+    let denied = server
+        .call_stellar_pay(pay_args(&source_g, "600000000"))
+        .await
+        .expect("the second simulate must return a business error, not a protocol error");
+    let (code, _message, _text) = common::assert_business_envelope(&denied);
+    assert_eq!(
+        code, "policy.deny.per_period_cap_exceeded",
+        "a reservation counts against the cap while it stands"
+    );
+}
+
+/// A rebuilt envelope for the same intent is refused: the replay identity the
+/// network enforces is the source account and sequence, not the bytes.
+#[tokio::test]
+#[serial]
+async fn a_rebuilt_envelope_at_the_same_sequence_is_refused() {
+    let _data_root = common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(232);
+
+    let seed = [0x63_u8; 32];
+    let source_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct-f2-dup")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+
+    let account_key_xdr = account_ledger_key_xdr(&source_g);
+    let account_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
+
+    let mock_server = MockServer::start().await;
+    // The first simulate sees a 100-stroop fee ladder, the second a different
+    // one, so the rebuilt envelope's bytes differ the way live fee stats make
+    // them differ.
+    Mock::given(method("POST"))
+        .respond_with(PayTimeoutRpcResponder::new(
+            account_key_xdr,
+            account_xdr,
+            vec![
+                fee_stats_result("333", "999"),
+                fee_stats_result("877", "999"),
+            ],
+        ))
+        .mount(&mock_server)
+        .await;
+
+    let profile = timeout_profile(&mock_server.uri(), "acct-f2-dup");
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    let first = simulate_then_commit(&server, &pay_args_auto_fee(&source_g, "600000000")).await;
+    let first_json = call_result_json(&first);
+    assert_eq!(first_json["error"]["code"], "submission.tx_timeout");
+    let first_hash = first_json["error"]["details"]["tx_hash"]
+        .as_str()
+        .expect("the first submission reports its hash")
+        .to_owned();
+
+    let second = simulate_then_commit(&server, &pay_args_auto_fee(&source_g, "600000000")).await;
+    let second_json = call_result_json(&second);
+    assert_eq!(
+        second_json["error"]["code"], "submission.tx_already_submitted",
+        "a second submission for a sequence a pending record holds is refused: {second_json}"
+    );
+    assert_eq!(
+        second_json["error"]["details"]["tx_hash"], first_hash,
+        "the refusal names the transaction to reconcile: {second_json}"
+    );
+    assert_ne!(
+        second_json["error"]["details"]["envelope_hash"],
+        first_json["error"]["details"]["envelope_hash"],
+        "the rebuilt envelope differs, which is why the bytes cannot be the duplicate signal"
+    );
+}
+
+/// A submission the wallet cannot record is refused before anything is sent.
+#[tokio::test]
+#[serial]
+async fn a_submission_that_cannot_be_recorded_sends_nothing() {
+    let data_root = tempfile::tempdir().expect("temporary data root");
+    let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(data_root.path());
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(233);
+
+    // The receipts directory cannot be created: a file already occupies its
+    // path.
+    std::fs::write(data_root.path().join("receipts"), b"not a directory")
+        .expect("write the blocking file");
+
+    let seed = [0x64_u8; 32];
+    let source_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct-f2-unwritable")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+
+    let mock_server = MockServer::start().await;
+    let send_guard = Mock::given(method("POST"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"method": "sendTransaction"}),
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .named("sendTransaction must never be reached");
+    mock_server.register(send_guard).await;
+    Mock::given(method("POST"))
+        .respond_with(PayTimeoutRpcResponder::new(
+            account_ledger_key_xdr(&source_g),
+            account_entry_xdr_with_balance(&source_g, 100_000_000_000_000),
+            vec![fee_stats_result("333", "999")],
+        ))
+        .mount(&mock_server)
+        .await;
+
+    let profile = timeout_profile(&mock_server.uri(), "acct-f2-unwritable");
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    let commit = simulate_then_commit(&server, &pay_args(&source_g, "600000000")).await;
+    let json = call_result_json(&commit);
+    assert_eq!(
+        json["error"]["code"], "submission.record_unavailable",
+        "a submission the wallet cannot record is refused: {json}"
+    );
+
+    // Verified on drop: the guard mock expects zero calls.
+    drop(mock_server);
+}
+
+/// Answers a submit as accepted and never confirms it, until the test says the
+/// chain has moved on.
+///
+/// `confirm` makes `getTransaction` report `SUCCESS`; `advance_sequence` makes
+/// the source account report the sequence the submitted transaction needed,
+/// which is what tells a `NOT_FOUND` apart from "not indexed yet".
+#[derive(Clone)]
+struct PayReconcileRpcResponder {
+    account_key_xdr: String,
+    account_g: String,
+    balance_stroops: i64,
+    base_sequence: i64,
+    confirm: Arc<std::sync::atomic::AtomicBool>,
+    advance_sequence: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PayReconcileRpcResponder {
+    fn new(account_g: &str, balance_stroops: i64, base_sequence: i64) -> Self {
+        Self {
+            account_key_xdr: account_ledger_key_xdr(account_g),
+            account_g: account_g.to_owned(),
+            balance_stroops,
+            base_sequence,
+            confirm: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            advance_sequence: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+#[async_trait]
+impl Respond for PayReconcileRpcResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        use std::sync::atomic::Ordering;
+
+        let body = serde_json::from_slice::<serde_json::Value>(&request.body)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let req_id = body
+            .get("id")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(1));
+        let rpc_method = body
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+
+        let sequence = if self.advance_sequence.load(Ordering::Acquire) {
+            self.base_sequence + 1
+        } else {
+            self.base_sequence
+        };
+
+        let result = match rpc_method {
+            "getNetwork" => common::EndpointNetwork::testnet().result(),
+            "getHealth" => serde_json::json!({
+                "status": "healthy",
+                "latestLedger": 2000,
+                "oldestLedger": 1,
+                "ledgerRetentionWindow": 1999
+            }),
+            "getLedgerEntries" => {
+                let raw = String::from_utf8_lossy(&request.body);
+                if raw.contains(&self.account_key_xdr) {
+                    serde_json::json!({
+                        "entries": [{
+                            "key": self.account_key_xdr,
+                            "xdr": account_entry_xdr_with_seq(
+                                &self.account_g,
+                                self.balance_stroops,
+                                0,
+                                sequence,
+                            ),
+                            "lastModifiedLedgerSeq": 1000
+                        }],
+                        "latestLedger": 1001
+                    })
+                } else {
+                    serde_json::json!({ "entries": [], "latestLedger": 1001 })
+                }
+            }
+            "sendTransaction" => serde_json::json!({
+                "hash": common::submitted_tx_hash(request),
+                "status": "PENDING",
+                "latestLedger": 1001,
+                "latestLedgerCloseTime": "1234567890"
+            }),
+            "getTransaction" => {
+                if self.confirm.load(Ordering::Acquire) {
+                    serde_json::json!({
+                        "status": "SUCCESS",
+                        "ledger": 1005,
+                        "latestLedger": 1006,
+                        "oldestLedger": 1,
+                        "txHash": common::polled_tx_hash(request),
+                    })
+                } else {
+                    serde_json::json!({
+                        "status": "NOT_FOUND",
+                        "latestLedger": 1002,
+                        "oldestLedger": 1,
+                    })
+                }
+            }
+            _ => serde_json::json!({}),
+        };
+
+        ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": result,
+            }))
+            .insert_header("content-type", "application/json")
+    }
+}
+
+/// Reconciling a timed-out submission the chain did confirm records the spend
+/// and writes the value-action row the submission never got to write.
+#[tokio::test]
+#[serial]
+async fn transaction_status_confirms_a_timed_out_submission() {
+    let _data_root = common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(234);
+
+    let seed = [0x65_u8; 32];
+    let source_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct-f2-status")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+
+    let responder = PayReconcileRpcResponder::new(&source_g, 100_000_000_000_000, 41);
+    let confirm = Arc::clone(&responder.confirm);
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(responder)
+        .mount(&mock_server)
+        .await;
+
+    let profile = timeout_profile(&mock_server.uri(), "acct-f2-status");
+    let audit_profile = profile.clone();
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+    let profile_name = server.profile_name_for_approval();
+
+    let commit = simulate_then_commit(&server, &pay_args(&source_g, "600000000")).await;
+    let json = call_result_json(&commit);
+    assert_eq!(json["error"]["code"], "submission.tx_timeout");
+    let tx_hash = json["error"]["details"]["tx_hash"]
+        .as_str()
+        .expect("the timeout reports its hash")
+        .to_owned();
+    let envelope_hash = json["error"]["details"]["envelope_hash"]
+        .as_str()
+        .expect("the timeout reports its envelope hash")
+        .to_owned();
+
+    // The chain had it all along.
+    confirm.store(true, std::sync::atomic::Ordering::Release);
+
+    let status = server
+        .call_stellar_transaction_status(stellar_agent_mcp::server::StellarTransactionStatusArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            tx_hash: tx_hash.clone(),
+        })
+        .await
+        .expect("the status tool must not error");
+    let status_json = call_result_json(&status);
+    assert_ne!(
+        status.is_error,
+        Some(true),
+        "reconciliation must succeed: {status_json}"
+    );
+    assert_eq!(status_json["data"]["chain_status"], "SUCCESS");
+    assert_eq!(status_json["data"]["record"]["status"], "success");
+    assert_eq!(status_json["data"]["record"]["ledger"], 1005);
+
+    let receipts = stellar_agent_core::profile::receipt::ReceiptStore::open(&profile_name)
+        .expect("receipt store");
+    assert_eq!(
+        receipts.get(&envelope_hash).unwrap().unwrap().status,
+        stellar_agent_core::profile::receipt::ReceiptStatus::Success
+    );
+
+    let rows = audit_rows(&audit_profile);
+    assert_eq!(
+        rows_of_kind(&rows, "value_action_pending").len(),
+        1,
+        "the pending row stands: {rows:?}"
+    );
+    let submitted = rows_of_kind(&rows, "value_action_submitted");
+    assert_eq!(
+        submitted.len(),
+        1,
+        "reconciliation writes the row the submission never got to write: {rows:?}"
+    );
+    assert_eq!(
+        submitted[0]["ledger"], 1005,
+        "the settled row names the ledger the chain confirmed it in: {rows:?}"
+    );
+    assert_eq!(
+        submitted[0]["envelope_hash"], envelope_hash,
+        "the settled row names the same submission as the pending row: {rows:?}"
+    );
+}
+
+/// Reconciling a timed-out submission the chain never took releases its hold
+/// on the spending window, and the next payment proceeds.
+#[tokio::test]
+#[serial]
+async fn transaction_status_releases_a_submission_the_chain_never_took() {
+    let _data_root = common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(235);
+
+    let seed = [0x66_u8; 32];
+    let source_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct-f2-release")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+
+    let responder = PayReconcileRpcResponder::new(&source_g, 100_000_000_000_000, 41);
+    let advance = Arc::clone(&responder.advance_sequence);
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(responder)
+        .mount(&mock_server)
+        .await;
+
+    let profile = timeout_profile(&mock_server.uri(), "acct-f2-release");
+    let mut server = WalletServer::new(profile).expect("WalletServer::new");
+    let profile_name = server.profile_name_for_approval();
+    // The reconciliation tool is named in the rule as well: an operator policy
+    // that denies it leaves a timed-out submission unresolvable through this
+    // server.
+    server.set_policy_engine_for_test(Arc::new(per_period_cap_engine(
+        &[
+            "stellar_pay",
+            "stellar_pay_commit",
+            "stellar_transaction_status",
+        ],
+        &profile_name,
+        1_000_000_000, // 100 XLM: one 60 XLM payment fits, two do not
+        "1d",
+    )));
+
+    let commit = simulate_then_commit(&server, &pay_args(&source_g, "600000000")).await;
+    let json = call_result_json(&commit);
+    assert_eq!(json["error"]["code"], "submission.tx_timeout");
+    let tx_hash = json["error"]["details"]["tx_hash"]
+        .as_str()
+        .expect("the timeout reports its hash")
+        .to_owned();
+    let envelope_hash = json["error"]["details"]["envelope_hash"]
+        .as_str()
+        .expect("the timeout reports its envelope hash")
+        .to_owned();
+
+    // Something else consumed the sequence the submitted transaction needed,
+    // so it can never apply.
+    advance.store(true, std::sync::atomic::Ordering::Release);
+
+    let status = server
+        .call_stellar_transaction_status(stellar_agent_mcp::server::StellarTransactionStatusArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            tx_hash,
+        })
+        .await
+        .expect("the status tool must not error");
+    let status_json = call_result_json(&status);
+    assert_ne!(
+        status.is_error,
+        Some(true),
+        "the status tool must answer: {status_json}"
+    );
+    assert_eq!(status_json["data"]["chain_status"], "NOT_FOUND");
+    assert_eq!(
+        status_json["data"]["record"]["status"], "ambiguous",
+        "the release rests on the endpoint's answers, so the outcome is recorded as unknown: \
+         {status_json}"
+    );
+    assert_eq!(
+        status_json["data"]["record"]["reservation_open"], false,
+        "the reservation is released: {status_json}"
+    );
+
+    let receipts = stellar_agent_core::profile::receipt::ReceiptStore::open(&profile_name)
+        .expect("receipt store");
+    assert_eq!(
+        receipts.get(&envelope_hash).unwrap().unwrap().status,
+        stellar_agent_core::profile::receipt::ReceiptStatus::Ambiguous
+    );
+
+    // With the reservation released, the cap admits the next payment again.
+    let sim = server
+        .call_stellar_pay(pay_args(&source_g, "600000000"))
+        .await
+        .expect("the next simulate must not error");
+    assert_ne!(
+        sim.is_error,
+        Some(true),
+        "a released reservation stops holding the cap: {}",
+        call_result_text(&sim)
     );
 }

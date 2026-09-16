@@ -73,6 +73,13 @@ On failure, `ok` is `false` and `error` carries a stable wire `code` (such as
 `ok`; use `code` for control flow, not the human message. The `request_id`
 correlates the call with the audit log.
 
+Three codes carry an `error.details` object as well: `submission.tx_timeout`,
+`submission.tx_already_submitted` and `submission.hash_mismatch`. Each reports
+a submission whose outcome is unknown, and resolving one needs the full
+transaction hash that the message redacts. `details` carries that hash and the
+verb or tool that reconciles it. No other code carries `details`, and the field
+is absent from the envelope when it is not set.
+
 ## Tool shapes
 
 Each tool is read-only, signs without submitting, or signs and submits; the

@@ -348,6 +348,8 @@ pub(crate) fn render_detail_page(
         r#"<div class="notice">Already resolved &mdash; consent for this request is recorded.</div>"#
     } else if matches!(view.summary, ApprovalSummaryView::Rejected { .. }) {
         r#"<div class="notice">This request was rejected. Nothing was signed.</div>"#
+    } else if matches!(view.summary, ApprovalSummaryView::Consumed { .. }) {
+        r#"<div class="notice">This approval was already spent on a submission. There is nothing left to decide; ask the wallet what became of that transaction.</div>"#
     } else if view.expired {
         r#"<div class="notice warn">This request has expired. It can only be rejected now.</div>"#
     } else {
@@ -376,7 +378,15 @@ pub(crate) fn render_detail_page(
       <p class="caution">Approve only if you expected this request. Nothing is signed until you decide.</p>"#,
             html_escape(approve_button_label(&view.summary))
         )
-    } else if view.attested || matches!(view.summary, ApprovalSummaryView::Rejected { .. }) {
+    } else if view.attested
+        || matches!(
+            view.summary,
+            ApprovalSummaryView::Rejected { .. } | ApprovalSummaryView::Consumed { .. }
+        )
+    {
+        // A spent approval is settled. Offering a reject would present an
+        // action that changes nothing, on an entry whose outcome the chain
+        // already owns.
         String::new()
     } else {
         // Expired-not-yet-resolved and informational (e.g. passkey) kinds:
@@ -397,8 +407,10 @@ pub(crate) fn render_detail_page(
     // sentence expects.
     let expiry_line = if view.expired
         || view.attested
-        || matches!(view.summary, ApprovalSummaryView::Rejected { .. })
-    {
+        || matches!(
+            view.summary,
+            ApprovalSummaryView::Rejected { .. } | ApprovalSummaryView::Consumed { .. }
+        ) {
         format!(
             r#"<p class="expiry" id="expiry-line" data-created-ms="{created}" data-expires-ms="{expires}" data-expiry-form="absolute">
         Created <b id="created-text">{created} (unix ms)</b>. Expiry:

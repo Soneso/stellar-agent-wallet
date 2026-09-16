@@ -11,7 +11,7 @@
 use serde::Serialize;
 
 use super::rule_proposal::ContextRuleProposalSnapshot;
-use super::store::{ApprovalKind, PendingApproval, redact_g_strkey};
+use super::store::{ApprovalKind, PendingApproval, redact_g_strkey, redact_tx_hash};
 
 /// Read-only, non-secret view of a single pending approval entry.
 ///
@@ -227,6 +227,20 @@ pub enum ApprovalSummaryView {
         /// `kind_name()` of the entry before it was rejected.
         original_kind_name: String,
     },
+
+    /// [`ApprovalKind::Consumed`] tombstone — carries no summary data, only
+    /// the kind name of the entry that was consumed, the transaction it was
+    /// spent on, and what is known about that transaction.
+    Consumed {
+        /// `kind_name()` of the entry before it was consumed.
+        original_kind_name: String,
+        /// First-8-last-8 redaction of the transaction hash the approval was
+        /// spent on.
+        tx_hash_redacted: String,
+        /// `confirmed` when the transaction reached a ledger, `unknown` while
+        /// its outcome is still to be reconciled.
+        outcome: String,
+    },
 }
 
 impl PendingApprovalView {
@@ -242,7 +256,9 @@ impl PendingApprovalView {
             ApprovalKind::RegisterPasskey {
                 registration_input, ..
             } => registration_input.is_some(),
-            ApprovalKind::ToolsetFirstInvokeGate { .. } | ApprovalKind::Rejected { .. } => false,
+            ApprovalKind::ToolsetFirstInvokeGate { .. }
+            | ApprovalKind::Rejected { .. }
+            | ApprovalKind::Consumed { .. } => false,
         };
 
         let summary = match &entry.kind {
@@ -366,6 +382,15 @@ impl PendingApprovalView {
             },
             ApprovalKind::Rejected { original_kind_name } => ApprovalSummaryView::Rejected {
                 original_kind_name: original_kind_name.clone(),
+            },
+            ApprovalKind::Consumed {
+                original_kind_name,
+                tx_hash,
+                outcome,
+            } => ApprovalSummaryView::Consumed {
+                original_kind_name: original_kind_name.clone(),
+                tx_hash_redacted: redact_tx_hash(tx_hash),
+                outcome: outcome.label().to_owned(),
             },
         };
 

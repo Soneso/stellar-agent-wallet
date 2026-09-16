@@ -665,6 +665,96 @@ pub enum ApprovalKind {
         /// `"PaymentSimulated"`).
         original_kind_name: String,
     },
+
+    /// A tombstone left behind when the approval is spent by a submission.
+    ///
+    /// Written on both the confirmed and the unknown-outcome arms of a
+    /// commit. Marking rather than removing is what lets a retry be told apart
+    /// from a first attempt: the
+    /// commit gate maps a live `Consumed` entry to the distinct
+    /// `policy.approval_consumed` wire code, so the agent learns its approval
+    /// was already spent and on which transaction, instead of seeing the
+    /// same shape as "no decision yet".
+    ///
+    /// The entry keeps its `attestation_blob_b64` — the evidence of the
+    /// operator decision the submission was made under — and keeps the
+    /// original entry's expiry, so the existing GC sweeps it on the same
+    /// schedule as any other entry. A `Consumed` entry can never be attested.
+    ///
+    /// Summary data from the original entry does not survive: only the kind
+    /// name it replaced, the transaction it was spent on, and whether that
+    /// transaction was confirmed.
+    Consumed {
+        /// `kind_name()` of the entry before it was consumed (e.g.
+        /// `"PaymentSimulated"`).
+        original_kind_name: String,
+        /// The transaction hash the approval was spent on, 64 lowercase hex
+        /// characters. A public identifier.
+        tx_hash: String,
+        /// Whether that transaction was confirmed on-chain.
+        outcome: ConsumedOutcome,
+    },
+}
+
+/// What the wallet knows about the transaction a [`ApprovalKind::Consumed`]
+/// entry was spent on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumedOutcome {
+    /// The transaction was confirmed in a ledger.
+    Confirmed,
+    /// The transaction was sent and its outcome is not known. Resolved by
+    /// reconciling the transaction hash against the chain.
+    Unknown,
+}
+
+impl ConsumedOutcome {
+    /// Returns the stable wire label for this outcome.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Parses a wire label back into an outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the accepted labels when `raw` is neither.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "confirmed" => Ok(Self::Confirmed),
+            "unknown" => Ok(Self::Unknown),
+            other => Err(format!(
+                "Consumed.outcome must be `confirmed` or `unknown`, got `{other}`"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for ConsumedOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Validates the on-disk invariants of a `Consumed` entry.
+fn validate_consumed_invariants(
+    original_kind_name: &str,
+    tx_hash: &str,
+    outcome: &str,
+) -> Result<(), String> {
+    if original_kind_name.is_empty() || original_kind_name.len() > 64 {
+        return Err("Consumed.original_kind_name must be 1-64 characters".to_owned());
+    }
+    if tx_hash.len() != 64 || !tx_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("Consumed.tx_hash must be 64 hex characters".to_owned());
+    }
+    if tx_hash.bytes().any(|b| b.is_ascii_uppercase()) {
+        return Err("Consumed.tx_hash must be lowercase hex".to_owned());
+    }
+    ConsumedOutcome::parse(outcome).map(|_| ())
 }
 
 impl ApprovalKind {
@@ -681,6 +771,7 @@ impl ApprovalKind {
             Self::RuleProposalSimulated { .. } => "RuleProposalSimulated",
             Self::MppChargeSimulated { .. } => "MppChargeSimulated",
             Self::Rejected { .. } => "Rejected",
+            Self::Consumed { .. } => "Consumed",
         }
     }
 }
@@ -883,7 +974,28 @@ impl std::fmt::Debug for ApprovalKind {
                 .debug_struct("Rejected")
                 .field("original_kind_name", original_kind_name)
                 .finish(),
+            Self::Consumed {
+                original_kind_name,
+                tx_hash,
+                outcome,
+            } => f
+                .debug_struct("Consumed")
+                .field("original_kind_name", original_kind_name)
+                .field("tx_hash_redacted", &redact_tx_hash(tx_hash))
+                .field("outcome", &outcome.label())
+                .finish(),
         }
+    }
+}
+
+/// Redacts a transaction hash to first-8-last-8 for debug and operator-facing
+/// rendering, matching the redaction the error surface applies to the same
+/// value.
+pub(super) fn redact_tx_hash(hash: &str) -> String {
+    if hash.len() > 16 {
+        format!("{}...{}", &hash[..8], &hash[hash.len() - 8..])
+    } else {
+        hash.to_owned()
     }
 }
 
@@ -1015,6 +1127,20 @@ struct RejectedWire {
     original_kind_name: String,
 }
 
+/// Wire representation for `ApprovalKind::Consumed`.
+///
+/// Serialised as a `consumed = { ... }` sub-table, structurally distinct from
+/// all other arms.  Enables the cross-kind contamination checks in the custom
+/// `Deserialize` impl.  Unlike `rejected`, an entry carrying this sub-table
+/// keeps its `attestation_blob_b64`: the attestation is the evidence of the
+/// operator decision the consumed submission was made under.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConsumedWire {
+    original_kind_name: String,
+    tx_hash: String,
+    outcome: String,
+}
+
 /// Wire representation for `ApprovalKind::ClaimSimulated`.
 ///
 /// Serialised as a `claim_simulated = { ... }` sub-table, structurally distinct
@@ -1134,6 +1260,12 @@ struct PendingApprovalOnDisk {
     // Rejected sub-table — present iff all other kind fields are absent.
     #[serde(default)]
     rejected: Option<RejectedWire>,
+
+    // Consumed sub-table — present iff all other kind sub-tables and the
+    // PaymentSimulated flat fields are absent. `attestation_blob_b64` may
+    // accompany it.
+    #[serde(default)]
+    consumed: Option<ConsumedWire>,
 
     // Cross-kind attestation/result fields.
     #[serde(default)]
@@ -1386,6 +1518,7 @@ impl Serialize for PendingApproval {
             rule_proposal_simulated,
             mpp_charge_simulated,
             rejected,
+            consumed,
             // registration_input lives inside the RegisterPasskey arm; extract it here
             // so it can be written to the top-level on-disk field.
             registration_input_for_disk,
@@ -1416,6 +1549,7 @@ impl Serialize for PendingApproval {
                 None::<RuleProposalSimulatedWire>,
                 None::<MppChargeSimulatedWire>,
                 None::<RejectedWire>,
+                None::<ConsumedWire>,
                 None::<RegistrationInput>,
             ),
             ApprovalKind::SignWithPasskey {
@@ -1449,6 +1583,7 @@ impl Serialize for PendingApproval {
                 None::<RuleProposalSimulatedWire>,
                 None::<MppChargeSimulatedWire>,
                 None::<RejectedWire>,
+                None::<ConsumedWire>,
                 None::<RegistrationInput>,
             ),
             ApprovalKind::RegisterPasskey {
@@ -1481,6 +1616,7 @@ impl Serialize for PendingApproval {
                 None::<RuleProposalSimulatedWire>,
                 None::<MppChargeSimulatedWire>,
                 None::<RejectedWire>,
+                None::<ConsumedWire>,
                 registration_input.clone(),
             ),
             ApprovalKind::ToolsetFirstInvokeGate {
@@ -1514,6 +1650,7 @@ impl Serialize for PendingApproval {
                 None::<RuleProposalSimulatedWire>,
                 None::<MppChargeSimulatedWire>,
                 None::<RejectedWire>,
+                None::<ConsumedWire>,
                 None::<RegistrationInput>,
             ),
             ApprovalKind::TrustlineClawbackOptIn {
@@ -1541,6 +1678,7 @@ impl Serialize for PendingApproval {
                 None::<RuleProposalSimulatedWire>,
                 None::<MppChargeSimulatedWire>,
                 None::<RejectedWire>,
+                None::<ConsumedWire>,
                 None::<RegistrationInput>,
             ),
             ApprovalKind::ClaimSimulated {
@@ -1580,6 +1718,7 @@ impl Serialize for PendingApproval {
                 None::<RuleProposalSimulatedWire>,
                 None::<MppChargeSimulatedWire>,
                 None::<RejectedWire>,
+                None::<ConsumedWire>,
                 None::<RegistrationInput>,
             ),
             ApprovalKind::RuleProposalSimulated {
@@ -1615,6 +1754,7 @@ impl Serialize for PendingApproval {
                 }),
                 None::<MppChargeSimulatedWire>,
                 None::<RejectedWire>,
+                None::<ConsumedWire>,
                 None::<RegistrationInput>,
             ),
             ApprovalKind::MppChargeSimulated {
@@ -1662,6 +1802,7 @@ impl Serialize for PendingApproval {
                     simulated_fee_stroops: *simulated_fee_stroops,
                 }),
                 None::<RejectedWire>,
+                None::<ConsumedWire>,
                 None::<RegistrationInput>,
             ),
             ApprovalKind::Rejected { original_kind_name } => (
@@ -1682,6 +1823,35 @@ impl Serialize for PendingApproval {
                 None::<MppChargeSimulatedWire>,
                 Some(RejectedWire {
                     original_kind_name: original_kind_name.clone(),
+                }),
+                None::<ConsumedWire>,
+                None::<RegistrationInput>,
+            ),
+            ApprovalKind::Consumed {
+                original_kind_name,
+                tx_hash,
+                outcome,
+            } => (
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None::<SignWithPasskeyWire>,
+                None::<RegisterPasskeyWire>,
+                None::<ToolsetFirstInvokeGateWire>,
+                None::<TrustlineClawbackOptInWire>,
+                None::<ClaimSimulatedWire>,
+                None::<RuleProposalSimulatedWire>,
+                None::<MppChargeSimulatedWire>,
+                None::<RejectedWire>,
+                Some(ConsumedWire {
+                    original_kind_name: original_kind_name.clone(),
+                    tx_hash: tx_hash.clone(),
+                    outcome: outcome.label().to_owned(),
                 }),
                 None::<RegistrationInput>,
             ),
@@ -1708,6 +1878,7 @@ impl Serialize for PendingApproval {
             rule_proposal_simulated,
             mpp_charge_simulated,
             rejected,
+            consumed,
             attestation_blob_b64: self.attestation_blob_b64.clone(),
             passkey_assertion: self.passkey_assertion.clone(),
             registration_input: registration_input_for_disk,
@@ -1787,6 +1958,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
             ),
             ("mpp_charge_simulated", raw.mpp_charge_simulated.is_some()),
             ("rejected", raw.rejected.is_some()),
+            ("consumed", raw.consumed.is_some()),
         ]
         .into_iter()
         .filter_map(|(name, present)| present.then_some(name))
@@ -1837,6 +2009,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
                     raw.rule_proposal_simulated.is_some(),
                 ),
                 ("rejected", raw.rejected.is_some()),
+                ("consumed", raw.consumed.is_some()),
             ] {
                 if present {
                     return Err(serde::de::Error::custom(format!(
@@ -1906,6 +2079,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
                     raw.rule_proposal_simulated.is_some(),
                 ),
                 ("rejected", raw.rejected.is_some()),
+                ("consumed", raw.consumed.is_some()),
             ] {
                 if present {
                     return Err(serde::de::Error::custom(format!(
@@ -1981,6 +2155,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
                     raw.rule_proposal_simulated.is_some(),
                 ),
                 ("rejected", raw.rejected.is_some()),
+                ("consumed", raw.consumed.is_some()),
             ] {
                 if present {
                     return Err(serde::de::Error::custom(format!(
@@ -2041,6 +2216,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
                     raw.rule_proposal_simulated.is_some(),
                 ),
                 ("rejected", raw.rejected.is_some()),
+                ("consumed", raw.consumed.is_some()),
             ] {
                 if present {
                     return Err(serde::de::Error::custom(format!(
@@ -2097,6 +2273,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
                     raw.rule_proposal_simulated.is_some(),
                 ),
                 ("rejected", raw.rejected.is_some()),
+                ("consumed", raw.consumed.is_some()),
             ] {
                 if present {
                     return Err(serde::de::Error::custom(format!(
@@ -2165,6 +2342,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
                 ("passkey_assertion", raw.passkey_assertion.is_some()),
                 ("registration_input", raw.registration_input.is_some()),
                 ("rejected", raw.rejected.is_some()),
+                ("consumed", raw.consumed.is_some()),
             ] {
                 if present {
                     return Err(serde::de::Error::custom(format!(
@@ -2290,6 +2468,49 @@ impl<'de> Deserialize<'de> for PendingApproval {
 
             ApprovalKind::Rejected {
                 original_kind_name: r.original_kind_name,
+            }
+        } else if let Some(c) = raw.consumed {
+            // Cross-kind contamination check: Consumed must not carry
+            // PaymentSimulated flat fields or passkey-related fields. The
+            // attestation blob is NOT in this list: a consumed entry keeps the
+            // attestation it was committed under. Every other sub-table is
+            // already ruled out by the if-else chain above.
+            for (field, present) in [
+                ("envelope_xdr_b64", raw.envelope_xdr_b64.is_some()),
+                ("envelope_sha256_hex", raw.envelope_sha256_hex.is_some()),
+                ("summary_to", raw.summary_to.is_some()),
+                (
+                    "summary_amount_stroops",
+                    raw.summary_amount_stroops.is_some(),
+                ),
+                ("summary_asset", raw.summary_asset.is_some()),
+                ("summary_memo", raw.summary_memo.is_some()),
+                (
+                    "summary_simulated_fee_stroops",
+                    raw.summary_simulated_fee_stroops.is_some(),
+                ),
+                (
+                    "summary_simulated_seq_num",
+                    raw.summary_simulated_seq_num.is_some(),
+                ),
+                ("passkey_assertion", raw.passkey_assertion.is_some()),
+                ("registration_input", raw.registration_input.is_some()),
+            ] {
+                if present {
+                    return Err(serde::de::Error::custom(format!(
+                        "cross-kind field contamination: Consumed entry must not carry \
+                         field `{field}`",
+                    )));
+                }
+            }
+
+            validate_consumed_invariants(&c.original_kind_name, &c.tx_hash, &c.outcome)
+                .map_err(serde::de::Error::custom)?;
+
+            ApprovalKind::Consumed {
+                original_kind_name: c.original_kind_name,
+                tx_hash: c.tx_hash,
+                outcome: ConsumedOutcome::parse(&c.outcome).map_err(serde::de::Error::custom)?,
             }
         } else {
             // Cross-kind contamination check: an entry routed to PaymentSimulated
@@ -4342,6 +4563,70 @@ impl PendingApprovalStore {
             expires_at_unix_ms: now_unix_ms.saturating_add(ttl_ms),
             kind: ApprovalKind::Rejected { original_kind_name },
             attestation_blob_b64: None,
+            passkey_assertion: None,
+        };
+
+        self.persist()?;
+        Ok(true)
+    }
+
+    /// Replaces the entry with the given `approval_nonce` with an
+    /// [`ApprovalKind::Consumed`] tombstone and persists the store.
+    ///
+    /// Called where a commit spends the approval, on both the confirmed and
+    /// the unknown-outcome arms. The tombstone carries only the consumed
+    /// entry's `kind_name()`, the transaction hash it was spent on, and
+    /// whether that transaction was confirmed; the entry's summary data
+    /// (destination, amount, asset, and so on) does not survive.
+    ///
+    /// The entry keeps its `attestation_blob_b64` and its original
+    /// `created_at_unix_ms` / `expires_at_unix_ms`, so it is swept by the
+    /// existing [`Self::gc_expired`] / [`Self::insert`]-time pruning on the
+    /// schedule the original entry already had.
+    ///
+    /// A `Consumed` tombstone can never be attested: it is not one of the
+    /// kinds any attestation path dispatches on, so an attest attempt against
+    /// it always fails closed.
+    ///
+    /// Returns `Ok(true)` if an entry with `approval_nonce` was present and
+    /// replaced, `Ok(false)` if absent (idempotent — consuming an unknown
+    /// nonce is not an error).
+    ///
+    /// # Errors
+    ///
+    /// - [`ApprovalError::Io`] / [`ApprovalError::Toml`] on persistence failure.
+    /// - [`ApprovalError::InvalidEntry`] if `tx_hash` is not 64 lowercase hex
+    ///   characters.
+    pub fn consume(
+        &mut self,
+        approval_nonce: &str,
+        tx_hash: &str,
+        outcome: ConsumedOutcome,
+    ) -> Result<bool, ApprovalError> {
+        let Some(idx) = self
+            .entries
+            .iter()
+            .position(|e| e.approval_nonce == approval_nonce)
+        else {
+            return Ok(false);
+        };
+
+        let original_kind_name = self.entries[idx].kind.kind_name().to_owned();
+        validate_consumed_invariants(&original_kind_name, tx_hash, outcome.label())
+            .map_err(|detail| ApprovalError::InvalidEntry { detail })?;
+
+        let existing = &self.entries[idx];
+        self.entries[idx] = PendingApproval {
+            approval_nonce: approval_nonce.to_owned(),
+            process_uid: existing.process_uid.clone(),
+            created_at_unix_ms: existing.created_at_unix_ms,
+            expires_at_unix_ms: existing.expires_at_unix_ms,
+            kind: ApprovalKind::Consumed {
+                original_kind_name,
+                tx_hash: tx_hash.to_owned(),
+                outcome,
+            },
+            attestation_blob_b64: existing.attestation_blob_b64.clone(),
             passkey_assertion: None,
         };
 
@@ -9355,6 +9640,216 @@ is_proposer = true
             &fingerprint,
             &artifact,
             now,
+        ));
+    }
+
+    // ── Consumed tombstone ───────────────────────────────────────────────────
+
+    /// A commit spends an approval by replacing it with a tombstone, not by
+    /// removing it: the entry keeps its attestation and its expiry, and states
+    /// which transaction it was spent on.
+    #[test]
+    fn consume_replaces_the_entry_and_keeps_its_attestation() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let tx_hash = "ab".repeat(32);
+
+        let toml_content = "[[pending]]\n\
+             approval_nonce = \"AAAAAAAAAAAAAAAAAAAAAA\"\n\
+             envelope_xdr_b64 = \"b64xdr\"\n\
+             envelope_sha256_hex = \"aa\"\n\
+             summary_to = \"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY\"\n\
+             summary_amount_stroops = 100\n\
+             summary_asset = \"XLM\"\n\
+             summary_simulated_fee_stroops = 100\n\
+             summary_simulated_seq_num = 1\n\
+             attestation_blob_b64 = \"YXR0ZXN0YXRpb24\"\n\
+             process_uid = \"1000\"\n\
+             created_at_unix_ms = 1000\n\
+             expires_at_unix_ms = 9999999999999\n\
+             ";
+        std::fs::write(&path, toml_content).unwrap();
+
+        {
+            let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+            let replaced = store
+                .consume("AAAAAAAAAAAAAAAAAAAAAA", &tx_hash, ConsumedOutcome::Unknown)
+                .unwrap();
+            assert!(replaced, "the entry must have been present");
+        }
+
+        // Reopened from disk: the tombstone round-trips, keeps the blob and
+        // the original expiry, and names the transaction it was spent on.
+        let store = PendingApprovalStore::open(path).unwrap();
+        let entry = store
+            .get("AAAAAAAAAAAAAAAAAAAAAA")
+            .expect("the tombstone must still be in the store");
+        match &entry.kind {
+            ApprovalKind::Consumed {
+                original_kind_name,
+                tx_hash: recorded,
+                outcome,
+            } => {
+                assert_eq!(original_kind_name, "PaymentSimulated");
+                assert_eq!(recorded, &tx_hash);
+                assert_eq!(*outcome, ConsumedOutcome::Unknown);
+            }
+            other => panic!("the entry must be a Consumed tombstone; got {other:?}"),
+        }
+        assert_eq!(
+            entry.attestation_blob_b64.as_deref(),
+            Some("YXR0ZXN0YXRpb24"),
+            "the attestation the submission was made under is retained, unchanged"
+        );
+        assert_eq!(
+            entry.expires_at_unix_ms, 9_999_999_999_999,
+            "the tombstone expires on the original entry's schedule"
+        );
+        assert_eq!(entry.created_at_unix_ms, 1_000);
+    }
+
+    /// A confirmed commit records a confirmed outcome.
+    #[test]
+    fn a_confirmed_commit_records_a_confirmed_outcome() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let tx_hash = "cd".repeat(32);
+
+        let toml_content = "[[pending]]\n\
+             approval_nonce = \"BBBBBBBBBBBBBBBBBBBBBB\"\n\
+             envelope_xdr_b64 = \"b64xdr\"\n\
+             envelope_sha256_hex = \"aa\"\n\
+             summary_to = \"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY\"\n\
+             summary_amount_stroops = 100\n\
+             summary_asset = \"XLM\"\n\
+             summary_simulated_fee_stroops = 100\n\
+             summary_simulated_seq_num = 1\n\
+             process_uid = \"1000\"\n\
+             created_at_unix_ms = 1000\n\
+             expires_at_unix_ms = 9999999999999\n\
+             ";
+        std::fs::write(&path, toml_content).unwrap();
+
+        let mut store = PendingApprovalStore::open(path).unwrap();
+        store
+            .consume(
+                "BBBBBBBBBBBBBBBBBBBBBB",
+                &tx_hash,
+                ConsumedOutcome::Confirmed,
+            )
+            .unwrap();
+        let entry = store.get("BBBBBBBBBBBBBBBBBBBBBB").unwrap();
+        assert!(matches!(
+            entry.kind,
+            ApprovalKind::Consumed {
+                outcome: ConsumedOutcome::Confirmed,
+                ..
+            }
+        ));
+    }
+
+    /// Consuming an unknown nonce is not an error: the commit path cannot tell
+    /// an already-swept entry from one that was never there, and neither
+    /// changes what it should do.
+    #[test]
+    fn consuming_an_unknown_nonce_is_not_an_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let mut store = PendingApprovalStore::open(path).unwrap();
+        let replaced = store
+            .consume(
+                "CCCCCCCCCCCCCCCCCCCCCC",
+                &"ef".repeat(32),
+                ConsumedOutcome::Unknown,
+            )
+            .unwrap();
+        assert!(!replaced);
+    }
+
+    /// The tombstone refuses a transaction hash that is not a 64-character
+    /// lowercase hex string: the value is what an operator reconciles with.
+    #[test]
+    fn consume_refuses_a_malformed_transaction_hash() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+
+        let toml_content = "[[pending]]\n\
+             approval_nonce = \"DDDDDDDDDDDDDDDDDDDDDD\"\n\
+             envelope_xdr_b64 = \"b64xdr\"\n\
+             envelope_sha256_hex = \"aa\"\n\
+             summary_to = \"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY\"\n\
+             summary_amount_stroops = 100\n\
+             summary_asset = \"XLM\"\n\
+             summary_simulated_fee_stroops = 100\n\
+             summary_simulated_seq_num = 1\n\
+             process_uid = \"1000\"\n\
+             created_at_unix_ms = 1000\n\
+             expires_at_unix_ms = 9999999999999\n\
+             ";
+        std::fs::write(&path, toml_content).unwrap();
+
+        let mut store = PendingApprovalStore::open(path).unwrap();
+        let err = store
+            .consume("DDDDDDDDDDDDDDDDDDDDDD", "AB", ConsumedOutcome::Unknown)
+            .expect_err("a malformed transaction hash must be refused");
+        assert!(matches!(err, ApprovalError::InvalidEntry { .. }));
+    }
+
+    /// A tombstone carrying a cross-kind field is refused on open: the wire
+    /// shape is one kind's, not several.
+    #[test]
+    fn a_consumed_entry_carrying_payment_fields_is_refused_on_open() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+
+        let toml_content = format!(
+            "[[pending]]\n\
+             approval_nonce = \"EEEEEEEEEEEEEEEEEEEEEE\"\n\
+             process_uid = \"1000\"\n\
+             created_at_unix_ms = 1000\n\
+             expires_at_unix_ms = 9999999999999\n\
+             summary_to = \"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY\"\n\
+             [pending.consumed]\n\
+             original_kind_name = \"PaymentSimulated\"\n\
+             tx_hash = \"{}\"\n\
+             outcome = \"unknown\"\n",
+            "ab".repeat(32)
+        );
+        std::fs::write(&path, toml_content).unwrap();
+
+        let err = PendingApprovalStore::open(path)
+            .expect_err("a contaminated tombstone must be refused on open");
+        assert!(matches!(
+            err,
+            ApprovalError::Toml { .. } | ApprovalError::InvalidEntry { .. }
+        ));
+    }
+
+    /// An outcome label the wallet does not write is refused on open.
+    #[test]
+    fn a_consumed_entry_with_an_unknown_outcome_is_refused_on_open() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+
+        let toml_content = format!(
+            "[[pending]]\n\
+             approval_nonce = \"FFFFFFFFFFFFFFFFFFFFFF\"\n\
+             process_uid = \"1000\"\n\
+             created_at_unix_ms = 1000\n\
+             expires_at_unix_ms = 9999999999999\n\
+             [pending.consumed]\n\
+             original_kind_name = \"PaymentSimulated\"\n\
+             tx_hash = \"{}\"\n\
+             outcome = \"maybe\"\n",
+            "ab".repeat(32)
+        );
+        std::fs::write(&path, toml_content).unwrap();
+
+        let err = PendingApprovalStore::open(path)
+            .expect_err("an unrecognised outcome must be refused on open");
+        assert!(matches!(
+            err,
+            ApprovalError::Toml { .. } | ApprovalError::InvalidEntry { .. }
         ));
     }
 }

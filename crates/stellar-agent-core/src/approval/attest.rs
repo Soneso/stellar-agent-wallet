@@ -310,8 +310,8 @@ pub fn load_attestation_key(
 /// Returns a [`WalletError`] on key-length mismatch, hash-decode failure, a
 /// store-level `NotFound` / `Expired` / `AlreadyAttested` race, a
 /// `persist_toolset_grant` failure, or when `entry.kind` is not one of the
-/// five attestable kinds (including `ApprovalKind::Rejected`, which can never
-/// be attested).
+/// attestable kinds. `ApprovalKind::Rejected` and `ApprovalKind::Consumed`
+/// are tombstones and can never be attested.
 pub fn attest_and_persist(
     store: &mut PendingApprovalStore,
     entry: &PendingApproval,
@@ -603,6 +603,13 @@ pub fn attest_and_persist(
             return Err(WalletError::Internal(InternalError::UnexpectedState {
                 detail: "approval.rejected: this pending approval was rejected by the operator \
                          and cannot be attested"
+                    .to_owned(),
+            }));
+        }
+        ApprovalKind::Consumed { .. } => {
+            return Err(WalletError::Internal(InternalError::UnexpectedState {
+                detail: "approval.consumed: this pending approval was already spent on a \
+                         submission and cannot be attested"
                     .to_owned(),
             }));
         }

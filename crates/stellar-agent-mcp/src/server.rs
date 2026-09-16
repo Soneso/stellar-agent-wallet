@@ -273,6 +273,7 @@ pub use crate::tools::create_account::{StellarCreateAccountArgs, StellarCreateAc
 pub use crate::tools::dex_trade::DexQuoteArgs;
 /// Re-exported for back-compat: argument type for `stellar_fee_stats`.
 pub use crate::tools::fee_stats::StellarFeeStatsArgs;
+
 /// Re-exported for back-compat: argument type for `stellar_friendbot`.
 pub use crate::tools::friendbot::StellarFriendbotArgs;
 /// Re-exported for back-compat: argument types for `stellar_pay`.
@@ -293,6 +294,9 @@ pub use crate::tools::sep47_discover::Sep47DiscoverArgs;
 /// `stellar_sep48_preview_invocation`.
 pub use crate::tools::sep48_preview_invocation::Sep48PreviewInvocationArgs;
 pub use crate::tools::toolsets::StellarToolsetInvokeArgs;
+/// Re-exported for back-compat: argument type for
+/// `stellar_transaction_status`.
+pub use crate::tools::transaction_status::StellarTransactionStatusArgs;
 /// Re-exported for back-compat: argument types for `stellar_trustline`.
 pub use crate::tools::trustline::{StellarTrustlineArgs, StellarTrustlineCommitArgs};
 /// Re-exported for testnet acceptance and integration tests: x402 authenticated-payment args.
@@ -785,6 +789,7 @@ impl WalletServer {
     fn merged_tool_router() -> ToolRouter<WalletServer> {
         let mut router = Self::balances_tool_router();
         router.merge(Self::fee_stats_tool_router());
+        router.merge(Self::transaction_status_tool_router());
         router.merge(Self::friendbot_tool_router());
         router.merge(Self::create_account_tool_router());
         router.merge(Self::pay_tool_router());
@@ -1054,6 +1059,9 @@ impl ServerHandler for WalletServer {
              accounting, and ledger-outcome state); \
              stellar_fee_stats (fetch network fee statistics for fee estimation, \
              read-only); \
+             stellar_transaction_status (reconcile one submitted transaction against \
+             the chain and settle the wallet's record of it; the way out of \
+             submission.tx_timeout, never re-simulate); \
              stellar_defindex_vault_deposit (DeFindex vault deposit via \
              smart-account submit, destructive); \
              stellar_defindex_vault_withdraw (DeFindex vault withdraw via \

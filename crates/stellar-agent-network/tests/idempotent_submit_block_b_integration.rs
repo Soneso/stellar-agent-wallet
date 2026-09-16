@@ -103,20 +103,13 @@ async fn mount_probe_and_signers(server: &MockServer, envelope: &SignedTestEnvel
         .await;
 }
 
-/// Computes the envelope hash for a base64-encoded signed envelope XDR.
+/// The idempotency key the submit paths record under.
+///
+/// Delegates rather than restating the derivation: the key is one definition
+/// shared by both submit paths, and a test that computed its own would pass
+/// while the two disagreed.
 fn envelope_hash_for(signed_xdr: &str) -> String {
-    use base64::Engine as _;
-    use sha2::{Digest, Sha256};
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(signed_xdr.trim())
-        .unwrap();
-    Sha256::digest(&bytes)
-        .iter()
-        .fold(String::new(), |mut s, b| {
-            use std::fmt::Write;
-            let _ = write!(s, "{b:02x}");
-            s
-        })
+    stellar_agent_network::envelope_hash_hex(signed_xdr)
 }
 
 /// JSON-RPC `sendTransaction` response for a PENDING submission of `tx_hash`.
@@ -494,7 +487,7 @@ async fn reorg_demotes_success_to_reorged_with_prior_ledger() {
     let tx_hash = FAKE_TX_HASH;
 
     store
-        .try_begin(envelope_hash, tx_hash, 9_999_999, RECORDED_AT_LEDGER)
+        .try_begin(envelope_hash, tx_hash, "", 0, 9_999_999, RECORDED_AT_LEDGER)
         .unwrap();
     store
         .finalize(envelope_hash, ReceiptStatus::Success, Some(FAKE_LEDGER))
@@ -665,7 +658,7 @@ async fn reconcile_receipt_noop_on_non_success() {
     let tx_hash = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
     store
-        .try_begin(envelope_hash, tx_hash, 0, RECORDED_AT_LEDGER)
+        .try_begin(envelope_hash, tx_hash, "", 0, 0, RECORDED_AT_LEDGER)
         .unwrap();
     // Receipt is Pending.
 
@@ -708,7 +701,7 @@ async fn reconcile_receipt_success_still_success_no_reorg() {
     let tx_hash = FAKE_TX_HASH;
 
     store
-        .try_begin(envelope_hash, tx_hash, 0, RECORDED_AT_LEDGER)
+        .try_begin(envelope_hash, tx_hash, "", 0, 0, RECORDED_AT_LEDGER)
         .unwrap();
     store
         .finalize(envelope_hash, ReceiptStatus::Success, Some(FAKE_LEDGER))
@@ -1024,7 +1017,7 @@ async fn not_found_then_success_clears_anchor_no_reorged() {
     let tx_hash = FAKE_TX_HASH;
 
     store
-        .try_begin(envelope_hash, tx_hash, 9_999_999, RECORDED_AT_LEDGER)
+        .try_begin(envelope_hash, tx_hash, "", 0, 9_999_999, RECORDED_AT_LEDGER)
         .unwrap();
     store
         .finalize(envelope_hash, ReceiptStatus::Success, Some(FAKE_LEDGER))
@@ -1145,7 +1138,7 @@ async fn success_reappear_then_miss_requires_fresh_two_poll_window() {
     let tx_hash = FAKE_TX_HASH;
 
     store
-        .try_begin(envelope_hash, tx_hash, 9_999_999, RECORDED_AT_LEDGER)
+        .try_begin(envelope_hash, tx_hash, "", 0, 9_999_999, RECORDED_AT_LEDGER)
         .unwrap();
     store
         .finalize(envelope_hash, ReceiptStatus::Success, Some(FAKE_LEDGER))
@@ -1283,7 +1276,7 @@ async fn two_consecutive_not_found_still_demotes_to_reorged() {
     let tx_hash = FAKE_TX_HASH;
 
     store
-        .try_begin(envelope_hash, tx_hash, 9_999_999, RECORDED_AT_LEDGER)
+        .try_begin(envelope_hash, tx_hash, "", 0, 9_999_999, RECORDED_AT_LEDGER)
         .unwrap();
     store
         .finalize(envelope_hash, ReceiptStatus::Success, Some(FAKE_LEDGER))
@@ -1390,7 +1383,7 @@ async fn retention_drop_returns_ambiguous_not_reorged() {
     let envelope_hash = "1111111111111111111111111111111111111111111111111111111111111111";
     let tx_hash = FAKE_TX_HASH;
     store
-        .try_begin(envelope_hash, tx_hash, 9_999_999, RECORDED_AT_LEDGER)
+        .try_begin(envelope_hash, tx_hash, "", 0, 9_999_999, RECORDED_AT_LEDGER)
         .unwrap();
     store
         .finalize(envelope_hash, ReceiptStatus::Success, Some(FAKE_LEDGER))
@@ -1476,7 +1469,7 @@ async fn reconcile_receipt_degraded_health_returns_ambiguous() {
     let envelope_hash = "2222222222222222222222222222222222222222222222222222222222222222";
     let tx_hash = FAKE_TX_HASH;
     store
-        .try_begin(envelope_hash, tx_hash, 0, RECORDED_AT_LEDGER)
+        .try_begin(envelope_hash, tx_hash, "", 0, 0, RECORDED_AT_LEDGER)
         .unwrap();
     store
         .finalize(envelope_hash, ReceiptStatus::Success, Some(FAKE_LEDGER))

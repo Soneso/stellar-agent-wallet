@@ -297,8 +297,9 @@ enum TipAnchorOpenMode {
 enum AnchorOutcome {
     /// No anchor store is attached; nothing was checked.
     NotAnchored,
-    /// No anchor existed and the active file is empty; the empty-file anchor
-    /// was written. No row is emitted — there is no tip to record.
+    /// No anchor existed and the active file holds no entries. The store is
+    /// left empty, which says exactly that; the first append writes the first
+    /// anchor. No row is emitted — there is no tip to record.
     AdoptedEmpty,
     /// No anchor existed and the active file carried entries; its tip was
     /// adopted. The caller emits the `audit_tip_anchored` row.
@@ -6784,18 +6785,49 @@ mod tests {
     /// Visibility is not part of the predicate: a `pub(crate)` constructor
     /// reachable from anywhere in this crate opens exactly the same hole as a
     /// `pub` one.
+    /// Returns `true` when `signature` takes an anchor store the caller cannot
+    /// omit.
+    ///
+    /// An optional store is not an exemption: a keyed writer constructed with
+    /// `None` writes rows no anchor covers, which is the whole condition this
+    /// scan exists to prevent. The check looks for an `Option<` within the
+    /// parameter that names the store, so `Option<Arc<dyn TipAnchorStore>>`
+    /// and `Option<&dyn TipAnchorStore>` both read as optional.
+    fn takes_a_required_anchor_store(signature: &str) -> bool {
+        let mut required = false;
+        for (idx, _) in signature.match_indices("TipAnchorStore") {
+            let window_start = signature[..idx]
+                .rfind([',', '('])
+                .map_or(0, |offset| offset + 1);
+            if signature[window_start..idx].contains("Option<") {
+                continue;
+            }
+            required = true;
+        }
+        required
+    }
+
     fn keyed_constructors_without_an_anchor(source: &str) -> Vec<String> {
         let mut offenders = Vec::new();
         for (idx, _) in source.match_indices("fn open") {
             let line_start = source[..idx].rfind('\n').map_or(0, |nl| nl + 1);
             // Only a declaration at the head of its line, so call sites and
-            // prose mentioning `fn open` are not scanned.
-            if !source[line_start..idx].split_whitespace().all(|word| {
+            // prose mentioning `fn open` are not scanned. A declaration with no
+            // visibility keyword is the shared private implementation every
+            // public entry point funnels through; it cannot be reached by a
+            // caller holding `AuditWriter`, which is the reach this scan is
+            // about.
+            let prefix: Vec<&str> = source[line_start..idx].split_whitespace().collect();
+            let visible = prefix
+                .iter()
+                .any(|word| matches!(*word, "pub" | "pub(crate)" | "pub(super)"));
+            let well_formed = prefix.iter().all(|word| {
                 matches!(
-                    word,
+                    *word,
                     "pub" | "pub(crate)" | "pub(super)" | "const" | "async" | "unsafe"
                 )
-            }) {
+            });
+            if !visible || !well_formed {
                 continue;
             }
             let end = source[idx..]
@@ -6804,7 +6836,7 @@ mod tests {
             let signature = &source[idx..end];
             if !signature.contains("Zeroizing<[u8; 32]>")
                 || signature.contains("KeyedAuditAccess")
-                || signature.contains("TipAnchorStore")
+                || takes_a_required_anchor_store(signature)
             {
                 continue;
             }
@@ -6852,6 +6884,31 @@ mod tests {
             1,
             "visibility must not exempt a constructor from the scan"
         );
+        let optional_store_offender = "    pub fn open_keyed(\n        path: PathBuf,\n        \
+             hmac_key: Zeroizing<[u8; 32]>,\n        anchor: Option<Arc<dyn TipAnchorStore>>,\n\
+                 ) -> Result<Self, WriterError> {";
+        assert_eq!(
+            keyed_constructors_without_an_anchor(optional_store_offender).len(),
+            1,
+            "an anchor store the caller may omit is not an exemption: a keyed writer \
+             constructed with None writes rows no anchor covers"
+        );
+        let private_helper = "    fn open_inner(\n        path: PathBuf,\n        \
+             hmac_key: Option<Zeroizing<[u8; 32]>>,\n        anchor: Option<Arc<dyn TipAnchorStore>>,\n\
+                 ) -> Result<Self, WriterError> {";
+        assert!(
+            keyed_constructors_without_an_anchor(private_helper).is_empty(),
+            "the shared private implementation every public entry point funnels through is \
+             not reachable by a caller holding AuditWriter"
+        );
+        let required_store = "    pub fn open_keyed(\n        path: PathBuf,\n        \
+             hmac_key: Zeroizing<[u8; 32]>,\n        anchor: &dyn TipAnchorStore,\n\
+                 ) -> Result<Self, WriterError> {";
+        assert!(
+            keyed_constructors_without_an_anchor(required_store).is_empty(),
+            "a required anchor store is the exemption the scan is written around"
+        );
+
         let gated = format!("    #[cfg(any(test, feature = \"test-helpers\"))]\n{public_offender}");
         assert!(
             keyed_constructors_without_an_anchor(&gated).is_empty(),
@@ -6908,5 +6965,61 @@ mod tests {
     /// Runs the verifier's chain walk and reports whether it passes.
     fn verify_log_is_clean(path: &Path) -> bool {
         crate::audit_log::verify::verify_log(path, None).is_ok()
+    }
+
+    /// A log replaced underneath the writer AND grown past the rotation
+    /// threshold refuses, and archives nothing.
+    ///
+    /// The identity check runs before the rotation decision, which is the one
+    /// moment the handle and the path are legitimately allowed to diverge.
+    /// Reversing the two would rename a file the writer never verified into an
+    /// archive and start a fresh chain on top of it, turning a substituted log
+    /// into a rotation the chain walk accepts.
+    #[test]
+    fn a_replaced_log_over_the_rotation_threshold_refuses_and_archives_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        let mut writer = open_anchored(&path, &store).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        let anchored_bytes = fs::read(&path).unwrap();
+
+        // A replacement that is both a different file and over the threshold.
+        let replacement = dir.path().join("replacement.jsonl");
+        let mut padded = anchored_bytes.clone();
+        padded.resize(
+            usize::try_from(crate::audit_log::rotation::ROTATION_THRESHOLD_BYTES).unwrap() + 1,
+            b'\n',
+        );
+        fs::write(&replacement, &padded).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+
+        let err = writer
+            .write_entry(make_entry(""))
+            .expect_err("a replaced log must refuse before anything is archived");
+        assert!(
+            matches!(
+                &err,
+                WriterError::TipAnchorMismatch { reason, .. } if *reason == LOG_REPLACED_REASON
+            ),
+            "the refusal must name the replacement, not the size: {err:?}"
+        );
+
+        let archives: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| is_rotated_sibling("audit.jsonl", name))
+            .collect();
+        assert!(
+            archives.is_empty(),
+            "a refused append must archive nothing: {archives:?}"
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            padded.len() as u64,
+            "the file at the path is untouched by the refusal"
+        );
     }
 }

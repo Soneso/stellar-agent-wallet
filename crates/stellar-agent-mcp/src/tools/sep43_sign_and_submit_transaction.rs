@@ -339,12 +339,60 @@ impl WalletServer {
         let timeout = crate::tools::common::submit_timeout(&self.profile);
         let network_passphrase = self.profile.network_passphrase.as_str();
 
+        // Record the submission before the bytes leave. The envelope is the
+        // caller's, so the policy engine sized no value for it and no
+        // spending-window reservation is possible — but the receipt, the
+        // pending row and the duplicate suppression are, and they are what
+        // make a timeout here reconcilable and the sequence protected.
+        let profile_name = self.profile_name_for_approval();
+        let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(crate::tools::common::business_error_result(
+                    "wallet.clock_error",
+                    e.to_string(),
+                ));
+            }
+        };
+        let recorder = match crate::tools::submission_record::build_recorder(
+            crate::tools::submission_record::CommitRecord {
+                profile: &self.profile,
+                profile_name: profile_name.clone(),
+                tool: "stellar_sep43_sign_and_submit_transaction",
+                chain_id: self.profile.chain_id.caip2_str().to_owned(),
+                legs: Vec::new(),
+                engine: self.policy_engine.as_ref(),
+                descriptor: None,
+                value_class: stellar_agent_core::policy::v1::ValueClass::Opaque(
+                    OpaqueReason::RawTransactionSignature,
+                ),
+                audit: std::sync::Arc::clone(&audit_writer),
+                nonce_id: None,
+                approval_nonce: None,
+                approval_dir: None,
+                now_ms,
+            },
+            None,
+        ) {
+            // The tool writes the row that carries its own contract, so the
+            // recorder leaves the confirmed arm to it: one settled row per
+            // confirmed send.
+            Ok(r) => r.with_caller_written_confirmed_row(),
+            Err(err) => {
+                return Ok(crate::tools::submission_record::submission_error_result(
+                    &err,
+                    &signed_xdr,
+                ));
+            }
+        };
+
         match submit_transaction_and_wait(
             &client,
             &signed_xdr,
             timeout,
             network_passphrase,
             Some(stellar_agent_network::SubmissionSignerKind::Keyring),
+            Some(&recorder),
         )
         .await
         {
@@ -370,6 +418,12 @@ impl WalletServer {
                 // legs are empty and the opaque reason is the tool's fixed
                 // classification (name-derived, not argument-derived). The on-chain
                 // tx is identified by the redacted hash.
+                //
+                // The row names the submission it settles. It is the only
+                // settled row this send writes, so without the envelope hash
+                // the pending row written before the send stays owed for good
+                // and a later reconciliation of the same transaction appends a
+                // second one.
                 let request_id = uuid::Uuid::new_v4().to_string();
                 let audit_entry = AuditEntry::new_opaque_action_submitted(
                     "stellar_sep43_sign_and_submit_transaction",
@@ -378,7 +432,7 @@ impl WalletServer {
                     redacted.as_str(),
                     result.ledger,
                     PolicyDecision::Allow,
-                    None,
+                    Some(stellar_agent_network::envelope_hash_hex(&signed_xdr)),
                     None,
                     &request_id,
                 );
@@ -404,10 +458,11 @@ impl WalletServer {
                 stellar_agent_core::error::SubmissionError::TxTimeout { ref tx_hash, .. },
             )) => {
                 // The transaction was submitted but not confirmed within the
-                // polling window. The transaction MAY still be accepted in a
-                // future ledger. Map to `status: "pending"`. `tx_hash` may be
-                // empty-string if timeout fired before the hash was retrieved;
-                // use what we have.
+                // polling window. It MAY still be accepted in a future ledger,
+                // so the response is `status: "pending"` carrying the full
+                // transaction hash: the hash is computed from the envelope
+                // before the send, so it is always populated, and it is what
+                // `stellar_transaction_status` reconciles against.
                 let redacted = stellar_agent_network::submit::redact_tx_hash(tx_hash);
                 tracing::info!(
                     tx_hash = %redacted,
@@ -472,6 +527,27 @@ impl WalletServer {
                 Ok(crate::tools::common::business_error_result(
                     sep43_err.wire_code(),
                     sep43_err.to_string(),
+                ))
+            }
+
+            // A submission whose outcome only reconciliation can settle keeps
+            // its own code and carries the transaction to reconcile. The tool
+            // records its submissions like any other, so a dapp that
+            // re-submits the same sequence after a timeout gets the hash it
+            // needs rather than a generic transport failure.
+            Err(ref err)
+                if matches!(
+                    err,
+                    stellar_agent_core::WalletError::Submission(
+                        stellar_agent_core::error::SubmissionError::TxAlreadySubmitted { .. }
+                            | stellar_agent_core::error::SubmissionError::HashMismatch { .. }
+                            | stellar_agent_core::error::SubmissionError::RecordUnavailable { .. }
+                    )
+                ) =>
+            {
+                Ok(crate::tools::submission_record::submission_error_result(
+                    err,
+                    &signed_xdr,
                 ))
             }
 

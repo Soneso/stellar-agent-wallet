@@ -79,6 +79,49 @@ single-use nonce is burned, so a refusal here leaves the nonce usable.
 | `network.envelope_unsigned` | The envelope carries no signature, or on a fee-bump the outer or the inner transaction carries none; typically a build-only envelope handed straight to a submit step. | Sign the envelope first, then submit. On a fee-bump, both the inner transaction and the fee source must sign. |
 | `network.account_not_found` | A transaction-source or operation-source account on the envelope is absent from the ledger, so its signer set cannot be read. | Nothing was sent. Confirm the account exists and is funded on the target network. |
 
+## Submission codes (unresolved outcomes)
+
+Every value-moving verb records its transaction before it is sent: a submission
+receipt, a spending-window reservation, and a `value_action_pending` audit row.
+A submission whose outcome never comes back keeps that record, and the codes
+below report one. Three of them carry an `error.details` object with the full
+transaction hash the message redacts.
+
+The rule for all of them is the same: **reconcile, never rebuild.** At most one
+transaction per source account and sequence can ever apply, and the wallet
+cannot tell whether the recorded one did. A second submission at that sequence
+is refused until the first is settled, and a different fee does not get around
+it.
+
+| Code | Meaning | Agent action |
+|---|---|---|
+| `submission.tx_timeout` | The transaction was accepted for inclusion and was not confirmed within the submission timeout. It may still apply. `details` carries `tx_hash`, `timeout_seconds`, `outcome: "unknown"`, `reconcile_with`, and `envelope_hash` where the reporting surface holds the signed bytes. | Call `stellar_transaction_status` with `details.tx_hash` (CLI: `stellar-agent tx status <HASH>`). Do not re-simulate and do not rebuild. |
+| `submission.tx_already_submitted` | A pending record already holds this transaction's source account and sequence. Nothing was sent. `details.tx_hash` names the transaction to reconcile. | Reconcile `details.tx_hash` first. Once it is settled, the sequence is free and a fresh simulate-and-commit proceeds. |
+| `submission.hash_mismatch` | The endpoint reported a transaction hash that does not describe the transaction that was sent. `details` carries both hashes. | Reconcile `details.tx_hash`. Report the mismatch to the operator: the endpoint is not describing what it was handed. |
+| `submission.record_unavailable` | The wallet could not durably record the submission, so nothing was sent. The condition is local: an unwritable receipt store, an unreadable spending-window file, or an audit log that cannot be appended. | Not agent-recoverable. Report to the operator; the submission is safe to retry once it is fixed. |
+| `submission.tx_malformed` | The network refused the transaction outright (for example the fee was below the current floor). Nothing was queued and no value moved. | A fresh simulate-and-commit is the next step; the sequence is free. |
+| `policy.approval_consumed` | The approval presented was already spent on a submission. | Check that transaction's status before asking for the action again. Do not re-present the same approval. |
+
+What `stellar_transaction_status` reports, and what it means:
+
+- `chain_status: "SUCCESS"` — the payment went through. Report it as done.
+- `chain_status: "FAILED"` — the transaction applied and failed. Nothing moved.
+- `chain_status: "NOT_FOUND"` with `record.status: "pending"` — nothing is
+  settled. The transaction can still apply. Wait and call again.
+- `chain_status: "NOT_FOUND"` with `record.status: "failed"` — the transaction
+  can no longer apply. A fresh simulate-and-commit is the next step.
+- `chain_status: "NOT_FOUND"` with `record.status: "ambiguous"` — the endpoint
+  can no longer answer for it at all, and only the operator can resolve it, with
+  `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge`.
+
+Read `record.status`, not `record.reservation_open`. An action the policy engine
+sized no value for takes no reservation at all, so `reservation_open` is `false`
+for it from the start and says nothing about whether the submission settled.
+
+An operator policy that lists tools explicitly must include
+`stellar_transaction_status`, or a timed-out submission cannot be resolved
+through the MCP server. The CLI verb is not policy-gated.
+
 ## Nonce codes (two-phase signing verbs)
 
 A simulate step (`stellar_pay`, `stellar_create_account`, `stellar_trustline`,

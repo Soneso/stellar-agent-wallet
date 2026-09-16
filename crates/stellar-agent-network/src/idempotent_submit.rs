@@ -218,8 +218,9 @@ pub async fn submit_transaction_idempotent(
         }));
     }
 
-    // ── Step 3: extract tx_hash and max_time from the V1 envelope ──────────
+    // ── Step 3: extract tx_hash, replay identity and max_time ──────────────
     let tx_hash_hex = compute_tx_hash_hex(&envelope, network_passphrase)?;
+    let (source, sequence) = crate::submit::replay_identity(&envelope)?;
     let max_time = extract_max_time(&envelope);
 
     let redacted = redact_envelope_hash(&envelope_hash);
@@ -297,7 +298,14 @@ pub async fn submit_transaction_idempotent(
 
     // ── Step 5: atomic winner/loser gate ───────────────────────────────────
     let outcome = store
-        .try_begin(&envelope_hash, &tx_hash_hex, max_time, recorded_at_ledger)
+        .try_begin(
+            &envelope_hash,
+            &tx_hash_hex,
+            &source,
+            sequence,
+            max_time,
+            recorded_at_ledger,
+        )
         .map_err(|e| {
             WalletError::Internal(stellar_agent_core::error::InternalError::UnexpectedState {
                 detail: format!("receipt store try_begin failed: {e}"),
@@ -346,17 +354,21 @@ pub async fn submit_transaction_idempotent(
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Decodes the base64-encoded envelope XDR and computes the SHA-256 hash of
-/// the raw XDR bytes (the idempotency key).
+/// Decodes the base64-encoded envelope XDR and computes the idempotency key.
+///
+/// The key is [`crate::submit::envelope_hash_hex`]: `SHA-256` over the base64
+/// string. One definition keys the receipt store, because both this path and
+/// the recorded submit path write receipts into it, and the same envelope
+/// reaching the store by two routes has to answer as one record. The string
+/// form is the wallet's convention elsewhere too: the approval store hashes
+/// the same bytes.
 fn decode_and_hash_envelope(
     envelope_xdr: &str,
 ) -> Result<(TransactionEnvelope, String), WalletError> {
     // Decode base64 → raw XDR bytes.
     let xdr_bytes = base64_decode(envelope_xdr)?;
 
-    // Compute SHA-256 over the full signed envelope bytes.
-    let hash_bytes = Sha256::digest(&xdr_bytes);
-    let envelope_hash = bytes_to_hex(&hash_bytes);
+    let envelope_hash = crate::submit::envelope_hash_hex(envelope_xdr);
 
     // Decode from XDR for structural access. The envelope is caller-supplied and
     // untrusted; bounded limits prevent a deeply nested auth-invocation tree from
@@ -991,6 +1003,16 @@ pub(crate) async fn submit_with_retention_poll(
             }
         };
 
+    // The transaction hash is a property of the envelope: computing it here
+    // means the poll handle, the receipt and every diagnostic name the
+    // transaction the wallet signed.
+    let tx_hash_hex = crate::submit::compute_local_tx_hash_hex(&envelope, network_passphrase)?;
+    let local_tx_hash_bytes = stellar_agent_core::hex::decode_hex32(&tx_hash_hex).map_err(|e| {
+        WalletError::Protocol(ProtocolError::XdrCodecFailed {
+            detail: format!("computed transaction hash is not 32 hex-encoded bytes: {e}"),
+        })
+    })?;
+
     // Mark the receipt as submitted BEFORE calling send_transaction.
     //
     // This sets `submitted = true` on the Pending receipt so that
@@ -1001,10 +1023,11 @@ pub(crate) async fn submit_with_retention_poll(
     // A persist failure here is logged at warn and NOT returned as an error: the
     // mark_submitted write is a best-effort durability hint.  The primary
     // safety invariant — the Pending entry exists — was established by
-    // try_begin's sync_all persist.  Losing the `submitted` flag on a crash
-    // means abandon_pre_submit will conservatively treat the receipt as
-    // submitted=false (via #[serde(default)]), which allows a retry; that is
-    // the safer failure mode compared to abandoning a potentially-on-network tx.
+    // try_begin's sync_all persist.  A receipt whose `submitted` field is
+    // absent deserialises as `true` (`#[serde(default)]` on the field), so a
+    // crash that loses this write leaves the receipt un-abandonable rather
+    // than abandonable: the receipt is kept for a transaction that may have
+    // reached the network.
     if let Err(e) = store.mark_submitted(envelope_hash) {
         tracing::warn!(
             envelope_hash = %redact_envelope_hash(envelope_hash),
@@ -1025,7 +1048,7 @@ pub(crate) async fn submit_with_retention_poll(
     // TransactionSubmissionFailed is NOT retried.
     let retry_policy = RetryPolicy::default();
 
-    let tx_hash_bytes = {
+    let server_tx_hash = {
         let inner = &client.inner;
         let url = &client.url;
         retry_with_backoff(
@@ -1043,14 +1066,18 @@ pub(crate) async fn submit_with_retention_poll(
         })?
     };
 
-    let tx_hash_hex: String = tx_hash_bytes
-        .0
-        .iter()
-        .fold(String::with_capacity(64), |mut s, b| {
-            use std::fmt::Write as _;
-            let _ = write!(s, "{b:02x}");
-            s
-        });
+    // The hash polled and recorded is the one computed from the bytes that
+    // were sent. An endpoint reporting a different one is not describing this
+    // transaction; the receipt stays keyed on the local hash and stays
+    // pending, because what the endpoint did with the bytes is unknown.
+    let server_tx_hash_hex = crate::submit::bytes_to_hex(&server_tx_hash.0);
+    if server_tx_hash_hex != tx_hash_hex {
+        return Err(WalletError::Submission(SubmissionError::HashMismatch {
+            local: tx_hash_hex,
+            server: server_tx_hash_hex,
+        }));
+    }
+
     let redacted_tx = redact_tx_hash(&tx_hash_hex);
     tracing::info!(
         envelope_hash = %redacted,
@@ -1058,7 +1085,7 @@ pub(crate) async fn submit_with_retention_poll(
         "submit_with_retention_poll: sendTransaction accepted"
     );
 
-    let tx_hash_obj = Hash(tx_hash_bytes.0);
+    let tx_hash_obj = Hash(local_tx_hash_bytes);
 
     // Poll until SUCCESS, FAILED, timeout, or retention-window closure.
     //
@@ -1846,6 +1873,24 @@ mod tests {
         assert_eq!(original, decoded);
     }
 
+    /// The idempotency key is the one `submit_transaction_and_wait` records
+    /// under, so one envelope reaching the receipt store by either route is
+    /// one record.
+    #[test]
+    fn the_idempotency_key_is_the_recorded_envelope_hash() {
+        let xdr =
+            stellar_agent_test_support::signed_envelope::SignedTestEnvelope::for_source([0x44; 32])
+                .envelope_xdr()
+                .to_owned();
+
+        let (_, key) = decode_and_hash_envelope(&xdr).unwrap();
+        assert_eq!(
+            key,
+            crate::submit::envelope_hash_hex(&xdr),
+            "both submit paths key the receipt store the same way"
+        );
+    }
+
     /// `decode_and_hash_envelope` produces a stable hash for the same input.
     #[test]
     fn decode_and_hash_envelope_stable() {
@@ -1895,7 +1940,9 @@ mod tests {
         let (_dir, store) = open_temp_store();
 
         // Pre-populate a terminal Success receipt.
-        store.try_begin(&envelope_hash, &tx_hash, 0, 100).unwrap();
+        store
+            .try_begin(&envelope_hash, &tx_hash, "", 0, 0, 100)
+            .unwrap();
         store
             .finalize(&envelope_hash, ReceiptStatus::Success, Some(42))
             .unwrap();
@@ -2095,7 +2142,9 @@ mod tests {
         let (_dir, store) = open_temp_store();
 
         // Manually inject a stale Pending receipt with the all-zeros sentinel.
-        store.try_begin(&envelope_hash, ZERO_HASH, 0, 100).unwrap();
+        store
+            .try_begin(&envelope_hash, ZERO_HASH, "", 0, 0, 100)
+            .unwrap();
 
         // Client must never be contacted.  Use an unreachable URL.
         let client = crate::StellarRpcClient::new("https://localhost:19999").unwrap();
@@ -2169,7 +2218,7 @@ mod tests {
 
         let (dir, store) = open_temp_store();
         store
-            .try_begin(&envelope_hash, fake_tx_hash, 0, 100)
+            .try_begin(&envelope_hash, fake_tx_hash, "", 0, 0, 100)
             .unwrap();
         (xdr, envelope_hash, dir, store)
     }

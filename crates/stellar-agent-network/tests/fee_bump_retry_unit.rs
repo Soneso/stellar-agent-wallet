@@ -93,7 +93,9 @@ fn fee_bump_receipt_to_result_failed_yields_rpc_unreachable_with_code() {
         "feebump-inner:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let outer_tx_hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-    store.try_begin(inner_key, outer_tx_hash, 0, 100).unwrap();
+    store
+        .try_begin(inner_key, outer_tx_hash, "", 0, 0, 100)
+        .unwrap();
     store
         .finalize(
             inner_key,
@@ -160,7 +162,9 @@ async fn fee_bump_idempotent_with_cached_ambiguous_receipt_returns_error() {
     let inner_key = format!("feebump-inner:{hash_hex}");
     let outer_tx_hash = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
-    store.try_begin(&inner_key, outer_tx_hash, 0, 100).unwrap();
+    store
+        .try_begin(&inner_key, outer_tx_hash, "", 0, 0, 100)
+        .unwrap();
     store
         .finalize(&inner_key, ReceiptStatus::Ambiguous, None)
         .unwrap();
@@ -239,7 +243,9 @@ async fn fee_bump_idempotent_with_cached_reorged_receipt_returns_error() {
     let inner_key = format!("feebump-inner:{hash_hex}");
     let outer_tx_hash = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
-    store.try_begin(&inner_key, outer_tx_hash, 0, 100).unwrap();
+    store
+        .try_begin(&inner_key, outer_tx_hash, "", 0, 0, 100)
+        .unwrap();
     store
         .finalize(&inner_key, ReceiptStatus::Reorged, None)
         .unwrap();
@@ -315,7 +321,9 @@ async fn fee_bump_idempotent_with_cached_failed_receipt_returns_error_with_code(
     let outer_tx_hash = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
     let failure_code = "ledger.insufficient_balance";
 
-    store.try_begin(&inner_key, outer_tx_hash, 0, 100).unwrap();
+    store
+        .try_begin(&inner_key, outer_tx_hash, "", 0, 0, 100)
+        .unwrap();
     store
         .finalize(
             &inner_key,
@@ -480,7 +488,9 @@ fn inner_key_format_preserves_prefix_and_redacts_hash() {
         "feebump-inner:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
     let outer_tx_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-    store.try_begin(inner_key, outer_tx_hash, 0, 100).unwrap();
+    store
+        .try_begin(inner_key, outer_tx_hash, "", 0, 0, 100)
+        .unwrap();
 
     let receipt = store.get(inner_key).unwrap().unwrap();
     // The store key IS the inner_key verbatim — the prefix is preserved.
@@ -552,7 +562,9 @@ async fn loser_poll_timeout_when_winner_never_finalises() {
     let inner_key = format!("feebump-inner:{hash_hex}");
     // Seed a Pending receipt (submitted=true so abandon_pre_submit is blocked).
     let outer_tx_hash = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-    store.try_begin(&inner_key, outer_tx_hash, 0, 100).unwrap();
+    store
+        .try_begin(&inner_key, outer_tx_hash, "", 0, 0, 100)
+        .unwrap();
     // Mark as submitted so the winner path is blocked and loser-wait kicks in.
     store.mark_submitted(&inner_key).unwrap();
 

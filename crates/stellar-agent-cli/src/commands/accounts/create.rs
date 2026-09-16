@@ -813,6 +813,28 @@ where
             }
         };
 
+    // Settle the spending-window reservations that have stood long enough to
+    // be settleable, before the gate below counts them. A reservation the
+    // chain has since answered for should not hold the operator's cap, and one
+    // the chain has not is counted as spend.
+    let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
+        Ok(v) => v,
+        Err(e) => {
+            print_error(
+                &Envelope::<()>::err_raw("wallet.clock_error", e.to_string()),
+                args.output,
+            );
+            return 1;
+        }
+    };
+    crate::commands::submission_record::reconcile_open_reservations(
+        &profile,
+        &resolved.name,
+        &client,
+        now_ms,
+    )
+    .await;
+
     // ── Operator policy evaluation (before signing/submission) ───────────────
     let chain_id = caip2_chain_id_for_network(args.network);
     let starting_balance_stroops = starting_balance.as_stroops();
@@ -849,50 +871,44 @@ where
         }
     };
 
-    // Sign and submit.
-    match sponsored_create(args, &sponsor, &new_account.g_strkey, starting_balance).await {
+    // Record, then sign and submit. The recorder writes the receipt, the
+    // pending audit row and the spending-window reservation before the bytes
+    // leave, and settles all three against what the network answers.
+    // Sponsored mode only: the Friendbot path is not policy-gated.
+    let recorder = match crate::commands::submission_record::build_recorder(
+        crate::commands::submission_record::SubmitRecord {
+            profile: &profile,
+            profile_name: resolved.name.clone(),
+            verb: "accounts create",
+            tool: "stellar_create_account",
+            chain_id,
+            effects: create_effects.as_ref(),
+            audit: audit_writer.clone(),
+            now_ms,
+        },
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            print_error(
+                &crate::commands::submission_record::error_envelope(&e, ""),
+                args.output,
+            );
+            return 1;
+        }
+    };
+
+    match sponsored_create(
+        args,
+        &sponsor,
+        &new_account.g_strkey,
+        starting_balance,
+        Some(&recorder),
+    )
+    .await
+    {
         Ok(sponsored_result) => {
             let secret_key = new_account.secret.as_ref().map(|s| s.as_str().to_owned());
             let sub_result = sponsored_result.submission;
-
-            // Non-fatal allow-path audit row carrying the SAME legs the gate
-            // sized (single-derivation invariant), recorded on confirmed submit.
-            // Sponsored mode only: the Friendbot path is not policy-gated.
-            let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> = create_effects
-                .as_ref()
-                .map(|e| e.legs().iter().map(Into::into).collect())
-                .unwrap_or_default();
-            let audit_request_id = uuid::Uuid::new_v4().to_string();
-            let audit_tx_redacted =
-                stellar_agent_network::submit::redact_tx_hash(&sub_result.tx_hash);
-            let audit_entry = stellar_agent_core::audit_log::AuditEntry::new_value_action_submitted(
-                "stellar_create_account",
-                chain_id,
-                audit_legs,
-                audit_tx_redacted.as_str(),
-                sub_result.ledger,
-                stellar_agent_core::audit_log::PolicyDecision::Allow,
-                None,
-                None,
-                &audit_request_id,
-            );
-            // Skipped entirely when no writer was acquired (the synthesized
-            // zero-config profile with an unminted audit key).
-            if let Some(writer) = &audit_writer {
-                crate::commands::value_audit::emit_value_audit_row_with_writer(
-                    writer,
-                    &resolved.name,
-                    audit_entry,
-                );
-            }
-            crate::commands::policy_engine::record_confirmed_value_moving(
-                "accounts create",
-                &profile,
-                &resolved.name,
-                "stellar_create_account",
-                chain_id,
-                create_effects.as_ref(),
-            );
 
             let result = CreateAccountResult {
                 account_id: new_account.g_strkey.clone(),
@@ -911,8 +927,10 @@ where
             0
         }
         Err(e) => {
-            let envelope = Envelope::<()>::err(&e);
-            print_error(&envelope, args.output);
+            print_error(
+                &crate::commands::submission_record::error_envelope(&e, ""),
+                args.output,
+            );
             1
         }
     }
@@ -937,6 +955,7 @@ async fn sponsored_create(
     sponsor: &str,
     new_account: &str,
     starting_balance: StellarAmount,
+    recorder: Option<&dyn stellar_agent_network::SubmissionRecorder>,
 ) -> Result<SponsoredCreateResult, WalletError> {
     let built =
         build_sponsored_unsigned_envelope(args, sponsor, new_account, starting_balance).await?;
@@ -998,6 +1017,7 @@ async fn sponsored_create(
         timeout,
         passphrase,
         Some(SubmissionSignerKind::Software),
+        recorder,
     )
     .await?;
 

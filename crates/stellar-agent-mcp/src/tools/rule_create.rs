@@ -1264,6 +1264,12 @@ impl WalletServer {
                 stellar_agent_core::approval::ApprovalKind::Rejected { .. } => {
                     return Ok(approval_rejected_error());
                 }
+                // A spent approval is named as spent rather than as absent:
+                // the agent needs to know its approval was already used, and
+                // on which transaction, instead of being told to ask again.
+                stellar_agent_core::approval::ApprovalKind::Consumed { .. } => {
+                    return Ok(crate::tools::common::approval_consumed_error());
+                }
                 stellar_agent_core::approval::ApprovalKind::RuleProposalSimulated {
                     smart_account,
                     chain_id,

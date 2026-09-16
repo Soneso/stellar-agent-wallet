@@ -300,6 +300,8 @@ pub(crate) fn render_detail_page(
         r#"<div class="notice">Already resolved &mdash; consent for this request is recorded.</div>"#
     } else if matches!(view.summary, ApprovalSummaryView::Rejected { .. }) {
         r#"<div class="notice">This request was rejected. Nothing was signed.</div>"#
+    } else if matches!(view.summary, ApprovalSummaryView::Consumed { .. }) {
+        r#"<div class="notice">This approval was already spent on a submission. There is nothing left to decide; ask the wallet what became of that transaction.</div>"#
     } else if view.expired {
         r#"<div class="notice warn">This request has expired. It can only be rejected now.</div>"#
     } else {
@@ -328,7 +330,15 @@ pub(crate) fn render_detail_page(
       <p class="caution">Approve only if you expected this request. Nothing is signed until you decide.</p>"#,
             html_escape(approve_button_label(&view.summary))
         )
-    } else if view.attested || matches!(view.summary, ApprovalSummaryView::Rejected { .. }) {
+    } else if view.attested
+        || matches!(
+            view.summary,
+            ApprovalSummaryView::Rejected { .. } | ApprovalSummaryView::Consumed { .. }
+        )
+    {
+        // A spent approval is settled. Offering a reject would present an
+        // action that changes nothing, on an entry whose outcome the chain
+        // already owns.
         String::new()
     } else {
         // Expired-but-unresolved and informational (passkey) kinds: a reject
@@ -348,8 +358,10 @@ pub(crate) fn render_detail_page(
     // sentence expects.
     let expiry_line = if view.expired
         || view.attested
-        || matches!(view.summary, ApprovalSummaryView::Rejected { .. })
-    {
+        || matches!(
+            view.summary,
+            ApprovalSummaryView::Rejected { .. } | ApprovalSummaryView::Consumed { .. }
+        ) {
         format!(
             r#"<p class="expiry" id="expiry-line" data-created-ms="{created}" data-expires-ms="{expires}" data-expiry-form="absolute">
         Created <b id="created-text">{created} (unix ms)</b>. Expiry:
@@ -439,6 +451,9 @@ pub fn kind_pill(view: &PendingApprovalView) -> (String, bool) {
         ApprovalSummaryView::ToolsetFirstInvokeGate { .. } => ("TOOLSET GATE".to_owned(), false),
         ApprovalSummaryView::TrustlineClawbackOptIn { .. } => ("CLAWBACK OPT-IN".to_owned(), false),
         ApprovalSummaryView::Rejected { .. } => ("REJECTED".to_owned(), false),
+        ApprovalSummaryView::Consumed { outcome, .. } => {
+            (format!("SPENT ({})", outcome.to_uppercase()), false)
+        }
         _ => (view.kind_name.to_uppercase(), false),
     }
 }
@@ -1218,6 +1233,60 @@ mod tests {
         store.insert(entry, NOW_MS).unwrap();
         store.reject(&nonce, NOW_MS, DEFAULT_TTL_MS).unwrap();
         store.snapshot(NOW_MS).into_iter().next().unwrap()
+    }
+
+    /// A spent approval, the tombstone a commit leaves behind.
+    fn consumed_view(dir: &TempDir) -> PendingApprovalView {
+        let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
+        let entry = PendingApproval::new_payment_pending(
+            "b64xdr".to_owned(),
+            b"fake-xdr",
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            1_000,
+            "XLM".to_owned(),
+            None,
+            100,
+            1,
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let nonce = entry.approval_nonce.clone();
+        store.insert(entry, NOW_MS).unwrap();
+        store
+            .consume(
+                &nonce,
+                &"ab".repeat(32),
+                stellar_agent_core::approval::ConsumedOutcome::Unknown,
+            )
+            .unwrap();
+        store.snapshot(NOW_MS).into_iter().next().unwrap()
+    }
+
+    /// A spent approval says so and offers no decision.
+    ///
+    /// The entry is settled: the commit spent it and the chain owns the
+    /// outcome. A Reject button there would present an action that changes
+    /// nothing, and the page would say nothing about why.
+    #[test]
+    fn a_spent_approval_shows_its_state_and_offers_no_action() {
+        let dir = TempDir::new().unwrap();
+        let view = consumed_view(&dir);
+        let html = render_detail_page(&view, "aa", None, &PageIdentity::default());
+
+        assert!(
+            html.contains("already spent on a submission"),
+            "the page states the entry was spent: {html}"
+        );
+        assert!(
+            !html.contains("reject-btn"),
+            "a spent approval offers no reject button: {html}"
+        );
+        assert!(
+            !html.contains("approve-btn"),
+            "a spent approval offers no approve button: {html}"
+        );
+        assert_eq!(kind_pill(&view).0, "SPENT (UNKNOWN)");
     }
 
     #[test]

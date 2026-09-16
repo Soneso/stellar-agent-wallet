@@ -53,6 +53,7 @@ use crate::retry::{
     truncate_error_display,
 };
 use crate::signing::verify_binding::{reject_v0_envelope, verify_signature_network_binding};
+use crate::submission_record::{SubmissionIntent, SubmissionOutcome, SubmissionRecorder};
 
 // Mainnet network passphrase (canonical; same constant used by friendbot.rs).
 // `pub(crate)` so every in-crate write path (idempotent_submit's retention
@@ -173,6 +174,7 @@ pub enum SubmissionSignerKind {
 ///     Duration::from_secs(60),
 ///     "Test SDF Network ; September 2015",
 ///     Some(stellar_agent_network::SubmissionSignerKind::Software),
+///     None, // no durable-submission recorder
 /// ).await?;
 /// println!("confirmed in ledger {}", result.ledger);
 /// # Ok(()) }
@@ -183,6 +185,7 @@ pub async fn submit_transaction_and_wait(
     timeout: Duration,
     network_passphrase: &str,
     signer_kind: Option<SubmissionSignerKind>,
+    recorder: Option<&dyn SubmissionRecorder>,
 ) -> Result<SubmissionResult, WalletError> {
     // Mainnet write is structurally forbidden at the submit layer.
     //
@@ -229,26 +232,55 @@ pub async fn submit_transaction_and_wait(
 
     // With the endpoint's network established, verify that the envelope's
     // signatures were produced for that network. This is what stops an
-    // envelope signed for one network from being relayed to another.
-    verify_signature_network_binding(client, &envelope, network_passphrase, send_deadline).await?;
+    // envelope signed for one network from being relayed to another. The
+    // response's ledger is the endpoint's view of the chain immediately before
+    // the send, which is what a later reconciliation compares against the
+    // endpoint's retention floor.
+    let submission_ledger =
+        verify_signature_network_binding(client, &envelope, network_passphrase, send_deadline)
+            .await?;
+
+    // The transaction hash is a property of the envelope, not of the endpoint:
+    // it is computable from the bytes about to be sent. Computing it here
+    // means the wallet polls, records and reports the hash of what it signed,
+    // and can tell when the endpoint describes something else.
+    let tx_hash_hex = compute_local_tx_hash_hex(&envelope, network_passphrase)?;
+    let local_hash_bytes = tx_hash_bytes(&tx_hash_hex)?;
+    let redacted = redact_tx_hash(&tx_hash_hex);
+
+    let (source, sequence) = replay_identity(&envelope)?;
+    let intent = SubmissionIntent {
+        envelope_hash: envelope_hash_hex(envelope_xdr),
+        tx_hash: tx_hash_hex.clone(),
+        source,
+        sequence,
+        max_time: crate::idempotent_submit::extract_max_time(&envelope),
+        submission_ledger,
+    };
+
+    // The record is written before the send, so a submission whose outcome
+    // never comes back is still one the wallet remembers.
+    if let Some(rec) = recorder {
+        rec.pre_send(&intent).await?;
+    }
 
     // Submit via `sendTransaction`, with bounded exponential-backoff retry for
     // transient transport errors.
     //
-    // Safety: retrying the same signed envelope is safe ONLY because the
-    // idempotent-submit layer (`idempotent_submit`) tracks the envelope hash.
-    // A retried send that already landed is caught by the receipt store.
-    // Do NOT remove or bypass idempotency when using this retry.
+    // Safety: retrying the same signed envelope is safe because the receipt
+    // written by `pre_send` is keyed on the envelope hash and the submission's
+    // `(source, sequence)`: a retried send that already landed is caught by
+    // that record, and a second submission for the same sequence is refused
+    // before it is built. Do NOT remove or bypass the recorder when using this
+    // retry.
     //
     // `TransactionSubmissionFailed` is NOT retried — it wraps both genuine
     // on-chain rejections AND transport-429-on-send, and those are
     // indistinguishable here without fragile Display-string matching.
     // Retry-After / transport-429-on-send is not currently honoured; blind backoff is used instead.
 
-    let tx_hash = {
+    let server_tx_hash = {
         let inner = &client.inner;
-        let url = &client.url;
-        let timeout_secs = timeout.as_secs();
         // `envelope` is borrowed (not moved) across each retry attempt so the
         // closure can be called multiple times (FnMut requirement).
         retry_with_backoff(
@@ -258,11 +290,43 @@ pub async fn submit_transaction_and_wait(
             || async { inner.send_transaction(&envelope).await },
         )
         .await
-        .map_err(|e| map_send_error(&e, url, timeout_secs))?
     };
 
-    let tx_hash_hex = bytes_to_hex(&tx_hash.0);
-    let redacted = redact_tx_hash(&tx_hash_hex);
+    let server_tx_hash = match server_tx_hash {
+        Ok(h) => h,
+        Err(e) => {
+            return Err(
+                handle_send_failure(recorder, &intent, &e, &client.url, timeout.as_secs()).await,
+            );
+        }
+    };
+
+    // The endpoint reporting a different hash means it is not describing the
+    // transaction that was sent. The receipt stays keyed on the local hash and
+    // stays pending: what the endpoint did with the bytes is unknown.
+    let server_tx_hash_hex = bytes_to_hex(&server_tx_hash.0);
+    if server_tx_hash_hex != tx_hash_hex {
+        let err = WalletError::Submission(SubmissionError::HashMismatch {
+            local: tx_hash_hex.clone(),
+            server: server_tx_hash_hex.clone(),
+        });
+        if let Some(rec) = recorder {
+            rec.outcome(
+                &intent,
+                &SubmissionOutcome::TransportAfterSend {
+                    error: format!(
+                        "the endpoint reported transaction hash {} for a transaction whose local hash is {}",
+                        redact_tx_hash(&server_tx_hash_hex),
+                        redacted
+                    ),
+                },
+            )
+            .await;
+        }
+        return Err(err);
+    }
+
+    let tx_hash = stellar_xdr::Hash(local_hash_bytes);
     tracing::info!(tx_hash = %redacted, "submit_transaction_and_wait: transaction submitted");
 
     // Poll until SUCCESS, FAILED, or timeout.
@@ -297,16 +361,34 @@ pub async fn submit_transaction_and_wait(
                 );
                 // Fall through to deadline check below.
                 if started.elapsed() >= timeout {
-                    return Err(WalletError::Submission(SubmissionError::TxTimeout {
-                        tx_hash: tx_hash_hex,
-                        seconds: timeout.as_secs(),
-                    }));
+                    return Err(record_timeout(recorder, &intent, timeout.as_secs()).await);
                 }
                 tokio::time::sleep(POLL_INTERVAL).await;
                 continue;
             }
             Err(e) => {
-                return Err(map_rpc_error_generic(&e, &client.url, timeout.as_secs()));
+                // The bytes are already away, so the outcome is unknown and
+                // the caller gets the shape the recovery protocol is written
+                // against: the transaction hash, and a verb that settles it.
+                // Without a recorder there is nothing to settle, so the
+                // transport failure is reported as itself.
+                let Some(rec) = recorder else {
+                    return Err(map_rpc_error_generic(&e, &client.url, timeout.as_secs()));
+                };
+                rec.outcome(
+                    &intent,
+                    &SubmissionOutcome::TransportAfterSend {
+                        error: format!(
+                            "the confirmation poll could not reach the endpoint: {}",
+                            truncate_error_display(&e)
+                        ),
+                    },
+                )
+                .await;
+                return Err(WalletError::Submission(SubmissionError::TxTimeout {
+                    tx_hash: intent.tx_hash.clone(),
+                    seconds: timeout.as_secs(),
+                }));
             }
         };
 
@@ -318,6 +400,10 @@ pub async fn submit_transaction_and_wait(
                     ledger,
                     "submit_transaction_and_wait: confirmed"
                 );
+                if let Some(rec) = recorder {
+                    rec.outcome(&intent, &SubmissionOutcome::Success { ledger })
+                        .await;
+                }
                 return Ok(SubmissionResult {
                     tx_hash: tx_hash_hex,
                     ledger,
@@ -332,6 +418,15 @@ pub async fn submit_transaction_and_wait(
                     error = %err,
                     "submit_transaction_and_wait: transaction failed on-chain"
                 );
+                if let Some(rec) = recorder {
+                    rec.outcome(
+                        &intent,
+                        &SubmissionOutcome::OnChainFailed {
+                            code: err.code().to_owned(),
+                        },
+                    )
+                    .await;
+                }
                 return Err(err);
             }
 
@@ -339,22 +434,116 @@ pub async fn submit_transaction_and_wait(
             "NOT_FOUND" => {}
 
             other => {
-                return Err(WalletError::Network(NetworkError::RpcUnreachable {
-                    url: redact_url_authority(&client.url),
-                    reason: format!("unexpected getTransaction status: {other}"),
+                let Some(rec) = recorder else {
+                    return Err(WalletError::Network(NetworkError::RpcUnreachable {
+                        url: redact_url_authority(&client.url),
+                        reason: format!("unexpected getTransaction status: {other}"),
+                    }));
+                };
+                rec.outcome(
+                    &intent,
+                    &SubmissionOutcome::TransportAfterSend {
+                        error: format!(
+                            "the endpoint reported an unexpected transaction status: {other}"
+                        ),
+                    },
+                )
+                .await;
+                return Err(WalletError::Submission(SubmissionError::TxTimeout {
+                    tx_hash: intent.tx_hash.clone(),
+                    seconds: timeout.as_secs(),
                 }));
             }
         }
 
         if started.elapsed() >= timeout {
-            return Err(WalletError::Submission(SubmissionError::TxTimeout {
-                tx_hash: tx_hash_hex,
-                seconds: timeout.as_secs(),
-            }));
+            return Err(record_timeout(recorder, &intent, timeout.as_secs()).await);
         }
 
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// Settles the record for a submission whose confirmation never arrived, and
+/// builds the timeout the caller returns.
+///
+/// The transaction was accepted for inclusion and may still apply, so the
+/// receipt, the pending audit row and the window reservation all stand. The
+/// agent resolves it by reconciling the hash, never by re-simulating.
+async fn record_timeout(
+    recorder: Option<&dyn SubmissionRecorder>,
+    intent: &SubmissionIntent,
+    seconds: u64,
+) -> WalletError {
+    if let Some(rec) = recorder {
+        rec.outcome(
+            intent,
+            &SubmissionOutcome::Timeout {
+                tx_hash: intent.tx_hash.clone(),
+            },
+        )
+        .await;
+    }
+    WalletError::Submission(SubmissionError::TxTimeout {
+        tx_hash: intent.tx_hash.clone(),
+        seconds,
+    })
+}
+
+/// Settles the record for a send that did not return a transaction hash, and
+/// builds the error the caller returns.
+///
+/// Two classes, and they settle differently:
+///
+/// - The endpoint refused the bytes with a real `TransactionResult`. Nothing
+///   was queued and no value moved, so the reservation goes back and the
+///   caller gets the refusal itself, with its result code.
+/// - Anything else left the outcome unknown. The layer cannot tell a refused
+///   connection from a lost response, and by this point the same client has
+///   already answered the identity probe and the signer fetch, so the failure
+///   is mid-flight rather than a dead endpoint. The record stands and the
+///   caller gets the timeout shape, which is what the agent's recovery
+///   protocol is written against.
+async fn handle_send_failure(
+    recorder: Option<&dyn SubmissionRecorder>,
+    intent: &SubmissionIntent,
+    error: &stellar_rpc_client::Error,
+    url: &str,
+    timeout_secs: u64,
+) -> WalletError {
+    let mapped = map_send_error(error, url, timeout_secs);
+    let definitive = is_definitive_send_refusal(error);
+
+    let Some(rec) = recorder else {
+        return mapped;
+    };
+
+    if definitive {
+        rec.outcome(
+            intent,
+            &SubmissionOutcome::Rejected {
+                code: mapped.code().to_owned(),
+                error: truncate_error_display(error),
+            },
+        )
+        .await;
+        return mapped;
+    }
+
+    rec.outcome(
+        intent,
+        &SubmissionOutcome::TransportAfterSend {
+            error: format!(
+                "the send did not complete and the endpoint's answer is unknown: {}",
+                truncate_error_display(error)
+            ),
+        },
+    )
+    .await;
+    WalletError::Submission(SubmissionError::TxTimeout {
+        tx_hash: intent.tx_hash.clone(),
+        seconds: timeout_secs,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -373,6 +562,167 @@ pub(crate) fn bytes_to_hex(bytes: &[u8]) -> String {
             let _ = write!(s, "{b:02x}");
             s
         })
+}
+
+/// The marker `stellar-rpc-client` puts on a `sendTransaction` failure where
+/// no response body was read.
+///
+/// `stellar_rpc_client::Error::TransactionSubmissionFailed` carries two
+/// unrelated conditions: a request that never produced a response, which the
+/// client prefixes with this marker, and an endpoint that answered
+/// `status: "ERROR"` with a decoded `TransactionResult`, whose message is that
+/// result. The two settle a submission differently, so they have to be told
+/// apart.
+const SEND_NO_RESPONSE_MARKER: &str = "No status yet:";
+
+/// Returns true when the send step's failure is the endpoint's own verdict on
+/// the transaction.
+///
+/// The test is negative on purpose. A failure the layer cannot positively
+/// attribute to a verdict is treated as one whose outcome is unknown, which is
+/// the direction that keeps a transaction that may have been queued recorded.
+/// Classifying the other way round would release a reservation and record a
+/// failure for a transaction that later applies.
+///
+/// # Dependency coupling
+///
+/// The marker is the dependency's own wording, not a contract it publishes:
+/// `stellar-rpc-client`'s `send_transaction` builds it at
+/// `src/lib.rs`, in the arm that wraps a `jsonrpsee` request failure, while
+/// the arm that wraps an endpoint verdict carries the decoded
+/// `TransactionResult` instead. A version bump that rewords either arm
+/// reclassifies every transport failure as a verdict, which would release a
+/// reservation and record a failure for a transaction that may have been
+/// queued.
+///
+/// Both sides are pinned against the real client by
+/// `a_transport_failure_after_the_record_returns_the_timeout_shape` and
+/// `a_refused_send_releases_the_reservation_and_frees_the_sequence`
+/// (`tests/submission_record_integration.rs`), which drive a mocked endpoint
+/// through the real client. A reword fails those two rather than silently
+/// reclassifying submissions, so a `stellar-rpc-client` bump that turns them
+/// red is reporting this coupling, not a flake.
+fn is_definitive_send_refusal(error: &stellar_rpc_client::Error) -> bool {
+    match error {
+        stellar_rpc_client::Error::TransactionSubmissionFailed(detail) => {
+            !detail.contains(SEND_NO_RESPONSE_MARKER)
+        }
+        _ => false,
+    }
+}
+
+/// Computes the canonical transaction hash from a decoded envelope.
+///
+/// `SHA-256(network_id ‖ tagged transaction)`, the same preimage the signing
+/// path builds, so it needs no round trip. A fee-bump hashes its OUTER
+/// transaction: that is what `getTransaction` is polled by, and stellar-rpc
+/// indexes a fee-bump under both its outer and inner hash.
+///
+/// # Errors
+///
+/// - [`WalletError::Protocol`] wrapping [`ProtocolError::XdrCodecFailed`] for
+///   a legacy `TxV0` envelope, which has no tagged-transaction form, or if the
+///   payload cannot be encoded.
+pub(crate) fn compute_local_tx_hash_hex(
+    envelope: &TransactionEnvelope,
+    network_passphrase: &str,
+) -> Result<String, WalletError> {
+    use sha2::{Digest as _, Sha256};
+    use stellar_xdr::{
+        Hash, Limits, TransactionSignaturePayload, TransactionSignaturePayloadTaggedTransaction,
+        WriteXdr,
+    };
+
+    let tagged_transaction = match envelope {
+        TransactionEnvelope::Tx(v1) => {
+            TransactionSignaturePayloadTaggedTransaction::Tx(v1.tx.clone())
+        }
+        TransactionEnvelope::TxFeeBump(fb) => {
+            TransactionSignaturePayloadTaggedTransaction::TxFeeBump(fb.tx.clone())
+        }
+        TransactionEnvelope::TxV0(_) => {
+            return Err(WalletError::Protocol(ProtocolError::XdrCodecFailed {
+                detail: "a legacy TxV0 envelope has no tagged-transaction form and cannot be \
+                         hashed or signed"
+                    .to_owned(),
+            }));
+        }
+    };
+
+    let payload = TransactionSignaturePayload {
+        network_id: Hash(Sha256::digest(network_passphrase.as_bytes()).into()),
+        tagged_transaction,
+    };
+    let payload_bytes = payload.to_xdr(Limits::none()).map_err(|e| {
+        WalletError::Protocol(ProtocolError::XdrCodecFailed {
+            detail: format!("failed to encode TransactionSignaturePayload: {e}"),
+        })
+    })?;
+
+    Ok(bytes_to_hex(&Sha256::digest(&payload_bytes)))
+}
+
+/// Returns the `(source account, sequence)` pair the network enforces replay
+/// protection on.
+///
+/// A fee-bump's replay identity is its INNER transaction's: the fee source
+/// consumes no sequence of its own.
+///
+/// A muxed source resolves to its underlying account. The mux id selects a
+/// sub-account for memo purposes; the sequence number, the signer set and the
+/// ledger entry all belong to the `G...` account beneath it, which is what the
+/// network enforces replay protection on.
+///
+/// # Errors
+///
+/// - [`WalletError::Protocol`] wrapping [`ProtocolError::XdrCodecFailed`] for
+///   a legacy `TxV0` envelope.
+pub(crate) fn replay_identity(
+    envelope: &TransactionEnvelope,
+) -> Result<(String, i64), WalletError> {
+    let tx = match envelope {
+        TransactionEnvelope::Tx(v1) => &v1.tx,
+        TransactionEnvelope::TxFeeBump(fb) => {
+            let stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) = &fb.tx.inner_tx;
+            &inner.tx
+        }
+        TransactionEnvelope::TxV0(_) => {
+            return Err(WalletError::Protocol(ProtocolError::XdrCodecFailed {
+                detail: "a legacy TxV0 envelope is refused before the replay identity is read"
+                    .to_owned(),
+            }));
+        }
+    };
+
+    let key = match &tx.source_account {
+        stellar_xdr::MuxedAccount::Ed25519(uint256) => uint256.0,
+        stellar_xdr::MuxedAccount::MuxedEd25519(med) => med.ed25519.0,
+    };
+
+    Ok((
+        format!("{}", stellar_strkey::ed25519::PublicKey(key)),
+        tx.seq_num.0,
+    ))
+}
+
+/// `SHA-256` over the signed envelope XDR, the identity of these exact bytes.
+///
+/// This is the key the submission receipt and the window reservation are
+/// stored under, so a caller that needs to name a submission in a response or
+/// an operator verb derives it the same way here.
+#[must_use]
+pub fn envelope_hash_hex(envelope_xdr: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    bytes_to_hex(&Sha256::digest(envelope_xdr.as_bytes()))
+}
+
+/// Parses a 64-character hex transaction hash into its raw bytes.
+fn tx_hash_bytes(hex: &str) -> Result<[u8; 32], WalletError> {
+    stellar_agent_core::hex::decode_hex32(hex).map_err(|e| {
+        WalletError::Protocol(ProtocolError::XdrCodecFailed {
+            detail: format!("computed transaction hash is not 32 hex-encoded bytes: {e}"),
+        })
+    })
 }
 
 /// Returns true if the URL appears to target Stellar mainnet / pubnet.
@@ -707,6 +1057,7 @@ mod tests {
             Duration::from_secs(5),
             MAINNET_PASSPHRASE,
             None,
+            None,
         )
         .await;
         assert!(
@@ -738,6 +1089,7 @@ mod tests {
             "not-valid-base64-xdr",
             Duration::from_secs(5),
             "Test SDF Network ; September 2015",
+            None,
             None,
         )
         .await;

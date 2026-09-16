@@ -92,19 +92,13 @@ async fn mount_probe_and_signers(server: &MockServer, envelope: &SignedTestEnvel
         .await;
 }
 
+/// The idempotency key the submit paths record under.
+///
+/// Delegates rather than restating the derivation: the key is one definition
+/// shared by both submit paths, and a test that computed its own would pass
+/// while the two disagreed.
 fn envelope_hash_for(signed_xdr: &str) -> String {
-    use base64::Engine as _;
-    use sha2::{Digest, Sha256};
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(signed_xdr.trim())
-        .unwrap();
-    Sha256::digest(&bytes)
-        .iter()
-        .fold(String::new(), |mut s, b| {
-            use std::fmt::Write;
-            let _ = write!(s, "{b:02x}");
-            s
-        })
+    stellar_agent_network::envelope_hash_hex(signed_xdr)
 }
 
 /// JSON-RPC `sendTransaction` response for a PENDING submission.
@@ -220,6 +214,7 @@ async fn submit_and_wait_success_path_no_regression() {
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
+        None,
     )
     .await;
 
@@ -271,6 +266,7 @@ async fn send_submission_failed_is_not_retried() {
         signed_xdr,
         Duration::from_secs(10),
         TESTNET_PASSPHRASE,
+        None,
         None,
     )
     .await;
@@ -337,6 +333,7 @@ async fn poll_transient_error_treated_as_not_found_then_succeeds() {
         signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
+        None,
         None,
     )
     .await;

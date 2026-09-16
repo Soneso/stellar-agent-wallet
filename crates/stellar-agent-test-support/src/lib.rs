@@ -60,8 +60,12 @@ mod bip39_english;
 
 #[cfg(feature = "wiremock-helpers")]
 pub use echo_id_responder::EchoIdResponder;
+#[cfg(feature = "test-helpers")]
+pub use echo_id_responder::SubmissionEchoResponder;
 pub use env_guard::{ProfileEnvVarGuard, StellarAgentHomeGuard};
 pub use log_capture::{CaptureWriter, RedactionStrictSubscriber, with_captured_logs};
 pub use secret_patterns::assert_no_secret_bytes;
 #[cfg(feature = "test-helpers")]
-pub use signed_envelope::{SignedTestEnvelope, SignedTestEnvelopeBuilder};
+pub use signed_envelope::{
+    SignedTestEnvelope, SignedTestEnvelopeBuilder, send_transaction_hash_hex, transaction_hash_hex,
+};

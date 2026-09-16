@@ -327,7 +327,7 @@ server holds the audit writer's exclusive lock.
 
 ## Tool catalog
 
-The server registers 38 tools. For each tool below: the exact registered name,
+The server registers 43 tools. For each tool below: the exact registered name,
 its purpose, and whether it is read-only, signs without submitting, or signs and
 submits. Every tool except `stellar_x402_parse_receipt`, `stellar_toolset_list`,
 and `stellar_toolset_invoke` requires a `chain_id` argument carrying the CAIP-2
@@ -348,6 +348,7 @@ supplied.
 | `stellar_claim_commit` | Verify the nonce, re-derive the balance ID from the envelope, re-fetch the entry and re-run the claimant and predicate guards, sign, submit. | Signs and submits. Two-phase verb; approval spine. |
 | `stellar_balances` | Fetch native XLM balance and optional trustline balances for an account. | Read-only. |
 | `stellar_friendbot` | Fund a testnet account via Friendbot. | Mutating, testnet-only; gated. |
+| `stellar_transaction_status` | Reconcile one submitted transaction against the chain and settle the wallet's record of it. The way out of `submission.tx_timeout`. | Reads the chain and writes the wallet's record; moves no value. Not annotated read-only. |
 
 ### Trustline
 
@@ -510,3 +511,16 @@ Business errors return `{ "ok": false, "error": { "code", "message" }, "request_
 with `is_error` set; consumers branch on `error.code`. Every tool, including
 the SEP-43 family, uses this same envelope — see
 [The result envelope](agents.md#the-result-envelope).
+
+Three codes carry an additional `details` object on the error:
+`submission.tx_timeout`, `submission.tx_already_submitted` and
+`submission.hash_mismatch`. Each describes a submission whose outcome the
+wallet cannot settle on its own, and resolving it needs the full transaction
+hash, which the message redacts. `details` carries that hash, `outcome: "unknown"`,
+`reconcile_with: "stellar_transaction_status"`, and the envelope hash naming
+the submission record where the reporting tool holds the signed bytes. The
+DeFi tools do not, so an agent recovers the envelope hash from
+`stellar_transaction_status`'s `record.envelope_hash`. No other code carries
+`details`, and the field is absent from the serialised envelope when it is not
+set. The recovery protocol is in
+[the MCP usage reference](../crates/stellar-agent-mcp/docs/usage.md).

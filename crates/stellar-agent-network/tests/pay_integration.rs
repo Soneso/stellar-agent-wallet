@@ -195,6 +195,7 @@ async fn submit_invalid_xdr_returns_protocol_error() {
         Duration::from_secs(5),
         TESTNET_PASSPHRASE,
         None,
+        None,
     )
     .await;
     assert!(
@@ -214,6 +215,7 @@ async fn mainnet_rejected_zero_rpc_calls() {
         "AAAAAA==",
         Duration::from_secs(5),
         "Public Global Stellar Network ; September 2015",
+        None,
         None,
     )
     .await;
@@ -283,6 +285,7 @@ async fn submit_and_poll_success_with_mock() {
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
+        None,
     )
     .await;
 
@@ -337,6 +340,7 @@ async fn submit_and_poll_not_found_then_success() {
         envelope.envelope_xdr(),
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
+        None,
         None,
     )
     .await;

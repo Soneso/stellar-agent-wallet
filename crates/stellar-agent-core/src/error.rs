@@ -2049,6 +2049,62 @@ pub enum SubmissionError {
         /// The original wire error code recorded when the transaction failed.
         code: String,
     },
+
+    /// The durable record of the submission could not be written, so the
+    /// transaction was not sent.
+    ///
+    /// The submission layer records every signed transaction as "submitted,
+    /// outcome unknown" before `sendTransaction` is called. When that record
+    /// cannot be written the send is refused: an unrecorded submission is one
+    /// the wallet cannot reconcile, cap, or audit afterwards.
+    ///
+    /// # Field semantics
+    ///
+    /// `detail` is a non-secret diagnostic naming which record failed (for
+    /// example `"receipt store"` or `"window reservation"`) and why.
+    ///
+    /// # Wire code
+    ///
+    /// `submission.record_unavailable`
+    #[error("the submission could not be durably recorded, so nothing was sent: {detail}")]
+    RecordUnavailable {
+        /// A non-secret diagnostic naming the record that could not be written.
+        detail: String,
+    },
+
+    /// The hash the endpoint returned for the accepted transaction differs
+    /// from the hash computed locally from the envelope.
+    ///
+    /// The wallet computes `SHA-256(network_id ‖ tagged transaction)` from the
+    /// decoded envelope before the send and uses it for polling, recording and
+    /// reconciliation. A different hash from the endpoint means the endpoint
+    /// is not describing the transaction that was sent; the receipt stays
+    /// keyed on the local hash and stays pending.
+    ///
+    /// # Field semantics
+    ///
+    /// Both fields hold hex transaction hashes (public identifiers). Display
+    /// output redacts both to first-8-last-8; the fields hold the full values
+    /// for callers that surface them as structured data.
+    ///
+    /// # Wire code
+    ///
+    /// `submission.hash_mismatch`
+    #[error(
+        "the endpoint reported transaction hash '{server_redacted}' for a transaction whose local hash is '{local_redacted}'",
+        local_redacted = redact_tx_hash_display(local),
+        server_redacted = redact_tx_hash_display(server)
+    )]
+    HashMismatch {
+        /// The hex-encoded transaction hash computed locally from the envelope.
+        /// The variant's Display impl redacts this to first-8-last-8; callers
+        /// reading the field directly must apply redaction before logging.
+        local: String,
+        /// The hex-encoded transaction hash the endpoint returned. The
+        /// variant's Display impl redacts this to first-8-last-8; callers
+        /// reading the field directly must apply redaction before logging.
+        server: String,
+    },
 }
 
 impl SubmissionError {
@@ -2063,6 +2119,8 @@ impl SubmissionError {
             Self::FeeBumpInnerRejected { .. } => "submission.feebump_inner_rejected",
             Self::AuthMismatch { .. } => "submission.auth_mismatch",
             Self::OnChainFailed { .. } => "submission.on_chain_failed",
+            Self::RecordUnavailable { .. } => "submission.record_unavailable",
+            Self::HashMismatch { .. } => "submission.hash_mismatch",
         }
     }
 }
@@ -2877,6 +2935,20 @@ mod tests {
                 },
                 "submission.on_chain_failed",
             ),
+            (
+                SubmissionError::RecordUnavailable {
+                    detail: "receipt store is not writable".to_owned(),
+                },
+                "submission.record_unavailable",
+            ),
+            (
+                SubmissionError::HashMismatch {
+                    local: full_hash.clone(),
+                    server: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_owned(),
+                },
+                "submission.hash_mismatch",
+            ),
         ];
 
         assert_code_round_trips!(&cases);
@@ -2918,6 +2990,25 @@ mod tests {
         assert!(msg.contains("abcdef01"), "must show first-8: {msg}");
         assert!(msg.contains("23456789"), "must show last-8: {msg}");
         assert!(!msg.contains(&full_hash), "must NOT show full hash: {msg}");
+
+        // HashMismatch Display redacts BOTH hashes to first-8-last-8.
+        let server_hash =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned();
+        let mismatch_err = WalletError::Submission(SubmissionError::HashMismatch {
+            local: full_hash.clone(),
+            server: server_hash.clone(),
+        });
+        let msg = mismatch_err.message();
+        assert!(msg.contains("abcdef01"), "must show local first-8: {msg}");
+        assert!(msg.contains("01234567"), "must show server first-8: {msg}");
+        assert!(
+            !msg.contains(&full_hash),
+            "must NOT show the full local hash: {msg}"
+        );
+        assert!(
+            !msg.contains(&server_hash),
+            "must NOT show the full server hash: {msg}"
+        );
     }
 
     // ── Internal errors ──────────────────────────────────────────────────────
@@ -3244,6 +3335,14 @@ mod tests {
             }),
             WalletError::Submission(SubmissionError::AuthMismatch {
                 reason: AuthMismatchReason::EntryMutated,
+            }),
+            WalletError::Submission(SubmissionError::RecordUnavailable {
+                detail: "receipt store is not writable".to_owned(),
+            }),
+            WalletError::Submission(SubmissionError::HashMismatch {
+                local: full_hash.clone(),
+                server: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_owned(),
             }),
             WalletError::Internal(InternalError::InvariantViolated {
                 detail: "test".to_owned(),

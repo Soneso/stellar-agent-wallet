@@ -62,6 +62,12 @@ On failure, `ok` is `false` and `error` carries a stable wire `code` (such as
 correlates the call with the audit log. Argument values are never written to the
 audit log; only key names and lifecycle metadata are recorded.
 
+Three codes carry an `error.details` object as well — `submission.tx_timeout`,
+`submission.tx_already_submitted` and `submission.hash_mismatch`. Each reports a
+submission whose outcome the wallet cannot settle on its own; `details` carries
+the full transaction hash the message redacts. No other code carries `details`.
+See "Unresolved submissions" below.
+
 ## Gating model in brief
 
 Every call is dispatched through one gate before the tool's logic runs. The
@@ -172,6 +178,7 @@ A mismatch is refused before any network call.
 | `stellar_create_account_commit` | Verify the nonce, re-check the envelope, sign, submit. | Signs and submits. Two-phase; approval spine. |
 | `stellar_balances` | Fetch native XLM balance and optional trustline balances. | Read-only. |
 | `stellar_friendbot` | Fund a testnet account via Friendbot. | Mutating, testnet-only; gated. |
+| `stellar_transaction_status` | Reconcile one submitted transaction against the chain and settle the wallet's record of it. | Reads the chain, writes the wallet's record; moves no value. The way out of `submission.tx_timeout`. |
 
 ### stellar_pay (simulate) arguments
 
@@ -632,6 +639,68 @@ The toolsets dispatcher enforces a toolset's declared capabilities and never rea
 a signing tool directly regardless of those declarations. The routed tool runs
 under its normal gate, so the first-invoke gate and per-action approval still
 fire.
+
+## Unresolved submissions
+
+Every value-moving tool records its transaction before it is sent. A submission
+whose outcome never comes back keeps that record, and three codes report one:
+
+| Code | What happened |
+| --- | --- |
+| `submission.tx_timeout` | Accepted for inclusion, not confirmed within the submission timeout. It may still apply. |
+| `submission.tx_already_submitted` | A pending record already holds this transaction's source account and sequence. Nothing was sent. |
+| `submission.hash_mismatch` | The endpoint reported a hash that does not describe the transaction that was sent. |
+
+All three carry `error.details`:
+
+```json
+{
+  "tx_hash": "<64 lowercase hex>",
+  "envelope_hash": "<64 lowercase hex>",   // optional; see below
+  "timeout_seconds": 30,
+  "outcome": "unknown",
+  "reconcile_with": "stellar_transaction_status"
+}
+```
+
+`timeout_seconds` appears on `submission.tx_timeout` only, and
+`server_tx_hash` on `submission.hash_mismatch` only.
+
+**What to do.** Call `stellar_transaction_status` with `details.tx_hash`. Never
+re-simulate and never rebuild the payment: the sequence the transaction consumes
+may already be spent by it, and a second submission at that sequence is refused
+with `submission.tx_already_submitted` until the first is settled. A different
+fee does not get around it.
+
+`stellar_transaction_status` reports what the chain says and settles the record:
+
+- `SUCCESS` — the payment went through. Report it as done.
+- `FAILED` — the transaction applied and failed. Nothing moved; a fresh
+  simulate-and-commit is the next step.
+- `NOT_FOUND` with `record.status: "pending"` — nothing is settled yet. The
+  transaction can still apply. Wait and call again.
+- `NOT_FOUND` with `record.status: "failed"` — the transaction can no longer
+  apply. A fresh simulate-and-commit is the next step.
+- `NOT_FOUND` with `record.status: "ambiguous"` — the endpoint can no longer
+  answer for it at all, and only the operator resolves it, with
+  `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge`.
+
+Every submitting tool reports these codes, `stellar_dex_trade` and the two
+vault tools included.
+
+`details.envelope_hash` is present only where the reporting surface holds the signed bytes; the DeFi tools do not. Recover it from `stellar_transaction_status`'s `record.envelope_hash` when it is absent.
+
+Read `record.status`, not `record.reservation_open`. An action the policy engine
+sized no value for takes no reservation at all, so `reservation_open` is `false`
+for it from the start and says nothing about whether the submission settled.
+
+`submission.record_unavailable` is different: the wallet could not write the
+record, so nothing was sent. The condition is local and the submission is safe
+to retry once the operator has fixed it.
+
+`policy.approval_consumed` means the approval you presented was already spent on
+a submission. Check that transaction's status before asking for the action
+again.
 
 ## Resources
 

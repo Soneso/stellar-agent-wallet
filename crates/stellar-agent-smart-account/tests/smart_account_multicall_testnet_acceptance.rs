@@ -422,6 +422,7 @@ async fn h1_happy_path_3_transfer_bundle() {
             fee: ResolvedFeePerOp::default(),
             chain_id: CHAIN_ID,
             request_id: "h1-happy-path-3-transfer",
+            submission_recorder: None,
         },
         &registry,
     )
@@ -546,6 +547,7 @@ async fn h2_per_period_cap_deny_at_inner_3() {
             fee: ResolvedFeePerOp::default(),
             chain_id: CHAIN_ID,
             request_id: "h2-per-period-cap-deny",
+            submission_recorder: None,
         },
         &empty_registry,
     )
@@ -639,6 +641,7 @@ async fn h3_bundle_aggregate_cap_deny() {
             fee: ResolvedFeePerOp::default(),
             chain_id: CHAIN_ID,
             request_id: "h3-bundle-aggregate-cap-deny",
+            submission_recorder: None,
         },
         &empty_registry,
     )

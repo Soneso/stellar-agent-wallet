@@ -386,6 +386,13 @@ pub(crate) fn wrap_sa_error(err: &SaError) -> WalletError {
 ///
 /// Returns exit code `1`.
 pub(crate) fn emit_sa_error(e: &SaError) -> i32 {
+    // A submission whose outcome is unknown keeps its own code and carries the
+    // transaction to reconcile, so the operator reads the same vocabulary a
+    // classic verb gives them.
+    if let Some(unresolved) = crate::commands::submission_record::unresolved_from_sa(e) {
+        render_json(&unresolved.envelope());
+        return 1;
+    }
     let wallet_err = build_sa_error_envelope(e);
     render_json(&Envelope::<()>::err(&wallet_err));
     1

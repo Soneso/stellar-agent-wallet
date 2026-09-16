@@ -156,8 +156,12 @@ impl Respond for TrustlineSubmitSuccessRpcResponder {
                     serde_json::json!({ "entries": [], "latestLedger": 1001 })
                 }
             }
+            // The endpoint answers with the hash of the transaction it was
+            // handed, the way a real one does: the wallet polls and records
+            // the hash it computed from the bytes it signed, and reports a
+            // disagreement as `submission.hash_mismatch`.
             "sendTransaction" => serde_json::json!({
-                "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "hash": common::submitted_tx_hash(request),
                 "status": "PENDING",
                 "latestLedger": 1001,
                 "latestLedgerCloseTime": "1234567890"
@@ -165,7 +169,7 @@ impl Respond for TrustlineSubmitSuccessRpcResponder {
             "getTransaction" => serde_json::json!({
                 "status": "SUCCESS",
                 "ledger": 1005,
-                "txHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                "txHash": common::polled_tx_hash(request),
             }),
             _ => serde_json::json!({}),
         };
@@ -190,6 +194,7 @@ impl Respond for TrustlineSubmitSuccessRpcResponder {
 #[tokio::test]
 #[serial]
 async fn trustline_commit_full_round_trip_succeeds_with_string_encoded_limit() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(210);
 
@@ -316,6 +321,7 @@ async fn trustline_commit_full_round_trip_succeeds_with_string_encoded_limit() {
 #[tokio::test]
 #[serial]
 async fn trustline_simulate_echoes_canonical_limit_stroops_not_raw_caller_string() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(211);
 
@@ -387,6 +393,7 @@ async fn trustline_simulate_echoes_canonical_limit_stroops_not_raw_caller_string
 #[tokio::test]
 #[serial]
 async fn simulate_nonce_mint_failed_envelope_shape() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     // Deliberately no `install_test_nonce_key(...)` call — the mock store
     // stays empty at the nonce coordinate.
@@ -460,6 +467,7 @@ async fn simulate_nonce_mint_failed_envelope_shape() {
 #[tokio::test]
 #[serial]
 async fn commit_rejects_invalid_from_strkey_before_any_rpc_call() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(212);
 
@@ -565,6 +573,7 @@ async fn commit_rejects_invalid_from_strkey_before_any_rpc_call() {
 #[tokio::test]
 #[serial]
 async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(212);
 

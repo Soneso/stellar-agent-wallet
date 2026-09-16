@@ -76,7 +76,7 @@ use sha2::{Digest as _, Sha256};
 use super::{
     chain::{ZERO_BLOCK_HASH, compute_entry_hash},
     entry::AuditEntry,
-    schema::EventKind,
+    schema::{EventKind, ValueLegRecord},
     signer_set::{ObservedSignerSet, SignerSetStatePayload},
     verify::VerifyError,
     writer::{AuditWriter, is_rotated_sibling, wait_out_transient_rotation_window},
@@ -1719,6 +1719,134 @@ mod tests {
 
     fn open_writer(path: PathBuf) -> Arc<Mutex<AuditWriter>> {
         Arc::new(Mutex::new(AuditWriter::open(path, None).unwrap()))
+    }
+
+    // ── Helpers: value-action rows for the settlement lookup ─────────────────
+
+    const SETTLE_ENVELOPE: &str = "aa";
+    const OTHER_ENVELOPE: &str = "bb";
+
+    fn pending_row(envelope_hash: &str) -> AuditEntry {
+        AuditEntry::new_value_action_pending(
+            "stellar_pay",
+            Some("stellar:testnet".to_owned()),
+            vec![ValueLegRecord {
+                action: crate::audit_log::schema::ValueActionKind::Payment,
+                amount: Some(10_000_000),
+                asset: Some("native".to_owned()),
+                destination_redacted: Some("GDNYY...B2PKP".to_owned()),
+            }],
+            "6ba7aaac...69060003",
+            "GAOTC...PZ6X4",
+            7,
+            PolicyDecision::Allow,
+            Some(envelope_hash.to_owned()),
+            None,
+            "req-pending",
+        )
+    }
+
+    fn submitted_row(envelope_hash: &str) -> AuditEntry {
+        AuditEntry::new_value_action_submitted(
+            "stellar_pay",
+            Some("stellar:testnet".to_owned()),
+            vec![],
+            "6ba7aaac...69060003",
+            9,
+            PolicyDecision::Allow,
+            Some(envelope_hash.to_owned()),
+            None,
+            "req-submitted",
+        )
+    }
+
+    /// A pending row with nothing after it is owed a settled row, and reports
+    /// the legs the gate sized.
+    #[test]
+    fn a_pending_row_awaiting_settlement_is_found_with_its_legs() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        writer
+            .lock()
+            .unwrap()
+            .write_entry(pending_row(SETTLE_ENVELOPE))
+            .unwrap();
+
+        let ValueActionSettlement::Owed(found) = value_action_settlement(&path, SETTLE_ENVELOPE)
+        else {
+            panic!("a pending row with no settled row is owed one");
+        };
+        assert_eq!(found.tool, "stellar_pay");
+        assert_eq!(found.chain_id.as_deref(), Some("stellar:testnet"));
+        assert_eq!(found.legs.len(), 1, "the gate's legs are carried through");
+    }
+
+    /// A submission a settled row already accounts for is owed nothing.
+    ///
+    /// Reconciliation is repeatable by the operator, and a second run that
+    /// appended a second row would count one spend twice.
+    #[test]
+    fn a_settled_submission_is_owed_no_further_row() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        {
+            let mut guard = writer.lock().unwrap();
+            guard.write_entry(pending_row(SETTLE_ENVELOPE)).unwrap();
+            guard.write_entry(submitted_row(SETTLE_ENVELOPE)).unwrap();
+        }
+
+        assert_eq!(
+            value_action_settlement(&path, SETTLE_ENVELOPE),
+            ValueActionSettlement::Settled,
+            "a submission already accounted for is owed no second row"
+        );
+    }
+
+    /// A settled row for a different submission does not settle this one.
+    #[test]
+    fn another_submissions_settled_row_does_not_settle_this_one() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        {
+            let mut guard = writer.lock().unwrap();
+            guard.write_entry(pending_row(SETTLE_ENVELOPE)).unwrap();
+            guard.write_entry(pending_row(OTHER_ENVELOPE)).unwrap();
+            guard.write_entry(submitted_row(OTHER_ENVELOPE)).unwrap();
+        }
+
+        assert!(
+            matches!(
+                value_action_settlement(&path, SETTLE_ENVELOPE),
+                ValueActionSettlement::Owed(_)
+            ),
+            "the settled row names a different submission"
+        );
+        assert_eq!(
+            value_action_settlement(&path, OTHER_ENVELOPE),
+            ValueActionSettlement::Settled
+        );
+    }
+
+    /// A submission whose pending row is not in the active file is still owed
+    /// a settled row, written without the legs rotation took away.
+    #[test]
+    fn a_submission_whose_pending_row_rotated_out_is_owed_a_row_without_legs() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        writer
+            .lock()
+            .unwrap()
+            .write_entry(pending_row(OTHER_ENVELOPE))
+            .unwrap();
+
+        assert_eq!(
+            value_action_settlement(&path, SETTLE_ENVELOPE),
+            ValueActionSettlement::OwedWithoutLegs
+        );
     }
 
     // ── Helper: build a SaSignerSetBaselined EventKind ────────────────────────
@@ -3595,4 +3723,126 @@ mod tests {
             }
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pending value-action lookup
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What a `value_action_pending` row recorded for one submission.
+///
+/// The reconciliation surfaces settle a submission whose confirmation never
+/// arrived, and the row they write has to carry the SAME value legs the gate
+/// sized. Those legs were written once, by the pending row, so they are read
+/// back from it rather than re-derived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PendingValueAction {
+    /// The verb that made the submission, as it appears on the outer entry.
+    pub tool: String,
+    /// CAIP-2 chain identifier from the outer entry.
+    pub chain_id: Option<String>,
+    /// The value legs the policy gate sized.
+    pub legs: Vec<ValueLegRecord>,
+    /// The commit nonce prefix the pending row carried.
+    pub nonce_id: Option<String>,
+}
+
+/// Whether the active log already carries an operator-clear row for
+/// `envelope_hash`.
+///
+/// `stellar-agent tx receipt clear` writes its row before it marks the
+/// receipt, so that a failure at the mark leaves a reservation already
+/// released rather than one stranded under a receipt no verb accepts again.
+/// The cost of that order is that a re-run after such a failure would append a
+/// second row for one clear. This lookup is what makes the re-run complete the
+/// mark instead.
+///
+/// Scans the active file only, backwards from the tail. Performs no chain or
+/// HMAC verification, and opens the file with no lock of its own: the caller
+/// holds the audit writer's exclusive lock by the time it calls.
+///
+/// # Panics
+///
+/// Never panics.
+#[must_use]
+pub fn submission_receipt_cleared_exists(log_path: &Path, envelope_hash: &str) -> bool {
+    let Ok(raw) = std::fs::read_to_string(log_path) else {
+        return false;
+    };
+    raw.lines().rev().any(|line| {
+        serde_json::from_str::<AuditEntry>(line).is_ok_and(|entry| {
+            entry.envelope_hash.as_deref() == Some(envelope_hash)
+                && matches!(entry.event_kind, EventKind::SubmissionReceiptCleared { .. })
+        })
+    })
+}
+
+/// What a submission's value action still owes the log.
+///
+/// The scan runs backwards from the tail and stops at the first row naming the
+/// submission, so a settled row met first means the submission is already
+/// accounted for. Reconciliation is an operator-repeatable verb, and this is
+/// what keeps a second run from appending a second row for one spend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueActionSettlement {
+    /// A pending row is in the active file and nothing has settled it. Its
+    /// value legs are the ones the policy gate sized.
+    Owed(PendingValueAction),
+    /// Neither row is in the active file, so the submission is still owed a
+    /// settled row and its legs are not recoverable.
+    ///
+    /// The active file is what a reconciliation surface reads, and a pending
+    /// row rotates out of it after the log passes its size threshold. The row
+    /// is written anyway, with no legs, because the submission's outcome
+    /// belongs in the log whether or not its sizing survived rotation. Legs
+    /// from a different submission would be worse than none.
+    OwedWithoutLegs,
+    /// A settled row already accounts for the submission.
+    Settled,
+}
+
+/// Reports what the value action for `envelope_hash` still owes the log.
+///
+/// Scans the active file only, backwards from the tail, and stops at the first
+/// row naming the submission.
+///
+/// Performs no chain or HMAC verification: the value verbs' own pre-flight
+/// already refuses a log whose tip does not match its anchor, so a caller that
+/// reached this point has an anchored log. An unparseable line is skipped, the
+/// way a torn tail is: this lookup reports what it can read, it does not judge
+/// the log. It opens the file with no lock of its own; both callers hold the
+/// audit writer's exclusive lock by the time they call it.
+///
+/// # Panics
+///
+/// Never panics.
+#[must_use]
+pub fn value_action_settlement(log_path: &Path, envelope_hash: &str) -> ValueActionSettlement {
+    let Ok(raw) = std::fs::read_to_string(log_path) else {
+        return ValueActionSettlement::OwedWithoutLegs;
+    };
+    for line in raw.lines().rev() {
+        let Ok(entry) = serde_json::from_str::<AuditEntry>(line) else {
+            continue;
+        };
+        if entry.envelope_hash.as_deref() != Some(envelope_hash) {
+            continue;
+        }
+        match &entry.event_kind {
+            EventKind::ValueActionSubmitted { .. } | EventKind::ValueActionFailed { .. } => {
+                return ValueActionSettlement::Settled;
+            }
+            EventKind::ValueActionPending { legs, .. } => {
+                return ValueActionSettlement::Owed(PendingValueAction {
+                    legs: legs.clone(),
+                    tool: entry.tool,
+                    chain_id: entry.chain_id,
+                    nonce_id: entry.nonce_id,
+                });
+            }
+            _ => {}
+        }
+    }
+    ValueActionSettlement::OwedWithoutLegs
 }

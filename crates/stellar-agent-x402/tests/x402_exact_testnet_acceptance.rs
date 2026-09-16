@@ -316,6 +316,7 @@ async fn submit_to_testnet_reaches_ledger() {
         std::time::Duration::from_secs(60),
         TESTNET_PASSPHRASE,
         None,
+        None,
     )
     .await
     .expect("[submit/confirm FAIL] submit-and-confirm must reach ledger inclusion for a funded transfer");

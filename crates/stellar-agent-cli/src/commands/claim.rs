@@ -496,6 +496,30 @@ where
         return 1;
     }
 
+    // Settle the spending-window reservations that have stood long enough to
+    // be settleable, before the gate below counts them. A reservation the
+    // chain has since answered for should not hold the operator's cap, and one
+    // the chain has not is counted as spend.
+    let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
+        Ok(v) => v,
+        Err(e) => {
+            print_error(
+                &Envelope::<()>::err_raw("wallet.clock_error", e.to_string()),
+                args.output,
+            );
+            return 1;
+        }
+    };
+    if let Ok(reconcile_client) = StellarRpcClient::new(&args.rpc_url) {
+        crate::commands::submission_record::reconcile_open_reservations(
+            &profile,
+            &resolved.name,
+            &reconcile_client,
+            now_ms,
+        )
+        .await;
+    }
+
     let chain_id = caip2_chain_id_for_network(args.network);
     // The envelope arrives pre-signed, but broadcasting it still spends
     // funds — gate here even though signing already happened elsewhere.
@@ -525,32 +549,30 @@ where
         }
     };
 
-    match submit_envelope(args, signed_xdr).await {
-        Ok((signed_xdr, sub_result)) => {
-            // Non-fatal allow-path audit row: the SAME legs the gate sized
-            // (single-derivation invariant), on confirmed submit. Skipped
-            // entirely when no writer was acquired (the synthesized
-            // zero-config profile with an unminted audit key).
-            if let Some(writer) = &audit_writer {
-                crate::commands::value_audit::emit_value_action_submitted_row_with_writer(
-                    writer,
-                    &resolved.name,
-                    "stellar_claim_commit",
-                    chain_id,
-                    claim_effects.as_ref(),
-                    &sub_result.tx_hash,
-                    sub_result.ledger,
-                );
-            }
-            crate::commands::policy_engine::record_confirmed_value_moving(
-                "claim",
-                &profile,
-                &resolved.name,
-                "stellar_claim_commit",
-                chain_id,
-                claim_effects.as_ref(),
+    let recorder = match crate::commands::submission_record::build_recorder(
+        crate::commands::submission_record::SubmitRecord {
+            profile: &profile,
+            profile_name: resolved.name.clone(),
+            verb: "claim",
+            tool: "stellar_claim_commit",
+            chain_id,
+            effects: claim_effects.as_ref(),
+            audit: audit_writer.clone(),
+            now_ms,
+        },
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            print_error(
+                &crate::commands::submission_record::error_envelope(&e, signed_xdr),
+                args.output,
             );
+            return 1;
+        }
+    };
 
+    match submit_envelope(args, signed_xdr, Some(&recorder)).await {
+        Ok((signed_xdr, sub_result)) => {
             let result = ClaimResult {
                 envelope_xdr: signed_xdr,
                 tx_hash: Some(sub_result.tx_hash.clone()),
@@ -809,6 +831,30 @@ where
     };
     let unsigned_xdr = built.envelope_xdr.clone();
 
+    // Settle the spending-window reservations that have stood long enough to
+    // be settleable, before the gate below counts them. A reservation the
+    // chain has since answered for should not hold the operator's cap, and one
+    // the chain has not is counted as spend.
+    let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
+        Ok(v) => v,
+        Err(e) => {
+            print_error(
+                &Envelope::<()>::err_raw("wallet.clock_error", e.to_string()),
+                args.output,
+            );
+            return 1;
+        }
+    };
+    if let Ok(reconcile_client) = StellarRpcClient::new(&args.rpc_url) {
+        crate::commands::submission_record::reconcile_open_reservations(
+            &profile,
+            &resolved.name,
+            &reconcile_client,
+            now_ms,
+        )
+        .await;
+    }
+
     // ── Operator policy evaluation (before signing) ───────────────────────────
     let chain_id = caip2_chain_id_for_network(args.network);
     let claim_effects =
@@ -846,33 +892,33 @@ where
         }
     };
 
-    // 3. Submit.
-    match submit_envelope(args, &signed_xdr).await {
-        Ok((xdr, sub_result)) => {
-            // Non-fatal allow-path audit row: the SAME legs the gate sized
-            // (single-derivation invariant), on confirmed submit. Skipped
-            // entirely when no writer was acquired (the synthesized
-            // zero-config profile with an unminted audit key).
-            if let Some(writer) = &audit_writer {
-                crate::commands::value_audit::emit_value_action_submitted_row_with_writer(
-                    writer,
-                    &resolved.name,
-                    "stellar_claim",
-                    chain_id,
-                    claim_effects.as_ref(),
-                    &sub_result.tx_hash,
-                    sub_result.ledger,
-                );
-            }
-            crate::commands::policy_engine::record_confirmed_value_moving(
-                "claim",
-                &profile,
-                &resolved.name,
-                "stellar_claim",
-                chain_id,
-                claim_effects.as_ref(),
+    // 3. Record, then submit. The recorder writes the receipt, the pending
+    // audit row and the spending-window reservation before the bytes leave,
+    // and settles all three against what the network answers.
+    let recorder = match crate::commands::submission_record::build_recorder(
+        crate::commands::submission_record::SubmitRecord {
+            profile: &profile,
+            profile_name: resolved.name.clone(),
+            verb: "claim",
+            tool: "stellar_claim",
+            chain_id,
+            effects: claim_effects.as_ref(),
+            audit: audit_writer.clone(),
+            now_ms,
+        },
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            print_error(
+                &crate::commands::submission_record::error_envelope(&e, &signed_xdr),
+                args.output,
             );
+            return 1;
+        }
+    };
 
+    match submit_envelope(args, &signed_xdr, Some(&recorder)).await {
+        Ok((xdr, sub_result)) => {
             let result = ClaimResult {
                 envelope_xdr: xdr,
                 tx_hash: Some(sub_result.tx_hash.clone()),
@@ -884,7 +930,10 @@ where
             0
         }
         Err(e) => {
-            print_error(&Envelope::<()>::err(&e), args.output);
+            print_error(
+                &crate::commands::submission_record::error_envelope(&e, &signed_xdr),
+                args.output,
+            );
             1
         }
     }
@@ -1144,6 +1193,7 @@ async fn probe_endpoint_network(args: &ClaimArgs) -> Result<(), WalletError> {
 async fn submit_envelope(
     args: &ClaimArgs,
     signed_xdr: &str,
+    recorder: Option<&dyn stellar_agent_network::SubmissionRecorder>,
 ) -> Result<(String, SubmissionResult), WalletError> {
     let client = StellarRpcClient::new(&args.rpc_url)?;
     let timeout = Duration::from_secs(args.timeout_seconds);
@@ -1154,6 +1204,7 @@ async fn submit_envelope(
         timeout,
         passphrase,
         Some(SubmissionSignerKind::Software),
+        recorder,
     )
     .await?;
     Ok((signed_xdr.to_owned(), result))

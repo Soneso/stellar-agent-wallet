@@ -578,6 +578,47 @@ impl WalletServer {
         ctx.audit_legs = Some(&audit_legs);
         ctx.audit_tool = Some("stellar_defindex_vault_deposit");
 
+        // Record the submission before the bytes leave: the receipt, the
+        // pending audit row and the spending-window reservation. The recorder
+        // settles all three against what the network answers, and owns the
+        // confirmed row the adapter would otherwise emit.
+        let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(rmcp::ErrorData::internal_error(
+                    format!("clock_error: {e}"),
+                    None,
+                ));
+            }
+        };
+        let recorder = match crate::tools::submission_record::build_recorder(
+            crate::tools::submission_record::CommitRecord {
+                profile: &self.profile,
+                profile_name: audit_profile_name.clone(),
+                tool: "stellar_defindex_vault_deposit",
+                chain_id: args.chain_id.to_string(),
+                legs: audit_legs.clone(),
+                engine: self.policy_engine.as_ref(),
+                descriptor: self.tool_registry.get("stellar_defindex_vault_deposit"),
+                value_class: ValueClass::Value(ValueEffects::new(value_legs_for_record)),
+                audit: std::sync::Arc::clone(&audit_writer),
+                nonce_id: None,
+                approval_nonce: None,
+                approval_dir: None,
+                now_ms,
+            },
+            Some(&sequence_floor_hook),
+        ) {
+            Ok(r) => r,
+            Err(err) => {
+                return Ok(crate::tools::common::business_error_result(
+                    err.code(),
+                    err.message(),
+                ));
+            }
+        };
+        ctx.submission_recorder = Some(&recorder);
+
         tracing::info!(
             verb = "vault",
             action = "deposit",
@@ -607,19 +648,6 @@ impl WalletServer {
 
         match submit_result {
             Ok(()) => {
-                // Non-fatal window-state record on confirmed submit: the SAME
-                // legs the gate sized (single-derivation invariant).
-                if let Some(descriptor) = self.tool_registry.get("stellar_defindex_vault_deposit") {
-                    let value_class = ValueClass::Value(ValueEffects::new(value_legs_for_record));
-                    stellar_agent_network::policy_state::record_confirmed_window_state(
-                        self.policy_engine.as_ref(),
-                        descriptor,
-                        &self.profile,
-                        &audit_profile_name,
-                        &value_class,
-                    );
-                }
-
                 let resp = json!({
                     "status": "submitted",
                     "action": "deposit",
@@ -634,9 +662,9 @@ impl WalletServer {
                     serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
                 Ok(CallToolResult::success(vec![Content::text(json_str)]))
             }
-            Err(e) => Ok(crate::tools::common::business_error_result(
+            Err(e) => Ok(crate::tools::submission_record::defi_submit_error_result(
+                &e,
                 "vault.submit_failed",
-                e.to_string(),
             )),
         }
     }
@@ -1005,6 +1033,47 @@ impl WalletServer {
         ctx.audit_legs = Some(&audit_legs);
         ctx.audit_tool = Some("stellar_defindex_vault_withdraw");
 
+        // Record the submission before the bytes leave: the receipt, the
+        // pending audit row and the spending-window reservation. The recorder
+        // settles all three against what the network answers, and owns the
+        // confirmed row the adapter would otherwise emit.
+        let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(rmcp::ErrorData::internal_error(
+                    format!("clock_error: {e}"),
+                    None,
+                ));
+            }
+        };
+        let recorder = match crate::tools::submission_record::build_recorder(
+            crate::tools::submission_record::CommitRecord {
+                profile: &self.profile,
+                profile_name: audit_profile_name.clone(),
+                tool: "stellar_defindex_vault_withdraw",
+                chain_id: args.chain_id.to_string(),
+                legs: audit_legs.clone(),
+                engine: self.policy_engine.as_ref(),
+                descriptor: self.tool_registry.get("stellar_defindex_vault_withdraw"),
+                value_class: ValueClass::single(value_leg_for_record),
+                audit: std::sync::Arc::clone(&audit_writer),
+                nonce_id: None,
+                approval_nonce: None,
+                approval_dir: None,
+                now_ms,
+            },
+            Some(&sequence_floor_hook),
+        ) {
+            Ok(r) => r,
+            Err(err) => {
+                return Ok(crate::tools::common::business_error_result(
+                    err.code(),
+                    err.message(),
+                ));
+            }
+        };
+        ctx.submission_recorder = Some(&recorder);
+
         tracing::info!(
             verb = "vault",
             action = "withdraw",
@@ -1034,22 +1103,6 @@ impl WalletServer {
 
         match submit_result {
             Ok(()) => {
-                // Non-fatal window-state record on confirmed submit: the SAME
-                // leg the gate sized (single-derivation invariant). The leg is
-                // non-debit (a redemption), so it contributes only to
-                // rate_limit's call count, not per_period_cap's sum.
-                if let Some(descriptor) = self.tool_registry.get("stellar_defindex_vault_withdraw")
-                {
-                    let value_class = ValueClass::single(value_leg_for_record);
-                    stellar_agent_network::policy_state::record_confirmed_window_state(
-                        self.policy_engine.as_ref(),
-                        descriptor,
-                        &self.profile,
-                        &audit_profile_name,
-                        &value_class,
-                    );
-                }
-
                 let resp = json!({
                     "status": "submitted",
                     "action": "withdraw",
@@ -1064,9 +1117,9 @@ impl WalletServer {
                     serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_owned());
                 Ok(CallToolResult::success(vec![Content::text(json_str)]))
             }
-            Err(e) => Ok(crate::tools::common::business_error_result(
+            Err(e) => Ok(crate::tools::submission_record::defi_submit_error_result(
+                &e,
                 "vault.submit_failed",
-                e.to_string(),
             )),
         }
     }

@@ -352,6 +352,7 @@ async fn deploy_threshold_policy_wasm(
             Duration::from_secs(TIMEOUT_SECS),
             TESTNET_PASSPHRASE,
             None,
+            None,
         )
         .await
         .expect("upload submit must succeed");
@@ -449,6 +450,7 @@ async fn deploy_threshold_policy_wasm(
         &signed_deploy_xdr,
         Duration::from_secs(TIMEOUT_SECS),
         TESTNET_PASSPHRASE,
+        None,
         None,
     )
     .await;

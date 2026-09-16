@@ -457,6 +457,16 @@ pub struct SubmitInvokeArgs<'a> {
     /// original plain-fetch, no-recording behaviour exactly — every caller
     /// other than the DeFi adapter submit paths leaves this unset.
     pub sequence_floor: Option<&'a dyn stellar_agent_network::SequenceFloorHook>,
+
+    /// Durable-submission recorder (see
+    /// `stellar_agent_network::submission_record::SubmissionRecorder`).
+    ///
+    /// When `Some`, the signed transaction is recorded as sent with an unknown
+    /// outcome immediately before `sendTransaction`, and that record is settled
+    /// against what the network answered. `None` (the default) reproduces the
+    /// unrecorded submit behaviour — administration verbs and deployment
+    /// stages, which move no operator-capped value, leave this unset.
+    pub submission_recorder: Option<&'a dyn stellar_agent_network::SubmissionRecorder>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1307,12 +1317,10 @@ pub async fn submit_signed_invoke(
         args.timeout,
         args.network_passphrase,
         None,
+        args.submission_recorder,
     )
     .await
-    .map_err(|e| SaError::DeploymentFailed {
-        phase: "submit",
-        redacted_reason: format!("{} submission failed: {e}", args.op_label),
-    })?;
+    .map_err(|e| map_submit_error(&e, args.op_label, &final_signed_xdr))?;
     tracing::debug!(
         target: "sa_submit_timing",
         stage = "submit_and_wait",
@@ -1351,6 +1359,59 @@ pub async fn submit_signed_invoke(
         tx_hash: submission.tx_hash,
         ledger: submission.ledger,
     })
+}
+
+/// Maps a submit-layer failure into the smart-account error surface.
+///
+/// A submission whose outcome is unknown, and one refused because it could not
+/// be recorded, keep their own wire code and their identifiers: the caller's
+/// next step is to reconcile a transaction hash, and a generic deployment
+/// failure would send it to rebuild and re-submit instead. Every other failure
+/// is a deployment failure at the submit phase, as before.
+fn map_submit_error(
+    error: &stellar_agent_core::error::WalletError,
+    op_label: &'static str,
+    signed_xdr: &str,
+) -> SaError {
+    use stellar_agent_core::error::{SubmissionError, WalletError};
+
+    let unresolved = match error {
+        WalletError::Submission(SubmissionError::TxTimeout { tx_hash, seconds }) => Some((
+            crate::error::SubmissionUnresolvedKind::Timeout,
+            Some(tx_hash.clone()),
+            Some(*seconds),
+        )),
+        WalletError::Submission(SubmissionError::TxAlreadySubmitted { hash }) => Some((
+            crate::error::SubmissionUnresolvedKind::AlreadySubmitted,
+            Some(hash.clone()),
+            None,
+        )),
+        WalletError::Submission(SubmissionError::HashMismatch { local, .. }) => Some((
+            crate::error::SubmissionUnresolvedKind::HashMismatch,
+            Some(local.clone()),
+            None,
+        )),
+        WalletError::Submission(SubmissionError::RecordUnavailable { .. }) => Some((
+            crate::error::SubmissionUnresolvedKind::RecordUnavailable,
+            None,
+            None,
+        )),
+        _ => None,
+    };
+
+    match unresolved {
+        Some((kind, tx_hash, timeout_seconds)) => SaError::SubmissionUnresolved {
+            kind,
+            message: error.message(),
+            tx_hash,
+            timeout_seconds,
+            envelope_hash: Some(stellar_agent_network::envelope_hash_hex(signed_xdr)),
+        },
+        None => SaError::DeploymentFailed {
+            phase: "submit",
+            redacted_reason: format!("{op_label} submission failed: {error}"),
+        },
+    }
 }
 
 /// Asserts the [`SubmitInvokeArgs`] cross-field invariant that a caller which

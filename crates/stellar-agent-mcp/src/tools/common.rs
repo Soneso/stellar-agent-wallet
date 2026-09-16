@@ -854,6 +854,22 @@ pub(crate) fn approval_rejected_error() -> rmcp::model::CallToolResult {
     )
 }
 
+/// Returns the wire error for a live `ApprovalKind::Consumed` tombstone.
+///
+/// Distinct from [`approval_rejected_error`] and
+/// [`approval_required_indistinguishable`] so the agent can tell "this
+/// approval was already spent on a submission" apart from "the operator
+/// declined" and from "no decision yet". The three call for different next
+/// steps: reconcile the transaction the approval was spent on, stop asking,
+/// or wait.
+pub(crate) fn approval_consumed_error() -> rmcp::model::CallToolResult {
+    business_error_result(
+        "policy.approval_consumed",
+        "this pending approval was already spent on a submission; \
+         check that transaction's status before simulating the action again",
+    )
+}
+
 /// Returns the fail-closed wire error for a `RequireApproval` verdict on a
 /// single-shot sign tool.
 ///
@@ -1143,6 +1159,77 @@ impl WalletServer {
         .await
     }
 
+    /// Settles the spending-window reservations that have stood long enough to
+    /// be settleable, before the gate reads them.
+    ///
+    /// Never fails the dispatch. An endpoint that cannot be reached, a
+    /// receipt store that cannot be opened, and a window file that cannot be
+    /// read all leave every reservation standing, which is the direction that
+    /// keeps the operator's caps honest: a reservation that may still apply
+    /// keeps counting.
+    async fn reconcile_open_reservations(&self) {
+        let Ok(now_ms) = stellar_agent_core::timefmt::now_unix_ms() else {
+            tracing::debug!("window reconcile: system clock unavailable; reservations stand");
+            return;
+        };
+        let Ok(client) = stellar_agent_network::StellarRpcClient::new(&self.profile.rpc_url) else {
+            return;
+        };
+        let profile_name = self.profile_name_for_approval();
+        let receipts = stellar_agent_core::profile::receipt::ReceiptStore::open(&profile_name).ok();
+        let window =
+            stellar_agent_network::policy_state::PersistedWindowStore::for_profile(&profile_name);
+        let report = match window
+            .reconcile_due(
+                &self.profile,
+                &client,
+                receipts.as_ref(),
+                now_ms,
+                stellar_agent_network::policy_state::RECONCILE_BUDGET,
+            )
+            .await
+        {
+            Ok(report) => report,
+            Err(e) => {
+                tracing::debug!(
+                    profile = %profile_name,
+                    error = ?e,
+                    "window reconcile: pass failed; open reservations stand"
+                );
+                return;
+            }
+        };
+
+        // A submission the pass settled is owed the value-action row it never
+        // got to write. The writer is the same keyed one every value verb
+        // uses, so a log that cannot be appended leaves the row owed rather
+        // than the settlement undone.
+        if report.settled.is_empty() {
+            return;
+        }
+        let Ok(audit) =
+            crate::tools::value_audit::require_value_audit_writer(&self.profile, &profile_name)
+        else {
+            tracing::debug!(
+                profile = %profile_name,
+                settled = report.settled.len(),
+                "window reconcile: no audit writer; the settled rows stay owed"
+            );
+            return;
+        };
+        for settled in &report.settled {
+            crate::tools::submission_record::write_settled_row(
+                &self.profile,
+                &profile_name,
+                &audit,
+                &settled.envelope_hash,
+                &settled.tx_hash,
+                &settled.status,
+                settled.ledger,
+            );
+        }
+    }
+
     /// Shared gate core. `value` is `Some` for the value-carrying path
     /// ([`Self::dispatch_gate_with_value`]) and `None` for the args-derived path
     /// ([`Self::dispatch_gate`] / [`Self::dispatch_gate_with_views`]).
@@ -1200,6 +1287,31 @@ impl WalletServer {
                     None
                 }
             };
+
+        // Step 1.4 — settle the reservations that have stood long enough to be
+        // settleable, before the refresh below reads them.
+        //
+        // The order is deliberate: this pass writes the window FILE, and the
+        // refresh below replaces the engine's in-memory view from that file.
+        // Running it the other way round would leave the engine holding a view
+        // the pass had just invalidated for the rest of the dispatch.
+        //
+        // A reservation counts against the operator's caps while it stands, so
+        // the oldest few are asked about first. This pass is not a gate: a
+        // failure to reach the endpoint leaves every reservation standing and
+        // the dispatch continues, because counting a reservation that may
+        // still apply is the safe direction. It never joins the hydration
+        // errors below, which are fail-closed for a different reason.
+        //
+        // Only for a dispatch whose headroom the reservations actually shape.
+        // A read-only tool spends none, so settling before it would buy two
+        // keyring reads, an HMAC verify and a receipt-store read per call for
+        // an answer nothing in that call uses.
+        if descriptor.value_kind != stellar_agent_core::policy::ToolValueKind::ReadOnly
+            && self.policy_engine.window_state_store().is_some()
+        {
+            self.reconcile_open_reservations().await;
+        }
 
         // Step 1.5 — refresh window state before evaluation.
         //
@@ -1678,6 +1790,22 @@ pub(crate) async fn verify_attestation_gate(
             "approval entry was rejected by the operator"
         );
         return Err(approval_rejected_error());
+    }
+
+    // 5c. A consumption tombstone refuses before any attestation check: the
+    //     entry retains the attestation blob it was committed under, so an
+    //     attestation check would pass and admit a second commit on an
+    //     approval that has already been spent.
+    if matches!(
+        entry.kind,
+        stellar_agent_core::approval::ApprovalKind::Consumed { .. }
+    ) {
+        tracing::debug!(
+            nonce = %approval_nonce_str,
+            tool = tool_name,
+            "approval entry was already spent on a submission"
+        );
+        return Err(approval_consumed_error());
     }
 
     // 6. Confirm envelope XDR hash matches the stored hash.
@@ -2693,6 +2821,38 @@ mod tests {
             v["error"].get("data").is_none(),
             "envelope error object must expose no data field; got: {v}"
         );
+        // `details` is the field that DOES exist on the error object, carried
+        // by the three unresolved-submission codes. A refusal that names an
+        // approval must never carry one: its presence or absence would be a
+        // side channel distinguishing the reasons this uniform error covers.
+        assert!(
+            v["error"].get("details").is_none(),
+            "an approval refusal must carry no details object; got: {v}"
+        );
+    }
+
+    /// The three approval refusals differ in code and in nothing else.
+    ///
+    /// They are deliberately distinguishable from each other — an agent acts
+    /// differently on each — but each must be uniform across the reasons it
+    /// covers, so none of them may carry a `details` object.
+    #[test]
+    fn no_approval_refusal_carries_a_details_object() {
+        for (label, result) in [
+            ("required", approval_required_indistinguishable()),
+            ("rejected", approval_rejected_error()),
+            ("consumed", approval_consumed_error()),
+        ] {
+            let v: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+            assert!(
+                v["error"].get("details").is_none(),
+                "the {label} refusal must carry no details object; got: {v}"
+            );
+            assert!(
+                v["error"].get("data").is_none(),
+                "the {label} refusal must expose no data field; got: {v}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

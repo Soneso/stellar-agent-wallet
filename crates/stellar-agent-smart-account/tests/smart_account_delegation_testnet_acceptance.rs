@@ -350,6 +350,7 @@ async fn submit_testnet_signed_xdr(
         Duration::from_secs(TIMEOUT_SECS),
         TESTNET_PASSPHRASE,
         Some(SubmissionSignerKind::Software),
+        None,
     )
     .await?)
 }

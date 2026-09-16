@@ -37,10 +37,10 @@ use stellar_agent_network::builder::ClassicOpBuilder;
 use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::signing::software::SoftwareSigningKey;
 use stellar_agent_network::{StellarRpcClient, fund_with_friendbot, submit_transaction_and_wait};
-use stellar_agent_test_support::EchoIdResponder;
 use stellar_agent_test_support::signed_envelope::{
     account_id_for_seed, get_network_result, ledger_entries_result_for,
 };
+use stellar_agent_test_support::{EchoIdResponder, SubmissionEchoResponder};
 use stellar_xdr::{Limits, OperationBody, ReadXdr, TransactionEnvelope};
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -247,10 +247,11 @@ async fn sponsored_create_account_mock_pipeline() {
         .mount(&mock_server)
         .await;
 
-    // Mock 3: sendTransaction — `hash` field per soroban-client schema.
-    let tx_hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    // Mock 3: sendTransaction — `hash` field per soroban-client schema. The
+    // responder answers with the hash of the transaction it was handed, the
+    // way a real endpoint does.
     let send_result = json!({
-        "hash": tx_hash,
+        "hash": "",
         "status": "PENDING",
         "latestLedger": 200,
         "latestLedgerCloseTime": "1234567890",
@@ -258,7 +259,10 @@ async fn sponsored_create_account_mock_pipeline() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_result))
+        .respond_with(SubmissionEchoResponder::new(
+            send_result,
+            TESTNET_PASSPHRASE,
+        ))
         .up_to_n_times(1)
         .mount(&mock_server)
         .await;
@@ -266,13 +270,13 @@ async fn sponsored_create_account_mock_pipeline() {
     // Mock 4: getTransaction SUCCESS (minimal fields matching soroban-client schema).
     let get_result = json!({
         "status": "SUCCESS",
-        "txHash": tx_hash,
+        "txHash": "",
         "ledger": 201,
     });
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "getTransaction"})))
-        .respond_with(EchoIdResponder::new(get_result))
+        .respond_with(SubmissionEchoResponder::new(get_result, TESTNET_PASSPHRASE))
         .up_to_n_times(1)
         .mount(&mock_server)
         .await;
@@ -283,6 +287,7 @@ async fn sponsored_create_account_mock_pipeline() {
         &signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
+        None,
         None,
     )
     .await

@@ -1259,115 +1259,70 @@ impl WalletServer {
             .map(|effects| effects.legs().iter().map(Into::into).collect())
             .unwrap_or_default();
 
-        // ── Submit ────────────────────────────────────────────────────────────
+        // ── Record before submit ──────────────────────────────────────────────
+        //
+        // The recorder writes the receipt, the pending audit row and the
+        // spending-window reservation immediately before the bytes leave, and
+        // settles all three against what the network answers. The window
+        // entries it reserves come from the SAME gate_value_effects the audit
+        // rows carry, keyed by the SAME registry descriptor the gate evaluated
+        // against.
+        let value_class = gate_value_effects
+            .clone()
+            .map(stellar_agent_core::policy::v1::ValueClass::Value)
+            .unwrap_or(stellar_agent_core::policy::v1::ValueClass::ReadOnly);
+        let floor_hook = crate::sequence_floor::hook(&self.sequence_floor);
+        let recorder = match crate::tools::submission_record::build_recorder(
+            crate::tools::submission_record::CommitRecord {
+                profile: &self.profile,
+                profile_name: self.profile_name_for_approval(),
+                tool: "stellar_trustline_commit",
+                chain_id: args.chain_id.to_string(),
+                legs: audit_legs,
+                engine: self.policy_engine.as_ref(),
+                descriptor: self.tool_registry.get("stellar_trustline_commit"),
+                value_class,
+                audit: std::sync::Arc::clone(&audit_writer),
+                nonce_id: Some(nonce_id_prefix.to_string()),
+                approval_nonce: args.approval_nonce.clone(),
+                approval_dir: self.resolve_approval_dir().ok(),
+                now_ms,
+            },
+            Some(&floor_hook),
+        ) {
+            Ok(r) => r,
+            Err(err) => {
+                return Ok(crate::tools::submission_record::submission_error_result(
+                    &err,
+                    &signed_xdr,
+                ));
+            }
+        };
+
+        // ── Submit ───────────────────────────────────────────────────────────
         match submit_transaction_and_wait(
             &client,
             &signed_xdr,
             submit_timeout(&self.profile),
             &self.profile.network_passphrase,
             Some(SubmissionSignerKind::Keyring),
+            Some(&recorder),
         )
         .await
         {
             Ok(SubmissionResult {
                 tx_hash, ledger, ..
             }) => {
-                // Log tx hash first-8-last-8 at info per the redaction policy.
-                let tx_hash_redacted = format!(
-                    "{}…{}",
-                    &tx_hash[..8.min(tx_hash.len())],
-                    if tx_hash.len() > 8 {
-                        &tx_hash[tx_hash.len().saturating_sub(8)..]
-                    } else {
-                        ""
-                    }
-                );
                 tracing::info!(
                     tool = "stellar_trustline_commit",
                     chain = %args.chain_id,
                     nonce_id = %nonce_id_prefix,
                     code = %auth_asset_code,
                     issuer = %redact_strkey_first5_last5(&auth_asset_issuer),
-                    tx_hash = %tx_hash_redacted,
+                    tx_hash = %stellar_agent_network::submit::redact_tx_hash(&tx_hash),
                     decision = "committed",
                     "ChangeTrust tx submitted"
                 );
-
-                // Non-fatal allow-path audit row carrying the gate-sized legs.
-                let audit_request_id = uuid::Uuid::new_v4().to_string();
-                let audit_entry =
-                    stellar_agent_core::audit_log::AuditEntry::new_value_action_submitted(
-                        "stellar_trustline_commit",
-                        args.chain_id.as_str(),
-                        audit_legs,
-                        tx_hash_redacted.as_str(),
-                        ledger,
-                        stellar_agent_core::audit_log::PolicyDecision::Allow,
-                        None,
-                        Some(nonce_id_prefix.to_string()),
-                        &audit_request_id,
-                    );
-                crate::tools::value_audit::emit_value_audit_row_with_writer(
-                    &audit_writer,
-                    &self.profile_name_for_approval(),
-                    audit_entry,
-                );
-
-                if let Some(descriptor) = self.tool_registry.get("stellar_trustline_commit") {
-                    let value_class = gate_value_effects
-                        .clone()
-                        .map(stellar_agent_core::policy::v1::ValueClass::Value)
-                        .unwrap_or(stellar_agent_core::policy::v1::ValueClass::ReadOnly);
-                    stellar_agent_network::policy_state::record_confirmed_window_state(
-                        self.policy_engine.as_ref(),
-                        descriptor,
-                        &self.profile,
-                        &self.profile_name_for_approval(),
-                        &value_class,
-                    );
-                }
-
-                // Record the confirmed sequence for this source account so a
-                // later build in this same process can wait out avoidable
-                // read-after-write propagation lag (source_sequence is the
-                // PRE-submit value; the submitted envelope's sequence is
-                // source_sequence + 1).
-                self.sequence_floor
-                    .lock()
-                    .await
-                    .record_confirmed(&args.from, source_sequence + 1);
-
-                // Best-effort: remove the consumed approval entry.
-                if let Some(ref approval_nonce_str) = args.approval_nonce
-                    && let Ok(approvals_dir) =
-                        stellar_agent_core::profile::schema::default_approval_dir()
-                {
-                    let profile_name = self.profile_name_for_approval();
-                    let store_path = approvals_dir.join(format!("{profile_name}.toml"));
-                    match open_with_retry(
-                        &store_path,
-                        DEFAULT_RETRY_ATTEMPTS,
-                        DEFAULT_RETRY_BACKOFF,
-                    ) {
-                        Ok(mut store) => {
-                            if let Err(e) = store.remove(approval_nonce_str) {
-                                tracing::warn!(
-                                    nonce = %approval_nonce_str,
-                                    error = %e,
-                                    "stellar_trustline_commit: approval entry remove failed after \
-                                     successful submit; entry will expire via gc"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "stellar_trustline_commit: approval store open failed during \
-                                 post-commit cleanup; entry will expire via gc"
-                            );
-                        }
-                    }
-                }
 
                 let view = json!({
                     "tx_hash": tx_hash,
@@ -1379,15 +1334,10 @@ impl WalletServer {
                     .unwrap_or_else(|_| String::from("{}"));
                 Ok(CallToolResult::success(vec![Content::text(json_out)]))
             }
-            Err(err) => {
-                let envelope = stellar_agent_core::envelope::Envelope::<()>::err(&err);
-                let json = envelope
-                    .to_json_pretty()
-                    .unwrap_or_else(|_| String::from("{}"));
-                let mut result = CallToolResult::success(vec![Content::text(json)]);
-                result.is_error = Some(true);
-                Ok(result)
-            }
+            Err(err) => Ok(crate::tools::submission_record::submission_error_result(
+                &err,
+                &signed_xdr,
+            )),
         }
     }
 }

@@ -414,6 +414,10 @@ fn apply_reject(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity)
         None => (true, None, None),
         Some(e) => match &e.kind {
             ApprovalKind::Rejected { .. } => (true, None, None),
+            // A spent approval is resolved, and its attestation is not handed
+            // back: the blob is retained so the commit gate can tell a retry
+            // from a first attempt, not so a second flow can present it again.
+            ApprovalKind::Consumed { .. } => (true, None, None),
             _ if e.attestation_blob_b64.is_some() => (true, e.attestation_blob_b64.clone(), None),
             _ => (false, None, Some(e.kind.kind_name().to_owned())),
         },

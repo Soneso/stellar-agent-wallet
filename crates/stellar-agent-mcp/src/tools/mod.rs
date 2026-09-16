@@ -50,6 +50,8 @@ pub(crate) mod sep43_sign_and_submit_transaction;
 pub(crate) mod sep43_sign_auth_entry;
 pub(crate) mod sep43_sign_message;
 pub(crate) mod sep43_sign_transaction;
+pub(crate) mod submission_record;
+pub(crate) mod transaction_status;
 pub(crate) mod value_audit;
 // x402 Exact Stellar payment scheme MCP tools.
 pub(crate) mod x402_create_payment;

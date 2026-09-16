@@ -43,10 +43,10 @@ use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::builder::{Asset, ClassicOpBuilder};
 use stellar_agent_network::fee_bump_retry::submit_fee_bump_idempotent;
 use stellar_agent_network::signing::software::SoftwareSigningKey;
-use stellar_agent_test_support::EchoIdResponder;
 use stellar_agent_test_support::signed_envelope::{
     account_id_for_seed, get_network_result, ledger_entries_result_for,
 };
+use stellar_agent_test_support::{EchoIdResponder, SubmissionEchoResponder};
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer};
 
@@ -212,7 +212,10 @@ async fn inner_key_idempotency_no_second_send_transaction() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(SubmissionEchoResponder::new(
+            send_pending_response(),
+            TESTNET_PASSPHRASE,
+        ))
         .expect(1)
         .mount(&server)
         .await;
@@ -221,7 +224,10 @@ async fn inner_key_idempotency_no_second_send_transaction() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "getTransaction"})))
-        .respond_with(EchoIdResponder::new(get_success_response()))
+        .respond_with(SubmissionEchoResponder::new(
+            get_success_response(),
+            TESTNET_PASSPHRASE,
+        ))
         .up_to_n_times(20)
         .mount(&server)
         .await;
@@ -336,7 +342,10 @@ async fn higher_fee_inner_already_applied_returns_cached_no_rebump() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(SubmissionEchoResponder::new(
+            send_pending_response(),
+            TESTNET_PASSPHRASE,
+        ))
         .expect(1)
         .mount(&server)
         .await;
@@ -345,7 +354,10 @@ async fn higher_fee_inner_already_applied_returns_cached_no_rebump() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "getTransaction"})))
-        .respond_with(EchoIdResponder::new(get_success_response()))
+        .respond_with(SubmissionEchoResponder::new(
+            get_success_response(),
+            TESTNET_PASSPHRASE,
+        ))
         .up_to_n_times(20)
         .mount(&server)
         .await;
@@ -507,7 +519,10 @@ async fn higher_fee_same_inner_key_regardless_of_outer_fee() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(SubmissionEchoResponder::new(
+            send_pending_response(),
+            TESTNET_PASSPHRASE,
+        ))
         .expect(1)
         .mount(&server)
         .await;
@@ -515,7 +530,10 @@ async fn higher_fee_same_inner_key_regardless_of_outer_fee() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "getTransaction"})))
-        .respond_with(EchoIdResponder::new(get_success_response()))
+        .respond_with(SubmissionEchoResponder::new(
+            get_success_response(),
+            TESTNET_PASSPHRASE,
+        ))
         .up_to_n_times(20)
         .mount(&server)
         .await;
@@ -617,7 +635,10 @@ async fn inner_max_time_stored_in_receipt() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(SubmissionEchoResponder::new(
+            send_pending_response(),
+            TESTNET_PASSPHRASE,
+        ))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -625,7 +646,10 @@ async fn inner_max_time_stored_in_receipt() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "getTransaction"})))
-        .respond_with(EchoIdResponder::new(get_success_response()))
+        .respond_with(SubmissionEchoResponder::new(
+            get_success_response(),
+            TESTNET_PASSPHRASE,
+        ))
         .up_to_n_times(20)
         .mount(&server)
         .await;
@@ -691,7 +715,9 @@ async fn txfeebumpinnersuccess_routes_to_success_receipt_via_fast_path() {
     let store = ReceiptStore::open_at(dir.path(), "fb-557-test").unwrap();
 
     // Pre-seed a Success receipt (what the winner stores after status:SUCCESS).
-    store.try_begin(&inner_key, outer_tx_hash, 0, 100).unwrap();
+    store
+        .try_begin(&inner_key, outer_tx_hash, "", 0, 0, 100)
+        .unwrap();
     store
         .finalize(&inner_key, ReceiptStatus::Success, Some(FAKE_LEDGER))
         .unwrap();
@@ -772,13 +798,19 @@ async fn probe_failure_leaves_no_receipt_and_the_retry_sends() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(SubmissionEchoResponder::new(
+            send_pending_response(),
+            TESTNET_PASSPHRASE,
+        ))
         .mount(&server)
         .await;
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "getTransaction"})))
-        .respond_with(EchoIdResponder::new(get_success_response()))
+        .respond_with(SubmissionEchoResponder::new(
+            get_success_response(),
+            TESTNET_PASSPHRASE,
+        ))
         .mount(&server)
         .await;
     Mock::given(method("POST"))

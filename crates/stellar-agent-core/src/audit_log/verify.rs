@@ -920,6 +920,9 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
                 // hash check.
             }
             EventKind::ValueActionSubmitted { .. }
+            | EventKind::ValueActionPending { .. }
+            | EventKind::ValueActionFailed { .. }
+            | EventKind::SubmissionReceiptCleared { .. }
             | EventKind::X402PaymentAuthorized { .. }
             | EventKind::OpaquePayloadSigned { .. }
             | EventKind::MppChargeAuthorized { .. }
@@ -1534,6 +1537,9 @@ mod tests {
             EventKind::ApprovalAttestedRemote { .. } => "approval_attested_remote",
             EventKind::ApprovalRejectedRemote { .. } => "approval_rejected_remote",
             EventKind::ValueActionSubmitted { .. } => "value_action_submitted",
+            EventKind::ValueActionPending { .. } => "value_action_pending",
+            EventKind::ValueActionFailed { .. } => "value_action_failed",
+            EventKind::SubmissionReceiptCleared { .. } => "submission_receipt_cleared",
             EventKind::X402PaymentAuthorized { .. } => "x402_payment_authorized",
             EventKind::OpaquePayloadSigned { .. } => "opaque_payload_signed",
             EventKind::MppChargeAuthorized { .. } => "mpp_charge_authorized",
@@ -1912,6 +1918,32 @@ mod tests {
                 transaction_hash_redacted: "abcd1234...5678efgh".to_owned(),
                 ledger: 42,
             },
+            EventKind::ValueActionPending {
+                legs: vec![ValueLegRecord {
+                    action: ValueActionKind::Payment,
+                    amount: Some(1_000_000),
+                    asset: Some("native".to_owned()),
+                    destination_redacted: Some("GAAAA...ZZZZZ".to_owned()),
+                }],
+                transaction_hash_redacted: "abcd1234...5678efgh".to_owned(),
+                source_redacted: "GAAAA...ZZZZZ".to_owned(),
+                sequence: 7,
+            },
+            EventKind::ValueActionFailed {
+                legs: vec![ValueLegRecord {
+                    action: ValueActionKind::Payment,
+                    amount: Some(1_000_000),
+                    asset: Some("native".to_owned()),
+                    destination_redacted: Some("GAAAA...ZZZZZ".to_owned()),
+                }],
+                transaction_hash_redacted: "abcd1234...5678efgh".to_owned(),
+                code: "ledger.insufficient_balance".to_owned(),
+            },
+            EventKind::SubmissionReceiptCleared {
+                transaction_hash_redacted: "abcd1234...5678efgh".to_owned(),
+                cleared_from: "ambiguous".to_owned(),
+                reservation_released: true,
+            },
             EventKind::X402PaymentAuthorized {
                 legs: vec![ValueLegRecord {
                     action: ValueActionKind::X402Payment,
@@ -2232,6 +2264,9 @@ mod tests {
                 "approval_attested_remote",
                 "approval_rejected_remote",
                 "value_action_submitted",
+                "value_action_pending",
+                "value_action_failed",
+                "submission_receipt_cleared",
                 "x402_payment_authorized",
                 "opaque_payload_signed",
                 "mpp_charge_authorized",

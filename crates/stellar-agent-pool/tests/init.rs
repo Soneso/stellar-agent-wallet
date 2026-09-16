@@ -26,10 +26,10 @@ use stellar_agent_network::{SoftwareSigningKey, StellarRpcClient};
 use stellar_agent_pool::PoolError;
 use stellar_agent_pool::init::{InitParams, assert_sandwich_structure, init_pool};
 use stellar_agent_pool::pool::ChannelPool;
-use stellar_agent_test_support::EchoIdResponder;
 use stellar_agent_test_support::signed_envelope::{
     account_id_for_seed, get_network_result, ledger_entries_result_for,
 };
+use stellar_agent_test_support::{EchoIdResponder, SubmissionEchoResponder};
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -199,12 +199,25 @@ async fn init_pool_n2_success_submits_valid_sandwich() {
             {
                 g.push(body);
             }
-            let id = serde_json::from_slice::<Value>(&request.body)
-                .ok()
-                .and_then(|v| v.get("id").cloned())
-                .unwrap_or_else(|| json!(1));
+            let body = serde_json::from_slice::<Value>(&request.body).unwrap_or_else(|_| json!({}));
+            let id = body.get("id").cloned().unwrap_or_else(|| json!(1));
+            // A real endpoint answers `sendTransaction` with the hash of the
+            // transaction it was handed, and the submitting wallet refuses a
+            // hash that does not describe what it signed.
+            let mut result = self.result.clone();
+            if body.get("method").and_then(Value::as_str) == Some("sendTransaction")
+                && let Some(object) = result.as_object_mut()
+            {
+                object.insert(
+                    "hash".to_owned(),
+                    json!(stellar_agent_test_support::send_transaction_hash_hex(
+                        &body,
+                        TESTNET_PASSPHRASE
+                    )),
+                );
+            }
             ResponseTemplate::new(200)
-                .set_body_json(json!({"jsonrpc":"2.0","id":id,"result":self.result.clone()}))
+                .set_body_json(json!({"jsonrpc":"2.0","id":id,"result":result}))
                 .insert_header("content-type", "application/json")
         }
     }
@@ -354,12 +367,15 @@ async fn init_pool_n1_success_single_channel() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(json!({
-            "hash": tx_hash,
-            "status": "PENDING",
-            "latestLedger": 1000,
-            "latestLedgerCloseTime": "1234567890"
-        })))
+        .respond_with(SubmissionEchoResponder::new(
+            json!({
+                "hash": tx_hash,
+                "status": "PENDING",
+                "latestLedger": 1000,
+                "latestLedgerCloseTime": "1234567890"
+            }),
+            TESTNET_PASSPHRASE,
+        ))
         .mount(&server)
         .await;
 

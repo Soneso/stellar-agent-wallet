@@ -4748,6 +4748,17 @@ pub(crate) fn sa_error_to_invocation_result(
             "submit" | "post_submit_verification" => SaInvocationResult::OnChainRejected,
             _ => SaInvocationResult::PreSubmissionRefused,
         },
+        // SubmissionUnresolved: the kinds differ on whether this call sent
+        // anything. A timeout and a hash mismatch follow a send whose outcome
+        // the chain has yet to settle. A duplicate refusal and a
+        // record-unavailable refusal both stop before the send.
+        SaError::SubmissionUnresolved { kind, .. } => match kind {
+            crate::error::SubmissionUnresolvedKind::Timeout
+            | crate::error::SubmissionUnresolvedKind::HashMismatch => {
+                SaInvocationResult::PostSubmitVerificationFailed
+            }
+            _ => SaInvocationResult::PreSubmissionRefused,
+        },
         // MulticallSha256Drift: fires at registry-lookup time, before any I/O.
         SaError::MulticallSha256Drift { .. } => SaInvocationResult::PreSubmissionRefused,
         // MulticallRegistryEntryNotFound: fires at registry-lookup time, before any I/O.

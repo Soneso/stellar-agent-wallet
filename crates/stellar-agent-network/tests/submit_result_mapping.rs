@@ -139,6 +139,7 @@ async fn failed_result_error(
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
+        None,
     )
     .await
     .unwrap_err()
@@ -511,6 +512,7 @@ async fn inner_code_for(
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
+        None,
     )
     .await
     .unwrap_err();
@@ -704,6 +706,7 @@ async fn success_with_missing_ledger_field_falls_back_to_zero() {
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         Some(SubmissionSignerKind::Keyring),
+        None,
     )
     .await;
 
@@ -773,6 +776,7 @@ async fn success_with_hardware_signer_kind_forwarded() {
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         Some(SubmissionSignerKind::Hardware),
+        None,
     )
     .await;
 
@@ -825,6 +829,7 @@ async fn success_with_none_signer_kind_forwarded() {
         envelope.envelope_xdr(),
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
+        None,
         None,
     )
     .await
