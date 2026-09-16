@@ -92,8 +92,8 @@ pub use rule_proposal::{
     RuleProposalSignerKind, try_decode_spending_limit_params,
 };
 pub use store::{
-    ApprovalKind, DEFAULT_TTL_MS, EXPECTED_NONCE_LEN, PendingApproval, PendingApprovalStore,
-    RuleProposalGateError, generate_csrf_token,
+    ApprovalKind, ConsumedOutcome, DEFAULT_TTL_MS, EXPECTED_NONCE_LEN, PendingApproval,
+    PendingApprovalStore, RuleProposalGateError, generate_csrf_token,
 };
 pub use toolset_grant::{
     TOOLSET_GRANT_DEFAULT_TTL_MS, ToolsetGrant, ToolsetGrantStore, build_attested_grant,

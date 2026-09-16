@@ -81,19 +81,13 @@ async fn mount_probe_and_signers(server: &MockServer, envelope: &SignedTestEnvel
         .await;
 }
 
-/// Computes the envelope hash for a base64-encoded signed envelope XDR.
+/// The idempotency key the submit paths record under.
+///
+/// Delegates rather than restating the derivation: the key is one definition
+/// shared by both submit paths, and a test that computed its own would pass
+/// while the two disagreed.
 fn envelope_hash_for(signed_xdr: &str) -> String {
-    use base64::Engine as _;
-    use sha2::{Digest, Sha256};
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(signed_xdr.trim())
-        .unwrap();
-    let h = Sha256::digest(&bytes);
-    h.iter().fold(String::new(), |mut s, b| {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    stellar_agent_network::envelope_hash_hex(signed_xdr)
 }
 
 /// JSON-RPC `sendTransaction` response for a PENDING submission.
@@ -140,7 +134,7 @@ async fn terminal_cached_receipt_no_send_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let store = ReceiptStore::open_at(dir.path(), "test").unwrap();
     store
-        .try_begin(&envelope_hash, FAKE_TX_HASH, 0, 100)
+        .try_begin(&envelope_hash, FAKE_TX_HASH, "", 0, 0, 100)
         .unwrap();
     store
         .finalize(&envelope_hash, ReceiptStatus::Success, Some(FAKE_LEDGER))

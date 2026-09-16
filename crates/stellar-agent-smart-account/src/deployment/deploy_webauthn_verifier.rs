@@ -506,6 +506,7 @@ async fn deploy_webauthn_verifier_body(
                 args.timeout,
                 &args.network_passphrase,
                 None,
+                None,
             ),
         )
         .await
@@ -706,6 +707,7 @@ async fn deploy_webauthn_verifier_body(
             &signed_xdr,
             args.timeout,
             &args.network_passphrase,
+            None,
             None,
         ),
     )

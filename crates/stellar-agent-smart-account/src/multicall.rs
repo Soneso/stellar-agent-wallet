@@ -208,6 +208,13 @@ pub struct MulticallSubmitArgs<'a> {
     /// `submit_multicall_bundle` call.  All audit rows emitted in a single
     /// bundle submission share this `request_id` for forensic correlation.
     pub request_id: &'a str,
+    /// Durable-submission recorder.
+    ///
+    /// When `Some`, the bundle is recorded as sent with an unknown outcome
+    /// immediately before `sendTransaction`, and that record is settled
+    /// against what the network answered. `None` leaves the unrecorded
+    /// submit behaviour.
+    pub submission_recorder: Option<&'a dyn stellar_agent_network::SubmissionRecorder>,
 }
 
 // ── MulticallResult ───────────────────────────────────────────────────────────
@@ -1459,6 +1466,7 @@ pub async fn submit_multicall_bundle(
             .emit_observability_logs(true)
             .required_checks(&["multicall"])
             .multicall_check(multicall_check)
+            .maybe_submission_recorder(args.submission_recorder)
             .build(),
     )
     .await;

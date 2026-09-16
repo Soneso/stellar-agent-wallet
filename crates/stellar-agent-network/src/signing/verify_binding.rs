@@ -99,6 +99,11 @@ struct AccountRef {
 /// Signer sets are fetched in a single bounded, retried `getLedgerEntries`
 /// under `deadline`.
 ///
+/// Returns that response's `latestLedger`: the endpoint's view of the chain
+/// immediately before the send, which is the ledger the submission is recorded
+/// against. `getNetwork` carries no ledger, so this is the read that supplies
+/// it at no extra round trip.
+///
 /// # Errors
 ///
 /// - [`NetworkError::EnvelopeUnsigned`] if any signature set on the envelope
@@ -117,7 +122,7 @@ pub(crate) async fn verify_signature_network_binding(
     envelope: &TransactionEnvelope,
     endpoint_passphrase: &str,
     deadline: Instant,
-) -> Result<(), WalletError> {
+) -> Result<u32, WalletError> {
     let groups = signature_groups(envelope)?;
 
     // An unsigned envelope is the natural mistake after a build-only stage.
@@ -144,7 +149,8 @@ pub(crate) async fn verify_signature_network_binding(
             }
         }
     }
-    let signers_by_account = fetch_account_signers(client, &accounts_to_fetch, deadline).await?;
+    let (signers_by_account, latest_ledger) =
+        fetch_account_signers(client, &accounts_to_fetch, deadline).await?;
 
     let endpoint_network_id = network_id(endpoint_passphrase);
     let mainnet_network_id = network_id(MAINNET_PASSPHRASE);
@@ -170,7 +176,7 @@ pub(crate) async fn verify_signature_network_binding(
         }
     }
 
-    Ok(())
+    Ok(latest_ledger)
 }
 
 /// Splits an envelope into the signature groups that must be verified, each

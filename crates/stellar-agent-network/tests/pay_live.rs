@@ -103,6 +103,7 @@ async fn live_payment_round_trip() {
         Duration::from_secs(60),
         TESTNET_PASSPHRASE,
         None,
+        None,
     )
     .await
     .expect("transaction must confirm");

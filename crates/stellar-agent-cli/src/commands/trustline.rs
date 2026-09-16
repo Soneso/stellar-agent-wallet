@@ -345,6 +345,28 @@ where
     };
     let source_sequence = source_account_view.sequence_number;
 
+    // Settle the spending-window reservations that have stood long enough to
+    // be settleable, before the gate below counts them. A reservation the
+    // chain has since answered for should not hold the operator's cap, and one
+    // the chain has not is counted as spend.
+    let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
+        Ok(v) => v,
+        Err(e) => {
+            render_json(&Envelope::<()>::err_raw(
+                "wallet.clock_error",
+                e.to_string(),
+            ));
+            return 1;
+        }
+    };
+    crate::commands::submission_record::reconcile_open_reservations(
+        &profile,
+        &profile_name,
+        &rpc_client,
+        now_ms,
+    )
+    .await;
+
     // ── GATE 4: Operator policy evaluation (args-path; mirrors the MCP
     // `stellar_trustline` twin, which derives its `Trustline` leg from the
     // dispatch args via `derive_value_class` rather than a typed builder) ────
@@ -703,7 +725,35 @@ where
         }
     };
 
-    // ── Submit ────────────────────────────────────────────────────────────────
+    // ── Record, then submit ───────────────────────────────────────────────────
+    // The recorder writes the receipt, the pending audit row and the
+    // spending-window reservation before the bytes leave, and settles all
+    // three against what the network answers.
+    let recorder = match crate::commands::submission_record::build_recorder(
+        crate::commands::submission_record::SubmitRecord {
+            profile: &profile,
+            profile_name: profile_name.clone(),
+            verb: "trustline",
+            tool: "stellar_trustline",
+            chain_id,
+            effects: trustline_effects.as_ref(),
+            audit: Some(std::sync::Arc::clone(&audit_writer)),
+            now_ms,
+        },
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            render_json(
+                &crate::commands::submission_record::error_envelope_with_fallback(
+                    &e,
+                    &signed_xdr,
+                    "trustline.submit_failed",
+                ),
+            );
+            return 1;
+        }
+    };
+
     let timeout = std::time::Duration::from_secs(profile.submit_timeout_seconds.unwrap_or(90));
     match submit_transaction_and_wait(
         &rpc_client,
@@ -711,6 +761,7 @@ where
         timeout,
         network_passphrase,
         Some(SubmissionSignerKind::Keyring),
+        Some(&recorder),
     )
     .await
     {
@@ -728,28 +779,6 @@ where
                 "ChangeTrust tx submitted"
             );
 
-            // Non-fatal allow-path audit row carrying the SAME legs the gate
-            // sized (single-derivation invariant), recorded on confirmed
-            // submit through the shared emission helper, so the redaction
-            // format matches every other value verb's rows.
-            crate::commands::value_audit::emit_value_action_submitted_row_with_writer(
-                &audit_writer,
-                &profile_name,
-                "stellar_trustline",
-                chain_id,
-                trustline_effects.as_ref(),
-                &tx_hash,
-                ledger,
-            );
-            crate::commands::policy_engine::record_confirmed_value_moving_with_engine(
-                policy_engine.as_ref(),
-                &profile,
-                &profile_name,
-                "stellar_trustline",
-                chain_id,
-                trustline_effects.as_ref(),
-            );
-
             render_json(&Envelope::ok(json!({
                 "status": "submitted",
                 "action": "change_trust",
@@ -763,10 +792,13 @@ where
             0
         }
         Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                "trustline.submit_failed",
-                e.to_string(),
-            ));
+            render_json(
+                &crate::commands::submission_record::error_envelope_with_fallback(
+                    &e,
+                    &signed_xdr,
+                    "trustline.submit_failed",
+                ),
+            );
             1
         }
     }

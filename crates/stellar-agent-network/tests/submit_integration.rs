@@ -143,6 +143,7 @@ async fn send_pending_then_get_success_returns_ok_with_correct_ledger() {
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         Some(SubmissionSignerKind::Software),
+        None,
     )
     .await;
 
@@ -212,6 +213,7 @@ async fn not_found_then_success_confirms_on_subsequent_poll() {
         signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
+        None,
         None,
     )
     .await;
@@ -285,6 +287,7 @@ async fn get_failed_with_underfunded_xdr_returns_insufficient_balance() {
         signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
+        None,
         None,
     )
     .await;
@@ -368,6 +371,7 @@ async fn get_failed_with_no_trust_xdr_returns_trustline_missing_destination() {
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
+        None,
     )
     .await;
 
@@ -441,6 +445,7 @@ async fn get_failed_with_src_no_trust_xdr_returns_trustline_missing_source() {
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
+        None,
     )
     .await;
 
@@ -513,6 +518,7 @@ async fn get_failed_with_no_destination_yields_destination_invalid() {
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
+        None,
     )
     .await;
 
@@ -580,6 +586,7 @@ async fn get_failed_with_op_bad_auth_yields_op_failed_bad_auth() {
         signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
+        None,
         None,
     )
     .await;
@@ -650,6 +657,7 @@ async fn get_failed_with_op_no_account_yields_op_failed_no_account() {
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
+        None,
     )
     .await;
 
@@ -718,6 +726,7 @@ async fn get_failed_with_empty_ops_yields_op_failed_no_ops() {
         signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
+        None,
         None,
     )
     .await;
@@ -788,6 +797,7 @@ async fn get_failed_with_tx_success_result_maps_to_defensive_op_failed() {
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
+        None,
     )
     .await;
 
@@ -853,6 +863,7 @@ async fn unexpected_get_transaction_status_returns_rpc_unreachable() {
         signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
+        None,
         None,
     )
     .await;
@@ -932,6 +943,7 @@ async fn transient_poll_error_falls_through_to_not_found_then_success() {
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
+        None,
     )
     .await;
 
@@ -967,6 +979,7 @@ async fn mainnet_url_pattern_rejected_at_submit() {
         Duration::from_secs(5),
         TESTNET_PASSPHRASE,
         None,
+        None,
     )
     .await;
 
@@ -992,6 +1005,7 @@ async fn pubnet_url_pattern_rejected_at_submit() {
         signed_xdr,
         Duration::from_secs(5),
         TESTNET_PASSPHRASE,
+        None,
         None,
     )
     .await;
@@ -1044,6 +1058,7 @@ async fn send_transaction_submission_failed_returns_tx_malformed() {
         signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
+        None,
         None,
     )
     .await;
@@ -1134,6 +1149,7 @@ async fn get_failed_fee_bump_inner_rejected_carries_inner_result_code() {
         signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
+        None,
         None,
     )
     .await;
@@ -1229,6 +1245,7 @@ async fn get_failed_fee_bump_inner_bad_seq_is_feebump_inner_rejected_not_stale()
         signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
+        None,
         None,
     )
     .await;
@@ -1374,6 +1391,7 @@ async fn get_failed_outer_tx_bad_seq_yields_sequence_number_stale() {
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
         None,
+        None,
     )
     .await;
 
@@ -1434,6 +1452,7 @@ async fn get_failed_with_null_result_xdr_returns_typed_error_no_panic() {
         signed_xdr,
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
+        None,
         None,
     )
     .await;
@@ -1572,6 +1591,7 @@ async fn endpoint_serving_mainnet_refuses_with_no_send() {
         Duration::from_secs(10),
         TESTNET_PASSPHRASE,
         None,
+        None,
     )
     .await;
 
@@ -1605,6 +1625,7 @@ async fn endpoint_serving_third_network_refuses_endpoint_network_mismatch() {
         envelope.envelope_xdr(),
         Duration::from_secs(10),
         TESTNET_PASSPHRASE,
+        None,
         None,
     )
     .await
@@ -1650,6 +1671,7 @@ async fn probe_failing_throughout_refuses_endpoint_identity_unavailable() {
         timeout,
         TESTNET_PASSPHRASE,
         None,
+        None,
     )
     .await
     .expect_err("an endpoint of unknown identity must be refused");
@@ -1693,6 +1715,7 @@ async fn probe_transient_failure_then_answer_proceeds_to_send() {
         envelope.envelope_xdr(),
         Duration::from_secs(30),
         TESTNET_PASSPHRASE,
+        None,
         None,
     )
     .await

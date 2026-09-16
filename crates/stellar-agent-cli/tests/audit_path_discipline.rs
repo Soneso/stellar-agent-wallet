@@ -222,3 +222,30 @@ fn value_verbs_evaluate_policy_before_the_audit_preflight() {
         }
     }
 }
+
+/// The two `tx` verbs acquire the audit writer the same way the value verbs
+/// do: fail-closed on a persisted profile, best-effort on the synthesized one.
+///
+/// A submission on a zero-config profile leaves a receipt holding its source
+/// account's sequence. If the verbs that settle it refused on a profile with
+/// no audit key, that hold would have nothing able to free it and every later
+/// payment from that account would be refused as a duplicate.
+#[test]
+fn the_tx_verbs_acquire_the_audit_writer_by_profile_origin() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    for file in ["commands/tx/status.rs", "commands/tx/receipt.rs"] {
+        // The Windows checkout is CRLF; the scan is substring-based, so the
+        // normalisation only keeps the reported source readable.
+        let source = std::fs::read_to_string(src.join(file))
+            .expect("read source")
+            .replace("\r\n", "\n");
+        assert!(
+            source.contains("value_audit::require_value_audit_writer_for_origin("),
+            "{file}: the audit writer must be acquired by profile origin"
+        );
+        assert!(
+            source.contains("load_profile_or_synthesize_testnet("),
+            "{file}: the profile must be resolved the way the value verbs resolve it"
+        );
+    }
+}

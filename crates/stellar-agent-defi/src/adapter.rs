@@ -237,6 +237,16 @@ pub struct DefiAdapterCtx<'a> {
     /// `stellar_agent_mcp::sequence_floor`'s CLI-out-of-scope-by-design
     /// discipline for the classic commit verbs.
     pub sequence_floor: Option<&'a dyn stellar_agent_network::SequenceFloorHook>,
+    /// Durable-submission recorder, threaded through to
+    /// `SubmitInvokeArgs::submission_recorder` at the adapter's
+    /// `submit_signed_invoke` call site.
+    ///
+    /// When `Some`, the recorder owns the value-action rows and the
+    /// spending-window reservation for this submission: it writes the pending
+    /// row before the send and the submitted or failed row after, so
+    /// [`Self::emit_value_action_submitted`] stands down. `None` leaves the
+    /// unrecorded behaviour, where the confirmed row is emitted here.
+    pub submission_recorder: Option<&'a dyn stellar_agent_network::SubmissionRecorder>,
 }
 
 impl<'a> DefiAdapterCtx<'a> {
@@ -283,6 +293,7 @@ impl<'a> DefiAdapterCtx<'a> {
             audit_legs: None,
             audit_tool: None,
             sequence_floor: None,
+            submission_recorder: None,
         }
     }
 
@@ -337,6 +348,7 @@ impl<'a> DefiAdapterCtx<'a> {
             audit_legs: None,
             audit_tool: None,
             sequence_floor: None,
+            submission_recorder: None,
         }
     }
 
@@ -352,6 +364,13 @@ impl<'a> DefiAdapterCtx<'a> {
         ledger: u32,
         request_id: &str,
     ) {
+        // The recorder writes this row itself, from the same gate-sized legs,
+        // alongside the pending row it wrote before the send. One row, not
+        // two.
+        if self.submission_recorder.is_some() {
+            return;
+        }
+
         let (Some(writer), Some(legs), Some(tool), Some(chain_id)) = (
             self.audit_writer.as_ref(),
             self.audit_legs,
@@ -488,6 +507,27 @@ pub enum DefiAdapterError {
         /// Non-sensitive reason string; hashes and addresses must be redacted
         /// (first-8 hex and first-5-last-5 respectively).
         reason: String,
+    },
+    /// The submission was sent and its outcome is not known, or it was refused
+    /// before the send because the wallet could not record it.
+    ///
+    /// Distinct from [`Self::Network`], which reports a failure that moved
+    /// nothing: this one may have. The caller reconciles `tx_hash` against the
+    /// chain and reports `wire_code` unchanged, so an agent reads the same
+    /// `submission.*` vocabulary a classic verb would give it.
+    #[error("{message}")]
+    SubmissionUnresolved {
+        /// The stable `submission.*` wire code for this condition.
+        wire_code: &'static str,
+        /// Redacted operator-facing message from the submission layer.
+        message: String,
+        /// Full transaction hash to reconcile against, when one exists.
+        tx_hash: Option<String>,
+        /// Full envelope hash naming the submission record, when one exists.
+        envelope_hash: Option<String>,
+        /// The submission timeout in seconds, on the one condition that has
+        /// one: a confirmation that did not arrive in time.
+        timeout_seconds: Option<u64>,
     },
 }
 

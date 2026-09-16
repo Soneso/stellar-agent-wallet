@@ -359,6 +359,7 @@ impl Respond for EntryGoneResponder {
 #[tokio::test]
 #[serial]
 async fn simulate_happy_path_returns_envelope_nonce_and_preview() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key();
 
@@ -430,6 +431,7 @@ async fn simulate_happy_path_returns_envelope_nonce_and_preview() {
 #[tokio::test]
 #[serial]
 async fn simulate_balance_not_found() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key();
 
@@ -470,6 +472,7 @@ async fn simulate_balance_not_found() {
 #[tokio::test]
 #[serial]
 async fn simulate_not_claimant() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key();
 
@@ -514,6 +517,7 @@ async fn simulate_not_claimant() {
 #[tokio::test]
 #[serial]
 async fn simulate_predicate_not_satisfied() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key();
 
@@ -560,6 +564,7 @@ async fn simulate_predicate_not_satisfied() {
 #[tokio::test]
 #[serial]
 async fn simulate_approval_required_returns_approval_block() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key();
 
@@ -679,6 +684,7 @@ fn commit_args(
 #[tokio::test]
 #[serial]
 async fn commit_replayed_nonce_returns_replayed() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key();
 
@@ -763,6 +769,7 @@ async fn commit_replayed_nonce_returns_replayed() {
 #[tokio::test]
 #[serial]
 async fn commit_envelope_divergence_on_account_sequence_mismatch() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key();
 
@@ -833,6 +840,7 @@ async fn commit_envelope_divergence_on_account_sequence_mismatch() {
 #[tokio::test]
 #[serial]
 async fn commit_entry_gone_returns_balance_not_found() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key();
 
@@ -940,8 +948,12 @@ impl Respond for ClaimSubmitSuccessRpcResponder {
                     empty_ledger_entries_result()
                 }
             }
+            // The endpoint answers with the hash of the transaction it was
+            // handed, the way a real one does: the wallet polls and records
+            // the hash it computed from the bytes it signed, and reports a
+            // disagreement as `submission.hash_mismatch`.
             "sendTransaction" => serde_json::json!({
-                "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "hash": common::submitted_tx_hash(request),
                 "status": "PENDING",
                 "latestLedger": 1001,
                 "latestLedgerCloseTime": "1234567890"
@@ -949,7 +961,7 @@ impl Respond for ClaimSubmitSuccessRpcResponder {
             "getTransaction" => serde_json::json!({
                 "status": "SUCCESS",
                 "ledger": 1005,
-                "txHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                "txHash": common::polled_tx_hash(request),
             }),
             _ => serde_json::json!({}),
         };
@@ -966,6 +978,7 @@ impl Respond for ClaimSubmitSuccessRpcResponder {
 #[tokio::test]
 #[serial]
 async fn claim_commit_full_round_trip_succeeds_with_string_encoded_amount() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key();
 
@@ -1086,6 +1099,7 @@ async fn claim_commit_full_round_trip_succeeds_with_string_encoded_amount() {
 #[tokio::test]
 #[serial]
 async fn claim_two_phase_round_trip_succeeds_under_satisfied_minimum_reserve_rule() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key();
 
@@ -1188,6 +1202,7 @@ async fn claim_two_phase_round_trip_succeeds_under_satisfied_minimum_reserve_rul
 #[tokio::test]
 #[serial]
 async fn claim_commit_denies_under_unsatisfied_minimum_reserve_rule() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
 
     let id = test_balance_id();
@@ -1275,6 +1290,7 @@ async fn claim_commit_denies_under_unsatisfied_minimum_reserve_rule() {
 #[tokio::test]
 #[serial]
 async fn simulate_nonce_mint_failed_envelope_shape() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     // Deliberately no `install_test_nonce_key()` call — the mock store stays
     // empty at the nonce coordinate.
@@ -1333,6 +1349,7 @@ async fn simulate_nonce_mint_failed_envelope_shape() {
 #[tokio::test]
 #[serial]
 async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key();
 

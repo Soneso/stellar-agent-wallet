@@ -59,8 +59,8 @@ use stellar_agent_pool::derive::derive_channel_signer;
 use stellar_agent_pool::pool::{ChannelPool, TerminalOutcome};
 use stellar_agent_pool::submit::submit_pooled;
 use stellar_agent_pool::{ChannelRecord, PoolError};
-use stellar_agent_test_support::EchoIdResponder;
 use stellar_agent_test_support::signed_envelope::{get_network_result, ledger_entries_result_for};
+use stellar_agent_test_support::{EchoIdResponder, SubmissionEchoResponder};
 use zeroize::Zeroizing;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -168,25 +168,31 @@ async fn submit_pooled_tx_bad_seq_triggers_refetch_path() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(json!({
-            "hash": tx_hash,
-            "status": "PENDING",
-            "latestLedger": 1000,
-            "latestLedgerCloseTime": "1234567890"
-        })))
+        .respond_with(SubmissionEchoResponder::new(
+            json!({
+                "hash": tx_hash,
+                "status": "PENDING",
+                "latestLedger": 1000,
+                "latestLedgerCloseTime": "1234567890"
+            }),
+            TESTNET_PASSPHRASE,
+        ))
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "getTransaction"})))
-        .respond_with(EchoIdResponder::new(json!({
-            "status": "FAILED",
-            "txHash": tx_hash,
-            "ledger": null,
-            "resultXdr": result_xdr,
-            "resultMetaXdr": null
-        })))
+        .respond_with(SubmissionEchoResponder::new(
+            json!({
+                "status": "FAILED",
+                "txHash": tx_hash,
+                "ledger": null,
+                "resultXdr": result_xdr,
+                "resultMetaXdr": null
+            }),
+            TESTNET_PASSPHRASE,
+        ))
         .mount(&server)
         .await;
 
@@ -279,25 +285,31 @@ async fn submit_pooled_generic_failed_returns_wallet_error() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(json!({
-            "hash": tx_hash,
-            "status": "PENDING",
-            "latestLedger": 1000,
-            "latestLedgerCloseTime": "1234567890"
-        })))
+        .respond_with(SubmissionEchoResponder::new(
+            json!({
+                "hash": tx_hash,
+                "status": "PENDING",
+                "latestLedger": 1000,
+                "latestLedgerCloseTime": "1234567890"
+            }),
+            TESTNET_PASSPHRASE,
+        ))
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "getTransaction"})))
-        .respond_with(EchoIdResponder::new(json!({
-            "status": "FAILED",
-            "txHash": tx_hash,
-            "ledger": null,
-            "resultXdr": result_xdr,
-            "resultMetaXdr": null
-        })))
+        .respond_with(SubmissionEchoResponder::new(
+            json!({
+                "status": "FAILED",
+                "txHash": tx_hash,
+                "ledger": null,
+                "resultXdr": result_xdr,
+                "resultMetaXdr": null
+            }),
+            TESTNET_PASSPHRASE,
+        ))
         .mount(&server)
         .await;
 
@@ -510,25 +522,31 @@ async fn submit_pooled_tx_bad_seq_with_successful_refetch_updates_sequence() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(json!({
-            "hash": tx_hash,
-            "status": "PENDING",
-            "latestLedger": 1000,
-            "latestLedgerCloseTime": "1234567890"
-        })))
+        .respond_with(SubmissionEchoResponder::new(
+            json!({
+                "hash": tx_hash,
+                "status": "PENDING",
+                "latestLedger": 1000,
+                "latestLedgerCloseTime": "1234567890"
+            }),
+            TESTNET_PASSPHRASE,
+        ))
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "getTransaction"})))
-        .respond_with(EchoIdResponder::new(json!({
-            "status": "FAILED",
-            "txHash": tx_hash,
-            "ledger": null,
-            "resultXdr": result_xdr,
-            "resultMetaXdr": null
-        })))
+        .respond_with(SubmissionEchoResponder::new(
+            json!({
+                "status": "FAILED",
+                "txHash": tx_hash,
+                "ledger": null,
+                "resultXdr": result_xdr,
+                "resultMetaXdr": null
+            }),
+            TESTNET_PASSPHRASE,
+        ))
         .mount(&server)
         .await;
 

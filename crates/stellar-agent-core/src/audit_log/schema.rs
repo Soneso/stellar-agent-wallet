@@ -2301,6 +2301,101 @@ pub enum EventKind {
         ledger: u32,
     },
 
+    /// A signed value-moving transaction was recorded before it was sent.
+    ///
+    /// Written immediately before `sendTransaction`, so the log holds the
+    /// intent whatever happens to the send. The row stands until a
+    /// [`Self::ValueActionSubmitted`] or [`Self::ValueActionFailed`] row
+    /// records the outcome; a row that stands alone is a submission whose
+    /// outcome is not known, resolved by reconciling `transaction_hash_redacted`
+    /// against the chain.
+    ///
+    /// The `legs` are the SAME descriptor the policy gate sized — the
+    /// single-derivation invariant. The verb identity, chain id, policy
+    /// decision, request id, and the full envelope hash ride on the OUTER
+    /// [`AuditEntry`](super::entry::AuditEntry) fields.
+    ///
+    /// # Field redaction
+    ///
+    /// - `legs[].destination_redacted` — first-5-last-5 (see [`ValueLegRecord`]).
+    /// - `transaction_hash_redacted` — first-8-last-8 of the transaction hash
+    ///   computed locally from the envelope before the send.
+    ///
+    /// This variant intentionally has NO field named `request_id` or `tool`
+    /// (the outer [`AuditEntry`](super::entry::AuditEntry) owns those; see the
+    /// serde-flatten collision documented on the module).
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    ValueActionPending {
+        /// The value legs the policy gate sized for this action. Empty for an
+        /// allow from an engine that sizes no value.
+        legs: Vec<ValueLegRecord>,
+        /// Transaction hash computed locally from the envelope, redacted
+        /// first-8-last-8.
+        transaction_hash_redacted: String,
+        /// The account whose sequence the transaction consumes, redacted
+        /// first-5-last-5.
+        source_redacted: String,
+        /// The sequence number the transaction consumes.
+        sequence: i64,
+    },
+
+    /// A value-moving transaction the network refused, or that failed
+    /// on-chain.
+    ///
+    /// Written where a [`Self::ValueActionPending`] row's transaction reached
+    /// a definitive negative answer: the send step refused the bytes, or the
+    /// poll reported the transaction applied and failed. The value did not
+    /// move, and the spending window reservation the pending row took is
+    /// released.
+    ///
+    /// # Field redaction
+    ///
+    /// - `legs[].destination_redacted` — first-5-last-5 (see [`ValueLegRecord`]).
+    /// - `transaction_hash_redacted` — first-8-last-8.
+    ///
+    /// This variant intentionally has NO field named `request_id` or `tool`
+    /// (the outer [`AuditEntry`](super::entry::AuditEntry) owns those).
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    ValueActionFailed {
+        /// The value legs the policy gate sized for the action that failed.
+        legs: Vec<ValueLegRecord>,
+        /// Transaction hash, redacted first-8-last-8.
+        transaction_hash_redacted: String,
+        /// Stable wire error code for the failure (for example
+        /// `"ledger.insufficient_balance"` or `"submission.tx_malformed"`).
+        code: String,
+    },
+
+    /// An operator acknowledged a submission whose outcome reconciliation
+    /// cannot settle, and released its hold on the spending window.
+    ///
+    /// Written by `tx receipt clear --acknowledge`. The row names the state
+    /// the receipt was left in, so the log records what the operator
+    /// acknowledged rather than only that they acknowledged something.
+    ///
+    /// # Field redaction
+    ///
+    /// - `transaction_hash_redacted` — first-8-last-8.
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    SubmissionReceiptCleared {
+        /// Transaction hash of the cleared submission, redacted first-8-last-8.
+        transaction_hash_redacted: String,
+        /// The receipt status the clear replaced, as its stable wire tag
+        /// (`"pending"` or `"ambiguous"`).
+        cleared_from: String,
+        /// Whether a spending-window reservation was released by the clear.
+        reservation_released: bool,
+    },
+
     /// An x402 payment authorization was signed.
     ///
     /// Emitted at the point the authorization signature is produced and about
@@ -2513,7 +2608,7 @@ pub enum EventKind {
 /// the test stays green, leaving the new variant unpinned by any tag assertion.
 /// Closing that would need the count derived from the enum itself, which needs a
 /// derive macro this workspace does not carry.
-pub const EVENT_KIND_VARIANT_COUNT: usize = 59;
+pub const EVENT_KIND_VARIANT_COUNT: usize = 62;
 
 /// Why an [`EventKind::AuditTipAnchored`] row was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

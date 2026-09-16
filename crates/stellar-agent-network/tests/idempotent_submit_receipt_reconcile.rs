@@ -75,20 +75,13 @@ async fn mount_probe_and_signers(server: &MockServer, envelope: &SignedTestEnvel
         .await;
 }
 
-/// Computes the SHA-256 envelope hash (the idempotency key) for a signed XDR.
+/// The idempotency key the submit paths record under.
+///
+/// Delegates rather than restating the derivation: the key is one definition
+/// shared by both submit paths, and a test that computed its own would pass
+/// while the two disagreed.
 fn envelope_hash_for(signed_xdr: &str) -> String {
-    use base64::Engine as _;
-    use sha2::{Digest, Sha256};
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(signed_xdr.trim())
-        .unwrap();
-    Sha256::digest(&bytes)
-        .iter()
-        .fold(String::new(), |mut s, b| {
-            use std::fmt::Write;
-            let _ = write!(s, "{b:02x}");
-            s
-        })
+    stellar_agent_network::envelope_hash_hex(signed_xdr)
 }
 
 fn open_store(dir: &tempfile::TempDir, name: &str) -> ReceiptStore {
@@ -244,7 +237,14 @@ async fn cached_failed_receipt_returned_without_rpc_call() {
     let store = open_store(&dir, "cached-failed-test");
 
     store
-        .try_begin(&envelope_hash, FAKE_TX_HASH, 9_999_999, RECORDED_AT_LEDGER)
+        .try_begin(
+            &envelope_hash,
+            FAKE_TX_HASH,
+            "",
+            0,
+            9_999_999,
+            RECORDED_AT_LEDGER,
+        )
         .unwrap();
     store
         .finalize(
@@ -305,7 +305,14 @@ async fn cached_ambiguous_receipt_returned_without_rpc_call() {
     let store = open_store(&dir, "cached-ambiguous-test");
 
     store
-        .try_begin(&envelope_hash, FAKE_TX_HASH, 9_999_999, RECORDED_AT_LEDGER)
+        .try_begin(
+            &envelope_hash,
+            FAKE_TX_HASH,
+            "",
+            0,
+            9_999_999,
+            RECORDED_AT_LEDGER,
+        )
         .unwrap();
     store
         .finalize(&envelope_hash, ReceiptStatus::Ambiguous, None)
@@ -354,7 +361,14 @@ async fn cached_reorged_receipt_returned_without_rpc_call() {
     let store = open_store(&dir, "cached-reorged-test");
 
     store
-        .try_begin(&envelope_hash, FAKE_TX_HASH, 9_999_999, RECORDED_AT_LEDGER)
+        .try_begin(
+            &envelope_hash,
+            FAKE_TX_HASH,
+            "",
+            0,
+            9_999_999,
+            RECORDED_AT_LEDGER,
+        )
         .unwrap();
     // finalize_reorged requires the receipt to be Success first.
     store
@@ -440,7 +454,7 @@ async fn reconcile_receipt_noop_on_ambiguous() {
 
     let hash = "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0";
     store
-        .try_begin(hash, FAKE_TX_HASH, 0, RECORDED_AT_LEDGER)
+        .try_begin(hash, FAKE_TX_HASH, "", 0, 0, RECORDED_AT_LEDGER)
         .unwrap();
     store
         .finalize(hash, ReceiptStatus::Ambiguous, None)
@@ -468,7 +482,7 @@ async fn reconcile_receipt_noop_on_failed() {
 
     let hash = "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1";
     store
-        .try_begin(hash, FAKE_TX_HASH, 0, RECORDED_AT_LEDGER)
+        .try_begin(hash, FAKE_TX_HASH, "", 0, 0, RECORDED_AT_LEDGER)
         .unwrap();
     store
         .finalize(
@@ -501,7 +515,7 @@ async fn reconcile_receipt_noop_on_reorged() {
 
     let hash = "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2";
     store
-        .try_begin(hash, FAKE_TX_HASH, 0, RECORDED_AT_LEDGER)
+        .try_begin(hash, FAKE_TX_HASH, "", 0, 0, RECORDED_AT_LEDGER)
         .unwrap();
     store
         .finalize(hash, ReceiptStatus::Success, Some(FAKE_LEDGER))
@@ -544,7 +558,7 @@ async fn reconcile_receipt_impossible_prior_ledger_returns_ambiguous() {
 
     let hash = "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3";
     store
-        .try_begin(hash, FAKE_TX_HASH, 0, RECORDED_AT_LEDGER)
+        .try_begin(hash, FAKE_TX_HASH, "", 0, 0, RECORDED_AT_LEDGER)
         .unwrap();
     // Confirmed at ledger 9000 — far above what getHealth will claim.
     store
@@ -617,7 +631,7 @@ async fn reconcile_receipt_second_not_found_no_ledger_advance_returns_success() 
 
     let hash = "e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4";
     store
-        .try_begin(hash, FAKE_TX_HASH, 0, RECORDED_AT_LEDGER)
+        .try_begin(hash, FAKE_TX_HASH, "", 0, 0, RECORDED_AT_LEDGER)
         .unwrap();
     store
         .finalize(hash, ReceiptStatus::Success, Some(FAKE_LEDGER))
@@ -691,7 +705,7 @@ async fn reconcile_receipt_health_error_on_not_found_returns_ambiguous() {
 
     let hash = "f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5";
     store
-        .try_begin(hash, FAKE_TX_HASH, 0, RECORDED_AT_LEDGER)
+        .try_begin(hash, FAKE_TX_HASH, "", 0, 0, RECORDED_AT_LEDGER)
         .unwrap();
     store
         .finalize(hash, ReceiptStatus::Success, Some(FAKE_LEDGER))
@@ -759,7 +773,7 @@ async fn reconcile_receipt_unexpected_get_transaction_status_returns_success_unc
 
     let hash = "9191919191919191919191919191919191919191919191919191919191919191";
     store
-        .try_begin(hash, FAKE_TX_HASH, 0, RECORDED_AT_LEDGER)
+        .try_begin(hash, FAKE_TX_HASH, "", 0, 0, RECORDED_AT_LEDGER)
         .unwrap();
     store
         .finalize(hash, ReceiptStatus::Success, Some(FAKE_LEDGER))

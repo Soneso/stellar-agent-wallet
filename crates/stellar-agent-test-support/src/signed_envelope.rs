@@ -141,6 +141,7 @@ impl LedgerAccount {
 pub struct SignedTestEnvelope {
     source: String,
     source_seed: [u8; 32],
+    sequence: i64,
     destination: String,
     envelope_xdr: String,
     tx_hash_hex: String,
@@ -187,6 +188,12 @@ impl SignedTestEnvelope {
     #[must_use]
     pub fn source_seed(&self) -> [u8; 32] {
         self.source_seed
+    }
+
+    /// The sequence number the transaction consumes.
+    #[must_use]
+    pub fn sequence(&self) -> i64 {
+        self.sequence
     }
 
     /// The payment destination's G-strkey.
@@ -242,6 +249,7 @@ pub struct SignedTestEnvelopeBuilder {
     amount_stroops: i64,
     network_passphrase: String,
     operation_source: Option<[u8; 32]>,
+    muxed_source_id: Option<u64>,
     claim_balance_id: Option<[u8; 32]>,
     fee_bump_source: Option<[u8; 32]>,
     inner_signatures: Option<Vec<SignatureSpec>>,
@@ -265,6 +273,7 @@ impl SignedTestEnvelopeBuilder {
             amount_stroops: DEFAULT_AMOUNT_STROOPS,
             network_passphrase: TESTNET_PASSPHRASE.to_owned(),
             operation_source: None,
+            muxed_source_id: None,
             claim_balance_id: None,
             fee_bump_source: None,
             inner_signatures: None,
@@ -277,6 +286,18 @@ impl SignedTestEnvelopeBuilder {
     #[must_use]
     pub fn sequence(mut self, sequence: i64) -> Self {
         self.sequence = sequence;
+        self
+    }
+
+    /// Makes the transaction source a muxed account (`M...`) carrying `id`
+    /// over the same underlying `G...` account.
+    ///
+    /// The mux id selects a sub-account for memo purposes. The sequence
+    /// number, the signer set and the ledger entry all belong to the account
+    /// beneath it, so the signature and the reported signers are unchanged.
+    #[must_use]
+    pub fn muxed_source_id(mut self, id: u64) -> Self {
+        self.muxed_source_id = Some(id);
         self
     }
 
@@ -453,7 +474,13 @@ impl SignedTestEnvelopeBuilder {
         };
 
         let tx = Transaction {
-            source_account: MuxedAccount::Ed25519(Uint256(source_key)),
+            source_account: match self.muxed_source_id {
+                Some(id) => MuxedAccount::MuxedEd25519(stellar_xdr::MuxedAccountMed25519 {
+                    id,
+                    ed25519: Uint256(source_key),
+                }),
+                None => MuxedAccount::Ed25519(Uint256(source_key)),
+            },
             fee: 100,
             seq_num: SequenceNumber(self.sequence),
             cond: Preconditions::None,
@@ -570,6 +597,7 @@ impl SignedTestEnvelopeBuilder {
         SignedTestEnvelope {
             source: source_strkey,
             source_seed: self.source_seed,
+            sequence: self.sequence,
             destination: format!("{}", stellar_strkey::ed25519::PublicKey(self.destination)),
             envelope_xdr,
             tx_hash_hex,
@@ -672,6 +700,60 @@ fn payload_hash(
         .to_xdr(Limits::none())
         .unwrap_or_else(|err| panic!("TransactionSignaturePayload XDR encoding failed: {err}"));
     Sha256::digest(&bytes).into()
+}
+
+/// Computes the transaction hash a Stellar endpoint reports for
+/// `envelope_xdr` under `passphrase`.
+///
+/// `SHA-256(network_id ‖ tagged transaction)`, built here from the decoded
+/// envelope rather than borrowed from the wallet, so a mocked endpoint answers
+/// what a real one would and the wallet's own computation is checked against
+/// an independent one.
+///
+/// # Panics
+///
+/// Panics if `envelope_xdr` is not a decodable `TransactionEnvelope`, or is a
+/// legacy `TxV0` envelope, which has no tagged-transaction form.
+#[must_use]
+pub fn transaction_hash_hex(envelope_xdr: &str, passphrase: &str) -> String {
+    use stellar_xdr::{FeeBumpTransactionInnerTx, ReadXdr as _};
+
+    let envelope = TransactionEnvelope::from_xdr_base64(envelope_xdr, Limits::none())
+        .unwrap_or_else(|err| panic!("TransactionEnvelope decode failed: {err}"));
+    let tagged = match &envelope {
+        TransactionEnvelope::Tx(v1) => {
+            TransactionSignaturePayloadTaggedTransaction::Tx(v1.tx.clone())
+        }
+        TransactionEnvelope::TxFeeBump(fb) => {
+            let FeeBumpTransactionInnerTx::Tx(_) = &fb.tx.inner_tx;
+            TransactionSignaturePayloadTaggedTransaction::TxFeeBump(fb.tx.clone())
+        }
+        TransactionEnvelope::TxV0(_) => {
+            panic!("a legacy TxV0 envelope has no tagged-transaction form")
+        }
+    };
+    hex(&payload_hash(passphrase, &tagged))
+}
+
+/// Computes the transaction hash for the envelope carried by a
+/// `sendTransaction` JSON-RPC request body.
+///
+/// A mocked endpoint calls this to answer with the hash of the transaction it
+/// was actually handed, the way a real endpoint does.
+///
+/// # Panics
+///
+/// Panics if the request carries no decodable `transaction` parameter.
+#[must_use]
+pub fn send_transaction_hash_hex(request_body: &Value, passphrase: &str) -> String {
+    let envelope_xdr = request_body
+        .get("params")
+        .and_then(|p| p.get("transaction"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!("sendTransaction request carries no `params.transaction` string")
+        });
+    transaction_hash_hex(envelope_xdr, passphrase)
 }
 
 /// Decodes a G-strkey into its 32 key bytes.

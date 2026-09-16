@@ -234,9 +234,10 @@ async fn run_benchmark() {
             .build_and_sign(&funder_signer)
             .await
             .expect("sign must succeed");
-        let r = submit_transaction_and_wait(&*client, &xdr, TIMEOUT, TESTNET_PASSPHRASE, None)
-            .await
-            .unwrap_or_else(|e| panic!("channel {} funding failed: {e}", i + 1));
+        let r =
+            submit_transaction_and_wait(&*client, &xdr, TIMEOUT, TESTNET_PASSPHRASE, None, None)
+                .await
+                .unwrap_or_else(|e| panic!("channel {} funding failed: {e}", i + 1));
         // Redact channel public keys (first-5-last-5).
         eprintln!(
             "Channel {}: {} (ledger {})",

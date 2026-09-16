@@ -47,7 +47,7 @@ pub mod webauthn;
 pub mod webauthn_verifier;
 pub mod weighted_threshold_policy;
 
-pub use error::{AdminOrOwnerKey, SaError};
+pub use error::{AdminOrOwnerKey, SaError, SubmissionUnresolvedKind};
 pub use managers::migration::{
     MigrationPlan, MigrationPlanner, MigrationSubmitResult, RuleMigration, SignerMigrationStep,
     SignerStepSubmitOutcome,

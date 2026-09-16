@@ -394,6 +394,51 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         );
     }
 
+    // Record the submission before the bytes leave. The bundle's per-inner
+    // debits are sized by the multicall gate's own window accounting, so the
+    // record here is the receipt and the audit rows.
+    let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
+        Ok(v) => v,
+        Err(e) => {
+            render_json(&Envelope::<()>::err_raw(
+                "wallet.clock_error",
+                e.to_string(),
+            ));
+            return 1;
+        }
+    };
+    // Settle what stands open before this verb's own submission. The
+    // multicall gate reads the window store for its own accounting, so a
+    // reservation an earlier verb left behind would count there unreconciled.
+    if let Ok(reconcile_client) = stellar_agent_network::StellarRpcClient::new(&args.rpc_url) {
+        crate::commands::submission_record::reconcile_open_reservations(
+            &profile,
+            &profile_name,
+            &reconcile_client,
+            now_ms,
+        )
+        .await;
+    }
+
+    let recorder = match crate::commands::submission_record::build_recorder(
+        crate::commands::submission_record::SubmitRecord {
+            profile: &profile,
+            profile_name: profile_name.clone(),
+            verb: "multicall",
+            tool: "stellar_smart_account_multicall",
+            chain_id: &chain_id,
+            effects: None,
+            audit: audit_writer.as_ref().map(Arc::clone),
+            now_ms,
+        },
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            render_json(&crate::commands::submission_record::error_envelope(&e, ""));
+            return 1;
+        }
+    };
+
     let submit_args = MulticallSubmitArgs {
         smart_account: &args.smart_account,
         rule_id: args.rule_id,
@@ -409,6 +454,7 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         fee,
         chain_id: &chain_id,
         request_id: &request_id,
+        submission_recorder: Some(&recorder),
     };
 
     match submit_multicall_bundle(submit_args, &registry).await {

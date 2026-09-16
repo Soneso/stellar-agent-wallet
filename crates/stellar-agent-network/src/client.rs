@@ -15,6 +15,17 @@ use crate::redact::redact_url_authority;
 use crate::retry::{RetryPolicy, is_retryable_send_error, retry_with_backoff};
 use crate::submit::MAINNET_PASSPHRASE;
 
+/// What the endpoint reports about one transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionStatusView {
+    /// The `getTransaction` status string: `SUCCESS`, `FAILED` or
+    /// `NOT_FOUND`. A `NOT_FOUND` from an endpoint whose retention window no
+    /// longer covers the submission proves nothing about the transaction.
+    pub status: String,
+    /// The ledger the transaction confirmed in, when it did.
+    pub ledger: Option<u32>,
+}
+
 /// A typed wrapper around the `stellar-rpc-client` JSON-RPC transport.
 ///
 /// Wraps `stellar_rpc_client::Client` and converts upstream errors into
@@ -155,6 +166,43 @@ impl StellarRpcClient {
                 url: self.redacted_url(),
                 reason: format!("getHealth failed: {e}"),
             })
+    }
+
+    /// Asks the endpoint what became of one transaction.
+    ///
+    /// Returns the `getTransaction` status string (`SUCCESS`, `FAILED`,
+    /// `NOT_FOUND`) and the ledger it confirmed in, when there is one. This is
+    /// the read a reconciliation surface makes on a transaction hash it holds;
+    /// callers inside this crate that also need the result XDR use the inner
+    /// client directly.
+    ///
+    /// # Errors
+    ///
+    /// - [`NetworkError::RpcUnreachable`] when the request fails, or when
+    ///   `tx_hash_hex` is not 32 hex-encoded bytes. The `url` field is
+    ///   authority-only.
+    pub async fn get_transaction_status(
+        &self,
+        tx_hash_hex: &str,
+    ) -> Result<TransactionStatusView, NetworkError> {
+        let bytes = stellar_agent_core::hex::decode_hex32(tx_hash_hex).map_err(|e| {
+            NetworkError::RpcUnreachable {
+                url: self.redacted_url(),
+                reason: format!("transaction hash is not 32 hex-encoded bytes: {e}"),
+            }
+        })?;
+        let response = self
+            .inner
+            .get_transaction(&stellar_xdr::Hash(bytes))
+            .await
+            .map_err(|e| NetworkError::RpcUnreachable {
+                url: self.redacted_url(),
+                reason: format!("getTransaction failed: {e}"),
+            })?;
+        Ok(TransactionStatusView {
+            status: response.status,
+            ledger: response.ledger,
+        })
     }
 
     /// Asks the endpoint which network it serves and requires the answer to be

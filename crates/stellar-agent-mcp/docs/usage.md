@@ -66,7 +66,9 @@ Commit step: verifies the nonce, re-builds the envelope for divergence check, si
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=true`.
 
-**Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`, `policy.engine_required`, `network.endpoint_network_mismatch`, `network.endpoint_identity_unavailable`, `network.envelope_signed_for_mainnet`, `network.envelope_signature_unverifiable`, `network.envelope_unsigned`.
+**Submission record:** Before the transaction is sent, the wallet records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation, and a `value_action_pending` audit row. The record is settled by what the network answers; a submission whose outcome never comes back keeps it. See "Unresolved submissions" below.
+
+**Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`, `policy.engine_required`, `policy.approval_consumed`, `network.endpoint_network_mismatch`, `network.endpoint_identity_unavailable`, `network.envelope_signed_for_mainnet`, `network.envelope_signature_unverifiable`, `network.envelope_unsigned`, `submission.tx_timeout`, `submission.tx_already_submitted`, `submission.hash_mismatch`, `submission.record_unavailable`.
 
 ## stellar_pay
 
@@ -113,4 +115,73 @@ Commit step: verifies the nonce, re-builds the Payment envelope for divergence c
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=true`.
 
-**Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`, `policy.engine_required`, `validation.memo_required`, `validation.memo_mutually_exclusive`, `network.endpoint_network_mismatch`, `network.endpoint_identity_unavailable`, `network.envelope_signed_for_mainnet`, `network.envelope_signature_unverifiable`, `network.envelope_unsigned`.
+**Submission record:** Before the transaction is sent, the wallet records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation, and a `value_action_pending` audit row. The record is settled by what the network answers; a submission whose outcome never comes back keeps it. See "Unresolved submissions" below.
+
+**Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`, `policy.engine_required`, `policy.approval_consumed`, `validation.memo_required`, `validation.memo_mutually_exclusive`, `network.endpoint_network_mismatch`, `network.endpoint_identity_unavailable`, `network.envelope_signed_for_mainnet`, `network.envelope_signature_unverifiable`, `network.envelope_unsigned`, `submission.tx_timeout`, `submission.tx_already_submitted`, `submission.hash_mismatch`, `submission.record_unavailable`.
+
+## stellar_claim_commit
+
+Commit step for `stellar_claim`: verifies the nonce, re-builds the `ClaimClaimableBalance` envelope for the divergence check, signs via the profile keyring, and submits. Testnet-only. Carries the same pre-send endpoint-identity probe, signature-binding check and submission record as the other commit tools.
+
+**Returns:** `{tx_hash, ledger}` on success.
+
+**Annotations:** `readOnlyHint=false`, `destructiveHint=true`.
+
+**Error codes:** the same set as `stellar_pay_commit`, without the memo codes.
+
+## stellar_trustline_commit
+
+Commit step for `stellar_trustline`: verifies the nonce, re-builds the `ChangeTrust` envelope for the divergence check, signs via the profile keyring, and submits. Testnet-only. Carries the same pre-send endpoint-identity probe, signature-binding check and submission record as the other commit tools.
+
+**Returns:** `{tx_hash, ledger}` on success.
+
+**Annotations:** `readOnlyHint=false`, `destructiveHint=true`.
+
+**Error codes:** the same set as `stellar_pay_commit`, without the memo codes, plus `policy.approval_required` when the issuer has clawback enabled and no operator opt-in is recorded.
+
+## stellar_transaction_status
+
+Reconciles one submitted transaction against the chain and settles the wallet's record of it.
+
+**Arguments:**
+- `chain_id` (string, required): CAIP-2 chain identifier.
+- `tx_hash` (string, required): 64 lowercase hex characters — the `details.tx_hash` a `submission.tx_timeout` response carries.
+
+**Returns:** `{tx_hash, chain_status, ledger, record}`. `chain_status` is what the endpoint reported (`SUCCESS`, `FAILED` or `NOT_FOUND`); `record` is the wallet's settled record of the submission, or absent when it holds none.
+
+**Annotations:** `readOnlyHint=false`, `destructiveHint=false`. The pairing is deliberate: the call moves no value, and it does change the wallet's record — a confirmed transaction records its spend and writes the value-action row the submission never got to write, and one that can no longer apply releases its spending-window reservation.
+
+**Error codes:** `validation.address_invalid`, `submission.record_unavailable`, `network.rpc_unreachable`, `audit.chain_key_unavailable`, `audit.tip_anchor_mismatch`.
+
+## Unresolved submissions
+
+Three error codes describe a submission whose outcome the wallet cannot settle on its own. All three carry a `details` object alongside the redacted message, and all three are resolved the same way.
+
+| Code | What happened |
+|---|---|
+| `submission.tx_timeout` | The transaction was accepted for inclusion and was not confirmed within the submission timeout. It may still apply. |
+| `submission.tx_already_submitted` | A pending record already holds this transaction's source account and sequence. Nothing was sent. |
+| `submission.hash_mismatch` | The endpoint reported a transaction hash that does not describe the transaction that was sent. |
+
+`details` carries:
+
+- `tx_hash` — the transaction to reconcile, 64 lowercase hex characters, in full.
+- `envelope_hash` — the submission record's identity, which `stellar-agent tx receipt clear` takes. Present only where the reporting surface holds the signed bytes; the DeFi verbs do not. Recover it from `stellar_transaction_status`'s `record.envelope_hash` when it is absent.
+- `timeout_seconds` — present on `submission.tx_timeout`.
+- `server_tx_hash` — present on `submission.hash_mismatch`.
+- `outcome` — always `"unknown"`.
+- `reconcile_with` — `"stellar_transaction_status"`.
+
+**Recovery protocol.** Call `stellar_transaction_status` with `details.tx_hash`. Do not re-simulate and do not rebuild the payment: the sequence number the transaction consumes may already be spent by it, and a second submission at that sequence is refused with `submission.tx_already_submitted` until the first is settled. `stellar_transaction_status` reports what the chain says and settles the record:
+
+- `SUCCESS` — the payment went through. The spend is recorded and the value-action row is written. Calling again appends no second row.
+- `FAILED` — the transaction applied and failed. Nothing moved, and the reservation is released.
+- `NOT_FOUND` — the endpoint has no record of it. When the transaction can no longer apply (its sequence has been consumed, or its time bound has passed) the reservation is released and the record is marked `ambiguous`. Otherwise it can still apply, and the record stands: call again later.
+
+A submission whose ledger has fallen outside the endpoint's retention window can never be settled this way. `stellar_transaction_status` reports it as `ambiguous` with `reservation_open: true`; the operator resolves it with `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge`.
+
+`submission.record_unavailable` is different: the wallet could not write the record, so nothing was sent. The condition is local — an unwritable receipt store, an unreadable spending-window file, an audit log that cannot be appended — and the submission is safe to retry once it is fixed.
+
+Every submitting tool reports these codes, `stellar_dex_trade`, the two vault tools and `stellar_sep43_sign_and_submit_transaction` included. The SEP-43 tool keeps its own `status: "pending"` response shape for a timeout and records the submission the same way, so `stellar_transaction_status` settles it too.
+
+An operator policy that lists tools explicitly must include `stellar_transaction_status`, or a timed-out submission cannot be resolved through this server.

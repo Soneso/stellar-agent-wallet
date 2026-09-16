@@ -1897,6 +1897,139 @@ impl AuditEntry {
         }
     }
 
+    /// Constructs a `ValueActionPending` audit entry.
+    ///
+    /// Emitted immediately before a value-moving verb calls
+    /// `sendTransaction`, so the intent is in the log whatever happens to the
+    /// send. `legs` MUST be built from the SAME `ValueEffects` the policy gate
+    /// sized — the single-derivation invariant.
+    /// `transaction_hash_redacted` MUST be pre-redacted to first-8-last-8 and
+    /// `source_redacted` to first-5-last-5 at the call site; `legs`
+    /// destinations are redacted by [`ValueLegRecord`] construction.
+    /// `envelope_hash` carries the FULL envelope hash on the outer entry, so
+    /// the operator verbs can address this submission.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "flat audit-field constructor, mirrors new_value_action_submitted"
+    )]
+    pub fn new_value_action_pending(
+        tool: impl Into<String>,
+        chain_id: impl IntoOptionalChainId,
+        legs: Vec<ValueLegRecord>,
+        transaction_hash_redacted: impl Into<String>,
+        source_redacted: impl Into<String>,
+        sequence: i64,
+        policy_decision: PolicyDecision,
+        envelope_hash: Option<String>,
+        nonce_id: Option<String>,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.into(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash,
+            nonce_id,
+            policy_decision,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::ValueActionPending {
+                legs,
+                transaction_hash_redacted: transaction_hash_redacted.into(),
+                source_redacted: source_redacted.into(),
+                sequence,
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
+    /// Constructs a `ValueActionFailed` audit entry.
+    ///
+    /// Emitted where a recorded submission reached a definitive negative
+    /// answer: the send step refused the bytes, or the poll reported the
+    /// transaction applied and failed. `code` is the stable wire code of that
+    /// answer. `transaction_hash_redacted` MUST be pre-redacted to
+    /// first-8-last-8 at the call site.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "flat audit-field constructor, mirrors new_value_action_submitted"
+    )]
+    pub fn new_value_action_failed(
+        tool: impl Into<String>,
+        chain_id: impl IntoOptionalChainId,
+        legs: Vec<ValueLegRecord>,
+        transaction_hash_redacted: impl Into<String>,
+        code: impl Into<String>,
+        policy_decision: PolicyDecision,
+        envelope_hash: Option<String>,
+        nonce_id: Option<String>,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.into(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash,
+            nonce_id,
+            policy_decision,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::ValueActionFailed {
+                legs,
+                transaction_hash_redacted: transaction_hash_redacted.into(),
+                code: code.into(),
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
+    /// Constructs a `SubmissionReceiptCleared` audit entry.
+    ///
+    /// Emitted by `tx receipt clear --acknowledge`. `cleared_from` names the
+    /// receipt status the clear replaced, and `reservation_released` records
+    /// whether a spending-window reservation was released with it.
+    /// `transaction_hash_redacted` MUST be pre-redacted to first-8-last-8 at
+    /// the call site; `envelope_hash` carries the full envelope hash the
+    /// operator addressed.
+    #[must_use]
+    pub fn new_submission_receipt_cleared(
+        tool: impl Into<String>,
+        chain_id: impl IntoOptionalChainId,
+        transaction_hash_redacted: impl Into<String>,
+        cleared_from: impl Into<String>,
+        reservation_released: bool,
+        envelope_hash: Option<String>,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.into(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::SubmissionReceiptCleared {
+                transaction_hash_redacted: transaction_hash_redacted.into(),
+                cleared_from: cleared_from.into(),
+                reservation_released,
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
     /// Constructs an opaque `ValueActionSubmitted` audit entry.
     ///
     /// Emitted after a raw sign-and-submit that the policy could not size (an

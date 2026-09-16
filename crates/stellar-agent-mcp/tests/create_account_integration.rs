@@ -295,6 +295,7 @@ fn valid_create_account_envelope_b64() -> String {
 #[tokio::test]
 #[serial]
 async fn simulate_rejects_invalid_source_strkey() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let profile = testnet_profile_with_rpc("https://soroban-testnet.stellar.org");
     let server = WalletServer::new(profile).expect("WalletServer::new");
@@ -320,6 +321,7 @@ async fn simulate_rejects_invalid_source_strkey() {
 #[tokio::test]
 #[serial]
 async fn simulate_rejects_invalid_destination_strkey() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -353,6 +355,7 @@ async fn simulate_rejects_invalid_destination_strkey() {
 #[tokio::test]
 #[serial]
 async fn simulate_rejects_chain_id_mismatch() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let profile = testnet_profile_with_rpc("https://soroban-testnet.stellar.org");
     let server = WalletServer::new(profile).expect("WalletServer::new");
@@ -380,6 +383,7 @@ async fn simulate_rejects_chain_id_mismatch() {
 #[tokio::test]
 #[serial]
 async fn simulate_allowed_on_mainnet_profile() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     // Mainnet profile — chain_id = stellar:mainnet
     let mut profile = mainnet_profile();
@@ -421,6 +425,7 @@ async fn simulate_allowed_on_mainnet_profile() {
 #[tokio::test]
 #[serial]
 async fn simulate_create_account_fee_auto_selects_p95_and_binds_envelope_fee() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(11);
 
@@ -470,6 +475,7 @@ async fn simulate_create_account_fee_auto_selects_p95_and_binds_envelope_fee() {
 #[tokio::test]
 #[serial]
 async fn simulate_create_account_fee_auto_p99_selects_p99() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(12);
 
@@ -517,6 +523,7 @@ async fn simulate_create_account_fee_auto_p99_selects_p99() {
 #[tokio::test]
 #[serial]
 async fn simulate_create_account_fee_explicit_above_profile_cap_fails() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(13);
 
@@ -577,6 +584,7 @@ async fn simulate_create_account_fee_explicit_above_profile_cap_fails() {
 #[tokio::test]
 #[serial]
 async fn policy_noop_engine_refuses_mainnet_destructive() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -626,6 +634,7 @@ async fn policy_noop_engine_refuses_mainnet_destructive() {
 #[tokio::test]
 #[serial]
 async fn policy_v1_engine_allow_rule_passes_gate() {
+    let _data_root = common::isolated_data_root();
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(CreateAccountFeeRpcResponder::new(
@@ -669,6 +678,7 @@ async fn policy_v1_engine_allow_rule_passes_gate() {
 #[tokio::test]
 #[serial]
 async fn policy_v1_engine_no_matching_rule_emits_wire_code() {
+    let _data_root = common::isolated_data_root();
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(CreateAccountFeeRpcResponder::new(
@@ -712,6 +722,7 @@ async fn policy_v1_engine_no_matching_rule_emits_wire_code() {
 #[tokio::test]
 #[serial]
 async fn policy_v1_engine_explicit_deny_emits_wire_code() {
+    let _data_root = common::isolated_data_root();
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(CreateAccountFeeRpcResponder::new(
@@ -758,6 +769,7 @@ async fn policy_v1_engine_explicit_deny_emits_wire_code() {
 #[tokio::test]
 #[serial]
 async fn commit_returns_nonce_expired_on_bad_nonce() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let profile = testnet_profile_with_rpc("https://soroban-testnet.stellar.org");
     let server = WalletServer::new(profile).expect("WalletServer::new");
@@ -791,6 +803,7 @@ async fn commit_returns_nonce_expired_on_bad_nonce() {
 #[tokio::test]
 #[serial]
 async fn commit_returns_nonce_expired_on_wrong_length_nonce() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let profile = testnet_profile_with_rpc("https://soroban-testnet.stellar.org");
     let server = WalletServer::new(profile).expect("WalletServer::new");
@@ -844,6 +857,7 @@ async fn commit_returns_nonce_expired_on_wrong_length_nonce() {
 #[tokio::test]
 #[serial]
 async fn nonce_mint_verify_returns_replayed() {
+    let _data_root = common::isolated_data_root();
     use stellar_agent_nonce::{NonceVerifyRequest, ReplayWindow};
     keyring_mock::install().expect("mock keyring store init");
 
@@ -919,6 +933,7 @@ async fn nonce_mint_verify_returns_replayed() {
 #[tokio::test]
 #[serial]
 async fn nonce_mint_verify_returns_expired_on_expiry() {
+    let _data_root = common::isolated_data_root();
     use stellar_agent_nonce::{NonceVerifyRequest, ReplayWindow};
     keyring_mock::install().expect("mock keyring store init");
 
@@ -969,6 +984,7 @@ async fn nonce_mint_verify_returns_expired_on_expiry() {
 #[tokio::test]
 #[serial]
 async fn nonce_mint_hmac_mismatch_via_corrupted_nonce() {
+    let _data_root = common::isolated_data_root();
     use stellar_agent_nonce::mint::Nonce;
     use stellar_agent_nonce::{NonceVerifyRequest, ReplayWindow};
     keyring_mock::install().expect("mock keyring store init");
@@ -1044,6 +1060,7 @@ async fn nonce_mint_hmac_mismatch_via_corrupted_nonce() {
 #[tokio::test]
 #[serial]
 async fn commit_handles_rpc_error_during_rebuild() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
 
     // A mock RPC server that handles getLedgerEntries.
@@ -1169,6 +1186,7 @@ async fn commit_handles_rpc_error_during_rebuild() {
 #[tokio::test]
 #[serial]
 async fn commit_indistinguishability_expired_vs_hmac_mismatch() {
+    let _data_root = common::isolated_data_root();
     use base64::Engine;
     use stellar_agent_nonce::mint::Nonce;
 
@@ -1308,9 +1326,28 @@ async fn commit_indistinguishability_expired_vs_hmac_mismatch() {
             "{label} path must carry wire code nonce.expired; got: {code}"
         );
     }
-    let pair_a = (code_a, message_a);
-    let pair_b = (code_b, message_b);
-    let pair_c = (code_c, message_c);
+    // `details` is part of the comparison: an object present on one refusal
+    // and absent on another tells the caller which refusal it got.
+    let pair_a = (
+        code_a,
+        message_a,
+        common::business_envelope_details(&result_a),
+    );
+    let pair_b = (
+        code_b,
+        message_b,
+        common::business_envelope_details(&result_b),
+    );
+    let pair_c = (
+        code_c,
+        message_c,
+        common::business_envelope_details(&result_c),
+    );
+    assert!(
+        pair_a.2.is_none(),
+        "an approval refusal carries no structured detail: {:?}",
+        pair_a.2
+    );
     assert_eq!(
         pair_a, pair_b,
         "indistinguishability violated: Expired and HmacMismatch must produce \
@@ -1467,6 +1504,7 @@ fn below_threshold_create_account_envelope_b64() -> String {
 #[tokio::test]
 #[serial]
 async fn create_account_commit_high_value_cross_check_passes_on_match() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(52);
 
@@ -1539,6 +1577,7 @@ async fn create_account_commit_high_value_cross_check_passes_on_match() {
 #[tokio::test]
 #[serial]
 async fn create_account_commit_high_value_cross_check_fails_on_mismatch() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(53);
 
@@ -1598,6 +1637,7 @@ async fn create_account_commit_high_value_cross_check_fails_on_mismatch() {
 #[tokio::test]
 #[serial]
 async fn create_account_commit_high_value_cross_check_skips_when_oracle_url_unset() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(54);
 
@@ -1660,6 +1700,7 @@ async fn create_account_commit_high_value_cross_check_skips_when_oracle_url_unse
 #[tokio::test]
 #[serial]
 async fn create_account_commit_below_threshold_skips_cross_check_unconditionally() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(55);
 
@@ -1795,8 +1836,12 @@ impl Respond for CreateAccountSubmitSuccessRpcResponder {
                     serde_json::json!({ "entries": [], "latestLedger": 1001 })
                 }
             }
+            // The endpoint answers with the hash of the transaction it was
+            // handed, the way a real one does: the wallet polls and records
+            // the hash it computed from the bytes it signed, and reports a
+            // disagreement as `submission.hash_mismatch`.
             "sendTransaction" => serde_json::json!({
-                "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "hash": common::submitted_tx_hash(request),
                 "status": "PENDING",
                 "latestLedger": 1001,
                 "latestLedgerCloseTime": "1234567890"
@@ -1804,7 +1849,7 @@ impl Respond for CreateAccountSubmitSuccessRpcResponder {
             "getTransaction" => serde_json::json!({
                 "status": "SUCCESS",
                 "ledger": 1005,
-                "txHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                "txHash": common::polled_tx_hash(request),
             }),
             _ => serde_json::json!({}),
         };
@@ -1828,6 +1873,7 @@ impl Respond for CreateAccountSubmitSuccessRpcResponder {
 #[tokio::test]
 #[serial]
 async fn create_account_commit_full_round_trip_succeeds_with_string_encoded_amounts() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(201);
 
@@ -1953,6 +1999,7 @@ async fn create_account_commit_full_round_trip_succeeds_with_string_encoded_amou
 #[tokio::test]
 #[serial]
 async fn create_account_two_phase_round_trip_succeeds_under_satisfied_minimum_reserve_rule() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(202);
 
@@ -2063,6 +2110,7 @@ async fn create_account_two_phase_round_trip_succeeds_under_satisfied_minimum_re
 #[tokio::test]
 #[serial]
 async fn create_account_commit_denies_under_unsatisfied_minimum_reserve_rule() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
 
     let account_key_xdr = account_ledger_key_xdr(SOURCE_G);
@@ -2129,6 +2177,7 @@ async fn create_account_commit_denies_under_unsatisfied_minimum_reserve_rule() {
 #[tokio::test]
 #[serial]
 async fn simulate_nonce_mint_failed_envelope_shape() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     // Deliberately no nonce-key seeding call — the mock store stays empty
     // at the nonce coordinate.
@@ -2214,6 +2263,7 @@ mod helpers {
 #[tokio::test]
 #[serial]
 async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
+    let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(202);
 

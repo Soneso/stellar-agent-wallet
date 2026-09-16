@@ -200,16 +200,31 @@ impl Respond for CapturingEchoResponder {
             guard.push(body_val);
         }
 
-        let req_id = serde_json::from_slice::<serde_json::Value>(&request.body)
-            .ok()
-            .and_then(|v| v.get("id").cloned())
-            .unwrap_or_else(|| json!(1));
+        let body = serde_json::from_slice::<serde_json::Value>(&request.body)
+            .unwrap_or_else(|_| json!({}));
+        let req_id = body.get("id").cloned().unwrap_or_else(|| json!(1));
+
+        // A real endpoint answers `sendTransaction` with the hash of the
+        // transaction it was handed, and the submitting wallet refuses a hash
+        // that does not describe what it signed.
+        let mut result = (*self.result).clone();
+        if body.get("method").and_then(serde_json::Value::as_str) == Some("sendTransaction")
+            && let Some(object) = result.as_object_mut()
+        {
+            object.insert(
+                "hash".to_owned(),
+                json!(stellar_agent_test_support::send_transaction_hash_hex(
+                    &body,
+                    TESTNET_PASSPHRASE
+                )),
+            );
+        }
 
         ResponseTemplate::new(200)
             .set_body_json(json!({
                 "jsonrpc": "2.0",
                 "id": req_id,
-                "result": *self.result,
+                "result": result,
             }))
             .insert_header("content-type", "application/json")
     }

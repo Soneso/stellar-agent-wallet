@@ -627,6 +627,38 @@ pub enum SaError {
         redacted_reason: String,
     },
 
+    /// The submission was sent and its outcome is not known, or it was refused
+    /// before the send because the wallet could not record it.
+    ///
+    /// Kept distinct from [`Self::DeploymentFailed`] with `phase = "submit"`,
+    /// which reports a submission that definitively did not apply. This
+    /// variant reports one that may have: the agent's next step is to
+    /// reconcile `tx_hash` against the chain, never to rebuild and re-submit.
+    ///
+    /// # Field semantics
+    ///
+    /// `kind` selects the wire code, so the surface reports the same
+    /// `submission.*` code the classic paths report for the same condition.
+    /// `tx_hash` and `envelope_hash` are public identifiers carried in full so
+    /// the caller can place them in structured response data; `message` is the
+    /// redacted operator-facing text.
+    #[error("{message}")]
+    #[serde(rename = "sa.submission_unresolved")]
+    SubmissionUnresolved {
+        /// Which submission condition this is.
+        kind: SubmissionUnresolvedKind,
+        /// Redacted operator-facing message from the submission layer.
+        message: String,
+        /// Full transaction hash to reconcile against, when one exists.
+        tx_hash: Option<String>,
+        /// Full envelope hash naming the submission record, when one exists.
+        envelope_hash: Option<String>,
+        /// The submission timeout in seconds, on the one condition that has
+        /// one: a confirmation that did not arrive in time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_seconds: Option<u64>,
+    },
+
     /// Local `ScAddress` XDR encoding failed while building an injective cache key.
     ///
     /// This is a local encoding failure, not a deployment or simulation failure.
@@ -1965,6 +1997,41 @@ pub(crate) const ALL_AUTH_ENTRY_STAGES: &[&str] = &[
     "rule_proposal_digest",
 ];
 
+/// Which unresolved-submission condition [`SaError::SubmissionUnresolved`]
+/// reports.
+///
+/// Each maps to the same `submission.*` wire code the classic submit paths
+/// return for that condition, so an agent reads one vocabulary whatever verb
+/// it called.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SubmissionUnresolvedKind {
+    /// The transaction was accepted for inclusion and was not confirmed
+    /// within the submission timeout. It may still apply.
+    Timeout,
+    /// A pending record already holds this transaction's source account and
+    /// sequence, so the submission was refused before anything was sent.
+    AlreadySubmitted,
+    /// The endpoint reported a transaction hash that does not describe the
+    /// transaction that was sent.
+    HashMismatch,
+    /// The submission could not be durably recorded, so nothing was sent.
+    RecordUnavailable,
+}
+
+impl SubmissionUnresolvedKind {
+    /// Returns the stable wire code for this condition.
+    #[must_use]
+    pub fn wire_code(self) -> &'static str {
+        match self {
+            Self::Timeout => "submission.tx_timeout",
+            Self::AlreadySubmitted => "submission.tx_already_submitted",
+            Self::HashMismatch => "submission.hash_mismatch",
+            Self::RecordUnavailable => "submission.record_unavailable",
+        }
+    }
+}
+
 /// Pre-signing simulation-divergence attribution sub-code.
 ///
 /// These values refine [`SaError::SimulationDivergence`] without changing the
@@ -2330,6 +2397,7 @@ impl SaError {
             Self::ContextRuleCapsExceeded { .. } => "sa.context_rule_caps_exceeded",
             Self::RuleExpired { .. } => "sa.rule_expired",
             Self::DeploymentFailed { .. } => "sa.deployment_failed",
+            Self::SubmissionUnresolved { kind, .. } => kind.wire_code(),
             Self::ScAddressEncodingFailed { .. } => "sa.scaddress_encoding_failed",
             Self::AuthEntryConstructionFailed { .. } => "sa.auth_entry_construction_failed",
             Self::WebAuthnVerifierProvenanceMismatch { .. } => {

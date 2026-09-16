@@ -198,9 +198,11 @@ pub(crate) fn emit_value_audit_row_with_writer(
 /// # Errors
 ///
 /// [`WalletError::Validation`], with the same variants and wire codes
-/// [`require_value_audit_writer`] produces, plus
-/// [`ValidationError::AuditWriterOpenFailed`] when the row itself cannot be
-/// appended.
+/// [`require_value_audit_writer`] produces. The append runs the same
+/// tip-anchor check the acquisition does, so a refusal there carries
+/// [`ValidationError::AuditTipAnchorMismatch`] and its reason rather than a
+/// registration-conflict code; everything else carries
+/// [`ValidationError::AuditWriterOpenFailed`].
 pub(crate) fn emit_value_audit_row_strict(
     profile: &Profile,
     profile_name: &str,
@@ -230,7 +232,11 @@ pub(crate) fn emit_value_audit_row_strict(
             error = %e,
             "value audit: authorization row NOT emitted; withholding the authorization"
         );
-        audit_writer_open_failed(profile_name)
+        // The append runs its own tip-anchor check, so a log rolled back under
+        // a live writer refuses here as well as at acquisition. It carries the
+        // code that names that condition, the way the acquisition path does:
+        // an operator sent after a registration conflict never finds one.
+        audit_writer_acquisition_error(profile_name, &e)
     })
 }
 

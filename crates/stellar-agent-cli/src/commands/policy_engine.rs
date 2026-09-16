@@ -488,108 +488,6 @@ pub(crate) fn evaluate_value_moving_policy(
     }
 }
 
-/// Records a confirmed value-moving CLI verb's contribution into the
-/// persisted policy window-state store, after a confirmed on-chain submit.
-///
-/// Rebuilds a FRESH engine via [`build_v1_policy_engine`] rather than
-/// threading the evaluation-time engine instance through the caller's
-/// control flow: the accumulation entries land in the SAME on-disk
-/// window-state store regardless of which engine instance derived them (the
-/// store is the source of truth — see
-/// `stellar_agent_network::policy_state`), so a second policy-file
-/// load/signature-verify at record time is a safe, if slightly redundant,
-/// trade-off against a deeper signature change to every value-moving verb's
-/// evaluate function. `tool_name` / `chain_id` reconstruct the IDENTICAL
-/// [`ToolDescriptor`] shape [`evaluate_value_moving_policy`] used, so rule
-/// matching is unchanged. `effects` MUST be the SAME [`stellar_agent_core::policy::v1::ValueEffects`]
-/// the gate sized (single-derivation invariant) — the same value already
-/// passed to `emit_value_action_submitted_row_with_writer` at this call site.
-///
-/// `profile_name` is the operator's resolved name. It selects the same
-/// window-state file on both halves of the round trip: the rebuild hydrates
-/// from it and [`record_confirmed_value_moving_with_engine`] appends to it.
-///
-/// Non-fatal: mirrors the `value_action_submitted` audit-row emission
-/// discipline (the on-chain action already committed). A rebuild failure or a
-/// record/persist failure logs a `tracing::warn!` and returns without
-/// disturbing the caller.
-pub(crate) fn record_confirmed_value_moving(
-    verb: &str,
-    profile: &Profile,
-    profile_name: &str,
-    tool_name: &'static str,
-    chain_id: &str,
-    effects: Option<&stellar_agent_core::policy::v1::ValueEffects>,
-) {
-    let policy_engine =
-        match build_v1_policy_engine(verb, &profile.policy.engine, profile, profile_name) {
-            Ok(pe) => pe,
-            Err(e) => {
-                tracing::warn!(
-                    profile = %profile_name,
-                    verb,
-                    error = %e,
-                    "policy window-state record: could not rebuild the policy engine; \
-                     record skipped (the next call's accumulated window total under-counts \
-                     this one)"
-                );
-                return;
-            }
-        };
-    record_confirmed_value_moving_with_engine(
-        policy_engine.as_ref(),
-        profile,
-        profile_name,
-        tool_name,
-        chain_id,
-        effects,
-    );
-}
-
-/// Leaner sibling of [`record_confirmed_value_moving`] for callers that
-/// already hold the evaluation-time `policy_engine` in scope (e.g. `trustline`,
-/// whose single `run` function never drops it before the confirmed-submit
-/// audit row) — avoids a redundant policy-file reload/signature-verify.
-///
-/// `tool_name` / `chain_id` reconstruct the IDENTICAL [`ToolDescriptor`] shape
-/// [`evaluate_value_moving_policy`] used, so rule matching is unchanged.
-/// `effects` MUST be the SAME [`stellar_agent_core::policy::v1::ValueEffects`]
-/// the gate sized (single-derivation invariant).
-///
-/// Non-fatal: mirrors the `value_action_submitted` audit-row emission
-/// discipline.
-pub(crate) fn record_confirmed_value_moving_with_engine(
-    policy_engine: &dyn PolicyEngine,
-    profile: &Profile,
-    profile_name: &str,
-    tool_name: &'static str,
-    chain_id: &str,
-    effects: Option<&stellar_agent_core::policy::v1::ValueEffects>,
-) {
-    let reg = McpToolRegistration {
-        name: tool_name,
-        destructive_hint: true,
-        read_only_hint: false,
-        chain_id_required: true,
-        value_kind: ToolValueKind::MovesValue,
-    };
-    let mut tool_descriptor = ToolDescriptor::from_registration(&reg);
-    tool_descriptor.chain_id = chain_id.to_owned();
-
-    let value_class = match effects {
-        Some(e) => stellar_agent_core::policy::v1::ValueClass::Value(e.clone()),
-        None => stellar_agent_core::policy::v1::ValueClass::ReadOnly,
-    };
-
-    stellar_agent_network::policy_state::record_confirmed_window_state(
-        policy_engine,
-        &tool_descriptor,
-        profile,
-        profile_name,
-        &value_class,
-    );
-}
-
 /// Evaluates operator policy for a value-moving DeFi verb (`trade`, `lend`,
 /// `vault`) whose effect cannot be derived from pre-decode args alone —
 /// mirroring the MCP DeFi tools' `WalletServer::dispatch_gate_with_value`
@@ -795,6 +693,40 @@ mod tests {
         // Override the service name directly (the field is `pub` on Profile).
         profile.policy_owner_key_id.service = service.to_owned();
         profile
+    }
+
+    /// Records a confirmed value-moving contribution the way the submission
+    /// recorder does: the policy engine accounts for the action, and the
+    /// resulting entries are persisted to the profile's window-state file.
+    ///
+    /// The tests below pin that the persisted file is what a FRESH engine
+    /// hydrates from, so they drive the same two steps production drives
+    /// rather than a shape of their own.
+    fn record_confirmed_to_window_file(
+        verb: &str,
+        profile: &Profile,
+        profile_name: &str,
+        tool_name: &'static str,
+        chain_id: &str,
+        effects: &stellar_agent_core::policy::v1::ValueEffects,
+    ) {
+        let engine = build_v1_policy_engine(verb, &profile.policy.engine, profile, profile_name)
+            .expect("policy engine must rebuild for the record step");
+        let reg = McpToolRegistration {
+            name: tool_name,
+            destructive_hint: true,
+            read_only_hint: false,
+            chain_id_required: true,
+            value_kind: ToolValueKind::MovesValue,
+        };
+        let mut descriptor = ToolDescriptor::from_registration(&reg);
+        descriptor.chain_id = chain_id.to_owned();
+        let entries = engine
+            .record_confirmed(&descriptor, profile, &ValueClass::Value(effects.clone()))
+            .expect("the engine must account for the action");
+        stellar_agent_network::policy_state::PersistedWindowStore::for_profile(profile_name)
+            .record_and_persist(profile, &entries)
+            .expect("the window-state file must accept the recorded entries");
     }
 
     // Helper: extract the error string from a Result without requiring T: Debug.
@@ -1886,14 +1818,7 @@ mod tests {
             result1.is_ok(),
             "first invocation's 60 XLM payment must be allowed under the 100 XLM cap: {result1:?}"
         );
-        record_confirmed_value_moving(
-            "pay",
-            &profile,
-            name,
-            "pay",
-            "stellar:testnet",
-            Some(&effects),
-        );
+        record_confirmed_to_window_file("pay", &profile, name, "pay", "stellar:testnet", &effects);
 
         // ── "Invocation 2": a FRESH build_v1_policy_engine call, over the
         // SAME file, must see invocation 1's recorded 60 XLM and deny this
@@ -2091,13 +2016,13 @@ mod tests {
             "pay",
         )
         .expect("60 XLM under the 100 XLM cap must be allowed");
-        record_confirmed_value_moving(
+        record_confirmed_to_window_file(
             "pay",
             profile,
             I114_REQUESTED,
             "pay",
             "stellar:testnet",
-            Some(&effects),
+            &effects,
         );
 
         assert!(

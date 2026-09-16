@@ -399,6 +399,28 @@ where
         return 1;
     }
 
+    // Settle the spending-window reservations that have stood long enough to
+    // be settleable, before the gate below counts them. A reservation the
+    // chain has since answered for should not hold the operator's cap, and one
+    // the chain has not is counted as spend.
+    let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
+        Ok(v) => v,
+        Err(e) => {
+            render_json(&Envelope::<()>::err_raw(
+                "wallet.clock_error",
+                e.to_string(),
+            ));
+            return 1;
+        }
+    };
+    crate::commands::submission_record::reconcile_open_reservations(
+        &profile,
+        &profile_name,
+        &primary_rpc,
+        now_ms,
+    )
+    .await;
+
     // ── Operator policy evaluation (value-carrying; mirrors the MCP
     // `stellar_defindex_vault_deposit` twin's `dispatch_gate_with_value`
     // mechanism) ──────────────────────────────────────────────────────────
@@ -422,6 +444,9 @@ where
     // sized (single-derivation invariant).
     let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> =
         value_legs.iter().map(Into::into).collect();
+    // The SAME effects the gate is about to size, kept for the submission
+    // record (single-derivation invariant).
+    let deposit_effects = ValueEffects::new(value_legs);
     let policy_args = json!({
         "vault_address": args.vault,
         "from_address": args.from,
@@ -432,7 +457,7 @@ where
         "stellar_defindex_vault_deposit",
         chain_id,
         &policy_args,
-        ValueClass::Value(ValueEffects::new(value_legs)),
+        ValueClass::Value(deposit_effects.clone()),
         "vault_deposit",
     ) {
         render_json(&envelope);
@@ -517,6 +542,30 @@ where
     ctx.audit_legs = Some(&audit_legs);
     ctx.audit_tool = Some("stellar_defindex_vault_deposit");
 
+    // Record the submission before the bytes leave: the receipt, the pending
+    // audit row and the spending-window reservation. The recorder settles all
+    // three against what the network answers, and owns the confirmed row the
+    // adapter would otherwise emit.
+    let recorder = match crate::commands::submission_record::build_recorder(
+        crate::commands::submission_record::SubmitRecord {
+            profile: &profile,
+            profile_name: profile_name.clone(),
+            verb: "vault_deposit",
+            tool: "stellar_defindex_vault_deposit",
+            chain_id,
+            effects: Some(&deposit_effects),
+            audit: Some(std::sync::Arc::clone(&audit_writer)),
+            now_ms,
+        },
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            render_json(&crate::commands::submission_record::error_envelope(&e, ""));
+            return 1;
+        }
+    };
+    ctx.submission_recorder = Some(&recorder);
+
     // ── Delegate to DefindexVaultAdapter::submit ──────────────────────────────
     let adapter = DefindexVaultAdapter::new();
     let submit_result = adapter
@@ -542,11 +591,7 @@ where
             0
         }
         Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                "vault.submit_failed",
-                format!("{e}"),
-            ));
-            1
+            crate::commands::submission_record::render_defi_submit_error(&e, "vault.submit_failed")
         }
     }
 }
@@ -729,6 +774,28 @@ where
         return 1;
     }
 
+    // Settle the spending-window reservations that have stood long enough to
+    // be settleable, before the gate below counts them. A reservation the
+    // chain has since answered for should not hold the operator's cap, and one
+    // the chain has not is counted as spend.
+    let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
+        Ok(v) => v,
+        Err(e) => {
+            render_json(&Envelope::<()>::err_raw(
+                "wallet.clock_error",
+                e.to_string(),
+            ));
+            return 1;
+        }
+    };
+    crate::commands::submission_record::reconcile_open_reservations(
+        &profile,
+        &profile_name,
+        &primary_rpc,
+        now_ms,
+    )
+    .await;
+
     // ── Operator policy evaluation (value-carrying; mirrors the MCP
     // `stellar_defindex_vault_withdraw` twin's `dispatch_gate_with_value`
     // mechanism) ──────────────────────────────────────────────────────────
@@ -747,6 +814,9 @@ where
     let audit_legs = vec![stellar_agent_core::audit_log::ValueLegRecord::from(
         &value_leg,
     )];
+    // The SAME effects the gate is about to size, kept for the submission
+    // record (single-derivation invariant).
+    let withdraw_effects = ValueEffects::new(vec![value_leg]);
     let policy_args = json!({
         "vault_address": args.vault,
         "from_address": args.from,
@@ -757,7 +827,7 @@ where
         "stellar_defindex_vault_withdraw",
         chain_id,
         &policy_args,
-        ValueClass::Value(ValueEffects::new(vec![value_leg])),
+        ValueClass::Value(withdraw_effects.clone()),
         "vault_withdraw",
     ) {
         render_json(&envelope);
@@ -842,6 +912,30 @@ where
     ctx.audit_legs = Some(&audit_legs);
     ctx.audit_tool = Some("stellar_defindex_vault_withdraw");
 
+    // Record the submission before the bytes leave: the receipt, the pending
+    // audit row and the spending-window reservation. The recorder settles all
+    // three against what the network answers, and owns the confirmed row the
+    // adapter would otherwise emit.
+    let recorder = match crate::commands::submission_record::build_recorder(
+        crate::commands::submission_record::SubmitRecord {
+            profile: &profile,
+            profile_name: profile_name.clone(),
+            verb: "vault_withdraw",
+            tool: "stellar_defindex_vault_withdraw",
+            chain_id,
+            effects: Some(&withdraw_effects),
+            audit: Some(std::sync::Arc::clone(&audit_writer)),
+            now_ms,
+        },
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            render_json(&crate::commands::submission_record::error_envelope(&e, ""));
+            return 1;
+        }
+    };
+    ctx.submission_recorder = Some(&recorder);
+
     // ── Delegate to DefindexVaultAdapter::submit ──────────────────────────────
     let adapter = DefindexVaultAdapter::new();
     let submit_result = adapter
@@ -867,11 +961,7 @@ where
             0
         }
         Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                "vault.submit_failed",
-                format!("{e}"),
-            ));
-            1
+            crate::commands::submission_record::render_defi_submit_error(&e, "vault.submit_failed")
         }
     }
 }

@@ -507,6 +507,7 @@ async fn deploy_ed25519_verifier_body(
                 args.timeout,
                 &args.network_passphrase,
                 None,
+                None,
             ),
         )
         .await
@@ -708,6 +709,7 @@ async fn deploy_ed25519_verifier_body(
             &signed_xdr,
             args.timeout,
             &args.network_passphrase,
+            None,
             None,
         ),
     )

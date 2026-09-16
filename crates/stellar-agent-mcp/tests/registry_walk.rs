@@ -276,12 +276,12 @@ fn instructions_string_names_every_registered_tool() {
 /// The count assertion guards against a tool being accidentally added or dropped.
 /// When the tool set changes, update the expected count and the name list below.
 #[test]
-fn registry_contains_forty_two_tools() {
+fn registry_contains_forty_three_tools() {
     let registry = collect_registry_names();
     assert_eq!(
         registry.len(),
-        42,
-        "registry must contain exactly 42 tools \
+        43,
+        "registry must contain exactly 43 tools \
          (stellar_balances + stellar_friendbot + stellar_create_account \
          + stellar_create_account_commit + stellar_pay + stellar_pay_commit \
          + stellar_fee_stats + stellar_sep43_get_address + stellar_sep43_get_network \
@@ -301,8 +301,12 @@ fn registry_contains_forty_two_tools() {
          + stellar_rule_create + stellar_rule_create_commit \
          + stellar_mpp_charge_prepare + stellar_mpp_charge_commit \
          + stellar_mpp_record_receipt + stellar_mpp_reconcile_transaction \
-         + stellar_mpp_authorization_status); \
+         + stellar_mpp_authorization_status + stellar_transaction_status); \
          got: {registry:?}"
+    );
+    assert!(
+        registry.contains("stellar_transaction_status"),
+        "registry must contain stellar_transaction_status; got: {registry:?}"
     );
     assert!(
         registry.contains("stellar_balances"),

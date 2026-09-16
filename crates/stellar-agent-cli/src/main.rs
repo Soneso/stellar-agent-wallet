@@ -57,6 +57,16 @@ enum Commands {
     /// - `approve gc` — evict all expired pending approvals for a profile.
     Approve(commands::approve::ApproveArgs),
 
+    /// Submission-record subcommand group.
+    ///
+    /// Provides:
+    /// - `tx status <HASH>` — reconcile one submitted transaction against the
+    ///   chain and settle the wallet's record of it. This is the way out of
+    ///   `submission.tx_timeout`.
+    /// - `tx receipt clear <ENVELOPE_HASH> --acknowledge` — release a
+    ///   submission record reconciliation cannot settle.
+    Tx(commands::tx::TxArgs),
+
     /// Audit-log management subcommand group.
     ///
     /// Provides:
@@ -249,6 +259,7 @@ impl Commands {
         match self {
             Self::Approve(a) => a.profile_flag(),
             Self::Audit(a) => a.profile_flag(),
+            Self::Tx(a) => a.profile_flag(),
             Self::Accounts(a) => a.profile_flag(),
             Self::Counterparty(a) => a.profile_flag(),
             Self::Fees(a) => a.profile_flag(),
@@ -318,6 +329,7 @@ async fn main() {
         Commands::Claim(args) => commands::claim::run(&args).await,
         Commands::Approve(args) => commands::approve::dispatch(args).await,
         Commands::Audit(args) => commands::audit::run(&args).await,
+        Commands::Tx(args) => commands::tx::run(&args).await,
         Commands::Accounts(args) => commands::accounts::run(&args).await,
         Commands::Balances(args) => commands::balances::run(&args).await,
         Commands::Counterparty(args) => commands::counterparty::run(&args).await,

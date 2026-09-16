@@ -238,6 +238,7 @@ mod live {
             Duration::from_secs(60),
             TESTNET_PASSPHRASE,
             None,
+            None,
         )
         .await;
 

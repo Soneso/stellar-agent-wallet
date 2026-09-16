@@ -36,6 +36,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A submission that lands but is not confirmed within the poll deadline is now
+  recorded. It was recorded nowhere: every post-submit record sat in the
+  success arm, so a timeout left no audit row, no spend against the operator's
+  caps, a burned commit nonce, and a live attested approval entry for a
+  transaction whose bytes had already been sent. The agent's only signal was a
+  redacted error, and re-simulating was the only thing it could do, at a
+  sequence the sent transaction might already be consuming.
+
+  Before `sendTransaction`, the submit layer now records the signed transaction
+  as submitted with an unknown outcome: a submission receipt keyed on the
+  envelope hash, a reservation in the spending-window file, and a
+  `value_action_pending` audit row carrying the value legs the policy gate
+  sized. The receipt and the reservation fail closed; the audit row fails closed
+  on a persisted profile. The record is settled by what the network answers: a
+  confirmed transaction records its spend and its `value_action_submitted` row,
+  a refused or on-chain-failed one releases the reservation and records
+  `value_action_failed`, and a timeout or a transport failure after the send
+  leaves everything standing. Nothing clears a record on a transport error. The
+  transaction hash is computed locally from the envelope before the send and
+  used for polling, recording and reporting; an endpoint that answers with a
+  different hash is reported as `submission.hash_mismatch` and the record
+  stands.
+
+  `submission.tx_timeout` is terminal for the agent: the error now carries an
+  `error.details` object with the full transaction hash, the envelope hash,
+  `outcome: "unknown"` and the verb or tool that reconciles it, while the
+  message stays redacted. Two other codes carry the same object:
+  `submission.tx_already_submitted`, which refuses a second submission for a
+  source account and sequence a pending record already holds, and
+  `submission.hash_mismatch`. New refusal classes `submission.record_unavailable`
+  (the record could not be written, so nothing was sent) and
+  `policy.approval_consumed` (the approval was already spent on a submission)
+  join them.
+
+  Two new surfaces settle a record: `stellar_transaction_status` (MCP) and
+  `stellar-agent tx status <HASH>` (CLI) reconcile one submission against the
+  chain, and `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge` is
+  the operator's way out of the two states reconciliation cannot settle.
+  Reconciliation is repeatable: a submission a settled row already accounts for
+  is owed no second row. `tx receipt clear` evaluates the record's own state
+  first, then asks the endpoint what became of the transaction, and refuses when
+  the chain has answered for it or cannot be reached; every precondition is
+  checked before anything is released or written, and a re-run appends no second
+  clear row. It accepts a record for a submission that was never sent, which is
+  what a process killed between the record and the send leaves behind. A
+  reservation whose record is gone is released once its sequence is consumed or
+  its time bound has passed. Every value verb also settles the oldest open reservations, bounded
+  at five per pass, only those older than five minutes, and skipping the ones
+  whose receipt already records an unknown outcome so younger reservations are
+  reached. A pass that settles a submission writes the value-action row it was
+  owed. The MCP tool count moves from 42 to 43.
+
+  The DeFi and smart-account verbs report an unresolved submission in the same
+  vocabulary as the classic ones: `stellar_dex_trade`, both vault tools,
+  `stellar-agent trade`, `stellar-agent vault`, `smart-account execute` and
+  `smart-account multicall` carry the `submission.*` code and the `details`
+  object. They reported a generic submit failure with no hash.
+  `stellar_sep43_sign_and_submit_transaction` records its submission too: it
+  takes no spending-window reservation, because the envelope is the caller's and
+  the policy engine sizes no value for it, but it writes a receipt and a pending
+  row and its timeout is reconcilable like any other. A confirmed submission
+  writes one settled row, the opaque-action row that carries the tool's own
+  contract, and the tool reports the `submission.*` codes.
+
+  A submission the wallet cannot fully record is unwound: the receipt is
+  removed, a reservation already taken is released, and the retry the refusal
+  invites is admitted at the same sequence. `submission.record_unavailable`
+  therefore means what it says, and carries no `details`, because nothing was
+  sent and there is no transaction to reconcile.
+
+  A spent approval entry is now kept as a `Consumed` tombstone (it was removed).
+  The tombstone keeps its attestation and names the transaction it was spent
+  on, and the commit gate refuses it with `policy.approval_consumed`. A send the
+  network refuses outright leaves the approval untouched, because no value moved
+  and the agent is expected to make a fresh attempt.
+
+  The window-state file is written as version 2. Its records now carry the
+  identity of the submission that wrote them: the envelope hash, the transaction
+  hash, the source account, the sequence number, the time bound, and when the
+  reservation was taken. The file is HMAC-tagged and 0600 on Unix, as before; it
+  is not encrypted, and it now holds account identifiers and sequence numbers.
+  A version 1 file reads as fully confirmed, and alpha.6 reads a version 2 file
+  and counts pending records as confirmed spend. A file written by a newer build
+  is refused.
+
+  Submission receipts gain a `cleared_by_operator` status. `ReceiptStatus` is a
+  serde-tagged non-exhaustive enum, so a reader older than this release treats
+  the new tag as an error; no production path read the receipt store before this
+  release.
+
 - Submit derives the target network from the RPC endpoint instead of the
   caller's declaration, and verifies which network the envelope's signatures
   were made for. It previously trusted the declared passphrase and checked
@@ -84,8 +174,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entry. A refusal is `audit.tip_anchor_mismatch` with the reason named, evicts
   the writer, and anchors the row it owed, so every later open refuses until
   `stellar-agent audit reanchor --acknowledge-rollback`, whose report shows one
-  more anchored entry than the log holds. The MPP verbs surface these refusals
-  under their own `audit.*` codes. A keyed writer cannot be constructed without
+  more anchored entry than the log holds. Anchoring the owed row is best-effort,
+  like every other anchor write: a keyring that rejects it leaves the refusal
+  standing for that writer and its callers, but not past the process. The MPP
+  verbs surface these refusals under their own `audit.*` codes, and an
+  append-time refusal carries `audit.tip_anchor_mismatch` and its reason. A keyed writer cannot be constructed without
   an anchor store. `docs/maintainers/audit-log-recovery.md` now states that two
   profiles on one log path hold one anchor each and that the configuration is
   unsupported.

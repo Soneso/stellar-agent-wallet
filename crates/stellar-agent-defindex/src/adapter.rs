@@ -392,6 +392,7 @@ impl DefindexVaultAdapter {
                 .op_label(DEFINDEX_SUBMIT_OP_LABEL)
                 .emit_observability_logs(true)
                 .maybe_sequence_floor(ctx.sequence_floor)
+                .maybe_submission_recorder(ctx.submission_recorder)
                 .build(),
         )
         .await;
@@ -429,9 +430,7 @@ impl DefindexVaultAdapter {
                         &request_id,
                     );
                 }
-                Err(DefiAdapterError::Network {
-                    reason: format!("submit_signed_invoke failed: {e}"),
-                })
+                Err(map_submit_invoke_error(&e))
             }
         }
     }
@@ -561,6 +560,7 @@ impl DefindexVaultAdapter {
                 .op_label(DEFINDEX_SUBMIT_OP_LABEL)
                 .emit_observability_logs(true)
                 .maybe_sequence_floor(ctx.sequence_floor)
+                .maybe_submission_recorder(ctx.submission_recorder)
                 .build(),
         )
         .await;
@@ -598,9 +598,7 @@ impl DefindexVaultAdapter {
                         &request_id,
                     );
                 }
-                Err(DefiAdapterError::Network {
-                    reason: format!("submit_signed_invoke failed: {e}"),
-                })
+                Err(map_submit_invoke_error(&e))
             }
         }
     }
@@ -681,6 +679,33 @@ fn build_invoke_contract_args(
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Maps a `submit_signed_invoke` failure into the adapter error surface.
+///
+/// A submission whose outcome is unknown keeps its own wire code and its
+/// identifiers, so the caller reconciles a transaction hash instead of
+/// rebuilding and re-submitting. Every other failure is reported as a network
+/// failure, which moved nothing.
+fn map_submit_invoke_error(error: &stellar_agent_smart_account::SaError) -> DefiAdapterError {
+    match error {
+        stellar_agent_smart_account::SaError::SubmissionUnresolved {
+            kind,
+            message,
+            tx_hash,
+            envelope_hash,
+            timeout_seconds,
+        } => DefiAdapterError::SubmissionUnresolved {
+            wire_code: kind.wire_code(),
+            message: message.clone(),
+            tx_hash: tx_hash.clone(),
+            envelope_hash: envelope_hash.clone(),
+            timeout_seconds: *timeout_seconds,
+        },
+        other => DefiAdapterError::Network {
+            reason: format!("submit_signed_invoke failed: {other}"),
+        },
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -21,7 +21,7 @@ use serde_json::json;
 use stellar_agent_core::error::{NetworkError, ProtocolError, WalletError};
 use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::submit::submit_transaction_and_wait;
-use stellar_agent_test_support::EchoIdResponder;
+use stellar_agent_test_support::SubmissionEchoResponder;
 use stellar_agent_test_support::signed_envelope::{
     MAINNET_PASSPHRASE, SignedTestEnvelope, TESTNET_PASSPHRASE, account_id_for_seed,
     get_network_result, public_key_for_seed,
@@ -93,10 +93,13 @@ async fn mount_method(
     result: serde_json::Value,
     label: &str,
 ) {
+    // The submit-path methods answer with the hash of the transaction they
+    // were handed, the way a real endpoint does; every other method answers
+    // the fixed body.
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({ "method": rpc_method })))
-        .respond_with(EchoIdResponder::new(result))
+        .respond_with(SubmissionEchoResponder::new(result, TESTNET_PASSPHRASE))
         .named(label.to_owned())
         .mount(server)
         .await;
@@ -110,6 +113,7 @@ async fn submit(server: &MockServer, envelope: &SignedTestEnvelope) -> Result<()
         envelope.envelope_xdr(),
         SUBMIT_TIMEOUT,
         TESTNET_PASSPHRASE,
+        None,
         None,
     )
     .await
@@ -444,10 +448,16 @@ async fn v0_envelope_refuses_before_any_rpc_call() {
     mount_full_surface(&server, &envelope, TESTNET_PASSPHRASE).await;
 
     let client = StellarRpcClient::new(&server.uri()).unwrap();
-    let err =
-        submit_transaction_and_wait(&client, &v0_xdr, SUBMIT_TIMEOUT, TESTNET_PASSPHRASE, None)
-            .await
-            .expect_err("a V0 envelope must be refused");
+    let err = submit_transaction_and_wait(
+        &client,
+        &v0_xdr,
+        SUBMIT_TIMEOUT,
+        TESTNET_PASSPHRASE,
+        None,
+        None,
+    )
+    .await
+    .expect_err("a V0 envelope must be refused");
 
     assert!(
         matches!(
@@ -676,6 +686,7 @@ async fn operation_source_created_by_the_transaction_verifies_against_its_master
         SUBMIT_TIMEOUT,
         TESTNET_PASSPHRASE,
         None,
+        None,
     )
     .await;
 
@@ -758,10 +769,16 @@ async fn created_operation_source_signed_for_mainnet_still_refuses() {
     .await;
 
     let client = StellarRpcClient::new(&server.uri()).unwrap();
-    let err =
-        submit_transaction_and_wait(&client, &tampered, SUBMIT_TIMEOUT, TESTNET_PASSPHRASE, None)
-            .await
-            .expect_err("a mainnet-bound signature by the created account must be refused");
+    let err = submit_transaction_and_wait(
+        &client,
+        &tampered,
+        SUBMIT_TIMEOUT,
+        TESTNET_PASSPHRASE,
+        None,
+        None,
+    )
+    .await
+    .expect_err("a mainnet-bound signature by the created account must be refused");
 
     assert_eq!(err.code(), "network.envelope_signed_for_mainnet", "{err:?}");
 }
@@ -894,6 +911,7 @@ async fn operation_source_created_by_a_later_operation_is_not_treated_as_created
         &envelope_xdr,
         SUBMIT_TIMEOUT,
         TESTNET_PASSPHRASE,
+        None,
         None,
     )
     .await

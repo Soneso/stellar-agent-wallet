@@ -34,10 +34,10 @@ use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::builder::{Asset, ClassicOpBuilder};
 use stellar_agent_network::fee_bump_retry::submit_fee_bump_idempotent;
 use stellar_agent_network::signing::SoftwareSigningKey;
-use stellar_agent_test_support::EchoIdResponder;
 use stellar_agent_test_support::signed_envelope::{
     account_id_for_seed, get_network_result, ledger_entries_result_for,
 };
+use stellar_agent_test_support::{EchoIdResponder, SubmissionEchoResponder};
 use stellar_xdr::{
     Hash, Limits, ReadXdr, TransactionEnvelope, TransactionSignaturePayload,
     TransactionSignaturePayloadTaggedTransaction, WriteXdr,
@@ -207,7 +207,10 @@ async fn winner_path_rpc_failed_stores_failed_receipt_and_returns_error() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(SubmissionEchoResponder::new(
+            send_pending_response(),
+            TESTNET_PASSPHRASE,
+        ))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -316,7 +319,9 @@ async fn loser_poll_resolves_ok_when_winner_finalises_success() {
 
     // Pre-seed a Pending receipt (submitted=true) — simulates a live winner.
     let outer_tx_hash = "2222222222222222222222222222222222222222222222222222222222222222";
-    store.try_begin(&inner_key, outer_tx_hash, 0, 100).unwrap();
+    store
+        .try_begin(&inner_key, outer_tx_hash, "", 0, 0, 100)
+        .unwrap();
     store.mark_submitted(&inner_key).unwrap();
 
     // Clone the store (ReceiptStore is Clone — shares the same Arc<Mutex>
@@ -444,7 +449,10 @@ async fn receipt_tx_hash_equals_outer_hash_and_differs_from_inner_key() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(SubmissionEchoResponder::new(
+            send_pending_response(),
+            TESTNET_PASSPHRASE,
+        ))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -452,7 +460,10 @@ async fn receipt_tx_hash_equals_outer_hash_and_differs_from_inner_key() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "getTransaction"})))
-        .respond_with(EchoIdResponder::new(get_success_response()))
+        .respond_with(SubmissionEchoResponder::new(
+            get_success_response(),
+            TESTNET_PASSPHRASE,
+        ))
         .up_to_n_times(10)
         .mount(&server)
         .await;
@@ -615,7 +626,10 @@ async fn fee_source_signer_mismatch_abandons_pending_receipt_allowing_retry() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(SubmissionEchoResponder::new(
+            send_pending_response(),
+            TESTNET_PASSPHRASE,
+        ))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -623,7 +637,10 @@ async fn fee_source_signer_mismatch_abandons_pending_receipt_allowing_retry() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "getTransaction"})))
-        .respond_with(EchoIdResponder::new(get_success_response()))
+        .respond_with(SubmissionEchoResponder::new(
+            get_success_response(),
+            TESTNET_PASSPHRASE,
+        ))
         .up_to_n_times(5)
         .mount(&server)
         .await;
@@ -891,7 +908,10 @@ async fn receipt_max_time_is_zero_when_inner_has_no_time_bounds() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(SubmissionEchoResponder::new(
+            send_pending_response(),
+            TESTNET_PASSPHRASE,
+        ))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -899,7 +919,10 @@ async fn receipt_max_time_is_zero_when_inner_has_no_time_bounds() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "getTransaction"})))
-        .respond_with(EchoIdResponder::new(get_success_response()))
+        .respond_with(SubmissionEchoResponder::new(
+            get_success_response(),
+            TESTNET_PASSPHRASE,
+        ))
         .up_to_n_times(5)
         .mount(&server)
         .await;
@@ -965,7 +988,10 @@ async fn winner_path_feebump_inner_failed_stores_failed_receipt() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
-        .respond_with(EchoIdResponder::new(send_pending_response()))
+        .respond_with(SubmissionEchoResponder::new(
+            send_pending_response(),
+            TESTNET_PASSPHRASE,
+        ))
         .up_to_n_times(1)
         .mount(&server)
         .await;

@@ -243,7 +243,8 @@ where
     drop(signer);
 
     let submission_result =
-        submit_transaction_and_wait(client, &signed_xdr, timeout, network_passphrase, None).await;
+        submit_transaction_and_wait(client, &signed_xdr, timeout, network_passphrase, None, None)
+            .await;
 
     // ── Step 5: map outcome and release ─────────────────────────────────────
     match submission_result {

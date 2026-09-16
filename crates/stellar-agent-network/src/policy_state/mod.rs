@@ -149,7 +149,10 @@
 pub mod lock;
 pub mod store;
 
-pub use store::{MintOutcome, PersistedWindowStore};
+pub use store::{
+    MintOutcome, PersistedWindowStore, RECONCILE_BUDGET, RECONCILE_MIN_AGE_MS, ReconcileReport,
+    SettledSubmission, WindowReservation,
+};
 
 /// Records a confirmed call's contribution into `engine`'s window state and
 /// persists the new entries to the on-disk store for `profile_name`.

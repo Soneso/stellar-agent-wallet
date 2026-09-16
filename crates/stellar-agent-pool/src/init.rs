@@ -204,6 +204,7 @@ pub async fn init_pool(
         INIT_SUBMIT_TIMEOUT,
         params.network_passphrase,
         None,
+        None,
     )
     .await
     .map_err(|e| PoolError::InitFailed {

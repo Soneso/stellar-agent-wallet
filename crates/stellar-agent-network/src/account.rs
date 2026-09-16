@@ -778,6 +778,10 @@ pub async fn fetch_account(
 ///
 /// Duplicate entries in `account_ids` are requested once.
 ///
+/// Returns the signer sets and the endpoint's `latestLedger` from the same
+/// response: it is the ledger a submission made straight after this read is
+/// recorded against.
+///
 /// # Errors
 ///
 /// - [`WalletError::Protocol`] wrapping [`ProtocolError::XdrCodecFailed`] if an
@@ -791,7 +795,7 @@ pub(crate) async fn fetch_account_signers(
     client: &StellarRpcClient,
     account_ids: &[String],
     deadline: tokio::time::Instant,
-) -> Result<BTreeMap<String, Vec<[u8; 32]>>, WalletError> {
+) -> Result<(BTreeMap<String, Vec<[u8; 32]>>, u32), WalletError> {
     use std::collections::BTreeSet;
 
     use stellar_xdr::SignerKey;
@@ -867,7 +871,13 @@ pub(crate) async fn fetch_account_signers(
         }
     }
 
-    Ok(signers_by_account)
+    // The endpoint's view of the chain at the moment the signer sets were
+    // read. The submission that follows is recorded against this ledger, so a
+    // later reconciliation can tell "the endpoint never saw the transaction"
+    // apart from "the endpoint no longer remembers that far back".
+    let latest_ledger = u32::try_from(response.latest_ledger).unwrap_or(0);
+
+    Ok((signers_by_account, latest_ledger))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -294,6 +294,7 @@ impl<T: Serialize> Envelope<T> {
             error: Some(EnvelopeError {
                 code: err.code().to_owned(),
                 message: err.message(),
+                details: None,
             }),
             request_id,
         }
@@ -373,6 +374,85 @@ impl Envelope<()> {
             error: Some(EnvelopeError {
                 code: err.code().to_owned(),
                 message: err.message(),
+                details: None,
+            }),
+            request_id,
+        }
+    }
+
+    /// Constructs an error envelope from a [`WalletError`] carrying a
+    /// machine-readable `details` object alongside the redacted message.
+    ///
+    /// Reserved for the error codes whose recovery protocol needs a value the
+    /// message redacts. `details` holds public identifiers only.
+    ///
+    /// Generates a fresh UUIDv4 `request_id`.
+    ///
+    /// # Panics
+    ///
+    /// Only if the OS randomness source is unavailable — see
+    /// [`uuid::Uuid::new_v4`]. Call [`Envelope::err_with_details_and_request_id`]
+    /// to avoid this path.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::envelope::Envelope;
+    /// use stellar_agent_core::error::{SubmissionError, WalletError};
+    ///
+    /// let err = WalletError::Submission(SubmissionError::TxTimeout {
+    ///     tx_hash: "ab".repeat(32),
+    ///     seconds: 30,
+    /// });
+    /// let env = Envelope::<()>::err_with_details(
+    ///     &err,
+    ///     serde_json::json!({ "tx_hash": "ab".repeat(32) }),
+    /// );
+    /// let e = env.error.as_ref().unwrap();
+    /// assert_eq!(e.code, "submission.tx_timeout");
+    /// assert_eq!(e.details.as_ref().unwrap()["tx_hash"], "ab".repeat(32));
+    /// ```
+    #[must_use]
+    pub fn err_with_details(err: &WalletError, details: serde_json::Value) -> Self {
+        Self::err_with_details_and_request_id(err, details, new_request_id())
+    }
+
+    /// Constructs an error envelope from a [`WalletError`] carrying a
+    /// machine-readable `details` object and a caller-supplied `request_id`.
+    ///
+    /// Use this overload when threading a request ID through a multi-step flow
+    /// or when a deterministic ID is required in tests.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::envelope::Envelope;
+    /// use stellar_agent_core::error::{SubmissionError, WalletError};
+    ///
+    /// let err = WalletError::Submission(SubmissionError::TxTimeout {
+    ///     tx_hash: "ab".repeat(32),
+    ///     seconds: 30,
+    /// });
+    /// let env = Envelope::<()>::err_with_details_and_request_id(
+    ///     &err,
+    ///     serde_json::json!({ "outcome": "unknown" }),
+    ///     "fixed-id".to_owned(),
+    /// );
+    /// assert_eq!(env.request_id, "fixed-id");
+    /// ```
+    #[must_use]
+    pub fn err_with_details_and_request_id(
+        err: &WalletError,
+        details: serde_json::Value,
+        request_id: String,
+    ) -> Self {
+        Self {
+            ok: false,
+            data: None,
+            error: Some(EnvelopeError {
+                code: err.code().to_owned(),
+                message: err.message(),
+                details: Some(details),
             }),
             request_id,
         }
@@ -442,8 +522,48 @@ impl Envelope<()> {
             error: Some(EnvelopeError {
                 code: code.into(),
                 message: message.into(),
+                details: None,
             }),
             request_id,
+        }
+    }
+
+    /// Constructs an error envelope from a raw code string and message,
+    /// carrying a machine-readable `details` object.
+    ///
+    /// For a caller that holds the code and the structured detail directly
+    /// rather than a [`WalletError`] to derive them from, which is the shape
+    /// the DeFi surfaces report an unresolved submission in.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::envelope::Envelope;
+    ///
+    /// let env = Envelope::<()>::err_raw_with_details(
+    ///     "submission.tx_timeout",
+    ///     "transaction was not confirmed within 30s",
+    ///     serde_json::json!({ "outcome": "unknown" }),
+    /// );
+    /// let e = env.error.as_ref().unwrap();
+    /// assert_eq!(e.code, "submission.tx_timeout");
+    /// assert_eq!(e.details.as_ref().unwrap()["outcome"], "unknown");
+    /// ```
+    #[must_use]
+    pub fn err_raw_with_details(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        details: serde_json::Value,
+    ) -> Self {
+        Self {
+            ok: false,
+            data: None,
+            error: Some(EnvelopeError {
+                code: code.into(),
+                message: message.into(),
+                details: Some(details),
+            }),
+            request_id: new_request_id(),
         }
     }
 }
@@ -493,6 +613,21 @@ pub struct EnvelopeError {
     /// Sourced from [`WalletError::message`] (which delegates to `Display`).
     /// Safe to display to operators; contains no secret material.
     pub message: String,
+
+    /// Machine-readable detail for the error codes whose recovery protocol
+    /// needs a value the redacted `message` cannot carry.
+    ///
+    /// Absent on every other code, and absent from the serialised JSON when
+    /// absent here. A caller that needs the value reads this field; the
+    /// `message` stays redacted whatever is set here.
+    ///
+    /// The object is populated for `submission.tx_timeout`,
+    /// `submission.tx_already_submitted` and `submission.hash_mismatch`, whose
+    /// resolution is reconciliation against a transaction hash the agent
+    /// cannot otherwise obtain. Values are public identifiers only; no secret
+    /// material is ever placed here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

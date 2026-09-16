@@ -35,16 +35,32 @@
 //!
 //! # Concurrency model
 //!
-//! The in-memory state is protected by a `std::sync::Mutex`.  `parking_lot`
+//! Two layers protect the store, one per contention domain.
+//!
+//! In-process, the state is protected by a `std::sync::Mutex`.  `parking_lot`
 //! is not a workspace dependency; adding it solely for this module would be
 //! disproportionate.  `std::sync::Mutex` is sufficient here because the lock
-//! is held for microseconds (in-memory map update + file write), never across
-//! an `.await`.  If `parking_lot` is adopted workspace-wide, this module
-//! should migrate at the same time.
+//! is held for the duration of one store operation (file read, in-memory map
+//! update, file write), never across an `.await`.  If `parking_lot` is adopted
+//! workspace-wide, this module should migrate at the same time.
 //!
-//! The atomic check-and-insert operation (`try_begin`) holds the lock, inserts
-//! or reads the entry, writes the file under the same lock, and then releases
-//! it.  The lock is **never** held across an `.await` boundary.
+//! Cross-process, every mutating operation acquires an exclusive advisory lock
+//! on a sidecar file next to the store file (`<store>.json.lock`), mirroring
+//! [`crate::audit_log::lock::AuditWriterLock`] and
+//! `stellar_agent_network::policy_state::lock::WindowStoreLock`.  Contention
+//! is absorbed by a bounded retry ([`RECEIPT_LOCK_ATTEMPTS`] attempts,
+//! [`RECEIPT_LOCK_BACKOFF`] apart, the same settings the pending-approval
+//! store uses); an exhausted retry surfaces as
+//! [`ReceiptStoreError::WriterLocked`].  The lock is taken per operation and
+//! released when that operation returns, so it is never held across a network
+//! send.
+//!
+//! Every operation re-reads the file before acting on it, so a receipt another
+//! process wrote is visible immediately.  Mutating operations do this under
+//! the sidecar lock, which makes the read-modify-write sequence atomic against
+//! other processes.  Read-only lookups skip the sidecar lock: the file is only
+//! ever replaced by an atomic rename, so a concurrent reader observes either
+//! the old file or the new one, never a torn one.
 //!
 //! Under the pool's concurrent submissions, the first task to call `try_begin`
 //! for a given envelope hash becomes the **winner** and proceeds to submit. Any
@@ -52,6 +68,21 @@
 //! and receives `BeginOutcome::AlreadyPresent`.  The loser must not submit; it
 //! should poll the store (or `getTransaction`) until the winner records a
 //! terminal status.
+//!
+//! # Lookup indexes
+//!
+//! The map is keyed on `envelope_hash`, but two other identities have to be
+//! resolved to a receipt:
+//!
+//! - `tx_hash`, so `stellar_transaction_status` and `tx status` can find the
+//!   record for a hash an agent holds.
+//! - `(source account, sequence)`, so a second submission for a sequence a
+//!   pending submission already consumed is refused whatever its fee or bytes.
+//!
+//! Both are in-memory maps from the secondary identity to the `envelope_hash`,
+//! rebuilt from the map whenever it is read from disk or mutated.  Every
+//! lookup resolves through the map, so a receipt's status always comes from
+//! the map rather than from anything cached in an index.
 //!
 //! # Re-org reconciliation
 //!
@@ -81,11 +112,31 @@
 //! from `tempfile` uses `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`.
 
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sidecar lock settings
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Number of sidecar-lock acquisition attempts per store operation.
+///
+/// Matches `stellar_agent_core::approval::retry::DEFAULT_RETRY_ATTEMPTS`: the
+/// two stores contend for the same reason (short operations by two processes
+/// serving one profile) and resolve it with the same bounded wait.
+pub const RECEIPT_LOCK_ATTEMPTS: u32 = 5;
+
+/// Wait between sidecar-lock acquisition attempts.
+///
+/// Matches `stellar_agent_core::approval::retry::DEFAULT_RETRY_BACKOFF`, so a
+/// fully contended operation blocks for at most four backoffs before
+/// surfacing [`ReceiptStoreError::WriterLocked`].
+pub const RECEIPT_LOCK_BACKOFF: Duration = Duration::from_millis(20);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ReceiptStatus
@@ -148,21 +199,85 @@ pub enum ReceiptStatus {
     /// Distinct from `Failed` so the caller can detect "it was rewound"
     /// separately from "it was rejected".
     Reorged,
+
+    /// An operator acknowledged an unresolvable submission and released its
+    /// hold on the spending window.
+    ///
+    /// Written by `tx receipt clear --acknowledge` for the two states
+    /// reconciliation cannot settle: a submitted `Pending` receipt whose
+    /// transaction `getTransaction` reports `NOT_FOUND`, and an `Ambiguous`
+    /// receipt whose window reservation is still open because the submission
+    /// ledger has fallen outside the endpoint's retention window.
+    ///
+    /// The receipt is marked, not removed, so the envelope keeps its
+    /// idempotency anchor: a byte-identical resubmission still gets
+    /// [`BeginOutcome::AlreadyPresent`] from [`ReceiptStore::try_begin`].
+    ClearedByOperator,
 }
 
 impl ReceiptStatus {
     /// Returns `true` if the status is terminal (no further state transition
     /// expected from the normal submission path).
     ///
-    /// `Pending` is non-terminal. `Ambiguous` and `Reorged` are considered
-    /// terminal for the purposes of idempotency checking (they will not
-    /// transition to Success/Failed via the standard poll path).
+    /// `Pending` is non-terminal. `Ambiguous`, `Reorged` and
+    /// `ClearedByOperator` are terminal for the purposes of idempotency
+    /// checking (they will not transition to Success/Failed via the standard
+    /// poll path).
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Self::Success | Self::Failed { .. } | Self::Ambiguous | Self::Reorged
+            Self::Success
+                | Self::Failed { .. }
+                | Self::Ambiguous
+                | Self::Reorged
+                | Self::ClearedByOperator
         )
+    }
+
+    /// Returns `true` when the status records an outcome the network itself
+    /// reported: `Success` or `Failed`.
+    ///
+    /// Only a definitive `getTransaction` answer produces one, which is what
+    /// makes these the two statuses [`ReceiptStore::finalize`] accepts for a
+    /// receipt whose outcome is otherwise recorded as unknown.
+    #[must_use]
+    pub fn is_definitive_outcome(&self) -> bool {
+        matches!(self, Self::Success | Self::Failed { .. })
+    }
+
+    /// Returns `true` when an operator may clear a receipt in this status.
+    ///
+    /// The two states reconciliation cannot settle: a `Pending` receipt, whose
+    /// transaction the endpoint does not report, and an `Ambiguous` one, whose
+    /// submission ledger has fallen outside the endpoint's retention window. A
+    /// receipt the network answered for is refused, because it needs no
+    /// acknowledgement.
+    ///
+    /// The chain-side half of the rule is the caller's: clearing states that
+    /// the transaction did not move value, and only the endpoint can
+    /// contradict that. `stellar-agent tx receipt clear` evaluates this
+    /// predicate first, so a clear it will refuse releases nothing and writes
+    /// no row, then asks the endpoint before it accepts.
+    #[must_use]
+    pub fn is_operator_clearable(&self) -> bool {
+        matches!(self, Self::Pending | Self::Ambiguous)
+    }
+
+    /// Returns the stable wire tag for this status.
+    ///
+    /// The same string the serde tag writes, so a diagnostic naming a status
+    /// and the persisted file cannot drift.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Success => "success",
+            Self::Failed { .. } => "failed",
+            Self::Ambiguous => "ambiguous",
+            Self::Reorged => "reorged",
+            Self::ClearedByOperator => "cleared_by_operator",
+        }
     }
 }
 
@@ -222,6 +337,26 @@ pub struct SubmissionReceipt {
     /// Derived as `SHA-256(network_id ‖ ENVELOPE_TYPE_TX ‖ unsigned-tx-body)`.
     /// Used for `getTransaction` polling during stale-Pending recovery.
     pub tx_hash: String,
+
+    /// The account whose sequence number this transaction consumes, as a
+    /// `G...` strkey. For a fee-bump this is the INNER transaction's source.
+    ///
+    /// Together with [`Self::sequence`] this is the replay identity the
+    /// network enforces: at most one transaction per `(source, sequence)` can
+    /// ever apply. A second submission for a pair a pending receipt already
+    /// holds is refused whatever its fee or bytes.
+    ///
+    /// Empty on a receipt written before the pair was recorded; such a receipt
+    /// is not indexed by the pair and never produces a duplicate refusal.
+    #[serde(default)]
+    pub source: String,
+
+    /// The sequence number this transaction consumes. For a fee-bump this is
+    /// the INNER transaction's sequence.
+    ///
+    /// Meaningful only when [`Self::source`] is non-empty.
+    #[serde(default)]
+    pub sequence: i64,
 
     /// Current state of the submission.
     pub status: ReceiptStatus,
@@ -354,6 +489,34 @@ pub enum BeginOutcome {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// BeginSubmissionOutcome
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The result of a [`ReceiptStore::begin_submission`] call.
+///
+/// The variants are ordered by the checks that produce them: the replay
+/// identity is settled first, the envelope identity second.
+///
+/// Deliberately exhaustive: every caller decides whether to send on this
+/// answer, so a new variant has to make each of them fail to compile rather
+/// than fall into a catch-all whose disposition nobody chose.
+#[derive(Debug)]
+pub enum BeginSubmissionOutcome {
+    /// A fresh `Pending` receipt was written and the caller may send.
+    Recorded,
+
+    /// A receipt already exists for this envelope hash. The caller MUST NOT
+    /// send; the carried receipt holds the outcome recorded for it.
+    AlreadyPresent(SubmissionReceipt),
+
+    /// A pending receipt already holds this `(source, sequence)` pair under a
+    /// different envelope hash. The caller MUST NOT send: at most one
+    /// transaction per pair can apply, and the pending one may still be
+    /// in flight. The carried receipt names the transaction to reconcile.
+    DuplicateSequence(SubmissionReceipt),
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ReceiptStoreError
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -387,6 +550,24 @@ pub enum ReceiptStoreError {
     /// holding the lock). The store is unusable after this.
     #[error("receipt store mutex poisoned")]
     MutexPoisoned,
+
+    /// Another process held the sidecar write lock for the whole bounded
+    /// retry window.
+    #[error("receipt store writer is locked by another process")]
+    WriterLocked,
+
+    /// A status transition the store refuses.
+    ///
+    /// The receipt's recorded outcome may not be replaced by the requested
+    /// one: a receipt never returns to `Pending`, and a receipt whose outcome
+    /// is recorded as unknown moves only to a definitive network answer.
+    #[error("receipt status transition from '{from}' to '{to}' is refused")]
+    InvalidTransition {
+        /// The status the receipt currently holds.
+        from: &'static str,
+        /// The status the caller asked to write.
+        to: &'static str,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -409,10 +590,203 @@ pub struct ReceiptStore {
 
 #[derive(Debug)]
 struct StoreState {
-    /// In-memory map from `envelope_hash` to receipt.
+    /// In-memory map from `envelope_hash` to receipt, refreshed from the file
+    /// at the start of every operation.
     map: HashMap<String, SubmissionReceipt>,
+    /// `tx_hash` to `envelope_hash`, derived from `map`. A pending receipt
+    /// wins a transaction hash more than one receipt claims.
+    by_tx_hash: HashMap<String, String>,
+    /// `(source, sequence)` to `envelope_hash`, derived from `map`. Holds
+    /// PENDING receipts only, and none whose `source` is empty.
+    by_source_sequence: HashMap<(String, i64), String>,
     /// Path to the persisted JSON file.
     file_path: PathBuf,
+    /// Path to the sidecar advisory-lock file.
+    lock_path: PathBuf,
+}
+
+impl StoreState {
+    /// Rebuilds both secondary indexes from `map`.
+    ///
+    /// Called after every read from disk and after every mutation, so an
+    /// index entry can never outlive the receipt it points at.
+    ///
+    /// # One slot, several claimants
+    ///
+    /// Each index holds one envelope hash per key, and more than one receipt
+    /// can claim a key. Re-signing one transaction produces the same
+    /// transaction hash under a fresh envelope hash, and a settled submission
+    /// leaves its receipt behind when a replacement is built at the same
+    /// sequence. `map` is a `HashMap`, so which receipt a bare insert loop
+    /// leaves in the slot changes from one read to the next. Two rules make
+    /// the answer the same on every pass:
+    ///
+    /// - `by_source_sequence` indexes PENDING receipts only. A settled receipt
+    ///   no longer holds its source account's sequence: either the network
+    ///   applied the transaction, and the account has moved past that number,
+    ///   or it did not, and a replacement at that number is what the agent is
+    ///   expected to build.
+    /// - `by_tx_hash` indexes every receipt, because a settled one is what
+    ///   `tx status` reports on, and a pending claimant wins the slot: it is
+    ///   the one reconciliation still has work to do on. Equal claimants are
+    ///   ordered by envelope hash, which is unique.
+    fn rebuild_indexes(&mut self) {
+        let mut by_tx_hash: HashMap<String, String> = HashMap::new();
+        let mut by_source_sequence: HashMap<(String, i64), String> = HashMap::new();
+
+        let mut envelope_hashes: Vec<&String> = self.map.keys().collect();
+        envelope_hashes.sort_unstable();
+
+        for envelope_hash in envelope_hashes {
+            let Some(receipt) = self.map.get(envelope_hash) else {
+                continue;
+            };
+            if !receipt.tx_hash.is_empty() {
+                let held_is_pending = by_tx_hash
+                    .get(&receipt.tx_hash)
+                    .and_then(|held| self.map.get(held))
+                    .is_some_and(|held| held.status == ReceiptStatus::Pending);
+                if !held_is_pending {
+                    by_tx_hash.insert(receipt.tx_hash.clone(), envelope_hash.clone());
+                }
+            }
+            if !receipt.source.is_empty() && receipt.status == ReceiptStatus::Pending {
+                by_source_sequence.insert(
+                    (receipt.source.clone(), receipt.sequence),
+                    envelope_hash.clone(),
+                );
+            }
+        }
+
+        self.by_tx_hash = by_tx_hash;
+        self.by_source_sequence = by_source_sequence;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sidecar lock
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// An exclusive advisory lock over the receipt store's sidecar lock file.
+///
+/// The store file itself is never locked: `File::try_lock` maps to
+/// `LockFileEx` on Windows, whose exclusivity is enforced against all I/O
+/// through any other handle to the same file, which would make a concurrent
+/// reader fail. Locking a sidecar file keeps cross-process exclusivity
+/// without placing an OS lock on the data readers touch.
+struct ReceiptStoreLock {
+    /// The open lock file. Closing it (on drop) releases the lock.
+    _file: File,
+}
+
+impl std::fmt::Debug for ReceiptStoreLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReceiptStoreLock").finish_non_exhaustive()
+    }
+}
+
+impl ReceiptStoreLock {
+    /// Acquires the exclusive advisory lock, retrying a bounded number of
+    /// times while another holder owns it.
+    ///
+    /// Only contention is retried: any other failure to open or lock the file
+    /// is returned from the first attempt that produces it.
+    fn acquire_with_retry(
+        path: &Path,
+        attempts: u32,
+        backoff: Duration,
+    ) -> Result<Self, ReceiptStoreError> {
+        let attempts = attempts.max(1);
+        let mut attempt = 0_u32;
+        loop {
+            attempt += 1;
+            match Self::try_acquire(path) {
+                Ok(lock) => return Ok(lock),
+                Err(ReceiptStoreError::WriterLocked) if attempt < attempts => {
+                    std::thread::sleep(backoff);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn try_acquire(path: &Path) -> Result<Self, ReceiptStoreError> {
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                // Do NOT truncate: the lock file is only an advisory-lock
+                // carrier; its content is irrelevant.
+                .truncate(false)
+                .mode(0o600)
+                .open(path)
+                .map_err(|e| ReceiptStoreError::Io {
+                    path: path.to_path_buf(),
+                    source: e,
+                })?
+        };
+        #[cfg(not(unix))]
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|e| ReceiptStoreError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            })?;
+
+        // Acquire the lock BEFORE any content check — a pre-lock check is a
+        // TOCTOU race.
+        file.try_lock().map_err(|e| match e {
+            std::fs::TryLockError::WouldBlock => ReceiptStoreError::WriterLocked,
+            std::fs::TryLockError::Error(io_err) => ReceiptStoreError::Io {
+                path: path.to_path_buf(),
+                source: io_err,
+            },
+        })?;
+
+        Ok(Self { _file: file })
+    }
+}
+
+/// Derives the sidecar lock path for a store file: the store path with
+/// `.lock` appended, so it sits next to the file it protects.
+fn lock_path_for(file_path: &Path) -> PathBuf {
+    let mut p = file_path.to_path_buf();
+    let name = p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("receipts.json")
+        .to_owned();
+    p.set_file_name(format!("{name}.lock"));
+    p
+}
+
+/// Reads the store file into a map. A missing file is an empty store.
+fn read_map(file_path: &Path) -> Result<HashMap<String, SubmissionReceipt>, ReceiptStoreError> {
+    match std::fs::read_to_string(file_path) {
+        Ok(raw) => serde_json::from_str(&raw).map_err(|e| ReceiptStoreError::Json {
+            path: file_path.to_path_buf(),
+            source: e,
+        }),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(e) => Err(ReceiptStoreError::Io {
+            path: file_path.to_path_buf(),
+            source: e,
+        }),
+    }
+}
+
+/// A store operation in progress: the in-process guard, and the sidecar lock
+/// when the operation mutates.
+struct Session<'a> {
+    guard: MutexGuard<'a, StoreState>,
+    /// Held for the operation's duration; `None` for read-only operations,
+    /// which never mutate and so need no cross-process exclusion.
+    _lock: Option<ReceiptStoreLock>,
 }
 
 impl ReceiptStore {
@@ -450,33 +824,95 @@ impl ReceiptStore {
         })?;
 
         let file_path = dir.join(format!("{profile_name}.json"));
+        let lock_path = lock_path_for(&file_path);
 
-        let map: HashMap<String, SubmissionReceipt> = if file_path.exists() {
-            let raw = std::fs::read_to_string(&file_path).map_err(|e| ReceiptStoreError::Io {
-                path: file_path.clone(),
-                source: e,
-            })?;
-            serde_json::from_str(&raw).map_err(|e| ReceiptStoreError::Json {
-                path: file_path.clone(),
-                source: e,
-            })?
-        } else {
-            HashMap::new()
+        let map = read_map(&file_path)?;
+
+        let mut state = StoreState {
+            map,
+            by_tx_hash: HashMap::new(),
+            by_source_sequence: HashMap::new(),
+            file_path,
+            lock_path,
         };
+        state.rebuild_indexes();
 
         Ok(Self {
-            state: Arc::new(Mutex::new(StoreState { map, file_path })),
+            state: Arc::new(Mutex::new(state)),
         })
     }
 
     /// Returns the stored receipt for `envelope_hash`, if any.
     ///
+    /// Re-reads the store file first, so a receipt another process wrote is
+    /// visible.
+    ///
     /// # Errors
     ///
     /// - [`ReceiptStoreError::MutexPoisoned`] if the internal lock is poisoned.
+    /// - [`ReceiptStoreError::Io`] or [`ReceiptStoreError::Json`] if the store
+    ///   file cannot be read.
     pub fn get(&self, envelope_hash: &str) -> Result<Option<SubmissionReceipt>, ReceiptStoreError> {
-        let guard = self.lock()?;
-        Ok(guard.map.get(envelope_hash).cloned())
+        let session = self.read_session()?;
+        Ok(session.guard.map.get(envelope_hash).cloned())
+    }
+
+    /// Returns the receipt whose `tx_hash` is `tx_hash`, if any.
+    ///
+    /// The transaction hash is the identity an agent holds after a timeout,
+    /// so this is how `stellar_transaction_status` and `tx status` reach the
+    /// record. The receipt comes from the map, so its status is the current
+    /// one however the index was built.
+    ///
+    /// # Errors
+    ///
+    /// - [`ReceiptStoreError::MutexPoisoned`] if the internal lock is poisoned.
+    /// - [`ReceiptStoreError::Io`] or [`ReceiptStoreError::Json`] if the store
+    ///   file cannot be read.
+    pub fn find_by_tx_hash(
+        &self,
+        tx_hash: &str,
+    ) -> Result<Option<SubmissionReceipt>, ReceiptStoreError> {
+        let session = self.read_session()?;
+        let Some(envelope_hash) = session.guard.by_tx_hash.get(tx_hash) else {
+            return Ok(None);
+        };
+        Ok(session.guard.map.get(envelope_hash).cloned())
+    }
+
+    /// Returns the `Pending` receipt holding `(source, sequence)`, if any.
+    ///
+    /// A terminal receipt for the pair is not returned: its transaction can no
+    /// longer be in flight, so it does not stand in the way of a fresh
+    /// submission at the same sequence.
+    ///
+    /// # Errors
+    ///
+    /// - [`ReceiptStoreError::MutexPoisoned`] if the internal lock is poisoned.
+    /// - [`ReceiptStoreError::Io`] or [`ReceiptStoreError::Json`] if the store
+    ///   file cannot be read.
+    pub fn find_pending_by_source_sequence(
+        &self,
+        source: &str,
+        sequence: i64,
+    ) -> Result<Option<SubmissionReceipt>, ReceiptStoreError> {
+        let session = self.read_session()?;
+        Ok(find_pending_for_pair(&session.guard, source, sequence))
+    }
+
+    /// Returns every receipt currently held, in unspecified order.
+    ///
+    /// Used by the operator-facing status verbs, which report on all of a
+    /// profile's outstanding submissions.
+    ///
+    /// # Errors
+    ///
+    /// - [`ReceiptStoreError::MutexPoisoned`] if the internal lock is poisoned.
+    /// - [`ReceiptStoreError::Io`] or [`ReceiptStoreError::Json`] if the store
+    ///   file cannot be read.
+    pub fn all(&self) -> Result<Vec<SubmissionReceipt>, ReceiptStoreError> {
+        let session = self.read_session()?;
+        Ok(session.guard.map.values().cloned().collect())
     }
 
     /// Atomically inserts a `Pending` receipt for `envelope_hash` or returns the
@@ -510,7 +946,7 @@ impl ReceiptStore {
     ///
     /// # fn run() -> Result<(), Box<dyn std::error::Error>> {
     /// let store = ReceiptStore::open("default")?;
-    /// match store.try_begin("aabb...", "ccdd...", 0, 100)? {
+    /// match store.try_begin("aabb...", "ccdd...", "GSOURCE", 7, 0, 100)? {
     ///     BeginOutcome::Winner => { /* submit */ }
     ///     BeginOutcome::AlreadyPresent(_r) => { /* return cached */ }
     ///     _ => {}
@@ -521,35 +957,95 @@ impl ReceiptStore {
         &self,
         envelope_hash: &str,
         tx_hash: &str,
+        source: &str,
+        sequence: i64,
         max_time: u64,
         recorded_at_ledger: u32,
     ) -> Result<BeginOutcome, ReceiptStoreError> {
-        let mut guard = self.lock()?;
+        let mut session = self.write_session()?;
 
         // Atomic check-and-insert under the lock.
-        if let Some(existing) = guard.map.get(envelope_hash) {
+        if let Some(existing) = session.guard.map.get(envelope_hash) {
             return Ok(BeginOutcome::AlreadyPresent(existing.clone()));
         }
 
-        let receipt = SubmissionReceipt {
-            envelope_hash: envelope_hash.to_owned(),
-            tx_hash: tx_hash.to_owned(),
-            status: ReceiptStatus::Pending,
-            ledger: None,
-            recorded_at_ledger,
+        insert_pending(
+            &mut session.guard,
+            envelope_hash,
+            tx_hash,
+            source,
+            sequence,
             max_time,
-            prior_ledger: None,
-            reorg_pending_at_ledger: None,
-            submitted: false,
-        };
-
-        guard.map.insert(envelope_hash.to_owned(), receipt);
-
-        // Persist under the same lock so no reader sees an in-memory entry
-        // without the file also reflecting it.
-        persist_locked(&mut guard)?;
+            recorded_at_ledger,
+        )?;
 
         Ok(BeginOutcome::Winner)
+    }
+
+    /// Records a submission about to be sent, refusing a second envelope for a
+    /// `(source, sequence)` pair a pending receipt already holds.
+    ///
+    /// The two checks run under one lock hold, in this order:
+    ///
+    /// 1. `(source, sequence)`: a pending receipt for the pair means a
+    ///    transaction that consumes this sequence may still be in flight, and
+    ///    at most one transaction per pair can ever apply. Answered with
+    ///    [`BeginSubmissionOutcome::DuplicateSequence`].
+    /// 2. `envelope_hash`: an existing receipt for these exact bytes is the
+    ///    winner/loser gate, answered with
+    ///    [`BeginSubmissionOutcome::AlreadyPresent`].
+    ///
+    /// The order is load-bearing. Step 2 inserts this submission's own
+    /// receipt, which holds this submission's `(source, sequence)`; running it
+    /// first would make step 1 find that receipt and refuse the very
+    /// submission that created it.
+    ///
+    /// The replay identity is what the network enforces, so the refusal holds
+    /// whatever the fee or the byte layout: a rebuilt envelope for the same
+    /// intent picks up a fresh fee from live fee stats and hashes differently,
+    /// yet still cannot apply once the pending one has.
+    ///
+    /// # Errors
+    ///
+    /// - [`ReceiptStoreError::MutexPoisoned`] if the lock is poisoned.
+    /// - [`ReceiptStoreError::WriterLocked`] if another process holds the
+    ///   sidecar lock for the whole retry window.
+    /// - [`ReceiptStoreError::Io`] or [`ReceiptStoreError::Json`] on read or
+    ///   persist failure.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    pub fn begin_submission(
+        &self,
+        envelope_hash: &str,
+        tx_hash: &str,
+        source: &str,
+        sequence: i64,
+        max_time: u64,
+        recorded_at_ledger: u32,
+    ) -> Result<BeginSubmissionOutcome, ReceiptStoreError> {
+        let mut session = self.write_session()?;
+
+        if let Some(pending) = find_pending_for_pair(&session.guard, source, sequence) {
+            return Ok(BeginSubmissionOutcome::DuplicateSequence(pending));
+        }
+
+        if let Some(existing) = session.guard.map.get(envelope_hash) {
+            return Ok(BeginSubmissionOutcome::AlreadyPresent(existing.clone()));
+        }
+
+        insert_pending(
+            &mut session.guard,
+            envelope_hash,
+            tx_hash,
+            source,
+            sequence,
+            max_time,
+            recorded_at_ledger,
+        )?;
+
+        Ok(BeginSubmissionOutcome::Recorded)
     }
 
     /// Updates or inserts a terminal receipt (upsert semantics).
@@ -559,12 +1055,29 @@ impl ReceiptStore {
     /// inserted so that a winner's terminal status is never dropped when a
     /// Pending row was lost (e.g. due to a failed `try_begin` persist).
     ///
-    /// The upsert is performed under the mutex and persisted atomically
-    /// (temp-file + fsync + rename) before the lock is released.
+    /// The upsert is performed under the mutex and the sidecar lock, and
+    /// persisted atomically (temp-file + fsync + rename) before both are
+    /// released.
+    ///
+    /// # Transition rule
+    ///
+    /// A receipt never returns to `Pending`, and a receipt whose outcome is
+    /// recorded as unknown (`Ambiguous`, `ClearedByOperator`) moves only to a
+    /// status the network itself reported, which is `Success` or `Failed`.
+    /// Only a definitive `getTransaction` answer produces one of those, so an
+    /// unknown outcome is settled by reconciliation against the chain and by
+    /// nothing else. A transition the rule refuses returns
+    /// [`ReceiptStoreError::InvalidTransition`] and leaves the receipt as it
+    /// stands; writing the status a receipt already holds is accepted and
+    /// refreshes its ledger.
     ///
     /// # Errors
     ///
+    /// - [`ReceiptStoreError::InvalidTransition`] if the transition is refused
+    ///   by the rule above.
     /// - [`ReceiptStoreError::MutexPoisoned`] if the lock is poisoned.
+    /// - [`ReceiptStoreError::WriterLocked`] if another process holds the
+    ///   sidecar lock for the whole retry window.
     /// - [`ReceiptStoreError::Io`] or [`ReceiptStoreError::Json`] on persist failure.
     ///
     /// # Panics
@@ -576,7 +1089,11 @@ impl ReceiptStore {
         status: ReceiptStatus,
         ledger: Option<u32>,
     ) -> Result<(), ReceiptStoreError> {
-        let mut guard = self.lock()?;
+        let mut session = self.write_session()?;
+
+        if let Some(existing) = session.guard.map.get(envelope_hash) {
+            check_transition(&existing.status, &status)?;
+        }
 
         // Upsert: update existing entry or insert a minimal terminal receipt.
         // Inserting is safe because terminal statuses carry no sub-fields that
@@ -584,7 +1101,8 @@ impl ReceiptStore {
         // recorded_at_ledger); the caller can always re-derive these from
         // context if needed. A missing-entry-silent-noop would silently drop
         // terminal status when a Pending row was lost after a failed persist.
-        guard
+        session
+            .guard
             .map
             .entry(envelope_hash.to_owned())
             .and_modify(|r| {
@@ -594,6 +1112,8 @@ impl ReceiptStore {
             .or_insert_with(|| SubmissionReceipt {
                 envelope_hash: envelope_hash.to_owned(),
                 tx_hash: String::new(),
+                source: String::new(),
+                sequence: 0,
                 status,
                 ledger,
                 recorded_at_ledger: 0,
@@ -603,8 +1123,83 @@ impl ReceiptStore {
                 submitted: true, // upsert on finalize: sendTransaction has already been called
             });
 
-        persist_locked(&mut guard)?;
+        session.guard.rebuild_indexes();
+        persist_locked(&mut session.guard)?;
         Ok(())
+    }
+
+    /// Marks a receipt cleared by an operator and releases it from the states
+    /// reconciliation cannot settle.
+    ///
+    /// The accepted states are the ones [`ReceiptStatus::is_operator_clearable`]
+    /// names: any `Pending` receipt, and an `Ambiguous` one. A receipt the
+    /// network has answered for is refused, because it needs no
+    /// acknowledgement.
+    ///
+    /// An unsent `Pending` receipt is accepted as well as a sent one. A
+    /// submission the wallet recorded and then never sent — a process killed
+    /// between the two steps — holds its source account's sequence with
+    /// nothing else able to free it, and "the wallet never sent it and the
+    /// chain has never seen it" is the plainest case an operator can
+    /// acknowledge.
+    ///
+    /// This method reads the receipt and nothing else, so the chain-side half
+    /// of the rule belongs to the caller: `stellar-agent tx receipt clear`
+    /// asks the endpoint what became of the transaction and refuses a
+    /// `SUCCESS` or `FAILED` answer before it gets here, and refuses too when
+    /// the endpoint cannot answer at all. That caller also evaluates
+    /// [`ReceiptStatus::is_operator_clearable`] before it takes any other
+    /// step, so nothing is released and no row is written for a clear this
+    /// method will refuse.
+    ///
+    /// # Errors
+    ///
+    /// - [`ReceiptStoreError::InvalidTransition`] if the receipt's status is
+    ///   not one the rule accepts.
+    /// - [`ReceiptStoreError::MutexPoisoned`] if the lock is poisoned.
+    /// - [`ReceiptStoreError::WriterLocked`] if another process holds the
+    ///   sidecar lock for the whole retry window.
+    /// - [`ReceiptStoreError::Io`] or [`ReceiptStoreError::Json`] on read or
+    ///   persist failure.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    pub fn clear_by_operator(
+        &self,
+        envelope_hash: &str,
+    ) -> Result<SubmissionReceipt, ReceiptStoreError> {
+        let mut session = self.write_session()?;
+
+        let Some(existing) = session.guard.map.get(envelope_hash) else {
+            return Err(ReceiptStoreError::InvalidTransition {
+                from: "absent",
+                to: ReceiptStatus::ClearedByOperator.label(),
+            });
+        };
+
+        if !existing.status.is_operator_clearable() {
+            return Err(ReceiptStoreError::InvalidTransition {
+                from: existing.status.label(),
+                to: ReceiptStatus::ClearedByOperator.label(),
+            });
+        }
+
+        let cleared = {
+            let Some(r) = session.guard.map.get_mut(envelope_hash) else {
+                return Err(ReceiptStoreError::InvalidTransition {
+                    from: "absent",
+                    to: ReceiptStatus::ClearedByOperator.label(),
+                });
+            };
+            r.status = ReceiptStatus::ClearedByOperator;
+            r.ledger = None;
+            r.clone()
+        };
+
+        session.guard.rebuild_indexes();
+        persist_locked(&mut session.guard)?;
+        Ok(cleared)
     }
 
     /// Demotes a previously-`Success` receipt to `Reorged`, preserving the
@@ -639,24 +1234,24 @@ impl ReceiptStore {
     ///
     /// Never panics.
     pub fn finalize_reorged(&self, envelope_hash: &str) -> Result<(), ReceiptStoreError> {
-        let mut guard = self.lock()?;
+        let mut session = self.write_session()?;
 
         // Determine whether the entry is Success and capture the prior ledger
         // before taking a mutable reference (borrow-split to allow persist_locked).
-        let prior = match guard.map.get(envelope_hash) {
+        let prior = match session.guard.map.get(envelope_hash) {
             Some(r) if r.status == ReceiptStatus::Success => r.ledger,
             // Non-Success or missing: no-op.
             _ => return Ok(()),
         };
 
         // Apply the demotion.
-        if let Some(r) = guard.map.get_mut(envelope_hash) {
+        if let Some(r) = session.guard.map.get_mut(envelope_hash) {
             r.prior_ledger = prior;
             r.status = ReceiptStatus::Reorged;
             r.ledger = None;
         }
 
-        persist_locked(&mut guard)
+        persist_locked(&mut session.guard)
     }
 
     /// Marks the receipt for `envelope_hash` as submitted (sets `submitted = true`).
@@ -678,18 +1273,18 @@ impl ReceiptStore {
     ///
     /// Never panics.
     pub fn mark_submitted(&self, envelope_hash: &str) -> Result<(), ReceiptStoreError> {
-        let mut guard = self.lock()?;
+        let mut session = self.write_session()?;
 
         let should_update = matches!(
-            guard.map.get(envelope_hash),
+            session.guard.map.get(envelope_hash),
             Some(r) if !r.submitted
         );
 
         if should_update {
-            if let Some(r) = guard.map.get_mut(envelope_hash) {
+            if let Some(r) = session.guard.map.get_mut(envelope_hash) {
                 r.submitted = true;
             }
-            persist_locked(&mut guard)?;
+            persist_locked(&mut session.guard)?;
         }
 
         Ok(())
@@ -735,16 +1330,17 @@ impl ReceiptStore {
     /// # Ok(()) }
     /// ```
     pub fn abandon_pre_submit(&self, envelope_hash: &str) -> Result<(), ReceiptStoreError> {
-        let mut guard = self.lock()?;
+        let mut session = self.write_session()?;
 
         let should_remove = matches!(
-            guard.map.get(envelope_hash),
+            session.guard.map.get(envelope_hash),
             Some(r) if r.status == ReceiptStatus::Pending && !r.submitted
         );
 
         if should_remove {
-            guard.map.remove(envelope_hash);
-            persist_locked(&mut guard)?;
+            session.guard.map.remove(envelope_hash);
+            session.guard.rebuild_indexes();
+            persist_locked(&mut session.guard)?;
         }
 
         Ok(())
@@ -775,18 +1371,18 @@ impl ReceiptStore {
         envelope_hash: &str,
         latest_ledger_at_first_miss: u32,
     ) -> Result<(), ReceiptStoreError> {
-        let mut guard = self.lock()?;
+        let mut session = self.write_session()?;
 
         let should_update = matches!(
-            guard.map.get(envelope_hash),
+            session.guard.map.get(envelope_hash),
             Some(r) if r.status == ReceiptStatus::Success && r.reorg_pending_at_ledger.is_none()
         );
 
         if should_update {
-            if let Some(r) = guard.map.get_mut(envelope_hash) {
+            if let Some(r) = session.guard.map.get_mut(envelope_hash) {
                 r.reorg_pending_at_ledger = Some(latest_ledger_at_first_miss);
             }
-            persist_locked(&mut guard)?;
+            persist_locked(&mut session.guard)?;
         }
 
         Ok(())
@@ -814,18 +1410,18 @@ impl ReceiptStore {
     ///
     /// Never panics.
     pub fn clear_reorg_pending(&self, envelope_hash: &str) -> Result<(), ReceiptStoreError> {
-        let mut guard = self.lock()?;
+        let mut session = self.write_session()?;
 
         let should_update = matches!(
-            guard.map.get(envelope_hash),
+            session.guard.map.get(envelope_hash),
             Some(r) if r.status == ReceiptStatus::Success && r.reorg_pending_at_ledger.is_some()
         );
 
         if should_update {
-            if let Some(r) = guard.map.get_mut(envelope_hash) {
+            if let Some(r) = session.guard.map.get_mut(envelope_hash) {
                 r.reorg_pending_at_ledger = None;
             }
-            persist_locked(&mut guard)?;
+            persist_locked(&mut session.guard)?;
         }
 
         Ok(())
@@ -840,12 +1436,146 @@ impl ReceiptStore {
         Ok(self.lock()?.file_path.clone())
     }
 
+    /// Returns the path to the sidecar advisory-lock file (for tests and
+    /// diagnostics).
+    ///
+    /// # Errors
+    ///
+    /// - [`ReceiptStoreError::MutexPoisoned`] if the internal lock is poisoned.
+    pub fn lock_file_path(&self) -> Result<PathBuf, ReceiptStoreError> {
+        Ok(self.lock()?.lock_path.clone())
+    }
+
     // ── Private ──────────────────────────────────────────────────────────────
 
     fn lock(&self) -> Result<MutexGuard<'_, StoreState>, ReceiptStoreError> {
         self.state
             .lock()
             .map_err(|_| ReceiptStoreError::MutexPoisoned)
+    }
+
+    /// Opens a mutating operation: in-process guard, sidecar lock with bounded
+    /// retry, then the file re-read so the mutation is applied to the state
+    /// every process shares.
+    fn write_session(&self) -> Result<Session<'_>, ReceiptStoreError> {
+        let mut guard = self.lock()?;
+        if let Some(parent) = guard.lock_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| ReceiptStoreError::Io {
+                path: parent.to_path_buf(),
+                source: e,
+            })?;
+        }
+        let lock = ReceiptStoreLock::acquire_with_retry(
+            &guard.lock_path,
+            RECEIPT_LOCK_ATTEMPTS,
+            RECEIPT_LOCK_BACKOFF,
+        )?;
+        refresh_locked(&mut guard)?;
+        Ok(Session {
+            guard,
+            _lock: Some(lock),
+        })
+    }
+
+    /// Opens a read-only operation: in-process guard and the file re-read. No
+    /// sidecar lock is taken; the file is only ever replaced by an atomic
+    /// rename, so a reader observes one whole version of it.
+    fn read_session(&self) -> Result<Session<'_>, ReceiptStoreError> {
+        let mut guard = self.lock()?;
+        refresh_locked(&mut guard)?;
+        Ok(Session { guard, _lock: None })
+    }
+}
+
+/// Re-reads the store file into the guarded state and rebuilds the indexes.
+fn refresh_locked(guard: &mut MutexGuard<'_, StoreState>) -> Result<(), ReceiptStoreError> {
+    let map = read_map(&guard.file_path)?;
+    guard.map = map;
+    guard.rebuild_indexes();
+    Ok(())
+}
+
+/// Returns the `Pending` receipt holding `(source, sequence)`, if any.
+///
+/// An empty `source` matches nothing: it marks a receipt whose replay identity
+/// was not recorded, and such a receipt must not stand in for another's.
+fn find_pending_for_pair(
+    state: &StoreState,
+    source: &str,
+    sequence: i64,
+) -> Option<SubmissionReceipt> {
+    if source.is_empty() {
+        return None;
+    }
+    let envelope_hash = state
+        .by_source_sequence
+        .get(&(source.to_owned(), sequence))?;
+    let receipt = state.map.get(envelope_hash)?;
+    // The index holds pending receipts only; the status check restates that
+    // rather than relying on it.
+    (receipt.status == ReceiptStatus::Pending).then(|| receipt.clone())
+}
+
+/// Inserts a fresh `Pending` receipt, rebuilds the indexes, and persists.
+///
+/// Persisting under the same lock hold means no reader sees an in-memory entry
+/// without the file also reflecting it.
+fn insert_pending(
+    guard: &mut MutexGuard<'_, StoreState>,
+    envelope_hash: &str,
+    tx_hash: &str,
+    source: &str,
+    sequence: i64,
+    max_time: u64,
+    recorded_at_ledger: u32,
+) -> Result<(), ReceiptStoreError> {
+    let receipt = SubmissionReceipt {
+        envelope_hash: envelope_hash.to_owned(),
+        tx_hash: tx_hash.to_owned(),
+        source: source.to_owned(),
+        sequence,
+        status: ReceiptStatus::Pending,
+        ledger: None,
+        recorded_at_ledger,
+        max_time,
+        prior_ledger: None,
+        reorg_pending_at_ledger: None,
+        submitted: false,
+    };
+
+    guard.map.insert(envelope_hash.to_owned(), receipt);
+    guard.rebuild_indexes();
+    persist_locked(guard)
+}
+
+/// Applies the [`ReceiptStore::finalize`] transition rule.
+fn check_transition(from: &ReceiptStatus, to: &ReceiptStatus) -> Result<(), ReceiptStoreError> {
+    if from == to {
+        return Ok(());
+    }
+    let allowed = if *to == ReceiptStatus::Pending {
+        // A submission that has been recorded never becomes un-recorded.
+        false
+    } else {
+        match from {
+            // A receipt that has not settled yet accepts any recorded outcome.
+            ReceiptStatus::Pending => true,
+            // An unknown outcome is settled only by an answer from the chain.
+            ReceiptStatus::Ambiguous | ReceiptStatus::ClearedByOperator => {
+                to.is_definitive_outcome()
+            }
+            // A recorded network answer stands; a re-org demotion has its own
+            // entry point, which carries the prior ledger this one would drop.
+            ReceiptStatus::Success | ReceiptStatus::Failed { .. } | ReceiptStatus::Reorged => false,
+        }
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(ReceiptStoreError::InvalidTransition {
+            from: from.label(),
+            to: to.label(),
+        })
     }
 }
 
@@ -949,6 +1679,12 @@ mod tests {
     const TX_HASH_A: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const HASH_B: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const TX_HASH_B: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const SOURCE_A: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+    const SOURCE_B: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
+    const HASH_C: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const TX_HASH_C: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    const SEQ_A: i64 = 7;
+    const SEQ_B: i64 = 11;
 
     fn open_temp_store() -> (tempfile::TempDir, ReceiptStore) {
         let dir = tempfile::tempdir().unwrap();
@@ -967,7 +1703,9 @@ mod tests {
     #[test]
     fn try_begin_fresh_returns_winner() {
         let (_dir, store) = open_temp_store();
-        let outcome = store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        let outcome = store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
         assert!(matches!(outcome, BeginOutcome::Winner));
     }
 
@@ -975,8 +1713,12 @@ mod tests {
     #[test]
     fn try_begin_duplicate_returns_already_present() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
-        let outcome = store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        let outcome = store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
         assert!(matches!(outcome, BeginOutcome::AlreadyPresent(_)));
     }
 
@@ -984,7 +1726,9 @@ mod tests {
     #[test]
     fn get_after_try_begin_returns_pending() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 30_000, 99).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 30_000, 99)
+            .unwrap();
         let receipt = store.get(HASH_A).unwrap().unwrap();
         assert_eq!(receipt.envelope_hash, HASH_A);
         assert_eq!(receipt.tx_hash, TX_HASH_A);
@@ -998,7 +1742,9 @@ mod tests {
     #[test]
     fn finalize_success_updates_status() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
         store
             .finalize(HASH_A, ReceiptStatus::Success, Some(1234))
             .unwrap();
@@ -1011,7 +1757,9 @@ mod tests {
     #[test]
     fn finalize_failed_stores_code() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
         store
             .finalize(
                 HASH_A,
@@ -1032,7 +1780,9 @@ mod tests {
     #[test]
     fn terminal_receipt_returned_by_get() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
         store
             .finalize(HASH_A, ReceiptStatus::Success, Some(99))
             .unwrap();
@@ -1045,11 +1795,15 @@ mod tests {
     #[test]
     fn try_begin_after_finalize_returns_already_present() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
         store
             .finalize(HASH_A, ReceiptStatus::Success, Some(42))
             .unwrap();
-        let outcome = store.try_begin(HASH_A, TX_HASH_A, 0, 101).unwrap();
+        let outcome = store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 101)
+            .unwrap();
         assert!(matches!(outcome, BeginOutcome::AlreadyPresent(_)));
     }
 
@@ -1061,7 +1815,9 @@ mod tests {
         // Write a receipt in the first store instance.
         {
             let store = ReceiptStore::open_at(dir.path(), "ptest").unwrap();
-            store.try_begin(HASH_A, TX_HASH_A, 0, 50).unwrap();
+            store
+                .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 50)
+                .unwrap();
             store
                 .finalize(HASH_A, ReceiptStatus::Success, Some(77))
                 .unwrap();
@@ -1078,8 +1834,12 @@ mod tests {
     #[test]
     fn multiple_hashes_independent() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
-        store.try_begin(HASH_B, TX_HASH_B, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        store
+            .try_begin(HASH_B, TX_HASH_B, SOURCE_B, SEQ_B, 0, 100)
+            .unwrap();
         store
             .finalize(HASH_A, ReceiptStatus::Success, Some(1))
             .unwrap();
@@ -1174,7 +1934,9 @@ mod tests {
     #[test]
     fn try_begin_persists_submitted_false_survives_reload() {
         let (dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
 
         // Reload from the same file.
         let store2 = ReceiptStore::open_at(dir.path(), "test").unwrap();
@@ -1193,7 +1955,9 @@ mod tests {
     #[test]
     fn mark_submitted_sets_submitted_true() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
 
         // Initially false after try_begin.
         let before = store.get(HASH_A).unwrap().unwrap();
@@ -1224,7 +1988,9 @@ mod tests {
     #[test]
     fn mark_submitted_idempotent() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
         store.mark_submitted(HASH_A).unwrap();
         // Second call must not error.
         store.mark_submitted(HASH_A).unwrap();
@@ -1236,7 +2002,9 @@ mod tests {
     #[test]
     fn mark_submitted_on_terminal_receipt_is_noop() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
         store
             .finalize(HASH_A, ReceiptStatus::Success, Some(5))
             .unwrap();
@@ -1254,7 +2022,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let store = ReceiptStore::open_at(dir.path(), "ms").unwrap();
-            store.try_begin(HASH_A, TX_HASH_A, 0, 1).unwrap();
+            store
+                .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 1)
+                .unwrap();
             store.mark_submitted(HASH_A).unwrap();
         }
         let store2 = ReceiptStore::open_at(dir.path(), "ms").unwrap();
@@ -1268,7 +2038,9 @@ mod tests {
     #[test]
     fn abandon_pre_submit_removes_pending_not_yet_submitted() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
         // submitted is false after try_begin — eligible for abandonment.
         store.abandon_pre_submit(HASH_A).unwrap();
         // Receipt must be gone.
@@ -1279,7 +2051,9 @@ mod tests {
     #[test]
     fn abandon_pre_submit_refuses_already_submitted() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
         store.mark_submitted(HASH_A).unwrap();
 
         // Attempt to abandon — must be a no-op.
@@ -1303,7 +2077,9 @@ mod tests {
     #[test]
     fn abandon_pre_submit_on_terminal_receipt_is_noop() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
         store
             .finalize(HASH_A, ReceiptStatus::Success, Some(1))
             .unwrap();
@@ -1320,11 +2096,15 @@ mod tests {
     #[test]
     fn abandon_pre_submit_allows_re_entry() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
         store.abandon_pre_submit(HASH_A).unwrap();
 
         // Same envelope hash can now win again.
-        let outcome = store.try_begin(HASH_A, TX_HASH_B, 0, 101).unwrap();
+        let outcome = store
+            .try_begin(HASH_A, TX_HASH_B, SOURCE_A, SEQ_A, 0, 101)
+            .unwrap();
         assert!(
             matches!(outcome, BeginOutcome::Winner),
             "a second try_begin after abandon must win"
@@ -1342,7 +2122,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let store = ReceiptStore::open_at(dir.path(), "aps").unwrap();
-            store.try_begin(HASH_A, TX_HASH_A, 0, 10).unwrap();
+            store
+                .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 10)
+                .unwrap();
             store.abandon_pre_submit(HASH_A).unwrap();
         }
         let store2 = ReceiptStore::open_at(dir.path(), "aps").unwrap();
@@ -1359,7 +2141,9 @@ mod tests {
     #[test]
     fn finalize_reorged_demotes_success_to_reorged() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
         store
             .finalize(HASH_A, ReceiptStatus::Success, Some(42))
             .unwrap();
@@ -1383,7 +2167,9 @@ mod tests {
     #[test]
     fn finalize_reorged_on_pending_is_noop() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
 
         store.finalize_reorged(HASH_A).unwrap();
 
@@ -1399,7 +2185,9 @@ mod tests {
     #[test]
     fn finalize_reorged_on_failed_is_noop() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
         store
             .finalize(
                 HASH_A,
@@ -1423,7 +2211,9 @@ mod tests {
     #[test]
     fn finalize_reorged_on_ambiguous_is_noop() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
         store
             .finalize(HASH_A, ReceiptStatus::Ambiguous, None)
             .unwrap();
@@ -1451,7 +2241,9 @@ mod tests {
     #[test]
     fn finalize_reorged_idempotent_second_call() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
         store
             .finalize(HASH_A, ReceiptStatus::Success, Some(77))
             .unwrap();
@@ -1471,7 +2263,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let store = ReceiptStore::open_at(dir.path(), "fr").unwrap();
-            store.try_begin(HASH_A, TX_HASH_A, 0, 10).unwrap();
+            store
+                .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 10)
+                .unwrap();
             store
                 .finalize(HASH_A, ReceiptStatus::Success, Some(55))
                 .unwrap();
@@ -1490,7 +2284,9 @@ mod tests {
     #[test]
     fn mark_reorg_pending_sets_first_miss_ledger() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
         store
             .finalize(HASH_A, ReceiptStatus::Success, Some(10))
             .unwrap();
@@ -1512,7 +2308,9 @@ mod tests {
     #[test]
     fn mark_reorg_pending_idempotent_does_not_overwrite() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
         store
             .finalize(HASH_A, ReceiptStatus::Success, Some(10))
             .unwrap();
@@ -1533,7 +2331,9 @@ mod tests {
     #[test]
     fn mark_reorg_pending_on_pending_is_noop() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
 
         store.mark_reorg_pending(HASH_A, 200).unwrap();
 
@@ -1554,7 +2354,9 @@ mod tests {
     #[test]
     fn clear_reorg_pending_clears_first_miss_anchor() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
         store
             .finalize(HASH_A, ReceiptStatus::Success, Some(10))
             .unwrap();
@@ -1576,7 +2378,9 @@ mod tests {
     #[test]
     fn clear_reorg_pending_no_anchor_is_noop() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
         store
             .finalize(HASH_A, ReceiptStatus::Success, Some(10))
             .unwrap();
@@ -1592,7 +2396,9 @@ mod tests {
     #[test]
     fn clear_reorg_pending_on_pending_is_noop() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
 
         store.clear_reorg_pending(HASH_A).unwrap();
 
@@ -1613,7 +2419,9 @@ mod tests {
     #[test]
     fn reorg_detection_two_poll_cycle() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 1_000_000, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 1_000_000, 100)
+            .unwrap();
         store
             .finalize(HASH_A, ReceiptStatus::Success, Some(110))
             .unwrap();
@@ -1651,7 +2459,9 @@ mod tests {
         let (_dir, store) = open_temp_store();
         let store2 = store.clone();
 
-        store.try_begin(HASH_A, TX_HASH_A, 0, 50).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 50)
+            .unwrap();
 
         // The clone must see the entry written via the original.
         let r = store2.get(HASH_A).unwrap().unwrap();
@@ -1667,6 +2477,8 @@ mod tests {
         let original = SubmissionReceipt {
             envelope_hash: HASH_A.to_owned(),
             tx_hash: TX_HASH_A.to_owned(),
+            source: SOURCE_A.to_owned(),
+            sequence: SEQ_A,
             status: ReceiptStatus::Reorged,
             ledger: None,
             recorded_at_ledger: 1234,
@@ -1685,6 +2497,8 @@ mod tests {
         assert_eq!(decoded.ledger, None);
         assert_eq!(decoded.recorded_at_ledger, 1234);
         assert_eq!(decoded.max_time, 9_999_999);
+        assert_eq!(decoded.source, SOURCE_A);
+        assert_eq!(decoded.sequence, SEQ_A);
         assert_eq!(decoded.prior_ledger, Some(1200));
         assert_eq!(decoded.reorg_pending_at_ledger, Some(1210));
         assert!(decoded.submitted);
@@ -1698,6 +2512,8 @@ mod tests {
         let r = SubmissionReceipt {
             envelope_hash: HASH_A.to_owned(),
             tx_hash: TX_HASH_A.to_owned(),
+            source: SOURCE_A.to_owned(),
+            sequence: SEQ_A,
             status: ReceiptStatus::Pending,
             ledger: None,
             recorded_at_ledger: 1,
@@ -1763,7 +2579,9 @@ mod tests {
         let inner_tx_hex = TX_HASH_A; // 64 hex chars
         let feebump_key = format!("feebump-inner:{inner_tx_hex}");
 
-        let outcome = store.try_begin(&feebump_key, inner_tx_hex, 0, 300).unwrap();
+        let outcome = store
+            .try_begin(&feebump_key, inner_tx_hex, SOURCE_A, SEQ_A, 0, 300)
+            .unwrap();
         assert!(matches!(outcome, BeginOutcome::Winner));
 
         let r = store.get(&feebump_key).unwrap().unwrap();
@@ -1796,7 +2614,9 @@ mod tests {
     #[test]
     fn finalize_ambiguous_stores_and_is_terminal() {
         let (_dir, store) = open_temp_store();
-        store.try_begin(HASH_A, TX_HASH_A, 0, 100).unwrap();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
         store
             .finalize(HASH_A, ReceiptStatus::Ambiguous, None)
             .unwrap();
@@ -1829,8 +2649,10 @@ mod tests {
         let s1 = ReceiptStore::open_at(dir.path(), "profile-a").unwrap();
         let s2 = ReceiptStore::open_at(dir.path(), "profile-b").unwrap();
 
-        s1.try_begin(HASH_A, TX_HASH_A, 0, 1).unwrap();
-        s2.try_begin(HASH_B, TX_HASH_B, 0, 2).unwrap();
+        s1.try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 1)
+            .unwrap();
+        s2.try_begin(HASH_B, TX_HASH_B, SOURCE_B, SEQ_B, 0, 2)
+            .unwrap();
 
         // s1 has only HASH_A.
         assert!(s1.get(HASH_A).unwrap().is_some());
@@ -1842,5 +2664,699 @@ mod tests {
 
         // File names are distinct.
         assert_ne!(s1.file_path().unwrap(), s2.file_path().unwrap());
+    }
+
+    // ── secondary indexes ────────────────────────────────────────────────
+
+    /// A receipt is found by the transaction hash it carries, even though the
+    /// store is keyed on the envelope hash.
+    #[test]
+    fn tx_hash_lookup_finds_a_receipt_stored_under_its_envelope_hash() {
+        let (_dir, store) = open_temp_store();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+
+        let found = store
+            .find_by_tx_hash(TX_HASH_A)
+            .unwrap()
+            .expect("the transaction hash must reach the receipt");
+        assert_eq!(found.envelope_hash, HASH_A);
+        assert!(
+            store.find_by_tx_hash(TX_HASH_B).unwrap().is_none(),
+            "a hash no receipt carries finds nothing"
+        );
+    }
+
+    /// The lookup reports the receipt's current status, so a settled receipt
+    /// is never reported as still pending.
+    #[test]
+    fn tx_hash_lookup_reports_the_settled_status() {
+        let (_dir, store) = open_temp_store();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        store
+            .finalize(HASH_A, ReceiptStatus::Success, Some(42))
+            .unwrap();
+
+        let found = store.find_by_tx_hash(TX_HASH_A).unwrap().unwrap();
+        assert_eq!(
+            found.status,
+            ReceiptStatus::Success,
+            "the lookup resolves through the map, so it cannot report a stale status"
+        );
+        assert_eq!(found.ledger, Some(42));
+    }
+
+    /// The `(source, sequence)` pair finds a pending receipt whatever envelope
+    /// hash it is stored under: the pair is the identity the network enforces.
+    #[test]
+    fn source_sequence_lookup_finds_a_pending_receipt_under_another_envelope_hash() {
+        let (_dir, store) = open_temp_store();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+
+        let found = store
+            .find_pending_by_source_sequence(SOURCE_A, SEQ_A)
+            .unwrap()
+            .expect("the replay identity must reach the receipt");
+        assert_eq!(found.envelope_hash, HASH_A);
+        assert!(
+            store
+                .find_pending_by_source_sequence(SOURCE_B, SEQ_A)
+                .unwrap()
+                .is_none(),
+            "another account's sequence is a different replay identity"
+        );
+        assert!(
+            store
+                .find_pending_by_source_sequence(SOURCE_A, SEQ_B)
+                .unwrap()
+                .is_none(),
+            "another sequence on the same account is a different replay identity"
+        );
+    }
+
+    /// A settled receipt does not hold its `(source, sequence)` pair: its
+    /// transaction can no longer be in flight.
+    #[test]
+    fn a_settled_receipt_stops_holding_its_replay_identity() {
+        let (_dir, store) = open_temp_store();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        store
+            .finalize(
+                HASH_A,
+                ReceiptStatus::Failed {
+                    code: "ledger.op_failed".to_owned(),
+                },
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .find_pending_by_source_sequence(SOURCE_A, SEQ_A)
+                .unwrap()
+                .is_none(),
+            "a settled receipt does not stand in the way of a fresh submission"
+        );
+    }
+
+    /// A receipt with no recorded replay identity matches nothing, so it never
+    /// stands in for another submission's.
+    #[test]
+    fn a_receipt_without_a_source_holds_no_replay_identity() {
+        let (_dir, store) = open_temp_store();
+        store.try_begin(HASH_A, TX_HASH_A, "", 0, 0, 100).unwrap();
+        assert!(
+            store
+                .find_pending_by_source_sequence("", 0)
+                .unwrap()
+                .is_none(),
+            "an empty source matches nothing"
+        );
+    }
+
+    // ── begin_submission ─────────────────────────────────────────────────
+
+    /// A first submission with an empty store is recorded and may be sent.
+    ///
+    /// The ordering is what makes this true: the replay-identity check runs
+    /// before the insert, so it cannot find the receipt the insert is about to
+    /// write.
+    #[test]
+    fn a_first_submission_is_recorded() {
+        let (_dir, store) = open_temp_store();
+        let outcome = store
+            .begin_submission(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        assert!(
+            matches!(outcome, BeginSubmissionOutcome::Recorded),
+            "a first submission must be recorded, not refused; got {outcome:?}"
+        );
+        let receipt = store.get(HASH_A).unwrap().unwrap();
+        assert_eq!(receipt.status, ReceiptStatus::Pending);
+        assert!(!receipt.submitted, "nothing has been sent yet");
+    }
+
+    /// A second submission for a `(source, sequence)` a pending receipt holds
+    /// is refused, whatever bytes it carries.
+    #[test]
+    fn a_second_submission_at_the_same_sequence_is_refused() {
+        let (_dir, store) = open_temp_store();
+        store
+            .begin_submission(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+
+        let outcome = store
+            .begin_submission(HASH_B, TX_HASH_B, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        match outcome {
+            BeginSubmissionOutcome::DuplicateSequence(existing) => {
+                assert_eq!(
+                    existing.tx_hash, TX_HASH_A,
+                    "the refusal names the transaction to reconcile"
+                );
+            }
+            other => {
+                panic!("a second submission at the same sequence must be refused; got {other:?}")
+            }
+        }
+        assert!(
+            store.get(HASH_B).unwrap().is_none(),
+            "a refused submission writes no receipt"
+        );
+    }
+
+    /// A settled receipt does not block a fresh submission at the same
+    /// sequence: its transaction can no longer apply.
+    #[test]
+    fn a_settled_receipt_does_not_block_the_same_sequence() {
+        let (_dir, store) = open_temp_store();
+        store
+            .begin_submission(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        store
+            .finalize(
+                HASH_A,
+                ReceiptStatus::Failed {
+                    code: "submission.tx_malformed".to_owned(),
+                },
+                None,
+            )
+            .unwrap();
+
+        let outcome = store
+            .begin_submission(HASH_B, TX_HASH_B, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        assert!(
+            matches!(outcome, BeginSubmissionOutcome::Recorded),
+            "a refused send leaves the sequence free for a fresh attempt; got {outcome:?}"
+        );
+    }
+
+    /// The same envelope twice is the winner/loser gate, reported separately
+    /// from the replay-identity refusal.
+    #[test]
+    fn the_same_envelope_twice_reports_already_present() {
+        let (_dir, store) = open_temp_store();
+        store
+            .begin_submission(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        store
+            .finalize(HASH_A, ReceiptStatus::Success, Some(9))
+            .unwrap();
+
+        let outcome = store
+            .begin_submission(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        match outcome {
+            BeginSubmissionOutcome::AlreadyPresent(existing) => {
+                assert_eq!(existing.status, ReceiptStatus::Success);
+            }
+            other => panic!("the same envelope must report AlreadyPresent; got {other:?}"),
+        }
+    }
+
+    // ── transition rule ──────────────────────────────────────────────────
+
+    /// A definitive answer from the chain settles an unknown outcome.
+    #[test]
+    fn a_definitive_answer_settles_an_ambiguous_receipt() {
+        let (_dir, store) = open_temp_store();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        store.mark_submitted(HASH_A).unwrap();
+        store
+            .finalize(HASH_A, ReceiptStatus::Ambiguous, None)
+            .unwrap();
+
+        store
+            .finalize(HASH_A, ReceiptStatus::Success, Some(77))
+            .unwrap();
+        let receipt = store.get(HASH_A).unwrap().unwrap();
+        assert_eq!(receipt.status, ReceiptStatus::Success);
+        assert_eq!(receipt.ledger, Some(77));
+    }
+
+    /// An unknown outcome never returns to pending: the submission has been
+    /// recorded and cannot become un-recorded.
+    #[test]
+    fn an_ambiguous_receipt_never_returns_to_pending() {
+        let (_dir, store) = open_temp_store();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        store
+            .finalize(HASH_A, ReceiptStatus::Ambiguous, None)
+            .unwrap();
+
+        let err = store
+            .finalize(HASH_A, ReceiptStatus::Pending, None)
+            .expect_err("an ambiguous receipt must not return to pending");
+        assert!(
+            matches!(
+                err,
+                ReceiptStoreError::InvalidTransition {
+                    from: "ambiguous",
+                    to: "pending"
+                }
+            ),
+            "the refusal must name both states; got {err:?}"
+        );
+        assert_eq!(
+            store.get(HASH_A).unwrap().unwrap().status,
+            ReceiptStatus::Ambiguous,
+            "a refused transition leaves the receipt as it stands"
+        );
+    }
+
+    /// A recorded network answer stands: it is not replaced by another.
+    #[test]
+    fn a_recorded_network_answer_is_not_replaced() {
+        let (_dir, store) = open_temp_store();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        store
+            .finalize(HASH_A, ReceiptStatus::Success, Some(5))
+            .unwrap();
+
+        let err = store
+            .finalize(
+                HASH_A,
+                ReceiptStatus::Failed {
+                    code: "ledger.op_failed".to_owned(),
+                },
+                None,
+            )
+            .expect_err("a confirmed receipt must not be overwritten");
+        assert!(matches!(
+            err,
+            ReceiptStoreError::InvalidTransition {
+                from: "success",
+                to: "failed"
+            }
+        ));
+    }
+
+    // ── operator clear ───────────────────────────────────────────────────
+
+    /// A submitted pending receipt is clearable: the endpoint cannot account
+    /// for its transaction.
+    #[test]
+    fn clear_accepts_a_submitted_pending_receipt() {
+        let (_dir, store) = open_temp_store();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        store.mark_submitted(HASH_A).unwrap();
+
+        let cleared = store.clear_by_operator(HASH_A).unwrap();
+        assert_eq!(cleared.status, ReceiptStatus::ClearedByOperator);
+        assert_eq!(cleared.tx_hash, TX_HASH_A, "the record keeps its identity");
+        assert!(
+            store.get(HASH_A).unwrap().unwrap().status.is_terminal(),
+            "a cleared receipt is terminal"
+        );
+    }
+
+    /// An ambiguous receipt is clearable: reconciliation has already reported
+    /// that the endpoint cannot answer.
+    #[test]
+    fn clear_accepts_an_ambiguous_receipt() {
+        let (_dir, store) = open_temp_store();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        store.mark_submitted(HASH_A).unwrap();
+        store
+            .finalize(HASH_A, ReceiptStatus::Ambiguous, None)
+            .unwrap();
+
+        let cleared = store.clear_by_operator(HASH_A).unwrap();
+        assert_eq!(cleared.status, ReceiptStatus::ClearedByOperator);
+    }
+
+    /// A receipt the chain has answered for needs no acknowledgement.
+    #[test]
+    fn clear_refuses_a_receipt_the_chain_answered_for() {
+        let (_dir, store) = open_temp_store();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        store
+            .finalize(HASH_A, ReceiptStatus::Success, Some(3))
+            .unwrap();
+
+        let err = store
+            .clear_by_operator(HASH_A)
+            .expect_err("a confirmed submission is not cleared by an operator");
+        assert!(matches!(
+            err,
+            ReceiptStoreError::InvalidTransition {
+                from: "success",
+                ..
+            }
+        ));
+    }
+
+    /// A receipt for a submission that was never sent is clearable, and the
+    /// pair it holds is freed.
+    ///
+    /// A process killed between the record and the send leaves exactly this
+    /// shape. It holds its source account's sequence, and the account's
+    /// sequence never advances because nothing applied, so every rebuild at
+    /// that number is refused. The operator verb establishes what the chain
+    /// says before it gets here; "never sent and never seen" is the plainest
+    /// case there is.
+    #[test]
+    fn clear_accepts_a_receipt_that_was_never_sent() {
+        let (_dir, store) = open_temp_store();
+        store
+            .begin_submission(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        assert!(
+            !store.get(HASH_A).unwrap().unwrap().submitted,
+            "the fixture is an unsent receipt"
+        );
+
+        let cleared = store.clear_by_operator(HASH_A).unwrap();
+        assert_eq!(cleared.status, ReceiptStatus::ClearedByOperator);
+
+        let outcome = store
+            .begin_submission(HASH_B, TX_HASH_B, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        assert!(
+            matches!(outcome, BeginSubmissionOutcome::Recorded),
+            "clearing frees the pair the unsent receipt held; got {outcome:?}"
+        );
+    }
+
+    /// A cleared receipt keeps its idempotency anchor: the same bytes are
+    /// still recognised.
+    #[test]
+    fn a_cleared_receipt_still_answers_for_its_envelope() {
+        let (_dir, store) = open_temp_store();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        store.mark_submitted(HASH_A).unwrap();
+        store.clear_by_operator(HASH_A).unwrap();
+
+        let outcome = store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        assert!(
+            matches!(outcome, BeginOutcome::AlreadyPresent(_)),
+            "the cleared receipt is marked, not removed; got {outcome:?}"
+        );
+    }
+
+    /// A cleared receipt stops holding its replay identity, so a fresh
+    /// submission at the same sequence proceeds.
+    #[test]
+    fn a_cleared_receipt_frees_its_sequence() {
+        let (_dir, store) = open_temp_store();
+        store
+            .begin_submission(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        store.mark_submitted(HASH_A).unwrap();
+        store.clear_by_operator(HASH_A).unwrap();
+
+        let outcome = store
+            .begin_submission(HASH_B, TX_HASH_B, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        assert!(
+            matches!(outcome, BeginSubmissionOutcome::Recorded),
+            "clearing is what frees the sequence for a fresh attempt; got {outcome:?}"
+        );
+    }
+
+    // ── cross-process lock ───────────────────────────────────────────────
+
+    /// A mutating operation refuses while another holder owns the sidecar
+    /// lock, after the bounded retry is exhausted.
+    ///
+    /// The holder takes the lock through its own descriptor, which is what a
+    /// second process does: an OS advisory lock is held per open file, not per
+    /// process, so the contention this produces is the same one.
+    #[test]
+    fn a_held_sidecar_lock_refuses_a_write_after_the_bounded_retry() {
+        let (_dir, store) = open_temp_store();
+        // A write first, so the lock file exists and the store is initialised.
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+
+        let lock_path = store.lock_file_path().unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        holder.try_lock().expect("the holder must take the lock");
+
+        let err = store
+            .try_begin(HASH_B, TX_HASH_B, SOURCE_B, SEQ_B, 0, 100)
+            .expect_err("a held lock must refuse the write");
+        assert!(
+            matches!(err, ReceiptStoreError::WriterLocked),
+            "an exhausted retry surfaces as WriterLocked; got {err:?}"
+        );
+
+        drop(holder);
+        store
+            .try_begin(HASH_B, TX_HASH_B, SOURCE_B, SEQ_B, 0, 100)
+            .expect("the write succeeds once the holder releases");
+    }
+
+    /// A read sees what another writer has already committed to the file.
+    #[test]
+    fn a_read_sees_another_writers_committed_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ReceiptStore::open_at(dir.path(), "shared").unwrap();
+        let reader = ReceiptStore::open_at(dir.path(), "shared").unwrap();
+
+        assert!(reader.get(HASH_A).unwrap().is_none());
+        writer
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+
+        let seen = reader
+            .get(HASH_A)
+            .unwrap()
+            .expect("a reader must see a receipt another holder wrote");
+        assert_eq!(seen.tx_hash, TX_HASH_A);
+    }
+
+    /// A write applies to the state the file holds, not to a stale in-memory
+    /// copy: a receipt another holder wrote is not lost.
+    #[test]
+    fn a_write_does_not_discard_another_holders_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = ReceiptStore::open_at(dir.path(), "shared").unwrap();
+        let second = ReceiptStore::open_at(dir.path(), "shared").unwrap();
+
+        first
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        second
+            .try_begin(HASH_B, TX_HASH_B, SOURCE_B, SEQ_B, 0, 100)
+            .unwrap();
+
+        assert!(
+            first.get(HASH_B).unwrap().is_some() && first.get(HASH_A).unwrap().is_some(),
+            "both receipts survive: each write re-reads the file under the lock"
+        );
+    }
+
+    /// `ClearedByOperator` is terminal, alongside the other settled states.
+    #[test]
+    fn cleared_by_operator_is_terminal() {
+        assert!(ReceiptStatus::ClearedByOperator.is_terminal());
+        assert!(!ReceiptStatus::ClearedByOperator.is_definitive_outcome());
+        assert_eq!(
+            ReceiptStatus::ClearedByOperator.label(),
+            "cleared_by_operator"
+        );
+    }
+
+    /// The submitted flag survives the send marker, which is what makes a
+    /// timed-out submission un-abandonable.
+    #[test]
+    fn a_timed_out_submission_stays_pending_and_submitted() {
+        let (_dir, store) = open_temp_store();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        store.mark_submitted(HASH_A).unwrap();
+
+        // A timeout settles nothing, so nothing is written.
+        let receipt = store.get(HASH_A).unwrap().unwrap();
+        assert_eq!(receipt.status, ReceiptStatus::Pending);
+        assert!(receipt.submitted);
+
+        store.abandon_pre_submit(HASH_A).unwrap();
+        assert!(
+            store.get(HASH_A).unwrap().is_some(),
+            "a submitted receipt is never abandoned"
+        );
+    }
+
+    // ── index determinism ────────────────────────────────────────────────
+
+    /// A third envelope at a pair one pending receipt holds is refused on
+    /// every read, whichever envelope hash the settled receipt carries.
+    ///
+    /// The index holds one envelope hash per pair and the store's map is a
+    /// `HashMap`, so a settled receipt sharing the pair would otherwise win
+    /// the slot on some reads and not others, and the refusal would turn on
+    /// iteration order. Both hash orderings are exercised: a rule that only
+    /// happened to prefer the lower hash would pass one and fail the other.
+    /// The store is re-opened on every iteration so each answer comes from a
+    /// fresh index build.
+    #[test]
+    fn a_pair_a_pending_receipt_holds_is_refused_on_every_read() {
+        for (settled_hash, settled_tx, pending_hash, pending_tx) in [
+            (HASH_A, TX_HASH_A, HASH_B, TX_HASH_B),
+            (HASH_B, TX_HASH_B, HASH_A, TX_HASH_A),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = ReceiptStore::open_at(dir.path(), "test").unwrap();
+
+            // The state the recovery flows produce: a settled receipt and a
+            // pending one on one (source, sequence).
+            store
+                .begin_submission(settled_hash, settled_tx, SOURCE_A, SEQ_A, 0, 100)
+                .unwrap();
+            store
+                .finalize(
+                    settled_hash,
+                    ReceiptStatus::Failed {
+                        code: "x".to_owned(),
+                    },
+                    None,
+                )
+                .unwrap();
+            store
+                .begin_submission(pending_hash, pending_tx, SOURCE_A, SEQ_A, 0, 100)
+                .unwrap();
+            store.mark_submitted(pending_hash).unwrap();
+
+            for iteration in 0..200 {
+                let reopened = ReceiptStore::open_at(dir.path(), "test").unwrap();
+                let found = reopened
+                    .find_pending_by_source_sequence(SOURCE_A, SEQ_A)
+                    .unwrap();
+                assert_eq!(
+                    found.as_ref().map(|r| r.envelope_hash.as_str()),
+                    Some(pending_hash),
+                    "the pending receipt answers for the pair on read {iteration} \
+                     (settled {settled_hash}, pending {pending_hash})"
+                );
+                let outcome = reopened
+                    .begin_submission(HASH_C, TX_HASH_C, SOURCE_A, SEQ_A, 0, 100)
+                    .unwrap();
+                assert!(
+                    matches!(outcome, BeginSubmissionOutcome::DuplicateSequence(_)),
+                    "read {iteration} admitted a third envelope at a held pair \
+                     (settled {settled_hash}, pending {pending_hash}): {outcome:?}"
+                );
+            }
+        }
+    }
+
+    /// Settling the pending receipt frees the pair on every read.
+    #[test]
+    fn a_pair_frees_on_every_read_once_its_pending_receipt_settles() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReceiptStore::open_at(dir.path(), "test").unwrap();
+
+        store
+            .begin_submission(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        store
+            .finalize(
+                HASH_A,
+                ReceiptStatus::Failed {
+                    code: "x".to_owned(),
+                },
+                None,
+            )
+            .unwrap();
+        store
+            .begin_submission(HASH_B, TX_HASH_B, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        store.mark_submitted(HASH_B).unwrap();
+        store
+            .finalize(HASH_B, ReceiptStatus::Success, Some(4))
+            .unwrap();
+
+        for iteration in 0..200 {
+            let reopened = ReceiptStore::open_at(dir.path(), "test").unwrap();
+            assert!(
+                reopened
+                    .find_pending_by_source_sequence(SOURCE_A, SEQ_A)
+                    .unwrap()
+                    .is_none(),
+                "no receipt holds the pair on read {iteration}"
+            );
+        }
+        let reopened = ReceiptStore::open_at(dir.path(), "test").unwrap();
+        let outcome = reopened
+            .begin_submission(HASH_C, TX_HASH_C, SOURCE_A, SEQ_A, 0, 100)
+            .unwrap();
+        assert!(
+            matches!(outcome, BeginSubmissionOutcome::Recorded),
+            "a settled pair admits a fresh submission: {outcome:?}"
+        );
+    }
+
+    /// A transaction hash two receipts claim answers with the pending one on
+    /// every read, whichever envelope hash each carries.
+    ///
+    /// Two signatures over one transaction give the same transaction hash
+    /// under different envelope bytes, so `tx status` would otherwise report
+    /// on whichever receipt the iteration reached last.
+    #[test]
+    fn a_shared_transaction_hash_answers_with_the_pending_receipt() {
+        for (settled_hash, pending_hash) in [(HASH_A, HASH_B), (HASH_B, HASH_A)] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = ReceiptStore::open_at(dir.path(), "test").unwrap();
+
+            store
+                .try_begin(settled_hash, TX_HASH_A, SOURCE_A, SEQ_A, 0, 100)
+                .unwrap();
+            store
+                .finalize(
+                    settled_hash,
+                    ReceiptStatus::Failed {
+                        code: "x".to_owned(),
+                    },
+                    None,
+                )
+                .unwrap();
+            store
+                .try_begin(pending_hash, TX_HASH_A, SOURCE_B, SEQ_B, 0, 100)
+                .unwrap();
+            store.mark_submitted(pending_hash).unwrap();
+
+            for iteration in 0..200 {
+                let reopened = ReceiptStore::open_at(dir.path(), "test").unwrap();
+                let found = reopened.find_by_tx_hash(TX_HASH_A).unwrap().unwrap();
+                assert_eq!(
+                    found.envelope_hash, pending_hash,
+                    "the pending receipt answers for the transaction hash on read \
+                     {iteration} (settled {settled_hash})"
+                );
+            }
+        }
     }
 }

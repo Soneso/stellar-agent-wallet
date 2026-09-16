@@ -50,6 +50,84 @@ impl Respond for EchoIdResponder {
     }
 }
 
+/// A wiremock responder that answers with the transaction hash of the
+/// transaction it was handed, the way a real endpoint does.
+///
+/// A submitting wallet computes the transaction hash from the bytes it signed
+/// and treats a different hash from the endpoint as a submission whose outcome
+/// it cannot account for. A mock answering a canned hash therefore trips that
+/// on every call. This responder substitutes the request-derived hash into the
+/// `hash` and `txHash` fields of a result template, so the test's fixed body
+/// keeps every other field and the hash tells the truth:
+///
+/// - `sendTransaction`: the hash computed from the envelope in the request,
+///   under `passphrase`.
+/// - `getTransaction`: the hash the caller asked about.
+///
+/// Every other method is answered with the template unchanged.
+pub struct SubmissionEchoResponder {
+    result: Arc<serde_json::Value>,
+    passphrase: String,
+}
+
+impl SubmissionEchoResponder {
+    /// Creates a responder returning `result` with its hash fields rewritten
+    /// to match the request.
+    #[must_use]
+    pub fn new(result: serde_json::Value, passphrase: impl Into<String>) -> Self {
+        Self {
+            result: Arc::new(result),
+            passphrase: passphrase.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Respond for SubmissionEchoResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body = serde_json::from_slice::<serde_json::Value>(&request.body)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let req_id = body
+            .get("id")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(1));
+        let method = body
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+
+        let hash = match method {
+            "sendTransaction" => Some(crate::signed_envelope::send_transaction_hash_hex(
+                &body,
+                &self.passphrase,
+            )),
+            "getTransaction" => body
+                .get("params")
+                .and_then(|p| p.get("hash"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            _ => None,
+        };
+
+        let mut result = (*self.result).clone();
+        if let (Some(hash), Some(object)) = (hash, result.as_object_mut()) {
+            for field in ["hash", "txHash"] {
+                if object.contains_key(field) {
+                    object.insert(field.to_owned(), serde_json::Value::String(hash.clone()));
+                }
+            }
+        }
+
+        ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": result,
+            }))
+            .insert_header("content-type", "application/json")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(

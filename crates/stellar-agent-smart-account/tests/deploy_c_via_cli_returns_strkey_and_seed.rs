@@ -39,8 +39,8 @@
 // reason: integration tests use unwrap/expect to make fixture construction failures explicit.
 #![allow(clippy::unwrap_used, clippy::expect_used, reason = "test-only")]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -1035,6 +1035,11 @@ struct StatefulSorobanRpcResponder {
     post_upload_account_fetch_failure: bool,
     /// Optional post-deploy `ContractInstance` entry with the configured WASM hash.
     post_deploy_contract_instance_wasm_hash: Option<[u8; 32]>,
+    /// The hash the responder issued for the upload transaction, recorded so a
+    /// later `getTransaction` poll can be attributed to that phase.
+    upload_tx_hash: Arc<Mutex<Option<String>>>,
+    /// The hash the responder issued for the deploy transaction.
+    deploy_tx_hash: Arc<Mutex<Option<String>>>,
     /// Canned account entry XDR (key + xdr) for `getLedgerEntries` account calls.
     account_key_b64: String,
     account_entry_b64: String,
@@ -1094,18 +1099,6 @@ impl Signer for FailingSigner {
         self.signing_key.public_key().await
     }
 }
-
-/// Fixed upload tx hash returned by the stateful responder.
-///
-/// Must be exactly 64 lowercase hex characters (32 bytes) so that
-/// `stellar_xdr::Hash::from_str` succeeds inside `stellar-rpc-client`'s
-/// `send_transaction` response parsing.
-const UPLOAD_TX_HASH: &str = "aaaa000000000000000000000000000000000000000000000000000011111111";
-
-/// Fixed deploy tx hash returned by the stateful responder.
-///
-/// Must be exactly 64 lowercase hex characters (32 bytes).
-const DEPLOY_TX_HASH: &str = "bbbb000000000000000000000000000000000000000000000000000022222222";
 
 /// TransactionResult XDR for `txMalformed`, used by deploy typed-submission tests.
 const TX_MALFORMED_RESULT_XDR: &str = "AAAAAAAAAGT////wAAAAAA==";
@@ -1197,6 +1190,8 @@ impl StatefulSorobanRpcResponder {
             wasm_preflight_rpc_error: false,
             post_upload_account_fetch_failure: false,
             post_deploy_contract_instance_wasm_hash: None,
+            upload_tx_hash: Arc::new(Mutex::new(None)),
+            deploy_tx_hash: Arc::new(Mutex::new(None)),
             account_key_b64,
             account_entry_b64,
         }
@@ -1269,6 +1264,16 @@ impl StatefulSorobanRpcResponder {
     /// Return a cloned `Arc<AtomicUsize>` counting deploy `sendTransaction` calls.
     fn deploy_send_count_handle(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.deploy_send_count)
+    }
+
+    /// Return the hash this responder issued for the upload transaction.
+    fn issued_upload_tx_hash(&self) -> Arc<Mutex<Option<String>>> {
+        Arc::clone(&self.upload_tx_hash)
+    }
+
+    /// Return the hash this responder issued for the deploy transaction.
+    fn issued_deploy_tx_hash(&self) -> Arc<Mutex<Option<String>>> {
+        Arc::clone(&self.deploy_tx_hash)
     }
 
     /// Return a cloned `Arc<AtomicUsize>` counting upload `getTransaction` polls.
@@ -1450,6 +1455,15 @@ impl StatefulSorobanRpcResponder {
         })
     }
 
+    /// The hash a real endpoint reports for the transaction in `body`.
+    ///
+    /// The submitting layer computes the transaction hash from the bytes it
+    /// signed and refuses a hash that describes something else, so a responder
+    /// that answered a fixed value would be refused on every send.
+    fn send_hash(body: &serde_json::Value) -> String {
+        stellar_agent_test_support::send_transaction_hash_hex(body, TESTNET_PASSPHRASE)
+    }
+
     fn respond_send(&self, body: &serde_json::Value) -> serde_json::Value {
         // Classify the call by inspecting the tx XDR first.  The tx XDR is sent
         // via stellar-rpc-client in `params.transaction` as a base64-encoded XDR string.
@@ -1473,7 +1487,7 @@ impl StatefulSorobanRpcResponder {
             if self.typed_malformed_on_upload_send {
                 return serde_json::json!({
                     "status": "ERROR",
-                    "hash": UPLOAD_TX_HASH,
+                    "hash": Self::send_hash(body),
                     "latestLedger": 1000,
                     "latestLedgerCloseTime": "1234567890",
                     "errorResultXdr": TX_MALFORMED_RESULT_XDR,
@@ -1483,9 +1497,13 @@ impl StatefulSorobanRpcResponder {
 
             // Successful upload: flip the wasm_uploaded flag.
             self.wasm_uploaded.store(true, Ordering::Release);
+            let hash = Self::send_hash(body);
+            if let Ok(mut guard) = self.upload_tx_hash.lock() {
+                *guard = Some(hash.clone());
+            }
             serde_json::json!({
                 "status": "PENDING",
-                "hash": UPLOAD_TX_HASH,
+                "hash": hash,
                 "latestLedger": 1000,
                 "latestLedgerCloseTime": "1234567890"
             })
@@ -1496,7 +1514,7 @@ impl StatefulSorobanRpcResponder {
             if self.send_error_on_deploy {
                 return serde_json::json!({
                     "status": "ERROR",
-                    "hash": DEPLOY_TX_HASH,
+                    "hash": Self::send_hash(body),
                     "latestLedger": 1001,
                     "latestLedgerCloseTime": "1234567891",
                     "errorResultXdr": TX_MALFORMED_RESULT_XDR,
@@ -1504,9 +1522,13 @@ impl StatefulSorobanRpcResponder {
                 });
             }
 
+            let hash = Self::send_hash(body);
+            if let Ok(mut guard) = self.deploy_tx_hash.lock() {
+                *guard = Some(hash.clone());
+            }
             serde_json::json!({
                 "status": "PENDING",
-                "hash": DEPLOY_TX_HASH,
+                "hash": hash,
                 "latestLedger": 1001,
                 "latestLedgerCloseTime": "1234567891"
             })
@@ -1526,7 +1548,12 @@ impl StatefulSorobanRpcResponder {
             });
         }
 
-        let is_upload_hash = hash == UPLOAD_TX_HASH;
+        let is_upload_hash = self
+            .upload_tx_hash
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .is_some_and(|issued| issued == hash);
         if is_upload_hash {
             self.upload_get_tx_count.fetch_add(1, Ordering::AcqRel);
         }
@@ -1646,6 +1673,8 @@ async fn wasm_absent_uploads_then_deploys() {
     let wasm_uploaded = responder.wasm_uploaded_handle();
     let upload_count = responder.upload_send_count_handle();
     let deploy_count = responder.deploy_send_count_handle();
+    let issued_upload_hash = responder.issued_upload_tx_hash();
+    let issued_deploy_hash = responder.issued_deploy_tx_hash();
 
     Mock::given(method("POST"))
         .respond_with(responder)
@@ -1706,8 +1735,21 @@ async fn wasm_absent_uploads_then_deploys() {
         result.wasm_hash, MULTISIG_ACCOUNT_WASM_SHA256,
         "wasm_hash must match the pinned multisig WASM hash"
     );
-    assert_redacted_tx_hash_eq!(result.upload_tx_hash.as_deref(), UPLOAD_TX_HASH);
-    assert_redacted_tx_hash_eq!(result.tx_hash.as_deref(), DEPLOY_TX_HASH);
+    // The hashes the result reports are the ones the endpoint answered for the
+    // transactions it was handed, which are the hashes the submit layer
+    // computed from the bytes it signed.
+    let issued_upload = issued_upload_hash
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .expect("the endpoint must have issued an upload transaction hash");
+    let issued_deploy = issued_deploy_hash
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .expect("the endpoint must have issued a deploy transaction hash");
+    assert_redacted_tx_hash_eq!(result.upload_tx_hash.as_deref(), &issued_upload);
+    assert_redacted_tx_hash_eq!(result.tx_hash.as_deref(), &issued_deploy);
     assert_eq!(result.ledger, Some(1001));
     assert!(
         result.wasm_uploaded,

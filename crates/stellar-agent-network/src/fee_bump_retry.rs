@@ -286,11 +286,18 @@ pub async fn submit_fee_bump_idempotent(
     let inner_envelope_for_max_time = TransactionEnvelope::Tx(v1_inner.clone());
     let inner_max_time = extract_max_time(&inner_envelope_for_max_time);
 
+    // The replay identity is the INNER transaction's: the fee source consumes
+    // no sequence of its own.
+    let (inner_source, inner_sequence) =
+        crate::submit::replay_identity(&inner_envelope_for_max_time)?;
+
     // ── Step 5: atomic winner/loser gate ─────────────────────────────────────
     let outcome = store
         .try_begin(
             &inner_key,
             &outer_tx_hash_hex,
+            &inner_source,
+            inner_sequence,
             inner_max_time,
             recorded_at_ledger,
         )
@@ -721,7 +728,9 @@ mod tests {
         let inner_key =
             "feebump-inner:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let outer_tx_hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        store.try_begin(inner_key, outer_tx_hash, 0, 100).unwrap();
+        store
+            .try_begin(inner_key, outer_tx_hash, "", 0, 0, 100)
+            .unwrap();
         store
             .finalize(inner_key, ReceiptStatus::Success, Some(42))
             .unwrap();
@@ -941,7 +950,9 @@ mod tests {
         let outer_tx_hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
         // Winner: try_begin sets submitted=false.
-        let outcome = store.try_begin(inner_key, outer_tx_hash, 0, 100).unwrap();
+        let outcome = store
+            .try_begin(inner_key, outer_tx_hash, "", 0, 0, 100)
+            .unwrap();
         assert!(matches!(
             outcome,
             stellar_agent_core::profile::receipt::BeginOutcome::Winner
@@ -959,7 +970,9 @@ mod tests {
 
         // A subsequent try_begin must be Winner (corrected-retry can proceed).
         let outer_tx_hash2 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-        let outcome2 = store.try_begin(inner_key, outer_tx_hash2, 0, 100).unwrap();
+        let outcome2 = store
+            .try_begin(inner_key, outer_tx_hash2, "", 0, 0, 100)
+            .unwrap();
         assert!(
             matches!(
                 outcome2,
@@ -979,7 +992,9 @@ mod tests {
         let outer_tx_hash = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
         // (b-1) Refuse after mark_submitted.
-        store.try_begin(inner_key, outer_tx_hash, 0, 100).unwrap();
+        store
+            .try_begin(inner_key, outer_tx_hash, "", 0, 0, 100)
+            .unwrap();
         store.mark_submitted(inner_key).unwrap();
 
         let receipt = store.get(inner_key).unwrap().unwrap();

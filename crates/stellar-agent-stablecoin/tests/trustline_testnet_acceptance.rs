@@ -272,6 +272,7 @@ async fn happy_path_usdc_trustline() {
         timeout,
         TESTNET_PASSPHRASE,
         Some(SubmissionSignerKind::Software),
+        None,
     )
     .await
     .expect("ChangeTrust submit must succeed; on-chain auth failure is a hard failure");
@@ -435,6 +436,7 @@ async fn clawback_gate_opt_in_round_trip() {
         timeout,
         TESTNET_PASSPHRASE,
         Some(SubmissionSignerKind::Software),
+        None,
     )
     .await
     .expect("SetOptions AUTH_REVOCABLE|AUTH_CLAWBACK_ENABLED must submit and confirm");
@@ -626,6 +628,7 @@ async fn clawback_gate_opt_in_round_trip() {
         timeout,
         TESTNET_PASSPHRASE,
         Some(SubmissionSignerKind::Software),
+        None,
     )
     .await
     .expect("ChangeTrust TEST:<issuer> must submit and confirm on-chain");

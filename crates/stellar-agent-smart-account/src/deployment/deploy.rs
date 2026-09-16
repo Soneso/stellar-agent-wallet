@@ -1019,6 +1019,7 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
                 args.timeout,
                 &args.network_passphrase,
                 None,
+                None,
             ),
         )
         .await
@@ -1262,6 +1263,7 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
             &signed_xdr,
             args.timeout,
             &args.network_passphrase,
+            None,
             None,
         ),
     )

@@ -271,44 +271,6 @@ fn acquire_value_audit_writer(
     }
 }
 
-/// Constructs and emits the allow-path `value_action_submitted` row for a
-/// confirmed CLI submit, using an audit writer the caller already acquired via
-/// [`require_value_audit_writer`] — no second acquisition, no re-acquisition
-/// race.
-///
-/// The legs are the SAME `ValueEffects` the policy gate sized
-/// (single-derivation invariant), the redacted transaction hash, and the
-/// confirmed ledger. Non-fatal past this point: the transaction already
-/// committed, so a write failure logs a `tracing::warn!` via
-/// [`emit_value_audit_row_with_writer`] and never changes the command result.
-pub(crate) fn emit_value_action_submitted_row_with_writer(
-    writer: &Arc<Mutex<AuditWriter>>,
-    profile_name: &str,
-    tool: &'static str,
-    chain_id: &str,
-    effects: Option<&stellar_agent_core::policy::v1::ValueEffects>,
-    tx_hash: &str,
-    ledger: u32,
-) {
-    let legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> = effects
-        .map(|e| e.legs().iter().map(Into::into).collect())
-        .unwrap_or_default();
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let tx_redacted = stellar_agent_network::submit::redact_tx_hash(tx_hash);
-    let entry = AuditEntry::new_value_action_submitted(
-        tool,
-        chain_id,
-        legs,
-        tx_redacted.as_str(),
-        ledger,
-        stellar_agent_core::audit_log::PolicyDecision::Allow,
-        None,
-        None,
-        &request_id,
-    );
-    emit_value_audit_row_with_writer(writer, profile_name, entry);
-}
-
 /// Writes `entry` through an audit writer the caller already acquired (via
 /// [`require_value_audit_writer`]).
 ///
@@ -367,9 +329,11 @@ pub(crate) fn emit_value_audit_row(profile: &Profile, profile_name: &str, entry:
 /// # Errors
 ///
 /// [`WalletError::Validation`], with the same variants and wire codes
-/// [`require_value_audit_writer`] produces, plus
-/// [`ValidationError::AuditWriterOpenFailed`] when the row itself cannot be
-/// appended.
+/// [`require_value_audit_writer`] produces. The append runs the same
+/// tip-anchor check the acquisition does, so a refusal there carries
+/// [`ValidationError::AuditTipAnchorMismatch`] and its reason rather than a
+/// registration-conflict code; everything else carries
+/// [`ValidationError::AuditWriterOpenFailed`].
 pub(crate) fn emit_value_audit_row_strict(
     profile: &Profile,
     profile_name: &str,
@@ -399,7 +363,11 @@ pub(crate) fn emit_value_audit_row_strict(
             error = %e,
             "value audit: authorization row NOT emitted; withholding the authorization"
         );
-        audit_writer_open_failed(profile_name)
+        // The append runs its own tip-anchor check, so a log rolled back under
+        // a live writer refuses here as well as at acquisition. It carries the
+        // code that names that condition, the way the acquisition path does:
+        // an operator sent after a registration conflict never finds one.
+        audit_writer_acquisition_error(profile_name, &e)
     })
 }
 

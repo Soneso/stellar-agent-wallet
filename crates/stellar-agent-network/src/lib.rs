@@ -55,6 +55,7 @@ pub mod sep41;
 pub mod sequence_floor;
 pub mod signing;
 pub mod simulation_audit;
+pub mod submission_record;
 pub mod submit;
 pub mod wasm_hash;
 
@@ -72,7 +73,7 @@ pub use account::{
     fetch_account, fetch_data_entry,
 };
 pub use builder::{Asset, ClassicOpBuilder};
-pub use client::StellarRpcClient;
+pub use client::{StellarRpcClient, TransactionStatusView};
 pub use fee_bump::{FeeBumpError, build_and_sign_fee_bump};
 pub use fee_bump_retry::submit_fee_bump_idempotent;
 #[cfg(any(test, feature = "test-loopback"))]
@@ -100,8 +101,13 @@ pub use simulation_audit::{
     AuthEntryFingerprint, fingerprint_soroban_auth_entries, verify_auth_entries_unchanged,
 };
 pub use stellar_rpc_client::{GetLedgerEntriesResponse, LedgerEntryResult};
+pub use submission_record::{
+    ApprovalTombstone, AuditWriterHandle, SubmissionIntent, SubmissionOutcome, SubmissionRecorder,
+    WalletSubmissionRecorder,
+};
 pub use submit::{
-    SubmissionResult, SubmissionSignerKind, redact_tx_hash, submit_transaction_and_wait,
+    SubmissionResult, SubmissionSignerKind, envelope_hash_hex, redact_tx_hash,
+    submit_transaction_and_wait,
 };
 pub use wasm_hash::{
     FetchContractWasmHashError, WasmHashDivergenceError, WasmHashFetch, fetch_contract_wasm_hash,

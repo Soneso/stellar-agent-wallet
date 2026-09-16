@@ -151,6 +151,8 @@ Under `policy.engine = "v1"` `pay` evaluates operator policy before signing. The
 
 `--submit-only` runs the endpoint identity probe on its own client before the policy gate and before the audit-key pre-flight, so an `--rpc-url` pointing at a different network than `--network` is refused early. It also requires an already-signed envelope: handing it the unsigned XDR that `--build-only` emitted is refused with `network.envelope_unsigned` before anything is sent. `claim --submit-only` behaves the same way.
 
+Before the transaction is sent, `pay` records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation, and a `value_action_pending` audit row. A submission whose confirmation does not arrive exits 1 with `submission.tx_timeout`, keeps that record, and carries the full transaction hash in `error.details`. Resolve it with `tx status <HASH>`, never by rebuilding and re-sending: a second submission for the same source account and sequence is refused with `submission.tx_already_submitted` while the first stands. The same applies to `claim`, `accounts create`, `trustline`, `trade` and `vault`.
+
 ```bash
 export WALLET_SK="S..."
 stellar-agent pay GDEST...WXYZ "10 XLM" --source GSRC...WXYZ \
@@ -607,6 +609,34 @@ stellar-agent audit reanchor --profile default --acknowledge-rollback
 2. The wallet owner runs `approve --id <NONCE>`, reads the wallet-controlled summary, and consents; an HMAC attestation (or toolset grant) is written, bound to the nonce, the executed envelope's hash, and the local user.
 3. The agent surface verifies the attestation and executes; every invocation is appended to the hash-chained log.
 4. The operator periodically runs `audit verify --profile <NAME>` to confirm the chain, the chain-root HMAC sidecars, and the tip anchor are intact.
+
+---
+
+## tx
+
+Settles the submission records the value verbs write. Every value-moving verb records a transaction before it is sent, so a submission whose confirmation never arrived leaves a receipt and a spending-window reservation behind; both hold the operator's caps and the wallet's duplicate check until something settles them.
+
+### `tx status <HASH> [flags]`
+
+Asks the endpoint what became of `<HASH>` and settles the wallet's record of it. This is the way out of `submission.tx_timeout`.
+
+| Flag / arg | Meaning | Default |
+|---|---|---|
+| `<HASH>` (positional) | Transaction hash, 64 lowercase hex — `error.details.tx_hash` from the timed-out submission | — |
+| `--profile <NAME>` | Profile whose records and spending window are settled | `STELLAR_AGENT_PROFILE`, else `default` |
+| `--output <FORMAT>` | `json` or `table` | `json` |
+
+Returns `{tx_hash, chain_status, ledger, record}`. `SUCCESS` records the spend and writes the value-action row the submission never got to write; `FAILED` releases the reservation; `NOT_FOUND` releases it only when the transaction can no longer apply (its sequence has been consumed, or its time bound has passed) and otherwise leaves the record standing. The verb is repeatable: a submission already accounted for gets no second row.
+
+Writing the settled row needs the audit writer's exclusive lock, so while a `stellar-agent-mcp` server is running the verb refuses with `audit.writer_locked`. Stop the server, reconcile, start it again.
+
+### `tx receipt clear <ENVELOPE_HASH> --acknowledge [flags]`
+
+Releases a submission record reconciliation cannot settle. Two record states qualify: `pending`, whether or not the submission was sent, and `ambiguous`. A record the network has answered for is refused with `submission.not_clearable`.
+
+The verb asks the endpoint what became of the transaction before it accepts. A `SUCCESS` or `FAILED` answer is refused, and so is an endpoint that cannot answer at all: a transaction still in flight is the case an operator would be wrong about. The record state is checked first, so a clear the verb refuses releases nothing and writes no row.
+
+`--acknowledge` is required: releasing the reservation states that the transaction did not move value, which the wallet cannot establish. Without the flag nothing is written and the exit code is 1. The receipt is marked `cleared_by_operator`, not removed, and an audit row names the state the clear replaced.
 
 ---
 
