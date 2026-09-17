@@ -25,6 +25,7 @@
 //! - `"skipped: Friendbot funding failed for effect target"` — same.
 //!
 //! No balance / funding-threshold checks; existence/reachability only.
+//! Submission, confirmation, and assertion failures fail the test.
 //!
 //! # No committed secrets
 //!
@@ -204,7 +205,15 @@ mod live {
         // ── Call #1: submit at outer_fee=500 ─────────────────────────────────
         // CAP-15 minimum for 1 op, inner_fee=100:
         //   (1+1) * max(100, ceil(100/1)) = 200.
-        // outer_fee=500 > 200 ✓; 500 <= 10_000 (policy cap) ✓.
+        // outer_fee=500 exceeds 200 and is within the 10_000 policy cap.
+        // Anchor retention checks at the ledger observed immediately before
+        // submission so an indexing delay remains eligible for the 90-second poll.
+        let recorded_at_ledger = client
+            .get_health()
+            .await
+            .expect("testnet RPC must provide the submission ledger after funding")
+            .latest_ledger;
+        assert!(recorded_at_ledger > 0, "submission ledger must be non-zero");
         let r1 = submit_fee_bump_idempotent(
             &client,
             &inner_signed_xdr,
@@ -214,18 +223,12 @@ mod live {
             TESTNET_PASSPHRASE,
             &fee_payer_signer,
             &store,
-            0,
+            recorded_at_ledger,
             Duration::from_secs(90),
         )
         .await;
 
-        let sub1 = match r1 {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("skipped: first submit_fee_bump_idempotent failed: {e:?}");
-                return;
-            }
-        };
+        let sub1 = r1.expect("first fee-bump must confirm within the 90-second poll deadline");
 
         eprintln!(
             "call-1: fee-bump confirmed in ledger {}, outer_tx_hash {}...",
@@ -244,7 +247,7 @@ mod live {
             TESTNET_PASSPHRASE,
             &fee_payer_signer,
             &store,
-            0,
+            recorded_at_ledger,
             Duration::from_secs(90),
         )
         .await;

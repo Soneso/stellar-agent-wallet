@@ -70,23 +70,22 @@ fn every_audit_writer_open_registers_the_profile_path() {
     }
 }
 
-/// The only production caller of `default_audit_log_path_for` in this crate
-/// is the startup advisory in main.rs, which READS the per-profile default
-/// location without a loaded profile and never registers a writer for a
-/// real profile name.
+/// No production code in this crate derives an audit-log path from a profile
+/// name. Every reader, the startup advisory included, takes the path from the
+/// loaded profile's `audit_log_path`, so a profile configuring a non-default
+/// location is scanned and written at that location only.
 #[test]
-fn default_path_derivation_is_confined_to_the_startup_advisory() {
+fn no_production_code_derives_the_default_audit_path() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut hits = Vec::new();
     walk(&src, "default_audit_log_path_for(", &mut hits);
 
-    for (path, _source) in &hits {
-        assert!(
-            path.ends_with("src/main.rs"),
-            "{path}: default_audit_log_path_for must not be used outside the startup \
-             advisory — commands resolve the audit path from the loaded profile"
-        );
-    }
+    let paths: Vec<&str> = hits.iter().map(|(path, _)| path.as_str()).collect();
+    assert!(
+        paths.is_empty(),
+        "default_audit_log_path_for must not be called from production code; resolve \
+         the audit path from the loaded profile. Call sites: {paths:?}"
+    );
 }
 
 /// The two on-chain smart-account signing verbs acquire the audit writer as

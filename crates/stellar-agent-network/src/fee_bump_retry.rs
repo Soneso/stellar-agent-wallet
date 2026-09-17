@@ -119,8 +119,10 @@ const FEEBUMP_INNER_PREFIX: &str = "feebump-inner:";
 /// `TransactionEnvelope::Tx` (V1 only).  Non-V1 inner envelopes are rejected
 /// fail-closed by `build_and_sign_fee_bump` → [`crate::fee_bump::FeeBumpError::InnerNotV1`].
 ///
-/// `recorded_at_ledger` should be the current ledger sequence number at call
-/// time (used for retention-window awareness in the stale-pending poll path).
+/// `recorded_at_ledger` must be the current ledger sequence number at call
+/// time. The poll loop finalises `Ambiguous` when this anchor predates the
+/// RPC's retention floor while the transaction is still `NOT_FOUND`, so a zero
+/// anchor turns the first not-found poll into an ambiguous result.
 ///
 /// # Idempotency key
 ///
@@ -177,6 +179,7 @@ const FEEBUMP_INNER_PREFIX: &str = "feebump-inner:";
 /// let client = StellarRpcClient::new("https://soroban-testnet.stellar.org")?;
 /// let store = ReceiptStore::open("default").unwrap();
 /// let fee_payer = SoftwareSigningKey::new_from_bytes([1u8; 32]);
+/// let recorded_at_ledger = client.get_health().await?.latest_ledger;
 /// let result = submit_fee_bump_idempotent(
 ///     &client,
 ///     inner_xdr,
@@ -186,7 +189,7 @@ const FEEBUMP_INNER_PREFIX: &str = "feebump-inner:";
 ///     "Test SDF Network ; September 2015",
 ///     &fee_payer,
 ///     &store,
-///     0,          // recorded_at_ledger
+///     recorded_at_ledger,
 ///     Duration::from_secs(60),
 /// ).await?;
 /// println!("confirmed in ledger {}", result.ledger);

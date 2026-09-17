@@ -68,7 +68,7 @@ test-helpers = ["dep:p256"]
 #   cargo test -p stellar-agent-approval-remote --features testnet-acceptance \
 #     --test remote_approval_browser_testnet_acceptance -- --ignored
 # CI/dev-only; MUST NOT be enabled in any release-artefact feature set.
-testnet-acceptance = ["test-helpers", "stellar-agent-mcp/test-helpers"]
+testnet-acceptance = ["test-helpers", "stellar-agent-mcp/test-helpers", "stellar-agent-test-support/testnet-helpers"]
 # Gate the interactive operator-enrollment browser acceptance suite: a
 # headless Chromium driving the real loopback `operator_enroll` server. No
 # testnet/RPC dependency (unlike `testnet-acceptance` above) — only

@@ -622,6 +622,31 @@ mod tests {
 
     // ── The pre-flight's failure mapping ─────────────────────────────────────
 
+    #[test]
+    fn writer_locked_refusal_names_the_holder_and_recovery_without_a_path() {
+        let mapped = audit_writer_acquisition_error("default", &WriterError::FileLocked);
+        assert_eq!(mapped.code(), "audit.chain_key_unavailable");
+        let WalletError::Validation(ValidationError::AuditLogUnusable { profile, detail }) =
+            &mapped
+        else {
+            panic!("writer lock must map to AuditLogUnusable");
+        };
+        assert_eq!(profile, "default");
+        assert_eq!(
+            detail,
+            "audit.writer_locked: an active audit writer holds this profile's lock \
+            (for example, a running stellar-agent-mcp server); stop the process using \
+            this profile, retry the command, then restart the server if needed"
+        );
+        assert_eq!(
+            mapped.message(),
+            format!(
+                "profile 'default' cannot be audited: {detail}; signing refuses to proceed \
+             unaudited — see docs/maintainers/audit-log-recovery.md"
+            )
+        );
+    }
+
     /// Every acquisition failure class maps to an operator-facing message that
     /// names the actual condition.
     ///

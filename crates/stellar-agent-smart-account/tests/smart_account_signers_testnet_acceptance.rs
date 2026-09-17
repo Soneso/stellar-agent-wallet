@@ -160,7 +160,7 @@ fn fresh_deployer() -> (String, DeployerKeypair) {
 /// Funds a G-strkey via testnet Friendbot.
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = reqwest::get(&url)
+    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
         .await
         .expect("Friendbot HTTP must succeed");
     assert!(
