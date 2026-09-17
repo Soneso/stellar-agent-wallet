@@ -223,6 +223,30 @@ pub async fn run(args: &StatusArgs) -> i32 {
         }
     }
 
+    if let Some(record) = &receipt
+        && record.approval_nonce.is_some()
+    {
+        let approval_dir = match stellar_agent_core::profile::schema::default_approval_dir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                render_json(&Envelope::<()>::err_raw(
+                    "submission.record_unavailable",
+                    e.to_string(),
+                ));
+                return 1;
+            }
+        };
+        if let Err(e) = stellar_agent_network::submission_record::repair_approval_consumption(
+            &receipts,
+            &record.envelope_hash,
+            &approval_dir,
+            &resolved.name,
+        ) {
+            render_json(&Envelope::<()>::err(&e));
+            return 1;
+        }
+    }
+
     let chain = match client.get_transaction_status(&args.tx_hash).await {
         Ok(s) => s,
         Err(e) => {

@@ -465,7 +465,13 @@ What it changes:
 
 - `SUCCESS` — the transaction reached a ledger. The reservation becomes recorded spend, the receipt becomes `success`, and the value-action row the submission never got to write is appended. Running the verb again appends no second row.
 - `FAILED` — the transaction applied and failed. The reservation is released and the receipt records the failure.
-- `NOT_FOUND` — the endpoint has no record of it. The reservation is released only when the transaction can no longer apply: its sequence has been consumed, or its time bound has passed. Otherwise it can still apply and the record stands; run the verb again later.
+- `NOT_FOUND` — the endpoint has no record of it. Within the retention window, an expired time bound permits release. A consumed sequence requires a second transaction lookup: `SUCCESS` records the spend, `FAILED` releases it, and a second `NOT_FOUND` permits release. Otherwise the record stands; run the verb again later.
+
+Automatic reconciliation applies the same chain and retention checks when the
+receipts file is absent. A definitive chain answer restores the receipt's
+transaction identity from its reservation.
+Status also completes any approval-consumption write owed by a sent receipt.
+The receipt holds that approval against reuse until the write succeeds.
 
 A submission whose ledger has fallen outside the endpoint's retention window can
 never be settled this way. The verb reports it as `ambiguous` with

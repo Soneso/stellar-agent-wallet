@@ -330,6 +330,8 @@ pub struct TimelockExecuteArgs<'a> {
     /// to skip the hash round-trip for non-Ready ops. Pass `None` when no prior
     /// ID is available; state check is deferred to after hash derivation.
     pub expected_operation_id: Option<&'a TimelockOperationId>,
+    /// Records an execution's signed transaction and settles its outcome.
+    pub submission_recorder: Option<&'a dyn stellar_agent_network::SubmissionRecorder>,
 }
 
 // ── Salt derivation ───────────────────────────────────────────────────────────
@@ -1586,6 +1588,7 @@ pub async fn schedule_upgrade(
             network_passphrase,
             timeout: std::time::Duration::from_secs(60),
             op_label: "timelock_schedule",
+            submission_recorder: None,
         },
     )
     .await
@@ -1817,6 +1820,7 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
             network_passphrase,
             timeout: std::time::Duration::from_secs(60),
             op_label: "timelock_cancel",
+            submission_recorder: None,
         },
     )
     .await
@@ -1944,6 +1948,7 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
         audit_writer,
         request_id,
         expected_operation_id,
+        submission_recorder,
     } = args;
 
     // Pre-check operation state cross-RPC before submitting.
@@ -2276,10 +2281,15 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
             network_passphrase,
             timeout: std::time::Duration::from_secs(60),
             op_label: "timelock_execute",
+            submission_recorder,
         },
     )
     .await
     .map_err(|e| {
+        if matches!(e, SaError::SubmissionUnresolved { .. }) {
+            return e;
+        }
+
         let reason = format!("{e}");
         let classified = classify_execute_error(&reason);
         SaError::TimelockExecuteFailed {

@@ -745,23 +745,6 @@ pub async fn submit_signed_invoke(
             });
         }
 
-        // Defence-in-depth: verify the bundle descriptor count matches the
-        // number of auth_rule_ids (each inner needs its own rule context).
-        // A mismatch here surfaces a caller construction error before any RPC I/O.
-        if !mc.bundle_descriptors.is_empty()
-            && mc.bundle_descriptors.len() != args.auth_rule_ids.len()
-        {
-            return Err(SaError::MulticallFailed {
-                phase: "build",
-                redacted_reason: format!(
-                    "MulticallCheck bundle_descriptors.len()={} != auth_rule_ids.len()={}",
-                    mc.bundle_descriptors.len(),
-                    args.auth_rule_ids.len(),
-                ),
-                post_submit_kind: None,
-            });
-        }
-
         // (a) Wasm-hash 4-way equality: fetch on-chain hashes from both RPCs and
         // compare against the registry-recorded SHA and MULTICALL_WASM_SHA256.
         let primary_hash = crate::multicall::fetch_wasm_hash_via_rpc(
@@ -882,6 +865,22 @@ pub async fn submit_signed_invoke(
             .sum::<usize>()
     }
     let invocation_context_count = count_invocation_contexts(&prepared_entry.root_invocation);
+
+    // A multicall's authorization rules follow the simulated invocation tree.
+    // A single rule expands across that tree; an explicit list must cover it.
+    if args.multicall_check.is_some()
+        && args.auth_rule_ids.len() != 1
+        && args.auth_rule_ids.len() != invocation_context_count
+    {
+        return Err(SaError::MulticallFailed {
+            phase: "build",
+            redacted_reason: format!(
+                "authorization rule count {} does not cover {invocation_context_count} invocation contexts",
+                args.auth_rule_ids.len(),
+            ),
+            post_submit_kind: None,
+        });
+    }
 
     // Soroban-RPC's simulateTransaction returns signature_expiration_ledger = 0
     // (placeholder). Overwrite with latest_ledger + AUTH_VALIDITY_LEDGERS before
@@ -1368,7 +1367,7 @@ pub async fn submit_signed_invoke(
 /// next step is to reconcile a transaction hash, and a generic deployment
 /// failure would send it to rebuild and re-submit instead. Every other failure
 /// is a deployment failure at the submit phase, as before.
-fn map_submit_error(
+pub(crate) fn map_submit_error(
     error: &stellar_agent_core::error::WalletError,
     op_label: &'static str,
     signed_xdr: &str,

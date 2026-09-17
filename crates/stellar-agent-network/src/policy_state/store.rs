@@ -50,7 +50,7 @@ const WIRE_VERSION_MAX: u32 = 2;
 ///
 /// A value verb runs a pass before its policy gate, so this bounds the extra
 /// round trips it can spend: at most this many reservations, each costing at
-/// most two reads.
+/// most three transaction/account reads, plus one shared retention query.
 pub const RECONCILE_BUDGET: usize = 5;
 
 /// How long a reservation must stand before a reconciliation pass looks at it.
@@ -850,32 +850,12 @@ impl PersistedWindowStore {
         now_ms: u64,
         oldest_ledger: &mut Option<u32>,
     ) -> Result<Settlement, WindowStoreError> {
-        // A reservation whose receipt is gone is one no verb can address: the
-        // operator clear refuses it for want of a record, and the age prune
-        // leaves a pending record alone. It arises when a submission that was
-        // never sent unwound and the release step failed while the receipt
-        // removal succeeded.
-        //
-        // Nothing was sent, so the only question is whether the transaction it
-        // reserved for can still apply. That is the same exactness the release
-        // rule rests on everywhere else: a consumed sequence or a passed time
-        // bound says it cannot, and the endpoint has nothing to add.
-        //
-        // Only a receipt the store positively reports as absent takes that
-        // branch. A store that cannot be read has not said the receipt is
-        // gone, and treating a read failure as absence would release exactly
-        // the reservations this pass exists to protect: a landed-but-timed-out
-        // submission sits at a consumed sequence, which is the orphan
-        // branch's release condition. Every other failure in this module keeps
-        // the reservation, and so does this one.
+        // A missing receipt leaves the authenticated reservation as the
+        // submission identity. Its chain outcome and retention boundary still
+        // govern settlement. An unreadable receipt store keeps the hold.
         if let Some(store) = receipts {
             match store.get(&reservation.id) {
-                Ok(None) => {
-                    return self
-                        .settle_orphaned_reservation(profile, client, reservation, now_ms)
-                        .await;
-                }
-                Ok(Some(_)) => {}
+                Ok(_) => {}
                 Err(e) => {
                     tracing::debug!(
                         error = %e,
@@ -906,12 +886,35 @@ impl PersistedWindowStore {
             }
         };
 
+        if response.status == "NOT_FOUND" {
+            return self
+                .settle_not_found(
+                    profile,
+                    client,
+                    receipts,
+                    reservation,
+                    now_ms,
+                    oldest_ledger,
+                )
+                .await;
+        }
+        self.settle_chain_answer(profile, receipts, reservation, &response)
+    }
+
+    /// Applies a definitive transaction answer to the reservation and receipt.
+    fn settle_chain_answer(
+        &self,
+        profile: &Profile,
+        receipts: Option<&ReceiptStore>,
+        reservation: &WindowReservation,
+        response: &stellar_rpc_client::GetTransactionResponse,
+    ) -> Result<Settlement, WindowStoreError> {
         match response.status.as_str() {
             "SUCCESS" => {
                 self.confirm(profile, &reservation.id)?;
                 finalize_receipt(
                     receipts,
-                    &reservation.id,
+                    reservation,
                     ReceiptStatus::Success,
                     response.ledger,
                 );
@@ -926,68 +929,22 @@ impl PersistedWindowStore {
                     .to_owned();
                 finalize_receipt(
                     receipts,
-                    &reservation.id,
+                    reservation,
                     ReceiptStatus::Failed { code: code.clone() },
                     None,
                 );
                 Ok(Settlement::Released { code: Some(code) })
             }
-            "NOT_FOUND" => {
-                self.settle_not_found(
-                    profile,
-                    client,
-                    receipts,
-                    reservation,
-                    now_ms,
-                    oldest_ledger,
-                )
-                .await
-            }
             _ => Ok(Settlement::KeptPending),
         }
     }
 
-    /// Releases a reservation whose receipt no longer exists, once its
-    /// transaction can no longer apply.
-    ///
-    /// No receipt means nothing was sent under this reservation, so no
-    /// `getTransaction` round trip is needed and no receipt is written: the
-    /// record is removed outright rather than marked ambiguous. Until the
-    /// transaction becomes impossible the reservation stands, because a
-    /// replacement at the same sequence may still be in flight and the
-    /// operator's cap has to account for it.
-    async fn settle_orphaned_reservation(
-        &self,
-        profile: &Profile,
-        client: &crate::client::StellarRpcClient,
-        reservation: &WindowReservation,
-        now_ms: u64,
-    ) -> Result<Settlement, WindowStoreError> {
-        let now_secs = now_ms / 1_000;
-        if reservation.max_time > 0 && reservation.max_time <= now_secs {
-            self.release(profile, &reservation.id)?;
-            return Ok(Settlement::Released { code: None });
-        }
-
-        let account = match crate::account::fetch_account(client, &reservation.source, &[]).await {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    "window reconcile: source account fetch failed; the orphaned reservation stands"
-                );
-                return Ok(Settlement::KeptPending);
-            }
-        };
-        if account.sequence_number >= reservation.sequence {
-            self.release(profile, &reservation.id)?;
-            return Ok(Settlement::Released { code: None });
-        }
-
-        Ok(Settlement::KeptPending)
-    }
-
     /// The `NOT_FOUND` half of the release rule.
+    ///
+    /// A consumed sequence requires one extra bounded transaction query: the
+    /// reserved transaction can land between the first query and the account
+    /// read. Settling that answer preserves its debit when it consumed its own
+    /// sequence. Only a second `NOT_FOUND` permits sequence-based release.
     async fn settle_not_found(
         &self,
         profile: &Profile,
@@ -1017,7 +974,7 @@ impl PersistedWindowStore {
             && reservation.submission_ledger > 0
             && reservation.submission_ledger < floor
         {
-            finalize_receipt(receipts, &reservation.id, ReceiptStatus::Ambiguous, None);
+            finalize_receipt(receipts, reservation, ReceiptStatus::Ambiguous, None);
             return Ok(Settlement::RetentionExpired);
         }
 
@@ -1027,9 +984,8 @@ impl PersistedWindowStore {
             return self.release_as_ambiguous(profile, receipts, reservation);
         }
 
-        // Nor once the sequence it needs has been consumed. The endpoint would
-        // still remember this transaction, and does not report it, so whatever
-        // consumed that sequence was something else.
+        // A consumed sequence needs a fresh transaction answer to distinguish
+        // this submission landing from another submission using the sequence.
         let account = match crate::account::fetch_account(client, &reservation.source, &[]).await {
             Ok(a) => a,
             Err(e) => {
@@ -1041,7 +997,23 @@ impl PersistedWindowStore {
             }
         };
         if account.sequence_number >= reservation.sequence {
-            return self.release_as_ambiguous(profile, receipts, reservation);
+            let Ok(hash) = stellar_agent_core::hex::decode_hex32(&reservation.tx_hash) else {
+                return Ok(Settlement::KeptPending);
+            };
+            let response = match client.inner.get_transaction(&stellar_xdr::Hash(hash)).await {
+                Ok(response) => response,
+                Err(e) => {
+                    tracing::debug!(
+                        error = %crate::retry::truncate_error_display(&e),
+                        "window reconcile: confirmation query failed; reservation stands"
+                    );
+                    return Ok(Settlement::KeptPending);
+                }
+            };
+            if response.status == "NOT_FOUND" {
+                return self.release_as_ambiguous(profile, receipts, reservation);
+            }
+            return self.settle_chain_answer(profile, receipts, reservation, &response);
         }
 
         Ok(Settlement::KeptPending)
@@ -1061,7 +1033,7 @@ impl PersistedWindowStore {
         reservation: &WindowReservation,
     ) -> Result<Settlement, WindowStoreError> {
         self.release(profile, &reservation.id)?;
-        finalize_receipt(receipts, &reservation.id, ReceiptStatus::Ambiguous, None);
+        finalize_receipt(receipts, reservation, ReceiptStatus::Ambiguous, None);
         Ok(Settlement::Released { code: None })
     }
 
@@ -1434,14 +1406,31 @@ fn reservation_from_receipt(receipts: &ReceiptStore, id: &str) -> Option<WindowR
 /// handle.
 fn finalize_receipt(
     receipts: Option<&ReceiptStore>,
-    envelope_hash: &str,
+    reservation: &WindowReservation,
     status: ReceiptStatus,
     ledger: Option<u32>,
 ) {
     let Some(store) = receipts else {
         return;
     };
-    if let Err(e) = store.finalize(envelope_hash, status, ledger) {
+    let persist = || {
+        if store.get(&reservation.id)?.is_none() {
+            if !status.is_definitive_outcome() {
+                return Ok(());
+            }
+            store.try_begin(
+                &reservation.id,
+                &reservation.tx_hash,
+                &reservation.source,
+                reservation.sequence,
+                reservation.max_time,
+                reservation.submission_ledger,
+            )?;
+            store.mark_submitted(&reservation.id)?;
+        }
+        store.finalize(&reservation.id, status, ledger)
+    };
+    if let Err(e) = persist() {
         tracing::warn!(
             error = %e,
             "window reconcile: receipt finalize failed; the window file is settled and the \

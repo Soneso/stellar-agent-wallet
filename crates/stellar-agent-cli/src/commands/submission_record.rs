@@ -584,6 +584,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn multicall_timeout_preserves_full_hash_in_details() {
+        let tx_hash = "ab".repeat(32);
+        let envelope_hash = "cd".repeat(32);
+        let error = stellar_agent_smart_account::SaError::SubmissionUnresolved {
+            kind: stellar_agent_smart_account::SubmissionUnresolvedKind::Timeout,
+            message: "transaction 'abababab...abababab' was not confirmed within 2s".to_owned(),
+            tx_hash: Some(tx_hash.clone()),
+            envelope_hash: Some(envelope_hash.clone()),
+            timeout_seconds: Some(2),
+        };
+        let rendered = serde_json::to_value(
+            unresolved_from_sa(&error)
+                .expect("typed multicall timeout")
+                .envelope(),
+        )
+        .unwrap();
+        assert_eq!(rendered["error"]["code"], "submission.tx_timeout");
+        assert_eq!(rendered["error"]["details"]["tx_hash"], tx_hash);
+        assert_eq!(rendered["error"]["details"]["envelope_hash"], envelope_hash);
+        assert_eq!(rendered["error"]["details"]["timeout_seconds"], 2);
+        assert_eq!(
+            rendered["error"]["details"]["reconcile_with"],
+            RECONCILE_VERB
+        );
+        assert!(
+            !rendered["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(&tx_hash)
+        );
+    }
+
     /// Every other failure keeps the surface's own code.
     #[test]
     fn a_failure_that_moved_nothing_is_not_an_unresolved_submission() {

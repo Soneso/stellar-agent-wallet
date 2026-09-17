@@ -16,6 +16,10 @@
 # Environment:
 #   FILTER          only run suites whose "<crate>/<target>" contains this
 #                   substring (empty runs everything)
+#   STELLAR_AGENT_KEYRING_BACKEND
+#                   keyring backend for the spawned binary. Unset selects the
+#                   encrypted headless store with a key generated for this
+#                   run, so no suite reaches the machine's own keyring.
 #   PACE            seconds to sleep between suites (default 30)
 #   RETRY_COOLDOWN  seconds to sleep before the single retry (default 60)
 #
@@ -45,6 +49,25 @@ PACE="${PACE:-30}"
 RETRY_COOLDOWN="${RETRY_COOLDOWN:-60}"
 BROWSER_RETRY_COOLDOWN="${BROWSER_RETRY_COOLDOWN:-90}"
 FILTER="${FILTER:-}"
+
+# The suites spawn the real binary, which reads its audit keys, window-state
+# generation counters and tip anchors from the OS keyring. On macOS that is
+# the login Keychain, and an unsigned development build is a program the
+# Keychain has not seen before, so it asks the person at the machine for
+# access, once per item per build, and waits for an answer that an unattended
+# run never gives. The encrypted headless store needs no such permission.
+# An environment that already selects a backend keeps it: CI brackets the run
+# in gnome-keyring and sets nothing here.
+if [ -z "${STELLAR_AGENT_KEYRING_BACKEND:-}" ]; then
+  export STELLAR_AGENT_KEYRING_BACKEND=headless-env
+  # 32 random bytes, URL-safe base64, unpadded: the key format the headless
+  # store requires. It lives for this run only, so the store it protects is
+  # discarded with it.
+  STELLAR_AGENT_HEADLESS_KEYRING_KEY="${STELLAR_AGENT_HEADLESS_KEYRING_KEY:-$(
+    LC_ALL=C tr -dc 'A-Za-z0-9_-' < /dev/urandom | head -c 43
+  )}"
+  export STELLAR_AGENT_HEADLESS_KEYRING_KEY
+fi
 
 # Suites that launch a headless Chromium (see the module comment above for
 # which test within each suite actually drives the browser). Page-load

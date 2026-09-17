@@ -208,13 +208,58 @@ pub struct MulticallSubmitArgs<'a> {
     /// `submit_multicall_bundle` call.  All audit rows emitted in a single
     /// bundle submission share this `request_id` for forensic correlation.
     pub request_id: &'a str,
-    /// Durable-submission recorder.
-    ///
-    /// When `Some`, the bundle is recorded as sent with an unknown outcome
-    /// immediately before `sendTransaction`, and that record is settled
-    /// against what the network answered. `None` leaves the unrecorded
-    /// submit behaviour.
-    pub submission_recorder: Option<&'a dyn stellar_agent_network::SubmissionRecorder>,
+}
+
+/// Builds the durable record from the same bundle view the policy gate evaluated.
+fn build_bundle_recorder<'a>(
+    args: &MulticallSubmitArgs<'a>,
+    tool: &stellar_agent_core::policy::ToolDescriptor,
+    bundle: &stellar_agent_core::policy::v1::bundle::BundleView<'_>,
+) -> Result<stellar_agent_network::submission_record::WalletSubmissionRecorder<'a>, SaError> {
+    use stellar_agent_core::audit_log::schema::ValueLegRecord;
+    use stellar_agent_core::policy::v1::value::{ValueClass, value_class_for_inner};
+    use stellar_agent_core::profile::receipt::ReceiptStore;
+    use stellar_agent_network::policy_state::PersistedWindowStore;
+    use stellar_agent_network::submission_record::WalletSubmissionRecorder;
+
+    let unavailable = |message: String| SaError::SubmissionUnresolved {
+        kind: crate::error::SubmissionUnresolvedKind::RecordUnavailable,
+        message,
+        tx_hash: None,
+        envelope_hash: None,
+        timeout_seconds: None,
+    };
+    let profile_name = args.policy_engine.profile_name();
+    let receipts = ReceiptStore::open(profile_name)
+        .map_err(|e| unavailable(format!("submission receipt store unavailable: {e}")))?;
+    let now_ms = stellar_agent_core::timefmt::now_unix_ms()
+        .map_err(|e| unavailable(format!("submission clock unavailable: {e}")))?;
+    let entries = args
+        .policy_engine
+        .record_confirmed_bundle(tool, args.profile, bundle)
+        .map_err(|e| unavailable(format!("bundle accounting unavailable: {e}")))?;
+    let legs = bundle
+        .inners
+        .iter()
+        .flat_map(|inner| match value_class_for_inner(inner) {
+            ValueClass::Value(effects) => effects.legs().iter().map(ValueLegRecord::from).collect(),
+            _ => Vec::new(),
+        })
+        .collect();
+    Ok(WalletSubmissionRecorder::new(
+        args.profile,
+        profile_name,
+        "stellar_smart_account_multicall",
+        Some(args.chain_id.to_owned()),
+        legs,
+        entries,
+        receipts,
+        PersistedWindowStore::for_profile(profile_name),
+        args.audit_writer.clone(),
+        None,
+        args.request_id,
+        now_ms,
+    ))
 }
 
 // ── MulticallResult ───────────────────────────────────────────────────────────
@@ -1436,10 +1481,7 @@ pub async fn submit_multicall_bundle(
 
     // Build the MulticallCheck for the submit path.
     let multicall_check = MulticallCheck {
-        // Cloned (not moved): `descriptors` remains borrowed by `bundle_view`,
-        // which is read again after the submit confirms to record the
-        // policy window-state debits for the SAME descriptors the gate
-        // evaluated (single-derivation invariant).
+        // The recorder and trust-anchor check share the policy-gated descriptors.
         bundle_descriptors: descriptors.clone(),
         registry_entry_address: registry_entry.address.clone(),
         registry_entry_wasm_sha256: registry_entry.wasm_sha256.clone(),
@@ -1449,6 +1491,8 @@ pub async fn submit_multicall_bundle(
     use stellar_agent_core::smart_account::rule_id::ContextRuleId;
     let rule_id = ContextRuleId::from(args.rule_id);
     let auth_rule_ids = vec![rule_id];
+
+    let recorder = build_bundle_recorder(&args, &tool, &bundle_view)?;
 
     let submit_result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
@@ -1466,7 +1510,7 @@ pub async fn submit_multicall_bundle(
             .emit_observability_logs(true)
             .required_checks(&["multicall"])
             .multicall_check(multicall_check)
-            .maybe_submission_recorder(args.submission_recorder)
+            .submission_recorder(&recorder)
             .build(),
     )
     .await;
@@ -1474,6 +1518,7 @@ pub async fn submit_multicall_bundle(
     // ── Step 4: audit ─────────────────────────────────────────────────────────
 
     match submit_result {
+        Err(sa_err @ SaError::SubmissionUnresolved { .. }) => Err(sa_err),
         Err(ref sa_err) => {
             // Map SaError to a MulticallFailed phase.
             let phase = map_sa_error_to_multicall_phase(sa_err);
@@ -1600,51 +1645,6 @@ pub async fn submit_multicall_bundle(
                     rule_id = args.rule_id,
                     "multicall: audit emission failed post-submit (bundle landed on-chain)"
                 );
-            }
-
-            // ── Policy window-state recording (post-confirm, non-fatal) ──
-            //
-            // Records each matching inner's debit / call-count into the
-            // engine's in-memory state store (single-derivation invariant:
-            // the SAME bundle_view the policy gate evaluated), then persists
-            // the new entries to the shared on-disk window-state store so
-            // per_period_cap / rate_limit / bundle_per_period_cap /
-            // bundle_rate_limit criteria actually accumulate across
-            // dispatches. A failure here does NOT fail the (already
-            // confirmed, irreversible) submit — but it means the NEXT call's
-            // window total under-counts, so it is surfaced loudly.
-            match args
-                .policy_engine
-                .record_confirmed_bundle(&tool, args.profile, &bundle_view)
-            {
-                Ok(recorded) if !recorded.is_empty() => {
-                    let window_store =
-                        stellar_agent_network::policy_state::PersistedWindowStore::for_profile(
-                            args.policy_engine.profile_name(),
-                        );
-                    if let Err(e) = window_store.record_and_persist(args.profile, &recorded) {
-                        tracing::warn!(
-                            smart_account = %smart_account_redacted,
-                            rule_id = args.rule_id,
-                            error = ?e,
-                            "multicall: policy window-state persist failed post-confirm; \
-                             the next call's accumulated window total under-counts this bundle"
-                        );
-                    }
-                }
-                Ok(_) => {
-                    // No stateful criterion matched this rule — nothing to persist.
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        smart_account = %smart_account_redacted,
-                        rule_id = args.rule_id,
-                        error = %e,
-                        "multicall: policy window-state record_confirmed_bundle failed \
-                         post-confirm; the next call's accumulated window total under-counts \
-                         this bundle"
-                    );
-                }
             }
 
             Ok(MulticallResult {

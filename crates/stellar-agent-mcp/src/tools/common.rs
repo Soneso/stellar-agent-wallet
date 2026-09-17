@@ -1808,6 +1808,17 @@ pub(crate) async fn verify_attestation_gate(
         return Err(approval_consumed_error());
     }
 
+    // The submission receipt holds a spent approval while its tombstone is owed.
+    let receipts = stellar_agent_core::profile::receipt::ReceiptStore::open(&profile_name)
+        .map_err(|_| approval_required_indistinguishable())?;
+    if receipts
+        .find_by_approval_nonce(approval_nonce_str)
+        .map_err(|_| approval_required_indistinguishable())?
+        .is_some()
+    {
+        return Err(approval_consumed_error());
+    }
+
     // 6. Confirm envelope XDR hash matches the stored hash.
     //    Extract envelope_sha256_hex from the PaymentSimulated or ClaimSimulated
     //    arm; both bind a simulated classic-transaction envelope through the same

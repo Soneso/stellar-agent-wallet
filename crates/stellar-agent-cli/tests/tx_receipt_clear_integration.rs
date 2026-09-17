@@ -88,6 +88,10 @@ fn run_cli(home: &Path, args: &[&str]) -> (i32, Value) {
 /// Writes a persisted profile pointing at `rpc_url`, mints its audit key, and
 /// seeds a sent-but-unanswered submission receipt.
 fn fixture(home: &Path, rpc_url: &str) {
+    fixture_with_approval(home, rpc_url, None);
+}
+
+fn fixture_with_approval(home: &Path, rpc_url: &str, approval_nonce: Option<&str>) {
     let dir = home.join("profiles");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -125,9 +129,77 @@ fn fixture(home: &Path, rpc_url: &str) {
 
     let receipts = ReceiptStore::open_at(&home.join("receipts"), PROFILE).unwrap();
     receipts
-        .begin_submission(ENVELOPE_HASH, TX_HASH, SOURCE, 7, 0, 1_000)
+        .begin_submission_with_approval(ENVELOPE_HASH, TX_HASH, SOURCE, 7, 0, 1_000, approval_nonce)
         .unwrap();
     receipts.mark_submitted(ENVELOPE_HASH).unwrap();
+}
+
+#[tokio::test]
+async fn tx_status_completes_owed_approval_consumption_once() {
+    use stellar_agent_core::approval::{
+        ApprovalKind, ConsumedOutcome, PendingApproval, PendingApprovalStore,
+    };
+    let home = tempfile::TempDir::new().unwrap();
+    let rpc = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(FixedStatusRpc { status: "SUCCESS" })
+        .mount(&rpc)
+        .await;
+    let entry = PendingApproval::new_payment_pending(
+        "AAAAAgAAAAA=".to_owned(),
+        b"payment",
+        SOURCE.to_owned(),
+        50,
+        "XLM".to_owned(),
+        None,
+        100,
+        7,
+        stellar_agent_core::approval::process_uid_for_attestation().unwrap(),
+        60_000,
+    )
+    .unwrap();
+    let nonce = entry.approval_nonce.clone();
+    let approval_path = home
+        .path()
+        .join("approvals")
+        .join(format!("{PROFILE}.toml"));
+    {
+        let mut store = PendingApprovalStore::open(approval_path.clone()).unwrap();
+        store
+            .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())
+            .unwrap();
+    }
+    fixture_with_approval(home.path(), &rpc.uri(), Some(&nonce));
+    let receipts = ReceiptStore::open_at(&home.path().join("receipts"), PROFILE).unwrap();
+    assert!(
+        !receipts
+            .get(ENVELOPE_HASH)
+            .unwrap()
+            .unwrap()
+            .approval_consumed
+    );
+    for _ in 0..2 {
+        let (code, envelope) = run_cli(
+            home.path(),
+            &["tx", "status", TX_HASH, "--profile", PROFILE],
+        );
+        assert_eq!(code, 0, "{envelope}");
+        assert_eq!(envelope["data"]["chain_status"], "SUCCESS");
+    }
+    assert!(
+        receipts
+            .get(ENVELOPE_HASH)
+            .unwrap()
+            .unwrap()
+            .approval_consumed
+    );
+    let store = PendingApprovalStore::open(approval_path).unwrap();
+    assert!(matches!(
+        &store.get(&nonce).unwrap().kind,
+        ApprovalKind::Consumed { tx_hash, outcome: ConsumedOutcome::Confirmed, .. }
+            if tx_hash == TX_HASH
+    ));
 }
 
 /// The rows the profile's audit log holds.

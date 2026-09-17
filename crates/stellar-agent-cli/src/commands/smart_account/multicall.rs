@@ -420,25 +420,6 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         .await;
     }
 
-    let recorder = match crate::commands::submission_record::build_recorder(
-        crate::commands::submission_record::SubmitRecord {
-            profile: &profile,
-            profile_name: profile_name.clone(),
-            verb: "multicall",
-            tool: "stellar_smart_account_multicall",
-            chain_id: &chain_id,
-            effects: None,
-            audit: audit_writer.as_ref().map(Arc::clone),
-            now_ms,
-        },
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            render_json(&crate::commands::submission_record::error_envelope(&e, ""));
-            return 1;
-        }
-    };
-
     let submit_args = MulticallSubmitArgs {
         smart_account: &args.smart_account,
         rule_id: args.rule_id,
@@ -454,7 +435,6 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         fee,
         chain_id: &chain_id,
         request_id: &request_id,
-        submission_recorder: Some(&recorder),
     };
 
     match submit_multicall_bundle(submit_args, &registry).await {

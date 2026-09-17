@@ -36,6 +36,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Multicall reserves policy-sized bundle spend and writes its value legs before
+  submission. Confirmation settles that reservation once, and timeouts retain
+  the full transaction hash for reconciliation. Timelock execution writes a
+  submission receipt and pending audit row and preserves unresolved-submission
+  details.
+- Reconciliation checks the transaction again after observing a consumed source
+  sequence. A transaction confirmed during those reads keeps its counted spend.
+  Reservations with missing receipt files use the same chain and retention
+  checks, and confirmed outcomes restore the receipt identity.
+- Submission receipts durably hold the approval nonce until a definitive send
+  refusal releases it. The commit gate refuses a held approval while its
+  consumption is owed; transaction status retries the tombstone and records
+  completion. Receipt replacement also syncs the directory on Unix.
+- A multicall bundle of two or more inner calls is submitted. The submit path
+  required one authorization rule per inner call while multicall passes the one
+  rule the verb takes, so every bundle past a single call was refused as it was
+  built. The rule count is now checked against the simulated invocation tree,
+  which is what the authorization entries are expanded across.
+
 - A submission that lands but is not confirmed within the poll deadline is now
   recorded. It was recorded nowhere: every post-submit record sat in the
   success arm, so a timeout left no audit row, no spend against the operator's

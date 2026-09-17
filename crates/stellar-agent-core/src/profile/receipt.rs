@@ -452,6 +452,15 @@ pub struct SubmissionReceipt {
     /// remains a valid abandon candidate until `mark_submitted` flips it.
     #[serde(default = "receipt_submitted_default")]
     pub submitted: bool,
+
+    /// Approval reserved by this submission. Its presence prevents reuse even
+    /// when the approval-store tombstone is still owed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_nonce: Option<String>,
+
+    /// The approval store durably contains the terminal consumption state.
+    #[serde(default)]
+    pub approval_consumed: bool,
 }
 
 /// Serde default for [`SubmissionReceipt::submitted`].
@@ -514,6 +523,10 @@ pub enum BeginSubmissionOutcome {
     /// transaction per pair can apply, and the pending one may still be
     /// in flight. The carried receipt names the transaction to reconcile.
     DuplicateSequence(SubmissionReceipt),
+
+    /// Another submission holds this approval nonce. The caller must reconcile
+    /// that submission and must not spend the approval again.
+    DuplicateApproval(SubmissionReceipt),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -977,6 +990,7 @@ impl ReceiptStore {
             sequence,
             max_time,
             recorded_at_ledger,
+            None,
         )?;
 
         Ok(BeginOutcome::Winner)
@@ -1025,7 +1039,49 @@ impl ReceiptStore {
         max_time: u64,
         recorded_at_ledger: u32,
     ) -> Result<BeginSubmissionOutcome, ReceiptStoreError> {
+        self.begin_submission_with_approval(
+            envelope_hash,
+            tx_hash,
+            source,
+            sequence,
+            max_time,
+            recorded_at_ledger,
+            None,
+        )
+    }
+
+    /// Atomically reserves the submission identity and its approval nonce.
+    ///
+    /// The approval hold is durable before any bytes can leave. Concurrent
+    /// submissions using different source sequences still share this guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns a receipt-store error if the identity cannot be read or persisted.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the receipt identity and approval are persisted atomically"
+    )]
+    pub fn begin_submission_with_approval(
+        &self,
+        envelope_hash: &str,
+        tx_hash: &str,
+        source: &str,
+        sequence: i64,
+        max_time: u64,
+        recorded_at_ledger: u32,
+        approval_nonce: Option<&str>,
+    ) -> Result<BeginSubmissionOutcome, ReceiptStoreError> {
         let mut session = self.write_session()?;
+        if let Some(nonce) = approval_nonce
+            && let Some(existing) = session
+                .guard
+                .map
+                .values()
+                .find(|r| r.approval_nonce.as_deref() == Some(nonce))
+        {
+            return Ok(BeginSubmissionOutcome::DuplicateApproval(existing.clone()));
+        }
 
         if let Some(pending) = find_pending_for_pair(&session.guard, source, sequence) {
             return Ok(BeginSubmissionOutcome::DuplicateSequence(pending));
@@ -1043,9 +1099,78 @@ impl ReceiptStore {
             sequence,
             max_time,
             recorded_at_ledger,
+            approval_nonce,
         )?;
 
         Ok(BeginSubmissionOutcome::Recorded)
+    }
+
+    /// Finds the submission that holds an approval, including an owed tombstone.
+    ///
+    /// # Errors
+    ///
+    /// Returns a receipt-store error if the current file cannot be read.
+    pub fn find_by_approval_nonce(
+        &self,
+        nonce: &str,
+    ) -> Result<Option<SubmissionReceipt>, ReceiptStoreError> {
+        Ok(self
+            .all()?
+            .into_iter()
+            .find(|r| r.approval_nonce.as_deref() == Some(nonce)))
+    }
+
+    /// Acknowledges a durably written approval tombstone.
+    ///
+    /// # Errors
+    ///
+    /// Returns a receipt-store error if the receipt is absent or cannot be persisted.
+    pub fn mark_approval_consumed(&self, envelope_hash: &str) -> Result<(), ReceiptStoreError> {
+        self.acknowledge_approval_consumption(envelope_hash)
+    }
+
+    /// Records a definitive send refusal and releases its approval atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns a receipt-store error if the receipt is absent, settled, or cannot be persisted.
+    pub fn finalize_send_refusal(
+        &self,
+        envelope_hash: &str,
+        code: &str,
+    ) -> Result<(), ReceiptStoreError> {
+        let mut session = self.write_session()?;
+        let receipt = session.guard.map.get_mut(envelope_hash).ok_or(
+            ReceiptStoreError::InvalidTransition {
+                from: "absent",
+                to: "failed",
+            },
+        )?;
+        let status = ReceiptStatus::Failed {
+            code: code.to_owned(),
+        };
+        check_transition(&receipt.status, &status)?;
+        receipt.status = status;
+        receipt.ledger = None;
+        receipt.approval_nonce = None;
+        receipt.approval_consumed = false;
+        session.guard.rebuild_indexes();
+        persist_locked(&mut session.guard)
+    }
+
+    fn acknowledge_approval_consumption(
+        &self,
+        envelope_hash: &str,
+    ) -> Result<(), ReceiptStoreError> {
+        let mut session = self.write_session()?;
+        let receipt = session.guard.map.get_mut(envelope_hash).ok_or(
+            ReceiptStoreError::InvalidTransition {
+                from: "absent",
+                to: "approval_settled",
+            },
+        )?;
+        receipt.approval_consumed = true;
+        persist_locked(&mut session.guard)
     }
 
     /// Updates or inserts a terminal receipt (upsert semantics).
@@ -1121,6 +1246,8 @@ impl ReceiptStore {
                 prior_ledger: None,
                 reorg_pending_at_ledger: None,
                 submitted: true, // upsert on finalize: sendTransaction has already been called
+                approval_nonce: None,
+                approval_consumed: false,
             });
 
         session.guard.rebuild_indexes();
@@ -1520,6 +1647,10 @@ fn find_pending_for_pair(
 ///
 /// Persisting under the same lock hold means no reader sees an in-memory entry
 /// without the file also reflecting it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the receipt identity and approval are persisted atomically"
+)]
 fn insert_pending(
     guard: &mut MutexGuard<'_, StoreState>,
     envelope_hash: &str,
@@ -1528,6 +1659,7 @@ fn insert_pending(
     sequence: i64,
     max_time: u64,
     recorded_at_ledger: u32,
+    approval_nonce: Option<&str>,
 ) -> Result<(), ReceiptStoreError> {
     let receipt = SubmissionReceipt {
         envelope_hash: envelope_hash.to_owned(),
@@ -1541,6 +1673,8 @@ fn insert_pending(
         prior_ledger: None,
         reorg_pending_at_ledger: None,
         submitted: false,
+        approval_nonce: approval_nonce.map(str::to_owned),
+        approval_consumed: false,
     };
 
     guard.map.insert(envelope_hash.to_owned(), receipt);
@@ -1634,6 +1768,14 @@ fn persist_locked(guard: &mut MutexGuard<'_, StoreState>) -> Result<(), ReceiptS
         .map_err(|e| ReceiptStoreError::Io {
             path: guard.file_path.clone(),
             source: e.error,
+        })?;
+
+    #[cfg(unix)]
+    File::open(dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| ReceiptStoreError::Io {
+            path: dir.to_path_buf(),
+            source,
         })?;
 
     Ok(())
@@ -2486,6 +2628,8 @@ mod tests {
             prior_ledger: Some(1200),
             reorg_pending_at_ledger: Some(1210),
             submitted: true,
+            approval_nonce: None,
+            approval_consumed: false,
         };
 
         let json = serde_json::to_string(&original).unwrap();
@@ -2521,6 +2665,8 @@ mod tests {
             prior_ledger: None,
             reorg_pending_at_ledger: None,
             submitted: false,
+            approval_nonce: None,
+            approval_consumed: false,
         };
 
         let json = serde_json::to_string(&r).unwrap();
@@ -3358,5 +3504,99 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn approval_hold_survives_reopen_and_refuses_another_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReceiptStore::open_at(dir.path(), "approval-hold").unwrap();
+        assert!(matches!(
+            store
+                .begin_submission_with_approval(
+                    "first",
+                    &"a".repeat(64),
+                    "source",
+                    1,
+                    0,
+                    100,
+                    Some("approval"),
+                )
+                .unwrap(),
+            BeginSubmissionOutcome::Recorded
+        ));
+        store.mark_submitted("first").unwrap();
+        drop(store);
+        let store = ReceiptStore::open_at(dir.path(), "approval-hold").unwrap();
+        let receipt = store.find_by_approval_nonce("approval").unwrap().unwrap();
+        assert!(!receipt.approval_consumed);
+        assert!(matches!(
+            store
+                .begin_submission_with_approval(
+                    "second",
+                    &"b".repeat(64),
+                    "source",
+                    2,
+                    0,
+                    100,
+                    Some("approval"),
+                )
+                .unwrap(),
+            BeginSubmissionOutcome::DuplicateApproval(_)
+        ));
+        assert!(store.get("second").unwrap().is_none());
+        store.mark_approval_consumed("first").unwrap();
+        let reopened = ReceiptStore::open_at(dir.path(), "approval-hold").unwrap();
+        assert!(
+            reopened
+                .find_by_approval_nonce("approval")
+                .unwrap()
+                .unwrap()
+                .approval_consumed
+        );
+    }
+
+    #[test]
+    fn definitive_send_refusal_releases_approval_in_the_receipt_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReceiptStore::open_at(dir.path(), "approval-refusal").unwrap();
+        store
+            .begin_submission_with_approval(
+                "first",
+                &"a".repeat(64),
+                "source",
+                1,
+                0,
+                100,
+                Some("approval"),
+            )
+            .unwrap();
+        store.mark_submitted("first").unwrap();
+        store
+            .finalize_send_refusal("first", "submission.tx_malformed")
+            .unwrap();
+        let reopened = ReceiptStore::open_at(dir.path(), "approval-refusal").unwrap();
+        assert!(
+            reopened
+                .find_by_approval_nonce("approval")
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            reopened.get("first").unwrap().unwrap().status,
+            ReceiptStatus::Failed { .. }
+        ));
+        assert!(matches!(
+            reopened
+                .begin_submission_with_approval(
+                    "second",
+                    &"b".repeat(64),
+                    "source",
+                    1,
+                    0,
+                    100,
+                    Some("approval"),
+                )
+                .unwrap(),
+            BeginSubmissionOutcome::Recorded
+        ));
     }
 }

@@ -115,6 +115,8 @@ pub(crate) struct TimelockSubmitArgs<'a> {
     pub(crate) timeout: std::time::Duration,
     /// Human-readable operation label for error messages and logs.
     pub(crate) op_label: &'static str,
+    /// Records the signed execution before sending and settles its outcome.
+    pub(crate) submission_recorder: Option<&'a dyn stellar_agent_network::SubmissionRecorder>,
 }
 
 // ── Main submit function ──────────────────────────────────────────────────────
@@ -587,13 +589,10 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
         args.timeout,
         args.network_passphrase,
         None,
-        None,
+        args.submission_recorder,
     )
     .await
-    .map_err(|e| SaError::DeploymentFailed {
-        phase: "submit",
-        redacted_reason: format!("{} submission failed: {e}", args.op_label),
-    })?;
+    .map_err(|e| crate::submit::map_submit_error(&e, args.op_label, &final_signed_xdr))?;
 
     Ok(TimelockSubmitResult {
         return_val,
