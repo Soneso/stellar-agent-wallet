@@ -278,6 +278,27 @@ pub struct FriendbotResult {
     pub funding_confirmed_after_ms: u64,
 }
 
+/// Deadline for the funding request, including connection, headers, and body.
+const FRIENDBOT_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Issues the funding request under `timeout`, which bounds connection,
+/// response headers, and response body consumption alike.
+///
+/// The deadline is a parameter so the bound can be exercised without waiting
+/// out the production one; [`fund_with_friendbot`] supplies
+/// [`FRIENDBOT_REQUEST_TIMEOUT`].
+async fn friendbot_request(
+    url: &str,
+    timeout: Duration,
+) -> Result<reqwest::Response, reqwest::Error> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()?
+        .get(url)
+        .send()
+        .await
+}
+
 /// Upper bound on the number of `fetch_account` polls after a successful
 /// Friendbot HTTP response, before [`fund_with_friendbot`] gives up and
 /// reports [`NetworkError::FriendbotFundingNotConfirmed`].
@@ -435,14 +456,17 @@ pub async fn fund_with_friendbot(
         "fund_with_friendbot: GET {friendbot_url}",
     );
 
-    let response = reqwest::get(&url).await.map_err(|e| {
+    let transport_error = |e: reqwest::Error| {
         WalletError::Network(NetworkError::RpcUnreachable {
             url: redact_url_authority(friendbot_url),
             // redact_rpc_error strips any URL authority (including userinfo)
             // that reqwest may embed in the transport-error Display.
             reason: redact_rpc_error(&e.to_string()),
         })
-    })?;
+    };
+    let response = friendbot_request(&url, FRIENDBOT_REQUEST_TIMEOUT)
+        .await
+        .map_err(transport_error)?;
 
     if !response.status().is_success() {
         let status = response.status().as_u16();
@@ -505,6 +529,125 @@ mod tests {
     )]
 
     use super::*;
+
+    /// Accepts one request, answers with `headers`, then stalls forever.
+    async fn stalled_friendbot(headers: &'static [u8]) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://funding-user:funding-secret@{}/private-funding-path?addr=private-account",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let mut chunk = [0; 1024];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0 && request.len() + count <= 4096);
+                request.extend_from_slice(&chunk[..count]);
+            }
+            socket.write_all(headers).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        (url, server)
+    }
+
+    /// Bounds each deadline assertion from the outside, so a request that
+    /// carries no deadline fails here instead of running until the test
+    /// harness is killed.
+    const STALL_GUARD: Duration = Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn the_funding_deadline_bounds_stalled_headers() {
+        let (url, server) = stalled_friendbot(b"").await;
+        let error = tokio::time::timeout(
+            STALL_GUARD,
+            friendbot_request(&url, Duration::from_millis(200)),
+        )
+        .await
+        .expect("the request deadline must bound stalled headers")
+        .expect_err("stalled headers must reach the deadline");
+        assert!(error.is_timeout(), "expected a deadline expiry: {error}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn the_funding_deadline_bounds_a_stalled_body() {
+        let (url, server) =
+            stalled_friendbot(b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\n{\"hash\":").await;
+        let error = tokio::time::timeout(STALL_GUARD, async {
+            friendbot_request(&url, Duration::from_millis(200))
+                .await
+                .expect("headers arrive before the deadline")
+                .text()
+                .await
+        })
+        .await
+        .expect("the request deadline must bound a stalled body")
+        .expect_err("a stalled body must reach the deadline");
+        assert!(error.is_timeout(), "expected a deadline expiry: {error}");
+        server.abort();
+    }
+
+    /// The deadline the production path supplies, pinned at its call site so
+    /// the bound the tests above exercise is the one funding actually carries.
+    #[test]
+    fn funding_carries_the_documented_deadline() {
+        assert_eq!(FRIENDBOT_REQUEST_TIMEOUT, Duration::from_secs(20));
+        // The boundary is the attribute on its own line: the token also
+        // appears inside a doc comment above, and `lines` reads alike on
+        // either line ending.
+        let production: Vec<&str> = include_str!("friendbot.rs")
+            .lines()
+            .take_while(|line| line.trim() != "#[cfg(test)]")
+            .collect();
+        assert_eq!(
+            production
+                .iter()
+                .filter(|line| {
+                    // Two needles, so an edit that rewrites the call site does
+                    // not rewrite what this test looks for.
+                    line.contains("friendbot_request(")
+                        && line.contains("FRIENDBOT_REQUEST_TIMEOUT")
+                })
+                .count(),
+            1,
+            "the funding request must carry the deadline constant"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_funding_request_reports_a_redacted_transport_error() {
+        let error = fund_with_friendbot(
+            "http://funding-user:funding-secret@127.0.0.1:1/private-funding-path",
+            "private-account",
+            "Test SDF Network ; September 2015",
+            "http://127.0.0.1:1",
+        )
+        .await
+        .expect_err("a refused connection must fail");
+        assert_eq!(error.code(), "network.rpc_unreachable");
+        let WalletError::Network(NetworkError::RpcUnreachable { url, reason }) = error else {
+            unreachable!()
+        };
+        assert_eq!(url, "http://127.0.0.1:1");
+        for secret in [
+            "http://",
+            "https://",
+            "funding-user",
+            "funding-secret",
+            "private-funding-path",
+            "private-account",
+            "addr=",
+        ] {
+            assert!(
+                !reason.contains(secret),
+                "transport reason must be redacted: {reason}"
+            );
+        }
+        assert!(!reason.is_empty());
+    }
 
     #[tokio::test]
     async fn mainnet_rejected_before_network_call() {

@@ -40,8 +40,8 @@ use std::sync::{Arc, Mutex};
 
 use stellar_agent_core::audit_log::schema::ValueLegRecord;
 use stellar_agent_core::audit_log::writer::AuditWriter;
-use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
-use stellar_agent_core::error::{SubmissionError, WalletError};
+use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision, WriterError};
+use stellar_agent_core::error::{SubmissionError, ValidationError, WalletError};
 use stellar_agent_core::profile::receipt::{
     BeginSubmissionOutcome, ReceiptStatus, ReceiptStore, ReceiptStoreError,
 };
@@ -368,10 +368,16 @@ impl<'a> WalletSubmissionRecorder<'a> {
                 "the audit writer mutex is poisoned, so the submission cannot be recorded",
             )
         })?;
-        guard.write_entry(entry).map_err(|e| {
-            record_unavailable(format!(
-                "the pending value-action row could not be appended: {e}"
-            ))
+        guard.write_entry(entry).map_err(|error| match error {
+            WriterError::TipAnchorMismatch { reason, .. } => {
+                WalletError::Validation(ValidationError::AuditTipAnchorMismatch {
+                    profile: self.profile_name.clone(),
+                    reason: reason.to_owned(),
+                })
+            }
+            other => record_unavailable(format!(
+                "the pending value-action row could not be appended: {other}"
+            )),
         })
     }
 

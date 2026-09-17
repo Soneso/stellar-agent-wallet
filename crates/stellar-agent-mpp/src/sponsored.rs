@@ -8,12 +8,13 @@ use sha2::{Digest as _, Sha256};
 use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
 use stellar_agent_network::{sep41::build_sep41_transfer_invoke, signing::Signer};
 use stellar_agent_sep43::signing::sign_soroban_auth_entry;
+use stellar_agent_xdr_limits::untrusted_decode_limits;
 use stellar_baselib::{
     account::{Account as BaselibAccount, AccountBehavior},
     transaction::TransactionBehavior,
     transaction_builder::{TransactionBuilder, TransactionBuilderBehavior},
 };
-use stellar_rpc_client::{Client, SimulateTransactionResponse};
+use stellar_rpc_client::{Client, SimulateHostFunctionResult, SimulateTransactionResponse};
 use stellar_strkey::Strkey;
 use stellar_xdr::{
     AccountId, ContractId, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization, HostFunction,
@@ -253,7 +254,7 @@ pub async fn prepare_sponsored(
 
     let response = rpc.simulate(&envelope).await?;
     validate_simulation_response(&response)?;
-    let mut results = response.results().map_err(|_error| simulation_error())?;
+    let mut results = decode_simulation_results(&response)?;
     if results.len() != 1 {
         return Err(simulation_error());
     }
@@ -395,9 +396,8 @@ pub async fn commit_sponsored(
     if resource_fee > MAX_RESOURCE_FEE_STROOPS {
         return Err(simulation_error());
     }
-    let soroban_data = response
-        .transaction_data()
-        .map_err(|_error| simulation_error())?;
+    let soroban_data: stellar_xdr::SorobanTransactionData =
+        decode_rpc_xdr(&response.transaction_data)?;
     let data_size = soroban_data
         .to_xdr(Limits::none())
         .map_err(|_error| simulation_error())?
@@ -465,6 +465,31 @@ fn invoke_operation(
     }
 }
 
+// Simulation responses expose encoded fields; each decode applies both wallet limits.
+fn decode_rpc_xdr<T: ReadXdr>(encoded: &str) -> Result<T, MppError> {
+    T::from_xdr_base64(encoded, untrusted_decode_limits(encoded.len()))
+        .map_err(|_error| simulation_error())
+}
+
+fn decode_simulation_results(
+    response: &SimulateTransactionResponse,
+) -> Result<Vec<SimulateHostFunctionResult>, MppError> {
+    response
+        .results
+        .iter()
+        .map(|result| {
+            Ok(SimulateHostFunctionResult {
+                auth: result
+                    .auth
+                    .iter()
+                    .map(|entry| decode_rpc_xdr(entry))
+                    .collect::<Result<_, _>>()?,
+                xdr: decode_rpc_xdr(&result.xdr)?,
+            })
+        })
+        .collect()
+}
+
 fn validate_simulation_response(response: &SimulateTransactionResponse) -> Result<(), MppError> {
     if response.error.is_some()
         || response.min_resource_fee == 0
@@ -488,7 +513,7 @@ fn validate_resimulation_auth(
     response: &SimulateTransactionResponse,
     expected: &[SorobanAuthorizationEntry],
 ) -> Result<(), MppError> {
-    let results = response.results().map_err(|_error| simulation_error())?;
+    let results = decode_simulation_results(response)?;
     let Some(result) = results.first() else {
         return Err(simulation_error());
     };
@@ -895,6 +920,97 @@ pub(crate) mod tests {
         .expect_err("mainnet must be refused");
         assert_eq!(error.code(), "mpp.network_forbidden");
         assert_eq!(rpc.calls.load(Ordering::SeqCst), 0);
+    }
+
+    fn deep_value() -> ScVal {
+        let mut value = ScVal::Void;
+        for _ in 0..600 {
+            value = ScVal::Vec(Some(vec![value].try_into().expect("one child")));
+        }
+        value
+    }
+
+    fn on_decode_fixture_stack(test: fn()) {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(test)
+            .expect("fixture thread")
+            .join()
+            .expect("decode assertion");
+    }
+
+    #[test]
+    fn simulation_result_decode_rejects_excess_depth() {
+        on_decode_fixture_stack(|| {
+            let response = SimulateTransactionResponse {
+                results: vec![stellar_rpc_client::SimulateHostFunctionResultRaw {
+                    auth: vec![],
+                    xdr: deep_value()
+                        .to_xdr_base64(Limits::none())
+                        .expect("fixture XDR"),
+                }],
+                ..Default::default()
+            };
+            let error =
+                decode_simulation_results(&response).expect_err("deep result must be refused");
+            assert_eq!(error.code(), "mpp.simulation_failed");
+        });
+    }
+
+    #[test]
+    fn simulation_auth_decode_rejects_excess_depth() {
+        on_decode_fixture_stack(|| {
+            let entry = SorobanAuthorizationEntry {
+                credentials: SorobanCredentials::Address(SorobanAddressCredentials {
+                    address: ScAddress::Contract(ContractId(Hash([1; 32]))),
+                    nonce: 7,
+                    signature_expiration_ledger: 1000,
+                    signature: deep_value(),
+                }),
+                root_invocation: SorobanAuthorizedInvocation {
+                    function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                        contract_address: ScAddress::Contract(ContractId(Hash([2; 32]))),
+                        function_name: "transfer".try_into().expect("function name"),
+                        args: VecM::default(),
+                    }),
+                    sub_invocations: VecM::default(),
+                },
+            };
+            let response = SimulateTransactionResponse {
+                results: vec![stellar_rpc_client::SimulateHostFunctionResultRaw {
+                    auth: vec![entry.to_xdr_base64(Limits::none()).expect("fixture XDR")],
+                    xdr: ScVal::Void.to_xdr_base64(Limits::none()).expect("void XDR"),
+                }],
+                ..Default::default()
+            };
+            let error = decode_simulation_results(&response)
+                .expect_err("deep authorization must be refused");
+            assert_eq!(error.code(), "mpp.simulation_failed");
+        });
+    }
+
+    #[test]
+    fn simulation_transaction_data_decode_rejects_excess_depth() {
+        on_decode_fixture_stack(|| {
+            let mut data = stellar_xdr::SorobanTransactionData::from_xdr_base64(
+                TRANSACTION_DATA,
+                Limits::none(),
+            )
+            .expect("fixture data");
+            data.resources.footprint.read_only = vec![stellar_xdr::LedgerKey::ContractData(
+                stellar_xdr::LedgerKeyContractData {
+                    contract: ScAddress::Contract(ContractId(Hash([3; 32]))),
+                    key: deep_value(),
+                    durability: stellar_xdr::ContractDataDurability::Persistent,
+                },
+            )]
+            .try_into()
+            .expect("one footprint key");
+            let encoded = data.to_xdr_base64(Limits::none()).expect("fixture XDR");
+            let error = decode_rpc_xdr::<stellar_xdr::SorobanTransactionData>(&encoded)
+                .expect_err("deep footprint must be refused");
+            assert_eq!(error.code(), "mpp.simulation_failed");
+        });
     }
 
     #[tokio::test]

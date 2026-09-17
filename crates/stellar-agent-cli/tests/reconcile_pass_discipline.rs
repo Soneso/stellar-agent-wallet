@@ -45,6 +45,11 @@ const VALUE_VERB_SOURCES: &[(&str, &str, usize)] = &[
         include_str!("../src/commands/smart_account/multicall.rs"),
         1,
     ),
+    (
+        "smart-account timelock execute",
+        include_str!("../src/commands/smart_account/timelock/execute.rs"),
+        1,
+    ),
 ];
 
 /// The call every value verb makes.

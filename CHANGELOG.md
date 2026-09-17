@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The submission recorder reports `audit.tip_anchor_mismatch` with the writer's reason and the reanchor recovery command when a pre-send audit append detects rollback.
+- Friendbot funding requests have a 20-second deadline covering connection, response headers, and response body.
 - The startup verifier advisory scans the selected profile's configured
   `audit_log_path`, including a non-default location.
 - Multicall reserves policy-sized bundle spend and writes its value legs before
