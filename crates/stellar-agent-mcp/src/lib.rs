@@ -63,6 +63,7 @@ pub mod transport;
 /// Public so per-tool dispatch sites can construct [`policy_adapter::AccountViewAdapter`]
 /// when populating `EvalContext.account_view`.  Per-tool wiring is deferred.
 pub mod policy_adapter;
+mod policy_advisory;
 
 /// In-process per-source-account confirmed-sequence floor and bounded
 /// catch-up poll (see the module docs for the propagation-lag problem this

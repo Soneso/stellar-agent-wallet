@@ -588,6 +588,15 @@ impl WalletServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         self.stellar_dex_quote(Parameters(args)).await
     }
+
+    /// Calls the trade handler for integration tests without the transport.
+    #[doc(hidden)]
+    pub async fn call_stellar_dex_trade(
+        &self,
+        args: DexTradeArgs,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.stellar_dex_trade(Parameters(args)).await
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

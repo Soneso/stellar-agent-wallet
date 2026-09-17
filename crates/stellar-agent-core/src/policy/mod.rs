@@ -1020,6 +1020,9 @@ fn validate_approval_url(candidate: &str) -> Result<(), ApprovalError> {
 // PolicyError
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Startup advisory code for a v1 policy with no transaction-status tool rule.
+pub const TRANSACTION_STATUS_UNMATCHED_ADVISORY_CODE: &str = "policy.transaction_status_unmatched";
+
 /// Errors returned by [`PolicyEngine::evaluate`] or by the policy subsystem
 /// (loader, signer, evaluator).
 ///

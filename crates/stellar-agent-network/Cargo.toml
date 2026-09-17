@@ -92,6 +92,8 @@ dbus-secret-service-keyring-store = { workspace = true, features = ["crypto-rust
 windows-native-keyring-store = { workspace = true }
 
 [dev-dependencies]
+syn = { workspace = true, features = ["visit"] }
+proc-macro2 = { workspace = true, features = ["span-locations"] }
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["wiremock-helpers", "test-helpers"] }
 # STELLAR_AGENT_HOME override on headless_keyring_path, for the
 # init_platform_keyring_store headless-dispatch test.

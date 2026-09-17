@@ -268,11 +268,15 @@ pub use crate::tools::claim::{StellarClaimArgs, StellarClaimCommitArgs};
 pub use crate::tools::common::check_duplicate_registrations;
 /// Re-exported for back-compat: argument types for `stellar_create_account`.
 pub use crate::tools::create_account::{StellarCreateAccountArgs, StellarCreateAccountCommitArgs};
-/// Re-exported for the MCP-tool-layer decimal-string wire acceptance test:
-/// argument type for `stellar_dex_quote`.
-pub use crate::tools::dex_trade::DexQuoteArgs;
+/// Re-exported for integration tests: argument types for `stellar_dex_quote`
+/// (the MCP-tool-layer decimal-string wire acceptance test) and
+/// `stellar_dex_trade` (the submission-record harness).
+pub use crate::tools::dex_trade::{DexQuoteArgs, DexTradeArgs};
 /// Re-exported for back-compat: argument type for `stellar_fee_stats`.
 pub use crate::tools::fee_stats::StellarFeeStatsArgs;
+/// Re-exported for integration tests: argument types for
+/// `stellar_defindex_vault_deposit` and `stellar_defindex_vault_withdraw`.
+pub use crate::tools::vault::{VaultDepositMcpArgs, VaultWithdrawMcpArgs};
 
 /// Re-exported for back-compat: argument type for `stellar_friendbot`.
 pub use crate::tools::friendbot::StellarFriendbotArgs;
@@ -498,6 +502,8 @@ fn build_policy_engine(
                 profile: profile_name.clone(),
                 source,
             })?;
+
+            crate::policy_advisory::warn_if_transaction_status_unmatched(&document, &profile_name);
 
             // Hydrate the persisted window-state store BEFORE constructing the
             // engine — see `stellar-agent-cli`'s `build_v1_policy_engine` for
