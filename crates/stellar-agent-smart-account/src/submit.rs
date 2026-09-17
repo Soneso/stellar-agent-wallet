@@ -43,8 +43,6 @@ use stellar_xdr::{
 };
 use tracing::info;
 
-use stellar_agent_core::policy::v1::bundle::InnerOpDescriptor;
-
 use crate::SaError;
 use crate::managers::auth_entry::{
     AuthorizationSimulation, PartialSorobanAuthorizationEntry, PreSubmitBudget,
@@ -73,18 +71,15 @@ use crate::signing::divergence::{
 /// passed through `SubmitInvokeArgs::multicall_check` to
 /// [`submit_signed_invoke`] Step 4.
 ///
-/// All four fields are read in Step 4:
+/// The fields supply the cross-RPC trust-anchor checks:
 /// - `registry_entry_address` + `registry_entry_wasm_sha256` → wasm-hash 4-way equality.
 /// - `network_passphrase` → defence-in-depth network mismatch check (ensures
 ///   the check was built for the same network as the submission).
-/// - `bundle_descriptors` → defence-in-depth bundle/rule-id count alignment check.
 ///
 /// # Field ownership
 ///
-/// Fields are owned (`Vec<InnerOpDescriptor>`, `String`) rather than borrowed
-/// so that `MulticallCheck` can outlive the intermediate `BundleView<'_>` that
-/// carries borrows into the policy engine.  `BundleView` is re-materialised
-/// on-demand at the comparator call site from these owned values.
+/// The contract address, registered WASM hash and network passphrase are
+/// owned strings so the submit path can retain the check across RPC calls.
 ///
 /// # Trust-anchor enforcement
 ///
@@ -98,12 +93,6 @@ use crate::signing::divergence::{
 /// - Secondary RPC on-chain hash
 #[derive(Debug)]
 pub struct MulticallCheck {
-    /// Ordered per-inner descriptors materialised from the validated bundle.
-    ///
-    /// Mirrors the `InnerOpDescriptor` shape from `policy::v1::bundle`; carried
-    /// owned so `BundleView` can be re-materialised on demand.
-    pub bundle_descriptors: Vec<InnerOpDescriptor>,
-
     /// C-strkey of the registered multicall router contract.
     ///
     /// Cross-checked against the primary and secondary RPC on-chain state at
@@ -1735,7 +1724,6 @@ mod tests {
     #[test]
     fn check_required_passes_when_multicall_check_present() {
         let mc = MulticallCheck {
-            bundle_descriptors: vec![],
             registry_entry_address: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                 .to_owned(),
             registry_entry_wasm_sha256:
@@ -1752,7 +1740,6 @@ mod tests {
     #[should_panic(expected = "multicall_check requires required_checks")]
     fn submit_invariant_panics_when_multicall_check_is_undeclared() {
         let mc = MulticallCheck {
-            bundle_descriptors: vec![],
             registry_entry_address: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                 .to_owned(),
             registry_entry_wasm_sha256:
@@ -1770,7 +1757,6 @@ mod tests {
     #[test]
     fn submit_invariant_holds_when_multicall_check_is_declared() {
         let mc = MulticallCheck {
-            bundle_descriptors: vec![],
             registry_entry_address: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                 .to_owned(),
             registry_entry_wasm_sha256:
@@ -1822,7 +1808,6 @@ mod tests {
     fn check_required_fails_on_unknown_check_name() {
         // multicall_check is Some — should not matter for an unrecognised name.
         let mc = MulticallCheck {
-            bundle_descriptors: vec![],
             registry_entry_address: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                 .to_owned(),
             registry_entry_wasm_sha256:

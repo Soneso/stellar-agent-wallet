@@ -28,7 +28,7 @@
 //! # Synthesis is keyed on PROVENANCE, never on the name
 //!
 //! [`load_profile_or_synthesize_testnet`] synthesises only when the operator
-//! named no profile at all — [`ProfileNameSource::Default`], the case the
+//! named no profile at all — [`stellar_agent_core::profile::name::ProfileNameSource::Default`], the case the
 //! zero-config quickstart exists for. A name that came from `--profile` or
 //! `STELLAR_AGENT_PROFILE` is honoured as given: if its file does not exist the
 //! loader's `NotFound` is returned as an error and the command refuses.

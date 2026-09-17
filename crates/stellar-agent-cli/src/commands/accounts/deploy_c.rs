@@ -524,7 +524,7 @@ where
 /// profile-agnostic deploy-c behavior for callers that do not opt into profile
 /// resolution.
 ///
-/// Delegates to [`AuditWriterRegistry::get_or_open`] so the same
+/// Delegates to [`AuditWriterRegistry::get_or_open_keyed`] so the same
 /// `Arc<Mutex<AuditWriter>>` is returned for every call with the same
 /// `profile_name` within the process, preventing multiple writers from racing
 /// to open the same file (single-writer invariant).

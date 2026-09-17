@@ -436,7 +436,7 @@ fn launch_browser(url: &str) -> bool {
 /// approval store, so this helper only ever sees a profile that already
 /// belongs to the requested name.
 ///
-/// Uses [`AuditWriterRegistry::get_or_open`] instead of `AuditWriter::open`
+/// Uses [`AuditWriterRegistry::get_or_open_keyed`] instead of `AuditWriter::open`
 /// directly so the single-writer invariant is enforced — if another call site
 /// in the same process holds the writer for this profile the same `Arc` is
 /// returned rather than a second open attempt that would receive `FileLocked`.

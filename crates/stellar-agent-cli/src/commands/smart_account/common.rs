@@ -303,7 +303,7 @@ pub(crate) fn network_to_chain_id(network: TargetNetwork) -> &'static str {
 ///
 /// This is the single `SignersManager::new(SignersManagerConfig::new(...))` call
 /// site in the CLI crate.  Callers obtain `audit_writer` and `audit_log_path`
-/// from [`open_audit_writer`] and pass them here; no I/O is performed inside
+/// from [`open_profile_audit_writer`] and pass them here; no I/O is performed inside
 /// this function.
 ///
 /// The argument count (8) mirrors [`SignersManagerConfig::new`] exactly; a

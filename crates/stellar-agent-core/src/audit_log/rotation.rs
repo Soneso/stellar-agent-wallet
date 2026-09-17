@@ -90,7 +90,7 @@ impl std::error::Error for SidecarResignError {}
 /// canonical body — the exact bytes [`sign_chain_root`] signs when the writer
 /// creates the file. Each sidecar is replaced atomically via a sibling temp
 /// file plus rename. The file chain is enumerated with the same
-/// [`collect_file_chain`] discovery `verify_log` uses; a referenced-but-missing
+/// `collect_file_chain` discovery `verify_log` uses; a referenced-but-missing
 /// rotated file is skipped (it is a chain gap `verify_log` reports separately).
 ///
 /// # Invariant (rotate-audit-key ordering)

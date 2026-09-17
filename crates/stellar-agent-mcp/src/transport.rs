@@ -2,12 +2,12 @@
 //!
 //! Provides `BoundedStdioTransport`, a wallet-owned `Transport<RoleServer>`
 //! implementation that enforces the 1 MiB max-line bound, and the startup
-//! functions that wire a `WalletServer` to it: [`build_server`] and [`serve`]
-//! as separate steps, with [`run`] composing them.
+//! functions that wire a `WalletServer` to it: [`crate::transport::build_server`] and [`crate::transport::serve`]
+//! as separate steps, with [`crate::transport::run`] composing them.
 //!
 //! It also holds the startup refusals that are decided from the loaded profile
-//! alone: [`mcp_disabled_refusal`] for the per-profile kill-switch and
-//! [`profile_name_mismatch_refusal`] for a profile file whose owner-key
+//! alone: [`crate::transport::mcp_disabled_refusal`] for the per-profile kill-switch and
+//! [`crate::transport::profile_name_mismatch_refusal`] for a profile file whose owner-key
 //! coordinate names a different profile than the one selected. The latter is
 //! re-exported from `stellar-agent-core`, where it is shared with the CLI so
 //! both surfaces reconcile a profile against its own name identically.
@@ -177,7 +177,7 @@ pub async fn run(profile: Profile) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Constructs the [`WalletServer`] for `profile` without starting the MCP loop.
 ///
-/// Split out from [`run`] so a caller can match the typed
+/// Split out from [`crate::transport::run`] so a caller can match the typed
 /// [`BuildRegistryError`] and translate it into an operator-facing recovery
 /// message. `run` erases the error into `Box<dyn Error>`, and the refusal class
 /// this seam exists for — an incomplete V1 ceremony — is a startup condition

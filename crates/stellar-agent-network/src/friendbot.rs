@@ -326,7 +326,7 @@ async fn verify_funding_landed(rpc_url: &str, account_id: &str) -> Result<Durati
     .await
 }
 
-/// [`verify_funding_landed`] with caller-supplied poll count and backoff
+/// `verify_funding_landed` with caller-supplied poll count and backoff
 /// schedule. Production goes through the wrapper above with the module
 /// constants; tests inject millisecond-scale schedules so the exhausted-window
 /// paths run without real multi-second sleeps. `backoff` must hold at least
@@ -373,7 +373,7 @@ async fn verify_funding_landed_with(
 /// via `reqwest`. The caller awaits the future; the CLI binary runs under
 /// `#[tokio::main]`. On a successful HTTP response, polls `rpc_url` via
 /// `fetch_account` until the funded account is queryable (see
-/// [`verify_funding_landed`]) — Friendbot's HTTP response confirms the
+/// `verify_funding_landed`) — Friendbot's HTTP response confirms the
 /// funding transaction was submitted, not that it has propagated to the
 /// queried RPC endpoint, and callers that build a follow-on transaction
 /// against an unpropagated account fail with a confusing `TxNoAccount`

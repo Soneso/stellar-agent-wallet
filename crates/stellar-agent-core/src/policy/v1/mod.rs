@@ -268,7 +268,7 @@ pub trait CounterpartyCacheView: Send + Sync {
     /// Defaults to `false` (fail-closed) so implementations predating this
     /// method — including test mocks that only override `has_resolved` — deny
     /// rather than silently pass an unverified account-domain binding.
-    /// [`stellar_agent_network::counterparty::CounterpartyCacheSnapshot`]
+    /// `stellar_agent_network::counterparty::CounterpartyCacheSnapshot`
     /// (the production implementation) overrides this with a real check
     /// against the cached `ACCOUNTS` list.
     fn is_account_listed(&self, home_domain: &str, account_id: &str) -> bool {
@@ -1357,7 +1357,7 @@ impl PolicyEngineV1 {
     }
 
     /// Records a CONFIRMED single-tx call's contribution into the shared
-    /// window-state store, for the SAME rule and criteria [`Self::evaluate_inner`]
+    /// window-state store, for the SAME rule and criteria `Self::evaluate_inner`
     /// resolved when the call was originally gated (recording side of the
     /// single-derivation invariant).
     ///

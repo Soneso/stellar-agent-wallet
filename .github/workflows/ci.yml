@@ -1,7 +1,7 @@
 name: CI
 
 # Offline gate suite for the workspace. Every push and pull request to main runs
-# format, lint, the offline test tier, unused-dependency detection, and the
+# format, lint, rustdoc, the offline test tier, unused-dependency detection, and the
 # license/advisory check. The live testnet-acceptance tests are intentionally
 # out of scope here: they hit real RPC and Friendbot and run from a separate,
 # deliberately paced workflow.
@@ -68,6 +68,22 @@ jobs:
       # workspace lints declared in the root Cargo.toml deny warnings; -D
       # warnings turns any remaining warning into a failure.
       - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  doc:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
+        with:
+          toolchain: stable
+      - name: Install libudev (Linux hidapi)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo doc --no-deps --all-features
 
   test:
     name: test (offline)

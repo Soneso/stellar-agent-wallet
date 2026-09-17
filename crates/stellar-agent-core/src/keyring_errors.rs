@@ -2,25 +2,25 @@
 //!
 //! Every keyring operation — entry construction (`Entry::new`), reads
 //! (`get_password`), and writes (`set_password`) — routes its
-//! `keyring_core::Error` through [`classify_keyring_error`] (or its
-//! `WalletError`-returning wrapper [`map_keyring_error`]) so that
+//! `keyring_core::Error` through [`crate::keyring_errors::classify_keyring_error`] (or its
+//! `WalletError`-returning wrapper [`crate::keyring_errors::map_keyring_error`]) so that
 //! environmental causes are reported precisely. Hand-rolling
 //! [`AuthError::KeyringNotFound`] around a failed keyring op misreports those
 //! causes — most notably a non-interactive Windows session, which must surface
 //! as [`AuthError::KeyringInteractiveSessionRequired`], not "not found".
 //!
-//! `stellar-agent-network` re-exports [`classify_keyring_error`] and
-//! [`map_keyring_error`] from `stellar_agent_network::keyring`, so existing
+//! `stellar-agent-network` re-exports [`crate::keyring_errors::classify_keyring_error`] and
+//! [`crate::keyring_errors::map_keyring_error`] from `stellar_agent_network::keyring`, so existing
 //! callers on that path are unaffected by the classifier living in core.
 
 use crate::error::{AuthError, WalletError};
 
 /// Maps a `keyring_core::Error` to a `WalletError`.
 ///
-/// Wire-level wrapper over [`classify_keyring_error`]; see there for the
+/// Wire-level wrapper over [`crate::keyring_errors::classify_keyring_error`]; see there for the
 /// classification contract. Callers that render a `WalletError` envelope use
 /// this form; callers with their own error domain wrap the [`AuthError`]
-/// from [`classify_keyring_error`] instead.
+/// from [`crate::keyring_errors::classify_keyring_error`] instead.
 #[must_use]
 pub fn map_keyring_error(e: &keyring_core::Error, service: &str) -> WalletError {
     WalletError::Auth(classify_keyring_error(e, service))

@@ -1,4 +1,4 @@
-//! [`HeadlessStore`] (`CredentialStoreApi`) and [`HeadlessCredential`]
+//! [`HeadlessStore`] (`CredentialStoreApi`) and `HeadlessCredential`
 //! (`CredentialApi`) — the file-backed keyring store `keyring_core::Entry`
 //! transparently routes to once [`crate::init_headless_store`] registers it
 //! as the process default.
@@ -10,7 +10,7 @@
 //! (temp-file + `sync_data` + rename + parent-directory fsync on Unix — the
 //! `PersistedWindowStore` / `stellar_agent_core::audit_log` sidecar-write
 //! precedent). Mutations are serialised ACROSS PROCESSES by an exclusive OS
-//! lock on a sidecar file (see [`acquire_store_lock`]), so a long-lived MCP
+//! lock on a sidecar file (see `acquire_store_lock`), so a long-lived MCP
 //! server writing (e.g. an HMAC-key rotation) cannot silently discard a
 //! concurrent CLI enrollment's write, or vice versa. Reads take no lock: the
 //! atomic rename guarantees a reader sees a complete former or current
@@ -256,7 +256,7 @@ fn sealed_from_wire_entry(entry: &WireEntry) -> KcResult<Sealed> {
 // Atomic file I/O
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Bound on lock-acquisition retries in [`acquire_store_lock`] (40 x 50ms =
+/// Bound on lock-acquisition retries in `acquire_store_lock` (40 x 50ms =
 /// a nominal 2s), sized for the store's write pattern: enrollments and
 /// rotations are one-shot operator actions, so genuine contention is brief.
 const STORE_LOCK_RETRY_ATTEMPTS: u32 = 40;

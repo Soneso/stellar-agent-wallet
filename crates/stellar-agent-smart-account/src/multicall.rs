@@ -1481,8 +1481,6 @@ pub async fn submit_multicall_bundle(
 
     // Build the MulticallCheck for the submit path.
     let multicall_check = MulticallCheck {
-        // The recorder and trust-anchor check share the policy-gated descriptors.
-        bundle_descriptors: descriptors.clone(),
         registry_entry_address: registry_entry.address.clone(),
         registry_entry_wasm_sha256: registry_entry.wasm_sha256.clone(),
         network_passphrase: args.network_passphrase.to_owned(),

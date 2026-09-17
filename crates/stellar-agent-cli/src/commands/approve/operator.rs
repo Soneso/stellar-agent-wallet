@@ -496,7 +496,7 @@ impl OperatorArgs {
     /// resolves it.
     ///
     /// `None` means the subcommand supplied no name, so
-    /// [`resolve_profile_name`](crate::common::resolve_profile_name) falls through
+    /// [`resolve_profile_name`] falls through
     /// to `STELLAR_AGENT_PROFILE` and then `"default"` — the same fall-through the
     /// subcommand itself performs. The startup advisory consumes this so it scans
     /// the audit log of the profile the command uses.

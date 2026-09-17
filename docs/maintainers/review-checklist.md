@@ -70,6 +70,21 @@ every reviewer approves with no blocking findings.
 - Dependencies are pinned to the latest stable version available at authoring
   time. No unused dependencies.
 
+### Dependency bumps
+
+- When updating `stellar-rpc-client`, inspect its `send_transaction` error
+  construction and re-check `is_definitive_send_refusal` in
+  `crates/stellar-agent-network/src/submit.rs`. The classifier depends on the
+  client's `No status yet:` wording to distinguish an unknown transport outcome
+  from a definitive endpoint refusal; that distinction controls reservation
+  retention and sequence release.
+- Run both real-client tests in
+  `crates/stellar-agent-network/tests/submission_record_integration.rs`:
+  `a_transport_failure_after_the_record_returns_the_timeout_shape` and
+  `a_refused_send_releases_the_reservation_and_frees_the_sequence`. Confirm that
+  transport failures retain the submission for reconciliation and definitive
+  refusals release the reservation and sequence.
+
 ### 6. Public API and dead code
 
 - The public API is minimal and coherent; unused public items are removed.

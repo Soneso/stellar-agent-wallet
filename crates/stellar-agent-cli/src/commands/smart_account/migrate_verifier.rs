@@ -309,13 +309,13 @@ pub struct MigrateVerifierResult {
 
 /// Builds a read-only [`SignersManager`] for the dry-run path.
 ///
-/// Opens the audit writer via [`open_audit_writer`] then constructs the manager
+/// Opens the audit writer via [`open_profile_audit_writer_read_only`] then constructs the manager
 /// via [`construct_signers_manager_from_fields`].  Does not resolve a signer source.
 ///
 /// # Errors
 ///
 /// - Audit-log directory creation or [`stellar_agent_core::audit_log::writer::AuditWriter::open`]
-///   fails → propagated from [`open_audit_writer`].
+///   fails → propagated from [`open_profile_audit_writer_read_only`].
 /// - [`stellar_agent_smart_account::managers::signers::SignersManager::new`] fails →
 ///   propagated from [`construct_signers_manager_from_fields`].
 fn dry_run_signers_manager(

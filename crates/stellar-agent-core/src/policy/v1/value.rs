@@ -15,7 +15,7 @@
 //! asset / a SAC C-strkey), and a destination is the raw G-/C-strkey (or a
 //! home-domain string) the counterparty criteria already compare. No parallel
 //! asset/counterparty value types are introduced; the canonical asset id is
-//! produced by [`asset_normalise`], which is the single normalisation both the
+//! produced by [`crate::policy::v1::value::asset_normalise`], which is the single normalisation both the
 //! derivation site and the criteria share so their comparisons cannot drift.
 
 use serde_json::Value;
@@ -156,7 +156,7 @@ pub struct ValueLeg {
     /// boundary.
     pub amount: Option<i128>,
     /// The canonical policy asset id: `"native"` for XLM, or `"CODE:GISSUER"`
-    /// / a SAC C-strkey for a non-native asset. Produced by [`asset_normalise`].
+    /// / a SAC C-strkey for a non-native asset. Produced by [`crate::policy::v1::value::asset_normalise`].
     pub asset: Option<String>,
     /// The counterparty this leg moves value to: a raw G-/C-strkey, or a
     /// home-domain string, matching what the counterparty criteria compare.
@@ -344,7 +344,7 @@ pub fn asset_normalise(asset: &str) -> String {
 /// (debit legs), `stellar_claim` / `stellar_trustline` (non-debit legs), and
 /// their two-phase `_commit` twins. The pay/create amount is resolved from the
 /// SAME resolved-key logic the value criteria use
-/// ([`resolve_pay_or_create_account_stroops`]); on the commit path `args` is
+/// (`resolve_pay_or_create_account_stroops`); on the commit path `args` is
 /// the HMAC-bound `authoritative_args`, so the derived leg is transitively bound
 /// to the signed envelope.
 ///

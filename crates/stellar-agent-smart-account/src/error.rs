@@ -1112,7 +1112,7 @@ pub enum SaError {
     },
 
     /// The audit-log writer could not be opened for a smart-account manager
-    /// (directory creation or [`AuditWriterRegistry::get_or_open`] failure).
+    /// (directory creation or [`AuditWriterRegistry`] failure).
     ///
     /// Distinct from [`SaError::NetworksTomlIo`]: the failing path here is the
     /// audit log (`audit/<profile>.jsonl`), never `networks.toml`.  Routing an
@@ -1125,7 +1125,7 @@ pub enum SaError {
     /// `io::Error` or `WriterError` rendered as a string (neither carries
     /// secret material).
     ///
-    /// [`AuditWriterRegistry::get_or_open`]: stellar_agent_core::audit_log::writer::AuditWriterRegistry::get_or_open
+    /// [`AuditWriterRegistry`]: stellar_agent_core::audit_log::writer::AuditWriterRegistry
     #[error("audit writer setup error at {path}: {detail}")]
     #[serde(rename = "sa.audit_writer_io")]
     AuditWriterIo {

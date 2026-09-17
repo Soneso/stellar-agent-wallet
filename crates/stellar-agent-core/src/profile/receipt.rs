@@ -46,7 +46,7 @@
 //!
 //! Cross-process, every mutating operation acquires an exclusive advisory lock
 //! on a sidecar file next to the store file (`<store>.json.lock`), mirroring
-//! [`crate::audit_log::lock::AuditWriterLock`] and
+//! `crate::audit_log::lock::AuditWriterLock` and
 //! `stellar_agent_network::policy_state::lock::WindowStoreLock`.  Contention
 //! is absorbed by a bounded retry ([`RECEIPT_LOCK_ATTEMPTS`] attempts,
 //! [`RECEIPT_LOCK_BACKOFF`] apart, the same settings the pending-approval
