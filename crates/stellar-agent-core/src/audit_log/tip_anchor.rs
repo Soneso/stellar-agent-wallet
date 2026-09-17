@@ -434,7 +434,7 @@ pub fn normalize_path_lexically(path: &Path) -> PathBuf {
 /// Derives the keyring account name that holds the anchor for `log_path`,
 /// given the profile's audit-key account as the base.
 ///
-/// The suffix is the first [`PATH_DIGEST_HEX_LEN`] hex characters of the
+/// The suffix is the first `PATH_DIGEST_HEX_LEN` hex characters of the
 /// SHA-256 of the lexically normalized path, so the anchor follows the FILE the
 /// profile points at: repointing `audit_log_path` starts a fresh anchor, which
 /// adopts the new file's tip.

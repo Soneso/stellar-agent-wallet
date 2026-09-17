@@ -343,6 +343,7 @@ mod tests {
         DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, process_uid_for_attestation,
     };
     use stellar_agent_core::profile::schema::default_approval_dir;
+    use stellar_agent_test_support::StellarAgentHomeGuard;
     use tempfile::TempDir;
 
     use super::*;
@@ -391,15 +392,13 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn list_run_empty_store_yields_empty_pending_and_exit_0() {
-        let dir = match default_approval_dir() {
-            Ok(d) => d,
-            Err(_) => return, // no approval dir available in this CI env
-        };
-        std::fs::create_dir_all(&dir).ok();
+        let home = TempDir::new().unwrap();
+        let _home_guard = StellarAgentHomeGuard::new(home.path());
+        let dir = default_approval_dir().unwrap();
+        assert_eq!(dir, home.path().join("approvals"));
         let profile = "__stellar_agent_approve_test_list_empty";
         let path = dir.join(format!("{profile}.toml"));
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(dir.join(format!("{profile}.toml.lock"))).ok();
+        assert!(!path.exists());
 
         let args = ListArgs {
             profile: Some(profile.to_owned()),
@@ -413,15 +412,12 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn list_run_populated_store_reports_payment_and_rejected_entries() {
-        let dir = match default_approval_dir() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-        std::fs::create_dir_all(&dir).ok();
+        let home = TempDir::new().unwrap();
+        let _home_guard = StellarAgentHomeGuard::new(home.path());
+        let dir = default_approval_dir().unwrap();
+        assert_eq!(dir, home.path().join("approvals"));
         let profile = "__stellar_agent_approve_test_list_populated";
         let path = dir.join(format!("{profile}.toml"));
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(dir.join(format!("{profile}.toml.lock"))).ok();
 
         let now_ms = timefmt::now_unix_ms().unwrap();
         {
@@ -457,15 +453,12 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn list_run_excludes_expired_unless_include_expired() {
-        let dir = match default_approval_dir() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-        std::fs::create_dir_all(&dir).ok();
+        let home = TempDir::new().unwrap();
+        let _home_guard = StellarAgentHomeGuard::new(home.path());
+        let dir = default_approval_dir().unwrap();
+        assert_eq!(dir, home.path().join("approvals"));
         let profile = "__stellar_agent_approve_test_list_expired_filter";
         let path = dir.join(format!("{profile}.toml"));
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(dir.join(format!("{profile}.toml.lock"))).ok();
 
         let now_ms = timefmt::now_unix_ms().unwrap();
         {

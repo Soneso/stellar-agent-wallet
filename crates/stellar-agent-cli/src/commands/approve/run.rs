@@ -769,7 +769,7 @@ mod tests {
     };
     use stellar_agent_core::error::AuthError;
     use stellar_agent_core::profile::schema::KeyringEntryRef;
-    use stellar_agent_test_support::keyring_mock;
+    use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
     use tempfile::TempDir;
 
     use super::*;
@@ -867,8 +867,12 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn run_with_no_pending_returns_exit_1() {
-        // Uses the real approval dir; the nonce is unique so the entry
-        // is absent by design.  Exit code must be 1.
+        let home = TempDir::new().unwrap();
+        let _home_guard = StellarAgentHomeGuard::new(home.path());
+        assert_eq!(
+            default_approval_dir().unwrap(),
+            home.path().join("approvals")
+        );
         keyring_mock::install().unwrap();
         let args = RunArgs {
             id: Some("__stellar_agent_approve_test_not_found_nonce123".to_owned()),
@@ -898,14 +902,13 @@ mod tests {
     // `approval_store_open_error` now lives in `common.rs` and is tested there.
 
     // ── Full run with mock profile+store (--yes path) ─────────────────────────
-    // These tests exercise the run() function end-to-end against a real temp
-    // store directory.  Because run() calls default_approval_dir() we need to
-    // test via a profile that's non-existent (to exercise the error paths) or
-    // via direct store helper tests.
+    // Command tests resolve profiles and approvals under a temporary home.
 
     #[tokio::test]
     #[serial]
     async fn run_missing_id_arg_returns_exit_1() {
+        let home = TempDir::new().unwrap();
+        let _home_guard = StellarAgentHomeGuard::new(home.path());
         keyring_mock::install().unwrap();
         let args = RunArgs {
             id: None,
@@ -919,6 +922,8 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn run_empty_id_arg_returns_exit_1() {
+        let home = TempDir::new().unwrap();
+        let _home_guard = StellarAgentHomeGuard::new(home.path());
         keyring_mock::install().unwrap();
         let args = RunArgs {
             id: Some(String::new()),

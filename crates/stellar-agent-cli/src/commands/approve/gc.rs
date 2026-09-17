@@ -179,6 +179,7 @@ mod tests {
     use stellar_agent_core::approval::process_uid_for_attestation;
     use stellar_agent_core::approval::{DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore};
     use stellar_agent_core::profile::schema::default_approval_dir;
+    use stellar_agent_test_support::StellarAgentHomeGuard;
     use tempfile::TempDir;
 
     use super::*;
@@ -243,16 +244,19 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn gc_nonexistent_profile_creates_store_and_exits_0() {
+        let home = TempDir::new().unwrap();
+        let _home_guard = StellarAgentHomeGuard::new(home.path());
+        assert_eq!(
+            default_approval_dir().unwrap(),
+            home.path().join("approvals")
+        );
         // When the profile store does not exist yet, open() creates it (empty).
         // GC on an empty store evicts 0 entries and returns exit 0.
         let args = GcArgs {
             profile: Some("__stellar_agent_approve_test_gc_empty".to_owned()),
         };
         let code = run(args).await;
-        // If default_approval_dir() succeeds, exit 0.  If the dir cannot be
-        // determined (e.g. CI without home dir), the exit code is 1 — both are
-        // acceptable; we only assert it doesn't panic.
-        assert!(code == 0 || code == 1, "gc must not panic");
+        assert_eq!(code, 0, "gc on an empty store must succeed");
     }
 
     // ── Full gc run against a real temp dir (via custom approval dir) ─────────
@@ -263,26 +267,13 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn gc_run_with_real_store_evicts_expired_and_exits_0() {
-        // Create a temp dir, insert entries into a store, then run gc via a
-        // profile name that maps to that dir.
-        //
-        // We can only exercise this if default_approval_dir() is available.
-        let dir = match default_approval_dir() {
-            Ok(d) => d,
-            Err(_) => return, // no approval dir available in this CI env
-        };
-        std::fs::create_dir_all(&dir).ok();
+        let home = TempDir::new().unwrap();
+        let _home_guard = StellarAgentHomeGuard::new(home.path());
+        let dir = default_approval_dir().unwrap();
+        assert_eq!(dir, home.path().join("approvals"));
 
         let profile = "__stellar_agent_approve_test_gc_run";
         let path = dir.join(format!("{profile}.toml"));
-
-        // Remove any stale store file from a previous test run (e.g. one written
-        // with an older schema that has `tty_user_id` instead of `process_uid`).
-        // Ignore errors: if the file doesn't exist, that's fine.
-        std::fs::remove_file(&path).ok();
-        // Also remove the advisory lock file.
-        let lock_path = dir.join(format!("{profile}.toml.lock"));
-        std::fs::remove_file(&lock_path).ok();
 
         {
             let mut store = PendingApprovalStore::open(path.clone()).unwrap();

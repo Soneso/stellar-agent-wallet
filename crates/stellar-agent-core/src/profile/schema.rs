@@ -191,7 +191,7 @@ impl KeyringEntryRef {
     ///
     /// This is the only writer of the coordinate both binaries invert to
     /// recover a profile's own name, so the prefix comes from
-    /// [`OWNER_KEY_SERVICE_PREFIX`](crate::profile::name::OWNER_KEY_SERVICE_PREFIX)
+    /// [`OWNER_KEY_SERVICE_PREFIX`]
     /// rather than a local literal. The example below pins the resulting value,
     /// so a change to the constant surfaces here as a failing doctest rather
     /// than as profiles the reconciliation refuses.
@@ -649,15 +649,9 @@ pub struct Profile {
     /// Path to the structured audit-log file.
     ///
     /// When not set explicitly, [`ProfileBuilder::build`] resolves this via
-    /// [`default_audit_log_path`] — a single path shared across every
-    /// profile on the host (`<canonical_data_root>/audit.log`), NOT the
-    /// per-profile `<canonical_data_root>/audit/<profile>.jsonl` path
-    /// [`default_audit_log_path_for`] derives (used by call sites that key
-    /// audit-writer acquisition off an explicit profile name). This
-    /// contradicts the per-profile contract the rest of this schema assumes;
-    /// issue #89 tracks the redesign. Until then, an operator running
-    /// multiple profiles concurrently on the default path gets one shared
-    /// audit log unless `audit_log_path` is set explicitly per profile.
+    /// [`default_audit_log_path_for`] using the profile name, yielding
+    /// `<canonical_data_root>/audit/<profile>.jsonl` so each profile has its
+    /// own audit log.
     pub audit_log_path: PathBuf,
 
     /// Disables the MCP server when `true`.
@@ -1903,10 +1897,8 @@ pub fn default_policy_dir() -> Result<PathBuf, StateDirError> {
 /// `<canonical_data_root>/approvals` — see [`canonical_data_root`] for the
 /// per-platform root.
 ///
-/// This helper does not honour `STELLAR_AGENT_HOME`, unlike
-/// [`default_profile_dir`]/[`default_policy_dir`]/[`default_passkeys_dir`]/
-/// [`default_toolsets_dir`]/[`default_operator_approval_credentials_dir`] —
-/// the override surface is inconsistent across these helpers.
+/// In test builds or with `test-helpers`, [`canonical_data_root`] honours
+/// `STELLAR_AGENT_HOME`, placing approvals under `$STELLAR_AGENT_HOME/approvals`.
 ///
 /// # Errors
 ///

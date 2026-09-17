@@ -50,11 +50,11 @@ mod i128_decimal_str {
 
 /// Serializes/deserializes `Option<i128>` as an optional decimal string.
 ///
-/// The `Option`-aware sibling of [`i128_decimal_str`]: `None` serializes as
+/// The `Option`-aware sibling of `i128_decimal_str`: `None` serializes as
 /// JSON `null` (and is skipped entirely under `skip_serializing_if`), `Some(v)`
 /// as the decimal-string form. The same `Content`-buffering limitation that
 /// forbids a bare `i128` on an internally-tagged variant (see
-/// [`i128_decimal_str`]) applies to `Option<i128>`; routing through a string
+/// `i128_decimal_str`) applies to `Option<i128>`; routing through a string
 /// sidesteps it and preserves precision beyond ±2^53.
 mod i128_decimal_str_opt {
     use serde::{Deserialize, Deserializer, Serializer};
@@ -336,7 +336,7 @@ pub struct ValueLegRecord {
     /// Stroop amount; `None` when the leg carries no resolvable amount.
     /// Wire-encoded as an optional decimal string (`i128_decimal_str_opt`) —
     /// a bare `i128` cannot appear on an internally-tagged variant (see
-    /// [`i128_decimal_str`]).
+    /// `i128_decimal_str`).
     #[serde(
         with = "i128_decimal_str_opt",
         default,

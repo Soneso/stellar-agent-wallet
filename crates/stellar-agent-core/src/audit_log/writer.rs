@@ -13,8 +13,8 @@
 //! # Single-writer invariant
 //!
 //! An exclusive advisory lock is held on a **sidecar** lock file
-//! (`<log>.lock`, next to the log — see [`lock_sidecar_path`] and
-//! [`crate::audit_log::lock::AuditWriterLock`]) using
+//! (`<log>.lock`, next to the log — see `lock_sidecar_path` and
+//! `crate::audit_log::lock::AuditWriterLock`) using
 //! [`std::fs::File::lock`] (stable since Rust 1.89; exclusive by default).
 //! The log file itself is NEVER locked.  The lock is held for the entire
 //! lifetime of the [`AuditWriter`], including across every rotation — it is

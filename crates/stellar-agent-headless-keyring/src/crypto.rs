@@ -15,7 +15,7 @@
 //!   Manager, minus the interactive-logon-session requirement DPAPI
 //!   CurrentUser scope does not have.
 //!
-//! Both modes are tamper-evident: [`open`] returns [`CryptoError::SealFailed`]
+//! Both modes are tamper-evident: `open` returns [`CryptoError::SealFailed`]
 //! for a corrupted or tampered ciphertext rather than silently returning
 //! altered plaintext. XChaCha20-Poly1305 carries its own Poly1305 tag; DPAPI
 //! blobs are self-authenticating (`CryptUnprotectData` fails on a modified

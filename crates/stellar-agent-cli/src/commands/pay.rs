@@ -769,7 +769,7 @@ where
 /// signed or broadcast.
 ///
 /// Decodes `envelope_xdr` via the SAME decoder the MCP `stellar_pay_commit`
-/// path uses ([`decode_authoritative_args`]), fetches the account views the
+/// path uses ([`stellar_agent_core::decode_authoritative_args`]), fetches the account views the
 /// decoded fields need, and delegates the decision to
 /// [`dispatch_staged_pay_gate`] — the pure, network-free dispatch this
 /// function's tests exercise directly. Returns `Ok(effects)` on allow
@@ -869,7 +869,7 @@ async fn evaluate_staged_pay_policy(
 /// real (or absent) decode outcome.
 ///
 /// `decode_result` is the outcome of decoding the staged envelope via
-/// [`decode_authoritative_args`] under `"stellar_pay_commit"`. `Ok` evaluates
+/// [`stellar_agent_core::decode_authoritative_args`] under `"stellar_pay_commit"`. `Ok` evaluates
 /// the decoded fields through [`evaluate_value_moving_policy`] under the same
 /// tool name — the same rule-matching scope and wire codes the commit-phase
 /// MCP twin uses, so sizing comes from the ENVELOPE, not caller-supplied

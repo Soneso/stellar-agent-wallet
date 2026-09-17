@@ -9,8 +9,8 @@
 //! iteration count is a loop bound, a poll condition, or a caller-supplied
 //! list rather than a small fixed constant.
 //!
-//! [`SequentialRpcBudget`] computes ONE deadline once, at the top of the
-//! flow; [`bound_stage`] wraps each stage/iteration against that SAME
+//! [`crate::rpc_budget::SequentialRpcBudget`] computes ONE deadline once, at the top of the
+//! flow; [`crate::rpc_budget::bound_stage`] wraps each stage/iteration against that SAME
 //! deadline, so time already spent in an earlier stage shrinks the budget
 //! left for a later one, rather than each stage re-arming a fresh timeout.
 //! This mirrors `stellar-agent-smart-account`'s `PreSubmitBudget` /
@@ -52,11 +52,11 @@ impl SequentialRpcBudget {
     }
 }
 
-/// The shared [`SequentialRpcBudget`] elapsed before a stage completed.
+/// The shared [`crate::rpc_budget::SequentialRpcBudget`] elapsed before a stage completed.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("collective RPC-sequence budget of {total_secs}s elapsed during stage \"{stage}\"")]
 pub struct SequentialRpcBudgetElapsed {
-    /// The stage tag passed to [`bound_stage`] at the call site that timed out.
+    /// The stage tag passed to [`crate::rpc_budget::bound_stage`] at the call site that timed out.
     pub stage: &'static str,
     /// The [`SequentialRpcBudget::total`] the deadline was derived from.
     pub total_secs: u64,

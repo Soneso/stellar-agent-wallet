@@ -49,7 +49,7 @@
 //!   active file as two separate filesystem operations; a reader can observe
 //!   the directory in the microsecond-scale window between them, in which the
 //!   active path does not exist even though the log is not actually empty.
-//!   [`collect_files_newest_first`] tolerates this: when the active file is
+//!   `collect_files_newest_first` tolerates this: when the active file is
 //!   absent but rotated siblings are present, it re-scans the directory a
 //!   small bounded number of times (never indefinitely) WHILE the writer's
 //!   sidecar lock is observably held by a live writer (probed by
@@ -760,7 +760,7 @@ fn collect_files_newest_first(log_path: &Path) -> Result<Vec<PathBuf>, AuditLogI
 }
 
 /// Performs one directory scan, returning the active file first followed by
-/// rotated siblings newest-first. See [`collect_files_newest_first`] for the
+/// rotated siblings newest-first. See `collect_files_newest_first` for the
 /// scan-order contract; this function performs no retry.
 fn scan_files_newest_first(log_path: &Path) -> Result<Vec<PathBuf>, AuditLogIntegrityError> {
     let dir = log_path

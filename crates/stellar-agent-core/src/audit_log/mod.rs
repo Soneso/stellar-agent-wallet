@@ -79,8 +79,8 @@
 //! itself — see `audit_log::lock` and the "Single-writer invariant" section of
 //! `writer.rs` for why. A second process attempting to open the same profile
 //! receives [`crate::audit_log::WriterError::FileLocked`]. Because the log
-//! file itself carries no OS lock, readers ([`reader::AuditReader`],
-//! [`verify::verify_log`]) can scan it freely while a writer is alive, on
+//! file itself carries no OS lock, readers ([`crate::audit_log::reader::AuditReader`],
+//! [`crate::audit_log::verify::verify_log`]) can scan it freely while a writer is alive, on
 //! every platform.
 //!
 //! # Redaction discipline

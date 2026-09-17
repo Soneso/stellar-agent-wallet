@@ -2355,7 +2355,7 @@ impl AuditEntry {
     /// Emitted by `policy reset-window-state --profile <p>` after the
     /// persisted policy-window-state store is re-initialised to empty.
     /// `reason` is bounded to [`crate::audit_log::schema::RECORDED_STR_MAX`]
-    /// characters via [`crate::audit_log::schema::bound_recorded_str`]. Not
+    /// characters via `crate::audit_log::schema::bound_recorded_str`. Not
     /// policy-gated, so `policy_decision` is `Allow`; `chain_id` is absent —
     /// the reset is chain-independent.
     #[must_use]

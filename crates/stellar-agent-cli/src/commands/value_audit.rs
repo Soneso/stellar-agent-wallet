@@ -17,9 +17,8 @@
 //! value-moving signing verb calls BEFORE any signing key is touched or
 //! transaction submitted: it proves the audit writer is acquirable, refusing
 //! with `audit.chain_key_unavailable` if not. The verb then threads the
-//! returned writer into [`emit_value_action_submitted_row_with_writer`] /
-//! [`emit_value_audit_row_with_writer`] for the post-confirm row — no second
-//! acquisition, no re-acquisition race.
+//! returned writer into [`emit_value_audit_row_with_writer`] for the post-confirm
+//! row, reusing the acquired writer.
 //!
 //! [`emit_value_audit_row`] (acquire-then-write) remains for the one
 //! legitimately non-signing caller of this module
@@ -54,8 +53,7 @@ use stellar_agent_network::keyring::keyed_audit_access;
 /// Callers invoke this BEFORE any signing key is touched and BEFORE any
 /// transaction is submitted (see the module docs). On success, the returned
 /// writer MUST be reused for the verb's post-confirm emission
-/// ([`emit_value_action_submitted_row_with_writer`] /
-/// [`emit_value_audit_row_with_writer`]) rather than re-acquired.
+/// ([`emit_value_audit_row_with_writer`]) rather than re-acquired.
 ///
 /// This is the CLI twin of `stellar_agent_mcp::tools::value_audit::require_value_audit_writer`
 /// (crate-private there, so not directly linkable): the two implementations
@@ -162,11 +160,11 @@ fn audit_writer_open_failed(profile_name: &str) -> WalletError {
 /// in-memory zero-config synthesized profile (see
 /// [`crate::common::profile_access::load_profile_or_synthesize_testnet`]).
 ///
-/// - [`ProfileOrigin::Persisted`] delegates to [`require_value_audit_writer`]:
+/// - [`crate::common::profile_access::ProfileOrigin::Persisted`] delegates to [`require_value_audit_writer`]:
 ///   fails closed with `audit.chain_key_unavailable` when the writer cannot be
 ///   acquired. An operator who authored a profile file is expected to run
 ///   `stellar-agent profile rotate-audit-key <name>` before signing.
-/// - [`ProfileOrigin::Synthesized`] is the zero-config quickstart path — no
+/// - [`crate::common::profile_access::ProfileOrigin::Synthesized`] is the zero-config quickstart path — no
 ///   profile file, no `rotate-audit-key` step to run. The writer is acquired
 ///   opportunistically (a `tracing::warn!` on failure, no refusal), matching
 ///   the pre-existing zero-config behavior. Returns `Ok(None)` when the writer
@@ -177,7 +175,7 @@ fn audit_writer_open_failed(profile_name: &str) -> WalletError {
 ///
 /// # Errors
 ///
-/// Returns `Err` only for [`ProfileOrigin::Persisted`]; see
+/// Returns `Err` only for [`crate::common::profile_access::ProfileOrigin::Persisted`]; see
 /// [`require_value_audit_writer`].
 pub(crate) fn require_value_audit_writer_for_origin(
     profile: &Profile,
@@ -238,7 +236,7 @@ fn audit_writer_open_failed_io(profile_name: &str, e: &impl std::fmt::Display) -
 /// writer cannot be opened. Private: the callers are [`emit_value_audit_row`]
 /// (the one exempt, non-signing call site),
 /// [`require_value_audit_writer_for_origin`]'s
-/// [`ProfileOrigin::Synthesized`](crate::common::profile_access::ProfileOrigin::Synthesized)
+/// [`crate::common::profile_access::ProfileOrigin::Synthesized`]
 /// arm (the zero-config quickstart's warn-only path), and
 /// [`acquire_best_effort_audit_writer`]'s keyed attempt. Every
 /// persisted-profile signing verb uses [`require_value_audit_writer`]
@@ -518,7 +516,7 @@ mod tests {
 
     use crate::common::profile_access::ProfileOrigin;
 
-    /// A [`ProfileOrigin::Persisted`] profile with no audit key seeded fails
+    /// A [`crate::common::profile_access::ProfileOrigin::Persisted`] profile with no audit key seeded fails
     /// closed exactly like [`require_value_audit_writer`] — the origin-aware
     /// wrapper does not relax the persisted-profile invariant.
     #[test]
@@ -545,7 +543,7 @@ mod tests {
         );
     }
 
-    /// A [`ProfileOrigin::Synthesized`] profile with no audit key seeded stays
+    /// A [`crate::common::profile_access::ProfileOrigin::Synthesized`] profile with no audit key seeded stays
     /// fail-open: `Ok(None)`, no refusal — the zero-config quickstart keeps
     /// working even though no audit row can be written for it.
     #[test]
@@ -571,7 +569,7 @@ mod tests {
         );
     }
 
-    /// A [`ProfileOrigin::Synthesized`] profile with a seeded audit key still
+    /// A [`crate::common::profile_access::ProfileOrigin::Synthesized`] profile with a seeded audit key still
     /// returns a writer that writes through — the zero-config path opts INTO
     /// auditing whenever the key happens to be acquirable; it only tolerates
     /// its absence.
