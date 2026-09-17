@@ -301,6 +301,16 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
             return 1;
         }
     };
+    // Settle open reservations before this operation records or signs a submission.
+    if let Ok(reconcile_client) = stellar_agent_network::StellarRpcClient::new(&args.rpc_url) {
+        crate::commands::submission_record::reconcile_open_reservations(
+            &audit_profile,
+            &profile_name,
+            &reconcile_client,
+            now_ms,
+        )
+        .await;
+    }
     let chain_id = audit_profile.chain_id.caip2_str();
     let recorder = match crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {

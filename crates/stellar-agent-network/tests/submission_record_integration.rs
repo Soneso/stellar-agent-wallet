@@ -948,3 +948,143 @@ async fn an_unexpected_poll_status_reports_the_timeout_shape() {
         "an unknown outcome leaves the reservation standing"
     );
 }
+
+#[derive(Clone, Copy)]
+enum AuditAppendFailure {
+    Truncated,
+    Rewritten,
+    Io,
+}
+
+async fn assert_audit_append_refusal(failure: AuditAppendFailure) {
+    use base64::Engine as _;
+    use stellar_agent_core::audit_log::{
+        AuditEntry, AuditWriter, NewToolInvocation, PolicyDecision,
+    };
+
+    let mut fx = fixture("record-audit-append");
+    let audit_dir = fx._dir.path().join("audit");
+    let audit_path = audit_dir.join("log.jsonl");
+    fx.profile.audit_log_path = audit_path.clone();
+    let coordinate = &fx.profile.audit_log_hash_chain_key_id;
+    keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+        .unwrap()
+        .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([4_u8; 32]))
+        .unwrap();
+    let access = stellar_agent_network::keyring::keyed_audit_access(&fx.profile).unwrap();
+    let mut writer = AuditWriter::open(audit_path.clone(), Some(access)).unwrap();
+    writer
+        .write_entry(AuditEntry::new_tool_invocation(NewToolInvocation::new(
+            "stellar_pay_commit",
+            "stellar:testnet",
+            Vec::new(),
+            PolicyDecision::Allow,
+            "audit-request",
+        )))
+        .unwrap();
+    let original = std::fs::read(&audit_path).unwrap();
+    match failure {
+        AuditAppendFailure::Truncated => std::fs::write(&audit_path, b"").unwrap(),
+        AuditAppendFailure::Rewritten => {
+            let mut changed = original.clone();
+            let offset = changed
+                .windows(b"audit-request".len())
+                .position(|bytes| bytes == b"audit-request")
+                .unwrap();
+            changed[offset] = b'A';
+            std::fs::write(&audit_path, changed).unwrap();
+        }
+        AuditAppendFailure::Io => {
+            std::fs::rename(&audit_dir, fx._dir.path().join("held-audit")).unwrap();
+            std::fs::write(&audit_dir, b"a file cannot be traversed as a directory").unwrap();
+        }
+    }
+    let audit = Arc::new(Mutex::new(writer));
+    let recorder = WalletSubmissionRecorder::new(
+        &fx.profile,
+        fx.profile_name.clone(),
+        "stellar_pay_commit",
+        Some("stellar:testnet".to_owned()),
+        Vec::new(),
+        vec![(state_key(&fx.profile_name), now_ms(), 500)],
+        fx.receipts.clone(),
+        fx.window.clone(),
+        Some(audit),
+        None,
+        "test-request",
+        now_ms(),
+    );
+    let envelope = SignedTestEnvelope::for_source([0x62; 32]);
+    let server = MockServer::start().await;
+    mount_pre_send(&server, &envelope).await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method": "sendTransaction"})))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let error = submit_transaction_and_wait(
+        &client,
+        envelope.envelope_xdr(),
+        SUBMIT_TIMEOUT,
+        TESTNET_PASSPHRASE,
+        None,
+        Some(&recorder),
+    )
+    .await
+    .expect_err("failed audit append refuses before send");
+    match failure {
+        AuditAppendFailure::Truncated | AuditAppendFailure::Rewritten => {
+            let reason = match failure {
+                AuditAppendFailure::Truncated => "the log is shorter than the writer's last append",
+                _ => "the entry at the writer's last append is not the one it wrote",
+            };
+            assert_eq!(error.code(), "audit.tip_anchor_mismatch", "{error:?}");
+            let WalletError::Validation(
+                stellar_agent_core::error::ValidationError::AuditTipAnchorMismatch {
+                    profile,
+                    reason: actual,
+                },
+            ) = &error
+            else {
+                panic!("typed audit refusal: {error:?}")
+            };
+            assert_eq!(actual, reason);
+            assert_eq!(profile, &fx.profile_name);
+            assert!(error.message().contains("stellar-agent audit reanchor"));
+        }
+        AuditAppendFailure::Io => {
+            assert_eq!(error.code(), "submission.record_unavailable", "{error:?}");
+            assert!(
+                error
+                    .message()
+                    .contains("the pending value-action row could not be appended")
+            );
+        }
+    }
+    let hash = stellar_agent_network::envelope_hash_hex(envelope.envelope_xdr());
+    assert!(
+        fx.receipts.get(&hash).unwrap().is_none(),
+        "the unsent receipt is unwound"
+    );
+    assert!(!fx.reservation_is_open(&hash));
+}
+
+#[tokio::test]
+#[serial]
+async fn audit_append_truncation_preserves_rollback_code_and_unwinds() {
+    assert_audit_append_refusal(AuditAppendFailure::Truncated).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn audit_append_rewrite_preserves_rollback_code_and_unwinds() {
+    assert_audit_append_refusal(AuditAppendFailure::Rewritten).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn audit_append_io_failure_remains_record_unavailable_and_unwinds() {
+    assert_audit_append_refusal(AuditAppendFailure::Io).await;
+}

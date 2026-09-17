@@ -61,8 +61,20 @@ the payer key, signs the address authorization, re-simulates, re-inspects the
 final envelope, stores only the credential digest, appends the authorization
 audit event, persists `authorized`, and returns the credential once.
 
-The configured RPC observes signed authorization during re-simulation. It is a
-trust boundary, not a passive read endpoint.
+The configured RPC observes signed authorization during re-simulation and is a
+trusted endpoint. Simulation responses expose encoded authorization entries,
+result values, and transaction data; the wallet decodes those fields with
+`untrusted_decode_limits(encoded.len())`, bounding depth to 500 and length to
+the encoded input size.
+
+Reconciliation reads `get_transaction` from `stellar-rpc-client`, which decodes
+the response metadata, events, envelope, and result inside the client and hands
+the wallet values that are already decoded. Those decodes carry no XDR depth or
+length bound, and there is no point at which the wallet can impose its own, so
+reconciliation relies on the configured endpoint at that boundary. The test at
+`crates/stellar-agent-mpp/tests/rpc_decode_boundary.rs` holds the inventory of
+those decode sites in the pinned version and fails when the locked version
+changes, so a bump reinspects them.
 
 ## Fingerprints and approval binding
 
