@@ -63,7 +63,11 @@ impl LoginChallengeStore {
     /// Returns `None` if the store is at capacity after pruning — the caller
     /// must reject the mint request (fail closed) rather than mint anyway.
     pub fn mint(&mut self) -> Option<[u8; 32]> {
-        self.prune();
+        self.mint_at(Instant::now())
+    }
+
+    fn mint_at(&mut self, now: Instant) -> Option<[u8; 32]> {
+        self.prune_at(now);
         if self.entries.len() >= LOGIN_CHALLENGE_STORE_CAP {
             return None;
         }
@@ -71,7 +75,7 @@ impl LoginChallengeStore {
         OsRng.fill_bytes(&mut challenge);
         self.entries.push_back(LoginChallengeEntry {
             challenge,
-            minted_at: Instant::now(),
+            minted_at: now,
         });
         Some(challenge)
     }
@@ -82,7 +86,11 @@ impl LoginChallengeStore {
     /// the single-use check: a second call with the same bytes always
     /// returns `false`.
     pub fn consume(&mut self, challenge: &[u8; 32]) -> bool {
-        self.prune();
+        self.consume_at(challenge, Instant::now())
+    }
+
+    fn consume_at(&mut self, challenge: &[u8; 32], now: Instant) -> bool {
+        self.prune_at(now);
         if let Some(pos) = self.entries.iter().position(|e| &e.challenge == challenge) {
             self.entries.remove(pos);
             true
@@ -92,8 +100,7 @@ impl LoginChallengeStore {
     }
 
     /// Removes entries older than [`CHALLENGE_TTL`].
-    fn prune(&mut self) {
-        let now = Instant::now();
+    fn prune_at(&mut self, now: Instant) {
         self.entries
             .retain(|e| now.duration_since(e.minted_at) < CHALLENGE_TTL);
     }
@@ -152,14 +159,18 @@ impl ActionChallengeStore {
     /// Prunes expired entries, evicts the oldest if at capacity, then stores
     /// `challenge` bound to `approval_nonce`.
     pub fn mint(&mut self, challenge: [u8; 32], approval_nonce: impl Into<String>) {
-        self.prune();
+        self.mint_at(challenge, approval_nonce, Instant::now());
+    }
+
+    fn mint_at(&mut self, challenge: [u8; 32], approval_nonce: impl Into<String>, now: Instant) {
+        self.prune_at(now);
         if self.entries.len() >= ACTION_CHALLENGE_STORE_CAP {
             self.entries.pop_front();
         }
         self.entries.push_back(ActionChallengeEntry {
             challenge,
             approval_nonce: approval_nonce.into(),
-            minted_at: Instant::now(),
+            minted_at: now,
         });
     }
 
@@ -172,7 +183,11 @@ impl ActionChallengeStore {
     /// the nonce check makes the store's cross-entry binding independent of
     /// that assumption).
     pub fn consume(&mut self, challenge: &[u8; 32], approval_nonce: &str) -> bool {
-        self.prune();
+        self.consume_at(challenge, approval_nonce, Instant::now())
+    }
+
+    fn consume_at(&mut self, challenge: &[u8; 32], approval_nonce: &str, now: Instant) -> bool {
+        self.prune_at(now);
         if let Some(pos) = self
             .entries
             .iter()
@@ -186,8 +201,7 @@ impl ActionChallengeStore {
     }
 
     /// Removes entries older than [`CHALLENGE_TTL`].
-    fn prune(&mut self) {
-        let now = Instant::now();
+    fn prune_at(&mut self, now: Instant) {
         self.entries
             .retain(|e| now.duration_since(e.minted_at) < CHALLENGE_TTL);
     }
@@ -241,20 +255,22 @@ mod tests {
 
     #[test]
     fn login_challenge_mint_and_consume_once() {
+        let now = Instant::now();
         let mut store = LoginChallengeStore::new();
-        let challenge = store.mint().unwrap();
+        let challenge = store.mint_at(now).unwrap();
         assert_eq!(store.len(), 1);
-        assert!(store.consume(&challenge));
+        assert!(store.consume_at(&challenge, now));
         assert!(store.is_empty());
     }
 
     #[test]
     fn login_challenge_consume_is_single_use() {
+        let now = Instant::now();
         let mut store = LoginChallengeStore::new();
-        let challenge = store.mint().unwrap();
-        assert!(store.consume(&challenge));
+        let challenge = store.mint_at(now).unwrap();
+        assert!(store.consume_at(&challenge, now));
         assert!(
-            !store.consume(&challenge),
+            !store.consume_at(&challenge, now),
             "a second consume of the same challenge must fail — replay must be refused"
         );
     }
@@ -266,13 +282,25 @@ mod tests {
     }
 
     #[test]
+    fn login_challenge_expires_at_ttl() {
+        let now = Instant::now();
+        let mut store = LoginChallengeStore::new();
+        let first = store.mint_at(now).unwrap();
+        let second = store.mint_at(now).unwrap();
+        assert!(store.consume_at(&first, now + CHALLENGE_TTL - Duration::from_nanos(1)));
+        assert!(!store.consume_at(&second, now + CHALLENGE_TTL));
+        assert!(store.is_empty());
+    }
+
+    #[test]
     fn login_challenge_store_fails_closed_at_capacity() {
+        let now = Instant::now();
         let mut store = LoginChallengeStore::new();
         for _ in 0..LOGIN_CHALLENGE_STORE_CAP {
-            assert!(store.mint().is_some());
+            assert!(store.mint_at(now).is_some());
         }
         assert!(
-            store.mint().is_none(),
+            store.mint_at(now).is_none(),
             "minting past the cap must fail closed, not evict"
         );
         assert_eq!(store.len(), LOGIN_CHALLENGE_STORE_CAP);
@@ -280,15 +308,16 @@ mod tests {
 
     #[test]
     fn action_challenge_mint_and_consume_bound_to_nonce() {
+        let now = Instant::now();
         let mut store = ActionChallengeStore::new();
         let challenge = derive_action_challenge(&random_32(), &[0x11; 32], "nonce-a");
-        store.mint(challenge, "nonce-a");
+        store.mint_at(challenge, "nonce-a", now);
         assert!(
-            !store.consume(&challenge, "nonce-b"),
+            !store.consume_at(&challenge, "nonce-b", now),
             "a challenge minted for nonce-a must not consume as nonce-b"
         );
         assert!(
-            store.consume(&challenge, "nonce-a"),
+            store.consume_at(&challenge, "nonce-a", now),
             "consuming with the correct nonce must succeed"
         );
         assert!(store.is_empty());
@@ -296,11 +325,27 @@ mod tests {
 
     #[test]
     fn action_challenge_consume_is_single_use() {
+        let now = Instant::now();
         let mut store = ActionChallengeStore::new();
         let challenge = derive_action_challenge(&random_32(), &[0x22; 32], "nonce-x");
-        store.mint(challenge, "nonce-x");
-        assert!(store.consume(&challenge, "nonce-x"));
-        assert!(!store.consume(&challenge, "nonce-x"));
+        store.mint_at(challenge, "nonce-x", now);
+        assert!(store.consume_at(&challenge, "nonce-x", now));
+        assert!(!store.consume_at(&challenge, "nonce-x", now));
+    }
+
+    #[test]
+    fn action_challenge_expires_at_ttl() {
+        let now = Instant::now();
+        let mut store = ActionChallengeStore::new();
+        store.mint_at([0x11; 32], "nonce-a", now);
+        store.mint_at([0x22; 32], "nonce-b", now);
+        assert!(store.consume_at(
+            &[0x11; 32],
+            "nonce-a",
+            now + CHALLENGE_TTL - Duration::from_nanos(1)
+        ));
+        assert!(!store.consume_at(&[0x22; 32], "nonce-b", now + CHALLENGE_TTL));
+        assert!(store.is_empty());
     }
 
     /// WYSIWYS: a challenge derived from entry A's envelope hash differs from
@@ -320,20 +365,21 @@ mod tests {
 
     #[test]
     fn action_challenge_store_evicts_oldest_at_capacity() {
+        let now = Instant::now();
         let mut store = ActionChallengeStore::new();
         let first = derive_action_challenge(&random_32(), &[0x01; 32], "nonce-0");
-        store.mint(first, "nonce-0");
+        store.mint_at(first, "nonce-0", now);
         for i in 1..ACTION_CHALLENGE_STORE_CAP {
             let c = derive_action_challenge(&random_32(), &[i as u8; 32], &format!("nonce-{i}"));
-            store.mint(c, format!("nonce-{i}"));
+            store.mint_at(c, format!("nonce-{i}"), now);
         }
         assert_eq!(store.len(), ACTION_CHALLENGE_STORE_CAP);
         // Minting one more evicts the oldest (`first` / "nonce-0").
         let extra = derive_action_challenge(&random_32(), &[0xFF; 32], "nonce-extra");
-        store.mint(extra, "nonce-extra");
+        store.mint_at(extra, "nonce-extra", now);
         assert_eq!(store.len(), ACTION_CHALLENGE_STORE_CAP);
         assert!(
-            !store.consume(&first, "nonce-0"),
+            !store.consume_at(&first, "nonce-0", now),
             "the oldest entry must have been evicted"
         );
     }

@@ -1824,12 +1824,12 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("enroll-rate-limited");
+            const CAPACITY: usize = 3;
+            // A non-refilling bucket isolates the routes' shared capacity.
+            *fx.state.login_rate_limiter.lock().unwrap() = TokenBucket::new(CAPACITY as f64, 0.0);
             let router = build_router();
 
-            // Exhaust the SAME bucket `/login/challenge` draws from, by
-            // calling that endpoint directly — proving the two routes
-            // genuinely share one limiter rather than each having its own.
-            loop {
+            for attempt in 0..=CAPACITY {
                 let resp = router
                     .clone()
                     .with_state(fx.state.clone())
@@ -1842,10 +1842,12 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                if resp.status() == StatusCode::TOO_MANY_REQUESTS {
-                    break;
-                }
-                assert_eq!(resp.status(), StatusCode::OK);
+                let expected = if attempt < CAPACITY {
+                    StatusCode::OK
+                } else {
+                    StatusCode::TOO_MANY_REQUESTS
+                };
+                assert_eq!(resp.status(), expected);
             }
 
             let resp = router

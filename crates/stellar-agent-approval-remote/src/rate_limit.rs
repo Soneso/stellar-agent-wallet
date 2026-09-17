@@ -43,9 +43,13 @@ impl TokenBucket {
     /// full.
     #[must_use]
     pub fn new(capacity: f64, refill_per_second: f64) -> Self {
+        Self::new_at(capacity, refill_per_second, Instant::now())
+    }
+
+    fn new_at(capacity: f64, refill_per_second: f64, now: Instant) -> Self {
         Self {
             tokens: capacity,
-            last_refill: Instant::now(),
+            last_refill: now,
             capacity,
             refill_per_second,
         }
@@ -57,7 +61,11 @@ impl TokenBucket {
     /// after refilling for elapsed time; `false` if the bucket is empty —
     /// the caller should reject the request (e.g. `429 Too Many Requests`).
     pub fn try_acquire(&mut self) -> bool {
-        self.refill();
+        self.try_acquire_at(Instant::now())
+    }
+
+    fn try_acquire_at(&mut self, now: Instant) -> bool {
+        self.refill_at(now);
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
             true
@@ -66,8 +74,7 @@ impl TokenBucket {
         }
     }
 
-    fn refill(&mut self) {
-        let now = Instant::now();
+    fn refill_at(&mut self, now: Instant) {
         let elapsed = now.duration_since(self.last_refill);
         self.last_refill = now;
         let added = elapsed.as_secs_f64() * self.refill_per_second;
@@ -75,54 +82,57 @@ impl TokenBucket {
     }
 }
 
-/// Test-only refill-rate override, kept separate from [`TokenBucket::new`]'s
-/// public constructor purely so production call sites always use
-/// [`TokenBucket::default`] and never accidentally configure a weaker cap.
-#[cfg(test)]
-fn fast_test_bucket() -> TokenBucket {
-    TokenBucket::new(3.0, 1000.0)
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, reason = "test-only")]
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
     fn allows_up_to_capacity_then_refuses() {
-        let mut bucket = TokenBucket::new(3.0, 0.0); // no refill during the test
-        assert!(bucket.try_acquire());
-        assert!(bucket.try_acquire());
-        assert!(bucket.try_acquire());
+        let now = Instant::now();
+        let mut bucket = TokenBucket::new_at(3.0, 1000.0, now);
+        assert!(bucket.try_acquire_at(now));
+        assert!(bucket.try_acquire_at(now));
+        assert!(bucket.try_acquire_at(now));
         assert!(
-            !bucket.try_acquire(),
+            !bucket.try_acquire_at(now),
             "a fourth immediate acquire must be refused once capacity is exhausted"
         );
     }
 
     #[test]
     fn refills_over_time() {
-        let mut bucket = fast_test_bucket();
+        let start = Instant::now();
+        let mut bucket = TokenBucket::new_at(3.0, 1000.0, start);
         for _ in 0..3 {
-            assert!(bucket.try_acquire());
+            assert!(bucket.try_acquire_at(start));
         }
         assert!(
-            !bucket.try_acquire(),
+            !bucket.try_acquire_at(start),
             "bucket must be empty immediately after burst"
         );
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        let refilled_at = start + Duration::from_millis(20);
         assert!(
-            bucket.try_acquire(),
-            "bucket must have refilled at least one token after a short wait"
+            bucket.try_acquire_at(refilled_at),
+            "bucket must have refilled after 20 milliseconds"
+        );
+        assert!(bucket.try_acquire_at(refilled_at));
+        assert!(bucket.try_acquire_at(refilled_at));
+        assert!(
+            !bucket.try_acquire_at(refilled_at),
+            "refill must stop at capacity"
         );
     }
 
     #[test]
     fn default_bucket_allows_a_reasonable_burst() {
         let mut bucket = TokenBucket::default();
+        let now = bucket.last_refill;
         let mut allowed = 0;
         for _ in 0..(BUCKET_CAPACITY as usize + 5) {
-            if bucket.try_acquire() {
+            if bucket.try_acquire_at(now) {
                 allowed += 1;
             }
         }

@@ -145,7 +145,11 @@ impl SessionState {
     /// session was minted.
     #[must_use]
     pub fn is_expired(&self) -> bool {
-        self.created_at.elapsed() >= SESSION_ABSOLUTE_TTL
+        self.is_expired_at(Instant::now())
+    }
+
+    fn is_expired_at(&self, now: Instant) -> bool {
+        now.duration_since(self.created_at) >= SESSION_ABSOLUTE_TTL
     }
 }
 
@@ -274,13 +278,17 @@ mod tests {
     #[test]
     fn fresh_session_is_not_expired() {
         let session = SessionState::generate("cred-1");
-        assert!(!session.is_expired());
+        assert!(!session.is_expired_at(session.created_at));
+        assert!(
+            !session
+                .is_expired_at(session.created_at + SESSION_ABSOLUTE_TTL - Duration::from_nanos(1))
+        );
     }
 
     #[test]
-    fn session_past_absolute_ttl_is_expired() {
-        let created_at = Instant::now() - SESSION_ABSOLUTE_TTL - Duration::from_secs(1);
-        let session = SessionState::generate_at("cred-1", created_at);
-        assert!(session.is_expired());
+    fn session_at_absolute_ttl_is_expired() {
+        let created_at = Instant::now();
+        let session = SessionState::new_at("cred-1", created_at);
+        assert!(session.is_expired_at(created_at + SESSION_ABSOLUTE_TTL));
     }
 }
