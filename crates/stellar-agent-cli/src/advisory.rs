@@ -379,6 +379,78 @@ mod tests {
         writer.lock().unwrap().write_entry(entry).unwrap();
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn startup_scans_the_loaded_profiles_configured_audit_log() {
+        use stellar_agent_core::profile::{loader, schema::Profile};
+        use stellar_agent_test_support::StellarAgentHomeGuard;
+
+        let dir = TempDir::new().unwrap();
+        let _home = StellarAgentHomeGuard::new(dir.path());
+        let path = dir.path().join("custom-audit.jsonl");
+        let profile =
+            Profile::builder_testnet_named("configured", "signer", "test", "nonce", "test")
+                .audit_log_path(&path)
+                .build();
+        loader::save("configured", &profile).unwrap();
+        let default_path =
+            stellar_agent_core::profile::schema::default_audit_log_path_for("configured");
+        std::fs::create_dir_all(default_path.parent().unwrap()).unwrap();
+        let default_writer = open_writer(default_path.clone());
+        write_context_rule_created(
+            &default_writer,
+            99,
+            "CDABC...12345",
+            vec!["abababab".to_owned()],
+        );
+        drop(default_writer);
+        let default_bytes = std::fs::read(&default_path).unwrap();
+
+        let writer = open_writer(path.clone());
+        write_context_rule_created(&writer, 4, "CDABC...12345", vec!["abababab".to_owned()]);
+        drop(writer);
+        let allowlist = [VerifierAllowlistEntry::new_for_test(
+            [0xAB; 32],
+            VerifierAuditStatus::Revoked {
+                revoked_at: "2026-01-01",
+                reason: "test fixture",
+            },
+        )];
+        let result = crate::run_profile_startup_advisory(Some("configured"), |selected_path| {
+            run_startup_advisory_with_allowlist(selected_path, &allowlist)
+        });
+
+        assert_eq!(result.triggered_rule_ids, vec![4]);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("sa_verifier_allowlist_advisory")
+        );
+        assert_eq!(std::fs::read(&default_path).unwrap(), default_bytes);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn startup_profile_load_failures_are_nonfatal_and_do_not_scan() {
+        use stellar_agent_core::profile::{loader, schema::Profile};
+        use stellar_agent_test_support::StellarAgentHomeGuard;
+
+        let dir = TempDir::new().unwrap();
+        let _home = StellarAgentHomeGuard::new(dir.path());
+        let profile =
+            Profile::builder_testnet_named("owner", "signer", "test", "nonce", "test").build();
+        let malformed = loader::save("malformed", &profile).unwrap();
+        std::fs::write(malformed, "invalid = [").unwrap();
+        loader::save("mismatched", &profile).unwrap();
+
+        for name in ["missing", "malformed", "mismatched"] {
+            let result = crate::run_profile_startup_advisory(Some(name), |_| {
+                panic!("a profile load failure must not scan an audit log")
+            });
+            assert_eq!(result, AdvisoryResult::default());
+        }
+    }
+
     // ── Test 1: empty result when audit log is absent ─────────────────────────
 
     #[test]

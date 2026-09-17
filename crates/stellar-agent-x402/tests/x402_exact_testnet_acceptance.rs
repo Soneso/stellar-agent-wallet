@@ -118,7 +118,7 @@ fn fresh_keypair() -> (String, Zeroizing<[u8; 32]>) {
 /// Returns the tx hash on success, or panics on failure.
 async fn fund_via_friendbot(g_strkey: &str) -> String {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = reqwest::get(&url)
+    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
         .await
         .expect("Friendbot GET request failed");
     assert!(

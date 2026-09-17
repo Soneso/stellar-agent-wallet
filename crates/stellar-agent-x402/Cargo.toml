@@ -15,7 +15,7 @@ categories = ["cryptography::cryptocurrencies", "finance"]
 # Never enable in production binaries.
 test-helpers = []
 # Gated testnet acceptance tests.  Implies test-helpers.
-testnet-acceptance = ["test-helpers"]
+testnet-acceptance = ["test-helpers", "stellar-agent-test-support/testnet-helpers"]
 
 [dependencies]
 stellar-xdr = { workspace = true }

@@ -135,7 +135,7 @@ fn fresh_keypair() -> (String, Zeroizing<[u8; 32]>) {
 /// Does NOT panic — callers decide whether to skip or fail.
 async fn try_fund_via_friendbot(g_strkey: &str) -> Result<(), String> {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = reqwest::get(&url)
+    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
         .await
         .map_err(|e| format!("Friendbot GET failed: {e}"))?;
     if resp.status().is_success() {

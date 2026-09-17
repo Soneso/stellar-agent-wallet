@@ -22,7 +22,6 @@ mod render;
 
 use clap::{Parser, Subcommand};
 use stellar_agent_core::observability;
-use stellar_agent_core::profile::schema::default_audit_log_path_for;
 
 use crate::common::resolve_profile_name;
 
@@ -312,15 +311,8 @@ async fn main() {
     //
     // `run_startup_advisory` accepts no `StellarRpcClient`: the advisory scan is
     // strictly local and issues no network calls.
-    {
-        let profile_name = resolve_profile_name(cli.command.profile_flag()).name;
-        // Reads the per-profile DEFAULT location without loading the profile.
-        // A profile with an explicit non-default audit_log_path is outside the
-        // advisory's scan; the per-command audit machinery always uses the
-        // loaded profile's configured path.
-        let audit_log_path = default_audit_log_path_for(&profile_name);
-        let _ = advisory::run_startup_advisory(&audit_log_path);
-    }
+    let _ =
+        run_profile_startup_advisory(cli.command.profile_flag(), advisory::run_startup_advisory);
 
     let exit_code = match cli.command {
         Commands::Vault(args) => commands::vault::run(&args).await,
@@ -345,6 +337,31 @@ async fn main() {
     };
 
     std::process::exit(exit_code);
+}
+
+/// Loads the selected profile locally before scanning its configured audit log.
+///
+/// A profile-load failure skips the advisory silently: subcommand dispatch
+/// owns every refusal, and the commands that need no profile (`profile init`
+/// on a fresh installation, the vault verbs) run without a profile on disk.
+/// The skip is recorded at `debug!` only, so stderr carries one report per
+/// failure and none for a profile that does not exist yet.
+fn run_profile_startup_advisory(
+    profile_flag: Option<&str>,
+    scan: impl FnOnce(&std::path::Path) -> advisory::AdvisoryResult,
+) -> advisory::AdvisoryResult {
+    let resolved = resolve_profile_name(profile_flag);
+    match common::profile_access::load_profile_reconciled(&resolved, None) {
+        Ok(profile) => scan(&profile.audit_log_path),
+        Err(error) => {
+            tracing::debug!(
+                profile = %resolved.name,
+                code = error.code(),
+                "startup advisory: profile not loaded; advisory skipped"
+            );
+            advisory::AdvisoryResult::default()
+        }
+    }
 }
 
 #[cfg(test)]

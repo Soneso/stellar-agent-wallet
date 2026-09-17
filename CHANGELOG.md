@@ -36,6 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The startup verifier advisory scans the selected profile's configured
+  `audit_log_path`, including a non-default location.
 - Multicall reserves policy-sized bundle spend and writes its value legs before
   submission. Confirmation settles that reservation once, and timeouts retain
   the full transaction hash for reconciliation. Timelock execution writes a

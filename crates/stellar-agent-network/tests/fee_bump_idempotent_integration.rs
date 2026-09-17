@@ -190,6 +190,76 @@ async fn mount_probe_and_signers(server: &MockServer) {
 //     with NO second sendTransaction.
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[tokio::test]
+async fn current_ledger_anchor_polls_past_not_found_to_success() {
+    let (inner_xdr, fp_gstrkey, fp_signer) = build_signed_inner(100, None).await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = ReceiptStore::open_at(dir.path(), "fb-indexing-delay").unwrap();
+    let server = MockServer::start().await;
+    mount_probe_and_signers(&server).await;
+
+    Mock::given(body_partial_json(json!({"method": "getHealth"})))
+        .respond_with(EchoIdResponder::new(json!({
+            "status": "healthy", "latestLedger": 2000,
+            "oldestLedger": 1000, "ledgerRetentionWindow": 1000
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(body_partial_json(json!({"method": "sendTransaction"})))
+        .respond_with(SubmissionEchoResponder::new(
+            send_pending_response(),
+            TESTNET_PASSPHRASE,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(body_partial_json(json!({"method": "getTransaction"})))
+        .respond_with(EchoIdResponder::new(json!({"status": "NOT_FOUND"})))
+        .with_priority(1)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(body_partial_json(json!({"method": "getTransaction"})))
+        .respond_with(SubmissionEchoResponder::new(
+            get_success_response(),
+            TESTNET_PASSPHRASE,
+        ))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let recorded_at_ledger = client.get_health().await.unwrap().latest_ledger;
+    let result = submit_fee_bump_idempotent(
+        &client,
+        &inner_xdr,
+        &fp_gstrkey,
+        500,
+        10_000,
+        TESTNET_PASSPHRASE,
+        &fp_signer,
+        &store,
+        recorded_at_ledger,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("indexing delay must be polled through to confirmation");
+
+    assert_eq!(result.ledger, FAKE_LEDGER);
+    assert_eq!(
+        store
+            .get(&inner_key_for(&inner_xdr))
+            .unwrap()
+            .unwrap()
+            .status,
+        ReceiptStatus::Success
+    );
+    server.verify().await;
+}
+
 /// Submitting the same inner envelope twice results in exactly ONE
 /// `sendTransaction` call; the second call returns the cached Success receipt.
 ///

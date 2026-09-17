@@ -132,8 +132,11 @@ pub(crate) const LOSER_MAX_POLLS: u32 = 120; // 60 seconds at 500 ms intervals
 /// are rejected fail-closed with [`ProtocolError::XdrCodecFailed`] — see
 /// module-level documentation for the double-apply rationale.
 ///
-/// `recorded_at_ledger` should be the current ledger sequence number at
-/// submission time (used for retention-window awareness in the poll loop).
+/// `recorded_at_ledger` must be the current ledger sequence number at
+/// submission time. The poll loop finalises `Ambiguous` when this anchor
+/// predates the RPC's retention floor while the transaction is still
+/// `NOT_FOUND`, so a zero anchor turns the first not-found poll into an
+/// ambiguous result.
 ///
 /// # Idempotency key
 ///
@@ -161,13 +164,14 @@ pub(crate) const LOSER_MAX_POLLS: u32 = 120; // 60 seconds at 500 ms intervals
 /// # async fn run() -> Result<(), stellar_agent_core::WalletError> {
 /// let client = StellarRpcClient::new("https://soroban-testnet.stellar.org")?;
 /// let store = ReceiptStore::open("default").unwrap();
+/// let recorded_at_ledger = client.get_health().await?.latest_ledger;
 /// let result = submit_transaction_idempotent(
 ///     &client,
 ///     "AAAAAA...",
 ///     Duration::from_secs(60),
 ///     "Test SDF Network ; September 2015",
 ///     &store,
-///     0,      // recorded_at_ledger (current ledger sequence)
+///     recorded_at_ledger,
 /// ).await?;
 /// println!("confirmed in ledger {}", result.ledger);
 /// # Ok(()) }

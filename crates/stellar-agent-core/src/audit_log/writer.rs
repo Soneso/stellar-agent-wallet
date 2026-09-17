@@ -2761,8 +2761,9 @@ pub enum WriterError {
 pub fn audit_log_unusable_detail(e: &WriterError) -> Option<String> {
     match e {
         WriterError::FileLocked => Some(
-            "audit.writer_locked: the audit log's writer lock is held by another process; \
-             stop the running stellar-agent-mcp server and retry"
+            "audit.writer_locked: an active audit writer holds this profile's lock \
+             (for example, a running stellar-agent-mcp server); stop the process using \
+             this profile, retry the command, then restart the server if needed"
                 .to_owned(),
         ),
         // These carry their own `audit.*` code at the head of their Display.

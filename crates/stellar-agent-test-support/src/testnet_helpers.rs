@@ -568,6 +568,32 @@ const FRIENDBOT_CONFIRM_POLLS: u32 = 30;
 /// confirm-wait (30 polls × 500ms ≈ 15s per round).
 const FRIENDBOT_CONFIRM_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Issues a Friendbot funding GET with a 20-second deadline covering connection,
+/// response headers, and response body. Callers decide how to handle HTTP status
+/// codes and request failures; this helper performs no retries or RPC polling.
+///
+/// # Errors
+///
+/// Returns the HTTP client's error if client construction or the request fails,
+/// including when the request deadline expires.
+pub async fn friendbot_funding_request(
+    url: impl reqwest::IntoUrl,
+) -> Result<reqwest::Response, reqwest::Error> {
+    friendbot_request_with_timeout(url, Duration::from_secs(20)).await
+}
+
+async fn friendbot_request_with_timeout(
+    url: impl reqwest::IntoUrl,
+    timeout: Duration,
+) -> Result<reqwest::Response, reqwest::Error> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()?
+        .get(url)
+        .send()
+        .await
+}
+
 /// Requests Friendbot funding for `account_id`, then confirms the account
 /// became visible on `rpc_url` before returning.
 ///
@@ -621,7 +647,7 @@ async fn request_friendbot_funding(
     account_id: &str,
     label: &str,
 ) -> TestnetHelperResult<()> {
-    let response = reqwest::get(format!("{friendbot_url}?addr={account_id}")).await?;
+    let response = friendbot_funding_request(format!("{friendbot_url}?addr={account_id}")).await?;
     if response.status().is_success() {
         Ok(())
     } else {
@@ -644,4 +670,73 @@ async fn wait_for_account_visible(client: &stellar_rpc_client::Client, account_i
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, reason = "test fixtures and assertions")]
+
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn friendbot_response(response: &'static [u8]) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let url = format!(
+            "http://{}/?addr=test-account",
+            listener.local_addr().expect("address")
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = [0; 1024];
+            let count = socket.read(&mut request).await.expect("read request");
+            assert!(request[..count].starts_with(b"GET /?addr=test-account "));
+            socket.write_all(response).await.expect("write response");
+            std::future::pending::<()>().await;
+        });
+        (url, server)
+    }
+
+    #[tokio::test]
+    async fn friendbot_request_preserves_http_failure_status_and_body() {
+        let (url, server) = friendbot_response(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\n\r\nbusy",
+        )
+        .await;
+        let response = friendbot_funding_request(&url)
+            .await
+            .expect("HTTP response");
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.text().await.expect("response body"), "busy");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn friendbot_deadline_bounds_stalled_headers_and_body() {
+        for headers in [
+            b"".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n".as_slice(),
+        ] {
+            let (url, server) = friendbot_response(headers).await;
+            let error = tokio::time::timeout(Duration::from_secs(5), async {
+                let response =
+                    friendbot_request_with_timeout(&url, Duration::from_millis(200)).await;
+                if headers.is_empty() {
+                    response.expect_err("stalled headers must time out")
+                } else {
+                    response
+                        .expect("headers must arrive before the deadline")
+                        .text()
+                        .await
+                        .expect_err("stalled body must time out")
+                }
+            })
+            .await
+            .expect("request deadline must bound stalled I/O");
+            server.abort();
+            assert!(error.is_timeout(), "expected request timeout: {error}");
+        }
+    }
 }
