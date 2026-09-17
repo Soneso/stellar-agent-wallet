@@ -350,6 +350,8 @@ supplied.
 | `stellar_friendbot` | Fund a testnet account via Friendbot. | Mutating, testnet-only; gated. |
 | `stellar_transaction_status` | Reconcile one submitted transaction against the chain and settle the wallet's record of it. The way out of `submission.tx_timeout`. | Reads the chain and writes the wallet's record; moves no value. Not annotated read-only. |
 
+A v1 rule set that names tools explicitly must include `stellar_transaction_status` to settle timed-out submissions through that server; the server logs `policy.transaction_status_unmatched` at startup when neither that tool nor `*` appears.
+
 ### Trustline
 
 | Tool | Purpose | Gating |
@@ -518,9 +520,9 @@ Three codes carry an additional `details` object on the error:
 wallet cannot settle on its own, and resolving it needs the full transaction
 hash, which the message redacts. `details` carries that hash, `outcome: "unknown"`,
 `reconcile_with: "stellar_transaction_status"`, and the envelope hash naming
-the submission record where the reporting tool holds the signed bytes. The
-DeFi tools do not, so an agent recovers the envelope hash from
-`stellar_transaction_status`'s `record.envelope_hash`. No other code carries
+the submission record where the reporting tool holds the signed bytes.
+DeFi submission errors carry both hashes, and `stellar_transaction_status`
+also reports `record.envelope_hash`. No other code carries
 `details`, and the field is absent from the serialised envelope when it is not
 set. The recovery protocol is in
 [the MCP usage reference](../crates/stellar-agent-mcp/docs/usage.md).

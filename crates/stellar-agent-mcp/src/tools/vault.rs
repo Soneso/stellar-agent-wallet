@@ -1140,6 +1140,27 @@ fn tool_error_result(code: &str, message: &str) -> CallToolResult {
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[cfg(any(test, feature = "test-helpers"))]
+impl WalletServer {
+    /// Calls the deposit handler for integration tests without the transport.
+    #[doc(hidden)]
+    pub async fn call_stellar_defindex_vault_deposit(
+        &self,
+        args: VaultDepositMcpArgs,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.stellar_defindex_vault_deposit(Parameters(args)).await
+    }
+
+    /// Calls the withdrawal handler for integration tests without the transport.
+    #[doc(hidden)]
+    pub async fn call_stellar_defindex_vault_withdraw(
+        &self,
+        args: VaultWithdrawMcpArgs,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.stellar_defindex_vault_withdraw(Parameters(args)).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The MCP server warns at startup when a v1 policy names tools explicitly and
+  carries no rule for `stellar_transaction_status`, the tool that settles a
+  timed-out submission.
 - `docs/maintainers/stability-tiers.md`: per-crate support tiers (stable
   core, supported optional, experimental, internal, removed), the mainnet
   posture of each surface, and the intended-but-unimplemented feature groups
