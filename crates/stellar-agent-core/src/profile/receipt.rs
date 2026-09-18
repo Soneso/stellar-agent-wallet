@@ -461,6 +461,11 @@ pub struct SubmissionReceipt {
     /// The approval store durably contains the terminal consumption state.
     #[serde(default)]
     pub approval_consumed: bool,
+
+    /// Identity recovered from an authenticated spending-window reservation.
+    /// Approval metadata is unknown when the original receipt is absent.
+    #[serde(default)]
+    pub recovered_from_reservation: bool,
 }
 
 /// Serde default for [`SubmissionReceipt::submitted`].
@@ -996,6 +1001,61 @@ impl ReceiptStore {
         Ok(BeginOutcome::Winner)
     }
 
+    /// Restores an absent receipt from a verified reservation after an operator
+    /// has checked `NOT_FOUND` beyond retention and acknowledged no value moved.
+    /// Existing matching receipts are returned without overwriting their state.
+    ///
+    /// # Errors
+    /// Returns a store error on read/write failure or a conflicting identity.
+    pub fn recover_from_reservation(
+        &self,
+        envelope_hash: &str,
+        tx_hash: &str,
+        source: &str,
+        sequence: i64,
+        max_time: u64,
+        recorded_at_ledger: u32,
+    ) -> Result<SubmissionReceipt, ReceiptStoreError> {
+        let mut session = self.write_session()?;
+        if let Some(existing) = session.guard.map.get(envelope_hash) {
+            if existing.tx_hash != tx_hash
+                || existing.source != source
+                || existing.sequence != sequence
+                || existing.max_time != max_time
+                || existing.recorded_at_ledger != recorded_at_ledger
+            {
+                return Err(ReceiptStoreError::InvalidTransition {
+                    from: "conflicting identity",
+                    to: "recovered",
+                });
+            }
+            return Ok(existing.clone());
+        }
+        let receipt = SubmissionReceipt {
+            envelope_hash: envelope_hash.to_owned(),
+            tx_hash: tx_hash.to_owned(),
+            source: source.to_owned(),
+            sequence,
+            max_time,
+            recorded_at_ledger,
+            status: ReceiptStatus::Ambiguous,
+            ledger: None,
+            prior_ledger: None,
+            reorg_pending_at_ledger: None,
+            submitted: true,
+            approval_nonce: None,
+            approval_consumed: false,
+            recovered_from_reservation: true,
+        };
+        session
+            .guard
+            .map
+            .insert(envelope_hash.to_owned(), receipt.clone());
+        session.guard.rebuild_indexes();
+        persist_locked(&mut session.guard)?;
+        Ok(receipt)
+    }
+
     /// Records a submission about to be sent, refusing a second envelope for a
     /// `(source, sequence)` pair a pending receipt already holds.
     ///
@@ -1248,6 +1308,7 @@ impl ReceiptStore {
                 submitted: true, // upsert on finalize: sendTransaction has already been called
                 approval_nonce: None,
                 approval_consumed: false,
+                recovered_from_reservation: false,
             });
 
         session.guard.rebuild_indexes();
@@ -1675,6 +1736,7 @@ fn insert_pending(
         submitted: false,
         approval_nonce: approval_nonce.map(str::to_owned),
         approval_consumed: false,
+        recovered_from_reservation: false,
     };
 
     guard.map.insert(envelope_hash.to_owned(), receipt);
@@ -2630,6 +2692,7 @@ mod tests {
             submitted: true,
             approval_nonce: None,
             approval_consumed: false,
+            recovered_from_reservation: false,
         };
 
         let json = serde_json::to_string(&original).unwrap();
@@ -2667,6 +2730,7 @@ mod tests {
             submitted: false,
             approval_nonce: None,
             approval_consumed: false,
+            recovered_from_reservation: false,
         };
 
         let json = serde_json::to_string(&r).unwrap();

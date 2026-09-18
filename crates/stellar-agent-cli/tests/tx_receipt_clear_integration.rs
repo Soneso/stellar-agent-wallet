@@ -586,3 +586,332 @@ async fn a_settled_record_the_endpoint_forgot_is_refused_and_writes_no_row() {
         "the record is untouched"
     );
 }
+
+/// Answers transaction and retention queries independently.
+struct OrphanRpc {
+    status: &'static str,
+    floor: u32,
+}
+
+impl Respond for OrphanRpc {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let result = match body["method"].as_str() {
+            Some("getHealth") => json!({"status":"healthy", "latestLedger":2000,
+                "oldestLedger": self.floor, "ledgerRetentionWindow":2000-self.floor}),
+            Some("getLedgers") => json!({"latestLedger":2000,"oldestLedger":self.floor,
+                "latestLedgerCloseTime":"100", "oldestLedgerCloseTime":1, "cursor":"2000", "ledgers":[]}),
+            _ => json!({"status":self.status,"latestLedger":2000,"oldestLedger":self.floor,
+                "ledger": if self.status == "SUCCESS" { Some(1500) } else { None },
+                "createdAt": if self.status == "SUCCESS" {
+                    Some((stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000).to_string())
+                } else { None }}),
+        };
+        ResponseTemplate::new(200)
+            .set_body_json(json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+    }
+}
+
+/// Seeds a real authenticated window using the subprocesses' encrypted keyring.
+fn orphan_fixture(
+    home: &Path,
+    rpc_url: &str,
+) -> (
+    stellar_agent_network::policy_state::PersistedWindowStore,
+    stellar_agent_core::profile::schema::Profile,
+) {
+    use std::sync::Arc;
+    use stellar_agent_core::policy::v1::criteria::state_store::StateKey;
+    use stellar_agent_headless_keyring::{crypto::ProtectionMode, store::HeadlessStore};
+    use stellar_agent_network::policy_state::{PersistedWindowStore, WindowReservation};
+    fixture(home, rpc_url);
+    keyring_core::set_default_store(Arc::new(HeadlessStore::new(
+        home.join("headless-keyring/store.keyring"),
+        ProtectionMode::EnvKey(Arc::new(zeroize::Zeroizing::new(std::array::from_fn(
+            |i| i as u8,
+        )))),
+    )));
+    let profile = stellar_agent_core::profile::loader::load_from_path(
+        PROFILE,
+        &home.join(format!("profiles/{PROFILE}.toml")),
+        None,
+    )
+    .unwrap();
+    let window = PersistedWindowStore::at_path(home.join(format!("policy/{PROFILE}.window")));
+    let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+    let res = WindowReservation {
+        id: ENVELOPE_HASH.to_owned(),
+        tx_hash: TX_HASH.to_owned(),
+        source: SOURCE.to_owned(),
+        sequence: 7,
+        max_time: 0,
+        pending_since_ms: now - 400_000,
+        submission_ledger: 1000,
+        operator_required: false,
+    };
+    window
+        .record_pending(
+            &profile,
+            &[(StateKey::new(PROFILE, 1, "native", 86_400), now, 75)],
+            &res,
+        )
+        .unwrap();
+    std::fs::remove_file(home.join(format!("receipts/{PROFILE}.json"))).unwrap();
+    (window, profile)
+}
+
+fn orphan_clear(home: &Path) -> (i32, Value) {
+    run_cli(
+        home,
+        &[
+            "tx",
+            "receipt",
+            "clear",
+            ENVELOPE_HASH,
+            "--acknowledge",
+            "--profile",
+            PROFILE,
+        ],
+    )
+}
+
+/// Orphan recovery preserves authenticated identity and provenance, writes one
+/// operator audit row, and releases the debit without inventing approval metadata.
+#[tokio::test]
+#[serial_test::serial]
+async fn orphan_clear_recovers_identity_and_releases_headroom() {
+    let home = tempfile::TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(OrphanRpc {
+            status: "NOT_FOUND",
+            floor: 1200,
+        })
+        .mount(&server)
+        .await;
+    let (window, profile) = orphan_fixture(home.path(), &server.uri());
+    let (code, data) = orphan_clear(home.path());
+    assert_eq!(code, 0, "{data}");
+    assert_eq!(data["data"]["reservation_released"], true);
+    let receipts = ReceiptStore::open_at(&home.path().join("receipts"), PROFILE).unwrap();
+    let receipt = receipts.get(ENVELOPE_HASH).unwrap().unwrap();
+    assert_eq!(receipt.status.label(), "cleared_by_operator");
+    assert!(receipt.recovered_from_reservation);
+    assert_eq!(receipt.tx_hash, TX_HASH);
+    assert_eq!(receipt.source, SOURCE);
+    assert_eq!(receipt.sequence, 7);
+    assert_eq!(receipt.recorded_at_ledger, 1000);
+    assert!(receipt.approval_nonce.is_none());
+    assert!(!receipt.approval_consumed);
+    assert!(window.pending_reservations(&profile).unwrap().is_empty());
+    assert_eq!(cleared_rows(home.path()), 1);
+    orphan_clear(home.path());
+    assert_eq!(cleared_rows(home.path()), 1);
+}
+
+/// Only an absent transaction beyond retention permits orphan reconstruction.
+#[tokio::test]
+#[serial_test::serial]
+async fn answerable_or_in_retention_orphans_are_not_cleared() {
+    for (status, floor) in [
+        ("SUCCESS", 1200),
+        ("FAILED", 1200),
+        ("NOT_FOUND", 1000),
+        ("PENDING", 1200),
+    ] {
+        let home = tempfile::TempDir::new().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(OrphanRpc { status, floor })
+            .mount(&server)
+            .await;
+        let (window, profile) = orphan_fixture(home.path(), &server.uri());
+        let (code, data) = orphan_clear(home.path());
+        assert_eq!(code, 1, "{status} {floor}: {data}");
+        assert_eq!(data["error"]["code"], "submission.not_clearable");
+        assert_eq!(window.pending_reservations(&profile).unwrap().len(), 1);
+        assert!(
+            ReceiptStore::open_at(&home.path().join("receipts"), PROFILE)
+                .unwrap()
+                .get(ENVELOPE_HASH)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(cleared_rows(home.path()), 0);
+    }
+}
+
+/// The durable recovery receipt is the crash checkpoint before reservation
+/// release. A new process finishes from either side of release and records one clear.
+#[tokio::test]
+#[serial_test::serial]
+async fn clear_resumes_after_recovered_receipt_write_before_release() {
+    for released_before_retry in [false, true] {
+        let home = tempfile::TempDir::new().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(OrphanRpc {
+                status: "NOT_FOUND",
+                floor: 1200,
+            })
+            .mount(&server)
+            .await;
+        let (window, profile) = orphan_fixture(home.path(), &server.uri());
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .open(home.path().join(format!("policy/{PROFILE}.window.lock")))
+            .unwrap();
+        lock.try_lock().unwrap();
+        let (interrupted, error) = orphan_clear(home.path());
+        assert_eq!(
+            interrupted, 1,
+            "release must stop at the held lock: {error}"
+        );
+        let recovered = ReceiptStore::open_at(&home.path().join("receipts"), PROFILE)
+            .unwrap()
+            .get(ENVELOPE_HASH)
+            .unwrap()
+            .expect("recovery receipt precedes release");
+        assert!(recovered.recovered_from_reservation);
+        assert_eq!(recovered.status.label(), "ambiguous");
+        drop(lock);
+        assert_eq!(window.pending_reservations(&profile).unwrap().len(), 1);
+        if released_before_retry {
+            window.release(&profile, ENVELOPE_HASH).unwrap();
+        }
+        let (code, data) = orphan_clear(home.path());
+        assert_eq!(code, 0, "{data}");
+        assert!(window.pending_reservations(&profile).unwrap().is_empty());
+        let receipt = ReceiptStore::open_at(&home.path().join("receipts"), PROFILE)
+            .unwrap()
+            .get(ENVELOPE_HASH)
+            .unwrap()
+            .unwrap();
+        assert!(receipt.recovered_from_reservation);
+        assert_eq!(receipt.status.label(), "cleared_by_operator");
+        assert_eq!(cleared_rows(home.path()), 1);
+    }
+}
+
+/// Status exposes an authenticated orphan marker while keeping the debit held.
+#[tokio::test]
+#[serial_test::serial]
+async fn tx_status_reports_an_orphan_requiring_operator_recovery() {
+    let home = tempfile::TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(OrphanRpc {
+            status: "NOT_FOUND",
+            floor: 1200,
+        })
+        .mount(&server)
+        .await;
+    let (window, profile) = orphan_fixture(home.path(), &server.uri());
+    let (code, data) = run_cli(
+        home.path(),
+        &["tx", "status", TX_HASH, "--profile", PROFILE],
+    );
+    assert_eq!(code, 0, "{data}");
+    assert_eq!(data["data"]["reservation"]["envelope_hash"], ENVELOPE_HASH);
+    assert_eq!(data["data"]["reservation"]["operator_required"], true);
+    let held = window.pending_reservations(&profile).unwrap();
+    assert_eq!(held.len(), 1);
+    assert!(held[0].operator_required);
+}
+
+/// Recovery requires a readable receipt store, authenticated window state,
+/// and explicit acknowledgement before the first durable write.
+#[tokio::test]
+#[serial_test::serial]
+async fn orphan_recovery_preconditions_leave_state_untouched() {
+    for condition in ["unreadable_receipt", "bad_hmac", "no_acknowledgement"] {
+        let home = tempfile::TempDir::new().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(OrphanRpc {
+                status: "NOT_FOUND",
+                floor: 1200,
+            })
+            .mount(&server)
+            .await;
+        let (_window, _profile) = orphan_fixture(home.path(), &server.uri());
+        let window_path = home.path().join(format!("policy/{PROFILE}.window"));
+        let receipt_path = home.path().join(format!("receipts/{PROFILE}.json"));
+        if condition == "unreadable_receipt" {
+            std::fs::write(&receipt_path, b"invalid json").unwrap();
+        }
+        if condition == "bad_hmac" {
+            let mut bytes = std::fs::read(&window_path).unwrap();
+            bytes[0] ^= 1;
+            std::fs::write(&window_path, bytes).unwrap();
+        }
+        let original_window = std::fs::read(&window_path).unwrap();
+        let original_receipts = std::fs::read(&receipt_path).ok();
+        let (code, data) = if condition == "no_acknowledgement" {
+            run_cli(
+                home.path(),
+                &[
+                    "tx",
+                    "receipt",
+                    "clear",
+                    ENVELOPE_HASH,
+                    "--profile",
+                    PROFILE,
+                ],
+            )
+        } else {
+            orphan_clear(home.path())
+        };
+        assert_eq!(code, 1, "{condition}: {data}");
+        assert_eq!(
+            data["error"]["code"],
+            if condition == "no_acknowledgement" {
+                "submission.acknowledgement_required"
+            } else {
+                "submission.record_unavailable"
+            }
+        );
+        assert_eq!(std::fs::read(&window_path).unwrap(), original_window);
+        assert_eq!(std::fs::read(&receipt_path).ok(), original_receipts);
+        assert_eq!(cleared_rows(home.path()), 0);
+    }
+}
+
+/// A definitive answer can restore an orphan's receipt during status lookup;
+/// the resulting receipt and its one settlement audit row must be visible.
+#[tokio::test]
+#[serial_test::serial]
+async fn tx_status_surfaces_a_restored_orphan_receipt_and_settlement_row() {
+    let home = tempfile::TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(OrphanRpc {
+            status: "SUCCESS",
+            floor: 1200,
+        })
+        .mount(&server)
+        .await;
+    let (window, profile) = orphan_fixture(home.path(), &server.uri());
+    let args = ["tx", "status", TX_HASH, "--profile", PROFILE];
+    let (code, data) = run_cli(home.path(), &args);
+    assert_eq!(code, 0, "{data}");
+    assert_eq!(data["data"]["record"]["status"], "success");
+    assert_eq!(data["data"]["record"]["reservation_open"], false);
+    assert!(window.pending_reservations(&profile).unwrap().is_empty());
+    assert_eq!(
+        audit_rows(home.path())
+            .iter()
+            .filter(|row| row.contains("value_action_submitted"))
+            .count(),
+        1
+    );
+    let (code, data) = run_cli(home.path(), &args);
+    assert_eq!(code, 0, "{data}");
+    assert_eq!(
+        audit_rows(home.path())
+            .iter()
+            .filter(|row| row.contains("value_action_submitted"))
+            .count(),
+        1
+    );
+}

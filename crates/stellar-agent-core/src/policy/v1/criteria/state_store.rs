@@ -3,8 +3,8 @@
 //!
 //! [`PolicyStateStore`] is the runtime state holder injected into
 //! [`crate::policy::v1::EvalContext`].  It maintains per-key `VecDeque` records
-//! of `(timestamp_ms, amount_or_count)` tuples, where entries older than the
-//! configured window are evicted on each read pass.
+//! carrying a timestamp, amount, and pending status. Confirmed entries age out
+//! of their window; unresolved entries hold headroom until settlement.
 //!
 //! The store is in-process only; persistence across restarts is not provided.
 //! Every entry it holds is therefore reconstructed fresh at process start —
@@ -155,15 +155,22 @@ impl StateKey {
 ///
 #[derive(Debug)]
 pub struct PolicyStateStore {
-    /// Map from state key to a deque of (timestamp_ms, amount_or_count)
-    /// entries in insertion order (oldest at front).  The amount is `i128`
+    /// Map from state key to entries in insertion order. Ledger close times
+    /// need not follow that order. The amount is `i128`
     /// (see the module-level "Accumulator width" section) — exact across the
     /// full range a per-period stroop total can take.
     ///
     /// `Mutex<HashMap<...>>` enables `Send + Sync` without `parking_lot`
     /// (not yet a workspace dep; std Mutex is adequate here because this
     /// store is never held across an await point).
-    inner: Mutex<HashMap<StateKey, VecDeque<(u64, i128)>>>,
+    inner: Mutex<HashMap<StateKey, VecDeque<StateEntry>>>,
+}
+
+#[derive(Debug)]
+struct StateEntry {
+    timestamp_ms: u64,
+    amount: i128,
+    pending: bool,
 }
 
 /// Error variants for [`PolicyStateStore`] operations.
@@ -211,8 +218,8 @@ impl PolicyStateStore {
     /// Queries the current window for a given key, evicting stale entries and
     /// returning `(sum_of_amounts, count_of_entries)` for the surviving window.
     ///
-    /// Eviction removes entries with `timestamp_ms < now_ms -
-    /// (window_secs * 1_000)`.
+    /// Eviction removes confirmed entries with `timestamp_ms < now_ms -
+    /// (window_secs * 1_000)`. Pending entries count regardless of age.
     ///
     /// Clock-skew check: any entry with
     /// `timestamp_ms > now_ms + 30_000` (30-second tolerance) causes
@@ -261,7 +268,8 @@ impl PolicyStateStore {
 
         // Check for clock-skew violations before eviction so we surface the
         // error before silently discarding future entries.
-        for &(ts, _) in deque.iter() {
+        for entry in deque.iter() {
+            let ts = entry.timestamp_ms;
             if ts > future_limit {
                 return Err(StateStoreError::ClockSkewExceeded {
                     entry_ts_ms: ts,
@@ -270,15 +278,14 @@ impl PolicyStateStore {
             }
         }
 
-        // Evict entries older than the window.
-        while deque.front().is_some_and(|&(ts, _)| ts < cutoff) {
-            deque.pop_front();
-        }
+        // Pending entries hold headroom until settlement. Confirmed entries
+        // age from ledger close time, which need not follow insertion order.
+        deque.retain(|entry| entry.pending || entry.timestamp_ms >= cutoff);
 
         let mut sum: i128 = 0;
         let mut count: u32 = 0;
-        for &(_, amount) in deque.iter() {
-            sum = sum.saturating_add(amount);
+        for entry in deque.iter() {
+            sum = sum.saturating_add(entry.amount);
             count = count.saturating_add(1);
         }
 
@@ -313,6 +320,29 @@ impl PolicyStateStore {
         timestamp_ms: u64,
         amount_or_count: i128,
     ) -> Result<(), StateStoreError> {
+        self.append_entry(key, timestamp_ms, amount_or_count, false)
+    }
+
+    /// Appends an unresolved debit that counts regardless of its age.
+    ///
+    /// # Errors
+    /// Returns [`StateStoreError::LockPoisoned`] if the mutex is poisoned.
+    pub fn append_pending(
+        &self,
+        key: &StateKey,
+        timestamp_ms: u64,
+        amount_or_count: i128,
+    ) -> Result<(), StateStoreError> {
+        self.append_entry(key, timestamp_ms, amount_or_count, true)
+    }
+
+    fn append_entry(
+        &self,
+        key: &StateKey,
+        timestamp_ms: u64,
+        amount_or_count: i128,
+        pending: bool,
+    ) -> Result<(), StateStoreError> {
         let mut guard = self
             .inner
             .lock()
@@ -320,10 +350,11 @@ impl PolicyStateStore {
                 detail: e.to_string(),
             })?;
 
-        guard
-            .entry(key.clone())
-            .or_default()
-            .push_back((timestamp_ms, amount_or_count));
+        guard.entry(key.clone()).or_default().push_back(StateEntry {
+            timestamp_ms,
+            amount: amount_or_count,
+            pending,
+        });
 
         Ok(())
     }

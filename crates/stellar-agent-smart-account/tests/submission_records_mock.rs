@@ -148,6 +148,9 @@ impl Respond for Rpc {
             "getTransaction" => json!({
                 "status": self.poll_status, "latestLedger": 1001, "oldestLedger": 1,
                 "ledger": if self.poll_status == "SUCCESS" { Some(1001) } else { None },
+                "createdAt": if self.poll_status == "SUCCESS" {
+                    Some((stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1_000).to_string())
+                } else { None },
             }),
             other => panic!("unexpected RPC method: {other}"),
         };
@@ -358,6 +361,8 @@ async fn timed_out_multicall_reserves_sized_legs_and_denies_a_second_bundle() {
     assert_eq!(sends.load(Ordering::SeqCst), 1);
 }
 
+/// The applying ledger's close time dates each confirmed leg, so a complete
+/// success answer closes the holds and preserves each debit exactly once.
 #[tokio::test]
 #[serial]
 async fn confirmed_multicall_counts_each_leg_once() {

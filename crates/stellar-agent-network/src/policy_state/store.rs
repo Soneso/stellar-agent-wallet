@@ -36,21 +36,99 @@ const HMAC_CONTEXT_LABEL: &[u8] = b"stellar-agent-policy-window/v1/body\x00";
 /// window shrinks or a rule is removed.
 const RETENTION_MS: u64 = 604_800 * 1_000;
 
+/// Bounds the chain-time observation independently of the transport timeout.
+const LEDGER_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Chain observations and RPC allowance shared by one reconciliation pass.
+struct ReconcilePass {
+    remaining: usize,
+    spent: usize,
+    observed: bool,
+    oldest_ledger: Option<u32>,
+    chain: Option<(u32, u64)>,
+}
+
+impl ReconcilePass {
+    fn new(budget: usize) -> Self {
+        Self {
+            remaining: budget.saturating_mul(3).saturating_add(2),
+            spent: 0,
+            observed: false,
+            oldest_ledger: None,
+            chain: None,
+        }
+    }
+
+    fn charge(&mut self) -> bool {
+        if self.remaining == 0 {
+            return false;
+        }
+        self.remaining -= 1;
+        self.spent += 1;
+        true
+    }
+
+    async fn observe(&mut self, client: &crate::client::StellarRpcClient) {
+        if self.observed {
+            return;
+        }
+        self.observed = true;
+        if !self.charge() {
+            return;
+        }
+        let health = match client.get_health().await {
+            Ok(health) => health,
+            Err(error) => {
+                tracing::debug!(%error, "window reconcile: retention observation unavailable; reservation stands");
+                return;
+            }
+        };
+        self.oldest_ledger = Some(health.oldest_ledger);
+        if !self.charge() {
+            return;
+        }
+        let answer = tokio::time::timeout(
+            LEDGER_OBSERVATION_TIMEOUT,
+            client.inner.get_ledgers(
+                stellar_rpc_client::LedgerStart::Ledger(health.latest_ledger),
+                Some(1),
+                None,
+            ),
+        )
+        .await;
+        if let Ok(Ok(answer)) = answer
+            && answer.latest_ledger_close_time > 0
+            && answer.latest_ledger_close_time >= answer.oldest_ledger_close_time
+            && answer.latest_ledger >= health.latest_ledger
+            && answer.oldest_ledger <= answer.latest_ledger
+        {
+            self.oldest_ledger = Some(health.oldest_ledger.max(answer.oldest_ledger));
+            self.chain = Some((answer.latest_ledger, answer.latest_ledger_close_time as u64));
+            return;
+        }
+        tracing::debug!(
+            "window reconcile: valid ledger close time unavailable; time-bound release stays closed"
+        );
+    }
+}
+
 /// Wire-format version this build writes.
-const WIRE_VERSION: u32 = 2;
+const WIRE_VERSION: u32 = 3;
 
 /// Highest wire-format version this build reads.
 ///
 /// A file written by a newer build carries records this one cannot account
 /// for, so it is refused rather than read with the fields it happens to
 /// recognise.
-const WIRE_VERSION_MAX: u32 = 2;
+const WIRE_VERSION_MAX: u32 = 3;
 
 /// How many reservations one reconciliation pass settles.
 ///
 /// A value verb runs a pass before its policy gate, so this bounds the extra
 /// round trips it can spend: at most this many reservations, each costing at
-/// most three transaction/account reads, plus one shared retention query.
+/// most three transaction/account reads, plus one shared retention query and
+/// one ledger observation. Every RPC consumes that pass's `3 * budget + 2`
+/// allowance, including the ledger observation.
 pub const RECONCILE_BUDGET: usize = 5;
 
 /// How long a reservation must stand before a reconciliation pass looks at it.
@@ -73,8 +151,8 @@ pub const RECONCILE_MIN_AGE_MS: u64 = 300_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum RecordStatus {
-    /// The transaction reached a ledger. A record written before this field
-    /// existed reads as confirmed, which is the accounting a v1 file meant.
+    /// The transaction reached a ledger. Version 1 records default to
+    /// confirmed spend so their window accounting remains defined.
     #[default]
     Confirmed,
     /// A signed transaction was sent and its outcome is not known yet.
@@ -119,6 +197,9 @@ struct WireRecord {
     /// it" apart from "the endpoint no longer remembers it".
     #[serde(default)]
     submission_ledger: u32,
+    /// An orphan beyond retention requires an operator decision.
+    #[serde(default)]
+    operator_required: bool,
 }
 
 impl WireRecord {
@@ -138,6 +219,7 @@ impl WireRecord {
             max_time: 0,
             pending_since_ms: 0,
             submission_ledger: 0,
+            operator_required: false,
         }
     }
 }
@@ -162,6 +244,8 @@ pub struct WindowReservation {
     pub pending_since_ms: u64,
     /// The endpoint's latest ledger when the reservation was taken.
     pub submission_ledger: u32,
+    /// The receipt is absent beyond retention; automatic reconciliation skips this hold.
+    pub operator_required: bool,
 }
 
 /// What one reconciliation pass did.
@@ -169,6 +253,8 @@ pub struct WindowReservation {
 pub struct ReconcileReport {
     /// Reservations the pass asked the endpoint about.
     pub examined: usize,
+    /// RPC calls charged to this pass, including its shared observations.
+    pub rpc_calls: usize,
     /// Reservations confirmed by a `SUCCESS` answer.
     pub confirmed: usize,
     /// Reservations released, either by a `FAILED` answer or because the
@@ -221,6 +307,10 @@ struct WireFile {
     version: u32,
     generation: u64,
     entries: Vec<WireBucket>,
+    /// Prepared next generation, authenticated with the current snapshot.
+    /// The keyring counter selects exactly one side of the atomic commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepared: Option<Box<WireFile>>,
 }
 
 /// Decimal-string `i128` serde adapter, mirroring
@@ -368,10 +458,7 @@ impl PersistedWindowStore {
                 detail: format!("{e}"),
             })?;
         let wire = self.verify_with_key(&key, &bytes)?;
-        match load_generation(&gen_entry)? {
-            Some(keyring_gen) if keyring_gen == wire.generation => {}
-            _ => return Err(WindowStoreError::GenerationMismatch),
-        }
+        let wire = select_generation(wire, load_counter(&gen_entry)?)?;
 
         for entry in wire.entries {
             let key = StateKey::new(
@@ -381,10 +468,14 @@ impl PersistedWindowStore {
                 entry.window_secs,
             );
             for record in entry.records {
-                dest.append(&key, record.ts_ms, record.amount)
-                    .map_err(|e| WindowStoreError::Invalid {
-                        detail: format!("in-memory store append failed: {e}"),
-                    })?;
+                let appended = if record.status == RecordStatus::Pending {
+                    dest.append_pending(&key, record.ts_ms, record.amount)
+                } else {
+                    dest.append(&key, record.ts_ms, record.amount)
+                };
+                appended.map_err(|e| WindowStoreError::Invalid {
+                    detail: format!("in-memory store append failed: {e}"),
+                })?;
             }
         }
         Ok(())
@@ -432,11 +523,8 @@ impl PersistedWindowStore {
         prune_stale(&mut wire, now_ms);
         wire.version = WIRE_VERSION;
 
-        // Generation bump is keyring-first: a crash between this line and the
-        // file write below leaves the file BEHIND the keyring (fails closed
-        // on next read), never ahead of it. See the module docs.
-        wire.generation = bump_generation(&gen_entry)?;
-
+        wire.generation = next_generation(&gen_entry)?;
+        write_generation(&gen_entry, &wire)?;
         self.write_atomic(&key, &wire)?;
         Ok(mint_outcome)
     }
@@ -479,31 +567,49 @@ impl PersistedWindowStore {
                 max_time: reservation.max_time,
                 pending_since_ms: reservation.pending_since_ms,
                 submission_ledger: reservation.submission_ledger,
+                operator_required: false,
             });
         }
 
         prune_stale(&mut wire, now_ms()?);
         wire.version = WIRE_VERSION;
-        wire.generation = bump_generation(&gen_entry)?;
+        wire.generation = next_generation(&gen_entry)?;
+        write_generation(&gen_entry, &wire)?;
         self.write_atomic(&key, &wire)?;
         Ok(mint_outcome)
     }
 
     /// Marks every record held by reservation `id` confirmed.
     ///
-    /// The records stay: the transaction reached a ledger, so the spend is
-    /// real and keeps counting against the window.
+    /// Confirmed spend ages from the applying ledger's close time. A missing
+    /// or invalid close time leaves the hold pending because its age is unknown.
     ///
     /// # Errors
     ///
     /// See [`WindowStoreError`].
-    pub fn confirm(&self, profile: &Profile, id: &str) -> Result<(), WindowStoreError> {
+    pub fn confirm(
+        &self,
+        profile: &Profile,
+        id: &str,
+        created_at: Option<i64>,
+    ) -> Result<(), WindowStoreError> {
+        let close_ms = created_at
+            .and_then(|time| u64::try_from(time).ok())
+            .filter(|time| *time > 0)
+            .and_then(|time| time.checked_mul(1_000));
+        let Some(close_ms) = close_ms else {
+            tracing::warn!(
+                "window confirm: applying ledger close time unavailable; reservation stays pending"
+            );
+            return Ok(());
+        };
         self.rewrite_records(profile, |wire| {
             let mut touched = false;
             for bucket in &mut wire.entries {
                 for record in &mut bucket.records {
                     if record.id == id && record.status == RecordStatus::Pending {
                         record.status = RecordStatus::Confirmed;
+                        record.ts_ms = close_ms;
                         touched = true;
                     }
                 }
@@ -531,6 +637,33 @@ impl PersistedWindowStore {
             let after: usize = wire.entries.iter().map(|b| b.records.len()).sum();
             after != before
         })
+    }
+
+    /// Keeps an orphan's authenticated identity and debit while excluding it
+    /// from automatic reconciliation until an operator resolves its outcome.
+    fn mark_operator_required(&self, profile: &Profile, id: &str) -> Result<(), WindowStoreError> {
+        let result = self.rewrite_records(profile, |wire| {
+            let mut touched = false;
+            for bucket in &mut wire.entries {
+                for record in &mut bucket.records {
+                    if record.id == id
+                        && record.status == RecordStatus::Pending
+                        && !record.operator_required
+                    {
+                        record.operator_required = true;
+                        touched = true;
+                    }
+                }
+            }
+            touched
+        });
+        if let Err(error) = &result {
+            tracing::warn!(
+                ?error,
+                "window reconcile: operator marker write failed; reservation remains selectable"
+            );
+        }
+        result
     }
 
     /// Returns every reservation the file currently holds pending, oldest
@@ -564,9 +697,10 @@ impl PersistedWindowStore {
     ///   the endpoint's retention floor it proves nothing, so the reservation
     ///   stands and the receipt is marked ambiguous for an operator to
     ///   resolve. Otherwise the reservation is released when the source
-    ///   account's sequence has reached the one the transaction needs, or its
-    ///   time bound has passed: either way the transaction can no longer
-    ///   apply. Failing both, the reservation stands.
+    ///   account's sequence has reached the one the transaction needs, or an
+    ///   observed ledger close time is strictly past its nonzero time bound.
+    ///   Both arms require a fresh `NOT_FOUND`; a fresh definitive answer
+    ///   settles the spend. Missing chain time closes only the time arm.
     ///
     /// An endpoint that cannot answer leaves the reservation standing. Nothing
     /// here releases a reservation on a transport error.
@@ -625,28 +759,22 @@ impl PersistedWindowStore {
         let due: Vec<WindowReservation> = collect_pending(&wire)
             .into_iter()
             .filter(|r| now_ms.saturating_sub(r.pending_since_ms) >= RECONCILE_MIN_AGE_MS)
-            .filter(|r| !outcome_already_unknown(&known, &r.id))
+            .filter(|r| !r.operator_required && !outcome_already_unknown(&known, &r.id))
             .take(budget)
             .collect();
 
         let mut report = ReconcileReport::default();
-        let mut oldest_ledger: Option<u32> = None;
+        let mut pass = ReconcilePass::new(budget);
 
         for reservation in due {
             report.examined += 1;
             let settlement = self
-                .settle_reservation(
-                    profile,
-                    client,
-                    receipts,
-                    &reservation,
-                    now_ms,
-                    &mut oldest_ledger,
-                )
+                .settle_reservation(profile, client, receipts, &reservation, &mut pass)
                 .await?;
             record_settlement(&mut report, &reservation, settlement);
         }
 
+        report.rpc_calls = pass.spent;
         Ok(report)
     }
 
@@ -673,7 +801,7 @@ impl PersistedWindowStore {
         client: &crate::client::StellarRpcClient,
         receipts: Option<&ReceiptStore>,
         id: &str,
-        now_ms: u64,
+        _now_ms: u64,
     ) -> Result<ReconcileReport, WindowStoreError> {
         let open = match self.read_for_inspection(profile)? {
             Some(wire) => collect_pending(&wire).into_iter().find(|r| r.id == id),
@@ -689,18 +817,12 @@ impl PersistedWindowStore {
             examined: 1,
             ..ReconcileReport::default()
         };
-        let mut oldest_ledger: Option<u32> = None;
+        let mut pass = ReconcilePass::new(1);
         let settlement = self
-            .settle_reservation(
-                profile,
-                client,
-                receipts,
-                &reservation,
-                now_ms,
-                &mut oldest_ledger,
-            )
+            .settle_reservation(profile, client, receipts, &reservation, &mut pass)
             .await?;
         record_settlement(&mut report, &reservation, settlement);
+        report.rpc_calls = pass.spent;
         Ok(report)
     }
 
@@ -725,12 +847,14 @@ impl PersistedWindowStore {
         let _lock = WindowStoreLock::acquire(&self.lock_path())?;
         let (key, mint_outcome) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
-        let new_generation = bump_generation(&gen_entry)?;
+        let new_generation = next_generation(&gen_entry)?;
         let empty = WireFile {
             version: WIRE_VERSION,
             generation: new_generation,
             entries: Vec::new(),
+            prepared: None,
         };
+        write_generation(&gen_entry, &empty)?;
         self.write_atomic(&key, &empty)?;
         Ok(mint_outcome)
     }
@@ -828,6 +952,7 @@ impl PersistedWindowStore {
         let (key, _mint) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
         let mut wire = self.read_verified(&key, &gen_entry)?;
+        let original = wire.clone();
 
         if !mutate(&mut wire) {
             return Ok(());
@@ -835,8 +960,46 @@ impl PersistedWindowStore {
 
         prune_stale(&mut wire, now_ms()?);
         wire.version = WIRE_VERSION;
-        wire.generation = bump_generation(&gen_entry)?;
-        self.write_atomic(&key, &wire)
+        self.commit_generation(&key, &gen_entry, original, wire)
+    }
+
+    /// Persists both sides before advancing the keyring commit point. A crash
+    /// at any write leaves a snapshot matching the counter, while replay of an
+    /// older file cannot supply a matching committed generation.
+    fn commit_generation(
+        &self,
+        key: &[u8; 32],
+        gen_entry: &KeyringEntryRef,
+        mut original: WireFile,
+        mut next: WireFile,
+    ) -> Result<(), WindowStoreError> {
+        next.generation =
+            original
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| WindowStoreError::Invalid {
+                    detail: "policy window-state generation counter overflow".to_owned(),
+                })?;
+        next.prepared = None;
+        if original.generation == 0 {
+            // Initialisation has no prior debit to retain. A missing trusted
+            // counter on an existing file must remain a deletion error.
+            write_generation(gen_entry, &next)?;
+            return self.write_atomic(key, &next);
+        }
+        original.version = WIRE_VERSION;
+        original.prepared = Some(Box::new(next.clone()));
+        self.write_atomic(key, &original)?;
+        write_generation(gen_entry, &next)?;
+        // The committed candidate is already durable. Compaction is optional:
+        // readers use it directly if replacing the prepared image fails.
+        if let Err(error) = self.write_atomic(key, &next) {
+            tracing::warn!(
+                ?error,
+                "window store: committed prepared generation retained; compaction failed"
+            );
+        }
+        Ok(())
     }
 
     /// Settles one reservation against the chain. See [`Self::reconcile_due`]
@@ -847,8 +1010,7 @@ impl PersistedWindowStore {
         client: &crate::client::StellarRpcClient,
         receipts: Option<&ReceiptStore>,
         reservation: &WindowReservation,
-        now_ms: u64,
-        oldest_ledger: &mut Option<u32>,
+        pass: &mut ReconcilePass,
     ) -> Result<Settlement, WindowStoreError> {
         // A missing receipt leaves the authenticated reservation as the
         // submission identity. Its chain outcome and retention boundary still
@@ -874,6 +1036,9 @@ impl PersistedWindowStore {
         };
         let tx_hash = stellar_xdr::Hash(hash_bytes);
 
+        if !pass.charge() {
+            return Ok(Settlement::KeptPending);
+        }
         let response = match client.inner.get_transaction(&tx_hash).await {
             Ok(r) => r,
             Err(e) => {
@@ -888,14 +1053,7 @@ impl PersistedWindowStore {
 
         if response.status == "NOT_FOUND" {
             return self
-                .settle_not_found(
-                    profile,
-                    client,
-                    receipts,
-                    reservation,
-                    now_ms,
-                    oldest_ledger,
-                )
+                .settle_not_found(profile, client, receipts, reservation, pass)
                 .await;
         }
         self.settle_chain_answer(profile, receipts, reservation, &response)
@@ -911,7 +1069,7 @@ impl PersistedWindowStore {
     ) -> Result<Settlement, WindowStoreError> {
         match response.status.as_str() {
             "SUCCESS" => {
-                self.confirm(profile, &reservation.id)?;
+                self.confirm(profile, &reservation.id, response.created_at)?;
                 finalize_receipt(
                     receipts,
                     reservation,
@@ -951,41 +1109,52 @@ impl PersistedWindowStore {
         client: &crate::client::StellarRpcClient,
         receipts: Option<&ReceiptStore>,
         reservation: &WindowReservation,
-        now_ms: u64,
-        oldest_ledger: &mut Option<u32>,
+        pass: &mut ReconcilePass,
     ) -> Result<Settlement, WindowStoreError> {
         // The retention boundary first: an endpoint that no longer holds the
         // ledger range the submission was made in cannot report the
         // transaction whatever happened to it, so its NOT_FOUND carries no
         // information.
-        if oldest_ledger.is_none() {
-            match client.get_health().await {
-                Ok(health) => *oldest_ledger = Some(health.oldest_ledger),
-                Err(e) => {
-                    tracing::debug!(
-                        error = %e,
-                        "window reconcile: getHealth failed; reservation stands"
-                    );
-                    return Ok(Settlement::KeptPending);
+        pass.observe(client).await;
+        let Some(floor) = pass.oldest_ledger else {
+            return Ok(Settlement::KeptPending);
+        };
+        if reservation.submission_ledger > 0 && reservation.submission_ledger < floor {
+            if let Some(receipts) = receipts {
+                match receipts.get(&reservation.id) {
+                    Ok(None) => self.mark_operator_required(profile, &reservation.id)?,
+                    Ok(Some(_)) => finalize_receipt(
+                        Some(receipts),
+                        reservation,
+                        ReceiptStatus::Ambiguous,
+                        None,
+                    ),
+                    Err(error) => {
+                        tracing::warn!(%error, "window reconcile: receipt read failed; orphan status unknown");
+                        return Ok(Settlement::KeptPending);
+                    }
                 }
             }
-        }
-        if let Some(floor) = *oldest_ledger
-            && reservation.submission_ledger > 0
-            && reservation.submission_ledger < floor
-        {
-            finalize_receipt(receipts, reservation, ReceiptStatus::Ambiguous, None);
             return Ok(Settlement::RetentionExpired);
         }
 
-        // The transaction cannot apply once its time bound has passed.
-        let now_secs = now_ms / 1_000;
-        if reservation.max_time > 0 && reservation.max_time <= now_secs {
-            return self.release_as_ambiguous(profile, receipts, reservation);
+        let time_expired = reservation.max_time > 0
+            && reservation.submission_ledger >= floor
+            && reservation.submission_ledger > 0
+            && pass.chain.is_some_and(|(ledger, close_time)| {
+                reservation.submission_ledger <= ledger && close_time > reservation.max_time
+            });
+        if time_expired {
+            return self
+                .fresh_answer_or_release(profile, client, receipts, reservation, pass)
+                .await;
         }
 
         // A consumed sequence needs a fresh transaction answer to distinguish
         // this submission landing from another submission using the sequence.
+        if !pass.charge() {
+            return Ok(Settlement::KeptPending);
+        }
         let account = match crate::account::fetch_account(client, &reservation.source, &[]).await {
             Ok(a) => a,
             Err(e) => {
@@ -997,26 +1166,41 @@ impl PersistedWindowStore {
             }
         };
         if account.sequence_number >= reservation.sequence {
-            let Ok(hash) = stellar_agent_core::hex::decode_hex32(&reservation.tx_hash) else {
-                return Ok(Settlement::KeptPending);
-            };
-            let response = match client.inner.get_transaction(&stellar_xdr::Hash(hash)).await {
-                Ok(response) => response,
-                Err(e) => {
-                    tracing::debug!(
-                        error = %crate::retry::truncate_error_display(&e),
-                        "window reconcile: confirmation query failed; reservation stands"
-                    );
-                    return Ok(Settlement::KeptPending);
-                }
-            };
-            if response.status == "NOT_FOUND" {
-                return self.release_as_ambiguous(profile, receipts, reservation);
-            }
-            return self.settle_chain_answer(profile, receipts, reservation, &response);
+            return self
+                .fresh_answer_or_release(profile, client, receipts, reservation, pass)
+                .await;
         }
 
         Ok(Settlement::KeptPending)
+    }
+
+    /// Rechecks the transaction after observing that it cannot apply.
+    async fn fresh_answer_or_release(
+        &self,
+        profile: &Profile,
+        client: &crate::client::StellarRpcClient,
+        receipts: Option<&ReceiptStore>,
+        reservation: &WindowReservation,
+        pass: &mut ReconcilePass,
+    ) -> Result<Settlement, WindowStoreError> {
+        let Ok(hash) = stellar_agent_core::hex::decode_hex32(&reservation.tx_hash) else {
+            return Ok(Settlement::KeptPending);
+        };
+        if !pass.charge() {
+            return Ok(Settlement::KeptPending);
+        }
+        let response = match client.inner.get_transaction(&stellar_xdr::Hash(hash)).await {
+            Ok(response) => response,
+            Err(e) => {
+                tracing::debug!(error = %crate::retry::truncate_error_display(&e),
+                    "window reconcile: confirmation query failed; reservation stands");
+                return Ok(Settlement::KeptPending);
+            }
+        };
+        if response.status == "NOT_FOUND" {
+            return self.release_as_ambiguous(profile, receipts, reservation);
+        }
+        self.settle_chain_answer(profile, receipts, reservation, &response)
     }
 
     /// Releases a reservation whose transaction can no longer apply, recording
@@ -1059,10 +1243,7 @@ impl PersistedWindowStore {
                 }
             })?;
         let wire = self.verify_with_key(&key, &bytes)?;
-        match load_generation(&gen_entry)? {
-            Some(keyring_gen) if keyring_gen == wire.generation => Ok(Some(wire)),
-            _ => Err(WindowStoreError::GenerationMismatch),
-        }
+        select_generation(wire, load_counter(&gen_entry)?).map(Some)
     }
 
     fn ensure_parent_dir(&self) -> Result<(), WindowStoreError> {
@@ -1129,10 +1310,7 @@ impl PersistedWindowStore {
         match fs::read(&self.path) {
             Ok(bytes) => {
                 let wire = self.verify_with_key(key, &bytes)?;
-                match load_generation(gen_entry)? {
-                    Some(keyring_gen) if keyring_gen == wire.generation => Ok(wire),
-                    _ => Err(WindowStoreError::GenerationMismatch),
-                }
+                select_generation(wire, load_counter(gen_entry)?)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => match load_generation(gen_entry)?
             {
@@ -1140,6 +1318,7 @@ impl PersistedWindowStore {
                     version: WIRE_VERSION,
                     generation: 0,
                     entries: Vec::new(),
+                    prepared: None,
                 }),
                 Some(_) => Err(WindowStoreError::GenerationMismatch),
             },
@@ -1248,30 +1427,55 @@ fn generation_entry_ref(profile: &Profile) -> KeyringEntryRef {
     KeyringEntryRef::new(base.service.clone(), format!("{}-generation", base.account))
 }
 
-/// Reads the current generation counter. `Ok(None)` means the entry has
-/// never been minted — a genuine first-run signal, distinct from `Some(0)`
-/// (which cannot occur: [`bump_generation`] always writes a value `>= 1`).
-fn load_generation(entry_ref: &KeyringEntryRef) -> Result<Option<u64>, WindowStoreError> {
-    // Keyring failures are carried inside the crate-local `WindowStoreError::Keyring`
-    // with the raw error text; `NoEntry` is distinguished as the first-run signal.
-    // This path is not routed through `classify_keyring_error`, so a non-interactive
-    // Windows session reads as a generic keyring error rather than
-    // `auth.keyring_interactive_session_required`. On the T6 keyring-classification
-    // allow-set for that reason; full surface-layer classification here is a
-    // candidate follow-up (the generation counter is a non-secret integer).
+/// The trusted commit binds one generation to exactly one canonical body.
+/// An abandoned candidate can reuse a generation number, but cannot replace
+/// another body's commitment when that generation is later committed.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenerationCommitment {
+    generation: u64,
+    body_sha256: String,
+}
+
+struct GenerationState {
+    generation: u64,
+    body_sha256: Option<String>,
+}
+
+/// Numeric entries retain compatibility with files written under versions 1 and 2.
+fn load_counter(entry_ref: &KeyringEntryRef) -> Result<Option<GenerationState>, WindowStoreError> {
     let entry = keyring_core::Entry::new(&entry_ref.service, &entry_ref.account).map_err(|e| {
         WindowStoreError::Keyring {
             detail: format!("generation entry open failed: {e}"),
         }
     })?;
     match entry.get_password() {
-        Ok(s) => s
-            .trim()
-            .parse::<u64>()
-            .map(Some)
-            .map_err(|e| WindowStoreError::Keyring {
-                detail: format!("generation entry value is not a valid counter: {e}"),
-            }),
+        Ok(value) => {
+            if let Ok(generation) = value.trim().parse::<u64>() {
+                return Ok(Some(GenerationState {
+                    generation,
+                    body_sha256: None,
+                }));
+            }
+            let committed: GenerationCommitment =
+                serde_json::from_str(&value).map_err(|e| WindowStoreError::Keyring {
+                    detail: format!("generation entry value is not a valid commitment: {e}"),
+                })?;
+            if committed.body_sha256.len() != 64
+                || !committed
+                    .body_sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err(WindowStoreError::Keyring {
+                    detail: "generation commitment digest is invalid".to_owned(),
+                });
+            }
+            Ok(Some(GenerationState {
+                generation: committed.generation,
+                body_sha256: Some(committed.body_sha256),
+            }))
+        }
         Err(keyring_core::Error::NoEntry) => Ok(None),
         Err(e) => Err(WindowStoreError::Keyring {
             detail: format!("generation entry read failed: {e}"),
@@ -1279,27 +1483,56 @@ fn load_generation(entry_ref: &KeyringEntryRef) -> Result<Option<u64>, WindowSto
     }
 }
 
-/// Atomically-from-this-process's-perspective increments the generation
-/// counter (read-then-write; concurrent bumps are serialised by the SAME
-/// [`WindowStoreLock`] every caller of this function already holds — see
-/// [`PersistedWindowStore::record_and_persist`] / `reset`) and returns the
-/// NEW value. Absent-entry reads as `0`, so the first-ever bump returns `1`.
-fn bump_generation(entry_ref: &KeyringEntryRef) -> Result<u64, WindowStoreError> {
-    let current = load_generation(entry_ref)?.unwrap_or(0);
-    let next = current
+fn load_generation(entry_ref: &KeyringEntryRef) -> Result<Option<u64>, WindowStoreError> {
+    Ok(load_counter(entry_ref)?.map(|state| state.generation))
+}
+
+fn next_generation(entry_ref: &KeyringEntryRef) -> Result<u64, WindowStoreError> {
+    load_generation(entry_ref)?
+        .unwrap_or(0)
         .checked_add(1)
         .ok_or_else(|| WindowStoreError::Invalid {
             detail: "policy window-state generation counter overflow".to_owned(),
-        })?;
-    // Same keyring-error discipline as `load_generation` (T6 allow-set;
-    // classification follow-up candidate): raw text inside `WindowStoreError::Keyring`.
+        })
+}
+
+/// Hashes the selected snapshot, whose prepared field is absent. The digest
+/// stays identical across the prepared and compacted representations.
+fn body_digest(wire: &WireFile) -> Result<String, WindowStoreError> {
+    let body = serde_json::to_vec(wire).map_err(|e| WindowStoreError::Invalid {
+        detail: format!("failed to serialise committed store body: {e}"),
+    })?;
+    Ok(stellar_agent_core::hex::encode(
+        &<Sha256 as sha2::Digest>::digest(&body),
+    ))
+}
+
+/// The window lock serialises callers; one keyring write commits both fields.
+fn write_generation(entry_ref: &KeyringEntryRef, wire: &WireFile) -> Result<(), WindowStoreError> {
+    let committed = GenerationCommitment {
+        generation: wire.generation,
+        body_sha256: body_digest(wire)?,
+    };
+    let value = serde_json::to_string(&committed).map_err(|e| WindowStoreError::Invalid {
+        detail: format!("failed to serialise generation commitment: {e}"),
+    })?;
     let entry = keyring_core::Entry::new(&entry_ref.service, &entry_ref.account).map_err(|e| {
         WindowStoreError::Keyring {
             detail: format!("generation entry open failed: {e}"),
         }
     })?;
     entry
-        .set_password(&next.to_string())
+        .set_password(&value)
+        .map_err(|e| WindowStoreError::Keyring {
+            detail: format!("generation entry write failed: {e}"),
+        })
+}
+
+#[cfg(test)]
+fn bump_generation(entry_ref: &KeyringEntryRef) -> Result<u64, WindowStoreError> {
+    let next = next_generation(entry_ref)?;
+    keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+        .and_then(|entry| entry.set_password(&next.to_string()))
         .map_err(|e| WindowStoreError::Keyring {
             detail: format!("generation entry write failed: {e}"),
         })?;
@@ -1395,6 +1628,7 @@ fn reservation_from_receipt(receipts: &ReceiptStore, id: &str) -> Option<WindowR
         max_time: receipt.max_time,
         pending_since_ms: 0,
         submission_ledger: receipt.recorded_at_ledger,
+        operator_required: false,
     })
 }
 
@@ -1478,6 +1712,43 @@ fn record_settlement(
     }
 }
 
+/// Resolves a verified prepared image against the trusted keyring counter.
+///
+/// A candidate is adopted only against a commitment that carries a digest.
+/// Every commit of a candidate writes one, so a numeric counter has never
+/// committed a candidate and a numeric counter equal to a candidate's
+/// generation is refused.
+fn select_generation(
+    mut wire: WireFile,
+    counter: Option<GenerationState>,
+) -> Result<WireFile, WindowStoreError> {
+    if let Some(next) = &wire.prepared
+        && (wire.version != WIRE_VERSION
+            || next.version != WIRE_VERSION
+            || next.prepared.is_some()
+            || wire.generation.checked_add(1) != Some(next.generation))
+    {
+        return Err(WindowStoreError::GenerationMismatch);
+    }
+    let counter = counter.ok_or(WindowStoreError::GenerationMismatch)?;
+    if counter.generation == wire.generation {
+        wire.prepared = None;
+    } else if counter.body_sha256.is_some()
+        && let Some(next) = wire.prepared
+        && counter.generation == next.generation
+    {
+        wire = *next;
+    } else {
+        return Err(WindowStoreError::GenerationMismatch);
+    }
+    if let Some(expected) = counter.body_sha256
+        && expected != body_digest(&wire)?
+    {
+        return Err(WindowStoreError::GenerationMismatch);
+    }
+    Ok(wire)
+}
+
 fn collect_pending(wire: &WireFile) -> Vec<WindowReservation> {
     let mut seen: Vec<WindowReservation> = Vec::new();
     for bucket in &wire.entries {
@@ -1496,6 +1767,7 @@ fn collect_pending(wire: &WireFile) -> Vec<WindowReservation> {
                 max_time: record.max_time,
                 pending_since_ms: record.pending_since_ms,
                 submission_ledger: record.submission_ledger,
+                operator_required: record.operator_required,
             });
         }
     }
@@ -2138,6 +2410,7 @@ mod tests {
             max_time: 0,
             pending_since_ms,
             submission_ledger: 1_000,
+            operator_required: false,
         }
     }
 
@@ -2193,7 +2466,9 @@ mod tests {
             .unwrap();
         assert_eq!(store.pending_reservations(&profile).unwrap().len(), 1);
 
-        store.confirm(&profile, &id).unwrap();
+        store
+            .confirm(&profile, &id, Some((now / 1_000) as i64))
+            .unwrap();
 
         assert!(
             store.pending_reservations(&profile).unwrap().is_empty(),
@@ -2283,13 +2558,34 @@ mod tests {
         let bytes = fs::read(&store.path).unwrap();
         let mut wire: serde_json::Value = serde_json::from_slice(&bytes[HMAC_TAG_LEN..]).unwrap();
         wire["version"] = serde_json::json!(version);
+        let gen_entry = generation_entry_ref(profile);
+        keyring_core::Entry::new(&gen_entry.service, &gen_entry.account)
+            .unwrap()
+            .set_password(&wire["generation"].as_u64().unwrap().to_string())
+            .unwrap();
+        if version == 1 {
+            for bucket in wire["entries"].as_array_mut().unwrap() {
+                for record in bucket["records"].as_array_mut().unwrap() {
+                    record
+                        .as_object_mut()
+                        .unwrap()
+                        .retain(|name, _| name == "ts_ms" || name == "amount");
+                }
+            }
+        }
+        if version == 2 {
+            for bucket in wire["entries"].as_array_mut().unwrap() {
+                for record in bucket["records"].as_array_mut().unwrap() {
+                    record.as_object_mut().unwrap().remove("operator_required");
+                }
+            }
+        }
         let body = serde_json::to_vec(&wire).unwrap();
         let tag = compute_tag(key.as_slice(), &body).unwrap();
         store.write_atomic_raw(&tag, &body).unwrap();
     }
 
-    /// A v1 file predates the reservation fields, so every record in it reads
-    /// as confirmed spend and none is reported as an open reservation.
+    /// A v1 file contains confirmed spend and no open reservation identity.
     #[test]
     #[serial]
     fn a_v1_file_reads_as_confirmed() {
@@ -2304,13 +2600,316 @@ mod tests {
             .unwrap();
         rewrite_body_version(&store, &profile, 1);
 
+        let original = fs::read(&store.path).unwrap();
         let dest = PolicyStateStore::new();
         store.load_into("v1-read", &profile, &dest).unwrap();
+        assert_eq!(
+            fs::read(&store.path).unwrap(),
+            original,
+            "hydration leaves v1 bytes unchanged"
+        );
         assert_eq!(dest.query_window(&k, now + 1_000).unwrap(), (4_200, 1));
+        assert_eq!(dest.query_window(&k, now + 86_400_001).unwrap(), (0, 0));
         assert!(
             store.pending_reservations(&profile).unwrap().is_empty(),
             "a v1 record carries no reservation to reconcile"
         );
+    }
+
+    /// A prepared settlement is selected only by its trusted generation;
+    /// both crash checkpoints remain readable and a replayed old file is refused.
+    #[test]
+    #[serial]
+    fn prepared_settlement_recovers_both_sides_of_the_commit_point() {
+        for release in [false, true] {
+            keyring_mock::install().unwrap();
+            let dir = TempDir::new().unwrap();
+            let profile = test_profile(dir.path(), "prepared-hold");
+            let store = PersistedWindowStore::at_path(dir.path().join("prepared-hold.window"));
+            let k = key("prepared-hold", "native", 86_400);
+            let now = now_ms().unwrap();
+            let res = reservation(&"c".repeat(64), "GSOURCE", 7, now);
+            store
+                .record_pending(&profile, &[(k.clone(), now, 43)], &res)
+                .unwrap();
+            let old_bytes = fs::read(&store.path).unwrap();
+            let mut original = store.read_for_inspection(&profile).unwrap().unwrap();
+            let mut next = original.clone();
+            next.generation += 1;
+            if release {
+                next.entries.clear();
+            } else {
+                next.entries[0].records[0].operator_required = true;
+            }
+            original.prepared = Some(Box::new(next.clone()));
+            let hmac_key =
+                crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
+            store.write_atomic(&hmac_key, &original).unwrap();
+            let prepared_bytes = fs::read(&store.path).unwrap();
+            let reopened = PersistedWindowStore::at_path(store.path.clone());
+            assert_eq!(
+                reopened.pending_reservations(&profile).unwrap(),
+                vec![res.clone()]
+            );
+            let memory = PolicyStateStore::new();
+            reopened
+                .load_into("prepared-hold", &profile, &memory)
+                .unwrap();
+            assert_eq!(memory.query_window(&k, now).unwrap(), (43, 1));
+            write_generation(&generation_entry_ref(&profile), &next).unwrap();
+            let held = reopened.pending_reservations(&profile).unwrap();
+            assert_eq!(held.len(), usize::from(!release));
+            if !release {
+                assert!(held[0].operator_required);
+            }
+            let memory = PolicyStateStore::new();
+            reopened
+                .load_into("prepared-hold", &profile, &memory)
+                .unwrap();
+            assert_eq!(
+                memory.query_window(&k, now).unwrap(),
+                if release { (0, 0) } else { (43, 1) }
+            );
+            fs::write(&store.path, &old_bytes).unwrap();
+            assert!(matches!(
+                reopened.pending_reservations(&profile),
+                Err(WindowStoreError::GenerationMismatch)
+            ));
+            fs::write(&store.path, &prepared_bytes).unwrap();
+            reopened.release(&profile, &res.id).unwrap();
+            assert!(reopened.pending_reservations(&profile).unwrap().is_empty());
+        }
+    }
+
+    /// An abandoned candidate cannot replace a different committed body that
+    /// receives the same generation number after retrying the write.
+    #[test]
+    #[serial]
+    fn abandoned_candidate_cannot_replay_at_a_reused_generation() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "abandoned-candidate");
+        let store = PersistedWindowStore::at_path(dir.path().join("abandoned-candidate.window"));
+        let k = key("abandoned-candidate", "native", 86_400);
+        let now = now_ms().unwrap();
+        let res = reservation(&"e".repeat(64), "GSOURCE", 7, now);
+        store
+            .record_pending(&profile, &[(k.clone(), now, 45)], &res)
+            .unwrap();
+        let mut original = store.read_for_inspection(&profile).unwrap().unwrap();
+        let mut abandoned = original.clone();
+        abandoned.generation += 1;
+        abandoned.entries.clear();
+        original.prepared = Some(Box::new(abandoned));
+        let hmac_key =
+            crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
+        store.write_atomic(&hmac_key, &original).unwrap();
+        let abandoned_bytes = fs::read(&store.path).unwrap();
+
+        // A new debit commits while the abandoned release remains uncommitted.
+        store
+            .record_and_persist(&profile, &[(k.clone(), now, 5)])
+            .unwrap();
+        let committed_bytes = fs::read(&store.path).unwrap();
+        assert_eq!(
+            load_generation(&generation_entry_ref(&profile)).unwrap(),
+            Some(original.generation + 1)
+        );
+        fs::write(&store.path, abandoned_bytes).unwrap();
+        assert!(matches!(
+            store.pending_reservations(&profile),
+            Err(WindowStoreError::GenerationMismatch)
+        ));
+        assert!(matches!(
+            store.load_into("abandoned-candidate", &profile, &PolicyStateStore::new()),
+            Err(WindowStoreError::GenerationMismatch)
+        ));
+        assert!(matches!(
+            store.release(&profile, &res.id),
+            Err(WindowStoreError::GenerationMismatch)
+        ));
+        fs::write(&store.path, committed_bytes).unwrap();
+        let memory = PolicyStateStore::new();
+        store
+            .load_into("abandoned-candidate", &profile, &memory)
+            .unwrap();
+        assert_eq!(memory.query_window(&k, now).unwrap(), (50, 2));
+        assert_eq!(store.pending_reservations(&profile).unwrap(), vec![res]);
+    }
+
+    /// A failed prepare write cannot advance the trusted generation or hide a hold.
+    #[test]
+    #[serial]
+    fn failed_prepare_write_keeps_the_authenticated_hold_readable() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "prepare-write-failure");
+        let store = PersistedWindowStore::at_path(dir.path().join("prepare-write-failure.window"));
+        let k = key("prepare-write-failure", "native", 86_400);
+        let now = now_ms().unwrap();
+        let res = reservation(&"d".repeat(64), "GSOURCE", 7, now);
+        store
+            .record_pending(&profile, &[(k.clone(), now, 44)], &res)
+            .unwrap();
+        let blocker = dir.path().join("prepare-write-failure.window.tmp");
+        fs::create_dir(&blocker).unwrap();
+        assert!(store.mark_operator_required(&profile, &res.id).is_err());
+        assert_eq!(store.pending_reservations(&profile).unwrap(), vec![res]);
+        let memory = PolicyStateStore::new();
+        store
+            .load_into("prepare-write-failure", &profile, &memory)
+            .unwrap();
+        assert_eq!(memory.query_window(&k, now).unwrap(), (44, 1));
+    }
+
+    /// A candidate is committed only by a digest-bearing keyring write, so a
+    /// numeric counter equal to a candidate's generation is not a commitment
+    /// of it and the file is refused. A numeric counter at the outer
+    /// generation still reads the outer, which is the state a crash before
+    /// the commit point leaves under a legacy counter.
+    #[test]
+    #[serial]
+    fn a_numeric_counter_never_selects_a_candidate() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "numeric-candidate");
+        let store = PersistedWindowStore::at_path(dir.path().join("numeric-candidate.window"));
+        let k = key("numeric-candidate", "native", 86_400);
+        let now = now_ms().unwrap();
+        let res = reservation(&"f".repeat(64), "GSOURCE", 7, now);
+        store
+            .record_pending(&profile, &[(k.clone(), now, 46)], &res)
+            .unwrap();
+        let gen_entry = generation_entry_ref(&profile);
+        let hmac_key =
+            crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
+        let mut original = store.read_for_inspection(&profile).unwrap().unwrap();
+        let mut candidate = original.clone();
+        candidate.generation += 1;
+        candidate.entries.clear();
+        original.prepared = Some(Box::new(candidate.clone()));
+        store.write_atomic(&hmac_key, &original).unwrap();
+        let counter = keyring_core::Entry::new(&gen_entry.service, &gen_entry.account).unwrap();
+
+        counter
+            .set_password(&candidate.generation.to_string())
+            .unwrap();
+        assert!(matches!(
+            store.pending_reservations(&profile),
+            Err(WindowStoreError::GenerationMismatch)
+        ));
+        assert!(matches!(
+            store.load_into("numeric-candidate", &profile, &PolicyStateStore::new()),
+            Err(WindowStoreError::GenerationMismatch)
+        ));
+        assert!(matches!(
+            store.release(&profile, &res.id),
+            Err(WindowStoreError::GenerationMismatch)
+        ));
+
+        counter
+            .set_password(&original.generation.to_string())
+            .unwrap();
+        assert_eq!(store.pending_reservations(&profile).unwrap(), vec![res]);
+        let memory = PolicyStateStore::new();
+        store
+            .load_into("numeric-candidate", &profile, &memory)
+            .unwrap();
+        assert_eq!(memory.query_window(&k, now).unwrap(), (46, 1));
+    }
+
+    /// A keyring failure at the commit point, through the production commit:
+    /// the prepared image is on disk, the counter is unchanged, the hold is
+    /// still reported and counted, and a retry completes and compacts.
+    ///
+    /// The injected error is single-shot and lands on the commit write
+    /// because the commit does not read the counter again after the
+    /// verified read.
+    #[test]
+    #[serial]
+    fn a_keyring_failure_at_the_commit_point_keeps_the_hold_and_the_retry_completes() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "commit-point");
+        let store = PersistedWindowStore::at_path(dir.path().join("commit-point.window"));
+        let k = key("commit-point", "native", 86_400);
+        let now = now_ms().unwrap();
+        let res = reservation(&"a".repeat(64), "GSOURCE", 7, now);
+        store
+            .record_pending(&profile, &[(k.clone(), now, 47)], &res)
+            .unwrap();
+        let gen_entry = generation_entry_ref(&profile);
+        let counter = keyring_core::Entry::new(&gen_entry.service, &gen_entry.account).unwrap();
+        let committed = counter.get_password().unwrap();
+        let hmac_key =
+            crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
+        let original = store.read_for_inspection(&profile).unwrap().unwrap();
+        let mut next = original.clone();
+        next.entries.clear();
+        keyring_mock::inject_error(
+            &gen_entry.service,
+            &gen_entry.account,
+            keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other(
+                "keyring unavailable at the commit point",
+            ))),
+        )
+        .unwrap();
+
+        let result = store.commit_generation(&hmac_key, &gen_entry, original.clone(), next);
+        assert!(
+            matches!(result, Err(WindowStoreError::Keyring { .. })),
+            "the commit must report the keyring failure, got {result:?}"
+        );
+        assert_eq!(counter.get_password().unwrap(), committed);
+        let body: serde_json::Value =
+            serde_json::from_slice(&fs::read(&store.path).unwrap()[HMAC_TAG_LEN..]).unwrap();
+        assert_eq!(body["generation"], original.generation);
+        assert_eq!(body["prepared"]["generation"], original.generation + 1);
+        assert_eq!(
+            store.pending_reservations(&profile).unwrap(),
+            vec![res.clone()]
+        );
+        let memory = PolicyStateStore::new();
+        store.load_into("commit-point", &profile, &memory).unwrap();
+        assert_eq!(memory.query_window(&k, now).unwrap(), (47, 1));
+
+        store.release(&profile, &res.id).unwrap();
+        assert!(store.pending_reservations(&profile).unwrap().is_empty());
+        let body: serde_json::Value =
+            serde_json::from_slice(&fs::read(&store.path).unwrap()[HMAC_TAG_LEN..]).unwrap();
+        assert!(
+            body.get("prepared").is_none(),
+            "a completed commit is compacted"
+        );
+        assert_eq!(body["generation"], original.generation + 1);
+        assert_eq!(
+            load_generation(&gen_entry).unwrap(),
+            Some(original.generation + 1)
+        );
+    }
+
+    /// Version 2 preserves pending identity and headroom without an operator marker.
+    #[test]
+    #[serial]
+    fn a_v2_pending_file_keeps_its_hold() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "v2-hold");
+        let store = PersistedWindowStore::at_path(dir.path().join("v2-hold.window"));
+        let k = key("v2-hold", "native", 86_400);
+        let now = now_ms().unwrap();
+        let old = now - 14 * 86_400_000;
+        let res = reservation(&"a".repeat(64), "GSOURCE", 7, old);
+        store
+            .record_pending(&profile, &[(k.clone(), old, 42)], &res)
+            .unwrap();
+        rewrite_body_version(&store, &profile, 2);
+        let original = fs::read(&store.path).unwrap();
+        let dest = PolicyStateStore::new();
+        store.load_into("v2-hold", &profile, &dest).unwrap();
+        assert_eq!(dest.query_window(&k, now).unwrap(), (42, 1));
+        assert_eq!(store.pending_reservations(&profile).unwrap(), vec![res]);
+        assert_eq!(fs::read(&store.path).unwrap(), original);
     }
 
     /// A file written by a newer build carries records this one cannot
@@ -2326,7 +2925,7 @@ mod tests {
         let k = key("v3-read", "native", 86_400);
         let now = now_ms().unwrap();
         store.record_and_persist(&profile, &[(k, now, 1)]).unwrap();
-        rewrite_body_version(&store, &profile, 3);
+        rewrite_body_version(&store, &profile, 4);
 
         let dest = PolicyStateStore::new();
         let err = store

@@ -293,6 +293,46 @@ async fn a_first_submission_reaches_the_send() {
     );
 }
 
+/// Confirmation carries the applying ledger time through the recorder; a
+/// missing close time keeps the debit pending even when the receipt succeeds.
+#[tokio::test]
+#[serial]
+async fn submission_confirmation_dates_spend_only_from_created_at() {
+    for created_at in [Some((now_ms() / 1000) as i64), None] {
+        let fx = fixture("record-close-time");
+        let envelope = SignedTestEnvelope::for_source([0x29; 32]);
+        let server = MockServer::start().await;
+        mount_pre_send(&server, &envelope).await;
+        mount_send_pending(&server, envelope.tx_hash_hex()).await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method":"getTransaction"})))
+            .respond_with(rpc_ok(json!({"status":"SUCCESS", "latestLedger":1002,
+                "ledger":1002, "createdAt":created_at.map(|t| t.to_string())})))
+            .mount(&server)
+            .await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorder = fx.recorder(&calls);
+        let client = StellarRpcClient::new(&server.uri()).unwrap();
+        submit_transaction_and_wait(
+            &client,
+            envelope.envelope_xdr(),
+            SUBMIT_TIMEOUT,
+            TESTNET_PASSPHRASE,
+            None,
+            Some(&recorder),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fx.window.pending_reservations(&fx.profile).unwrap().len(),
+            usize::from(created_at.is_none())
+        );
+        assert!(
+            matches!(&calls.lock().unwrap()[1], Call::Outcome(SubmissionOutcome::Success { created_at: received, .. }) if *received == created_at)
+        );
+    }
+}
+
 /// A refusal before the send never writes a record: the endpoint identity
 /// probe and the signature-binding check run first, and neither has sent
 /// anything.

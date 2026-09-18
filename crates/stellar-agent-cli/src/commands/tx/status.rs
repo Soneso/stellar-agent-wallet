@@ -19,10 +19,12 @@
 //!   finalizes the receipt.
 //! - `FAILED` releases the reservation and finalizes the receipt failed.
 //! - `NOT_FOUND` releases the reservation only when the transaction can no
-//!   longer apply: its sequence has been consumed, or its time bound has
-//!   passed. When the submission ledger predates the endpoint's retention
+//!   longer apply: its sequence has been consumed, or an observed ledger close
+//!   time is strictly past its time bound, followed by a fresh `NOT_FOUND`.
+//!   When the submission ledger predates the endpoint's retention
 //!   floor, `NOT_FOUND` proves nothing, so the reservation stands and the
-//!   receipt is marked ambiguous for `tx receipt clear` to resolve.
+//!   receipt is marked ambiguous for `tx receipt clear` to resolve. An absent
+//!   receipt leaves an authenticated hold marked `operator_required`.
 //!
 //! # Concurrency
 //!
@@ -93,6 +95,13 @@ struct RecordView {
     reservation_open: bool,
 }
 
+/// Authenticated hold identity, available even when its receipt is absent.
+#[derive(Debug, Serialize)]
+struct ReservationView {
+    envelope_hash: String,
+    operator_required: bool,
+}
+
 /// Success payload for the `tx status` envelope.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -107,6 +116,9 @@ struct StatusData {
     /// The wallet's record of the submission, when it holds one.
     #[serde(skip_serializing_if = "Option::is_none")]
     record: Option<RecordView>,
+    /// A held debit, including an orphan requiring operator recovery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reservation: Option<ReservationView>,
 }
 
 /// Runs `tx status`.
@@ -192,10 +204,25 @@ pub async fn run(args: &StatusArgs) -> i32 {
 
     let window = PersistedWindowStore::for_profile(&resolved.name);
 
+    let held = match window.pending_reservations(&profile) {
+        Ok(open) => open.into_iter().find(|r| r.tx_hash == args.tx_hash),
+        Err(e) => {
+            render_json(&Envelope::<()>::err_raw(
+                "submission.record_unavailable",
+                format!("the spending-window file could not be read: {e:?}"),
+            ));
+            return 1;
+        }
+    };
+    let envelope_hash = receipt
+        .as_ref()
+        .map(|r| r.envelope_hash.as_str())
+        .or_else(|| held.as_ref().map(|r| r.id.as_str()));
+
     // The operator asked about this transaction by name, so the reconciliation
     // runs with no budget and no minimum age: there is exactly one round
     // trip's worth of work and it was requested.
-    if let Some(receipt) = &receipt {
+    if let Some(envelope_hash) = envelope_hash {
         let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
             Ok(v) => v,
             Err(e) => {
@@ -207,13 +234,7 @@ pub async fn run(args: &StatusArgs) -> i32 {
             }
         };
         if let Err(e) = window
-            .reconcile_one(
-                &profile,
-                &client,
-                Some(&receipts),
-                &receipt.envelope_hash,
-                now_ms,
-            )
+            .reconcile_one(&profile, &client, Some(&receipts), envelope_hash, now_ms)
             .await
         {
             tracing::debug!(
@@ -255,9 +276,30 @@ pub async fn run(args: &StatusArgs) -> i32 {
         }
     };
 
+    let reservation = match window.pending_reservations(&profile) {
+        Ok(open) => open.into_iter().find(|r| r.tx_hash == args.tx_hash),
+        Err(e) => {
+            render_json(&Envelope::<()>::err_raw(
+                "submission.record_unavailable",
+                format!("the spending-window file could not be read: {e:?}"),
+            ));
+            return 1;
+        }
+    };
+    // Reconciliation can restore a receipt from the authenticated hold. Read
+    // the resulting record so its status and settlement audit row are surfaced.
+    let receipt = match receipts.find_by_tx_hash(&args.tx_hash) {
+        Ok(record) => record,
+        Err(e) => {
+            render_json(&Envelope::<()>::err_raw(
+                "submission.record_unavailable",
+                format!("the submission receipt store could not be read: {e}"),
+            ));
+            return 1;
+        }
+    };
     let record = match receipt {
-        Some(r) => {
-            let settled = receipts.get(&r.envelope_hash).ok().flatten().unwrap_or(r);
+        Some(settled) => {
             // A submission the chain has now answered for gets the
             // value-action row it never got to write, carrying the legs the
             // gate sized.
@@ -272,10 +314,9 @@ pub async fn run(args: &StatusArgs) -> i32 {
                     settled.ledger.or(chain.ledger),
                 );
             }
-            let reservation_open = window
-                .pending_reservations(&profile)
-                .map(|open| open.iter().any(|res| res.id == settled.envelope_hash))
-                .unwrap_or(false);
+            let reservation_open = reservation
+                .as_ref()
+                .is_some_and(|r| r.id == settled.envelope_hash);
             Some(record_view(&settled, reservation_open))
         }
         None => None,
@@ -286,6 +327,10 @@ pub async fn run(args: &StatusArgs) -> i32 {
         chain_status: chain.status,
         ledger: chain.ledger,
         record,
+        reservation: reservation.map(|r| ReservationView {
+            envelope_hash: r.id,
+            operator_required: r.operator_required,
+        }),
     }));
     0
 }
