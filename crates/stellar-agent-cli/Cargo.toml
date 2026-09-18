@@ -53,6 +53,7 @@ stellar-agent-toolsets-runtime = { workspace = true }
 stellar-agent-smart-account = { workspace = true, features = ["deploy-cli"] }
 # Nonce-key rotation subcommand.
 stellar-agent-nonce = { workspace = true }
+async-trait = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "sync"] }
 tracing = { workspace = true }
@@ -128,7 +129,6 @@ stellar-agent-smart-account = { path = "../stellar-agent-smart-account", feature
 # Deterministic mocked RPC responses in pay.rs / accounts/create.rs tests.
 wiremock = { workspace = true }
 # wiremock::Respond impls in command-module unit tests.
-async-trait = { workspace = true }
 # process-global keyring store serialisation (key_ops.rs tests).
 serial_test = { workspace = true }
 # keyring_mock::install for the mock store setup (key_ops.rs tests);

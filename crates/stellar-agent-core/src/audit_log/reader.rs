@@ -165,6 +165,44 @@ impl AuditReader {
         Self { writer, hmac_key }
     }
 
+    /// Finds the completion event for one pool lifecycle across the verified
+    /// active and rotated log. The shared writer excludes concurrent appends.
+    ///
+    /// # Errors
+    /// Propagates integrity, parse, and I/O failures. Completion lookup requires
+    /// a verified audit chain.
+    pub fn pool_initialization_exists(
+        &self,
+        request_id: &str,
+    ) -> Result<bool, AuditLogIntegrityError> {
+        let writer = self.writer.lock().map_err(|_| {
+            AuditLogIntegrityError::Io(std::io::Error::other("audit writer mutex is poisoned"))
+        })?;
+        let path = writer.path();
+        super::verify::verify_log(path, self.hmac_key.as_ref())?;
+        for file in collect_files_newest_first(path)? {
+            let raw = std::fs::read_to_string(&file).map_err(AuditLogIntegrityError::Io)?;
+            for (line, text) in raw
+                .lines()
+                .enumerate()
+                .filter(|(_, text)| !text.trim().is_empty())
+            {
+                let entry: AuditEntry = serde_json::from_str(text).map_err(|error| {
+                    AuditLogIntegrityError::ParseError {
+                        line: line + 1,
+                        detail: error.to_string(),
+                    }
+                })?;
+                if entry.request_id == request_id
+                    && matches!(entry.event_kind, EventKind::ChannelPoolInitialised { .. })
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Scans the rotated chain backwards for the most-recent row matching
     /// `(rule_id, smart_account_redacted)` whose event kind is one of
     /// `SaSignerAdded`, `SaSignerRemoved`, `SaThresholdChanged`, or

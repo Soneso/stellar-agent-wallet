@@ -25,10 +25,8 @@ zeroize               = { workspace = true }
 secrecy               = { workspace = true }
 base64                = { workspace = true }
 stellar-strkey        = { workspace = true }
-# stellar-xdr is only used by assert_sandwich_structure (test-helpers gate) to
-# decode the envelope XDR and inspect op-level sources and operation bodies.
-# It is optional here; the test-helpers feature enables it.
-stellar-xdr           = { workspace = true, optional = true }
+# XDR memo IDs distinguish initialization attempts without changing channel keys.
+stellar-xdr = { workspace = true }
 # keyring-core: used by derive::load_pool_master_seed_from_keyring to read the
 # pool master seed with proper Zeroizing on both the base64 string and decoded bytes.
 keyring-core          = { workspace = true }
@@ -39,7 +37,7 @@ stellar-agent-network = { workspace = true }
 stellar-agent-sep5  = { workspace = true }
 
 [dev-dependencies]
-tokio                      = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio                      = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
 stellar-xdr                = { workspace = true }
 stellar-agent-network = { path = "../stellar-agent-network" }
@@ -57,8 +55,7 @@ secrecy                    = { workspace = true }
 
 [features]
 # Expose test-only helpers (assert_sandwich_structure, etc.).
-# Enables stellar-xdr for the XDR-inspection helper.
-test-helpers = ["dep:stellar-xdr"]
+test-helpers = []
 # Gate end-to-end testnet acceptance tests.
 # Run with: cargo test -p stellar-agent-pool --features testnet-acceptance
 testnet-acceptance = ["test-helpers"]

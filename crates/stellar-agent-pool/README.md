@@ -8,6 +8,21 @@ It does not submit transactions itself (that is `stellar-agent-network`), does n
 
 It is part of the stellar-agent-wallet workspace. Most users interact with it through the `stellar-agent-cli` `pool init` / `pool list` / `pool status` subcommands rather than directly.
 
+The CLI persists the pool seed and a public initialization checkpoint before sending.
+An interrupted initialization appears in `pool status`, including its transaction hash
+and `pool init --resume` command. Resume derives the same channel keys, completes
+configuration for accounts observed on chain, or retries a failed creation when no
+channel exists. An unknown outcome remains pending; a creation whose receipt settles
+as ambiguous is retried only after `tx receipt clear --acknowledge` records that it
+did not apply, which `pool status` names. `--force` refuses to replace a pending seed.
+
+Library callers supply a nonoptional `SubmissionRecorder` to `InitParams` and
+`submit_pooled`. Sponsored initialization has no transferred balance, so its
+recorder carries no value legs or spending-cap entries. Callers of `submit_pooled`
+supply the value effects of their operation closure to their recorder.
+`InitParams::attempt` is a memo ID; increment it for each proven retry so each
+attempt retains a distinct receipt.
+
 ## Status
 
 Pre-release alpha. APIs may change between alpha releases without notice.

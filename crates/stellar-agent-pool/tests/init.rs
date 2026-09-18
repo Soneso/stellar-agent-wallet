@@ -18,6 +18,7 @@
     reason = "test-only; panics and unwraps acceptable in integration tests"
 )]
 
+mod common;
 use std::sync::LazyLock;
 
 use serde_json::json;
@@ -60,7 +61,13 @@ async fn init_pool_n0_returns_size_out_of_range() {
     let client = StellarRpcClient::new("http://127.0.0.1:1").expect("URL parses");
     let funder_key = SoftwareSigningKey::new_from_bytes(FUNDER_SEED);
 
+    let recording = crate::common::RecorderFixture::new();
+
     let params = InitParams {
+        attempt: 0,
+        timeout: stellar_agent_pool::init::INIT_SUBMIT_TIMEOUT,
+
+        recorder: &recording.recorder(),
         funder_strkey: FUNDER_KEY.as_str(),
         funder_sequence: 100,
         funder_signer: &funder_key as &dyn Signer,
@@ -95,7 +102,13 @@ async fn init_pool_n_exceeds_max_returns_size_out_of_range() {
         .collect();
     let channel_indices: Vec<u32> = (1..=n as u32).collect();
 
+    let recording = crate::common::RecorderFixture::new();
+
     let params = InitParams {
+        attempt: 0,
+        timeout: stellar_agent_pool::init::INIT_SUBMIT_TIMEOUT,
+
+        recorder: &recording.recorder(),
         funder_strkey: FUNDER_KEY.as_str(),
         funder_sequence: 100,
         funder_signer: &funder_key as &dyn Signer,
@@ -119,7 +132,13 @@ async fn init_pool_signers_len_mismatch_returns_init_failed() {
     let client = StellarRpcClient::new("http://127.0.0.1:1").expect("URL parses");
     let funder_key = SoftwareSigningKey::new_from_bytes(FUNDER_SEED);
 
+    let recording = crate::common::RecorderFixture::new();
+
     let params = InitParams {
+        attempt: 0,
+        timeout: stellar_agent_pool::init::INIT_SUBMIT_TIMEOUT,
+
+        recorder: &recording.recorder(),
         funder_strkey: FUNDER_KEY.as_str(),
         funder_sequence: 100,
         funder_signer: &funder_key as &dyn Signer,
@@ -144,7 +163,13 @@ async fn init_pool_indices_len_mismatch_returns_init_failed() {
     let client = StellarRpcClient::new("http://127.0.0.1:1").expect("URL parses");
     let funder_key = SoftwareSigningKey::new_from_bytes(FUNDER_SEED);
 
+    let recording = crate::common::RecorderFixture::new();
+
     let params = InitParams {
+        attempt: 0,
+        timeout: stellar_agent_pool::init::INIT_SUBMIT_TIMEOUT,
+
+        recorder: &recording.recorder(),
         funder_strkey: FUNDER_KEY.as_str(),
         funder_sequence: 100,
         funder_signer: &funder_key as &dyn Signer,
@@ -279,7 +304,13 @@ async fn init_pool_n2_success_submits_valid_sandwich() {
     let channel_strkeys = vec![CHANNEL_KEY_1.clone(), CHANNEL_KEY_2.clone()];
     let channel_indices = vec![1u32, 2u32];
 
+    let recording = crate::common::RecorderFixture::new();
+
     let params = InitParams {
+        attempt: 0,
+        timeout: stellar_agent_pool::init::INIT_SUBMIT_TIMEOUT,
+
+        recorder: &recording.recorder(),
         funder_strkey: FUNDER_KEY.as_str(),
         funder_sequence: 500,
         funder_signer: &funder_signer as &dyn Signer,
@@ -293,6 +324,14 @@ async fn init_pool_n2_success_submits_valid_sandwich() {
     let result = init_pool(&client, params)
         .await
         .expect("init_pool must succeed against mock RPC");
+
+    let rows = std::fs::read_to_string(&recording.profile.audit_log_path).unwrap();
+    assert!(rows.contains("value_action_submitted"));
+    assert!(rows.contains(&stellar_agent_network::redact_tx_hash(&result.tx_hash)));
+    assert_eq!(
+        recording.receipts.all().unwrap()[0].status,
+        stellar_agent_core::profile::receipt::ReceiptStatus::Success
+    );
 
     // ── Structural assertions on InitResult ──────────────────────────────────
     assert_eq!(
@@ -395,7 +434,13 @@ async fn init_pool_n1_success_single_channel() {
     let funder_signer = SoftwareSigningKey::new_from_bytes(FUNDER_SEED);
     let ch_signer = SoftwareSigningKey::new_from_bytes(CHANNEL_SEED_1);
 
+    let recording = crate::common::RecorderFixture::new();
+
     let params = InitParams {
+        attempt: 0,
+        timeout: stellar_agent_pool::init::INIT_SUBMIT_TIMEOUT,
+
+        recorder: &recording.recorder(),
         funder_strkey: FUNDER_KEY.as_str(),
         funder_sequence: 200,
         funder_signer: &funder_signer as &dyn Signer,
@@ -457,7 +502,13 @@ async fn init_pool_rpc_error_returns_init_failed() {
     let funder_signer = SoftwareSigningKey::new_from_bytes(FUNDER_SEED);
     let ch_signer = SoftwareSigningKey::new_from_bytes(CHANNEL_SEED_1);
 
+    let recording = crate::common::RecorderFixture::new();
+
     let params = InitParams {
+        attempt: 0,
+        timeout: stellar_agent_pool::init::INIT_SUBMIT_TIMEOUT,
+
+        recorder: &recording.recorder(),
         funder_strkey: FUNDER_KEY.as_str(),
         funder_sequence: 100,
         funder_signer: &funder_signer as &dyn Signer,
@@ -493,7 +544,13 @@ async fn init_pool_invalid_channel_strkey_returns_init_failed() {
     let funder_signer = SoftwareSigningKey::new_from_bytes(FUNDER_SEED);
     let ch_signer = SoftwareSigningKey::new_from_bytes(CHANNEL_SEED_1);
 
+    let recording = crate::common::RecorderFixture::new();
+
     let params = InitParams {
+        attempt: 0,
+        timeout: stellar_agent_pool::init::INIT_SUBMIT_TIMEOUT,
+
+        recorder: &recording.recorder(),
         funder_strkey: FUNDER_KEY.as_str(),
         funder_sequence: 100,
         funder_signer: &funder_signer as &dyn Signer,
@@ -515,4 +572,92 @@ async fn init_pool_invalid_channel_strkey_returns_init_failed() {
         Err(e) => panic!("expected InitFailed for invalid strkey, got Err: {e}"),
         Ok(_) => panic!("expected InitFailed for invalid strkey, got Ok"),
     }
+}
+
+/// A timed-out initialization retains its receipt and the hash-bearing pending
+/// row; the same named reconciliation used by tx status settles that receipt.
+#[tokio::test]
+#[serial_test::serial]
+async fn timed_out_initialization_is_recorded_and_reconcilable() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let rpc = MockServer::start().await;
+    Mock::given(body_partial_json(json!({"method":"getNetwork"})))
+        .respond_with(EchoIdResponder::new(get_network_result(TESTNET_PASSPHRASE)))
+        .mount(&rpc)
+        .await;
+    Mock::given(body_partial_json(json!({"method":"getLedgerEntries"})))
+        .respond_with(EchoIdResponder::new(ledger_entries_result_for(&[
+            FUNDER_KEY.as_str(),
+        ])))
+        .mount(&rpc)
+        .await;
+    Mock::given(body_partial_json(json!({"method":"sendTransaction"})))
+        .respond_with(SubmissionEchoResponder::new(json!({"hash":"","status":"PENDING","latestLedger":1000,"latestLedgerCloseTime":"1700000000"}), TESTNET_PASSPHRASE)).expect(1).mount(&rpc).await;
+    let pending = Mock::given(body_partial_json(json!({"method":"getTransaction"})))
+        .respond_with(EchoIdResponder::new(json!({"status":"NOT_FOUND"})))
+        .mount_as_scoped(&rpc)
+        .await;
+    let fixture = common::RecorderFixture::new();
+    let recorder = fixture.recorder();
+    let funder = SoftwareSigningKey::new_from_bytes(FUNDER_SEED);
+    let client = StellarRpcClient::new(&rpc.uri()).unwrap();
+    let params = InitParams {
+        attempt: 0,
+        timeout: stellar_agent_pool::init::INIT_SUBMIT_TIMEOUT,
+        funder_strkey: FUNDER_KEY.as_str(),
+        funder_sequence: 100,
+        funder_signer: &funder,
+        channel_signers: vec![SoftwareSigningKey::new_from_bytes(CHANNEL_SEED_1)],
+        channel_strkeys: vec![CHANNEL_KEY_1.clone()],
+        channel_indices: vec![1],
+        network_passphrase: TESTNET_PASSPHRASE,
+        fee_per_op: 100,
+        recorder: &recorder,
+    };
+    let error = common::expire_confirmation(init_pool(&client, params), &rpc)
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        error.to_string().contains("not confirmed within 120s"),
+        "{error}"
+    );
+    let records = fixture.receipts.all().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].status,
+        stellar_agent_core::profile::receipt::ReceiptStatus::Pending
+    );
+    let rows = std::fs::read_to_string(&fixture.profile.audit_log_path).unwrap();
+    assert!(rows.contains("value_action_pending"));
+    assert!(rows.contains(&stellar_agent_network::redact_tx_hash(&records[0].tx_hash)));
+    drop(pending);
+    Mock::given(body_partial_json(json!({"method":"getTransaction"})))
+        .respond_with(SubmissionEchoResponder::new(
+            json!({"txHash":"","status":"SUCCESS","ledger":1001,"createdAt":"1700000001"}),
+            TESTNET_PASSPHRASE,
+        ))
+        .mount(&rpc)
+        .await;
+    stellar_agent_network::policy_state::PersistedWindowStore::at_path(
+        fixture.dir.path().join("window"),
+    )
+    .reconcile_one(
+        &fixture.profile,
+        &client,
+        Some(&fixture.receipts),
+        &records[0].envelope_hash,
+        1_700_000_002_000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fixture
+            .receipts
+            .get(&records[0].envelope_hash)
+            .unwrap()
+            .unwrap()
+            .status,
+        stellar_agent_core::profile::receipt::ReceiptStatus::Success
+    );
 }

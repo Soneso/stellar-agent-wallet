@@ -44,7 +44,8 @@ use std::time::Duration;
 
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_network::{
-    ClassicOpBuilder, StellarRpcClient, submit::SubmissionResult, submit_transaction_and_wait,
+    ClassicOpBuilder, StellarRpcClient, SubmissionRecorder, submit::SubmissionResult,
+    submit_transaction_and_wait,
 };
 use zeroize::Zeroizing;
 
@@ -81,6 +82,7 @@ pub struct PoolSubmitResult {
 /// - `network_passphrase`: the Stellar network passphrase string.
 /// - `fee_per_op`: the per-operation fee in stroops.
 /// - `timeout`: how long to poll for on-chain confirmation.
+/// - `recorder`: records the submission and the value effects supplied by the caller.
 /// - `build_ops`: a synchronous, infallible closure that receives a mutable
 ///   reference to a freshly-constructed [`ClassicOpBuilder`] and adds operations
 ///   to it.  The builder is pre-configured with the channel's public key and
@@ -131,7 +133,7 @@ pub struct PoolSubmitResult {
 /// use stellar_agent_pool::submit::submit_pooled;
 /// use zeroize::Zeroizing;
 ///
-/// # async fn run() -> Result<(), stellar_agent_pool::PoolError> {
+/// # async fn run(recorder: &dyn stellar_agent_network::SubmissionRecorder) -> Result<(), stellar_agent_pool::PoolError> {
 /// let channels = vec![ChannelRecord::new(1, "GABC...XYZ")];
 /// let pool = Arc::new(ChannelPool::from_records(channels, vec![100]).unwrap());
 /// let client = StellarRpcClient::new("https://soroban-testnet.stellar.org").unwrap();
@@ -144,6 +146,7 @@ pub struct PoolSubmitResult {
 ///     "Test SDF Network ; September 2015",
 ///     100,
 ///     Duration::from_secs(60),
+///     recorder,
 ///     |builder| {
 ///         let _ = builder.payment(
 ///             "GDST...DST",
@@ -156,6 +159,10 @@ pub struct PoolSubmitResult {
 /// # Ok(())
 /// # }
 /// ```
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the submission contract includes an explicit recorder alongside the operation closure"
+)]
 pub async fn submit_pooled<F>(
     pool: &ChannelPool,
     client: &StellarRpcClient,
@@ -163,6 +170,7 @@ pub async fn submit_pooled<F>(
     network_passphrase: &str,
     fee_per_op: u32,
     timeout: Duration,
+    recorder: &dyn SubmissionRecorder,
     build_ops: F,
 ) -> Result<PoolSubmitResult, PoolError>
 where
@@ -242,9 +250,15 @@ where
     // Signer is dropped here — secret zeroed before submit .await.
     drop(signer);
 
-    let submission_result =
-        submit_transaction_and_wait(client, &signed_xdr, timeout, network_passphrase, None, None)
-            .await;
+    let submission_result = submit_transaction_and_wait(
+        client,
+        &signed_xdr,
+        timeout,
+        network_passphrase,
+        None,
+        Some(recorder),
+    )
+    .await;
 
     // ── Step 5: map outcome and release ─────────────────────────────────────
     match submission_result {

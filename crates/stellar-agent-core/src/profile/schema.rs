@@ -835,6 +835,11 @@ pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_config: Option<PoolConfig>,
 
+    /// Recoverable initialization state. Only public identities are stored;
+    /// the seed remains in the pool master keyring entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_initialization: Option<PoolInitialization>,
+
     /// Remote-approval HTTP surface configuration.
     ///
     /// `None` (the default) means remote approval is off: `approve serve`
@@ -963,6 +968,47 @@ impl PoolConfig {
             channels,
         }
     }
+}
+
+/// Public checkpoints for a sponsored pool initialization.
+///
+/// Seed preparation precedes submission. A submission with `send_started`
+/// false is durably known not to have left; true keeps its outcome unknown
+/// until the chain answers. Completion stays pending until config and audit
+/// persistence have both finished.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolInitialization {
+    /// Stable identity for deduplicating the initialization audit event.
+    pub id: String,
+    /// Network identity to which the channel creation is bound.
+    pub network_passphrase: String,
+    /// Account paying the fees and sponsoring the reserves.
+    pub funder: String,
+    /// Public keys derived from the one persisted seed.
+    pub channels: Vec<PoolChannelRecord>,
+    /// The keyring seed has been persisted and checked against the channels.
+    pub seed_ready: bool,
+    /// Memo ID distinguishing a proven retry from its failed envelope.
+    pub attempt: u64,
+    /// Identity saved before the submission can leave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission: Option<PoolInitSubmission>,
+    /// Ledger observation establishing that every channel exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_ledger: Option<u32>,
+}
+
+/// The transaction associated with one pool initialization attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolInitSubmission {
+    /// Hash of the signed envelope, indexing its receipt.
+    pub envelope_hash: String,
+    /// Locally computed transaction hash used for chain lookup.
+    pub tx_hash: String,
+    /// Sequence number consumed by this attempt.
+    pub sequence: i64,
+    /// Whether bytes may have left the process.
+    pub send_started: bool,
 }
 
 /// Configuration for the network-exposed remote-approval HTTP surface.
@@ -1186,6 +1232,7 @@ impl std::fmt::Debug for Profile {
             )
             .field("pool_master_key_id", &self.pool_master_key_id)
             .field("pool_config", &self.pool_config)
+            .field("pool_initialization", &self.pool_initialization)
             .field(
                 "policy_window_state_key_id",
                 &self.policy_window_state_key_id,
@@ -1659,6 +1706,7 @@ impl ProfileBuilder {
             // Pool not yet initialised in newly-built profiles.
             pool_master_key_id: None,
             pool_config: None,
+            pool_initialization: None,
             // Remote approval is off by default; the operator opts in by
             // writing a `[remote_approval]` block to the profile TOML.
             remote_approval: None,

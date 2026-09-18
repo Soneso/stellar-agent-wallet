@@ -57,6 +57,7 @@
     reason = "test-only; panics, unwraps, and eprintln are acceptable in acceptance tests"
 )]
 
+mod common;
 #[cfg(feature = "testnet-acceptance")]
 mod live {
     use std::sync::Arc;
@@ -310,6 +311,7 @@ mod live {
                     TESTNET_PASSPHRASE,
                     FEE_PER_OP,
                     SUBMIT_TIMEOUT,
+                    &crate::common::RecorderFixture::new().recorder(),
                     |builder| {
                         let _ = builder.payment(
                             &dest_clone,

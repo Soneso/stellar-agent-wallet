@@ -629,6 +629,7 @@ pub fn load_from_path(
         secondary_rpc_url: partial.secondary_rpc_url,
         pool_master_key_id: partial.pool_master_key_id,
         pool_config: partial.pool_config,
+        pool_initialization: partial.pool_initialization,
         remote_approval: partial.remote_approval,
         served_pages: partial.served_pages,
         policy_window_state_key_id,
@@ -878,6 +879,59 @@ pub fn set_pool_state(
     )
 }
 
+/// Atomically patches the public pool initialization checkpoint and keyring
+/// coordinate in the stored document. Active configuration is withheld while
+/// creation is pending; clearing a completed checkpoint preserves that config.
+/// The caller serialises the pool lifecycle across processes.
+///
+/// # Errors
+/// Returns an error if the existing profile cannot be read or durably replaced.
+pub fn set_pool_initialization(
+    name: &str,
+    master: &super::schema::KeyringEntryRef,
+    pending: Option<&super::schema::PoolInitialization>,
+) -> Result<PathBuf, ProfileSaveError> {
+    guard_name_for_save(name)?;
+    let dir = default_profile_dir().map_err(ProfileSaveError::NoStateDir)?;
+    let dest = dir.join(format!("{name}.toml"));
+    let raw = std::fs::read_to_string(&dest).map_err(ProfileSaveError::Io)?;
+    let mut doc: toml::Value = toml::from_str(&raw).map_err(|e| {
+        ProfileSaveError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    })?;
+    let table = doc.as_table_mut().ok_or_else(|| {
+        ProfileSaveError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "profile must be a table",
+        ))
+    })?;
+    table.insert(
+        "pool_master_key_id".to_owned(),
+        toml::Value::try_from(master)?,
+    );
+    if let Some(pending) = pending {
+        table.insert(
+            "pool_initialization".to_owned(),
+            toml::Value::try_from(pending)?,
+        );
+        if pending.completion_ledger.is_none() {
+            table.remove("pool_config");
+        }
+    } else {
+        table.remove("pool_initialization");
+    }
+    let bytes = toml::to_string_pretty(&doc).map_err(ProfileSaveError::Serialize)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(&dir).map_err(ProfileSaveError::Io)?;
+    std::io::Write::write_all(&mut tmp, bytes.as_bytes()).map_err(ProfileSaveError::Io)?;
+    tmp.as_file().sync_all().map_err(ProfileSaveError::Io)?;
+    tmp.persist(&dest)
+        .map_err(|e| ProfileSaveError::Io(e.error))?;
+    #[cfg(unix)]
+    std::fs::File::open(&dir)
+        .and_then(|file| file.sync_all())
+        .map_err(ProfileSaveError::Io)?;
+    Ok(dest)
+}
+
 /// Reads the `[mcp_signer_default]` keyring reference exactly as stored in
 /// the profile's on-disk TOML, with NO environment or CLI overlays applied.
 ///
@@ -1051,8 +1105,13 @@ pub fn set_pool_state_on_disk(
     let toml_str = toml::to_string_pretty(&doc).map_err(ProfileSaveError::Serialize)?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(ProfileSaveError::Io)?;
     std::io::Write::write_all(&mut tmp, toml_str.as_bytes()).map_err(ProfileSaveError::Io)?;
+    tmp.as_file().sync_all().map_err(ProfileSaveError::Io)?;
     tmp.persist(&dest)
         .map_err(|e| ProfileSaveError::Io(e.error))?;
+    #[cfg(unix)]
+    std::fs::File::open(dir)
+        .and_then(|file| file.sync_all())
+        .map_err(ProfileSaveError::Io)?;
     Ok(dest)
 }
 
@@ -1258,6 +1317,7 @@ pub fn load_with_overlay_from_dir(
         secondary_rpc_url: partial.secondary_rpc_url,
         pool_master_key_id: partial.pool_master_key_id,
         pool_config: partial.pool_config,
+        pool_initialization: partial.pool_initialization,
         remote_approval: partial.remote_approval,
         served_pages: partial.served_pages,
         policy_window_state_key_id,
@@ -1419,6 +1479,8 @@ struct PartialProfile {
     /// `None` when the pool has not been initialised.
     #[serde(default)]
     pool_config: Option<super::schema::PoolConfig>,
+    #[serde(default)]
+    pool_initialization: Option<super::schema::PoolInitialization>,
     /// Remote-approval HTTP surface configuration. Absent from profiles
     /// predating remote approval; defaults to `None` (off).
     #[serde(default)]
