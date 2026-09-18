@@ -60,7 +60,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
 use crate::policy::v1::criteria::Criterion;
-use crate::policy::v1::criteria::state_store::StateKey;
+use crate::policy::v1::criteria::state_store::{StateKey, WindowEntry, WindowLimit};
 use crate::policy::v1::value::{ValueGate, asset_normalise, classify_value};
 use crate::policy::{DenyReason, PolicyError};
 
@@ -337,10 +337,7 @@ impl Criterion for PerPeriodCapCriterion {
     /// call does not resolve `ValueClass::Value` effects matching this
     /// criterion's asset (e.g. the single-tx path of a multicall bundle, whose
     /// per-inner debits are recorded by `BundlePerPeriodCapCriterion` instead).
-    fn record_confirmed(
-        &self,
-        ctx: &EvalContext<'_>,
-    ) -> Result<Vec<(StateKey, u64, i128)>, PolicyError> {
+    fn record_confirmed(&self, ctx: &EvalContext<'_>) -> Result<Vec<WindowEntry>, PolicyError> {
         let crate::policy::v1::value::ValueClass::Value(effects) = &ctx.value else {
             return Ok(Vec::new());
         };
@@ -373,11 +370,29 @@ impl Criterion for PerPeriodCapCriterion {
             .map_err(|e| PolicyError::CriterionEvaluationFailed {
                 detail: format!("per_period_cap: record_confirmed state store error: {e}"),
             })?;
-        Ok(vec![(state_key, now_ms, sum)])
+        Ok(vec![WindowEntry::new(
+            state_key,
+            now_ms,
+            sum,
+            self.window_limit(),
+        )])
     }
 }
 
 impl PerPeriodCapCriterion {
+    /// The limit every entry this criterion records carries, so the durable
+    /// reservation write re-applies the comparison `check_window` makes.
+    ///
+    /// The denial names the configured asset string, the window label and the
+    /// cap, the same three fields `check_window` puts in its own denial.
+    fn window_limit(&self) -> WindowLimit {
+        WindowLimit::Amount {
+            asset: self.asset.clone(),
+            window: self.window.label().to_owned(),
+            max_stroops: self.max_stroops,
+        }
+    }
+
     /// Checks `attempted_stroops` against the rolling window for
     /// `criterion_asset`, combining the state-store-recorded total with any
     /// bundle overlay contribution.

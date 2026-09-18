@@ -56,7 +56,7 @@ use crate::policy::v1::EvalContext;
 use crate::policy::v1::bundle::InnerOpDescriptor;
 use crate::policy::v1::criteria::Criterion;
 use crate::policy::v1::criteria::per_period_cap::Window;
-use crate::policy::v1::criteria::state_store::StateKey;
+use crate::policy::v1::criteria::state_store::{StateKey, WindowEntry, WindowLimit};
 use crate::policy::v1::value::asset_normalise;
 use crate::policy::{DenyReason, PolicyError};
 
@@ -123,6 +123,16 @@ impl BundlePerPeriodCapCriterion {
             asset,
             window,
             max_stroops,
+        }
+    }
+
+    /// The limit every entry this criterion records carries, so the durable
+    /// reservation write re-applies the comparison `evaluate` makes.
+    fn window_limit(&self) -> WindowLimit {
+        WindowLimit::Amount {
+            asset: self.asset.clone(),
+            window: self.window.label().to_owned(),
+            max_stroops: self.max_stroops,
         }
     }
 
@@ -251,10 +261,7 @@ impl Criterion for BundlePerPeriodCapCriterion {
     /// Appends one entry per matching `TokenTransfer` inner into
     /// `ctx.state_store`, using the SAME `StateKey` derivation `evaluate`
     /// uses. No-op on the single-tx path (`ctx.bundle` is `None`).
-    fn record_confirmed(
-        &self,
-        ctx: &EvalContext<'_>,
-    ) -> Result<Vec<(StateKey, u64, i128)>, PolicyError> {
+    fn record_confirmed(&self, ctx: &EvalContext<'_>) -> Result<Vec<WindowEntry>, PolicyError> {
         let Some(view) = ctx.bundle else {
             return Ok(Vec::new());
         };
@@ -285,7 +292,12 @@ impl Criterion for BundlePerPeriodCapCriterion {
                         "bundle_per_period_cap: record_confirmed state store error: {e}"
                     ),
                 })?;
-            recorded.push((state_key.clone(), now_ms, *amount));
+            recorded.push(WindowEntry::new(
+                state_key.clone(),
+                now_ms,
+                *amount,
+                self.window_limit(),
+            ));
         }
         Ok(recorded)
     }

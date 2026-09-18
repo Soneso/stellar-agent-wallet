@@ -890,7 +890,7 @@ where
         Ok(r) => r,
         Err(e) => {
             print_error(
-                &crate::commands::submission_record::error_envelope(&e, ""),
+                &crate::commands::submission_record::error_envelope(&e, "", "accounts create"),
                 args.output,
             );
             return 1;
@@ -928,7 +928,7 @@ where
         }
         Err(e) => {
             print_error(
-                &crate::commands::submission_record::error_envelope(&e, ""),
+                &crate::commands::submission_record::error_envelope(&e, "", "accounts create"),
                 args.output,
             );
             1

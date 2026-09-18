@@ -1222,7 +1222,7 @@ impl PolicyEngine for PolicyEngineV1 {
         tool: &ToolDescriptor,
         profile: &Profile,
         value: &value::ValueClass,
-    ) -> Result<Vec<(criteria::state_store::StateKey, u64, i128)>, PolicyError> {
+    ) -> Result<Vec<criteria::state_store::WindowEntry>, PolicyError> {
         PolicyEngineV1::record_confirmed(self, tool, profile, value)
     }
 
@@ -1388,7 +1388,7 @@ impl PolicyEngineV1 {
         tool: &ToolDescriptor,
         profile: &Profile,
         value: &value::ValueClass,
-    ) -> Result<Vec<(criteria::state_store::StateKey, u64, i128)>, PolicyError> {
+    ) -> Result<Vec<criteria::state_store::WindowEntry>, PolicyError> {
         let rules = self.matching_rules(&self.profile_name, self.project_id.as_deref());
         for rule in rules {
             if !rule.matches_tool(tool) {
@@ -1708,7 +1708,7 @@ impl PolicyEngineV1 {
         tool: &ToolDescriptor,
         profile: &Profile,
         bundle: &BundleView<'_>,
-    ) -> Result<Vec<(criteria::state_store::StateKey, u64, i128)>, PolicyError> {
+    ) -> Result<Vec<criteria::state_store::WindowEntry>, PolicyError> {
         let rules = self.matching_rules(&self.profile_name, self.project_id.as_deref());
         for rule in rules {
             if !rule.matches_tool(tool) {
@@ -2953,7 +2953,8 @@ mod tests {
         let recorded = engine.record_confirmed(&td, &profile, &value).unwrap();
         assert_eq!(recorded.len(), 1, "exactly one debit entry recorded");
         assert_eq!(
-            recorded[0].2, 600_000_000,
+            recorded[0].amount(),
+            600_000_000,
             "recorded amount must match the debit leg"
         );
 

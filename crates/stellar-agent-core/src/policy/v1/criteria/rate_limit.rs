@@ -30,7 +30,7 @@ use crate::policy::v1::EvalContext;
 use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
 use crate::policy::v1::criteria::Criterion;
 use crate::policy::v1::criteria::per_period_cap::Window;
-use crate::policy::v1::criteria::state_store::StateKey;
+use crate::policy::v1::criteria::state_store::{StateKey, WindowEntry, WindowLimit};
 use crate::policy::{DenyReason, PolicyError};
 
 /// Rate-limit criterion (calls per rolling window).
@@ -79,6 +79,15 @@ impl RateLimitCriterion {
     #[must_use]
     pub fn max_calls(&self) -> u32 {
         self.max_calls
+    }
+
+    /// The limit every entry this criterion records carries, so the durable
+    /// reservation write re-applies the comparison `evaluate` makes.
+    fn window_limit(&self) -> WindowLimit {
+        WindowLimit::Count {
+            window: self.window.label().to_owned(),
+            max_calls: self.max_calls,
+        }
     }
 }
 
@@ -190,10 +199,7 @@ impl Criterion for RateLimitCriterion {
     /// per-inner counting is handled by `BundleRateLimitCriterion` instead
     /// (this criterion's `evaluate` is not called at bundle level either — see
     /// its per-tool-call scoping).
-    fn record_confirmed(
-        &self,
-        ctx: &EvalContext<'_>,
-    ) -> Result<Vec<(StateKey, u64, i128)>, PolicyError> {
+    fn record_confirmed(&self, ctx: &EvalContext<'_>) -> Result<Vec<WindowEntry>, PolicyError> {
         // Bundle path: per-inner counting is BundleRateLimitCriterion's job;
         // this criterion counts single-tx calls only.
         if ctx.bundle.is_some() {
@@ -213,7 +219,12 @@ impl Criterion for RateLimitCriterion {
                 detail: format!("rate_limit: record_confirmed state store error: {e}"),
             }
         })?;
-        Ok(vec![(state_key, now_ms, 1)])
+        Ok(vec![WindowEntry::new(
+            state_key,
+            now_ms,
+            1,
+            self.window_limit(),
+        )])
     }
 }
 

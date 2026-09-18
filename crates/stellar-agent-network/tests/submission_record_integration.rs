@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use serial_test::serial;
 use stellar_agent_core::error::{SubmissionError, WalletError};
-use stellar_agent_core::policy::v1::criteria::state_store::StateKey;
+use stellar_agent_core::policy::v1::criteria::state_store::{StateKey, WindowEntry, WindowLimit};
 use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore};
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
 use stellar_agent_network::policy_state::PersistedWindowStore;
@@ -82,6 +82,23 @@ fn test_profile(name: &str) -> Profile {
 
 fn state_key(profile_name: &str) -> StateKey {
     StateKey::new(profile_name, 1, "native", 86_400)
+}
+
+/// One entry under a cap far above what these tests reserve.
+///
+/// These tests pin what the recorder writes at each exit, not what the window
+/// admits, so no reservation they take is refused by its own limit.
+fn entry(profile_name: &str, ts_ms: u64, amount: i128) -> WindowEntry {
+    WindowEntry::new(
+        state_key(profile_name),
+        ts_ms,
+        amount,
+        WindowLimit::Amount {
+            asset: "native".to_owned(),
+            window: "1d".to_owned(),
+            max_stroops: 1_000_000,
+        },
+    )
 }
 
 fn now_ms() -> u64 {
@@ -147,10 +164,47 @@ impl Fixture {
                 "stellar_pay_commit",
                 Some("stellar:testnet".to_owned()),
                 Vec::new(),
-                vec![(state_key(&self.profile_name), now_ms(), 500)],
+                vec![entry(&self.profile_name, now_ms(), 500)],
                 self.receipts.clone(),
                 self.window.clone(),
                 None,
+                None,
+                "test-request",
+                now_ms(),
+            ),
+            calls: Arc::clone(calls),
+        }
+    }
+
+    /// A recorder whose window entry carries `max_stroops`, so the reservation
+    /// write decides admission rather than waving every amount through.
+    fn capped_recorder<'a>(
+        &'a self,
+        calls: &Arc<Mutex<Vec<Call>>>,
+        audit: Arc<Mutex<stellar_agent_core::audit_log::AuditWriter>>,
+        amount: i128,
+        max_stroops: i128,
+    ) -> RecordingRecorder<'a> {
+        RecordingRecorder {
+            inner: WalletSubmissionRecorder::new(
+                &self.profile,
+                self.profile_name.clone(),
+                "stellar_pay_commit",
+                Some("stellar:testnet".to_owned()),
+                Vec::new(),
+                vec![WindowEntry::new(
+                    state_key(&self.profile_name),
+                    now_ms(),
+                    amount,
+                    WindowLimit::Amount {
+                        asset: "native".to_owned(),
+                        window: "1d".to_owned(),
+                        max_stroops,
+                    },
+                )],
+                self.receipts.clone(),
+                self.window.clone(),
+                Some(audit),
                 None,
                 "test-request",
                 now_ms(),
@@ -1046,7 +1100,7 @@ async fn assert_audit_append_refusal(failure: AuditAppendFailure) {
         "stellar_pay_commit",
         Some("stellar:testnet".to_owned()),
         Vec::new(),
-        vec![(state_key(&fx.profile_name), now_ms(), 500)],
+        vec![entry(&fx.profile_name, now_ms(), 500)],
         fx.receipts.clone(),
         fx.window.clone(),
         Some(audit),
@@ -1127,4 +1181,163 @@ async fn audit_append_rewrite_preserves_rollback_code_and_unwinds() {
 #[serial]
 async fn audit_append_io_failure_remains_record_unavailable_and_unwinds() {
     assert_audit_append_refusal(AuditAppendFailure::Io).await;
+}
+
+/// A second submission the window can no longer admit is refused at the
+/// reservation, under the policy code the gate reports for the same reason.
+///
+/// Both recorders carry entries a gate admitted against the state each read.
+/// The reservation write is where the second one meets the first one's open
+/// hold, and the refusal unwinds the way every other pre-send refusal does:
+/// the receipt goes, the pending row is closed out, the sequence is free, and
+/// nothing reaches the endpoint.
+#[tokio::test]
+#[serial]
+async fn a_reservation_the_window_cannot_admit_is_refused_as_a_policy_denial() {
+    use base64::Engine as _;
+    use stellar_agent_core::audit_log::AuditWriter;
+    use stellar_agent_core::audit_log::reader::{ValueActionSettlement, value_action_settlement};
+
+    let mut fx = fixture("record-admission");
+    let audit_path = fx._dir.path().join("audit").join("log.jsonl");
+    fx.profile.audit_log_path = audit_path.clone();
+    let coordinate = &fx.profile.audit_log_hash_chain_key_id;
+    keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+        .unwrap()
+        .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7_u8; 32]))
+        .unwrap();
+    let access = stellar_agent_network::keyring::keyed_audit_access(&fx.profile).unwrap();
+    let audit = Arc::new(Mutex::new(
+        AuditWriter::open(audit_path.clone(), Some(access)).unwrap(),
+    ));
+
+    // The first submission reaches the send and is never confirmed, so its
+    // reservation stands and holds 600 of the 1000-stroop cap.
+    let first = SignedTestEnvelope::for_source([0x41; 32]);
+    let server = MockServer::start().await;
+    mount_pre_send(&server, &first).await;
+    mount_send_pending(&server, first.tx_hash_hex()).await;
+    mount_get_not_found(&server).await;
+    let first_calls = Arc::new(Mutex::new(Vec::new()));
+    let first_recorder = fx.capped_recorder(&first_calls, Arc::clone(&audit), 600, 1_000);
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let first_result = submit_transaction_and_wait(
+        &client,
+        first.envelope_xdr(),
+        SUBMIT_TIMEOUT,
+        TESTNET_PASSPHRASE,
+        None,
+        Some(&first_recorder),
+    )
+    .await;
+    assert_eq!(
+        first_result
+            .expect_err("the mocked endpoint never confirms")
+            .code(),
+        "submission.tx_timeout",
+        "the first submission reaches the send"
+    );
+    assert!(fx.reservation_is_open(&envelope_hash(&first)));
+
+    // The second submission was admissible against the state its gate read,
+    // and 600 + 600 no longer fits the cap.
+    let second = SignedTestEnvelope::for_source([0x42; 32]);
+    let second_server = MockServer::start().await;
+    mount_pre_send(&second_server, &second).await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "sendTransaction"})))
+        .respond_with(rpc_ok(
+            json!({"hash": second.tx_hash_hex(), "status": "PENDING"}),
+        ))
+        .expect(0)
+        .mount(&second_server)
+        .await;
+
+    let second_calls = Arc::new(Mutex::new(Vec::new()));
+    let second_recorder = fx.capped_recorder(&second_calls, Arc::clone(&audit), 600, 1_000);
+    let second_client = StellarRpcClient::new(&second_server.uri()).unwrap();
+    let refused = submit_transaction_and_wait(
+        &second_client,
+        second.envelope_xdr(),
+        SUBMIT_TIMEOUT,
+        TESTNET_PASSPHRASE,
+        None,
+        Some(&second_recorder),
+    )
+    .await
+    .expect_err("the window can no longer admit this submission");
+
+    assert_eq!(
+        refused.code(),
+        "policy.deny.per_period_cap_exceeded",
+        "the refusal names the code the gate names for the same reason: {refused:?}"
+    );
+    match &refused {
+        WalletError::PolicyDenied { reason } => match reason.as_ref() {
+            stellar_agent_core::policy::DenyReason::PerPeriodCapExceeded {
+                max_stroops,
+                attempted_stroops,
+                period_used_stroops,
+                ..
+            } => {
+                assert_eq!(*max_stroops, 1_000);
+                assert_eq!(*attempted_stroops, 600);
+                assert_eq!(*period_used_stroops, 600);
+            }
+            other => panic!("expected PerPeriodCapExceeded, got {other:?}"),
+        },
+        other => panic!("expected a typed policy denial, got {other:?}"),
+    }
+
+    assert_eq!(
+        second_calls.lock().unwrap().as_slice(),
+        &[Call::PreSend],
+        "no outcome is reported for a submission that was never sent"
+    );
+    let second_hash = envelope_hash(&second);
+    assert!(
+        fx.receipts.get(&second_hash).unwrap().is_none(),
+        "the receipt for the refused submission is removed"
+    );
+    assert!(
+        fx.receipts
+            .find_pending_by_source_sequence(second.source(), second.sequence())
+            .unwrap()
+            .is_none(),
+        "the sequence the refused submission would have consumed is free"
+    );
+    assert!(
+        !fx.reservation_is_open(&second_hash),
+        "the refused submission holds no reservation"
+    );
+    assert_eq!(
+        fx.window.pending_reservations(&fx.profile).unwrap().len(),
+        1,
+        "only the admitted submission's reservation stands"
+    );
+    drop(audit);
+    assert!(
+        matches!(
+            value_action_settlement(&audit_path, &second_hash),
+            ValueActionSettlement::Settled
+        ),
+        "the pending row the refused submission wrote is closed out"
+    );
+    // The row that closes the pending row names the refusal that stopped the
+    // submission, so the audit log records a cap refusal as the policy denial
+    // it is.
+    let closing_code = std::fs::read_to_string(&audit_path)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|row| {
+            row["envelope_hash"] == second_hash.as_str() && row["kind"] == "value_action_failed"
+        })
+        .map(|row| row["code"].as_str().unwrap_or_default().to_owned())
+        .expect("the closing row for the refused submission");
+    assert_eq!(
+        closing_code, "policy.deny.per_period_cap_exceeded",
+        "the closing audit row carries the refusal's own code"
+    );
 }

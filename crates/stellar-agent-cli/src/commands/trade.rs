@@ -388,7 +388,9 @@ where
     ) {
         Ok(r) => r,
         Err(e) => {
-            render_json(&crate::commands::submission_record::error_envelope(&e, ""));
+            render_json(&crate::commands::submission_record::error_envelope(
+                &e, "", "trade",
+            ));
             return 1;
         }
     };
@@ -422,9 +424,11 @@ where
             }));
             0
         }
-        Err(e) => {
-            crate::commands::submission_record::render_defi_submit_error(&e, "dex.submit_failed")
-        }
+        Err(e) => crate::commands::submission_record::render_defi_submit_error(
+            &e,
+            "trade",
+            "dex.submit_failed",
+        ),
     }
 }
 

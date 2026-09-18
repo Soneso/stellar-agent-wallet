@@ -851,6 +851,59 @@ impl DenyReason {
             Self::Sep45SessionMissing { .. } => "sep45.session_missing",
         }
     }
+
+    /// Returns the full wire code, `policy.deny.` prefix included.
+    ///
+    /// The same string `dispatch_gate` and the CLI's policy-evaluation
+    /// helpers build from [`Self::code`], available as a `&'static str` to
+    /// callers that carry a denial through a typed error whose own `code()`
+    /// returns `&'static str`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::policy::DenyReason;
+    ///
+    /// assert_eq!(
+    ///     DenyReason::NoMatchingRule.wire_code(),
+    ///     "policy.deny.no_matching_rule"
+    /// );
+    /// assert_eq!(
+    ///     DenyReason::RateLimitExceeded {
+    ///         window: "1m".into(),
+    ///         max_calls: 5,
+    ///         calls_in_window: 5,
+    ///     }
+    ///     .wire_code(),
+    ///     "policy.deny.rate_limit_exceeded"
+    /// );
+    /// ```
+    #[must_use]
+    pub fn wire_code(&self) -> &'static str {
+        match self {
+            Self::PerTxCapExceeded { .. } => "policy.deny.per_tx_cap_exceeded",
+            Self::PerPeriodCapExceeded { .. } => "policy.deny.per_period_cap_exceeded",
+            Self::RateLimitExceeded { .. } => "policy.deny.rate_limit_exceeded",
+            Self::CounterpartyDenied { .. } => "policy.deny.counterparty_denied",
+            Self::MinimumReserveBreached { .. } => "policy.deny.minimum_reserve_breached",
+            Self::OwnerSignatureStale { .. } => "policy.deny.owner_signature_stale",
+            Self::NoMatchingRule => "policy.deny.no_matching_rule",
+            Self::CounterpartyKindUnsupported { .. } => "policy.deny.counterparty_kind_unsupported",
+            Self::EvaluationError { .. } => "policy.deny.evaluation_error",
+            Self::UnsizableValueEffect { .. } => "policy.deny.unsizable_value_effect",
+            Self::ExplicitRuleDeny => "policy.deny.explicit_rule_deny",
+            Self::InnerInvocationCountCapExceeded { .. } => {
+                "policy.deny.inner_invocation_count_cap_exceeded"
+            }
+            Self::BundleAggregateCapExceeded { .. } => "policy.deny.bundle_aggregate_cap_exceeded",
+            Self::BundleContainsGenericKind { .. } => "policy.deny.bundle_contains_generic_kind",
+            Self::BundleDenied { .. } => "policy.deny.bundle_denied",
+            Self::QuorumNotSatisfied { .. } => "policy.deny.quorum_not_satisfied",
+            Self::HomeDomainNotResolved { .. } => "policy.deny.home_domain_not_resolved",
+            Self::Sep10SessionMissing { .. } => "policy.deny.sep10.session_missing",
+            Self::Sep45SessionMissing { .. } => "policy.deny.sep45.session_missing",
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1358,8 +1411,10 @@ pub trait PolicyEngine: Send + Sync {
     /// [`crate::policy::v1::PolicyEngineV1`] overrides this to delegate to its
     /// inherent `record_confirmed`, which mutates its in-memory
     /// [`crate::policy::v1::PolicyStateStore`] and returns the appended
-    /// `(key, timestamp_ms, amount)` entries for the caller to persist to the
-    /// on-disk window-state store.
+    /// [`crate::policy::v1::criteria::state_store::WindowEntry`] values for the
+    /// caller to persist to the on-disk window-state store. Each carries the
+    /// limit that governs its bucket, which the durable reservation write
+    /// re-applies under its own lock.
     ///
     /// # Errors
     ///
@@ -1371,14 +1426,7 @@ pub trait PolicyEngine: Send + Sync {
         _tool: &ToolDescriptor,
         _profile: &Profile,
         _value: &crate::policy::v1::ValueClass,
-    ) -> Result<
-        Vec<(
-            crate::policy::v1::criteria::state_store::StateKey,
-            u64,
-            i128,
-        )>,
-        PolicyError,
-    > {
+    ) -> Result<Vec<crate::policy::v1::criteria::state_store::WindowEntry>, PolicyError> {
         Ok(Vec::new())
     }
 
@@ -1900,6 +1948,98 @@ mod tests {
             round_tripped.v, v,
             "an i128 value beyond i64::MAX must round-trip exactly, with no saturating clamp"
         );
+    }
+
+    /// Every `DenyReason` variant's full wire code is its `code()` under the
+    /// `policy.deny.` prefix, so a surface that reports a denial through a
+    /// typed error names it exactly as the gate does.
+    ///
+    /// The list is the closed variant inventory: a new variant that is not
+    /// added here leaves its `wire_code()` unchecked, so the list is what
+    /// keeps the two tables from drifting apart.
+    #[test]
+    fn deny_reason_wire_code_is_the_prefixed_code_for_every_variant() {
+        let all = [
+            DenyReason::PerTxCapExceeded {
+                asset: "native".into(),
+                max_stroops: 1,
+                attempted_stroops: 2,
+            },
+            DenyReason::PerPeriodCapExceeded {
+                asset: "native".into(),
+                window: "1d".into(),
+                max_stroops: 1,
+                attempted_stroops: 2,
+                period_used_stroops: 0,
+            },
+            DenyReason::RateLimitExceeded {
+                window: "1m".into(),
+                max_calls: 1,
+                calls_in_window: 1,
+            },
+            DenyReason::CounterpartyDenied {
+                kind: "ADDRESS".into(),
+                value: "GAAA".into(),
+            },
+            DenyReason::MinimumReserveBreached {
+                reserve_required_stroops: 1,
+                balance_stroops: 0,
+            },
+            DenyReason::OwnerSignatureStale {
+                rotated_at: "2026-04-29T00:00:00Z".into(),
+            },
+            DenyReason::NoMatchingRule,
+            DenyReason::ExplicitRuleDeny,
+            DenyReason::CounterpartyKindUnsupported {
+                kind: "HOME_DOMAIN".into(),
+            },
+            DenyReason::EvaluationError {
+                detail: "detail".into(),
+            },
+            DenyReason::UnsizableValueEffect {
+                detail: "detail".into(),
+            },
+            DenyReason::InnerInvocationCountCapExceeded {
+                max: 1,
+                attempted: 2,
+            },
+            DenyReason::BundleAggregateCapExceeded {
+                asset: None,
+                max: 1,
+                sum: 2,
+            },
+            DenyReason::BundleContainsGenericKind { inner_index: 0 },
+            DenyReason::BundleDenied {
+                inner_index: 0,
+                deny_reason: Box::new(DenyReason::NoMatchingRule),
+            },
+            DenyReason::QuorumNotSatisfied {
+                groups_short_by: vec!["ops".into()],
+                combinator: "And".into(),
+            },
+            DenyReason::HomeDomainNotResolved {
+                home_domain: "example.com".into(),
+            },
+            DenyReason::Sep10SessionMissing {
+                account_id: "GAAA".into(),
+            },
+            DenyReason::Sep45SessionMissing {
+                contract_id: "CAAA".into(),
+            },
+        ];
+
+        assert_eq!(
+            all.len(),
+            19,
+            "the inventory must name every DenyReason variant"
+        );
+        for reason in &all {
+            assert_eq!(
+                reason.wire_code(),
+                format!("policy.deny.{}", reason.code()),
+                "wire_code must be the prefixed code for {reason:?}"
+            );
+        }
     }
 
     #[test]

@@ -354,14 +354,34 @@ pub(crate) fn construct_signers_manager_from_fields(
 /// active profile name through the wire envelope (same class as the
 /// `WalletError::Io.message` path leak handled in [`wallet_io_error`]).
 fn build_sa_error_envelope(e: &SaError) -> WalletError {
+    if let Some(denial) = sa_policy_denial(e) {
+        return denial;
+    }
     WalletError::SmartAccount {
         wire_code: e.wire_code(),
         message: redact_path_in_message(&e.to_string()),
     }
 }
 
+/// Carries a policy refusal through as the typed denial it is, or `None` for
+/// every other smart-account error.
+///
+/// The spending-window reservation write refuses a submission the operator's
+/// window can no longer admit. Flattening that into the smart-account
+/// envelope would report a refused cap under `sa.*`, and the operator's next
+/// step for the two is not the same.
+fn sa_policy_denial(e: &SaError) -> Option<WalletError> {
+    match e {
+        SaError::PolicyDenied { reason } => Some(WalletError::PolicyDenied {
+            reason: reason.clone(),
+        }),
+        _ => None,
+    }
+}
+
 /// Maps an [`SaError`] into the `WalletError::SmartAccount { wire_code, message }`
-/// envelope shape, without path redaction.
+/// envelope shape, without path redaction. A policy refusal keeps its typed
+/// denial instead.
 ///
 /// Distinct from [`build_sa_error_envelope`]: this is the plain mapping used
 /// by `execute`, `signers`, and `migrate-verifier`'s `emit_error_sa` helpers,
@@ -369,6 +389,9 @@ fn build_sa_error_envelope(e: &SaError) -> WalletError {
 /// `Display`. Call sites that do need path redaction use
 /// [`emit_sa_error`]/[`build_sa_error_envelope`] instead.
 pub(crate) fn wrap_sa_error(err: &SaError) -> WalletError {
+    if let Some(denial) = sa_policy_denial(err) {
+        return denial;
+    }
     WalletError::SmartAccount {
         wire_code: err.wire_code(),
         message: err.to_string(),
@@ -545,6 +568,46 @@ mod tests {
     use stellar_agent_core::profile::name::ProfileNameSource;
 
     use super::*;
+
+    /// A refusal the spending window decided keeps the criterion's own code
+    /// through the smart-account bridge, rather than reading as an `sa.*`
+    /// failure an agent would answer by rebuilding and re-submitting.
+    #[test]
+    fn a_policy_refusal_keeps_its_code_through_the_smart_account_bridge() {
+        let err = SaError::PolicyDenied {
+            reason: Box::new(
+                stellar_agent_core::policy::DenyReason::PerPeriodCapExceeded {
+                    asset: "native".to_owned(),
+                    window: "1d".to_owned(),
+                    max_stroops: 1_000,
+                    attempted_stroops: 600,
+                    period_used_stroops: 600,
+                },
+            ),
+        };
+
+        for wrapped in [wrap_sa_error(&err), build_sa_error_envelope(&err)] {
+            assert_eq!(
+                wrapped.code(),
+                "policy.deny.per_period_cap_exceeded",
+                "expected the criterion's own code, got {wrapped:?}"
+            );
+            assert!(
+                matches!(wrapped, WalletError::PolicyDenied { .. }),
+                "expected a typed policy denial, got {wrapped:?}"
+            );
+        }
+    }
+
+    /// Every other smart-account failure still reports under `sa.*`.
+    #[test]
+    fn a_deployment_failure_still_reports_its_own_code() {
+        let err = SaError::DeploymentFailed {
+            phase: "submit",
+            redacted_reason: "endpoint refused the bytes".to_owned(),
+        };
+        assert_eq!(wrap_sa_error(&err).code(), "sa.deployment_failed");
+    }
 
     /// A resolved name with an explicit source, as `--profile <name>` produces.
     fn named(name: &str) -> ResolvedProfileName {

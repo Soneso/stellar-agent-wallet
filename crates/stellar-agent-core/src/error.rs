@@ -234,6 +234,34 @@ pub enum WalletError {
         /// Pre-redacted at the call site (no secret material).
         message: String,
     },
+
+    /// Operator policy refused the operation.
+    ///
+    /// Carried by the spending-window reservation write, which re-applies the
+    /// governing criterion's comparison under its own lock against the state
+    /// on disk at that moment, and refuses a submission the window can no
+    /// longer admit.
+    ///
+    /// # Wire code
+    ///
+    /// [`WalletError::code`] returns [`crate::policy::DenyReason::wire_code`],
+    /// so the refusal names the same `policy.deny.*` code the gate names for
+    /// the same reason.
+    ///
+    /// # Display
+    ///
+    /// The `Display` text carries the wire code and nothing else. The
+    /// structured reason is rendered by each surface, which applies its own
+    /// redaction before the payload crosses that surface's boundary: a
+    /// `DenyReason` may carry account identifiers, and a `Display` that
+    /// serialised them would place them in every log line and every generic
+    /// error renderer unredacted. A surface that knows which verb it is
+    /// reporting for names it, the way the policy gate's own refusal does.
+    #[error("this operation was denied by operator policy ({})", reason.wire_code())]
+    PolicyDenied {
+        /// The typed denial, as the governing criterion produced it.
+        reason: Box<crate::policy::DenyReason>,
+    },
 }
 
 /// The top-level category of a [`WalletError`].
@@ -263,6 +291,8 @@ pub enum ErrorCategory {
     Io,
     /// Smart-account orchestration failure (`sa.*` wire code).
     SmartAccount,
+    /// Operator policy refusal (`policy.deny.*` wire code).
+    Policy,
 }
 
 impl WalletError {
@@ -297,6 +327,7 @@ impl WalletError {
             // WalletError::SmartAccount variant stores a copy so that no
             // circular crate dependency is required.
             Self::SmartAccount { wire_code, .. } => wire_code,
+            Self::PolicyDenied { reason } => reason.wire_code(),
         }
     }
 
@@ -326,6 +357,7 @@ impl WalletError {
             Self::Internal(_) => ErrorCategory::Internal,
             Self::Io { .. } => ErrorCategory::Io,
             Self::SmartAccount { .. } => ErrorCategory::SmartAccount,
+            Self::PolicyDenied { .. } => ErrorCategory::Policy,
         }
     }
 
@@ -3068,6 +3100,38 @@ mod tests {
             "envelope must NOT contain old validation code; got: {json}"
         );
         assert!(!envelope.ok);
+    }
+
+    /// `WalletError::PolicyDenied` reports the wire code of the denial it
+    /// carries, for every criterion family, so a refused reservation reads
+    /// as the gate's own refusal on the envelope.
+    #[test]
+    fn wallet_error_policy_denied_code_is_the_reasons_wire_code() {
+        use crate::policy::DenyReason;
+
+        let reasons = [
+            DenyReason::RateLimitExceeded {
+                window: "1m".to_owned(),
+                max_calls: 5,
+                calls_in_window: 5,
+            },
+            DenyReason::PerPeriodCapExceeded {
+                asset: "native".to_owned(),
+                window: "1d".to_owned(),
+                max_stroops: 100,
+                attempted_stroops: 40,
+                period_used_stroops: 70,
+            },
+            DenyReason::NoMatchingRule,
+        ];
+        for reason in reasons {
+            let expected = reason.wire_code();
+            let err = WalletError::PolicyDenied {
+                reason: Box::new(reason),
+            };
+            assert_eq!(err.code(), expected, "{err}");
+            assert_eq!(err.category(), ErrorCategory::Policy);
+        }
     }
 
     /// `WalletError::SmartAccount` code round-trip.

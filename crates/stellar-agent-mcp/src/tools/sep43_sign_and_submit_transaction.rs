@@ -530,53 +530,55 @@ impl WalletServer {
                 ))
             }
 
-            // A submission whose outcome only reconciliation can settle keeps
-            // its own code and carries the transaction to reconcile. The tool
-            // records its submissions like any other, so a dapp that
-            // re-submits the same sequence after a timeout gets the hash it
-            // needs rather than a generic transport failure.
-            Err(ref err)
-                if matches!(
-                    err,
-                    stellar_agent_core::WalletError::Submission(
-                        stellar_agent_core::error::SubmissionError::TxAlreadySubmitted { .. }
-                            | stellar_agent_core::error::SubmissionError::HashMismatch { .. }
-                            | stellar_agent_core::error::SubmissionError::RecordUnavailable { .. }
-                    )
-                ) =>
-            {
-                Ok(crate::tools::submission_record::submission_error_result(
-                    err,
-                    &signed_xdr,
-                ))
-            }
-
-            Err(err) => {
-                // All other errors (XDR decode failure, on-chain FAILED, bad auth,
-                // etc.) map to the SEP-43 `RpcError` wire code (`sep43.rpc_error`).
-                // `stellar_agent_network::submit` error taxonomy:
-                // WalletError::Protocol → XdrCodecFailed
-                // WalletError::Submission → TxMalformed
-                // WalletError::Ledger   → on-chain failure
-                //
-                // NOTE: WalletError::Network variants RpcUnreachable and RpcTimeout
-                // are handled in explicit arms above to strip URL from Display.
-                // AccountNotFound carries a G-strkey and is redacted in the
-                // shared formatter below before crossing the dapp wire boundary.
-                tracing::warn!(
-                    error = %err,
-                    "sep43_sign_and_submit: submission failed",
-                );
-                let sep43_err = stellar_agent_sep43::Sep43Error::RpcError {
-                    detail: submission_failed_detail(&err),
-                };
-                Ok(crate::tools::common::business_error_result(
-                    sep43_err.wire_code(),
-                    sep43_err.to_string(),
-                ))
-            }
+            Err(err) => Ok(submit_failure_result(&err, &signed_xdr)),
         }
     }
+}
+
+/// Reports a submit-path failure this tool did not answer with a status of its
+/// own.
+///
+/// Three routes, in order:
+///
+/// - A refusal operator policy decided reports the criterion's own code, the
+///   way this server reports the same decision made at the dispatch gate. A
+///   dapp told the endpoint failed would re-submit against a cap that has
+///   already refused it.
+/// - A submission whose outcome only reconciliation can settle keeps its own
+///   code and carries the transaction to reconcile. The tool records its
+///   submissions like any other, so a dapp that re-submits the same sequence
+///   after a timeout gets the hash it needs rather than a generic transport
+///   failure.
+/// - Everything else (XDR decode failure, on-chain FAILED, bad auth) maps to
+///   the SEP-43 `RpcError` wire code. `AccountNotFound` carries a G-strkey and
+///   is redacted by the shared formatter before crossing the dapp wire
+///   boundary; the `RpcUnreachable` and `RpcTimeout` arms at the call site
+///   strip the endpoint URL from their own `Display` before reaching here.
+fn submit_failure_result(
+    err: &stellar_agent_core::WalletError,
+    signed_xdr: &str,
+) -> CallToolResult {
+    if let stellar_agent_core::WalletError::PolicyDenied { reason } = err {
+        return crate::tools::common::policy_denial_error_result(reason.as_ref());
+    }
+    if matches!(
+        err,
+        stellar_agent_core::WalletError::Submission(
+            stellar_agent_core::error::SubmissionError::TxAlreadySubmitted { .. }
+                | stellar_agent_core::error::SubmissionError::HashMismatch { .. }
+                | stellar_agent_core::error::SubmissionError::RecordUnavailable { .. }
+        )
+    ) {
+        return crate::tools::submission_record::submission_error_result(err, signed_xdr);
+    }
+    tracing::warn!(
+        error = %err,
+        "sep43_sign_and_submit: submission failed",
+    );
+    let sep43_err = stellar_agent_sep43::Sep43Error::RpcError {
+        detail: submission_failed_detail(err),
+    };
+    crate::tools::common::business_error_result(sep43_err.wire_code(), sep43_err.to_string())
 }
 
 fn submission_failed_detail(err: &stellar_agent_core::WalletError) -> String {
@@ -640,6 +642,65 @@ mod tests {
     use super::*;
     use stellar_agent_core::WalletError;
     use stellar_agent_core::error::NetworkError;
+
+    /// The error code a tool result reports.
+    fn result_code(result: &CallToolResult) -> String {
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            other => panic!("expected text content; got {other:?}"),
+        };
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        json["error"]["code"].as_str().unwrap().to_owned()
+    }
+
+    /// A refusal operator policy decided keeps the criterion's own code here
+    /// too: a dapp told the endpoint failed would rebuild and re-submit
+    /// against a cap that has already refused it.
+    #[test]
+    fn a_policy_refusal_is_not_reported_as_an_rpc_error() {
+        let err = WalletError::PolicyDenied {
+            reason: Box::new(
+                stellar_agent_core::policy::DenyReason::PerPeriodCapExceeded {
+                    asset: "native".to_owned(),
+                    window: "1d".to_owned(),
+                    max_stroops: 1_000,
+                    attempted_stroops: 600,
+                    period_used_stroops: 600,
+                },
+            ),
+        };
+        assert_eq!(
+            result_code(&submit_failure_result(&err, "AAAAAgAAAAA=")),
+            "policy.deny.per_period_cap_exceeded"
+        );
+    }
+
+    /// A submission whose outcome is unknown still keeps its own code.
+    #[test]
+    fn an_unresolved_submission_keeps_its_submission_code() {
+        let err = WalletError::Submission(
+            stellar_agent_core::error::SubmissionError::TxAlreadySubmitted {
+                hash: "ab".repeat(32),
+            },
+        );
+        assert_eq!(
+            result_code(&submit_failure_result(&err, "AAAAAgAAAAA=")),
+            "submission.tx_already_submitted"
+        );
+    }
+
+    /// Every other submit failure still reports the SEP-43 RPC-error code.
+    #[test]
+    fn every_other_submit_failure_is_still_an_rpc_error() {
+        let err =
+            WalletError::Submission(stellar_agent_core::error::SubmissionError::TxMalformed {
+                detail: "txINSUFFICIENT_FEE".to_owned(),
+            });
+        assert_eq!(
+            result_code(&submit_failure_result(&err, "AAAAAgAAAAA=")),
+            "sep43.rpc_error"
+        );
+    }
     use stellar_agent_core::policy::ToolDescriptor;
     use stellar_agent_core::policy::v1::{
         AccountIdentityView, AccountReservesView, CounterpartyCacheView, Sep10SessionView,

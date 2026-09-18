@@ -529,6 +529,17 @@ pub enum DefiAdapterError {
         /// one: a confirmation that did not arrive in time.
         timeout_seconds: Option<u64>,
     },
+    /// Operator policy refused the operation.
+    ///
+    /// Distinct from [`Self::Network`] and [`Self::SubmissionUnresolved`]: the
+    /// refusal is a decision, not a failure, and nothing was sent. The surface
+    /// reports the criterion's own `policy.deny.*` code so an agent reads a
+    /// refused cap as a refused cap.
+    #[error("this operation was denied by operator policy ({})", reason.wire_code())]
+    PolicyDenied {
+        /// The typed denial, as the governing criterion produced it.
+        reason: Box<stellar_agent_core::policy::DenyReason>,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

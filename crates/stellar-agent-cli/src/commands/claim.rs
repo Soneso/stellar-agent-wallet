@@ -564,7 +564,7 @@ where
         Ok(r) => r,
         Err(e) => {
             print_error(
-                &crate::commands::submission_record::error_envelope(&e, signed_xdr),
+                &crate::commands::submission_record::error_envelope(&e, signed_xdr, "claim"),
                 args.output,
             );
             return 1;
@@ -910,7 +910,7 @@ where
         Ok(r) => r,
         Err(e) => {
             print_error(
-                &crate::commands::submission_record::error_envelope(&e, &signed_xdr),
+                &crate::commands::submission_record::error_envelope(&e, &signed_xdr, "claim"),
                 args.output,
             );
             return 1;
@@ -931,7 +931,7 @@ where
         }
         Err(e) => {
             print_error(
-                &crate::commands::submission_record::error_envelope(&e, &signed_xdr),
+                &crate::commands::submission_record::error_envelope(&e, &signed_xdr, "claim"),
                 args.output,
             );
             1

@@ -4759,6 +4759,8 @@ pub(crate) fn sa_error_to_invocation_result(
             }
             _ => SaInvocationResult::PreSubmissionRefused,
         },
+        // PolicyDenied: the wallet's own refusal, decided before the send.
+        SaError::PolicyDenied { .. } => SaInvocationResult::PreSubmissionRefused,
         // MulticallSha256Drift: fires at registry-lookup time, before any I/O.
         SaError::MulticallSha256Drift { .. } => SaInvocationResult::PreSubmissionRefused,
         // MulticallRegistryEntryNotFound: fires at registry-lookup time, before any I/O.

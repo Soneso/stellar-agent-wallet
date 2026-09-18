@@ -48,6 +48,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A spending-window reservation is admitted under the store's lock: the write
+  that reserves a submission's spend re-applies the governing criterion's
+  comparison against the state on disk at that moment, and refuses a
+  submission the window can no longer admit under the same
+  `policy.deny.per_period_cap_exceeded` or `policy.deny.rate_limit_exceeded`
+  code the policy gate reports. Two callers on one profile can no longer each
+  pass the gate against the same window state and both spend against it.
+  Nothing is sent and no record is left behind for a refused submission.
+
 - `pool init` persists its seed and profile checkpoint before sending sponsored
   channel creation. `pool status` reports pending creation and its transaction
   hash; `pool init --resume` completes confirmed creation without another send,

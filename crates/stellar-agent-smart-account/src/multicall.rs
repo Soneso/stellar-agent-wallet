@@ -1517,6 +1517,10 @@ pub async fn submit_multicall_bundle(
 
     match submit_result {
         Err(sa_err @ SaError::SubmissionUnresolved { .. }) => Err(sa_err),
+        // A reservation the window refuses is a policy denial: it carries the
+        // gate's own code, the recorder's closing row records it, and nothing
+        // was sent, so it passes through unwrapped and writes no second row.
+        Err(sa_err @ SaError::PolicyDenied { .. }) => Err(sa_err),
         Err(ref sa_err) => {
             // Map SaError to a MulticallFailed phase.
             let phase = map_sa_error_to_multicall_phase(sa_err);

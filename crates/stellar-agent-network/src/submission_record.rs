@@ -47,7 +47,7 @@ use stellar_agent_core::profile::receipt::{
 };
 use stellar_agent_core::profile::schema::Profile;
 
-use crate::policy_state::{PersistedWindowStore, WindowReservation};
+use crate::policy_state::{PersistedWindowStore, WindowReservation, WindowStoreError};
 use crate::sequence_floor::SequenceFloorHook;
 use crate::submit::redact_tx_hash;
 use stellar_agent_core::observability::redact::redact_strkey_first5_last5 as redact_account;
@@ -210,11 +210,7 @@ pub struct WalletSubmissionRecorder<'a> {
     tool: &'static str,
     chain_id: Option<String>,
     legs: Vec<ValueLegRecord>,
-    window_entries: Vec<(
-        stellar_agent_core::policy::v1::criteria::state_store::StateKey,
-        u64,
-        i128,
-    )>,
+    window_entries: Vec<stellar_agent_core::policy::v1::criteria::state_store::WindowEntry>,
     receipts: ReceiptStore,
     window: PersistedWindowStore,
     audit: Option<AuditWriterHandle>,
@@ -243,10 +239,10 @@ impl std::fmt::Debug for WalletSubmissionRecorder<'_> {
 impl<'a> WalletSubmissionRecorder<'a> {
     /// Builds a recorder for one submission.
     ///
-    /// `window_entries` are the `(state key, timestamp, amount)` triples the
-    /// policy engine sized for this action — the SAME derivation the gate
-    /// evaluated and the audit rows carry. `legs` is that same sizing in its
-    /// audit-row form.
+    /// `window_entries` are the window entries the policy engine sized for this
+    /// action: the SAME derivation the gate evaluated and the audit rows carry.
+    /// Each carries the limit its governing criterion compared the call
+    /// against. `legs` is that same sizing in its audit-row form.
     ///
     /// `audit` is `None` only where the profile has no audit log to write to,
     /// which is the synthesized zero-configuration origin; every persisted
@@ -262,11 +258,7 @@ impl<'a> WalletSubmissionRecorder<'a> {
         tool: &'static str,
         chain_id: Option<String>,
         legs: Vec<ValueLegRecord>,
-        window_entries: Vec<(
-            stellar_agent_core::policy::v1::criteria::state_store::StateKey,
-            u64,
-            i128,
-        )>,
+        window_entries: Vec<stellar_agent_core::policy::v1::criteria::state_store::WindowEntry>,
         receipts: ReceiptStore,
         window: PersistedWindowStore,
         audit: Option<AuditWriterHandle>,
@@ -545,7 +537,7 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
         // step is undone on failure, so a submission that never reached the
         // network leaves the sequence free for the retry the refusal invites.
         if let Err(e) = self.write_pending_row(intent) {
-            self.unwind(intent, UnwoundAfter::Receipt);
+            self.unwind(intent, UnwoundAfter::Receipt, e.code());
             return Err(e);
         }
 
@@ -556,10 +548,9 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
                 &self.reservation(intent),
             )
         {
-            self.unwind(intent, UnwoundAfter::PendingRow);
-            return Err(record_unavailable(format!(
-                "the spending-window reservation could not be written: {e:?}"
-            )));
+            let refusal = reservation_refusal(e);
+            self.unwind(intent, UnwoundAfter::PendingRow, refusal.code());
+            return Err(refusal);
         }
 
         // Last, and immediately before the send: `submitted` is what says the
@@ -567,8 +558,9 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
         // Setting it earlier would strand a receipt for a submission a later
         // failure stopped.
         if let Err(e) = self.mark_submitted(&intent.envelope_hash) {
-            self.unwind(intent, UnwoundAfter::Reservation);
-            return Err(receipt_store_refusal(&e));
+            let refusal = receipt_store_refusal(&e);
+            self.unwind(intent, UnwoundAfter::Reservation, refusal.code());
+            return Err(refusal);
         }
 
         Ok(())
@@ -625,6 +617,22 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
     }
 }
 
+/// Turns a refused reservation write into the error the caller reports.
+///
+/// A bucket that can no longer admit the spend is a policy denial, reported
+/// under the wire code the gate reports for the same reason and carrying the
+/// same typed reason. Every other refusal is a record the wallet could not
+/// write, which is what `submission.record_unavailable` names. Both refuse the
+/// send, and `pre_send` unwinds identically for either.
+fn reservation_refusal(error: WindowStoreError) -> WalletError {
+    match error {
+        WindowStoreError::PolicyDenied { reason } => WalletError::PolicyDenied { reason },
+        other => record_unavailable(format!(
+            "the spending-window reservation could not be written: {other:?}"
+        )),
+    }
+}
+
 /// Which way a reservation is settled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WindowSettlement {
@@ -669,8 +677,11 @@ impl WalletSubmissionRecorder<'_> {
     /// never happened against the operator's caps.
     ///
     /// Every step is best-effort and logged. The receipt is removed last,
-    /// because it is the record the other two are keyed to.
-    fn unwind(&self, intent: &SubmissionIntent, reached: UnwoundAfter) {
+    /// because it is the record the other two are keyed to. `code` is the
+    /// wire code of the refusal that stopped the submission; the row that
+    /// closes out the pending row carries it, so the audit log names a cap
+    /// refusal as the policy denial it is.
+    fn unwind(&self, intent: &SubmissionIntent, reached: UnwoundAfter, code: &str) {
         if reached == UnwoundAfter::Reservation {
             self.settle_window(intent, WindowSettlement::Release);
         }
@@ -680,7 +691,7 @@ impl WalletSubmissionRecorder<'_> {
         ) {
             // The pending row is in an append-only log and cannot be taken
             // back, so it is closed out instead.
-            self.write_failed_row(intent, RECORD_UNAVAILABLE_CODE);
+            self.write_failed_row(intent, code);
         }
         if let Err(e) = self.receipts.abandon_pre_submit(&intent.envelope_hash) {
             tracing::warn!(
@@ -748,11 +759,6 @@ impl WalletSubmissionRecorder<'_> {
         }
     }
 }
-
-/// Builds the refusal that stops a send whose record cannot be written.
-/// The wire code a submission that was never sent reports, and the code the
-/// closing audit row carries for it.
-const RECORD_UNAVAILABLE_CODE: &str = "submission.record_unavailable";
 
 /// Forces the `mark_submitted` step of `pre_send` to fail, so the unwind that
 /// follows it is reachable from a test.

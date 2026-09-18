@@ -560,7 +560,9 @@ where
     ) {
         Ok(r) => r,
         Err(e) => {
-            render_json(&crate::commands::submission_record::error_envelope(&e, ""));
+            render_json(&crate::commands::submission_record::error_envelope(
+                &e, "", "vault",
+            ));
             return 1;
         }
     };
@@ -590,9 +592,11 @@ where
             })));
             0
         }
-        Err(e) => {
-            crate::commands::submission_record::render_defi_submit_error(&e, "vault.submit_failed")
-        }
+        Err(e) => crate::commands::submission_record::render_defi_submit_error(
+            &e,
+            "vault",
+            "vault.submit_failed",
+        ),
     }
 }
 
@@ -930,7 +934,9 @@ where
     ) {
         Ok(r) => r,
         Err(e) => {
-            render_json(&crate::commands::submission_record::error_envelope(&e, ""));
+            render_json(&crate::commands::submission_record::error_envelope(
+                &e, "", "vault",
+            ));
             return 1;
         }
     };
@@ -960,9 +966,11 @@ where
             })));
             0
         }
-        Err(e) => {
-            crate::commands::submission_record::render_defi_submit_error(&e, "vault.submit_failed")
-        }
+        Err(e) => crate::commands::submission_record::render_defi_submit_error(
+            &e,
+            "vault",
+            "vault.submit_failed",
+        ),
     }
 }
 
