@@ -1354,14 +1354,24 @@ pub async fn submit_signed_invoke(
 /// A submission whose outcome is unknown, and one refused because it could not
 /// be recorded, keep their own wire code and their identifiers: the caller's
 /// next step is to reconcile a transaction hash, and a generic deployment
-/// failure would send it to rebuild and re-submit instead. Every other failure
-/// is a deployment failure at the submit phase, as before.
+/// failure would send it to rebuild and re-submit instead. A policy denial
+/// keeps the criterion's own code for the same reason. Every other failure is
+/// a deployment failure at the submit phase.
 pub(crate) fn map_submit_error(
     error: &stellar_agent_core::error::WalletError,
     op_label: &'static str,
     signed_xdr: &str,
 ) -> SaError {
     use stellar_agent_core::error::{SubmissionError, WalletError};
+
+    // A refusal the wallet's own policy decided keeps the criterion's code:
+    // nothing was sent, and an agent told the deployment failed would rebuild
+    // and re-submit against a cap that has already refused it.
+    if let WalletError::PolicyDenied { reason } = error {
+        return SaError::PolicyDenied {
+            reason: reason.clone(),
+        };
+    }
 
     let unresolved = match error {
         WalletError::Submission(SubmissionError::TxTimeout { tx_hash, seconds }) => Some((
@@ -1544,6 +1554,46 @@ mod tests {
     };
 
     use super::*;
+
+    /// A refusal the spending window decided reaches the smart-account
+    /// surface as a policy denial, under the criterion's own code.
+    ///
+    /// Reporting it as a deployment failure would send an agent to rebuild and
+    /// re-submit against a cap that has already refused it.
+    #[test]
+    fn a_policy_refusal_keeps_its_code_through_the_submit_mapping() {
+        let err = WalletError::PolicyDenied {
+            reason: Box::new(
+                stellar_agent_core::policy::DenyReason::PerPeriodCapExceeded {
+                    asset: "native".to_owned(),
+                    window: "1d".to_owned(),
+                    max_stroops: 1_000,
+                    attempted_stroops: 600,
+                    period_used_stroops: 600,
+                },
+            ),
+        };
+        let mapped = map_submit_error(&err, "multicall", "AAAAAgAAAAA=");
+        assert_eq!(mapped.wire_code(), "policy.deny.per_period_cap_exceeded");
+        assert!(
+            matches!(mapped, SaError::PolicyDenied { .. }),
+            "expected a typed policy denial, got {mapped:?}"
+        );
+    }
+
+    /// Every other submit failure is still a deployment failure at the submit
+    /// phase.
+    #[test]
+    fn a_malformed_transaction_is_still_a_deployment_failure() {
+        let err =
+            WalletError::Submission(stellar_agent_core::error::SubmissionError::TxMalformed {
+                detail: "txINSUFFICIENT_FEE".to_owned(),
+            });
+        assert_eq!(
+            map_submit_error(&err, "multicall", "AAAAAgAAAAA=").wire_code(),
+            "sa.deployment_failed"
+        );
+    }
 
     // ── host_function_kind_str closed-set ──────────────────────────────────────
 

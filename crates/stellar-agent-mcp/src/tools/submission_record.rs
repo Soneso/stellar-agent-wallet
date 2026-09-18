@@ -213,8 +213,12 @@ pub(crate) fn write_settled_row(
 /// reconciliation can settle, and the agent needs the full transaction hash to
 /// do it. The message stays redacted; the hash travels as data.
 ///
-/// Every other error renders exactly as it did before.
+/// A policy denial from the reservation write renders as the dispatch gate
+/// renders one. Every other error renders as a wallet error.
 pub(crate) fn submission_error_result(err: &WalletError, signed_xdr: &str) -> CallToolResult {
+    if let Some(result) = policy_denial_result(err) {
+        return result;
+    }
     let envelope = match submission_details(err, signed_xdr) {
         Some(details) => Envelope::<()>::err_with_details(err, details),
         None => Envelope::<()>::err(err),
@@ -225,6 +229,21 @@ pub(crate) fn submission_error_result(err: &WalletError, signed_xdr: &str) -> Ca
     let mut result = CallToolResult::success(vec![Content::text(json)]);
     result.is_error = Some(true);
     result
+}
+
+/// The tool result for a policy denial reported by the submit path, or `None`
+/// for every other error.
+///
+/// The spending-window reservation write re-applies the governing criterion's
+/// comparison under its own lock and refuses a submission the window can no
+/// longer admit. That refusal is the same decision the dispatch gate makes, so
+/// it is reported the same way, down to the redaction the reason passes
+/// through on its way to the wire.
+pub(crate) fn policy_denial_result(err: &WalletError) -> Option<CallToolResult> {
+    let WalletError::PolicyDenied { reason } = err else {
+        return None;
+    };
+    Some(crate::tools::common::policy_denial_error_result(reason))
 }
 
 /// The wire code a submission that was never sent reports. A pre-send
@@ -303,12 +322,16 @@ pub(crate) fn unresolved_from_defi(
 
 /// Renders a DeFi submit failure as a tool result.
 ///
-/// An unresolved submission keeps its `submission.*` code and its `details`;
-/// everything else is reported under `fallback_code`, as it was.
+/// A policy denial renders as the dispatch gate renders one. An unresolved
+/// submission keeps its `submission.*` code and its `details`; everything else
+/// is reported under `fallback_code`.
 pub(crate) fn defi_submit_error_result(
     error: &stellar_agent_defi::adapter::DefiAdapterError,
     fallback_code: &str,
 ) -> CallToolResult {
+    if let stellar_agent_defi::adapter::DefiAdapterError::PolicyDenied { reason } = error {
+        return crate::tools::common::policy_denial_error_result(reason);
+    }
     match unresolved_from_defi(error) {
         Some(unresolved) => unresolved_result(&unresolved),
         None => crate::tools::common::business_error_result(fallback_code, error.to_string()),
@@ -498,6 +521,95 @@ mod tests {
             json["error"]["details"].is_null(),
             "a pre-send refusal carries no details; got {json}"
         );
+    }
+
+    /// The result envelope's error code and message.
+    fn rendered(result: &CallToolResult) -> (String, String) {
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            other => panic!("expected text content; got {other:?}"),
+        };
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        (
+            json["error"]["code"].as_str().unwrap().to_owned(),
+            json["error"]["message"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    fn per_period_denial() -> stellar_agent_core::policy::DenyReason {
+        stellar_agent_core::policy::DenyReason::PerPeriodCapExceeded {
+            asset: "native".to_owned(),
+            window: "1d".to_owned(),
+            max_stroops: 1_000,
+            attempted_stroops: 600,
+            period_used_stroops: 600,
+        }
+    }
+
+    /// A submission the spending window refused reads exactly as a denial the
+    /// dispatch gate made: the criterion's own code, and the reason in the
+    /// message.
+    #[test]
+    fn a_refused_reservation_reads_as_a_gate_denial() {
+        let err = WalletError::PolicyDenied {
+            reason: Box::new(per_period_denial()),
+        };
+        let result = submission_error_result(&err, SIGNED_XDR);
+        assert_eq!(result.is_error, Some(true));
+        let (code, message) = rendered(&result);
+        assert_eq!(code, "policy.deny.per_period_cap_exceeded");
+        assert_eq!(
+            message,
+            format!(
+                "policy denied this operation: {}",
+                serde_json::to_string(&per_period_denial()).unwrap()
+            ),
+            "the message is the one the dispatch gate produces for this reason"
+        );
+    }
+
+    /// A refused submission was never sent, so it carries no reconciliation
+    /// detail.
+    #[test]
+    fn a_refused_reservation_carries_no_reconciliation_detail() {
+        let err = WalletError::PolicyDenied {
+            reason: Box::new(per_period_denial()),
+        };
+        let text = match &submission_error_result(&err, SIGNED_XDR).content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            other => panic!("expected text content; got {other:?}"),
+        };
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            json["error"]["details"].is_null(),
+            "nothing was sent, so there is no transaction to reconcile: {json}"
+        );
+    }
+
+    /// A DeFi tool reports the denial rather than its own submit-failure code.
+    #[test]
+    fn a_defi_tool_keeps_the_denial_rather_than_its_submit_failure_code() {
+        let error = stellar_agent_defi::adapter::DefiAdapterError::PolicyDenied {
+            reason: Box::new(per_period_denial()),
+        };
+        let result = defi_submit_error_result(&error, "dex.submit_failed");
+        assert_eq!(result.is_error, Some(true));
+        let (code, _message) = rendered(&result);
+        assert_eq!(
+            code, "policy.deny.per_period_cap_exceeded",
+            "a refused cap must not read as a submit failure"
+        );
+    }
+
+    /// A store this server cannot write still reports a record it could not
+    /// make, under the code that names exactly that.
+    #[test]
+    fn a_record_that_cannot_be_written_is_still_record_unavailable() {
+        let err = WalletError::Submission(SubmissionError::RecordUnavailable {
+            detail: "the spending-window reservation could not be written".to_owned(),
+        });
+        let (code, _message) = rendered(&submission_error_result(&err, SIGNED_XDR));
+        assert_eq!(code, "submission.record_unavailable");
     }
 
     /// A timeout carries the window it ran out of.

@@ -326,7 +326,11 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     ) {
         Ok(recorder) => recorder,
         Err(e) => {
-            render_json(&crate::commands::submission_record::error_envelope(&e, ""));
+            render_json(&crate::commands::submission_record::error_envelope(
+                &e,
+                "",
+                "timelock execute",
+            ));
             return 1;
         }
     };

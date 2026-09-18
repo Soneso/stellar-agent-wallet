@@ -61,7 +61,7 @@ pub use rate_limit::RateLimitCriterion;
 pub use restrict_bundle_to_recognised_kinds::RestrictBundleToRecognisedKindsCriterion;
 pub use sep10_session_active::Sep10SessionActiveCriterion;
 pub use sep45_session_active::Sep45SessionActiveCriterion;
-pub use state_store::PolicyStateStore;
+pub use state_store::{PolicyStateStore, WindowEntry, WindowLimit};
 
 /// A single policy criterion evaluated against an [`EvalContext`].
 ///
@@ -197,8 +197,13 @@ pub trait Criterion: Send + Sync + std::fmt::Debug {
     /// Implementations append into `ctx.state_store` via the SAME [`state_store::StateKey`]
     /// derivation their `evaluate` uses (the read-key/write-key identity
     /// invariant, same discipline as [`Self::accumulate_overlay`]), and return
-    /// every `(key, timestamp_ms, amount_or_count)` tuple appended so the
-    /// caller can persist the identical entries to the on-disk store.
+    /// every [`state_store::WindowEntry`] appended so the caller can persist
+    /// the identical entries to the on-disk store.
+    ///
+    /// Each entry carries the [`state_store::WindowLimit`] this criterion
+    /// compared the call against, built from the same fields its `evaluate`
+    /// reads, so the durable reservation write re-applies that comparison
+    /// under its own lock.
     ///
     /// Default: no-op (most criteria are not stateful). Stateful criteria
     /// (`per_period_cap`, `rate_limit`, `bundle_per_period_cap`,
@@ -211,7 +216,7 @@ pub trait Criterion: Send + Sync + std::fmt::Debug {
     fn record_confirmed(
         &self,
         _ctx: &EvalContext<'_>,
-    ) -> Result<Vec<(state_store::StateKey, u64, i128)>, PolicyError> {
+    ) -> Result<Vec<state_store::WindowEntry>, PolicyError> {
         Ok(Vec::new())
     }
 }

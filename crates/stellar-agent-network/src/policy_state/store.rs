@@ -10,7 +10,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use sha2::Sha256;
-use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
+use stellar_agent_core::policy::DenyReason;
+use stellar_agent_core::policy::v1::criteria::state_store::{
+    CLOCK_SKEW_TOLERANCE_MS, PolicyStateStore, StateKey, WindowEntry,
+};
 use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore};
 use stellar_agent_core::profile::schema::{
     KeyringEntryRef, Profile, default_policy_window_state_path_for,
@@ -500,7 +503,7 @@ impl PersistedWindowStore {
     pub fn record_and_persist(
         &self,
         profile: &Profile,
-        new_entries: &[(StateKey, u64, i128)],
+        new_entries: &[WindowEntry],
     ) -> Result<MintOutcome, WindowStoreError> {
         self.ensure_parent_dir()?;
         let _lock = WindowStoreLock::acquire(&self.lock_path())?;
@@ -510,11 +513,11 @@ impl PersistedWindowStore {
 
         let mut wire = self.read_verified(&key, &gen_entry)?;
 
-        for (state_key, ts_ms, amount) in new_entries {
-            let bucket = find_or_insert_bucket(&mut wire.entries, state_key);
+        for entry in new_entries {
+            let bucket = find_or_insert_bucket(&mut wire.entries, entry.key());
             bucket.records.push(WireRecord {
-                ts_ms: *ts_ms,
-                amount: *amount,
+                ts_ms: entry.timestamp_ms(),
+                amount: entry.amount(),
                 ..WireRecord::confirmed_defaults()
             });
         }
@@ -538,13 +541,29 @@ impl PersistedWindowStore {
     /// operator's cap has to hold against it. It is settled by
     /// [`Self::confirm`], [`Self::release`], or a reconciliation pass.
     ///
+    /// # Admission
+    ///
+    /// The policy gate evaluates a call against the window state it read
+    /// before the transaction was built and signed. This write is where the
+    /// spend is reserved, and it holds the store's exclusive lock, so it
+    /// re-applies the governing criterion's comparison here: against the file
+    /// it has just read and verified, at each entry's own timestamp, with the
+    /// entries of this batch accumulating against each other on a shared key.
+    /// A same-key record dated past the clock-skew tolerance fails the gate's
+    /// query closed and is refused here the same way.
+    /// A batch that would take any bucket past the limit its entry carries is
+    /// refused as [`WindowStoreError::PolicyDenied`] before anything is
+    /// written. Admission is whole-batch: every entry is written, or none is.
+    ///
     /// # Errors
     ///
-    /// See [`WindowStoreError`].
+    /// See [`WindowStoreError`]. A batch a bucket can no longer admit is
+    /// [`WindowStoreError::PolicyDenied`], carrying the denial the criterion
+    /// itself produces for that condition.
     pub fn record_pending(
         &self,
         profile: &Profile,
-        new_entries: &[(StateKey, u64, i128)],
+        new_entries: &[WindowEntry],
         reservation: &WindowReservation,
     ) -> Result<MintOutcome, WindowStoreError> {
         self.ensure_parent_dir()?;
@@ -554,11 +573,13 @@ impl PersistedWindowStore {
         let gen_entry = generation_entry_ref(profile);
         let mut wire = self.read_verified(&key, &gen_entry)?;
 
-        for (state_key, ts_ms, amount) in new_entries {
-            let bucket = find_or_insert_bucket(&mut wire.entries, state_key);
+        admit(&wire, new_entries)?;
+
+        for entry in new_entries {
+            let bucket = find_or_insert_bucket(&mut wire.entries, entry.key());
             bucket.records.push(WireRecord {
-                ts_ms: *ts_ms,
-                amount: *amount,
+                ts_ms: entry.timestamp_ms(),
+                amount: entry.amount(),
                 id: reservation.id.clone(),
                 status: RecordStatus::Pending,
                 tx_hash: reservation.tx_hash.clone(),
@@ -1779,6 +1800,76 @@ fn collect_pending(wire: &WireFile) -> Vec<WindowReservation> {
     seen
 }
 
+/// The window `key` holds in `wire` at `now_ms`, as
+/// [`PolicyStateStore::query_window`] computes it from the same records.
+///
+/// A confirmed record ages out at `now_ms - window_secs * 1000`. A pending
+/// record counts whatever its age: it holds the operator's cap for a
+/// submission whose outcome is still open. A record dated more than
+/// [`CLOCK_SKEW_TOLERANCE_MS`] past `now_ms` is a clock the gate's query does
+/// not trust; it fails closed there, and admission refuses it here with the
+/// evaluation error the criterion reports for that query.
+fn window_in_file(wire: &WireFile, key: &StateKey, now_ms: u64) -> Result<(i128, u32), DenyReason> {
+    let window_ms = key.window_secs().saturating_mul(1_000);
+    let cutoff = now_ms.saturating_sub(window_ms);
+    let future_limit = now_ms.saturating_add(CLOCK_SKEW_TOLERANCE_MS);
+    let mut sum: i128 = 0;
+    let mut count: u32 = 0;
+    for bucket in &wire.entries {
+        if bucket.scope_specificity != key.scope_specificity()
+            || bucket.bucket != key.bucket()
+            || bucket.window_secs != key.window_secs()
+        {
+            continue;
+        }
+        for record in &bucket.records {
+            if record.ts_ms > future_limit {
+                return Err(DenyReason::EvaluationError {
+                    detail: format!(
+                        "spending window: a record dated {} ms is more than \
+                         {CLOCK_SKEW_TOLERANCE_MS} ms ahead of the admission clock {now_ms} ms",
+                        record.ts_ms
+                    ),
+                });
+            }
+            if record.status != RecordStatus::Pending && record.ts_ms < cutoff {
+                continue;
+            }
+            sum = sum.saturating_add(record.amount);
+            count = count.saturating_add(1);
+        }
+    }
+    Ok((sum, count))
+}
+
+/// Refuses `entries` when any of them would take its bucket past the limit it
+/// carries, measured against `wire` plus the entries ahead of it in the batch.
+///
+/// The batch is one submission's reservation, so entries that share a key are
+/// accumulated against each other: a batch whose own entries jointly exceed a
+/// bucket is refused, at the first entry that tips it.
+fn admit(wire: &WireFile, entries: &[WindowEntry]) -> Result<(), WindowStoreError> {
+    let mut batch: HashMap<&StateKey, (i128, u32)> = HashMap::new();
+    for entry in entries {
+        let (file_sum, file_count) = window_in_file(wire, entry.key(), entry.timestamp_ms())
+            .map_err(|reason| WindowStoreError::PolicyDenied {
+                reason: Box::new(reason),
+            })?;
+        let (batch_sum, batch_count) = batch.get(entry.key()).copied().unwrap_or((0, 0));
+        let used = file_sum.saturating_add(batch_sum);
+        let calls = file_count.saturating_add(batch_count);
+        if let Some(reason) = entry.refusal(used, calls) {
+            return Err(WindowStoreError::PolicyDenied {
+                reason: Box::new(reason),
+            });
+        }
+        let accrued = batch.entry(entry.key()).or_insert((0, 0));
+        accrued.0 = accrued.0.saturating_add(entry.amount());
+        accrued.1 = accrued.1.saturating_add(1);
+    }
+    Ok(())
+}
+
 fn find_or_insert_bucket<'a>(
     entries: &'a mut Vec<WireBucket>,
     key: &StateKey,
@@ -1817,6 +1908,7 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
+    use stellar_agent_core::policy::v1::criteria::state_store::WindowLimit;
     use stellar_agent_test_support::keyring_mock;
     use tempfile::TempDir;
 
@@ -1828,6 +1920,24 @@ mod tests {
             );
         p.audit_log_path = dir.join("audit.jsonl");
         p
+    }
+
+    /// One entry under a cap far above every amount these tests record.
+    ///
+    /// These tests pin the file's integrity, retention and settlement
+    /// behaviour, not admission, so no write they make is refused by the
+    /// limit its entries carry.
+    fn entry(key: StateKey, ts_ms: u64, amount: i128) -> WindowEntry {
+        WindowEntry::new(
+            key,
+            ts_ms,
+            amount,
+            WindowLimit::Amount {
+                asset: "native".to_owned(),
+                window: "1d".to_owned(),
+                max_stroops: i128::from(u32::MAX),
+            },
+        )
     }
 
     fn key(profile_name: &str, bucket: &str, window_secs: u64) -> StateKey {
@@ -1861,7 +1971,7 @@ mod tests {
         let k = key("acc", "native", 86_400);
         let now = now_ms().unwrap();
         let outcome = store
-            .record_and_persist(&profile, &[(k.clone(), now, 500_000_000)])
+            .record_and_persist(&profile, &[entry(k.clone(), now, 500_000_000)])
             .unwrap();
         assert!(outcome.newly_minted, "first write mints the key");
 
@@ -1882,10 +1992,10 @@ mod tests {
         let k = key("acc2", "native", 86_400);
         let now = now_ms().unwrap();
         store
-            .record_and_persist(&profile, &[(k.clone(), now, 100)])
+            .record_and_persist(&profile, &[entry(k.clone(), now, 100)])
             .unwrap();
         let outcome2 = store
-            .record_and_persist(&profile, &[(k.clone(), now, 200)])
+            .record_and_persist(&profile, &[entry(k.clone(), now, 200)])
             .unwrap();
         assert!(!outcome2.newly_minted, "second write reuses the minted key");
 
@@ -1909,7 +2019,7 @@ mod tests {
         let now = now_ms().unwrap();
         let beyond = i128::from(i64::MAX) + 1_000;
         store
-            .record_and_persist(&profile, &[(k.clone(), now, beyond)])
+            .record_and_persist(&profile, &[entry(k.clone(), now, beyond)])
             .unwrap();
 
         let dest = PolicyStateStore::new();
@@ -1930,11 +2040,11 @@ mod tests {
         let now = now_ms().unwrap();
         let ancient = now.saturating_sub(RETENTION_MS + 1_000);
         store
-            .record_and_persist(&profile, &[(k.clone(), ancient, 999)])
+            .record_and_persist(&profile, &[entry(k.clone(), ancient, 999)])
             .unwrap();
         // A second write triggers pruning against the ancient entry.
         store
-            .record_and_persist(&profile, &[(k.clone(), now, 1)])
+            .record_and_persist(&profile, &[entry(k.clone(), now, 1)])
             .unwrap();
 
         let dest = PolicyStateStore::new();
@@ -1956,7 +2066,7 @@ mod tests {
         let store = PersistedWindowStore::at_path(path.clone());
         let k = key("tamper", "native", 86_400);
         store
-            .record_and_persist(&profile, &[(k, now_ms().unwrap(), 500)])
+            .record_and_persist(&profile, &[entry(k, now_ms().unwrap(), 500)])
             .unwrap();
 
         // Flip a byte in the body (past the 32-byte tag prefix).
@@ -1980,7 +2090,7 @@ mod tests {
         let store = PersistedWindowStore::at_path(path.clone());
         let k = key("tamper2", "native", 86_400);
         store
-            .record_and_persist(&profile, &[(k.clone(), now_ms().unwrap(), 500)])
+            .record_and_persist(&profile, &[entry(k.clone(), now_ms().unwrap(), 500)])
             .unwrap();
 
         let mut bytes = fs::read(&path).unwrap();
@@ -1988,7 +2098,7 @@ mod tests {
         bytes[last] ^= 0xFF;
         fs::write(&path, bytes).unwrap();
 
-        let result = store.record_and_persist(&profile, &[(k, now_ms().unwrap(), 1)]);
+        let result = store.record_and_persist(&profile, &[entry(k, now_ms().unwrap(), 1)]);
         assert!(matches!(result, Err(WindowStoreError::HmacMismatch)));
     }
 
@@ -2009,10 +2119,10 @@ mod tests {
         // their entries are both present — the lock serialises rather than
         // drops either writer.
         store
-            .record_and_persist(&profile, &[(k.clone(), now, 10)])
+            .record_and_persist(&profile, &[entry(k.clone(), now, 10)])
             .unwrap();
         store
-            .record_and_persist(&profile, &[(k.clone(), now, 20)])
+            .record_and_persist(&profile, &[entry(k.clone(), now, 20)])
             .unwrap();
 
         let dest = PolicyStateStore::new();
@@ -2049,7 +2159,7 @@ mod tests {
         let k = key("crash", "native", 86_400);
         let now = now_ms().unwrap();
         store
-            .record_and_persist(&profile, &[(k.clone(), now, 42)])
+            .record_and_persist(&profile, &[entry(k.clone(), now, 42)])
             .unwrap();
 
         let dest = PolicyStateStore::new();
@@ -2071,7 +2181,7 @@ mod tests {
         let k = key("reset", "native", 86_400);
         let now = now_ms().unwrap();
         store
-            .record_and_persist(&profile, &[(k.clone(), now, 999)])
+            .record_and_persist(&profile, &[entry(k.clone(), now, 999)])
             .unwrap();
 
         let outcome = store.reset(&profile).unwrap();
@@ -2099,7 +2209,7 @@ mod tests {
         let k = key("resign", "native", 86_400);
         let now = now_ms().unwrap();
         store
-            .record_and_persist(&profile, &[(k.clone(), now, 777)])
+            .record_and_persist(&profile, &[entry(k.clone(), now, 777)])
             .unwrap();
 
         // Rotate: mint a NEW key at the same keyring coordinate, then re-sign.
@@ -2145,7 +2255,7 @@ mod tests {
         let k = key("firstrun", "native", 86_400);
         let now = now_ms().unwrap();
         let outcome = store
-            .record_and_persist(&profile, &[(k.clone(), now, 111)])
+            .record_and_persist(&profile, &[entry(k.clone(), now, 111)])
             .unwrap();
         assert!(outcome.newly_minted);
 
@@ -2169,7 +2279,7 @@ mod tests {
         let store = PersistedWindowStore::at_path(path.clone());
         let k = key("deleted", "native", 86_400);
         store
-            .record_and_persist(&profile, &[(k, now_ms().unwrap(), 500)])
+            .record_and_persist(&profile, &[entry(k, now_ms().unwrap(), 500)])
             .unwrap();
 
         fs::remove_file(&path).unwrap();
@@ -2199,14 +2309,14 @@ mod tests {
         let now = now_ms().unwrap();
 
         store
-            .record_and_persist(&profile, &[(k.clone(), now, 100)])
+            .record_and_persist(&profile, &[entry(k.clone(), now, 100)])
             .unwrap();
         // Snapshot the validly-signed generation=1 file bytes before the
         // second write bumps the generation to 2.
         let old_bytes = fs::read(&path).unwrap();
 
         store
-            .record_and_persist(&profile, &[(k.clone(), now, 200)])
+            .record_and_persist(&profile, &[entry(k.clone(), now, 200)])
             .unwrap();
 
         // Restore the older (generation=1) snapshot: still a valid HMAC tag
@@ -2238,7 +2348,7 @@ mod tests {
         let now = now_ms().unwrap();
 
         store
-            .record_and_persist(&profile, &[(k.clone(), now, 50)])
+            .record_and_persist(&profile, &[entry(k.clone(), now, 50)])
             .unwrap();
 
         // Simulate the crash: bump the keyring generation as
@@ -2429,7 +2539,7 @@ mod tests {
         store
             .record_pending(
                 &profile,
-                &[(k.clone(), now, 600_000_000)],
+                &[entry(k.clone(), now, 600_000_000)],
                 &reservation("a".repeat(64).as_str(), "GSOURCE", 7, now),
             )
             .unwrap();
@@ -2460,7 +2570,7 @@ mod tests {
         store
             .record_pending(
                 &profile,
-                &[(k.clone(), now, 250)],
+                &[entry(k.clone(), now, 250)],
                 &reservation(&id, "GSOURCE", 7, now),
             )
             .unwrap();
@@ -2500,7 +2610,7 @@ mod tests {
         store
             .record_pending(
                 &profile,
-                &[(k.clone(), now, 900)],
+                &[entry(k.clone(), now, 900)],
                 &reservation(&id, "GSOURCE", 7, now),
             )
             .unwrap();
@@ -2534,7 +2644,7 @@ mod tests {
             store
                 .record_pending(
                     &profile,
-                    &[(k.clone(), now, 1)],
+                    &[entry(k.clone(), now, 1)],
                     &reservation(&id, "GSOURCE", i64::from(index), now - offset),
                 )
                 .unwrap();
@@ -2596,7 +2706,7 @@ mod tests {
         let k = key("v1-read", "native", 86_400);
         let now = now_ms().unwrap();
         store
-            .record_and_persist(&profile, &[(k.clone(), now, 4_200)])
+            .record_and_persist(&profile, &[entry(k.clone(), now, 4_200)])
             .unwrap();
         rewrite_body_version(&store, &profile, 1);
 
@@ -2630,7 +2740,7 @@ mod tests {
             let now = now_ms().unwrap();
             let res = reservation(&"c".repeat(64), "GSOURCE", 7, now);
             store
-                .record_pending(&profile, &[(k.clone(), now, 43)], &res)
+                .record_pending(&profile, &[entry(k.clone(), now, 43)], &res)
                 .unwrap();
             let old_bytes = fs::read(&store.path).unwrap();
             let mut original = store.read_for_inspection(&profile).unwrap().unwrap();
@@ -2694,7 +2804,7 @@ mod tests {
         let now = now_ms().unwrap();
         let res = reservation(&"e".repeat(64), "GSOURCE", 7, now);
         store
-            .record_pending(&profile, &[(k.clone(), now, 45)], &res)
+            .record_pending(&profile, &[entry(k.clone(), now, 45)], &res)
             .unwrap();
         let mut original = store.read_for_inspection(&profile).unwrap().unwrap();
         let mut abandoned = original.clone();
@@ -2708,7 +2818,7 @@ mod tests {
 
         // A new debit commits while the abandoned release remains uncommitted.
         store
-            .record_and_persist(&profile, &[(k.clone(), now, 5)])
+            .record_and_persist(&profile, &[entry(k.clone(), now, 5)])
             .unwrap();
         let committed_bytes = fs::read(&store.path).unwrap();
         assert_eq!(
@@ -2749,7 +2859,7 @@ mod tests {
         let now = now_ms().unwrap();
         let res = reservation(&"d".repeat(64), "GSOURCE", 7, now);
         store
-            .record_pending(&profile, &[(k.clone(), now, 44)], &res)
+            .record_pending(&profile, &[entry(k.clone(), now, 44)], &res)
             .unwrap();
         let blocker = dir.path().join("prepare-write-failure.window.tmp");
         fs::create_dir(&blocker).unwrap();
@@ -2778,7 +2888,7 @@ mod tests {
         let now = now_ms().unwrap();
         let res = reservation(&"f".repeat(64), "GSOURCE", 7, now);
         store
-            .record_pending(&profile, &[(k.clone(), now, 46)], &res)
+            .record_pending(&profile, &[entry(k.clone(), now, 46)], &res)
             .unwrap();
         let gen_entry = generation_entry_ref(&profile);
         let hmac_key =
@@ -2836,7 +2946,7 @@ mod tests {
         let now = now_ms().unwrap();
         let res = reservation(&"a".repeat(64), "GSOURCE", 7, now);
         store
-            .record_pending(&profile, &[(k.clone(), now, 47)], &res)
+            .record_pending(&profile, &[entry(k.clone(), now, 47)], &res)
             .unwrap();
         let gen_entry = generation_entry_ref(&profile);
         let counter = keyring_core::Entry::new(&gen_entry.service, &gen_entry.account).unwrap();
@@ -2901,7 +3011,7 @@ mod tests {
         let old = now - 14 * 86_400_000;
         let res = reservation(&"a".repeat(64), "GSOURCE", 7, old);
         store
-            .record_pending(&profile, &[(k.clone(), old, 42)], &res)
+            .record_pending(&profile, &[entry(k.clone(), old, 42)], &res)
             .unwrap();
         rewrite_body_version(&store, &profile, 2);
         let original = fs::read(&store.path).unwrap();
@@ -2924,7 +3034,9 @@ mod tests {
         let store = PersistedWindowStore::at_path(dir.path().join("v3-read.window"));
         let k = key("v3-read", "native", 86_400);
         let now = now_ms().unwrap();
-        store.record_and_persist(&profile, &[(k, now, 1)]).unwrap();
+        store
+            .record_and_persist(&profile, &[entry(k, now, 1)])
+            .unwrap();
         rewrite_body_version(&store, &profile, 4);
 
         let dest = PolicyStateStore::new();
@@ -2962,7 +3074,9 @@ mod tests {
         let store = PersistedWindowStore::at_path(path.clone());
         let k = key("mode-guard", "native", 86_400);
         let now = now_ms().unwrap();
-        store.record_and_persist(&profile, &[(k, now, 1)]).unwrap();
+        store
+            .record_and_persist(&profile, &[entry(k, now, 1)])
+            .unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(

@@ -684,10 +684,16 @@ fn build_invoke_contract_args(
 ///
 /// A submission whose outcome is unknown keeps its own wire code and its
 /// identifiers, so the caller reconciles a transaction hash instead of
-/// rebuilding and re-submitting. Every other failure is reported as a network
-/// failure, which moved nothing.
+/// rebuilding and re-submitting. A policy refusal keeps the criterion's own
+/// code, so the caller reads a refused cap rather than an endpoint failure.
+/// Every other failure is reported as a network failure, which moved nothing.
 fn map_submit_invoke_error(error: &stellar_agent_smart_account::SaError) -> DefiAdapterError {
     match error {
+        stellar_agent_smart_account::SaError::PolicyDenied { reason } => {
+            DefiAdapterError::PolicyDenied {
+                reason: reason.clone(),
+            }
+        }
         stellar_agent_smart_account::SaError::SubmissionUnresolved {
             kind,
             message,
@@ -720,6 +726,45 @@ mod tests {
     use crate::abi::{VaultDepositArgs, VaultWithdrawArgs};
     use stellar_agent_defi::pins::DefiContractPin;
     use stellar_agent_network::StellarRpcClient;
+
+    /// A refusal the spending window decided reaches the adapter surface as a
+    /// policy denial, not as a network failure that moved nothing.
+    #[test]
+    fn a_policy_refusal_keeps_its_code_through_the_adapter_mapping() {
+        let error = stellar_agent_smart_account::SaError::PolicyDenied {
+            reason: Box::new(
+                stellar_agent_core::policy::DenyReason::PerPeriodCapExceeded {
+                    asset: "native".to_owned(),
+                    window: "1d".to_owned(),
+                    max_stroops: 1_000,
+                    attempted_stroops: 600,
+                    period_used_stroops: 600,
+                },
+            ),
+        };
+        match map_submit_invoke_error(&error) {
+            DefiAdapterError::PolicyDenied { reason } => {
+                assert_eq!(reason.wire_code(), "policy.deny.per_period_cap_exceeded");
+            }
+            other => panic!("expected a typed policy denial, got {other:?}"),
+        }
+    }
+
+    /// Every other submit failure is still reported as a network failure.
+    #[test]
+    fn every_other_submit_failure_is_still_a_network_failure() {
+        let error = stellar_agent_smart_account::SaError::DeploymentFailed {
+            phase: "submit",
+            redacted_reason: "endpoint refused the bytes".to_owned(),
+        };
+        assert!(
+            matches!(
+                map_submit_invoke_error(&error),
+                DefiAdapterError::Network { .. }
+            ),
+            "a failure that moved nothing is a network failure"
+        );
+    }
 
     fn test_pin() -> DefiContractPin {
         DefiContractPin::new(

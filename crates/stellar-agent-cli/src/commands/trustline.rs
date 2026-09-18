@@ -747,6 +747,7 @@ where
                 &crate::commands::submission_record::error_envelope_with_fallback(
                     &e,
                     &signed_xdr,
+                    "trustline",
                     "trustline.submit_failed",
                 ),
             );
@@ -796,6 +797,7 @@ where
                 &crate::commands::submission_record::error_envelope_with_fallback(
                     &e,
                     &signed_xdr,
+                    "trustline",
                     "trustline.submit_failed",
                 ),
             );

@@ -34,7 +34,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::criteria::Criterion;
 use crate::policy::v1::criteria::per_period_cap::Window;
-use crate::policy::v1::criteria::state_store::StateKey;
+use crate::policy::v1::criteria::state_store::{StateKey, WindowEntry, WindowLimit};
 use crate::policy::{DenyReason, PolicyError};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -94,6 +94,15 @@ impl BundleRateLimitCriterion {
     #[must_use]
     pub fn max_calls(&self) -> u32 {
         self.max_calls
+    }
+
+    /// The limit every entry this criterion records carries, so the durable
+    /// reservation write re-applies the comparison `evaluate` makes.
+    fn window_limit(&self) -> WindowLimit {
+        WindowLimit::Count {
+            window: self.window.label().to_owned(),
+            max_calls: self.max_calls,
+        }
     }
 }
 
@@ -184,10 +193,7 @@ impl Criterion for BundleRateLimitCriterion {
     /// Appends one call-count entry (unit weight 1) per inner into
     /// `ctx.state_store`, using the SAME `StateKey` derivation `evaluate`
     /// uses. No-op on the single-tx path (`ctx.bundle` is `None`).
-    fn record_confirmed(
-        &self,
-        ctx: &EvalContext<'_>,
-    ) -> Result<Vec<(StateKey, u64, i128)>, PolicyError> {
+    fn record_confirmed(&self, ctx: &EvalContext<'_>) -> Result<Vec<WindowEntry>, PolicyError> {
         let Some(view) = ctx.bundle else {
             return Ok(Vec::new());
         };
@@ -209,7 +215,12 @@ impl Criterion for BundleRateLimitCriterion {
                     detail: format!("bundle_rate_limit: record_confirmed state store error: {e}"),
                 }
             })?;
-            recorded.push((state_key.clone(), now_ms, 1));
+            recorded.push(WindowEntry::new(
+                state_key.clone(),
+                now_ms,
+                1,
+                self.window_limit(),
+            ));
         }
         Ok(recorded)
     }

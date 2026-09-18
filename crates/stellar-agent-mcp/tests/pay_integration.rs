@@ -4305,3 +4305,261 @@ async fn transaction_status_releases_a_submission_the_chain_never_took() {
         call_result_text(&sim)
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Admission at the reservation write
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Wraps the submit-success responder and, once armed, writes a competing
+/// reservation into the profile's window file part-way through the commit.
+///
+/// That is what a sibling process does: this server's gate read the window,
+/// found room, and built and signed a transaction; the other caller reserved
+/// before this one did. The write lands on the endpoint round trip the submit
+/// path makes after the gate and before it takes its own reservation.
+struct CompetingReservationResponder {
+    inner: PaySubmitSuccessRpcResponder,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    /// Endpoint calls seen while armed, in order, for the failure message.
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+    injected: Arc<std::sync::atomic::AtomicBool>,
+    sends: Arc<std::sync::atomic::AtomicUsize>,
+    profile: Profile,
+    profile_name: String,
+    cap_stroops: i128,
+    amount_stroops: i128,
+}
+
+impl CompetingReservationResponder {
+    fn write_competing_reservation(&self) {
+        use stellar_agent_core::policy::v1::criteria::state_store::{
+            StateKey, WindowEntry, WindowLimit,
+        };
+        use stellar_agent_network::policy_state::{PersistedWindowStore, WindowReservation};
+
+        let now = stellar_agent_core::timefmt::now_unix_ms().expect("clock");
+        let entry = WindowEntry::new(
+            StateKey::new(&self.profile_name, 1, "native", 86_400),
+            now,
+            self.amount_stroops,
+            WindowLimit::Amount {
+                asset: "native".to_owned(),
+                window: "1d".to_owned(),
+                max_stroops: self.cap_stroops,
+            },
+        );
+        PersistedWindowStore::for_profile(&self.profile_name)
+            .record_pending(
+                &self.profile,
+                &[entry],
+                &WindowReservation {
+                    id: "9".repeat(64),
+                    tx_hash: "9".repeat(64),
+                    source: DEST_G.to_owned(),
+                    sequence: 4_242,
+                    max_time: 0,
+                    pending_since_ms: now,
+                    submission_ledger: 1_000,
+                    operator_required: false,
+                },
+            )
+            .expect("the competing caller's reservation fits the cap on its own");
+    }
+}
+
+#[async_trait]
+impl Respond for CompetingReservationResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        use std::sync::atomic::Ordering;
+
+        let body = serde_json::from_slice::<serde_json::Value>(&request.body)
+            .unwrap_or(serde_json::json!({}));
+        let rpc_method = body
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if rpc_method == "sendTransaction" {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+        }
+        if self.armed.load(Ordering::SeqCst) {
+            self.seen
+                .lock()
+                .expect("method log")
+                .push(rpc_method.clone());
+            // The submit path opens with an endpoint identity probe. That
+            // probe is the first `getNetwork` of the commit: the gate's
+            // account reads come before it, and the signature-binding read and
+            // the reservation write come after, so writing here puts the
+            // competing reservation exactly in the window the change closes.
+            if rpc_method == "getNetwork" && !self.injected.swap(true, Ordering::SeqCst) {
+                self.write_competing_reservation();
+            }
+        }
+        self.inner.respond(request)
+    }
+}
+
+/// A commit whose window no longer admits it when it takes its reservation is
+/// refused under the criterion's own code, and sends nothing.
+///
+/// The gate evaluated this call against a window with room. A competing caller
+/// reserved before this one reached its own reservation write, which is where
+/// the overspend is caught: the write holds the store's lock and re-applies
+/// the criterion's comparison against the file as it stands.
+#[tokio::test]
+#[serial]
+async fn pay_commit_refused_at_the_reservation_reports_the_gate_code_and_sends_nothing() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let _data_root = common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(211);
+
+    let home_dir = tempfile::TempDir::new().expect("tempdir");
+    let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home_dir.path());
+
+    let seed = [0x52_u8; 32];
+    let source_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+
+    let account_key_xdr = account_ledger_key_xdr(&source_g);
+    let account_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
+
+    let profile = testnet_profile_with_rpc("http://127.0.0.1:1");
+    let mut server = WalletServer::new(profile).expect("WalletServer::new");
+    let profile_name = server.profile_name_for_approval();
+
+    // 100 XLM cap; this call and the competing caller each move 60 XLM, so
+    // each fits the cap alone and the two together do not.
+    let cap_stroops: i128 = 1_000_000_000;
+    let amount_stroops: i128 = 600_000_000;
+
+    let armed = Arc::new(AtomicBool::new(false));
+    let injected = Arc::new(AtomicBool::new(false));
+    let sends = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(CompetingReservationResponder {
+            inner: PaySubmitSuccessRpcResponder {
+                account_key_xdr,
+                account_xdr,
+                network: common::EndpointNetwork::testnet(),
+            },
+            armed: Arc::clone(&armed),
+            seen: Arc::clone(&seen),
+            injected: Arc::clone(&injected),
+            sends: Arc::clone(&sends),
+            profile: testnet_profile_with_rpc("http://127.0.0.1:1"),
+            profile_name: profile_name.clone(),
+            cap_stroops,
+            amount_stroops,
+        })
+        .mount(&mock_server)
+        .await;
+
+    let profile = testnet_profile_with_rpc(&mock_server.uri());
+    let mut server_with_rpc = WalletServer::new(profile).expect("WalletServer::new");
+    server_with_rpc.set_policy_engine_for_test(Arc::new(per_period_cap_engine(
+        &["stellar_pay", "stellar_pay_commit"],
+        &profile_name,
+        cap_stroops,
+        "1d",
+    )));
+    std::mem::swap(&mut server, &mut server_with_rpc);
+
+    let pay_args = StellarPayArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        source: source_g.clone(),
+        destination: DEST_G.to_owned(),
+        amount: None,
+        amount_in_stroops: Some(amount_stroops.to_string()),
+        asset: "native".to_owned(),
+        memo_text: None,
+        memo_id: None,
+        memo_hash_hex: None,
+        memo_return_hex: None,
+        classic_base: None,
+    };
+
+    let sim = server
+        .call_stellar_pay(pay_args.clone())
+        .await
+        .expect("simulate must not error");
+    assert_ne!(
+        sim.is_error,
+        Some(true),
+        "the simulate is admitted against an empty window: {}",
+        call_result_text(&sim)
+    );
+    let sim_json = call_result_json(&sim);
+    let sim_data = sim_json.get("data").expect("simulate carries data");
+    let nonce = sim_data["nonce"].as_str().expect("nonce").to_owned();
+    let expires = sim_data["expires_at_unix_ms"]
+        .as_u64()
+        .expect("expires_at_unix_ms");
+    let envelope_xdr = sim_data["envelope_xdr"]
+        .as_str()
+        .expect("envelope_xdr")
+        .to_owned();
+
+    // From here the competing caller reserves part-way through the commit.
+    armed.store(true, Ordering::SeqCst);
+    let audit_log_path = testnet_profile_with_rpc(&mock_server.uri()).audit_log_path;
+    let audit_len_before = std::fs::metadata(&audit_log_path)
+        .map(|m| usize::try_from(m.len()).expect("audit log length fits usize"))
+        .unwrap_or(0);
+
+    let commit = server
+        .call_stellar_pay_commit(StellarPayCommitArgs {
+            chain_id: pay_args.chain_id,
+            source: pay_args.source,
+            destination: pay_args.destination,
+            amount: pay_args.amount,
+            amount_in_stroops: pay_args.amount_in_stroops,
+            asset: pay_args.asset,
+            memo_text: None,
+            memo_id: None,
+            memo_hash_hex: None,
+            memo_return_hex: None,
+            nonce,
+            expires_at_unix_ms: expires,
+            envelope_xdr,
+            approval_nonce: None,
+            approval_attestation: None,
+        })
+        .await
+        .expect("the commit must return a business-error result, not a protocol error");
+
+    let observed = seen.lock().expect("method log").clone();
+    assert!(
+        injected.load(Ordering::SeqCst),
+        "the competing reservation must be written during the commit; endpoint calls: {observed:?}"
+    );
+
+    // The refusal has to be the reservation write's, not a second gate
+    // evaluation's: only the recorder writes the pending row, and it writes it
+    // after the gate and immediately before it reserves.
+    let audit_log = std::fs::read_to_string(&audit_log_path).unwrap_or_default();
+    let written_by_this_commit = &audit_log[audit_len_before.min(audit_log.len())..];
+    assert!(
+        written_by_this_commit.contains("value_action_pending"),
+        "the commit reached its own reservation write, past the gate; \
+         endpoint calls: {observed:?}; rows: {written_by_this_commit}"
+    );
+    let (code, _message, text) = common::assert_business_envelope(&commit);
+    assert_eq!(
+        code, "policy.deny.per_period_cap_exceeded",
+        "the refusal names the code the gate names for the same reason; \
+         endpoint calls: {observed:?}; body: {text}"
+    );
+    assert_eq!(
+        sends.load(Ordering::SeqCst),
+        0,
+        "a refused submission sends nothing; endpoint calls: {observed:?}"
+    );
+}

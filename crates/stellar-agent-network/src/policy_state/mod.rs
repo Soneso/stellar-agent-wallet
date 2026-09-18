@@ -47,23 +47,33 @@
 //! start at all on a tampered/unparseable store file, rather than deferring
 //! that discovery to first dispatch.
 //!
-//! ## Known race: concurrent in-flight calls within one process
+//! # Admission
 //!
-//! Recording happens AFTER a confirmed on-chain submit — necessarily so,
-//! since only a confirmed submit is real spend. Two concurrent MCP dispatches
-//! for the SAME profile can both refresh-and-evaluate against the identical
-//! pre-submit window total (neither has recorded yet), both pass a
-//! `per_period_cap` check that is individually correct, both submit, and both
-//! record afterward. The window can therefore be jointly overshot by AT MOST
-//! the smaller of the two calls' own amounts — each call remains individually
-//! bounded by `per_tx_cap` (a rule combining both criteria is unaffected by
-//! this race; only `per_period_cap` alone, under concurrent load, admits this
-//! bounded overshoot). This is an accepted, DELIBERATE trade-off: closing it
-//! would require holding a cross-request lock across the submit round-trip,
-//! serialising unrelated calls behind a single profile's on-chain latency.
-//! The on-disk file total is never wrong — both records land, in some order,
-//! under the single-writer lock — so the very next call after the race sees
-//! the true, fully-accumulated history and is capped correctly from then on.
+//! A call passes through the window in three steps.
+//!
+//! 1. **Evaluation at dispatch.** The policy gate reads this store into the
+//!    engine's in-memory view and evaluates the call against it, before the
+//!    transaction is built and signed.
+//! 2. **Reservation under the lock.** Immediately before the send,
+//!    [`PersistedWindowStore::record_pending`] takes the store's exclusive
+//!    lock, re-reads and verifies the file, and re-applies the governing
+//!    criterion's own comparison against what the file holds at that moment.
+//!    Time passes between the two steps, and the profile is shared by every
+//!    process on the host, so the state the gate read is not necessarily the
+//!    state the reservation meets. A batch any bucket can no longer admit is
+//!    refused as [`WindowStoreError::PolicyDenied`], carrying the denial the
+//!    criterion produces for that condition, and nothing is written. Each
+//!    entry carries the limit that governs it
+//!    ([`stellar_agent_core::policy::v1::criteria::state_store::WindowLimit`]),
+//!    which is policy rather than history and is never persisted.
+//! 3. **Settlement on confirmation.** The reservation counts against every
+//!    window criterion while it stands and becomes confirmed spend, or is
+//!    released, when the chain answers.
+//!
+//! Admission is whole-batch: the entries of one submission are written
+//! together or not at all, and entries of one batch on one key are measured
+//! against each other, so a single call cannot overshoot a bucket by spreading
+//! its spend across legs.
 //!
 //! # Reservation settlement
 //!
@@ -278,5 +288,22 @@ pub enum WindowStoreError {
     Keyring {
         /// Operator-facing detail. MUST NOT include key material.
         detail: String,
+    },
+
+    /// A window bucket cannot admit the reservation.
+    ///
+    /// Produced by [`PersistedWindowStore::record_pending`] when it re-applies
+    /// the governing criterion's comparison under the store's lock, against
+    /// the state the file holds at that moment, and the batch would take a
+    /// bucket past its limit. Nothing is written: the batch is admitted whole
+    /// or refused whole.
+    ///
+    /// `reason` is the denial the criterion itself produces for the same
+    /// condition, built from the limit the entry carries, so the surface that
+    /// reports it names the gate's own wire code.
+    #[error("policy denied this reservation: {}", reason.wire_code())]
+    PolicyDenied {
+        /// The typed denial, built from the refused entry's limit.
+        reason: Box<stellar_agent_core::policy::DenyReason>,
     },
 }

@@ -779,6 +779,24 @@ pub(crate) fn build_tool_registry()
 // redact_deny_reason — account-ID redaction at the wire boundary
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Renders a typed policy denial as the wire error an agent branches on.
+///
+/// The wire code is the reason's own `policy.deny.*` code and the message
+/// carries the redacted reason, so no structured detail is lost in the move
+/// from the JSON-RPC `data` field.
+///
+/// Used by the dispatch gate and by every surface that reports a denial the
+/// spending-window reservation write decided, so one refusal reads the same
+/// whichever step of the call made it.
+pub(crate) fn policy_denial_error_result(reason: &DenyReason) -> rmcp::model::CallToolResult {
+    let redacted = redact_deny_reason(reason);
+    let detail = serde_json::to_string(&redacted).unwrap_or_else(|_| reason.code().to_owned());
+    business_error_result(
+        reason.wire_code(),
+        format!("policy denied this operation: {detail}"),
+    )
+}
+
 /// Applies first-5-last-5 redaction to any account-ID-bearing
 /// fields inside a [`DenyReason`] before the value is serialised into the MCP
 /// wire error envelope.
@@ -1434,14 +1452,7 @@ impl WalletServer {
                 // redacted `DenyReason` (first-5-last-5 on account IDs) is carried
                 // in the message so no structured detail is lost in the move from
                 // the JSON-RPC `data` field.
-                let redacted = redact_deny_reason(&reason);
-                let wire_code = format!("policy.deny.{}", reason.code());
-                let detail =
-                    serde_json::to_string(&redacted).unwrap_or_else(|_| reason.code().to_owned());
-                return Err(ToolError::Business(business_error_result(
-                    wire_code,
-                    format!("policy denied this operation: {detail}"),
-                )));
+                return Err(ToolError::Business(policy_denial_error_result(&reason)));
             }
 
             Decision::RequireApproval(req) => {

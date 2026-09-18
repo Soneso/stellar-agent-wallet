@@ -621,7 +621,9 @@ fn orphan_fixture(
     stellar_agent_core::profile::schema::Profile,
 ) {
     use std::sync::Arc;
-    use stellar_agent_core::policy::v1::criteria::state_store::StateKey;
+    use stellar_agent_core::policy::v1::criteria::state_store::{
+        StateKey, WindowEntry, WindowLimit,
+    };
     use stellar_agent_headless_keyring::{crypto::ProtectionMode, store::HeadlessStore};
     use stellar_agent_network::policy_state::{PersistedWindowStore, WindowReservation};
     fixture(home, rpc_url);
@@ -652,7 +654,16 @@ fn orphan_fixture(
     window
         .record_pending(
             &profile,
-            &[(StateKey::new(PROFILE, 1, "native", 86_400), now, 75)],
+            &[WindowEntry::new(
+                StateKey::new(PROFILE, 1, "native", 86_400),
+                now,
+                75,
+                WindowLimit::Amount {
+                    asset: "native".to_owned(),
+                    window: "1d".to_owned(),
+                    max_stroops: 1_000_000,
+                },
+            )],
             &res,
         )
         .unwrap();

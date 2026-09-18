@@ -25,6 +25,16 @@
 //! sweeper).  The criterion evaluator reads the accumulated total; the dispatch
 //! site is responsible for appending new entries at commit time.
 //!
+//! # Carrying the limit with the entry
+//!
+//! [`WindowEntry`] is what a stateful criterion hands back from
+//! [`crate::policy::v1::criteria::Criterion::record_confirmed`]: the key, the
+//! timestamp, the amount, and the [`WindowLimit`] that governs the bucket.
+//! The durable store behind this one holds its own lock at the moment a
+//! submission's spend is reserved, and re-applies the criterion's comparison
+//! there via [`WindowEntry::refusal`]. The limit is policy rather than
+//! history, so it travels with the entry and is never written to the file.
+//!
 //! # Thread safety
 //!
 //! `PolicyStateStore` wraps all mutable state in `std::sync::Mutex` so it is
@@ -34,8 +44,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
+use crate::policy::DenyReason;
+
 /// Maximum tolerated future clock skew for state-store entries, in milliseconds.
-const CLOCK_SKEW_TOLERANCE_MS: u64 = 30_000;
+pub const CLOCK_SKEW_TOLERANCE_MS: u64 = 30_000;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // StateKey
@@ -114,6 +126,171 @@ impl StateKey {
     #[must_use]
     pub fn window_secs(&self) -> u64 {
         self.window_secs
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WindowLimit / WindowEntry
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The operator limit governing one window bucket.
+///
+/// A stateful criterion compares a call against this limit when it evaluates,
+/// and carries the same limit on every entry it records. The reservation write
+/// re-applies the comparison under the store's lock against the state the file
+/// holds at that moment, so two calls that were each admissible against the
+/// state they read cannot both reserve past the bucket. The limit is policy,
+/// not history: it travels with the entry and is never persisted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowLimit {
+    /// An aggregate-amount bucket, as `per_period_cap` and
+    /// `bundle_per_period_cap` configure it.
+    Amount {
+        /// The asset identifier the cap is configured for, as its denial names it.
+        asset: String,
+        /// The window label its denial names (e.g. `"1d"`).
+        window: String,
+        /// The aggregate stroops the window admits.
+        max_stroops: i128,
+    },
+    /// A call-count bucket, as `rate_limit` and `bundle_rate_limit` configure it.
+    Count {
+        /// The window label its denial names (e.g. `"1m"`).
+        window: String,
+        /// The calls the window admits.
+        max_calls: u32,
+    },
+}
+
+/// One window record a call contributes, with the limit that governs it.
+///
+/// Produced by the stateful criteria from the same fields their `evaluate`
+/// compares against, so the key, the amount and the limit on the entry are the
+/// ones the gate decided with.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::policy::v1::criteria::state_store::{
+///     StateKey, WindowEntry, WindowLimit,
+/// };
+///
+/// let entry = WindowEntry::new(
+///     StateKey::new("alice", 1, "native", 86_400),
+///     1_000_000,
+///     400,
+///     WindowLimit::Amount {
+///         asset: "native".to_owned(),
+///         window: "1d".to_owned(),
+///         max_stroops: 1_000,
+///     },
+/// );
+/// assert_eq!(entry.amount(), 400);
+/// assert!(entry.refusal(500, 1).is_none());
+/// assert!(entry.refusal(700, 1).is_some());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowEntry {
+    key: StateKey,
+    timestamp_ms: u64,
+    amount: i128,
+    limit: WindowLimit,
+}
+
+impl WindowEntry {
+    /// Constructs a window entry for `key` at `timestamp_ms`.
+    ///
+    /// `amount` is the stroop total for an amount bucket and `1` for a
+    /// call-count bucket, matching what the criterion appends to the
+    /// in-memory store.
+    #[must_use]
+    pub fn new(key: StateKey, timestamp_ms: u64, amount: i128, limit: WindowLimit) -> Self {
+        Self {
+            key,
+            timestamp_ms,
+            amount,
+            limit,
+        }
+    }
+
+    /// Returns the bucket this entry accumulates into.
+    #[must_use]
+    pub fn key(&self) -> &StateKey {
+        &self.key
+    }
+
+    /// Returns the entry's timestamp in unix milliseconds.
+    #[must_use]
+    pub fn timestamp_ms(&self) -> u64 {
+        self.timestamp_ms
+    }
+
+    /// Returns the stroop total, or `1` for a call-count bucket.
+    #[must_use]
+    pub fn amount(&self) -> i128 {
+        self.amount
+    }
+
+    /// Returns the limit governing this entry's bucket.
+    #[must_use]
+    pub fn limit(&self) -> &WindowLimit {
+        &self.limit
+    }
+
+    /// Returns the denial this entry's limit produces against a window that
+    /// already holds `used_stroops` across `calls` entries, or `None` when the
+    /// window admits it.
+    ///
+    /// The comparison is the gate's own: an amount entry is refused when
+    /// `used_stroops + amount > max_stroops`, a count entry when
+    /// `calls + 1 > max_calls`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::policy::v1::criteria::state_store::{
+    ///     StateKey, WindowEntry, WindowLimit,
+    /// };
+    ///
+    /// let entry = WindowEntry::new(
+    ///     StateKey::new("alice", 1, "rate_limit", 60),
+    ///     1_000_000,
+    ///     1,
+    ///     WindowLimit::Count {
+    ///         window: "1m".to_owned(),
+    ///         max_calls: 2,
+    ///     },
+    /// );
+    /// assert!(entry.refusal(0, 1).is_none());
+    /// assert!(entry.refusal(0, 2).is_some());
+    /// ```
+    #[must_use]
+    pub fn refusal(&self, used_stroops: i128, calls: u32) -> Option<DenyReason> {
+        match &self.limit {
+            WindowLimit::Amount {
+                asset,
+                window,
+                max_stroops,
+            } => {
+                let would_use = used_stroops.saturating_add(self.amount);
+                (would_use > *max_stroops).then(|| DenyReason::PerPeriodCapExceeded {
+                    asset: asset.clone(),
+                    window: window.clone(),
+                    max_stroops: *max_stroops,
+                    attempted_stroops: self.amount,
+                    period_used_stroops: used_stroops,
+                })
+            }
+            // `calls >= max_calls` is `calls + 1 > max_calls` over the whole
+            // `u32` range, and is the comparison the rate-limit criteria make.
+            WindowLimit::Count { window, max_calls } => {
+                (calls >= *max_calls).then(|| DenyReason::RateLimitExceeded {
+                    window: window.clone(),
+                    max_calls: *max_calls,
+                    calls_in_window: calls,
+                })
+            }
+        }
     }
 }
 
@@ -413,6 +590,7 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
+        clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
 
@@ -420,6 +598,103 @@ mod tests {
 
     fn key() -> StateKey {
         StateKey::new("alice", 2, "native", 3_600)
+    }
+
+    // ── WindowEntry admission boundaries ────────────────────────────────────
+
+    fn amount_entry(amount: i128, max_stroops: i128) -> WindowEntry {
+        WindowEntry::new(
+            key(),
+            1_000_000,
+            amount,
+            WindowLimit::Amount {
+                asset: "native".to_owned(),
+                window: "1d".to_owned(),
+                max_stroops,
+            },
+        )
+    }
+
+    fn count_entry(max_calls: u32) -> WindowEntry {
+        WindowEntry::new(
+            StateKey::new("alice", 1, "rate_limit", 60),
+            1_000_000,
+            1,
+            WindowLimit::Count {
+                window: "1m".to_owned(),
+                max_calls,
+            },
+        )
+    }
+
+    /// A spend that lands exactly on the cap is admitted; one stroop past it
+    /// is refused. `per_period_cap` denies on `used + attempted > max`, so the
+    /// cap is a ceiling the window may reach.
+    #[test]
+    fn an_amount_entry_is_admitted_at_the_cap_and_refused_one_past_it() {
+        let entry = amount_entry(400, 1_000);
+        assert!(entry.refusal(600, 0).is_none(), "600 + 400 reaches the cap");
+        assert!(
+            entry.refusal(601, 0).is_some(),
+            "601 + 400 is one stroop past it"
+        );
+    }
+
+    /// The refusal reports the numbers the criterion's own denial reports.
+    #[test]
+    fn an_amount_refusal_carries_the_cap_the_attempt_and_the_window_total() {
+        match amount_entry(600, 1_000).refusal(600, 1) {
+            Some(DenyReason::PerPeriodCapExceeded {
+                asset,
+                window,
+                max_stroops,
+                attempted_stroops,
+                period_used_stroops,
+            }) => {
+                assert_eq!(asset, "native");
+                assert_eq!(window, "1d");
+                assert_eq!(max_stroops, 1_000);
+                assert_eq!(attempted_stroops, 600);
+                assert_eq!(period_used_stroops, 600);
+            }
+            other => panic!("expected PerPeriodCapExceeded, got {other:?}"),
+        }
+    }
+
+    /// A call is admitted while the window holds fewer than `max_calls`, and
+    /// refused once it holds that many. `rate_limit` denies on
+    /// `calls_in_window >= max_calls`.
+    #[test]
+    fn a_count_entry_is_admitted_below_the_limit_and_refused_at_it() {
+        let entry = count_entry(2);
+        assert!(entry.refusal(0, 1).is_none(), "one call so far, limit two");
+        assert!(entry.refusal(0, 2).is_some(), "the window is already full");
+    }
+
+    /// The comparison holds at the top of the `u32` range: a window already at
+    /// `u32::MAX` calls under a `u32::MAX` limit admits nothing further, which
+    /// an `n + 1` form would get wrong by saturating.
+    #[test]
+    fn a_count_entry_is_refused_at_the_top_of_the_u32_range() {
+        assert!(count_entry(u32::MAX).refusal(0, u32::MAX).is_some());
+        assert!(count_entry(u32::MAX).refusal(0, u32::MAX - 1).is_none());
+    }
+
+    /// The refusal reports the numbers the criterion's own denial reports.
+    #[test]
+    fn a_count_refusal_carries_the_limit_and_the_window_total() {
+        match count_entry(1).refusal(0, 1) {
+            Some(DenyReason::RateLimitExceeded {
+                window,
+                max_calls,
+                calls_in_window,
+            }) => {
+                assert_eq!(window, "1m");
+                assert_eq!(max_calls, 1);
+                assert_eq!(calls_in_window, 1);
+            }
+            other => panic!("expected RateLimitExceeded, got {other:?}"),
+        }
     }
 
     #[test]

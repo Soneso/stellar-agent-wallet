@@ -659,6 +659,23 @@ pub enum SaError {
         timeout_seconds: Option<u64>,
     },
 
+    /// Operator policy refused the operation.
+    ///
+    /// Distinct from [`Self::DeploymentFailed`] with `phase = "submit"`, which
+    /// reports a submission the network turned down: this one reports the
+    /// wallet's own refusal, decided before anything was sent.
+    ///
+    /// `wire_code()` returns the criterion's own `policy.deny.*` code, so the
+    /// surface reports the refusal exactly as the policy gate reports the same
+    /// decision. The serde tag stays `sa.policy_denied`, as
+    /// [`Self::SubmissionUnresolved`]'s stays `sa.submission_unresolved`.
+    #[error("this operation was denied by operator policy ({})", reason.wire_code())]
+    #[serde(rename = "sa.policy_denied")]
+    PolicyDenied {
+        /// The typed denial, as the governing criterion produced it.
+        reason: Box<stellar_agent_core::policy::DenyReason>,
+    },
+
     /// Local `ScAddress` XDR encoding failed while building an injective cache key.
     ///
     /// This is a local encoding failure, not a deployment or simulation failure.
@@ -2398,6 +2415,7 @@ impl SaError {
             Self::RuleExpired { .. } => "sa.rule_expired",
             Self::DeploymentFailed { .. } => "sa.deployment_failed",
             Self::SubmissionUnresolved { kind, .. } => kind.wire_code(),
+            Self::PolicyDenied { reason } => reason.wire_code(),
             Self::ScAddressEncodingFailed { .. } => "sa.scaddress_encoding_failed",
             Self::AuthEntryConstructionFailed { .. } => "sa.auth_entry_construction_failed",
             Self::WebAuthnVerifierProvenanceMismatch { .. } => {

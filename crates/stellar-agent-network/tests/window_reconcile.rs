@@ -26,7 +26,9 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::json;
 use serial_test::serial;
-use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
+use stellar_agent_core::policy::v1::criteria::state_store::{
+    PolicyStateStore, StateKey, WindowEntry, WindowLimit,
+};
 use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore};
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
 use stellar_agent_network::StellarRpcClient;
@@ -72,6 +74,24 @@ fn test_profile(name: &str) -> Profile {
 
 fn state_key(profile_name: &str) -> StateKey {
     StateKey::new(profile_name, 1, "native", 86_400)
+}
+
+/// The cap every reservation these tests take is admitted under.
+///
+/// These tests pin what settles an open reservation, not what admits one, so
+/// the cap sits far above every amount they reserve and no reservation is
+/// refused at the write.
+fn window_limit() -> WindowLimit {
+    WindowLimit::Amount {
+        asset: "native".to_owned(),
+        window: "1d".to_owned(),
+        max_stroops: 1_000_000,
+    }
+}
+
+/// One entry for the tests' single bucket.
+fn entry(profile_name: &str, ts_ms: u64, amount: i128) -> WindowEntry {
+    WindowEntry::new(state_key(profile_name), ts_ms, amount, window_limit())
 }
 
 fn reservation(id: &str, source: &str, sequence: i64, pending_since_ms: u64) -> WindowReservation {
@@ -219,7 +239,7 @@ impl Fixture {
         self.window
             .record_pending(
                 &self.profile,
-                &[(state_key(&self.profile_name), now, amount)],
+                &[entry(&self.profile_name, now, amount)],
                 reservation,
             )
             .unwrap();
@@ -982,7 +1002,7 @@ async fn a_pending_reservation_is_not_pruned_by_age() {
     fx.window
         .record_pending(
             &fx.profile,
-            &[(state_key(&fx.profile_name), ancient_ts, 10)],
+            &[entry(&fx.profile_name, ancient_ts, 10)],
             &reservation(&ancient, &source, 7, ancient_ts),
         )
         .unwrap();
@@ -992,7 +1012,7 @@ async fn a_pending_reservation_is_not_pruned_by_age() {
     fx.window
         .record_pending(
             &fx.profile,
-            &[(state_key(&fx.profile_name), now, 10)],
+            &[entry(&fx.profile_name, now, 10)],
             &reservation(&fresh, &source, 8, now),
         )
         .unwrap();
@@ -1071,7 +1091,7 @@ async fn an_orphaned_reservation_is_released_once_its_sequence_is_consumed() {
     fx.window
         .record_pending(
             &fx.profile,
-            &[(state_key(&fx.profile_name), now, 10)],
+            &[entry(&fx.profile_name, now, 10)],
             &reservation(&unconsumed, &source, 9, due_since(now)),
         )
         .unwrap();
@@ -1107,7 +1127,7 @@ async fn an_orphaned_reservation_is_released_once_its_sequence_is_consumed() {
     fx.window
         .record_pending(
             &fx.profile,
-            &[(state_key(&fx.profile_name), now, 10)],
+            &[entry(&fx.profile_name, now, 10)],
             &reservation(&consumed, &source, 1, due_since(now)),
         )
         .unwrap();
@@ -1625,7 +1645,7 @@ async fn orphan_markers_survive_restart_and_free_the_next_pass_budget() {
         );
         res.submission_ledger = if index == 7 { 1_500 } else { 1_000 };
         fx.window
-            .record_pending(&fx.profile, &[(state_key(&fx.profile_name), now, 10)], &res)
+            .record_pending(&fx.profile, &[entry(&fx.profile_name, now, 10)], &res)
             .unwrap();
     }
     let counts = MethodCounts::default();
@@ -1686,7 +1706,7 @@ async fn failed_orphan_marker_write_keeps_the_reservation_selectable() {
         due_since(now),
     );
     fx.window
-        .record_pending(&fx.profile, &[(state_key(&fx.profile_name), now, 53)], &res)
+        .record_pending(&fx.profile, &[entry(&fx.profile_name, now, 53)], &res)
         .unwrap();
     let lock = std::fs::OpenOptions::new()
         .write(true)

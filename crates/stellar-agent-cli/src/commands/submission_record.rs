@@ -291,12 +291,34 @@ pub(crate) fn write_settled_row(
 /// reconciliation can settle, and the caller needs the full transaction hash
 /// to do it. The message stays redacted; the hash travels as data.
 ///
-/// Every other error renders exactly as it did before.
-pub(crate) fn error_envelope(err: &WalletError, signed_xdr: &str) -> Envelope<()> {
+/// A policy denial from the reservation write renders as this binary's gate
+/// denials do, under `verb`. Every other error renders as a wallet error.
+pub(crate) fn error_envelope(err: &WalletError, signed_xdr: &str, verb: &str) -> Envelope<()> {
+    if let Some(envelope) = policy_denial_envelope(err, verb) {
+        return envelope;
+    }
     match submission_details(err, signed_xdr) {
         Some(details) => Envelope::<()>::err_with_details(err, details),
         None => Envelope::<()>::err(err),
     }
+}
+
+/// The refusal envelope for a policy denial reported by the submit path, or
+/// `None` for every other error.
+///
+/// The spending-window reservation write re-applies the governing criterion's
+/// comparison under its own lock and refuses a submission the window can no
+/// longer admit. That refusal is the same decision the gate makes, so it is
+/// reported the same way: the criterion's own wire code, and the wording
+/// `policy_engine`'s deny arm uses for `verb`.
+pub(crate) fn policy_denial_envelope(err: &WalletError, verb: &str) -> Option<Envelope<()>> {
+    let WalletError::PolicyDenied { reason } = err else {
+        return None;
+    };
+    Some(Envelope::<()>::err_raw(
+        reason.wire_code(),
+        format!("{verb} operation denied by operator policy"),
+    ))
 }
 
 /// The wire code a submission that was never sent reports. A pre-send
@@ -409,24 +431,38 @@ pub(crate) fn unresolved_from_defi(
 
 /// Renders a DeFi submit failure and returns the process exit code.
 ///
-/// An unresolved submission keeps its `submission.*` code and its `details`;
-/// everything else is reported under `fallback_code`, as it was.
+/// A policy denial renders as this binary's gate denials do, under `verb`. An
+/// unresolved submission keeps its `submission.*` code and its `details`;
+/// everything else is reported under `fallback_code`.
 pub(crate) fn render_defi_submit_error(
     error: &stellar_agent_defi::adapter::DefiAdapterError,
+    verb: &str,
     fallback_code: &str,
 ) -> i32 {
-    match unresolved_from_defi(error) {
-        Some(unresolved) => {
-            crate::common::render::render_json(&unresolved.envelope());
-        }
-        None => {
-            crate::common::render::render_json(&Envelope::<()>::err_raw(
-                fallback_code,
-                error.to_string(),
-            ));
-        }
-    }
+    crate::common::render::render_json(&defi_submit_error_envelope(error, verb, fallback_code));
     1
+}
+
+/// The refusal envelope a DeFi submit failure is reported in.
+///
+/// A policy denial reads as this binary's gate denials read, under `verb`. An
+/// unresolved submission keeps its `submission.*` code and its `details`;
+/// everything else is reported under `fallback_code`.
+fn defi_submit_error_envelope(
+    error: &stellar_agent_defi::adapter::DefiAdapterError,
+    verb: &str,
+    fallback_code: &str,
+) -> Envelope<()> {
+    if let stellar_agent_defi::adapter::DefiAdapterError::PolicyDenied { reason } = error {
+        return Envelope::<()>::err_raw(
+            reason.wire_code(),
+            format!("{verb} operation denied by operator policy"),
+        );
+    }
+    match unresolved_from_defi(error) {
+        Some(unresolved) => unresolved.envelope(),
+        None => Envelope::<()>::err_raw(fallback_code, error.to_string()),
+    }
 }
 
 /// Renders a submit-path error for a verb whose other submission failures
@@ -435,13 +471,18 @@ pub(crate) fn render_defi_submit_error(
 /// The three unknown-outcome codes are reported unchanged, with their
 /// reconciliation detail: an agent told the submission failed under a
 /// verb-specific code would rebuild and re-submit, which is exactly what a
-/// transaction that may still apply forbids. Everything else keeps
-/// `fallback_code`.
+/// transaction that may still apply forbids. A policy denial keeps the
+/// criterion's own code, so an agent reads a refused cap as a refused cap.
+/// Everything else keeps `fallback_code`.
 pub(crate) fn error_envelope_with_fallback(
     err: &WalletError,
     signed_xdr: &str,
+    verb: &str,
     fallback_code: &str,
 ) -> Envelope<()> {
+    if let Some(envelope) = policy_denial_envelope(err, verb) {
+        return envelope;
+    }
     match submission_details(err, signed_xdr) {
         Some(details) => Envelope::<()>::err_with_details(err, details),
         None => Envelope::<()>::err_raw(fallback_code, err.message()),
@@ -507,7 +548,7 @@ mod tests {
             tx_hash: hash.clone(),
             seconds: 30,
         });
-        let envelope = error_envelope(&err, SIGNED_XDR);
+        let envelope = error_envelope(&err, SIGNED_XDR, "pay");
         let details = envelope.error.as_ref().unwrap().details.as_ref().unwrap();
         assert_eq!(details["tx_hash"], hash);
         assert_eq!(details["timeout_seconds"], 30);
@@ -523,7 +564,7 @@ mod tests {
             tx_hash: hash.clone(),
             seconds: 30,
         });
-        let envelope = error_envelope(&err, SIGNED_XDR);
+        let envelope = error_envelope(&err, SIGNED_XDR, "pay");
         let message = &envelope.error.as_ref().unwrap().message;
         assert!(!message.contains(&hash), "message must stay redacted");
         assert!(message.contains("..."));
@@ -534,7 +575,7 @@ mod tests {
         let err = WalletError::Submission(SubmissionError::TxMalformed {
             detail: "txINSUFFICIENT_FEE".to_owned(),
         });
-        let envelope = error_envelope(&err, SIGNED_XDR);
+        let envelope = error_envelope(&err, SIGNED_XDR, "pay");
         assert!(envelope.error.as_ref().unwrap().details.is_none());
     }
 
@@ -640,6 +681,126 @@ mod tests {
         let envelope = unresolved.envelope();
         let details = envelope.error.as_ref().unwrap().details.as_ref().unwrap();
         assert_eq!(details["timeout_seconds"], 45);
+    }
+
+    /// A per-period cap the reservation write refused reports the criterion's
+    /// own code and reads as this binary's gate denials read.
+    #[test]
+    fn a_refused_reservation_reports_the_gate_code_and_wording() {
+        let err = WalletError::PolicyDenied {
+            reason: Box::new(
+                stellar_agent_core::policy::DenyReason::PerPeriodCapExceeded {
+                    asset: "native".to_owned(),
+                    window: "1d".to_owned(),
+                    max_stroops: 1_000,
+                    attempted_stroops: 600,
+                    period_used_stroops: 600,
+                },
+            ),
+        };
+        let envelope = error_envelope(&err, SIGNED_XDR, "pay");
+        let rendered = envelope.error.as_ref().unwrap();
+        assert_eq!(rendered.code, "policy.deny.per_period_cap_exceeded");
+        assert_eq!(rendered.message, "pay operation denied by operator policy");
+        assert!(
+            rendered.details.is_none(),
+            "nothing was sent, so there is no transaction to reconcile"
+        );
+    }
+
+    /// A rate limit the reservation write refused does the same.
+    #[test]
+    fn a_refused_rate_limited_reservation_reports_the_gate_code() {
+        let err = WalletError::PolicyDenied {
+            reason: Box::new(stellar_agent_core::policy::DenyReason::RateLimitExceeded {
+                window: "1m".to_owned(),
+                max_calls: 1,
+                calls_in_window: 1,
+            }),
+        };
+        let envelope = error_envelope(&err, SIGNED_XDR, "claim");
+        let rendered = envelope.error.as_ref().unwrap();
+        assert_eq!(rendered.code, "policy.deny.rate_limit_exceeded");
+        assert_eq!(
+            rendered.message,
+            "claim operation denied by operator policy"
+        );
+    }
+
+    /// A verb whose other submission failures carry their own code keeps the
+    /// denial rather than flattening it into that fallback.
+    #[test]
+    fn a_verb_with_a_fallback_code_keeps_the_denial() {
+        let err = WalletError::PolicyDenied {
+            reason: Box::new(
+                stellar_agent_core::policy::DenyReason::PerPeriodCapExceeded {
+                    asset: "native".to_owned(),
+                    window: "1d".to_owned(),
+                    max_stroops: 1_000,
+                    attempted_stroops: 600,
+                    period_used_stroops: 600,
+                },
+            ),
+        };
+        let envelope =
+            error_envelope_with_fallback(&err, SIGNED_XDR, "trustline", "trustline.submit_failed");
+        let rendered = envelope.error.as_ref().unwrap();
+        assert_eq!(
+            rendered.code, "policy.deny.per_period_cap_exceeded",
+            "a refused cap must not read as a submission failure"
+        );
+        assert_eq!(
+            rendered.message,
+            "trustline operation denied by operator policy"
+        );
+    }
+
+    /// A DeFi verb reports the denial rather than its own submit-failure code.
+    #[test]
+    fn a_defi_verb_keeps_the_denial_rather_than_its_submit_failure_code() {
+        let error = stellar_agent_defi::adapter::DefiAdapterError::PolicyDenied {
+            reason: Box::new(
+                stellar_agent_core::policy::DenyReason::PerPeriodCapExceeded {
+                    asset: "native".to_owned(),
+                    window: "1d".to_owned(),
+                    max_stroops: 1_000,
+                    attempted_stroops: 600,
+                    period_used_stroops: 600,
+                },
+            ),
+        };
+        let envelope = defi_submit_error_envelope(&error, "trade", "dex.submit_failed");
+        let rendered = envelope.error.as_ref().unwrap();
+        assert_eq!(
+            rendered.code, "policy.deny.per_period_cap_exceeded",
+            "a refused cap must not read as a submit failure"
+        );
+        assert_eq!(
+            rendered.message,
+            "trade operation denied by operator policy"
+        );
+        assert!(rendered.details.is_none());
+    }
+
+    /// Every other DeFi failure still reports under the verb's own code.
+    #[test]
+    fn a_defi_network_failure_still_reports_the_fallback_code() {
+        let error = stellar_agent_defi::adapter::DefiAdapterError::Network {
+            reason: "endpoint unreachable".to_owned(),
+        };
+        let envelope = defi_submit_error_envelope(&error, "trade", "dex.submit_failed");
+        assert_eq!(envelope.error.as_ref().unwrap().code, "dex.submit_failed");
+    }
+
+    /// A store this binary cannot write still reports a record it could not
+    /// make, under the code that names exactly that.
+    #[test]
+    fn a_record_that_cannot_be_written_is_still_record_unavailable() {
+        let err = record_unavailable("the spending-window reservation could not be written");
+        let envelope = error_envelope(&err, SIGNED_XDR, "pay");
+        let rendered = envelope.error.as_ref().unwrap();
+        assert_eq!(rendered.code, "submission.record_unavailable");
+        assert!(rendered.details.is_none());
     }
 
     /// A submission that was never sent carries no `details`.

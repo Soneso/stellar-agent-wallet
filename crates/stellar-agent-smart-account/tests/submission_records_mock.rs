@@ -18,12 +18,14 @@ use stellar_agent_core::policy::Decision;
 use stellar_agent_core::policy::v1::PolicyEngineV1;
 use stellar_agent_core::policy::v1::criteria::bundle_per_period_cap::BundlePerPeriodCapCriterion;
 use stellar_agent_core::policy::v1::criteria::per_period_cap::Window;
-use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
+use stellar_agent_core::policy::v1::criteria::state_store::{
+    PolicyStateStore, StateKey, WindowEntry, WindowLimit,
+};
 use stellar_agent_core::policy::v1::loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
 use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore};
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_network::SoftwareSigningKey;
-use stellar_agent_network::policy_state::PersistedWindowStore;
+use stellar_agent_network::policy_state::{PersistedWindowStore, WindowReservation};
 use stellar_agent_network::submission_record::WalletSubmissionRecorder;
 use stellar_agent_smart_account::SaError;
 use stellar_agent_smart_account::multicall::{
@@ -55,10 +57,16 @@ fn contract(byte: u8) -> String {
     stellar_strkey::Contract([byte; 32]).to_string().to_string()
 }
 
+/// Runs once inside the mock RPC, on the first simulation.
+type SimulateHook = Box<dyn FnOnce() + Send>;
+
 struct Rpc {
     poll_status: &'static str,
     sends: Arc<AtomicUsize>,
     sent_hash: Arc<Mutex<String>>,
+    /// Runs once, on the first simulation: the point after the bundle gate
+    /// has admitted the call and before its reservation is written.
+    before_simulate: Arc<Mutex<Option<SimulateHook>>>,
 }
 
 impl Respond for Rpc {
@@ -90,6 +98,9 @@ impl Respond for Rpc {
                 }
             }
             "simulateTransaction" => {
+                if let Some(hook) = self.before_simulate.lock().unwrap().take() {
+                    hook();
+                }
                 let envelope = TransactionEnvelope::from_xdr_base64(
                     body["params"]["transaction"].as_str().unwrap(),
                     Limits::none(),
@@ -293,6 +304,13 @@ impl Fixture {
 }
 
 async fn rpc(status: &'static str) -> (MockServer, Arc<AtomicUsize>, Arc<Mutex<String>>) {
+    rpc_with_hook(status, None).await
+}
+
+async fn rpc_with_hook(
+    status: &'static str,
+    before_simulate: Option<SimulateHook>,
+) -> (MockServer, Arc<AtomicUsize>, Arc<Mutex<String>>) {
     let server = MockServer::start().await;
     let sends = Arc::new(AtomicUsize::new(0));
     let sent_hash = Arc::new(Mutex::new(String::new()));
@@ -301,10 +319,80 @@ async fn rpc(status: &'static str) -> (MockServer, Arc<AtomicUsize>, Arc<Mutex<S
             poll_status: status,
             sends: Arc::clone(&sends),
             sent_hash: Arc::clone(&sent_hash),
+            before_simulate: Arc::new(Mutex::new(before_simulate)),
         })
         .mount(&server)
         .await;
     (server, sends, sent_hash)
+}
+
+/// A bundle the gate admits against an empty window is refused at its
+/// reservation when a competing reservation lands in between, and the
+/// refusal reaches the caller as the gate's own denial: no multicall wrapper,
+/// no send, and the recorder's closing row carries the policy code.
+#[tokio::test]
+#[serial]
+async fn a_reservation_refused_at_pre_send_surfaces_as_the_gate_denial() {
+    let fixture = Fixture::new();
+    let profile = fixture.profile.clone();
+    let competing = Box::new(move || {
+        let asset = stellar_agent_core::policy::v1::value::asset_normalise(&contract(0x47));
+        let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        let entry = WindowEntry::new(
+            StateKey::new(PROFILE, 1, &asset, 86_400),
+            now,
+            60,
+            WindowLimit::Amount {
+                asset: contract(0x47),
+                window: "1d".to_owned(),
+                max_stroops: 100,
+            },
+        );
+        PersistedWindowStore::for_profile(PROFILE)
+            .record_pending(
+                &profile,
+                &[entry],
+                &WindowReservation {
+                    id: "c".repeat(64),
+                    tx_hash: "d".repeat(64),
+                    source: "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY".to_owned(),
+                    sequence: 9,
+                    max_time: 0,
+                    pending_since_ms: now,
+                    submission_ledger: 1_000,
+                    operator_required: false,
+                },
+            )
+            .unwrap();
+    });
+    let (server, sends, _) = rpc_with_hook("SUCCESS", Some(competing)).await;
+    let err = fixture.multicall(&server.uri()).await.unwrap_err();
+    assert_eq!(
+        err.wire_code(),
+        "policy.deny.per_period_cap_exceeded",
+        "{err:?}"
+    );
+    assert!(
+        matches!(err, SaError::PolicyDenied { .. }),
+        "the refusal passes through unwrapped: {err:?}"
+    );
+    assert_eq!(
+        sends.load(Ordering::SeqCst),
+        0,
+        "a refused reservation sends nothing"
+    );
+    assert_eq!(
+        PersistedWindowStore::for_profile(PROFILE)
+            .pending_reservations(&fixture.profile)
+            .unwrap()
+            .len(),
+        1,
+        "only the competing reservation stands"
+    );
+    assert!(fixture.rows("value_action_submitted").is_empty());
+    let closing = fixture.rows("value_action_failed");
+    assert_eq!(closing.len(), 1, "the pending row is closed out once");
+    assert_eq!(closing[0]["code"], "policy.deny.per_period_cap_exceeded");
 }
 
 #[tokio::test]
