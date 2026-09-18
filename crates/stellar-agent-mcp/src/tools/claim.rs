@@ -862,11 +862,11 @@ impl WalletServer {
         // ValueEffects the gate evaluated (single-derivation invariant). Empty on
         // any non-value allow path.
         // Resolved once and reused for BOTH the audit row's legs and the
-        // window-state recording after confirmed submit (single-derivation
-        // invariant on the recording side too).
+        // pre-send window reservation, which confirmation settles.
         let gate_value_effects: Option<stellar_agent_core::policy::v1::ValueEffects> =
             match &dispatch_outcome {
                 DispatchOutcome::Allow(Some(effects)) => Some(effects.clone()),
+                DispatchOutcome::RequireApproval(approval) => approval.value_effects.clone(),
                 _ => None,
             };
         let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> = gate_value_effects

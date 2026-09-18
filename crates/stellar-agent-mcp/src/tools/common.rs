@@ -62,8 +62,29 @@ pub(crate) enum DispatchOutcome {
     /// Policy engine returned `Decision::RequireApproval`; the simulate handler
     /// must persist a `PendingApproval` entry and embed `approval_nonce` in the
     /// response.  The commit handler must verify the attestation blob before
-    /// proceeding.
-    RequireApproval(ApprovalRequest),
+    /// proceeding. The effects are the same descriptor the criteria evaluated
+    /// and must be recorded when an attested submission proceeds.
+    RequireApproval(ApprovalOutcome),
+}
+
+/// An approval request together with the effects its policy criteria sized.
+#[derive(Debug)]
+pub(crate) struct ApprovalOutcome {
+    #[allow(
+        dead_code,
+        reason = "retains the policy request alongside its sized effects"
+    )]
+    pub request: ApprovalRequest,
+    pub value_effects: Option<stellar_agent_core::policy::v1::ValueEffects>,
+}
+
+impl From<ApprovalRequest> for ApprovalOutcome {
+    fn from(request: ApprovalRequest) -> Self {
+        Self {
+            request,
+            value_effects: None,
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1067,7 +1088,7 @@ impl WalletServer {
     ///      refusal surfaced as the documented result envelope with wire code
     ///      `policy.deny.<reason.code()>` and the redacted `DenyReason`
     ///      (first-5-last-5 on account IDs) carried in the message.
-    ///    - `Decision::RequireApproval(req)` → `Ok(DispatchOutcome::RequireApproval(req))`.
+    ///    - `Decision::RequireApproval(req)` → `Ok(DispatchOutcome::RequireApproval(_))`.
     ///      The simulate handler persists a `PendingApproval` and embeds the
     ///      nonce in the response; commit handlers verify the attestation.
     ///    - Any future `Decision` variant not listed above →
@@ -1429,7 +1450,10 @@ impl WalletServer {
                 // the attestation before proceeding.  Do NOT produce a wire
                 // error here — that is the job of commit handlers that receive
                 // a commit call without valid attestation.
-                DispatchOutcome::RequireApproval(req)
+                DispatchOutcome::RequireApproval(ApprovalOutcome {
+                    request: req,
+                    value_effects,
+                })
             }
 
             // Forward-compat catch-all: Decision is #[non_exhaustive]; any future
@@ -2806,7 +2830,7 @@ mod tests {
         match result {
             Ok(DispatchOutcome::RequireApproval(req)) => {
                 assert_eq!(
-                    req.nonce, "test-nonce-abc",
+                    req.request.nonce, "test-nonce-abc",
                     "nonce must be preserved in DispatchOutcome"
                 );
             }
@@ -3120,8 +3144,9 @@ mod tests {
         profile.policy_owner_key_id.service = "stellar-agent-owner-\0path-leak".to_owned();
         let server =
             crate::server::WalletServer::new(profile).expect("WalletServer::new must not fail");
-        let dispatch_outcome =
-            DispatchOutcome::RequireApproval(ApprovalRequest::new("approval-nonce".into(), 120));
+        let dispatch_outcome = DispatchOutcome::RequireApproval(
+            ApprovalRequest::new("approval-nonce".into(), 120).into(),
+        );
         let attestation_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0_u8; 32]);
         let capture = CaptureWriter::new();
         let subscriber = Subscriber::builder()
@@ -3217,8 +3242,9 @@ mod tests {
         store.insert(entry, now_ms).unwrap();
         drop(store);
 
-        let dispatch_outcome =
-            DispatchOutcome::RequireApproval(ApprovalRequest::new(approval_nonce.clone(), 120));
+        let dispatch_outcome = DispatchOutcome::RequireApproval(
+            ApprovalRequest::new(approval_nonce.clone(), 120).into(),
+        );
         let attestation_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0_u8; 32]);
 
         let result = verify_attestation_gate(
@@ -3310,8 +3336,9 @@ mod tests {
         store.insert(entry, now_ms).unwrap();
         drop(store);
 
-        let dispatch_outcome =
-            DispatchOutcome::RequireApproval(ApprovalRequest::new(approval_nonce.clone(), 120));
+        let dispatch_outcome = DispatchOutcome::RequireApproval(
+            ApprovalRequest::new(approval_nonce.clone(), 120).into(),
+        );
         let attestation_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0_u8; 32]);
 
         let result = verify_attestation_gate(
@@ -3423,8 +3450,9 @@ mod tests {
         .expect("PaymentSimulated must surface an attestation blob");
         drop(store);
 
-        let dispatch_outcome =
-            DispatchOutcome::RequireApproval(ApprovalRequest::new(approval_nonce.clone(), 120));
+        let dispatch_outcome = DispatchOutcome::RequireApproval(
+            ApprovalRequest::new(approval_nonce.clone(), 120).into(),
+        );
 
         use stellar_agent_test_support::CaptureWriter;
         let capture = CaptureWriter::new();

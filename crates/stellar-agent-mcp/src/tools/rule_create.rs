@@ -1126,7 +1126,8 @@ impl WalletServer {
         // as-is, using its own real nonce/ttl) or this forced override ever
         // reaches the commit path.
         let forced = DispatchOutcome::RequireApproval(
-            stellar_agent_core::policy::ApprovalRequest::new(args.approval_nonce.clone(), 86_400),
+            stellar_agent_core::policy::ApprovalRequest::new(args.approval_nonce.clone(), 86_400)
+                .into(),
         );
         self.stellar_rule_create_commit_impl(args, Some(forced))
             .await
@@ -1505,7 +1506,8 @@ impl WalletServer {
         args: StellarRuleCreateCommitArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let forced = DispatchOutcome::RequireApproval(
-            stellar_agent_core::policy::ApprovalRequest::new(args.approval_nonce.clone(), 86_400),
+            stellar_agent_core::policy::ApprovalRequest::new(args.approval_nonce.clone(), 86_400)
+                .into(),
         );
         self.stellar_rule_create_commit_impl(args, Some(forced))
             .await
@@ -2249,7 +2251,7 @@ mod tests {
 
         let nonce = insert_rule_proposal_entry(&server, "stellar:testnet", None, DEFAULT_TTL_MS);
         let forced = DispatchOutcome::RequireApproval(
-            stellar_agent_core::policy::ApprovalRequest::new(nonce.clone(), 86_400),
+            stellar_agent_core::policy::ApprovalRequest::new(nonce.clone(), 86_400).into(),
         );
         let result = server
             .stellar_rule_create_commit_impl(commit_args("stellar:testnet", nonce), Some(forced))
@@ -2270,7 +2272,7 @@ mod tests {
         let mut args = commit_args("stellar:testnet", nonce.clone());
         args.approval_attestation = Some("not valid base64!!".to_owned());
         let forced = DispatchOutcome::RequireApproval(
-            stellar_agent_core::policy::ApprovalRequest::new(nonce, 86_400),
+            stellar_agent_core::policy::ApprovalRequest::new(nonce, 86_400).into(),
         );
         let result = server
             .stellar_rule_create_commit_impl(args, Some(forced))
@@ -2298,7 +2300,7 @@ mod tests {
         args.approval_attestation =
             Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 32]));
         let forced = DispatchOutcome::RequireApproval(
-            stellar_agent_core::policy::ApprovalRequest::new(nonce, 86_400),
+            stellar_agent_core::policy::ApprovalRequest::new(nonce, 86_400).into(),
         );
         let result = server
             .stellar_rule_create_commit_impl(args, Some(forced))

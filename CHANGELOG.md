@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A value submission that proceeds under an approval carries the audit legs the
+  policy sized and reserves its contribution to the spending caps before the
+  send, the same as one that proceeds under an allow.
+
 - The submission recorder reports `audit.tip_anchor_mismatch` with the writer's reason and the reanchor recovery command when a pre-send audit append detects rollback.
 - Friendbot funding requests have a 20-second deadline covering connection, response headers, and response body.
 - The startup verifier advisory scans the selected profile's configured
