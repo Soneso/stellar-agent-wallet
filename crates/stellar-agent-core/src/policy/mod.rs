@@ -1309,7 +1309,7 @@ pub trait PolicyEngine: Send + Sync {
     ///
     /// The default returns the [`Self::evaluate_with_value`] decision with
     /// `value_effects = None`; value-sizing engines override it to echo the
-    /// supplied descriptor's effects back on the allow path.
+    /// supplied descriptor's effects for Allow and RequireApproval decisions.
     ///
     /// # Errors
     ///
@@ -1409,10 +1409,11 @@ pub trait PolicyEngine: Send + Sync {
 }
 
 /// Outcome of a policy evaluation: the [`Decision`] plus the value descriptor
-/// the engine sized on the allow path, when the engine sizes value.
+/// the engine sized for an allowed or approval-required call.
 ///
-/// `value_effects` is `Some` only for a [`Decision::Allow`] from an engine that
-/// sizes value ([`crate::policy::v1::PolicyEngineV1`]); it is `None` for
+/// `value_effects` is `Some` for [`Decision::Allow`] or
+/// [`Decision::RequireApproval`] from an engine that sizes value
+/// ([`crate::policy::v1::PolicyEngineV1`]); it is `None` for
 /// read-only/opaque tools, for denials, and for engines that do not size value.
 /// It carries the SAME [`ValueEffects`](crate::policy::v1::ValueEffects) the
 /// value criteria evaluated, so a caller records exactly what the gate sized
@@ -1423,7 +1424,7 @@ pub trait PolicyEngine: Send + Sync {
 pub struct Evaluation {
     /// The policy decision.
     pub decision: Decision,
-    /// The value descriptor the engine sized on the allow path, or `None`.
+    /// The sized value effects for an allowed or approval-required call, or `None`.
     pub value_effects: Option<crate::policy::v1::ValueEffects>,
 }
 

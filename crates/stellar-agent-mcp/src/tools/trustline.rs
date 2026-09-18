@@ -302,8 +302,9 @@ impl WalletServer {
         summary_simulated_seq_num: i64,
         profile_name: &str,
     ) -> Result<PendingApproval, String> {
-        let approvals_dir =
-            default_approval_dir().map_err(|e| format!("approval dir resolution failed: {e}"))?;
+        let approvals_dir = self
+            .resolve_approval_dir()
+            .map_err(|e| format!("approval dir resolution failed: {e}"))?;
         std::fs::create_dir_all(&approvals_dir)
             .map_err(|e| format!("approval dir create_all failed: {e}"))?;
         let store_path = approvals_dir.join(format!("{profile_name}.toml"));
@@ -1247,11 +1248,11 @@ impl WalletServer {
         // ValueEffects the gate evaluated (single-derivation invariant). Empty on
         // any non-value allow path.
         // Resolved once and reused for BOTH the audit row's legs and the
-        // window-state recording after confirmed submit (single-derivation
-        // invariant on the recording side too).
+        // pre-send window reservation, which confirmation settles.
         let gate_value_effects: Option<stellar_agent_core::policy::v1::ValueEffects> =
             match &dispatch_outcome {
                 DispatchOutcome::Allow(Some(effects)) => Some(effects.clone()),
+                DispatchOutcome::RequireApproval(approval) => approval.value_effects.clone(),
                 _ => None,
             };
         let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> = gate_value_effects

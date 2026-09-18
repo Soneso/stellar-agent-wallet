@@ -59,7 +59,9 @@ refuses until `profile reset-window-state <name>` re-baselines it; a copy
 without the field starts a fresh, empty window and the original's spend does
 not count against it. Neither is a way to inherit or reset a spend window on
 purpose — use `profile init` for a new profile and `profile reset-window-state`
-for a deliberate reset.
+for a deliberate reset. Amount caps size outbound value, so a vault withdrawal,
+which returns underlying assets and burns the wallet's shares, reserves no
+amount against them.
 
 Every `profile` subcommand accepts a `--profile <NAME>` flag to name the
 profile it operates on; the subcommands that also take a positional `<NAME>`

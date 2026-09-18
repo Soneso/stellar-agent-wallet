@@ -1360,11 +1360,14 @@ impl WalletServer {
         // path, from the Allow the override displaced. Empty when the engine
         // sized no value (the row then records an unsized allow).
         // Resolved once and reused for BOTH the audit row's legs and the
-        // window-state recording after confirmed submit (single-derivation
-        // invariant on the recording side too).
+        // pre-send window reservation, which confirmation settles.
         let gate_value_effects: Option<stellar_agent_core::policy::v1::ValueEffects> =
             match &dispatch_outcome {
                 super::common::DispatchOutcome::Allow(Some(effects)) => Some(effects.clone()),
+                super::common::DispatchOutcome::RequireApproval(approval) => approval
+                    .value_effects
+                    .clone()
+                    .or_else(|| overridden_gate_effects.clone()),
                 _ => overridden_gate_effects.clone(),
             };
         let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> = gate_value_effects
@@ -1876,21 +1879,7 @@ impl WalletServer {
                 .unwrap_or("XLM")
                 .to_owned();
 
-            // Decode envelope XDR bytes for SHA-256.
-            use base64::Engine as _;
-            let envelope_xdr_bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(&args.envelope_xdr)
-                .or_else(|_| base64::engine::general_purpose::STANDARD.decode(&args.envelope_xdr))
-            {
-                Ok(b) => b,
-                Err(e) => {
-                    return Ok(crate::tools::common::business_error_result(
-                        "simulation.divergence",
-                        format!("base64 decode: {e}"),
-                    ));
-                }
-            };
-
+            // The approval binds the envelope text supplied to the commit verifier.
             let uid = process_uid_for_attestation().map_err(|e| {
                 rmcp::ErrorData::internal_error(format!("approval.uid_unavailable: {e}"), None)
             })?;
@@ -1907,7 +1896,7 @@ impl WalletServer {
 
             let pending = PendingApproval::new_payment_pending(
                 args.envelope_xdr.clone(),
-                &envelope_xdr_bytes,
+                args.envelope_xdr.as_bytes(),
                 summary_to,
                 summary_amount_stroops,
                 summary_asset,
@@ -1994,7 +1983,7 @@ impl WalletServer {
             .clone()
             .expect("approval_nonce is Some because has_approval is true at this point");
         let forced_outcome = super::common::DispatchOutcome::RequireApproval(
-            stellar_agent_core::policy::ApprovalRequest::new(forced_nonce, 86_400),
+            stellar_agent_core::policy::ApprovalRequest::new(forced_nonce, 86_400).into(),
         );
         self.stellar_pay_commit_impl(args, Some(forced_outcome))
             .await

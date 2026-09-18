@@ -26,7 +26,6 @@ use stellar_agent_core::approval::retry::{
 use stellar_agent_core::approval::store::PendingApproval;
 use stellar_agent_core::approval::user_id::process_uid_for_attestation;
 use stellar_agent_core::envelope_decode::decode_authoritative_args;
-use stellar_agent_core::profile::schema::default_approval_dir;
 use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_core::wallet::Wallet;
 use stellar_agent_network::{
@@ -235,8 +234,9 @@ impl WalletServer {
         summary_simulated_seq_num: i64,
         profile_name: &str,
     ) -> Result<PendingApproval, String> {
-        let approvals_dir =
-            default_approval_dir().map_err(|e| format!("approval dir resolution failed: {e}"))?;
+        let approvals_dir = self
+            .resolve_approval_dir()
+            .map_err(|e| format!("approval dir resolution failed: {e}"))?;
         std::fs::create_dir_all(&approvals_dir)
             .map_err(|e| format!("approval dir create_all failed: {e}"))?;
         let store_path = approvals_dir.join(format!("{profile_name}.toml"));
@@ -1042,11 +1042,11 @@ impl WalletServer {
         // ValueEffects the policy gate evaluated (single-derivation invariant).
         // Empty on any non-value allow path.
         // Resolved once and reused for BOTH the audit row's legs and the
-        // window-state recording after confirmed submit (single-derivation
-        // invariant on the recording side too).
+        // pre-send window reservation, which confirmation settles.
         let gate_value_effects: Option<stellar_agent_core::policy::v1::ValueEffects> =
             match &dispatch_outcome {
                 DispatchOutcome::Allow(Some(effects)) => Some(effects.clone()),
+                DispatchOutcome::RequireApproval(approval) => approval.value_effects.clone(),
                 _ => None,
             };
         let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> = gate_value_effects

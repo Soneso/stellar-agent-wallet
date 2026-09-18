@@ -1151,7 +1151,7 @@ impl PolicyEngine for PolicyEngineV1 {
             sep45_sessions,
         )?;
         Ok(crate::policy::Evaluation {
-            value_effects: value_effects_on_allow(&decision, &value),
+            value_effects: value_effects_on_permitted_decision(&decision, &value),
             decision,
         })
     }
@@ -1196,7 +1196,7 @@ impl PolicyEngine for PolicyEngineV1 {
     ) -> Result<crate::policy::Evaluation, PolicyError> {
         // The dispatch site resolved the value from the SAME decoded requirements
         // it signs (the single-decode invariant); use it as-is and echo it back
-        // on the allow path so the caller records exactly what the gate sized.
+        // for allowed and approval-required calls so recording uses the gate sizing.
         self.assert_value_kind_populated(tool, &value);
         let decision = self.evaluate_inner(
             tool,
@@ -1210,7 +1210,7 @@ impl PolicyEngine for PolicyEngineV1 {
             sep45_sessions,
         )?;
         Ok(crate::policy::Evaluation {
-            value_effects: value_effects_on_allow(&decision, &value),
+            value_effects: value_effects_on_permitted_decision(&decision, &value),
             decision,
         })
     }
@@ -1234,15 +1234,16 @@ impl PolicyEngine for PolicyEngineV1 {
     }
 }
 
-/// Extracts the sized [`value::ValueEffects`] from a resolved descriptor, but
-/// only on the allow path — `value_effects` is surfaced for a permitted
-/// value-moving call, never for a denial, an opaque sign, or a read-only tool.
-fn value_effects_on_allow(
+/// Carries the resolved value effects for calls that may proceed after any
+/// required approval. Denials and calls without sized value carry no effects.
+fn value_effects_on_permitted_decision(
     decision: &Decision,
     value: &value::ValueClass,
 ) -> Option<value::ValueEffects> {
     match (decision, value) {
-        (Decision::Allow, value::ValueClass::Value(effects)) => Some(effects.clone()),
+        (Decision::Allow | Decision::RequireApproval(_), value::ValueClass::Value(effects)) => {
+            Some(effects.clone())
+        }
         _ => None,
     }
 }
@@ -2137,6 +2138,64 @@ mod tests {
                 allow_opaque_signing: false,
             }],
             signature: None,
+        }
+    }
+
+    #[test]
+    fn full_evaluations_carry_exact_effects_for_allow_and_approval_only() {
+        let profile = testnet_profile();
+        let td = tool("stellar_pay", "stellar:testnet");
+        let args = serde_json::json!({
+            "amount_stroops": "60000000", "asset": "native", "destination": "recipient"
+        });
+        let derived = value::derive_value_class("stellar_pay", &args);
+        let supplied = value::ValueClass::single(value::ValueLeg {
+            kind: value::ActionKind::Payment,
+            amount: Some(70_000_000),
+            asset: Some("native".to_owned()),
+            destination: Some("resolved-recipient".to_owned()),
+        });
+        for decision in [
+            Decision::Allow,
+            Decision::RequireApproval(crate::policy::ApprovalRequest::new("approval".into(), 120)),
+            Decision::Deny(DenyReason::ExplicitRuleDeny),
+        ] {
+            let permitted = !matches!(decision, Decision::Deny(_));
+            let mut doc = allow_all_doc_with_criteria(vec![]);
+            doc.rules[0].decision = decision.clone();
+            let engine = PolicyEngineV1::new(doc, "alice".into());
+            let evaluation = engine
+                .evaluate_full(&td, &args, &profile, None, None, None, None, None)
+                .unwrap();
+            assert_eq!(evaluation.decision, decision);
+            let value::ValueClass::Value(ref effects) = derived else {
+                unreachable!()
+            };
+            assert_eq!(
+                evaluation.value_effects.as_ref(),
+                permitted.then_some(effects)
+            );
+            let evaluation = engine
+                .evaluate_with_value_full(
+                    &td,
+                    &args,
+                    &profile,
+                    supplied.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(evaluation.decision, decision);
+            let value::ValueClass::Value(ref effects) = supplied else {
+                unreachable!()
+            };
+            assert_eq!(
+                evaluation.value_effects.as_ref(),
+                permitted.then_some(effects)
+            );
         }
     }
 
