@@ -34,6 +34,7 @@
     reason = "test-only; panics, unwraps, and eprintln are acceptable in acceptance tests"
 )]
 
+mod common;
 #[cfg(feature = "testnet-acceptance")]
 mod live {
     use ed25519_dalek::SigningKey as DalekSigningKey;
@@ -173,7 +174,11 @@ mod live {
         }
 
         // ── Build + submit the sponsored sandwich ─────────────────────────────
+        let recording = crate::common::RecorderFixture::new();
         let params = InitParams {
+            attempt: 0,
+            timeout: stellar_agent_pool::init::INIT_SUBMIT_TIMEOUT,
+            recorder: &recording.recorder(),
             funder_strkey: &funder_strkey,
             funder_sequence,
             funder_signer: &funder_signer,

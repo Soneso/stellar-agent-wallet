@@ -41,6 +41,7 @@
     reason = "test-only; panics, unwraps, and eprintln acceptable in integration tests"
 )]
 
+mod common;
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
@@ -337,6 +338,7 @@ async fn concurrent_submit_k4_distinct_channels_correct_seq_nums() {
                 TESTNET_PASSPHRASE,
                 FEE_PER_OP,
                 SUBMIT_TIMEOUT,
+                &crate::common::RecorderFixture::new().recorder(),
                 |builder| {
                     // Hold the InFlight lease until all K tasks have acquired.
                     rendezvous_clone.wait();
@@ -492,6 +494,7 @@ async fn single_submit_mock_rpc_seq_num_correct() {
         TESTNET_PASSPHRASE,
         FEE_PER_OP,
         SUBMIT_TIMEOUT,
+        &crate::common::RecorderFixture::new().recorder(),
         |builder| {
             let _ = builder.payment(
                 DEST_KEY,
@@ -554,6 +557,7 @@ async fn submit_pooled_pool_exhausted_immediate() {
             TESTNET_PASSPHRASE,
             FEE_PER_OP,
             SUBMIT_TIMEOUT,
+            &crate::common::RecorderFixture::new().recorder(),
             |_builder| {}, // no ops — never reaches build_and_sign
         )
         .await

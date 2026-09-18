@@ -75,6 +75,10 @@
     reason = "benchmark example binary; relaxed lints for clarity and diagnostics output"
 )]
 
+#[cfg(feature = "testnet-acceptance")]
+#[path = "../tests/common/mod.rs"]
+mod recording;
+
 fn main() {
     // This example requires `--features testnet-acceptance` to build with
     // the live Stellar network code paths.  Without that feature it prints
@@ -266,6 +270,16 @@ async fn run_benchmark() {
 
     // ── Single-submission baseline ────────────────────────────────────────────
     let dest = funder.clone();
+    let mut recordings = recording::RecorderFixture::new();
+    recordings.legs = vec![stellar_agent_core::audit_log::schema::ValueLegRecord {
+        action: stellar_agent_core::audit_log::schema::ValueActionKind::Payment,
+        amount: Some(1),
+        asset: Some("native".to_owned()),
+        destination_redacted: Some(redact_strkey_first5_last5(&dest)),
+    }];
+    recordings.dir.disable_cleanup(true);
+    eprintln!("Submission records: {}", recordings.dir.path().display());
+    let recordings = Arc::new(recordings);
     let single_start = Instant::now();
     let single_result = submit_pooled(
         &pool,
@@ -274,6 +288,7 @@ async fn run_benchmark() {
         TESTNET_PASSPHRASE,
         FEE,
         TIMEOUT,
+        &recordings.recorder(),
         |builder| {
             let _ = builder.payment(&dest, StellarAmount::from_stroops(1), &Asset::Native);
         },
@@ -303,6 +318,7 @@ async fn run_benchmark() {
         let client_clone = Arc::clone(&client);
         let seed_clone = Zeroizing::new(*pool_master_seed);
         let dest_clone = dest.clone();
+        let recordings = Arc::clone(&recordings);
 
         join_set.spawn(async move {
             use stellar_agent_pool::PoolError;
@@ -313,6 +329,7 @@ async fn run_benchmark() {
                 TESTNET_PASSPHRASE,
                 FEE,
                 TIMEOUT,
+                &recordings.recorder(),
                 |builder| {
                     let _ = builder.payment(
                         &dest_clone,

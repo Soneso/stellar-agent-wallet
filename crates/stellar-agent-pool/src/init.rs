@@ -36,17 +36,17 @@
 use std::time::Duration;
 
 use stellar_agent_core::observability::redact_strkey_first5_last5;
-use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::signing::Signer;
 use stellar_agent_network::{ClassicOpBuilder, SoftwareSigningKey, submit_transaction_and_wait};
+use stellar_agent_network::{StellarRpcClient, SubmissionRecorder};
 
 use crate::config::PoolChannelRecord;
 use crate::error::PoolError;
 use crate::pool::ChannelPool;
 use PoolChannelRecord as ChannelRecord;
 
-/// Default submission timeout for the init transaction.
-const INIT_SUBMIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Default deadline for the initialization transaction's confirmation.
+pub const INIT_SUBMIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Parameters for `init_pool`.
 ///
@@ -74,6 +74,13 @@ pub struct InitParams<'a> {
     pub network_passphrase: &'a str,
     /// Base fee in stroops per operation (total = fee × op_count).
     pub fee_per_op: u32,
+    /// Durable receipt and audit recorder, invoked before the transaction leaves.
+    pub recorder: &'a dyn SubmissionRecorder,
+    /// Monotonic initialization attempt, carried as a memo ID for receipt identity.
+    pub attempt: u64,
+    /// Deadline for confirmation after the send; [`INIT_SUBMIT_TIMEOUT`] is the
+    /// default the CLI supplies.
+    pub timeout: Duration,
 }
 
 /// The result of a successful `init_pool` call.
@@ -134,6 +141,10 @@ pub async fn init_pool(
         params.network_passphrase,
         total_fee,
     );
+
+    builder
+        .memo(&stellar_xdr::Memo::Id(params.attempt))
+        .map_err(PoolError::Wallet)?;
 
     // Build N strictly-sequential (Begin, Create, End) triples.
     //
@@ -201,10 +212,10 @@ pub async fn init_pool(
     let submission = submit_transaction_and_wait(
         client,
         &signed_xdr,
-        INIT_SUBMIT_TIMEOUT,
+        params.timeout,
         params.network_passphrase,
         None,
-        None,
+        Some(params.recorder),
     )
     .await
     .map_err(|e| PoolError::InitFailed {

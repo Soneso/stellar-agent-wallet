@@ -39,6 +39,7 @@
     reason = "test-only; panics and unwraps acceptable in integration tests"
 )]
 
+mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -229,6 +230,7 @@ async fn submit_pooled_tx_bad_seq_triggers_refetch_path() {
         TESTNET_PASSPHRASE,
         FEE_PER_OP,
         TIMEOUT,
+        &crate::common::RecorderFixture::new().recorder(),
         |builder| {
             let _ = builder.payment(
                 DEST_KEY,
@@ -324,6 +326,7 @@ async fn submit_pooled_generic_failed_returns_wallet_error() {
         TESTNET_PASSPHRASE,
         FEE_PER_OP,
         TIMEOUT,
+        &crate::common::RecorderFixture::new().recorder(),
         |builder| {
             let _ = builder.payment(
                 DEST_KEY,
@@ -375,6 +378,7 @@ async fn submit_pooled_pool_exhausted_no_rpc_call() {
             TESTNET_PASSPHRASE,
             FEE_PER_OP,
             TIMEOUT,
+            &crate::common::RecorderFixture::new().recorder(),
             |_| {},
         )
         .await
@@ -579,6 +583,7 @@ async fn submit_pooled_tx_bad_seq_with_successful_refetch_updates_sequence() {
         TESTNET_PASSPHRASE,
         FEE_PER_OP,
         TIMEOUT,
+        &crate::common::RecorderFixture::new().recorder(),
         |builder| {
             let _ = builder.payment(
                 DEST_KEY,
@@ -644,6 +649,7 @@ async fn submit_pooled_derive_failed_releases_channel() {
         TESTNET_PASSPHRASE,
         FEE_PER_OP,
         TIMEOUT,
+        &crate::common::RecorderFixture::new().recorder(),
         |builder| {
             let _ = builder.payment(
                 DEST_KEY,
@@ -703,6 +709,7 @@ async fn submit_pooled_build_and_sign_failure_releases_channel() {
         TESTNET_PASSPHRASE,
         FEE_PER_OP,
         TIMEOUT,
+        &crate::common::RecorderFixture::new().recorder(),
         // Empty closure — no ops added. build_and_sign must fail.
         |_builder| {},
     )
@@ -725,5 +732,98 @@ async fn submit_pooled_build_and_sign_failure_releases_channel() {
     assert_eq!(
         snap[0].sequence_number, initial_seq,
         "sequence must not change after build_and_sign failure (no ledger involvement)"
+    );
+}
+
+/// A pooled timeout keeps the exact submission identity and its pending audit
+/// row available to the named reconciliation used by transaction status.
+#[tokio::test]
+#[serial_test::serial]
+async fn pooled_timeout_is_recorded_and_reconcilable() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let server = MockServer::start().await;
+    let channel = channel_key().await;
+    mount_network_probe(&server).await;
+    Mock::given(body_partial_json(json!({"method":"getLedgerEntries"})))
+        .respond_with(EchoIdResponder::new(ledger_entries_result_for(&[&channel])))
+        .mount(&server)
+        .await;
+    Mock::given(body_partial_json(json!({"method":"sendTransaction"})))
+        .respond_with(SubmissionEchoResponder::new(json!({"hash":"","status":"PENDING","latestLedger":1000,"latestLedgerCloseTime":"1700000000"}), TESTNET_PASSPHRASE)).expect(1).mount(&server).await;
+    let pending = Mock::given(body_partial_json(json!({"method":"getTransaction"})))
+        .respond_with(EchoIdResponder::new(json!({"status":"NOT_FOUND"})))
+        .mount_as_scoped(&server)
+        .await;
+    let fixture = common::RecorderFixture::new();
+    let recorder = fixture.recorder();
+    let pool = make_pool_1().await;
+    let seed = mock_seed();
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(6),
+        submit_pooled(
+            &pool,
+            &client,
+            &seed,
+            TESTNET_PASSPHRASE,
+            FEE_PER_OP,
+            Duration::from_secs(2),
+            &recorder,
+            |builder| {
+                builder
+                    .payment(
+                        DEST_KEY,
+                        stellar_agent_core::StellarAmount::from_stroops(1),
+                        &stellar_agent_network::builder::Asset::Native,
+                    )
+                    .unwrap();
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        result,
+        Err(PoolError::Wallet(WalletError::Submission(
+            SubmissionError::TxTimeout { .. }
+        )))
+    ));
+    let records = fixture.receipts.all().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].status,
+        stellar_agent_core::profile::receipt::ReceiptStatus::Pending
+    );
+    let rows = std::fs::read_to_string(&fixture.profile.audit_log_path).unwrap();
+    assert!(rows.contains("value_action_pending"));
+    assert!(rows.contains(&stellar_agent_network::redact_tx_hash(&records[0].tx_hash)));
+    drop(pending);
+    Mock::given(body_partial_json(json!({"method":"getTransaction"})))
+        .respond_with(SubmissionEchoResponder::new(
+            json!({"txHash":"","status":"SUCCESS","ledger":1001,"createdAt":"1700000001"}),
+            TESTNET_PASSPHRASE,
+        ))
+        .mount(&server)
+        .await;
+    stellar_agent_network::policy_state::PersistedWindowStore::at_path(
+        fixture.dir.path().join("window"),
+    )
+    .reconcile_one(
+        &fixture.profile,
+        &client,
+        Some(&fixture.receipts),
+        &records[0].envelope_hash,
+        1_700_000_002_000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fixture
+            .receipts
+            .get(&records[0].envelope_hash)
+            .unwrap()
+            .unwrap()
+            .status,
+        stellar_agent_core::profile::receipt::ReceiptStatus::Success
     );
 }

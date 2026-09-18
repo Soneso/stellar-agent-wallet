@@ -17,7 +17,7 @@
 //!   in-flight.
 //! - **`release(lease, outcome)`**: returns the channel to `Free`, advancing
 //!   the cached sequence on success or scheduling a re-fetch on `tx_bad_seq`.
-//! - **`submit_pooled(pool, client, seed, passphrase, fee, timeout, ops)`**:
+//! - **`submit_pooled(pool, client, seed, passphrase, fee, timeout, recorder, ops)`**:
 //!   acquires a channel, signs and submits a transaction with the caller-supplied
 //!   operations, then releases.  Safe to call from N concurrent tasks with no
 //!   `tx_bad_seq` from pool contention.

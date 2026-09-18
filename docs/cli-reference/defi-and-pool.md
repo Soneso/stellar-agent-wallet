@@ -118,19 +118,25 @@ The channel pool is a set of channel accounts derived from a single pool master 
 
 ### `stellar-agent pool init`
 
-Fund `N` channel accounts on-chain via a single CAP-33 sponsored-reserve sandwich transaction. Signing command: the funder signer is loaded from the keyring, and the profile's audit chain key must be minted (`profile rotate-audit-key`) — the audit writer is acquired before any seed generation or submit, refusing `audit.chain_key_unavailable` otherwise, and is reused for the post-confirm `channel_pool_initialised` row. The pool master seed is generated in memory and written to the OS keyring only after the on-chain transaction confirms; the public `PoolConfig` bookkeeping is then persisted to the profile TOML. A failure before confirmation leaves no keyring entry and no config, so a clean retry needs no `--force`.
+Create `N` channel accounts through a single CAP-33 sponsored-reserve transaction. The funder sponsors their reserves and pays the fee; each account starts with zero balance, so initialization has no transferred-balance legs or spending-cap entries. A receipt and a pending audit row record the transaction before transmission. Confirmation writes its settled row and the `channel_pool_initialised` event.
 
-The persistence step patches only the two pool keys (`pool_master_key_id`, `[pool_config]`) on the on-disk profile document; every other stored key is preserved verbatim. `STELLAR_AGENT_*` environment overrides remain load-time-only: an override present during `pool init` affects that run (for example which RPC endpoint it submits to) but is never written into the profile.
+The funder signer comes from the keyring. The profile's audit chain key must be minted with `profile rotate-audit-key`; the command acquires the audit writer before generating the pool seed or submitting the transaction. It persists the seed in the keyring and a public `[pool_initialization]` checkpoint in the profile before any send. The profile stores channel identities and submission hashes, never seed bytes. Persistence patches only the pool keys (`pool_master_key_id`, `[pool_initialization]`, `[pool_config]`); other stored values are preserved and environment overrides remain transient.
 
-`--size` must be in the range `1..=19`. The bound exists because the funder plus each channel must sign the sandwich envelope, and `N+1` signatures must fit the 20-signature cap. A size outside this range is rejected before any network call. Pool refusals surface on the envelope as `error.code` `internal.unexpected_state`; the `error.message` carries the fixed prefix `unexpected internal state:` followed by the specific pool reason (such as `pool.size_out_of_range:` or `pool.already_initialised:`), rather than a distinct top-level code.
+`pool init --resume` loads the saved seed and verifies that it derives the recorded channels. When all channel accounts exist, it completes config and audit persistence without another send. With a failed receipt and no channel accounts, it retries the same creation with the same keys and a distinct attempt memo. An unknown outcome or a partial account observation remains pending and leaves the checkpoint unchanged. `pool status` names the transaction hash and completion command. A repeated resume of a completed pool returns its channel summary.
 
-If a pool master key already exists for the profile, `pool init` refuses (message `pool.already_initialised:`) unless `--force` is given. The existence probe fails closed: an ambiguous keyring backend error (as opposed to a definite "absent") also refuses, even without `--force`, rather than risk overwriting a key that may exist but is temporarily unreadable. Using `--force` to overwrite the master orphans all previously funded channels.
+A creation past the endpoint's retention settles as an ambiguous receipt, and resume holds there: that is the state where a second envelope could create the channels twice. Releasing it takes the operator's statement that the transaction did not apply, recorded by `tx receipt clear <ENVELOPE_HASH> --acknowledge`; `pool status` names that command in the pending checkpoint's `clear_with` field. Resume then retries with the same channel keys and the next attempt memo. `--force` is not an escape from this state: it replaces the seed.
+
+`--size` must be in `1..=19`; the funder plus the channels must fit the 20-signature cap. Size and existing-pool refusals use `internal.unexpected_state`, with the pool reason in the message. Recovery-checkpoint failures use `submission.record_unavailable`; keyring and network failures retain their typed codes when available.
+
+An existing pool seed requires `--force` for replacement. Replacing a completed pool's seed makes its funded channels unreachable through that seed. While initialization is pending, `--force` refuses: use `--resume` to complete it. An ambiguous keyring existence probe also refuses replacement.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--size <N>` | Number of channel accounts to create (`1..=19`) | Required | — |
+| `--size <N>` | Number of channel accounts to create (`1..=19`) | Required for a new initialization | — |
+| `--timeout-seconds <N>` | Confirmation deadline for the creation transaction | Optional | `120` |
+| `--resume` | Complete pending initialization using the saved seed; excludes `--size` and `--force` | Optional | `false` |
 | `--profile <NAME>` | Profile for the funder key and RPC endpoint | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
-| `--force` | Overwrite an existing pool master key (orphans previously funded channels) | Optional | `false` |
+| `--force` | Replace a completed pool seed; refuses while pending | Optional | `false` |
 | `--output <FORMAT>` | Output format: `json` or `table` | Optional | `json` |
 
 Example:
@@ -139,7 +145,7 @@ Example:
 stellar-agent pool init --size 5 --profile default
 ```
 
-The success result reports the channel count, the channel records (BIP-44 index plus public G-strkey), a redacted transaction hash, the confirmation ledger, a redacted funder address, and the keyring service and account where the master seed is stored. No seed bytes appear in the output.
+The success result reports the channel count, the channel records (BIP-44 index plus public G-strkey), a redacted transaction hash when a submission was recorded, the confirmation or account-observation ledger, a redacted funder address, and the keyring service and account where the master seed is stored. No seed bytes appear in the output.
 
 ### `stellar-agent pool list`
 
@@ -160,7 +166,7 @@ stellar-agent pool list --profile default
 
 ### `stellar-agent pool status`
 
-Report pool utilisation: `initialised`, `pool_size`, `free`, and `in_flight`. Read-only and makes no network call — it reads the persisted `PoolConfig` only. In a fresh CLI invocation `free == pool_size` and `in_flight == 0`. The result carries a note that `free` and `in_flight` reflect the persisted config of a stateless process, not a live allocator; do not read `in_flight: 0` as "safe to flood".
+Report pool utilisation: `initialised`, `pool_size`, `free`, and `in_flight`. Read-only and makes no network call; it reads the persisted pool config and initialization checkpoint. While initialization is pending, `initialised` is false and `pending` carries the channel count, seed readiness, transaction hash when recorded, and `resume_with` command. A pending checkpoint whose receipt is ambiguous also carries `clear_with`, the acknowledgement command resume requires before it will retry. In a fresh CLI invocation `free == pool_size` and `in_flight == 0`. The result carries a note that `free` and `in_flight` reflect the persisted config of a stateless process, not a live allocator; do not read `in_flight: 0` as "safe to flood".
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|

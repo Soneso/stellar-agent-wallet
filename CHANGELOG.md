@@ -18,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and facades. The four internal crates' descriptions now state that they
   carry no API stability promise.
 
+### Changed
+
+- `stellar-agent-pool`: `InitParams` requires a `SubmissionRecorder` reference
+  and an `attempt` memo ID; `submit_pooled` requires a recorder argument before
+  its operation closure, and `InitParams` carries the confirmation deadline.
+  Each submission records its receipt and audit state before transmission.
+  Initialization attempt IDs distinguish retry receipts. `pool init` gains
+  `--timeout-seconds`, default 120.
+
 ### Removed
 
 - The Blend lending integration: the `stellar-agent-blend` crate, the CLI
@@ -38,6 +47,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consumer.
 
 ### Fixed
+
+- `pool init` persists its seed and profile checkpoint before sending sponsored
+  channel creation. `pool status` reports pending creation and its transaction
+  hash; `pool init --resume` completes confirmed creation without another send,
+  or retries a failed creation with the same keys. Pending initialization
+  refuses seed replacement through `--force`. A creation whose receipt settles
+  as ambiguous is retried only after `tx receipt clear --acknowledge` records
+  that it did not apply; `pool status` names that command in `clear_with`.
 
 - An unresolved submission holds its spending-window headroom until it
   settles, whatever its age. Confirmed spend ages from the close time of the

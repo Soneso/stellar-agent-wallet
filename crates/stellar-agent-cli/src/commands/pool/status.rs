@@ -9,11 +9,16 @@
 //!
 //! # Output
 //!
-//! JSON object with `initialised`, `pool_size`, `free`, `in_flight`.
+//! JSON object with `initialised`, `pool_size`, `free`, `in_flight`, and an
+//! optional `pending` checkpoint naming the transaction hash and resume command.
+//! A pending checkpoint whose receipt is ambiguous also names the
+//! acknowledgement command that releases it.
 
 use clap::Args;
 use serde::{Deserialize, Serialize};
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
+use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore};
+use stellar_agent_core::profile::schema::PoolInitialization;
 
 use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
 use crate::common::render::render_json;
@@ -39,6 +44,9 @@ pub struct PoolStatusArgs {
 pub struct PoolStatusResult {
     /// Whether the pool has been initialised (`pool init` completed).
     pub initialised: bool,
+    /// Recovery checkpoint, including the transaction hash when recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending: Option<serde_json::Value>,
     /// Total pool size from the persisted `PoolConfig`.
     pub pool_size: usize,
     /// Number of free channels.
@@ -75,6 +83,28 @@ pub struct PoolStatusResult {
 /// # Panics
 ///
 /// Never panics.
+/// The acknowledgement command for a pending initialization whose submission
+/// receipt reconciliation records as ambiguous.
+///
+/// `pool init --resume` retries such an attempt only once an operator states
+/// out of band that it did not apply, so the one state that needs the
+/// statement names the verb that makes it. Every other receipt state, and a
+/// receipt store this process cannot read, yield no command: the reader is a
+/// diagnostic and answers with what it has.
+fn operator_clear_command(profile_name: &str, pending: &PoolInitialization) -> Option<String> {
+    let submission = pending.submission.as_ref()?;
+    let receipt = ReceiptStore::open(profile_name)
+        .ok()?
+        .get(&submission.envelope_hash)
+        .ok()??;
+    (receipt.status == ReceiptStatus::Ambiguous).then(|| {
+        format!(
+            "stellar-agent tx receipt clear {} --acknowledge --profile {profile_name}",
+            submission.envelope_hash
+        )
+    })
+}
+
 pub async fn run(args: &PoolStatusArgs) -> i32 {
     // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
     let resolved_profile = resolve_profile_name(args.profile.as_deref());
@@ -90,13 +120,28 @@ pub async fn run(args: &PoolStatusArgs) -> i32 {
         }
     };
 
+    let pending = profile.pool_initialization.as_ref().map(|pending| {
+        let mut fields = serde_json::json!({
+            "channel_count": pending.channels.len(),
+            "tx_hash": pending.submission.as_ref().map(|submission| &submission.tx_hash),
+            "seed_ready": pending.seed_ready,
+            "resume_with": format!("stellar-agent pool init --resume --profile {profile_name}")
+        });
+        if let Some(command) = operator_clear_command(&profile_name, pending)
+            && let Some(object) = fields.as_object_mut()
+        {
+            object.insert("clear_with".to_owned(), command.into());
+        }
+        fields
+    });
     let (initialised, pool_size) = match &profile.pool_config {
         Some(cfg) => (true, cfg.pool_size),
         None => (false, 0),
     };
 
     let result = PoolStatusResult {
-        initialised,
+        initialised: initialised && pending.is_none(),
+        pending,
         pool_size,
         free: pool_size, // no in-flight channels in a fresh CLI invocation
         in_flight: 0,

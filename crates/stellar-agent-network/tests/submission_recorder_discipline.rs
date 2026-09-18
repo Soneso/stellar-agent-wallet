@@ -19,16 +19,6 @@ use syn::{Expr, Member};
 /// Each allowance states its scope and pins its number of literal omissions.
 const ALLOWED_NONE: &[(&str, usize, &str)] = &[
     (
-        "crates/stellar-agent-pool/src/init.rs",
-        1,
-        "Pool initialization awaits a recorder decision.",
-    ),
-    (
-        "crates/stellar-agent-pool/src/submit.rs",
-        1,
-        "Pool submission awaits a recorder decision.",
-    ),
-    (
         "crates/stellar-agent-smart-account/src/deployment/deploy.rs",
         2,
         "Account deployment is fee-only with no value legs.",
@@ -71,6 +61,8 @@ const ALLOWED_NONE: &[(&str, usize, &str)] = &[
 ];
 
 const REQUIRED_FILES: &[&str] = &[
+    "crates/stellar-agent-pool/src/init.rs",
+    "crates/stellar-agent-pool/src/submit.rs",
     "crates/stellar-agent-cli/src/commands/pay.rs",
     "crates/stellar-agent-cli/src/commands/claim.rs",
     "crates/stellar-agent-cli/src/commands/trustline.rs",
