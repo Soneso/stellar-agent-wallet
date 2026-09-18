@@ -408,6 +408,7 @@ impl wiremock::Respond for TimeoutRpc {
                     "latestLedger": 1002,
                     "oldestLedger": 1,
                     "ledger": ledger,
+                    "createdAt": (stellar_agent_core::timefmt::now_unix_ms().expect("test clock") / 1000).to_string(),
                 }),
                 None => serde_json::json!({
                     "status": "NOT_FOUND",

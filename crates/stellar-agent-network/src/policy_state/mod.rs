@@ -65,6 +65,20 @@
 //! under the single-writer lock — so the very next call after the race sees
 //! the true, fully-accumulated history and is capped correctly from then on.
 //!
+//! # Reservation settlement
+//!
+//! Pending records count regardless of age. Confirmation requires the applying
+//! transaction's `created_at` ledger close time; missing time leaves the hold
+//! pending. Confirmed records age from that close time.
+//!
+//! A NOT_FOUND releases only within retention after observing a consumed
+//! sequence or a ledger close time strictly past a nonzero maxTime, followed
+//! by a fresh NOT_FOUND. A fresh SUCCESS or FAILED settles that chain outcome.
+//! The pass shares one bounded getLedgers observation; unavailable or invalid
+//! chain time closes the time arm. The host clock only controls minimum age.
+//! Receiptless holds beyond retention carry an authenticated operator marker,
+//! retain their debit, and are excluded from automatic selection.
+//!
 //! # Wire format
 //!
 //! `[32-byte HMAC-SHA256 tag] || [canonical JSON body]`, mirroring
@@ -75,7 +89,9 @@
 //! serialise as decimal strings (the `wire_stroops::i128` / audit
 //! `i128_decimal_str` convention), never a bare JSON number, so no value is
 //! silently truncated by a JSON-number-as-f64 reader. The body also carries a
-//! `generation: u64` field — see "Anti-rollback" below.
+//! `generation: u64` field; see "Anti-rollback" below. Version 3 includes the
+//! operator marker and optional prepared settlement. Versions 1 and 2 remain readable; absent status means
+//! confirmed spend and an absent operator marker means automatic selection.
 //!
 //! # Integrity
 //!
@@ -101,34 +117,17 @@
 //!
 //! A second keyring entry — derived from `policy_window_state_key_id` by
 //! suffixing `-generation` onto its `account` field, same `service` — holds a
-//! monotonic `u64` counter, independent of the HMAC key. EVERY write
-//! ([`PersistedWindowStore::record_and_persist`] and
-//! [`PersistedWindowStore::reset`]) increments the keyring counter FIRST,
-//! then stamps that exact value into the file body's `generation` field
-//! before signing. On load, the file's `generation` MUST equal the keyring's
-//! CURRENT counter value:
-//!
-//! - File generation < keyring generation → an older snapshot was restored,
-//!   or the current file predates a crash between the keyring bump and the
-//!   file write — fail closed (`WindowStoreError::GenerationMismatch`).
-//! - File exists but no keyring generation entry exists → the counter itself
-//!   was deleted (or never existed for a file that does) — fail closed.
-//! - File is missing but a keyring generation entry exists → the file was
-//!   deleted after at least one write — fail closed (deletion detected).
-//! - File is missing AND no keyring generation entry exists → genuine first
-//!   run for this profile — empty history, `Ok`.
-//!
-//! Keyring-first ordering means a crash between the two writes always leaves
-//! the file BEHIND the keyring, never ahead of it — the conservative
-//! direction: the failure mode is always "fail closed, operator must
-//! `reset-window-state`", never "silently accept a state the keyring never
-//! actually reached". `reset-window-state` re-baselines both the file (to
-//! empty) and the keyring counter (bumped past whatever the last legitimate
-//! or illegitimate value was) in one operation.
-//! `rotate-policy-state-key` — a DIFFERENT keyring entry (the HMAC key, not
-//! the generation counter) — leaves the generation counter untouched: it
-//! re-signs the existing body (including its `generation` field) under the
-//! new key, so rotation does not itself look like a rollback.
+//! monotonic generation and a SHA-256 commitment to its canonical body, updated
+//! together. Numeric counters remain readable for version 1 and 2 files.
+//! Appending a debit commits the trusted state before replacing the file, so
+//! failure cannot expose a smaller total. Settlement writes both the current
+//! and candidate snapshots before committing the candidate's generation and
+//! digest; either crash checkpoint retains an authenticated, readable state.
+//! An abandoned candidate cannot substitute for a different committed body
+//! sharing its generation. Readers reject missing, rolled-back, or substituted
+//! state. Initialisation and reset also commit the counter first and fail closed
+//! if their file write fails. Key rotation re-signs the existing body while
+//! preserving its trusted commitment.
 //!
 //! # Concurrency
 //!
@@ -144,7 +143,7 @@
 //! # Retention
 //!
 //! Entries older than the largest supported criterion window (`1w` =
-//! 604,800 s) are pruned on every write.
+//! 604,800 s) are pruned on every write once confirmed. Pending records are retained.
 
 pub mod lock;
 pub mod store;

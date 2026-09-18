@@ -83,6 +83,7 @@ fn reservation(id: &str, source: &str, sequence: i64, pending_since_ms: u64) -> 
         max_time: 0,
         pending_since_ms,
         submission_ledger: SUBMISSION_LEDGER,
+        operator_required: false,
     }
 }
 
@@ -154,6 +155,12 @@ fn health(oldest_ledger: u32) -> serde_json::Value {
     })
 }
 
+fn ledgers(close: u64, oldest_close: u64) -> serde_json::Value {
+    json!({"latestLedger": 2_000, "latestLedgerCloseTime": close.to_string(),
+        "oldestLedger": 1, "oldestLedgerCloseTime": oldest_close,
+        "cursor": "2000", "ledgers": []})
+}
+
 /// A `getTransaction` body for `status`, with no result XDR.
 fn get_transaction(status: &str) -> serde_json::Value {
     json!({
@@ -161,6 +168,7 @@ fn get_transaction(status: &str) -> serde_json::Value {
         "latestLedger": 2_000,
         "oldestLedger": 1,
         "ledger": if status == "SUCCESS" { Some(1_500) } else { None },
+        "createdAt": if status == "SUCCESS" { Some((now_ms() / 1_000).to_string()) } else { None },
     })
 }
 
@@ -305,6 +313,74 @@ async fn success_confirms_the_reservation_and_finalizes_the_receipt() {
     assert_eq!(receipt.ledger, Some(1_500));
 }
 
+/// Confirmed spend is dated from the applying ledger's close time, not from
+/// the clock at settlement: a ledger two days old leaves the one-day window
+/// as soon as the reservation confirms.
+#[tokio::test]
+#[serial]
+async fn success_dates_the_spend_from_the_applying_ledger_close_time() {
+    let now = now_ms();
+    let fx = fixture("reconcile-success-close-time");
+    let source = account_id_for_seed([0x12; 32]);
+    let res = reservation(&"a8".repeat(32), &source, 7, due_since(now));
+    fx.take_reservation(now, &res, 500);
+    assert_eq!(
+        fx.window_total(now),
+        (500, 1),
+        "the hold counts until settled"
+    );
+
+    let counts = MethodCounts::default();
+    let server = MockServer::start().await;
+    let two_days_ago = now / 1_000 - 2 * 86_400;
+    mount(
+        &server,
+        "getTransaction",
+        json!({
+            "status": "SUCCESS",
+            "latestLedger": 2_000,
+            "oldestLedger": 1,
+            "ledger": 1_500,
+            "createdAt": two_days_ago.to_string(),
+        }),
+        &counts,
+    )
+    .await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+
+    let report = fx
+        .window
+        .reconcile_due(
+            &fx.profile,
+            &client,
+            Some(&fx.receipts),
+            now,
+            RECONCILE_BUDGET,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.confirmed, 1, "a SUCCESS answer confirms: {report:?}");
+    assert!(
+        fx.window
+            .pending_reservations(&fx.profile)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        fx.window_total(now),
+        (0, 0),
+        "spend applied two days ago is outside a one-day window"
+    );
+    assert_eq!(
+        fx.window_total(two_days_ago * 1_000),
+        (500, 1),
+        "the same spend counts inside the window of the ledger that applied it"
+    );
+    let receipt = fx.receipts.get(&res.id).unwrap().unwrap();
+    assert_eq!(receipt.status, ReceiptStatus::Success);
+}
+
 /// `FAILED` releases the reservation and finalizes the receipt failed: the
 /// transaction applied and moved nothing.
 #[tokio::test]
@@ -429,9 +505,8 @@ async fn not_found_with_a_consumed_sequence_releases() {
     );
 }
 
-/// `NOT_FOUND` with a passed time bound releases without asking about the
-/// account: a transaction past its `maxTime` cannot apply whatever the
-/// sequence is.
+/// Ledger close time strictly past maxTime requires a fresh NOT_FOUND before
+/// release, because the reserved transaction may have applied during observation.
 #[tokio::test]
 #[serial]
 async fn not_found_with_a_passed_time_bound_releases() {
@@ -459,6 +534,7 @@ async fn not_found_with_a_passed_time_bound_releases() {
     )
     .await;
     mount(&server, "getHealth", health(1), &counts).await;
+    mount(&server, "getLedgers", ledgers(now / 1_000, 1), &counts).await;
     let client = StellarRpcClient::new(&server.uri()).unwrap();
 
     let report = fx
@@ -480,12 +556,19 @@ async fn not_found_with_a_passed_time_bound_releases() {
     assert_eq!(
         counts.count("getLedgerEntries"),
         0,
-        "a passed time bound settles the reservation without a second read"
+        "a passed time bound settles the reservation without an account read"
     );
+    assert_eq!(
+        counts.count("getTransaction"),
+        2,
+        "release requires a fresh answer"
+    );
+    assert_eq!(counts.count("getLedgers"), 1);
+    assert_eq!(report.rpc_calls, 4, "both observations consume RPC budget");
 }
 
-/// `NOT_FOUND` with the sequence still unconsumed and no time bound settles
-/// nothing: the transaction can still apply.
+/// An unconsumed sequence keeps the reservation at the time bound itself:
+/// ledger close time must strictly exceed maxTime to rule out application.
 #[tokio::test]
 #[serial]
 async fn not_found_with_an_unconsumed_sequence_keeps_the_reservation() {
@@ -494,7 +577,8 @@ async fn not_found_with_an_unconsumed_sequence_keeps_the_reservation() {
     let source = account_id_for_seed([0x15; 32]);
     // `ledger_entries_result_for` reports sequence 1, so a reservation at
     // sequence 9 still needs a sequence the account has not reached.
-    let res = reservation(&"e".repeat(64), &source, 9, due_since(now));
+    let mut res = reservation(&"e".repeat(64), &source, 9, due_since(now));
+    res.max_time = now / 1_000 - 10;
     fx.take_reservation(now, &res, 500);
 
     let counts = MethodCounts::default();
@@ -521,6 +605,7 @@ async fn not_found_with_an_unconsumed_sequence_keeps_the_reservation() {
         &counts,
     )
     .await;
+    mount(&server, "getLedgers", ledgers(res.max_time, 1), &counts).await;
     let client = StellarRpcClient::new(&server.uri()).unwrap();
 
     let report = fx
@@ -917,6 +1002,30 @@ async fn a_pending_reservation_is_not_pruned_by_age() {
         open.iter().any(|r| r.id == ancient),
         "a pending reservation outlives the retention window: {open:?}"
     );
+    assert_eq!(
+        fx.window_total(now),
+        (20, 2),
+        "old pending spend holds headroom"
+    );
+    fx.window
+        .confirm(&fx.profile, &ancient, Some((now / 1_000) as i64))
+        .unwrap();
+    assert_eq!(
+        fx.window_total(now),
+        (20, 2),
+        "confirmation ages from ledger close"
+    );
+    assert_eq!(
+        fx.window_total(now + 86_400_000),
+        (10, 1),
+        "only confirmed spend ages out"
+    );
+    fx.window.release(&fx.profile, &fresh).unwrap();
+    assert_eq!(
+        fx.window_total(now + 86_400_000),
+        (0, 0),
+        "release removes the unresolved debit"
+    );
 }
 
 /// A reservation without a receipt uses the chain's transaction answer and
@@ -1296,4 +1405,369 @@ async fn lost_receipt_outside_retention_keeps_the_reservation() {
     assert_eq!(counts.count("getTransaction"), 1);
     assert_eq!(counts.count("getHealth"), 1);
     assert_eq!(counts.count("getLedgerEntries"), 0);
+}
+
+/// A success answer without an applying ledger time cannot date the spend.
+#[tokio::test]
+#[serial]
+async fn confirmation_without_a_valid_close_time_keeps_the_hold() {
+    let now = now_ms();
+    let fx = fixture("confirm-no-time");
+    let res = reservation(
+        &"f".repeat(64),
+        &account_id_for_seed([0x23; 32]),
+        7,
+        due_since(now),
+    );
+    fx.take_reservation(now, &res, 23);
+    for time in [None, Some(0), Some(-1), Some(i64::MAX)] {
+        fx.window.confirm(&fx.profile, &res.id, time).unwrap();
+        assert_eq!(
+            fx.window.pending_reservations(&fx.profile).unwrap().len(),
+            1
+        );
+        assert_eq!(fx.window_total(now + 86_400_000), (23, 1));
+    }
+}
+
+/// Host time controls eligibility; only a valid chain observation can expire a bound.
+#[tokio::test]
+#[serial]
+async fn host_clock_ahead_and_invalid_chain_times_keep_headroom() {
+    for (close_delta, oldest_delta) in [(0, 0), (-10, -20), (10, 20)] {
+        let now = now_ms();
+        let fx = fixture("chain-clock-validation");
+        let source = account_id_for_seed([0x30; 32]);
+        let mut res = reservation(&"b0".repeat(32), &source, 9, due_since(now));
+        res.max_time = now / 1_000;
+        fx.take_reservation(now, &res, 50);
+        let counts = MethodCounts::default();
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            "getTransaction",
+            get_transaction("NOT_FOUND"),
+            &counts,
+        )
+        .await;
+        mount(&server, "getHealth", health(1), &counts).await;
+        let close = if close_delta == 0 {
+            0
+        } else {
+            res.max_time.saturating_add_signed(close_delta)
+        };
+        let oldest = if oldest_delta == 0 {
+            0
+        } else {
+            res.max_time.saturating_add_signed(oldest_delta)
+        };
+        mount(&server, "getLedgers", ledgers(close, oldest), &counts).await;
+        mount(
+            &server,
+            "getLedgerEntries",
+            ledger_entries_result_for(&[&source]),
+            &counts,
+        )
+        .await;
+        let client = StellarRpcClient::new(&server.uri()).unwrap();
+        let report = fx
+            .window
+            .reconcile_due(
+                &fx.profile,
+                &client,
+                Some(&fx.receipts),
+                now + 30 * 86_400_000,
+                RECONCILE_BUDGET,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report.kept_pending, 1,
+            "invalid or unexpired chain time keeps the hold"
+        );
+        assert_eq!(fx.window_total(now), (50, 1));
+        assert_eq!(counts.count("getTransaction"), 1);
+    }
+}
+
+/// A fresh definitive answer at an expired bound settles the chain's outcome.
+#[tokio::test]
+#[serial]
+async fn time_bound_fresh_answer_settles_success_and_failure() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for status in ["SUCCESS", "FAILED"] {
+        let now = now_ms();
+        let fx = fixture("chain-time-race");
+        let mut res = reservation(
+            &"b1".repeat(32),
+            &account_id_for_seed([0x31; 32]),
+            9,
+            due_since(now),
+        );
+        res.max_time = now / 1_000 - 1;
+        fx.take_reservation(now, &res, 51);
+        let counts = MethodCounts::default();
+        let server = MockServer::start().await;
+        let queries = Arc::new(AtomicUsize::new(0));
+        let observed = queries.clone();
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method":"getTransaction"})))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let result = if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    get_transaction("NOT_FOUND")
+                } else if status == "FAILED" {
+                    get_transaction_failed()
+                } else {
+                    get_transaction(status)
+                };
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"jsonrpc":"2.0", "id":body["id"], "result":result}))
+            })
+            .mount(&server)
+            .await;
+        mount(&server, "getHealth", health(1), &counts).await;
+        mount(&server, "getLedgers", ledgers(now / 1_000, 1), &counts).await;
+        let client = StellarRpcClient::new(&server.uri()).unwrap();
+        let report = fx
+            .window
+            .reconcile_due(
+                &fx.profile,
+                &client,
+                Some(&fx.receipts),
+                now,
+                RECONCILE_BUDGET,
+            )
+            .await
+            .unwrap();
+        assert_eq!(queries.load(Ordering::SeqCst), 2);
+        let receipt = fx.receipts.get(&res.id).unwrap().unwrap();
+        if status == "SUCCESS" {
+            assert_eq!(report.confirmed, 1);
+            assert_eq!(fx.window_total(now), (51, 1));
+            assert_eq!(receipt.status, ReceiptStatus::Success);
+        } else {
+            assert_eq!(report.released, 1);
+            assert_eq!(fx.window_total(now), (0, 0));
+            assert!(matches!(receipt.status, ReceiptStatus::Failed { .. }));
+        }
+    }
+}
+
+/// An unavailable chain clock closes the time arm while sequence settlement remains usable.
+/// The six-second outer deadline bounds the two-second ledger observation.
+#[tokio::test]
+#[serial]
+async fn unavailable_ledgers_leave_sequence_settlement_available() {
+    for sequence in [9, 1] {
+        let now = now_ms();
+        let fx = fixture("ledgers-unavailable");
+        let source = account_id_for_seed([0x32; 32]);
+        let mut res = reservation(&"b2".repeat(32), &source, sequence, due_since(now));
+        res.max_time = now / 1_000 - 10;
+        fx.take_reservation(now, &res, 52);
+        let counts = MethodCounts::default();
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            "getTransaction",
+            get_transaction("NOT_FOUND"),
+            &counts,
+        )
+        .await;
+        mount(&server, "getHealth", health(1), &counts).await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method":"getLedgers"})))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(20)))
+            .mount(&server)
+            .await;
+        mount(
+            &server,
+            "getLedgerEntries",
+            ledger_entries_result_for(&[&source]),
+            &counts,
+        )
+        .await;
+        let client = StellarRpcClient::new(&server.uri()).unwrap();
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            fx.window.reconcile_due(
+                &fx.profile,
+                &client,
+                Some(&fx.receipts),
+                now,
+                RECONCILE_BUDGET,
+            ),
+        )
+        .await
+        .expect("ledger observation must be bounded")
+        .unwrap();
+        assert_eq!(report.released, usize::from(sequence == 1));
+        assert_eq!(report.kept_pending, usize::from(sequence == 9));
+        assert_eq!(counts.count("getLedgerEntries"), 1);
+    }
+}
+
+/// Six receiptless holds beyond retention cannot starve a younger answerable submission.
+/// Operator markers retain their identity, debit, and selection state across restart.
+#[tokio::test]
+#[serial]
+async fn orphan_markers_survive_restart_and_free_the_next_pass_budget() {
+    let now = now_ms();
+    let fx = fixture("orphan-budget");
+    let source = account_id_for_seed([0x33; 32]);
+    for index in 1..=7 {
+        let mut res = reservation(
+            &format!("{index:064x}"),
+            &source,
+            index,
+            due_since(now) - (8 - index) as u64 * 1000,
+        );
+        res.submission_ledger = if index == 7 { 1_500 } else { 1_000 };
+        fx.window
+            .record_pending(&fx.profile, &[(state_key(&fx.profile_name), now, 10)], &res)
+            .unwrap();
+    }
+    let counts = MethodCounts::default();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method":"getTransaction"})))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let status = if body["params"]["hash"] == format!("{:064x}", 7) {
+                "SUCCESS"
+            } else {
+                "NOT_FOUND"
+            };
+            ResponseTemplate::new(200).set_body_json(
+                json!({"jsonrpc":"2.0", "id":body["id"], "result":get_transaction(status)}),
+            )
+        })
+        .mount(&server)
+        .await;
+    mount(&server, "getHealth", health(1_200), &counts).await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let first = fx
+        .window
+        .reconcile_due(&fx.profile, &client, Some(&fx.receipts), now, 5)
+        .await
+        .unwrap();
+    assert_eq!(first.examined, 5);
+    assert_eq!(first.retention_expired, 5);
+    let reopened = PersistedWindowStore::at_path(fx._dir.path().join("orphan-budget.window"));
+    let held = reopened.pending_reservations(&fx.profile).unwrap();
+    assert_eq!(held.iter().filter(|r| r.operator_required).count(), 5);
+    assert_eq!(fx.window_total(now), (70, 7));
+    let second = reopened
+        .reconcile_due(&fx.profile, &client, Some(&fx.receipts), now, 5)
+        .await
+        .unwrap();
+    assert_eq!(second.examined, 2);
+    assert_eq!(second.confirmed, 1);
+    assert_eq!(second.retention_expired, 1);
+    let third = reopened
+        .reconcile_due(&fx.profile, &client, Some(&fx.receipts), now, 5)
+        .await
+        .unwrap();
+    assert_eq!(third.examined, 0);
+    assert_eq!(third.rpc_calls, 0);
+}
+
+/// An unsuccessful durable marker write is reported and leaves the hold selectable.
+#[tokio::test]
+#[serial]
+async fn failed_orphan_marker_write_keeps_the_reservation_selectable() {
+    let now = now_ms();
+    let fx = fixture("orphan-marker-failure");
+    let res = reservation(
+        &"b3".repeat(32),
+        &account_id_for_seed([0x33; 32]),
+        7,
+        due_since(now),
+    );
+    fx.window
+        .record_pending(&fx.profile, &[(state_key(&fx.profile_name), now, 53)], &res)
+        .unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .open(fx._dir.path().join("orphan-marker-failure.window.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let counts = MethodCounts::default();
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "getTransaction",
+        get_transaction("NOT_FOUND"),
+        &counts,
+    )
+    .await;
+    mount(&server, "getHealth", health(1200), &counts).await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let result = fx
+        .window
+        .reconcile_due(&fx.profile, &client, Some(&fx.receipts), now, 5)
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(stellar_agent_network::policy_state::WindowStoreError::WriterLocked)
+        ),
+        "{result:?}"
+    );
+    assert!(!fx.window.pending_reservations(&fx.profile).unwrap()[0].operator_required);
+    assert_eq!(fx.window_total(now), (53, 1));
+    drop(lock);
+    let next = fx
+        .window
+        .reconcile_due(&fx.profile, &client, Some(&fx.receipts), now, 5)
+        .await
+        .unwrap();
+    assert_eq!(next.examined, 1);
+    assert_eq!(next.retention_expired, 1);
+    assert!(fx.window.pending_reservations(&fx.profile).unwrap()[0].operator_required);
+}
+
+/// One ledger observation serves all due reservations and is charged once.
+#[tokio::test]
+#[serial]
+async fn chain_observation_is_shared_and_charged_once_per_pass() {
+    let now = now_ms();
+    let fx = fixture("shared-chain-observation");
+    let source = account_id_for_seed([0x34; 32]);
+    for index in 1..=2 {
+        let mut res = reservation(&format!("{index:064x}"), &source, 9, due_since(now));
+        res.max_time = now / 1_000 - 10;
+        fx.take_reservation(now, &res, 54);
+    }
+    let counts = MethodCounts::default();
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "getTransaction",
+        get_transaction("NOT_FOUND"),
+        &counts,
+    )
+    .await;
+    mount(&server, "getHealth", health(1), &counts).await;
+    mount(&server, "getLedgers", ledgers(now / 1_000, 1), &counts).await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let report = fx
+        .window
+        .reconcile_due(&fx.profile, &client, Some(&fx.receipts), now, 2)
+        .await
+        .unwrap();
+    assert_eq!(report.released, 2);
+    assert_eq!(report.rpc_calls, 6);
+    assert_eq!(counts.count("getHealth"), 1);
+    assert_eq!(counts.count("getLedgers"), 1);
+    assert_eq!(counts.count("getTransaction"), 4);
+    let requests = server.received_requests().await.unwrap();
+    let body = requests
+        .iter()
+        .map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).unwrap())
+        .find(|r| r["method"] == "getLedgers")
+        .unwrap();
+    assert_eq!(body["params"]["startLedger"], 2000);
+    assert_eq!(body["params"]["pagination"]["limit"], 1);
 }

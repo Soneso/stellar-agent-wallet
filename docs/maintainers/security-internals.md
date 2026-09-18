@@ -367,7 +367,7 @@ Multicall bundles also carry a hard floor independent of policy: `evaluate_bundl
 
 ### Persisted window-state store
 
-`per_period_cap`, `rate_limit`, `bundle_per_period_cap`, and `bundle_rate_limit` are stateful: their evaluation reads accumulated history from `PolicyStateStore` (`policy/v1/criteria/state_store.rs`), an in-memory `Mutex<HashMap<StateKey, VecDeque<(timestamp_ms, amount)>>>`. In-memory state alone would reset to empty on every process start (and every CLI invocation is its own process), so a durable backing store is required for these criteria to actually accumulate across calls.
+`per_period_cap`, `rate_limit`, `bundle_per_period_cap`, and `bundle_rate_limit` are stateful: their evaluation reads accumulated history from `PolicyStateStore` (`policy/v1/criteria/state_store.rs`), an in-memory `Mutex<HashMap<StateKey, VecDeque<StateEntry>>>` of timestamp, amount, and pending flag. A pending entry counts whatever its age; a confirmed entry is dated from the close time of the ledger that applied it and leaves the window from there. In-memory state alone would reset to empty on every process start (and every CLI invocation is its own process), so a durable backing store is required for these criteria to actually accumulate across calls.
 
 `PersistedWindowStore` (`stellar-agent-network::policy_state`, not `stellar-agent-core` — see the crate-placement rationale in that module's rustdoc: the store needs the keyring primitives that live in `stellar-agent-network`, and `stellar-agent-core` must not depend on `stellar-agent-network`) is one file per profile at `<canonical_data_root>/policy/<profile>.window`.
 
@@ -375,7 +375,7 @@ Multicall bundles also carry a hard floor independent of policy: `evaluate_bundl
 - **Key**: the profile's `policy_window_state_key_id` keyring coordinate (`stellar-agent-policy-window-<profile>` by convention), lazily minted on first write.
 - **Lock**: `WindowStoreLock`, an OFD-advisory exclusive flock at `<store-file>.lock`, structurally identical to the counterparty cache's `CacheLock` — serialises every read-modify-write (record, reset, resign) across concurrent MCP-server and CLI processes.
 - **Atomic write**: temp file + `sync_data` + rename + parent-directory fsync, the same discipline as the audit log's rotation `write_sidecar_atomic`.
-- **Retention**: entries older than the largest supported window (`1w` = 604,800s) are pruned on every write.
+- **Retention**: confirmed entries older than the largest supported window (`1w` = 604,800s) are pruned on every write. A pending entry is kept until it settles, whatever its age.
 - **Failure posture**: an unreadable, tampered (HMAC mismatch), or unparseable store file is fail-closed — `PolicyEngineV1`'s construction site hydrates the store BEFORE the engine is usable, and a hydration failure refuses engine construction (`policy.engine_unavailable` / `BuildRegistryError::PolicyEngineError`) rather than silently starting with an empty store. Recovery: `stellar-agent profile reset-window-state <name> --reason <reason>`, which re-initialises the file to empty and audits the reset (`PolicyWindowStateReset`).
 - **Rotation**: `stellar-agent profile rotate-policy-state-key <name>` mints a fresh key and re-signs the store file's existing body under it (no old-key read required — the same "recompute the tag over the unchanged body" shape as `rotate-audit-key`'s chain-root sidecar re-sign), so accumulated history survives rotation.
 

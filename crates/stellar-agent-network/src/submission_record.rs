@@ -107,6 +107,8 @@ pub enum SubmissionOutcome {
     Success {
         /// The ledger sequence the transaction confirmed in.
         ledger: u32,
+        /// Close time of the applying ledger, in unix seconds.
+        created_at: Option<i64>,
     },
 
     /// The transaction applied and failed. The confirmation poll reported
@@ -339,6 +341,7 @@ impl<'a> WalletSubmissionRecorder<'a> {
             max_time: intent.max_time,
             pending_since_ms: self.now_ms,
             submission_ledger: intent.submission_ledger,
+            operator_required: false,
         }
     }
 
@@ -573,7 +576,7 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
 
     async fn outcome(&self, intent: &SubmissionIntent, outcome: &SubmissionOutcome) {
         match outcome {
-            SubmissionOutcome::Success { ledger } => {
+            SubmissionOutcome::Success { ledger, created_at } => {
                 self.finalize_receipt(intent, ReceiptStatus::Success, Some(*ledger));
                 if !self.caller_writes_confirmed_row {
                     self.write_outcome_row(AuditEntry::new_value_action_submitted(
@@ -588,7 +591,7 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
                         &self.request_id,
                     ));
                 }
-                self.settle_window(intent, WindowSettlement::Confirm);
+                self.settle_window(intent, WindowSettlement::Confirm(*created_at));
                 self.record_floor(intent).await;
                 self.tombstone_approval(intent);
             }
@@ -626,7 +629,7 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WindowSettlement {
     /// The spend was real; the records stay and keep counting.
-    Confirm,
+    Confirm(Option<i64>),
     /// The spend did not happen; the records go.
     Release,
 }
@@ -727,7 +730,10 @@ impl WalletSubmissionRecorder<'_> {
             return;
         }
         let result = match settlement {
-            WindowSettlement::Confirm => self.window.confirm(self.profile, &intent.envelope_hash),
+            WindowSettlement::Confirm(created_at) => {
+                self.window
+                    .confirm(self.profile, &intent.envelope_hash, created_at)
+            }
             WindowSettlement::Release => self.window.release(self.profile, &intent.envelope_hash),
         };
         if let Err(e) = result {

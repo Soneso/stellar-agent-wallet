@@ -39,6 +39,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An unresolved submission holds its spending-window headroom until it
+  settles, whatever its age. Confirmed spend ages from the close time of the
+  ledger that applied it.
+- Time-bound reconciliation releases a reservation only on an observed ledger
+  close time past the bound and a fresh transaction answer, never on the host
+  clock.
+- `tx receipt clear --acknowledge` recovers an absent receipt from its
+  authenticated reservation when the endpoint no longer retains the
+  transaction, and `tx status` reports the holds that need that recovery.
+- The spending-window store writes wire format version 3 and anchors each
+  generation in the keyring together with a SHA-256 digest of the committed
+  body. A build that reads only version 2 refuses a store this build has
+  written once; on that build `profile reset-window-state` is the only
+  recovery, and it discards the accumulated history.
+
 - A value submission that proceeds under an approval carries the audit legs the
   policy sized and reserves its contribution to the spending caps before the
   send, the same as one that proceeds under an allow.

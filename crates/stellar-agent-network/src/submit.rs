@@ -401,8 +401,14 @@ pub async fn submit_transaction_and_wait(
                     "submit_transaction_and_wait: confirmed"
                 );
                 if let Some(rec) = recorder {
-                    rec.outcome(&intent, &SubmissionOutcome::Success { ledger })
-                        .await;
+                    rec.outcome(
+                        &intent,
+                        &SubmissionOutcome::Success {
+                            ledger,
+                            created_at: response.created_at,
+                        },
+                    )
+                    .await;
                 }
                 return Ok(SubmissionResult {
                     tx_hash: tx_hash_hex,

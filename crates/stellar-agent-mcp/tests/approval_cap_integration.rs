@@ -224,7 +224,8 @@ decision = "{decision}"
                 };
                 return ResponseTemplate::new(200).set_body_json(json!({
                     "jsonrpc": "2.0", "id": body["id"],
-                    "result": { "status": status, "ledger": 1001, "latestLedger": 1002, "oldestLedger": 1 }
+                    "result": { "status": status, "ledger": 1001, "latestLedger": 1002, "oldestLedger": 1,
+                        "createdAt": (stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000).to_string() }
                 }));
             }
         let responder = common::TimeoutRpc::new(vec![
