@@ -56,15 +56,15 @@ FILTER="${FILTER:-}"
 # Keychain has not seen before, so it asks the person at the machine for
 # access, once per item per build, and waits for an answer that an unattended
 # run never gives. The encrypted headless store needs no such permission.
-# An environment that already selects a backend keeps it: CI brackets the run
-# in gnome-keyring and sets nothing here.
+# An environment that already selects a backend keeps it.
 if [ -z "${STELLAR_AGENT_KEYRING_BACKEND:-}" ]; then
   export STELLAR_AGENT_KEYRING_BACKEND=headless-env
   # 32 random bytes, URL-safe base64, unpadded: the key format the headless
-  # store requires. It lives for this run only, so the store it protects is
-  # discarded with it.
+  # store requires. The store decodes the value strictly, as the encoding of
+  # exactly 32 bytes, so the key is encoded from the bytes. It lives for this
+  # run only, so the store it protects is discarded with it.
   STELLAR_AGENT_HEADLESS_KEYRING_KEY="${STELLAR_AGENT_HEADLESS_KEYRING_KEY:-$(
-    LC_ALL=C tr -dc 'A-Za-z0-9_-' < /dev/urandom | head -c 43
+    head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n'
   )}"
   export STELLAR_AGENT_HEADLESS_KEYRING_KEY
 fi
