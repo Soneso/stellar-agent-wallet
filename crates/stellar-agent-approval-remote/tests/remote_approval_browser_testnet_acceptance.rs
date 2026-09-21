@@ -86,6 +86,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::network::{
     EnableParams as NetworkEnableParams, EventRequestWillBeSent, EventRequestWillBeSentExtraInfo,
+    GetCookiesParams,
 };
 use chromiumoxide::cdp::browser_protocol::web_authn::{
     AddVirtualAuthenticatorParams, AuthenticatorProtocol, AuthenticatorTransport, EnableParams,
@@ -491,7 +492,12 @@ async fn poll_enroll_output(page: &chromiumoxide::Page, deadline: Instant) -> (S
 /// `deadline` with the `#status` element's current text (if any) so a
 /// failed ceremony's actual error message is visible in the test failure
 /// rather than just "did not navigate".
-async fn wait_for_url_ending(page: &chromiumoxide::Page, suffix: &str, deadline: Instant) {
+async fn wait_for_url_ending(
+    page: &chromiumoxide::Page,
+    origin: &str,
+    suffix: &str,
+    deadline: Instant,
+) {
     loop {
         let url = page
             .url()
@@ -577,6 +583,61 @@ async fn wait_for_url_ending(page: &chromiumoxide::Page, suffix: &str, deadline:
             eprintln!(
                 "==== DEBUG variations ====\n{}\n==== END DEBUG ====",
                 variations.unwrap_or_default()
+            );
+            // DEBUG BRANCH ONLY: which stored cookies the browser considers
+            // eligible for the failed URL and for its scheme, port and host
+            // variants; the answer separates a binding rule from a race.
+            let target = format!("{origin}{suffix}");
+            let parsed = url::Url::parse(origin).expect("origin must parse");
+            let port = parsed.port().unwrap_or(443);
+            let host = parsed.host_str().unwrap_or("localhost").to_owned();
+            let probes = [
+                target.clone(),
+                format!("http://{host}:{port}{suffix}"),
+                format!("https://{host}{suffix}"),
+                format!("https://127.0.0.1:{port}{suffix}"),
+            ];
+            for probe in &probes {
+                let eligible = page
+                    .execute(GetCookiesParams {
+                        urls: Some(vec![probe.clone()]),
+                    })
+                    .await
+                    .map(|r| {
+                        r.result
+                            .cookies
+                            .iter()
+                            .map(|c| {
+                                let prefix: String = c.value.chars().take(8).collect();
+                                format!(
+                                    "{}={} scheme={:?} port={}",
+                                    c.name, prefix, c.source_scheme, c.source_port
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                eprintln!("DEBUG eligible-for {probe}: {eligible:?}");
+            }
+            // DEBUG BRANCH ONLY: a second navigation from the same browser to
+            // the same URL. Arriving means the first navigation lost a race
+            // with the cookie's commit; the same refusal means the browser
+            // excludes the cookie for this URL.
+            let renav = page.goto(target.clone()).await.map(|_| ());
+            let renav_deadline = Instant::now() + Duration::from_secs(5);
+            let mut renav_url = String::new();
+            while Instant::now() < renav_deadline {
+                renav_url = page.url().await.ok().flatten().unwrap_or_default();
+                if renav_url.ends_with(suffix) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            eprintln!(
+                "DEBUG re-navigation to {target}: goto={} landed_on={renav_url:?}",
+                match &renav {
+                    Ok(()) => "ok".to_owned(),
+                    Err(e) => format!("err: {e}"),
+                }
             );
             panic!(
                 "navigation to a URL ending in {suffix:?} did not occur within the deadline; \
@@ -889,7 +950,7 @@ async fn remote_approval_browser_drives_real_payment_commit() {
     // rather than chromiumoxide's `wait_for_navigation()`, which can resolve
     // on frame-lifecycle events unrelated to an actual URL change.
     let login_deadline = Instant::now() + Duration::from_secs(30);
-    wait_for_url_ending(&page, "/inbox", login_deadline).await;
+    wait_for_url_ending(&page, &base_url, "/inbox", login_deadline).await;
 
     // ── 8. Drive the SHIPPED frontend: inbox -> detail ───────────────────────
     let entry_selector = format!(r#"a[href="/approval/{approval_nonce}"]"#);
@@ -909,6 +970,7 @@ async fn remote_approval_browser_drives_real_payment_commit() {
     let detail_deadline = Instant::now() + Duration::from_secs(15);
     wait_for_url_ending(
         &page,
+        &base_url,
         &format!("/approval/{approval_nonce}"),
         detail_deadline,
     )

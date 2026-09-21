@@ -103,6 +103,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::network::{
     EnableParams as NetworkEnableParams, EventRequestWillBeSent, EventRequestWillBeSentExtraInfo,
+    GetCookiesParams,
 };
 use chromiumoxide::cdp::browser_protocol::web_authn::{
     AddVirtualAuthenticatorParams, AuthenticatorProtocol, AuthenticatorTransport, EnableParams,
@@ -582,7 +583,12 @@ async fn poll_attestation_textarea(page: &chromiumoxide::Page, deadline: Instant
     }
 }
 
-async fn wait_for_url_ending(page: &chromiumoxide::Page, suffix: &str, deadline: Instant) {
+async fn wait_for_url_ending(
+    page: &chromiumoxide::Page,
+    origin: &str,
+    suffix: &str,
+    deadline: Instant,
+) {
     loop {
         let url = page
             .url()
@@ -665,6 +671,61 @@ async fn wait_for_url_ending(page: &chromiumoxide::Page, suffix: &str, deadline:
             eprintln!(
                 "==== DEBUG variations ====\n{}\n==== END DEBUG ====",
                 variations.unwrap_or_default()
+            );
+            // DEBUG BRANCH ONLY: which stored cookies the browser considers
+            // eligible for the failed URL and for its scheme, port and host
+            // variants; the answer separates a binding rule from a race.
+            let target = format!("{origin}{suffix}");
+            let parsed = url::Url::parse(origin).expect("origin must parse");
+            let port = parsed.port().unwrap_or(443);
+            let host = parsed.host_str().unwrap_or("localhost").to_owned();
+            let probes = [
+                target.clone(),
+                format!("http://{host}:{port}{suffix}"),
+                format!("https://{host}{suffix}"),
+                format!("https://127.0.0.1:{port}{suffix}"),
+            ];
+            for probe in &probes {
+                let eligible = page
+                    .execute(GetCookiesParams {
+                        urls: Some(vec![probe.clone()]),
+                    })
+                    .await
+                    .map(|r| {
+                        r.result
+                            .cookies
+                            .iter()
+                            .map(|c| {
+                                let prefix: String = c.value.chars().take(8).collect();
+                                format!(
+                                    "{}={} scheme={:?} port={}",
+                                    c.name, prefix, c.source_scheme, c.source_port
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                eprintln!("DEBUG eligible-for {probe}: {eligible:?}");
+            }
+            // DEBUG BRANCH ONLY: a second navigation from the same browser to
+            // the same URL. Arriving means the first navigation lost a race
+            // with the cookie's commit; the same refusal means the browser
+            // excludes the cookie for this URL.
+            let renav = page.goto(target.clone()).await.map(|_| ());
+            let renav_deadline = Instant::now() + Duration::from_secs(5);
+            let mut renav_url = String::new();
+            while Instant::now() < renav_deadline {
+                renav_url = page.url().await.ok().flatten().unwrap_or_default();
+                if renav_url.ends_with(suffix) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            eprintln!(
+                "DEBUG re-navigation to {target}: goto={} landed_on={renav_url:?}",
+                match &renav {
+                    Ok(()) => "ok".to_owned(),
+                    Err(e) => format!("err: {e}"),
+                }
             );
             panic!(
                 "navigation to a URL ending in {suffix:?} did not occur within the deadline; \
@@ -1100,7 +1161,7 @@ async fn rule_proposal_remote_browser_drives_real_rule_install() {
         .await
         .expect("login button click must succeed");
     let login_deadline = Instant::now() + Duration::from_secs(30);
-    wait_for_url_ending(&page, "/inbox", login_deadline).await;
+    wait_for_url_ending(&page, &base_url, "/inbox", login_deadline).await;
 
     // ── 8. Detail-page rendering assertions for all three proposals ─────────
 
@@ -1109,7 +1170,13 @@ async fn rule_proposal_remote_browser_drives_real_rule_install() {
         .await
         .expect("navigation to the full-rule detail page must succeed");
     let full_deadline = Instant::now() + Duration::from_secs(15);
-    wait_for_url_ending(&page, &format!("/approval/{full_nonce}"), full_deadline).await;
+    wait_for_url_ending(
+        &page,
+        &base_url,
+        &format!("/approval/{full_nonce}"),
+        full_deadline,
+    )
+    .await;
     let full_body = detail_page_body_text(&page).await;
     assert!(
         full_body.contains("PROPOSER"),
@@ -1135,6 +1202,7 @@ async fn rule_proposal_remote_browser_drives_real_rule_install() {
     let default_deadline = Instant::now() + Duration::from_secs(15);
     wait_for_url_ending(
         &page,
+        &base_url,
         &format!("/approval/{default_nonce}"),
         default_deadline,
     )
@@ -1153,6 +1221,7 @@ async fn rule_proposal_remote_browser_drives_real_rule_install() {
     let override_deadline = Instant::now() + Duration::from_secs(15);
     wait_for_url_ending(
         &page,
+        &base_url,
         &format!("/approval/{override_nonce}"),
         override_deadline,
     )
@@ -1169,7 +1238,13 @@ async fn rule_proposal_remote_browser_drives_real_rule_install() {
         .await
         .expect("navigation back to the full-rule detail page must succeed");
     let back_deadline = Instant::now() + Duration::from_secs(15);
-    wait_for_url_ending(&page, &format!("/approval/{full_nonce}"), back_deadline).await;
+    wait_for_url_ending(
+        &page,
+        &base_url,
+        &format!("/approval/{full_nonce}"),
+        back_deadline,
+    )
+    .await;
     let approve_btn = page
         .find_element("#approve-btn")
         .await
