@@ -228,6 +228,21 @@ for line in "${SUITES[@]}"; do
   ran=$((ran + 1))
   # DEBUG BRANCH ONLY: per-suite resource snapshot — disk, memory, and any
   # chrome processes surviving from earlier browser suites.
+  # DEBUG BRANCH ONLY: the Chromium profile every launch shares (chromiumoxide
+  # passes a fixed user-data-dir under the temp dir) and whether it has
+  # persisted a variations seed since the previous browser suite.
+  profile_dir="${TMPDIR:-/tmp}/chromiumoxide-runner"
+  echo "DEBUG profile before $suite: dir=$profile_dir entries=$(ls -1 "$profile_dir" 2>/dev/null | wc -l | tr -d ' ') local_state=$(python3 - "$profile_dir/Local State" <<'PY2' 2>/dev/null || echo absent
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as e:
+    print("unreadable:" + type(e).__name__); raise SystemExit
+keys = sorted(k for k in d if "variation" in k.lower())
+seed = d.get("variations_compressed_seed") or d.get("variations_seed") or ""
+print("keys=" + ",".join(keys) + " seed_len=" + str(len(seed)))
+PY2
+)"
   echo "DEBUG resources before $suite: $(df -h /home 2>/dev/null | tail -1 | awk '{print "disk_avail="$4}') $(free -m 2>/dev/null | awk '/^Mem:/{print "mem_avail_mb="$7}') chrome_procs=$(pgrep -c -f chrome 2>/dev/null || echo 0) time_wait=$(ss -tan state time-wait 2>/dev/null | tail -n +2 | wc -l | tr -d ' ') total_socks=$(ss -s 2>/dev/null | awk '/^TCP:/{print $2}')"
   echo "::group::$suite"
   if run_suite "$crate" "$feature" "$target"; then

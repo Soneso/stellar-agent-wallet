@@ -101,6 +101,9 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::network::{
+    EnableParams as NetworkEnableParams, EventRequestWillBeSent, EventRequestWillBeSentExtraInfo,
+};
 use chromiumoxide::cdp::browser_protocol::web_authn::{
     AddVirtualAuthenticatorParams, AuthenticatorProtocol, AuthenticatorTransport, EnableParams,
     RemoveVirtualAuthenticatorParams, VirtualAuthenticatorOptions,
@@ -625,7 +628,7 @@ async fn wait_for_url_ending(page: &chromiumoxide::Page, suffix: &str, deadline:
                     for c in cookies {
                         let value_prefix: String = c.value.chars().take(8).collect();
                         eprintln!(
-                            "DEBUG cookie-jar: name={} value_prefix={} domain={:?} path={} secure={} http_only={} same_site={:?} session={:?}",
+                            "DEBUG cookie-jar: name={} value_prefix={} domain={:?} path={} secure={} http_only={} same_site={:?} session={:?} source_scheme={:?} source_port={}",
                             c.name,
                             value_prefix,
                             c.domain,
@@ -633,12 +636,36 @@ async fn wait_for_url_ending(page: &chromiumoxide::Page, suffix: &str, deadline:
                             c.secure,
                             c.http_only,
                             c.same_site,
-                            c.session
+                            c.session,
+                            c.source_scheme,
+                            c.source_port
                         );
                     }
                 }
                 Err(e) => eprintln!("DEBUG cookie-jar: unavailable: {e}"),
             }
+            // DEBUG BRANCH ONLY: the browser's active field trials, filtered
+            // to the cookie-related ones, from chrome://version.
+            let variations: Option<String> = match page.goto("chrome://version").await {
+                Ok(_) => page
+                    .evaluate(evaluate_by_value(
+                        "(function(){\
+                           var v = document.getElementById('variations-list');\
+                           var text = v ? v.innerText : (document.body ? document.body.innerText : '');\
+                           var lines = text.split('\\n');\
+                           var hits = lines.filter(function(l){ return /cookie|bound|samesite|scheme|port|storage/i.test(l); });\
+                           return 'total_lines=' + lines.length + '\\n' + hits.slice(0, 60).join('\\n');\
+                         })()",
+                    ))
+                    .await
+                    .ok()
+                    .and_then(|r| r.into_value::<String>().ok()),
+                Err(e) => Some(format!("chrome://version unavailable: {e}")),
+            };
+            eprintln!(
+                "==== DEBUG variations ====\n{}\n==== END DEBUG ====",
+                variations.unwrap_or_default()
+            );
             panic!(
                 "navigation to a URL ending in {suffix:?} did not occur within the deadline; \
                  last seen URL: {url:?}; #status text: {status:?}"
@@ -884,6 +911,51 @@ async fn rule_proposal_remote_browser_drives_real_rule_install() {
     page.execute(EnableParams::default())
         .await
         .expect("WebAuthn domain must enable");
+
+    // DEBUG BRANCH ONLY: the network service's per-request cookie decisions.
+    // `requestWillBeSent` names the URL per request id; `...ExtraInfo` lists
+    // every cookie considered for that request with the reasons it was
+    // withheld, which is the only place the browser states why a stored
+    // cookie was not sent.
+    page.execute(NetworkEnableParams::default())
+        .await
+        .expect("Network domain must enable");
+    {
+        let mut sent = page
+            .event_listener::<EventRequestWillBeSent>()
+            .await
+            .expect("requestWillBeSent listener");
+        tokio::spawn(async move {
+            while let Some(ev) = sent.next().await {
+                eprintln!(
+                    "DEBUG request: id={:?} {} {}",
+                    ev.request_id, ev.request.method, ev.request.url
+                );
+            }
+        });
+        let mut extra = page
+            .event_listener::<EventRequestWillBeSentExtraInfo>()
+            .await
+            .expect("requestWillBeSentExtraInfo listener");
+        tokio::spawn(async move {
+            while let Some(ev) = extra.next().await {
+                for c in &ev.associated_cookies {
+                    let prefix: String = c.cookie.value.chars().take(8).collect();
+                    eprintln!(
+                        "DEBUG cookie-send: id={:?} name={} value_prefix={} secure={} source_scheme={:?} source_port={} blocked={:?} exemption={:?}",
+                        ev.request_id,
+                        c.cookie.name,
+                        prefix,
+                        c.cookie.secure,
+                        c.cookie.source_scheme,
+                        c.cookie.source_port,
+                        c.blocked_reasons,
+                        c.exemption_reason
+                    );
+                }
+            }
+        });
+    }
     let cosigner_authenticator_id = add_virtual_authenticator(&page).await;
 
     // ── 3. Register the co-signer WebAuthn credential via the bridge ────────
