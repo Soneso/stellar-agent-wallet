@@ -144,14 +144,30 @@ impl Drop for OperatorEnrollGuard {
 /// Launches a headless Chromium. See the sibling suites' `launch_chromium`
 /// for the full rationale (no `--disable-web-security`, `.no_sandbox()` for
 /// CI's restricted user namespaces).
-async fn launch_chromium() -> (Browser, chromiumoxide::Handler) {
+async fn launch_chromium() -> (Browser, chromiumoxide::Handler, TempDir) {
+    // chromiumoxide's default profile directory is one fixed path under the
+    // temp dir, shared by every launch on the host and never cleared, so
+    // cookies, virtual-authenticator credentials and other browser state
+    // would carry from one suite into the next. Each launch gets its own
+    // directory, removed when the returned guard drops.
+    let profile = tempfile::Builder::new()
+        .prefix("stellar-agent-chromium-")
+        .tempdir()
+        .expect("profile directory must be created");
     let config = BrowserConfig::builder()
         .no_sandbox()
+        .user_data_dir(profile.path())
         .build()
         .expect("BrowserConfig must build");
-    Browser::launch(config)
+    assert_eq!(
+        config.user_data_dir.as_deref(),
+        Some(profile.path()),
+        "the browser must run in its own profile directory"
+    );
+    let (browser, handler) = Browser::launch(config)
         .await
-        .expect("Chromium must launch; ensure chromium/google-chrome is on PATH")
+        .expect("Chromium must launch; ensure chromium/google-chrome is on PATH");
+    (browser, handler, profile)
 }
 
 /// Adds an empty virtual authenticator to `page` and returns its id.
@@ -265,7 +281,9 @@ async fn operator_enroll_browser_creates_and_persists_credential() {
     let url = handle.enroll_url();
     let mut enroll_guard = OperatorEnrollGuard(Some(handle));
 
-    let (browser, mut handler) = launch_chromium().await;
+    // The profile directory outlives the browser guard declared below, so it
+    // is removed after the browser has been killed.
+    let (browser, mut handler, _profile) = launch_chromium().await;
     let handler_task = tokio::spawn(async move {
         loop {
             if handler.next().await.is_none() {

@@ -35,9 +35,8 @@
 //! - Defence: private key NEVER crosses the CDP wire; `addCredential` /
 //!   PKCS#8 injection is NOT used.  The virtual authenticator generates the
 //!   P-256 keypair internally during `navigator.credentials.create()`.
-//! - Defence: no `user_data_dir` is set on `BrowserConfig`; chromiumoxide
-//!   defaults to an ephemeral path under `std::env::temp_dir()`.  Asserted
-//!   at construction.
+//! - Defence: each launch runs in its own temporary profile directory
+//!   (`launch_chromium`), removed when the guard drops.
 //! - Defence: `BrowserGuard` drives `browser.kill()` in its `Drop` impl
 //!   via `tokio::task::block_in_place` + `Handle::current().block_on(...)`.
 //!   `BridgeGuard::drop` uses the same pattern for `handle.shutdown()`.
@@ -387,37 +386,39 @@ impl Drop for BrowserGuard {
 ///   `http://127.0.0.1:<port>/...`) so the browser origin exactly matches the
 ///   RP-ID `"localhost"`, satisfying WebAuthn §5.1.2 without disabling security.
 ///
-/// # Ephemeral user-data-dir hardening
+/// # Profile directory
 ///
-/// `user_data_dir` is intentionally NOT set on `BrowserConfig`.  chromiumoxide
-/// defaults to `std::env::temp_dir()/chromiumoxide-runner` — an ephemeral
-/// path removed on process exit.  The Chromium virtual-authenticator writes
-/// credentials to `<user-data-dir>/Default/Web Data` (SQLite); using a stable
-/// dir would leak the private-key material across runs.
-///
-/// This function asserts `config.user_data_dir.is_none()` before launching so
-/// that an accidental `.user_data_dir(...)` call on the builder panics at launch
-/// time rather than silently writing credentials to a stable path.
-async fn launch_chromium() -> (Browser, chromiumoxide::Handler) {
+/// Each launch runs in its own temporary profile directory, removed when the
+/// returned guard drops. The Chromium virtual authenticator writes its
+/// credentials to `<user-data-dir>/Default/Web Data` (SQLite), so a directory
+/// shared across launches would carry private-key material from one run into
+/// the next.
+async fn launch_chromium() -> (Browser, chromiumoxide::Handler, TempDir) {
     // NOTE: --disable-web-security and --allow-insecure-localhost are
     // intentionally absent.  See the "No --disable-web-security" section above.
+    // chromiumoxide's default profile directory is one fixed path under the
+    // temp dir, shared by every launch on the host and never cleared, so
+    // cookies, virtual-authenticator credentials and other browser state
+    // would carry from one suite into the next. Each launch gets its own
+    // directory, removed when the returned guard drops.
+    let profile = tempfile::Builder::new()
+        .prefix("stellar-agent-chromium-")
+        .tempdir()
+        .expect("profile directory must be created");
     let config = BrowserConfig::builder()
         .no_sandbox()
+        .user_data_dir(profile.path())
         .build()
         .expect("BrowserConfig must build");
-
-    // Assert ephemeral user-data-dir: `None` means chromiumoxide picks
-    // `std::env::temp_dir()/chromiumoxide-runner`, preventing credential leakage
-    // across runs.
-    assert!(
-        config.user_data_dir.is_none(),
-        "BrowserConfig.user_data_dir must be None (ephemeral); \
-         a caller accidentally set user_data_dir() on the builder"
+    assert_eq!(
+        config.user_data_dir.as_deref(),
+        Some(profile.path()),
+        "the browser must run in its own profile directory"
     );
-
-    Browser::launch(config)
+    let (browser, handler) = Browser::launch(config)
         .await
-        .expect("Chromium must launch; ensure chromium/google-chrome is on PATH")
+        .expect("Chromium must launch; ensure chromium/google-chrome is on PATH");
+    (browser, handler, profile)
 }
 
 /// Error returned by [`goto_loopback`] when the target URL is rejected.
@@ -600,8 +601,10 @@ async fn webauthn_passkey_signing_testnet_acceptance() {
     // ── Launch Chromium browser ───────────────────────────────────────────────
     //
     // Wrapped in `BrowserGuard` for RAII subprocess kill on drop.
-    // `launch_chromium()` asserts ephemeral `user_data_dir`.
-    let (browser, mut handler) = launch_chromium().await;
+    // `launch_chromium()` gives the browser its own profile directory.
+    // The profile directory outlives the browser guard declared below, so it
+    // is removed after the browser has been killed.
+    let (browser, mut handler, _profile) = launch_chromium().await;
 
     // Drive the CDP handler loop in a background task.
     let handler_task = tokio::spawn(async move {

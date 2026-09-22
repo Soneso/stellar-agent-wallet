@@ -408,19 +408,31 @@ impl Drop for EnvOverrideGuard {
 
 /// Launches a headless Chromium. See `remote_approval_browser_testnet_acceptance.rs`
 /// for the full rationale (no `--disable-web-security`, builder-default TLS
-/// cert-error acceptance, `.no_sandbox()`, ephemeral `user_data_dir`).
-async fn launch_chromium() -> (Browser, chromiumoxide::Handler) {
+/// cert-error acceptance, `.no_sandbox()`, a profile directory per launch).
+async fn launch_chromium() -> (Browser, chromiumoxide::Handler, TempDir) {
+    // chromiumoxide's default profile directory is one fixed path under the
+    // temp dir, shared by every launch on the host and never cleared, so
+    // cookies, virtual-authenticator credentials and other browser state
+    // would carry from one suite into the next. Each launch gets its own
+    // directory, removed when the returned guard drops.
+    let profile = tempfile::Builder::new()
+        .prefix("stellar-agent-chromium-")
+        .tempdir()
+        .expect("profile directory must be created");
     let config = BrowserConfig::builder()
         .no_sandbox()
+        .user_data_dir(profile.path())
         .build()
         .expect("BrowserConfig must build");
-    assert!(
-        config.user_data_dir.is_none(),
-        "BrowserConfig.user_data_dir must be None (ephemeral)"
+    assert_eq!(
+        config.user_data_dir.as_deref(),
+        Some(profile.path()),
+        "the browser must run in its own profile directory"
     );
-    Browser::launch(config)
+    let (browser, handler) = Browser::launch(config)
         .await
-        .expect("Chromium must launch; ensure chromium/google-chrome is on PATH")
+        .expect("Chromium must launch; ensure chromium/google-chrome is on PATH");
+    (browser, handler, profile)
 }
 
 /// Adds a resident-key (discoverable) virtual authenticator and returns its
@@ -824,7 +836,9 @@ async fn rule_proposal_remote_browser_drives_real_rule_install() {
     // comment for why. The co-signer's raw bytes (captured into the passkeys
     // registry by the registration ceremony) are all this flow ever needs;
     // the co-signer credential is never asserted again.
-    let (browser, mut handler) = launch_chromium().await;
+    // The profile directory outlives the browser guard declared below, so it
+    // is removed after the browser has been killed.
+    let (browser, mut handler, _profile) = launch_chromium().await;
     let handler_task = tokio::spawn(async move {
         loop {
             if handler.next().await.is_none() {
