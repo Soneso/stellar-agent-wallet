@@ -334,13 +334,11 @@ impl WalletServer {
         let audit_profile_name = profile_name.clone();
         let withheld_audit_profile = self.profile.clone();
         let withheld_audit_profile_name = profile_name.clone();
-        // The delivery gate withholds the credential by returning an `MppError`,
-        // whose codes are all `mpp.*`. An audit refusal is not one of those: it
-        // names a log an operator has to repair, and folding it into the uniform
-        // state refusal sends them after the MPP state file instead. The gate
-        // records the wallet error here and the result below renders it.
-        let audit_refusal: Arc<Mutex<Option<WalletError>>> = Arc::new(Mutex::new(None));
-        let delivery_refusal = Arc::clone(&audit_refusal);
+        // Policy and audit refusals retain their wallet code while the MPP
+        // service withholds the credential at its accounting or delivery gate.
+        let wallet_refusal: Arc<Mutex<Option<WalletError>>> = Arc::new(Mutex::new(None));
+        let delivery_refusal = Arc::clone(&wallet_refusal);
+        let accounting_refusal = Arc::clone(&wallet_refusal);
         let credential = commit_authorization(
             &state,
             approval_store.as_ref(),
@@ -358,7 +356,7 @@ impl WalletServer {
                     &accounting_profile_name,
                     &ValueClass::Value(exact_effects.clone()),
                 )
-                .map_err(|_| state_error())
+                .map_err(|error| accounting_error(error, &accounting_refusal))
             },
             move |authorized| {
                 let legs = authorized
@@ -414,10 +412,10 @@ impl WalletServer {
                 "authorization_id": args.authorization_id,
                 "credential": credential,
             }))),
-            Err(error) => match audit_refusal.lock().ok().and_then(|mut slot| slot.take()) {
-                Some(audit_error) => Ok(business_error_result(
-                    audit_error.code(),
-                    audit_error.message(),
+            Err(error) => match wallet_refusal.lock().ok().and_then(|mut slot| slot.take()) {
+                Some(wallet_error) => Ok(crate::tools::submission_record::submission_error_result(
+                    &wallet_error,
+                    "",
                 )),
                 None => Ok(mpp_error_result(&error)),
             },
@@ -677,6 +675,19 @@ fn mpp_signing_error() -> CallToolResult {
     ))
 }
 
+/// Retains a typed policy refusal across the service's MPP error boundary.
+fn accounting_error(
+    error: stellar_agent_network::policy_state::WindowStoreError,
+    refusal: &Mutex<Option<WalletError>>,
+) -> MppError {
+    if let stellar_agent_network::policy_state::WindowStoreError::PolicyDenied { reason } = error
+        && let Ok(mut slot) = refusal.lock()
+    {
+        *slot = Some(WalletError::PolicyDenied { reason });
+    }
+    state_error()
+}
+
 /// The uniform state refusal.
 ///
 /// Byte-identical to `stellar_agent_mpp::store`'s definition and to
@@ -710,6 +721,28 @@ mod tests {
     use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
 
     use super::*;
+
+    #[test]
+    fn accounting_denial_preserves_the_policy_code() {
+        let reason = stellar_agent_core::policy::DenyReason::RateLimitExceeded {
+            window: "1m".to_owned(),
+            max_calls: 1,
+            calls_in_window: 1,
+        };
+        let refusal = Mutex::new(None);
+        let _ = accounting_error(
+            stellar_agent_network::policy_state::WindowStoreError::PolicyDenied {
+                reason: Box::new(reason),
+            },
+            &refusal,
+        );
+        let error = refusal
+            .lock()
+            .expect("refusal lock")
+            .take()
+            .expect("typed policy refusal");
+        assert_eq!(error.code(), "policy.deny.rate_limit_exceeded");
+    }
 
     const MPP_TOOLS: [&str; 5] = [
         "stellar_mpp_charge_prepare",

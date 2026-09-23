@@ -166,9 +166,9 @@ pub use store::{
 /// Records a confirmed call's contribution into `engine`'s window state and
 /// persists the new entries to the on-disk store for `profile_name`.
 ///
-/// This is the single call site every value-moving dispatch site uses after a
-/// confirmed on-chain submit (or, for x402, after authorization signing — see
-/// the call sites' own doc comments for the exact confirmation point). `value`
+/// Records unconditionally, without admission, for spend that has already
+/// applied on-chain. Authorized external settlement records through
+/// [`record_authorized_window_state`] instead. `value`
 /// MUST be the SAME [`stellar_agent_core::policy::v1::ValueClass`] the
 /// original gate evaluated — the single-derivation invariant, matching the
 /// audit-row `value_action_submitted` emission this call is always paired
@@ -214,17 +214,16 @@ pub fn record_confirmed_window_state(
     }
 }
 
-/// Records authorized external-settlement value before signer access and
+/// Records authorized external-settlement value before payment signing and
 /// propagates every failure to the caller.
 ///
-/// MPP uses this fail-closed variant because a credential can still be
-/// withheld when accounting fails; unlike post-submit paths, no irreversible
-/// on-chain action has occurred yet.
+/// MPP and x402 call this before constructing payment credentials, so an
+/// accounting refusal withholds the authorization.
 ///
 /// # Errors
 ///
 /// Returns a typed window-store error when in-memory accounting or durable
-/// persistence fails.
+/// persistence fails, or the shared window cannot admit the authorization.
 pub fn record_authorized_window_state(
     engine: &dyn stellar_agent_core::policy::PolicyEngine,
     tool: &stellar_agent_core::policy::ToolDescriptor,
@@ -241,7 +240,7 @@ pub fn record_authorized_window_state(
         return Ok(());
     }
     PersistedWindowStore::for_profile(profile_name)
-        .record_and_persist(profile, &recorded)
+        .record_authorized(profile, &recorded)
         .map(|_outcome| ())
 }
 

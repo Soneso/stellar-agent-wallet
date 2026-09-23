@@ -394,7 +394,7 @@ mod tests {
         let criterion = RateLimitCriterion::new(w, 5);
         let key = StateKey::new("alice", 1, "rate_limit", 60);
         // Insert a future entry with clock skew > 30 seconds.
-        store.append(&key, now_ms() + 31_000, 1).unwrap();
+        store.append_pending(&key, now_ms() + 31_000, 1).unwrap();
         let args = json!({});
         let ctx = make_ctx(&tool, &profile, &args, &store);
         let result = criterion.evaluate(&ctx);

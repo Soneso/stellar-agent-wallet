@@ -324,6 +324,15 @@ impl WalletServer {
         let signer: Arc<dyn stellar_agent_network::signing::Signer + Send + Sync> =
             Arc::new(signer_handle);
 
+        // Shared-window admission precedes signing and the signed RPC re-simulation.
+        if let Err(refusal) = crate::tools::x402_create_payment::record_x402_authorization(
+            self,
+            "stellar_x402_create_payment",
+            &stellar_agent_core::policy::v1::ValueClass::single(value_leg_for_record),
+        ) {
+            return Ok(refusal);
+        }
+
         let payment_payload =
             match create_payment(&requirements, signer.as_ref(), rpc_url, profile_passphrase).await
             {
@@ -372,29 +381,6 @@ impl WalletServer {
             audit_entry,
         );
 
-        // Non-fatal window-state record at authorization — value is
-        // authorized for external settlement here; there is no on-chain
-        // submit on this path (see the audit-row comment above).
-        //
-        // Single-record invariant: this call records EXACTLY ONCE per
-        // authorized payment, here at signature production. There is
-        // currently no settle-confirmation callback into the wallet — the
-        // host settles externally and never reports back. If a future
-        // settle-confirmation path is added, it MUST NOT also call
-        // `record_confirmed_window_state` for the same payment, or the
-        // window total would double-count a single authorized value.
-        if let Some(descriptor) = self.tool_registry.get("stellar_x402_create_payment") {
-            let value_class =
-                stellar_agent_core::policy::v1::ValueClass::single(value_leg_for_record);
-            stellar_agent_network::policy_state::record_confirmed_window_state(
-                self.policy_engine.as_ref(),
-                descriptor,
-                &self.profile,
-                &self.profile_name_for_approval(),
-                &value_class,
-            );
-        }
-
         // ── Build response ────────────────────────────────────────────────────
         // amounts are public (payment values); account IDs in the response are
         // NOT telemetry — they are the intended tool output for the MCP caller.
@@ -412,6 +398,34 @@ impl WalletServer {
             .unwrap_or_else(|_| String::from("{}"));
         Ok(CallToolResult::success(vec![Content::text(json_str)]))
     }
+}
+
+/// Accounts for an external payment while its credential can still be withheld.
+pub(super) fn record_x402_authorization(
+    server: &WalletServer,
+    tool: &str,
+    value: &stellar_agent_core::policy::v1::ValueClass,
+) -> Result<(), CallToolResult> {
+    let unavailable = || {
+        business_error_result(
+            "policy.engine_required",
+            "authorized payment accounting is unavailable",
+        )
+    };
+    let descriptor = server.tool_registry.get(tool).ok_or_else(unavailable)?;
+    stellar_agent_network::policy_state::record_authorized_window_state(
+        server.policy_engine.as_ref(),
+        descriptor,
+        &server.profile,
+        &server.profile_name_for_approval(),
+        value,
+    )
+    .map_err(|error| match error {
+        stellar_agent_network::policy_state::WindowStoreError::PolicyDenied { reason } => {
+            crate::tools::common::policy_denial_error_result(&reason)
+        }
+        _ => unavailable(),
+    })
 }
 
 /// Returns a stable telemetry class string for an [`stellar_agent_x402::X402Error`].

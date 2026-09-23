@@ -484,6 +484,15 @@ impl WalletServer {
         let signer: Arc<dyn stellar_agent_network::signing::Signer + Send + Sync> =
             Arc::new(signer_handle);
 
+        // Shared-window admission precedes signing and the signed RPC re-simulation.
+        if let Err(refusal) = crate::tools::x402_create_payment::record_x402_authorization(
+            self,
+            "stellar_x402_authenticated_payment",
+            &stellar_agent_core::policy::v1::ValueClass::single(value_leg_for_record),
+        ) {
+            return Ok(refusal);
+        }
+
         let payment_payload =
             match create_payment(&requirements, signer.as_ref(), rpc_url, network_passphrase).await
             {
@@ -535,29 +544,6 @@ impl WalletServer {
             &self.profile_name_for_approval(),
             audit_entry,
         );
-
-        // Non-fatal window-state record at authorization — value is
-        // authorized for external settlement here; there is no on-chain
-        // submit on this path (see the audit-row comment above).
-        //
-        // Single-record invariant: this call records EXACTLY ONCE per
-        // authorized payment, here at signature production. There is
-        // currently no settle-confirmation callback into the wallet — the
-        // host settles externally and never reports back. If a future
-        // settle-confirmation path is added, it MUST NOT also call
-        // `record_confirmed_window_state` for the same payment, or the
-        // window total would double-count a single authorized value.
-        if let Some(descriptor) = self.tool_registry.get("stellar_x402_authenticated_payment") {
-            let value_class =
-                stellar_agent_core::policy::v1::ValueClass::single(value_leg_for_record);
-            stellar_agent_network::policy_state::record_confirmed_window_state(
-                self.policy_engine.as_ref(),
-                descriptor,
-                &self.profile,
-                &self.profile_name_for_approval(),
-                &value_class,
-            );
-        }
 
         // ── Build response ────────────────────────────────────────────────────
         // `authorization` = the Bearer token for `Authorization: Bearer <jwt>`.

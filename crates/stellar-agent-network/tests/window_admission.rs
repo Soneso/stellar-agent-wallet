@@ -460,7 +460,8 @@ fn a_record_past_the_clock_skew_tolerance_refuses_admission() {
         WindowStoreError::PolicyDenied { reason } => {
             assert_eq!(reason.wire_code(), "policy.deny.evaluation_error");
             assert!(
-                matches!(*reason, DenyReason::EvaluationError { .. }),
+                matches!(reason.as_ref(), DenyReason::EvaluationError { detail }
+                    if detail.contains("host clock is 30001 ms behind")),
                 "{reason:?}"
             );
         }
@@ -537,4 +538,134 @@ fn a_record_at_the_clock_skew_tolerance_counts_toward_the_limit() {
         other => panic!("expected PolicyDenied, got {other:?}"),
     }
     assert_eq!(fx.open_reservation_ids(), vec![first_id, second_id]);
+}
+
+/// Ledger-dated spend stays in the cap while the host clock trails the chain.
+#[test]
+#[serial]
+fn confirmed_ledger_time_ahead_of_host_counts_at_admission_and_gate() {
+    let fx = fixture("admit-ledger-clock");
+    let now = now_ms();
+    let first_id = "5".repeat(64);
+    fx.first
+        .record_pending(
+            &fx.profile,
+            &[amount_entry(&fx.profile_name, now, 600)],
+            &reservation(&first_id, 7, now),
+        )
+        .unwrap();
+    fx.first
+        .confirm(
+            &fx.profile,
+            &first_id,
+            Some(i64::try_from(now / 1_000 + 3_600).unwrap()),
+        )
+        .unwrap();
+    assert_eq!(fx.window(&amount_key(&fx.profile_name), now), (600, 1));
+    fx.second
+        .record_pending(
+            &fx.profile,
+            &[amount_entry(&fx.profile_name, now, 400)],
+            &reservation(&"6".repeat(64), 8, now),
+        )
+        .expect("ledger time ahead of the host leaves 400 stroops of headroom");
+    let err = fx
+        .second
+        .record_pending(
+            &fx.profile,
+            &[amount_entry(&fx.profile_name, now, 1)],
+            &reservation(&"7".repeat(64), 9, now),
+        )
+        .expect_err("ledger-dated spend counts toward the cap");
+    assert!(matches!(err, WindowStoreError::PolicyDenied { reason }
+        if reason.wire_code() == "policy.deny.per_period_cap_exceeded"));
+    assert_eq!(fx.window(&amount_key(&fx.profile_name), now), (1_000, 2));
+}
+
+/// Independent gate snapshots must share one durable authorization cap.
+#[test]
+#[serial]
+fn authorized_settlements_share_admission_and_refusal_records_nothing() {
+    use stellar_agent_core::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
+    use stellar_agent_core::policy::v1::loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
+    use stellar_agent_core::policy::v1::value::{ActionKind, ValueLeg};
+    use stellar_agent_core::policy::v1::{PolicyEngineV1, ValueClass};
+    use stellar_agent_core::policy::{
+        Decision, McpToolRegistration, PolicyEngine, ToolDescriptor, ToolValueKind,
+    };
+    use stellar_agent_network::policy_state::record_authorized_window_state;
+    use stellar_agent_test_support::StellarAgentHomeGuard;
+
+    let fx = fixture("authorized-admission");
+    let _home = StellarAgentHomeGuard::new(fx._dir.path());
+    let engine = || {
+        PolicyEngineV1::new(
+            PolicyDocument {
+                version: 1,
+                scope: ScopeId::AllProfiles,
+                signature: None,
+                rules: vec![PolicyRule {
+                    r#match: RuleMatch {
+                        tool: "*".into(),
+                        chain: "*".into(),
+                    },
+                    criteria: vec![Box::new(PerPeriodCapCriterion::new(
+                        "native".into(),
+                        Window::parse("1d").unwrap(),
+                        1_000,
+                    ))],
+                    decision: Decision::Allow,
+                    allow_opaque_signing: false,
+                }],
+            },
+            fx.profile_name.clone(),
+        )
+    };
+    let first = engine();
+    let second = engine();
+    let tool = ToolDescriptor::from_registration(&McpToolRegistration {
+        name: "stellar_mpp_charge_commit",
+        destructive_hint: false,
+        read_only_hint: false,
+        chain_id_required: false,
+        value_kind: ToolValueKind::MovesValue,
+    });
+    let value = ValueClass::single(ValueLeg {
+        kind: ActionKind::Payment,
+        amount: Some(600),
+        asset: Some("native".into()),
+        destination: None,
+    });
+    for snapshot in [&first, &second] {
+        assert!(matches!(
+            snapshot
+                .evaluate_with_value(
+                    &tool,
+                    &serde_json::Value::Null,
+                    &fx.profile,
+                    value.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None
+                )
+                .unwrap(),
+            Decision::Allow
+        ));
+    }
+    record_authorized_window_state(&first, &tool, &fx.profile, &fx.profile_name, &value).unwrap();
+    let err = record_authorized_window_state(&second, &tool, &fx.profile, &fx.profile_name, &value)
+        .expect_err("the second authorization exceeds the shared cap");
+    assert!(matches!(err, WindowStoreError::PolicyDenied { reason }
+        if reason.wire_code() == "policy.deny.per_period_cap_exceeded"));
+    let gate = PolicyStateStore::new();
+    PersistedWindowStore::for_profile(&fx.profile_name)
+        .load_into(&fx.profile_name, &fx.profile, &gate)
+        .unwrap();
+    assert_eq!(
+        gate.query_window(&amount_key(&fx.profile_name), now_ms())
+            .unwrap(),
+        (600, 1)
+    );
 }
