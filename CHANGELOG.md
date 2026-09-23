@@ -50,6 +50,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Ledger-dated spending-window confirmations count toward caps when the host
+  clock trails the chain. Pending reservations retain the 30-second clock check,
+  and clock refusals identify the host-clock offset.
+- MPP and x402 authorized settlement check the shared spending cap under the
+  store lock before releasing a credential. A refused authorization records no
+  spend and reports the governing policy denial through CLI and MCP.
+
 - A spending-window reservation is admitted under the store's lock: the write
   that reserves a submission's spend re-applies the governing criterion's
   comparison against the state on disk at that moment, and refuses a

@@ -23,8 +23,8 @@
 //!
 //! # Clock-skew tolerance
 //!
-//! `now_ms` is derived from `std::time::SystemTime::now()`.  Entries up to 30
-//! seconds in the future are tolerated; beyond that,
+//! `now_ms` is derived from `std::time::SystemTime::now()`. Host-dated pending
+//! entries up to 30 seconds in the future are tolerated; beyond that,
 //! [`PolicyError::CriterionEvaluationFailed`] is returned.
 //!
 //! # Read-only evaluation
@@ -613,6 +613,40 @@ mod tests {
 
     #[test]
     #[serial]
+    fn confirmed_ledger_time_ahead_of_host_is_counted_by_the_gate() {
+        let tool = make_tool("stellar_pay");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = PerPeriodCapCriterion::new(
+            "native".into(),
+            Window::parse("1h").unwrap(),
+            1_000_000_000,
+        );
+        let key = StateKey::new("alice", 1, "native", 3_600);
+        store
+            .append(&key, system_time_to_ms().unwrap() + 3_600_000, 600_000_000)
+            .unwrap();
+        let allowed = json!({ "amount": "40 XLM", "asset": "native" });
+        assert!(
+            criterion
+                .evaluate(&make_ctx(&tool, &profile, &allowed, &store))
+                .unwrap()
+                .is_none()
+        );
+        let denied = json!({ "amount": "41 XLM", "asset": "native" });
+        assert!(matches!(
+            criterion
+                .evaluate(&make_ctx(&tool, &profile, &denied, &store))
+                .unwrap(),
+            Some(DenyReason::PerPeriodCapExceeded {
+                period_used_stroops: 600_000_000,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    #[serial]
     fn clock_skew_over_30s_returns_evaluation_failed() {
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -623,7 +657,7 @@ mod tests {
         let key = StateKey::new("alice", 1, "native", 3_600);
         let now = system_time_to_ms().unwrap();
         // Insert an entry 31 seconds in the future (clock skew violation).
-        store.append(&key, now + 31_000, 1).unwrap();
+        store.append_pending(&key, now + 31_000, 1).unwrap();
 
         let args = json!({ "amount": "1 XLM", "asset": "native" });
         let ctx = make_ctx(&tool, &profile, &args, &store);

@@ -46,7 +46,7 @@ use std::sync::Mutex;
 
 use crate::policy::DenyReason;
 
-/// Maximum tolerated future clock skew for state-store entries, in milliseconds.
+/// Maximum tolerated future clock skew for host-dated pending entries, in milliseconds.
 pub const CLOCK_SKEW_TOLERANCE_MS: u64 = 30_000;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -306,9 +306,13 @@ impl WindowEntry {
 /// `timestamp_ms` is older than `now_ms - window_ms` (where
 /// `window_ms = window_secs × 1_000`).
 ///
-/// Clock-skew tolerance: entries with `timestamp_ms > now_ms + 30_000`
-/// (i.e. more than 30 seconds in the future) are treated as evidence of
-/// excessive clock skew and cause [`StateStoreError::ClockSkewExceeded`].
+/// Pending entries are dated by the host. A pending timestamp more than
+/// 30 seconds ahead of the host clock causes [`StateStoreError::ClockSkewExceeded`].
+/// Confirmed entries are exempt from that check and count while they are
+/// inside the window. A confirmed timestamp ahead of the host clock is either
+/// a ledger close time from a chain clock ahead of the host, or a host-dated
+/// authorization recorded before the host clock stepped back; both hold the cap
+/// until the host clock passes the timestamp plus the window.
 ///
 /// The store is read-only from the criterion evaluator's perspective.
 /// Recording new entries after a successful commit is the dispatch site's
@@ -360,12 +364,13 @@ pub enum StateStoreError {
         detail: String,
     },
 
-    /// A recorded timestamp is more than 30 seconds in the future.
+    /// A host-dated pending timestamp is more than 30 seconds ahead of the host clock.
     ///
     /// Indicates excessive clock skew; the caller should surface a
     /// `PolicyError::CriterionEvaluationFailed` to the engine.
     #[error(
-        "clock skew exceeded: entry timestamp {entry_ts_ms} ms is more than 30s in the future (now={now_ms} ms)"
+        "host clock is {offset_ms} ms behind a pending reservation timestamp; maximum tolerated offset is 30000 ms (host={now_ms} ms, reservation={entry_ts_ms} ms)",
+        offset_ms = entry_ts_ms.saturating_sub(*now_ms)
     )]
     ClockSkewExceeded {
         /// The offending entry timestamp in unix-milliseconds.
@@ -398,7 +403,7 @@ impl PolicyStateStore {
     /// Eviction removes confirmed entries with `timestamp_ms < now_ms -
     /// (window_secs * 1_000)`. Pending entries count regardless of age.
     ///
-    /// Clock-skew check: any entry with
+    /// Clock-skew check: a host-dated pending entry with
     /// `timestamp_ms > now_ms + 30_000` (30-second tolerance) causes
     /// [`StateStoreError::ClockSkewExceeded`].
     ///
@@ -406,7 +411,7 @@ impl PolicyStateStore {
     ///
     /// - [`StateStoreError::LockPoisoned`] — the mutex was poisoned by a
     ///   previous panic.
-    /// - [`StateStoreError::ClockSkewExceeded`] — an entry is more than 30
+    /// - [`StateStoreError::ClockSkewExceeded`] — a pending entry is more than 30
     ///   seconds in the future relative to `now_ms`.
     ///
     /// # Examples
@@ -447,7 +452,7 @@ impl PolicyStateStore {
         // error before silently discarding future entries.
         for entry in deque.iter() {
             let ts = entry.timestamp_ms;
-            if ts > future_limit {
+            if entry.pending && ts > future_limit {
                 return Err(StateStoreError::ClockSkewExceeded {
                     entry_ts_ms: ts,
                     now_ms,
@@ -765,17 +770,27 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_ledger_time_ahead_of_host_counts_in_window() {
+        let store = PolicyStateStore::new();
+        let k = key();
+        let now = 1_000_000;
+        store.append(&k, now + 3_600_000, 600).unwrap();
+        assert_eq!(store.query_window(&k, now).unwrap(), (600, 1));
+    }
+
+    #[test]
     fn clock_skew_over_30s_future_is_rejected() {
         let store = PolicyStateStore::new();
         let k = key();
         let now_ms = 1_000_000u64;
         // Entry is 31 seconds in the future — exceeds tolerance.
-        store.append(&k, now_ms + 31_000, 1).unwrap();
+        store.append_pending(&k, now_ms + 31_000, 1).unwrap();
         let err = store.query_window(&k, now_ms).unwrap_err();
         assert!(
             matches!(err, StateStoreError::ClockSkewExceeded { .. }),
             "expected ClockSkewExceeded, got {err:?}"
         );
+        assert!(err.to_string().contains("host clock is 31000 ms behind"));
     }
 
     #[test]
@@ -784,7 +799,7 @@ mod tests {
         let k = key();
         let now_ms = 1_000_000u64;
         // Entry is exactly 30 seconds in the future — within tolerance.
-        store.append(&k, now_ms + 30_000, 1).unwrap();
+        store.append_pending(&k, now_ms + 30_000, 1).unwrap();
         let result = store.query_window(&k, now_ms);
         assert!(result.is_ok(), "30s future should be within tolerance");
     }

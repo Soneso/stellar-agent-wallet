@@ -217,9 +217,13 @@ fn result_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {
 ///
 /// Each commit needs its own authorization and its own process-bound nonce, so
 /// the prepare step runs per round.
-async fn prepare_and_commit(server: &WalletServer, round: u8) -> rmcp::model::CallToolResult {
+async fn prepare_and_commit(
+    server: &WalletServer,
+    profile_name: &str,
+    round: u8,
+) -> rmcp::model::CallToolResult {
     let prepared = server
-        .call_stellar_mpp_charge_prepare(PROFILE.to_owned(), challenge(round))
+        .call_stellar_mpp_charge_prepare(profile_name.to_owned(), challenge(round))
         .await
         .expect("prepare must not error at the protocol layer");
     assert_ne!(
@@ -297,7 +301,7 @@ async fn mpp_charge_commit_refuses_tip_anchor_mismatch_when_the_log_is_rolled_ba
     let server = WalletServer::new(profile).expect("WalletServer::new");
 
     // Round one: a commit that succeeds, leaving the anchor naming the log.
-    let first = prepare_and_commit(&server, 1).await;
+    let first = prepare_and_commit(&server, PROFILE, 1).await;
     assert_ne!(
         first.is_error,
         Some(true),
@@ -313,7 +317,7 @@ async fn mpp_charge_commit_refuses_tip_anchor_mismatch_when_the_log_is_rolled_ba
     // Roll the log back underneath the writer the server is still holding.
     std::fs::write(&audit_log_path, b"").expect("truncate the audit log");
 
-    let second = prepare_and_commit(&server, 2).await;
+    let second = prepare_and_commit(&server, PROFILE, 2).await;
     let (code, _message, _text) = common::assert_business_envelope(&second);
     assert_eq!(
         code, "audit.tip_anchor_mismatch",
@@ -324,5 +328,220 @@ async fn mpp_charge_commit_refuses_tip_anchor_mismatch_when_the_log_is_rolled_ba
         row_count(&audit_log_path),
         0,
         "a refused commit must append no row to the rolled-back log"
+    );
+}
+
+/// A sibling authorization reserves after evaluation and before accounting.
+#[derive(Debug)]
+struct CompetingAuthorization(
+    stellar_agent_core::policy::v1::criteria::per_period_cap::PerPeriodCapCriterion,
+);
+
+impl stellar_agent_core::policy::v1::criteria::Criterion for CompetingAuthorization {
+    fn kind(&self) -> &'static str {
+        "per_period_cap"
+    }
+
+    fn evaluate(
+        &self,
+        ctx: &stellar_agent_core::policy::v1::EvalContext<'_>,
+    ) -> Result<
+        Option<stellar_agent_core::policy::DenyReason>,
+        stellar_agent_core::policy::PolicyError,
+    > {
+        self.0.evaluate(ctx)
+    }
+
+    fn record_confirmed(
+        &self,
+        ctx: &stellar_agent_core::policy::v1::EvalContext<'_>,
+    ) -> Result<
+        Vec<stellar_agent_core::policy::v1::criteria::state_store::WindowEntry>,
+        stellar_agent_core::policy::PolicyError,
+    > {
+        let entries = self.0.record_confirmed(ctx)?;
+        stellar_agent_network::policy_state::PersistedWindowStore::for_profile(ctx.profile_name)
+            .record_authorized(ctx.profile, &entries)
+            .expect("the sibling authorization fits alone");
+        Ok(entries)
+    }
+}
+
+/// An accounting refusal withholds the credential and keeps its policy code.
+#[tokio::test]
+#[serial]
+async fn mpp_accounting_cap_refusal_withholds_the_credential() {
+    const PROFILE: &str = "mpp-admission";
+    use stellar_agent_core::policy::Decision;
+    use stellar_agent_core::policy::v1::PolicyEngineV1;
+    use stellar_agent_core::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
+    use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
+    use stellar_agent_core::policy::v1::loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
+    use stellar_agent_network::policy_state::PersistedWindowStore;
+    let home = tempfile::tempdir().unwrap();
+    let _home = StellarAgentHomeGuard::new(home.path());
+    keyring_mock::install().unwrap();
+    install_test_nonce_key(241);
+    let seed = [0x6d; 32];
+    let payer = gstrkey_for_seed(seed);
+    keyring_core::Entry::new(SIGNER_SERVICE, &payer)
+        .unwrap()
+        .set_password(&sstrkey_for_seed(seed))
+        .unwrap();
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(SponsoredSimulateResponder {
+            payer: payer_sc_address(&payer),
+        })
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let mut profile =
+        Profile::builder_testnet_named(PROFILE, SIGNER_SERVICE, &payer, "n-svc", "n-acct")
+            .with_noop_engine()
+            .build();
+    profile.rpc_url = mock.uri();
+    common::install_test_audit_key(&mut profile);
+    let mut server = WalletServer::new(profile.clone()).unwrap();
+    let engine = PolicyEngineV1::new(
+        PolicyDocument {
+            version: 1,
+            scope: ScopeId::AllProfiles,
+            signature: None,
+            rules: vec![PolicyRule {
+                r#match: RuleMatch {
+                    tool: "*".into(),
+                    chain: "*".into(),
+                },
+                criteria: vec![Box::new(CompetingAuthorization(
+                    PerPeriodCapCriterion::new(
+                        CONTRACT.into(),
+                        Window::parse("1d").unwrap(),
+                        15_000_000,
+                    ),
+                ))],
+                decision: Decision::Allow,
+                allow_opaque_signing: false,
+            }],
+        },
+        PROFILE.into(),
+    );
+    server.set_policy_engine_for_test(std::sync::Arc::new(engine));
+    let result = prepare_and_commit(&server, PROFILE, 3).await;
+    let (code, _, _) = common::assert_business_envelope(&result);
+    assert_eq!(code, "policy.deny.per_period_cap_exceeded");
+    assert!(result_json(&result)["data"]["credential"].is_null());
+    let window = PolicyStateStore::new();
+    PersistedWindowStore::for_profile(PROFILE)
+        .load_into(PROFILE, &profile, &window)
+        .unwrap();
+    let key = StateKey::new(
+        PROFILE,
+        1,
+        &stellar_agent_core::policy::v1::value::asset_normalise(CONTRACT),
+        86_400,
+    );
+    assert_eq!(
+        window
+            .query_window(&key, stellar_agent_core::timefmt::now_unix_ms().unwrap())
+            .unwrap(),
+        (10_000_000, 1)
+    );
+}
+
+/// x402 admission precedes payment signing and signed RPC re-simulation.
+#[tokio::test]
+#[serial]
+async fn x402_accounting_cap_refusal_withholds_the_payment_signature() {
+    use stellar_agent_core::policy::Decision;
+    use stellar_agent_core::policy::v1::PolicyEngineV1;
+    use stellar_agent_core::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
+    use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
+    use stellar_agent_core::policy::v1::loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
+    use stellar_agent_mcp::server::X402CreatePaymentArgs;
+    use stellar_agent_network::policy_state::PersistedWindowStore;
+    const PROFILE: &str = "x402-admission";
+    let home = tempfile::tempdir().unwrap();
+    let _home = StellarAgentHomeGuard::new(home.path());
+    keyring_mock::install().unwrap();
+    install_test_nonce_key(242);
+    let seed = [0x6e; 32];
+    let payer = gstrkey_for_seed(seed);
+    keyring_core::Entry::new(SIGNER_SERVICE, &payer)
+        .unwrap()
+        .set_password(&sstrkey_for_seed(seed))
+        .unwrap();
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(SponsoredSimulateResponder {
+            payer: payer_sc_address(&payer),
+        })
+        .mount(&mock)
+        .await;
+    let mut profile =
+        Profile::builder_testnet_named(PROFILE, SIGNER_SERVICE, &payer, "n-svc", "n-acct")
+            .with_noop_engine()
+            .build();
+    profile.rpc_url = mock.uri();
+    common::install_test_audit_key(&mut profile);
+    let mut server = WalletServer::new(profile.clone()).unwrap();
+    server.set_policy_engine_for_test(std::sync::Arc::new(PolicyEngineV1::new(
+        PolicyDocument {
+            version: 1,
+            scope: ScopeId::AllProfiles,
+            signature: None,
+            rules: vec![PolicyRule {
+                r#match: RuleMatch {
+                    tool: "*".into(),
+                    chain: "*".into(),
+                },
+                criteria: vec![Box::new(CompetingAuthorization(
+                    PerPeriodCapCriterion::new(
+                        CONTRACT.into(),
+                        Window::parse("1d").unwrap(),
+                        15_000_000,
+                    ),
+                ))],
+                decision: Decision::Allow,
+                allow_opaque_signing: false,
+            }],
+        },
+        PROFILE.into(),
+    )));
+    let result = server
+        .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+            chain_id: "stellar:testnet".into(),
+            address: None,
+            payment_required: serde_json::json!({
+                "scheme": "exact", "network": "stellar:testnet", "asset": CONTRACT,
+                "amount": "10000000", "payTo": RECIPIENT, "maxTimeoutSeconds": 300,
+                "extra": { "areFeesSponsored": true }
+            })
+            .to_string(),
+        })
+        .await
+        .unwrap();
+    let (code, _, _) = common::assert_business_envelope(&result);
+    assert_eq!(code, "policy.deny.per_period_cap_exceeded");
+    assert!(
+        mock.received_requests().await.unwrap().is_empty(),
+        "accounting refuses before signing and RPC re-simulation"
+    );
+    assert!(result_json(&result)["data"]["paymentSignature"].is_null());
+    let window = PolicyStateStore::new();
+    PersistedWindowStore::for_profile(PROFILE)
+        .load_into(PROFILE, &profile, &window)
+        .unwrap();
+    let key = StateKey::new(
+        PROFILE,
+        1,
+        &stellar_agent_core::policy::v1::value::asset_normalise(CONTRACT),
+        86_400,
+    );
+    assert_eq!(
+        window
+            .query_window(&key, stellar_agent_core::timefmt::now_unix_ms().unwrap())
+            .unwrap(),
+        (10_000_000, 1)
     );
 }

@@ -315,10 +315,13 @@ pub(crate) fn policy_denial_envelope(err: &WalletError, verb: &str) -> Option<En
     let WalletError::PolicyDenied { reason } = err else {
         return None;
     };
-    Some(Envelope::<()>::err_raw(
-        reason.wire_code(),
-        format!("{verb} operation denied by operator policy"),
-    ))
+    let message = match reason.as_ref() {
+        stellar_agent_core::policy::DenyReason::EvaluationError { detail } => {
+            format!("{verb} operation denied by operator policy: {detail}")
+        }
+        _ => format!("{verb} operation denied by operator policy"),
+    };
+    Some(Envelope::<()>::err_raw(reason.wire_code(), message))
 }
 
 /// The wire code a submission that was never sent reports. A pre-send
@@ -708,7 +711,21 @@ mod tests {
         );
     }
 
-    /// A rate limit the reservation write refused does the same.
+    /// Clock refusals identify the host-clock offset on the CLI response.
+    #[test]
+    fn a_clock_refusal_reports_the_host_clock_offset() {
+        let detail = stellar_agent_core::policy::v1::criteria::state_store::StateStoreError::ClockSkewExceeded {
+            entry_ts_ms: 1_031_000, now_ms: 1_000_000,
+        }.to_string();
+        let err = WalletError::PolicyDenied {
+            reason: Box::new(stellar_agent_core::policy::DenyReason::EvaluationError { detail }),
+        };
+        let envelope = error_envelope(&err, SIGNED_XDR, "pay");
+        let error = envelope.error.as_ref().unwrap();
+        assert_eq!(error.code, "policy.deny.evaluation_error");
+        assert!(error.message.contains("host clock is 31000 ms behind"));
+    }
+
     #[test]
     fn a_refused_rate_limited_reservation_reports_the_gate_code() {
         let err = WalletError::PolicyDenied {

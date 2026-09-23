@@ -12,7 +12,7 @@ use hmac::{Hmac, KeyInit as _, Mac as _};
 use sha2::Sha256;
 use stellar_agent_core::policy::DenyReason;
 use stellar_agent_core::policy::v1::criteria::state_store::{
-    CLOCK_SKEW_TOLERANCE_MS, PolicyStateStore, StateKey, WindowEntry,
+    CLOCK_SKEW_TOLERANCE_MS, PolicyStateStore, StateKey, StateStoreError, WindowEntry,
 };
 use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore};
 use stellar_agent_core::profile::schema::{
@@ -505,6 +505,34 @@ impl PersistedWindowStore {
         profile: &Profile,
         new_entries: &[WindowEntry],
     ) -> Result<MintOutcome, WindowStoreError> {
+        self.record_settled(profile, new_entries, false)
+    }
+
+    /// Admits authorized external-settlement spend before credential release.
+    ///
+    /// The exclusive lock covers the file read, the same whole-batch comparison
+    /// used by reservations, and the write. Admitted spend is retained as window
+    /// usage because a released credential can be redeemed outside this wallet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WindowStoreError::PolicyDenied`] without recording any entry
+    /// when the batch exceeds a window limit. Integrity and I/O errors also
+    /// withhold authorization.
+    pub fn record_authorized(
+        &self,
+        profile: &Profile,
+        new_entries: &[WindowEntry],
+    ) -> Result<MintOutcome, WindowStoreError> {
+        self.record_settled(profile, new_entries, true)
+    }
+
+    fn record_settled(
+        &self,
+        profile: &Profile,
+        new_entries: &[WindowEntry],
+        require_admission: bool,
+    ) -> Result<MintOutcome, WindowStoreError> {
         self.ensure_parent_dir()?;
         let _lock = WindowStoreLock::acquire(&self.lock_path())?;
 
@@ -512,6 +540,9 @@ impl PersistedWindowStore {
         let gen_entry = generation_entry_ref(profile);
 
         let mut wire = self.read_verified(&key, &gen_entry)?;
+        if require_admission {
+            admit(&wire, new_entries)?;
+        }
 
         for entry in new_entries {
             let bucket = find_or_insert_bucket(&mut wire.entries, entry.key());
@@ -549,7 +580,7 @@ impl PersistedWindowStore {
     /// re-applies the governing criterion's comparison here: against the file
     /// it has just read and verified, at each entry's own timestamp, with the
     /// entries of this batch accumulating against each other on a shared key.
-    /// A same-key record dated past the clock-skew tolerance fails the gate's
+    /// A same-key pending record dated past the clock-skew tolerance fails the gate's
     /// query closed and is refused here the same way.
     /// A batch that would take any bucket past the limit its entry carries is
     /// refused as [`WindowStoreError::PolicyDenied`] before anything is
@@ -1805,10 +1836,10 @@ fn collect_pending(wire: &WireFile) -> Vec<WindowReservation> {
 ///
 /// A confirmed record ages out at `now_ms - window_secs * 1000`. A pending
 /// record counts whatever its age: it holds the operator's cap for a
-/// submission whose outcome is still open. A record dated more than
-/// [`CLOCK_SKEW_TOLERANCE_MS`] past `now_ms` is a clock the gate's query does
-/// not trust; it fails closed there, and admission refuses it here with the
-/// evaluation error the criterion reports for that query.
+/// submission whose outcome is still open. Only host-dated pending records
+/// are subject to [`CLOCK_SKEW_TOLERANCE_MS`]. Confirmed records, whether
+/// dated by a ledger close time or by the host at authorization, count even
+/// when they are ahead of the host clock.
 fn window_in_file(wire: &WireFile, key: &StateKey, now_ms: u64) -> Result<(i128, u32), DenyReason> {
     let window_ms = key.window_secs().saturating_mul(1_000);
     let cutoff = now_ms.saturating_sub(window_ms);
@@ -1823,13 +1854,13 @@ fn window_in_file(wire: &WireFile, key: &StateKey, now_ms: u64) -> Result<(i128,
             continue;
         }
         for record in &bucket.records {
-            if record.ts_ms > future_limit {
+            if record.status == RecordStatus::Pending && record.ts_ms > future_limit {
                 return Err(DenyReason::EvaluationError {
-                    detail: format!(
-                        "spending window: a record dated {} ms is more than \
-                         {CLOCK_SKEW_TOLERANCE_MS} ms ahead of the admission clock {now_ms} ms",
-                        record.ts_ms
-                    ),
+                    detail: StateStoreError::ClockSkewExceeded {
+                        entry_ts_ms: record.ts_ms,
+                        now_ms,
+                    }
+                    .to_string(),
                 });
             }
             if record.status != RecordStatus::Pending && record.ts_ms < cutoff {

@@ -434,13 +434,11 @@ async fn commit_cli(
         Err(error) => return render_error(&error),
     };
     let descriptor = policy_descriptor("stellar_mpp_charge_commit");
-    // The delivery gate withholds the credential by returning an `MppError`,
-    // whose codes are all `mpp.*`. An audit refusal is not one of those: it names
-    // a log an operator has to repair, and folding it into the uniform state
-    // refusal sends them after the MPP state file instead. The gate records the
-    // wallet error here and the result below renders it.
-    let audit_refusal: Arc<Mutex<Option<WalletError>>> = Arc::new(Mutex::new(None));
-    let delivery_refusal = Arc::clone(&audit_refusal);
+    // Policy and audit refusals retain their wallet code while the MPP
+    // service withholds the credential at its accounting or delivery gate.
+    let wallet_refusal: Arc<Mutex<Option<WalletError>>> = Arc::new(Mutex::new(None));
+    let delivery_refusal = Arc::clone(&wallet_refusal);
+    let accounting_refusal = Arc::clone(&wallet_refusal);
     let result = commit_authorization(
         state,
         approvals.as_ref(),
@@ -458,7 +456,7 @@ async fn commit_cli(
                 profile_name,
                 &ValueClass::Value(effects.clone()),
             )
-            .map_err(|_| state_error())
+            .map_err(|error| accounting_error(error, &accounting_refusal))
         },
         |authorized| {
             let entry = AuditEntry::new_mpp_charge_authorized(
@@ -509,8 +507,8 @@ async fn commit_cli(
             }));
             0
         }
-        Err(error) => match audit_refusal.lock().ok().and_then(|mut slot| slot.take()) {
-            Some(audit_error) => render_wallet_error(&audit_error),
+        Err(error) => match wallet_refusal.lock().ok().and_then(|mut slot| slot.take()) {
+            Some(wallet_error) => render_wallet_error(&wallet_error),
             None => render_error(&error),
         },
     }
@@ -870,14 +868,13 @@ fn render_error(error: &MppError) -> i32 {
     1
 }
 
-/// Renders a wallet-level refusal under its own wire code.
-///
-/// The audit refusals the strict emission raises carry `audit.*` codes whose
-/// remedies have nothing to do with the MPP state file. Rendering them as the
-/// uniform state refusal would tell an operator to look at a store that is
-/// intact and leave the log that needs `audit reanchor` unnamed.
+/// Renders policy and audit refusals with their wallet code and diagnostic.
 fn render_wallet_error(error: &WalletError) -> i32 {
-    print_json(&Envelope::<()>::err(error));
+    print_json(&crate::commands::submission_record::error_envelope(
+        error,
+        "",
+        "mpp charge authorize",
+    ));
     1
 }
 
@@ -889,6 +886,19 @@ fn now_unix() -> i64 {
 
 fn redact_reference(value: &str) -> String {
     format!("{}...{}", &value[..8], &value[value.len() - 8..])
+}
+
+/// Retains a typed policy refusal across the service's MPP error boundary.
+fn accounting_error(
+    error: stellar_agent_network::policy_state::WindowStoreError,
+    refusal: &Mutex<Option<WalletError>>,
+) -> MppError {
+    if let stellar_agent_network::policy_state::WindowStoreError::PolicyDenied { reason } = error
+        && let Ok(mut slot) = refusal.lock()
+    {
+        *slot = Some(WalletError::PolicyDenied { reason });
+    }
+    state_error()
 }
 
 /// The uniform state refusal.
@@ -980,6 +990,28 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn accounting_denial_preserves_the_policy_code() {
+        let reason = stellar_agent_core::policy::DenyReason::RateLimitExceeded {
+            window: "1m".to_owned(),
+            max_calls: 1,
+            calls_in_window: 1,
+        };
+        let refusal = Mutex::new(None);
+        let _ = accounting_error(
+            stellar_agent_network::policy_state::WindowStoreError::PolicyDenied {
+                reason: Box::new(reason),
+            },
+            &refusal,
+        );
+        let error = refusal
+            .lock()
+            .expect("refusal lock")
+            .take()
+            .expect("typed policy refusal");
+        assert_eq!(error.code(), "policy.deny.rate_limit_exceeded");
+    }
 
     #[derive(Parser)]
     struct Harness {
