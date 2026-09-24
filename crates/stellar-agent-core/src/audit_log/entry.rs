@@ -2387,6 +2387,62 @@ impl AuditEntry {
         }
     }
 
+    /// Records the verified MPP baseline selected for anchoring.
+    #[must_use]
+    pub fn new_mpp_state_adopted(
+        profile: impl Into<String>,
+        generation: u64,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "mpp_state_adopt".to_owned(),
+            chain_id: None,
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::MppStateAdopted {
+                profile: profile.into(),
+                generation,
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
+    /// Records an acknowledged MPP reset request before state mutation.
+    #[must_use]
+    pub fn new_mpp_state_reset(
+        profile: impl Into<String>,
+        discarded_generation: Option<u64>,
+        reason: &str,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "profile_reset_mpp_state".to_owned(),
+            chain_id: None,
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::MppStateReset {
+                profile: profile.into(),
+                discarded_generation,
+                reason: crate::audit_log::schema::bound_recorded_str(reason),
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
     /// Constructs an `AuditTipAnchored` audit entry.
     ///
     /// Written by the audit writer itself, not by a tool: the `tool` field

@@ -411,7 +411,7 @@ mod tests {
         profile: &str,
     ) -> (TempDir, MppAuthorizationStore, String, TransactionEnvelope) {
         let directory = TempDir::new().expect("tempdir");
-        let state = MppAuthorizationStore::at_path(directory.path().join("state"), [9; 32]);
+        let state = crate::store::tests::test_store(directory.path().join("state"), [9; 32]);
         let (prepared, signer, rpc) = prepared_fixture(NOW).await;
         let preview = persist_prepared_authorization(
             profile,
@@ -494,7 +494,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn direct_reconciliation_is_idempotent_across_timestamps() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let (_directory, state, id, envelope) = authorized_fixture("direct").await;
         let rpc = observation(TransactionStatus::Success, envelope);
         let first = reconcile_transaction(&state, &id, HASH, NOW + 2, &rpc)
@@ -512,7 +514,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn fee_bump_inner_transaction_is_verified() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let (_directory, state, id, envelope) = authorized_fixture("fee-bump").await;
         let TransactionEnvelope::Tx(inner) = envelope else {
             panic!("fixture must be v1")
@@ -539,7 +543,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn final_failure_is_recorded_independently_of_a_receipt() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let (_directory, state, id, envelope) = authorized_fixture("failed").await;
         let result = reconcile_transaction(
             &state,
@@ -561,7 +567,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn not_found_does_not_mutate_authorization_state() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let (_directory, state, id, _envelope) = authorized_fixture("not-found").await;
         let rpc = StaticRpc(TransactionObservation {
             status: TransactionStatus::NotFound,
@@ -580,7 +588,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn rpc_failure_does_not_mutate_authorization_state() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let (_directory, state, id, _envelope) = authorized_fixture("rpc-failure").await;
         let error = reconcile_transaction(&state, &id, HASH, NOW + 2, &FailingRpc)
             .await
@@ -594,7 +604,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn mutated_authorization_signature_is_rejected() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let (_directory, state, id, mut envelope) = authorized_fixture("mutated-signature").await;
         let TransactionEnvelope::Tx(inner) = &mut envelope else {
             panic!("fixture must be v1")
@@ -651,7 +663,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn mutated_server_source_without_a_matching_signature_is_rejected() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let (_directory, state, id, mut envelope) = authorized_fixture("mutated-server").await;
         let TransactionEnvelope::Tx(inner) = &mut envelope else {
             panic!("fixture must be v1")

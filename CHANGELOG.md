@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `profile reset-mpp-state <NAME> --acknowledge --reason <REASON>` recovers MPP
+  authorization state by discarding replay history, rotating its HMAC key, and
+  resetting the generation. The audit row names the discarded generation.
+
 - The MCP server warns at startup when a v1 policy names tools explicitly and
   carries no rule for `stellar_transaction_status`, the tool that settles a
   timed-out submission.
@@ -21,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carry no API stability promise.
 
 ### Changed
+
+- MPP authorization state uses wire format version 2 with a generation field
+  and a `default-generation` counter beside its state key in the keyring.
+  Verified version 1 state is adopted once under the store lock with an audit
+  row and enters the protected format at generation one. A version 2 file
+  without its counter refuses.
+  `MppAuthorizationStore::at_path` requires the trusted generation entry;
+  profile openers require the profile's audit configuration.
 
 - `stellar-agent-pool`: `InitParams` requires a `SubmissionRecorder` reference
   and an `attempt` memo ID; `submit_pooled` requires a recorder argument before
@@ -49,6 +61,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consumer.
 
 ### Fixed
+
+- MPP state reads and mutations refuse deleted or stale authorization history
+  against the keyring generation, naming rollback in the refusal. A minted key
+  at generation zero with no file remains a valid empty store. Rolled-back
+  refusals name `profile reset-mpp-state` as the acknowledged recovery.
 
 - Ledger-dated spending-window confirmations count toward caps when the host
   clock trails the chain. Pending reservations retain the 30-second clock check,

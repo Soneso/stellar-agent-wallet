@@ -2560,6 +2560,25 @@ pub enum EventKind {
         reason: String,
     },
 
+    /// Verified MPP history was selected for generation anchoring. The row
+    /// precedes the anchor write so the selected baseline remains auditable.
+    MppStateAdopted {
+        /// Profile whose authorization history is adopted.
+        profile: String,
+        /// Generation assigned to the verified snapshot.
+        generation: u64,
+    },
+
+    /// An acknowledged MPP history reset was requested under the store lock.
+    MppStateReset {
+        /// Profile whose replay markers are discarded.
+        profile: String,
+        /// Trusted generation discarded, or null for an absent/unparseable counter.
+        discarded_generation: Option<u64>,
+        /// Bounded operator reason.
+        reason: String,
+    },
+
     /// The audit log's keyring-held tip anchor was established for the active
     /// file.
     ///
@@ -2608,7 +2627,7 @@ pub enum EventKind {
 /// the test stays green, leaving the new variant unpinned by any tag assertion.
 /// Closing that would need the count derived from the enum itself, which needs a
 /// derive macro this workspace does not carry.
-pub const EVENT_KIND_VARIANT_COUNT: usize = 62;
+pub const EVENT_KIND_VARIANT_COUNT: usize = 64;
 
 /// Why an [`EventKind::AuditTipAnchored`] row was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -4531,6 +4550,33 @@ mod tests {
             result.is_err(),
             "missing-field deserialisation must fail for KeyringKeyWritten"
         );
+    }
+
+    #[test]
+    fn mpp_state_lifecycle_events_round_trip() {
+        use crate::audit_log::AuditEntry;
+        let adopted = AuditEntry::new_mpp_state_adopted("alice", 7, "adopt-request");
+        let reset =
+            AuditEntry::new_mpp_state_reset("alice", Some(9), "operator recovery", "reset-request");
+        for (entry, kind, generation_field, generation) in [
+            (adopted, "mpp_state_adopted", "generation", 7),
+            (reset, "mpp_state_reset", "discarded_generation", 9),
+        ] {
+            let value = serde_json::to_value(&entry).unwrap();
+            assert_eq!(value["kind"], kind);
+            assert_eq!(value["profile"], "alice");
+            assert_eq!(value[generation_field], generation);
+            let decoded: AuditEntry = serde_json::from_value(value).unwrap();
+            assert_eq!(decoded.event_kind, entry.event_kind);
+        }
+        let missing = AuditEntry::new_mpp_state_reset("alice", None, "recovery", "request");
+        let wire = serde_json::to_value(&missing).unwrap();
+        assert!(wire["discarded_generation"].is_null());
+        let decoded: AuditEntry = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded.event_kind, missing.event_kind);
+        for kind in ["mpp_state_adopted", "mpp_state_reset"] {
+            assert!(serde_json::from_value::<EventKind>(serde_json::json!({"kind":kind})).is_err());
+        }
     }
 
     #[test]

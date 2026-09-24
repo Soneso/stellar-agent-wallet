@@ -96,23 +96,65 @@ never render XDR, credentials, challenge bodies, or raw context parameters.
 ## Durable state
 
 The per-profile file is below the canonical data root in `mpp/`; its filename is
-the SHA-256 of the profile name. A dedicated 32-byte HMAC key is stored in the
-platform keyring. Missing key plus existing file fails closed. The file format
-is versioned JSON prefixed by HMAC-SHA256 over a domain and body.
+the SHA-256 of the profile name. A dedicated 32-byte HMAC key occupies keyring
+service `stellar-agent-mpp-state-<profile>`, account `default`. The monotonic
+counter occupies the same service, account `default-generation`. Version 2 JSON
+includes a `generation` and is prefixed by HMAC-SHA256 over a domain and body.
+The counter is trusted independently of the state file.
 
-Opening is split by intent: `open_for_prepare` mints the key for a genuinely new
-store and is the only entry point that writes key material, while
-`open_for_read` returns `Ok(None)` for a profile that has never minted MPP state
-— proven by the key not loading AND the state path provably holding nothing.
-Read verbs answer `Ok(None)` as `mpp.authorization_not_found`, so a new profile
-is never reported as a broken store.
+`open_for_prepare` provisions generation zero and a state key under the store
+lock for a new profile. Only a proven absent key may be minted; keyring access
+errors refuse. `open_for_read` returns `Ok(None)` when the key and state file are
+provably absent and no advanced counter exists. A minted key with counter zero
+and no file is a valid empty store: policy denial after minting must leave the
+first prepare possible. Missing files with an advanced counter refuse even when
+the state key is also missing.
 
 Every read checks non-symlink regular-file shape, size, HMAC in constant time,
-schema version, record count, reconstructed prepared-artifact semantics,
-lifecycle invariants, and uniqueness of authorization IDs, fingerprints and
-approval nonces. Mutation holds a sibling-file cross-process lock and performs
-write, flush, atomic rename, and parent-directory synchronization. The store
-does not claim rollback resistance against a privileged whole-machine attacker.
+schema version, equality with the keyring generation, record count,
+reconstructed prepared-artifact semantics, lifecycle invariants, and uniqueness
+of authorization IDs, fingerprints and approval nonces. When the counter is
+proven absent by the keyring, opening adopts a verifying snapshot under the
+store lock. It records `mpp_state_adopted` with the profile and generation before
+anchoring. Only version 1, which has no generation, is adopted; it is rewritten
+as version 2 at generation one with all records preserved. A version 2 file is
+published only after its counter, so one with an absent counter refuses as an
+invalid anchor. Generation zero remains reserved for an unwritten store. A
+present counter, an unverifiable file, or a keyring access error cannot trigger
+adoption. A state key with neither counter nor file refuses the same way; it
+holds no history, and reset recovers it without discarding records.
+Concurrent opens share the lock, and an anchored read emits no adoption row.
+
+Mutation holds a sibling-file cross-process lock, increments the generation
+with overflow checking, and advances the keyring counter before writing any
+authenticated snapshot, including temporary files. It then writes, flushes,
+atomically renames, and synchronizes the parent directory. A failure after the
+counter advances leaves a mismatch and refuses further use; generations are
+never reused for an abandoned snapshot. Reads never reset or lower the counter.
+
+Deletion or generation mismatch returns `mpp.state_unavailable` with a message
+identifying the state as rolled back and naming `profile reset-mpp-state`.
+
+`stellar-agent profile reset-mpp-state <NAME> --acknowledge --reason <REASON>`
+recovers refused state. Under the store lock it writes `mpp_state_reset` with
+the profile, discarded generation, and bounded reason; rotates the state HMAC
+key; removes the file and synchronizes its directory; and sets the counter to
+zero. A missing or malformed counter is represented by a null discarded
+generation. Keyring access errors and audit failures refuse without resetting.
+The audit row records the operator's request even if a later reset step fails.
+The command can be retried with acknowledgement after a partial failure.
+
+Reset discards every prepared, authorized, indeterminate and settled replay
+marker. A charge settled before reset is no longer recognized as settled. The
+fresh key invalidates snapshots from discarded history even when a new store
+reuses their generation numbers; profile handles check that their cached key
+still matches the keyring before reading or writing. The first prepare after
+reset starts from an empty store. There is no automatic reset on read failure.
+
+Filesystem rollback cannot restore older protected history while the keyring
+remains trusted. Access to the keyring, which also holds the HMAC key, is outside
+this boundary; a filesystem-backed keyring needs independent protection from
+state-file rollback.
 
 The store never persists a credential, signature output, raw receipt, or exact
 transaction hash. It retains only the prepared unsigned artifact needed for one
