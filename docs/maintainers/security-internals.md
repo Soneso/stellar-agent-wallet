@@ -418,6 +418,36 @@ mismatch, and duplicate identities. Writes use a bounded temporary regular file,
 flush, atomic rename, and parent sync. Credentials, raw receipts, and exact
 transaction hashes are never persisted.
 
+The MPP generation counter is held beside the HMAC key in the keyring. Every
+state write advances it before publishing authenticated bytes, and every read
+checks it under the store lock. A missing file is empty only at generation zero;
+an advanced counter with a missing or stale file refuses as rolled back.
+
+When the anchor is proven absent (`NoEntry`), a fully verified file is adopted
+once under that lock, with a mandatory `mpp_state_adopted` row naming the profile
+and adopted generation. Only version 1 is adopted: it has no generation and is
+normalized to version 2 at generation one with its records and replay markers
+intact. A version 2 file exists only after its anchor was written, so one with
+an absent anchor refuses. A present anchor or a keyring access error cannot
+authorize adoption.
+
+`profile reset-mpp-state <NAME> --acknowledge --reason <REASON>` is the explicit
+recovery for a rolled-back or mismatched MPP store. The acknowledgement discards
+replay markers for every prepared, authorized, indeterminate and settled charge;
+a charge settled before reset is no longer recognized as settled. Under the MPP
+lock, reset emits `mpp_state_reset` with profile, discarded generation and reason,
+rotates the HMAC key, removes and synchronizes the state file, then sets the
+counter to zero. An absent or malformed counter is recorded as a null discarded
+generation. Audit/keyring access failures refuse. Rows record the selected
+adoption baseline or reset request before mutation, so failed storage writes
+remain visible and a failed reset can be retried with acknowledgement.
+
+Key rotation prevents pre-reset snapshots matching reused generation numbers.
+Existing profile handles check their key against the keyring on reads and
+mutations, so a handle opened before reset cannot recreate discarded history.
+Keyring compromise is outside the rollback boundary; a filesystem-backed
+keyring needs protection independent of the MPP state-file snapshots.
+
 Commit claims durable state before policy accounting or key access. Policy usage
 is recorded before signing and is never refunded from an absent receipt. The
 signer handle loads the secret only at the actual sign call. Mandatory signed

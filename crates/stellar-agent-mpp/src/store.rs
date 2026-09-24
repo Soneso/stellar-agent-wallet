@@ -1,4 +1,4 @@
-//! Locked, HMAC-authenticated, atomic MPP authorization persistence.
+//! Locked, HMAC-authenticated MPP persistence with a keyring generation anchor.
 
 use std::{
     collections::HashSet,
@@ -11,7 +11,10 @@ use std::{
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use stellar_agent_core::profile::schema::canonical_data_root;
+use stellar_agent_core::{
+    audit_log::{AuditEntry, AuditWriterRegistry},
+    profile::schema::{KeyringEntryRef, Profile, canonical_data_root},
+};
 use subtle::ConstantTimeEq as _;
 use zeroize::Zeroizing;
 
@@ -25,7 +28,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 const HMAC_TAG_BYTES: usize = 32;
 const HMAC_DOMAIN: &[u8] = b"stellar-agent-mpp-state:v1\0";
-const STORE_VERSION: u32 = 1;
+const STORE_VERSION: u32 = 2;
 const MAX_STORE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ACTIVE_RECORDS: usize = 1_000;
 const MAX_TOTAL_RECORDS: usize = MAX_ACTIVE_RECORDS * 2;
@@ -34,6 +37,8 @@ const TERMINAL_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 #[derive(Default, Deserialize, Serialize)]
 struct WireStore {
     version: u32,
+    #[serde(default)]
+    generation: u64,
     records: Vec<AuthorizationRecord>,
 }
 
@@ -45,6 +50,8 @@ struct StoreLock {
 pub struct MppAuthorizationStore {
     path: PathBuf,
     key: Zeroizing<[u8; 32]>,
+    generation_entry: KeyringEntryRef,
+    state_key_entry: Option<KeyringEntryRef>,
 }
 
 impl fmt::Debug for MppAuthorizationStore {
@@ -58,18 +65,23 @@ impl fmt::Debug for MppAuthorizationStore {
 }
 
 impl MppAuthorizationStore {
-    /// Creates a store handle at an explicit path with an injected HMAC key.
+    /// Creates a store handle with an injected key and a trusted generation entry.
+    ///
+    /// The caller must provision the entry to `0` only for a new store and retain
+    /// it across handles and process restarts. Its contents belong in the keyring,
+    /// outside the filesystem containing the state snapshots.
     #[must_use]
-    pub fn at_path(path: PathBuf, key: [u8; 32]) -> Self {
+    pub fn at_path(path: PathBuf, key: [u8; 32], generation_entry: KeyringEntryRef) -> Self {
         Self {
             path,
             key: Zeroizing::new(key),
+            generation_entry,
+            state_key_entry: None,
         }
     }
 
-    /// Creates a store handle under the canonical wallet data root. The file
-    /// name is a hash of the profile name, so hostile profile characters never
-    /// become path components.
+    /// Creates a handle under the canonical root with the profile's generation
+    /// entry. The hashed profile name cannot introduce path components.
     ///
     /// # Errors
     ///
@@ -80,109 +92,215 @@ impl MppAuthorizationStore {
         Ok(Self::at_path(
             root.join("mpp").join(format!("{stem}.state")),
             key,
+            generation_entry_ref(&KeyringEntryRef::default_mpp_state_key(profile_name)),
         ))
     }
 
-    /// Opens the canonical per-profile store for the prepare path, minting the
-    /// state key when the profile has none.
+    /// Opens and verifies the prepare store, provisioning a key and initial
+    /// generation for a new profile under the store lock.
     ///
-    /// A key is minted only for a genuinely new store: a missing key for an
-    /// existing state file fails closed so state deletion or key rotation
-    /// cannot silently reset replay protection. This is the only entry point
-    /// that writes key material, and it is reached only after validation and
-    /// successful simulation.
+    /// An advanced counter survives missing state or key material. Verified
+    /// version 1 history is adopted once with a mandatory audit row.
     ///
     /// # Errors
     ///
-    /// Returns `mpp.state_unavailable` when the keyring, the data root, or an
-    /// existing key is unavailable, or when a state file exists without its
-    /// key.
-    pub fn open_for_prepare(profile_name: &str) -> Result<Self, MppError> {
-        use stellar_agent_core::profile::schema::KeyringEntryRef;
-        use stellar_agent_network::keyring::{load_hmac_key_32, rotate_keyring_secret_32};
-
+    /// Returns `mpp.state_unavailable` for inaccessible or unverifiable state,
+    /// an invalid anchor, or rollback. Only a proven absent key may be minted.
+    pub fn open_for_prepare(profile_name: &str, profile: &Profile) -> Result<Self, MppError> {
         let placeholder = Self::for_profile(profile_name, [0; 32])?;
         let entry_ref = KeyringEntryRef::default_mpp_state_key(profile_name);
-        let key = match load_hmac_key_32(&entry_ref) {
-            Ok(key) => key,
-            Err(_) if provably_absent(&placeholder.path) => {
-                // The outward contract is the uniform `mpp.state_unavailable`;
-                // the already-classified `WalletError` is preserved at debug
-                // for operator forensics only.
-                rotate_keyring_secret_32(&entry_ref.service, &entry_ref.account).map_err(
-                    |error| {
-                        tracing::debug!(error = %error, "mpp state key rotation failed");
-                        state_error()
-                    },
-                )?;
-                load_hmac_key_32(&entry_ref).map_err(|error| {
-                    tracing::debug!(error = %error, "mpp state key reload after rotation failed");
-                    state_error()
-                })?
-            }
-            Err(error) => {
-                tracing::debug!(error = %error, "mpp state key load failed");
-                return Err(state_error());
-            }
-        };
-        Ok(Self {
-            path: placeholder.path,
-            key,
+        Self::open_for_prepare_audited_at(placeholder.path, &entry_ref, |generation| {
+            emit_state_audit(
+                profile,
+                profile_name,
+                AuditEntry::new_mpp_state_adopted(
+                    profile_name,
+                    generation,
+                    uuid::Uuid::new_v4().to_string(),
+                ),
+            )
         })
     }
 
-    /// Opens the canonical per-profile store for a read-only verb, reporting a
-    /// profile that has never minted MPP state as `Ok(None)` rather than as a
-    /// failure.
-    ///
-    /// `Ok(None)` requires proof of both halves of the never-minted state: the
-    /// keyring key does not load AND the state path provably holds nothing. A
-    /// key that does not load while a state file exists is a store that exists
-    /// and cannot be used, and fails closed — so state deletion or key rotation
-    /// can never be answered as "nothing was ever here".
+    fn open_for_prepare_audited_at(
+        path: PathBuf,
+        entry_ref: &KeyringEntryRef,
+        adopt: impl FnOnce(u64) -> Result<(), MppError>,
+    ) -> Result<Self, MppError> {
+        use stellar_agent_network::keyring::{load_hmac_key_32, rotate_keyring_secret_32};
+
+        let mut store = Self::at_path(path, [0; 32], generation_entry_ref(entry_ref));
+        let _lock = store.acquire_lock()?;
+        let generation = load_generation(&store.generation_entry)?;
+        if generation.is_some_and(|value| value > 0) && provably_absent(&store.path) {
+            return Err(rollback_error());
+        }
+        if key_is_absent(entry_ref)? {
+            if !provably_absent(&store.path) || generation.is_some_and(|value| value > 0) {
+                return Err(state_error());
+            }
+            if generation.is_none() {
+                write_generation(&store.generation_entry, 0)?;
+            }
+            rotate_keyring_secret_32(&entry_ref.service, &entry_ref.account).map_err(|error| {
+                tracing::debug!(error = %error, "mpp state key mint failed");
+                state_error()
+            })?;
+        }
+        store.key = load_hmac_key_32(entry_ref).map_err(|error| {
+            tracing::debug!(error = %error, "mpp state key load failed");
+            state_error()
+        })?;
+        store.state_key_entry = Some(entry_ref.clone());
+        store.verify_or_adopt(adopt)?;
+        Ok(store)
+    }
+
+    /// Opens a read handle, returning `Ok(None)` only for provably absent state
+    /// and key material with no advanced generation. Keyring failures refuse.
     ///
     /// # Errors
     ///
-    /// Returns `mpp.state_unavailable` when the data root is unavailable, or
-    /// when the state key cannot be loaded while a state file exists.
-    pub fn open_for_read(profile_name: &str) -> Result<Option<Self>, MppError> {
-        use stellar_agent_core::profile::schema::KeyringEntryRef;
-
+    /// Returns `mpp.state_unavailable` for inaccessible or unverifiable state,
+    /// or an invalid anchor. A missing file with an advanced anchor is rolled back.
+    pub fn open_for_read(profile_name: &str, profile: &Profile) -> Result<Option<Self>, MppError> {
         let placeholder = Self::for_profile(profile_name, [0; 32])?;
         let entry_ref = KeyringEntryRef::default_mpp_state_key(profile_name);
-        Self::open_for_read_at(placeholder.path, &entry_ref)
+        Self::open_for_read_audited_at(placeholder.path, &entry_ref, |generation| {
+            emit_state_audit(
+                profile,
+                profile_name,
+                AuditEntry::new_mpp_state_adopted(
+                    profile_name,
+                    generation,
+                    uuid::Uuid::new_v4().to_string(),
+                ),
+            )
+        })
     }
 
-    /// Path-injectable seam behind [`Self::open_for_read`].
-    ///
-    /// The public entry point supplies the canonical per-profile path; unit
-    /// tests supply a temporary one. Tests must drive this seam rather than
-    /// [`Self::open_for_read`]: under `cargo test -p stellar-agent-mpp --lib`
-    /// — how CI runs them — `stellar-agent-core` is built as a plain
-    /// dependency, so [`canonical_data_root`]'s `STELLAR_AGENT_HOME` override
-    /// is compiled out and a test going through the public entry point would
-    /// read and write the operator's real data root.
-    fn open_for_read_at(
+    /// Tests inject a temporary path so isolated unit runs cannot reach the
+    /// operator's data root when core's home override is compiled out.
+    fn open_for_read_audited_at(
         path: PathBuf,
-        entry_ref: &stellar_agent_core::profile::schema::KeyringEntryRef,
+        entry_ref: &KeyringEntryRef,
+        adopt: impl FnOnce(u64) -> Result<(), MppError>,
     ) -> Result<Option<Self>, MppError> {
         use stellar_agent_network::keyring::load_hmac_key_32;
 
-        match load_hmac_key_32(entry_ref) {
-            Ok(key) => Ok(Some(Self { path, key })),
-            Err(error) if provably_absent(&path) => {
-                // The classified `WalletError` is preserved at debug only: the
-                // outward answer is "this profile has no MPP state", which is
-                // true of every cause a failed key load can have while no
-                // state file exists.
-                tracing::debug!(error = %error, "mpp state key absent; reporting first run");
-                Ok(None)
-            }
-            Err(error) => {
-                tracing::debug!(error = %error, "mpp state key load failed");
-                Err(state_error())
-            }
+        let mut store = Self::at_path(path, [0; 32], generation_entry_ref(entry_ref));
+        // The lock also serializes first-read adoption and prepare/reset.
+        let _lock = store.acquire_lock()?;
+        let generation = load_generation(&store.generation_entry)?;
+        if generation.is_some_and(|value| value > 0) && provably_absent(&store.path) {
+            return Err(rollback_error());
         }
+        if key_is_absent(entry_ref)? {
+            return if provably_absent(&store.path) {
+                Ok(None)
+            } else {
+                Err(state_error())
+            };
+        }
+        store.key = load_hmac_key_32(entry_ref).map_err(|_error| state_error())?;
+        store.state_key_entry = Some(entry_ref.clone());
+        store.verify_or_adopt(adopt)?;
+        Ok(Some(store))
+    }
+
+    #[cfg(test)]
+    fn open_for_read_at(
+        path: PathBuf,
+        entry_ref: &KeyringEntryRef,
+    ) -> Result<Option<Self>, MppError> {
+        Self::open_for_read_audited_at(path, entry_ref, |_| Err(anchor_error()))
+    }
+
+    #[cfg(test)]
+    fn open_for_prepare_at(path: PathBuf, entry_ref: &KeyringEntryRef) -> Result<Self, MppError> {
+        Self::open_for_prepare_audited_at(path, entry_ref, |_| Err(anchor_error()))
+    }
+
+    fn verify_or_adopt(
+        &self,
+        audit: impl FnOnce(u64) -> Result<(), MppError>,
+    ) -> Result<(), MppError> {
+        if load_generation(&self.generation_entry)?.is_some() {
+            return self.read_verified().map(|_| ());
+        }
+        if provably_absent(&self.path) {
+            return Err(anchor_error());
+        }
+        let mut wire = self.read_authenticated()?;
+        // Every version 2 snapshot is published after its counter, so one with
+        // an absent counter proves the anchor was removed and is not adopted.
+        if wire.version != 1 {
+            return Err(anchor_error());
+        }
+        // The initial zero counter means no file has been committed. A version
+        // 1 snapshot therefore enters the protected format at generation one.
+        wire.version = STORE_VERSION;
+        wire.generation = 1;
+        audit(wire.generation)?;
+        self.write_atomic(&wire)
+    }
+
+    /// Discards MPP replay history after an operator acknowledgement at the
+    /// caller. The reset request is audited under the store lock before mutation.
+    /// A fresh HMAC key prevents snapshots from the discarded history matching
+    /// generations reused by a clean store.
+    ///
+    /// # Errors
+    ///
+    /// Refuses on lock, audit, keyring access, or filesystem errors. A failed
+    /// reset can be retried with the same explicit acknowledgement.
+    pub fn reset_for_profile(
+        profile_name: &str,
+        profile: &Profile,
+        reason: &str,
+    ) -> Result<Option<u64>, MppError> {
+        let placeholder = Self::for_profile(profile_name, [0; 32])?;
+        let key_ref = KeyringEntryRef::default_mpp_state_key(profile_name);
+        Self::reset_at(placeholder.path, &key_ref, |generation| {
+            emit_state_audit(
+                profile,
+                profile_name,
+                AuditEntry::new_mpp_state_reset(
+                    profile_name,
+                    generation,
+                    reason,
+                    uuid::Uuid::new_v4().to_string(),
+                ),
+            )
+        })
+    }
+
+    fn reset_at(
+        path: PathBuf,
+        key_ref: &KeyringEntryRef,
+        audit: impl FnOnce(Option<u64>) -> Result<(), MppError>,
+    ) -> Result<Option<u64>, MppError> {
+        let store = Self::at_path(path, [0; 32], generation_entry_ref(key_ref));
+        let _lock = store.acquire_lock()?;
+        let discarded =
+            load_generation_value(&store.generation_entry)?.and_then(|value| value.parse().ok());
+        audit(discarded)?;
+        stellar_agent_network::keyring::rotate_keyring_secret_32(
+            &key_ref.service,
+            &key_ref.account,
+        )
+        .map_err(|_error| state_error())?;
+        match fs::remove_file(&store.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(state_error()),
+        }
+        #[cfg(unix)]
+        File::open(store.path.parent().ok_or_else(state_error)?)
+            .and_then(|parent| parent.sync_all())
+            .map_err(|_error| state_error())?;
+        write_generation(&store.generation_entry, 0)?;
+        Ok(discarded)
     }
 
     /// Inserts a newly prepared record or returns the existing identical record.
@@ -595,6 +713,7 @@ impl MppAuthorizationStore {
         let _lock = self.acquire_lock()?;
         let mut wire = self.read_verified()?;
         let result = update(&mut wire)?;
+        wire.generation = wire.generation.checked_add(1).ok_or_else(state_error)?;
         self.write_atomic(&wire)?;
         Ok(result)
     }
@@ -663,15 +782,36 @@ impl MppAuthorizationStore {
     }
 
     fn read_verified(&self) -> Result<WireStore, MppError> {
+        if let Some(key_ref) = &self.state_key_entry {
+            let current = stellar_agent_network::keyring::load_hmac_key_32(key_ref)
+                .map_err(|_error| state_error())?;
+            if !bool::from(self.key.as_slice().ct_eq(current.as_slice())) {
+                return Err(rollback_error());
+            }
+        }
         // Only a proven absence reads as an empty store. Any other outcome —
         // a dangling symlink at the state path included — falls through to the
         // symlink and metadata checks and fails closed there.
         if provably_absent(&self.path) {
-            return Ok(WireStore {
-                version: STORE_VERSION,
-                records: Vec::new(),
-            });
+            return match load_generation(&self.generation_entry)? {
+                Some(0) => Ok(WireStore {
+                    version: STORE_VERSION,
+                    generation: 0,
+                    records: Vec::new(),
+                }),
+                Some(_) => Err(rollback_error()),
+                None => Err(anchor_error()),
+            };
         }
+        let wire = self.read_authenticated()?;
+        let generation = load_generation(&self.generation_entry)?.ok_or_else(anchor_error)?;
+        if wire.version != STORE_VERSION || wire.generation != generation || generation == 0 {
+            return Err(rollback_error());
+        }
+        Ok(wire)
+    }
+
+    fn read_authenticated(&self) -> Result<WireStore, MppError> {
         reject_symlink(&self.path)?;
         let metadata = fs::metadata(&self.path).map_err(|_error| state_error())?;
         if !metadata.is_file()
@@ -689,7 +829,11 @@ impl MppAuthorizationStore {
             return Err(state_error());
         }
         let wire: WireStore = serde_json::from_slice(body).map_err(|_error| state_error())?;
-        if wire.version != STORE_VERSION || wire.records.len() > MAX_TOTAL_RECORDS {
+        if !matches!(
+            (wire.version, wire.generation),
+            (1, 0) | (STORE_VERSION, 1..)
+        ) || wire.records.len() > MAX_TOTAL_RECORDS
+        {
             return Err(state_error());
         }
         let mut authorization_ids = HashSet::with_capacity(wire.records.len());
@@ -716,6 +860,10 @@ impl MppAuthorizationStore {
         }
         let tag = compute_tag(&self.key, &body)?;
         let parent = self.path.parent().ok_or_else(state_error)?;
+        // Advance before publishing any authenticated snapshot, including a temp
+        // file. An interrupted write leaves a gap that refuses; its generation
+        // can never be reused for a different snapshot.
+        write_generation(&self.generation_entry, wire.generation)?;
         let mut temporary =
             tempfile::NamedTempFile::new_in(parent).map_err(|_error| state_error())?;
         temporary.write_all(&tag).map_err(|_error| state_error())?;
@@ -735,6 +883,80 @@ impl MppAuthorizationStore {
         }
         Ok(())
     }
+}
+
+fn emit_state_audit(
+    profile: &Profile,
+    profile_name: &str,
+    entry: AuditEntry,
+) -> Result<(), MppError> {
+    let unavailable = || {
+        MppError::new(
+            MppErrorCode::StateUnavailable,
+            "MPP authorization state audit is unavailable",
+        )
+    };
+    let access =
+        stellar_agent_network::keyring::keyed_audit_access(profile).map_err(|_| unavailable())?;
+    let writer =
+        AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access)
+            .map_err(|_| unavailable())?;
+    writer
+        .lock()
+        .map_err(|_| unavailable())?
+        .write_entry(entry)
+        .map_err(|_| unavailable())
+}
+
+/// The counter shares the state key's service and uses a distinct account.
+fn generation_entry_ref(key: &KeyringEntryRef) -> KeyringEntryRef {
+    KeyringEntryRef::new(key.service.clone(), format!("{}-generation", key.account))
+}
+
+fn load_generation(entry_ref: &KeyringEntryRef) -> Result<Option<u64>, MppError> {
+    load_generation_value(entry_ref)?
+        .map(|value| value.parse().map_err(|_| anchor_error()))
+        .transpose()
+}
+
+fn load_generation_value(entry_ref: &KeyringEntryRef) -> Result<Option<String>, MppError> {
+    let entry = keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+        .map_err(|_error| state_error())?;
+    match entry.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring_core::Error::NoEntry) => Ok(None),
+        Err(_error) => Err(state_error()),
+    }
+}
+
+fn write_generation(entry_ref: &KeyringEntryRef, generation: u64) -> Result<(), MppError> {
+    keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+        .and_then(|entry| entry.set_password(&generation.to_string()))
+        .map_err(|_error| state_error())
+}
+
+fn key_is_absent(entry_ref: &KeyringEntryRef) -> Result<bool, MppError> {
+    let entry = keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+        .map_err(|_error| state_error())?;
+    match entry.get_password().map(Zeroizing::new) {
+        Ok(_) => Ok(false),
+        Err(keyring_core::Error::NoEntry) => Ok(true),
+        Err(_error) => Err(state_error()),
+    }
+}
+
+const fn rollback_error() -> MppError {
+    MppError::new(
+        MppErrorCode::StateUnavailable,
+        "MPP authorization state is rolled back; recover with stellar-agent profile reset-mpp-state <NAME> --acknowledge --reason <REASON>",
+    )
+}
+
+const fn anchor_error() -> MppError {
+    MppError::new(
+        MppErrorCode::StateUnavailable,
+        "MPP authorization state generation anchor is missing or invalid; recover with stellar-agent profile reset-mpp-state <NAME> --acknowledge --reason <REASON>",
+    )
 }
 
 fn compute_tag(key: &[u8; 32], body: &[u8]) -> Result<[u8; 32], MppError> {
@@ -865,7 +1087,7 @@ const fn replay_error() -> MppError {
 /// the operator's real data root. No feature unification in that invocation
 /// changes it.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(
         clippy::expect_used,
         reason = "test fixtures use expect for concise setup"
@@ -879,6 +1101,23 @@ mod tests {
     use stellar_agent_core::profile::schema::KeyringEntryRef;
     use stellar_agent_network::keyring::{load_hmac_key_32, rotate_keyring_secret_32};
     use tempfile::TempDir;
+
+    pub(crate) fn test_store(path: PathBuf, key: [u8; 32]) -> MppAuthorizationStore {
+        let entry = KeyringEntryRef::new(
+            format!(
+                "mpp-test-{}",
+                hex::encode(Sha256::digest(path.as_os_str().as_encoded_bytes()))
+            ),
+            "generation",
+        );
+        if load_generation(&entry)
+            .expect("read fixture anchor")
+            .is_none()
+        {
+            write_generation(&entry, 0).expect("initialize fixture anchor");
+        }
+        MppAuthorizationStore::at_path(path, key, entry)
+    }
 
     /// A well-formed identifier no store in this suite holds.
     const UNKNOWN_ID: &str = "mpp_00000000000000000000000000000000";
@@ -898,9 +1137,11 @@ mod tests {
     /// whether a profile has ever minted MPP state by sending one malformed
     /// identifier and reading which code came back.
     #[test]
+    #[serial_test::serial]
     fn a_malformed_identifier_classifies_identically_with_and_without_a_store() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let directory = TempDir::new().expect("tempdir");
-        let store = MppAuthorizationStore::at_path(directory.path().join("state"), [7; 32]);
+        let store = test_store(directory.path().join("state"), [7; 32]);
 
         for malformed in ["", "mpp_short", "mpp_G0000000000000000000000000000000"] {
             assert_eq!(
@@ -993,25 +1234,20 @@ mod tests {
         );
     }
 
-    /// A minted key with no file yet is a normal open that reads empty.
-    ///
-    /// This is the legitimate post-mint, pre-first-write state: the prepare
-    /// path mints the key before the first `insert_prepared` creates the file
-    /// and its directory, and a prepare denied after minting leaves exactly
-    /// this state — so the store directory is deliberately absent here. This
-    /// quadrant can never be treated as an error. It is also the state an
-    /// operator reaches by deleting the file alone, which this store cannot
-    /// detect — an anti-rollback guard would need a generation counter carried
-    /// outside the file, in the `PersistedWindowStore` style, and is not
-    /// attempted here.
-    #[test]
+    /// A minted key and initial counter with no file is the legitimate
+    /// post-mint, pre-first-write state. A prepare denied after minting leaves
+    /// this state, so reading must remain empty and a first prepare must work.
+    #[tokio::test]
     #[serial_test::serial]
-    fn open_for_read_opens_a_minted_store_before_its_first_write() {
+    async fn open_for_read_opens_a_minted_store_before_its_first_write() {
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let directory = TempDir::new().expect("tempdir");
         let path = directory.path().join("mpp").join("state");
         let entry_ref = state_key_coordinates("mpp-quadrant-minted-no-file");
-        rotate_keyring_secret_32(&entry_ref.service, &entry_ref.account).expect("mint the key");
+        MppAuthorizationStore::open_for_prepare_at(path.clone(), &entry_ref)
+            .expect("mint key and initial counter");
+        fs::remove_dir_all(path.parent().expect("store directory"))
+            .expect("remove empty store directory");
 
         let store = MppAuthorizationStore::open_for_read_at(path.clone(), &entry_ref)
             .expect("a minted key opens the store")
@@ -1027,6 +1263,313 @@ mod tests {
              it is not a store that cannot be used"
         );
         assert!(!path.exists(), "a read must not create the state file");
+        assert_eq!(
+            load_generation(&generation_entry_ref(&entry_ref)).expect("test value"),
+            Some(0)
+        );
+        let reopened =
+            MppAuthorizationStore::open_for_prepare_at(path, &entry_ref).expect("first prepare");
+        let now = 1_700_000_000;
+        let (prepared, _signer, _rpc) = prepared_fixture(now).await;
+        let record = AuthorizationRecord::new("first", TESTNET_PASSPHRASE, &prepared, now)
+            .expect("test value");
+        let id = record.authorization_id().to_owned();
+        reopened.insert_prepared(record, now).expect("first record");
+        assert_eq!(
+            reopened.load(&id).expect("test value").authorization_id(),
+            id
+        );
+        let bytes = fs::read(&reopened.path).expect("test value");
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes[HMAC_TAG_BYTES..]).expect("test value");
+        assert_eq!(body["version"], 2);
+        assert_eq!(body["generation"], 1);
+        assert_eq!(
+            load_generation(&generation_entry_ref(&entry_ref)).expect("test value"),
+            Some(1)
+        );
+    }
+
+    /// The keyring counter preserves history when filesystem state disappears.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn anti_rollback_deleted_state_refuses_on_existing_and_reopened_handles() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("test value");
+        let path = directory.path().join("state");
+        let key_ref = state_key_coordinates("deleted-state");
+        let store =
+            MppAuthorizationStore::open_for_prepare_at(path.clone(), &key_ref).expect("test value");
+        let now = 1_700_000_000;
+        let (prepared, _signer, _rpc) = prepared_fixture(now).await;
+        let record = AuthorizationRecord::new("delete", TESTNET_PASSPHRASE, &prepared, now)
+            .expect("test value");
+        let id = record.authorization_id().to_owned();
+        store.insert_prepared(record, now).expect("test value");
+        fs::remove_file(&path).expect("test value");
+        for error in [
+            store.load(&id).expect_err("refusal"),
+            store.prune(now).expect_err("refusal"),
+            MppAuthorizationStore::open_for_read_at(path.clone(), &key_ref).expect_err("refusal"),
+            MppAuthorizationStore::open_for_prepare_at(path.clone(), &key_ref)
+                .expect_err("refusal"),
+        ] {
+            assert_eq!(error.code(), STATE_CODE);
+            assert!(error.message().contains("state is rolled back"));
+        }
+        keyring_core::Entry::new(&key_ref.service, &key_ref.account)
+            .expect("test value")
+            .delete_credential()
+            .expect("test value");
+        assert!(
+            MppAuthorizationStore::open_for_read_at(path.clone(), &key_ref)
+                .expect_err("refusal")
+                .message()
+                .contains("rolled back")
+        );
+        assert!(
+            MppAuthorizationStore::open_for_prepare_at(path.clone(), &key_ref)
+                .expect_err("refusal")
+                .message()
+                .contains("rolled back")
+        );
+        assert!(!path.exists());
+        assert_eq!(
+            load_generation(&generation_entry_ref(&key_ref)).expect("test value"),
+            Some(1)
+        );
+    }
+
+    /// An authentic older snapshot cannot replace the committed generation.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn anti_rollback_restored_snapshot_refuses_reads_and_mutations() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("test value");
+        let path = directory.path().join("state");
+        let key_ref = state_key_coordinates("restored-state");
+        let store =
+            MppAuthorizationStore::open_for_prepare_at(path.clone(), &key_ref).expect("test value");
+        let now = 1_700_000_000;
+        let (prepared, _signer, _rpc) = prepared_fixture(now).await;
+        let first = AuthorizationRecord::new("first", TESTNET_PASSPHRASE, &prepared, now)
+            .expect("test value");
+        let id = first.authorization_id().to_owned();
+        store.insert_prepared(first, now).expect("test value");
+        let old = fs::read(&path).expect("test value");
+        let second = AuthorizationRecord::new("second", TESTNET_PASSPHRASE, &prepared, now)
+            .expect("test value");
+        store.insert_prepared(second, now).expect("test value");
+        assert_eq!(
+            load_generation(&generation_entry_ref(&key_ref)).expect("test value"),
+            Some(2)
+        );
+        fs::write(&path, &old).expect("test value");
+        assert!(MppAuthorizationStore::open_for_read_at(path.clone(), &key_ref).is_err());
+        for error in [
+            store.load(&id).expect_err("refusal"),
+            store.prune(now).expect_err("refusal"),
+            MppAuthorizationStore::open_for_prepare_at(path.clone(), &key_ref)
+                .expect_err("refusal"),
+        ] {
+            assert_eq!(error.code(), STATE_CODE);
+            assert!(error.message().contains("state is rolled back"));
+        }
+        assert_eq!(fs::read(&path).expect("test value"), old);
+        assert_eq!(
+            load_generation(&generation_entry_ref(&key_ref)).expect("test value"),
+            Some(2)
+        );
+    }
+
+    /// An anchor failure cannot publish a new authenticated snapshot.
+    #[test]
+    #[serial_test::serial]
+    fn anti_rollback_anchor_write_failure_leaves_no_snapshot() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("test value");
+        let path = directory.path().join("state");
+        let store = test_store(path.clone(), [7; 32]);
+        store.ensure_parent().expect("test value");
+        stellar_agent_test_support::keyring_mock::inject_no_logon_session(
+            &store.generation_entry.service,
+            &store.generation_entry.account,
+        )
+        .expect("test value");
+        let wire = WireStore {
+            version: STORE_VERSION,
+            generation: 1,
+            records: Vec::new(),
+        };
+        assert_eq!(
+            store.write_atomic(&wire).expect_err("refusal").code(),
+            STATE_CODE
+        );
+        assert!(!path.exists());
+        assert_eq!(
+            load_generation(&store.generation_entry).expect("test value"),
+            Some(0)
+        );
+    }
+
+    /// A failed filesystem commit consumes its generation before any snapshot
+    /// is published, so an abandoned temporary file cannot reuse a generation.
+    #[test]
+    #[serial_test::serial]
+    fn anti_rollback_failed_file_commit_retains_the_advanced_anchor() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("test value");
+        let path = directory.path().join("state");
+        let store = test_store(path.clone(), [7; 32]);
+        store
+            .mutate(|_wire| {
+                fs::create_dir(&path).expect("test value");
+                Ok(())
+            })
+            .expect_err("a directory blocks the atomic file replacement");
+        assert_eq!(
+            load_generation(&store.generation_entry).expect("test value"),
+            Some(1)
+        );
+        fs::remove_dir(&path).expect("test value");
+        assert!(
+            store
+                .load(UNKNOWN_ID)
+                .expect_err("refusal")
+                .message()
+                .contains("rolled back")
+        );
+    }
+
+    /// A missing, malformed, or inaccessible anchor never reads as empty state.
+    #[test]
+    #[serial_test::serial]
+    fn anti_rollback_untrusted_anchor_refuses_without_reinitialization() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("test value");
+        let path = directory.path().join("state");
+        let key_ref = state_key_coordinates("untrusted-anchor");
+        let store =
+            MppAuthorizationStore::open_for_prepare_at(path.clone(), &key_ref).expect("test value");
+        let anchor = keyring_core::Entry::new(
+            &store.generation_entry.service,
+            &store.generation_entry.account,
+        )
+        .expect("test value");
+        anchor.delete_credential().expect("test value");
+        assert!(
+            store
+                .load(UNKNOWN_ID)
+                .expect_err("refusal")
+                .message()
+                .contains("anchor is missing")
+        );
+        assert!(
+            MppAuthorizationStore::open_for_read_at(path.clone(), &key_ref)
+                .expect_err("refusal")
+                .message()
+                .contains("anchor is missing")
+        );
+        assert!(
+            MppAuthorizationStore::open_for_prepare_at(path.clone(), &key_ref)
+                .expect_err("refusal")
+                .message()
+                .contains("anchor is missing")
+        );
+        assert!(matches!(
+            anchor.get_password(),
+            Err(keyring_core::Error::NoEntry)
+        ));
+        anchor.set_password("invalid").expect("test value");
+        assert_eq!(
+            store.load(UNKNOWN_ID).expect_err("refusal").code(),
+            STATE_CODE
+        );
+        assert_eq!(
+            MppAuthorizationStore::open_for_prepare_at(path.clone(), &key_ref)
+                .expect_err("refusal")
+                .code(),
+            STATE_CODE
+        );
+        assert_eq!(anchor.get_password().expect("test value"), "invalid");
+        anchor.set_password("0").expect("test value");
+        stellar_agent_test_support::keyring_mock::inject_no_logon_session(
+            &store.generation_entry.service,
+            &store.generation_entry.account,
+        )
+        .expect("test value");
+        assert_eq!(
+            store.load(UNKNOWN_ID).expect_err("refusal").code(),
+            STATE_CODE
+        );
+        assert!(!path.exists());
+        anchor.delete_credential().expect("remove fixture anchor");
+    }
+
+    /// Generation exhaustion refuses without wrapping or changing the snapshot.
+    #[test]
+    #[serial_test::serial]
+    fn anti_rollback_generation_overflow_refuses_without_writing() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("test value");
+        let path = directory.path().join("state");
+        let store = test_store(path.clone(), [7; 32]);
+        store.ensure_parent().expect("test value");
+        store
+            .write_atomic(&WireStore {
+                version: STORE_VERSION,
+                generation: u64::MAX,
+                records: Vec::new(),
+            })
+            .expect("test value");
+        let snapshot = fs::read(&path).expect("test value");
+        assert_eq!(
+            store.prune(1_700_000_000).expect_err("refusal").code(),
+            STATE_CODE
+        );
+        assert_eq!(
+            load_generation(&store.generation_entry).expect("test value"),
+            Some(u64::MAX)
+        );
+        assert_eq!(fs::read(path).expect("test value"), snapshot);
+    }
+
+    /// Keyring outages do not prove absence and cannot authorize key minting.
+    #[test]
+    #[serial_test::serial]
+    fn anti_rollback_initialization_refuses_keyring_access_errors() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("test value");
+        let path = directory.path().join("state");
+        let key_ref = state_key_coordinates("inaccessible-key");
+        stellar_agent_test_support::keyring_mock::inject_no_logon_session(
+            &key_ref.service,
+            &key_ref.account,
+        )
+        .expect("test value");
+        assert_eq!(
+            MppAuthorizationStore::open_for_read_at(path.clone(), &key_ref)
+                .expect_err("refusal")
+                .code(),
+            STATE_CODE
+        );
+        stellar_agent_test_support::keyring_mock::inject_no_logon_session(
+            &key_ref.service,
+            &key_ref.account,
+        )
+        .expect("test value");
+        assert_eq!(
+            MppAuthorizationStore::open_for_prepare_at(path.clone(), &key_ref)
+                .expect_err("refusal")
+                .code(),
+            STATE_CODE
+        );
+        assert!(key_is_absent(&key_ref).expect("test value"));
+        assert_eq!(
+            load_generation(&generation_entry_ref(&key_ref)).expect("test value"),
+            None
+        );
+        assert!(!path.exists());
     }
 
     /// The negative control: a minted key over an existing file opens normally
@@ -1049,7 +1592,8 @@ mod tests {
         let record = AuthorizationRecord::new("quadrant", TESTNET_PASSPHRASE, &prepared, now)
             .expect("record");
         let id = record.authorization_id().to_owned();
-        MppAuthorizationStore::at_path(path.clone(), *key)
+        write_generation(&generation_entry_ref(&entry_ref), 0).expect("initial anchor");
+        MppAuthorizationStore::at_path(path.clone(), *key, generation_entry_ref(&entry_ref))
             .insert_prepared(record, now)
             .expect("seed one prepared record");
         assert!(path.exists(), "the fixture must have written the file");
@@ -1081,9 +1625,11 @@ mod tests {
     /// a record loaded under this same lock moments earlier, so a record
     /// missing there is corruption, not a caller mistake.
     #[test]
+    #[serial_test::serial]
     fn a_caller_supplied_identifier_is_not_found_while_a_lifecycle_transition_is_a_state_failure() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let directory = TempDir::new().expect("tempdir");
-        let store = MppAuthorizationStore::at_path(directory.path().join("state"), [7; 32]);
+        let store = test_store(directory.path().join("state"), [7; 32]);
         let now = 1_700_000_000;
         let receipt = parse_receipt(&ReceiptInput::Mcp {
             receipt: serde_json::json!({
@@ -1142,10 +1688,12 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn empty_store_is_lazy_until_mutation() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let directory = TempDir::new().expect("tempdir");
         let path = directory.path().join("state");
-        let store = MppAuthorizationStore::at_path(path.clone(), [7; 32]);
+        let store = test_store(path.clone(), [7; 32]);
         assert_eq!(
             store
                 .load(UNKNOWN_ID)
@@ -1157,12 +1705,15 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn hmac_tamper_fails_closed() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let directory = TempDir::new().expect("tempdir");
         let path = directory.path().join("state");
-        let store = MppAuthorizationStore::at_path(path.clone(), [7; 32]);
+        let store = test_store(path.clone(), [7; 32]);
         let wire = WireStore {
             version: STORE_VERSION,
+            generation: 1,
             records: Vec::new(),
         };
         store.ensure_parent().expect("parent");
@@ -1174,39 +1725,46 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn wrong_key_fails_closed() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let directory = TempDir::new().expect("tempdir");
         let path = directory.path().join("state");
-        let first = MppAuthorizationStore::at_path(path.clone(), [7; 32]);
+        let first = test_store(path.clone(), [7; 32]);
         first.ensure_parent().expect("parent");
         first
             .write_atomic(&WireStore {
                 version: STORE_VERSION,
+                generation: 1,
                 records: Vec::new(),
             })
             .expect("write");
-        let second = MppAuthorizationStore::at_path(path, [8; 32]);
+        let second = test_store(path, [8; 32]);
         assert!(second.read_verified().is_err());
     }
 
     #[test]
+    #[serial_test::serial]
     fn truncated_authenticated_store_fails_closed() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let directory = TempDir::new().expect("tempdir");
         let path = directory.path().join("state");
-        let store = MppAuthorizationStore::at_path(path.clone(), [7; 32]);
+        let store = test_store(path.clone(), [7; 32]);
         store.ensure_parent().expect("parent");
         fs::write(path, [0_u8; HMAC_TAG_BYTES - 1]).expect("truncated file");
         assert!(store.read_verified().is_err());
     }
 
     #[test]
+    #[serial_test::serial]
     fn lock_contention_fails_without_mutation() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let directory = TempDir::new().expect("tempdir");
         let path = directory.path().join("state");
-        let store = MppAuthorizationStore::at_path(path.clone(), [7; 32]);
+        let store = test_store(path.clone(), [7; 32]);
         store.ensure_parent().expect("parent");
         let lock = store.acquire_lock().expect("first lock");
-        let contender = MppAuthorizationStore::at_path(path.clone(), [7; 32]);
+        let contender = test_store(path.clone(), [7; 32]);
         assert!(contender.acquire_lock().is_err());
         assert!(!path.exists());
         drop(lock);
@@ -1215,7 +1773,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial]
     fn symlinked_state_file_fails_closed() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         use std::os::unix::fs::symlink;
 
         let directory = TempDir::new().expect("tempdir");
@@ -1223,7 +1783,7 @@ mod tests {
         let path = directory.path().join("state");
         fs::write(&target, b"not state").expect("target");
         symlink(target, &path).expect("symlink");
-        let store = MppAuthorizationStore::at_path(path, [7; 32]);
+        let store = test_store(path, [7; 32]);
         assert!(store.read_verified().is_err());
     }
 
@@ -1243,7 +1803,9 @@ mod tests {
     /// the creation or after it.
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial]
     fn a_dangling_symlink_refuses_without_creating_its_target() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         use std::os::unix::fs::symlink;
 
         let directory = TempDir::new().expect("tempdir");
@@ -1251,7 +1813,7 @@ mod tests {
         let file_target = directory.path().join("state-target");
         let path = directory.path().join("state");
         symlink(&file_target, &path).expect("dangling state symlink");
-        let store = MppAuthorizationStore::at_path(path, [7; 32]);
+        let store = test_store(path, [7; 32]);
         assert_eq!(
             store
                 .load(UNKNOWN_ID)
@@ -1267,7 +1829,7 @@ mod tests {
         let lock_target = directory.path().join("lock-target");
         let locked_path = directory.path().join("locked");
         symlink(&lock_target, sibling_path(&locked_path, ".lock")).expect("dangling lock symlink");
-        let store = MppAuthorizationStore::at_path(locked_path, [7; 32]);
+        let store = test_store(locked_path, [7; 32]);
         assert_eq!(
             store
                 .load(UNKNOWN_ID)
@@ -1283,7 +1845,7 @@ mod tests {
         let directory_target = directory.path().join("store-dir-target");
         let store_directory = directory.path().join("mpp");
         symlink(&directory_target, &store_directory).expect("dangling directory symlink");
-        let store = MppAuthorizationStore::at_path(store_directory.join("state"), [7; 32]);
+        let store = test_store(store_directory.join("state"), [7; 32]);
         assert_eq!(
             store
                 .load(UNKNOWN_ID)
@@ -1298,10 +1860,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn duplicate_authenticated_records_fail_closed() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let directory = TempDir::new().expect("tempdir");
         let path = directory.path().join("state");
-        let store = MppAuthorizationStore::at_path(path, [7; 32]);
+        let store = test_store(path, [7; 32]);
         let (prepared, _signer, _rpc) = prepared_fixture(1_700_000_000).await;
         let record =
             AuthorizationRecord::new("duplicate", TESTNET_PASSPHRASE, &prepared, 1_700_000_000)
@@ -1310,6 +1874,7 @@ mod tests {
         store
             .write_atomic(&WireStore {
                 version: STORE_VERSION,
+                generation: 1,
                 records: vec![record.clone(), record],
             })
             .expect("authenticated duplicate store");
@@ -1317,10 +1882,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn prune_removes_only_expired_records_past_terminal_retention() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let directory = TempDir::new().expect("tempdir");
         let path = directory.path().join("state");
-        let store = MppAuthorizationStore::at_path(path, [7; 32]);
+        let store = test_store(path, [7; 32]);
         let now = 1_700_000_000;
         let (prepared, _signer, _rpc) = prepared_fixture(now).await;
         let mut record =
@@ -1350,9 +1917,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn durable_transition_api_enforces_replay_receipt_and_outcome_rules() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let directory = TempDir::new().expect("tempdir");
-        let store = MppAuthorizationStore::at_path(directory.path().join("state"), [7; 32]);
+        let store = test_store(directory.path().join("state"), [7; 32]);
         let now = 1_700_000_000;
         let (prepared, _signer, _rpc) = prepared_fixture(now).await;
         let make_record = |profile: &str| {
@@ -1547,3 +2116,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod recovery_tests;

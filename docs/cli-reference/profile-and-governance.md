@@ -12,7 +12,7 @@ The `profile` group creates, lists, shows, and migrates profiles, and rotates th
 
 The seven key-writing commands — `enroll-signer`, `enroll-owner-key`, and the five key-rotation subcommands — each write a `keyring_key_written` audit row recording the key purpose and, where applicable, the redacted public address. `reset-window-state` writes the same row when the reset mints the window-state key on first use. `init` mints no key material and emits no audit row.
 
-Every `profile` subcommand accepts a `--profile <NAME>` flag. For `init`, `enroll-signer`, `enroll-owner-key`, and `sign-policy` it is the only form and resolves in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `show`, `migrate`, the `rotate-*` subcommands, and `reset-window-state` it is an alternative to the positional `<NAME>`: supply exactly one of the positional `<NAME>` or `--profile <NAME>` (supplying both, or neither, is a usage error), with no default. None of them has a confirmation flag.
+Every `profile` subcommand accepts a `--profile <NAME>` flag. For `init`, `enroll-signer`, `enroll-owner-key`, and `sign-policy` it is the only form and resolves in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `show`, `migrate`, the `rotate-*` subcommands, `reset-window-state`, and `reset-mpp-state` it is an alternative to the positional `<NAME>`: supply exactly one of the positional `<NAME>` or `--profile <NAME>` (supplying both, or neither, is a usage error), with no default. `reset-mpp-state` requires `--acknowledge`; the other profile verbs have no confirmation flag.
 
 The name itself becomes a path component and is validated before any path is built — charset, length, no leading `-`, and no Windows reserved device name. The rules and the recovery path for a file that already carries a refused name are in [Profile names](../profiles.md#profile-names).
 
@@ -193,6 +193,31 @@ Not a rotation: the fail-closed recovery path for the persisted policy-window-st
 ```bash
 stellar-agent profile reset-window-state default --reason "store file corrupted after disk failure"
 ```
+
+### `reset-mpp-state <NAME> --acknowledge --reason <REASON>`
+
+Resets MPP authorization state after rollback, an interrupted write, or an
+unrecoverable generation mismatch. Supply exactly one of positional `<NAME>` or
+`--profile <NAME>`. Both `--reason <REASON>` and `--acknowledge` are required.
+
+The acknowledgement discards replay markers for every prepared, authorized,
+indeterminate and settled charge; a charge settled before reset is no longer
+recognized as settled. Reset requires a usable audit log and writes one
+`mpp_state_reset` request row naming the profile, discarded generation and reason.
+It takes the MPP store lock, rotates the HMAC key, removes the file, and sets the
+counter to zero. The next prepare starts from an empty store. A failed reset can
+be retried with acknowledgement; each attempt records its request before changing
+state. An absent or malformed counter has a null discarded generation.
+
+```sh
+stellar-agent profile reset-mpp-state default --acknowledge --reason "MPP state recovery"
+stellar-agent profile reset-mpp-state --profile default --acknowledge --reason "MPP state recovery"
+```
+
+Verified version 1 MPP state is adopted automatically on open and records
+`mpp_state_adopted`, so an upgrade keeps its replay history. A profile whose
+state key was minted but which never stored a charge has no history to adopt
+and refuses with a missing anchor; resetting it discards nothing.
 
 ## `credentials`
 

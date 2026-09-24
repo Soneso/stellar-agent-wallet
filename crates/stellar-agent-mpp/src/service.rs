@@ -565,11 +565,13 @@ mod tests {
     const NOW: i64 = 1_700_000_000;
 
     fn store(directory: &TempDir) -> MppAuthorizationStore {
-        MppAuthorizationStore::at_path(directory.path().join("mpp.state"), [7; 32])
+        crate::store::tests::test_store(directory.path().join("mpp.state"), [7; 32])
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn repeated_prepare_promotes_ready_record_when_policy_now_requires_approval() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let directory = TempDir::new().expect("tempdir");
         let state = store(&directory);
         let (prepared, _signer, _rpc) = prepared_fixture(NOW).await;
@@ -606,7 +608,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn preview_and_approval_target_never_carry_query_values() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         use crate::sponsored::tests::prepared_fixture_for_resource;
 
         let directory = TempDir::new().expect("tempdir");
@@ -666,7 +670,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn status_derives_expiry_without_mutating_replay_state() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let directory = TempDir::new().expect("tempdir");
         let state = store(&directory);
         let (prepared, _signer, _rpc) = prepared_fixture(NOW).await;
@@ -694,7 +700,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn commit_is_one_shot_and_receipts_are_idempotent() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let directory = TempDir::new().expect("tempdir");
         let state = store(&directory);
         let (prepared, signer, rpc) = prepared_fixture(NOW).await;
@@ -803,7 +811,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn delivery_audit_failure_withholds_without_retrying_signature() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let directory = TempDir::new().expect("tempdir");
         let state = store(&directory);
         let (prepared, signer, rpc) = prepared_fixture(NOW).await;
@@ -871,7 +881,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn ambiguous_policy_accounting_fails_before_signing() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let directory = TempDir::new().expect("tempdir");
         let state = store(&directory);
         let (prepared, signer, rpc) = prepared_fixture(NOW).await;
@@ -924,10 +936,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn concurrent_claim_has_exactly_one_winner() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let directory = TempDir::new().expect("tempdir");
         let path = directory.path().join("mpp.state");
-        let state = MppAuthorizationStore::at_path(path.clone(), [7; 32]);
+        let state = crate::store::tests::test_store(path.clone(), [7; 32]);
         let (prepared, _signer, _rpc) = prepared_fixture(NOW).await;
         let preview = persist_prepared_authorization(
             "concurrent",
@@ -943,7 +957,7 @@ mod tests {
         let barrier = Arc::new(Barrier::new(2));
         let mut handles = Vec::new();
         for _ in 0..2 {
-            let store = MppAuthorizationStore::at_path(path.clone(), [7; 32]);
+            let store = crate::store::tests::test_store(path.clone(), [7; 32]);
             let id = preview.authorization_id.clone();
             let ready = Arc::clone(&barrier);
             handles.push(std::thread::spawn(move || {

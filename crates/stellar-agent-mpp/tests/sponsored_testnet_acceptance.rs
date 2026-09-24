@@ -320,7 +320,15 @@ async fn released_server_accepts_wallet_credential_and_settles_exact_transfer() 
         .await
         .expect("production sponsored prepare");
     let state_directory = TempDir::new().expect("state tempdir");
-    let state = MppAuthorizationStore::at_path(state_directory.path().join("state"), [9; 32]);
+    stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
+    let generation =
+        stellar_agent_core::profile::schema::KeyringEntryRef::new("mpp-acceptance", "generation");
+    keyring_core::Entry::new(&generation.service, &generation.account)
+        .expect("generation entry")
+        .set_password("0")
+        .expect("initial counter");
+    let state =
+        MppAuthorizationStore::at_path(state_directory.path().join("state"), [9; 32], generation);
 
     // Production policy/audit wiring: the same evaluate -> persist ->
     // account -> audit -> deliver sequence the binaries run, with a real

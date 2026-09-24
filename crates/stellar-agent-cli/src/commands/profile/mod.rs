@@ -32,6 +32,7 @@ pub mod init;
 pub mod key_ops;
 pub mod list;
 pub mod migrate;
+pub mod reset_mpp_state;
 pub mod reset_window_state;
 pub mod rotate_attestation_key;
 pub mod rotate_audit_key;
@@ -148,6 +149,8 @@ pub enum ProfileSubcommand {
     /// `bundle_per_period_cap`, `bundle_rate_limit`) fail closed until reset.
     /// Discards accumulated history for the profile; the reset is audited.
     ResetWindowState(reset_window_state::ResetWindowStateArgs),
+    /// Discard MPP replay history with an explicit acknowledgement and an audit row.
+    ResetMppState(reset_mpp_state::ResetMppStateArgs),
 }
 
 /// Runs the `profile` subcommand group.
@@ -178,6 +181,7 @@ pub async fn run(args: &ProfileArgs) -> i32 {
         ProfileSubcommand::RotateCounterpartyKey(a) => rotate_counterparty_key::run(a).await,
         ProfileSubcommand::RotatePolicyStateKey(a) => rotate_policy_state_key::run(a).await,
         ProfileSubcommand::ResetWindowState(a) => reset_window_state::run(a).await,
+        ProfileSubcommand::ResetMppState(a) => reset_mpp_state::run(a),
     }
 }
 
@@ -209,6 +213,7 @@ impl ProfileArgs {
             ProfileSubcommand::RotateCounterpartyKey(a) => Some(a.profile_name()),
             ProfileSubcommand::RotatePolicyStateKey(a) => Some(a.profile_name()),
             ProfileSubcommand::ResetWindowState(a) => Some(a.profile_name()),
+            ProfileSubcommand::ResetMppState(a) => Some(a.profile_name()),
         }
     }
 }

@@ -200,6 +200,34 @@ was wrong: correct it and retry. A malformed identifier answers this way on
 every store state, including a profile with no MPP state, so the answer never
 reveals whether a profile has one.
 
+Verified version 1 MPP history, which carries no generation, is adopted once on
+open, with an audit row naming the profile and generation. A version 2 file
+without its keyring counter, an invalid file, or a keyring access failure
+refuses. After adoption, deletion and stale snapshots are detected against the
+trusted counter. A profile whose state key exists with neither a counter nor a
+state file holds no replay history; it refuses with a missing anchor, and a
+reset recovers it without discarding any record.
+
+With the headless keyring backend the counter is kept in a file on the same
+host. Anyone who can replace both that keyring file and the MPP state file can
+restore older history, so protect the headless keyring directory separately.
+
+A refusal whose message says the authorization state is rolled back means its
+file is missing or does not match the generation held in the keyring. The
+recovery command is:
+
+```sh
+stellar-agent profile reset-mpp-state default --acknowledge --reason "state recovery"
+```
+
+This command discards all replay markers for prepared, authorized, indeterminate
+and settled charges. A charge settled before reset is no longer recognized as
+settled. Reset records the discarded generation in the audit log, rotates the
+state key, removes the state file, and resets the counter to zero. A newly
+minted key with counter zero and no file is a valid empty store. The next prepare
+can proceed. Reset requires a usable audit log and its key; it is never an
+automatic response to a state failure.
+
 `mpp state prune` on a profile with no MPP history succeeds with `pruned: 0`
 and records the maintenance request in the audit log, the same as pruning a
 store that holds no removable record. Like every audited verb it first needs

@@ -212,6 +212,13 @@ fn mint_mpp_state_key(home: &Path) {
         .expect("headless keyring entry")
         .set_password(&URL_SAFE_NO_PAD.encode([9_u8; 32]))
         .expect("seed the MPP state key");
+    keyring_core::Entry::new(
+        &entry_ref.service,
+        &format!("{}-generation", entry_ref.account),
+    )
+    .expect("headless generation entry")
+    .set_password("0")
+    .expect("seed the initial MPP generation");
 }
 
 /// The canonical state path for [`PROFILE`] under `home`.
@@ -523,4 +530,77 @@ fn an_unknown_id_on_a_minted_empty_store_reports_not_found() {
         state_path(home.path()).exists(),
         "pruning through a minted store must have written the state file"
     );
+}
+
+/// Reset requires acknowledgement and records the discarded generation.
+#[test]
+#[serial]
+fn mpp_reset_requires_acknowledgement_and_audits_recovery() {
+    let home = fresh_home();
+    mint_audit_key(home.path());
+    mint_mpp_state_key(home.path());
+    let coord =
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_mpp_state_key(PROFILE);
+    let anchor = keyring_core::Entry::new(&coord.service, &format!("{}-generation", coord.account))
+        .expect("anchor");
+    anchor.set_password("5").expect("counter-only write");
+    let before_keyring =
+        std::fs::read(home.path().join("headless-keyring/store.keyring")).expect("keyring bytes");
+    let before_audit = audit_log(home.path());
+    let refused = run_cli(
+        home.path(),
+        &[
+            "profile",
+            "reset-mpp-state",
+            PROFILE,
+            "--reason",
+            "recovery",
+        ],
+        None,
+    );
+    assert_eq!(
+        refused.code, 2,
+        "acknowledgement is required by the parser: {}",
+        refused.stderr
+    );
+    assert_eq!(
+        std::fs::read(home.path().join("headless-keyring/store.keyring")).expect("keyring"),
+        before_keyring
+    );
+    assert_eq!(audit_log(home.path()), before_audit);
+    assert!(!state_path(home.path()).exists());
+    let rollback = run_cli(home.path(), &status_args(), None);
+    assert!(rollback.message_field().contains("profile reset-mpp-state"));
+    let reset = run_cli(
+        home.path(),
+        &[
+            "profile",
+            "reset-mpp-state",
+            "--profile",
+            PROFILE,
+            "--reason",
+            "recovery",
+            "--acknowledge",
+        ],
+        None,
+    );
+    assert_eq!(reset.code, 0, "{} {}", reset.stdout, reset.stderr);
+    assert_eq!(reset.json()["data"]["discarded_generation"], 5);
+    assert_eq!(anchor.get_password().expect("counter"), "0");
+    assert!(!state_path(home.path()).exists());
+    let clean = run_cli(home.path(), &status_args(), None);
+    assert_eq!(clean.code_field(), NOT_FOUND_CODE);
+    let rows: Vec<Value> = audit_log(home.path())
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("row"))
+        .filter(|row: &Value| row["kind"] == "mpp_state_reset")
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["profile"], PROFILE);
+    assert_eq!(rows[0]["discarded_generation"], 5);
+    assert_eq!(rows[0]["reason"], "recovery");
+    let help = run_cli(home.path(), &["profile", "reset-mpp-state", "--help"], None);
+    assert_eq!(help.code, 0);
+    let help = help.stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(help.contains("Discard replay markers for every prepared, authorized, indeterminate and settled charge; a charge settled before the reset is no longer recognized as settled."));
 }

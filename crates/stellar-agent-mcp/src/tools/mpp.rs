@@ -148,7 +148,7 @@ impl WalletServer {
         };
 
         // Successful simulation precedes lazy MPP key creation.
-        let state = match MppAuthorizationStore::open_for_prepare(&args.profile) {
+        let state = match MppAuthorizationStore::open_for_prepare(&args.profile, &self.profile) {
             Ok(state) => state,
             Err(error) => return Ok(mpp_error_result(&error)),
         };
@@ -251,7 +251,7 @@ impl WalletServer {
             return error.into_result();
         }
         let profile_name = self.profile_name_for_approval();
-        let state = match MppAuthorizationStore::open_for_read(&profile_name) {
+        let state = match MppAuthorizationStore::open_for_read(&profile_name, &self.profile) {
             Ok(Some(state)) => state,
             // A profile that has never prepared a charge holds no
             // authorization under any identifier.
@@ -446,7 +446,7 @@ impl WalletServer {
             Err(error) => return Ok(mpp_error_result(&error)),
         };
         let profile_name = self.profile_name_for_approval();
-        let state = match MppAuthorizationStore::open_for_read(&profile_name) {
+        let state = match MppAuthorizationStore::open_for_read(&profile_name, &self.profile) {
             Ok(Some(state)) => state,
             Ok(None) => return Ok(mpp_absent_state_lookup_error(&args.authorization_id)),
             Err(error) => return Ok(mpp_error_result(&error)),
@@ -501,7 +501,7 @@ impl WalletServer {
             return Ok(result);
         }
         let profile_name = self.profile_name_for_approval();
-        let state = match MppAuthorizationStore::open_for_read(&profile_name) {
+        let state = match MppAuthorizationStore::open_for_read(&profile_name, &self.profile) {
             Ok(Some(state)) => state,
             Ok(None) => return Ok(mpp_absent_state_lookup_error(&args.authorization_id)),
             Err(error) => return Ok(mpp_error_result(&error)),
@@ -558,7 +558,7 @@ impl WalletServer {
             return Ok(result);
         }
         let profile_name = self.profile_name_for_approval();
-        let state = match MppAuthorizationStore::open_for_read(&profile_name) {
+        let state = match MppAuthorizationStore::open_for_read(&profile_name, &self.profile) {
             Ok(Some(state)) => state,
             Ok(None) => return Ok(mpp_absent_state_lookup_error(&args.authorization_id)),
             Err(error) => return Ok(mpp_error_result(&error)),
@@ -714,10 +714,7 @@ mod tests {
 
     use std::path::{Path, PathBuf};
 
-    use stellar_agent_core::{
-        policy::ToolValueKind,
-        profile::schema::{KeyringEntryRef, Profile},
-    };
+    use stellar_agent_core::{policy::ToolValueKind, profile::schema::Profile};
     use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
 
     use super::*;
@@ -1048,12 +1045,11 @@ mod tests {
         let home = tempfile::tempdir().expect("temp home");
         let _home_guard = StellarAgentHomeGuard::new(home.path());
         keyring_mock::install().expect("mock keyring store");
-        let entry_ref = KeyringEntryRef::default_mpp_state_key(FIRST_RUN_PROFILE);
-        stellar_agent_network::keyring::rotate_keyring_secret_32(
-            &entry_ref.service,
-            &entry_ref.account,
+        stellar_agent_mpp::MppAuthorizationStore::open_for_prepare(
+            FIRST_RUN_PROFILE,
+            &first_run_server().profile,
         )
-        .expect("mint the state key");
+        .expect("mint the state key and initial counter");
         let server = first_run_server();
 
         let status = server

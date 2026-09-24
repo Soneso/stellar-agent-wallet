@@ -930,6 +930,8 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
             | EventKind::MppReceiptObserved { .. }
             | EventKind::MppSettlementReconciled { .. }
             | EventKind::KeyringKeyWritten { .. }
+            | EventKind::MppStateAdopted { .. }
+            | EventKind::MppStateReset { .. }
             | EventKind::PolicyWindowStateReset { .. }
             | EventKind::AuditTipAnchored { .. } => {
                 // Value-action, key-write, window-state-reset, and tip-anchor
@@ -1548,6 +1550,8 @@ mod tests {
             EventKind::MppSettlementReconciled { .. } => "mpp_settlement_reconciled",
             EventKind::KeyringKeyWritten { .. } => "keyring_key_written",
             EventKind::PolicyWindowStateReset { .. } => "policy_window_state_reset",
+            EventKind::MppStateAdopted { .. } => "mpp_state_adopted",
+            EventKind::MppStateReset { .. } => "mpp_state_reset",
             EventKind::AuditTipAnchored { .. } => "audit_tip_anchored",
         }
     }
@@ -2019,6 +2023,15 @@ mod tests {
                 index: 0,
                 outcome: "success".to_owned(),
             },
+            EventKind::MppStateAdopted {
+                profile: "default".to_owned(),
+                generation: 1,
+            },
+            EventKind::MppStateReset {
+                profile: "default".to_owned(),
+                discarded_generation: Some(7),
+                reason: "recovery".to_owned(),
+            },
             EventKind::PolicyWindowStateReset {
                 profile: "default".to_owned(),
                 reason: "corrupt-file recovery".to_owned(),
@@ -2277,6 +2290,8 @@ mod tests {
                 "channel_pool_initialised",
                 "channel_acquired",
                 "channel_released",
+                "mpp_state_adopted",
+                "mpp_state_reset",
                 "policy_window_state_reset",
                 "audit_tip_anchored",
             ]

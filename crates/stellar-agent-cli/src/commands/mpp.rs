@@ -252,7 +252,7 @@ async fn authorize(args: MppAuthorizeArgs) -> i32 {
     };
     let now_unix = i64::try_from(now_ms / 1_000).unwrap_or(i64::MAX);
     if let Some(approval_id) = args.approval_id.as_deref() {
-        let state = match MppAuthorizationStore::open_for_read(&profile_name) {
+        let state = match MppAuthorizationStore::open_for_read(&profile_name, &profile) {
             Ok(Some(state)) => state,
             // A profile with no MPP state holds no authorization under any
             // approval, which is the same answer as a store that holds none.
@@ -298,7 +298,7 @@ async fn prepare_and_authorize_without_state(
         Ok(prepared) => prepared,
         Err(error) => return render_error(&error),
     };
-    let state = match MppAuthorizationStore::open_for_prepare(profile_name) {
+    let state = match MppAuthorizationStore::open_for_prepare(profile_name, &profile) {
         Ok(state) => state,
         Err(error) => return render_error(&error),
     };
@@ -516,13 +516,14 @@ async fn commit_cli(
 
 fn status(args: &MppStatusArgs) -> i32 {
     let profile_name = resolve_profile_name(args.profile.as_deref()).name;
-    if let Err(error) = load_testnet_profile(&profile_name) {
-        return render_profile_error(&error, &profile_name);
-    }
+    let profile = match load_testnet_profile(&profile_name) {
+        Ok(profile) => profile,
+        Err(error) => return render_profile_error(&error, &profile_name),
+    };
     if init_platform_keyring_store().is_err() {
         return render_error(&state_error());
     }
-    let state = match MppAuthorizationStore::open_for_read(&profile_name) {
+    let state = match MppAuthorizationStore::open_for_read(&profile_name, &profile) {
         Ok(Some(state)) => state,
         // A profile that has never prepared a charge holds no authorization
         // under any identifier — the store's own answer for an unknown one.
@@ -571,7 +572,7 @@ fn record_receipt(args: &MppReceiptArgs) -> i32 {
         Ok(receipt) => receipt,
         Err(error) => return render_error(&error),
     };
-    let state = match MppAuthorizationStore::open_for_read(&profile_name) {
+    let state = match MppAuthorizationStore::open_for_read(&profile_name, &profile) {
         Ok(Some(state)) => state,
         Ok(None) => return render_error(&absent_state_lookup_error(&args.authorization_id)),
         Err(error) => return render_error(&error),
@@ -621,7 +622,7 @@ async fn reconcile(args: MppReconcileArgs) -> i32 {
             },
             Err(error) => return render_error(&error),
         };
-    let state = match MppAuthorizationStore::open_for_read(&profile_name) {
+    let state = match MppAuthorizationStore::open_for_read(&profile_name, &profile) {
         Ok(Some(state)) => state,
         Ok(None) => return render_error(&absent_state_lookup_error(&args.authorization_id)),
         Err(error) => return render_error(&error),
@@ -667,7 +668,7 @@ fn prune(args: &MppPruneArgs) -> i32 {
     if init_platform_keyring_store().is_err() {
         return render_error(&state_error());
     }
-    let state = match MppAuthorizationStore::open_for_read(&args.profile) {
+    let state = match MppAuthorizationStore::open_for_read(&args.profile, &profile) {
         Ok(state) => state,
         Err(error) => return render_error(&error),
     };
