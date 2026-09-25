@@ -1,4 +1,4 @@
-//! Adversarial fixture: malformed instance storage decodes as a non-map ScVal.
+//! Adversarial fixture: the instance key holds a non-instance contract-data value.
 
 use stellar_agent_network::StellarRpcClient;
 use stellar_agent_smart_account::error::AdminOrOwnerKey;
@@ -96,8 +96,8 @@ async fn non_map_instance_storage_returns_mutable() {
     assert_eq!(
         status,
         MutabilityStatus::Mutable {
-            admin_or_owner_key: AdminOrOwnerKey::Admin,
-            holder_redacted: "[non-map-instance-storage]".to_owned(),
+            admin_or_owner_key: AdminOrOwnerKey::UndecodableInstance,
+            holder_redacted: "undecodable instance".to_owned(),
         }
     );
 }

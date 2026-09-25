@@ -221,7 +221,9 @@ pub struct StellarRuleCreateArgs {
 
     /// Opt-in to proposing a rule whose verifier or policy contract has a
     /// mutable admin/owner key. See `smart-account rules create
-    /// --accept-mutable-verifier` for the on-chain rationale.
+    /// --accept-mutable-verifier` for the on-chain rationale. A contract whose
+    /// instance is undecodable or has a non-Wasm executable is refused with
+    /// `sa.contract_instance_unsupported` regardless of this flag.
     #[serde(default)]
     pub accept_mutable_verifier: bool,
 

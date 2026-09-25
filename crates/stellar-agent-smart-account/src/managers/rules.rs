@@ -647,6 +647,7 @@ impl ContextRuleManager {
     /// [`SaError::AuthEntryConstructionFailed`] before any signing bytes are
     /// produced when the pre-signing guards fire.  Returns
     /// [`SaError::VerifierMutable`] / [`SaError::PolicyMutable`] /
+    /// [`SaError::ContractInstanceUnsupported`] /
     /// [`SaError::VerifierWasmNotInAllowlist`] / [`SaError::PolicyWasmNotInAllowlist`]
     /// when wasm-hash pinning rejects a referenced contract.
     /// Returns [`SaError::DeploymentFailed`] (`phase = "submit"`) when the
@@ -661,6 +662,8 @@ impl ContextRuleManager {
     /// - [`SaError::SimulationDivergence`] — caller-vs-envelope mismatch.
     /// - [`SaError::VerifierMutable`] — verifier mutable, no override set.
     /// - [`SaError::PolicyMutable`] — policy mutable, no override set.
+    /// - [`SaError::ContractInstanceUnsupported`]: verifier or policy instance
+    ///   cannot be read as Wasm; no override exists.
     /// - [`SaError::VerifierWasmNotInAllowlist`] — unknown verifier hash, no override.
     /// - [`SaError::PolicyWasmNotInAllowlist`] — unknown policy hash, no override.
     /// - [`SaError::NetworkRpcDivergence`] — primary / secondary RPC disagree.
@@ -979,6 +982,7 @@ impl ContextRuleManager {
     ///
     /// Same error surface as `install_rule`'s pre-submission checks:
     /// [`SaError::VerifierMutable`] / [`SaError::PolicyMutable`] /
+    /// [`SaError::ContractInstanceUnsupported`] /
     /// [`SaError::VerifierWasmNotInAllowlist`] / [`SaError::PolicyWasmNotInAllowlist`]
     /// from the pin check; [`SaError::DeploymentFailed`] (`phase = "simulate"`)
     /// on an RPC or simulate-transaction error.
@@ -4723,6 +4727,7 @@ pub(crate) fn sa_error_to_invocation_result(
         | SaError::PolicyHashDrift { .. }
         | SaError::VerifierMutable { .. }
         | SaError::PolicyMutable { .. }
+        | SaError::ContractInstanceUnsupported { .. }
         | SaError::VerifierWasmNotInAllowlist { .. }
         | SaError::PolicyWasmNotInAllowlist { .. }
         // Multi-hash guard fires before any signing attempt; signing aborted

@@ -24,7 +24,7 @@
 //! | [`verifier_identification_rpc_divergence`] | `NetworkRpcDivergence` on verifier hash mismatch |
 //! | [`contract_mutability_admin_key_present`] | `MutabilityStatus::Mutable` when Admin key present |
 //! | [`contract_mutability_non_address_admin_value`] | fail-closed Mutable on non-address Admin value |
-//! | [`contract_mutability_non_map_instance_storage`] | fail-closed Mutable on non-map instance storage |
+//! | [`contract_mutability_non_map_instance_storage`] | fail-closed Mutable on a non-instance value under the instance key |
 //! | [`divergence_failure_self_audit_writer`] | write-path divergence failures emit via `self.audit_writer` |
 //! | [`divergence_collective_budget_mock`] | `check_divergence_for_auth_rule_ids` collective wall-clock budget across `auth_rule_ids` |
 //! | [`wasm_hash_canonicalisation_parity`] | WASM hash canonicalisation regression-lock: byte-identical no-drift + idempotence + first8 formatter determinism |

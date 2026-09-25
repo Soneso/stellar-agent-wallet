@@ -1045,9 +1045,9 @@ impl<'a> MigrationPlanner<'a> {
                     smart_account_redacted.clone(),
                 ),
                 detail: format!(
-                    "destination verifier at {to_verifier_redacted} has a non-zero \
-                     {admin_or_owner_key} key in instance storage — mutable contracts \
-                     are refused as migration destinations"
+                    "destination verifier at {to_verifier_redacted} is mutable \
+                     (reason={admin_or_owner_key}); mutable contracts are refused as \
+                     migration destinations"
                 ),
                 request_id: request_id.to_owned(),
             });
