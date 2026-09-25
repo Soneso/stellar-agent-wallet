@@ -312,6 +312,7 @@ pub async fn run(args: &StatusArgs) -> i32 {
                     &settled.tx_hash,
                     &settled.status,
                     settled.ledger.or(chain.ledger),
+                    stellar_agent_core::audit_log::PolicyDecision::Allow,
                 );
             }
             let reservation_open = reservation

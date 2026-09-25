@@ -32,8 +32,8 @@ pub use reconcile::{
 };
 pub use service::{
     ApprovalDisposition, AuthorizationPreview, AuthorizationStatusView, AuthorizedCharge,
-    WithheldCharge, authorization_status, commit_authorization, persist_prepared_authorization,
-    verify_pending_approval,
+    BeforeSignError, WithheldCharge, authorization_status, commit_authorization,
+    persist_prepared_authorization, verify_pending_approval,
 };
 pub use sponsored::{
     PreparedSponsoredCharge, SponsoredRpc, StellarSponsoredRpc, commit_sponsored, prepare_sponsored,

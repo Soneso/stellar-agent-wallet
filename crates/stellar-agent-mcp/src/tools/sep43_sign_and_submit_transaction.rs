@@ -356,6 +356,7 @@ impl WalletServer {
         };
         let recorder = match crate::tools::submission_record::build_recorder(
             crate::tools::submission_record::CommitRecord {
+                policy_decision: dispatch_outcome.audit_decision(),
                 profile: &self.profile,
                 profile_name: profile_name.clone(),
                 tool: "stellar_sep43_sign_and_submit_transaction",

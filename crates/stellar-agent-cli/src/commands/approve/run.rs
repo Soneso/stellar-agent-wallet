@@ -504,6 +504,13 @@ fn render_rule_proposal_definition(definition: &ContextRuleProposalSnapshot) -> 
 /// For `SignWithPasskey` entries, displays the smart-account redacted address
 /// and rule IDs (no amount — this is a passkey signing request, not a payment).
 fn write_summary(entry: &PendingApproval, out: &mut dyn Write) -> std::io::Result<()> {
+    if let Some(reason) = &entry.reason {
+        writeln!(
+            out,
+            "Reason: {}",
+            crate::common::render::sanitize_for_table(reason)
+        )?;
+    }
     let created = unix_ms_to_rfc3339(entry.created_at_unix_ms);
     let expires = unix_ms_to_rfc3339(entry.expires_at_unix_ms);
 
@@ -1524,5 +1531,20 @@ mod tests {
         let rendered_no_warn = render_rule_proposal_definition(&without_overrides);
         assert!(!rendered_no_warn.contains("accept_mutable_verifier is set"));
         assert!(!rendered_no_warn.contains("accept_unknown_verifier is set"));
+    }
+    #[test]
+    fn approval_prompt_shows_rule_reason_and_expiry() {
+        let request = stellar_agent_core::policy::ApprovalRequest::new(String::new(), 617)
+            .with_reason("Treasury review\nconfirm".to_owned());
+        let entry = make_entry(DEFAULT_TTL_MS).with_policy_request(&request);
+        let mut sink = Vec::new();
+        write_summary(&entry, &mut sink).unwrap();
+        let text = String::from_utf8(sink).unwrap();
+        assert!(text.contains("Reason: Treasury review"), "{text}");
+        assert!(!text.contains("review\nconfirm"), "{text}");
+        assert!(
+            text.contains(&unix_ms_to_rfc3339(entry.created_at_unix_ms + 617_000)),
+            "{text}"
+        );
     }
 }

@@ -301,6 +301,7 @@ impl WalletServer {
         summary_simulated_total_stroops: u32,
         summary_simulated_seq_num: i64,
         profile_name: &str,
+        request: &stellar_agent_core::policy::ApprovalRequest,
     ) -> Result<PendingApproval, String> {
         let approvals_dir = self
             .resolve_approval_dir()
@@ -334,6 +335,8 @@ impl WalletServer {
             APPROVAL_TTL_MS,
         )
         .map_err(|e| format!("PendingApproval::new_payment_pending (trustline) failed: {e}"))?;
+
+        let entry = entry.with_policy_request(request);
 
         let now_ms = now_unix_ms()
             .map_err(|e| format!("approval store insert: current time unavailable: {e}"))?;
@@ -865,43 +868,46 @@ impl WalletServer {
         );
 
         // ── Step 11: Persist pending approval if policy requires it ──────────
-        let approval_block = if let DispatchOutcome::RequireApproval(ref _req) = dispatch_outcome {
-            let profile_name = self.profile_name_for_approval();
-            match self.persist_trustline_pending_approval(
-                &envelope_xdr,
-                &args.from,
-                &resolved.code,
-                &resolved.issuer,
-                limit_stroops,
-                total_fee_stroops,
-                source_sequence.saturating_add(1),
-                &profile_name,
-            ) {
-                Ok(entry) => {
-                    let approval_expires = entry.expires_at_unix_ms;
-                    let approval_nonce = entry.approval_nonce.clone();
-                    Some(json!({
-                        "approval_nonce": approval_nonce,
-                        "expires_at_unix_ms": approval_expires,
-                        "summary": {
-                            "asset_code": &resolved.code,
-                            "asset_issuer": redact_strkey_first5_last5(&resolved.issuer),
-                            "limit_stroops": limit_stroops.map(|v| v.to_string()),
-                            "simulated_fee_stroops": total_fee_stroops.to_string(),
-                            "simulated_seq_num": source_sequence + 1,
-                        }
-                    }))
+        let approval_block =
+            if let DispatchOutcome::RequireApproval(ref approval) = dispatch_outcome {
+                let profile_name = self.profile_name_for_approval();
+                match self.persist_trustline_pending_approval(
+                    &envelope_xdr,
+                    &args.from,
+                    &resolved.code,
+                    &resolved.issuer,
+                    limit_stroops,
+                    total_fee_stroops,
+                    source_sequence.saturating_add(1),
+                    &profile_name,
+                    &approval.request,
+                ) {
+                    Ok(entry) => {
+                        let approval_expires = entry.expires_at_unix_ms;
+                        let approval_nonce = entry.approval_nonce.clone();
+                        Some(json!({
+                            "approval_nonce": approval_nonce,
+                            "expires_at_unix_ms": approval_expires,
+                            "reason": entry.reason,
+                            "summary": {
+                                "asset_code": &resolved.code,
+                                "asset_issuer": redact_strkey_first5_last5(&resolved.issuer),
+                                "limit_stroops": limit_stroops.map(|v| v.to_string()),
+                                "simulated_fee_stroops": total_fee_stroops.to_string(),
+                                "simulated_seq_num": source_sequence + 1,
+                            }
+                        }))
+                    }
+                    Err(e) => {
+                        return Err(rmcp::ErrorData::internal_error(
+                            format!("approval.store_error: {e}"),
+                            None,
+                        ));
+                    }
                 }
-                Err(e) => {
-                    return Err(rmcp::ErrorData::internal_error(
-                        format!("approval.store_error: {e}"),
-                        None,
-                    ));
-                }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         // ── Build response ────────────────────────────────────────────────────
         // NEVER log envelope_xdr at info.
@@ -1275,6 +1281,7 @@ impl WalletServer {
         let floor_hook = crate::sequence_floor::hook(&self.sequence_floor);
         let recorder = match crate::tools::submission_record::build_recorder(
             crate::tools::submission_record::CommitRecord {
+                policy_decision: dispatch_outcome.audit_decision(),
                 profile: &self.profile,
                 profile_name: self.profile_name_for_approval(),
                 tool: "stellar_trustline_commit",

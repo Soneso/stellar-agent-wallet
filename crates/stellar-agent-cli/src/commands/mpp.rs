@@ -893,13 +893,15 @@ fn redact_reference(value: &str) -> String {
 fn accounting_error(
     error: stellar_agent_network::policy_state::WindowStoreError,
     refusal: &Mutex<Option<WalletError>>,
-) -> MppError {
-    if let stellar_agent_network::policy_state::WindowStoreError::PolicyDenied { reason } = error
-        && let Ok(mut slot) = refusal.lock()
-    {
-        *slot = Some(WalletError::PolicyDenied { reason });
+) -> stellar_agent_mpp::BeforeSignError {
+    if let stellar_agent_network::policy_state::WindowStoreError::PolicyDenied { reason } = error {
+        if let Ok(mut slot) = refusal.lock() {
+            *slot = Some(WalletError::PolicyDenied { reason });
+        }
+        stellar_agent_mpp::BeforeSignError::PolicyRefused(state_error())
+    } else {
+        stellar_agent_mpp::BeforeSignError::Accounting(state_error())
     }
-    state_error()
 }
 
 /// The uniform state refusal.
@@ -1000,18 +1002,33 @@ mod tests {
             calls_in_window: 1,
         };
         let refusal = Mutex::new(None);
-        let _ = accounting_error(
+        let classified = accounting_error(
             stellar_agent_network::policy_state::WindowStoreError::PolicyDenied {
                 reason: Box::new(reason),
             },
             &refusal,
         );
+        assert!(matches!(
+            classified,
+            stellar_agent_mpp::BeforeSignError::PolicyRefused(_)
+        ));
         let error = refusal
             .lock()
             .expect("refusal lock")
             .take()
             .expect("typed policy refusal");
         assert_eq!(error.code(), "policy.deny.rate_limit_exceeded");
+        let failure = accounting_error(
+            stellar_agent_network::policy_state::WindowStoreError::Io {
+                kind: std::io::ErrorKind::Other,
+            },
+            &refusal,
+        );
+        assert!(matches!(
+            failure,
+            stellar_agent_mpp::BeforeSignError::Accounting(_)
+        ));
+        assert!(refusal.lock().expect("refusal lock").is_none());
     }
 
     #[derive(Parser)]

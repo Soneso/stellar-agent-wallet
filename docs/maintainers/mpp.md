@@ -169,11 +169,11 @@ ready -> approval_pending                 (policy changed before commit)
 authorized -> receipt_observed
 authorized|receipt_observed -> settled|failed|expired_unresolved
 prepared|approval_pending|ready -> expired_unresolved
-authorizing -> failed|indeterminate
+authorizing -> refused|failed|indeterminate
 delivery_pending -> authorized_withheld
 ```
 
-Terminal states are `settled`, `failed`, `expired_unresolved`,
+Terminal states are `settled`, `failed`, `refused`, `expired_unresolved`,
 `authorized_withheld`, and `indeterminate`. No terminal state transitions or
 signs again. Status derives expiry without mutating state. Explicit audited
 prune persists eligible expiry markers and removes terminal records only after
@@ -182,7 +182,10 @@ prune persists eligible expiry markers and removes terminal records only after
 A failure after signer access begins becomes `indeterminate` unless the
 credential is known to exist, in which case a final-gate failure becomes
 `authorized_withheld`. Policy accounting ambiguity is also conservative:
-budget is treated as consumed and signing does not proceed.
+budget is treated as consumed and signing does not proceed. A typed policy
+refusal writes no window usage: the authorization becomes `refused`, and its
+withheld row records `policy_refusal` with the budget unconsumed.
+`BeforeSignError` distinguishes these outcomes at the accounting callback.
 
 ## Audit and redaction
 

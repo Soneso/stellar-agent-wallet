@@ -522,6 +522,19 @@ impl MppAuthorizationStore {
         self.transition(authorization_id, AuthorizationStatus::Failed, now_unix)
     }
 
+    /// Settles a policy refusal that wrote no window usage and constructed no credential.
+    ///
+    /// # Errors
+    ///
+    /// Refuses invalid transitions or unavailable durable state.
+    pub fn mark_refused(
+        &self,
+        authorization_id: &str,
+        now_unix: i64,
+    ) -> Result<AuthorizationRecord, MppError> {
+        self.transition(authorization_id, AuthorizationStatus::Refused, now_unix)
+    }
+
     /// Marks a post-credential delivery-gate failure.
     ///
     /// # Errors

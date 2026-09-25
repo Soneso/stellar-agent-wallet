@@ -225,6 +225,10 @@ impl WalletServer {
     /// # Errors
     ///
     /// Returns a string error description on any I/O, store-lock, or clock failure.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "approval binds the simulated account creation and its policy request"
+    )]
     pub(crate) fn persist_create_account_pending_approval(
         &self,
         envelope_xdr: &str,
@@ -233,6 +237,7 @@ impl WalletServer {
         summary_simulated_total_stroops: u32,
         summary_simulated_seq_num: i64,
         profile_name: &str,
+        request: &stellar_agent_core::policy::ApprovalRequest,
     ) -> Result<PendingApproval, String> {
         let approvals_dir = self
             .resolve_approval_dir()
@@ -258,6 +263,8 @@ impl WalletServer {
             APPROVAL_TTL_MS,
         )
         .map_err(|e| format!("PendingApproval::new_payment_pending failed: {e}"))?;
+
+        let entry = entry.with_policy_request(request);
 
         let now_ms = now_unix_ms()
             .map_err(|e| format!("approval store insert: current time unavailable: {e}"))?;
@@ -556,7 +563,7 @@ impl WalletServer {
         );
 
         // ── Persist pending approval if policy requires it ───────────────────
-        let approval_block = if let DispatchOutcome::RequireApproval(_) = &dispatch_outcome {
+        let approval_block = if let DispatchOutcome::RequireApproval(approval) = &dispatch_outcome {
             let profile_name = self.profile_name_for_approval();
             match self.persist_create_account_pending_approval(
                 &envelope_xdr,
@@ -565,10 +572,12 @@ impl WalletServer {
                 total_fee_stroops,
                 source_sequence.saturating_add(1),
                 &profile_name,
+                &approval.request,
             ) {
                 Ok(entry) => Some(json!({
                     "approval_nonce": entry.approval_nonce,
                     "expires_at_unix_ms": entry.expires_at_unix_ms,
+                    "reason": entry.reason,
                     "summary": {
                         "to": &args.destination,
                         "amount_stroops": starting_balance_stroops.to_string(),
@@ -779,13 +788,9 @@ impl WalletServer {
         validate_g_strkey(&args.source, "source")?;
         validate_g_strkey(&args.destination, "destination")?;
 
-        // ── Re-fetch source account state (feeds the policy gate's
-        // `account_view`; sequence number also consumed by the rebuild below) ──
-        // Moved ahead of the gate so `dispatch_gate_with_views` evaluates
-        // `minimum_reserve` against the SAME on-chain source state the commit
-        // path already needs for the sequence number — reused below, no second
-        // fetch. Nothing state-mutating (nonce decode/replay-window, approval
-        // writes, signing) runs before this point.
+        // Policy evaluates the account state that also supplies the rebuild's
+        // sequence number. No nonce consumption, approval write or signing
+        // occurs before the gate.
         let rpc_url = self.profile.rpc_url.as_str();
         let client = match StellarRpcClient::new(rpc_url) {
             Ok(c) => c,
@@ -845,7 +850,7 @@ impl WalletServer {
             Err(e) => return e.into_result(),
         };
 
-        // ── Decode nonce — map parse error to nonce.expired ──────────────────
+        // Syntax parsing follows the policy gate; it consumes no nonce.
         let nonce = match stellar_agent_nonce::Nonce::from_base64(&args.nonce) {
             Ok(n) => n,
             Err(_) => return Ok(commit_path_error_result("nonce parse failed")),
@@ -1186,6 +1191,7 @@ impl WalletServer {
         let floor_hook = crate::sequence_floor::hook(&self.sequence_floor);
         let recorder = match crate::tools::submission_record::build_recorder(
             crate::tools::submission_record::CommitRecord {
+                policy_decision: dispatch_outcome.audit_decision(),
                 profile: &self.profile,
                 profile_name: self.profile_name_for_approval(),
                 tool: "stellar_create_account_commit",

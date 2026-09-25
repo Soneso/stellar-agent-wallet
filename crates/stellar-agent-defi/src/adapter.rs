@@ -389,6 +389,7 @@ impl<'a> DefiAdapterCtx<'a> {
             stellar_agent_core::audit_log::PolicyDecision::Allow,
             None,
             None,
+            None,
             request_id,
         );
 

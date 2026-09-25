@@ -434,6 +434,7 @@ impl WalletServer {
         summary_simulated_total_stroops: u32,
         summary_simulated_seq_num: i64,
         profile_name: &str,
+        request: &stellar_agent_core::policy::ApprovalRequest,
     ) -> Result<PendingApproval, String> {
         #[cfg(any(test, feature = "test-helpers"))]
         let approvals_dir = match self.approval_dir_override {
@@ -466,6 +467,8 @@ impl WalletServer {
             APPROVAL_TTL_MS,
         )
         .map_err(|e| format!("PendingApproval::new_payment_pending failed: {e}"))?;
+
+        let entry = entry.with_policy_request(request);
 
         let now_ms = now_unix_ms()
             .map_err(|e| format!("approval store insert: current time unavailable: {e}"))?;
@@ -947,55 +950,58 @@ impl WalletServer {
         // the same user because the HMAC input binds `process_uid`; an
         // attestation produced by a different UID fails HMAC verification at
         // commit time.  This is the cross-account-on-host non-replay binding.
-        let approval_block = if let DispatchOutcome::RequireApproval(ref _req) = dispatch_outcome {
-            // Derive asset string for summary.
-            let asset_str = match &asset {
-                stellar_agent_network::Asset::Native => "XLM".to_owned(),
-                stellar_agent_network::Asset::Credit { code, issuer } => {
-                    format!("{code}:{issuer}")
-                }
-                _ => "unknown".to_owned(),
-            };
-            // Derive memo string for summary (None if Memo::None).
-            let memo_summary = memo_summary(&memo);
+        let approval_block =
+            if let DispatchOutcome::RequireApproval(ref approval) = dispatch_outcome {
+                // Derive asset string for summary.
+                let asset_str = match &asset {
+                    stellar_agent_network::Asset::Native => "XLM".to_owned(),
+                    stellar_agent_network::Asset::Credit { code, issuer } => {
+                        format!("{code}:{issuer}")
+                    }
+                    _ => "unknown".to_owned(),
+                };
+                // Derive memo string for summary (None if Memo::None).
+                let memo_summary = memo_summary(&memo);
 
-            let profile_name = self.profile_name_for_approval();
-            match self.persist_pay_pending_approval(
-                &envelope_xdr,
-                &args.destination,
-                amount_stroops_i64,
-                &asset_str,
-                memo_summary,
-                total_fee_stroops,
-                source_sequence.saturating_add(1),
-                &profile_name,
-            ) {
-                Ok(entry) => {
-                    let approval_expires = entry.expires_at_unix_ms;
-                    let approval_nonce = entry.approval_nonce.clone();
-                    Some(json!({
-                        "approval_nonce": approval_nonce,
-                        "expires_at_unix_ms": approval_expires,
-                        "summary": {
-                            "to": &args.destination,
-                            "amount_stroops": amount_stroops_i64.to_string(),
-                            "asset": &asset_str,
-                            "memo": memo_summary_for_json(&memo),
-                            "simulated_fee_stroops": total_fee_stroops.to_string(),
-                            "simulated_seq_num": source_sequence + 1,
-                        }
-                    }))
+                let profile_name = self.profile_name_for_approval();
+                match self.persist_pay_pending_approval(
+                    &envelope_xdr,
+                    &args.destination,
+                    amount_stroops_i64,
+                    &asset_str,
+                    memo_summary,
+                    total_fee_stroops,
+                    source_sequence.saturating_add(1),
+                    &profile_name,
+                    &approval.request,
+                ) {
+                    Ok(entry) => {
+                        let approval_expires = entry.expires_at_unix_ms;
+                        let approval_nonce = entry.approval_nonce.clone();
+                        Some(json!({
+                            "approval_nonce": approval_nonce,
+                            "expires_at_unix_ms": approval_expires,
+                            "reason": entry.reason,
+                            "summary": {
+                                "to": &args.destination,
+                                "amount_stroops": amount_stroops_i64.to_string(),
+                                "asset": &asset_str,
+                                "memo": memo_summary_for_json(&memo),
+                                "simulated_fee_stroops": total_fee_stroops.to_string(),
+                                "simulated_seq_num": source_sequence + 1,
+                            }
+                        }))
+                    }
+                    Err(e) => {
+                        return Err(rmcp::ErrorData::internal_error(
+                            format!("approval.store_error: {e}"),
+                            None,
+                        ));
+                    }
                 }
-                Err(e) => {
-                    return Err(rmcp::ErrorData::internal_error(
-                        format!("approval.store_error: {e}"),
-                        None,
-                    ));
-                }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         // ── Build response ────────────────────────────────────────────────────
         let simulation = json!({
@@ -1202,14 +1208,9 @@ impl WalletServer {
         validate_g_strkey(&args.source, "source")?;
         validate_g_strkey(&args.destination, "destination")?;
 
-        // ── Re-fetch source (+ destination) account state (feeds the policy
-        // gate's views; sequence number also consumed by the rebuild below) ──
-        // Moved ahead of the gate so `dispatch_gate_with_views` evaluates
-        // `minimum_reserve` against the SAME on-chain source state the commit
-        // path already needs for the sequence number — reused below, no
-        // second fetch. Nothing state-mutating (nonce decode/replay-window,
-        // approval writes, signing) runs before this point: nonce decode and
-        // replay-window consumption both still run strictly after this gate.
+        // Policy evaluates the account state that also supplies the rebuild's
+        // sequence number. No nonce consumption, approval write or signing
+        // occurs before the gate.
         let rpc_url = self.profile.rpc_url.as_str();
         let client = match StellarRpcClient::new(rpc_url) {
             Ok(c) => c,
@@ -1375,7 +1376,7 @@ impl WalletServer {
             .map(|effects| effects.legs().iter().map(Into::into).collect())
             .unwrap_or_default();
 
-        // ── Decode nonce — map parse error to nonce.expired (indistinguishability) ──
+        // Syntax parsing follows the policy gate; it consumes no nonce.
         let nonce = match stellar_agent_nonce::Nonce::from_base64(&args.nonce) {
             Ok(n) => n,
             Err(_) => return Ok(commit_path_error_result("nonce parse failed")),
@@ -1710,6 +1711,7 @@ impl WalletServer {
         let floor_hook = crate::sequence_floor::hook(&self.sequence_floor);
         let recorder = match crate::tools::submission_record::build_recorder(
             crate::tools::submission_record::CommitRecord {
+                policy_decision: dispatch_outcome.audit_decision(),
                 profile: &self.profile,
                 profile_name: self.profile_name_for_approval(),
                 tool: "stellar_pay_commit",
@@ -1956,35 +1958,29 @@ impl WalletServer {
             return Ok(approval_required_indistinguishable());
         }
 
-        // Approval fields present → delegate to the commit path with FORCED
-        // RequireApproval override.
-        //
-        // The forced outcome is constructed from the caller-supplied approval_nonce.
-        // `stellar_pay_commit_impl` with this override:
-        //   1. Still runs dispatch_gate for chain_id validation + Deny check.
-        //   2. Replaces any Allow result with the forced RequireApproval.
-        //   3. Calls verify_attestation_gate with the RequireApproval outcome,
-        //      which CRYPTOGRAPHICALLY verifies the HMAC attestation against the
-        //      stored PaymentSimulated pending entry — no-op shortcut bypassed.
-        //
-        // This is NOT policy-conditional: the HMAC check ALWAYS runs for
-        // toolset-routed payments, regardless of what the policy engine returns.
-        // INVARIANT: `has_approval` is `true` here — we entered this branch only
-        // when both `approval_nonce` and `approval_attestation` are `Some` (line
-        // immediately above this block checks `has_approval`).  The
-        // `unwrap_or_else` fallback is therefore unreachable; use `expect` to
-        // make the invariant explicit and catch future refactoring mistakes.
-        #[allow(
-            clippy::expect_used,
-            reason = "invariant-guarded: has_approval is true at this point, so approval_nonce is Some"
-        )]
-        let forced_nonce = args
+        // The forced gate carries the persisted request. Before submission the
+        // attestation must verify against the nonce, envelope and user, and the
+        // pending approval must be unexpired under both its stored expiry and
+        // the rule's ttl.
+        let approvals_dir = match self.resolve_approval_dir() {
+            Ok(dir) => dir,
+            Err(_) => return Ok(approval_required_indistinguishable()),
+        };
+        let store_path = approvals_dir.join(format!("{}.toml", self.profile_name_for_approval()));
+        let store =
+            match open_with_retry(&store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF) {
+                Ok(store) => store,
+                Err(_) => return Ok(approval_required_indistinguishable()),
+            };
+        let Some(pending) = args
             .approval_nonce
-            .clone()
-            .expect("approval_nonce is Some because has_approval is true at this point");
-        let forced_outcome = super::common::DispatchOutcome::RequireApproval(
-            stellar_agent_core::policy::ApprovalRequest::new(forced_nonce, 86_400).into(),
-        );
+            .as_deref()
+            .and_then(|nonce| store.get(nonce))
+        else {
+            return Ok(approval_required_indistinguishable());
+        };
+        let forced_outcome = DispatchOutcome::RequireApproval(pending.approval_request().into());
+        drop(store);
         self.stellar_pay_commit_impl(args, Some(forced_outcome))
             .await
     }

@@ -551,6 +551,7 @@ where
 
     let recorder = match crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {
+            policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
             profile: &profile,
             profile_name: resolved.name.clone(),
             verb: "claim",
@@ -897,6 +898,7 @@ where
     // and settles all three against what the network answers.
     let recorder = match crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {
+            policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
             profile: &profile,
             profile_name: resolved.name.clone(),
             verb: "claim",

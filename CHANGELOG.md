@@ -7,13 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.0-alpha.7] - 2026-09-19
-
 ### Added
 
 - `profile reset-mpp-state <NAME> --acknowledge --reason <REASON>` recovers MPP
   authorization state by discarding replay history, rotating its HMAC key, and
   resetting the generation. The audit row names the discarded generation.
+
+### Changed
+
+- MPP authorization state uses wire format version 2 with a generation field
+  and a `default-generation` counter beside its state key in the keyring.
+  Verified version 1 state is adopted once under the store lock with an audit
+  row and enters the protected format at generation one. A version 2 file
+  without its counter refuses.
+  `MppAuthorizationStore::at_path` requires the trusted generation entry;
+  profile openers require the profile's audit configuration.
+
+### Fixed
+
+- MPP state reads and mutations refuse deleted or stale authorization history
+  against the keyring generation, naming rollback in the refusal. A minted key
+  at generation zero with no file remains a valid empty store. Rolled-back
+  refusals name `profile reset-mpp-state` as the acknowledged recovery.
+- Ledger-dated spending-window confirmations count toward caps when the host
+  clock trails the chain. Pending reservations retain the 30-second clock check,
+  and clock refusals identify the host-clock offset.
+- MPP and x402 authorized settlement check the shared spending cap under the
+  store lock before releasing a credential. A refused authorization records no
+  spend and reports the governing policy denial through CLI and MCP.
+- An MPP authorization refused by the spending window ends in the `refused`
+  status with its budget recorded as not consumed; an accounting failure keeps
+  the authorization indeterminate.
+- Value-action pending and outcome audit rows retain the policy gate decision
+  and the approval nonce for approved submissions, including delayed settlement.
+  An allowed commit records no approval nonce and spends no pending approval.
+- Rule approval TTLs and reasons reach pending approvals, MCP responses and
+  CLI approval displays, and a commit is refused once the rule's TTL has passed.
+  Rules without a TTL use the 24-hour approval default.
+
+## [0.1.0-alpha.7] - 2026-09-19
+
+### Added
 
 - The MCP server warns at startup when a v1 policy names tools explicitly and
   carries no rule for `stellar_transaction_status`, the tool that settles a
@@ -25,14 +59,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carry no API stability promise.
 
 ### Changed
-
-- MPP authorization state uses wire format version 2 with a generation field
-  and a `default-generation` counter beside its state key in the keyring.
-  Verified version 1 state is adopted once under the store lock with an audit
-  row and enters the protected format at generation one. A version 2 file
-  without its counter refuses.
-  `MppAuthorizationStore::at_path` requires the trusted generation entry;
-  profile openers require the profile's audit configuration.
 
 - `stellar-agent-pool`: `InitParams` requires a `SubmissionRecorder` reference
   and an `attempt` memo ID; `submit_pooled` requires a recorder argument before
@@ -61,18 +87,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consumer.
 
 ### Fixed
-
-- MPP state reads and mutations refuse deleted or stale authorization history
-  against the keyring generation, naming rollback in the refusal. A minted key
-  at generation zero with no file remains a valid empty store. Rolled-back
-  refusals name `profile reset-mpp-state` as the acknowledged recovery.
-
-- Ledger-dated spending-window confirmations count toward caps when the host
-  clock trails the chain. Pending reservations retain the 30-second clock check,
-  and clock refusals identify the host-clock offset.
-- MPP and x402 authorized settlement check the shared spending cap under the
-  store lock before releasing a credential. A refused authorization records no
-  spend and reports the governing policy denial through CLI and MCP.
 
 - A spending-window reservation is admitted under the store's lock: the write
   that reserves a submission's spend re-applies the governing criterion's

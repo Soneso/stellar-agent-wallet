@@ -209,6 +209,7 @@ pub struct WalletSubmissionRecorder<'a> {
     profile_name: String,
     tool: &'static str,
     chain_id: Option<String>,
+    policy_decision: PolicyDecision,
     legs: Vec<ValueLegRecord>,
     window_entries: Vec<stellar_agent_core::policy::v1::criteria::state_store::WindowEntry>,
     receipts: ReceiptStore,
@@ -257,6 +258,7 @@ impl<'a> WalletSubmissionRecorder<'a> {
         profile_name: impl Into<String>,
         tool: &'static str,
         chain_id: Option<String>,
+        policy_decision: PolicyDecision,
         legs: Vec<ValueLegRecord>,
         window_entries: Vec<stellar_agent_core::policy::v1::criteria::state_store::WindowEntry>,
         receipts: ReceiptStore,
@@ -271,6 +273,7 @@ impl<'a> WalletSubmissionRecorder<'a> {
             profile_name: profile_name.into(),
             tool,
             chain_id,
+            policy_decision,
             legs,
             window_entries,
             receipts,
@@ -353,9 +356,12 @@ impl<'a> WalletSubmissionRecorder<'a> {
             redact_tx_hash(&intent.tx_hash),
             redact_account(&intent.source),
             intent.sequence,
-            PolicyDecision::Allow,
+            self.policy_decision.clone(),
             Some(intent.envelope_hash.clone()),
             self.nonce_id.clone(),
+            self.approval
+                .as_ref()
+                .map(|approval| approval.approval_nonce.clone()),
             &self.request_id,
         );
         let mut guard = writer.lock().map_err(|_| {
@@ -577,9 +583,12 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
                         self.legs.clone(),
                         redact_tx_hash(&intent.tx_hash),
                         *ledger,
-                        PolicyDecision::Allow,
+                        self.policy_decision.clone(),
                         Some(intent.envelope_hash.clone()),
                         self.nonce_id.clone(),
+                        self.approval
+                            .as_ref()
+                            .map(|approval| approval.approval_nonce.clone()),
                         &self.request_id,
                     ));
                 }
@@ -729,9 +738,12 @@ impl WalletSubmissionRecorder<'_> {
             self.legs.clone(),
             redact_tx_hash(&intent.tx_hash),
             code,
-            PolicyDecision::Allow,
+            self.policy_decision.clone(),
             Some(intent.envelope_hash.clone()),
             self.nonce_id.clone(),
+            self.approval
+                .as_ref()
+                .map(|approval| approval.approval_nonce.clone()),
             &self.request_id,
         ));
     }

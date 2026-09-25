@@ -1780,6 +1780,7 @@ mod tests {
             PolicyDecision::Allow,
             Some(envelope_hash.to_owned()),
             None,
+            None,
             "req-pending",
         )
     }
@@ -1793,6 +1794,7 @@ mod tests {
             9,
             PolicyDecision::Allow,
             Some(envelope_hash.to_owned()),
+            None,
             None,
             "req-submitted",
         )
@@ -3784,6 +3786,10 @@ pub struct PendingValueAction {
     pub legs: Vec<ValueLegRecord>,
     /// The commit nonce prefix the pending row carried.
     pub nonce_id: Option<String>,
+    /// The submission gate's decision from the pending row.
+    pub policy_decision: super::PolicyDecision,
+    /// Approval nonce bound to the pending submission.
+    pub approval_nonce: Option<String>,
 }
 
 /// Whether the active log already carries an operator-clear row for
@@ -3871,12 +3877,18 @@ pub fn value_action_settlement(log_path: &Path, envelope_hash: &str) -> ValueAct
             EventKind::ValueActionSubmitted { .. } | EventKind::ValueActionFailed { .. } => {
                 return ValueActionSettlement::Settled;
             }
-            EventKind::ValueActionPending { legs, .. } => {
+            EventKind::ValueActionPending {
+                legs,
+                approval_nonce,
+                ..
+            } => {
                 return ValueActionSettlement::Owed(PendingValueAction {
                     legs: legs.clone(),
                     tool: entry.tool,
                     chain_id: entry.chain_id,
                     nonce_id: entry.nonce_id,
+                    policy_decision: entry.policy_decision,
+                    approval_nonce: approval_nonce.clone(),
                 });
             }
             _ => {}

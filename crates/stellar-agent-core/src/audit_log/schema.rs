@@ -2286,6 +2286,9 @@ pub enum EventKind {
     ///
     /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
     ValueActionSubmitted {
+        /// Approval nonce presented for this submission, when approval was required.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval_nonce: Option<String>,
         /// The value legs the policy gate sized for this action. Empty for an
         /// opaque submit (`opaque_reason` is `Some`) or for an allow from an
         /// engine that sizes no value (`opaque_reason` is `None`).
@@ -2329,6 +2332,9 @@ pub enum EventKind {
     ///
     /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
     ValueActionPending {
+        /// Approval nonce presented for this submission, when approval was required.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval_nonce: Option<String>,
         /// The value legs the policy gate sized for this action. Empty for an
         /// allow from an engine that sizes no value.
         legs: Vec<ValueLegRecord>,
@@ -2363,6 +2369,9 @@ pub enum EventKind {
     ///
     /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
     ValueActionFailed {
+        /// Approval nonce presented for this submission, when approval was required.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval_nonce: Option<String>,
         /// The value legs the policy gate sized for the action that failed.
         legs: Vec<ValueLegRecord>,
         /// Transaction hash, redacted first-8-last-8.
@@ -4347,6 +4356,7 @@ mod tests {
     #[test]
     fn event_kind_value_action_submitted_round_trip() {
         let ev = EventKind::ValueActionSubmitted {
+            approval_nonce: None,
             legs: vec![ValueLegRecord {
                 action: ValueActionKind::Payment,
                 amount: Some(1_500_000_000),
@@ -4395,6 +4405,7 @@ mod tests {
         // The opaque shape: empty legs, opaque_reason Some — a raw submit the
         // policy could not size (e.g. sep43 sign-and-submit).
         let ev = EventKind::ValueActionSubmitted {
+            approval_nonce: None,
             legs: vec![],
             opaque_reason: Some("opaque_sign".to_owned()),
             transaction_hash_redacted: "aabb1122...ccdd3344".to_owned(),

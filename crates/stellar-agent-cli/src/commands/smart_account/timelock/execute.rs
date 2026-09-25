@@ -314,6 +314,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     let chain_id = audit_profile.chain_id.caip2_str();
     let recorder = match crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {
+            policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
             profile: &audit_profile,
             profile_name: profile_name.clone(),
             verb: "timelock execute",
