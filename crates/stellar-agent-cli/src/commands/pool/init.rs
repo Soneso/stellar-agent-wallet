@@ -400,6 +400,7 @@ async fn execute(args: &PoolInitArgs) -> Result<serde_json::Value, WalletError> 
                     &receipt.tx_hash,
                     &receipt.status,
                     receipt.ledger,
+                    stellar_agent_core::audit_log::PolicyDecision::Allow,
                 );
             }
         }
@@ -460,6 +461,7 @@ async fn execute(args: &PoolInitArgs) -> Result<serde_json::Value, WalletError> 
                 &receipt.tx_hash,
                 &receipt.status,
                 receipt.ledger,
+                stellar_agent_core::audit_log::PolicyDecision::Allow,
             );
         }
         pending.attempt = pending
@@ -481,6 +483,7 @@ async fn execute(args: &PoolInitArgs) -> Result<serde_json::Value, WalletError> 
     }
     let funder = fetch_account(&client, &pending.funder, &[]).await?;
     let inner = build_recorder(SubmitRecord {
+        policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
         profile: &profile,
         profile_name: name.clone(),
         verb: "pool init",

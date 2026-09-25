@@ -593,6 +593,7 @@ impl WalletServer {
         };
         let recorder = match crate::tools::submission_record::build_recorder(
             crate::tools::submission_record::CommitRecord {
+                policy_decision: dispatch_outcome.audit_decision(),
                 profile: &self.profile,
                 profile_name: audit_profile_name.clone(),
                 tool: "stellar_defindex_vault_deposit",
@@ -1048,6 +1049,7 @@ impl WalletServer {
         };
         let recorder = match crate::tools::submission_record::build_recorder(
             crate::tools::submission_record::CommitRecord {
+                policy_decision: dispatch_outcome.audit_decision(),
                 profile: &self.profile,
                 profile_name: audit_profile_name.clone(),
                 tool: "stellar_defindex_vault_withdraw",

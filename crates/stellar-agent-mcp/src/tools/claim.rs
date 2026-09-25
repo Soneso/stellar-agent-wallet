@@ -197,6 +197,7 @@ impl WalletServer {
         simulated_fee_stroops: u32,
         simulated_seq_num: i64,
         profile_name: &str,
+        request: &stellar_agent_core::policy::ApprovalRequest,
     ) -> Result<PendingApproval, String> {
         let approvals_dir = self
             .resolve_approval_dir()
@@ -223,6 +224,8 @@ impl WalletServer {
             APPROVAL_TTL_MS,
         )
         .map_err(|e| format!("PendingApproval::new_claim_pending failed: {e}"))?;
+
+        let entry = entry.with_policy_request(request);
 
         let now_ms = now_unix_ms()
             .map_err(|e| format!("approval store insert: current time unavailable: {e}"))?;
@@ -517,42 +520,45 @@ impl WalletServer {
 
         // ── Persist pending approval if policy requires it ────────────────────
         let asset_str = preview_asset_string(&preview);
-        let approval_block = if let DispatchOutcome::RequireApproval(ref _req) = dispatch_outcome {
-            let profile_name = self.profile_name_for_approval();
-            match self.persist_claim_pending_approval(
-                &envelope_xdr,
-                &preview.balance_id_hex72,
-                &preview.balance_id_strkey,
-                &asset_str,
-                preview.amount_stroops,
-                &source,
-                total_fee_stroops,
-                source_sequence.saturating_add(1),
-                &profile_name,
-            ) {
-                Ok(entry) => Some(json!({
-                    "approval_nonce": entry.approval_nonce,
-                    "expires_at_unix_ms": entry.expires_at_unix_ms,
-                    "summary": {
-                        "balance_id_hex72": &preview.balance_id_hex72,
-                        "balance_id_strkey": &preview.balance_id_strkey,
-                        "asset": &asset_str,
-                        "amount_stroops": preview.amount_stroops.to_string(),
-                        "source": &source,
-                        "simulated_fee_stroops": total_fee_stroops.to_string(),
-                        "simulated_seq_num": source_sequence.saturating_add(1),
+        let approval_block =
+            if let DispatchOutcome::RequireApproval(ref approval) = dispatch_outcome {
+                let profile_name = self.profile_name_for_approval();
+                match self.persist_claim_pending_approval(
+                    &envelope_xdr,
+                    &preview.balance_id_hex72,
+                    &preview.balance_id_strkey,
+                    &asset_str,
+                    preview.amount_stroops,
+                    &source,
+                    total_fee_stroops,
+                    source_sequence.saturating_add(1),
+                    &profile_name,
+                    &approval.request,
+                ) {
+                    Ok(entry) => Some(json!({
+                        "approval_nonce": entry.approval_nonce,
+                        "expires_at_unix_ms": entry.expires_at_unix_ms,
+                        "reason": entry.reason,
+                        "summary": {
+                            "balance_id_hex72": &preview.balance_id_hex72,
+                            "balance_id_strkey": &preview.balance_id_strkey,
+                            "asset": &asset_str,
+                            "amount_stroops": preview.amount_stroops.to_string(),
+                            "source": &source,
+                            "simulated_fee_stroops": total_fee_stroops.to_string(),
+                            "simulated_seq_num": source_sequence.saturating_add(1),
+                        }
+                    })),
+                    Err(e) => {
+                        return Err(rmcp::ErrorData::internal_error(
+                            format!("approval.store_error: {e}"),
+                            None,
+                        ));
                     }
-                })),
-                Err(e) => {
-                    return Err(rmcp::ErrorData::internal_error(
-                        format!("approval.store_error: {e}"),
-                        None,
-                    ));
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         // ── Build response ────────────────────────────────────────────────────
         let preview_json = serde_json::to_value(&preview).unwrap_or(serde_json::Value::Null);
@@ -971,6 +977,7 @@ impl WalletServer {
         let floor_hook = crate::sequence_floor::hook(&self.sequence_floor);
         let recorder = match crate::tools::submission_record::build_recorder(
             crate::tools::submission_record::CommitRecord {
+                policy_decision: dispatch_outcome.audit_decision(),
                 profile: &self.profile,
                 profile_name: self.profile_name_for_approval(),
                 tool: "stellar_claim_commit",

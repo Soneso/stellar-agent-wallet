@@ -387,7 +387,7 @@ async fn released_server_accepts_wallet_credential_and_settles_exact_transfer() 
                 "mpp-live-acceptance",
                 &ValueClass::Value(effects.clone()),
             )
-            .map_err(|_| state_error())
+            .map_err(|_| stellar_agent_mpp::BeforeSignError::Accounting(state_error()))
         },
         |authorized| {
             let entry = AuditEntry::new_mpp_charge_authorized(
@@ -492,9 +492,8 @@ async fn released_server_accepts_wallet_credential_and_settles_exact_transfer() 
         &signer,
         &sponsored_rpc,
         |_record, _prepared, _effects| {
-            Err(MppError::new(
-                MppErrorCode::ApprovalInvalid,
-                "over-cap policy denial",
+            Err(stellar_agent_mpp::BeforeSignError::PolicyRefused(
+                MppError::new(MppErrorCode::ApprovalInvalid, "over-cap policy denial"),
             ))
         },
         |_authorized| Ok(()),

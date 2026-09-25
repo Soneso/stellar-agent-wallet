@@ -548,6 +548,7 @@ where
     // adapter would otherwise emit.
     let recorder = match crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {
+            policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
             profile: &profile,
             profile_name: profile_name.clone(),
             verb: "vault_deposit",
@@ -922,6 +923,7 @@ where
     // adapter would otherwise emit.
     let recorder = match crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {
+            policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
             profile: &profile,
             profile_name: profile_name.clone(),
             verb: "vault_withdraw",

@@ -35,6 +35,8 @@ pub enum AuthorizationStatus {
     Settled,
     /// Ledger reconciliation verified failure.
     Failed,
+    /// Policy refused admission before window accounting or credential construction.
+    Refused,
     /// Authorization expired without a verified outcome.
     ExpiredUnresolved,
     /// Key access began and the result cannot safely be retried.
@@ -48,6 +50,7 @@ impl AuthorizationStatus {
         matches!(
             self,
             Self::Settled
+                | Self::Refused
                 | Self::Failed
                 | Self::ExpiredUnresolved
                 | Self::AuthorizedWithheld
@@ -68,7 +71,7 @@ impl AuthorizationStatus {
                 | (Self::Ready, Self::Authorizing)
                 | (
                     Self::Authorizing,
-                    Self::DeliveryPending | Self::Failed | Self::Indeterminate
+                    Self::DeliveryPending | Self::Failed | Self::Indeterminate | Self::Refused
                 )
                 | (
                     Self::DeliveryPending,
@@ -274,6 +277,7 @@ impl AuthorizationRecord {
             && matches!(
                 self.status,
                 AuthorizationStatus::Prepared
+                    | AuthorizationStatus::Refused
                     | AuthorizationStatus::ApprovalPending
                     | AuthorizationStatus::Ready
             )
@@ -284,6 +288,7 @@ impl AuthorizationRecord {
             && matches!(
                 self.status,
                 AuthorizationStatus::Prepared
+                    | AuthorizationStatus::Refused
                     | AuthorizationStatus::ApprovalPending
                     | AuthorizationStatus::Ready
                     | AuthorizationStatus::Authorizing
@@ -458,7 +463,7 @@ mod tests {
     use crate::sponsored::tests::prepared_fixture;
 
     fn status(index: u8) -> AuthorizationStatus {
-        match index % 12 {
+        match index % 13 {
             0 => AuthorizationStatus::Prepared,
             1 => AuthorizationStatus::ApprovalPending,
             2 => AuthorizationStatus::Ready,
@@ -470,7 +475,8 @@ mod tests {
             8 => AuthorizationStatus::Settled,
             9 => AuthorizationStatus::Failed,
             10 => AuthorizationStatus::ExpiredUnresolved,
-            _ => AuthorizationStatus::Indeterminate,
+            11 => AuthorizationStatus::Indeterminate,
+            _ => AuthorizationStatus::Refused,
         }
     }
 
@@ -488,7 +494,7 @@ mod tests {
                 )
                 | (
                     S::Authorizing,
-                    S::DeliveryPending | S::Failed | S::Indeterminate
+                    S::DeliveryPending | S::Failed | S::Indeterminate | S::Refused
                 )
                 | (S::DeliveryPending, S::Authorized | S::AuthorizedWithheld)
                 | (
@@ -640,6 +646,14 @@ mod tests {
         assert_invalid(&record);
         let mut record = base.clone();
         record.status = AuthorizationStatus::DeliveryPending;
+        assert_invalid(&record);
+        let mut record = base.clone();
+        record.status = AuthorizationStatus::Refused;
+        record.policy_accounted = true;
+        assert_invalid(&record);
+        let mut record = base.clone();
+        record.status = AuthorizationStatus::Refused;
+        record.credential_digest = Some([1; 32]);
         assert_invalid(&record);
 
         let mut record = base.clone();

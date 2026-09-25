@@ -452,6 +452,7 @@ mod tests {
                     PolicyDecision::Allow,
                     None,
                     None,
+                    None,
                     "req-pre",
                 );
                 writer.write_entry(entry).expect("write pre-rotation entry");
@@ -537,6 +538,7 @@ mod tests {
                 "abcd1234…wxyz5678",
                 7,
                 PolicyDecision::Allow,
+                None,
                 None,
                 None,
                 request_id,

@@ -1210,6 +1210,8 @@ struct PendingApprovalOnDisk {
     process_uid: String,
     created_at_unix_ms: u64,
     expires_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 
     // PaymentSimulated flat fields — present iff sign_with_passkey is absent.
     #[serde(default)]
@@ -1422,6 +1424,9 @@ pub struct PendingApproval {
     /// Entries with `expires_at_unix_ms <= now` are treated as expired.
     pub expires_at_unix_ms: u64,
 
+    /// Rule-provided explanation displayed to the operator; never a trust input.
+    pub reason: Option<String>,
+
     /// The kind-discriminated approval data.
     ///
     /// Carries all fields specific to the approval flow
@@ -1476,6 +1481,7 @@ impl std::fmt::Debug for PendingApproval {
             .field("process_uid", &self.process_uid)
             .field("created_at_unix_ms", &self.created_at_unix_ms)
             .field("expires_at_unix_ms", &self.expires_at_unix_ms)
+            .field("reason", &self.reason)
             .field("kind", &self.kind)
             .field("attestation_blob_b64", &attest_display)
             .field("passkey_assertion", &passkey_display)
@@ -1862,6 +1868,7 @@ impl Serialize for PendingApproval {
             process_uid: self.process_uid.clone(),
             created_at_unix_ms: self.created_at_unix_ms,
             expires_at_unix_ms: self.expires_at_unix_ms,
+            reason: self.reason.clone(),
             envelope_xdr_b64: envelope_xdr_b64.map(ToOwned::to_owned),
             envelope_sha256_hex: envelope_sha256_hex.map(ToOwned::to_owned),
             summary_to: summary_to.map(ToOwned::to_owned),
@@ -2568,6 +2575,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
             process_uid: raw.process_uid,
             created_at_unix_ms: raw.created_at_unix_ms,
             expires_at_unix_ms: raw.expires_at_unix_ms,
+            reason: raw.reason,
             kind,
             attestation_blob_b64: raw.attestation_blob_b64,
             passkey_assertion: raw.passkey_assertion,
@@ -2576,6 +2584,31 @@ impl<'de> Deserialize<'de> for PendingApproval {
 }
 
 impl PendingApproval {
+    /// Applies the policy rule's lifetime and explanation while retaining the wallet-issued nonce.
+    #[must_use]
+    pub fn with_policy_request(mut self, request: &crate::policy::ApprovalRequest) -> Self {
+        self.expires_at_unix_ms = self
+            .created_at_unix_ms
+            .saturating_add(u64::from(request.ttl_seconds) * 1_000);
+        self.reason = request.reason.clone();
+        self
+    }
+
+    /// Returns the request bound to this persisted approval.
+    #[must_use]
+    pub fn approval_request(&self) -> crate::policy::ApprovalRequest {
+        let ttl = self
+            .expires_at_unix_ms
+            .saturating_sub(self.created_at_unix_ms)
+            / 1_000;
+        let mut request = crate::policy::ApprovalRequest::new(
+            self.approval_nonce.clone(),
+            u32::try_from(ttl).unwrap_or(u32::MAX),
+        );
+        request.reason = self.reason.clone();
+        request
+    }
+
     /// Constructs a new unattested `PaymentSimulated` approval.
     ///
     /// Generates a random `approval_nonce` from `OsRng`, derives
@@ -2660,6 +2693,7 @@ impl PendingApproval {
             process_uid,
             created_at_unix_ms,
             expires_at_unix_ms,
+            reason: None,
             kind: ApprovalKind::PaymentSimulated {
                 envelope_xdr_b64,
                 envelope_sha256_hex,
@@ -2804,6 +2838,7 @@ impl PendingApproval {
             process_uid,
             created_at_unix_ms,
             expires_at_unix_ms,
+            reason: None,
             kind: ApprovalKind::SignWithPasskey {
                 auth_digest,
                 credential_id,
@@ -2920,6 +2955,7 @@ impl PendingApproval {
             process_uid,
             created_at_unix_ms,
             expires_at_unix_ms,
+            reason: None,
             kind: ApprovalKind::RegisterPasskey {
                 smart_account_redacted,
                 rule_ids,
@@ -3021,6 +3057,7 @@ impl PendingApproval {
             process_uid,
             created_at_unix_ms,
             expires_at_unix_ms,
+            reason: None,
             kind: ApprovalKind::ToolsetFirstInvokeGate {
                 toolset_name,
                 capability,
@@ -3096,6 +3133,7 @@ impl PendingApproval {
             process_uid,
             created_at_unix_ms,
             expires_at_unix_ms,
+            reason: None,
             kind: ApprovalKind::TrustlineClawbackOptIn {
                 network,
                 code,
@@ -3173,6 +3211,7 @@ impl PendingApproval {
             process_uid,
             created_at_unix_ms,
             expires_at_unix_ms,
+            reason: None,
             kind: ApprovalKind::ClaimSimulated {
                 envelope_xdr_b64,
                 envelope_sha256_hex,
@@ -3251,6 +3290,7 @@ impl PendingApproval {
             process_uid,
             created_at_unix_ms,
             expires_at_unix_ms,
+            reason: None,
             kind: ApprovalKind::RuleProposalSimulated {
                 smart_account,
                 smart_account_redacted,
@@ -3383,6 +3423,7 @@ impl PendingApproval {
             process_uid,
             created_at_unix_ms,
             expires_at_unix_ms,
+            reason: None,
             kind: ApprovalKind::MppChargeSimulated {
                 authorization_fingerprint,
                 prepared_artifact_hash,
@@ -4561,6 +4602,7 @@ impl PendingApprovalStore {
             process_uid,
             created_at_unix_ms: now_unix_ms,
             expires_at_unix_ms: now_unix_ms.saturating_add(ttl_ms),
+            reason: None,
             kind: ApprovalKind::Rejected { original_kind_name },
             attestation_blob_b64: None,
             passkey_assertion: None,
@@ -4621,6 +4663,7 @@ impl PendingApprovalStore {
             process_uid: existing.process_uid.clone(),
             created_at_unix_ms: existing.created_at_unix_ms,
             expires_at_unix_ms: existing.expires_at_unix_ms,
+            reason: None,
             kind: ApprovalKind::Consumed {
                 original_kind_name,
                 tx_hash: tx_hash.to_owned(),

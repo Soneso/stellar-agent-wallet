@@ -259,6 +259,15 @@ pub fn authorization_status(
     })
 }
 
+/// Failure at the policy accounting gate before signing.
+#[derive(Debug)]
+pub enum BeforeSignError {
+    /// Policy refused admission and no window usage was written.
+    PolicyRefused(MppError),
+    /// Accounting failed and window usage may have been written.
+    Accounting(MppError),
+}
+
 /// Claims, accounts, signs, audits, and releases one credential.
 ///
 /// `before_sign` must re-evaluate policy and durably record window usage for
@@ -291,7 +300,7 @@ where
         &AuthorizationRecord,
         &PreparedSponsoredCharge,
         &ValueEffects,
-    ) -> Result<(), MppError>,
+    ) -> Result<(), BeforeSignError>,
     BeforeDelivery: FnOnce(&AuthorizedCharge<'_>) -> Result<(), MppError>,
     OnWithheld: FnMut(&WithheldCharge<'_>),
 {
@@ -321,16 +330,30 @@ where
     let prepared = record.prepared_charge()?;
     let effects = crate::mpp_value_effects(prepared.selected());
     if let Err(error) = before_sign(&record, &prepared, &effects) {
-        notify_withheld(
-            state_store,
-            authorization_id,
-            now_unix,
-            "policy_accounting",
-            false,
-            true,
-            &mut on_withheld,
-        );
-        return Err(error);
+        return match error {
+            BeforeSignError::PolicyRefused(error) => {
+                let refused = state_store.mark_refused(authorization_id, now_unix)?;
+                on_withheld(&WithheldCharge {
+                    record: &refused,
+                    failure_stage: "policy_refusal",
+                    key_access_began: false,
+                    policy_budget_consumed: false,
+                });
+                Err(error)
+            }
+            BeforeSignError::Accounting(error) => {
+                notify_withheld(
+                    state_store,
+                    authorization_id,
+                    now_unix,
+                    "policy_accounting",
+                    false,
+                    true,
+                    &mut on_withheld,
+                );
+                Err(error)
+            }
+        };
     }
     if let Err(error) = state_store.mark_policy_accounted(authorization_id) {
         notify_withheld(
@@ -908,16 +931,20 @@ mod tests {
             TESTNET_PASSPHRASE,
             &signer,
             &rpc,
-            |_record, _prepared, _effects| Err(state_error()),
+            |_record, _prepared, _effects| Err(BeforeSignError::Accounting(state_error())),
             |_authorized| Ok(()),
             |withheld| {
-                event = Some((withheld.failure_stage, withheld.key_access_began));
+                event = Some((
+                    withheld.failure_stage,
+                    withheld.key_access_began,
+                    withheld.policy_budget_consumed,
+                ));
             },
         )
         .await
         .expect_err("accounting ambiguity must fail closed");
         assert_eq!(rpc.call_count(), 1, "only prepare simulation is allowed");
-        assert_eq!(event, Some(("policy_accounting", false)));
+        assert_eq!(event, Some(("policy_accounting", false, true)));
         assert_eq!(
             state
                 .load(&preview.authorization_id)
@@ -978,5 +1005,79 @@ mod tests {
                 .status(),
             AuthorizationStatus::Authorizing
         );
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn policy_refusal_withholds_without_consuming_budget() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let state = store(&directory);
+        let (prepared, signer, rpc) = prepared_fixture(NOW).await;
+        let preview = persist_prepared_authorization(
+            "policy-refused",
+            TESTNET_PASSPHRASE,
+            &prepared,
+            ApprovalDisposition::Allow,
+            "424242",
+            NOW,
+            &state,
+            None,
+        )
+        .expect("persist");
+        let mut row = None;
+        let mut delivered = false;
+        let error = commit_authorization(
+            &state,
+            None,
+            None,
+            &preview.authorization_id,
+            NOW + 1,
+            TESTNET_PASSPHRASE,
+            &signer,
+            &rpc,
+            |_record, _prepared, _effects| Err(BeforeSignError::PolicyRefused(approval_error())),
+            |_authorized| {
+                delivered = true;
+                Ok(())
+            },
+            |withheld| {
+                let entry =
+                    stellar_agent_core::audit_log::AuditEntry::new_mpp_authorization_withheld(
+                        "id",
+                        "fingerprint",
+                        withheld.failure_stage,
+                        withheld.key_access_began,
+                        withheld.policy_budget_consumed,
+                        "request",
+                    );
+                row = Some(serde_json::to_value(entry).expect("audit row"));
+            },
+        )
+        .await
+        .expect_err("policy refusal");
+        assert_eq!(error.code(), "mpp.approval_invalid");
+        assert!(!delivered, "refused authorization cannot reach delivery");
+        let row = row.expect("withheld row");
+        assert_eq!(row["kind"], "mpp_authorization_withheld");
+        assert_eq!(row["failure_stage"], "policy_refusal");
+        assert_eq!(row["policy_budget_consumed"], false);
+        assert_eq!(row["key_access_began"], false);
+        assert_eq!(rpc.call_count(), 1, "only prepare simulation is allowed");
+        let record = state
+            .load(&preview.authorization_id)
+            .expect("refused record");
+        assert_eq!(record.status(), AuthorizationStatus::Refused);
+        assert!(!record.policy_accounted());
+        assert!(!record.credential_constructed());
+        assert_eq!(
+            serde_json::to_value(record.status()).expect("status"),
+            "refused"
+        );
+        assert!(
+            state
+                .claim_ready(&preview.authorization_id, NOW + 2)
+                .is_err()
+        );
+        assert_eq!(state.prune(NOW + 90 * 24 * 60 * 60).expect("prune"), 1);
     }
 }

@@ -67,13 +67,21 @@ pub(crate) enum DispatchOutcome {
     RequireApproval(ApprovalOutcome),
 }
 
+impl DispatchOutcome {
+    /// The policy decision retained by submission audit rows.
+    pub(crate) fn audit_decision(&self) -> stellar_agent_core::audit_log::PolicyDecision {
+        match self {
+            Self::Allow(_) => stellar_agent_core::audit_log::PolicyDecision::Allow,
+            Self::RequireApproval(_) => {
+                stellar_agent_core::audit_log::PolicyDecision::RequireApproval
+            }
+        }
+    }
+}
+
 /// An approval request together with the effects its policy criteria sized.
 #[derive(Debug)]
 pub(crate) struct ApprovalOutcome {
-    #[allow(
-        dead_code,
-        reason = "retains the policy request alongside its sized effects"
-    )]
     pub request: ApprovalRequest,
     pub value_effects: Option<stellar_agent_core::policy::v1::ValueEffects>,
 }
@@ -260,17 +268,8 @@ pub(crate) fn commit_refusal_result(
 // APPROVAL_TTL_MS — 24-hour pending-approval TTL
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Default TTL for pending approvals persisted by simulate handlers: 24 hours.
-///
-/// An approval entry written to `~/.local/share/stellar-agent/approvals/<profile>.toml`
-/// is valid for 24 hours from the time of the simulate call.  Entries older
-/// than this are treated as expired and return `policy.approval_required` at
-/// the commit boundary (per the indistinguishability rule).
-///
-/// Also re-exported by [`stellar_agent_core::approval::store::DEFAULT_TTL_MS`].
-/// The constant is defined here (adjacent to `DEFAULT_NONCE_TTL_MS`) for
-/// discoverability by tool-handler authors.
-pub(crate) const APPROVAL_TTL_MS: u64 = 86_400_000; // 24 h
+/// Default pending-approval lifetime when a rule supplies no TTL: 24 hours.
+pub(crate) const APPROVAL_TTL_MS: u64 = stellar_agent_core::approval::store::DEFAULT_TTL_MS;
 
 /// Returns the first 8 base64 characters of a nonce for use as a tracing
 /// correlation prefix. Saturating: if the base64 encoding is shorter than 8
@@ -1265,6 +1264,7 @@ impl WalletServer {
                 &settled.tx_hash,
                 &settled.status,
                 settled.ledger,
+                stellar_agent_core::audit_log::PolicyDecision::Allow,
             );
         }
     }
@@ -1724,9 +1724,9 @@ pub(crate) async fn verify_attestation_gate(
     };
     use stellar_agent_core::profile::schema::default_approval_dir;
 
-    if !matches!(dispatch_outcome, DispatchOutcome::RequireApproval(_)) {
+    let DispatchOutcome::RequireApproval(approval) = dispatch_outcome else {
         return Ok(());
-    }
+    };
 
     let profile_name = server.profile_name_for_approval();
 
@@ -1803,7 +1803,11 @@ pub(crate) async fn verify_attestation_gate(
         tracing::debug!(error = %e, tool = tool_name, "clock error for expiry check");
         approval_required_indistinguishable()
     })?;
-    if entry.is_expired(now_ms_attest) {
+    // The requiring rule's lifetime bounds the entry as well as the stored expiry.
+    let rule_expires_at_unix_ms = entry
+        .created_at_unix_ms
+        .saturating_add(u64::from(approval.request.ttl_seconds).saturating_mul(1_000));
+    if entry.is_expired(now_ms_attest) || rule_expires_at_unix_ms <= now_ms_attest {
         tracing::debug!(
             nonce = %approval_nonce_str,
             tool = tool_name,

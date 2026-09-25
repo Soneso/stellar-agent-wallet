@@ -71,12 +71,13 @@ impl WalletServer {
         Parameters(args): Parameters<StellarTransactionStatusArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let args_value = json!({ "chain_id": &args.chain_id });
-        if let Err(e) = self
+        let reconciliation_decision = match self
             .dispatch_gate("stellar_transaction_status", &args_value, &args.chain_id)
             .await
         {
-            return e.into_result();
-        }
+            Ok(outcome) => outcome.audit_decision(),
+            Err(error) => return error.into_result(),
+        };
 
         if !is_tx_hash(&args.tx_hash) {
             return Ok(business_error_result(
@@ -209,6 +210,7 @@ impl WalletServer {
                 &record.tx_hash,
                 &record.status,
                 record.ledger.or(chain.ledger),
+                reconciliation_decision,
             );
         }
 

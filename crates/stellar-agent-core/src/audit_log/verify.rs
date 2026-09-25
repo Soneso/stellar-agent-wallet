@@ -1912,6 +1912,7 @@ mod tests {
                 operator_credential_id_redacted: "cafebabe".to_owned(),
             },
             EventKind::ValueActionSubmitted {
+                approval_nonce: None,
                 legs: vec![ValueLegRecord {
                     action: ValueActionKind::Payment,
                     amount: Some(1_000_000),
@@ -1923,6 +1924,7 @@ mod tests {
                 ledger: 42,
             },
             EventKind::ValueActionPending {
+                approval_nonce: None,
                 legs: vec![ValueLegRecord {
                     action: ValueActionKind::Payment,
                     amount: Some(1_000_000),
@@ -1934,6 +1936,7 @@ mod tests {
                 sequence: 7,
             },
             EventKind::ValueActionFailed {
+                approval_nonce: None,
                 legs: vec![ValueLegRecord {
                     action: ValueActionKind::Payment,
                     amount: Some(1_000_000),

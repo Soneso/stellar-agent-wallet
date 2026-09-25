@@ -37,6 +37,8 @@ pub(crate) struct SubmitRecord<'a> {
     pub verb: &'static str,
     /// The registered tool name, as it appears in the audit log.
     pub tool: &'static str,
+    /// The policy decision that admitted this submission.
+    pub policy_decision: stellar_agent_core::audit_log::PolicyDecision,
     /// CAIP-2 chain identifier for the audit rows.
     pub chain_id: &'a str,
     /// The value effects the policy gate sized. `None` records no window
@@ -107,6 +109,7 @@ pub(crate) fn build_recorder(
         record.profile_name.clone(),
         record.tool,
         Some(record.chain_id.to_owned()),
+        record.policy_decision,
         legs,
         window_entries,
         receipts,
@@ -198,6 +201,7 @@ pub(crate) async fn reconcile_open_reservations(
             &settled.tx_hash,
             &settled.status,
             settled.ledger,
+            stellar_agent_core::audit_log::PolicyDecision::Allow,
         );
     }
 }
@@ -211,6 +215,10 @@ pub(crate) async fn reconcile_open_reservations(
 ///
 /// Non-fatal: the chain has already answered, and the settled record is the
 /// receipt and the spending window. A row that cannot be appended is logged.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "settlement carries submission identity and the reconciliation decision"
+)]
 pub(crate) fn write_settled_row(
     profile: &Profile,
     profile_name: &str,
@@ -219,10 +227,11 @@ pub(crate) fn write_settled_row(
     tx_hash: &str,
     status: &ReceiptStatus,
     ledger: Option<u32>,
+    reconciliation_decision: stellar_agent_core::audit_log::PolicyDecision,
 ) {
     use stellar_agent_core::audit_log::reader::ValueActionSettlement;
 
-    let (tool, chain_id, legs, nonce_id) =
+    let (tool, chain_id, legs, nonce_id, policy_decision, approval_nonce) =
         match stellar_agent_core::audit_log::reader::value_action_settlement(
             &profile.audit_log_path,
             envelope_hash,
@@ -235,6 +244,8 @@ pub(crate) fn write_settled_row(
                 pending.chain_id,
                 pending.legs,
                 pending.nonce_id,
+                pending.policy_decision,
+                pending.approval_nonce,
             ),
             // The pending row has rotated out of the active file, so its sizing is
             // gone. The outcome still belongs in the log, under the name of the
@@ -243,6 +254,8 @@ pub(crate) fn write_settled_row(
                 RECONCILE_VERB.to_owned(),
                 profile.chain_id.caip2_str().to_owned().into(),
                 Vec::new(),
+                None,
+                reconciliation_decision,
                 None,
             ),
         };
@@ -257,9 +270,10 @@ pub(crate) fn write_settled_row(
                 legs,
                 tx_redacted.as_str(),
                 ledger.unwrap_or(0),
-                stellar_agent_core::audit_log::PolicyDecision::Allow,
+                policy_decision,
                 Some(envelope_hash.to_owned()),
                 nonce_id,
+                approval_nonce,
                 &request_id,
             )
         }
@@ -270,9 +284,10 @@ pub(crate) fn write_settled_row(
                 legs,
                 tx_redacted.as_str(),
                 code.as_str(),
-                stellar_agent_core::audit_log::PolicyDecision::Allow,
+                policy_decision,
                 Some(envelope_hash.to_owned()),
                 nonce_id,
+                approval_nonce,
                 &request_id,
             )
         }
@@ -842,5 +857,75 @@ mod tests {
             "a pre-send refusal carries no details; got {:?}",
             rendered.details
         );
+    }
+    #[test]
+    fn settlement_rows_preserve_pending_approval_context() {
+        use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
+        for approved in [false, true] {
+            for failed in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut profile =
+                    Profile::builder_testnet("signer", "default", "nonce", "default").build();
+                profile.audit_log_path = dir.path().join("audit.jsonl");
+                let audit = Arc::new(Mutex::new(
+                    AuditWriter::open(profile.audit_log_path.clone(), None).unwrap(),
+                ));
+                let decision = if approved {
+                    PolicyDecision::RequireApproval
+                } else {
+                    PolicyDecision::Allow
+                };
+                let nonce = approved.then(|| "approval-binding".to_owned());
+                audit
+                    .lock()
+                    .unwrap()
+                    .write_entry(AuditEntry::new_value_action_pending(
+                        "stellar_pay_commit",
+                        "stellar:testnet",
+                        Vec::new(),
+                        "transaction",
+                        "source",
+                        7,
+                        decision.clone(),
+                        Some("envelope".to_owned()),
+                        None,
+                        nonce.clone(),
+                        "pending-request",
+                    ))
+                    .unwrap();
+                let status = if failed {
+                    ReceiptStatus::Failed {
+                        code: "ledger.failed".to_owned(),
+                    }
+                } else {
+                    ReceiptStatus::Success
+                };
+                write_settled_row(
+                    &profile,
+                    "audit-settlement",
+                    &audit,
+                    "envelope",
+                    "transaction",
+                    &status,
+                    Some(9),
+                    PolicyDecision::Allow,
+                );
+                let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(rows.len(), 2);
+                assert_eq!(
+                    rows[1]["policy_decision"],
+                    serde_json::to_value(decision).unwrap()
+                );
+                assert_eq!(
+                    rows[1]["approval_nonce"],
+                    serde_json::to_value(nonce).unwrap()
+                );
+                assert_eq!(rows[1]["tool"], "stellar_pay_commit");
+            }
+        }
     }
 }

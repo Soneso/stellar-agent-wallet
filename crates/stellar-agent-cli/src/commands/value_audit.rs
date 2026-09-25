@@ -417,6 +417,7 @@ mod tests {
             stellar_agent_core::audit_log::PolicyDecision::Allow,
             None,
             None,
+            None,
             "req-e2e-1",
         );
         emit_value_audit_row(&profile, "e2e-emit", entry);
@@ -494,6 +495,7 @@ mod tests {
             "abcd1234…wxyz5678",
             9,
             stellar_agent_core::audit_log::PolicyDecision::Allow,
+            None,
             None,
             None,
             "req-require-1",
@@ -602,6 +604,7 @@ mod tests {
             "abcd1234…wxyz5678",
             11,
             stellar_agent_core::audit_log::PolicyDecision::Allow,
+            None,
             None,
             None,
             "req-origin-synth-1",
@@ -818,6 +821,7 @@ mod tests {
                     stellar_agent_core::audit_log::PolicyDecision::Allow,
                     None,
                     None,
+                    None,
                     "req-anchor-1",
                 ))
                 .expect("append");
@@ -833,6 +837,7 @@ mod tests {
                     "abcd1234…wxyz5678",
                     8,
                     stellar_agent_core::audit_log::PolicyDecision::Allow,
+                    None,
                     None,
                     None,
                     "req-anchor-2",
@@ -884,6 +889,7 @@ mod tests {
                     "abcd1234…wxyz5678",
                     1,
                     stellar_agent_core::audit_log::PolicyDecision::Allow,
+                    None,
                     None,
                     None,
                     "req-pre-anchor",

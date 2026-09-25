@@ -38,7 +38,10 @@ use tempfile::TempDir;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const SUBMIT_TIMEOUT: Duration = Duration::from_millis(400);
+const SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
+// Timeout is observed between two-second confirmation polls.
+const TIMEOUT_DEADLINE: Duration = Duration::from_secs(1);
+const TIMEOUT_OUTER_BOUND: Duration = Duration::from_secs(4);
 const SUBMISSION_LEDGER: u32 = 1_000;
 
 /// What the recorder was asked to do, in order.
@@ -163,6 +166,7 @@ impl Fixture {
                 self.profile_name.clone(),
                 "stellar_pay_commit",
                 Some("stellar:testnet".to_owned()),
+                stellar_agent_core::audit_log::PolicyDecision::Allow,
                 Vec::new(),
                 vec![entry(&self.profile_name, now_ms(), 500)],
                 self.receipts.clone(),
@@ -191,6 +195,7 @@ impl Fixture {
                 self.profile_name.clone(),
                 "stellar_pay_commit",
                 Some("stellar:testnet".to_owned()),
+                stellar_agent_core::audit_log::PolicyDecision::Allow,
                 Vec::new(),
                 vec![WindowEntry::new(
                     state_key(&self.profile_name),
@@ -450,15 +455,19 @@ async fn a_timeout_reports_the_local_hash_and_leaves_the_record_standing() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let recorder = fx.recorder(&calls);
     let client = StellarRpcClient::new(&server.uri()).unwrap();
-    let err = submit_transaction_and_wait(
-        &client,
-        envelope.envelope_xdr(),
-        SUBMIT_TIMEOUT,
-        TESTNET_PASSPHRASE,
-        None,
-        Some(&recorder),
+    let err = tokio::time::timeout(
+        TIMEOUT_OUTER_BOUND,
+        submit_transaction_and_wait(
+            &client,
+            envelope.envelope_xdr(),
+            TIMEOUT_DEADLINE,
+            TESTNET_PASSPHRASE,
+            None,
+            Some(&recorder),
+        ),
     )
     .await
+    .expect("submission must finish within the outer timeout bound")
     .expect_err("a submission that never confirms must report a timeout");
 
     match &err {
@@ -475,7 +484,7 @@ async fn a_timeout_reports_the_local_hash_and_leaves_the_record_standing() {
     let calls = calls.lock().unwrap().clone();
     assert_eq!(calls[0], Call::PreSend);
     assert!(
-        matches!(calls[1], Call::Outcome(SubmissionOutcome::Timeout { .. })),
+        matches!(&calls[1], Call::Outcome(SubmissionOutcome::Timeout { tx_hash }) if tx_hash == envelope.tx_hash_hex()),
         "a timeout reports Timeout; got {calls:?}"
     );
 
@@ -555,15 +564,19 @@ async fn a_transport_failure_after_the_record_returns_the_timeout_shape() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let recorder = fx.recorder(&calls);
     let client = StellarRpcClient::new(&server.uri()).unwrap();
-    let err = submit_transaction_and_wait(
-        &client,
-        envelope.envelope_xdr(),
-        SUBMIT_TIMEOUT,
-        TESTNET_PASSPHRASE,
-        None,
-        Some(&recorder),
+    let err = tokio::time::timeout(
+        TIMEOUT_OUTER_BOUND,
+        submit_transaction_and_wait(
+            &client,
+            envelope.envelope_xdr(),
+            TIMEOUT_DEADLINE,
+            TESTNET_PASSPHRASE,
+            None,
+            Some(&recorder),
+        ),
     )
     .await
+    .expect("submission must finish within the outer timeout bound")
     .expect_err("a send that never completes must report an unknown outcome");
 
     assert_eq!(
@@ -703,15 +716,25 @@ async fn a_second_submission_at_a_pending_sequence_is_refused() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let recorder = fx.recorder(&calls);
     let client = StellarRpcClient::new(&server.uri()).unwrap();
-    let _ = submit_transaction_and_wait(
-        &client,
-        envelope.envelope_xdr(),
-        SUBMIT_TIMEOUT,
-        TESTNET_PASSPHRASE,
-        None,
-        Some(&recorder),
+    let first = tokio::time::timeout(
+        TIMEOUT_OUTER_BOUND,
+        submit_transaction_and_wait(
+            &client,
+            envelope.envelope_xdr(),
+            TIMEOUT_DEADLINE,
+            TESTNET_PASSPHRASE,
+            None,
+            Some(&recorder),
+        ),
     )
-    .await;
+    .await
+    .expect("submission must finish within the outer timeout bound");
+    assert_eq!(
+        first
+            .expect_err("the mocked endpoint never confirms")
+            .code(),
+        "submission.tx_timeout"
+    );
 
     // A rebuilt envelope for the same intent: same source and sequence, a
     // different fee, and therefore different bytes.
@@ -830,15 +853,19 @@ async fn a_reservation_failure_unwinds_and_the_retry_is_admitted() {
     let calls2 = Arc::new(Mutex::new(Vec::new()));
     let recorder2 = fx.recorder(&calls2);
     let client2 = StellarRpcClient::new(&server2.uri()).unwrap();
-    let retry = submit_transaction_and_wait(
-        &client2,
-        envelope.envelope_xdr(),
-        SUBMIT_TIMEOUT,
-        TESTNET_PASSPHRASE,
-        None,
-        Some(&recorder2),
+    let retry = tokio::time::timeout(
+        TIMEOUT_OUTER_BOUND,
+        submit_transaction_and_wait(
+            &client2,
+            envelope.envelope_xdr(),
+            TIMEOUT_DEADLINE,
+            TESTNET_PASSPHRASE,
+            None,
+            Some(&recorder2),
+        ),
     )
-    .await;
+    .await
+    .expect("submission must finish within the outer timeout bound");
 
     let retry_err = retry.expect_err("the mocked endpoint never confirms");
     assert_eq!(
@@ -938,15 +965,19 @@ async fn a_muxed_source_reaches_the_send() {
     let client = StellarRpcClient::new(&server.uri()).unwrap();
 
     // Without a recorder: the replay identity is read on every submission.
-    let bare = submit_transaction_and_wait(
-        &client,
-        envelope.envelope_xdr(),
-        SUBMIT_TIMEOUT,
-        TESTNET_PASSPHRASE,
-        None,
-        None,
+    let bare = tokio::time::timeout(
+        TIMEOUT_OUTER_BOUND,
+        submit_transaction_and_wait(
+            &client,
+            envelope.envelope_xdr(),
+            TIMEOUT_DEADLINE,
+            TESTNET_PASSPHRASE,
+            None,
+            None,
+        ),
     )
-    .await;
+    .await
+    .expect("submission must finish within the outer timeout bound");
     let bare_err = bare.expect_err("the mocked endpoint never confirms");
     assert_eq!(
         bare_err.code(),
@@ -957,15 +988,19 @@ async fn a_muxed_source_reaches_the_send() {
     // With one: the record is keyed on the underlying account.
     let calls = Arc::new(Mutex::new(Vec::new()));
     let recorder = fx.recorder(&calls);
-    let recorded = submit_transaction_and_wait(
-        &client,
-        envelope.envelope_xdr(),
-        SUBMIT_TIMEOUT,
-        TESTNET_PASSPHRASE,
-        None,
-        Some(&recorder),
+    let recorded = tokio::time::timeout(
+        TIMEOUT_OUTER_BOUND,
+        submit_transaction_and_wait(
+            &client,
+            envelope.envelope_xdr(),
+            TIMEOUT_DEADLINE,
+            TESTNET_PASSPHRASE,
+            None,
+            Some(&recorder),
+        ),
     )
-    .await;
+    .await
+    .expect("submission must finish within the outer timeout bound");
     let recorded_err = recorded.expect_err("the mocked endpoint never confirms");
     assert_eq!(recorded_err.code(), "submission.tx_timeout");
 
@@ -1005,15 +1040,19 @@ async fn an_unexpected_poll_status_reports_the_timeout_shape() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let recorder = fx.recorder(&calls);
     let client = StellarRpcClient::new(&server.uri()).unwrap();
-    let result = submit_transaction_and_wait(
-        &client,
-        envelope.envelope_xdr(),
-        SUBMIT_TIMEOUT,
-        TESTNET_PASSPHRASE,
-        None,
-        Some(&recorder),
+    let result = tokio::time::timeout(
+        TIMEOUT_OUTER_BOUND,
+        submit_transaction_and_wait(
+            &client,
+            envelope.envelope_xdr(),
+            TIMEOUT_DEADLINE,
+            TESTNET_PASSPHRASE,
+            None,
+            Some(&recorder),
+        ),
     )
-    .await;
+    .await
+    .expect("submission must finish within the outer timeout bound");
 
     let err = result.expect_err("an unexpected status is not a confirmation");
     assert_eq!(
@@ -1099,6 +1138,7 @@ async fn assert_audit_append_refusal(failure: AuditAppendFailure) {
         fx.profile_name.clone(),
         "stellar_pay_commit",
         Some("stellar:testnet".to_owned()),
+        stellar_agent_core::audit_log::PolicyDecision::Allow,
         Vec::new(),
         vec![entry(&fx.profile_name, now_ms(), 500)],
         fx.receipts.clone(),
@@ -1221,15 +1261,19 @@ async fn a_reservation_the_window_cannot_admit_is_refused_as_a_policy_denial() {
     let first_calls = Arc::new(Mutex::new(Vec::new()));
     let first_recorder = fx.capped_recorder(&first_calls, Arc::clone(&audit), 600, 1_000);
     let client = StellarRpcClient::new(&server.uri()).unwrap();
-    let first_result = submit_transaction_and_wait(
-        &client,
-        first.envelope_xdr(),
-        SUBMIT_TIMEOUT,
-        TESTNET_PASSPHRASE,
-        None,
-        Some(&first_recorder),
+    let first_result = tokio::time::timeout(
+        TIMEOUT_OUTER_BOUND,
+        submit_transaction_and_wait(
+            &client,
+            first.envelope_xdr(),
+            TIMEOUT_DEADLINE,
+            TESTNET_PASSPHRASE,
+            None,
+            Some(&first_recorder),
+        ),
     )
-    .await;
+    .await
+    .expect("submission must finish within the outer timeout bound");
     assert_eq!(
         first_result
             .expect_err("the mocked endpoint never confirms")

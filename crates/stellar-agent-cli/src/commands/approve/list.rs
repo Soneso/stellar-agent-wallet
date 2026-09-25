@@ -239,7 +239,12 @@ fn render_pending_row(view: &PendingApprovalView, now_ms: u64) -> String {
     } else {
         format_expires_in(view.expires_at_unix_ms, now_ms)
     };
-    format!("{nonce}  {kind:<24}  {summary}  (expires in {expires_in})")
+    let reason = view
+        .reason
+        .as_deref()
+        .map(|reason| format!("  reason: {}", sanitize_for_table(reason)))
+        .unwrap_or_default();
+    format!("{nonce}  {kind:<24}  {summary}{reason}  (expires in {expires_in})")
 }
 
 /// Renders a one-line, non-secret summary for a [`PendingApprovalView`].
@@ -561,5 +566,50 @@ mod tests {
         dir_store.reject(&nonce, 0, DEFAULT_TTL_MS).unwrap();
         let rejected_view = dir_store.snapshot(0).into_iter().next().unwrap();
         assert!(render_summary_line(&rejected_view).contains("rejected"));
+    }
+    #[test]
+    fn rule_approval_shape_reaches_cli_list() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use stellar_agent_core::policy::{
+            Decision,
+            v1::{canonical::canonical_bytes, loader::load_signed_policy, signature::digest},
+        };
+        let dir = TempDir::new().unwrap();
+        let key = SigningKey::from_bytes(&[61; 32]);
+        let body = "version = 1\nscope = \"profile:shape\"\n[[rules]]\nmatch = { tool = \"*\", chain = \"*\" }\ncriteria = []\ndecision = \"require_approval\"\nttl_secs = 617\nreason = \"Treasury review\"\n";
+        let sig = hex::encode(
+            key.sign(&digest(&canonical_bytes(body).unwrap()))
+                .to_bytes(),
+        );
+        let owner = stellar_strkey::ed25519::PublicKey(key.verifying_key().to_bytes()).to_string();
+        let policy_path = dir.path().join("policy.toml");
+        std::fs::write(
+            &policy_path,
+            format!("{body}\n[signature]\nowner_id = \"{owner}\"\nsig = \"{sig}\"\n"),
+        )
+        .unwrap();
+        let policy =
+            load_signed_policy(&policy_path, "shape", &key.verifying_key().to_bytes()).unwrap();
+        let request = match &policy.rules[0].decision {
+            Decision::RequireApproval(request) => Some(request),
+            _ => None,
+        }
+        .expect("approval rule");
+        let entry = make_payment_entry(DEFAULT_TTL_MS).with_policy_request(request);
+        let now = entry.created_at_unix_ms;
+        let store_path = dir.path().join("pending.toml");
+        {
+            let mut store = PendingApprovalStore::open(store_path.clone()).unwrap();
+            store.insert(entry, now).unwrap();
+        }
+        let store = PendingApprovalStore::open(store_path).unwrap();
+        let views = store.snapshot(now);
+        let view = &views[0];
+        let json = serde_json::to_value(view).unwrap();
+        assert_eq!(json["reason"], "Treasury review");
+        assert_eq!(view.expires_at_unix_ms - view.created_at_unix_ms, 617_000);
+        let row = render_pending_row(view, now);
+        assert!(row.contains("reason: Treasury review"), "{row}");
+        assert!(row.contains("10m17s"), "{row}");
     }
 }

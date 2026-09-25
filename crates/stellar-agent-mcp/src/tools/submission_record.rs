@@ -38,6 +38,8 @@ pub(crate) struct CommitRecord<'a> {
     pub profile_name: String,
     /// The registered tool name, as it appears in the audit log.
     pub tool: &'static str,
+    /// The policy decision that admitted this submission.
+    pub policy_decision: stellar_agent_core::audit_log::PolicyDecision,
     /// CAIP-2 chain identifier for the audit rows.
     pub chain_id: String,
     /// The value legs the policy gate sized, in their audit-row form.
@@ -79,6 +81,36 @@ pub(crate) fn build_recorder<'a>(
     record: CommitRecord<'a>,
     sequence_floor: Option<&'a dyn SequenceFloorHook>,
 ) -> Result<WalletSubmissionRecorder<'a>, WalletError> {
+    // Only a gate that required approval verified the presented nonce, so only
+    // that decision binds, spends and records it.
+    let approval = match record.policy_decision {
+        stellar_agent_core::audit_log::PolicyDecision::RequireApproval => {
+            match (record.approval_nonce, record.approval_dir) {
+                (Some(approval_nonce), Some(store_dir)) => Some(ApprovalTombstone {
+                    store_dir,
+                    profile_name: record.profile_name.clone(),
+                    approval_nonce,
+                }),
+                (None, _) => {
+                    return Err(WalletError::Submission(
+                        SubmissionError::RecordUnavailable {
+                            detail: "the approved submission presented no approval nonce"
+                                .to_owned(),
+                        },
+                    ));
+                }
+                (Some(_), None) => {
+                    return Err(WalletError::Submission(
+                        SubmissionError::RecordUnavailable {
+                            detail: "the approved submission has no approval store".to_owned(),
+                        },
+                    ));
+                }
+            }
+        }
+        _ => None,
+    };
+
     let receipts = ReceiptStore::open(&record.profile_name).map_err(|e| {
         WalletError::Submission(SubmissionError::RecordUnavailable {
             detail: format!("the submission receipt store could not be opened: {e}"),
@@ -97,20 +129,12 @@ pub(crate) fn build_recorder<'a>(
         None => Vec::new(),
     };
 
-    let approval = match (record.approval_nonce, record.approval_dir) {
-        (Some(approval_nonce), Some(store_dir)) => Some(ApprovalTombstone {
-            store_dir,
-            profile_name: record.profile_name.clone(),
-            approval_nonce,
-        }),
-        _ => None,
-    };
-
     Ok(WalletSubmissionRecorder::new(
         record.profile,
         record.profile_name.clone(),
         record.tool,
         Some(record.chain_id),
+        record.policy_decision,
         record.legs,
         window_entries,
         receipts,
@@ -133,6 +157,10 @@ pub(crate) fn build_recorder<'a>(
 ///
 /// Non-fatal: the chain has already answered, and the settled record is the
 /// receipt and the spending window. A row that cannot be appended is logged.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "settlement carries submission identity and the reconciliation decision"
+)]
 pub(crate) fn write_settled_row(
     profile: &Profile,
     profile_name: &str,
@@ -141,10 +169,11 @@ pub(crate) fn write_settled_row(
     tx_hash: &str,
     status: &ReceiptStatus,
     ledger: Option<u32>,
+    reconciliation_decision: stellar_agent_core::audit_log::PolicyDecision,
 ) {
     use stellar_agent_core::audit_log::reader::ValueActionSettlement;
 
-    let (tool, chain_id, legs, nonce_id) =
+    let (tool, chain_id, legs, nonce_id, policy_decision, approval_nonce) =
         match stellar_agent_core::audit_log::reader::value_action_settlement(
             &profile.audit_log_path,
             envelope_hash,
@@ -157,6 +186,8 @@ pub(crate) fn write_settled_row(
                 pending.chain_id,
                 pending.legs,
                 pending.nonce_id,
+                pending.policy_decision,
+                pending.approval_nonce,
             ),
             // The pending row has rotated out of the active file, so its sizing is
             // gone. The outcome still belongs in the log, under the name of the
@@ -165,6 +196,8 @@ pub(crate) fn write_settled_row(
                 RECONCILE_TOOL.to_owned(),
                 profile.chain_id.caip2_str().to_owned().into(),
                 Vec::new(),
+                None,
+                reconciliation_decision,
                 None,
             ),
         };
@@ -179,9 +212,10 @@ pub(crate) fn write_settled_row(
                 legs,
                 tx_redacted.as_str(),
                 ledger.unwrap_or(0),
-                stellar_agent_core::audit_log::PolicyDecision::Allow,
+                policy_decision,
                 Some(envelope_hash.to_owned()),
                 nonce_id,
+                approval_nonce,
                 &request_id,
             )
         }
@@ -192,9 +226,10 @@ pub(crate) fn write_settled_row(
                 legs,
                 tx_redacted.as_str(),
                 code.as_str(),
-                stellar_agent_core::audit_log::PolicyDecision::Allow,
+                policy_decision,
                 Some(envelope_hash.to_owned()),
                 nonce_id,
+                approval_nonce,
                 &request_id,
             )
         }
@@ -630,5 +665,65 @@ mod tests {
         };
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(json["error"]["details"]["timeout_seconds"], 45);
+    }
+    #[test]
+    fn approved_recorder_requires_its_approval_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = Profile::builder_testnet("signer", "default", "nonce", "default").build();
+        let audit = Arc::new(Mutex::new(
+            AuditWriter::open(dir.path().join("audit.jsonl"), None).unwrap(),
+        ));
+        let result = build_recorder(
+            CommitRecord {
+                profile: &profile,
+                profile_name: "missing-approval-store".to_owned(),
+                tool: "stellar_pay_commit",
+                chain_id: "stellar:testnet".to_owned(),
+                policy_decision: stellar_agent_core::audit_log::PolicyDecision::RequireApproval,
+                legs: Vec::new(),
+                engine: &stellar_agent_core::policy::NoopPolicyEngine,
+                descriptor: None,
+                value_class: ValueClass::ReadOnly,
+                audit,
+                nonce_id: None,
+                approval_nonce: Some("approval-binding".to_owned()),
+                approval_dir: None,
+                now_ms: 0,
+            },
+            None,
+        );
+        let error = result.expect_err("an approval binding must not be silently dropped");
+        assert_eq!(error.code(), "submission.record_unavailable");
+        assert!(error.message().contains("approval store"));
+    }
+    #[test]
+    fn approved_recorder_requires_its_approval_nonce() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = Profile::builder_testnet("signer", "default", "nonce", "default").build();
+        let audit = Arc::new(Mutex::new(
+            AuditWriter::open(dir.path().join("audit.jsonl"), None).unwrap(),
+        ));
+        let result = build_recorder(
+            CommitRecord {
+                profile: &profile,
+                profile_name: "missing-approval-nonce".to_owned(),
+                tool: "stellar_pay_commit",
+                chain_id: "stellar:testnet".to_owned(),
+                policy_decision: stellar_agent_core::audit_log::PolicyDecision::RequireApproval,
+                legs: Vec::new(),
+                engine: &stellar_agent_core::policy::NoopPolicyEngine,
+                descriptor: None,
+                value_class: ValueClass::ReadOnly,
+                audit,
+                nonce_id: None,
+                approval_nonce: None,
+                approval_dir: Some(dir.path().to_path_buf()),
+                now_ms: 0,
+            },
+            None,
+        );
+        let error = result.expect_err("an approved submission must carry its approval nonce");
+        assert_eq!(error.code(), "submission.record_unavailable");
+        assert!(error.message().contains("approval nonce"));
     }
 }

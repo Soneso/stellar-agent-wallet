@@ -42,6 +42,10 @@ pub struct PendingApprovalView {
     /// Unix epoch timestamp (milliseconds) when this entry expires.
     pub expires_at_unix_ms: u64,
 
+    /// Rule-provided explanation for requiring operator approval.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+
     /// `true` if `expires_at_unix_ms <= now_unix_ms` at snapshot time.
     pub expired: bool,
 
@@ -399,6 +403,7 @@ impl PendingApprovalView {
             kind_name: entry.kind.kind_name(),
             created_at_unix_ms: entry.created_at_unix_ms,
             expires_at_unix_ms: entry.expires_at_unix_ms,
+            reason: entry.reason.clone(),
             expired: entry.is_expired(now_unix_ms),
             attested,
             summary,

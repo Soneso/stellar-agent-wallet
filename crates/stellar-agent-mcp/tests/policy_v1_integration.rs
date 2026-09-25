@@ -263,10 +263,13 @@ decision = "require_approval"
         Decision::RequireApproval(req) => req,
         other => panic!("require_approval rule must produce RequireApproval; got: {other:?}"),
     };
-    // Loader's parse_decision injects a 300s default TTL when promoting the
+    // Loader's parse_decision supplies the 24-hour default TTL for the
     // `require_approval` keyword; nonce is empty until populated by the
     // dispatch site.
-    assert_eq!(req.ttl_seconds, 300, "loader default TTL is 300");
+    assert_eq!(
+        req.ttl_seconds, 86_400,
+        "omitted TTL uses the 24-hour approval default"
+    );
 }
 
 /// End-to-end: an empty `[[rules]]` array hits the engine's default-deny

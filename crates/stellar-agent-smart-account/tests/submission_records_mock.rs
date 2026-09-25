@@ -480,6 +480,7 @@ async fn timed_out_timelock_execute_keeps_receipt_and_pending_row() {
         PROFILE,
         "stellar_smart_account_timelock_execute",
         Some("stellar:testnet".to_owned()),
+        stellar_agent_core::audit_log::PolicyDecision::Allow,
         Vec::new(),
         Vec::new(),
         ReceiptStore::open(PROFILE).unwrap(),

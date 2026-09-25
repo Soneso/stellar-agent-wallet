@@ -84,7 +84,7 @@ const MIN_POLICY_VERSION: u32 = 1;
 const MAX_POLICY_VERSION: u32 = 1;
 
 /// Default approval time-to-live for `require_approval` policy decisions, in seconds.
-const DEFAULT_APPROVAL_TTL_SECONDS: u32 = 300;
+const DEFAULT_APPROVAL_TTL_SECONDS: u32 = (crate::approval::store::DEFAULT_TTL_MS / 1_000) as u32;
 
 // Re-export serde: used only for the on-disk TOML/JSON representation.
 

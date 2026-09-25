@@ -41,6 +41,7 @@ impl RecorderFixture {
             "pool-test",
             "pool submission",
             Some("stellar:testnet".to_owned()),
+            stellar_agent_core::audit_log::PolicyDecision::Allow,
             self.legs.clone(),
             Vec::new(),
             self.receipts.clone(),

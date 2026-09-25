@@ -1858,7 +1858,7 @@ impl AuditEntry {
     /// single-derivation invariant. `transaction_hash_redacted` MUST be
     /// pre-redacted to first-8-last-8 at the call site; `legs` destinations are
     /// redacted by [`ValueLegRecord`] construction. `policy_decision` carries
-    /// the gate's actual decision (`Allow` on this path).
+    /// the gate's actual decision, including an attested approval.
     #[must_use]
     #[allow(
         clippy::too_many_arguments,
@@ -1873,6 +1873,7 @@ impl AuditEntry {
         policy_decision: PolicyDecision,
         envelope_hash: Option<String>,
         nonce_id: Option<String>,
+        approval_nonce: Option<String>,
         request_id: impl Into<String>,
     ) -> Self {
         Self {
@@ -1888,6 +1889,7 @@ impl AuditEntry {
             decision_reason: None,
             request_id: request_id.into(),
             event_kind: EventKind::ValueActionSubmitted {
+                approval_nonce,
                 legs,
                 opaque_reason: None,
                 transaction_hash_redacted: transaction_hash_redacted.into(),
@@ -1923,6 +1925,7 @@ impl AuditEntry {
         policy_decision: PolicyDecision,
         envelope_hash: Option<String>,
         nonce_id: Option<String>,
+        approval_nonce: Option<String>,
         request_id: impl Into<String>,
     ) -> Self {
         Self {
@@ -1938,6 +1941,7 @@ impl AuditEntry {
             decision_reason: None,
             request_id: request_id.into(),
             event_kind: EventKind::ValueActionPending {
+                approval_nonce,
                 legs,
                 transaction_hash_redacted: transaction_hash_redacted.into(),
                 source_redacted: source_redacted.into(),
@@ -1968,6 +1972,7 @@ impl AuditEntry {
         policy_decision: PolicyDecision,
         envelope_hash: Option<String>,
         nonce_id: Option<String>,
+        approval_nonce: Option<String>,
         request_id: impl Into<String>,
     ) -> Self {
         Self {
@@ -1983,6 +1988,7 @@ impl AuditEntry {
             decision_reason: None,
             request_id: request_id.into(),
             event_kind: EventKind::ValueActionFailed {
+                approval_nonce,
                 legs,
                 transaction_hash_redacted: transaction_hash_redacted.into(),
                 code: code.into(),
@@ -2068,6 +2074,7 @@ impl AuditEntry {
             decision_reason: None,
             request_id: request_id.into(),
             event_kind: EventKind::ValueActionSubmitted {
+                approval_nonce: None,
                 legs: vec![],
                 opaque_reason: Some(opaque_reason.into()),
                 transaction_hash_redacted: transaction_hash_redacted.into(),

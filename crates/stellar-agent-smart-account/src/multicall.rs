@@ -215,6 +215,7 @@ fn build_bundle_recorder<'a>(
     args: &MulticallSubmitArgs<'a>,
     tool: &stellar_agent_core::policy::ToolDescriptor,
     bundle: &stellar_agent_core::policy::v1::bundle::BundleView<'_>,
+    policy_decision: &Decision,
 ) -> Result<stellar_agent_network::submission_record::WalletSubmissionRecorder<'a>, SaError> {
     use stellar_agent_core::audit_log::schema::ValueLegRecord;
     use stellar_agent_core::policy::v1::value::{ValueClass, value_class_for_inner};
@@ -251,6 +252,20 @@ fn build_bundle_recorder<'a>(
         profile_name,
         "stellar_smart_account_multicall",
         Some(args.chain_id.to_owned()),
+        match policy_decision {
+            Decision::Allow => stellar_agent_core::audit_log::PolicyDecision::Allow,
+            Decision::RequireApproval(_) => {
+                stellar_agent_core::audit_log::PolicyDecision::RequireApproval
+            }
+            Decision::Deny(reason) => stellar_agent_core::audit_log::PolicyDecision::Deny(
+                deny_reason_wire_code(reason).to_owned(),
+            ),
+            _ => {
+                return Err(unavailable(
+                    "the gate produced an unsupported decision".to_owned(),
+                ));
+            }
+        },
         legs,
         entries,
         receipts,
@@ -1490,7 +1505,7 @@ pub async fn submit_multicall_bundle(
     let rule_id = ContextRuleId::from(args.rule_id);
     let auth_rule_ids = vec![rule_id];
 
-    let recorder = build_bundle_recorder(&args, &tool, &bundle_view)?;
+    let recorder = build_bundle_recorder(&args, &tool, &bundle_view, &policy_decision)?;
 
     let submit_result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
