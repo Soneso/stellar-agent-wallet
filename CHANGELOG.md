@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.8] - 2026-09-25
+
 ### Added
 
 - `profile reset-mpp-state <NAME> --acknowledge --reason <REASON>` recovers MPP
@@ -1586,7 +1588,8 @@ policy engine, operator-approval spine, and tamper-evident audit log.
 - An agent integration guide (`docs/agents.md`) and capability-isolation example
   toolsets under `examples/toolsets/`.
 
-[Unreleased]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.7...HEAD
+[Unreleased]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.8...HEAD
+[0.1.0-alpha.8]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.7...v0.1.0-alpha.8
 [0.1.0-alpha.7]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.6...v0.1.0-alpha.7
 [0.1.0-alpha.6]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.5...v0.1.0-alpha.6
 [0.1.0-alpha.5]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.4...v0.1.0-alpha.5
