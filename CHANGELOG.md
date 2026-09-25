@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Verifier and policy installation refuses a contract whose instance entry is
+  undecodable or has a non-Wasm executable with
+  `sa.contract_instance_unsupported`, naming the reason. The wallet cannot pin
+  such a contract's code, so `--accept-mutable-verifier` does not override the
+  refusal.
 - Policy loading requires approval TTLs from one second through seven days
   and limits approval reasons to 512 characters.
 - MPP state writes recheck the trusted generation before advancing it and

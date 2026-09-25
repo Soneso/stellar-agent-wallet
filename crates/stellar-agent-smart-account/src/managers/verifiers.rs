@@ -191,9 +191,12 @@ impl PinResult {
 ///
 /// 3. **Mutability detection** — for every identified contract (verifier +
 ///    policy), calls [`detect_contract_mutability`] (two-RPC instance-storage
-///    probe).  On mutable contract: returns `SaError::VerifierMutable`
-///    (verifier) or `SaError::PolicyMutable` (policy) UNLESS
-///    `accept_mutable_verifier` is set, in which case emits
+///    probe).  An existing instance that is undecodable or has a non-Wasm
+///    executable returns `SaError::ContractInstanceUnsupported` regardless of
+///    `accept_mutable_verifier`: its pin is the zero hash, so the signing-time
+///    drift check cannot observe a change to its code.  On an active admin key:
+///    returns `SaError::VerifierMutable` (verifier) or `SaError::PolicyMutable`
+///    (policy) UNLESS `accept_mutable_verifier` is set, in which case emits
 ///    `EventKind::SaMutableContractOverride` and records `mutable_override = true`.
 ///
 /// 4. **Override audit rows** — emitted via the shared `audit_writer` BEFORE
@@ -217,8 +220,9 @@ impl PinResult {
 ///   at post-install audit time with the real rule_id.
 /// - `source_account_strkey` — G-strkey of the fee-paying account (passed
 ///   through to `identify_verifier` for API symmetry).
-/// - `accept_mutable_verifier` — when `true`, mutable contracts proceed with
-///   an override audit row instead of returning an error.
+/// - `accept_mutable_verifier` — when `true`, contracts with an active admin
+///   key proceed with an override audit row instead of returning an error.
+///   It does not admit an unpinnable instance.
 /// - `accept_unknown_verifier` — when `true`, unknown-wasm-hash contracts
 ///   proceed with an override audit row instead of returning an error.
 /// - `chain_id` — network identifier forwarded to override audit-row constructors
@@ -231,6 +235,8 @@ impl PinResult {
 ///   `accept_mutable_verifier` is `false`.
 /// - [`SaError::PolicyMutable`] — policy has a non-zero admin key and
 ///   `accept_mutable_verifier` is `false`.
+/// - [`SaError::ContractInstanceUnsupported`]: a verifier or policy instance
+///   is undecodable or has a non-Wasm executable; no flag overrides it.
 /// - [`SaError::VerifierWasmNotInAllowlist`] — verifier wasm hash not in
 ///   allowlist and `accept_unknown_verifier` is `false`.
 /// - [`SaError::PolicyWasmNotInAllowlist`] — policy wasm hash not in
@@ -379,6 +385,22 @@ pub async fn pin_referenced_contracts(
         } = &mutability
         {
             let verifier_redacted = redact_strkey_first5_last5(&verifier_strkey);
+            // An unpinnable instance is refused before the override branch:
+            // its pin is the zero hash, so the drift check cannot see a code change.
+            if admin_or_owner_key.is_unpinnable_instance() {
+                return Err(SaError::ContractInstanceUnsupported {
+                    rule_id,
+                    contract_kind: ContractKind::Verifier,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted(
+                        smart_account_redacted,
+                    ),
+                    contract_address_redacted: RedactedStrkey::from_already_redacted(
+                        verifier_redacted,
+                    ),
+                    reason: *admin_or_owner_key,
+                    request_id,
+                });
+            }
             if accept_mutable_verifier {
                 mutable_override = true;
                 let now_ts = stellar_agent_core::timefmt::current_iso8601_utc();
@@ -538,6 +560,22 @@ pub async fn pin_referenced_contracts(
         } = &policy_mutability
         {
             let policy_redacted = redact_strkey_first5_last5(&policy_strkey);
+            // An unpinnable instance is refused before the override branch:
+            // its pin is the zero hash, so the drift check cannot see a code change.
+            if admin_or_owner_key.is_unpinnable_instance() {
+                return Err(SaError::ContractInstanceUnsupported {
+                    rule_id,
+                    contract_kind: ContractKind::Policy,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted(
+                        smart_account_redacted,
+                    ),
+                    contract_address_redacted: RedactedStrkey::from_already_redacted(
+                        policy_redacted,
+                    ),
+                    reason: *admin_or_owner_key,
+                    request_id,
+                });
+            }
             if accept_mutable_verifier {
                 mutable_override = true;
                 let now_ts = stellar_agent_core::timefmt::current_iso8601_utc();
@@ -1168,15 +1206,11 @@ pub enum MutabilityStatus {
     /// non-zero value.  Safe to pin against — upgrades require on-chain
     /// governance rather than a single privileged key.
     Immutable,
-    /// Contract has at least one admin-equivalent instance-storage key set to a
-    /// non-zero `Address`.  Its holder can upgrade the contract's WASM, silently
-    /// changing verification logic without triggering wasm-hash drift detection.
+    /// Contract has an active admin key or its instance cannot establish immutability.
     Mutable {
-        /// Instance-storage key name (`Admin` or `Owner`).
-        ///
-        /// Closed-set per OZ v0.7.2 survey (see module-level doc).
+        /// Active instance-storage key or reason the instance cannot be inspected.
         admin_or_owner_key: AdminOrOwnerKey,
-        /// First-5-last-5 redacted strkey of the admin / owner holder.
+        /// Redacted admin / owner holder, or a non-sensitive probe-failure reason.
         ///
         /// Derived via
         /// [`stellar_agent_core::observability::redact_strkey_first5_last5`]
@@ -1189,7 +1223,7 @@ pub enum MutabilityStatus {
 
 // ── Public detection helper ───────────────────────────────────────────────────
 
-/// Detect whether a contract is mutable (has a non-zero admin / owner key).
+/// Detect an active admin key or an instance that cannot establish immutability.
 ///
 /// # Two-RPC consultation
 ///
@@ -1210,17 +1244,18 @@ pub enum MutabilityStatus {
 ///
 /// # Return value
 ///
-/// - `Ok(MutabilityStatus::Immutable)` — no admin key with a non-zero address.
+/// - `Ok(MutabilityStatus::Immutable)` — the instance is absent, or its Wasm
+///   storage has no active admin key.
 /// - `Ok(MutabilityStatus::Mutable { admin_or_owner_key, holder_redacted })` —
-///   at least one admin key present.  The first match in `ADMIN_KEY_NAMES` order
-///   wins; `holder_redacted` is first-5-last-5 of the holder strkey.
+///   an active admin key or an unreadable instance. The typed reason distinguishes
+///   undecodable instance data and non-Wasm executables from admin storage keys.
 ///
 /// # Errors
 ///
 /// - [`SaError::NetworkRpcDivergence`] — primary and secondary RPC disagree on
 ///   the contract's instance storage.
 /// - [`SaError::DeploymentFailed`] (phase `"simulate"`) — either RPC fetch fails
-///   (network error, malformed response, contract address not found).
+///   or the storage bytes cannot be decoded.
 pub async fn detect_contract_mutability(
     primary: &StellarRpcClient,
     secondary: &StellarRpcClient,
@@ -1251,21 +1286,26 @@ pub async fn detect_contract_mutability(
         ),
     })?;
 
-    // Two-RPC agreement check (mirrors identify_verifier:1365-1395 in signers.rs).
-    // We digest the raw ScMap XDR from each side to compare them.
+    // Compare presence, probe failures, and storage bytes from both endpoints.
     if primary_storages != secondary_storages {
-        let digest_bytes = |storages: &[Option<Vec<u8>>]| {
-            let concatenated: Vec<u8> = storages
-                .iter()
-                .flat_map(|s| {
-                    s.as_deref()
-                        .unwrap_or(&[])
-                        .iter()
-                        .copied()
-                        .chain(std::iter::once(0u8)) // null separator to prevent prefix collision
-                })
-                .collect();
-            let d: [u8; 32] = Sha256::digest(&concatenated).into();
+        let digest_bytes = |storages: &[Option<InstanceStorage>]| {
+            let mut digest = Sha256::new();
+            for storage in storages {
+                match storage {
+                    None => digest.update([0]),
+                    Some(InstanceStorage::Storage(bytes)) => {
+                        digest.update([1]);
+                        digest.update(Sha256::digest(bytes));
+                    }
+                    Some(InstanceStorage::Unreadable { reason, entry_xdr }) => {
+                        digest.update([2]);
+                        digest.update(reason.to_string().as_bytes());
+                        digest.update([0]);
+                        digest.update(Sha256::digest(entry_xdr.as_bytes()));
+                    }
+                }
+            }
+            let d: [u8; 32] = digest.finalize().into();
             d[..8]
                 .iter()
                 .map(|b| format!("{b:02x}"))
@@ -1282,12 +1322,16 @@ pub async fn detect_contract_mutability(
         });
     }
 
-    // Both RPCs agree; use primary result.
-    // primary_storages is Vec<Option<Vec<u8>>> aligned with `keys`.
-    // We requested exactly one key, so there is at most one entry.
-    let storage_xdr_opt: Option<Vec<u8>> = primary_storages.into_iter().next().flatten();
-
-    let status = inspect_storage_for_admin_key(storage_xdr_opt, smart_account_redacted)?;
+    let status = match primary_storages.into_iter().next().flatten() {
+        None => MutabilityStatus::Immutable,
+        Some(InstanceStorage::Storage(bytes)) => {
+            inspect_storage_for_admin_key(Some(bytes), smart_account_redacted)?
+        }
+        Some(InstanceStorage::Unreadable { reason, .. }) => MutabilityStatus::Mutable {
+            admin_or_owner_key: reason,
+            holder_redacted: reason.to_string(),
+        },
+    };
 
     debug!(
         rule_id,
@@ -1301,14 +1345,21 @@ pub async fn detect_contract_mutability(
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum InstanceStorage {
+    Storage(Vec<u8>),
+    Unreadable {
+        reason: AdminOrOwnerKey,
+        entry_xdr: String,
+    },
+}
+
 /// Fetches the raw instance-storage `ScMap` XDR bytes from a contract's instance
 /// entry via `getLedgerEntries`.
 ///
-/// Returns `Vec<Option<Vec<u8>>>` aligned with `keys`:
-/// - `Some(bytes)` when the key resolved to a WASM contract instance that has
-///   a non-`None` `ScContractInstance.storage` map (raw XDR of `ScVal::Map`).
-/// - `None` when the key was absent from the ledger, resolved to a non-WASM
-///   entry, or the instance has no instance storage (`storage == None`).
+/// Returns observations aligned with `keys`. `None` means no matching entry.
+/// A present entry retains its storage bytes or a typed failure reason and
+/// the original entry XDR, so two-RPC agreement includes unreadable instances.
 ///
 /// # Why raw bytes?
 ///
@@ -1328,9 +1379,10 @@ pub async fn detect_contract_mutability(
 async fn fetch_contract_instance_storage(
     client: &StellarRpcClient,
     keys: &[LedgerKey],
-) -> Result<Vec<Option<Vec<u8>>>, String> {
+) -> Result<Vec<Option<InstanceStorage>>, String> {
     use stellar_xdr::{
-        ContractExecutable, LedgerEntryData, LedgerKey as XdrLedgerKey, ReadXdr, WriteXdr,
+        ContractDataEntry, ContractExecutable, LedgerEntryData, LedgerKey as XdrLedgerKey, ReadXdr,
+        WriteXdr,
     };
 
     if keys.is_empty() {
@@ -1344,8 +1396,7 @@ async fn fetch_contract_instance_storage(
 
     let raw_entries = response.entries.unwrap_or_default();
 
-    // Build a position-keyed map: key_index → raw ScMap XDR bytes (or None).
-    let mut storage_by_key_pos: std::collections::HashMap<usize, Vec<u8>> =
+    let mut storage_by_key_pos: std::collections::HashMap<usize, InstanceStorage> =
         std::collections::HashMap::new();
 
     for entry_result in &raw_entries {
@@ -1362,45 +1413,38 @@ async fn fetch_contract_instance_storage(
             continue; // response entry not in our request — skip
         };
 
+        let unreadable = |reason| InstanceStorage::Unreadable {
+            reason,
+            entry_xdr: entry_result.xdr.clone(),
+        };
+
         // Decode LedgerEntryData XDR.
         // `stellar-rpc-client` (rs-stellar-rpc-client) decodes `LedgerEntryResult.xdr`
         // as `LedgerEntryData` via `LedgerEntryData::from_xdr_base64`.
-        let entry_data = match LedgerEntryData::from_xdr_base64(
+        let observation = match LedgerEntryData::from_xdr_base64(
             &entry_result.xdr,
             stellar_agent_xdr_limits::untrusted_decode_limits(entry_result.xdr.len()),
         ) {
-            Ok(d) => d,
-            Err(_) => continue, // skip malformed entry — safe
-        };
-
-        if let LedgerEntryData::ContractData(cd) = &entry_data {
-            if let stellar_xdr::ScVal::ContractInstance(instance) = &cd.val
-                && matches!(instance.executable, ContractExecutable::Wasm(_))
-            {
+            Ok(LedgerEntryData::ContractData(ContractDataEntry {
+                val: ScVal::ContractInstance(instance),
+                ..
+            })) => match instance.executable {
                 // `instance.storage` is `Option<ScMap>`.
                 // Serialise the ScMap to raw XDR bytes for comparison; use empty vec for None.
-                let storage_bytes: Vec<u8> = match &instance.storage {
-                    Some(scmap) => {
+                ContractExecutable::Wasm(_) => {
+                    InstanceStorage::Storage(match instance.storage {
                         // Wrap in ScVal::Map for a self-describing XDR encoding.
-                        ScVal::Map(Some(scmap.clone()))
+                        Some(scmap) => ScVal::Map(Some(scmap))
                             .to_xdr(stellar_xdr::Limits::none())
-                            .unwrap_or_default()
-                    }
-                    None => vec![],
-                };
-                storage_by_key_pos.insert(pos, storage_bytes);
-            } else {
-                // Malformed contract-data value for the requested instance key:
-                // preserve the discriminant so inspect_storage_for_admin_key can
-                // fail closed instead of silently treating it as absent.
-                storage_by_key_pos.insert(
-                    pos,
-                    cd.val
-                        .to_xdr(stellar_xdr::Limits::none())
-                        .unwrap_or_default(),
-                );
-            }
-        }
+                            .unwrap_or_default(),
+                        None => vec![],
+                    })
+                }
+                ContractExecutable::StellarAsset => unreadable(AdminOrOwnerKey::NonWasmExecutable),
+            },
+            Ok(_) | Err(_) => unreadable(AdminOrOwnerKey::UndecodableInstance),
+        };
+        storage_by_key_pos.insert(pos, observation);
     }
 
     // Build the aligned result vector: Some(bytes) for resolved keys, None for missing.
@@ -1447,10 +1491,7 @@ fn inspect_storage_for_admin_key(
     ) {
         Ok(ScVal::Map(Some(m))) => m,
         Ok(_) => {
-            // Unexpected storage shape: fail closed so a malformed or evasive
-            // instance-storage value cannot bypass mutability refusal.
-            // Keep this branch aligned with the non-map instance-storage
-            // fail-closed path asserted by the mutability adversarial fixtures.
+            // Storage bytes are an encoded `ScVal::Map`; any other shape fails closed.
             return Ok(MutabilityStatus::Mutable {
                 admin_or_owner_key: AdminOrOwnerKey::Admin,
                 holder_redacted: "[non-map-instance-storage]".to_owned(),
@@ -2483,13 +2524,8 @@ mod tests {
 
     // ── fetch_contract_instance_storage edge-path tests via RPC mock ──────────
 
-    /// `detect_contract_mutability` handles a response entry that carries a
-    /// non-Wasm `ContractData` value (e.g. `ScVal::U64` instead of
-    /// `ScVal::ContractInstance`).  The code preserves the discriminant bytes
-    /// so `inspect_storage_for_admin_key` can fail closed.
-    ///
-    /// Both RPCs agree on this malformed response → the non-map fail-closed path
-    /// in `inspect_storage_for_admin_key` triggers → `Mutable` is returned.
+    /// A contract-data entry under the instance key whose value is not a
+    /// contract instance (`ScVal::U64`) is classified as mutable.
     #[tokio::test]
     async fn detect_mutability_non_wasm_contract_data_fails_closed_as_mutable() {
         use stellar_xdr::{
@@ -2503,7 +2539,6 @@ mod tests {
         let contract_addr = ScAddress::Contract(ContractId(Hash([0x07u8; 32])));
 
         // Build a ContractData entry whose `val` is ScVal::U64 (not ContractInstance).
-        // This reaches the `else` branch in fetch_contract_instance_storage.
         let instance_key_xdr = build_contract_instance_key_xdr(&contract_addr);
         let non_wasm_entry_xdr = LedgerEntryData::ContractData(ContractDataEntry {
             ext: ExtensionPoint::V0,
@@ -2540,14 +2575,11 @@ mod tests {
         .await
         .expect("detect_contract_mutability must not return Err");
 
-        // The non-Wasm ContractData val (ScVal::U64) gets XDR-encoded as storage bytes
-        // and passed to inspect_storage_for_admin_key, which decodes it as ScVal::U64
-        // (not ScVal::Map(Some(_))) → fail-closed Mutable branch.
         assert_eq!(
             result,
             MutabilityStatus::Mutable {
-                admin_or_owner_key: AdminOrOwnerKey::Admin,
-                holder_redacted: "[non-map-instance-storage]".to_owned(),
+                admin_or_owner_key: AdminOrOwnerKey::UndecodableInstance,
+                holder_redacted: "undecodable instance".to_owned(),
             },
             "non-Wasm ContractData must fail closed as Mutable; got {result:?}"
         );
@@ -2707,14 +2739,9 @@ mod tests {
         );
     }
 
-    /// `detect_contract_mutability` skips a response entry whose `xdr` field is
-    /// not valid `LedgerEntryData` XDR.  The entry is silently ignored and the
-    /// result is `Immutable`.
-    ///
-    /// This covers the `Err(_) => continue` branch in `fetch_contract_instance_storage`
-    /// that fires when `LedgerEntryData::from_xdr_base64` fails.
+    /// A matching entry with undecodable instance data is classified as mutable.
     #[tokio::test]
-    async fn detect_mutability_skips_malformed_response_xdr() {
+    async fn detect_mutability_undecodable_instance_is_mutable() {
         use wiremock::{
             Mock, MockServer,
             matchers::{method, path},
@@ -2751,14 +2778,391 @@ mod tests {
             "req-malformed-xdr",
         )
         .await
-        .expect("malformed XDR must be skipped, not errored");
+        .expect("undecodable instance has a mutability classification");
 
-        // After skipping the malformed entry, no position resolved → None → Immutable.
         assert_eq!(
             result,
-            MutabilityStatus::Immutable,
-            "malformed response XDR must be skipped; result is Immutable"
+            MutabilityStatus::Mutable {
+                admin_or_owner_key: AdminOrOwnerKey::UndecodableInstance,
+                holder_redacted: "undecodable instance".to_owned(),
+            },
+            "undecodable instance must fail closed as Mutable"
         );
+    }
+
+    fn non_wasm_instance_entry_xdr(contract: &ScAddress) -> String {
+        use stellar_xdr::{ContractExecutable, LedgerEntryData, ReadXdr, WriteXdr};
+        let mut entry = LedgerEntryData::from_xdr_base64(
+            build_contract_instance_entry_xdr_no_storage(contract),
+            stellar_xdr::Limits::none(),
+        )
+        .unwrap();
+        let LedgerEntryData::ContractData(ref mut data) = entry else {
+            panic!("fixture must be contract data");
+        };
+        let ScVal::ContractInstance(ref mut instance) = data.val else {
+            panic!("fixture must be a contract instance");
+        };
+        instance.executable = ContractExecutable::StellarAsset;
+        entry.to_xdr_base64(stellar_xdr::Limits::none()).unwrap()
+    }
+
+    async fn instance_rpc(contract: &ScAddress, entry_xdr: Option<&str>) -> wiremock::MockServer {
+        use wiremock::{Mock, MockServer, matchers::method};
+        let entries: Vec<_> = entry_xdr
+            .map(|xdr| {
+                serde_json::json!({
+                    "key": build_contract_instance_key_xdr(contract),
+                    "xdr": xdr,
+                    "lastModifiedLedgerSeq": 100,
+                })
+            })
+            .into_iter()
+            .collect();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(canned_ledger_entries_responder(serde_json::json!({
+                "entries": entries,
+                "latestLedger": 1000,
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn detect_mutability_non_wasm_executable_is_mutable() {
+        let contract = ScAddress::Contract(ContractId(Hash([0x0b; 32])));
+        let entry = non_wasm_instance_entry_xdr(&contract);
+        let server = instance_rpc(&contract, Some(&entry)).await;
+        let rpc = StellarRpcClient::new(&server.uri()).unwrap();
+        let status = detect_contract_mutability(&rpc, &rpc, &contract, 6, "CAAAA...ABSC4", "probe")
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            MutabilityStatus::Mutable {
+                admin_or_owner_key: AdminOrOwnerKey::NonWasmExecutable,
+                holder_redacted: "non-Wasm executable".to_owned(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_mutability_non_instance_entry_is_mutable() {
+        use stellar_xdr::{LedgerEntryData, TtlEntry, WriteXdr};
+        let contract = ScAddress::Contract(ContractId(Hash([0x0b; 32])));
+        let entry = LedgerEntryData::Ttl(TtlEntry {
+            key_hash: Hash([0x11; 32]),
+            live_until_ledger_seq: 1000,
+        })
+        .to_xdr_base64(stellar_xdr::Limits::none())
+        .unwrap();
+        let server = instance_rpc(&contract, Some(&entry)).await;
+        let rpc = StellarRpcClient::new(&server.uri()).unwrap();
+        let status = detect_contract_mutability(&rpc, &rpc, &contract, 6, "CAAAA...ABSC4", "probe")
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            MutabilityStatus::Mutable {
+                admin_or_owner_key: AdminOrOwnerKey::UndecodableInstance,
+                holder_redacted: "undecodable instance".to_owned(),
+            }
+        );
+    }
+
+    /// A contract-data entry under the instance key whose value is a map rather
+    /// than a contract instance is classified as mutable.
+    #[tokio::test]
+    async fn detect_mutability_map_contract_data_is_mutable() {
+        use stellar_xdr::{
+            ContractDataDurability, ContractDataEntry, ExtensionPoint, LedgerEntryData, ScMap,
+            WriteXdr,
+        };
+        let contract = ScAddress::Contract(ContractId(Hash([0x0b; 32])));
+        let entry = LedgerEntryData::ContractData(ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract.clone(),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+            val: ScVal::Map(Some(ScMap::default())),
+        })
+        .to_xdr_base64(stellar_xdr::Limits::none())
+        .expect("ContractData XDR must encode");
+        let server = instance_rpc(&contract, Some(&entry)).await;
+        let rpc = StellarRpcClient::new(&server.uri()).expect("RPC client");
+        let status = detect_contract_mutability(&rpc, &rpc, &contract, 6, "CAAAA...ABSC4", "probe")
+            .await
+            .expect("map contract data has a mutability classification");
+        assert_eq!(
+            status,
+            MutabilityStatus::Mutable {
+                admin_or_owner_key: AdminOrOwnerKey::UndecodableInstance,
+                holder_redacted: "undecodable instance".to_owned(),
+            }
+        );
+    }
+
+    /// A CAP-85 instance with an external executable reference (XDR
+    /// discriminant 2: owner `ScAddress` and tag `ScString`) is classified as
+    /// an undecodable instance.
+    #[tokio::test]
+    async fn detect_mutability_external_ref_executable_is_mutable() {
+        use base64::Engine as _;
+        let contract = ScAddress::Contract(ContractId(Hash([0x0b; 32])));
+        let wasm_entry = base64::engine::general_purpose::STANDARD
+            .decode(build_contract_instance_entry_xdr_no_storage(&contract))
+            .expect("fixture is base64");
+        let mut wasm_executable = vec![0, 0, 0, 0];
+        wasm_executable.extend_from_slice(&[0x42; 32]);
+        let start = wasm_entry
+            .windows(wasm_executable.len())
+            .position(|window| window == wasm_executable.as_slice())
+            .expect("fixture carries a Wasm executable");
+        let mut external_ref = vec![0, 0, 0, 2, 0, 0, 0, 1];
+        external_ref.extend_from_slice(&[0x0c; 32]);
+        external_ref.extend_from_slice(&[0, 0, 0, 2, b'v', b'1', 0, 0]);
+        let mut entry = wasm_entry[..start].to_vec();
+        entry.extend_from_slice(&external_ref);
+        entry.extend_from_slice(&wasm_entry[start + wasm_executable.len()..]);
+        let entry = base64::engine::general_purpose::STANDARD.encode(entry);
+        let server = instance_rpc(&contract, Some(&entry)).await;
+        let rpc = StellarRpcClient::new(&server.uri()).expect("RPC client");
+        let status = detect_contract_mutability(&rpc, &rpc, &contract, 6, "CAAAA...ABSC4", "probe")
+            .await
+            .expect("external executable has a mutability classification");
+        assert_eq!(
+            status,
+            MutabilityStatus::Mutable {
+                admin_or_owner_key: AdminOrOwnerKey::UndecodableInstance,
+                holder_redacted: "undecodable instance".to_owned(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_instance_requires_two_rpc_agreement() {
+        let contract = ScAddress::Contract(ContractId(Hash([0x0b; 32])));
+        let non_wasm = non_wasm_instance_entry_xdr(&contract);
+        for (primary, secondary) in [
+            ("bm90dmFsaWR4ZHI=", None),
+            (non_wasm.as_str(), None),
+            ("bm90dmFsaWR4ZHI=", Some("AAAAAA==")),
+        ] {
+            let primary_server = instance_rpc(&contract, Some(primary)).await;
+            let secondary_server = instance_rpc(&contract, secondary).await;
+            let primary_rpc = StellarRpcClient::new(&primary_server.uri()).unwrap();
+            let secondary_rpc = StellarRpcClient::new(&secondary_server.uri()).unwrap();
+            let error = detect_contract_mutability(
+                &primary_rpc,
+                &secondary_rpc,
+                &contract,
+                6,
+                "CAAAA...ABSC4",
+                "probe",
+            )
+            .await
+            .expect_err("different instance observations must refuse");
+            assert_eq!(error.wire_code(), "network.rpc_divergence", "{error:?}");
+            let json = serde_json::to_value(&error).unwrap();
+            assert_ne!(
+                json["context"]["primary_view_digest_first8"],
+                json["context"]["secondary_view_digest_first8"],
+                "divergent observations must have distinct diagnostic digests"
+            );
+        }
+    }
+
+    /// Audit-log substring that identifies a `SaMutableContractOverride` row.
+    const MUTABLE_OVERRIDE_ROW: &str = r#""kind":"sa_mutable_contract_override""#;
+
+    /// Pins a rule that references `contract` as its only verifier or policy,
+    /// against a mocked RPC that serves `entry_xdr` as the contract's instance
+    /// entry.  Unknown Wasm hashes are accepted so the probe reaches the
+    /// mutability step.  Returns the pin outcome and the audit-log contents.
+    async fn pin_single_contract(
+        contract: &ScAddress,
+        entry_xdr: &str,
+        contract_kind: ContractKind,
+        accept_mutable_verifier: bool,
+    ) -> (Result<PinResult, SaError>, String) {
+        use crate::managers::rules::{ContextRulePolicy, RuleContext};
+        use crate::managers::signers::SignersManagerConfig;
+
+        let smart_account = ScAddress::Contract(ContractId(Hash([0x0c; 32])));
+        let server = instance_rpc(contract, Some(entry_xdr)).await;
+        let directory = tempfile::tempdir().unwrap();
+        let audit_path = directory.path().join("audit.jsonl");
+        let writer = Arc::new(Mutex::new(
+            AuditWriter::open(audit_path.clone(), None).unwrap(),
+        ));
+        let manager = SignersManager::new(SignersManagerConfig::new(
+            server.uri(),
+            server.uri(),
+            Arc::clone(&writer),
+            audit_path.clone(),
+            "Test SDF Network ; September 2015".to_owned(),
+            "probe".to_owned(),
+            std::time::Duration::from_secs(5),
+            "stellar:testnet".to_owned(),
+        ))
+        .unwrap();
+        let (signers, policies) = if contract_kind == ContractKind::Policy {
+            (
+                vec![],
+                vec![ContextRulePolicy::new(contract.clone(), ScVal::Void)],
+            )
+        } else {
+            (
+                vec![ContextRuleSignerInput::External {
+                    verifier: contract.clone(),
+                    pubkey_data: vec![0xbb; 32],
+                }],
+                vec![],
+            )
+        };
+        let definition = ContextRuleDefinition::new(
+            RuleContext::Default,
+            "probe".to_owned(),
+            None,
+            signers,
+            policies,
+        );
+        let outcome = pin_referenced_contracts(
+            &manager,
+            Some(&writer),
+            smart_account,
+            "CAAAA...ABSC4",
+            &definition,
+            6,
+            "unused",
+            accept_mutable_verifier,
+            true,
+            "stellar:testnet",
+            "probe".to_owned(),
+        )
+        .await;
+        let audit_log = std::fs::read_to_string(&audit_path).unwrap_or_default();
+        (outcome, audit_log)
+    }
+
+    /// An undecodable instance and a non-Wasm executable are refused with
+    /// `sa.contract_instance_unsupported` with and without
+    /// `accept_mutable_verifier`, and no mutable-override row is written.
+    async fn assert_unpinnable_instance_refused(contract_kind: ContractKind) {
+        let contract = ScAddress::Contract(ContractId(Hash([0x0b; 32])));
+        let contract_redacted =
+            redact_strkey_first5_last5(&xdr_scaddress_to_strkey_or_sentinel(&contract));
+        for (entry_xdr, reason) in [
+            (
+                "bm90dmFsaWR4ZHI=".to_owned(),
+                AdminOrOwnerKey::UndecodableInstance,
+            ),
+            (
+                non_wasm_instance_entry_xdr(&contract),
+                AdminOrOwnerKey::NonWasmExecutable,
+            ),
+        ] {
+            for accept_mutable_verifier in [false, true] {
+                let (outcome, audit_log) = pin_single_contract(
+                    &contract,
+                    &entry_xdr,
+                    contract_kind,
+                    accept_mutable_verifier,
+                )
+                .await;
+                let error = outcome.expect_err("an unpinnable instance must be refused");
+                assert_eq!(
+                    error.wire_code(),
+                    "sa.contract_instance_unsupported",
+                    "reason={reason}, accept_mutable_verifier={accept_mutable_verifier}: {error:?}"
+                );
+                let SaError::ContractInstanceUnsupported {
+                    rule_id,
+                    contract_kind: actual_kind,
+                    smart_account_redacted,
+                    contract_address_redacted,
+                    reason: actual_reason,
+                    request_id,
+                } = &error
+                else {
+                    panic!("wrong install refusal: {error:?}");
+                };
+                assert_eq!(*rule_id, 6);
+                assert_eq!(*actual_kind, contract_kind);
+                assert_eq!(*actual_reason, reason);
+                assert_eq!(smart_account_redacted.as_str(), "CAAAA...ABSC4");
+                assert_eq!(contract_address_redacted.as_str(), contract_redacted);
+                assert_eq!(request_id, "probe");
+
+                let message = error.to_string();
+                assert!(message.contains(&reason.to_string()), "{message}");
+                assert!(
+                    message.contains("cannot pin this contract's code"),
+                    "{message}"
+                );
+                assert!(
+                    !message.contains("--accept-mutable-verifier"),
+                    "the refusal has no override: {message}"
+                );
+                let json = serde_json::to_value(&error).unwrap();
+                assert_eq!(
+                    json["context"]["reason"],
+                    serde_json::to_value(reason).unwrap()
+                );
+                assert_eq!(
+                    json["context"]["contract_kind"],
+                    serde_json::to_value(contract_kind).unwrap()
+                );
+                assert!(
+                    !audit_log.contains(MUTABLE_OVERRIDE_ROW),
+                    "no mutable-override row may be written for an unpinnable instance"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn install_refuses_unpinnable_verifier_instance_regardless_of_override() {
+        assert_unpinnable_instance_refused(ContractKind::Verifier).await;
+    }
+
+    #[tokio::test]
+    async fn install_refuses_unpinnable_policy_instance_regardless_of_override() {
+        assert_unpinnable_instance_refused(ContractKind::Policy).await;
+    }
+
+    /// A contract with an active `Admin` key is refused as mutable without the
+    /// flag and admitted with it, writing a mutable-override row.
+    #[tokio::test]
+    async fn install_admin_key_contract_admitted_only_with_mutable_override() {
+        let contract = ScAddress::Contract(ContractId(Hash([0x0b; 32])));
+        let admin = ScAddress::Contract(ContractId(Hash([0x0d; 32])));
+        let entry_xdr = build_contract_instance_entry_xdr_with_admin(&contract, &admin, "Admin");
+        for (contract_kind, wire_code) in [
+            (ContractKind::Verifier, "sa.verifier_mutable"),
+            (ContractKind::Policy, "sa.policy_mutable"),
+        ] {
+            let (outcome, audit_log) =
+                pin_single_contract(&contract, &entry_xdr, contract_kind, false).await;
+            let error = outcome.expect_err("an admin-key contract needs the override");
+            assert_eq!(error.wire_code(), wire_code, "{error:?}");
+            assert!(
+                error.to_string().contains("--accept-mutable-verifier"),
+                "{error}"
+            );
+            assert!(!audit_log.contains(MUTABLE_OVERRIDE_ROW));
+
+            let (outcome, audit_log) =
+                pin_single_contract(&contract, &entry_xdr, contract_kind, true).await;
+            let pin = outcome.expect("the override admits an admin-key contract");
+            assert!(pin.mutable_override);
+            assert!(
+                audit_log.contains(MUTABLE_OVERRIDE_ROW),
+                "the override must write a mutable-override row"
+            );
+        }
     }
 
     /// `detect_contract_mutability` skips a response entry whose key decodes to

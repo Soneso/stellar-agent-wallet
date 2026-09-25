@@ -10,6 +10,7 @@
 //! |---------|-----------------------|
 //! | [`verifier_mutable_admin_key_rejection`] | `sa.verifier_mutable` |
 //! | [`policy_mutable_owner_key_rejection`] | `sa.policy_mutable` |
+//! | [`contract_instance_unsupported_rejection`] | `sa.contract_instance_unsupported` |
 //! | [`verifier_wasm_drift_detection`] | `sa.verifier_hash_drift` + audit row |
 //! | [`policy_wasm_drift_detection`] | `sa.policy_hash_drift` + audit row |
 //! | [`verifier_drift_rpc_suppression`] | `network.rpc_divergence` (before drift) |
@@ -58,6 +59,9 @@ mod verifier_mutable_admin_key_rejection;
 
 #[path = "smart-account-fixtures/adversarial/policy_mutable_owner_key_rejection.rs"]
 mod policy_mutable_owner_key_rejection;
+
+#[path = "smart-account-fixtures/adversarial/contract_instance_unsupported_rejection.rs"]
+mod contract_instance_unsupported_rejection;
 
 #[path = "smart-account-fixtures/adversarial/verifier_wasm_drift_detection.rs"]
 mod verifier_wasm_drift_detection;

@@ -517,6 +517,10 @@ pub struct CreateArgs {
     /// ownable-storage convention).  A mutable contract can be silently upgraded
     /// by its administrator — pinning does not protect against that.
     ///
+    /// The flag does not admit a contract whose instance is undecodable or has
+    /// a non-Wasm executable: the wallet cannot pin that code, and the install
+    /// fails with `sa.contract_instance_unsupported` regardless of this flag.
+    ///
     /// When set, the install proceeds AND the audit log emits
     /// `SaMutableContractOverride { kind, rule_id, contract_address_redacted }`.
     /// The JSON envelope reflects `mutable_override: true`.

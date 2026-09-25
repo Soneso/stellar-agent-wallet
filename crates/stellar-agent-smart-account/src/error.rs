@@ -21,19 +21,22 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::signers::types::{ThresholdAffectingOp, WasmHashSummary};
+use stellar_agent_core::audit_log::schema::ContractKind;
 use stellar_agent_core::audit_log::signer_set::ObservedSignerSet;
 pub use stellar_agent_core::error::AuthMismatchReason;
 use stellar_agent_core::observability::RedactedStrkey;
 
-/// Which storage key triggered a mutability detection.
+/// Storage key or unreadable instance shape that prevents establishing immutability.
 ///
-/// Closed two-value set; mirrors the `admin_or_owner_key` field on
+/// `Admin` and `Owner` populate the `admin_or_owner_key` field on
 /// [`SaError::VerifierMutable`] and [`SaError::PolicyMutable`].
+/// `UndecodableInstance` and `NonWasmExecutable` populate the `reason` field on
+/// [`SaError::ContractInstanceUnsupported`].
 ///
 /// # Wire format
 ///
-/// `Display` renders as `"Admin"` or `"Owner"` (PascalCase — matches OZ
-/// stellar-contracts canonical naming at SHA `a9c4216`).
+/// Storage keys retain the canonical OZ names `"Admin"` and `"Owner"`.
+/// Probe failures identify the instance shape that cannot establish immutability.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum AdminOrOwnerKey {
@@ -41,6 +44,26 @@ pub enum AdminOrOwnerKey {
     Admin,
     /// `Ownable::Owner` storage key (OZ ownable/storage.rs).
     Owner,
+    /// A returned entry cannot be decoded as contract-instance data.
+    UndecodableInstance,
+    /// The instance executable is not Wasm.
+    NonWasmExecutable,
+}
+
+impl AdminOrOwnerKey {
+    /// Returns `true` for an instance whose code the wallet cannot pin.
+    ///
+    /// An existing instance that does not decode as a Wasm contract instance
+    /// has no Wasm hash to pin, and the signing-time drift check compares
+    /// against the zero hash, so a later code change stays invisible.
+    /// Rule install refuses such a contract with no override.
+    #[must_use]
+    pub fn is_unpinnable_instance(self) -> bool {
+        match self {
+            Self::UndecodableInstance | Self::NonWasmExecutable => true,
+            Self::Admin | Self::Owner => false,
+        }
+    }
 }
 
 impl std::fmt::Display for AdminOrOwnerKey {
@@ -48,6 +71,8 @@ impl std::fmt::Display for AdminOrOwnerKey {
         match self {
             Self::Admin => f.write_str("Admin"),
             Self::Owner => f.write_str("Owner"),
+            Self::UndecodableInstance => f.write_str("undecodable instance"),
+            Self::NonWasmExecutable => f.write_str("non-Wasm executable"),
         }
     }
 }
@@ -294,24 +319,23 @@ pub enum SaError {
         request_id: String,
     },
 
-    /// Verifier contract has a non-zero Admin or Owner storage key (mutable).
+    /// Verifier contract has an active admin key (mutable).
     ///
-    /// Fired at rule-install time by `VerifiersManager::detect_contract_mutability`
-    /// when the verifier contract's ledger storage contains a live `Admin` or
-    /// `Owner` key.  A mutable verifier can be upgraded by its administrator,
-    /// silently changing the on-chain verification logic without triggering drift
-    /// detection.  The wallet refuses rule-install unless the operator passes
-    /// `--accept-mutable-verifier`.
+    /// Fired at rule-install time when `managers::verifiers::detect_contract_mutability`
+    /// reports an active `Admin` or `Owner` key on the verifier. Its holder can
+    /// upgrade the contract's Wasm. The wallet requires the operator's
+    /// `--accept-mutable-verifier` acknowledgement. An instance that cannot be
+    /// read as Wasm is refused with [`SaError::ContractInstanceUnsupported`].
     ///
     /// # Forensic spine
     ///
     /// `smart_account_redacted` and `contract_address_redacted` MUST be passed
     /// through `stellar_agent_core::observability::redact_strkey_first5_last5`
-    /// at the call site.  `admin_or_owner_key` is a typed
-    /// closed set (`Admin` or `Owner`), not secret.
+    /// at the call site.  `admin_or_owner_key` is a typed storage key, not secret.
     #[error(
-        "verifier contract is mutable (has Admin/Owner key) for rule {rule_id}: \
-         contract={contract_address_redacted}, holder_key={admin_or_owner_key}"
+        "verifier contract is mutable for rule {rule_id}: \
+         contract={contract_address_redacted}, reason={admin_or_owner_key}; \
+         --accept-mutable-verifier is required"
     )]
     #[serde(rename = "sa.verifier_mutable")]
     VerifierMutable {
@@ -328,20 +352,18 @@ pub enum SaError {
         /// MUST be redacted at the call site via
         /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
         contract_address_redacted: RedactedStrkey,
-        /// Which admin key was found non-zero.
-        ///
-        /// Typed closed set; renders as `"Admin"` or `"Owner"`.
+        /// Active admin storage key (`Admin` or `Owner`).
         admin_or_owner_key: AdminOrOwnerKey,
         /// Per-request correlation identifier (UUIDv4).
         request_id: String,
     },
 
-    /// Policy contract has a non-zero Admin or Owner storage key (mutable).
+    /// Policy contract has an active admin key (mutable).
     ///
     /// Parallel to [`SaError::VerifierMutable`] for the threshold-policy contract
-    /// path.  Fired at rule-install time by
-    /// `VerifiersManager::detect_contract_mutability` when the policy contract's
-    /// ledger storage contains a live `Admin` or `Owner` key.
+    /// path.  Fired at rule-install time when
+    /// `managers::verifiers::detect_contract_mutability` reports a live `Admin`
+    /// or `Owner` key in the policy contract's instance storage.
     ///
     /// # Forensic spine
     ///
@@ -349,8 +371,9 @@ pub enum SaError {
     /// through `stellar_agent_core::observability::redact_strkey_first5_last5`
     /// at the call site.
     #[error(
-        "policy contract is mutable (has Admin/Owner key) for rule {rule_id}: \
-         contract={contract_address_redacted}, holder_key={admin_or_owner_key}"
+        "policy contract is mutable for rule {rule_id}: \
+         contract={contract_address_redacted}, reason={admin_or_owner_key}; \
+         --accept-mutable-verifier is required"
     )]
     #[serde(rename = "sa.policy_mutable")]
     PolicyMutable {
@@ -367,10 +390,51 @@ pub enum SaError {
         /// MUST be redacted at the call site via
         /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
         contract_address_redacted: RedactedStrkey,
-        /// Which admin key was found non-zero.
-        ///
-        /// Typed closed set; renders as `"Admin"` or `"Owner"`.
+        /// Active admin storage key (`Admin` or `Owner`).
         admin_or_owner_key: AdminOrOwnerKey,
+        /// Per-request correlation identifier (UUIDv4).
+        request_id: String,
+    },
+
+    /// Verifier or policy contract instance cannot be read as a Wasm instance.
+    ///
+    /// Fired at rule-install time when `managers::verifiers::detect_contract_mutability`
+    /// finds an existing instance entry that does not decode as contract-instance
+    /// data or whose executable is not Wasm. Such a contract has no Wasm hash to
+    /// pin, and the signing-time drift check cannot observe a change to its code.
+    /// No flag overrides this refusal; `--accept-mutable-verifier` covers only
+    /// [`SaError::VerifierMutable`] and [`SaError::PolicyMutable`].
+    ///
+    /// # Forensic spine
+    ///
+    /// `smart_account_redacted` and `contract_address_redacted` MUST be passed
+    /// through `stellar_agent_core::observability::redact_strkey_first5_last5`
+    /// at the call site.  `contract_kind` and `reason` are typed closed sets,
+    /// not secret.
+    #[error(
+        "{contract_kind} contract instance is unsupported for rule {rule_id}: \
+         contract={contract_address_redacted}, reason={reason}; \
+         the wallet cannot pin this contract's code"
+    )]
+    #[serde(rename = "sa.contract_instance_unsupported")]
+    ContractInstanceUnsupported {
+        /// Context-rule identifier for which the instance was probed.
+        rule_id: u32,
+        /// Whether the contract is referenced as a verifier or a policy.
+        contract_kind: ContractKind,
+        /// Redacted smart-account contract address (first-5-last-5 C-strkey).
+        ///
+        /// MUST be redacted at the call site via
+        /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
+        smart_account_redacted: RedactedStrkey,
+        /// Redacted address of the unsupported contract (first-5-last-5 C-strkey).
+        ///
+        /// MUST be redacted at the call site via
+        /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
+        contract_address_redacted: RedactedStrkey,
+        /// Instance shape that prevents pinning (`UndecodableInstance` or
+        /// `NonWasmExecutable`).
+        reason: AdminOrOwnerKey,
         /// Per-request correlation identifier (UUIDv4).
         request_id: String,
     },
@@ -2398,6 +2462,7 @@ impl SaError {
             Self::MultiplePinnedHashesUnsupported { .. } => "sa.multiple_pinned_hashes_unsupported",
             Self::VerifierMutable { .. } => "sa.verifier_mutable",
             Self::PolicyMutable { .. } => "sa.policy_mutable",
+            Self::ContractInstanceUnsupported { .. } => "sa.contract_instance_unsupported",
             Self::VerifierWasmNotInAllowlist { .. } => "sa.verifier_wasm_not_in_allowlist",
             Self::PolicyWasmNotInAllowlist { .. } => "sa.policy_wasm_not_in_allowlist",
             Self::RuleIdMismatch { .. } => "sa.rule_id_mismatch",
@@ -2593,6 +2658,19 @@ mod tests {
                     ),
                     admin_or_owner_key: AdminOrOwnerKey::Owner,
                     request_id: "test-req-mut-002".to_owned(),
+                },
+            ),
+            (
+                "sa.contract_instance_unsupported",
+                SaError::ContractInstanceUnsupported {
+                    rule_id: 4,
+                    contract_kind: ContractKind::Verifier,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    contract_address_redacted: RedactedStrkey::from_already_redacted(
+                        "CBBBB...YYYYY",
+                    ),
+                    reason: AdminOrOwnerKey::NonWasmExecutable,
+                    request_id: "test-req-unsupported-001".to_owned(),
                 },
             ),
             (
@@ -3215,6 +3293,27 @@ mod tests {
                 ],
             ),
             (
+                "sa.contract_instance_unsupported",
+                SaError::ContractInstanceUnsupported {
+                    rule_id: 4,
+                    contract_kind: ContractKind::Policy,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    contract_address_redacted: RedactedStrkey::from_already_redacted(
+                        "CBBBB...YYYYY",
+                    ),
+                    reason: AdminOrOwnerKey::UndecodableInstance,
+                    request_id: "test-req-unsupported-002".to_owned(),
+                },
+                &[
+                    "rule_id",
+                    "contract_kind",
+                    "smart_account_redacted",
+                    "contract_address_redacted",
+                    "reason",
+                    "request_id",
+                ],
+            ),
+            (
                 "sa.multiple_pinned_hashes_unsupported",
                 SaError::MultiplePinnedHashesUnsupported {
                     kind: "policy",
@@ -3776,6 +3875,14 @@ mod tests {
                 admin_or_owner_key: AdminOrOwnerKey::Owner,
                 request_id: "test-req-mut-002".to_owned(),
             },
+            SaError::ContractInstanceUnsupported {
+                rule_id: 4,
+                contract_kind: ContractKind::Verifier,
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                contract_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
+                reason: AdminOrOwnerKey::UndecodableInstance,
+                request_id: "test-req-unsupported-001".to_owned(),
+            },
             SaError::VerifierWasmNotInAllowlist {
                 rule_id: 5,
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
@@ -4114,6 +4221,7 @@ mod tests {
             "sa.multiple_pinned_hashes_unsupported",
             "sa.verifier_mutable",
             "sa.policy_mutable",
+            "sa.contract_instance_unsupported",
             "sa.verifier_wasm_not_in_allowlist",
             "sa.policy_wasm_not_in_allowlist",
             "sa.rule_id_mismatch",
@@ -4208,7 +4316,7 @@ mod tests {
             );
         }
 
-        assert_eq!(seen.len(), 72, "closed set must have exactly 72 wire codes");
+        assert_eq!(seen.len(), 73, "closed set must have exactly 73 wire codes");
     }
 
     /// Verifies the sub-code closed set is exhaustively matched by tests.
@@ -4285,23 +4393,41 @@ mod tests {
     }
 
     /// All `AdminOrOwnerKey` variants that production code can emit.
-    /// Must match the canonical OZ storage-key naming.
-    const ALL_EMITTED_ADMIN_OR_OWNER_KEYS: &[&str] = &["Admin", "Owner"];
+    /// Includes canonical storage keys and instance-probe failures.
+    const ALL_EMITTED_ADMIN_OR_OWNER_KEYS: &[&str] = &[
+        "Admin",
+        "Owner",
+        "undecodable instance",
+        "non-Wasm executable",
+    ];
 
     #[test]
     fn admin_or_owner_key_constant_set_is_closed() {
-        let rendered: Vec<String> = [AdminOrOwnerKey::Admin, AdminOrOwnerKey::Owner]
-            .iter()
-            .map(std::string::ToString::to_string)
-            .collect();
+        let rendered: Vec<String> = [
+            AdminOrOwnerKey::Admin,
+            AdminOrOwnerKey::Owner,
+            AdminOrOwnerKey::UndecodableInstance,
+            AdminOrOwnerKey::NonWasmExecutable,
+        ]
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
         let expected: Vec<String> = ALL_EMITTED_ADMIN_OR_OWNER_KEYS
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
         assert_eq!(
             rendered, expected,
-            "AdminOrOwnerKey Display output must match canonical OZ naming"
+            "mutability reason Display output must match the emitted reason set"
         );
+    }
+
+    #[test]
+    fn admin_or_owner_key_unpinnable_instance_covers_probe_failures_only() {
+        assert!(!AdminOrOwnerKey::Admin.is_unpinnable_instance());
+        assert!(!AdminOrOwnerKey::Owner.is_unpinnable_instance());
+        assert!(AdminOrOwnerKey::UndecodableInstance.is_unpinnable_instance());
+        assert!(AdminOrOwnerKey::NonWasmExecutable.is_unpinnable_instance());
     }
 
     /// Verifies that every `stage: "<literal>"` emit site in the crate's
