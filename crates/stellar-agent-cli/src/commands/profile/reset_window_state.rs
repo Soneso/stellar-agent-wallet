@@ -139,6 +139,14 @@ struct ResetWindowStateData {
 ///
 /// Never panics.
 pub async fn run(args: &ResetWindowStateArgs) -> i32 {
+    if args.reason.trim().is_empty() {
+        render::render_json(&Envelope::<()>::err_raw(
+            "validation.reason_empty",
+            "--reason must contain non-whitespace text",
+        ));
+        return 1;
+    }
+
     let profile = match load_profile_reconciled_by_requested_name(args.profile_name(), None) {
         Ok(p) => p,
         Err(e) => {

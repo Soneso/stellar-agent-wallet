@@ -86,6 +86,12 @@ const MAX_POLICY_VERSION: u32 = 1;
 /// Default approval time-to-live for `require_approval` policy decisions, in seconds.
 const DEFAULT_APPROVAL_TTL_SECONDS: u32 = (crate::approval::store::DEFAULT_TTL_MS / 1_000) as u32;
 
+/// Longest accepted `require_approval` lifetime, in seconds (seven days).
+const MAX_APPROVAL_TTL_SECONDS: u32 = 604_800;
+
+/// Longest accepted `require_approval` reason, in Unicode scalar values.
+const MAX_APPROVAL_REASON_CHARS: usize = 512;
+
 // Re-export serde: used only for the on-disk TOML/JSON representation.
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1244,11 +1250,21 @@ fn parse_optional_reason(
 ) -> Result<Option<String>, PolicyError> {
     match table.get("reason") {
         None => Ok(None),
-        Some(v) => v.as_str().map(ToOwned::to_owned).map(Some).ok_or_else(|| {
-            PolicyError::PolicyFileParseFailed {
-                detail: format!("rule[{idx}] `reason` must be a string"),
+        Some(v) => {
+            let reason = v
+                .as_str()
+                .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+                    detail: format!("rule[{idx}] `reason` must be a string"),
+                })?;
+            if reason.chars().count() > MAX_APPROVAL_REASON_CHARS {
+                return Err(PolicyError::PolicyFileParseFailed {
+                    detail: format!(
+                        "rule[{idx}] `reason` must contain at most {MAX_APPROVAL_REASON_CHARS} characters"
+                    ),
+                });
             }
-        }),
+            Ok(Some(reason.to_owned()))
+        }
     }
 }
 
@@ -1262,12 +1278,16 @@ fn parse_optional_ttl_secs(
             let raw = v
                 .as_integer()
                 .ok_or_else(|| PolicyError::PolicyFileParseFailed {
-                    detail: format!("rule[{idx}] `ttl_secs` must be a non-negative u32"),
+                    detail: format!("rule[{idx}] `ttl_secs` must be an integer between 1 and {MAX_APPROVAL_TTL_SECONDS}"),
                 })?;
             u32::try_from(raw)
+                .ok()
+                .filter(|ttl| (1..=MAX_APPROVAL_TTL_SECONDS).contains(ttl))
                 .map(Some)
-                .map_err(|_| PolicyError::PolicyFileParseFailed {
-                    detail: format!("rule[{idx}] `ttl_secs` must be a non-negative u32"),
+                .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+                    detail: format!(
+                        "rule[{idx}] `ttl_secs` must be between 1 and {MAX_APPROVAL_TTL_SECONDS}"
+                    ),
                 })
         }
     }
@@ -2443,6 +2463,71 @@ chain = "*"
             ),
             "underscore HOME_DOMAIN entry should produce PolicyFileParseFailed, got {err:?}"
         );
+    }
+
+    #[test]
+    fn approval_ttl_bounds_are_enforced_at_load() {
+        let (sk, pk) = make_keypair();
+        let dir = TempDir::new().unwrap();
+        for (ttl, accepted) in [(0, false), (1, true), (604_800, true), (604_801, false)] {
+            let body = format!(
+                "{}\n[[rules]]\nmatch = {{ tool = \"*\", chain = \"*\" }}\ncriteria = []\ndecision = \"require_approval\"\nttl_secs = {ttl}\n",
+                body_with_decision("decision = \"allow\"")
+            );
+            let signed = make_signed_toml(&body, &sk, "GABCDE");
+            let path = write_policy(&dir, "alice.toml", &signed);
+            let result = load_signed_policy(&path, "alice", &pk);
+            if accepted {
+                let doc = result.expect("bounded TTL must load");
+                assert!(matches!(
+                    &doc.rules[1].decision,
+                    Decision::RequireApproval(request) if request.ttl_seconds == ttl
+                ));
+            } else {
+                let error = result.expect_err("out-of-range TTL must refuse");
+                assert!(
+                    matches!(
+                        error,
+                        PolicyError::PolicyFileParseFailed { ref detail }
+                            if detail.contains("rule[1]") && detail.contains("`ttl_secs`")
+                    ),
+                    "{error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn approval_reason_limit_counts_characters_at_load() {
+        let (sk, pk) = make_keypair();
+        let dir = TempDir::new().unwrap();
+        for count in [512, 513] {
+            let reason = "é".repeat(count);
+            let body = format!(
+                "{}\n[[rules]]\nmatch = {{ tool = \"*\", chain = \"*\" }}\ncriteria = []\ndecision = \"require_approval\"\nreason = \"{reason}\"\n",
+                body_with_decision("decision = \"allow\"")
+            );
+            let signed = make_signed_toml(&body, &sk, "GABCDE");
+            let path = write_policy(&dir, "alice.toml", &signed);
+            let result = load_signed_policy(&path, "alice", &pk);
+            if count == 512 {
+                let doc = result.expect("512 characters must load");
+                assert!(matches!(
+                    &doc.rules[1].decision,
+                    Decision::RequireApproval(request) if request.reason.as_ref() == Some(&reason)
+                ));
+            } else {
+                let error = result.expect_err("513 characters must refuse");
+                assert!(
+                    matches!(
+                        error,
+                        PolicyError::PolicyFileParseFailed { ref detail }
+                            if detail.contains("rule[1]") && detail.contains("`reason`")
+                    ),
+                    "{error:?}"
+                );
+            }
+        }
     }
 
     #[test]

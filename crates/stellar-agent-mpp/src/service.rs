@@ -332,7 +332,18 @@ where
     if let Err(error) = before_sign(&record, &prepared, &effects) {
         return match error {
             BeforeSignError::PolicyRefused(error) => {
-                let refused = state_store.mark_refused(authorization_id, now_unix)?;
+                let refused = match state_store.mark_refused(authorization_id, now_unix) {
+                    Ok(refused) => refused,
+                    Err(persistence_error) => {
+                        on_withheld(&WithheldCharge {
+                            record: &record,
+                            failure_stage: "policy_refusal_persist_failed",
+                            key_access_began: false,
+                            policy_budget_consumed: false,
+                        });
+                        return Err(persistence_error);
+                    }
+                };
                 on_withheld(&WithheldCharge {
                     record: &refused,
                     failure_stage: "policy_refusal",
@@ -1079,5 +1090,79 @@ mod tests {
                 .is_err()
         );
         assert_eq!(state.prune(NOW + 90 * 24 * 60 * 60).expect("prune"), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn policy_refusal_persistence_failure_still_emits_one_withheld_row() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let state = store(&directory);
+        let (prepared, signer, rpc) = prepared_fixture(NOW).await;
+        let preview = persist_prepared_authorization(
+            "refusal-persistence",
+            TESTNET_PASSPHRASE,
+            &prepared,
+            ApprovalDisposition::Allow,
+            "424242",
+            NOW,
+            &state,
+            None,
+        )
+        .expect("persist");
+        let mut held_lock = None;
+        let mut rows = Vec::new();
+        let mut delivered = false;
+        let error = commit_authorization(
+            &state,
+            None,
+            None,
+            &preview.authorization_id,
+            NOW + 1,
+            TESTNET_PASSPHRASE,
+            &signer,
+            &rpc,
+            |_record, _prepared, _effects| {
+                let lock = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(directory.path().join("mpp.state.lock"))
+                    .expect("existing state lock");
+                lock.try_lock()
+                    .expect("hold lock during refusal persistence");
+                held_lock = Some(lock);
+                Err(BeforeSignError::PolicyRefused(approval_error()))
+            },
+            |_authorized| {
+                delivered = true;
+                Ok(())
+            },
+            |withheld| {
+                assert_eq!(withheld.record.authorization_id(), preview.authorization_id);
+                let row = stellar_agent_core::audit_log::AuditEntry::new_mpp_authorization_withheld(
+                    "id",
+                    "fingerprint",
+                    withheld.failure_stage,
+                    withheld.key_access_began,
+                    withheld.policy_budget_consumed,
+                    "request",
+                );
+                rows.push(serde_json::to_value(row).expect("audit row"));
+            },
+        )
+        .await
+        .expect_err("persistence must refuse");
+        assert_eq!(error.code(), "mpp.state_unavailable");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["kind"], "mpp_authorization_withheld");
+        assert_eq!(rows[0]["failure_stage"], "policy_refusal_persist_failed");
+        assert_eq!(rows[0]["policy_budget_consumed"], false);
+        assert_eq!(rows[0]["key_access_began"], false);
+        assert!(!delivered);
+        assert_eq!(rpc.call_count(), 1, "only preparation can use RPC");
+        drop(held_lock);
+        let record = state.load(&preview.authorization_id).expect("record");
+        assert_eq!(record.status(), AuthorizationStatus::Authorizing);
+        assert!(!record.policy_accounted());
+        assert!(!record.credential_constructed());
     }
 }

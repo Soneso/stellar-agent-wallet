@@ -131,6 +131,9 @@ authenticated snapshot, including temporary files. It then writes, flushes,
 atomically renames, and synchronizes the parent directory. A failure after the
 counter advances leaves a mismatch and refuses further use; generations are
 never reused for an abandoned snapshot. Reads never reset or lower the counter.
+Immediately before advancing, a write re-reads the counter. If another writer
+has moved it, the write refuses with `mpp.state_unavailable` and a message
+asking for a retry, and the other writer's snapshot stays in place.
 
 Deletion or generation mismatch returns `mpp.state_unavailable` with a message
 identifying the state as rolled back and naming `profile reset-mpp-state`.
@@ -184,7 +187,10 @@ credential is known to exist, in which case a final-gate failure becomes
 `authorized_withheld`. Policy accounting ambiguity is also conservative:
 budget is treated as consumed and signing does not proceed. A typed policy
 refusal writes no window usage: the authorization becomes `refused`, and its
-withheld row records `policy_refusal` with the budget unconsumed.
+withheld row records `policy_refusal` with the budget unconsumed. When the
+refusal itself cannot be persisted, the authorization stays `authorizing`, the
+withheld row records `policy_refusal_persist_failed` with the budget
+unconsumed, and the persistence error is returned.
 `BeforeSignError` distinguishes these outcomes at the accounting callback.
 
 ## Audit and redaction

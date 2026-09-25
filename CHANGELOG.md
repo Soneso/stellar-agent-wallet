@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Policy loading requires approval TTLs from one second through seven days
+  and limits approval reasons to 512 characters.
+- MPP state writes recheck the trusted generation before advancing it and
+  refuse when another writer has moved the counter.
+- MPP and spending-window reset commands reject blank reasons before changing
+  state, keyring entries or audit logs.
+- MPP policy refusals emit a withheld audit row when refusal persistence fails,
+  with the budget unconsumed and the persistence failure identified.
 - MPP state reads and mutations refuse deleted or stale authorization history
   against the keyring generation, naming rollback in the refusal. A minted key
   at generation zero with no file remains a valid empty store. Rolled-back

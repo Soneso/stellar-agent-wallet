@@ -510,7 +510,11 @@ async fn released_server_accepts_wallet_credential_and_settles_exact_transfer() 
     let denied_record = state
         .load(&deny_preview.authorization_id)
         .expect("denied record");
-    assert_eq!(denied_record.status(), AuthorizationStatus::Indeterminate);
+    assert_eq!(
+        denied_record.status(),
+        AuthorizationStatus::Refused,
+        "a policy refusal before signing settles the authorization as refused"
+    );
 
     // Item 7: the released server must reject a credential whose transaction
     // was altered after signing.
@@ -596,4 +600,215 @@ async fn released_server_accepts_wallet_credential_and_settles_exact_transfer() 
         "recipient must receive exactly one challenged amount; the denied and \
          tampered attempts must move nothing"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn owner_signed_v1_period_cap_refuses_charge_before_signing() {
+    use ed25519_dalek::Signer as _;
+    use stellar_agent_core::policy::v1::{
+        PolicyEngineV1, canonical::canonical_bytes, criteria::state_store::StateKey,
+        loader::load_signed_policy, signature::digest,
+    };
+    use stellar_agent_core::profile::schema::{KeyringEntryRef, PolicyEngineKind};
+    use stellar_agent_mpp::BeforeSignError;
+    use stellar_agent_network::policy_state::{PersistedWindowStore, WindowStoreError};
+
+    let harness = harness_dir();
+    prepare_harness(&harness);
+    let (payer, payer_seed) = fresh_keypair();
+    let (server_account, server_seed) = fresh_keypair();
+    let (recipient, _recipient_seed) = fresh_keypair();
+    for account in [&payer, &server_account, &recipient] {
+        fund_with_friendbot(FRIENDBOT_URL, account, TESTNET_PASSPHRASE, RPC_URL)
+            .await
+            .expect("Friendbot funding reaches RPC");
+    }
+    let server_secret = Zeroizing::new(secret_strkey(&server_seed));
+    let (_server, endpoint) = start_server(&harness, &server_secret, &recipient);
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+        .expect("HTTP client");
+    let input = fetch_challenge_input(&http, &endpoint).await;
+    let selected = select_and_validate(&input, now_unix()).expect("released challenge");
+    assert_eq!(selected.request().amount(), i128::from(AMOUNT_STROOPS));
+    assert_eq!(selected.request().currency(), NATIVE_SAC_TESTNET);
+    let rpc = StellarSponsoredRpc::new(RPC_URL).expect("sponsored RPC");
+    let prepared = prepare_sponsored(selected, &payer, TESTNET_PASSPHRASE, &rpc)
+        .await
+        .expect("production sponsored prepare");
+
+    let directory = TempDir::new().expect("isolated state");
+    let name = "mpp-live-v1-cap";
+    let owner = SigningKey::generate(&mut OsRng);
+    let owner_id = stellar_strkey::ed25519::PublicKey(owner.verifying_key().to_bytes()).to_string();
+    let cap = AMOUNT_STROOPS - 1;
+    let body = format!(
+        "version = 1\nscope = \"profile:{name}\"\n[[rules]]\nmatch = {{ tool = \"stellar_mpp_charge_commit\", chain = \"stellar:testnet\" }}\ncriteria = [{{ kind = \"per_period_cap\", asset = \"{NATIVE_SAC_TESTNET}\", window = \"1d\", max_stroops = {cap} }}]\ndecision = \"allow\"\n"
+    );
+    let signature = hex::encode(
+        owner
+            .sign(&digest(&canonical_bytes(&body).expect("canonical policy")))
+            .to_bytes(),
+    );
+    let policy_path = directory.path().join("policy.toml");
+    std::fs::write(
+        &policy_path,
+        format!("{body}\n[signature]\nowner_id = \"{owner_id}\"\nsig = \"{signature}\"\n"),
+    )
+    .expect("signed policy");
+    let document = load_signed_policy(&policy_path, name, &owner.verifying_key().to_bytes())
+        .expect("owner signature and policy load");
+    let engine = PolicyEngineV1::new(document, name.to_owned());
+    let mut profile = Profile::builder_testnet("svc", name, "nonce-svc", name).build();
+    profile.policy.engine = PolicyEngineKind::V1;
+    profile.rpc_url = RPC_URL.to_owned();
+    profile.audit_log_path = directory.path().join("audit.jsonl");
+    let descriptor = commit_descriptor();
+    let window = PersistedWindowStore::at_path(directory.path().join("policy.window"));
+    stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
+    window
+        .load_into(name, &profile, engine.state_store())
+        .expect("empty window");
+    let generation = KeyringEntryRef::new(name, "mpp-generation");
+    keyring_core::Entry::new(&generation.service, &generation.account)
+        .expect("generation entry")
+        .set_password("0")
+        .expect("initial generation");
+    let state =
+        MppAuthorizationStore::at_path(directory.path().join("mpp.state"), [9; 32], generation);
+    // The dispatch gate evaluates the prepared challenge's exact value before
+    // any authorization state exists.
+    let evaluation = engine
+        .evaluate_with_value_full(
+            &descriptor,
+            &serde_json::json!({}),
+            &profile,
+            ValueClass::Value(mpp_value_effects(prepared.selected())),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("production V1 evaluation");
+    match evaluation.decision {
+        Decision::Deny(reason) => assert_eq!(
+            WalletError::PolicyDenied {
+                reason: Box::new(reason)
+            }
+            .code(),
+            "policy.deny.per_period_cap_exceeded"
+        ),
+        other => panic!("expected the period cap to deny, got {other:?}"),
+    }
+    // The pre-sign accounting gate re-applies the cap under the window-store
+    // lock, so a commit that reaches it refuses before signing. Its body is
+    // `record_authorized_window_state` against this test's isolated store.
+    let preview = persist_prepared_authorization(
+        name,
+        TESTNET_PASSPHRASE,
+        &prepared,
+        ApprovalDisposition::Allow,
+        "acceptance",
+        now_unix(),
+        &state,
+        None,
+    )
+    .expect("ready authorization");
+    let signer = CountingSigner::new(SoftwareSigningKey::new_from_zeroizing(Zeroizing::new(
+        payer_seed,
+    )));
+    let mut audit = AuditWriter::open(profile.audit_log_path.clone(), None).expect("audit writer");
+    let mut refusal = None;
+    let mut delivered = false;
+    let service_error = commit_authorization(
+        &state,
+        None,
+        None,
+        &preview.authorization_id,
+        now_unix(),
+        TESTNET_PASSPHRASE,
+        &signer,
+        &rpc,
+        |_record, _prepared, effects| {
+            let value = ValueClass::Value(effects.clone());
+            let entries = engine
+                .record_confirmed(&descriptor, &profile, &value)
+                .map_err(|_| BeforeSignError::Accounting(state_error()))?;
+            window
+                .record_authorized(&profile, &entries)
+                .map(|_| ())
+                .map_err(|error| match error {
+                    WindowStoreError::PolicyDenied { reason } => {
+                        refusal = Some(WalletError::PolicyDenied { reason });
+                        BeforeSignError::PolicyRefused(state_error())
+                    }
+                    _ => BeforeSignError::Accounting(state_error()),
+                })
+        },
+        |_authorized| {
+            delivered = true;
+            Ok(())
+        },
+        |withheld| {
+            audit
+                .write_entry(AuditEntry::new_mpp_authorization_withheld(
+                    hex::encode(Sha256::digest(
+                        withheld.record.authorization_id().as_bytes(),
+                    )),
+                    hex::encode(withheld.record.fingerprint()),
+                    withheld.failure_stage,
+                    withheld.key_access_began,
+                    withheld.policy_budget_consumed,
+                    "v1-cap-refusal",
+                ))
+                .expect("withheld audit row");
+        },
+    )
+    .await
+    .expect_err("over-cap charge must refuse");
+    assert_eq!(service_error.code(), "mpp.state_unavailable");
+    let refusal = refusal.expect("the policy's wallet refusal is retained by the adapter");
+    assert_eq!(refusal.code(), "policy.deny.per_period_cap_exceeded");
+    assert_eq!(
+        signer.signature_count(),
+        0,
+        "over-cap charge cannot request any signature"
+    );
+    assert!(!delivered, "over-cap charge cannot release a credential");
+    let record = state
+        .load(&preview.authorization_id)
+        .expect("refused record");
+    assert_eq!(record.status(), AuthorizationStatus::Refused);
+    assert!(!record.policy_accounted());
+    assert!(!record.credential_constructed());
+    assert!(
+        !window.exists(),
+        "a denied charge writes no spending window"
+    );
+    // Dispatch reloads window usage from disk before every evaluation.
+    engine.state_store().clear().expect("clear window usage");
+    window
+        .load_into(name, &profile, engine.state_store())
+        .expect("reload window usage");
+    let bucket = StateKey::new(name, 1, NATIVE_SAC_TESTNET, 86_400);
+    let now_ms = u64::try_from(now_unix()).expect("positive clock") * 1_000;
+    assert_eq!(
+        engine
+            .state_store()
+            .query_window(&bucket, now_ms)
+            .expect("window usage"),
+        (0, 0)
+    );
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
+        .expect("audit")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("audit row"))
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["kind"], "mpp_authorization_withheld");
+    assert_eq!(rows[0]["failure_stage"], "policy_refusal");
+    assert_eq!(rows[0]["policy_budget_consumed"], false);
 }

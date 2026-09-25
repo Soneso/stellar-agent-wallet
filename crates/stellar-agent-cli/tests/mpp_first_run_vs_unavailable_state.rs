@@ -532,6 +532,75 @@ fn an_unknown_id_on_a_minted_empty_store_reports_not_found() {
     );
 }
 
+/// A blank or whitespace-only reason refuses both reset verbs before any file, key, or audit row
+/// changes.
+#[test]
+#[serial]
+fn reset_verbs_refuse_blank_reasons_without_changes() {
+    fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+        fn visit(
+            root: &Path,
+            path: &Path,
+            files: &mut std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>,
+        ) {
+            for entry in std::fs::read_dir(path).expect("read fixture directory") {
+                let path = entry.expect("entry").path();
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("relative path")
+                    .to_path_buf();
+                if path.is_dir() {
+                    files.insert(relative, None);
+                    visit(root, &path, files);
+                } else {
+                    files.insert(
+                        relative,
+                        Some(std::fs::read(path).expect("read fixture file")),
+                    );
+                }
+            }
+        }
+        let mut files = std::collections::BTreeMap::new();
+        visit(root, root, &mut files);
+        files
+    }
+
+    let home = fresh_home();
+    mint_audit_key(home.path());
+    mint_mpp_state_key(home.path());
+    let seeded = run_cli(home.path(), &prune_args(), Some(REASON));
+    assert_eq!(seeded.code, 0, "{} {}", seeded.stdout, seeded.stderr);
+    let seeded = run_cli(
+        home.path(),
+        &[
+            "profile",
+            "reset-window-state",
+            PROFILE,
+            "--reason",
+            "initialize fixture",
+        ],
+        None,
+    );
+    assert_eq!(seeded.code, 0, "{} {}", seeded.stdout, seeded.stderr);
+    let before = snapshot(home.path());
+    for verb in ["reset-mpp-state", "reset-window-state"] {
+        for reason in ["", " \t\n\u{2003}"] {
+            let mut args = vec!["profile", verb, PROFILE, "--reason", reason];
+            if verb == "reset-mpp-state" {
+                args.push("--acknowledge");
+            }
+            let refused = run_cli(home.path(), &args, None);
+            assert!(
+                snapshot(home.path()) == before,
+                "{verb} with {reason:?} changed state, keyring, audit, or profile files"
+            );
+            assert_eq!(refused.code, 1, "{} {}", refused.stdout, refused.stderr);
+            assert_eq!(refused.code_field(), "validation.reason_empty");
+            assert!(refused.message_field().contains("--reason"));
+        }
+    }
+}
+
 /// Reset requires acknowledgement and records the discarded generation.
 #[test]
 #[serial]

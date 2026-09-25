@@ -267,7 +267,9 @@ normal answer: correct the identifier or prepare a charge. Do not report it as
 a wallet fault. `mpp.state_unavailable` means the durable state or a
 prerequisite of it exists and cannot be used. Its store causes (unreadable or
 unverifiable store, unreadable state key, unusable clock, capacity ceiling) are
-operator problems that retrying will not clear; its call causes (malformed
+operator problems that retrying will not clear, except a concurrent update,
+whose message says the state changed during the update and asks for a retry;
+its call causes (malformed
 identifier, an input file that is not a bounded regular file) mean the call was
 wrong — correct it and retry. A malformed identifier answers this way on every
 store state, so it never reveals whether a profile has MPP state.

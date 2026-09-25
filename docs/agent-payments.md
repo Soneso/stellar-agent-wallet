@@ -194,7 +194,9 @@ correct the identifier or prepare a charge.
 exists and cannot be used. Its causes fall into two groups with different
 remedies. Store causes — an unreadable or unverifiable store, an unreadable
 state key over an existing store, an unusable clock, a capacity ceiling — are
-operator problems, and retrying will not clear them. Call causes — a malformed
+operator problems, and retrying will not clear them. The exception is a
+concurrent update, whose message says the state changed during the update and
+asks for a retry; retry the call. Call causes — a malformed
 identifier, an input file that is not a bounded regular file — mean the call
 was wrong: correct it and retry. A malformed identifier answers this way on
 every store state, including a profile with no MPP state, so the answer never
