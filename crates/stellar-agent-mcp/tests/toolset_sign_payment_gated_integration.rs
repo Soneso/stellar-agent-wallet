@@ -10,7 +10,8 @@
 //! 2. **permissive_policy_forces_per_action_approval** — under an `Allow`-returning
 //!    policy, a toolset with a current grant AND absent/invented attestation STILL
 //!    returns `policy.approval_required`. This proves the per-action approval is
-//!    not vacuous under a permissive policy.
+//!    not vacuous under a permissive policy. It then completes the approved
+//!    payment and checks that its audit rows record the approval decision and nonce.
 //! 3. **grant_present_creates_per_action_queue_entry** — after a grant is in
 //!    place, re-invoke with no attestation creates a `PaymentSimulated` pending
 //!    approval entry in the queue AND the invoke returns `policy.approval_required`.
@@ -20,7 +21,8 @@
 //!    does not write a grant; the grant store is empty; first invoke always hits
 //!    the gate.
 //! 6. **forged_grant_still_forces_per_action_approval** — a forged grant (wrong
-//!    HMAC) still triggers the forced per-action approval (structural).
+//!    HMAC) still triggers the forced per-action approval (structural), and the
+//!    approved payment's audit rows record the approval decision and nonce.
 //! 7. **adversarial_different_destination_reprompts** — a plain `G...` destination
 //!    different from the grant's destination re-prompts the first-invoke gate.
 //! 8. **adversarial_muxed_destination_reprompts** — muxed `M...` destination
@@ -219,6 +221,140 @@ fn build_allow_server(
     server.set_grant_store_path_for_test(grant_store_path.to_path_buf());
     server.set_toolsets_root_for_test(toolsets_root.to_path_buf());
     server
+}
+
+/// Completes an approved forced-approval payment and checks that its pending and submitted
+/// rows record `require_approval` and the attested nonce.
+async fn assert_approved_submission_audit(
+    name: &str,
+    approval_dir: &std::path::Path,
+    grant_file: &std::path::Path,
+    toolsets_root: &std::path::Path,
+    key: &[u8; 32],
+) {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use stellar_agent_core::approval::attestation::{compute_attestation, envelope_sha256};
+    use stellar_agent_test_support::xdr_fixtures::{
+        account_entry_xdr_with_seq, account_ledger_key_xdr,
+    };
+    use wiremock::{Mock, MockServer, matchers::method};
+
+    let _root = common::isolated_data_root();
+    let signer = ed25519_dalek::SigningKey::from_bytes(&[0x61; 32]);
+    let source = stellar_strkey::ed25519::PublicKey(signer.verifying_key().to_bytes())
+        .to_string()
+        .to_string();
+    keyring_core::Entry::new("svc", name)
+        .unwrap()
+        .set_password(
+            stellar_strkey::ed25519::PrivateKey(signer.to_bytes())
+                .as_unredacted()
+                .to_string()
+                .as_ref(),
+        )
+        .unwrap();
+    let rpc = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            common::TimeoutRpc::new(vec![
+                (
+                    account_ledger_key_xdr(&source),
+                    account_entry_xdr_with_seq(&source, 1_000_000_000, 0, 42),
+                ),
+                (
+                    account_ledger_key_xdr(DEST_G),
+                    account_entry_xdr_with_seq(DEST_G, 1_000_000_000, 0, 42),
+                ),
+            ])
+            .confirming_in(1001),
+        )
+        .mount(&rpc)
+        .await;
+    let mut profile = common::timeout_profile(&rpc.uri(), name);
+    profile.submit_timeout_seconds = Some(30);
+    keyring_core::Entry::new(
+        &profile.attestation_key_id.service,
+        &profile.attestation_key_id.account,
+    )
+    .unwrap()
+    .set_password(&URL_SAFE_NO_PAD.encode(key))
+    .unwrap();
+    let mut server = WalletServer::new(profile.clone()).unwrap();
+    server.set_policy_engine_for_test(Arc::new(common::policy_mock::MockPolicyEngine::allow()));
+    server.set_approval_dir_for_test(approval_dir.to_path_buf());
+    server.set_grant_store_path_for_test(grant_file.to_path_buf());
+    server.set_toolsets_root_for_test(toolsets_root.to_path_buf());
+    let simulated = server
+        .call_stellar_pay(
+            serde_json::from_value(serde_json::json!({
+                "chain_id":"stellar:testnet", "source":source, "destination":DEST_G,
+                "asset":"native", "amount_in_stroops":"10000000"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let simulated: serde_json::Value =
+        serde_json::from_str(&simulated.content[0].as_text().unwrap().text).unwrap();
+    assert_eq!(simulated["ok"], true, "{simulated}");
+    let data = &simulated["data"];
+    let mut payload = serde_json::json!({
+        "chain_id":"stellar:testnet", "source":source, "destination":DEST_G,
+        "asset":"native", "amount_in_stroops":"10000000",
+        "nonce":data["nonce"], "expires_at_unix_ms":data["expires_at_unix_ms"],
+        "envelope_xdr":data["envelope_xdr"]
+    });
+    let invoke = |args| StellarToolsetInvokeArgs {
+        toolset: TOOLSET_NAME.to_owned(),
+        action: "stellar_pay_commit".to_owned(),
+        chain_id: Some("stellar:testnet".to_owned()),
+        args,
+    };
+    let queued = server
+        .call_stellar_toolset_invoke(invoke(payload.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        common::assert_business_envelope(&queued).0,
+        "policy.approval_required"
+    );
+    let (approval_nonce, attestation) = {
+        let mut store =
+            PendingApprovalStore::open(approval_dir.join(format!("{name}.toml"))).unwrap();
+        let pending = store.snapshot(now_unix_ms().unwrap());
+        assert_eq!(pending.len(), 1);
+        let nonce = pending[0].approval_nonce.clone();
+        let blob = compute_attestation(
+            key,
+            &nonce,
+            &envelope_sha256(data["envelope_xdr"].as_str().unwrap().as_bytes()),
+            &process_uid_for_attestation().unwrap(),
+        );
+        store.record_attestation(&nonce, blob).unwrap();
+        (nonce, URL_SAFE_NO_PAD.encode(blob))
+    };
+    payload["approval_nonce"] = serde_json::json!(approval_nonce);
+    payload["approval_attestation"] = serde_json::json!(attestation);
+    let submitted = server
+        .call_stellar_toolset_invoke(invoke(payload))
+        .await
+        .unwrap();
+    let submitted: serde_json::Value =
+        serde_json::from_str(&submitted.content[0].as_text().unwrap().text).unwrap();
+    assert_eq!(submitted["ok"], true, "{submitted}");
+    let rows = common::audit_rows(&profile);
+    for kind in ["value_action_pending", "value_action_submitted"] {
+        let matching = common::rows_of_kind(&rows, kind);
+        assert_eq!(matching.len(), 1, "{kind}: {rows:?}");
+        assert_eq!(
+            matching[0]["policy_decision"], "require_approval",
+            "{kind} must record forced approval"
+        );
+        assert_eq!(
+            matching[0]["approval_nonce"], approval_nonce,
+            "{kind} must retain the attested nonce"
+        );
+    }
 }
 
 /// Extracts the JSON error payload from an MCP `ErrorData`.
@@ -648,6 +784,14 @@ async fn permissive_policy_forces_per_action_approval() {
         code, "policy.approval_required",
         "must return policy.approval_required for forged attestation; got: {code}"
     );
+    assert_approved_submission_audit(
+        "forced-audit-permissive",
+        approval_dir.path(),
+        &grant_file,
+        toolsets_dir.path(),
+        &key,
+    )
+    .await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -657,14 +801,10 @@ async fn permissive_policy_forces_per_action_approval() {
 /// A grant with a wrong HMAC (forged) still triggers the forced per-action
 /// approval — because even with a matching grant, the commit step ALWAYS
 /// requires a valid per-action `PaymentSimulated` attestation.
-///
-/// Note: the forged grant will fail HMAC verification inside `ToolsetGrantStore::find_matching`,
-/// so the gate will fire `FirstInvokeApprovalRequired` rather than proceeding to
-/// the per-action approval step.  Either way, the commit is refused.
 #[tokio::test]
 #[serial]
 async fn forged_grant_still_forces_per_action_approval() {
-    let _key = setup_mock_keyring();
+    let key = setup_mock_keyring();
     let toolsets_dir = TempDir::new().unwrap();
     let approval_dir = TempDir::new().unwrap();
     let grant_file = approval_dir.path().join("grants.toml");
@@ -724,6 +864,14 @@ async fn forged_grant_still_forces_per_action_approval() {
         code, "policy.approval_required",
         "forged grant must trigger per-action approval_required (not first_invoke gate); got: {code}"
     );
+    assert_approved_submission_audit(
+        "forced-audit-forged",
+        approval_dir.path(),
+        &grant_file,
+        toolsets_dir.path(),
+        &key,
+    )
+    .await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -41,6 +41,14 @@ impl ResetMppStateArgs {
 }
 
 pub(crate) fn run(args: &ResetMppStateArgs) -> i32 {
+    if args.reason.trim().is_empty() {
+        render::render_json(&Envelope::<()>::err_raw(
+            "validation.reason_empty",
+            "--reason must contain non-whitespace text",
+        ));
+        return 1;
+    }
+
     if !args.acknowledge {
         render::render_json(&Envelope::<()>::err_raw(
             "mpp.reset_acknowledgement_required",

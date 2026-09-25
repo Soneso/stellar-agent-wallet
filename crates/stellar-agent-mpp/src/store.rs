@@ -242,7 +242,7 @@ impl MppAuthorizationStore {
         wire.version = STORE_VERSION;
         wire.generation = 1;
         audit(wire.generation)?;
-        self.write_atomic(&wire)
+        self.write_atomic(&wire, None)
     }
 
     /// Discards MPP replay history after an operator acknowledgement at the
@@ -725,9 +725,10 @@ impl MppAuthorizationStore {
         // path — read and write — goes through first.
         let _lock = self.acquire_lock()?;
         let mut wire = self.read_verified()?;
+        let generation = wire.generation;
         let result = update(&mut wire)?;
-        wire.generation = wire.generation.checked_add(1).ok_or_else(state_error)?;
-        self.write_atomic(&wire)?;
+        wire.generation = generation.checked_add(1).ok_or_else(state_error)?;
+        self.write_atomic(&wire, Some(generation))?;
         Ok(result)
     }
 
@@ -866,13 +867,28 @@ impl MppAuthorizationStore {
         Ok(wire)
     }
 
-    fn write_atomic(&self, wire: &WireStore) -> Result<(), MppError> {
+    /// Publishes `wire` as the next snapshot. `expected_generation` is the
+    /// counter value this write started from; `None` means the counter must
+    /// still be absent, which holds only for the adoption of an unanchored
+    /// store.
+    fn write_atomic(
+        &self,
+        wire: &WireStore,
+        expected_generation: Option<u64>,
+    ) -> Result<(), MppError> {
         let body = serde_json::to_vec(wire).map_err(|_error| state_error())?;
         if body.len() > MAX_STORE_BYTES {
             return Err(state_error());
         }
         let tag = compute_tag(&self.key, &body)?;
         let parent = self.path.parent().ok_or_else(state_error)?;
+        // A replaced lock file can admit a second writer. Publishing only
+        // while the counter still holds the generation this write started from
+        // keeps that writer's committed snapshot; it is intact, so the refusal
+        // asks for a retry rather than a reset.
+        if load_generation(&self.generation_entry)? != expected_generation {
+            return Err(concurrent_update_error());
+        }
         // Advance before publishing any authenticated snapshot, including a temp
         // file. An interrupted write leaves a gap that refuses; its generation
         // can never be reused for a different snapshot.
@@ -943,6 +959,8 @@ fn load_generation_value(entry_ref: &KeyringEntryRef) -> Result<Option<String>, 
 }
 
 fn write_generation(entry_ref: &KeyringEntryRef, generation: u64) -> Result<(), MppError> {
+    #[cfg(test)]
+    tests::before_generation_write(entry_ref);
     keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
         .and_then(|entry| entry.set_password(&generation.to_string()))
         .map_err(|_error| state_error())
@@ -962,6 +980,13 @@ const fn rollback_error() -> MppError {
     MppError::new(
         MppErrorCode::StateUnavailable,
         "MPP authorization state is rolled back; recover with stellar-agent profile reset-mpp-state <NAME> --acknowledge --reason <REASON>",
+    )
+}
+
+const fn concurrent_update_error() -> MppError {
+    MppError::new(
+        MppErrorCode::StateUnavailable,
+        "MPP authorization state changed during this update; retry the operation",
     )
 }
 
@@ -1114,6 +1139,26 @@ pub(crate) mod tests {
     use stellar_agent_core::profile::schema::KeyringEntryRef;
     use stellar_agent_network::keyring::{load_hmac_key_32, rotate_keyring_secret_32};
     use tempfile::TempDir;
+
+    thread_local! {
+        static FAIL_NEXT_GENERATION_WRITE: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// A publish reads the counter immediately before advancing it, and the
+    /// mock keyring fails only the next operation on a credential, so no
+    /// injection placed before the call can reach the write. When armed, this
+    /// injects the keyring failure between that read and the write; the
+    /// refusal it produces is the production one.
+    pub(super) fn before_generation_write(entry_ref: &KeyringEntryRef) {
+        if FAIL_NEXT_GENERATION_WRITE.with(std::cell::Cell::take) {
+            stellar_agent_test_support::keyring_mock::inject_no_logon_session(
+                &entry_ref.service,
+                &entry_ref.account,
+            )
+            .expect("inject the generation write failure");
+        }
+    }
 
     pub(crate) fn test_store(path: PathBuf, key: [u8; 32]) -> MppAuthorizationStore {
         let entry = KeyringEntryRef::new(
@@ -1395,6 +1440,60 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_counter_advanced_during_mutation_preserves_the_other_writer() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let path = directory.path().join("state");
+        let store = test_store(path.clone(), [7; 32]);
+        let now = 1_700_000_000;
+        let (prepared, _signer, _rpc) = prepared_fixture(now).await;
+        let first = AuthorizationRecord::new("first", TESTNET_PASSPHRASE, &prepared, now)
+            .expect("first record");
+        let first_id = first.authorization_id().to_owned();
+        store.insert_prepared(first, now).expect("first write");
+        let other = test_store(path.clone(), [7; 32]);
+        let winner = AuthorizationRecord::new("winner", TESTNET_PASSPHRASE, &prepared, now)
+            .expect("winning record");
+        let winner_id = winner.authorization_id().to_owned();
+        let mut committed = Vec::new();
+        let error = store
+            .mutate(|wire| {
+                fs::remove_file(sibling_path(&path, ".lock")).expect("unlink held lock");
+                other
+                    .insert_prepared(winner, now)
+                    .expect("other writer commits");
+                committed = fs::read(&path).expect("other writer snapshot");
+                wire.records.clear();
+                Ok(())
+            })
+            .expect_err("stale writer must refuse");
+        assert_eq!(error.code(), STATE_CODE);
+        assert!(error.message().contains("changed during this update"));
+        assert!(!error.message().contains("reset-mpp-state"));
+        assert_eq!(fs::read(&path).expect("surviving snapshot"), committed);
+        assert_eq!(
+            load_generation(&store.generation_entry).expect("counter"),
+            Some(2)
+        );
+        assert_eq!(
+            store
+                .load(&first_id)
+                .expect("first record survives")
+                .authorization_id(),
+            first_id
+        );
+        assert_eq!(
+            store
+                .load(&winner_id)
+                .expect("winning record survives")
+                .authorization_id(),
+            winner_id
+        );
+    }
+
     /// An anchor failure cannot publish a new authenticated snapshot.
     #[test]
     #[serial_test::serial]
@@ -1404,19 +1503,22 @@ pub(crate) mod tests {
         let path = directory.path().join("state");
         let store = test_store(path.clone(), [7; 32]);
         store.ensure_parent().expect("test value");
-        stellar_agent_test_support::keyring_mock::inject_no_logon_session(
-            &store.generation_entry.service,
-            &store.generation_entry.account,
-        )
-        .expect("test value");
+        FAIL_NEXT_GENERATION_WRITE.with(|fail| fail.set(true));
         let wire = WireStore {
             version: STORE_VERSION,
             generation: 1,
             records: Vec::new(),
         };
         assert_eq!(
-            store.write_atomic(&wire).expect_err("refusal").code(),
+            store
+                .write_atomic(&wire, Some(0))
+                .expect_err("refusal")
+                .code(),
             STATE_CODE
+        );
+        assert!(
+            !FAIL_NEXT_GENERATION_WRITE.with(std::cell::Cell::get),
+            "the refusal comes from the generation write"
         );
         assert!(!path.exists());
         assert_eq!(
@@ -1529,11 +1631,14 @@ pub(crate) mod tests {
         let store = test_store(path.clone(), [7; 32]);
         store.ensure_parent().expect("test value");
         store
-            .write_atomic(&WireStore {
-                version: STORE_VERSION,
-                generation: u64::MAX,
-                records: Vec::new(),
-            })
+            .write_atomic(
+                &WireStore {
+                    version: STORE_VERSION,
+                    generation: u64::MAX,
+                    records: Vec::new(),
+                },
+                Some(0),
+            )
             .expect("test value");
         let snapshot = fs::read(&path).expect("test value");
         assert_eq!(
@@ -1730,7 +1835,7 @@ pub(crate) mod tests {
             records: Vec::new(),
         };
         store.ensure_parent().expect("parent");
-        store.write_atomic(&wire).expect("write");
+        store.write_atomic(&wire, Some(0)).expect("write");
         let mut bytes = fs::read(&path).expect("read");
         bytes[HMAC_TAG_BYTES] ^= 1;
         fs::write(&path, bytes).expect("tamper");
@@ -1746,11 +1851,14 @@ pub(crate) mod tests {
         let first = test_store(path.clone(), [7; 32]);
         first.ensure_parent().expect("parent");
         first
-            .write_atomic(&WireStore {
-                version: STORE_VERSION,
-                generation: 1,
-                records: Vec::new(),
-            })
+            .write_atomic(
+                &WireStore {
+                    version: STORE_VERSION,
+                    generation: 1,
+                    records: Vec::new(),
+                },
+                Some(0),
+            )
             .expect("write");
         let second = test_store(path, [8; 32]);
         assert!(second.read_verified().is_err());
@@ -1885,11 +1993,14 @@ pub(crate) mod tests {
                 .expect("record");
         store.ensure_parent().expect("parent");
         store
-            .write_atomic(&WireStore {
-                version: STORE_VERSION,
-                generation: 1,
-                records: vec![record.clone(), record],
-            })
+            .write_atomic(
+                &WireStore {
+                    version: STORE_VERSION,
+                    generation: 1,
+                    records: vec![record.clone(), record],
+                },
+                Some(0),
+            )
             .expect("authenticated duplicate store");
         assert!(store.read_verified().is_err());
     }

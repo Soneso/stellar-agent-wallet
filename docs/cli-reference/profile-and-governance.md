@@ -188,7 +188,7 @@ Each rotation exits `1` with `ProfileNotFound` if the profile does not exist, or
 
 ### `reset-window-state <NAME> --reason <REASON>`
 
-Not a rotation: the fail-closed recovery path for the persisted policy-window-state store. An unreadable, tampered, or unparseable store file makes the stateful criteria (`per_period_cap`, `rate_limit`, and their bundle forms) refuse every matched call until the store is re-initialised. `reset-window-state` re-initialises it to empty (minting the HMAC key if absent), discards all accumulated window history, and writes a `policy_window_state_reset` audit row recording the profile and the required `--reason`. The reset is audited BEFORE the mutation, so the audit trail records the request even if the re-initialisation fails midway.
+Not a rotation: the fail-closed recovery path for the persisted policy-window-state store. An unreadable, tampered, or unparseable store file makes the stateful criteria (`per_period_cap`, `rate_limit`, and their bundle forms) refuse every matched call until the store is re-initialised. `reset-window-state` re-initialises it to empty (minting the HMAC key if absent), discards all accumulated window history, and writes a `policy_window_state_reset` audit row recording the profile and the required `--reason`. The reset is audited BEFORE the mutation, so the audit trail records the request even if the re-initialisation fails midway. A blank or whitespace-only `--reason` exits `1` with `validation.reason_empty` before anything changes.
 
 ```bash
 stellar-agent profile reset-window-state default --reason "store file corrupted after disk failure"
@@ -208,6 +208,8 @@ It takes the MPP store lock, rotates the HMAC key, removes the file, and sets th
 counter to zero. The next prepare starts from an empty store. A failed reset can
 be retried with acknowledgement; each attempt records its request before changing
 state. An absent or malformed counter has a null discarded generation.
+A blank or whitespace-only `--reason` exits `1` with `validation.reason_empty`
+before anything changes.
 
 ```sh
 stellar-agent profile reset-mpp-state default --acknowledge --reason "MPP state recovery"
@@ -310,8 +312,9 @@ Declining the prompt exits `1` with `error.code` `credentials.delete_canceled`; 
 
 The summary is rendered by this command from the stored pending-approval fields, not from anything the agent supplied, so the agent cannot influence what the operator sees. Approval is bound to the local user: the process uid recorded when the approval was created is re-derived at approve time and must match, so a different local user cannot consent on the holder's behalf. On consent, the command records an HMAC attestation (or, for a toolset first-invoke gate, mints and persists a toolset grant and consumes the pending entry). The attestation is an HMAC-SHA256 tag keyed by the profile attestation key over a canonical input including the approval nonce, the envelope SHA-256, and the process uid; the agent surface verifies it before executing. See [concepts](../concepts.md) for the spine and attestation model, and [toolsets](../toolsets.md) for the first-invoke gate versus per-action approval distinction.
 
-A `require_approval` rule's `ttl_secs` sets the pending entry's lifetime;
-when omitted, the lifetime is 24 hours. Its optional `reason` is shown in the
+A `require_approval` rule's `ttl_secs` sets the pending entry's lifetime,
+from 1 second to 604800 seconds (seven days); when omitted, the lifetime is 24
+hours. Its optional `reason`, at most 512 characters, is shown in the
 MCP approval response, `approve list` JSON and table output, and the trusted
 CLI approval prompt. The reason is display text and grants no authority.
 

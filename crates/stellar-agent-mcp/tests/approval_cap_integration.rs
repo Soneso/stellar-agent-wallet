@@ -935,7 +935,7 @@ async fn rule_ttl_bounds_toolset_queued_approval_at_commit() {
         "cap-toolset-rule-ttl",
         "require_approval",
         Outcome::Success,
-        "ttl_secs = 0",
+        "ttl_secs = 1",
     )
     .await;
     let tools = tempfile::tempdir().unwrap();
@@ -989,7 +989,7 @@ async fn rule_ttl_bounds_toolset_queued_approval_at_commit() {
         "{prompt}"
     );
     let nonce = {
-        let store =
+        let mut store =
             PendingApprovalStore::open(h.approval_dir.path().join(format!("{}.toml", h.name)))
                 .unwrap();
         let queued: Vec<_> = store
@@ -1002,7 +1002,14 @@ async fn rule_ttl_bounds_toolset_queued_approval_at_commit() {
             !queued[0].expired,
             "the toolset entry carries its own expiry"
         );
-        queued[0].approval_nonce.clone()
+        let nonce = queued[0].approval_nonce.clone();
+        let now = now_unix_ms().unwrap();
+        let mut entry = store.get(&nonce).unwrap().clone();
+        entry.created_at_unix_ms = now - 2_000;
+        assert!(!entry.is_expired(now), "the stored expiry remains live");
+        assert!(store.remove(&nonce).unwrap());
+        store.insert(entry, now).unwrap();
+        nonce
     };
     let approval = h.attest_nonce(&nonce, &args.envelope_xdr);
     let result = result_json(
