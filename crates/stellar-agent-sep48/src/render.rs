@@ -320,6 +320,35 @@ mod tests {
         );
     }
 
+    /// Verifies that a CAP-85 `ScVal::ExecutableTag` argument for a typed
+    /// parameter returns `UnsupportedArgType` through the `catch_unwind`
+    /// boundary: `xdr_to_json(ScVal::ExecutableTag, ScType::Address)` reaches
+    /// the `(v, typed) => todo!()` catch-all in
+    /// `soroban_spec_tools::Spec::xdr_to_json`, which panics.
+    #[test]
+    fn executable_tag_for_address_param_returns_unsupported_via_panic_arm() {
+        use stellar_xdr::{Int128Parts, ScString, ScVal};
+        let entries = make_approve_spec();
+        let tag = ScVal::ExecutableTag(ScString("pool-v2".try_into().unwrap()));
+        let amount_val = ScVal::I128(Int128Parts { hi: 0, lo: 500 });
+        let args = vec![tag, amount_val];
+        let result = render_typed_args(&entries, "CTEST...", "approve", &args);
+        let Err(Sep48Error::UnsupportedArgType {
+            arg_index,
+            type_hint,
+        }) = result
+        else {
+            panic!(
+                "ExecutableTag for Address param must return UnsupportedArgType, got: {result:?}"
+            );
+        };
+        assert_eq!(arg_index, 0);
+        assert!(
+            type_hint.ends_with("unsupported (soroban_spec_tools todo! path)"),
+            "the panic arm must fire: {type_hint}"
+        );
+    }
+
     /// Verifies that passing a `ScVal::Vec(Some(_))` where an `Address` is expected
     /// returns `UnsupportedArgType` via the `Ok(Err(e))` arm (NOT via panic).
     ///

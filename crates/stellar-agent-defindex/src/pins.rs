@@ -112,7 +112,10 @@ pub const BLEND_STRATEGY_WASM_HASH_PUBNET: [u8; 32] =
 /// Returns [`DefindexPinError`] when:
 /// - The vault address is invalid.
 /// - The on-chain WASM hash does not match the pinned hash (Drift).
-/// - The vault is a SAC or absent (fail-closed by type).
+/// - The vault is a SAC, absent, or runs an owner-managed external-reference
+///   executable (fail-closed by type; an external reference is refused
+///   whatever hash it currently resolves to, because the owner can repoint
+///   it).
 /// - The primary or secondary RPC is unavailable.
 /// - Primary and secondary RPC disagree (Divergent).
 pub async fn verify_defindex_vault_wasm(
@@ -143,6 +146,11 @@ pub async fn verify_defindex_vault_wasm(
         }
         WasmHashFetch::Sac => Err(DefindexPinError::SacNotVault {
             vault_redacted: redact_strkey_first5_last5(vault_address),
+        }),
+        WasmHashFetch::ExternalRef(external) => Err(DefindexPinError::ExternalRef {
+            vault_redacted: redact_strkey_first5_last5(vault_address),
+            owner_redacted: external.owner_redacted(),
+            tag: external.tag_display(),
         }),
         WasmHashFetch::Absent => Err(DefindexPinError::Absent {
             vault_redacted: redact_strkey_first5_last5(vault_address),
@@ -201,6 +209,25 @@ pub enum DefindexPinError {
         vault_redacted: String,
     },
 
+    /// The vault's executable is a CAP-85 external reference: the owner named
+    /// in the instance decides, and can change at any time, which Wasm runs.
+    ///
+    /// `owner_redacted` is first-5-last-5 (or `<unsupported address>`); `tag`
+    /// is the owner-chosen tag rendered escaped and bounded.
+    #[error(
+        "DeFindex vault {vault_redacted} executable is an external reference managed by \
+         {owner_redacted} under tag \"{tag}\"; the wallet does not sign against \
+         owner-managed code"
+    )]
+    ExternalRef {
+        /// First-5-last-5 redacted vault address.
+        vault_redacted: String,
+        /// First-5-last-5 redacted executable owner.
+        owner_redacted: String,
+        /// Escaped, bounded rendering of the owner-chosen tag.
+        tag: String,
+    },
+
     /// The contract address is absent from the ledger.
     #[error("DeFindex vault {vault_redacted} is absent from the ledger")]
     Absent {
@@ -208,7 +235,8 @@ pub enum DefindexPinError {
         vault_redacted: String,
     },
 
-    /// The WASM-hash fetch failed (RPC unavailable or divergent).
+    /// The WASM-hash fetch failed (RPC unavailable, malformed ledger entry, or
+    /// divergent).
     #[error("DeFindex vault WASM-hash fetch failed: {reason}")]
     FetchFailed {
         /// Non-sensitive reason string.
@@ -328,6 +356,57 @@ mod tests {
         let random_hash = [0u8; 32];
         assert!(!is_blend_strategy(&random_hash, "testnet"));
         assert!(!is_blend_strategy(&random_hash, "pubnet"));
+    }
+
+    // ── External-reference vault (mocked getLedgerEntries) ────────────────────
+
+    /// The vault's executable is an external reference whose owner tag entry
+    /// currently holds exactly the pinned vault hash; the gate still refuses.
+    #[tokio::test]
+    async fn verify_vault_external_ref_refuses_even_when_resolved_equals_pin() {
+        use stellar_agent_test_support::{KeyedLedgerEntriesResponder, xdr_fixtures};
+
+        const VAULT: &str = "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN";
+        const OWNER: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+        let responder = KeyedLedgerEntriesResponder::new()
+            .with_entry(xdr_fixtures::ledger_entry_from_response_json(
+                &xdr_fixtures::external_ref_instance_ledger_entries_json(VAULT, OWNER, b"vault"),
+            ))
+            .with_entry(xdr_fixtures::ledger_entry_from_response_json(
+                &xdr_fixtures::executable_tag_ledger_entries_json(
+                    OWNER,
+                    b"vault",
+                    DEFINDEX_VAULT_WASM_HASH,
+                ),
+            ));
+        let server = responder.serve().await;
+        let rpc = StellarRpcClient::new(&server.uri()).expect("client constructs");
+
+        let result = verify_defindex_vault_wasm(VAULT, &rpc, None).await;
+
+        let Err(err) = result else {
+            panic!("external-reference vault must be refused");
+        };
+        let display = err.to_string();
+        let DefindexPinError::ExternalRef {
+            vault_redacted,
+            owner_redacted,
+            tag,
+        } = err
+        else {
+            panic!("expected DefindexPinError::ExternalRef; got {err:?}");
+        };
+        assert_eq!(vault_redacted, "CBMVK...ZDWHN");
+        assert_eq!(owner_redacted, "GAAAA...AAWHF");
+        assert_eq!(tag, "vault");
+        assert!(
+            display.contains("external reference managed by GAAAA...AAWHF under tag \"vault\""),
+            "{display}"
+        );
+        assert!(
+            !display.contains(VAULT) && !display.contains(OWNER),
+            "{display}"
+        );
     }
 
     // ── DefindexPinError Display redacts addresses ────────────────────────────

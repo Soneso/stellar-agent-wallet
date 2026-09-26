@@ -11,7 +11,7 @@
 //!
 //! This module uses baselib's `Account` + `TransactionBuilder` / `Transaction` +
 //! `TransactionBehavior` to construct the unsigned envelope, then serialises it
-//! to base64 XDR.  `stellar-baselib` 0.5.8 re-exports the workspace
+//! to base64 XDR.  `stellar-baselib` 0.6.0 re-exports the workspace
 //! `stellar_xdr` directly as `stellar_baselib::xdr`, so both use the same XDR
 //! types and there is no version bridge.
 //!
@@ -33,7 +33,7 @@ use stellar_baselib::asset::{Asset as BaselibAsset, AssetBehavior};
 use stellar_baselib::operation::Operation as BaselibOperation;
 use stellar_baselib::transaction::{Transaction, TransactionBehavior};
 use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilderBehavior};
-// stellar-baselib 0.5.8 re-exports stellar_xdr directly as stellar_baselib::xdr,
+// stellar-baselib 0.6.0 re-exports stellar_xdr directly as stellar_baselib::xdr,
 // so stellar_baselib::xdr::{Limits, Memo, WriteXdr} and the workspace
 // stellar_xdr::{Limits, Memo, WriteXdr} are the same types.
 use stellar_xdr::{Limits, Memo as BaselibMemo, WriteXdr};
@@ -986,7 +986,7 @@ impl ClassicOpBuilder {
 
     /// Sets the transaction memo.
     ///
-    /// `stellar-baselib` 0.5.8 re-exports the workspace `stellar_xdr` directly,
+    /// `stellar-baselib` 0.6.0 re-exports the workspace `stellar_xdr` directly,
     /// so `stellar_xdr::Memo` and `stellar_baselib::xdr::Memo` are the same type.
     /// The memo is stored as-is; no XDR round-trip is required.
     ///
@@ -1214,7 +1214,7 @@ impl ClassicOpBuilder {
         })?;
 
         // Encode as base64; attach_signature and submit paths consume base64 strings.
-        // stellar-baselib 0.5.8 re-exports stellar_xdr, so WriteXdr here is the
+        // stellar-baselib 0.6.0 re-exports stellar_xdr, so WriteXdr here is the
         // same trait as the workspace stellar_xdr::WriteXdr.
         envelope.to_xdr_base64(Limits::none()).map_err(|e| {
             WalletError::Protocol(ProtocolError::XdrCodecFailed {
@@ -1344,7 +1344,7 @@ mod tests {
     /// encoding via baselib's `to_xdr_base64` and re-decoding with the workspace
     /// `stellar_xdr` produces byte-for-byte identical output.
     ///
-    /// Since stellar-baselib 0.5.8 re-exports the workspace `stellar_xdr`
+    /// Since stellar-baselib 0.6.0 re-exports the workspace `stellar_xdr`
     /// directly, this is a self-consistency check of the XDR serialisation
     /// rather than a cross-version bridge test.
     #[test]

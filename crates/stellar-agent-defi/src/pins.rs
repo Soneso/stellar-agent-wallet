@@ -7,8 +7,9 @@
 //!
 //! - **Sign-time gate** (`verify_pin_for_sign`) — the only `Ok(())` path is a
 //!   confirmed on-chain WASM hash that matches the pin.  Every other outcome
-//!   (`Sac`, `Absent`, Drift, Unavailable, Divergent) maps to `Err` directly.
-//!   "Proceed on Unavailable/absent/SAC" is unrepresentable by type.
+//!   (`Sac`, `ExternalRef`, `Absent`, Drift, Unavailable, Divergent) maps to
+//!   `Err` directly.  "Proceed on Unavailable/absent/SAC/external reference"
+//!   is unrepresentable by type.
 //!
 //! - **Report-only surface** (`check_pin_outcome`) — returns a `PinOutcome` for
 //!   operator-facing inspection.  NOT consumed by any sign-time gate.
@@ -179,7 +180,8 @@ impl std::fmt::Debug for DefiContractPin {
 /// Error returned by `verify_pin_for_sign`.
 ///
 /// Every variant maps to a refused sign; `Ok(())` is the only proceed-to-sign
-/// path.  The "proceed on Unavailable/absent/SAC" branch is unrepresentable.
+/// path.  The "proceed on Unavailable/absent/SAC/external reference" branch is
+/// unrepresentable.
 ///
 /// All variants carry first-8 hex hashes and first-5-last-5 contract addresses
 /// where applicable; NEVER the full 32-byte hash or full address.
@@ -215,6 +217,29 @@ pub enum PinVerifyError {
         /// First-5-last-5 redacted contract address.
         contract_redacted: String,
         /// Typed machine-stable wire-code; always [`WIRE_CODE_SAC`].
+        wire_code: &'static str,
+    },
+
+    /// The contract's executable is a CAP-85 external reference: the owner
+    /// named in the contract instance decides, and can change at any time,
+    /// which Wasm runs.
+    ///
+    /// The wallet does not sign against owner-managed code, even when the
+    /// owner's tag entry currently resolves to the pinned hash, because the
+    /// owner can repoint it after the check. `owner_redacted` is first-5-last-5
+    /// (or `<unsupported address>`); `tag` is the owner-chosen tag rendered
+    /// escaped and bounded. `wire_code` is [`WIRE_CODE_EXTERNAL_REF`].
+    #[error(
+        "DeFi contract pin refused: the executable of {contract_redacted} is an external reference managed by {owner_redacted} under tag \"{tag}\"; the wallet does not sign against owner-managed code (wire_code={wire_code})"
+    )]
+    ExternalRef {
+        /// First-5-last-5 redacted contract address.
+        contract_redacted: String,
+        /// First-5-last-5 redacted executable owner.
+        owner_redacted: String,
+        /// Escaped, bounded rendering of the owner-chosen tag.
+        tag: String,
+        /// Typed machine-stable wire-code; always [`WIRE_CODE_EXTERNAL_REF`].
         wire_code: &'static str,
     },
 
@@ -305,7 +330,8 @@ pub enum PinOutcome {
         /// First-8 hex of the on-chain hash.
         observed_first8: String,
     },
-    /// The WASM-hash fetch was unavailable (RPC error, absent, or SAC).
+    /// The WASM-hash fetch was unavailable (RPC error, absent, SAC, or an
+    /// external-reference executable).
     Unavailable {
         /// First-5-last-5 redacted contract address.
         contract_redacted: String,
@@ -334,7 +360,8 @@ pub enum PinOutcome {
 ///
 /// Returns `Ok(())` ONLY when `fetch` resolves to `WasmHashFetch::Wasm` whose
 /// bytes match the pin's `wasm_hash` exactly.  Every other outcome
-/// (`Sac`, `Absent`, Drift, Unavailable/fetch-error) returns `Err`.
+/// (`Sac`, `ExternalRef`, `Absent`, Drift, Unavailable/fetch-error) returns
+/// `Err`.
 ///
 /// This is **fail-closed by type**: `PinVerifyError` has no "proceed anyway"
 /// variant; callers cannot reach submit without an `Ok(())`.
@@ -343,6 +370,8 @@ pub enum PinOutcome {
 ///
 /// - [`PinVerifyError::Drift`] — on-chain hash does not match the pin.
 /// - [`PinVerifyError::IsSac`] — contract is a Stellar Asset Contract.
+/// - [`PinVerifyError::ExternalRef`] — the contract's executable is an
+///   owner-managed external reference, whatever hash it currently resolves to.
 /// - [`PinVerifyError::Absent`] — contract not found on-chain.
 /// - [`PinVerifyError::Unavailable`] — fetch failed (RPC error).
 ///
@@ -352,11 +381,13 @@ pub enum PinOutcome {
 ///
 /// # Design note
 ///
-/// The `fetch` parameter accepts the `WasmHashFetch` tri-state returned by
-/// `stellar_agent_network::fetch_contract_wasm_hash`.  `Absent` and `Sac`
-/// map directly to `Err`, unlike `stellar-agent-smart-account`'s rule-pin
-/// verifier path which uses an `unwrap_or([0u8; 32])` zero-sentinel (a
-/// distinct accept-unknown-verifier install use-case with no DeFi analogue).
+/// The `fetch` parameter accepts the `WasmHashFetch` outcome returned by
+/// `stellar_agent_network::fetch_contract_wasm_hash`.  `Absent`, `Sac` and
+/// `ExternalRef` map directly to `Err`; no outcome other than a matching
+/// `Wasm` hash reaches `Ok(())`, and no zero value stands in for a missing
+/// hash.  `stellar-agent-smart-account`'s verifier install path applies
+/// `unwrap_or([0u8; 32])` to an absent contract for its
+/// accept-unknown-verifier flow, a use case with no DeFi analogue.
 pub fn verify_pin_for_sign(
     pin: &DefiContractPin,
     fetch: &WasmHashFetch,
@@ -409,6 +440,26 @@ pub fn verify_pin_for_sign(
                 wire_code: WIRE_CODE_SAC,
             })
         }
+        // External reference: the owner can repoint the executable at any
+        // time, so a resolved hash equal to the pin proves nothing about the
+        // code that runs when the transaction lands. Fail-closed.
+        WasmHashFetch::ExternalRef(external) => {
+            let owner_redacted = external.owner_redacted();
+            let tag = external.tag_display();
+            warn!(
+                contract_redacted = %contract_redacted,
+                owner_redacted = %owner_redacted,
+                tag = %tag,
+                resolved_first8 = %external.resolved_first8(),
+                "defi pin verify: external-reference executable — refusing sign"
+            );
+            Err(PinVerifyError::ExternalRef {
+                contract_redacted,
+                owner_redacted,
+                tag,
+                wire_code: WIRE_CODE_EXTERNAL_REF,
+            })
+        }
         // Absent: the contract is not deployed. Fail-closed.
         WasmHashFetch::Absent => {
             warn!(
@@ -455,7 +506,8 @@ pub fn verify_pin_for_sign(
 ///
 /// This function is infallible — it maps every fetch outcome to a `PinOutcome`
 /// variant without returning a `Result`.  Any error conditions (RPC failure,
-/// Absent, Divergent) become `PinOutcome::Unavailable` or `PinOutcome::Divergent`.
+/// Absent, SAC, external reference, Divergent) become `PinOutcome::Unavailable`
+/// or `PinOutcome::Divergent`.
 pub fn check_pin_outcome(pin: &DefiContractPin, fetch: &WasmHashFetch) -> PinOutcome {
     let contract_redacted = pin.redacted_address();
     let pinned_first8 = pin.pin_hash_first8_hex();
@@ -479,6 +531,10 @@ pub fn check_pin_outcome(pin: &DefiContractPin, fetch: &WasmHashFetch) -> PinOut
         WasmHashFetch::Sac => PinOutcome::Unavailable {
             contract_redacted,
             wire_code: WIRE_CODE_SAC,
+        },
+        WasmHashFetch::ExternalRef(_) => PinOutcome::Unavailable {
+            contract_redacted,
+            wire_code: WIRE_CODE_EXTERNAL_REF,
         },
         WasmHashFetch::Absent => PinOutcome::Unavailable {
             contract_redacted,
@@ -506,6 +562,9 @@ pub fn check_pin_outcome(pin: &DefiContractPin, fetch: &WasmHashFetch) -> PinOut
 pub const WIRE_CODE_SAC: &str = "defi.pin.sac";
 /// Typed wire-code: contract not found on-chain.
 pub const WIRE_CODE_ABSENT: &str = "defi.pin.absent";
+/// Typed wire-code: the contract's executable is an owner-managed CAP-85
+/// external reference.
+pub const WIRE_CODE_EXTERNAL_REF: &str = "defi.pin.external_ref";
 /// Typed wire-code: RPC fetch failed.
 pub const WIRE_CODE_FETCH_FAILED: &str = "defi.pin.fetch_failed";
 /// Typed wire-code: primary and secondary RPC disagree.
@@ -691,6 +750,97 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ── External reference ───────────────────────────────────────────────────
+
+    const OWNER: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
+    fn external_ref(resolved: Option<[u8; 32]>, tag: &[u8]) -> WasmHashFetch {
+        WasmHashFetch::ExternalRef(crate::network::ExternalRefExecutable {
+            owner: stellar_xdr::ScAddress::Account(stellar_xdr::AccountId(
+                stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256([0u8; 32])),
+            )),
+            tag: stellar_xdr::ScString(tag.to_vec().try_into().unwrap()),
+            resolved,
+        })
+    }
+
+    /// The owner's tag entry currently resolves to exactly the pinned hash;
+    /// the gate still refuses because the owner can repoint it.
+    #[test]
+    fn verify_pin_for_sign_external_ref_refuses_even_when_resolved_equals_pin() {
+        let hash = [7u8; 32];
+        let pin = test_pin(hash);
+        let result = verify_pin_for_sign(&pin, &external_ref(Some(hash), b"pool-v2"));
+        let Err(err) = result else {
+            panic!("external reference must be refused");
+        };
+        let display = err.to_string();
+        let PinVerifyError::ExternalRef {
+            owner_redacted,
+            tag,
+            wire_code,
+            ..
+        } = err
+        else {
+            panic!("expected PinVerifyError::ExternalRef; got {err:?}");
+        };
+        assert_eq!(wire_code, WIRE_CODE_EXTERNAL_REF);
+        assert_eq!(wire_code, "defi.pin.external_ref");
+        assert_eq!(owner_redacted, "GAAAA...AAWHF");
+        assert_eq!(tag, "pool-v2");
+        assert!(
+            display.contains("external reference managed by GAAAA...AAWHF"),
+            "{display}"
+        );
+        assert!(display.contains("under tag \"pool-v2\""), "{display}");
+        assert!(
+            display.contains("does not sign against owner-managed code"),
+            "{display}"
+        );
+        assert!(!display.contains(OWNER), "full owner leaked: {display}");
+    }
+
+    #[test]
+    fn verify_pin_for_sign_external_ref_without_live_tag_entry_refuses() {
+        let pin = test_pin([7u8; 32]);
+        let result = verify_pin_for_sign(&pin, &external_ref(None, b"pool-v2"));
+        assert!(matches!(
+            result,
+            Err(PinVerifyError::ExternalRef {
+                wire_code: WIRE_CODE_EXTERNAL_REF,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn verify_pin_for_sign_external_ref_display_bounds_the_tag() {
+        let pin = test_pin([7u8; 32]);
+        let mut tag = b"\x1b[31m".to_vec();
+        tag.extend(std::iter::repeat_n(b'z', 400));
+        let err = verify_pin_for_sign(&pin, &external_ref(Some([7u8; 32]), &tag)).unwrap_err();
+        let display = err.to_string();
+        assert!(!display.chars().any(char::is_control), "{display}");
+        assert!(
+            !display.contains(&"z".repeat(100)),
+            "unbounded tag: {display}"
+        );
+    }
+
+    #[test]
+    fn check_pin_outcome_external_ref_is_unavailable_with_typed_wire_code() {
+        let hash = [7u8; 32];
+        let pin = test_pin(hash);
+        let outcome = check_pin_outcome(&pin, &external_ref(Some(hash), b"pool-v2"));
+        assert_eq!(
+            outcome,
+            PinOutcome::Unavailable {
+                contract_redacted: pin.redacted_address(),
+                wire_code: WIRE_CODE_EXTERNAL_REF,
+            }
+        );
     }
 
     // ── Redaction helpers ────────────────────────────────────────────────────

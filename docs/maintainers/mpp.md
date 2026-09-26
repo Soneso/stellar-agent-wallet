@@ -69,9 +69,10 @@ the encoded input size.
 
 Reconciliation reads `get_transaction` from `stellar-rpc-client`, which decodes
 the response metadata, events, envelope, and result inside the client and hands
-the wallet values that are already decoded. Those decodes carry no XDR depth or
-length bound, and there is no point at which the wallet can impose its own, so
-reconciliation relies on the configured endpoint at that boundary. The test at
+the wallet values that are already decoded. Those decodes bound XDR depth to
+500 but carry no length bound, and there is no point at which the wallet can
+impose its own, so reconciliation relies on the configured endpoint at that
+boundary. The test at
 `crates/stellar-agent-mpp/tests/rpc_decode_boundary.rs` holds the inventory of
 those decode sites in the pinned version and fails when the locked version
 changes, so a bump reinspects them.

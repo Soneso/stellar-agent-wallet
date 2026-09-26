@@ -117,7 +117,7 @@ Verifier contracts are governed by a compile-time allowlist; no central server i
 
 Override flags on `smart-account rules create`:
 
-- `--accept-mutable-verifier` — proceed even if a referenced verifier or policy contract has a mutable admin/owner key (envelope reports `mutable_override: true`). A contract whose instance is undecodable or has a non-Wasm executable is refused with `sa.contract_instance_unsupported` whether or not the flag is set; the wallet cannot pin its code.
+- `--accept-mutable-verifier` — proceed even if a referenced verifier or policy contract has a mutable admin/owner key (envelope reports `mutable_override: true`). A contract whose instance is undecodable, has a non-Wasm executable, or has an owner-managed external-reference executable is refused with `sa.contract_instance_unsupported` whether or not this flag or `--accept-unknown-verifier` is set; the wallet cannot pin its code.
 - `--accept-unknown-verifier` — proceed even if a referenced verifier or policy WASM hash is not in the allowlist (envelope reports `unknown_override: true`).
 
 Drift detection: `smart-account rules verify-pins` compares a rule's pinned verifier and policy hashes against the live on-chain contracts (see the rules table).

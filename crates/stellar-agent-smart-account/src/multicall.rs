@@ -955,6 +955,17 @@ pub(crate) async fn fetch_wasm_hash_via_rpc(
                     "multicall router deployed as StellarAsset (not WASM)".to_owned(),
                 ));
             }
+            // The owner can repoint an external reference at any time, so no
+            // hash read here describes the code that runs at submit time.
+            ContractExecutable::ExternalRef(external) => {
+                let external = stellar_agent_network::ExternalRefExecutable::from_xdr(external);
+                return Err(rpc_err(format!(
+                    "multicall router executable is an external reference managed by {} \
+                     under tag \"{}\"; the wallet does not route through owner-managed code",
+                    external.owner_redacted(),
+                    external.tag_display(),
+                )));
+            }
         },
         _ => {
             return Err(rpc_err(
@@ -1922,6 +1933,7 @@ fn scval_discriminant_name(scval: &ScVal) -> &'static str {
         ScVal::LedgerKeyContractInstance => "LedgerKeyContractInstance",
         ScVal::LedgerKeyNonce(_) => "LedgerKeyNonce",
         ScVal::ContractInstance(_) => "ContractInstance",
+        ScVal::ExecutableTag(_) => "ExecutableTag",
     }
 }
 
@@ -3514,6 +3526,48 @@ wasm_sha256 = "{drifted_sha}"
         }
     }
 
+    // ── fetch_wasm_hash_via_rpc ───────────────────────────────────────────────
+
+    /// A router whose instance executable is an external reference is refused
+    /// with the module's RPC error naming the redacted owner and bounded tag.
+    #[tokio::test]
+    async fn fetch_wasm_hash_via_rpc_refuses_external_ref_router() {
+        use stellar_agent_test_support::{KeyedLedgerEntriesResponder, xdr_fixtures};
+
+        const ROUTER: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        const OWNER: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+        let responder = KeyedLedgerEntriesResponder::new().with_entry(
+            xdr_fixtures::ledger_entry_from_response_json(
+                &xdr_fixtures::external_ref_instance_ledger_entries_json(
+                    ROUTER,
+                    OWNER,
+                    b"router\ttag",
+                ),
+            ),
+        );
+        let server = responder.serve().await;
+
+        let result =
+            fetch_wasm_hash_via_rpc(&server.uri(), ROUTER, std::time::Duration::from_secs(10))
+                .await;
+
+        let Err(SaError::MulticallFailed {
+            phase,
+            redacted_reason,
+            post_submit_kind,
+        }) = result
+        else {
+            panic!("expected MulticallFailed; got {result:?}");
+        };
+        assert_eq!(phase, "rpc_divergence");
+        assert_eq!(post_submit_kind, None);
+        assert_eq!(
+            redacted_reason,
+            "multicall router executable is an external reference managed by GAAAA...AAWHF \
+             under tag \"router\\ttag\"; the wallet does not route through owner-managed code"
+        );
+    }
+
     // ── scval_discriminant_name ───────────────────────────────────────────────
 
     /// `scval_discriminant_name` returns the correct name for every ScVal variant
@@ -3549,6 +3603,10 @@ wasm_sha256 = "{drifted_sha}"
             (
                 "Symbol",
                 ScVal::Symbol(ScSymbol(b"".as_slice().try_into().unwrap())),
+            ),
+            (
+                "ExecutableTag",
+                ScVal::ExecutableTag(ScString(b"tag".as_slice().try_into().unwrap())),
             ),
             ("Vec", ScVal::Vec(None)),
             ("Map", ScVal::Map(None)),

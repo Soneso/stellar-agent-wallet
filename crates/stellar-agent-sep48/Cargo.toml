@@ -30,7 +30,7 @@ stellar-agent-xdr-limits = { workspace = true }
 tracing               = { workspace = true }
 
 [dev-dependencies]
-stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["wiremock-helpers"] }
+stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["wiremock-helpers", "test-helpers"] }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros"] }
 serial_test        = { workspace = true }
 soroban-spec-tools = { workspace = true }

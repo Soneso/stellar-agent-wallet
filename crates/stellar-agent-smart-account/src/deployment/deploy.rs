@@ -472,6 +472,8 @@ fn build_signer_delegated_scval(g_strkey: &str) -> Result<ScVal, SaError> {
 /// - `LedgerEntryData` discriminant other than `ContractData`;
 /// - `ScVal` discriminant other than `ContractInstance`;
 /// - `ContractExecutable::StellarAsset` (deployed contract is not a WASM contract);
+/// - `ContractExecutable::ExternalRef` (deployed contract runs an owner-managed
+///   executable, not the uploaded Wasm);
 /// - `expected_hash_hex` not parseable as 32-byte hex (programmer error);
 /// - hash mismatch (the substantive substitution check; `redacted_reason` carries
 ///   redacted C-strkey + first-8 hex of observed AND expected for operator triage).
@@ -512,6 +514,21 @@ pub(crate) fn verify_post_deploy_wasm_hash(
                 return Err(SaError::DeploymentFailed {
                     phase: "post_deploy_verification",
                     redacted_reason: "deployed executable was StellarAsset, not Wasm".to_owned(),
+                });
+            }
+            // The deployed instance names an owner-managed executable, not
+            // the Wasm the wallet uploaded; the owner can repoint it at any
+            // time, so it is never accepted as the deployed smart account.
+            ContractExecutable::ExternalRef(external) => {
+                let external = stellar_agent_network::ExternalRefExecutable::from_xdr(external);
+                return Err(SaError::DeploymentFailed {
+                    phase: "post_deploy_verification",
+                    redacted_reason: format!(
+                        "deployed executable is an external reference managed by {} under tag \
+                         \"{}\", not the uploaded Wasm",
+                        external.owner_redacted(),
+                        external.tag_display(),
+                    ),
                 });
             }
         },
@@ -900,7 +917,7 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
     // by the network. The upload and deploy are therefore submitted as two
     // sequential single-op transactions.
     //
-    // All XDR types use stellar_xdr to match the crate-wide xdr-27 stack.
+    // All XDR types use stellar_xdr to match the crate-wide xdr-28 stack.
     let upload_tx_hash: Option<String> = if wasm_already_on_chain {
         None
     } else {
@@ -1524,6 +1541,69 @@ mod tests {
         assert!(
             redacted_reason.contains("12345678"),
             "redacted_reason should carry expected first-8 hex: {redacted_reason}"
+        );
+    }
+
+    /// A deployed instance whose executable is a CAP-85 external reference is
+    /// refused at post-deploy verification with a reason naming the redacted
+    /// owner and the bounded tag, even though no Wasm hash is compared.
+    #[test]
+    fn post_deploy_verification_refuses_external_ref_executable() {
+        use stellar_xdr::{ContractExecutableExternalRef, ScContractInstance, ScString};
+
+        let owner = ScAddress::Contract(ContractId(Hash([0u8; 32])));
+        let mut tag = b"acct\x07".to_vec();
+        tag.extend(std::iter::repeat_n(b'q', 300));
+        let instance = ScContractInstance {
+            executable: ContractExecutable::ExternalRef(ContractExecutableExternalRef {
+                executable_owner: owner,
+                tag: ScString(tag.try_into().unwrap()),
+            }),
+            storage: None,
+        };
+        let led = SorobanLedgerEntryData::ContractData(ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: ScAddress::Contract(ContractId(Hash([1u8; 32]))),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+            val: ScVal::ContractInstance(instance),
+        });
+        let synthetic: LedgerEntryResult = serde_json::from_value(json!({
+            "key": "AAAABgAAAAAA",
+            "xdr": led.to_xdr_base64(Limits::none()).unwrap(),
+            "lastModifiedLedgerSeq": 1,
+            "liveUntilLedgerSeq": 1
+        }))
+        .expect("constructed via Deserialize impl");
+
+        let result = verify_post_deploy_wasm_hash(
+            &synthetic,
+            "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        );
+
+        let Err(SaError::DeploymentFailed {
+            phase,
+            redacted_reason,
+        }) = result
+        else {
+            panic!("expected DeploymentFailed; got: {result:?}");
+        };
+        assert_eq!(phase, "post_deploy_verification");
+        assert!(
+            redacted_reason.starts_with(
+                "deployed executable is an external reference managed by CAAAA...ABSC4 \
+                 under tag \"acct\\u{7}qqq"
+            ),
+            "{redacted_reason}"
+        );
+        assert!(
+            redacted_reason.ends_with("...\", not the uploaded Wasm"),
+            "{redacted_reason}"
+        );
+        assert!(
+            !redacted_reason.chars().any(char::is_control),
+            "{redacted_reason}"
         );
     }
 

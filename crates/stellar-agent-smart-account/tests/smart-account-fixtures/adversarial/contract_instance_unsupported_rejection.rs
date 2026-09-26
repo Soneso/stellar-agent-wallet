@@ -1,16 +1,23 @@
 //! Adversarial fixture: `contract_instance_unsupported_rejection`.
 //!
 //! Scenario: a verifier or policy contract's instance entry exists but does
-//! not decode as contract-instance data, or its executable is not Wasm.  Such
-//! a contract has no Wasm hash to pin, so the signing-time drift check cannot
-//! observe a change to its code.  `pin_referenced_contracts` MUST return
+//! not decode as contract-instance data, its executable is not Wasm, or its
+//! executable is a CAP-85 external reference.  Such a contract has no Wasm
+//! hash the wallet can pin: the signing-time drift check cannot observe a
+//! change to its code, and an external reference's owner can repoint it at
+//! any time.  `pin_referenced_contracts` MUST return
 //! `SaError::ContractInstanceUnsupported` with
-//! `wire_code = "sa.contract_instance_unsupported"` whether or not
-//! `accept_mutable_verifier` is set, and MUST NOT emit a
-//! `SaMutableContractOverride` audit row.
+//! `wire_code = "sa.contract_instance_unsupported"` whatever override flags
+//! are set, and MUST NOT emit a `SaMutableContractOverride` audit row.
 //!
-//! `accept_unknown_verifier` is set so the probe reaches the mutability step:
-//! an instance without a Wasm hash never matches the allowlist.
+//! Where the refusal happens decides which override rows can exist:
+//!
+//! - A Stellar Asset Contract instance has no Wasm hash, so identification
+//!   reports an allowlist miss; with `accept_unknown_verifier` the install
+//!   records the unknown-hash override and the mutability probe then refuses.
+//! - An undecodable instance and an external reference are refused by the
+//!   identification fetch itself, before either override flag is consulted,
+//!   so no override row of either kind is written.
 
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
@@ -104,17 +111,22 @@ fn read_audit_entries(log_path: &std::path::Path) -> Vec<AuditEntry> {
 /// Both instance shapes, for both contract kinds, with and without
 /// `accept_mutable_verifier`, are refused with
 /// `sa.contract_instance_unsupported` and write no mutable-override row.
+/// The SAC instance reaches the mutability probe through the unknown-hash
+/// override; the undecodable instance is refused at identification, before
+/// any override row.
 #[tokio::test]
 async fn unpinnable_instance_rejected_regardless_of_mutable_override() {
     let contract = contract_addr();
-    for (entry_xdr, reason) in [
+    for (entry_xdr, reason, expect_unknown_override_row) in [
         (
             UNDECODABLE_ENTRY_XDR.to_owned(),
             AdminOrOwnerKey::UndecodableInstance,
+            false,
         ),
         (
             non_wasm_instance_xdr(&contract),
             AdminOrOwnerKey::NonWasmExecutable,
+            true,
         ),
     ] {
         for contract_kind in [ContractKind::Verifier, ContractKind::Policy] {
@@ -201,12 +213,13 @@ async fn unpinnable_instance_rejected_regardless_of_mutable_override() {
                 );
 
                 let entries = read_audit_entries(&audit_log_path);
-                assert!(
+                assert_eq!(
                     entries.iter().any(|e| matches!(
                         e.event_kind,
                         EventKind::SaUnknownContractOverride { .. }
                     )),
-                    "{case}: the unknown-hash override row must be present in the log"
+                    expect_unknown_override_row,
+                    "{case}: unknown-hash override row presence"
                 );
                 assert!(
                     !entries.iter().any(|e| matches!(
@@ -217,5 +230,130 @@ async fn unpinnable_instance_rejected_regardless_of_mutable_override() {
                 );
             }
         }
+    }
+}
+
+/// A verifier or policy whose instance executable is an external reference is
+/// refused with `ContractInstanceUnsupported { reason: ExternalRefExecutable }`
+/// even with `accept_mutable_verifier` and `accept_unknown_verifier` both set,
+/// and even though the owner's tag entry currently resolves to an allowlisted
+/// hash. The refusal comes from identification, before either override
+/// branch, so no override row of either kind is written.
+#[tokio::test]
+async fn external_ref_instance_rejected_before_any_override() {
+    use stellar_agent_test_support::{KeyedLedgerEntriesResponder, xdr_fixtures};
+
+    const OWNER: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+    let contract = contract_addr();
+    let contract_strkey =
+        stellar_agent_core::sc_address::scaddress_to_strkey(&contract).expect("contract strkey");
+
+    for contract_kind in [ContractKind::Verifier, ContractKind::Policy] {
+        let allowlisted = if contract_kind == ContractKind::Verifier {
+            stellar_agent_smart_account::VERIFIER_ALLOWLIST[0].wasm_hash
+        } else {
+            super::rpc_mock_helpers::KNOWN_WASM_HASH
+        };
+        let responder = KeyedLedgerEntriesResponder::new()
+            .with_entry(xdr_fixtures::ledger_entry_from_response_json(
+                &xdr_fixtures::external_ref_instance_ledger_entries_json(
+                    &contract_strkey,
+                    OWNER,
+                    b"verifier-v1",
+                ),
+            ))
+            .with_entry(xdr_fixtures::ledger_entry_from_response_json(
+                &xdr_fixtures::executable_tag_ledger_entries_json(
+                    OWNER,
+                    b"verifier-v1",
+                    allowlisted,
+                ),
+            ));
+        let server = responder.serve().await;
+
+        let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
+        let manager = manager_one_url(
+            &server.uri(),
+            Arc::clone(&audit_writer),
+            audit_log_path.clone(),
+        );
+
+        let (signers, policies) = if contract_kind == ContractKind::Policy {
+            (
+                vec![ContextRuleSignerInput::Delegated {
+                    address: ScAddress::Account(stellar_xdr::AccountId(
+                        stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(
+                            [0x11u8; 32],
+                        )),
+                    )),
+                }],
+                vec![ContextRulePolicy::new(contract.clone(), ScVal::Void)],
+            )
+        } else {
+            (
+                vec![ContextRuleSignerInput::External {
+                    verifier: contract.clone(),
+                    pubkey_data: vec![0xbbu8; 32],
+                }],
+                vec![],
+            )
+        };
+        let definition = ContextRuleDefinition::new(
+            RuleContext::Default,
+            "external-ref-instance".to_owned(),
+            None,
+            signers,
+            policies,
+        );
+
+        let result = pin_referenced_contracts(
+            &manager,
+            Some(&audit_writer),
+            smart_account_addr(),
+            ZERO_CONTRACT_REDACTED,
+            &definition,
+            0,
+            SOURCE_G,
+            true, // accept_mutable_verifier
+            true, // accept_unknown_verifier
+            "stellar:testnet",
+            Uuid::new_v4().to_string(),
+        )
+        .await;
+
+        let case = format!("kind={contract_kind}");
+        let error = result.expect_err(&case);
+        assert_eq!(
+            error.wire_code(),
+            "sa.contract_instance_unsupported",
+            "{case}: {error:?}"
+        );
+        assert!(
+            matches!(
+                &error,
+                SaError::ContractInstanceUnsupported {
+                    contract_kind: actual_kind,
+                    reason: AdminOrOwnerKey::ExternalRefExecutable,
+                    ..
+                } if *actual_kind == contract_kind
+            ),
+            "{case}: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("owner-managed external reference"),
+            "{case}: {error}"
+        );
+
+        let entries = read_audit_entries(&audit_log_path);
+        assert!(
+            !entries.iter().any(|e| matches!(
+                e.event_kind,
+                EventKind::SaUnknownContractOverride { .. }
+                    | EventKind::SaMutableContractOverride { .. }
+            )),
+            "{case}: no override row of either kind may be written"
+        );
     }
 }

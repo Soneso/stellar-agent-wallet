@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The contract Wasm-hash fetch resolves Protocol 28 external-reference
+  executables (CAP-85). It reads the owner's executable-tag entry from the
+  endpoint that returned the instance and reports the owner, the tag and the
+  resolved hash, or no hash when there is no live tag entry. Both endpoints
+  must agree on the resolved hash. An instance or tag entry with an unexpected
+  shape is reported as malformed, not as an absent contract.
+
+### Changed
+
+- Protocol 28 crate versions: `stellar-xdr` 28.0.0, `stellar-baselib` 0.6.0,
+  `stellar-rpc-client` 28.0.0, `soroban-spec-tools` 28.0.0 and
+  `stellar-ledger` 28.0.0.
+- The wallet refuses a contract whose executable is an owner-managed external
+  reference, even when the owner's tag entry currently holds the expected
+  hash, because the owner can repoint it at any time. DeFi pin checks refuse
+  with `defi.pin.external_ref`. DeFindex vault, Soroswap router and multicall
+  router checks, post-deploy verification and SEP-48 argument previews refuse
+  with a message naming the owner and the tag. Smart-account verifier and
+  policy installation and signing-time drift checks refuse with
+  `sa.contract_instance_unsupported`,
+  reason `owner-managed external reference`; `--accept-mutable-verifier` and
+  `--accept-unknown-verifier` do not override it.
+- `WasmHashDivergenceError` names its fields `primary_summary` and
+  `secondary_summary`; each holds a bounded summary of that endpoint's outcome.
+- Verifier and policy installation refuses an undecodable instance entry while
+  identifying the contract, before any override flag applies, so no override
+  audit row is written for it.
+
 ## [0.1.0-alpha.8] - 2026-09-25
 
 ### Added

@@ -337,7 +337,7 @@ where
     tx_builder.add_operation(op_no_auth);
     let tx_for_simulate = tx_builder.build_for_simulation();
 
-    // stellar-baselib 0.5.8 re-exports the workspace stellar_xdr directly, so
+    // stellar-baselib 0.6.0 re-exports the workspace stellar_xdr directly, so
     // to_envelope() returns a stellar_xdr::TransactionEnvelope — no bridge needed.
     let sim_envelope = tx_for_simulate
         .to_envelope()
@@ -350,7 +350,7 @@ where
             "SAC transfer simulate returned error: {err}"
         ))));
     }
-    // min_resource_fee is u64 in rpc-client 27 (deserialised from the JSON number-as-string
+    // min_resource_fee is u64 in rpc-client 28 (deserialised from the JSON number-as-string
     // field, defaulting to 0 when absent).  A value of 0 means the simulate response did not
     // return resource fee information.
     if sim_resp.min_resource_fee == 0 {
@@ -360,7 +360,7 @@ where
     }
 
     // results()[0].auth contains the SorobanAuthorizationEntry values returned by the RPC.
-    // stellar-baselib 0.5.8 uses the same stellar_xdr as the workspace, so these entries
+    // stellar-baselib 0.6.0 uses the same stellar_xdr as the workspace, so these entries
     // can be embedded directly into the baselib Operation without a type bridge.
     let sim_results = sim_resp
         .results()

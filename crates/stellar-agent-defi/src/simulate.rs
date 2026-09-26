@@ -18,9 +18,9 @@
 //! reconstruction from `Int128Parts`. This module is the single authoritative
 //! implementation; both call sites delegate here.
 //!
-//! The `scval_variant_name` kept here is the complete copy, covering all 22
+//! The `scval_variant_name` kept here is the complete copy, covering all 23
 //! stable `ScVal` variants including `Error`, `Timepoint`, `Duration`, `U256`,
-//! `I256`, `Bytes`, `LedgerKeyNonce`, and `ContractInstance`.
+//! `I256`, `Bytes`, `LedgerKeyNonce`, `ContractInstance`, and `ExecutableTag`.
 //!
 //! # ABI provenance
 //!
@@ -264,7 +264,7 @@ pub fn decode_i128_scval(val: &ScVal) -> Result<i128, SimulateError> {
 /// Returns a non-sensitive discriminant name string for a `ScVal`.
 ///
 /// Used in error messages to avoid logging the full value, which may contain
-/// addresses or other sensitive data.  Covers all 22 stable variants.
+/// addresses or other sensitive data.  Covers all 23 stable variants.
 #[must_use]
 pub fn scval_variant_name(val: &ScVal) -> &'static str {
     match val {
@@ -290,6 +290,7 @@ pub fn scval_variant_name(val: &ScVal) -> &'static str {
         ScVal::LedgerKeyContractInstance => "LedgerKeyContractInstance",
         ScVal::LedgerKeyNonce(_) => "LedgerKeyNonce",
         ScVal::ContractInstance(_) => "ContractInstance",
+        ScVal::ExecutableTag(_) => "ExecutableTag",
     }
 }
 
@@ -357,11 +358,11 @@ mod tests {
 
     // ── scval_variant_name ───────────────────────────────────────────────────
 
-    /// Asserts the exact discriminant name string for ALL 22 stable `ScVal`
+    /// Asserts the exact discriminant name string for ALL 23 stable `ScVal`
     /// variants.  A constant-returning implementation would be caught because
     /// at most one variant can return any single string.
     #[test]
-    fn scval_variant_name_exact_name_for_all_22_variants() {
+    fn scval_variant_name_exact_name_for_all_23_variants() {
         use stellar_xdr::{
             ContractExecutable, Duration, Int256Parts, ScAddress, ScBytes, ScContractInstance,
             ScError, ScErrorCode, ScMap, ScNonceKey, ScString, ScVec, TimePoint, UInt256Parts,
@@ -479,6 +480,11 @@ mod tests {
                 storage: None,
             })),
             "ContractInstance"
+        );
+        // ExecutableTag (CAP-85 external-reference tag key).
+        assert_eq!(
+            scval_variant_name(&ScVal::ExecutableTag(ScString("tag".try_into().unwrap()))),
+            "ExecutableTag"
         );
     }
 

@@ -136,6 +136,10 @@ pub mod hex;
 /// `DEFAULT_CLASSIC_FEE_STROOPS`) colocated for single-source-of-truth imports.
 pub mod protocol_consts;
 
+/// Strkey rendering for XDR `ScAddress` values
+/// ([`sc_address::scaddress_to_strkey`]).
+pub mod sc_address;
+
 /// Shared timestamp formatting helpers (ISO-8601 UTC, epoch decomposition).
 pub mod timefmt;
 
@@ -185,7 +189,7 @@ pub use error::{
 };
 pub use observability::{
     FormatChoice, InitError, RedactingJsonFormatter, SubscriberConfig, init_subscriber,
-    init_subscriber_with, redact_first5_last5,
+    init_subscriber_with, redact_first5_last5, untrusted_display_bounded,
 };
 // `STROOPS_PER_XLM` is physically defined in `amount` (compile-time assertion
 // ties it to `STELLAR_DECIMALS`) and re-exported from `protocol_consts`.

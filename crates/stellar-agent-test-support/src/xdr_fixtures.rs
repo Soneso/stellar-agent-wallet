@@ -23,6 +23,13 @@
 //!   response for a WASM contract instance (`ContractExecutable::Wasm`).
 //! - [`sac_instance_ledger_entries_json`] — same shape but with
 //!   `ContractExecutable::StellarAsset` (SAC), for cross-parser parity tests.
+//! - [`external_ref_instance_ledger_entries_json`] — same shape but with
+//!   `ContractExecutable::ExternalRef` naming an owner and a tag.
+//! - [`executable_tag_ledger_entries_json`] — the owner's persistent
+//!   `ScVal::ExecutableTag` entry holding a 32-byte Wasm hash;
+//!   [`executable_tag_ledger_entries_json_with_value`] takes any value.
+//! - [`ledger_entry_from_response_json`] — extracts the single entry object
+//!   from one of the response bodies above, for a keyed responder.
 //!
 //! All helpers are test-only; they panic on malformed inputs (account-ID
 //! decode failure, asset-code length > 4) per the documented `# Panics`
@@ -286,6 +293,177 @@ pub fn sac_instance_ledger_entries_json(contract_address: &str) -> String {
     )
 }
 
+/// Builds a JSON-RPC `getLedgerEntries` response body containing a single
+/// `ContractData` entry for a contract instance whose executable is a CAP-85
+/// external reference (`ContractExecutable::ExternalRef`).
+///
+/// `owner_address` is the executable owner as a G- or C-strkey; `tag` is the
+/// owner-chosen tag bytes. The instance carries no Wasm hash: the executable
+/// is whatever the owner stores under its `ScVal::ExecutableTag(tag)` entry
+/// (see [`executable_tag_ledger_entries_json`]).
+///
+/// # Panics
+///
+/// Panics if `contract_address` is not a valid C-strkey, if `owner_address`
+/// is neither a valid G- nor C-strkey, or if XDR encoding fails.
+#[must_use]
+pub fn external_ref_instance_ledger_entries_json(
+    contract_address: &str,
+    owner_address: &str,
+    tag: &[u8],
+) -> String {
+    use stellar_xdr::{
+        ContractDataDurability, ContractDataEntry, ContractExecutable,
+        ContractExecutableExternalRef, ContractId, ExtensionPoint, Hash, LedgerEntryData,
+        LedgerKey, LedgerKeyContractData, ScAddress, ScContractInstance, ScVal,
+    };
+
+    let contract = stellar_strkey::Contract::from_string(contract_address)
+        .unwrap_or_else(|e| panic!("invalid contract address: {e}"));
+    let sc_addr = ScAddress::Contract(ContractId(Hash(contract.0)));
+
+    let key = LedgerKey::ContractData(LedgerKeyContractData {
+        contract: sc_addr.clone(),
+        key: ScVal::LedgerKeyContractInstance,
+        durability: ContractDataDurability::Persistent,
+    });
+    let instance = ScContractInstance {
+        executable: ContractExecutable::ExternalRef(ContractExecutableExternalRef {
+            executable_owner: sc_address_from_strkey("owner_address", owner_address),
+            tag: sc_string(tag),
+        }),
+        storage: None,
+    };
+    let entry_data = LedgerEntryData::ContractData(ContractDataEntry {
+        ext: ExtensionPoint::V0,
+        contract: sc_addr,
+        key: ScVal::LedgerKeyContractInstance,
+        durability: ContractDataDurability::Persistent,
+        val: ScVal::ContractInstance(instance),
+    });
+
+    single_entry_response_json(&key, &entry_data)
+}
+
+/// Builds a JSON-RPC `getLedgerEntries` response body containing the owner's
+/// persistent `ContractData` entry keyed by `ScVal::ExecutableTag(tag)`,
+/// holding `wasm_hash` as `ScVal::Bytes`.
+///
+/// This is the entry an external-reference instance built by
+/// [`external_ref_instance_ledger_entries_json`] resolves through.
+///
+/// # Panics
+///
+/// Panics if `owner_address` is neither a valid G- nor C-strkey, or if XDR
+/// encoding fails.
+#[must_use]
+pub fn executable_tag_ledger_entries_json(
+    owner_address: &str,
+    tag: &[u8],
+    wasm_hash: [u8; 32],
+) -> String {
+    let bytes = stellar_xdr::ScBytes(
+        wasm_hash
+            .to_vec()
+            .try_into()
+            .unwrap_or_else(|_| panic!("32-byte hash must fit ScBytes")),
+    );
+    executable_tag_ledger_entries_json_with_value(
+        owner_address,
+        tag,
+        stellar_xdr::ScVal::Bytes(bytes),
+    )
+}
+
+/// Same as [`executable_tag_ledger_entries_json`] with an arbitrary `value`
+/// stored under the tag key, for malformed-entry fixtures.
+///
+/// # Panics
+///
+/// Panics if `owner_address` is neither a valid G- nor C-strkey, or if XDR
+/// encoding fails.
+#[must_use]
+pub fn executable_tag_ledger_entries_json_with_value(
+    owner_address: &str,
+    tag: &[u8],
+    value: stellar_xdr::ScVal,
+) -> String {
+    use stellar_xdr::{
+        ContractDataDurability, ContractDataEntry, ExtensionPoint, LedgerEntryData, LedgerKey,
+        LedgerKeyContractData, ScVal,
+    };
+
+    let owner = sc_address_from_strkey("owner_address", owner_address);
+    let key = LedgerKey::ContractData(LedgerKeyContractData {
+        contract: owner.clone(),
+        key: ScVal::ExecutableTag(sc_string(tag)),
+        durability: ContractDataDurability::Persistent,
+    });
+    let entry_data = LedgerEntryData::ContractData(ContractDataEntry {
+        ext: ExtensionPoint::V0,
+        contract: owner,
+        key: ScVal::ExecutableTag(sc_string(tag)),
+        durability: ContractDataDurability::Persistent,
+        val: value,
+    });
+
+    single_entry_response_json(&key, &entry_data)
+}
+
+/// Extracts the single `entries[0]` object from a response body built by one
+/// of the `*_ledger_entries_json` fixtures, for registration with
+/// [`crate::echo_id_responder::KeyedLedgerEntriesResponder::with_entry`].
+///
+/// # Panics
+///
+/// Panics if `response_json` is not valid JSON or carries no `entries[0]`.
+#[must_use]
+pub fn ledger_entry_from_response_json(response_json: &str) -> serde_json::Value {
+    let parsed: serde_json::Value = serde_json::from_str(response_json)
+        .unwrap_or_else(|e| panic!("fixture response is not JSON: {e}"));
+    let entry = parsed["result"]["entries"][0].clone();
+    if entry.is_null() {
+        panic!("fixture response carries no entries[0]");
+    }
+    entry
+}
+
+fn sc_address_from_strkey(label: &str, value: &str) -> stellar_xdr::ScAddress {
+    use stellar_xdr::{AccountId, ContractId, Hash, PublicKey, ScAddress, Uint256};
+
+    if let Ok(contract) = stellar_strkey::Contract::from_string(value) {
+        return ScAddress::Contract(ContractId(Hash(contract.0)));
+    }
+    let pk = public_key_bytes(label, value);
+    ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(pk))))
+}
+
+fn sc_string(tag: &[u8]) -> stellar_xdr::ScString {
+    stellar_xdr::ScString(
+        tag.to_vec()
+            .try_into()
+            .unwrap_or_else(|_| panic!("tag exceeds the ScString length bound")),
+    )
+}
+
+fn single_entry_response_json(
+    key: &stellar_xdr::LedgerKey,
+    entry_data: &stellar_xdr::LedgerEntryData,
+) -> String {
+    use stellar_xdr::{Limits, WriteXdr};
+
+    let key_b64 = key
+        .to_xdr_base64(Limits::none())
+        .unwrap_or_else(|e| panic!("key XDR encode failed: {e}"));
+    let val_b64 = entry_data
+        .to_xdr_base64(Limits::none())
+        .unwrap_or_else(|e| panic!("entry XDR encode failed: {e}"));
+
+    format!(
+        r#"{{"jsonrpc":"2.0","id":1,"result":{{"entries":[{{"key":"{key_b64}","xdr":"{val_b64}","lastModifiedLedgerSeq":100,"liveUntilLedgerSeq":999999}}],"latestLedger":100}}}}"#
+    )
+}
+
 /// Builds a `LedgerKey::Trustline` XDR base64 string.
 ///
 /// # Panics
@@ -437,5 +615,72 @@ mod tests {
             inst.executable,
             stellar_xdr::ContractExecutable::StellarAsset
         ));
+    }
+
+    #[test]
+    fn external_ref_instance_json_names_owner_and_tag() {
+        let body = external_ref_instance_ledger_entries_json(&c(11), &c(12), b"pool-v2");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let xdr = v["result"]["entries"][0]["xdr"].as_str().unwrap();
+        let stellar_xdr::LedgerEntryData::ContractData(cd) =
+            stellar_xdr::LedgerEntryData::from_xdr_base64(xdr, Limits::none()).unwrap()
+        else {
+            panic!("expected ContractData");
+        };
+        assert_eq!(cd.key, stellar_xdr::ScVal::LedgerKeyContractInstance);
+        let stellar_xdr::ScVal::ContractInstance(inst) = cd.val else {
+            panic!("expected ContractInstance");
+        };
+        let stellar_xdr::ContractExecutable::ExternalRef(ext) = inst.executable else {
+            panic!("expected ExternalRef");
+        };
+        assert_eq!(
+            ext.executable_owner,
+            stellar_xdr::ScAddress::Contract(stellar_xdr::ContractId(stellar_xdr::Hash([12; 32])))
+        );
+        assert_eq!(ext.tag.0.as_vec().as_slice(), b"pool-v2");
+    }
+
+    #[test]
+    fn executable_tag_json_keys_by_tag_and_carries_hash() {
+        let body = executable_tag_ledger_entries_json(&g(13), b"pool-v2", [0xCD; 32]);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let entry = &v["result"]["entries"][0];
+        let key =
+            stellar_xdr::LedgerKey::from_xdr_base64(entry["key"].as_str().unwrap(), Limits::none())
+                .unwrap();
+        let stellar_xdr::LedgerKey::ContractData(k) = key else {
+            panic!("expected ContractData key");
+        };
+        assert_eq!(
+            k.durability,
+            stellar_xdr::ContractDataDurability::Persistent
+        );
+        assert!(matches!(
+            &k.key,
+            stellar_xdr::ScVal::ExecutableTag(t) if t.0.as_vec().as_slice() == b"pool-v2"
+        ));
+        assert!(matches!(k.contract, stellar_xdr::ScAddress::Account(_)));
+        let stellar_xdr::LedgerEntryData::ContractData(cd) =
+            stellar_xdr::LedgerEntryData::from_xdr_base64(
+                entry["xdr"].as_str().unwrap(),
+                Limits::none(),
+            )
+            .unwrap()
+        else {
+            panic!("expected ContractData");
+        };
+        assert!(matches!(
+            cd.val,
+            stellar_xdr::ScVal::Bytes(b) if b.0.as_vec().as_slice() == [0xCD; 32]
+        ));
+    }
+
+    #[test]
+    fn ledger_entry_from_response_json_returns_entry_object() {
+        let body = sac_instance_ledger_entries_json(&c(14));
+        let entry = ledger_entry_from_response_json(&body);
+        assert!(entry["key"].is_string());
+        assert!(entry["xdr"].is_string());
     }
 }

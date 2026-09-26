@@ -27,7 +27,7 @@ thiserror = "2.0.18"
 yaml-rust2 = { version = "=0.11.0", default-features = false }
 zeroize = { version = "=1.9.0", default-features = false }
 chacha20poly1305 = "=0.11.0"
-stellar-xdr = { version = "27.0.0", features = ["base64"] }
+stellar-xdr = { version = "28.0.0", features = ["base64"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
 base64 = { version = "=0.22.1", default-features = false, features = ["std"] }
 rand_core = { version = "=0.6.4", default-features = false, features = ["getrandom"] }
@@ -72,11 +72,11 @@ stellar-agent-sep10 = { path = "crates/stellar-agent-sep10", version = "0.1.0-al
 stellar-agent-sep53 = { path = "crates/stellar-agent-sep53", version = "0.1.0-alpha.8" }
 stellar-agent-sep43 = { path = "crates/stellar-agent-sep43", version = "0.1.0-alpha.8" }
 stellar-agent-xdr-limits = { path = "crates/stellar-agent-xdr-limits", version = "0.1.0-alpha.8" }
-soroban-spec-tools = { version = "=27.0.0", default-features = false }
+soroban-spec-tools = { version = "=28.0.0", default-features = false }
 wasmparser = { version = "=0.116.1", default-features = false }
-stellar-rpc-client = "=27.0.0"
-stellar-baselib = "=0.5.8"
-stellar-ledger = { version = "=27.0.0", default-features = false }
+stellar-rpc-client = "=28.0.0"
+stellar-baselib = "=0.6.0"
+stellar-ledger = { version = "=28.0.0", default-features = false }
 apple-native-keyring-store = { version = "=1.0.0", default-features = false }
 dbus-secret-service-keyring-store = { version = "=1.0.0", default-features = false }
 windows-native-keyring-store = { version = "=1.1.0", default-features = false }

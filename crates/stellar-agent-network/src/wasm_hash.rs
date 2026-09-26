@@ -1,76 +1,92 @@
-//! On-chain WASM-hash fetch primitive for DeFi contract-pin verification.
+//! On-chain WASM-hash fetch primitive for contract-pin verification.
 //!
 //! # What this module does
 //!
 //! Provides [`fetch_contract_wasm_hash`], a two-RPC parallel fetch that returns
-//! an explicit tri-state [`WasmHashFetch`] (`Wasm`, `Sac`, `Absent`) for a
-//! single Soroban contract address.  Primary and secondary endpoints are
+//! one of four explicit [`WasmHashFetch`] outcomes (`Wasm`, `Sac`,
+//! `ExternalRef`, `Absent`) for a single Soroban contract address, or a typed
+//! [`FetchContractWasmHashError`]. Primary and secondary endpoints are
 //! cross-checked; divergence is a hard error.
 //!
-//! This primitive is the shared single-contract fetch core: the smart-account
-//! path delegates here and applies its own per-caller absent-handling policy
-//! to the returned tri-state.  Only the smart-account multi-key batch fetch
-//! (`fetch_contract_wasm_hashes`) keeps a separate implementation — it has no
-//! single-contract analogue.
+//! This primitive is the shared single-contract fetch core: the DeFi,
+//! DeFindex, DEX and smart-account paths delegate here and apply their own
+//! per-caller policy to the returned outcome.  Only the smart-account
+//! multi-key batch fetch (`fetch_contract_wasm_hashes`) keeps a separate
+//! implementation — it has no single-contract analogue.
 //!
-//! # Per-caller absent-handling policy
+//! # Per-caller policy
 //!
-//! This primitive returns an explicit tri-state and NEVER collapses absent
-//! or SAC to a zero hash — callers must handle all three variants.  The DeFi
-//! sign-time gate (`stellar_agent_defi::pins::verify_pin_for_sign`) maps
-//! `Absent` and `Sac` to `Err` directly (fail-closed by type).  The
-//! smart-account caller maps `Sac`/`Absent` to `None`, and its verifier
-//! paths apply `unwrap_or([0u8;32])` to support an accept-unknown-verifier
-//! install flow that has no DeFi analogue; the zero sentinel exists only on
-//! that caller's side, never in this primitive.
+//! This primitive NEVER collapses a non-Wasm outcome to a zero hash or any
+//! other sentinel — callers must handle every variant.  The DeFi sign-time
+//! gate (`stellar_agent_defi::pins::verify_pin_for_sign`) maps `Absent`,
+//! `Sac` and `ExternalRef` to typed `Err` variants (fail-closed by type).  The
+//! smart-account caller maps `Sac`/`Absent` to `None` and refuses
+//! `ExternalRef` with a typed error; its verifier install paths apply
+//! `unwrap_or([0u8;32])` to `None` to support an accept-unknown-verifier
+//! install flow that has no DeFi analogue, so the zero value exists only on
+//! that caller's side and never stands for an owner-managed executable.
+//!
+//! # External references (CAP-85)
+//!
+//! A contract instance whose executable is
+//! `ContractExecutable::ExternalRef { executable_owner, tag }` runs the Wasm
+//! whose hash the owner stores in its persistent `ContractData` entry keyed by
+//! `ScVal::ExecutableTag(tag)`. The owner can repoint that entry at any time,
+//! so the executable is owner-controlled and mutable. The fetch resolves the
+//! tag entry at the same endpoint that returned the instance and reports the
+//! owner, the tag and the resolved hash as [`ExternalRefExecutable`]. The
+//! resolved hash is a snapshot that can change on the next ledger; a caller
+//! that acts on it fetches at act time.
 //!
 //! # Divergence detection
 //!
-//! For the single-contract case this module compares the two 32-byte hashes
-//! directly and reports first-8 hex of each side on divergence (or the
-//! `<SAC>` / `<Absent>` sentinel for a non-WASM side).  The multi-key
-//! smart-account batch path uses a SHA-256 digest-of-concatenation to
-//! compare aligned result vectors instead.
+//! The single-contract case compares the two endpoints' whole outcomes and
+//! reports a bounded summary of each side on divergence: first-8 hex of a
+//! Wasm hash, the `<SAC>` / `<Absent>` sentinel, or the redacted owner,
+//! bounded tag and resolved first-8 of an external reference.  A malformed
+//! ledger entry on either endpoint is reported as
+//! [`FetchContractWasmHashError::Malformed`] before any comparison.  The
+//! multi-key smart-account batch path uses a SHA-256
+//! digest-of-concatenation to compare aligned result vectors instead.
 //!
 //! # SAC variant
 //!
 //! `ContractExecutable::StellarAsset` is the on-chain XDR variant that
 //! indicates a Stellar Asset Contract (SAC) rather than an ordinary WASM
-//! contract (`pub enum ContractExecutable { Wasm(Hash), StellarAsset }` in
-//! the XDR schema).
+//! contract.
+
+use std::fmt;
 
 use stellar_xdr::{
-    ContractDataDurability, ContractExecutable, ContractId, Hash, LedgerEntryData, LedgerKey,
-    LedgerKeyContractData, ReadXdr, ScAddress, ScVal,
+    ContractDataDurability, ContractExecutable, ContractExecutableExternalRef, ContractId, Hash,
+    LedgerEntryData, LedgerKey, LedgerKeyContractData, ReadXdr, ScAddress, ScString, ScVal,
 };
 
 use crate::StellarRpcClient;
 use stellar_agent_core::error::NetworkError;
+use stellar_agent_core::observability::untrusted_display_bounded;
+use stellar_agent_core::sc_address::scaddress_redacted;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WasmHashFetch — explicit tri-state (NO zero-sentinel)
+// WasmHashFetch — four explicit outcomes, no zero value
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The result of fetching a contract's on-chain WASM hash.
+/// The result of fetching a contract's on-chain executable.
 ///
-/// This is a **strict tri-state**.  Callers MUST handle all three variants and
-/// MUST NOT collapse `Absent` or `Sac` to a zero hash or any other sentinel.
+/// Callers MUST handle every variant and MUST NOT collapse `Absent`, `Sac` or
+/// `ExternalRef` to a zero hash or any other sentinel.
 ///
 /// The distinction matters for the DeFi sign-time gate:
 /// `stellar_agent_defi::pins::verify_pin_for_sign` maps `Wasm` to a
-/// match-or-drift check, and maps `Sac` and `Absent` to typed `Err` variants
-/// fail-closed by type.
+/// match-or-drift check, and maps `Sac`, `ExternalRef` and `Absent` to typed
+/// `Err` variants fail-closed by type.
 ///
 /// # Design note
 ///
 /// The smart-account caller collapses `Absent` to `[0u8;32]` via
 /// `unwrap_or([0u8;32])` to support an accept-unknown-verifier install flow
-/// that has no DeFi analogue.  This type is the stronger form: the zero-sentinel
-/// path is impossible to express here.
-///
-/// # SAC variant
-///
-/// `ContractExecutable::StellarAsset` (from the XDR schema) maps to `Sac`.
+/// that has no DeFi analogue.  This type is the stronger form: a zero value
+/// is impossible to express here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WasmHashFetch {
@@ -80,8 +96,96 @@ pub enum WasmHashFetch {
     ///
     /// Corresponds to `ContractExecutable::StellarAsset` in the XDR schema.
     Sac,
-    /// The contract address is absent from the ledger (no instance entry found).
+    /// The contract's executable is a CAP-85 external reference: the owner
+    /// named in the instance decides, and can change, which Wasm runs.
+    ///
+    /// Corresponds to `ContractExecutable::ExternalRef` in the XDR schema.
+    ExternalRef(ExternalRefExecutable),
+    /// The RPC returned no entry for the contract-instance key.
     Absent,
+}
+
+/// A contract executable that is a CAP-85 external reference.
+///
+/// The fields keep their XDR types so a caller can rebuild the owner's tag
+/// key losslessly ([`Self::tag_ledger_key`]). `owner` and `tag` are
+/// ledger-supplied and owner-chosen: render them only through
+/// [`Self::owner_redacted`] and [`Self::tag_display`]. The `Debug` form uses
+/// the same bounded renderings.
+///
+/// `resolved` is the Wasm hash the owner's tag entry held when it was read.
+/// It is a snapshot of an owner-mutable entry that can change on the next
+/// ledger, so every consumer fetches at act time and never caches it as a
+/// pin.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExternalRefExecutable {
+    /// Address that owns the executable-tag entry.
+    pub owner: ScAddress,
+    /// Owner-chosen tag naming the entry.
+    pub tag: ScString,
+    /// The 32-byte Wasm hash stored under the tag entry, or `None` when the
+    /// endpoint returned no live tag entry (archived, or omitted).
+    pub resolved: Option<[u8; 32]>,
+}
+
+impl ExternalRefExecutable {
+    /// Wraps a raw XDR external reference for rendering, without reading the
+    /// owner's tag entry.
+    ///
+    /// `resolved` is `None` because no tag entry was read, so only
+    /// [`Self::owner_redacted`], [`Self::tag_display`] and
+    /// [`Self::tag_ledger_key`] carry information. Consumers that refuse an
+    /// external reference from a ledger entry they decoded themselves use
+    /// this for the refusal message.
+    #[must_use]
+    pub fn from_xdr(external: &ContractExecutableExternalRef) -> Self {
+        Self {
+            owner: external.executable_owner.clone(),
+            tag: external.tag.clone(),
+            resolved: None,
+        }
+    }
+
+    /// Returns the owner as a first-5-last-5 redacted strkey, or
+    /// `<unsupported address>` for an address variant with no account or
+    /// contract strkey form.
+    #[must_use]
+    pub fn owner_redacted(&self) -> String {
+        scaddress_redacted(&self.owner)
+    }
+
+    /// Returns the tag rendered lossily, with control and invisible
+    /// formatting characters escaped, and bounded to
+    /// [`stellar_agent_core::observability::UNTRUSTED_DISPLAY_MAX_BYTES`].
+    #[must_use]
+    pub fn tag_display(&self) -> String {
+        untrusted_display_bounded(self.tag.0.as_vec())
+    }
+
+    /// Returns first-8 hex of the resolved hash, or `<unset>` when no live
+    /// tag entry was returned.
+    #[must_use]
+    pub fn resolved_first8(&self) -> String {
+        self.resolved
+            .as_ref()
+            .map_or_else(|| "<unset>".to_owned(), first8_hex)
+    }
+
+    /// Returns the ledger key of the owner's executable-tag entry.
+    #[must_use]
+    pub fn tag_ledger_key(&self) -> LedgerKey {
+        executable_tag_ledger_key(&self.owner, &self.tag)
+    }
+}
+
+impl fmt::Debug for ExternalRefExecutable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExternalRefExecutable")
+            .field("owner", &self.owner_redacted())
+            .field("tag", &self.tag_display())
+            .field("resolved", &self.resolved_first8())
+            .finish()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -89,30 +193,33 @@ pub enum WasmHashFetch {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Error returned when primary and secondary RPC endpoints disagree on the
-/// on-chain WASM hash.
+/// on-chain executable.
 ///
-/// Carries first-8 hex of each side; full 32-byte hashes are NOT included.
-/// This guards against contract-substitution by requiring both endpoints to
-/// agree before the caller proceeds.
+/// Carries a bounded summary of each side; full 32-byte hashes and full
+/// addresses are NOT included. This guards against contract-substitution by
+/// requiring both endpoints to agree before the caller proceeds.
 #[derive(Debug, thiserror::Error)]
 #[error(
     "two-RPC WASM-hash divergence for {contract_redacted}: \
-     primary={primary_first8} secondary={secondary_first8}"
+     primary={primary_summary} secondary={secondary_summary}"
 )]
 pub struct WasmHashDivergenceError {
     /// First-5-last-5 redacted contract address.
     pub contract_redacted: String,
-    /// First-8 hex from the primary RPC.
-    pub primary_first8: String,
-    /// First-8 hex from the secondary RPC.
-    pub secondary_first8: String,
+    /// Summary of the primary RPC's outcome: first-8 hex of a Wasm hash,
+    /// `<SAC>`, `<Absent>`, or
+    /// `external-ref(owner=<redacted> tag="<bounded>" resolved=<first-8 or <unset>>)`.
+    pub primary_summary: String,
+    /// Summary of the secondary RPC's outcome, in the same form as
+    /// `primary_summary`.
+    pub secondary_summary: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // fetch_contract_wasm_hash
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Fetches the on-chain WASM hash for a single contract address using a
+/// Fetches the on-chain executable for a single contract address using a
 /// two-RPC parallel cross-check.
 ///
 /// Calls `getLedgerEntries` on both `primary_rpc` and `secondary_rpc` in
@@ -121,17 +228,16 @@ pub struct WasmHashDivergenceError {
 /// only the primary is queried (single-RPC trust, permitted ONLY when the
 /// profile configures no secondary endpoint).
 ///
-/// The returned [`WasmHashFetch`] is a strict tri-state:
+/// The returned [`WasmHashFetch`] is one of:
 /// - `Wasm(hash)` — ordinary WASM contract.
 /// - `Sac` — Stellar Asset Contract (`ContractExecutable::StellarAsset`).
-/// - `Absent` — no instance entry found on-chain.
+/// - `ExternalRef(..)` — CAP-85 external reference. Each endpoint resolves the
+///   owner's tag entry with a second `getLedgerEntries` at that same endpoint,
+///   and the resolved hash takes part in the two-RPC comparison.
+/// - `Absent` — the RPC returned no entry for the contract-instance key.
 ///
-/// # Divergence detection
-///
-/// For the single-contract case, divergence compares the two 32-byte hashes
-/// directly and reports first-8 hex of each side.  The multi-key smart-account
-/// batch path uses a SHA-256 digest-of-concatenation for aligned result vectors
-/// instead.
+/// Returned entries are matched to the requested key; entries for any other
+/// key are ignored.
 ///
 /// # Errors
 ///
@@ -141,10 +247,15 @@ pub struct WasmHashDivergenceError {
 ///   RPC request failed (connection refused, DNS failure, TLS error, etc.).
 ///   The `url` in the underlying [`NetworkError::RpcUnreachable`] is
 ///   authority-only (scheme://host\[:port\]); credentials are stripped.
+/// - [`FetchContractWasmHashError::Malformed`] — an endpoint returned an
+///   entry for a requested key that does not have the expected shape (see
+///   [`MalformedEntryReason`]). A malformed entry on either endpoint is
+///   reported as `Malformed`, never as `Divergent`.
 /// - [`FetchContractWasmHashError::Divergent`] — the primary and secondary
-///   RPC endpoints returned different on-chain states for the same contract
-///   key.  This is always possible when two independent endpoints are queried;
-///   it indicates either a ledger fork or a misconfigured endpoint.
+///   RPC endpoints returned different outcomes for the same contract,
+///   including different resolved hashes for the same external reference.
+///   This indicates either a ledger race, a fork, or a misconfigured
+///   endpoint.
 pub async fn fetch_contract_wasm_hash(
     primary_rpc: &StellarRpcClient,
     secondary_rpc: Option<&StellarRpcClient>,
@@ -161,26 +272,19 @@ pub async fn fetch_contract_wasm_hash(
                 fetch_single_wasm_hash(secondary, &key),
             );
 
-            let primary_fetch =
-                primary_result.map_err(|e| FetchContractWasmHashError::Unavailable {
-                    contract_redacted: contract_redacted.clone(),
-                    source: e,
-                })?;
-            let secondary_fetch =
-                secondary_result.map_err(|e| FetchContractWasmHashError::Unavailable {
-                    contract_redacted: contract_redacted.clone(),
-                    source: e,
-                })?;
+            let primary_fetch = primary_result.map_err(|e| e.into_error(&contract_redacted))?;
+            let secondary_fetch = secondary_result.map_err(|e| e.into_error(&contract_redacted))?;
 
-            // Compare the two tri-state results directly for the single-contract case.
+            // Compare the two whole outcomes, including an external
+            // reference's owner, tag and resolved hash.
             if primary_fetch != secondary_fetch {
-                let primary_first8 = wasm_hash_fetch_first8_hex(&primary_fetch);
-                let secondary_first8 = wasm_hash_fetch_first8_hex(&secondary_fetch);
+                let primary_summary = wasm_hash_fetch_summary(&primary_fetch);
+                let secondary_summary = wasm_hash_fetch_summary(&secondary_fetch);
                 return Err(FetchContractWasmHashError::Divergent(
                     WasmHashDivergenceError {
                         contract_redacted,
-                        primary_first8,
-                        secondary_first8,
+                        primary_summary,
+                        secondary_summary,
                     },
                 ));
             }
@@ -190,11 +294,20 @@ pub async fn fetch_contract_wasm_hash(
         // No secondary configured — single-RPC trust (explicit operator config only).
         None => fetch_single_wasm_hash(primary_rpc, &key)
             .await
-            .map_err(|e| FetchContractWasmHashError::Unavailable {
-                contract_redacted,
-                source: e,
-            }),
+            .map_err(|e| e.into_error(&contract_redacted)),
     }
+}
+
+/// Returns the ledger key of the persistent `ContractData` entry in which
+/// `owner` stores the Wasm hash for an external-reference `tag`
+/// (`ScVal::ExecutableTag(tag)`, persistent durability).
+#[must_use]
+pub fn executable_tag_ledger_key(owner: &ScAddress, tag: &ScString) -> LedgerKey {
+    LedgerKey::ContractData(LedgerKeyContractData {
+        contract: owner.clone(),
+        key: ScVal::ExecutableTag(tag.clone()),
+        durability: ContractDataDurability::Persistent,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -203,9 +316,9 @@ pub async fn fetch_contract_wasm_hash(
 
 /// Error returned by [`fetch_contract_wasm_hash`].
 ///
-/// All variants carry first-8 hex redactions or first-5-last-5 contract
-/// addresses; full hashes and full addresses NEVER appear in `Display` or
-/// `Debug`.
+/// All variants carry first-8 hex redactions, first-5-last-5 addresses or
+/// fixed shape descriptions; full hashes, full addresses and decoded ledger
+/// content NEVER appear in `Display` or `Debug`.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum FetchContractWasmHashError {
@@ -226,54 +339,188 @@ pub enum FetchContractWasmHashError {
         #[source]
         source: NetworkError,
     },
+    /// An endpoint returned an entry for a requested key whose shape is not
+    /// the expected one.
+    #[error("malformed ledger entry for {contract_redacted}: {reason}")]
+    Malformed {
+        /// First-5-last-5 redacted contract address.
+        contract_redacted: String,
+        /// Which shape check failed.
+        reason: MalformedEntryReason,
+    },
     /// Primary and secondary RPC disagree on the on-chain state.
     #[error(transparent)]
     Divergent(#[from] WasmHashDivergenceError),
+}
+
+/// The shape check a returned ledger entry failed.
+///
+/// A closed set of fixed descriptions; no decoded content or XDR bytes are
+/// carried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MalformedEntryReason {
+    /// A returned entry's `key` does not decode as a `LedgerKey`.
+    EntryKeyUndecodable,
+    /// The entry under the contract-instance key does not decode.
+    InstanceEntryUndecodable,
+    /// The value under the contract-instance key is not a contract instance.
+    NotContractInstance,
+    /// The entry under the owner's executable-tag key does not decode.
+    TagEntryUndecodable,
+    /// The value under the owner's executable-tag key is not 32 bytes.
+    TagValueNotHash,
+}
+
+impl MalformedEntryReason {
+    /// Returns the fixed description.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EntryKeyUndecodable => "ledger entry key does not decode",
+            Self::InstanceEntryUndecodable => "contract instance entry does not decode",
+            Self::NotContractInstance => "value under the instance key is not a contract instance",
+            Self::TagEntryUndecodable => "executable tag entry does not decode",
+            Self::TagValueNotHash => "executable tag entry value is not a 32-byte hash",
+        }
+    }
+}
+
+impl fmt::Display for MalformedEntryReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Fetches the `WasmHashFetch` tri-state for a single contract key from one
-/// RPC endpoint.
+/// Failure of one endpoint's fetch, before the contract context is attached.
+enum SingleFetchError {
+    Network(NetworkError),
+    Malformed(MalformedEntryReason),
+}
+
+impl SingleFetchError {
+    fn into_error(self, contract_redacted: &str) -> FetchContractWasmHashError {
+        match self {
+            Self::Network(source) => FetchContractWasmHashError::Unavailable {
+                contract_redacted: contract_redacted.to_owned(),
+                source,
+            },
+            Self::Malformed(reason) => FetchContractWasmHashError::Malformed {
+                contract_redacted: contract_redacted.to_owned(),
+                reason,
+            },
+        }
+    }
+}
+
+impl From<NetworkError> for SingleFetchError {
+    fn from(e: NetworkError) -> Self {
+        Self::Network(e)
+    }
+}
+
+/// Fetches the [`WasmHashFetch`] outcome for a single contract-instance key
+/// from one RPC endpoint, resolving an external reference at the same
+/// endpoint.
 async fn fetch_single_wasm_hash(
     client: &StellarRpcClient,
     key: &LedgerKey,
-) -> Result<WasmHashFetch, NetworkError> {
-    let keys = std::slice::from_ref(key);
-    let response = client.get_ledger_entries(keys).await?;
-    let raw_entries = response.entries.unwrap_or_default();
+) -> Result<WasmHashFetch, SingleFetchError> {
+    let Some(entry_data) =
+        fetch_entry_for_key(client, key, MalformedEntryReason::InstanceEntryUndecodable).await?
+    else {
+        return Ok(WasmHashFetch::Absent);
+    };
 
-    for entry_result in &raw_entries {
-        // Decode the entry data (LedgerEntryData XDR, base64-encoded).
-        // `LedgerEntryResult.xdr` contains `LedgerEntryData` from an untrusted
-        // RPC response. `LedgerEntryData::ContractData.val` is a recursive
-        // `ScVal`; the depth bound prevents a crafted depth-bomb from exhausting
-        // the stack. `Err` continues to the next entry (fail-open per existing
-        // behaviour for malformed entries).
-        let entry_data = match LedgerEntryData::from_xdr_base64(
-            &entry_result.xdr,
-            stellar_agent_xdr_limits::untrusted_decode_limits(entry_result.xdr.len()),
-        ) {
-            Ok(d) => d,
-            Err(_) => continue, // malformed entry — skip
-        };
+    let LedgerEntryData::ContractData(cd) = &entry_data else {
+        return Err(SingleFetchError::Malformed(
+            MalformedEntryReason::NotContractInstance,
+        ));
+    };
+    let ScVal::ContractInstance(instance) = &cd.val else {
+        return Err(SingleFetchError::Malformed(
+            MalformedEntryReason::NotContractInstance,
+        ));
+    };
 
-        // ContractExecutable::Wasm(Hash) → ordinary WASM contract.
-        // ContractExecutable::StellarAsset → SAC.
-        if let LedgerEntryData::ContractData(cd) = &entry_data
-            && let ScVal::ContractInstance(instance) = &cd.val
-        {
-            return match &instance.executable {
-                ContractExecutable::Wasm(Hash(bytes)) => Ok(WasmHashFetch::Wasm(*bytes)),
-                ContractExecutable::StellarAsset => Ok(WasmHashFetch::Sac),
+    match &instance.executable {
+        ContractExecutable::Wasm(Hash(bytes)) => Ok(WasmHashFetch::Wasm(*bytes)),
+        ContractExecutable::StellarAsset => Ok(WasmHashFetch::Sac),
+        ContractExecutable::ExternalRef(external) => {
+            let tag_key = executable_tag_ledger_key(&external.executable_owner, &external.tag);
+            let resolved = match fetch_entry_for_key(
+                client,
+                &tag_key,
+                MalformedEntryReason::TagEntryUndecodable,
+            )
+            .await?
+            {
+                None => None,
+                Some(LedgerEntryData::ContractData(tag_entry)) => match &tag_entry.val {
+                    ScVal::Bytes(bytes) => Some(
+                        <[u8; 32]>::try_from(bytes.0.as_vec().as_slice()).map_err(|_| {
+                            SingleFetchError::Malformed(MalformedEntryReason::TagValueNotHash)
+                        })?,
+                    ),
+                    _ => {
+                        return Err(SingleFetchError::Malformed(
+                            MalformedEntryReason::TagValueNotHash,
+                        ));
+                    }
+                },
+                Some(_) => {
+                    return Err(SingleFetchError::Malformed(
+                        MalformedEntryReason::TagValueNotHash,
+                    ));
+                }
             };
+            Ok(WasmHashFetch::ExternalRef(ExternalRefExecutable {
+                owner: external.executable_owner.clone(),
+                tag: external.tag.clone(),
+                resolved,
+            }))
         }
     }
+}
 
-    // No matching entry found.
-    Ok(WasmHashFetch::Absent)
+/// Requests `key` from one endpoint and returns the decoded data of the entry
+/// whose own key equals `key`, or `None` when the endpoint returned no such
+/// entry.
+///
+/// Both the entry key and the entry data come from an untrusted RPC response
+/// and are decoded under the depth- and length-bounded untrusted-decode
+/// limits, so a crafted depth-bomb is rejected without exhausting the stack.
+/// A returned key that does not decode is `EntryKeyUndecodable`; the matched
+/// entry's data that does not decode is `undecodable`.
+async fn fetch_entry_for_key(
+    client: &StellarRpcClient,
+    key: &LedgerKey,
+    undecodable: MalformedEntryReason,
+) -> Result<Option<LedgerEntryData>, SingleFetchError> {
+    let response = client.get_ledger_entries(std::slice::from_ref(key)).await?;
+
+    for entry_result in response.entries.unwrap_or_default() {
+        let entry_key = LedgerKey::from_xdr_base64(
+            &entry_result.key,
+            stellar_agent_xdr_limits::untrusted_decode_limits(entry_result.key.len()),
+        )
+        .map_err(|_| SingleFetchError::Malformed(MalformedEntryReason::EntryKeyUndecodable))?;
+        if &entry_key != key {
+            continue;
+        }
+        let data = LedgerEntryData::from_xdr_base64(
+            &entry_result.xdr,
+            stellar_agent_xdr_limits::untrusted_decode_limits(entry_result.xdr.len()),
+        )
+        .map_err(|_| SingleFetchError::Malformed(undecodable))?;
+        return Ok(Some(data));
+    }
+
+    Ok(None)
 }
 
 /// Constructs a `LedgerKey::ContractData` for the contract-instance slot.
@@ -299,16 +546,30 @@ fn contract_instance_ledger_key(
     }))
 }
 
-/// Returns first-8 hex of a `WasmHashFetch` variant for divergence reporting.
+/// Returns a bounded summary of a `WasmHashFetch` outcome for divergence
+/// reporting.
 ///
-/// `Sac` and `Absent` return distinguishable constant strings so divergence
-/// messages can identify the exact mismatch without leaking full hash bytes.
-fn wasm_hash_fetch_first8_hex(fetch: &WasmHashFetch) -> String {
+/// `Wasm` renders first-8 hex; `Sac` and `Absent` render distinguishable
+/// constant strings; `ExternalRef` renders the redacted owner, the bounded
+/// tag and the resolved first-8 (or `<unset>`), so divergence messages
+/// identify the exact mismatch without leaking full hashes or addresses.
+fn wasm_hash_fetch_summary(fetch: &WasmHashFetch) -> String {
     match fetch {
-        WasmHashFetch::Wasm(hash) => hash[..8].iter().map(|b| format!("{b:02x}")).collect(),
+        WasmHashFetch::Wasm(hash) => first8_hex(hash),
         WasmHashFetch::Sac => "<SAC>".to_owned(),
+        WasmHashFetch::ExternalRef(external) => format!(
+            "external-ref(owner={} tag=\"{}\" resolved={})",
+            external.owner_redacted(),
+            external.tag_display(),
+            external.resolved_first8()
+        ),
         WasmHashFetch::Absent => "<Absent>".to_owned(),
     }
+}
+
+/// Returns lower-case hex of the first 8 bytes of `hash`.
+fn first8_hex(hash: &[u8; 32]) -> String {
+    hash[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Redacts a strkey to first-5-last-5 characters for safe error reporting.
@@ -335,7 +596,9 @@ mod tests {
     )]
 
     use super::*;
-    use stellar_agent_test_support::{echo_id_responder::EchoIdResponder, xdr_fixtures};
+    use stellar_agent_test_support::{
+        KeyedLedgerEntriesResponder, echo_id_responder::EchoIdResponder, xdr_fixtures,
+    };
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer};
 
@@ -388,8 +651,8 @@ mod tests {
         );
         // Inspect divergence detail — must contain first-8 of each hash.
         if let Err(FetchContractWasmHashError::Divergent(e)) = result {
-            assert_eq!(e.primary_first8, "aaaaaaaaaaaaaaaa");
-            assert_eq!(e.secondary_first8, "bbbbbbbbbbbbbbbb");
+            assert_eq!(e.primary_summary, "aaaaaaaaaaaaaaaa");
+            assert_eq!(e.secondary_summary, "bbbbbbbbbbbbbbbb");
         }
     }
 
@@ -514,15 +777,16 @@ mod tests {
     // ── Depth-bomb regression ─────────────────────────────────────────────
     //
     // A `LedgerEntryData::ContractData` whose `val` field is a 600-deep
-    // `ScVal::Vec` chain is returned by the mocked RPC. The bounded decoder
-    // in `fetch_single_wasm_hash` must skip the entry (Err → continue) and
-    // return `WasmHashFetch::Absent` rather than panicking with a stack
-    // overflow. Without the depth bound the decode would be unbounded and
-    // exhaust the stack.
+    // `ScVal::Vec` chain is returned by the mocked RPC under the instance
+    // key. The bounded decoder rejects it without exhausting the stack, and
+    // the fetch reports the entry as `Malformed`: an instance entry that
+    // exists but does not decode is never read as "not deployed".
 
     /// A `getLedgerEntries` response whose single entry carries a 600-deep
-    /// `ScVal::Vec` chain in the `ContractDataEntry.val` field is skipped by
-    /// the bounded decoder and the call returns `WasmHashFetch::Absent`.
+    /// `ScVal::Vec` chain in the `ContractDataEntry.val` field is rejected by
+    /// the bounded decoder and the call returns
+    /// `FetchContractWasmHashError::Malformed` with reason
+    /// `InstanceEntryUndecodable`.
     ///
     /// The fixture is encoded on a thread with an extended stack
     /// (32 MiB) because XDR encoding of a 600-deep `ScVal::Vec` chain is also
@@ -530,7 +794,7 @@ mod tests {
     /// production decode path applies the depth bound; the encode-side stack
     /// extension is test-only scaffolding.
     #[tokio::test]
-    async fn depth_bomb_ledger_entry_is_skipped_without_panic() {
+    async fn depth_bomb_ledger_entry_is_malformed_without_panic() {
         use stellar_strkey::Contract as StrkeyContract;
         use stellar_xdr::{
             ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint, Hash,
@@ -595,11 +859,361 @@ mod tests {
         let (_s, primary) = mock_rpc_with_result(result_json).await;
         let result = fetch_contract_wasm_hash(&primary, None, TEST_CONTRACT).await;
 
-        // The depth-bomb entry is skipped (Err → continue in the loop);
-        // no matching entry is found so the function returns Absent.
+        assert!(
+            matches!(
+                result,
+                Err(FetchContractWasmHashError::Malformed {
+                    reason: MalformedEntryReason::InstanceEntryUndecodable,
+                    ..
+                })
+            ),
+            "expected Malformed(InstanceEntryUndecodable); got {result:?}"
+        );
+    }
+
+    // ── CAP-85 external references ───────────────────────────────────────
+
+    /// Owner of the external-reference fixtures (a contract address).
+    const OWNER: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+    const TAG: &[u8] = b"pool-v2";
+
+    fn entry(response_json: &str) -> serde_json::Value {
+        xdr_fixtures::ledger_entry_from_response_json(response_json)
+    }
+
+    fn external_ref_instance_entry() -> serde_json::Value {
+        entry(&xdr_fixtures::external_ref_instance_ledger_entries_json(
+            TEST_CONTRACT,
+            OWNER,
+            TAG,
+        ))
+    }
+
+    fn tag_entry(hash: [u8; 32]) -> serde_json::Value {
+        entry(&xdr_fixtures::executable_tag_ledger_entries_json(
+            OWNER, TAG, hash,
+        ))
+    }
+
+    fn expected_owner() -> ScAddress {
+        ScAddress::Contract(ContractId(Hash(
+            stellar_strkey::Contract::from_string(OWNER)
+                .expect("owner")
+                .0,
+        )))
+    }
+
+    #[tokio::test]
+    async fn external_ref_with_live_tag_entry_resolves_on_both_endpoints() {
+        let hash = [0x5au8; 32];
+        let responder = KeyedLedgerEntriesResponder::new()
+            .with_entry(external_ref_instance_entry())
+            .with_entry(tag_entry(hash));
+        let server1 = responder.clone().serve().await;
+        let primary = StellarRpcClient::new(&server1.uri()).expect("valid URL");
+        let server2 = responder.serve().await;
+        let secondary = StellarRpcClient::new(&server2.uri()).expect("valid URL");
+
+        let result = fetch_contract_wasm_hash(&primary, Some(&secondary), TEST_CONTRACT).await;
+
+        let Ok(WasmHashFetch::ExternalRef(external)) = result else {
+            panic!("expected ExternalRef; got {result:?}");
+        };
+        assert_eq!(external.owner, expected_owner());
+        assert_eq!(external.tag.0.as_vec().as_slice(), TAG);
+        assert_eq!(external.resolved, Some(hash));
+        assert_eq!(external.resolved_first8(), "5a5a5a5a5a5a5a5a");
+        assert_eq!(external.owner_redacted(), "CAAAA...ABSC4");
+        assert_eq!(external.tag_display(), "pool-v2");
+    }
+
+    #[tokio::test]
+    async fn external_ref_without_live_tag_entry_resolves_to_none() {
+        let responder =
+            KeyedLedgerEntriesResponder::new().with_entry(external_ref_instance_entry());
+        let server = responder.serve().await;
+        let primary = StellarRpcClient::new(&server.uri()).expect("valid URL");
+
+        let result = fetch_contract_wasm_hash(&primary, None, TEST_CONTRACT).await;
+
+        let Ok(WasmHashFetch::ExternalRef(external)) = result else {
+            panic!("expected ExternalRef; got {result:?}");
+        };
+        assert_eq!(external.resolved, None);
+        assert_eq!(external.resolved_first8(), "<unset>");
+    }
+
+    #[tokio::test]
+    async fn external_ref_tag_entry_with_non_hash_value_is_malformed() {
+        use stellar_xdr::{ScBytes, ScVal};
+
+        let short = ScVal::Bytes(ScBytes(vec![0x11u8; 31].try_into().expect("31 bytes")));
+        for value in [short, ScVal::U32(7)] {
+            let responder = KeyedLedgerEntriesResponder::new()
+                .with_entry(external_ref_instance_entry())
+                .with_entry(entry(
+                    &xdr_fixtures::executable_tag_ledger_entries_json_with_value(OWNER, TAG, value),
+                ));
+            let server = responder.serve().await;
+            let primary = StellarRpcClient::new(&server.uri()).expect("valid URL");
+
+            let result = fetch_contract_wasm_hash(&primary, None, TEST_CONTRACT).await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(FetchContractWasmHashError::Malformed {
+                        reason: MalformedEntryReason::TagValueNotHash,
+                        ..
+                    })
+                ),
+                "expected Malformed(TagValueNotHash); got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn external_ref_undecodable_tag_entry_is_malformed() {
+        let mut tag = tag_entry([0x01; 32]);
+        tag["xdr"] = serde_json::Value::String("AAAA////".to_owned());
+        let responder = KeyedLedgerEntriesResponder::new()
+            .with_entry(external_ref_instance_entry())
+            .with_entry(tag);
+        let server = responder.serve().await;
+        let primary = StellarRpcClient::new(&server.uri()).expect("valid URL");
+
+        let result = fetch_contract_wasm_hash(&primary, None, TEST_CONTRACT).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(FetchContractWasmHashError::Malformed {
+                    reason: MalformedEntryReason::TagEntryUndecodable,
+                    ..
+                })
+            ),
+            "expected Malformed(TagEntryUndecodable); got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn undecodable_entry_key_is_malformed() {
+        let instance_key = entry(&xdr_fixtures::contract_instance_ledger_entries_json(
+            TEST_CONTRACT,
+            [0u8; 32],
+        ))["key"]
+            .as_str()
+            .expect("key")
+            .to_owned();
+        let mut returned = entry(&xdr_fixtures::contract_instance_ledger_entries_json(
+            TEST_CONTRACT,
+            [0u8; 32],
+        ));
+        returned["key"] = serde_json::Value::String("AAAA////".to_owned());
+        let responder =
+            KeyedLedgerEntriesResponder::new().with_entry_for_key(instance_key, returned);
+        let server = responder.serve().await;
+        let primary = StellarRpcClient::new(&server.uri()).expect("valid URL");
+
+        let result = fetch_contract_wasm_hash(&primary, None, TEST_CONTRACT).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(FetchContractWasmHashError::Malformed {
+                    reason: MalformedEntryReason::EntryKeyUndecodable,
+                    ..
+                })
+            ),
+            "expected Malformed(EntryKeyUndecodable); got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_instance_value_with_matching_key_is_malformed() {
+        use stellar_xdr::{
+            ContractDataDurability, ContractDataEntry, ExtensionPoint, LedgerEntryData, Limits,
+            ScVal, WriteXdr,
+        };
+
+        let contract = stellar_strkey::Contract::from_string(TEST_CONTRACT).expect("contract");
+        let data = LedgerEntryData::ContractData(ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: ScAddress::Contract(ContractId(Hash(contract.0))),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+            val: ScVal::U64(1),
+        });
+        let mut instance = entry(&xdr_fixtures::contract_instance_ledger_entries_json(
+            TEST_CONTRACT,
+            [0u8; 32],
+        ));
+        instance["xdr"] =
+            serde_json::Value::String(data.to_xdr_base64(Limits::none()).expect("encode"));
+        let server = KeyedLedgerEntriesResponder::new()
+            .with_entry(instance)
+            .serve()
+            .await;
+        let primary = StellarRpcClient::new(&server.uri()).expect("valid URL");
+
+        let result = fetch_contract_wasm_hash(&primary, None, TEST_CONTRACT).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(FetchContractWasmHashError::Malformed {
+                    reason: MalformedEntryReason::NotContractInstance,
+                    ..
+                })
+            ),
+            "expected Malformed(NotContractInstance); got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn entry_for_an_unrequested_key_is_ignored() {
+        // The endpoint answers the instance request with the owner's tag
+        // entry only; no entry matches the instance key.
+        let instance_key = entry(&xdr_fixtures::contract_instance_ledger_entries_json(
+            TEST_CONTRACT,
+            [0u8; 32],
+        ))["key"]
+            .as_str()
+            .expect("key")
+            .to_owned();
+        let responder =
+            KeyedLedgerEntriesResponder::new().with_entry_for_key(instance_key, tag_entry([1; 32]));
+        let server = responder.serve().await;
+        let primary = StellarRpcClient::new(&server.uri()).expect("valid URL");
+
+        let result = fetch_contract_wasm_hash(&primary, None, TEST_CONTRACT).await;
+
         assert!(
             matches!(result, Ok(WasmHashFetch::Absent)),
-            "expected Absent (depth-bomb entry skipped); got {result:?}"
+            "expected Absent; got {result:?}"
+        );
+    }
+
+    /// Both endpoints return byte-identical instance entries and differ only
+    /// in the value stored under the owner's tag entry, so the resolved hash
+    /// alone decides the comparison.
+    #[tokio::test]
+    async fn external_ref_resolved_hash_divergence_is_divergent() {
+        let instance = external_ref_instance_entry();
+        let server1 = KeyedLedgerEntriesResponder::new()
+            .with_entry(instance.clone())
+            .with_entry(tag_entry([0xaa; 32]))
+            .serve()
+            .await;
+        let primary = StellarRpcClient::new(&server1.uri()).expect("valid URL");
+        let server2 = KeyedLedgerEntriesResponder::new()
+            .with_entry(instance)
+            .with_entry(tag_entry([0xbb; 32]))
+            .serve()
+            .await;
+        let secondary = StellarRpcClient::new(&server2.uri()).expect("valid URL");
+
+        let result = fetch_contract_wasm_hash(&primary, Some(&secondary), TEST_CONTRACT).await;
+
+        let Err(FetchContractWasmHashError::Divergent(e)) = result else {
+            panic!("expected Divergent; got {result:?}");
+        };
+        assert_eq!(
+            e.primary_summary,
+            "external-ref(owner=CAAAA...ABSC4 tag=\"pool-v2\" resolved=aaaaaaaaaaaaaaaa)"
+        );
+        assert_eq!(
+            e.secondary_summary,
+            "external-ref(owner=CAAAA...ABSC4 tag=\"pool-v2\" resolved=bbbbbbbbbbbbbbbb)"
+        );
+        let display = e.to_string();
+        assert!(!display.contains(OWNER), "full owner leaked: {display}");
+    }
+
+    #[tokio::test]
+    async fn malformed_on_one_endpoint_is_malformed_not_divergent() {
+        let responder = KeyedLedgerEntriesResponder::new()
+            .with_entry(external_ref_instance_entry())
+            .with_entry(entry(
+                &xdr_fixtures::executable_tag_ledger_entries_json_with_value(
+                    OWNER,
+                    TAG,
+                    stellar_xdr::ScVal::Void,
+                ),
+            ));
+        let (_s1, primary) = mock_rpc_with_result(wasm_result_json([0x01; 32])).await;
+        let server2 = responder.serve().await;
+        let secondary = StellarRpcClient::new(&server2.uri()).expect("valid URL");
+
+        let result = fetch_contract_wasm_hash(&primary, Some(&secondary), TEST_CONTRACT).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(FetchContractWasmHashError::Malformed {
+                    reason: MalformedEntryReason::TagValueNotHash,
+                    ..
+                })
+            ),
+            "expected Malformed; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn external_ref_tag_display_bounds_and_escapes_owner_chosen_bytes() {
+        let mut raw = b"evil\x1b[2J\n\r\t".to_vec();
+        raw.extend(std::iter::repeat_n(b'A', 500));
+        let external = ExternalRefExecutable {
+            owner: expected_owner(),
+            tag: stellar_xdr::ScString(raw.try_into().expect("tag fits")),
+            resolved: None,
+        };
+
+        let shown = external.tag_display();
+        assert!(shown.len() <= stellar_agent_core::observability::UNTRUSTED_DISPLAY_MAX_BYTES);
+        assert!(shown.starts_with("evil\\u{1b}[2J\\n\\r\\t"), "{shown}");
+        assert!(shown.ends_with("..."), "{shown}");
+        assert!(!shown.chars().any(char::is_control), "{shown}");
+
+        // The Debug form uses the same bounded renderings.
+        let debug = format!("{external:?}");
+        assert!(!debug.contains(OWNER), "{debug}");
+        assert!(!debug.chars().any(char::is_control), "{debug}");
+        assert!(debug.len() < 200, "{debug}");
+    }
+
+    #[test]
+    fn external_ref_owner_without_strkey_form_renders_placeholder() {
+        let external = ExternalRefExecutable {
+            owner: ScAddress::LiquidityPool(stellar_xdr::PoolId(Hash([9; 32]))),
+            tag: stellar_xdr::ScString(b"t".to_vec().try_into().expect("tag")),
+            resolved: Some([0; 32]),
+        };
+        assert_eq!(external.owner_redacted(), "<unsupported address>");
+    }
+
+    #[test]
+    fn tag_ledger_key_is_the_owner_persistent_executable_tag_key() {
+        let external = ExternalRefExecutable {
+            owner: expected_owner(),
+            tag: stellar_xdr::ScString(TAG.to_vec().try_into().expect("tag")),
+            resolved: None,
+        };
+        let fixture_key = entry(&xdr_fixtures::executable_tag_ledger_entries_json(
+            OWNER, TAG, [0; 32],
+        ))["key"]
+            .as_str()
+            .expect("key")
+            .to_owned();
+        let key = external.tag_ledger_key();
+        assert_eq!(
+            stellar_xdr::WriteXdr::to_xdr_base64(&key, stellar_xdr::Limits::none())
+                .expect("encode"),
+            fixture_key
+        );
+        assert_eq!(
+            key,
+            executable_tag_ledger_key(&external.owner, &external.tag)
         );
     }
 
@@ -609,8 +1223,8 @@ mod tests {
     fn divergence_error_display_redacts_full_hash() {
         let err = WasmHashDivergenceError {
             contract_redacted: "CAAAA\u{2026}AAB".to_owned(),
-            primary_first8: "aaaaaaaaaaaaaaa1".to_owned(),
-            secondary_first8: "bbbbbbbbbbbbbbb2".to_owned(),
+            primary_summary: "aaaaaaaaaaaaaaa1".to_owned(),
+            secondary_summary: "bbbbbbbbbbbbbbb2".to_owned(),
         };
         let display = err.to_string();
         // Full hex of a known hash must not appear

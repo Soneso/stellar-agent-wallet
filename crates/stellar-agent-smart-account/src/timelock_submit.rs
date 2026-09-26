@@ -330,7 +330,7 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
             | SorobanCredentials::AddressWithDelegates(_) => {
                 // SourceAccount entries need no explicit signing — the
                 // source-account envelope signature covers them.
-                // AddressV2 / AddressWithDelegates are xdr-27 variants not
+                // AddressV2 / AddressWithDelegates are credential variants not
                 // used by the OZ TimelockController; pass through unchanged.
                 signed_entries.push(entry);
                 continue;

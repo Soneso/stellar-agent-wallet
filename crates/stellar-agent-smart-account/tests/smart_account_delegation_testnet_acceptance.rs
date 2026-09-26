@@ -800,6 +800,10 @@ async fn agent_delegation_full_flow_testnet_acceptance() {
                 ContractExecutable::StellarAsset => {
                     panic!("expected ContractExecutable::Wasm for a WASM deploy; got StellarAsset")
                 }
+                ContractExecutable::ExternalRef(_) => panic!(
+                    "expected ContractExecutable::Wasm for a WASM deploy; got an external \
+                     reference to an owner-managed executable"
+                ),
             }
         }
         other => {

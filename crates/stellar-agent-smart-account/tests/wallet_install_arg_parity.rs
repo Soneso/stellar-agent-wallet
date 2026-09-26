@@ -100,7 +100,7 @@ fn option_u32_some_parity_with_onchain_canonical() {
 
     assert_eq!(
         wallet_xdr, onchain_xdr,
-        "Option<u32>::Some(n) wire shape diverges between wallet (stellar-xdr 27) \
+        "Option<u32>::Some(n) wire shape diverges between wallet (stellar-xdr 28) \
          and on-chain canonical (soroban-sdk).\n\
          wallet:  {wallet_xdr:02x?}\n\
          onchain: {onchain_xdr:02x?}"

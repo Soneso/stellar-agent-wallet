@@ -143,10 +143,10 @@ stellar-accounts = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 # stellar-rpc-client replaces soroban-client for tx-prep and submit-poll for
-# Soroban. Uses stellar-xdr 27 types throughout.
+# Soroban. Uses stellar-xdr 28 types throughout.
 stellar-rpc-client = { workspace = true }
 # stellar-baselib provides Account, TransactionBuilder, Transaction with the
-# same conceptual API as soroban-client but against stellar-xdr 27.
+# same conceptual API as soroban-client but against stellar-xdr 28.
 stellar-baselib = { workspace = true }
 stellar-xdr = { workspace = true }
 stellar-strkey = { workspace = true }
