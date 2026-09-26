@@ -375,6 +375,8 @@ mod tests {
             pinned_policy_wasm_hashes_first8: vec![],
             mutable_override: false,
             unknown_override: false,
+            pinned_verifier_executable_refs: vec![],
+            pinned_policy_executable_refs: vec![],
         };
         writer.lock().unwrap().write_entry(entry).unwrap();
     }

@@ -124,8 +124,8 @@ pub use health::{AuditWriterHealth, AuditWriterHealthHandle};
 pub use reader::{AuditLogIntegrityError, AuditReader, PinnedHashesRecord};
 pub use rotation::{SidecarResignError, resign_chain_root_sidecars};
 pub use schema::{
-    EVENT_KIND_VARIANT_COUNT, EventKind, KeyPurpose, PolicyDecision, TipAnchorReason,
-    ValueActionKind, ValueLegRecord,
+    EVENT_KIND_VARIANT_COUNT, EventKind, ExecutableRefPin, KeyPurpose, PolicyDecision,
+    TipAnchorReason, ValueActionKind, ValueLegRecord, executable_refs_or_empty,
 };
 pub use signer_set::{
     BaselineReason, DOMAIN_SA_SIGNER_SET_V1, ObservedSignerSet, SignerPubkey,

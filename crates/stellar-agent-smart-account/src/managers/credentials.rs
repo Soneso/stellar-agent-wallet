@@ -1867,7 +1867,13 @@ impl CredentialsManager {
                             stellar_agent_core::audit_log::reader::PinnedHashesRecord::default()
                         }
                         Err(audit_err) => {
-                            // Audit-log integrity failure → fail-CLOSED.
+                            // An audit-log integrity failure (chain break, HMAC
+                            // mismatch, a malformed pin record) aborts signing
+                            // with its typed source. It is neither an absent
+                            // baseline nor a diversification decision the
+                            // operator could override, so it routes to
+                            // DriftCheckUnavailable like every other failure
+                            // of the pin checks.
                             warn!(
                                 rule_id,
                                 error = %audit_err,
@@ -1875,21 +1881,7 @@ impl CredentialsManager {
                                  diversification check; aborting signing (fail-closed)"
                             );
                             return (
-                                Err(CredentialsError::DiversificationRequired {
-                                    source: Box::new(
-                                        crate::SaError::VerifierDiversificationRequired {
-                                            rule_id,
-                                            smart_account_redacted:
-                                                RedactedStrkey::from_already_redacted(
-                                                    smart_account_redacted.clone(),
-                                                ),
-                                            verifier_hash_first8: String::new(),
-                                            observed_value_threshold_stroops:
-                                                crate::managers::diversification::DiversificationCheck::SENTINEL_OBSERVED_VALUE_THRESHOLD_STROOPS,
-                                            request_id: divergence_request_id.clone(),
-                                        },
-                                    ),
-                                }),
+                                Err(drift_err_route(crate::SaError::AuditLog(audit_err))),
                                 String::new(),
                                 String::new(),
                                 Some(divergence_request_id),
@@ -2028,15 +2020,18 @@ impl CredentialsManager {
             // After the signer-set divergence check passes, run per-rule verifier
             // and policy wasm-hash drift detection BEFORE any bridge I/O.
             //
-            // Per-call `HashMap<ScAddress-XDR-bytes, [u8;32]>` cache prevents
-            // redundant two-RPC fetches when multiple rules reference the same
-            // verifier/policy contract.
+            // Per-call `HashMap<ScAddress-XDR-bytes, ObservedExecutable>` cache
+            // prevents redundant two-RPC fetches when multiple rules reference
+            // the same verifier/policy contract.
             //
             // Each verifier/policy call uses `divergence_request_id` so that the
             // `SaVerifierHashDrift` / `SaPolicyHashDrift` audit rows share the same
             // request_id as the eventual `PasskeyAssertion(failure:verifier_hash_drift)`
             // row — forensic correlation.
-            let mut wasm_hash_cache: HashMap<Vec<u8>, [u8; 32]> = HashMap::new();
+            let mut wasm_hash_cache: HashMap<
+                Vec<u8>,
+                crate::managers::signers::ObservedExecutable,
+            > = HashMap::new();
 
             for &rule_id in &rule_ids {
                 if rule_id == 0 {
@@ -4008,6 +4003,7 @@ registered_at_unix_ms = 1700000000000
             deploy_address_redacted: RedactedStrkey::from_already_redacted("CVERIF...ADDR1"),
             pinned_hash_first8: "abcdef01".to_owned(),
             observed_hash_first8: "12345678".to_owned(),
+            observed_executable: None,
             request_id: "req-id-1".to_owned(),
         };
         let result = drift_err_route(sa_err);
@@ -4035,6 +4031,7 @@ registered_at_unix_ms = 1700000000000
             deploy_address_redacted: RedactedStrkey::from_already_redacted("CPOLI...ADDR1"),
             pinned_hash_first8: "deadbeef".to_owned(),
             observed_hash_first8: "cafebabe".to_owned(),
+            observed_executable: None,
             request_id: "req-id-2".to_owned(),
         };
         let result = drift_err_route(sa_err);

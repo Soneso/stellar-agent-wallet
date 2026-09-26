@@ -76,7 +76,7 @@ use sha2::{Digest as _, Sha256};
 use super::{
     chain::{ZERO_BLOCK_HASH, compute_entry_hash},
     entry::AuditEntry,
-    schema::{EventKind, ValueLegRecord},
+    schema::{EventKind, ExecutableRefPin, ValueLegRecord},
     signer_set::{ObservedSignerSet, SignerSetStatePayload},
     verify::VerifyError,
     writer::{AuditWriter, is_rotated_sibling, wait_out_transient_rotation_window},
@@ -109,6 +109,112 @@ pub struct PinnedHashesRecord {
     /// `true` if `--accept-unknown-verifier` was set at install time.
     /// Rows that predate this field deserialise as `false`.
     pub unknown_override: bool,
+    /// Executable-reference pins aligned by position with
+    /// `pinned_verifier_first8`, or empty when no pinned verifier is an
+    /// external reference. A non-empty list has the length of
+    /// `pinned_verifier_first8`, and each `Some` entry's resolved first-8
+    /// equals the aligned first-8 entry.
+    pub pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
+    /// Executable-reference pins aligned by position with
+    /// `pinned_policy_first8`, with the same invariants as
+    /// `pinned_verifier_executable_refs`.
+    pub pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
+}
+
+impl PinnedHashesRecord {
+    /// Returns the executable-reference pin recorded for the verifier at
+    /// `position` in `pinned_verifier_first8`, or `None` when that verifier
+    /// was pinned by its Wasm hash.
+    #[must_use]
+    pub fn verifier_executable_ref(&self, position: usize) -> Option<&ExecutableRefPin> {
+        self.pinned_verifier_executable_refs
+            .get(position)
+            .and_then(Option::as_ref)
+    }
+
+    /// Returns the executable-reference pin recorded for the policy at
+    /// `position` in `pinned_policy_first8`, or `None` when that policy was
+    /// pinned by its Wasm hash.
+    #[must_use]
+    pub fn policy_executable_ref(&self, position: usize) -> Option<&ExecutableRefPin> {
+        self.pinned_policy_executable_refs
+            .get(position)
+            .and_then(Option::as_ref)
+    }
+}
+
+/// Builds a [`PinnedHashesRecord`] from the pin fields of one
+/// `SaContextRuleCreated` row, refusing a record the install path never
+/// writes.
+///
+/// An executable-reference list must be empty or aligned with its first-8
+/// list, every pin must have the shape [`ExecutableRefPin::new`] produces,
+/// and every pin's resolved first-8 must equal the aligned first-8 entry. The
+/// signing-time drift check reads the pin at the position it checks, so a
+/// misaligned or inconsistent record could pair a hash with the wrong
+/// reference; it is refused as a parse error at `line`.
+fn pinned_hashes_record_from_row(
+    line: usize,
+    pinned_verifier_first8: &[String],
+    pinned_policy_first8: &[String],
+    mutable_override: bool,
+    unknown_override: bool,
+    pinned_verifier_executable_refs: &[Option<ExecutableRefPin>],
+    pinned_policy_executable_refs: &[Option<ExecutableRefPin>],
+) -> Result<PinnedHashesRecord, AuditLogIntegrityError> {
+    for (kind, first8, refs) in [
+        (
+            "verifier",
+            pinned_verifier_first8,
+            pinned_verifier_executable_refs,
+        ),
+        (
+            "policy",
+            pinned_policy_first8,
+            pinned_policy_executable_refs,
+        ),
+    ] {
+        if !refs.is_empty() && refs.len() != first8.len() {
+            return Err(AuditLogIntegrityError::ParseError {
+                line,
+                detail: format!(
+                    "sa_context_rule_created: {} {kind} executable-reference pins for {} \
+                     pinned {kind} hashes",
+                    refs.len(),
+                    first8.len()
+                ),
+            });
+        }
+        for (position, pin) in refs.iter().enumerate() {
+            let Some(pin) = pin else { continue };
+            if !pin.is_well_formed() {
+                return Err(AuditLogIntegrityError::ParseError {
+                    line,
+                    detail: format!(
+                        "sa_context_rule_created: malformed {kind} executable-reference pin \
+                         at position {position}"
+                    ),
+                });
+            }
+            if first8.get(position) != Some(&pin.resolved_hash_first8) {
+                return Err(AuditLogIntegrityError::ParseError {
+                    line,
+                    detail: format!(
+                        "sa_context_rule_created: {kind} executable-reference pin at position \
+                         {position} does not match the pinned {kind} hash"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(PinnedHashesRecord {
+        pinned_verifier_first8: pinned_verifier_first8.to_vec(),
+        pinned_policy_first8: pinned_policy_first8.to_vec(),
+        mutable_override,
+        unknown_override,
+        pinned_verifier_executable_refs: pinned_verifier_executable_refs.to_vec(),
+        pinned_policy_executable_refs: pinned_policy_executable_refs.to_vec(),
+    })
 }
 
 /// Re-export of [`VerifyError`] under a reader-oriented name.
@@ -1250,17 +1356,22 @@ fn scan_file_for_context_rule_pins(
             pinned_policy_wasm_hashes_first8,
             mutable_override,
             unknown_override,
+            pinned_verifier_executable_refs,
+            pinned_policy_executable_refs,
             ..
         } = &entry.event_kind
             && *rid == rule_id
             && sa == smart_account_redacted
         {
-            best = Some(PinnedHashesRecord {
-                pinned_verifier_first8: pinned_verifier_wasm_hashes_first8.clone(),
-                pinned_policy_first8: pinned_policy_wasm_hashes_first8.clone(),
-                mutable_override: *mutable_override,
-                unknown_override: *unknown_override,
-            });
+            best = Some(pinned_hashes_record_from_row(
+                line_number,
+                pinned_verifier_wasm_hashes_first8,
+                pinned_policy_wasm_hashes_first8,
+                *mutable_override,
+                *unknown_override,
+                pinned_verifier_executable_refs,
+                pinned_policy_executable_refs,
+            )?);
         }
     }
 
@@ -1397,17 +1508,22 @@ fn scan_file_for_all_context_rule_created(
             pinned_policy_wasm_hashes_first8,
             mutable_override,
             unknown_override,
+            pinned_verifier_executable_refs,
+            pinned_policy_executable_refs,
             ..
         } = &entry.event_kind
         {
             out.insert(
                 (*rid, sa.clone()),
-                PinnedHashesRecord {
-                    pinned_verifier_first8: pinned_verifier_wasm_hashes_first8.clone(),
-                    pinned_policy_first8: pinned_policy_wasm_hashes_first8.clone(),
-                    mutable_override: *mutable_override,
-                    unknown_override: *unknown_override,
-                },
+                pinned_hashes_record_from_row(
+                    line_number,
+                    pinned_verifier_wasm_hashes_first8,
+                    pinned_policy_wasm_hashes_first8,
+                    *mutable_override,
+                    *unknown_override,
+                    pinned_verifier_executable_refs,
+                    pinned_policy_executable_refs,
+                )?,
             );
         }
     }
@@ -2630,6 +2746,8 @@ mod tests {
             pinned_policy_wasm_hashes_first8: policy_hashes,
             mutable_override,
             unknown_override,
+            pinned_verifier_executable_refs: vec![],
+            pinned_policy_executable_refs: vec![],
         }
     }
 
@@ -2822,6 +2940,176 @@ mod tests {
         );
         assert!(!record.mutable_override);
         assert!(!record.unknown_override);
+    }
+
+    fn executable_ref_pin(tag: &[u8], resolved: [u8; 32]) -> ExecutableRefPin {
+        use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
+        ExecutableRefPin::new(
+            &ScAddress::Contract(ContractId(Hash([9u8; 32]))),
+            &ScString(tag.to_vec().try_into().unwrap()),
+            &resolved,
+        )
+        .unwrap()
+    }
+
+    fn context_rule_created_event_with_refs(
+        rule_id: u32,
+        verifier_hashes: Vec<String>,
+        verifier_refs: Vec<Option<ExecutableRefPin>>,
+        policy_hashes: Vec<String>,
+        policy_refs: Vec<Option<ExecutableRefPin>>,
+    ) -> EventKind {
+        let EventKind::SaContextRuleCreated {
+            smart_account,
+            rule_id,
+            context_type,
+            signers_count,
+            policies_count,
+            valid_until,
+            pinned_verifier_wasm_hashes_first8,
+            pinned_policy_wasm_hashes_first8,
+            mutable_override,
+            unknown_override,
+            ..
+        } = context_rule_created_event(
+            rule_id,
+            "CDABC...12345",
+            verifier_hashes,
+            policy_hashes,
+            true,
+            false,
+        )
+        else {
+            unreachable!("context_rule_created_event builds SaContextRuleCreated");
+        };
+        EventKind::SaContextRuleCreated {
+            smart_account,
+            rule_id,
+            context_type,
+            signers_count,
+            policies_count,
+            valid_until,
+            pinned_verifier_wasm_hashes_first8,
+            pinned_policy_wasm_hashes_first8,
+            mutable_override,
+            unknown_override,
+            pinned_verifier_executable_refs: verifier_refs,
+            pinned_policy_executable_refs: policy_refs,
+        }
+    }
+
+    /// The record carries the executable-reference pins at their positions,
+    /// and the position accessors return them.
+    #[test]
+    fn find_latest_context_rule_pinned_hashes_returns_executable_refs() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        let verifier_pin = executable_ref_pin(b"verifier", [0xaau8; 32]);
+        let policy_pin = executable_ref_pin(b"policy", [0xbbu8; 32]);
+        {
+            let mut w = writer.lock().unwrap();
+            write_event(
+                &mut w,
+                context_rule_created_event_with_refs(
+                    5,
+                    vec!["1111111111111111".to_owned(), "aaaaaaaaaaaaaaaa".to_owned()],
+                    vec![None, Some(verifier_pin.clone())],
+                    vec!["bbbbbbbbbbbbbbbb".to_owned()],
+                    vec![Some(policy_pin.clone())],
+                ),
+            );
+        }
+
+        let reader = AuditReader::new(Arc::clone(&writer), None);
+        let record = reader
+            .find_latest_context_rule_pinned_hashes(5, "CDABC...12345")
+            .unwrap()
+            .expect("row must be found");
+        assert_eq!(
+            record.pinned_verifier_executable_refs,
+            vec![None, Some(verifier_pin.clone())]
+        );
+        assert_eq!(record.verifier_executable_ref(0), None);
+        assert_eq!(record.verifier_executable_ref(1), Some(&verifier_pin));
+        assert_eq!(record.policy_executable_ref(0), Some(&policy_pin));
+        assert_eq!(record.policy_executable_ref(1), None);
+
+        let all = reader.scan_all_context_rule_created().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(
+            all[0].2.pinned_policy_executable_refs,
+            vec![Some(policy_pin)]
+        );
+    }
+
+    /// A record whose executable-reference list is misaligned with its first-8
+    /// list, whose pin disagrees with the aligned first-8 entry, or whose pin
+    /// does not have the constructor's shape is refused as a parse error by
+    /// both readers.
+    #[test]
+    fn find_latest_context_rule_pinned_hashes_refuses_malformed_executable_refs() {
+        let pin = executable_ref_pin(b"verifier", [0xaau8; 32]);
+        let mut malformed_pin = pin.clone();
+        malformed_pin.ref_key_hex = "zz".to_owned();
+        let cases = [
+            (
+                "misaligned verifier list",
+                context_rule_created_event_with_refs(
+                    5,
+                    vec!["1111111111111111".to_owned(), "aaaaaaaaaaaaaaaa".to_owned()],
+                    vec![Some(pin.clone())],
+                    vec![],
+                    vec![],
+                ),
+            ),
+            (
+                "misaligned policy list",
+                context_rule_created_event_with_refs(5, vec![], vec![], vec![], vec![None]),
+            ),
+            (
+                "pin disagrees with first-8",
+                context_rule_created_event_with_refs(
+                    5,
+                    vec!["1111111111111111".to_owned()],
+                    vec![Some(pin.clone())],
+                    vec![],
+                    vec![],
+                ),
+            ),
+            (
+                "malformed pin",
+                context_rule_created_event_with_refs(
+                    5,
+                    vec!["aaaaaaaaaaaaaaaa".to_owned()],
+                    vec![Some(malformed_pin)],
+                    vec![],
+                    vec![],
+                ),
+            ),
+        ];
+        for (case, event) in cases {
+            let dir = TempDir::new().unwrap();
+            let path = tmp_log(&dir);
+            let writer = open_writer(path.clone());
+            {
+                let mut w = writer.lock().unwrap();
+                write_event(&mut w, event);
+            }
+            let reader = AuditReader::new(Arc::clone(&writer), None);
+            let err = reader
+                .find_latest_context_rule_pinned_hashes(5, "CDABC...12345")
+                .expect_err(case);
+            assert!(
+                matches!(err, AuditLogIntegrityError::ParseError { line: 1, .. }),
+                "{case}: {err:?}"
+            );
+            let err = reader.scan_all_context_rule_created().expect_err(case);
+            assert!(
+                matches!(err, AuditLogIntegrityError::ParseError { line: 1, .. }),
+                "{case}: {err:?}"
+            );
+        }
     }
 
     // ── 14. find_latest_context_rule_pinned_hashes: mutable/unknown overrides ──

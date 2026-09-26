@@ -57,6 +57,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
+use stellar_agent_core::audit_log::ExecutableRefPin;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::CapKind;
 use stellar_agent_core::error::{NetworkError, ValidationError, WalletError};
@@ -508,22 +509,32 @@ pub struct CreateArgs {
     #[arg(long)]
     pub accept_no_delegated_fallback: bool,
 
-    /// Opt-in to installing a rule whose verifier or policy contract has a
-    /// mutable admin / owner storage key.
+    /// Opt-in to installing a rule whose verifier or policy contract is
+    /// mutable: it has an admin / owner storage key, or its executable is an
+    /// owner-managed external reference.
     ///
     /// By default (`false`), `smart-account rules create` fails with
     /// `sa.verifier_mutable` / `sa.policy_mutable` when the referenced verifier
     /// or policy contract carries a non-zero `Admin` or `Owner` storage key (OZ
-    /// ownable-storage convention).  A mutable contract can be silently upgraded
-    /// by its administrator — pinning does not protect against that.
+    /// ownable-storage convention), or when its executable is an external
+    /// reference whose owner decides which Wasm runs.  A mutable contract can
+    /// be silently upgraded by its administrator; pinning does not protect
+    /// against that.
     ///
-    /// The flag does not admit a contract whose instance is undecodable, has a
-    /// non-Wasm executable, or has an owner-managed external-reference
-    /// executable: the wallet cannot pin that code, and the install fails with
+    /// For an external reference the pin records the owner, the tag and the
+    /// hash the tag resolves to; signing refuses when the owner repoints the
+    /// tag, the reference changes or the executable kind changes.
+    /// `--accept-unknown-verifier` is also required when the resolved hash is
+    /// outside the allowlist.
+    ///
+    /// The flag does not admit an external reference with no live tag entry,
+    /// an undecodable instance or a non-Wasm executable: the wallet cannot
+    /// pin that code, and the install fails with
     /// `sa.contract_instance_unsupported` regardless of this flag.
     ///
     /// When set, the install proceeds AND the audit log emits
-    /// `SaMutableContractOverride { kind, rule_id, contract_address_redacted }`.
+    /// `SaMutableContractOverride { kind, rule_id, contract_address_redacted }`,
+    /// naming the owner and tag of an external reference.
     /// The JSON envelope reflects `mutable_override: true`.
     #[arg(long)]
     pub accept_mutable_verifier: bool,
@@ -568,7 +579,8 @@ pub struct CreateArgs {
 /// Result envelope for `smart-account rules create`.
 ///
 /// Carries the wasm-pinning fields `pinned_verifier_wasm_hashes_first8`,
-/// `pinned_policy_wasm_hashes_first8`, `mutable_override`, and
+/// `pinned_policy_wasm_hashes_first8`, `pinned_verifier_executable_refs`,
+/// `pinned_policy_executable_refs`, `mutable_override`, and
 /// `unknown_override` — all sourced from the `PinResult` returned by
 /// `install_rule`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -603,6 +615,18 @@ pub struct CreateResult {
     /// `true` when `--accept-unknown-verifier` was set AND at least one
     /// referenced contract had a wasm hash outside the allowlist.
     pub unknown_override: bool,
+    /// Executable-reference pins aligned with
+    /// `pinned_verifier_wasm_hashes_first8`: an object (redacted owner,
+    /// bounded tag, tag-key digest, resolved first-8) for a verifier whose
+    /// executable is an external reference, `null` otherwise. Omitted when no
+    /// verifier is an external reference.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
+    /// Executable-reference pins aligned with
+    /// `pinned_policy_wasm_hashes_first8`, in the same form. Omitted when no
+    /// policy is an external reference.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
 }
 
 async fn create_run(args: &CreateArgs) -> i32 {
@@ -1041,6 +1065,8 @@ async fn create_run(args: &CreateArgs) -> i32 {
                 pinned_policy_wasm_hashes_first8,
                 mutable_override: pin_result.mutable_override,
                 unknown_override: pin_result.unknown_override,
+                pinned_verifier_executable_refs: pin_result.verifier_executable_refs(),
+                pinned_policy_executable_refs: pin_result.policy_executable_refs(),
             };
             emit_success(&result, args.common.output, &request_id, 0)
         }
@@ -3432,6 +3458,8 @@ mod tests {
             pinned_policy_wasm_hashes_first8: vec![],
             mutable_override: false,
             unknown_override: false,
+            pinned_verifier_executable_refs: vec![],
+            pinned_policy_executable_refs: vec![],
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -3443,6 +3471,60 @@ mod tests {
                 + round_trip.signer_webauthn_count
                 + round_trip.signer_ed25519_count
         );
+    }
+
+    /// The executable-reference lists are omitted when empty, serialised
+    /// aligned with the first-8 lists when present, and default to empty for
+    /// envelopes without them.
+    #[test]
+    fn create_result_executable_refs_are_optional_and_aligned() {
+        use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
+
+        let pin = ExecutableRefPin::new(
+            &ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+            &ScString(b"v1".to_vec().try_into().unwrap()),
+            &[0x42u8; 32],
+        )
+        .unwrap();
+        let mut result = CreateResult {
+            smart_account: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+            rule_id: 7,
+            name: "external-ref".to_owned(),
+            signers_count: 1,
+            signer_delegated_count: 0,
+            signer_webauthn_count: 1,
+            signer_ed25519_count: 0,
+            valid_until: None,
+            pinned_verifier_wasm_hashes_first8: vec![
+                "1111111111111111".to_owned(),
+                "4242424242424242".to_owned(),
+            ],
+            pinned_policy_wasm_hashes_first8: vec![],
+            mutable_override: true,
+            unknown_override: false,
+            pinned_verifier_executable_refs: vec![],
+            pinned_policy_executable_refs: vec![],
+        };
+        let without = serde_json::to_value(&result).unwrap();
+        assert!(without.get("pinned_verifier_executable_refs").is_none());
+        assert!(without.get("pinned_policy_executable_refs").is_none());
+        let legacy: CreateResult = serde_json::from_value(without).unwrap();
+        assert!(legacy.pinned_verifier_executable_refs.is_empty());
+
+        result.pinned_verifier_executable_refs = vec![None, Some(pin.clone())];
+        let with = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            with["pinned_verifier_executable_refs"][0],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            with["pinned_verifier_executable_refs"][1]["resolved_hash_first8"],
+            "4242424242424242"
+        );
+        assert_eq!(with["pinned_verifier_executable_refs"][1]["tag"], "v1");
+        assert!(with.get("pinned_policy_executable_refs").is_none());
+        let back: CreateResult = serde_json::from_value(with).unwrap();
+        assert_eq!(back.pinned_verifier_executable_refs, vec![None, Some(pin)]);
     }
 
     // ── Per-rule signer cap at `smart-account rules create` ─────────────────────────

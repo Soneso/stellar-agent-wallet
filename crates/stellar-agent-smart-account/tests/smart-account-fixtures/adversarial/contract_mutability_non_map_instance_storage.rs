@@ -98,6 +98,7 @@ async fn non_map_instance_storage_returns_mutable() {
         MutabilityStatus::Mutable {
             admin_or_owner_key: AdminOrOwnerKey::UndecodableInstance,
             holder_redacted: "undecodable instance".to_owned(),
+            executable_ref: None,
         }
     );
 }

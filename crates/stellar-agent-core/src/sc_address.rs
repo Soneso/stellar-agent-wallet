@@ -8,8 +8,18 @@
 //! [`crate::sc_address::ScAddressStrkeyError`] for them and callers that only
 //! display the address render
 //! [`crate::sc_address::UNSUPPORTED_ADDRESS_PLACEHOLDER`] instead.
+//!
+//! The module also builds the ledger key of a CAP-85 executable-tag entry
+//! ([`crate::sc_address::executable_tag_ledger_key`]) and its SHA-256 digest
+//! ([`crate::sc_address::executable_tag_key_digest`]), which identifies one
+//! owner and tag pair across the network fetch, the smart-account pin and the
+//! audit log.
 
-use stellar_xdr::{AccountId, ContractId, Hash, PublicKey, ScAddress, Uint256};
+use sha2::{Digest as _, Sha256};
+use stellar_xdr::{
+    AccountId, ContractDataDurability, ContractId, Hash, LedgerKey, LedgerKeyContractData, Limits,
+    PublicKey, ScAddress, ScString, ScVal, Uint256, WriteXdr,
+};
 
 /// Fixed display text for an [`ScAddress`] that has no account or contract
 /// strkey form.
@@ -68,12 +78,96 @@ pub fn scaddress_redacted(addr: &ScAddress) -> String {
     )
 }
 
+/// Returns the ledger key of the persistent `ContractData` entry in which
+/// `owner` stores the Wasm hash for an external-reference `tag`
+/// (`ScVal::ExecutableTag(tag)`, persistent durability).
+///
+/// A CAP-85 instance whose executable is
+/// `ContractExecutable::ExternalRef { executable_owner, tag }` runs the Wasm
+/// whose hash this entry holds.
+#[must_use]
+pub fn executable_tag_ledger_key(owner: &ScAddress, tag: &ScString) -> LedgerKey {
+    LedgerKey::ContractData(LedgerKeyContractData {
+        contract: owner.clone(),
+        key: ScVal::ExecutableTag(tag.clone()),
+        durability: ContractDataDurability::Persistent,
+    })
+}
+
+/// Returns the SHA-256 digest of the XDR encoding of
+/// [`executable_tag_ledger_key`] for `owner` and `tag`.
+///
+/// Two external references name the same owner-managed code slot exactly when
+/// their digests are equal, so the digest is the identity a pin records and a
+/// later observation is compared against. The owner and the tag are
+/// ledger-supplied; the digest carries neither in readable form.
+///
+/// # Errors
+///
+/// Returns the XDR encoder's error when the key cannot be encoded. The key is
+/// built from values that already passed XDR length checks and is encoded
+/// without depth or length limits, so no current input produces an error.
+pub fn executable_tag_key_digest(
+    owner: &ScAddress,
+    tag: &ScString,
+) -> Result<[u8; 32], stellar_xdr::Error> {
+    let key_xdr = executable_tag_ledger_key(owner, tag).to_xdr(Limits::none())?;
+    Ok(Sha256::digest(key_xdr).into())
+}
+
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, reason = "test-only assertions")]
+    #![allow(clippy::unwrap_used, clippy::panic, reason = "test-only assertions")]
 
     use super::*;
     use stellar_xdr::{ClaimableBalanceId, MuxedEd25519Account, PoolId};
+
+    fn tag(bytes: &[u8]) -> ScString {
+        ScString(bytes.to_vec().try_into().unwrap())
+    }
+
+    #[test]
+    fn executable_tag_ledger_key_is_the_owner_persistent_executable_tag_key() {
+        let owner = ScAddress::Contract(ContractId(Hash([7u8; 32])));
+        let LedgerKey::ContractData(key) = executable_tag_ledger_key(&owner, &tag(b"v1")) else {
+            panic!("executable tag key must be a contract-data key");
+        };
+        assert_eq!(key.contract, owner);
+        assert_eq!(key.key, ScVal::ExecutableTag(tag(b"v1")));
+        assert_eq!(key.durability, ContractDataDurability::Persistent);
+    }
+
+    #[test]
+    fn executable_tag_key_digest_is_the_sha256_of_the_key_xdr() {
+        let owner = ScAddress::Contract(ContractId(Hash([7u8; 32])));
+        let key_xdr = executable_tag_ledger_key(&owner, &tag(b"v1"))
+            .to_xdr(Limits::none())
+            .unwrap();
+        let expected: [u8; 32] = Sha256::digest(key_xdr).into();
+        assert_eq!(
+            executable_tag_key_digest(&owner, &tag(b"v1")).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn executable_tag_key_digest_separates_owner_and_tag() {
+        let owner = ScAddress::Contract(ContractId(Hash([7u8; 32])));
+        let other_owner = ScAddress::Contract(ContractId(Hash([8u8; 32])));
+        let base = executable_tag_key_digest(&owner, &tag(b"v1")).unwrap();
+        assert_eq!(
+            base,
+            executable_tag_key_digest(&owner, &tag(b"v1")).unwrap()
+        );
+        assert_ne!(
+            base,
+            executable_tag_key_digest(&owner, &tag(b"v2")).unwrap()
+        );
+        assert_ne!(
+            base,
+            executable_tag_key_digest(&other_owner, &tag(b"v1")).unwrap()
+        );
+    }
 
     #[test]
     fn account_address_renders_g_strkey() {

@@ -1596,6 +1596,8 @@ mod tests {
                 pinned_policy_wasm_hashes_first8: vec![],
                 mutable_override: false,
                 unknown_override: false,
+                pinned_verifier_executable_refs: vec![],
+                pinned_policy_executable_refs: vec![],
             },
             EventKind::SaContextRuleDeleted {
                 smart_account: "CDABC...12345".to_owned(),
@@ -1683,6 +1685,7 @@ mod tests {
                 deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...67890"),
                 pinned_hash_first8: "aabbccdd".to_owned(),
                 observed_hash_first8: "11223344".to_owned(),
+                observed_executable: None,
             },
             EventKind::SaPolicyHashDrift {
                 rule_id: 2,
@@ -1690,6 +1693,7 @@ mod tests {
                 deploy_address_redacted: RedactedStrkey::from_already_redacted("CCCCC...99999"),
                 pinned_hash_first8: "eeff0011".to_owned(),
                 observed_hash_first8: "22334455".to_owned(),
+                observed_executable: None,
             },
             EventKind::SaMutableContractOverride {
                 rule_id: 3,
@@ -1697,6 +1701,8 @@ mod tests {
                 contract_address_redacted: RedactedStrkey::from_already_redacted("CDABC...99999"),
                 contract_kind: ContractKind::Verifier,
                 override_acknowledged_at: "2026-05-19T10:00:00Z".to_owned(),
+                executable_owner_redacted: None,
+                executable_tag: None,
             },
             EventKind::SaUnknownContractOverride {
                 rule_id: 4,

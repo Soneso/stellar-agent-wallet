@@ -145,6 +145,8 @@ async fn policy_rpc_divergence_routes_to_drift_check_unavailable() {
             vec![pinned_policy_first8],
             false,
             false,
+            vec![],
+            vec![],
         );
         audit_writer
             .lock()

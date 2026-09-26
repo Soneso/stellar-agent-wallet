@@ -883,6 +883,8 @@ async fn p3_policy_hash_drift_detection_at_signing_time() {
             vec!["0000000000000000".to_owned()], // wrong policy hash (zero sentinel)
             false,
             false,
+            vec![],
+            vec![],
         );
         writer
             .write_entry(fake_entry)
@@ -1042,7 +1044,7 @@ async fn p3_policy_hash_drift_detection_at_signing_time() {
 ///
 /// # Reference cross-check
 ///
-/// - `crates/stellar-agent-smart-account/src/managers/signers.rs:fetch_observed_wasm_hash`
+/// - `crates/stellar-agent-smart-account/src/managers/signers.rs:fetch_observed_executable`
 ///   (real hash fetch without allowlist enforcement).
 /// - `crates/stellar-agent-smart-account/src/managers/verifiers.rs:verify_pinned_policy_against_chain`
 ///   (drift-detection re-fetch — policy path).
@@ -1177,6 +1179,8 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
             vec![real_hash_first8.clone()], // REAL hash (not a zero sentinel)
             false,                          // mutable_override
             true, // unknown_override = true (simulating accept-unknown path)
+            vec![],
+            vec![],
         );
         writer
             .write_entry(fake_entry)
@@ -1244,6 +1248,8 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
             vec!["0000000000000000".to_owned()], // zero sentinel (bug scenario)
             false,
             true, // unknown_override
+            vec![],
+            vec![],
         );
         writer
             .write_entry(bug_entry)
@@ -1454,6 +1460,8 @@ async fn p5_drift_check_infra_failure_routes_to_drift_check_unavailable_not_drif
             ],
             false, // mutable_override
             false, // unknown_override
+            vec![],
+            vec![],
         );
         writer
             .write_entry(fake_entry)
@@ -1974,7 +1982,7 @@ async fn accept_mutable_verifier_override_emits_audit_row() {
 /// - `VERIFIER_ALLOWLIST` at
 ///   `crates/stellar-agent-smart-account/src/verifier_allowlist.rs` —
 ///   only the OZ multisig-webauthn-verifier-example WASM hash is listed.
-/// - `crates/stellar-agent-smart-account/src/managers/signers.rs::fetch_observed_wasm_hash`
+/// - `crates/stellar-agent-smart-account/src/managers/signers.rs::fetch_observed_executable`
 ///   — real hash fetched without allowlist enforcement.
 ///
 /// The SA has no Admin key so `mutable_override=false`; the unknown-override path alone
@@ -2091,7 +2099,7 @@ async fn accept_unknown_verifier_override_emits_audit_row() {
     // ── observed_hash_first8 must be non-zero ─────────────────────────────────
     //
     // The real on-chain WASM hash must be stored in the override row, not a zero
-    // sentinel.  This is the regression gate for `fetch_observed_wasm_hash`.
+    // sentinel.  This is the regression gate for `fetch_observed_executable`.
     if let EventKind::SaUnknownContractOverride {
         observed_hash_first8,
         ..

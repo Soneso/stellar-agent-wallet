@@ -71,6 +71,7 @@ use stellar_agent_core::approval::user_id::process_uid_for_attestation;
 use stellar_agent_core::approval::{
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, RuleProposalGateError, open_with_retry,
 };
+use stellar_agent_core::audit_log::ExecutableRefPin;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_network::keyring::signer_from_keyring;
@@ -219,12 +220,17 @@ pub struct StellarRuleCreateArgs {
     #[serde(default = "default_auth_rule_ids")]
     pub auth_rule_ids: Vec<u32>,
 
-    /// Opt-in to proposing a rule whose verifier or policy contract has a
-    /// mutable admin/owner key. See `smart-account rules create
-    /// --accept-mutable-verifier` for the on-chain rationale. A contract whose
-    /// instance is undecodable, has a non-Wasm executable, or has an
-    /// owner-managed external-reference executable is refused with
-    /// `sa.contract_instance_unsupported` regardless of this flag.
+    /// Opt-in to proposing a rule whose verifier or policy contract is
+    /// mutable: it has an admin/owner key, or its executable is an
+    /// owner-managed external reference. See `smart-account rules create
+    /// --accept-mutable-verifier` for the on-chain rationale. For an external
+    /// reference the pin records the owner, the tag and the resolved hash, and
+    /// signing refuses when the owner repoints the tag, the reference changes
+    /// or the executable kind changes; `accept_unknown_verifier` is also
+    /// required when the resolved hash is outside the allowlist. An external
+    /// reference with no live tag entry, an undecodable instance and a
+    /// non-Wasm executable are refused with `sa.contract_instance_unsupported`
+    /// regardless of this flag.
     #[serde(default)]
     pub accept_mutable_verifier: bool,
 
@@ -1044,7 +1050,7 @@ impl WalletServer {
             })?;
 
         // ── Build response ─────────────────────────────────────────────────────
-        let view = json!({
+        let mut view = json!({
             "approval_nonce": entry.approval_nonce,
             "expires_at_unix_ms": entry.expires_at_unix_ms,
             "requires_operator_approval": requires_operator_approval,
@@ -1065,6 +1071,11 @@ impl WalletServer {
                 "summary_line": &summary_line,
             },
         });
+        insert_executable_refs(
+            &mut view,
+            simulate_output.pin_result.verifier_executable_refs(),
+            simulate_output.pin_result.policy_executable_refs(),
+        );
         let envelope = stellar_agent_core::envelope::Envelope::ok(view);
         let json_out = envelope
             .to_json_pretty()
@@ -1469,6 +1480,24 @@ impl WalletServer {
     }
 }
 
+/// Adds the executable-reference pins to a rule-create view: each list is
+/// aligned with its first-8 list and present only when at least one pinned
+/// contract is an external reference.
+fn insert_executable_refs(
+    view: &mut serde_json::Value,
+    verifier_refs: Vec<Option<ExecutableRefPin>>,
+    policy_refs: Vec<Option<ExecutableRefPin>>,
+) {
+    for (field, refs) in [
+        ("pinned_verifier_executable_refs", verifier_refs),
+        ("pinned_policy_executable_refs", policy_refs),
+    ] {
+        if !refs.is_empty() {
+            view[field] = json!(refs);
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Toolset-dispatch helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1557,6 +1586,35 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
     use super::*;
+
+    /// The rule-create view carries each executable-reference list only when
+    /// it is non-empty, aligned with its first-8 list.
+    #[test]
+    fn insert_executable_refs_adds_only_non_empty_lists() {
+        use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
+
+        let pin = ExecutableRefPin::new(
+            &ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+            &ScString(b"policy-v1".to_vec().try_into().unwrap()),
+            &[0x42u8; 32],
+        )
+        .unwrap();
+
+        let mut view = serde_json::json!({ "mutable_override": true });
+        insert_executable_refs(&mut view, vec![], vec![]);
+        assert_eq!(view, serde_json::json!({ "mutable_override": true }));
+
+        insert_executable_refs(&mut view, vec![], vec![None, Some(pin.clone())]);
+        assert!(view.get("pinned_verifier_executable_refs").is_none());
+        assert_eq!(
+            view["pinned_policy_executable_refs"],
+            serde_json::json!([null, pin])
+        );
+        assert_eq!(
+            view["pinned_policy_executable_refs"][1]["owner_redacted"],
+            "CAAAA...ABSC4"
+        );
+    }
 
     #[test]
     fn stellar_rule_create_args_deserialise_minimal() {

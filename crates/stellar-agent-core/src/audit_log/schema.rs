@@ -150,6 +150,109 @@ impl fmt::Display for ContractKind {
     }
 }
 
+// ── ExecutableRefPin ──────────────────────────────────────────────────────────
+
+/// Install-time pin of a verifier or policy contract whose executable is a
+/// CAP-85 external reference.
+///
+/// Such a contract runs the Wasm whose hash its owner stores under the
+/// owner's executable-tag entry, and the owner can repoint that entry at any
+/// time. The pin records which owner and tag the instance named at install
+/// time and which hash the tag resolved to, so the signing-time drift check
+/// can refuse when the owner repoints the tag, the instance names a different
+/// reference, or the executable is no longer a reference.
+///
+/// Carried by [`EventKind::SaContextRuleCreated`] beside the first-8 hash
+/// lists, and by the rule-install JSON envelopes.
+///
+/// # Rendering
+///
+/// Every field is already a bounded rendering: the owner is redacted
+/// first-5-last-5, the tag is rendered through
+/// [`crate::observability::untrusted_display_bounded`], and the key and hash
+/// are hex. The derived `Debug` form therefore prints no unbounded
+/// ledger-supplied bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutableRefPin {
+    /// Executable owner, redacted first-5-last-5, or the unsupported-address
+    /// placeholder for an address variant with no strkey form.
+    pub owner_redacted: RedactedStrkey,
+    /// Owner-chosen tag, rendered through
+    /// [`crate::observability::untrusted_display_bounded`].
+    pub tag: String,
+    /// Lower-case hex of the full SHA-256 digest of the owner's
+    /// executable-tag `LedgerKey` XDR
+    /// ([`crate::sc_address::executable_tag_key_digest`]); identifies the
+    /// owner and tag pair exactly.
+    pub ref_key_hex: String,
+    /// First-8 hex of the Wasm hash the tag resolved to at install time.
+    pub resolved_hash_first8: String,
+}
+
+impl ExecutableRefPin {
+    /// Builds the pin for the external reference `owner` / `tag` that
+    /// resolved to `resolved`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the XDR encoder's error from
+    /// [`crate::sc_address::executable_tag_key_digest`].
+    pub fn new(
+        owner: &stellar_xdr::ScAddress,
+        tag: &stellar_xdr::ScString,
+        resolved: &[u8; 32],
+    ) -> Result<Self, stellar_xdr::Error> {
+        let ref_key = crate::sc_address::executable_tag_key_digest(owner, tag)?;
+        Ok(Self {
+            owner_redacted: RedactedStrkey::from_already_redacted(
+                crate::sc_address::scaddress_redacted(owner),
+            ),
+            tag: crate::observability::untrusted_display_bounded(tag.0.as_vec()),
+            ref_key_hex: lower_hex(&ref_key),
+            resolved_hash_first8: lower_hex(&resolved[..8]),
+        })
+    }
+
+    /// Returns `true` when every field has the shape [`Self::new`] produces:
+    /// a 64-character and a 16-character lower-case hex string, a tag within
+    /// [`crate::observability::UNTRUSTED_DISPLAY_MAX_BYTES`], and a redacted
+    /// owner no longer than the placeholder.
+    ///
+    /// Audit readers refuse a record holding a pin of any other shape.
+    #[must_use]
+    pub fn is_well_formed(&self) -> bool {
+        fn is_lower_hex(s: &str, len: usize) -> bool {
+            s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        }
+        is_lower_hex(&self.ref_key_hex, 64)
+            && is_lower_hex(&self.resolved_hash_first8, 16)
+            && self.tag.len() <= crate::observability::UNTRUSTED_DISPLAY_MAX_BYTES
+            && self.owner_redacted.len() <= crate::sc_address::UNSUPPORTED_ADDRESS_PLACEHOLDER.len()
+    }
+}
+
+/// Returns `refs` unchanged when at least one entry is a pin, or an empty
+/// list when every entry is `None`.
+///
+/// An executable-reference list on a `SaContextRuleCreated` row or an
+/// install envelope is either aligned with its first-8 list or absent;
+/// recording an all-`None` list as empty keeps rules without an external
+/// reference in the shape older readers know.
+#[must_use]
+pub fn executable_refs_or_empty(
+    refs: Vec<Option<ExecutableRefPin>>,
+) -> Vec<Option<ExecutableRefPin>> {
+    if refs.iter().all(Option::is_none) {
+        Vec::new()
+    } else {
+        refs
+    }
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 // ── VerifierAdvisoryKind ──────────────────────────────────────────────────────
 
 /// Classification of the allowlist-advisory status for a verifier wasm hash.
@@ -598,6 +701,22 @@ pub enum EventKind {
         /// field read as `false`.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         unknown_override: bool,
+        /// Executable-reference pins aligned by position with
+        /// `pinned_verifier_wasm_hashes_first8`: `Some` for a verifier whose
+        /// executable was a CAP-85 external reference at install time, whose
+        /// first-8 entry then holds the resolved hash, and `None` for a Wasm
+        /// or absent verifier.
+        ///
+        /// Written empty when no verifier is an external reference, and read
+        /// as empty from rows without the field. A non-empty list has the
+        /// length of the first-8 list; readers refuse any other length.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
+        /// Executable-reference pins aligned by position with
+        /// `pinned_policy_wasm_hashes_first8`, with the same shape and
+        /// defaulting rules as `pinned_verifier_executable_refs`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
     },
 
     /// Smart-account context-rule deletion event.
@@ -1095,11 +1214,11 @@ pub enum EventKind {
     ///
     /// # Backward compatibility
     ///
-    /// No `#[serde(default)]` on fields — this variant has no legacy entries that
-    /// predate it. Allowing default deserialisation would let malformed wire input
-    /// (missing field) silently produce empty strings, a silent data-integrity
-    /// hole. The `#[non_exhaustive]` attribute on `EventKind` (not per-field
-    /// defaults) provides the schema-additivity guarantee.
+    /// `observed_executable` is the only field with a default: rows without it
+    /// read as `None`. Every other field carries no `#[serde(default)]`, so a
+    /// row missing one fails to deserialise instead of silently producing an
+    /// empty string. The `#[non_exhaustive]` attribute on `EventKind` provides
+    /// the schema-additivity guarantee for new variants.
     ///
     SaVerifierHashDrift {
         /// Context-rule identifier for which drift was detected (non-sensitive on-chain ID).
@@ -1110,8 +1229,15 @@ pub enum EventKind {
         deploy_address_redacted: RedactedStrkey,
         /// First-8 hex chars of the wasm hash pinned at rule-install time.
         pinned_hash_first8: String,
-        /// First-8 hex chars of the wasm hash observed via two-RPC re-fetch.
+        /// First-8 hex chars of the effective hash observed via two-RPC
+        /// re-fetch: the Wasm hash, the hash an external reference resolved
+        /// to, or the zero hash for no code or an unresolved reference.
         observed_hash_first8: String,
+        /// Bounded summary of the observed executable: `wasm`, `no code`, or
+        /// `external reference owner <redacted> tag "<bounded>" resolved
+        /// <first-8 or unset>`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_executable: Option<String>,
     },
 
     /// Policy wasm-hash drift was detected during a signing path re-fetch.
@@ -1133,9 +1259,9 @@ pub enum EventKind {
     ///
     /// # Backward compatibility
     ///
-    /// No `#[serde(default)]` on fields — this variant has no legacy entries that
-    /// predate it. Tampered or malformed wire input (missing field) MUST fail
-    /// deserialisation, not silently default.
+    /// `observed_executable` is the only field with a default: rows without it
+    /// read as `None`. Tampered or malformed wire input missing any other
+    /// field MUST fail deserialisation, not silently default.
     ///
     SaPolicyHashDrift {
         /// Context-rule identifier for which drift was detected.
@@ -1146,17 +1272,23 @@ pub enum EventKind {
         deploy_address_redacted: RedactedStrkey,
         /// First-8 hex chars of the pinned wasm hash.
         pinned_hash_first8: String,
-        /// First-8 hex chars of the observed wasm hash.
+        /// First-8 hex chars of the observed effective hash, with the same
+        /// meaning as on [`EventKind::SaVerifierHashDrift`].
         observed_hash_first8: String,
+        /// Bounded summary of the observed executable, in the form described
+        /// on [`EventKind::SaVerifierHashDrift`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_executable: Option<String>,
     },
 
     /// A mutable-contract override was acknowledged at rule-install time.
     ///
     /// Emitted when `ContextRuleManager::install_rule` detects that a referenced
-    /// verifier or policy contract has a non-zero `Admin` or `Owner` storage key,
-    /// AND the operator has passed `--accept-mutable-verifier`.  The audit row
-    /// records the acknowledgement with an ISO-8601 timestamp so the forensic
-    /// trail is complete.
+    /// verifier or policy contract has a non-zero `Admin` or `Owner` storage key
+    /// or an owner-managed external-reference executable, AND the operator has
+    /// passed `--accept-mutable-verifier`.  The audit row records the
+    /// acknowledgement with an ISO-8601 timestamp so the forensic trail is
+    /// complete.
     ///
     /// # Fields
     ///
@@ -1164,6 +1296,8 @@ pub enum EventKind {
     ///   contract.
     /// - `override_acknowledged_at`: ISO-8601 UTC timestamp (RFC 3339 format)
     ///   of when the CLI flag was processed.
+    /// - `executable_owner_redacted` / `executable_tag`: the owner and tag of
+    ///   an external-reference executable; absent for an admin or owner key.
     ///
     /// # Redaction
     ///
@@ -1180,9 +1314,10 @@ pub enum EventKind {
     ///
     /// # Backward compatibility
     ///
-    /// No `#[serde(default)]` on fields — this variant has no legacy entries that
-    /// predate it. Tampered or malformed wire input (missing field) MUST fail
-    /// deserialisation, not silently default.
+    /// `executable_owner_redacted` and `executable_tag` default to `None`, so
+    /// rows without them keep deserialising. Every other field carries no
+    /// `#[serde(default)]`: tampered or malformed wire input missing one MUST
+    /// fail deserialisation, not silently default.
     ///
     SaMutableContractOverride {
         /// Context-rule identifier to which the overridden contract belongs.
@@ -1199,6 +1334,16 @@ pub enum EventKind {
         contract_kind: ContractKind,
         /// ISO-8601 UTC timestamp (RFC 3339) of when the override was acknowledged.
         override_acknowledged_at: String,
+        /// Owner of the contract's external-reference executable, redacted
+        /// first-5-last-5; `None` when the override covers an admin or owner
+        /// storage key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        executable_owner_redacted: Option<RedactedStrkey>,
+        /// Tag of the contract's external-reference executable, rendered
+        /// through [`crate::observability::untrusted_display_bounded`]; `None`
+        /// when the override covers an admin or owner storage key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        executable_tag: Option<String>,
     },
 
     /// An unknown-wasm-hash override was acknowledged at rule-install time.
@@ -2943,6 +3088,8 @@ mod tests {
             pinned_policy_wasm_hashes_first8: vec![],
             mutable_override: false,
             unknown_override: false,
+            pinned_verifier_executable_refs: vec![],
+            pinned_policy_executable_refs: vec![],
         };
         let s = serde_json::to_string(&ev).unwrap();
         let back: EventKind = serde_json::from_str(&s).unwrap();
@@ -2982,6 +3129,8 @@ mod tests {
             pinned_policy_wasm_hashes_first8: vec![],
             mutable_override: false,
             unknown_override: false,
+            pinned_verifier_executable_refs: vec![],
+            pinned_policy_executable_refs: vec![],
         };
         let s = serde_json::to_string(&ev).unwrap();
         // valid_until field MUST be absent (skip_serializing_if).
@@ -3045,6 +3194,8 @@ mod tests {
             pinned_policy_wasm_hashes_first8: vec!["11223344".to_owned()],
             mutable_override: false,
             unknown_override: true,
+            pinned_verifier_executable_refs: vec![],
+            pinned_policy_executable_refs: vec![],
         };
         let s = serde_json::to_string(&ev).unwrap();
         let back: EventKind = serde_json::from_str(&s).unwrap();
@@ -3066,6 +3217,135 @@ mod tests {
         assert!(
             !s.contains("mutable_override"),
             "false mutable_override must be skipped: {s}"
+        );
+    }
+
+    fn executable_ref_pin_fixture(tag: &[u8], resolved: [u8; 32]) -> ExecutableRefPin {
+        use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
+        ExecutableRefPin::new(
+            &ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+            &ScString(tag.to_vec().try_into().unwrap()),
+            &resolved,
+        )
+        .unwrap()
+    }
+
+    /// `ExecutableRefPin::new` renders the redacted owner and the bounded tag,
+    /// records the full SHA-256 of the tag key XDR and the resolved first-8,
+    /// is stable for a fixed owner and tag, and differs for a different tag.
+    #[test]
+    fn executable_ref_pin_new_is_stable_and_tag_sensitive() {
+        use sha2::{Digest as _, Sha256};
+        use stellar_xdr::{ContractId, Hash, Limits, ScAddress, ScString, WriteXdr};
+
+        let owner = ScAddress::Contract(ContractId(Hash([0u8; 32])));
+        let tag = ScString("v1\u{202e}".as_bytes().to_vec().try_into().unwrap());
+        let pin = ExecutableRefPin::new(&owner, &tag, &[0xabu8; 32]).unwrap();
+        let again = ExecutableRefPin::new(&owner, &tag, &[0xabu8; 32]).unwrap();
+        assert_eq!(
+            pin, again,
+            "the pin is a pure function of owner, tag and hash"
+        );
+
+        let key_xdr = crate::sc_address::executable_tag_ledger_key(&owner, &tag)
+            .to_xdr(Limits::none())
+            .unwrap();
+        let expected_key: String = Sha256::digest(key_xdr)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(pin.ref_key_hex, expected_key);
+        assert_eq!(pin.ref_key_hex.len(), 64);
+        assert_eq!(pin.resolved_hash_first8, "abababababababab");
+        assert_eq!(pin.owner_redacted.as_str(), "CAAAA...ABSC4");
+        assert_eq!(
+            pin.tag, "v1\\u{202e}",
+            "the tag renders escaped and bounded"
+        );
+        assert!(pin.is_well_formed());
+
+        let other_tag = ScString(b"v2".to_vec().try_into().unwrap());
+        let other = ExecutableRefPin::new(&owner, &other_tag, &[0xabu8; 32]).unwrap();
+        assert_ne!(other.ref_key_hex, pin.ref_key_hex);
+    }
+
+    /// A pin whose fields do not have the constructor's shape is not
+    /// well-formed.
+    #[test]
+    fn executable_ref_pin_is_well_formed_rejects_other_shapes() {
+        let pin = executable_ref_pin_fixture(b"v1", [0x11u8; 32]);
+        assert!(pin.is_well_formed());
+
+        let mut short_key = pin.clone();
+        short_key.ref_key_hex.truncate(62);
+        assert!(!short_key.is_well_formed());
+
+        let mut upper_first8 = pin.clone();
+        upper_first8.resolved_hash_first8 = "ABABABABABABABAB".to_owned();
+        assert!(!upper_first8.is_well_formed());
+
+        let mut long_tag = pin.clone();
+        long_tag.tag = "t".repeat(crate::observability::UNTRUSTED_DISPLAY_MAX_BYTES + 1);
+        assert!(!long_tag.is_well_formed());
+
+        let mut long_owner = pin;
+        long_owner.owner_redacted = RedactedStrkey::from_already_redacted("G".repeat(56));
+        assert!(!long_owner.is_well_formed());
+    }
+
+    /// Round-trip: `SaContextRuleCreated` with executable-reference pins
+    /// aligned with the first-8 lists.
+    #[test]
+    fn event_kind_sa_context_rule_created_round_trip_with_executable_refs() {
+        let verifier_pin = executable_ref_pin_fixture(b"verifier", [0xaau8; 32]);
+        let policy_pin = executable_ref_pin_fixture(b"policy", [0xbbu8; 32]);
+        let ev = EventKind::SaContextRuleCreated {
+            smart_account: "CDABC...XYZ12".to_owned(),
+            rule_id: 6,
+            context_type: "default".to_owned(),
+            signers_count: 2,
+            policies_count: 1,
+            valid_until: None,
+            pinned_verifier_wasm_hashes_first8: vec![
+                "1111111111111111".to_owned(),
+                "aaaaaaaaaaaaaaaa".to_owned(),
+            ],
+            pinned_policy_wasm_hashes_first8: vec!["bbbbbbbbbbbbbbbb".to_owned()],
+            mutable_override: true,
+            unknown_override: false,
+            pinned_verifier_executable_refs: vec![None, Some(verifier_pin)],
+            pinned_policy_executable_refs: vec![Some(policy_pin)],
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: EventKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(ev, back);
+        assert!(
+            s.contains("\"pinned_verifier_executable_refs\":[null,{"),
+            "{s}"
+        );
+        assert!(s.contains("pinned_policy_executable_refs"), "{s}");
+    }
+
+    /// Missing-field: rows without the executable-reference lists read them as
+    /// empty, and empty lists are not serialised.
+    #[test]
+    fn event_kind_sa_context_rule_created_missing_executable_refs_default_empty() {
+        let legacy_json = r#"{"kind":"sa_context_rule_created","smart_account":"CDABC...XYZ12","rule_id":1,"context_type":"default","signers_count":1,"policies_count":1,"pinned_verifier_wasm_hashes_first8":["aabbccdd00112233"],"pinned_policy_wasm_hashes_first8":["1122334455667788"]}"#;
+        let back: EventKind = serde_json::from_str(legacy_json).unwrap();
+        let EventKind::SaContextRuleCreated {
+            pinned_verifier_executable_refs,
+            pinned_policy_executable_refs,
+            ..
+        } = &back
+        else {
+            panic!("expected SaContextRuleCreated, got {back:?}");
+        };
+        assert!(pinned_verifier_executable_refs.is_empty());
+        assert!(pinned_policy_executable_refs.is_empty());
+        let s = serde_json::to_string(&back).unwrap();
+        assert!(
+            !s.contains("executable_refs"),
+            "empty lists are skipped: {s}"
         );
     }
 
@@ -3330,6 +3610,7 @@ mod tests {
             deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
             pinned_hash_first8: "aabbccdd".to_owned(),
             observed_hash_first8: "11223344".to_owned(),
+            observed_executable: None,
         };
         let s = serde_json::to_string(&ev).unwrap();
         let back: EventKind = serde_json::from_str(&s).unwrap();
@@ -3377,6 +3658,67 @@ mod tests {
         );
     }
 
+    /// Round-trip: both drift events carry `observed_executable` when set.
+    #[test]
+    fn event_kind_hash_drift_round_trip_with_observed_executable() {
+        let summary = "external reference owner CAAAA...ABSC4 tag \"v2\" resolved 2233445566778899";
+        for ev in [
+            EventKind::SaVerifierHashDrift {
+                rule_id: 7,
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
+                pinned_hash_first8: "aabbccdd".to_owned(),
+                observed_hash_first8: "2233445566778899".to_owned(),
+                observed_executable: Some(summary.to_owned()),
+            },
+            EventKind::SaPolicyHashDrift {
+                rule_id: 8,
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                deploy_address_redacted: RedactedStrkey::from_already_redacted("CCCCC...DDDDD"),
+                pinned_hash_first8: "eeff0011".to_owned(),
+                observed_hash_first8: "0000000000000000".to_owned(),
+                observed_executable: Some("no code".to_owned()),
+            },
+        ] {
+            let s = serde_json::to_string(&ev).unwrap();
+            let back: EventKind = serde_json::from_str(&s).unwrap();
+            assert_eq!(ev, back);
+            assert!(s.contains("\"observed_executable\":"), "{s}");
+        }
+    }
+
+    /// Missing-field: drift rows without `observed_executable` read it as
+    /// `None`, and `None` is not serialised.
+    #[test]
+    fn event_kind_hash_drift_missing_observed_executable_defaults_none() {
+        for (kind, json) in [
+            (
+                "sa_verifier_hash_drift",
+                r#"{"kind":"sa_verifier_hash_drift","rule_id":7,"smart_account_redacted":"CAAAA...ZZZZZ","deploy_address_redacted":"CBBBB...YYYYY","pinned_hash_first8":"aabbccdd","observed_hash_first8":"11223344"}"#,
+            ),
+            (
+                "sa_policy_hash_drift",
+                r#"{"kind":"sa_policy_hash_drift","rule_id":8,"smart_account_redacted":"CAAAA...ZZZZZ","deploy_address_redacted":"CCCCC...DDDDD","pinned_hash_first8":"eeff0011","observed_hash_first8":"22334455"}"#,
+            ),
+        ] {
+            let back: EventKind = serde_json::from_str(json).unwrap();
+            let observed = match &back {
+                EventKind::SaVerifierHashDrift {
+                    observed_executable,
+                    ..
+                }
+                | EventKind::SaPolicyHashDrift {
+                    observed_executable,
+                    ..
+                } => observed_executable,
+                other => panic!("{kind}: unexpected {other:?}"),
+            };
+            assert_eq!(*observed, None, "{kind}");
+            let s = serde_json::to_string(&back).unwrap();
+            assert!(!s.contains("observed_executable"), "{kind}: {s}");
+        }
+    }
+
     /// Round-trip for `SaPolicyHashDrift`.
     #[test]
     fn event_kind_sa_policy_hash_drift_round_trip() {
@@ -3386,6 +3728,7 @@ mod tests {
             deploy_address_redacted: RedactedStrkey::from_already_redacted("CCCCC...DDDDD"),
             pinned_hash_first8: "eeff0011".to_owned(),
             observed_hash_first8: "22334455".to_owned(),
+            observed_executable: None,
         };
         let s = serde_json::to_string(&ev).unwrap();
         let back: EventKind = serde_json::from_str(&s).unwrap();
@@ -3422,6 +3765,8 @@ mod tests {
             contract_address_redacted: RedactedStrkey::from_already_redacted("CEFFE...11111"),
             contract_kind: ContractKind::Verifier,
             override_acknowledged_at: "2026-05-19T10:00:00Z".to_owned(),
+            executable_owner_redacted: None,
+            executable_tag: None,
         };
         let s = serde_json::to_string(&ev).unwrap();
         let back: EventKind = serde_json::from_str(&s).unwrap();
@@ -3460,6 +3805,49 @@ mod tests {
             result.is_err(),
             "missing-field deserialisation must fail for SaMutableContractOverride"
         );
+    }
+
+    /// Round-trip: `SaMutableContractOverride` with the owner and tag of an
+    /// external-reference executable.
+    #[test]
+    fn event_kind_sa_mutable_contract_override_round_trip_with_executable_ref() {
+        let ev = EventKind::SaMutableContractOverride {
+            rule_id: 0,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            contract_address_redacted: RedactedStrkey::from_already_redacted("CEFFE...11111"),
+            contract_kind: ContractKind::Policy,
+            override_acknowledged_at: "2026-09-26T10:00:00Z".to_owned(),
+            executable_owner_redacted: Some(RedactedStrkey::from_already_redacted("GAAAA...AWHF1")),
+            executable_tag: Some("policy-v1".to_owned()),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: EventKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(ev, back);
+        assert!(
+            s.contains("\"executable_owner_redacted\":\"GAAAA...AWHF1\""),
+            "{s}"
+        );
+        assert!(s.contains("\"executable_tag\":\"policy-v1\""), "{s}");
+    }
+
+    /// Missing-field: override rows without the executable fields read them
+    /// as `None`, and `None` is not serialised.
+    #[test]
+    fn event_kind_sa_mutable_contract_override_missing_executable_fields_default_none() {
+        let json = r#"{"kind":"sa_mutable_contract_override","rule_id":0,"smart_account_redacted":"CAAAA...ZZZZZ","contract_address_redacted":"CEFFE...11111","contract_kind":"verifier","override_acknowledged_at":"2026-05-19T10:00:00Z"}"#;
+        let back: EventKind = serde_json::from_str(json).unwrap();
+        let EventKind::SaMutableContractOverride {
+            executable_owner_redacted,
+            executable_tag,
+            ..
+        } = &back
+        else {
+            panic!("expected SaMutableContractOverride, got {back:?}");
+        };
+        assert_eq!(*executable_owner_redacted, None);
+        assert_eq!(*executable_tag, None);
+        let s = serde_json::to_string(&back).unwrap();
+        assert!(!s.contains("executable_"), "{s}");
     }
 
     /// Round-trip for `SaUnknownContractOverride`.

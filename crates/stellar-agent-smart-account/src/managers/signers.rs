@@ -86,18 +86,6 @@ use crate::signers::types::{
 };
 use crate::weighted_threshold_policy::WEIGHTED_THRESHOLD_POLICY_WASM_HASHES;
 
-/// Context passed to wasm-hash allowlist error constructors.
-pub(crate) struct NotInAllowlistContext {
-    /// Rule whose referenced contract failed the allowlist check.
-    pub(crate) rule_id: u32,
-    /// Redacted smart-account C-strkey.
-    pub(crate) smart_account_redacted: String,
-    /// Observed wasm-hash first eight hex characters, or `"none"`.
-    pub(crate) observed_hash_first8: String,
-    /// Request correlation ID.
-    pub(crate) request_id: String,
-}
-
 /// Weighted-threshold policy's on-chain view state: the current threshold
 /// and per-signer weight map.
 ///
@@ -3483,25 +3471,21 @@ impl SignersManager {
 
     // ── identify_verifier ─────────────────────────────────────────────────────
 
-    /// Identifies a deployed verifier contract by its wasm hash.
+    /// Identifies a deployed verifier contract by its effective wasm hash.
     ///
-    /// Fetches the wasm-hash of `verifier_addr` via two-RPC parallel
-    /// `getLedgerEntries` (`LedgerKey::ContractData { key:
-    /// LedgerKeyContractInstance }`) and matches against
-    /// [`crate::VERIFIER_ALLOWLIST`].  Exactly one match is required; zero
-    /// matches return [`SaError::VerifierWasmNotInAllowlist`] (fail-closed).
+    /// Observes `verifier_addr` via `SignersManager::observe_contract` and
+    /// matches the effective hash against [`crate::VERIFIER_ALLOWLIST`]. An
+    /// external reference identifies as the allowlisted code its tag
+    /// resolves to at this ledger; the owner can repoint it later, so the
+    /// install path pins the reference itself and treats it as mutable.
+    /// Zero matches return [`SaError::VerifierWasmNotInAllowlist`]
+    /// (fail-closed).
     ///
-    /// Returns the matched wasm hash on success.  The hash is the data needed
-    /// for pinning at rule-install time.
+    /// Returns the matched effective hash on success.
     ///
     /// For drift-detection at signing time where allowlist enforcement is not
     /// desired (comparison is against the pinned value), use
-    /// `fetch_observed_wasm_hash` instead.
-    ///
-    /// Mirrors [`SignersManager::identify_threshold_policy`] but accepts a
-    /// direct verifier address instead of fetching a context rule (verifiers
-    /// are looked up by address; policies are looked up via the rule's
-    /// `policies` list).
+    /// `fetch_observed_executable` instead.
     ///
     /// # Arguments
     ///
@@ -3516,22 +3500,23 @@ impl SignersManager {
     ///
     /// # Errors
     ///
-    /// - [`SaError::VerifierWasmNotInAllowlist`] — zero allowlist matches
-    ///   (fail-closed; allowlist is the authoritative gate).
+    /// - [`SaError::VerifierWasmNotInAllowlist`]: no code, or an effective
+    ///   hash outside the allowlist (fail-closed; allowlist is the
+    ///   authoritative gate).
     /// - [`SaError::ContractInstanceUnsupported`] — the verifier's executable
-    ///   is an owner-managed external reference (reason
-    ///   `ExternalRefExecutable`) or an endpoint returned a malformed entry
+    ///   is an external reference with no live tag entry (reason
+    ///   `ExternalRefUnresolved`) or an endpoint returned a malformed entry
     ///   (reason `UndecodableInstance`); no flag overrides it.
     /// - [`SaError::NetworkRpcDivergence`] — primary and secondary RPC disagree
-    ///   on the contract's wasm hash before the allowlist check runs.
+    ///   on the contract's executable before the allowlist check runs.
     /// - [`SaError::DeploymentFailed`] (phase `"simulate"`) — `getLedgerEntries`
     ///   RPC failure on primary or secondary.
     ///
     /// # Implements
     ///
-    /// Verifier pinning: matches the live on-chain wasm hash against the
+    /// Verifier pinning: matches the live on-chain effective hash against the
     /// allowlist before any rule-install operation, ensuring only approved
-    /// verifier contracts can be referenced.
+    /// verifier code can be referenced.
     pub async fn identify_verifier(
         &self,
         smart_account: ScAddress,
@@ -3546,92 +3531,61 @@ impl SignersManager {
         // but not used directly — smart_account_redacted populates forensic fields.
         let _ = source_account_strkey;
 
-        // Fetch the observed wasm hash via two-RPC consultation. Allowlist
-        // enforcement is done below against VERIFIER_ALLOWLIST[i].wasm_hash,
-        // not at the fetch layer.
-        let observed_hash = fetch_observed_wasm_hash(
-            &self.primary_rpc_client,
-            &self.secondary_rpc_client,
-            &verifier_addr,
-            ContractKind::Verifier,
-            rule_id,
-            &smart_account_redacted,
-            &request_id,
-        )
-        .await?;
+        let observation = self
+            .observe_contract(
+                &verifier_addr,
+                ContractKind::Verifier,
+                verifier_hash_allowlisted,
+                rule_id,
+                &smart_account_redacted,
+                &request_id,
+            )
+            .await?;
 
-        let Some(hash) = observed_hash else {
+        if !observation.allowlisted {
             return Err(SaError::VerifierWasmNotInAllowlist {
                 rule_id,
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted,
                 ),
-                observed_hash_first8: "none".to_owned(),
-                request_id,
-            });
-        };
-
-        let observed_hash_first8 = hash[..8]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
-
-        debug!(
-            wasm_hash_first8 = %observed_hash_first8,
-            "identify_verifier: observed verifier wasm hash"
-        );
-
-        // Allowlist check against VERIFIER_ALLOWLIST.
-        if !crate::VERIFIER_ALLOWLIST
-            .iter()
-            .any(|entry| entry.wasm_hash == hash)
-        {
-            return Err(SaError::VerifierWasmNotInAllowlist {
-                rule_id,
-                smart_account_redacted: RedactedStrkey::from_already_redacted(
-                    smart_account_redacted,
-                ),
-                observed_hash_first8,
+                observed_hash_first8: observation.observed_hash_first8(),
                 request_id,
             });
         }
 
-        Ok(hash)
+        Ok(observation.effective_hash)
     }
 
-    /// Identifies a deployed contract by two-RPC wasm-hash lookup and allowlist match.
+    /// Observes a deployed verifier or policy contract and decides whether
+    /// its effective hash is allowlisted.
     ///
-    /// The helper centralises the common verifier/policy shape: fetch a single
-    /// contract instance's wasm hash from primary and secondary RPCs, fail on
-    /// RPC disagreement, then require the observed hash to appear in `allowlist`.
+    /// Fetches the executable via [`fetch_observed_executable`] (two-RPC,
+    /// with an external reference resolved at each endpoint). An external
+    /// reference with no live tag entry is refused before any allowlist
+    /// decision, because it names no code the wallet can pin. Otherwise the
+    /// returned [`ContractObservation`] carries the executable, its effective
+    /// hash (zero for no code) and whether `is_allowlisted` accepts that
+    /// hash; no code is never allowlisted.
     ///
-    /// `contract_kind` names the role of `contract_addr` in a
-    /// [`SaError::ContractInstanceUnsupported`] refusal.
+    /// `contract_kind` names the role of `contract_addr` in a refusal.
     ///
     /// # Errors
     ///
-    /// - [`SaError::ContractInstanceUnsupported`] — the instance is an
-    ///   owner-managed external reference or an endpoint returned a malformed
-    ///   entry; no flag overrides it.
+    /// - [`SaError::ContractInstanceUnsupported`]: an external reference
+    ///   with no live tag entry (reason `ExternalRefUnresolved`), or a
+    ///   malformed entry (reason `UndecodableInstance`); no flag overrides it.
     /// - [`SaError::NetworkRpcDivergence`] — primary and secondary RPC disagree.
     /// - [`SaError::DeploymentFailed`] — RPC fetch failed.
-    /// - The caller-provided `not_in_allowlist_err` when the contract is absent
-    ///   or its hash is not in `allowlist`.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "contract identity + role + allowlist + forensic fields + caller-specific refusal constructor"
-    )]
-    pub(crate) async fn identify_contract_wasm_hash(
+    pub(crate) async fn observe_contract(
         &self,
         contract_addr: &ScAddress,
         contract_kind: ContractKind,
-        allowlist: &'static [[u8; 32]],
+        is_allowlisted: impl Fn(&[u8; 32]) -> bool,
         rule_id: u32,
         smart_account_redacted: &str,
         request_id: &str,
-        not_in_allowlist_err: impl FnOnce(NotInAllowlistContext) -> SaError,
-    ) -> Result<[u8; 32], SaError> {
-        let observed_hash = fetch_observed_wasm_hash(
+    ) -> Result<ContractObservation, SaError> {
+        let observed = fetch_observed_executable(
             &self.primary_rpc_client,
             &self.secondary_rpc_client,
             contract_addr,
@@ -3642,39 +3596,50 @@ impl SignersManager {
         )
         .await?;
 
-        let Some(hash) = observed_hash else {
-            return Err(not_in_allowlist_err(NotInAllowlistContext {
-                rule_id,
-                smart_account_redacted: smart_account_redacted.to_owned(),
-                observed_hash_first8: "none".to_owned(),
-                request_id: request_id.to_owned(),
-            }));
-        };
-
         let contract_redacted = scaddress_to_strkey(contract_addr)
             .map(|s| redact_strkey_first5_last5(&s))
             .unwrap_or_else(|_| "unknown".to_owned());
-        let observed_hash_first8 = hash[..8]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
+
+        if let ObservedExecutable::ExternalRef(external) = &observed
+            && external.resolved.is_none()
+        {
+            warn!(
+                contract_redacted = %contract_redacted,
+                contract_kind = %contract_kind,
+                owner_redacted = %external.owner_redacted(),
+                tag = %external.tag_display(),
+                rule_id,
+                "observe_contract: external reference has no live tag entry; refusing"
+            );
+            return Err(SaError::ContractInstanceUnsupported {
+                rule_id,
+                contract_kind,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
+                ),
+                contract_address_redacted: RedactedStrkey::from_already_redacted(contract_redacted),
+                reason: AdminOrOwnerKey::ExternalRefUnresolved,
+                request_id: request_id.to_owned(),
+            });
+        }
+
+        let effective = observed.effective_hash();
+        let observation = ContractObservation {
+            allowlisted: effective.is_some_and(|hash| is_allowlisted(&hash)),
+            effective_hash: effective.unwrap_or([0u8; 32]),
+            observed,
+        };
 
         debug!(
             contract = %contract_redacted,
-            wasm_hash_first8 = %observed_hash_first8,
-            "identify_contract_wasm_hash: observed contract wasm hash"
+            contract_kind = %contract_kind,
+            executable = %observation.observed.summary(),
+            wasm_hash_first8 = %observation.observed_hash_first8(),
+            allowlisted = observation.allowlisted,
+            "observe_contract: observed contract executable"
         );
 
-        if !allowlist.iter().any(|allowed| allowed == &hash) {
-            return Err(not_in_allowlist_err(NotInAllowlistContext {
-                rule_id,
-                smart_account_redacted: smart_account_redacted.to_owned(),
-                observed_hash_first8,
-                request_id: request_id.to_owned(),
-            }));
-        }
-
-        Ok(hash)
+        Ok(observation)
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
@@ -4524,17 +4489,34 @@ fn compute_post_op_invariant(
     Ok(())
 }
 
-/// Fetches the wasm hash of each `ContractInstance` from a ledger-entries response.
+/// Fetches the effective Wasm hash of each `ContractInstance` from one
+/// endpoint.
 ///
-/// Generic over any contract address slice — used for both policy contracts
-/// (via `identify_threshold_policy`) and verifier contracts (via
-/// `identify_verifier`).
+/// Generic over any contract address slice; its consumers are the on-chain
+/// policy identification helpers `identify_threshold_policy`,
+/// `identify_spending_limit_policy`, `identify_weighted_threshold_policy` and
+/// `classify_rule_policies`. The three identify helpers compare aligned
+/// results from both endpoints. The display-only `classify_rule_policies`
+/// uses the primary endpoint.
 ///
 /// Returns `Vec<Option<[u8; 32]>>` **aligned with `keys`**:
-/// `Some(hash)` when the key resolved to a WASM contract instance, `None`
-/// when the key was absent from the ledger or resolved to a non-WASM entry.
-/// The caller may zip this result with the original contract address slice using
-/// index position — no positional drift can occur because the lengths match.
+/// - `Some(hash)` when the key resolved to a Wasm contract instance, or to a
+///   CAP-85 external-reference instance whose owner's tag entry holds a
+///   32-byte hash.
+/// - `None` when the key was absent from the ledger, resolved to a
+///   non-Wasm, non-reference executable or an undecodable entry, or resolved
+///   to an external reference whose tag entry is not live, does not decode or
+///   does not hold a 32-byte hash.
+///
+/// The caller may zip this result with the original contract address slice
+/// using index position; no positional drift can occur because the lengths
+/// match.
+///
+/// External references are resolved with one more `getLedgerEntries` on the
+/// same endpoint for every distinct tag key found, matched by key. The
+/// resolved hash identifies the code the reference runs at this ledger; it is
+/// owner-mutable, so the result is a snapshot for the caller's allowlist
+/// decision and is never stored as a pin.
 ///
 /// The `LedgerEntryResult.xdr` field from `stellar-rpc-client` (rs-stellar-rpc-client)
 /// contains `LedgerEntryData` XDR — NOT a full `LedgerEntry` wrapper.
@@ -4554,74 +4536,124 @@ fn compute_post_op_invariant(
 /// the established known-working reference for the
 /// `getLedgerEntries` + `ContractData` + `ContractInstance::executable` walk.
 ///
-/// # Visibility
+/// # Errors
 ///
-/// `pub(crate)` — exposed to `managers::verifiers::identify_policy_wasm_hash`
-/// for `pin_referenced_contracts`.
+/// Returns a non-sensitive description when either `getLedgerEntries` request
+/// fails.
 pub(crate) async fn fetch_contract_wasm_hashes(
     client: &StellarRpcClient,
     keys: &[LedgerKey],
 ) -> Result<Vec<Option<[u8; 32]>>, String> {
-    use stellar_xdr::{ContractExecutable, LedgerEntryData, LedgerKey as XdrLedgerKey, ReadXdr};
+    use stellar_xdr::ContractExecutable;
 
     if keys.is_empty() {
         return Ok(vec![]);
     }
+
+    // Instance data per request position. A malformed key or entry is
+    // skipped and leaves its position `None`.
+    let instances = fetch_entries_by_key(client, keys).await?;
+
+    let mut hashes: Vec<Option<[u8; 32]>> = vec![None; keys.len()];
+    // Request position -> index into `tag_keys` for external references.
+    let mut tag_key_index: Vec<Option<usize>> = vec![None; keys.len()];
+    let mut tag_keys: Vec<LedgerKey> = Vec::new();
+
+    for (pos, entry_data) in instances.into_iter().enumerate() {
+        let Some(stellar_xdr::LedgerEntryData::ContractData(cd)) = entry_data else {
+            continue;
+        };
+        let ScVal::ContractInstance(instance) = &cd.val else {
+            continue;
+        };
+        match &instance.executable {
+            ContractExecutable::Wasm(Hash(bytes)) => hashes[pos] = Some(*bytes),
+            ContractExecutable::ExternalRef(external) => {
+                let tag_key = stellar_agent_network::executable_tag_ledger_key(
+                    &external.executable_owner,
+                    &external.tag,
+                );
+                let index = match tag_keys.iter().position(|k| k == &tag_key) {
+                    Some(index) => index,
+                    None => {
+                        tag_keys.push(tag_key);
+                        tag_keys.len() - 1
+                    }
+                };
+                tag_key_index[pos] = Some(index);
+            }
+            ContractExecutable::StellarAsset => {}
+        }
+    }
+
+    if tag_keys.is_empty() {
+        return Ok(hashes);
+    }
+
+    // Resolve every tag key at the same endpoint. No live tag entry, an
+    // undecodable entry, or a value that is not a 32-byte hash leaves the
+    // referencing positions `None`.
+    let resolved: Vec<Option<[u8; 32]>> = fetch_entries_by_key(client, &tag_keys)
+        .await?
+        .into_iter()
+        .map(|entry_data| match entry_data {
+            Some(stellar_xdr::LedgerEntryData::ContractData(tag_entry)) => match &tag_entry.val {
+                ScVal::Bytes(bytes) => <[u8; 32]>::try_from(bytes.0.as_vec().as_slice()).ok(),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+
+    for (pos, index) in tag_key_index.into_iter().enumerate() {
+        if let Some(index) = index {
+            hashes[pos] = resolved.get(index).copied().flatten();
+        }
+    }
+
+    Ok(hashes)
+}
+
+/// Requests `keys` from one endpoint and returns the decoded
+/// `LedgerEntryData` of the entry whose own key equals each requested key,
+/// aligned with `keys`.
+///
+/// Both the entry key and the entry data come from an untrusted RPC response
+/// and are decoded under the depth- and length-bounded untrusted-decode
+/// limits. A returned entry whose key or data does not decode, or whose key
+/// was not requested, is skipped, so its position reads `None` like a
+/// missing entry.
+async fn fetch_entries_by_key(
+    client: &StellarRpcClient,
+    keys: &[LedgerKey],
+) -> Result<Vec<Option<stellar_xdr::LedgerEntryData>>, String> {
+    use stellar_xdr::{LedgerEntryData, ReadXdr};
 
     let response = client
         .get_ledger_entries(keys)
         .await
         .map_err(|e| format!("get_ledger_entries failed: {e}"))?;
 
-    let raw_entries = response.entries.unwrap_or_default();
-
-    // Build a position-keyed map: key_index → wasm_hash.
-    // `LedgerEntryResult.key` is base64-encoded `LedgerKey` XDR.
-    // `LedgerEntryResult.xdr` is base64-encoded `LedgerEntryData` XDR.
-    // Both fields confirmed from the `stellar-rpc-client` (rs-stellar-rpc-client)
-    // `LedgerEntryResult` struct.
-    let mut hash_by_key_pos: std::collections::HashMap<usize, [u8; 32]> =
-        std::collections::HashMap::new();
-
-    for entry_result in &raw_entries {
-        // Decode the response key to match it against our request keys by position.
-        let response_key = match XdrLedgerKey::from_xdr_base64(
+    let mut by_pos: Vec<Option<LedgerEntryData>> = vec![None; keys.len()];
+    for entry_result in response.entries.unwrap_or_default() {
+        let Ok(response_key) = LedgerKey::from_xdr_base64(
             &entry_result.key,
             stellar_agent_xdr_limits::untrusted_decode_limits(entry_result.key.len()),
-        ) {
-            Ok(k) => k,
-            Err(_) => continue, // skip malformed key — safe, only loses one entry
+        ) else {
+            continue;
         };
-
-        // Find the position in our request key slice that matches this response key.
         let Some(pos) = keys.iter().position(|k| k == &response_key) else {
-            continue; // response contains an entry not in our request — skip
+            continue;
         };
-
-        // Decode the entry data.
-        // `LedgerEntryResult.xdr` contains `LedgerEntryData` XDR (not a full LedgerEntry).
-        // Confirmed from `stellar-rpc-client` (rs-stellar-rpc-client): `LedgerEntryResult.xdr`
-        // holds `LedgerEntryData`, decoded via `LedgerEntryData::from_xdr_base64`.
-        let entry_data = match LedgerEntryData::from_xdr_base64(
+        let Ok(entry_data) = LedgerEntryData::from_xdr_base64(
             &entry_result.xdr,
             stellar_agent_xdr_limits::untrusted_decode_limits(entry_result.xdr.len()),
-        ) {
-            Ok(d) => d,
-            Err(_) => continue, // skip malformed entry — safe
+        ) else {
+            continue;
         };
-
-        if let LedgerEntryData::ContractData(cd) = &entry_data
-            && let ScVal::ContractInstance(instance) = &cd.val
-            && let ContractExecutable::Wasm(Hash(bytes)) = &instance.executable
-        {
-            hash_by_key_pos.insert(pos, *bytes);
-        }
+        by_pos[pos] = Some(entry_data);
     }
-
-    // Build the aligned result vector: Some(hash) for resolved keys, None for missing.
-    Ok((0..keys.len())
-        .map(|i| hash_by_key_pos.get(&i).copied())
-        .collect())
+    Ok(by_pos)
 }
 
 #[cfg(feature = "test-helpers")]
@@ -4690,56 +4722,139 @@ fn mock_migration_submit_result(
     }))
 }
 
-/// Fetches the wasm hash of a single deployed contract via two-RPC consultation,
-/// WITHOUT allowlist enforcement.
+/// The executable a verifier or policy contract instance runs, as agreed by
+/// the primary and secondary endpoints.
 ///
-/// This is the lower-level primitive underlying [`SignersManager::identify_verifier`].
-/// It delegates the two-RPC fetch and divergence check to
-/// [`stellar_agent_network::fetch_contract_wasm_hash`], then maps the
-/// [`stellar_agent_network::WasmHashFetch`] outcome:
-/// `Wasm(h)` → `Some(h)`, `Sac` and `Absent` → `None`, and `ExternalRef` →
-/// [`SaError::ContractInstanceUnsupported`] with reason
-/// [`AdminOrOwnerKey::ExternalRefExecutable`].
+/// `NoCode` covers an absent instance and a Stellar Asset Contract, neither of
+/// which has a Wasm hash. An external reference carries the owner, the tag
+/// and the hash the owner's tag entry held when it was read (`None` when no
+/// tag entry was live).
 ///
-/// An external reference is never mapped to `None`: the `None` callers below
-/// substitute the zero hash, and no pin describes owner-mutable code.
+/// The `Debug` form renders an external reference's owner and tag through
+/// their bounded renderings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ObservedExecutable {
+    /// Ordinary Wasm executable with its 32-byte hash.
+    Wasm([u8; 32]),
+    /// No instance, or a Stellar Asset Contract: no Wasm hash.
+    NoCode,
+    /// CAP-85 external reference: the owner decides which Wasm runs.
+    ExternalRef(stellar_agent_network::ExternalRefExecutable),
+}
+
+impl ObservedExecutable {
+    /// Returns the hash of the code the instance runs: the Wasm hash, the
+    /// hash an external reference resolved to, or `None` for no code and for
+    /// an external reference with no live tag entry.
+    #[must_use]
+    pub fn effective_hash(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Wasm(hash) => Some(*hash),
+            Self::NoCode => None,
+            Self::ExternalRef(external) => external.resolved,
+        }
+    }
+
+    /// Returns a bounded summary for drift rows and errors: `wasm`,
+    /// `no code`, or `external reference owner <redacted> tag "<bounded>"
+    /// resolved <first-8 hex or unset>`.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Wasm(_) => "wasm".to_owned(),
+            Self::NoCode => "no code".to_owned(),
+            Self::ExternalRef(external) => format!(
+                "external reference owner {} tag \"{}\" resolved {}",
+                external.owner_redacted(),
+                external.tag_display(),
+                external
+                    .resolved
+                    .map_or_else(|| "unset".to_owned(), |hash| hash_first8_hex(&hash)),
+            ),
+        }
+    }
+}
+
+/// Returns `true` when `hash` is the Wasm hash of a
+/// [`crate::VERIFIER_ALLOWLIST`] entry.
+pub(crate) fn verifier_hash_allowlisted(hash: &[u8; 32]) -> bool {
+    crate::VERIFIER_ALLOWLIST
+        .iter()
+        .any(|entry| &entry.wasm_hash == hash)
+}
+
+/// Returns `true` when `hash` is one of the
+/// [`THRESHOLD_POLICY_WASM_HASHES`] a rule-install policy pin accepts.
+pub(crate) fn policy_hash_allowlisted(hash: &[u8; 32]) -> bool {
+    THRESHOLD_POLICY_WASM_HASHES
+        .iter()
+        .any(|allowed| allowed == hash)
+}
+
+/// Returns lower-case hex of the first 8 bytes of `hash`, the first-8
+/// projection the audit rows, pins and errors carry.
+pub(crate) fn hash_first8_hex(hash: &[u8; 32]) -> String {
+    hash[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Identification result of one verifier or policy contract: the observed
+/// executable, its effective hash, and whether that hash is allowlisted.
+#[derive(Clone, Debug)]
+pub(crate) struct ContractObservation {
+    /// The executable both endpoints agreed on.
+    pub(crate) observed: ObservedExecutable,
+    /// The effective hash, or the zero hash for no code.
+    pub(crate) effective_hash: [u8; 32],
+    /// `true` when the instance has code and its effective hash is in the
+    /// caller's allowlist.
+    pub(crate) allowlisted: bool,
+}
+
+impl ContractObservation {
+    /// First-8 hex of the effective hash, or `"none"` for no code; the form
+    /// the allowlist-miss errors and override rows carry.
+    pub(crate) fn observed_hash_first8(&self) -> String {
+        match self.observed {
+            ObservedExecutable::NoCode => "none".to_owned(),
+            _ => hash_first8_hex(&self.effective_hash),
+        }
+    }
+}
+
+/// Fetches the executable of a single deployed contract via two-RPC
+/// consultation, WITHOUT allowlist enforcement.
 ///
-/// The `None` mapping is deliberate and per-caller:
-/// - `identify_verifier` (install-time) — treats `None` as not-in-allowlist.
-/// - `pin_referenced_contracts` `accept_unknown_verifier` branch (install-time
-///   override) — calls `.unwrap_or([0u8; 32])` to store the zero hash for an
-///   absent or SAC contract; drift detection later compares the live hash
-///   against this pin.
-/// - `verify_pinned_verifier_against_chain` (signing-time drift detection) —
-///   calls `.unwrap_or([0u8; 32])` so a zero-pinned entry (from the absent-entry
-///   path above) compares equal to a zero observed value, passing cleanly.
+/// This is the lower-level primitive underlying
+/// [`SignersManager::observe_contract`], the signing-time drift check and the
+/// migration planner. It delegates the two-RPC fetch and divergence check to
+/// [`stellar_agent_network::fetch_contract_wasm_hash`], which resolves an
+/// external reference's tag entry at each endpoint, then maps the
+/// [`stellar_agent_network::WasmHashFetch`] outcome: `Wasm(h)` to
+/// [`ObservedExecutable::Wasm`], `Sac` and `Absent` to
+/// [`ObservedExecutable::NoCode`], and `ExternalRef` to
+/// [`ObservedExecutable::ExternalRef`], resolved or not. Each caller applies
+/// its own policy to the observation.
 ///
-/// `contract_kind` names the role of `contract_addr` in the refusal.
-///
-/// # Returns
-///
-/// - `Ok(Some(hash))` — two-RPC agreement reached; contract is present and is a
-///   WASM instance.
-/// - `Ok(None)` — two-RPC agreement reached; contract is absent from the ledger
-///   or is a Stellar Asset Contract (SAC); callers apply their per-caller absent
-///   semantics (see above).
+/// `contract_kind` names the role of `contract_addr` in a refusal.
 ///
 /// # Errors
 ///
-/// - [`SaError::ContractInstanceUnsupported`] — the instance's executable is an
-///   owner-managed external reference (reason `ExternalRefExecutable`), or an
-///   endpoint returned a malformed instance or tag entry (reason
-///   `UndecodableInstance`). No flag overrides either refusal.
-/// - [`SaError::NetworkRpcDivergence`] — primary and secondary RPC responses differ.
+/// - [`SaError::ContractInstanceUnsupported`]: an endpoint returned a
+///   malformed instance or tag entry (reason `UndecodableInstance`), or an
+///   outcome this crate does not know (reason `NonWasmExecutable`). No flag
+///   overrides either refusal.
+/// - [`SaError::NetworkRpcDivergence`]: primary and secondary RPC responses
+///   differ, including on an external reference's owner, tag or resolved hash.
 /// - [`SaError::DeploymentFailed`] (phase `"simulate"`) — `getLedgerEntries` RPC
 ///   failure on primary or secondary.
 ///
 /// # Implements
 ///
-/// Verifier pinning: fetches the live on-chain wasm hash without allowlist
-/// enforcement, for use in drift detection (signing-time) and the
-/// `accept_unknown_verifier` install-time override path.
-pub(crate) async fn fetch_observed_wasm_hash(
+/// Verifier pinning: fetches the live on-chain executable without allowlist
+/// enforcement, for install-time identification, signing-time drift
+/// detection and migration planning.
+pub(crate) async fn fetch_observed_executable(
     primary: &StellarRpcClient,
     secondary: &StellarRpcClient,
     contract_addr: &ScAddress,
@@ -4747,14 +4862,14 @@ pub(crate) async fn fetch_observed_wasm_hash(
     rule_id: u32,
     smart_account_redacted: &str,
     request_id: &str,
-) -> Result<Option<[u8; 32]>, SaError> {
+) -> Result<ObservedExecutable, SaError> {
     use stellar_agent_network::{
         FetchContractWasmHashError, WasmHashFetch, fetch_contract_wasm_hash,
     };
 
     // Convert ScAddress to strkey so the shared primitive can parse it.
-    // scaddress_to_strkey only fails for exotic non-Contract / non-Account variants;
-    // all callers of fetch_observed_wasm_hash pass contract addresses (C-strkeys).
+    // scaddress_to_strkey only fails for exotic non-Contract / non-Account
+    // variants; every caller passes a contract address (C-strkey).
     let strkey = scaddress_to_strkey(contract_addr)?;
     let unsupported = |reason: AdminOrOwnerKey| SaError::ContractInstanceUnsupported {
         rule_id,
@@ -4766,23 +4881,9 @@ pub(crate) async fn fetch_observed_wasm_hash(
     };
 
     match fetch_contract_wasm_hash(primary, Some(secondary), &strkey).await {
-        Ok(WasmHashFetch::Wasm(hash)) => Ok(Some(hash)),
-        // SAC and Absent both map to None — per-caller absent handling
-        // (unwrap_or([0u8;32]) or not-in-allowlist error) is applied at each call site.
-        Ok(WasmHashFetch::Sac | WasmHashFetch::Absent) => Ok(None),
-        Ok(WasmHashFetch::ExternalRef(external)) => {
-            warn!(
-                contract_redacted = %redact_strkey_first5_last5(&strkey),
-                contract_kind = %contract_kind,
-                owner_redacted = %external.owner_redacted(),
-                tag = %external.tag_display(),
-                resolved_first8 = %external.resolved_first8(),
-                rule_id,
-                "fetch_observed_wasm_hash: executable is an owner-managed external \
-                 reference; refusing"
-            );
-            Err(unsupported(AdminOrOwnerKey::ExternalRefExecutable))
-        }
+        Ok(WasmHashFetch::Wasm(hash)) => Ok(ObservedExecutable::Wasm(hash)),
+        Ok(WasmHashFetch::Sac | WasmHashFetch::Absent) => Ok(ObservedExecutable::NoCode),
+        Ok(WasmHashFetch::ExternalRef(external)) => Ok(ObservedExecutable::ExternalRef(external)),
         // WasmHashFetch is #[non_exhaustive]: an outcome this crate does not
         // know is not a Wasm executable and carries no hash the wallet can
         // pin, so it is refused and never read as absent.
@@ -4793,7 +4894,7 @@ pub(crate) async fn fetch_observed_wasm_hash(
                 contract_kind = %contract_kind,
                 reason = %reason,
                 rule_id,
-                "fetch_observed_wasm_hash: malformed ledger entry; refusing"
+                "fetch_observed_executable: malformed ledger entry; refusing"
             );
             Err(unsupported(AdminOrOwnerKey::UndecodableInstance))
         }
@@ -6143,7 +6244,7 @@ mod tests {
     // ── Cross-impl WASM-hash parity gate ─────────────────────────────────────
 
     /// Asserts that `fetch_contract_wasm_hash` (the shared network primitive, also
-    /// used by `fetch_observed_wasm_hash`) and
+    /// used by `fetch_observed_executable`) and
     /// `fetch_contract_wasm_hashes` (the multi-key batch primitive used by
     /// `identify_threshold_policy`) extract an IDENTICAL 32-byte WASM hash from
     /// the SAME shared fixture bytes.
@@ -6164,11 +6265,11 @@ mod tests {
     ///
     /// The remaining nominal variants — `Divergent` (two-RPC disagreement) and
     /// `Unavailable` (fetch error) — are covered at the shared network-primitive
-    /// level by `wasm_hash.rs` unit tests; `fetch_observed_wasm_hash` maps those
+    /// level by `wasm_hash.rs` unit tests; `fetch_observed_executable` maps those
     /// errors to `SaError::NetworkRpcDivergence` / `SaError::DeploymentFailed`.
     ///
     /// If this test fails after a parser change in either crate, the unification
-    /// in `fetch_observed_wasm_hash` must be revisited before sealing.
+    /// in `fetch_observed_executable` must be revisited before sealing.
     #[tokio::test]
     async fn wasm_hash_parse_parity_network_vs_smart_account() {
         use stellar_agent_network::WasmHashFetch;
@@ -6285,9 +6386,8 @@ mod tests {
     ///
     /// - **Network primitive** (`fetch_contract_wasm_hash`) → `WasmHashFetch::Sac`
     /// - **Smart-account primitive** (`fetch_contract_wasm_hashes`) → `None` for
-    ///   that entry (the Wasm-only match arm in `signers.rs:2713-2718` does not
-    ///   fire for `StellarAsset`; the entry is absent from `hash_by_key_pos`;
-    ///   the aligned-result vector yields `None`).
+    ///   that entry (a `StellarAsset` executable has no Wasm hash and no tag
+    ///   entry to resolve, so the aligned-result vector yields `None`).
     ///
     /// This is the "non-Wasm / SAC" case in the `# Coverage` block of
     /// `wasm_hash_parse_parity_network_vs_smart_account`.  It is a sibling test
@@ -6351,13 +6451,8 @@ mod tests {
         );
 
         // ── Path B: smart-account primitive ─────────────────────────────────
-        // Expected: None — the Wasm-only match arm does not fire for StellarAsset;
-        // the entry is absent from hash_by_key_pos; aligned result is None.
-        // signers.rs:2713-2718:
-        //   if let LedgerEntryData::ContractData(cd) = &entry_data
-        //      && let ScVal::ContractInstance(instance) = &cd.val
-        //      && let ContractExecutable::Wasm(Hash(bytes)) = &instance.executable
-        //   { hash_by_key_pos.insert(pos, *bytes); }
+        // Expected: None; a StellarAsset executable has no Wasm hash and no
+        // tag entry to resolve, so its aligned position stays None.
         let server_b = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/"))
@@ -6379,16 +6474,16 @@ mod tests {
         assert!(
             sa_entry.is_none(),
             "smart-account primitive must return None for a SAC fixture \
-             (Wasm-only match arm does not fire); got {sa_entry:?}"
+             (no Wasm hash, no tag entry); got {sa_entry:?}"
         );
 
         // ── Agreement assertion ──────────────────────────────────────────────
         // Both parsers agree: this is NOT a plain WASM hash.
-        // Network → Sac (explicit); smart-account → None (Wasm arm skipped).
+        // Network → Sac (explicit); smart-account → None (no hash).
         // Neither returns a 32-byte hash, confirming no false-positive extraction.
     }
 
-    // ── fetch_observed_wasm_hash: external reference and malformed entries ──
+    // ── fetch_observed_executable, observe_contract and the batch fetch ──
 
     const EXTERNAL_REF_CONTRACT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
     const EXTERNAL_REF_OWNER: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
@@ -6423,13 +6518,40 @@ mod tests {
         )))
     }
 
-    /// An external-reference contract is refused with
-    /// `ContractInstanceUnsupported { reason: ExternalRefExecutable }` for the
-    /// supplied contract kind, even when its tag entry resolves to an
-    /// allowlisted verifier hash. It is never mapped to `None`, which callers
-    /// would turn into the zero hash.
+    fn external_ref_instance_key() -> LedgerKey {
+        LedgerKey::ContractData(stellar_xdr::LedgerKeyContractData {
+            contract: external_ref_contract_scaddress(),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: stellar_xdr::ContractDataDurability::Persistent,
+        })
+    }
+
+    fn manager_for(uri: &str) -> (SignersManager, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir must succeed");
+        let audit_log_path = dir.path().join("audit.jsonl");
+        let audit_writer = Arc::new(Mutex::new(
+            AuditWriter::open(audit_log_path.clone(), None)
+                .expect("AuditWriter::open must succeed"),
+        ));
+        let manager = SignersManager::new(SignersManagerConfig::new(
+            uri.to_owned(),
+            uri.to_owned(),
+            audit_writer,
+            audit_log_path,
+            "Test SDF Network ; September 2015".to_owned(),
+            "test-profile".to_owned(),
+            Duration::from_secs(5),
+            "stellar:testnet".to_owned(),
+        ))
+        .expect("manager construction must succeed");
+        (manager, dir)
+    }
+
+    /// An external-reference contract is observed, not refused: the fetch
+    /// reports the owner, the tag and the resolved hash for either contract
+    /// kind, and the effective hash is the resolved hash.
     #[tokio::test]
-    async fn fetch_observed_wasm_hash_refuses_external_ref_for_each_kind() {
+    async fn fetch_observed_executable_reports_external_ref_for_each_kind() {
         let allowlisted = crate::VERIFIER_ALLOWLIST[0].wasm_hash;
         for kind in [ContractKind::Verifier, ContractKind::Policy] {
             let server1 = external_ref_responder(allowlisted).serve().await;
@@ -6437,7 +6559,7 @@ mod tests {
             let server2 = external_ref_responder(allowlisted).serve().await;
             let secondary = StellarRpcClient::new(&server2.uri()).expect("client");
 
-            let result = fetch_observed_wasm_hash(
+            let observed = fetch_observed_executable(
                 &primary,
                 &secondary,
                 &external_ref_contract_scaddress(),
@@ -6446,31 +6568,30 @@ mod tests {
                 "CSMART...ACCNT",
                 "req-1",
             )
-            .await;
+            .await
+            .unwrap_or_else(|e| panic!("{kind}: external reference must be observed: {e}"));
 
-            let Err(SaError::ContractInstanceUnsupported {
-                rule_id,
-                contract_kind,
-                contract_address_redacted,
-                reason,
-                request_id,
-                ..
-            }) = result
-            else {
-                panic!("expected ContractInstanceUnsupported for {kind}; got {result:?}");
+            let ObservedExecutable::ExternalRef(external) = &observed else {
+                panic!("{kind}: expected ExternalRef, got {observed:?}");
             };
-            assert_eq!(reason, AdminOrOwnerKey::ExternalRefExecutable);
-            assert_eq!(contract_kind, kind);
-            assert_eq!(rule_id, 7);
-            assert_eq!(request_id, "req-1");
-            assert_eq!(contract_address_redacted.as_str(), "CAAAA...AD2KM");
+            assert_eq!(external.owner_redacted(), "GAAAA...AAWHF");
+            assert_eq!(external.tag_display(), "verifier");
+            assert_eq!(external.resolved, Some(allowlisted));
+            assert_eq!(observed.effective_hash(), Some(allowlisted));
+            assert_eq!(
+                observed.summary(),
+                format!(
+                    "external reference owner GAAAA...AAWHF tag \"verifier\" resolved {}",
+                    hash_first8_hex(&allowlisted)
+                )
+            );
         }
     }
 
     /// A malformed instance entry is refused with reason `UndecodableInstance`,
     /// never read as absent.
     #[tokio::test]
-    async fn fetch_observed_wasm_hash_refuses_malformed_entry_as_undecodable_instance() {
+    async fn fetch_observed_executable_refuses_malformed_entry_as_undecodable_instance() {
         use stellar_agent_test_support::{KeyedLedgerEntriesResponder, xdr_fixtures};
 
         let mut instance = xdr_fixtures::ledger_entry_from_response_json(
@@ -6483,7 +6604,7 @@ mod tests {
         let server2 = responder.serve().await;
         let secondary = StellarRpcClient::new(&server2.uri()).expect("client");
 
-        let result = fetch_observed_wasm_hash(
+        let result = fetch_observed_executable(
             &primary,
             &secondary,
             &external_ref_contract_scaddress(),
@@ -6507,26 +6628,233 @@ mod tests {
         );
     }
 
-    /// The batch fetch extracts Wasm hashes only: an external-reference
-    /// instance yields `None` (no allowlist match), never the owner's resolved
-    /// hash.
+    /// `ObservedExecutable` renders the bounded summary for each kind and
+    /// reports no effective hash for no code or an unresolved reference.
+    #[test]
+    fn observed_executable_summary_and_effective_hash() {
+        let wasm = ObservedExecutable::Wasm([7u8; 32]);
+        assert_eq!(wasm.summary(), "wasm");
+        assert_eq!(wasm.effective_hash(), Some([7u8; 32]));
+        assert_eq!(ObservedExecutable::NoCode.summary(), "no code");
+        assert_eq!(ObservedExecutable::NoCode.effective_hash(), None);
+        let unresolved =
+            ObservedExecutable::ExternalRef(stellar_agent_network::ExternalRefExecutable {
+                owner: ScAddress::Contract(stellar_xdr::ContractId(stellar_xdr::Hash([0u8; 32]))),
+                tag: stellar_xdr::ScString("v\u{202e}1".as_bytes().to_vec().try_into().unwrap()),
+                resolved: None,
+            });
+        assert_eq!(unresolved.effective_hash(), None);
+        assert_eq!(
+            unresolved.summary(),
+            "external reference owner CAAAA...ABSC4 tag \"v\\u{202e}1\" resolved unset"
+        );
+    }
+
+    /// `observe_contract` identifies an external reference by the hash its tag
+    /// resolves to: an allowlisted resolved hash is allowlisted, and the
+    /// observation keeps the reference.
     #[tokio::test]
-    async fn fetch_contract_wasm_hashes_yields_none_for_external_ref() {
-        let server = external_ref_responder(crate::VERIFIER_ALLOWLIST[0].wasm_hash)
+    async fn observe_contract_accepts_allowlisted_resolved_hash() {
+        let allowlisted = crate::VERIFIER_ALLOWLIST[0].wasm_hash;
+        let server = external_ref_responder(allowlisted).serve().await;
+        let (manager, _dir) = manager_for(&server.uri());
+
+        let observation = manager
+            .observe_contract(
+                &external_ref_contract_scaddress(),
+                ContractKind::Verifier,
+                verifier_hash_allowlisted,
+                7,
+                "CSMART...ACCNT",
+                "req-1",
+            )
+            .await
+            .expect("resolved reference is observed");
+
+        assert!(observation.allowlisted);
+        assert_eq!(observation.effective_hash, allowlisted);
+        assert_eq!(
+            observation.observed_hash_first8(),
+            hash_first8_hex(&allowlisted)
+        );
+        assert!(matches!(
+            observation.observed,
+            ObservedExecutable::ExternalRef(ref external) if external.resolved == Some(allowlisted)
+        ));
+    }
+
+    /// A resolved hash outside the allowlist is reported as
+    /// `allowlisted: false` with the resolved hash, so the caller's
+    /// unknown-hash override applies.
+    #[tokio::test]
+    async fn observe_contract_reports_non_allowlisted_resolved_hash() {
+        let unknown = [0xd1u8; 32];
+        let server = external_ref_responder(unknown).serve().await;
+        let (manager, _dir) = manager_for(&server.uri());
+
+        let observation = manager
+            .observe_contract(
+                &external_ref_contract_scaddress(),
+                ContractKind::Policy,
+                policy_hash_allowlisted,
+                7,
+                "CSMART...ACCNT",
+                "req-1",
+            )
+            .await
+            .expect("resolved reference is observed");
+
+        assert!(!observation.allowlisted);
+        assert_eq!(observation.effective_hash, unknown);
+        assert_eq!(observation.observed_hash_first8(), "d1d1d1d1d1d1d1d1");
+    }
+
+    /// An external reference with no live tag entry is refused with
+    /// `ContractInstanceUnsupported { reason: ExternalRefUnresolved }` before
+    /// any allowlist decision, for either contract kind.
+    #[tokio::test]
+    async fn observe_contract_refuses_unresolved_external_ref() {
+        use stellar_agent_test_support::{KeyedLedgerEntriesResponder, xdr_fixtures};
+
+        let server = KeyedLedgerEntriesResponder::new()
+            .with_entry(xdr_fixtures::ledger_entry_from_response_json(
+                &xdr_fixtures::external_ref_instance_ledger_entries_json(
+                    EXTERNAL_REF_CONTRACT,
+                    EXTERNAL_REF_OWNER,
+                    b"verifier",
+                ),
+            ))
+            .serve()
+            .await;
+        let (manager, _dir) = manager_for(&server.uri());
+
+        for kind in [ContractKind::Verifier, ContractKind::Policy] {
+            let result = manager
+                .observe_contract(
+                    &external_ref_contract_scaddress(),
+                    kind,
+                    |_| true,
+                    7,
+                    "CSMART...ACCNT",
+                    "req-1",
+                )
+                .await;
+            let Err(SaError::ContractInstanceUnsupported {
+                rule_id,
+                contract_kind,
+                contract_address_redacted,
+                reason,
+                request_id,
+                ..
+            }) = result
+            else {
+                panic!("{kind}: expected ContractInstanceUnsupported; got {result:?}");
+            };
+            assert_eq!(reason, AdminOrOwnerKey::ExternalRefUnresolved);
+            assert_eq!(contract_kind, kind);
+            assert_eq!(rule_id, 7);
+            assert_eq!(request_id, "req-1");
+            assert_eq!(contract_address_redacted.as_str(), "CAAAA...AD2KM");
+        }
+    }
+
+    /// The batch fetch resolves an external reference through the owner's tag
+    /// entry and returns the resolved hash in the reference's position,
+    /// beside a Wasm instance and an absent contract.
+    #[tokio::test]
+    async fn fetch_contract_wasm_hashes_resolves_external_ref_in_position() {
+        use stellar_agent_test_support::xdr_fixtures;
+
+        const WASM_CONTRACT: &str = "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526";
+        const ABSENT_CONTRACT: &str = "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ";
+        let resolved = [0x5au8; 32];
+        let wasm_hash = [0x6bu8; 32];
+        let server = external_ref_responder(resolved)
+            .with_entry(xdr_fixtures::ledger_entry_from_response_json(
+                &xdr_fixtures::contract_instance_ledger_entries_json(WASM_CONTRACT, wasm_hash),
+            ))
             .serve()
             .await;
         let client = StellarRpcClient::new(&server.uri()).expect("client");
-        let key = LedgerKey::ContractData(stellar_xdr::LedgerKeyContractData {
-            contract: external_ref_contract_scaddress(),
-            key: ScVal::LedgerKeyContractInstance,
-            durability: stellar_xdr::ContractDataDurability::Persistent,
-        });
+        let key_for = |strkey: &str| {
+            LedgerKey::ContractData(stellar_xdr::LedgerKeyContractData {
+                contract: ScAddress::Contract(stellar_xdr::ContractId(stellar_xdr::Hash(
+                    stellar_strkey::Contract::from_string(strkey)
+                        .expect("contract")
+                        .0,
+                ))),
+                key: ScVal::LedgerKeyContractInstance,
+                durability: stellar_xdr::ContractDataDurability::Persistent,
+            })
+        };
+        let results = fetch_contract_wasm_hashes(
+            &client,
+            &[
+                key_for(WASM_CONTRACT),
+                key_for(ABSENT_CONTRACT),
+                external_ref_instance_key(),
+            ],
+        )
+        .await
+        .expect("batch fetch succeeds");
 
-        let results = fetch_contract_wasm_hashes(&client, &[key])
-            .await
-            .expect("batch fetch succeeds");
+        assert_eq!(results, vec![Some(wasm_hash), None, Some(resolved)]);
+    }
 
-        assert_eq!(results, vec![None]);
+    /// The batch fetch yields `None` for an external reference whose tag entry
+    /// is not live, does not decode, or does not hold a 32-byte hash.
+    #[tokio::test]
+    async fn fetch_contract_wasm_hashes_yields_none_for_unresolved_or_malformed_tag_entry() {
+        use stellar_agent_test_support::{KeyedLedgerEntriesResponder, xdr_fixtures};
+
+        let instance = xdr_fixtures::ledger_entry_from_response_json(
+            &xdr_fixtures::external_ref_instance_ledger_entries_json(
+                EXTERNAL_REF_CONTRACT,
+                EXTERNAL_REF_OWNER,
+                b"verifier",
+            ),
+        );
+        let short_value = xdr_fixtures::ledger_entry_from_response_json(
+            &xdr_fixtures::executable_tag_ledger_entries_json_with_value(
+                EXTERNAL_REF_OWNER,
+                b"verifier",
+                ScVal::Bytes(ScBytes(vec![1u8; 31].try_into().unwrap())),
+            ),
+        );
+        let mut undecodable = xdr_fixtures::ledger_entry_from_response_json(
+            &xdr_fixtures::executable_tag_ledger_entries_json(
+                EXTERNAL_REF_OWNER,
+                b"verifier",
+                [1u8; 32],
+            ),
+        );
+        undecodable["xdr"] = serde_json::Value::String("AAAA////".to_owned());
+
+        for (case, responder) in [
+            (
+                "no live tag entry",
+                KeyedLedgerEntriesResponder::new().with_entry(instance.clone()),
+            ),
+            (
+                "31-byte tag value",
+                KeyedLedgerEntriesResponder::new()
+                    .with_entry(instance.clone())
+                    .with_entry(short_value),
+            ),
+            (
+                "undecodable tag entry",
+                KeyedLedgerEntriesResponder::new()
+                    .with_entry(instance)
+                    .with_entry(undecodable),
+            ),
+        ] {
+            let server = responder.serve().await;
+            let client = StellarRpcClient::new(&server.uri()).expect("client");
+            let results = fetch_contract_wasm_hashes(&client, &[external_ref_instance_key()])
+                .await
+                .unwrap_or_else(|e| panic!("{case}: batch fetch succeeds: {e}"));
+            assert_eq!(results, vec![None], "{case}");
+        }
     }
 
     // ── extract_u32_return ────────────────────────────────────────────────────

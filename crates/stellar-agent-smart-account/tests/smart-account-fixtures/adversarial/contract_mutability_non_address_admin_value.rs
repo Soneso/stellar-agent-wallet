@@ -113,6 +113,7 @@ async fn non_address_admin_value_returns_mutable() {
         MutabilityStatus::Mutable {
             admin_or_owner_key: AdminOrOwnerKey::Admin,
             holder_redacted: "[non-address-admin-value]".to_owned(),
+            executable_ref: None,
         }
     );
 }

@@ -21,7 +21,8 @@
 //!    canonicalisation (e.g., a "normalisation" that re-keys on each call)
 //!    would break this.
 //! 3. **Bytes-in == bytes-out at the on-chain fetch boundary.** The
-//!    `fetch_observed_wasm_hash` path returns `Option<[u8; 32]>` — no
+//!    `fetch_observed_executable` path returns the `[u8; 32]` inside
+//!    `ObservedExecutable::Wasm`: no
 //!    string-encoding, no XDR re-wrapping, no normalisation. The fixture's
 //!    pinned `_first8` audit-row + matching mock-served full hash exercises
 //!    this end-to-end with no intermediate transformation.
@@ -43,7 +44,7 @@
 //!
 //! The wallet's wasm-hash pipeline has NO canonicalisation step: bytes flow as
 //! `[u8; 32]` from `stellar_agent_network::fetch_contract_wasm_hash` (called inside
-//! `fetch_observed_wasm_hash` at
+//! `fetch_observed_executable` at
 //! `crates/stellar-agent-smart-account/src/managers/signers.rs`)
 //! through to the byte-level comparison at the audit-log first-8 boundary.
 //! The audit-log row stores `pinned_verifier_wasm_hashes_first8: Vec<String>`
@@ -70,7 +71,7 @@
 //!
 //! This fixture exercises the re-fetch half end-to-end via
 //! `verify_pinned_verifier_against_chain` (which internally invokes
-//! `fetch_observed_wasm_hash`). The deploy-time half is modelled by writing
+//! `fetch_observed_executable`). The deploy-time half is modelled by writing
 //! the `SaContextRuleCreated` audit row directly with the canonical
 //! `pinned_first8` shape, bypassing the actual install-path code at
 //! `crates/stellar-agent-smart-account/src/managers/verifiers.rs:410-423`
@@ -95,6 +96,7 @@ use std::sync::Arc;
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::EventKind;
 use stellar_agent_smart_account::VERIFIER_ALLOWLIST;
+use stellar_agent_smart_account::managers::signers::ObservedExecutable;
 use stellar_agent_smart_account::managers::verifiers::test_helpers;
 use stellar_xdr::{ContractId, Hash, ScAddress};
 use uuid::Uuid;
@@ -191,6 +193,8 @@ async fn wasm_hash_canonicalisation_parity_byte_identical_no_drift_and_idempoten
         vec![],
         false,
         false,
+        vec![],
+        vec![],
     );
     {
         let mut writer = audit_writer.lock().expect("audit writer poisoned");
@@ -200,7 +204,7 @@ async fn wasm_hash_canonicalisation_parity_byte_identical_no_drift_and_idempoten
     }
 
     // ── Step 3: First call — must succeed (no drift) ──────────────────────────
-    let mut cache: HashMap<Vec<u8>, [u8; 32]> = HashMap::new();
+    let mut cache: HashMap<Vec<u8>, ObservedExecutable> = HashMap::new();
     let first_result = test_helpers::verify_pinned_verifier_against_chain(
         &manager,
         verifier.clone(),
@@ -217,7 +221,7 @@ async fn wasm_hash_canonicalisation_parity_byte_identical_no_drift_and_idempoten
     );
 
     // ── Step 4: Second call (idempotence) — also must succeed ─────────────────
-    let mut cache2: HashMap<Vec<u8>, [u8; 32]> = HashMap::new();
+    let mut cache2: HashMap<Vec<u8>, ObservedExecutable> = HashMap::new();
     let second_result = test_helpers::verify_pinned_verifier_against_chain(
         &manager,
         verifier.clone(),
@@ -258,7 +262,7 @@ async fn wasm_hash_canonicalisation_parity_byte_identical_no_drift_and_idempoten
 /// Asserts the first-8-hex formatter (`format!("{b:02x}")`) used on BOTH the
 /// install path (`verifiers.rs:423` derives `pinned_*_first8` for the audit row)
 /// AND the drift-check path (compares pinned `_first8` against
-/// `first8(fetch_observed_wasm_hash())`) is deterministic and idempotent.
+/// `first8(fetch_observed_executable().effective_hash())`) is deterministic and idempotent.
 ///
 /// This guards against a future refactor that swaps `format!("{b:02x}")` for
 /// (say) `hex::encode_upper` or `base64` on one side but not the other —
@@ -326,6 +330,8 @@ async fn wasm_hash_cache_carries_bytes_unmodified_from_rpc() {
         vec![],
         false,
         false,
+        vec![],
+        vec![],
     );
     {
         let mut writer = audit_writer.lock().expect("audit writer poisoned");
@@ -334,7 +340,7 @@ async fn wasm_hash_cache_carries_bytes_unmodified_from_rpc() {
             .expect("write_entry must succeed");
     }
 
-    let mut cache: HashMap<Vec<u8>, [u8; 32]> = HashMap::new();
+    let mut cache: HashMap<Vec<u8>, ObservedExecutable> = HashMap::new();
     test_helpers::verify_pinned_verifier_against_chain(
         &manager,
         verifier.clone(),
@@ -356,9 +362,10 @@ async fn wasm_hash_cache_carries_bytes_unmodified_from_rpc() {
          empty or multi-entry cache means the bytes-in==bytes-out assertion below \
          is vacuous or ambiguous",
     );
-    for observed_hash in cache.values() {
+    for observed in cache.values() {
         assert_eq!(
-            observed_hash, &pinned_hash,
+            observed,
+            &ObservedExecutable::Wasm(pinned_hash),
             "observed hash in cache must be byte-identical to RPC-served bytes; \
              a canonicalisation step would surface here",
         );

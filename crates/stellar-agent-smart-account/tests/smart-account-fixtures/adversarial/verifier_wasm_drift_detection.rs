@@ -33,6 +33,7 @@ use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::EventKind;
 use stellar_agent_smart_account::VERIFIER_ALLOWLIST;
 use stellar_agent_smart_account::error::SaError;
+use stellar_agent_smart_account::managers::signers::ObservedExecutable;
 use stellar_agent_smart_account::managers::verifiers::test_helpers;
 use stellar_xdr::{ContractId, Hash, ScAddress};
 use uuid::Uuid;
@@ -121,6 +122,8 @@ async fn verifier_wasm_hash_drift_detected_and_audit_row_emitted() {
         vec![],
         false,
         false,
+        vec![],
+        vec![],
     );
     {
         let mut writer = audit_writer.lock().expect("audit writer poisoned");
@@ -130,7 +133,7 @@ async fn verifier_wasm_hash_drift_detected_and_audit_row_emitted() {
     }
 
     // ── Step 3: Call verify_pinned_verifier_against_chain ────────────────────
-    let mut cache: HashMap<Vec<u8>, [u8; 32]> = HashMap::new();
+    let mut cache: HashMap<Vec<u8>, ObservedExecutable> = HashMap::new();
 
     let result = test_helpers::verify_pinned_verifier_against_chain(
         &manager,
