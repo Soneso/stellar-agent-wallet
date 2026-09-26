@@ -83,7 +83,7 @@ const CROSS_RPC_CONSUMER_SITES: &[(&str, &str)] = &[
         "crates/stellar-agent-smart-account/src/managers/signers.rs",
         "identify_weighted_threshold_policy",
     ),
-    // Executable identification and drift detection — 1 consumer in signers.rs
+    // Executable identification and drift detection; 1 consumer in signers.rs
     (
         "crates/stellar-agent-smart-account/src/managers/signers.rs",
         "fetch_observed_executable",

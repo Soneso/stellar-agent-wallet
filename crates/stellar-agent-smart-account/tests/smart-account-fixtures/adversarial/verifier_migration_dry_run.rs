@@ -12,6 +12,7 @@
 //! | [`external_ref_destination_fails_preflight_destination_mutable`] | wiremock planner invocation | external-reference destination refused as mutable, naming owner and tag |
 //! | [`unresolved_external_ref_destination_is_refused_as_unsupported`] | wiremock planner invocation | `sa.contract_instance_unsupported` (`ExternalRefUnresolved`) |
 //! | [`source_scan_plans_signer_whose_verifier_reference_resolves_to_from_hash`] | wiremock planner invocation | source scan reads a reference's resolved hash |
+//! | [`destination_changing_executable_between_identification_and_probe_is_refused`] | wiremock planner invocation | `sa.contract_instance_unsupported` (`ExecutableChanged`) |
 //!
 //! All tests are end-to-end [`MigrationPlanner::build`] invocations against a
 //! wiremock HTTP server.
@@ -865,4 +866,113 @@ async fn source_scan_plans_signer_whose_verifier_reference_resolves_to_from_hash
         "the reference-backed signer is planned"
     );
     assert_eq!(plan.total_transaction_count(), 2);
+}
+
+/// Serves `before` to every `getLedgerEntries` request until
+/// `switch_after` requests have asked for `instance_key`, then `after`, so
+/// the destination's identification (one instance request per endpoint)
+/// and its mutability probe (one more per endpoint) observe different
+/// executables. `simulateTransaction` is answered with `simulate`.
+struct SwitchingLedgerDispatcher {
+    before: serde_json::Value,
+    after: serde_json::Value,
+    simulate: serde_json::Value,
+    instance_key: String,
+    switch_after: usize,
+    instance_requests: std::sync::atomic::AtomicUsize,
+}
+
+impl wiremock::Respond for SwitchingLedgerDispatcher {
+    fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        use std::sync::atomic::Ordering;
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).unwrap_or(serde_json::json!({}));
+        let result = match body["method"].as_str() {
+            Some("getLedgerEntries") => {
+                let asks_for_instance = body["params"]["keys"].as_array().is_some_and(|keys| {
+                    keys.iter().any(|k| k.as_str() == Some(&self.instance_key))
+                });
+                let served_before = if asks_for_instance {
+                    self.instance_requests.fetch_add(1, Ordering::SeqCst) < self.switch_after
+                } else {
+                    self.instance_requests.load(Ordering::SeqCst) <= self.switch_after
+                };
+                if served_before {
+                    self.before.clone()
+                } else {
+                    self.after.clone()
+                }
+            }
+            Some("simulateTransaction") => self.simulate.clone(),
+            _ => serde_json::json!({}),
+        };
+        wiremock::ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": body.get("id").cloned().unwrap_or(serde_json::json!(1)),
+                "result": result
+            }))
+            .insert_header("content-type", "application/json")
+    }
+}
+
+/// A destination identified as an allowlisted resolved external reference
+/// that the mutability probe then observes as immutable Wasm is refused with
+/// `ContractInstanceUnsupported { reason: ExecutableChanged }` and no plan.
+#[tokio::test]
+async fn destination_changing_executable_between_identification_and_probe_is_refused() {
+    let server = MockServer::start().await;
+    let dest_addr = addr(0xA6);
+    // Identification: the destination is a reference resolving to the
+    // allowlisted OZ hash. The helper's own contract entry is for another
+    // address and is ignored.
+    let before = with_external_ref(
+        build_ledger_entries_account_and_contract(SOURCE_G, &addr(0xA7), OZ_VERIFIER_HASH),
+        &dest_addr,
+        b"dest-v1",
+        Some(OZ_VERIFIER_HASH),
+    );
+    // Probe: the destination is now an immutable Wasm instance with the same
+    // hash (no instance storage).
+    let after = build_ledger_entries_account_and_contract(SOURCE_G, &dest_addr, OZ_VERIFIER_HASH);
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(SwitchingLedgerDispatcher {
+            before,
+            after,
+            simulate: build_simulate_response(&u32_xdr(0)),
+            instance_key: contract_instance_key_xdr(&dest_addr),
+            switch_after: 2,
+            instance_requests: std::sync::atomic::AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+
+    let (manager, _tmp_dir) = manager_with_server(&server).await;
+    let result = MigrationPlanner::new(&manager)
+        .build(
+            addr(0x01),
+            [0xABu8; 32],
+            dest_addr,
+            &Uuid::new_v4().to_string(),
+        )
+        .await;
+
+    let err = result.expect_err("a destination that changed executable must not produce a plan");
+    assert_eq!(
+        err.wire_code(),
+        "sa.contract_instance_unsupported",
+        "{err:?}"
+    );
+    assert!(
+        matches!(
+            err,
+            SaError::ContractInstanceUnsupported {
+                reason: stellar_agent_smart_account::AdminOrOwnerKey::ExecutableChanged,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
 }

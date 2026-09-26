@@ -22,7 +22,7 @@
 //!    would break this.
 //! 3. **Bytes-in == bytes-out at the on-chain fetch boundary.** The
 //!    `fetch_observed_executable` path returns the `[u8; 32]` inside
-//!    `ObservedExecutable::Wasm` — no
+//!    `ObservedExecutable::Wasm`: no
 //!    string-encoding, no XDR re-wrapping, no normalisation. The fixture's
 //!    pinned `_first8` audit-row + matching mock-served full hash exercises
 //!    this end-to-end with no intermediate transformation.

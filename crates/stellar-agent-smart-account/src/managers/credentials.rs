@@ -1867,7 +1867,13 @@ impl CredentialsManager {
                             stellar_agent_core::audit_log::reader::PinnedHashesRecord::default()
                         }
                         Err(audit_err) => {
-                            // Audit-log integrity failure → fail-CLOSED.
+                            // An audit-log integrity failure (chain break, HMAC
+                            // mismatch, a malformed pin record) aborts signing
+                            // with its typed source. It is neither an absent
+                            // baseline nor a diversification decision the
+                            // operator could override, so it routes to
+                            // DriftCheckUnavailable like every other failure
+                            // of the pin checks.
                             warn!(
                                 rule_id,
                                 error = %audit_err,
@@ -1875,21 +1881,7 @@ impl CredentialsManager {
                                  diversification check; aborting signing (fail-closed)"
                             );
                             return (
-                                Err(CredentialsError::DiversificationRequired {
-                                    source: Box::new(
-                                        crate::SaError::VerifierDiversificationRequired {
-                                            rule_id,
-                                            smart_account_redacted:
-                                                RedactedStrkey::from_already_redacted(
-                                                    smart_account_redacted.clone(),
-                                                ),
-                                            verifier_hash_first8: String::new(),
-                                            observed_value_threshold_stroops:
-                                                crate::managers::diversification::DiversificationCheck::SENTINEL_OBSERVED_VALUE_THRESHOLD_STROOPS,
-                                            request_id: divergence_request_id.clone(),
-                                        },
-                                    ),
-                                }),
+                                Err(drift_err_route(crate::SaError::AuditLog(audit_err))),
                                 String::new(),
                                 String::new(),
                                 Some(divergence_request_id),

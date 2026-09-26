@@ -660,7 +660,7 @@ impl ContextRuleManager {
     /// - [`SaError::RuleIdMismatch`] — `auth_rule_ids` count does not match
     ///   simulation auth-context count.
     /// - [`SaError::SimulationDivergence`] — caller-vs-envelope mismatch.
-    /// - [`SaError::VerifierMutable`] — verifier mutable (admin/owner key or
+    /// - [`SaError::VerifierMutable`]: verifier mutable (admin/owner key or
     ///   external-reference executable), no override set.
     /// - [`SaError::PolicyMutable`] — policy mutable, no override set.
     /// - [`SaError::ContractInstanceUnsupported`]: verifier or policy instance

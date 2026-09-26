@@ -27,7 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pinned_policy_executable_refs`. Every new field is optional, and rows
   without it keep reading. A pin record whose reference lists are misaligned
   with its hash lists or disagree with them is refused as an audit parse
-  error.
+  error. Passkey signing reports that refusal, and any other audit-log
+  integrity failure while reading the pin record, as
+  `failure:drift_check_unavailable` with the integrity error as its source.
 - `sa.contract_instance_unsupported` has the reasons
   `external reference with no live tag entry` and
   `executable changed during install`.

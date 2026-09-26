@@ -153,10 +153,6 @@ impl PinnedHashesRecord {
 /// signing-time drift check reads the pin at the position it checks, so a
 /// misaligned or inconsistent record could pair a hash with the wrong
 /// reference; it is refused as a parse error at `line`.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one argument per pin field of the SaContextRuleCreated row plus the row's line"
-)]
 fn pinned_hashes_record_from_row(
     line: usize,
     pinned_verifier_first8: &[String],

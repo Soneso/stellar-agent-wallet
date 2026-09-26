@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 
 use super::schema::{
     ContractKind, EventKind, ExecutableRefPin, KeyPurpose, PolicyDecision, ValueLegRecord,
-    VerifierAdvisoryKind,
+    VerifierAdvisoryKind, executable_refs_or_empty,
 };
 use crate::error::ValidationError;
 use crate::observability::RedactedStrkey;
@@ -658,15 +658,6 @@ impl AuditEntry {
         pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
         pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
     ) -> Self {
-        fn empty_when_all_none(
-            refs: Vec<Option<ExecutableRefPin>>,
-        ) -> Vec<Option<ExecutableRefPin>> {
-            if refs.iter().all(Option::is_none) {
-                Vec::new()
-            } else {
-                refs
-            }
-        }
         Self {
             ts: current_iso8601_utc(),
             tool: "sa.context_rule_created".to_owned(),
@@ -690,10 +681,12 @@ impl AuditEntry {
                 pinned_policy_wasm_hashes_first8,
                 mutable_override,
                 unknown_override,
-                pinned_verifier_executable_refs: empty_when_all_none(
+                pinned_verifier_executable_refs: executable_refs_or_empty(
                     pinned_verifier_executable_refs,
                 ),
-                pinned_policy_executable_refs: empty_when_all_none(pinned_policy_executable_refs),
+                pinned_policy_executable_refs: executable_refs_or_empty(
+                    pinned_policy_executable_refs,
+                ),
             },
             previous_entry_hash: String::new(),
         }

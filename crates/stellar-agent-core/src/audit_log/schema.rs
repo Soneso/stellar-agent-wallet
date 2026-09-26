@@ -231,6 +231,24 @@ impl ExecutableRefPin {
     }
 }
 
+/// Returns `refs` unchanged when at least one entry is a pin, or an empty
+/// list when every entry is `None`.
+///
+/// An executable-reference list on a `SaContextRuleCreated` row or an
+/// install envelope is either aligned with its first-8 list or absent;
+/// recording an all-`None` list as empty keeps rules without an external
+/// reference in the shape older readers know.
+#[must_use]
+pub fn executable_refs_or_empty(
+    refs: Vec<Option<ExecutableRefPin>>,
+) -> Vec<Option<ExecutableRefPin>> {
+    if refs.iter().all(Option::is_none) {
+        Vec::new()
+    } else {
+        refs
+    }
+}
+
 fn lower_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

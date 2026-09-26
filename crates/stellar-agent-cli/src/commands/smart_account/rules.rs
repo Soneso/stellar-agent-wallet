@@ -518,7 +518,7 @@ pub struct CreateArgs {
     /// or policy contract carries a non-zero `Admin` or `Owner` storage key (OZ
     /// ownable-storage convention), or when its executable is an external
     /// reference whose owner decides which Wasm runs.  A mutable contract can
-    /// be silently upgraded by its administrator — pinning does not protect
+    /// be silently upgraded by its administrator; pinning does not protect
     /// against that.
     ///
     /// For an external reference the pin records the owner, the tag and the

@@ -98,7 +98,7 @@ use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::health::AuditWriterHealthHandle;
 use stellar_agent_core::audit_log::reader::{AuditReader, PinnedHashesRecord};
 use stellar_agent_core::audit_log::schema::ContractKind;
-use stellar_agent_core::audit_log::schema::ExecutableRefPin;
+use stellar_agent_core::audit_log::schema::{ExecutableRefPin, executable_refs_or_empty};
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_network::{ExternalRefExecutable, StellarRpcClient};
@@ -110,7 +110,8 @@ use crate::managers::rules::{
     xdr_scaddress_to_strkey_or_sentinel,
 };
 use crate::managers::signers::{
-    ObservedExecutable, SignersManager, fetch_observed_executable, verifier_hash_allowlisted,
+    ObservedExecutable, SignersManager, fetch_observed_executable, hash_first8_hex,
+    policy_hash_allowlisted, verifier_hash_allowlisted,
 };
 use crate::{AdminOrOwnerKey, SaError};
 
@@ -188,20 +189,20 @@ impl PinResult {
             .collect()
     }
 
-    /// Returns the verifier executable-reference pins for the audit row and
-    /// the JSON envelopes: aligned with `pinned_verifier_wasm_hashes`, or
-    /// empty when no pinned verifier is an external reference.
+    /// Returns the verifier executable-reference pins for the JSON envelopes:
+    /// aligned with `pinned_verifier_wasm_hashes`, or empty when no pinned
+    /// verifier is an external reference.
     #[must_use]
     pub fn verifier_executable_refs(&self) -> Vec<Option<ExecutableRefPin>> {
-        refs_or_empty(&self.pinned_verifier_executable_refs)
+        executable_refs_or_empty(self.pinned_verifier_executable_refs.clone())
     }
 
-    /// Returns the policy executable-reference pins for the audit row and the
-    /// JSON envelopes: aligned with `pinned_policy_wasm_hashes`, or empty
-    /// when no pinned policy is an external reference.
+    /// Returns the policy executable-reference pins for the JSON envelopes:
+    /// aligned with `pinned_policy_wasm_hashes`, or empty when no pinned
+    /// policy is an external reference.
     #[must_use]
     pub fn policy_executable_refs(&self) -> Vec<Option<ExecutableRefPin>> {
-        refs_or_empty(&self.pinned_policy_executable_refs)
+        executable_refs_or_empty(self.pinned_policy_executable_refs.clone())
     }
 
     /// Builds the `SaContextRuleCreated` audit row that records this pin for
@@ -231,17 +232,9 @@ impl PinResult {
             self.pinned_policy_hashes_first8(),
             self.mutable_override,
             self.unknown_override,
-            self.verifier_executable_refs(),
-            self.policy_executable_refs(),
+            self.pinned_verifier_executable_refs.clone(),
+            self.pinned_policy_executable_refs.clone(),
         )
-    }
-}
-
-fn refs_or_empty(refs: &[Option<ExecutableRefPin>]) -> Vec<Option<ExecutableRefPin>> {
-    if refs.iter().all(Option::is_none) {
-        Vec::new()
-    } else {
-        refs.to_vec()
     }
 }
 
@@ -254,7 +247,7 @@ fn refs_or_empty(refs: &[Option<ExecutableRefPin>]) -> Vec<Option<ExecutableRefP
 /// invariant. For each distinct verifier referenced by an `External` signer,
 /// then for each distinct policy:
 ///
-/// 1. **Identification** — `SignersManager::observe_contract` fetches the
+/// 1. **Identification**: `SignersManager::observe_contract` fetches the
 ///    executable (two-RPC, an external reference resolved at each endpoint)
 ///    and matches its effective hash against `VERIFIER_ALLOWLIST` (verifier)
 ///    or `THRESHOLD_POLICY_WASM_HASHES` (policy). An external reference with
@@ -265,7 +258,7 @@ fn refs_or_empty(refs: &[Option<ExecutableRefPin>]) -> Vec<Option<ExecutableRefP
 ///    `EventKind::SaUnknownContractOverride` row is written and the effective
 ///    hash (zero for no code) is pinned with `unknown_override = true`.
 ///
-/// 2. **Mutability detection** — [`detect_contract_mutability`] (two-RPC
+/// 2. **Mutability detection**: [`detect_contract_mutability`] (two-RPC
 ///    instance probe). An existing instance that is undecodable or has a
 ///    non-Wasm, non-reference executable returns
 ///    `SaError::ContractInstanceUnsupported` regardless of
@@ -279,7 +272,7 @@ fn refs_or_empty(refs: &[Option<ExecutableRefPin>]) -> Vec<Option<ExecutableRefP
 ///    `EventKind::SaMutableContractOverride` row is written (naming the owner
 ///    and tag of an external reference) and `mutable_override = true`.
 ///
-/// 3. **Pin** — the effective hash is pinned; an external reference also
+/// 3. **Pin**: the effective hash is pinned; an external reference also
 ///    records an [`ExecutableRefPin`] (owner, tag, tag-key digest and resolved
 ///    first-8) at the same position, so the signing-time drift check refuses
 ///    when the owner repoints the tag, the reference changes or the executable
@@ -294,22 +287,23 @@ fn refs_or_empty(refs: &[Option<ExecutableRefPin>]) -> Vec<Option<ExecutableRefP
 ///
 /// # Arguments
 ///
-/// - `signers_manager` — provides `observe_contract` and the RPC clients for
+/// - `signers_manager`: provides `observe_contract` and the RPC clients for
 ///   `detect_contract_mutability`.
 /// - `audit_writer` — shared writer for override-row emission.
-/// - `smart_account` — the smart-account being configured (for audit fields).
+/// - `smart_account`: accepted and unused; the audit fields use
+///   `smart_account_redacted`.
 /// - `rule_definition` — the rule to be installed.
 /// - `smart_account_redacted` — pre-computed first-5-last-5 of the smart-account
-///   strkey (passed in to avoid re-deriving from `smart_account` here).
+///   strkey, used for every audit field and error.
 /// - `rule_id` — placeholder `0` (pre-install; rule ID not yet assigned on-chain).
 ///   Used only for forensic audit fields.
-/// - `source_account_strkey` — G-strkey of the fee-paying account (accepted
-///   for API symmetry; identification needs no source account).
+/// - `source_account_strkey`: accepted and unused; identification needs no
+///   source account.
 /// - `accept_mutable_verifier` — when `true`, contracts with an active admin
 ///   key or an external-reference executable proceed with an override audit
 ///   row instead of returning an error. It does not admit an unpinnable
 ///   instance.
-/// - `accept_unknown_verifier` — when `true`, contracts whose effective hash
+/// - `accept_unknown_verifier`: when `true`, contracts whose effective hash
 ///   is outside the allowlist proceed with an override audit row instead of
 ///   returning an error.
 /// - `chain_id` — network identifier forwarded to override audit-row constructors
@@ -318,22 +312,22 @@ fn refs_or_empty(refs: &[Option<ExecutableRefPin>]) -> Vec<Option<ExecutableRefP
 ///
 /// # Errors
 ///
-/// - [`SaError::VerifierMutable`] — verifier has a non-zero admin key or an
+/// - [`SaError::VerifierMutable`]: verifier has a non-zero admin key or an
 ///   external-reference executable and `accept_mutable_verifier` is `false`.
-/// - [`SaError::PolicyMutable`] — the same for a policy.
+/// - [`SaError::PolicyMutable`]: the same for a policy.
 /// - [`SaError::ContractInstanceUnsupported`]: a verifier or policy instance
 ///   is undecodable, has a non-Wasm executable, is an external reference with
 ///   no live tag entry, or changed executable between identification and the
 ///   mutability probe; no flag overrides it.
-/// - [`SaError::VerifierWasmNotInAllowlist`] — verifier effective hash not in
+/// - [`SaError::VerifierWasmNotInAllowlist`]: verifier effective hash not in
 ///   allowlist and `accept_unknown_verifier` is `false`.
-/// - [`SaError::PolicyWasmNotInAllowlist`] — policy effective hash not in
+/// - [`SaError::PolicyWasmNotInAllowlist`]: policy effective hash not in
 ///   allowlist and `accept_unknown_verifier` is `false`.
 /// - [`SaError::NetworkRpcDivergence`] — primary and secondary RPC disagree.
 /// - [`SaError::DeploymentFailed`] — RPC fetch failed.
-/// - [`SaError::ScAddressEncodingFailed`] — an external reference's tag key
+/// - [`SaError::ScAddressEncodingFailed`]: an external reference's tag key
 ///   cannot be XDR-encoded for its digest.
-/// - [`SaError::AuditLog`] — an override row could not be written.
+/// - [`SaError::AuditLog`]: an override row could not be written.
 ///
 #[allow(
     clippy::too_many_arguments,
@@ -352,8 +346,8 @@ pub async fn pin_referenced_contracts(
     chain_id: &str,
     request_id: String,
 ) -> Result<PinResult, SaError> {
-    // The smart account and the source account identify the install for the
-    // caller; identification reads only the referenced contracts.
+    // Accepted and unused: identification reads only the referenced
+    // contracts, and the audit fields use `smart_account_redacted`.
     let _ = (smart_account, source_account_strkey);
 
     let context = PinContext {
@@ -388,7 +382,7 @@ pub async fn pin_referenced_contracts(
         if !seen_verifier_strkeys.insert(xdr_scaddress_to_strkey_or_sentinel(verifier)) {
             continue;
         }
-        let pinned = pin_contract(&context, verifier, ContractKind::Verifier).await?;
+        let pinned = pin_contract(&context, verifier, PinnedKind::Verifier).await?;
         result.mutable_override |= pinned.mutable_override;
         result.unknown_override |= pinned.unknown_override;
         result
@@ -408,7 +402,7 @@ pub async fn pin_referenced_contracts(
         {
             continue;
         }
-        let pinned = pin_contract(&context, &policy.policy_address, ContractKind::Policy).await?;
+        let pinned = pin_contract(&context, &policy.policy_address, PinnedKind::Policy).await?;
         result.mutable_override |= pinned.mutable_override;
         result.unknown_override |= pinned.unknown_override;
         result
@@ -455,10 +449,9 @@ struct PinnedContract {
 async fn pin_contract(
     context: &PinContext<'_>,
     contract_addr: &ScAddress,
-    contract_kind: ContractKind,
+    kind: PinnedKind,
 ) -> Result<PinnedContract, SaError> {
-    use crate::signers::policy_identification::THRESHOLD_POLICY_WASM_HASHES;
-
+    let contract_kind = kind.contract_kind();
     let signers_manager = context.signers_manager;
     let smart_account_redacted = context.smart_account_redacted;
     let rule_id = context.rule_id;
@@ -467,19 +460,11 @@ async fn pin_contract(
         redact_strkey_first5_last5(&xdr_scaddress_to_strkey_or_sentinel(contract_addr));
 
     // ── Identification ───────────────────────────────────────────────────────
-    let is_allowlisted = |hash: &[u8; 32]| match contract_kind {
-        ContractKind::Verifier => verifier_hash_allowlisted(hash),
-        ContractKind::Policy => THRESHOLD_POLICY_WASM_HASHES
-            .iter()
-            .any(|allowed| allowed == hash),
-        // A contract kind this crate does not know has no allowlist.
-        _ => false,
-    };
     let observation = signers_manager
         .observe_contract(
             contract_addr,
             contract_kind,
-            is_allowlisted,
+            |hash| kind.is_allowlisted(hash),
             rule_id,
             smart_account_redacted,
             request_id,
@@ -490,8 +475,7 @@ async fn pin_contract(
     if !observation.allowlisted {
         let observed_hash_first8 = observation.observed_hash_first8();
         if !context.accept_unknown_verifier {
-            return Err(not_in_allowlist_error(
-                contract_kind,
+            return Err(kind.not_in_allowlist_error(
                 rule_id,
                 smart_account_redacted,
                 observed_hash_first8,
@@ -613,8 +597,7 @@ async fn pin_contract(
             None => holder_redacted.clone(),
         };
         if !context.accept_mutable_verifier {
-            return Err(mutable_error(
-                contract_kind,
+            return Err(kind.mutable_error(
                 rule_id,
                 smart_account_redacted,
                 &contract_redacted,
@@ -698,60 +681,88 @@ fn tag_key_digest(
         })
 }
 
-fn not_in_allowlist_error(
-    contract_kind: ContractKind,
-    rule_id: u32,
-    smart_account_redacted: &str,
-    observed_hash_first8: String,
-    request_id: &str,
-) -> SaError {
-    let smart_account_redacted = RedactedStrkey::from_already_redacted(smart_account_redacted);
-    let request_id = request_id.to_owned();
-    match contract_kind {
-        ContractKind::Policy => SaError::PolicyWasmNotInAllowlist {
-            rule_id,
-            smart_account_redacted,
-            observed_hash_first8,
-            request_id,
-        },
-        _ => SaError::VerifierWasmNotInAllowlist {
-            rule_id,
-            smart_account_redacted,
-            observed_hash_first8,
-            request_id,
-        },
-    }
+/// The kind of a contract `pin_referenced_contracts` pins.
+///
+/// The allowlist and both refusal variants of a kind are chosen by
+/// exhaustive matches on this crate-private enum, so they cannot disagree,
+/// and the audit-schema `ContractKind` (which is `#[non_exhaustive]`) is only
+/// produced from it, never matched with a wildcard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PinnedKind {
+    Verifier,
+    Policy,
 }
 
-fn mutable_error(
-    contract_kind: ContractKind,
-    rule_id: u32,
-    smart_account_redacted: &str,
-    contract_redacted: &str,
-    admin_or_owner_key: AdminOrOwnerKey,
-    detail: String,
-    request_id: &str,
-) -> SaError {
-    let smart_account_redacted = RedactedStrkey::from_already_redacted(smart_account_redacted);
-    let contract_address_redacted = RedactedStrkey::from_already_redacted(contract_redacted);
-    let request_id = request_id.to_owned();
-    match contract_kind {
-        ContractKind::Policy => SaError::PolicyMutable {
-            rule_id,
-            smart_account_redacted,
-            contract_address_redacted,
-            admin_or_owner_key,
-            detail: Some(detail),
-            request_id,
-        },
-        _ => SaError::VerifierMutable {
-            rule_id,
-            smart_account_redacted,
-            contract_address_redacted,
-            admin_or_owner_key,
-            detail: Some(detail),
-            request_id,
-        },
+impl PinnedKind {
+    fn contract_kind(self) -> ContractKind {
+        match self {
+            Self::Verifier => ContractKind::Verifier,
+            Self::Policy => ContractKind::Policy,
+        }
+    }
+
+    fn is_allowlisted(self, hash: &[u8; 32]) -> bool {
+        match self {
+            Self::Verifier => verifier_hash_allowlisted(hash),
+            Self::Policy => policy_hash_allowlisted(hash),
+        }
+    }
+
+    fn not_in_allowlist_error(
+        self,
+        rule_id: u32,
+        smart_account_redacted: &str,
+        observed_hash_first8: String,
+        request_id: &str,
+    ) -> SaError {
+        let smart_account_redacted = RedactedStrkey::from_already_redacted(smart_account_redacted);
+        let request_id = request_id.to_owned();
+        match self {
+            Self::Verifier => SaError::VerifierWasmNotInAllowlist {
+                rule_id,
+                smart_account_redacted,
+                observed_hash_first8,
+                request_id,
+            },
+            Self::Policy => SaError::PolicyWasmNotInAllowlist {
+                rule_id,
+                smart_account_redacted,
+                observed_hash_first8,
+                request_id,
+            },
+        }
+    }
+
+    fn mutable_error(
+        self,
+        rule_id: u32,
+        smart_account_redacted: &str,
+        contract_redacted: &str,
+        admin_or_owner_key: AdminOrOwnerKey,
+        detail: String,
+        request_id: &str,
+    ) -> SaError {
+        let smart_account_redacted = RedactedStrkey::from_already_redacted(smart_account_redacted);
+        let contract_address_redacted = RedactedStrkey::from_already_redacted(contract_redacted);
+        let request_id = request_id.to_owned();
+        match self {
+            Self::Verifier => SaError::VerifierMutable {
+                rule_id,
+                smart_account_redacted,
+                contract_address_redacted,
+                admin_or_owner_key,
+                detail: Some(detail),
+                request_id,
+            },
+            Self::Policy => SaError::PolicyMutable {
+                rule_id,
+                smart_account_redacted,
+                contract_address_redacted,
+                admin_or_owner_key,
+                detail: Some(detail),
+                request_id,
+            },
+        }
     }
 }
 
@@ -893,13 +904,6 @@ pub(crate) fn read_pinned_hashes_for_rule(
         .map_err(SaError::AuditLog)
 }
 
-/// First-8-hex projection of a 32-byte wasm hash.
-///
-/// Mirrors the projection used in [`PinResult::pinned_verifier_hashes_first8`].
-fn hash_first8_hex(hash: &[u8; 32]) -> String {
-    hash[..8].iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// Comparison of a live executable against one pinned position.
 #[derive(Debug, PartialEq, Eq)]
 struct PinComparison {
@@ -997,7 +1001,7 @@ async fn observe_with_cache(
 /// Reads the pin from the audit log (the `SaContextRuleCreated` entry for
 /// `rule_id`), fetches the live executable via
 /// [`fetch_observed_executable`][crate::managers::signers::fetch_observed_executable]
-/// (two-RPC, no allowlist enforcement — drift detection compares against the
+/// (two-RPC, no allowlist enforcement; drift detection compares against the
 /// pin only; allowlist enforcement belongs at install time), and compares
 /// kind, reference and hash as described on `compare_against_pin`.
 ///
@@ -1010,11 +1014,11 @@ async fn observe_with_cache(
 ///
 /// - `signers_manager` — provides RPC clients and audit writer.
 /// - `verifier_addr` — the verifier contract address to check.
-/// - `rule_id` — the context rule whose pinned verifier to compare.
+/// - `rule_id`: the context rule whose pinned verifier to compare.
 /// - `smart_account_redacted` — pre-computed first-5-last-5 of the
 ///   smart-account strkey (for audit fields).
 /// - `request_id` — caller-supplied UUID for forensic correlation.
-/// - `wasm_hash_cache` — shared per-call cache of observed executables keyed
+/// - `wasm_hash_cache`: shared per-call cache of observed executables keyed
 ///   by verifier `ScAddress` XDR bytes.
 ///
 /// # Returns
@@ -1024,13 +1028,13 @@ async fn observe_with_cache(
 /// # Errors
 ///
 /// - [`SaError::NetworkRpcDivergence`] — RPCs disagree before drift check.
-/// - [`SaError::VerifierHashDrift`] — the live executable differs from the pin
+/// - [`SaError::VerifierHashDrift`]: the live executable differs from the pin
 ///   in kind, reference or hash.
-/// - [`SaError::ContractInstanceUnsupported`] — an endpoint returned a
+/// - [`SaError::ContractInstanceUnsupported`]: an endpoint returned a
 ///   malformed entry.
-/// - [`SaError::MultiplePinnedHashesUnsupported`] — the rule pins more than one
+/// - [`SaError::MultiplePinnedHashesUnsupported`]: the rule pins more than one
 ///   verifier.
-/// - [`SaError::AuditLog`] — audit-log integrity error, including a malformed
+/// - [`SaError::AuditLog`]: audit-log integrity error, including a malformed
 ///   pin record.
 /// - [`SaError::DeploymentFailed`] — RPC fetch failed.
 ///
@@ -1156,7 +1160,7 @@ pub(crate) async fn verify_pinned_verifier_against_chain(
 }
 
 /// Verify a rule's pinned policy against the live on-chain contract at
-/// signing time (drift-detection re-fetch — policy path).
+/// signing time (drift-detection re-fetch, policy path).
 ///
 /// Parallel to [`verify_pinned_verifier_against_chain`] for the
 /// threshold-policy contract path.
@@ -1165,11 +1169,11 @@ pub(crate) async fn verify_pinned_verifier_against_chain(
 ///
 /// - `signers_manager` — provides RPC clients and audit writer.
 /// - `policy_addr` — the policy contract address to verify.
-/// - `rule_id` — the context rule whose pinned policy to compare.
+/// - `rule_id`: the context rule whose pinned policy to compare.
 /// - `smart_account_redacted` — pre-computed first-5-last-5 of the
 ///   smart-account strkey (for audit fields).
 /// - `request_id` — caller-supplied UUID for forensic correlation.
-/// - `wasm_hash_cache` — shared per-call cache of observed executables keyed
+/// - `wasm_hash_cache`: shared per-call cache of observed executables keyed
 ///   by policy `ScAddress` XDR bytes.
 ///
 /// # Returns / Errors
@@ -1186,8 +1190,6 @@ pub(crate) async fn verify_pinned_policy_against_chain(
     request_id: &str,
     wasm_hash_cache: &mut HashMap<Vec<u8>, ObservedExecutable>,
 ) -> Result<(), SaError> {
-    use crate::signers::policy_identification::THRESHOLD_POLICY_WASM_HASHES;
-
     let policy_strkey = xdr_scaddress_to_strkey_or_sentinel(&policy_addr);
     let policy_redacted = redact_strkey_first5_last5(&policy_strkey);
 
@@ -1243,7 +1245,7 @@ pub(crate) async fn verify_pinned_policy_against_chain(
 
     // Informational: the pin, not the allowlist, decides at signing time.
     if let Some(hash) = observed.effective_hash()
-        && !THRESHOLD_POLICY_WASM_HASHES.iter().any(|h| h == &hash)
+        && !policy_hash_allowlisted(&hash)
     {
         warn!(
             rule_id,
@@ -1420,7 +1422,7 @@ pub enum MutabilityStatus {
 /// - `Ok(MutabilityStatus::Immutable)` — the instance is absent, or its Wasm
 ///   storage has no active admin key.
 /// - `Ok(MutabilityStatus::Mutable { admin_or_owner_key, holder_redacted,
-///   executable_ref })` — an active admin key, an owner-managed external
+///   executable_ref })`: an active admin key, an owner-managed external
 ///   reference, or an unreadable instance. The typed reason distinguishes
 ///   undecodable instance data and non-Wasm executables from admin storage
 ///   keys and external references. An external reference reports the

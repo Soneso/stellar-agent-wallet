@@ -3500,7 +3500,7 @@ impl SignersManager {
     ///
     /// # Errors
     ///
-    /// - [`SaError::VerifierWasmNotInAllowlist`] — no code, or an effective
+    /// - [`SaError::VerifierWasmNotInAllowlist`]: no code, or an effective
     ///   hash outside the allowlist (fail-closed; allowlist is the
     ///   authoritative gate).
     /// - [`SaError::ContractInstanceUnsupported`] — the verifier's executable
@@ -3571,7 +3571,7 @@ impl SignersManager {
     ///
     /// # Errors
     ///
-    /// - [`SaError::ContractInstanceUnsupported`] — an external reference
+    /// - [`SaError::ContractInstanceUnsupported`]: an external reference
     ///   with no live tag entry (reason `ExternalRefUnresolved`), or a
     ///   malformed entry (reason `UndecodableInstance`); no flag overrides it.
     /// - [`SaError::NetworkRpcDivergence`] — primary and secondary RPC disagree.
@@ -4493,10 +4493,11 @@ fn compute_post_op_invariant(
 /// endpoint.
 ///
 /// Generic over any contract address slice; its consumers are the on-chain
-/// policy identification helpers (`identify_threshold_policy`,
+/// policy identification helpers `identify_threshold_policy`,
 /// `identify_spending_limit_policy`, `identify_weighted_threshold_policy` and
-/// `classify_rule_policies`), each of which fetches from both endpoints and
-/// compares the aligned results.
+/// `classify_rule_policies`. The three identify helpers compare aligned
+/// results from both endpoints. The display-only `classify_rule_policies`
+/// uses the primary endpoint.
 ///
 /// Returns `Vec<Option<[u8; 32]>>` **aligned with `keys`**:
 /// - `Some(hash)` when the key resolved to a Wasm contract instance, or to a
@@ -4508,7 +4509,7 @@ fn compute_post_op_invariant(
 ///   does not hold a 32-byte hash.
 ///
 /// The caller may zip this result with the original contract address slice
-/// using index position — no positional drift can occur because the lengths
+/// using index position; no positional drift can occur because the lengths
 /// match.
 ///
 /// External references are resolved with one more `getLedgerEntries` on the
@@ -4783,8 +4784,17 @@ pub(crate) fn verifier_hash_allowlisted(hash: &[u8; 32]) -> bool {
         .any(|entry| &entry.wasm_hash == hash)
 }
 
-/// Returns lower-case hex of the first 8 bytes of `hash`.
-fn hash_first8_hex(hash: &[u8; 32]) -> String {
+/// Returns `true` when `hash` is one of the
+/// [`THRESHOLD_POLICY_WASM_HASHES`] a rule-install policy pin accepts.
+pub(crate) fn policy_hash_allowlisted(hash: &[u8; 32]) -> bool {
+    THRESHOLD_POLICY_WASM_HASHES
+        .iter()
+        .any(|allowed| allowed == hash)
+}
+
+/// Returns lower-case hex of the first 8 bytes of `hash`, the first-8
+/// projection the audit rows, pins and errors carry.
+pub(crate) fn hash_first8_hex(hash: &[u8; 32]) -> String {
     hash[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -4830,11 +4840,11 @@ impl ContractObservation {
 ///
 /// # Errors
 ///
-/// - [`SaError::ContractInstanceUnsupported`] — an endpoint returned a
+/// - [`SaError::ContractInstanceUnsupported`]: an endpoint returned a
 ///   malformed instance or tag entry (reason `UndecodableInstance`), or an
 ///   outcome this crate does not know (reason `NonWasmExecutable`). No flag
 ///   overrides either refusal.
-/// - [`SaError::NetworkRpcDivergence`] — primary and secondary RPC responses
+/// - [`SaError::NetworkRpcDivergence`]: primary and secondary RPC responses
 ///   differ, including on an external reference's owner, tag or resolved hash.
 /// - [`SaError::DeploymentFailed`] (phase `"simulate"`) — `getLedgerEntries` RPC
 ///   failure on primary or secondary.
@@ -6441,7 +6451,7 @@ mod tests {
         );
 
         // ── Path B: smart-account primitive ─────────────────────────────────
-        // Expected: None — a StellarAsset executable has no Wasm hash and no
+        // Expected: None; a StellarAsset executable has no Wasm hash and no
         // tag entry to resolve, so its aligned position stays None.
         let server_b = MockServer::start().await;
         Mock::given(method("POST"))
@@ -6686,7 +6696,7 @@ mod tests {
             .observe_contract(
                 &external_ref_contract_scaddress(),
                 ContractKind::Policy,
-                |hash| THRESHOLD_POLICY_WASM_HASHES.iter().any(|h| h == hash),
+                policy_hash_allowlisted,
                 7,
                 "CSMART...ACCNT",
                 "req-1",
