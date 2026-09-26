@@ -27,13 +27,20 @@
 //!
 //! # Pre-flight gates (fail-CLOSED)
 //!
-//! 1. The destination verifier's **wasm hash** (queried from chain) MUST appear
-//!    in [`VERIFIER_ALLOWLIST`] (else `VerifierMigrationFailed { phase: "preflight_destination_unknown" }`).
+//! 1. The destination verifier's **wasm hash** (queried from chain; for an
+//!    external reference, the hash its tag resolves to) MUST appear in
+//!    [`VERIFIER_ALLOWLIST`] (else `VerifierMigrationFailed { phase: "preflight_destination_unknown" }`).
+//!    An external reference with no live tag entry or an undecodable instance
+//!    is refused first with `SaError::ContractInstanceUnsupported`.
 //! 2. Destination audit status MUST be [`VerifierAuditStatus::Audited`],
 //!    [`VerifierAuditStatus::Provisional`], or [`VerifierAuditStatus::Unaudited`].
 //!    `Revoked` → `SaError::VerifierWasmRevoked`; `Retired` → `SaError::VerifierWasmRetired`.
-//! 3. Destination contract MUST be immutable (no admin/owner key in instance storage)
-//!    (else `VerifierMigrationFailed { phase: "preflight_destination_mutable" }`).
+//! 3. Destination contract MUST be immutable: no admin/owner key in instance
+//!    storage and no owner-managed external-reference executable (else
+//!    `VerifierMigrationFailed { phase: "preflight_destination_mutable" }`,
+//!    naming the owner and tag of a reference), and the probe MUST observe
+//!    the executable identified in gate 1 (else
+//!    `SaError::ContractInstanceUnsupported`, reason `ExecutableChanged`).
 //!
 //! # Inter-transaction failure mode
 //!
@@ -97,9 +104,12 @@ use tracing::{debug, info, warn};
 use crate::SaError;
 use crate::error::MIGRATION_PHASES;
 use crate::managers::rules::{ContextRuleManager, ContextRuleManagerConfig, scaddress_to_strkey};
-use crate::managers::signers::fetch_observed_wasm_hash;
-use crate::managers::signers::{SignersManager, simulate_read_only};
-use crate::managers::verifiers::{MutabilityStatus, detect_contract_mutability};
+use crate::managers::signers::{
+    SignersManager, fetch_observed_executable, simulate_read_only, verifier_hash_allowlisted,
+};
+use crate::managers::verifiers::{
+    MutabilityStatus, detect_contract_mutability, same_executable_reference,
+};
 use crate::verifier_allowlist::{VERIFIER_ALLOWLIST, VerifierAuditStatus};
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::ContractKind;
@@ -933,38 +943,48 @@ impl<'a> MigrationPlanner<'a> {
 
         // ── Pre-flight 1+2+3: destination hash, audit status, immutability ──────
 
-        // Query destination verifier WASM hash from chain (two-RPC consultation).
+        // Observe the destination verifier's executable (two-RPC
+        // consultation, an external reference resolved at each endpoint).
         // Rule ID 0 is a synthetic sentinel — not a real context-rule ID; used
-        // only for the forensic error fields of `NetworkRpcDivergence`.
-        let to_hash_opt = fetch_observed_wasm_hash(
-            self.signers_manager.primary_rpc_client(),
-            self.signers_manager.secondary_rpc_client(),
-            &to_verifier_addr,
-            ContractKind::Verifier,
-            0,
-            &smart_account_redacted,
-            request_id,
-        )
-        .await
-        .map_err(|e| SaError::VerifierMigrationFailed {
-            phase: MIGRATION_PHASES[2], // "plan_build"
-            smart_account_redacted: RedactedStrkey::from_already_redacted(
-                smart_account_redacted.clone(),
-            ),
-            detail: format!("destination verifier wasm-hash fetch failed: {e}"),
-            request_id: request_id.to_owned(),
-        })?;
+        // only for forensic error fields. A contract with no code the wallet
+        // can pin (an unresolved external reference, a malformed entry) is
+        // refused with its typed `ContractInstanceUnsupported`; any other
+        // fetch failure is a plan-build failure.
+        let observation = self
+            .signers_manager
+            .observe_contract(
+                &to_verifier_addr,
+                ContractKind::Verifier,
+                verifier_hash_allowlisted,
+                0,
+                &smart_account_redacted,
+                request_id,
+            )
+            .await
+            .map_err(|e| match e {
+                SaError::ContractInstanceUnsupported { .. } => e,
+                other => SaError::VerifierMigrationFailed {
+                    phase: MIGRATION_PHASES[2], // "plan_build"
+                    smart_account_redacted: RedactedStrkey::from_already_redacted(
+                        smart_account_redacted.clone(),
+                    ),
+                    detail: format!("destination verifier wasm-hash fetch failed: {other}"),
+                    request_id: request_id.to_owned(),
+                },
+            })?;
 
-        let to_hash = to_hash_opt.ok_or_else(|| SaError::VerifierMigrationFailed {
-            phase: MIGRATION_PHASES[0], // "preflight_destination_unknown"
-            smart_account_redacted: RedactedStrkey::from_already_redacted(
-                smart_account_redacted.clone(),
-            ),
-            detail: format!(
-                "destination verifier contract at {to_verifier_redacted} has no deployed WASM \
+        let to_hash = observation.observed.effective_hash().ok_or_else(|| {
+            SaError::VerifierMigrationFailed {
+                phase: MIGRATION_PHASES[0], // "preflight_destination_unknown"
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted.clone(),
+                ),
+                detail: format!(
+                    "destination verifier contract at {to_verifier_redacted} has no deployed WASM \
                  (contract not found or not a contract instance)"
-            ),
-            request_id: request_id.to_owned(),
+                ),
+                request_id: request_id.to_owned(),
+            }
         })?;
 
         let to_hash_first8: String = to_hash[..8].iter().map(|b| format!("{b:02x}")).collect();
@@ -1038,9 +1058,20 @@ impl<'a> MigrationPlanner<'a> {
         })?;
 
         if let MutabilityStatus::Mutable {
-            admin_or_owner_key, ..
-        } = mutability
+            admin_or_owner_key,
+            executable_ref,
+            ..
+        } = &mutability
         {
+            let reference = executable_ref
+                .as_ref()
+                .map_or_else(String::new, |external| {
+                    format!(
+                        ", owner {}, tag \"{}\"",
+                        external.owner_redacted(),
+                        external.tag_display()
+                    )
+                });
             return Err(SaError::VerifierMigrationFailed {
                 phase: MIGRATION_PHASES[1], // "preflight_destination_mutable"
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
@@ -1048,9 +1079,28 @@ impl<'a> MigrationPlanner<'a> {
                 ),
                 detail: format!(
                     "destination verifier at {to_verifier_redacted} is mutable \
-                     (reason={admin_or_owner_key}); mutable contracts are refused as \
-                     migration destinations"
+                     (reason={admin_or_owner_key}{reference}); mutable contracts are \
+                     refused as migration destinations"
                 ),
+                request_id: request_id.to_owned(),
+            });
+        }
+
+        // An immutable probe result must describe the executable identified
+        // above; a destination that was an external reference at
+        // identification and is not one now has no single observation to
+        // migrate to.
+        if !same_executable_reference(&observation.observed, &mutability)? {
+            return Err(SaError::ContractInstanceUnsupported {
+                rule_id: 0,
+                contract_kind: ContractKind::Verifier,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted.clone(),
+                ),
+                contract_address_redacted: RedactedStrkey::from_already_redacted(
+                    to_verifier_redacted,
+                ),
+                reason: crate::AdminOrOwnerKey::ExecutableChanged,
                 request_id: request_id.to_owned(),
             });
         }
@@ -1237,8 +1287,11 @@ impl<'a> MigrationPlanner<'a> {
             let mut steps: Vec<SignerMigrationStep> = Vec::new();
 
             for ext in external_signers {
-                // Fetch the wasm hash of this signer's verifier contract (two-RPC).
-                let observed_hash_opt = fetch_observed_wasm_hash(
+                // Fetch the effective hash of this signer's verifier contract
+                // (two-RPC): the Wasm hash, or the hash an external reference
+                // resolves to now. No code and an unresolved reference have
+                // none, and the signer is skipped.
+                let observed_hash_opt = fetch_observed_executable(
                     self.signers_manager.primary_rpc_client(),
                     self.signers_manager.secondary_rpc_client(),
                     &ext.verifier_addr,
@@ -1247,7 +1300,8 @@ impl<'a> MigrationPlanner<'a> {
                     smart_account_redacted,
                     request_id,
                 )
-                .await?;
+                .await?
+                .effective_hash();
 
                 let observed_hash = match observed_hash_opt {
                     Some(h) => h,

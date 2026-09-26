@@ -104,6 +104,8 @@ fn write_rule_created(writer: &Arc<Mutex<AuditWriter>>, rule_id: u32, sa_redacte
         vec![],
         false,
         false,
+        vec![],
+        vec![],
     );
     writer
         .lock()

@@ -26,12 +26,14 @@ use stellar_agent_core::audit_log::signer_set::ObservedSignerSet;
 pub use stellar_agent_core::error::AuthMismatchReason;
 use stellar_agent_core::observability::RedactedStrkey;
 
-/// Storage key or unreadable instance shape that prevents establishing immutability.
+/// Storage key or instance shape that prevents establishing immutability.
 ///
-/// `Admin` and `Owner` populate the `admin_or_owner_key` field on
-/// [`SaError::VerifierMutable`] and [`SaError::PolicyMutable`].
-/// `UndecodableInstance`, `NonWasmExecutable` and `ExternalRefExecutable`
-/// populate the `reason` field on [`SaError::ContractInstanceUnsupported`].
+/// `Admin`, `Owner` and `ExternalRefExecutable` populate the
+/// `admin_or_owner_key` field on [`SaError::VerifierMutable`] and
+/// [`SaError::PolicyMutable`]: the operator can admit such a contract with
+/// `--accept-mutable-verifier`. `UndecodableInstance`, `NonWasmExecutable`,
+/// `ExternalRefUnresolved` and `ExecutableChanged` populate the `reason` field
+/// on [`SaError::ContractInstanceUnsupported`], which no flag overrides.
 ///
 /// # Wire format
 ///
@@ -50,9 +52,18 @@ pub enum AdminOrOwnerKey {
     NonWasmExecutable,
     /// The instance executable is a CAP-85 external reference: the owner
     /// named in the instance decides, and can change at any time, which Wasm
-    /// runs, so no hash pinned at install time describes the code that runs
-    /// at signing time.
+    /// runs. The wallet pins the owner, the tag and the resolved hash and
+    /// refuses to sign when any of them changes; the owner's authority makes
+    /// the contract mutable in the same sense as an admin key.
     ExternalRefExecutable,
+    /// The instance executable is a CAP-85 external reference but the owner's
+    /// tag entry is not live (archived or expired), so there is no hash the
+    /// wallet can pin.
+    ExternalRefUnresolved,
+    /// The executable observed while identifying the contract and the one
+    /// observed by the mutability probe differ in kind or in external
+    /// reference, so the install has no single observation to pin.
+    ExecutableChanged,
 }
 
 impl AdminOrOwnerKey {
@@ -61,16 +72,22 @@ impl AdminOrOwnerKey {
     /// An existing instance that does not decode as a Wasm contract instance
     /// has no Wasm hash to pin, and the signing-time drift check compares
     /// against the zero hash, so a later code change stays invisible. An
-    /// external-reference executable has an owner-mutable hash, so a pin
-    /// taken at install time says nothing about the code that runs later.
-    /// Rule install refuses such a contract with no override.
+    /// external reference with no live tag entry resolves to no hash. An
+    /// executable that changed between the identification fetch and the
+    /// mutability probe leaves no single observation to pin. Rule install
+    /// refuses such a contract with no override.
+    ///
+    /// An external reference that resolves is pinnable: the pin records the
+    /// owner, the tag and the resolved hash, and the drift check compares all
+    /// three.
     #[must_use]
     pub fn is_unpinnable_instance(self) -> bool {
         match self {
-            Self::UndecodableInstance | Self::NonWasmExecutable | Self::ExternalRefExecutable => {
-                true
-            }
-            Self::Admin | Self::Owner => false,
+            Self::UndecodableInstance
+            | Self::NonWasmExecutable
+            | Self::ExternalRefUnresolved
+            | Self::ExecutableChanged => true,
+            Self::Admin | Self::Owner | Self::ExternalRefExecutable => false,
         }
     }
 }
@@ -83,8 +100,18 @@ impl std::fmt::Display for AdminOrOwnerKey {
             Self::UndecodableInstance => f.write_str("undecodable instance"),
             Self::NonWasmExecutable => f.write_str("non-Wasm executable"),
             Self::ExternalRefExecutable => f.write_str("owner-managed external reference"),
+            Self::ExternalRefUnresolved => f.write_str("external reference with no live tag entry"),
+            Self::ExecutableChanged => f.write_str("executable changed during install"),
         }
     }
+}
+
+/// Renders an optional bounded detail as a parenthesised Display suffix, or
+/// nothing when absent.
+fn paren_suffix(detail: &Option<String>) -> String {
+    detail
+        .as_deref()
+        .map_or_else(String::new, |detail| format!(" ({detail})"))
 }
 
 /// Typed post-submit verification failure kind for multicall bundles.
@@ -218,7 +245,8 @@ pub enum SaError {
     /// correlation without leaking the full preimage.
     #[error(
         "verifier wasm-hash drift detected for rule {rule_id}: \
-         pinned={pinned_hash_first8}, observed={observed_hash_first8}"
+         pinned={pinned_hash_first8}, observed={observed_hash_first8}{}",
+        paren_suffix(.observed_executable)
     )]
     #[serde(rename = "sa.verifier_hash_drift")]
     VerifierHashDrift {
@@ -237,9 +265,16 @@ pub enum SaError {
         deploy_address_redacted: RedactedStrkey,
         /// First-8 hex chars of the wasm hash pinned at rule-install time.
         pinned_hash_first8: String,
-        /// First-8 hex chars of the wasm hash observed on-chain via two-RPC
-        /// re-fetch.
+        /// First-8 hex chars of the effective hash observed on-chain via
+        /// two-RPC re-fetch: the Wasm hash, the hash an external reference
+        /// resolved to, or the zero hash for no code or an unresolved
+        /// reference.
         observed_hash_first8: String,
+        /// Bounded summary of the observed executable (`wasm`, `no code`, or
+        /// `external reference owner <redacted> tag "<bounded>" resolved
+        /// <first-8 or unset>`); appended to the Display when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_executable: Option<String>,
         /// Per-request correlation identifier (UUIDv4).
         request_id: String,
     },
@@ -258,7 +293,8 @@ pub enum SaError {
     /// at the call site.
     #[error(
         "policy wasm-hash drift detected for rule {rule_id}: \
-         pinned={pinned_hash_first8}, observed={observed_hash_first8}"
+         pinned={pinned_hash_first8}, observed={observed_hash_first8}{}",
+        paren_suffix(.observed_executable)
     )]
     #[serde(rename = "sa.policy_hash_drift")]
     PolicyHashDrift {
@@ -277,9 +313,16 @@ pub enum SaError {
         deploy_address_redacted: RedactedStrkey,
         /// First-8 hex chars of the wasm hash pinned at rule-install time.
         pinned_hash_first8: String,
-        /// First-8 hex chars of the wasm hash observed on-chain via two-RPC
-        /// re-fetch.
+        /// First-8 hex chars of the effective hash observed on-chain via
+        /// two-RPC re-fetch: the Wasm hash, the hash an external reference
+        /// resolved to, or the zero hash for no code or an unresolved
+        /// reference.
         observed_hash_first8: String,
+        /// Bounded summary of the observed executable (`wasm`, `no code`, or
+        /// `external reference owner <redacted> tag "<bounded>" resolved
+        /// <first-8 or unset>`); appended to the Display when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_executable: Option<String>,
         /// Per-request correlation identifier (UUIDv4).
         request_id: String,
     },
@@ -329,13 +372,15 @@ pub enum SaError {
         request_id: String,
     },
 
-    /// Verifier contract has an active admin key (mutable).
+    /// Verifier contract has an active admin key or an owner-managed
+    /// executable (mutable).
     ///
     /// Fired at rule-install time when `managers::verifiers::detect_contract_mutability`
-    /// reports an active `Admin` or `Owner` key on the verifier. Its holder can
-    /// upgrade the contract's Wasm. The wallet requires the operator's
+    /// reports an active `Admin` or `Owner` key on the verifier, or an
+    /// external-reference executable whose owner can repoint it. Either can
+    /// change the code the verifier runs. The wallet requires the operator's
     /// `--accept-mutable-verifier` acknowledgement. An instance that cannot be
-    /// read as Wasm is refused with [`SaError::ContractInstanceUnsupported`].
+    /// pinned is refused with [`SaError::ContractInstanceUnsupported`].
     ///
     /// # Forensic spine
     ///
@@ -344,8 +389,9 @@ pub enum SaError {
     /// at the call site.  `admin_or_owner_key` is a typed storage key, not secret.
     #[error(
         "verifier contract is mutable for rule {rule_id}: \
-         contract={contract_address_redacted}, reason={admin_or_owner_key}; \
-         --accept-mutable-verifier is required"
+         contract={contract_address_redacted}, reason={admin_or_owner_key}{}; \
+         --accept-mutable-verifier is required",
+        paren_suffix(.detail)
     )]
     #[serde(rename = "sa.verifier_mutable")]
     VerifierMutable {
@@ -362,18 +408,26 @@ pub enum SaError {
         /// MUST be redacted at the call site via
         /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
         contract_address_redacted: RedactedStrkey,
-        /// Active admin storage key (`Admin` or `Owner`).
+        /// Why the contract is mutable: an active `Admin` or `Owner` storage
+        /// key, or an `ExternalRefExecutable`.
         admin_or_owner_key: AdminOrOwnerKey,
+        /// Bounded detail appended to the Display when present: the redacted
+        /// holder of an admin or owner key, or `owner <redacted>, tag
+        /// "<bounded>"` for an external reference.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
         /// Per-request correlation identifier (UUIDv4).
         request_id: String,
     },
 
-    /// Policy contract has an active admin key (mutable).
+    /// Policy contract has an active admin key or an owner-managed executable
+    /// (mutable).
     ///
     /// Parallel to [`SaError::VerifierMutable`] for the threshold-policy contract
     /// path.  Fired at rule-install time when
     /// `managers::verifiers::detect_contract_mutability` reports a live `Admin`
-    /// or `Owner` key in the policy contract's instance storage.
+    /// or `Owner` key in the policy contract's instance storage, or an
+    /// external-reference executable.
     ///
     /// # Forensic spine
     ///
@@ -382,8 +436,9 @@ pub enum SaError {
     /// at the call site.
     #[error(
         "policy contract is mutable for rule {rule_id}: \
-         contract={contract_address_redacted}, reason={admin_or_owner_key}; \
-         --accept-mutable-verifier is required"
+         contract={contract_address_redacted}, reason={admin_or_owner_key}{}; \
+         --accept-mutable-verifier is required",
+        paren_suffix(.detail)
     )]
     #[serde(rename = "sa.policy_mutable")]
     PolicyMutable {
@@ -400,25 +455,32 @@ pub enum SaError {
         /// MUST be redacted at the call site via
         /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
         contract_address_redacted: RedactedStrkey,
-        /// Active admin storage key (`Admin` or `Owner`).
+        /// Why the contract is mutable: an active `Admin` or `Owner` storage
+        /// key, or an `ExternalRefExecutable`.
         admin_or_owner_key: AdminOrOwnerKey,
+        /// Bounded detail appended to the Display when present: the redacted
+        /// holder of an admin or owner key, or `owner <redacted>, tag
+        /// "<bounded>"` for an external reference.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
         /// Per-request correlation identifier (UUIDv4).
         request_id: String,
     },
 
-    /// Verifier or policy contract instance cannot be read as a Wasm instance.
+    /// Verifier or policy contract instance has no code the wallet can pin.
     ///
     /// Fired at rule-install time when `managers::verifiers::detect_contract_mutability`
     /// finds an existing instance entry that does not decode as contract-instance
-    /// data or whose executable is not Wasm, and whenever the verifier or policy
-    /// Wasm-hash fetch (install-time identification and signing-time drift)
-    /// finds an undecodable instance or an external-reference executable. Such
-    /// a contract has no Wasm hash the wallet can pin: the signing-time drift
-    /// check cannot observe a change to its code, and an external reference's
-    /// owner can repoint it at any time. No flag overrides this refusal;
-    /// `--accept-mutable-verifier` covers only [`SaError::VerifierMutable`] and
-    /// [`SaError::PolicyMutable`], and `--accept-unknown-verifier` covers only
-    /// an allowlist miss.
+    /// data or whose executable is not Wasm, when identification finds an
+    /// external reference whose owner holds no live tag entry, and when the
+    /// identification fetch and the mutability probe observe different
+    /// executables; and whenever the verifier or policy executable fetch
+    /// (install-time identification and signing-time drift) finds an
+    /// undecodable instance. Such a contract has no hash the wallet can pin,
+    /// so the signing-time drift check could not observe a change to its
+    /// code. No flag overrides this refusal; `--accept-mutable-verifier`
+    /// covers only [`SaError::VerifierMutable`] and [`SaError::PolicyMutable`],
+    /// and `--accept-unknown-verifier` covers only an allowlist miss.
     ///
     /// # Forensic spine
     ///
@@ -448,7 +510,8 @@ pub enum SaError {
         /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
         contract_address_redacted: RedactedStrkey,
         /// Instance shape that prevents pinning (`UndecodableInstance`,
-        /// `NonWasmExecutable` or `ExternalRefExecutable`).
+        /// `NonWasmExecutable`, `ExternalRefUnresolved` or
+        /// `ExecutableChanged`).
         reason: AdminOrOwnerKey,
         /// Per-request correlation identifier (UUIDv4).
         request_id: String,
@@ -1492,10 +1555,12 @@ pub enum SaError {
     /// short per-RPC view fingerprint for operator triage.  The exact form is
     /// producer-specific: the storage-view divergence paths emit the first
     /// 8 hex chars of a SHA-256 digest of the raw view; the WASM-hash fetch
-    /// path (`fetch_observed_wasm_hash`, delegating to
+    /// path (`fetch_observed_executable`, delegating to
     /// `stellar_agent_network::fetch_contract_wasm_hash`) emits the first
-    /// 8 hex chars of the observed WASM hash itself, or the literal sentinel
-    /// `<SAC>` / `<Absent>` when that side's view is not a plain-WASM contract.
+    /// 8 hex chars of the observed WASM hash itself, the literal sentinel
+    /// `<SAC>` / `<Absent>`, or a bounded external-reference summary (redacted
+    /// owner, bounded tag, resolved first-8) when that side's view is not a
+    /// plain-WASM contract.
     /// Consumers treat the field as an opaque comparison token; the two sides
     /// of one error are always produced the same way and are directly
     /// comparable to each other.
@@ -2637,6 +2702,7 @@ mod tests {
                     deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
                     pinned_hash_first8: "aabbccdd".to_owned(),
                     observed_hash_first8: "11223344".to_owned(),
+                    observed_executable: None,
                     request_id: "test-req-drift-001".to_owned(),
                 },
             ),
@@ -2648,6 +2714,7 @@ mod tests {
                     deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
                     pinned_hash_first8: "aabbccdd".to_owned(),
                     observed_hash_first8: "11223344".to_owned(),
+                    observed_executable: None,
                     request_id: "test-req-drift-002".to_owned(),
                 },
             ),
@@ -2660,6 +2727,7 @@ mod tests {
                         "CBBBB...YYYYY",
                     ),
                     admin_or_owner_key: AdminOrOwnerKey::Admin,
+                    detail: None,
                     request_id: "test-req-mut-001".to_owned(),
                 },
             ),
@@ -2672,6 +2740,7 @@ mod tests {
                         "CBBBB...YYYYY",
                     ),
                     admin_or_owner_key: AdminOrOwnerKey::Owner,
+                    detail: None,
                     request_id: "test-req-mut-002".to_owned(),
                 },
             ),
@@ -3239,6 +3308,7 @@ mod tests {
                     deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
                     pinned_hash_first8: "aabbccdd".to_owned(),
                     observed_hash_first8: "11223344".to_owned(),
+                    observed_executable: None,
                     request_id: "test-req-drift-001".to_owned(),
                 },
                 &[
@@ -3258,6 +3328,7 @@ mod tests {
                     deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
                     pinned_hash_first8: "aabbccdd".to_owned(),
                     observed_hash_first8: "11223344".to_owned(),
+                    observed_executable: None,
                     request_id: "test-req-drift-002".to_owned(),
                 },
                 &[
@@ -3278,6 +3349,7 @@ mod tests {
                         "CBBBB...YYYYY",
                     ),
                     admin_or_owner_key: AdminOrOwnerKey::Admin,
+                    detail: None,
                     request_id: "test-req-mut-001".to_owned(),
                 },
                 &[
@@ -3297,6 +3369,7 @@ mod tests {
                         "CBBBB...YYYYY",
                     ),
                     admin_or_owner_key: AdminOrOwnerKey::Owner,
+                    detail: None,
                     request_id: "test-req-mut-002".to_owned(),
                 },
                 &[
@@ -3304,6 +3377,90 @@ mod tests {
                     "smart_account_redacted",
                     "contract_address_redacted",
                     "admin_or_owner_key",
+                    "request_id",
+                ],
+            ),
+            (
+                "sa.verifier_hash_drift",
+                SaError::VerifierHashDrift {
+                    rule_id: 1,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
+                    pinned_hash_first8: "aabbccdd00112233".to_owned(),
+                    observed_hash_first8: "aabbccdd00112233".to_owned(),
+                    observed_executable: Some("wasm".to_owned()),
+                    request_id: "test-req-drift-003".to_owned(),
+                },
+                &[
+                    "rule_id",
+                    "smart_account_redacted",
+                    "deploy_address_redacted",
+                    "pinned_hash_first8",
+                    "observed_hash_first8",
+                    "observed_executable",
+                    "request_id",
+                ],
+            ),
+            (
+                "sa.policy_hash_drift",
+                SaError::PolicyHashDrift {
+                    rule_id: 2,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
+                    pinned_hash_first8: "aabbccdd00112233".to_owned(),
+                    observed_hash_first8: "0000000000000000".to_owned(),
+                    observed_executable: Some("no code".to_owned()),
+                    request_id: "test-req-drift-004".to_owned(),
+                },
+                &[
+                    "rule_id",
+                    "smart_account_redacted",
+                    "deploy_address_redacted",
+                    "pinned_hash_first8",
+                    "observed_hash_first8",
+                    "observed_executable",
+                    "request_id",
+                ],
+            ),
+            (
+                "sa.verifier_mutable",
+                SaError::VerifierMutable {
+                    rule_id: 3,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    contract_address_redacted: RedactedStrkey::from_already_redacted(
+                        "CBBBB...YYYYY",
+                    ),
+                    admin_or_owner_key: AdminOrOwnerKey::ExternalRefExecutable,
+                    detail: Some("owner GAAAA...AAWHF, tag \"v1\"".to_owned()),
+                    request_id: "test-req-mut-003".to_owned(),
+                },
+                &[
+                    "rule_id",
+                    "smart_account_redacted",
+                    "contract_address_redacted",
+                    "admin_or_owner_key",
+                    "detail",
+                    "request_id",
+                ],
+            ),
+            (
+                "sa.policy_mutable",
+                SaError::PolicyMutable {
+                    rule_id: 4,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    contract_address_redacted: RedactedStrkey::from_already_redacted(
+                        "CBBBB...YYYYY",
+                    ),
+                    admin_or_owner_key: AdminOrOwnerKey::Owner,
+                    detail: Some("GCCCC...CCCCC".to_owned()),
+                    request_id: "test-req-mut-004".to_owned(),
+                },
+                &[
+                    "rule_id",
+                    "smart_account_redacted",
+                    "contract_address_redacted",
+                    "admin_or_owner_key",
+                    "detail",
                     "request_id",
                 ],
             ),
@@ -3832,6 +3989,65 @@ mod tests {
         }
     }
 
+    /// `detail` and `observed_executable` are omitted from the context when
+    /// `None`, serialised when `Some`, and appended to the Display in
+    /// parentheses only when present.
+    #[test]
+    fn optional_detail_fields_serialise_and_render_only_when_present() {
+        let mutable = |detail: Option<&str>| SaError::VerifierMutable {
+            rule_id: 3,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            contract_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
+            admin_or_owner_key: AdminOrOwnerKey::ExternalRefExecutable,
+            detail: detail.map(ToOwned::to_owned),
+            request_id: "req".to_owned(),
+        };
+        let drift = |observed: Option<&str>| SaError::PolicyHashDrift {
+            rule_id: 2,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
+            pinned_hash_first8: "1111111111111111".to_owned(),
+            observed_hash_first8: "1111111111111111".to_owned(),
+            observed_executable: observed.map(ToOwned::to_owned),
+            request_id: "req".to_owned(),
+        };
+
+        let without = serde_json::to_value(mutable(None)).unwrap();
+        assert!(without["context"].get("detail").is_none(), "{without}");
+        assert_eq!(
+            mutable(None).to_string(),
+            "verifier contract is mutable for rule 3: contract=CBBBB...YYYYY, \
+             reason=owner-managed external reference; --accept-mutable-verifier is required"
+        );
+        let detail = "owner GAAAA...AAWHF, tag \"v1\"";
+        let with = serde_json::to_value(mutable(Some(detail))).unwrap();
+        assert_eq!(with["context"]["detail"], detail);
+        assert_eq!(
+            mutable(Some(detail)).to_string(),
+            "verifier contract is mutable for rule 3: contract=CBBBB...YYYYY, \
+             reason=owner-managed external reference (owner GAAAA...AAWHF, tag \"v1\"); \
+             --accept-mutable-verifier is required"
+        );
+
+        let without = serde_json::to_value(drift(None)).unwrap();
+        assert!(
+            without["context"].get("observed_executable").is_none(),
+            "{without}"
+        );
+        assert_eq!(
+            drift(None).to_string(),
+            "policy wasm-hash drift detected for rule 2: \
+             pinned=1111111111111111, observed=1111111111111111"
+        );
+        let with = serde_json::to_value(drift(Some("wasm"))).unwrap();
+        assert_eq!(with["context"]["observed_executable"], "wasm");
+        assert_eq!(
+            drift(Some("wasm")).to_string(),
+            "policy wasm-hash drift detected for rule 2: \
+             pinned=1111111111111111, observed=1111111111111111 (wasm)"
+        );
+    }
+
     /// Verifies the wire-code closed set has no duplicates and covers every variant.
     ///
     /// The `match` arms below are exhaustive — adding a variant without updating
@@ -3859,6 +4075,7 @@ mod tests {
                 deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
                 pinned_hash_first8: "aabbccdd".to_owned(),
                 observed_hash_first8: "11223344".to_owned(),
+                observed_executable: None,
                 request_id: "test-req-drift-001".to_owned(),
             },
             SaError::PolicyHashDrift {
@@ -3867,6 +4084,7 @@ mod tests {
                 deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
                 pinned_hash_first8: "aabbccdd".to_owned(),
                 observed_hash_first8: "11223344".to_owned(),
+                observed_executable: None,
                 request_id: "test-req-drift-002".to_owned(),
             },
             SaError::MultiplePinnedHashesUnsupported {
@@ -3881,6 +4099,7 @@ mod tests {
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 contract_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
                 admin_or_owner_key: AdminOrOwnerKey::Admin,
+                detail: None,
                 request_id: "test-req-mut-001".to_owned(),
             },
             SaError::PolicyMutable {
@@ -3888,6 +4107,7 @@ mod tests {
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 contract_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
                 admin_or_owner_key: AdminOrOwnerKey::Owner,
+                detail: None,
                 request_id: "test-req-mut-002".to_owned(),
             },
             SaError::ContractInstanceUnsupported {
@@ -4415,6 +4635,8 @@ mod tests {
         "undecodable instance",
         "non-Wasm executable",
         "owner-managed external reference",
+        "external reference with no live tag entry",
+        "executable changed during install",
     ];
 
     #[test]
@@ -4425,6 +4647,8 @@ mod tests {
             AdminOrOwnerKey::UndecodableInstance,
             AdminOrOwnerKey::NonWasmExecutable,
             AdminOrOwnerKey::ExternalRefExecutable,
+            AdminOrOwnerKey::ExternalRefUnresolved,
+            AdminOrOwnerKey::ExecutableChanged,
         ]
         .iter()
         .map(std::string::ToString::to_string)
@@ -4439,13 +4663,17 @@ mod tests {
         );
     }
 
+    /// Storage keys and a resolved external reference are overridable
+    /// mutability findings; instance shapes with no code to pin are not.
     #[test]
     fn admin_or_owner_key_unpinnable_instance_covers_probe_failures_only() {
         assert!(!AdminOrOwnerKey::Admin.is_unpinnable_instance());
         assert!(!AdminOrOwnerKey::Owner.is_unpinnable_instance());
+        assert!(!AdminOrOwnerKey::ExternalRefExecutable.is_unpinnable_instance());
         assert!(AdminOrOwnerKey::UndecodableInstance.is_unpinnable_instance());
         assert!(AdminOrOwnerKey::NonWasmExecutable.is_unpinnable_instance());
-        assert!(AdminOrOwnerKey::ExternalRefExecutable.is_unpinnable_instance());
+        assert!(AdminOrOwnerKey::ExternalRefUnresolved.is_unpinnable_instance());
+        assert!(AdminOrOwnerKey::ExecutableChanged.is_unpinnable_instance());
     }
 
     /// Verifies that every `stage: "<literal>"` emit site in the crate's

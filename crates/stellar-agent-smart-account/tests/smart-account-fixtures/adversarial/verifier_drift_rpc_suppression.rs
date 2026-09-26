@@ -23,6 +23,7 @@ use std::sync::Arc;
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_smart_account::VERIFIER_ALLOWLIST;
 use stellar_agent_smart_account::error::SaError;
+use stellar_agent_smart_account::managers::signers::ObservedExecutable;
 use stellar_agent_smart_account::managers::verifiers::test_helpers;
 use stellar_xdr::{ContractId, Hash, ScAddress};
 use uuid::Uuid;
@@ -103,6 +104,8 @@ async fn rpc_suppression_fires_divergence_before_drift_check() {
         vec![],
         false,
         false,
+        vec![],
+        vec![],
     );
     {
         let mut writer = audit_writer.lock().expect("audit writer poisoned");
@@ -112,7 +115,7 @@ async fn rpc_suppression_fires_divergence_before_drift_check() {
     }
 
     // Call verify_pinned_verifier_against_chain — should fire divergence before drift.
-    let mut cache: HashMap<Vec<u8>, [u8; 32]> = HashMap::new();
+    let mut cache: HashMap<Vec<u8>, ObservedExecutable> = HashMap::new();
 
     let result = test_helpers::verify_pinned_verifier_against_chain(
         &manager,

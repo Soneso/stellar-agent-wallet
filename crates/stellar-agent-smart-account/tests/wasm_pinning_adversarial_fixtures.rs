@@ -18,6 +18,8 @@
 //! | [`pinned_hash_audit_log_tampering`] | `sa.audit_log` before pin extraction |
 //! | [`verifier_wasm_not_in_allowlist`] | `sa.verifier_wasm_not_in_allowlist` |
 //! | [`accept_mutable_verifier_override_audit_row`] | `SaMutableContractOverride` row emitted |
+//! | [`external_ref_install_pinning`] | external reference: `sa.verifier_mutable` / `sa.policy_mutable`, override rows, `ExecutableRefPin`, `executable changed during install` |
+//! | [`external_ref_drift_detection`] | external reference drift by kind, reference and hash |
 //!
 //! # Test organisation
 //!
@@ -27,7 +29,8 @@
 //! `tests/wasm_pinning_adversarial_fixtures.rs` entry point.
 //!
 //! The drift-detection fixtures (`verifier_wasm_drift_detection`,
-//! `policy_wasm_drift_detection`, `verifier_drift_rpc_suppression`) use
+//! `policy_wasm_drift_detection`, `verifier_drift_rpc_suppression`,
+//! `external_ref_drift_detection`) use
 //! `pub(crate)` helpers exposed under `--features test-helpers` via
 //! `managers::verifiers::test_helpers`.  They require:
 //!
@@ -83,6 +86,12 @@ mod verifier_wasm_not_in_allowlist;
 
 #[path = "smart-account-fixtures/adversarial/accept_mutable_verifier_override_audit_row.rs"]
 mod accept_mutable_verifier_override_audit_row;
+
+#[path = "smart-account-fixtures/adversarial/external_ref_install_pinning.rs"]
+mod external_ref_install_pinning;
+
+#[path = "smart-account-fixtures/adversarial/external_ref_drift_detection.rs"]
+mod external_ref_drift_detection;
 
 #[test]
 fn warn_if_test_helpers_feature_disabled() {

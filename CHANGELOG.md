@@ -15,6 +15,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolved hash, or no hash when there is no live tag entry. Both endpoints
   must agree on the resolved hash. An instance or tag entry with an unexpected
   shape is reported as malformed, not as an absent contract.
+- Smart-account audit rows, errors and envelopes carry external-reference
+  details. `SaContextRuleCreated` gains `pinned_verifier_executable_refs` and
+  `pinned_policy_executable_refs`, aligned with the first-8 hash lists;
+  `SaMutableContractOverride` gains `executable_owner_redacted` and
+  `executable_tag`; `SaVerifierHashDrift`, `SaPolicyHashDrift`,
+  `sa.verifier_hash_drift` and `sa.policy_hash_drift` gain
+  `observed_executable`; `sa.verifier_mutable` and `sa.policy_mutable` gain
+  `detail`; the `smart-account rules create` and `stellar_rule_create`
+  envelopes gain `pinned_verifier_executable_refs` and
+  `pinned_policy_executable_refs`. Every new field is optional, and rows
+  without it keep reading. A pin record whose reference lists are misaligned
+  with its hash lists or disagree with them is refused as an audit parse
+  error.
+- `sa.contract_instance_unsupported` has the reasons
+  `external reference with no live tag entry` and
+  `executable changed during install`.
 
 ### Changed
 
@@ -27,10 +43,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `defi.pin.external_ref`. DeFindex vault, Soroswap router and multicall
   router checks, post-deploy verification and SEP-48 argument previews refuse
   with a message naming the owner and the tag. Smart-account verifier and
-  policy installation and signing-time drift checks refuse with
-  `sa.contract_instance_unsupported`,
-  reason `owner-managed external reference`; `--accept-mutable-verifier` and
-  `--accept-unknown-verifier` do not override it.
+  policy installation treats such a contract as mutable: it refuses with
+  `sa.verifier_mutable` / `sa.policy_mutable`, reason
+  `owner-managed external reference`, naming the owner and the tag, unless
+  `--accept-mutable-verifier` is set, and then pins the owner, the tag and
+  the resolved hash; `--accept-unknown-verifier` is also required when the
+  resolved hash is outside the allowlist. Signing refuses with
+  `sa.verifier_hash_drift` / `sa.policy_hash_drift` when the owner repoints
+  the tag, the reference changes or the executable kind changes, and also
+  when a contract pinned by its Wasm hash becomes an external reference. An
+  external reference with no live tag entry is refused with
+  `sa.contract_instance_unsupported` whatever the flags. On-chain policy
+  identification for signer, threshold and spending-limit changes resolves an
+  external-reference policy to the allowlisted code its tag points at.
+  Verifier migration refuses an external-reference destination as mutable,
+  and refuses an unresolved or undecodable destination with
+  `sa.contract_instance_unsupported`.
 - `WasmHashDivergenceError` names its fields `primary_summary` and
   `secondary_summary`; each holds a bounded summary of that endpoint's outcome.
 - Verifier and policy installation refuses an undecodable instance entry while

@@ -9,6 +9,9 @@
 //! | [`revoked_destination_error_shape`] | wiremock planner invocation | `VerifierWasmRevoked` wire code |
 //! | [`empty_plan_via_planner`] | wiremock planner invocation | `MigrationPlan::total_transaction_count() == 0` on zero-rule account |
 //! | [`plan_total_tx_count_two_per_signer_step`] | wiremock planner invocation | `2 * signer_steps.len()` invariant per CAP-46 |
+//! | [`external_ref_destination_fails_preflight_destination_mutable`] | wiremock planner invocation | external-reference destination refused as mutable, naming owner and tag |
+//! | [`unresolved_external_ref_destination_is_refused_as_unsupported`] | wiremock planner invocation | `sa.contract_instance_unsupported` (`ExternalRefUnresolved`) |
+//! | [`source_scan_plans_signer_whose_verifier_reference_resolves_to_from_hash`] | wiremock planner invocation | source scan reads a reference's resolved hash |
 //!
 //! All tests are end-to-end [`MigrationPlanner::build`] invocations against a
 //! wiremock HTTP server.
@@ -192,7 +195,7 @@ async fn preflight_unknown_destination_via_planner() {
     // getLedgerEntries → contract instance with UNKNOWN_HASH (not in VERIFIER_ALLOWLIST) +
     // account entry for SOURCE_G (required by ContextRuleManager::simulate_read_only which
     // calls fetch_account before every simulateTransaction — including the pre-flight
-    // fetch_observed_wasm_hash call).
+    // fetch_observed_executable call).
     let ledger_resp = build_ledger_entries_account_and_contract(SOURCE_G, &dest_addr, UNKNOWN_HASH);
     let simulate_resp = build_simulate_response(&u32_xdr(0)); // would be get_context_rules_count
 
@@ -346,7 +349,7 @@ async fn revoked_destination_error_shape() {
 ///
 /// # Mock sequence
 ///
-/// 1. `getLedgerEntries` (×2 parallel for two-RPC fetch_observed_wasm_hash) →
+/// 1. `getLedgerEntries` (×2 parallel for two-RPC fetch_observed_executable) →
 ///    contract instance with `OZ_VERIFIER_HASH` + `storage: None` (immutable).
 /// 2. `getLedgerEntries` (×2 parallel for detect_contract_mutability) →
 ///    same response (both use `ContractDataEntry`; `storage: None` → `Immutable`).
@@ -372,7 +375,7 @@ async fn empty_plan_via_planner() {
 
     let dest_addr = addr(0xCD);
 
-    // getLedgerEntries → OZ verifier hash (for fetch_observed_wasm_hash +
+    // getLedgerEntries → OZ verifier hash (for fetch_observed_executable +
     // detect_contract_mutability) AND account entry for SOURCE_G (for fetch_account
     // inside ContextRuleManager::simulate_read_only → list_active_context_rules).
     let ledger_resp =
@@ -553,11 +556,11 @@ async fn plan_total_tx_count_two_per_signer_step() {
 ///
 /// `getLedgerEntries` → account entry (SOURCE_G) + dest-addr contract instance
 ///   (OZ_VERIFIER_HASH). This single response serves ALL getLedgerEntries calls:
-///   - `fetch_observed_wasm_hash` (pre-flight 1, two-RPC consultation).
+///   - `fetch_observed_executable` (pre-flight 1, two-RPC consultation).
 ///   - `detect_contract_mutability` (pre-flight 3, two-RPC consultation).
 ///   - `fetch_account` inside `ContextRuleManager::simulate_read_only` (called
 ///     by `get_rules_count` + `get_rule` in `list_active_context_rules`).
-///   - `fetch_observed_wasm_hash` for each External signer's verifier address.
+///   - `fetch_observed_executable` for each External signer's verifier address.
 ///
 /// `simulateTransaction` sequence:
 ///   1. `get_context_rules_count` → `ScVal::U32(2)`.
@@ -678,4 +681,188 @@ async fn t9_sparse_id_migration_planner() {
         "rules_skipped_count must be >= 1 (gap at ID 1); got {}",
         plan.rules_skipped_count
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// external-reference destinations and sources
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Executable owner of the external-reference fixtures (the all-zero ed25519
+/// account).
+const EXTERNAL_REF_OWNER: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
+/// Returns `response` (a `getLedgerEntries` result) with an
+/// external-reference instance for `contract` naming `EXTERNAL_REF_OWNER` /
+/// `tag` appended, and the owner's tag entry holding `resolved` when given.
+fn with_external_ref(
+    mut response: serde_json::Value,
+    contract: &ScAddress,
+    tag: &[u8],
+    resolved: Option<[u8; 32]>,
+) -> serde_json::Value {
+    use stellar_agent_test_support::xdr_fixtures;
+
+    let contract_strkey =
+        stellar_agent_core::sc_address::scaddress_to_strkey(contract).expect("contract strkey");
+    let entries = response["entries"]
+        .as_array_mut()
+        .expect("ledger response has entries");
+    entries.push(xdr_fixtures::ledger_entry_from_response_json(
+        &xdr_fixtures::external_ref_instance_ledger_entries_json(
+            &contract_strkey,
+            EXTERNAL_REF_OWNER,
+            tag,
+        ),
+    ));
+    if let Some(hash) = resolved {
+        entries.push(xdr_fixtures::ledger_entry_from_response_json(
+            &xdr_fixtures::executable_tag_ledger_entries_json(EXTERNAL_REF_OWNER, tag, hash),
+        ));
+    }
+    response
+}
+
+/// A destination whose executable is an external reference resolving to an
+/// allowlisted hash passes identification and fails the mutability preflight
+/// with a detail naming the owner and the tag.
+#[tokio::test]
+async fn external_ref_destination_fails_preflight_destination_mutable() {
+    let server = MockServer::start().await;
+    let dest_addr = addr(0xA1);
+    // The account entry comes from the helper; the destination instance is
+    // the external reference appended below.
+    let ledger_resp = with_external_ref(
+        build_ledger_entries_account_and_contract(SOURCE_G, &addr(0xA2), OZ_VERIFIER_HASH),
+        &dest_addr,
+        b"dest-v1",
+        Some(OZ_VERIFIER_HASH),
+    );
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(SorobanRpcDispatcher::new(
+            ledger_resp,
+            build_simulate_response(&u32_xdr(0)),
+        ))
+        .mount(&server)
+        .await;
+
+    let (manager, _tmp_dir) = manager_with_server(&server).await;
+    let err = MigrationPlanner::new(&manager)
+        .build(
+            addr(0x01),
+            [0xABu8; 32],
+            dest_addr,
+            &Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect_err("an external-reference destination must be refused");
+
+    assert_eq!(err.wire_code(), "sa.verifier_migration_failed");
+    let msg = err.to_string();
+    assert!(msg.contains("preflight_destination_mutable"), "{msg}");
+    assert!(msg.contains("owner-managed external reference"), "{msg}");
+    assert!(msg.contains("owner GAAAA...AAWHF"), "{msg}");
+    assert!(msg.contains("tag \"dest-v1\""), "{msg}");
+}
+
+/// A destination whose external reference has no live tag entry is refused
+/// with `sa.contract_instance_unsupported`, reason `ExternalRefUnresolved`,
+/// before the no-deployed-Wasm check.
+#[tokio::test]
+async fn unresolved_external_ref_destination_is_refused_as_unsupported() {
+    let server = MockServer::start().await;
+    let dest_addr = addr(0xA3);
+    let ledger_resp = with_external_ref(
+        build_ledger_entries_account_and_contract(SOURCE_G, &addr(0xA4), OZ_VERIFIER_HASH),
+        &dest_addr,
+        b"dest-v1",
+        None,
+    );
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(SorobanRpcDispatcher::new(
+            ledger_resp,
+            build_simulate_response(&u32_xdr(0)),
+        ))
+        .mount(&server)
+        .await;
+
+    let (manager, _tmp_dir) = manager_with_server(&server).await;
+    let err = MigrationPlanner::new(&manager)
+        .build(
+            addr(0x01),
+            [0xABu8; 32],
+            dest_addr,
+            &Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect_err("an unresolved destination must be refused");
+
+    assert_eq!(err.wire_code(), "sa.contract_instance_unsupported");
+    assert!(
+        matches!(
+            err,
+            SaError::ContractInstanceUnsupported {
+                reason: stellar_agent_smart_account::AdminOrOwnerKey::ExternalRefUnresolved,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(!err.to_string().contains("no deployed WASM"), "{err}");
+}
+
+/// The source scan plans a signer whose verifier is an external reference
+/// resolving to `from_hash`.
+#[tokio::test]
+async fn source_scan_plans_signer_whose_verifier_reference_resolves_to_from_hash() {
+    let server = MockServer::start().await;
+    let smart_account = addr(0x01);
+    let dest_addr = addr(0xCD);
+    let source_verifier = addr(0xA5);
+    let from_hash = [0x77u8; 32];
+    let key_data = [0xABu8; 32];
+
+    let rule_0_xdr = build_context_rule_external_signers_xdr(0, &[10], &source_verifier, &key_data);
+    let ledger_resp = with_external_ref(
+        build_ledger_entries_account_and_contract(SOURCE_G, &dest_addr, OZ_VERIFIER_HASH),
+        &source_verifier,
+        b"source-v1",
+        Some(from_hash),
+    );
+    let sim_responses = vec![
+        build_simulate_response(&u32_xdr(1)), // get_context_rules_count → 1
+        build_simulate_response(&rule_0_xdr), // get_rule(0)
+        build_simulate_response(&rule_0_xdr), // get_context_rule(0)
+    ];
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(SorobanRpcDispatcher::new_multi_simulate(
+            ledger_resp,
+            sim_responses,
+        ))
+        .mount(&server)
+        .await;
+
+    let (manager, _tmp_dir) = manager_with_server(&server).await;
+    let plan = MigrationPlanner::new(&manager)
+        .with_max_scan_id(10)
+        .build(
+            smart_account,
+            from_hash,
+            dest_addr,
+            &Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("planner builds a plan for a reference-backed source verifier");
+
+    assert_eq!(plan.to_hash, OZ_VERIFIER_HASH);
+    assert_eq!(plan.affected_rules.len(), 1, "rule 0 is affected");
+    assert_eq!(plan.affected_rules[0].rule_id, 0);
+    assert_eq!(
+        plan.affected_rules[0].signer_steps.len(),
+        1,
+        "the reference-backed signer is planned"
+    );
+    assert_eq!(plan.total_transaction_count(), 2);
 }

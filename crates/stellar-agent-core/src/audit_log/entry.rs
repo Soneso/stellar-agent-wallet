@@ -46,7 +46,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::schema::{
-    ContractKind, EventKind, KeyPurpose, PolicyDecision, ValueLegRecord, VerifierAdvisoryKind,
+    ContractKind, EventKind, ExecutableRefPin, KeyPurpose, PolicyDecision, ValueLegRecord,
+    VerifierAdvisoryKind,
 };
 use crate::error::ValidationError;
 use crate::observability::RedactedStrkey;
@@ -624,6 +625,12 @@ impl AuditEntry {
     ///
     /// Emitted from `ContextRuleManager::install_rule`.
     ///
+    /// `pinned_verifier_executable_refs` and `pinned_policy_executable_refs`
+    /// are aligned by position with the corresponding first-8 lists. A list
+    /// whose entries are all `None` is recorded as empty, so rows for rules
+    /// without an external-reference contract keep the shape older readers
+    /// know.
+    ///
     /// # Redaction
     ///
     /// `smart_account` MUST be pre-redacted at the call site to first-5-last-5
@@ -648,7 +655,18 @@ impl AuditEntry {
         pinned_policy_wasm_hashes_first8: Vec<String>,
         mutable_override: bool,
         unknown_override: bool,
+        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
+        pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
     ) -> Self {
+        fn empty_when_all_none(
+            refs: Vec<Option<ExecutableRefPin>>,
+        ) -> Vec<Option<ExecutableRefPin>> {
+            if refs.iter().all(Option::is_none) {
+                Vec::new()
+            } else {
+                refs
+            }
+        }
         Self {
             ts: current_iso8601_utc(),
             tool: "sa.context_rule_created".to_owned(),
@@ -672,6 +690,10 @@ impl AuditEntry {
                 pinned_policy_wasm_hashes_first8,
                 mutable_override,
                 unknown_override,
+                pinned_verifier_executable_refs: empty_when_all_none(
+                    pinned_verifier_executable_refs,
+                ),
+                pinned_policy_executable_refs: empty_when_all_none(pinned_policy_executable_refs),
             },
             previous_entry_hash: String::new(),
         }
@@ -1027,8 +1049,10 @@ impl AuditEntry {
     ///
     /// Emitted by `managers::verifiers::pin_referenced_contracts` when a
     /// referenced verifier or policy contract has a non-zero Admin / Owner storage
-    /// key AND `--accept-mutable-verifier` is set.  Records the acknowledgement
-    /// with an ISO-8601 timestamp.
+    /// key or an owner-managed external-reference executable AND
+    /// `--accept-mutable-verifier` is set.  Records the acknowledgement with an
+    /// ISO-8601 timestamp. `executable_ref` names the owner and tag of an
+    /// external-reference executable and is `None` for a storage key.
     ///
     /// # Redaction
     ///
@@ -1046,6 +1070,7 @@ impl AuditEntry {
         contract_address_redacted: impl Into<RedactedStrkey>,
         contract_kind: ContractKind,
         override_acknowledged_at: impl Into<String>,
+        executable_ref: Option<&ExecutableRefPin>,
         chain_id: impl IntoOptionalChainId,
         request_id: impl Into<String>,
     ) -> Self {
@@ -1067,6 +1092,8 @@ impl AuditEntry {
                 contract_address_redacted: contract_address_redacted.into(),
                 contract_kind,
                 override_acknowledged_at: override_acknowledged_at.into(),
+                executable_owner_redacted: executable_ref.map(|pin| pin.owner_redacted.clone()),
+                executable_tag: executable_ref.map(|pin| pin.tag.clone()),
             },
             previous_entry_hash: String::new(),
         }
@@ -1134,7 +1161,8 @@ impl AuditEntry {
     /// `smart_account_redacted` and `deploy_address_redacted` MUST be
     /// pre-redacted (first-5-last-5) at the call site.  `pinned_hash_first8`
     /// and `observed_hash_first8` are the first-8 hex chars of the respective
-    /// 32-byte wasm hashes.
+    /// 32-byte wasm hashes. `observed_executable` is the bounded summary of the
+    /// observed executable kind.
     #[must_use]
     #[allow(
         clippy::too_many_arguments,
@@ -1146,6 +1174,7 @@ impl AuditEntry {
         deploy_address_redacted: impl Into<RedactedStrkey>,
         pinned_hash_first8: impl Into<String>,
         observed_hash_first8: impl Into<String>,
+        observed_executable: Option<String>,
         chain_id: impl IntoOptionalChainId,
         request_id: impl Into<String>,
     ) -> Self {
@@ -1167,6 +1196,7 @@ impl AuditEntry {
                 deploy_address_redacted: deploy_address_redacted.into(),
                 pinned_hash_first8: pinned_hash_first8.into(),
                 observed_hash_first8: observed_hash_first8.into(),
+                observed_executable,
             },
             previous_entry_hash: String::new(),
         }
@@ -1195,6 +1225,7 @@ impl AuditEntry {
         deploy_address_redacted: impl Into<RedactedStrkey>,
         pinned_hash_first8: impl Into<String>,
         observed_hash_first8: impl Into<String>,
+        observed_executable: Option<String>,
         chain_id: impl IntoOptionalChainId,
         request_id: impl Into<String>,
     ) -> Self {
@@ -1216,6 +1247,7 @@ impl AuditEntry {
                 deploy_address_redacted: deploy_address_redacted.into(),
                 pinned_hash_first8: pinned_hash_first8.into(),
                 observed_hash_first8: observed_hash_first8.into(),
+                observed_executable,
             },
             previous_entry_hash: String::new(),
         }
@@ -3743,6 +3775,8 @@ mod tests {
             vec![], // pinned_policy_wasm_hashes_first8 (empty → skipped in wire)
             false,  // mutable_override (false → skipped in wire)
             false,  // unknown_override (false → skipped in wire)
+            vec![], // pinned_verifier_executable_refs (empty → skipped in wire)
+            vec![], // pinned_policy_executable_refs (empty → skipped in wire)
         );
         fix_kat_ts(&mut sa_context_rule_created);
 
@@ -5297,6 +5331,10 @@ mod tests {
             RedactedStrkey::from_already_redacted("CXABC...VERIF"),
             "aaaabbbb",
             "ccccdddd",
+            Some(
+                "external reference owner CAAAA...ABSC4 tag \"v2\" resolved ccccdddd00000000"
+                    .to_owned(),
+            ),
             "stellar:mainnet",
             "req-vhd-001",
         );
@@ -5316,6 +5354,7 @@ mod tests {
             deploy_address_redacted,
             pinned_hash_first8,
             observed_hash_first8,
+            observed_executable,
         } = &entry.event_kind
         else {
             panic!("expected SaVerifierHashDrift; got: {:?}", entry.event_kind);
@@ -5325,6 +5364,10 @@ mod tests {
         assert_eq!(deploy_address_redacted, "CXABC...VERIF");
         assert_eq!(pinned_hash_first8, "aaaabbbb");
         assert_eq!(observed_hash_first8, "ccccdddd");
+        assert_eq!(
+            observed_executable.as_deref(),
+            Some("external reference owner CAAAA...ABSC4 tag \"v2\" resolved ccccdddd00000000")
+        );
     }
 
     #[test]
@@ -5335,6 +5378,7 @@ mod tests {
             RedactedStrkey::from_already_redacted("CXABC...VERIF"),
             "aabb1122",
             "ccdd3344",
+            None,
             "stellar:testnet",
             "req-vhd-rt",
         );
@@ -5355,6 +5399,7 @@ mod tests {
             RedactedStrkey::from_already_redacted("CPOLI...CYCON"),
             "11223344",
             "55667788",
+            None,
             "stellar:testnet",
             "req-phd-001",
         );
@@ -5370,10 +5415,12 @@ mod tests {
             deploy_address_redacted,
             pinned_hash_first8,
             observed_hash_first8,
+            observed_executable,
         } = &entry.event_kind
         else {
             panic!("expected SaPolicyHashDrift; got: {:?}", entry.event_kind);
         };
+        assert_eq!(*observed_executable, None);
         assert_eq!(*rule_id, 9u32);
         assert_eq!(smart_account_redacted, "CDABC...12345");
         assert_eq!(deploy_address_redacted, "CPOLI...CYCON");
@@ -5393,6 +5440,7 @@ mod tests {
             RedactedStrkey::from_already_redacted("CVER1...VERIF"),
             ContractKind::Verifier,
             "2026-06-20T10:00:00.000Z",
+            None,
             "stellar:testnet",
             "req-mco-001",
         );
@@ -5406,6 +5454,8 @@ mod tests {
             contract_address_redacted,
             contract_kind,
             override_acknowledged_at,
+            executable_owner_redacted,
+            executable_tag,
         } = &entry.event_kind
         else {
             panic!(
@@ -5418,6 +5468,49 @@ mod tests {
         assert_eq!(contract_address_redacted, "CVER1...VERIF");
         assert_eq!(*contract_kind, ContractKind::Verifier);
         assert_eq!(override_acknowledged_at, "2026-06-20T10:00:00.000Z");
+        assert_eq!(*executable_owner_redacted, None);
+        assert_eq!(*executable_tag, None);
+    }
+
+    #[test]
+    fn sa_mutable_contract_override_carries_executable_ref_owner_and_tag() {
+        use crate::audit_log::schema::{ContractKind, ExecutableRefPin};
+        use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
+
+        let pin = ExecutableRefPin::new(
+            &ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+            &ScString(b"v1\n".to_vec().try_into().expect("tag fits")),
+            &[0xabu8; 32],
+        )
+        .expect("pin builds");
+        let entry = AuditEntry::new_sa_mutable_contract_override(
+            0u32,
+            RedactedStrkey::from_already_redacted("CDABC...12345"),
+            RedactedStrkey::from_already_redacted("CVER1...VERIF"),
+            ContractKind::Verifier,
+            "2026-06-20T10:00:00.000Z",
+            Some(&pin),
+            "stellar:testnet",
+            "req-mco-ref",
+        );
+        let EventKind::SaMutableContractOverride {
+            executable_owner_redacted,
+            executable_tag,
+            ..
+        } = &entry.event_kind
+        else {
+            panic!(
+                "expected SaMutableContractOverride; got: {:?}",
+                entry.event_kind
+            );
+        };
+        assert_eq!(
+            executable_owner_redacted
+                .as_ref()
+                .map(RedactedStrkey::as_str),
+            Some("CAAAA...ABSC4")
+        );
+        assert_eq!(executable_tag.as_deref(), Some("v1\\n"));
     }
 
     #[test]
@@ -5430,6 +5523,7 @@ mod tests {
             RedactedStrkey::from_already_redacted("CPOLI...CYCON"),
             ContractKind::Policy,
             "2026-06-20T11:00:00.000Z",
+            None,
             "stellar:testnet",
             "req-mco-rt",
         );
@@ -6568,6 +6662,8 @@ mod tests {
             vec!["cafebabe".to_owned()],
             true, // mutable_override
             true, // unknown_override
+            vec![],
+            vec![],
         );
         assert_eq!(entry.tool, "sa.context_rule_created");
         assert_eq!(entry.chain_id.as_deref(), Some("stellar:mainnet"));
@@ -6612,6 +6708,47 @@ mod tests {
         );
     }
 
+    /// An executable-reference list whose entries are all `None` is recorded
+    /// empty; a list with a `Some` entry is recorded unchanged.
+    #[test]
+    fn sa_context_rule_created_records_all_none_executable_refs_empty() {
+        use crate::audit_log::schema::ExecutableRefPin;
+        use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
+
+        let pin = ExecutableRefPin::new(
+            &ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+            &ScString(b"v1".to_vec().try_into().expect("tag fits")),
+            &[0xcdu8; 32],
+        )
+        .expect("pin builds");
+        let entry = AuditEntry::new_sa_context_rule_created(
+            "CDABC...12345",
+            3u32,
+            "default",
+            2u32,
+            1u32,
+            None,
+            "stellar:testnet",
+            "req-crc-refs",
+            vec!["aaaaaaaaaaaaaaaa".to_owned(), "cdcdcdcdcdcdcdcd".to_owned()],
+            vec!["bbbbbbbbbbbbbbbb".to_owned()],
+            true,
+            false,
+            vec![None, Some(pin.clone())],
+            vec![None],
+        );
+        let EventKind::SaContextRuleCreated {
+            pinned_verifier_executable_refs,
+            pinned_policy_executable_refs,
+            ..
+        } = &entry.event_kind
+        else {
+            panic!("expected SaContextRuleCreated; got: {:?}", entry.event_kind);
+        };
+        assert_eq!(pinned_verifier_executable_refs, &vec![None, Some(pin)]);
+        assert!(pinned_policy_executable_refs.is_empty());
+    }
+
     #[test]
     fn sa_context_rule_created_false_overrides_omitted_from_json() {
         // When both override flags are false they must be omitted from JSON
@@ -6629,6 +6766,8 @@ mod tests {
             vec![],
             false,
             false,
+            vec![],
+            vec![],
         );
         let json = serde_json::to_string(&entry).expect("must serialise");
         assert!(

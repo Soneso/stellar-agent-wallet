@@ -660,10 +660,11 @@ impl ContextRuleManager {
     /// - [`SaError::RuleIdMismatch`] — `auth_rule_ids` count does not match
     ///   simulation auth-context count.
     /// - [`SaError::SimulationDivergence`] — caller-vs-envelope mismatch.
-    /// - [`SaError::VerifierMutable`] — verifier mutable, no override set.
+    /// - [`SaError::VerifierMutable`] — verifier mutable (admin/owner key or
+    ///   external-reference executable), no override set.
     /// - [`SaError::PolicyMutable`] — policy mutable, no override set.
     /// - [`SaError::ContractInstanceUnsupported`]: verifier or policy instance
-    ///   cannot be read as Wasm; no override exists.
+    ///   has no code the wallet can pin; no override exists.
     /// - [`SaError::VerifierWasmNotInAllowlist`] — unknown verifier hash, no override.
     /// - [`SaError::PolicyWasmNotInAllowlist`] — unknown policy hash, no override.
     /// - [`SaError::NetworkRpcDivergence`] — primary / secondary RPC disagree.
@@ -814,6 +815,8 @@ impl ContextRuleManager {
             crate::managers::verifiers::PinResult {
                 pinned_verifier_wasm_hashes: vec![],
                 pinned_policy_wasm_hashes: vec![],
+                pinned_verifier_executable_refs: vec![],
+                pinned_policy_executable_refs: vec![],
                 mutable_override: false,
                 unknown_override: false,
             }
@@ -834,21 +837,12 @@ impl ContextRuleManager {
         // production CLI pattern).
         match &outcome {
             Ok((rule_id, _tx_hash)) => {
-                let pinned_verifier_first8 = pin_result.pinned_verifier_hashes_first8();
-                let pinned_policy_first8 = pin_result.pinned_policy_hashes_first8();
-                let created = AuditEntry::new_sa_context_rule_created(
+                let created = pin_result.context_rule_created_entry(
                     &smart_account_redacted,
                     *rule_id,
-                    rule_definition.context_type_label(),
-                    rule_definition.signers_count(),
-                    rule_definition.policies_count(),
-                    rule_definition.valid_until,
+                    &rule_definition,
                     &self.chain_id,
                     &request_id,
-                    pinned_verifier_first8,
-                    pinned_policy_first8,
-                    pin_result.mutable_override,
-                    pin_result.unknown_override,
                 );
                 self.write_audit_entry(
                     audit_writer.as_deref_mut(),
@@ -1027,6 +1021,8 @@ impl ContextRuleManager {
             crate::managers::verifiers::PinResult {
                 pinned_verifier_wasm_hashes: vec![],
                 pinned_policy_wasm_hashes: vec![],
+                pinned_verifier_executable_refs: vec![],
+                pinned_policy_executable_refs: vec![],
                 mutable_override: false,
                 unknown_override: false,
             }
@@ -2375,8 +2371,10 @@ impl ContextRuleManager {
 
         // Per-call cache: avoids redundant two-RPC fetches when multiple
         // rules reference the same contract address.
-        let mut wasm_hash_cache: std::collections::HashMap<Vec<u8>, [u8; 32]> =
-            std::collections::HashMap::new();
+        let mut wasm_hash_cache: std::collections::HashMap<
+            Vec<u8>,
+            crate::managers::signers::ObservedExecutable,
+        > = std::collections::HashMap::new();
         let mut unavailable_wire_code: Option<&'static str> = None;
 
         // Verify each verifier address.
@@ -2398,8 +2396,11 @@ impl ContextRuleManager {
                 .await
                 {
                     Ok(()) => {
-                        // Fetch observed hash for the envelope (already cached).
-                        if let Some(&h) = wasm_hash_cache.get(&cache_key) {
+                        // Observed effective hash for the envelope (already
+                        // cached); the check passed, so no code reads as the
+                        // zero hash the pin holds.
+                        if let Some(executable) = wasm_hash_cache.get(&cache_key) {
+                            let h = executable.effective_hash().unwrap_or([0u8; 32]);
                             observed.push(h[..8].iter().map(|b| format!("{b:02x}")).collect());
                         }
                     }
@@ -2440,7 +2441,8 @@ impl ContextRuleManager {
                 .await
                 {
                     Ok(()) => {
-                        if let Some(&h) = wasm_hash_cache.get(&cache_key) {
+                        if let Some(executable) = wasm_hash_cache.get(&cache_key) {
+                            let h = executable.effective_hash().unwrap_or([0u8; 32]);
                             observed.push(h[..8].iter().map(|b| format!("{b:02x}")).collect());
                         }
                     }

@@ -38,6 +38,8 @@ fn pinned_hash_tampering_returns_audit_log_error_before_pin_extraction() {
         vec![],
         false,
         false,
+        vec![],
+        vec![],
     );
     let witness = AuditEntry::new_sa_context_rule_created(
         ZERO_CONTRACT_REDACTED,
@@ -52,6 +54,8 @@ fn pinned_hash_tampering_returns_audit_log_error_before_pin_extraction() {
         vec![],
         false,
         false,
+        vec![],
+        vec![],
     );
     {
         let mut writer = audit_writer.lock().expect("audit writer poisoned");

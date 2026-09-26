@@ -20,11 +20,14 @@
 //! other sentinel — callers must handle every variant.  The DeFi sign-time
 //! gate (`stellar_agent_defi::pins::verify_pin_for_sign`) maps `Absent`,
 //! `Sac` and `ExternalRef` to typed `Err` variants (fail-closed by type).  The
-//! smart-account caller maps `Sac`/`Absent` to `None` and refuses
-//! `ExternalRef` with a typed error; its verifier install paths apply
-//! `unwrap_or([0u8;32])` to `None` to support an accept-unknown-verifier
-//! install flow that has no DeFi analogue, so the zero value exists only on
-//! that caller's side and never stands for an owner-managed executable.
+//! smart-account caller maps `Sac`/`Absent` to "no code" and keeps
+//! `ExternalRef` as an observation: its install path pins an external
+//! reference's owner, tag and resolved hash only under the operator's
+//! mutable-contract acknowledgement, and its signing-time drift check
+//! compares all three and the executable kind. Its accept-unknown-verifier
+//! install flow, which has no DeFi analogue, pins the zero hash for an absent
+//! contract, so the zero value exists only on that caller's side and never
+//! stands for an owner-managed executable.
 //!
 //! # External references (CAP-85)
 //!
@@ -83,10 +86,9 @@ use stellar_agent_core::sc_address::scaddress_redacted;
 ///
 /// # Design note
 ///
-/// The smart-account caller collapses `Absent` to `[0u8;32]` via
-/// `unwrap_or([0u8;32])` to support an accept-unknown-verifier install flow
-/// that has no DeFi analogue.  This type is the stronger form: a zero value
-/// is impossible to express here.
+/// The smart-account caller pins `Absent` as `[0u8;32]` to support an
+/// accept-unknown-verifier install flow that has no DeFi analogue.  This type
+/// is the stronger form: a zero value is impossible to express here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WasmHashFetch {
@@ -115,8 +117,9 @@ pub enum WasmHashFetch {
 ///
 /// `resolved` is the Wasm hash the owner's tag entry held when it was read.
 /// It is a snapshot of an owner-mutable entry that can change on the next
-/// ledger, so every consumer fetches at act time and never caches it as a
-/// pin.
+/// ledger, so every consumer fetches at act time. A consumer that pins it
+/// (the smart-account install path) pins the owner and tag with it and
+/// compares all three against a fresh fetch before acting.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ExternalRefExecutable {
     /// Address that owns the executable-tag entry.
@@ -175,6 +178,17 @@ impl ExternalRefExecutable {
     #[must_use]
     pub fn tag_ledger_key(&self) -> LedgerKey {
         executable_tag_ledger_key(&self.owner, &self.tag)
+    }
+
+    /// Returns the SHA-256 digest of the XDR of [`Self::tag_ledger_key`],
+    /// which identifies this owner and tag pair exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns the XDR encoder's error from
+    /// [`stellar_agent_core::sc_address::executable_tag_key_digest`].
+    pub fn tag_key_digest(&self) -> Result<[u8; 32], stellar_xdr::Error> {
+        stellar_agent_core::sc_address::executable_tag_key_digest(&self.owner, &self.tag)
     }
 }
 
@@ -298,17 +312,10 @@ pub async fn fetch_contract_wasm_hash(
     }
 }
 
-/// Returns the ledger key of the persistent `ContractData` entry in which
-/// `owner` stores the Wasm hash for an external-reference `tag`
-/// (`ScVal::ExecutableTag(tag)`, persistent durability).
-#[must_use]
-pub fn executable_tag_ledger_key(owner: &ScAddress, tag: &ScString) -> LedgerKey {
-    LedgerKey::ContractData(LedgerKeyContractData {
-        contract: owner.clone(),
-        key: ScVal::ExecutableTag(tag.clone()),
-        durability: ContractDataDurability::Persistent,
-    })
-}
+/// Ledger key of an owner's executable-tag entry; defined in
+/// [`stellar_agent_core::sc_address`] so the smart-account pin and the audit
+/// log derive the same key.
+pub use stellar_agent_core::sc_address::executable_tag_ledger_key;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FetchContractWasmHashError

@@ -83,10 +83,10 @@ const CROSS_RPC_CONSUMER_SITES: &[(&str, &str)] = &[
         "crates/stellar-agent-smart-account/src/managers/signers.rs",
         "identify_weighted_threshold_policy",
     ),
-    // Wasm-hash drift detection — 1 consumer in signers.rs
+    // Executable identification and drift detection — 1 consumer in signers.rs
     (
         "crates/stellar-agent-smart-account/src/managers/signers.rs",
-        "fetch_observed_wasm_hash",
+        "fetch_observed_executable",
     ),
     // Contract mutability detection — 1 consumer in verifiers.rs
     (
@@ -293,14 +293,14 @@ fn cross_rpc_consumer_audit_covers_both_threat_surfaces() {
          got {timelock_count}",
     );
 
-    // The fetch_observed_wasm_hash consumer (wasm-hash drift) lives in
+    // The fetch_observed_executable consumer (executable drift) lives in
     // signers.rs (not verifiers.rs) — so the signers_count includes it.
     let has_wasm_hash_consumer = CROSS_RPC_CONSUMER_SITES
         .iter()
-        .any(|(_, fn_name)| *fn_name == "fetch_observed_wasm_hash");
+        .any(|(_, fn_name)| *fn_name == "fetch_observed_executable");
     assert!(
         has_wasm_hash_consumer,
-        "wasm-hash drift detection must have its `fetch_observed_wasm_hash` \
+        "executable drift detection must have its `fetch_observed_executable` \
          consumer enumerated",
     );
 
