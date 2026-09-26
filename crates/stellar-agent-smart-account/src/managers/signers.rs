@@ -50,6 +50,7 @@ use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::AuditLogIntegrityError;
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::health::{AuditWriterHealth, AuditWriterHealthHandle};
+use stellar_agent_core::audit_log::schema::ContractKind;
 use stellar_agent_core::audit_log::signer_set::{
     BaselineReason, ObservedSignerSet, SignerPubkey, compute_signer_set_digest,
     format_digest_first8_last8,
@@ -74,6 +75,7 @@ use stellar_xdr::{
 use tracing::{debug, info, warn};
 
 use crate::SaError;
+use crate::error::AdminOrOwnerKey;
 use crate::managers::rules::{
     BASE_FEE_STROOPS, ExpiryCheck, augment_with_oz_error_name, contract_instance_key,
     scaddress_to_strkey,
@@ -3516,6 +3518,10 @@ impl SignersManager {
     ///
     /// - [`SaError::VerifierWasmNotInAllowlist`] — zero allowlist matches
     ///   (fail-closed; allowlist is the authoritative gate).
+    /// - [`SaError::ContractInstanceUnsupported`] — the verifier's executable
+    ///   is an owner-managed external reference (reason
+    ///   `ExternalRefExecutable`) or an endpoint returned a malformed entry
+    ///   (reason `UndecodableInstance`); no flag overrides it.
     /// - [`SaError::NetworkRpcDivergence`] — primary and secondary RPC disagree
     ///   on the contract's wasm hash before the allowlist check runs.
     /// - [`SaError::DeploymentFailed`] (phase `"simulate"`) — `getLedgerEntries`
@@ -3547,6 +3553,7 @@ impl SignersManager {
             &self.primary_rpc_client,
             &self.secondary_rpc_client,
             &verifier_addr,
+            ContractKind::Verifier,
             rule_id,
             &smart_account_redacted,
             &request_id,
@@ -3598,15 +3605,26 @@ impl SignersManager {
     /// contract instance's wasm hash from primary and secondary RPCs, fail on
     /// RPC disagreement, then require the observed hash to appear in `allowlist`.
     ///
+    /// `contract_kind` names the role of `contract_addr` in a
+    /// [`SaError::ContractInstanceUnsupported`] refusal.
+    ///
     /// # Errors
     ///
+    /// - [`SaError::ContractInstanceUnsupported`] — the instance is an
+    ///   owner-managed external reference or an endpoint returned a malformed
+    ///   entry; no flag overrides it.
     /// - [`SaError::NetworkRpcDivergence`] — primary and secondary RPC disagree.
     /// - [`SaError::DeploymentFailed`] — RPC fetch failed.
     /// - The caller-provided `not_in_allowlist_err` when the contract is absent
     ///   or its hash is not in `allowlist`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "contract identity + role + allowlist + forensic fields + caller-specific refusal constructor"
+    )]
     pub(crate) async fn identify_contract_wasm_hash(
         &self,
         contract_addr: &ScAddress,
+        contract_kind: ContractKind,
         allowlist: &'static [[u8; 32]],
         rule_id: u32,
         smart_account_redacted: &str,
@@ -3617,6 +3635,7 @@ impl SignersManager {
             &self.primary_rpc_client,
             &self.secondary_rpc_client,
             contract_addr,
+            contract_kind,
             rule_id,
             smart_account_redacted,
             request_id,
@@ -4677,17 +4696,25 @@ fn mock_migration_submit_result(
 /// This is the lower-level primitive underlying [`SignersManager::identify_verifier`].
 /// It delegates the two-RPC fetch and divergence check to
 /// [`stellar_agent_network::fetch_contract_wasm_hash`], then maps the
-/// [`stellar_agent_network::WasmHashFetch`] tri-state to `Option<[u8; 32]>`:
-/// `Wasm(h)` → `Some(h)`, `Sac` and `Absent` → `None`.
+/// [`stellar_agent_network::WasmHashFetch`] outcome:
+/// `Wasm(h)` → `Some(h)`, `Sac` and `Absent` → `None`, and `ExternalRef` →
+/// [`SaError::ContractInstanceUnsupported`] with reason
+/// [`AdminOrOwnerKey::ExternalRefExecutable`].
+///
+/// An external reference is never mapped to `None`: the `None` callers below
+/// substitute the zero hash, and no pin describes owner-mutable code.
 ///
 /// The `None` mapping is deliberate and per-caller:
 /// - `identify_verifier` (install-time) — treats `None` as not-in-allowlist.
 /// - `pin_referenced_contracts` `accept_unknown_verifier` branch (install-time
-///   override) — calls `.unwrap_or([0u8; 32])` to store a zero sentinel for
-///   absent-entry edge cases; drift detection later compares live hash vs this pin.
+///   override) — calls `.unwrap_or([0u8; 32])` to store the zero hash for an
+///   absent or SAC contract; drift detection later compares the live hash
+///   against this pin.
 /// - `verify_pinned_verifier_against_chain` (signing-time drift detection) —
 ///   calls `.unwrap_or([0u8; 32])` so a zero-pinned entry (from the absent-entry
 ///   path above) compares equal to a zero observed value, passing cleanly.
+///
+/// `contract_kind` names the role of `contract_addr` in the refusal.
 ///
 /// # Returns
 ///
@@ -4699,6 +4726,10 @@ fn mock_migration_submit_result(
 ///
 /// # Errors
 ///
+/// - [`SaError::ContractInstanceUnsupported`] — the instance's executable is an
+///   owner-managed external reference (reason `ExternalRefExecutable`), or an
+///   endpoint returned a malformed instance or tag entry (reason
+///   `UndecodableInstance`). No flag overrides either refusal.
 /// - [`SaError::NetworkRpcDivergence`] — primary and secondary RPC responses differ.
 /// - [`SaError::DeploymentFailed`] (phase `"simulate"`) — `getLedgerEntries` RPC
 ///   failure on primary or secondary.
@@ -4712,6 +4743,7 @@ pub(crate) async fn fetch_observed_wasm_hash(
     primary: &StellarRpcClient,
     secondary: &StellarRpcClient,
     contract_addr: &ScAddress,
+    contract_kind: ContractKind,
     rule_id: u32,
     smart_account_redacted: &str,
     request_id: &str,
@@ -4724,24 +4756,52 @@ pub(crate) async fn fetch_observed_wasm_hash(
     // scaddress_to_strkey only fails for exotic non-Contract / non-Account variants;
     // all callers of fetch_observed_wasm_hash pass contract addresses (C-strkeys).
     let strkey = scaddress_to_strkey(contract_addr)?;
+    let unsupported = |reason: AdminOrOwnerKey| SaError::ContractInstanceUnsupported {
+        rule_id,
+        contract_kind,
+        smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
+        contract_address_redacted: RedactedStrkey::from_full(&strkey),
+        reason,
+        request_id: request_id.to_owned(),
+    };
 
     match fetch_contract_wasm_hash(primary, Some(secondary), &strkey).await {
         Ok(WasmHashFetch::Wasm(hash)) => Ok(Some(hash)),
         // SAC and Absent both map to None — per-caller absent handling
         // (unwrap_or([0u8;32]) or not-in-allowlist error) is applied at each call site.
         Ok(WasmHashFetch::Sac | WasmHashFetch::Absent) => Ok(None),
-        // Forward-compatibility arm: WasmHashFetch is #[non_exhaustive]; future
-        // variants (e.g. a new contract-executable type) map to None so callers
-        // treat them as "no plain WASM hash" — the fail-closed default (None
-        // drives drift detection against any real pin at the signing-time call
-        // sites).  If the primitive ever grows a hash-BEARING variant, this arm
-        // must be revisited so the hash is not silently discarded.
-        Ok(_) => Ok(None),
+        Ok(WasmHashFetch::ExternalRef(external)) => {
+            warn!(
+                contract_redacted = %redact_strkey_first5_last5(&strkey),
+                contract_kind = %contract_kind,
+                owner_redacted = %external.owner_redacted(),
+                tag = %external.tag_display(),
+                resolved_first8 = %external.resolved_first8(),
+                rule_id,
+                "fetch_observed_wasm_hash: executable is an owner-managed external \
+                 reference; refusing"
+            );
+            Err(unsupported(AdminOrOwnerKey::ExternalRefExecutable))
+        }
+        // WasmHashFetch is #[non_exhaustive]: an outcome this crate does not
+        // know is not a Wasm executable and carries no hash the wallet can
+        // pin, so it is refused and never read as absent.
+        Ok(_) => Err(unsupported(AdminOrOwnerKey::NonWasmExecutable)),
+        Err(FetchContractWasmHashError::Malformed { reason, .. }) => {
+            warn!(
+                contract_redacted = %redact_strkey_first5_last5(&strkey),
+                contract_kind = %contract_kind,
+                reason = %reason,
+                rule_id,
+                "fetch_observed_wasm_hash: malformed ledger entry; refusing"
+            );
+            Err(unsupported(AdminOrOwnerKey::UndecodableInstance))
+        }
         Err(FetchContractWasmHashError::Divergent(div)) => Err(SaError::NetworkRpcDivergence {
             rule_id,
             smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
-            primary_view_digest_first8: div.primary_first8,
-            secondary_view_digest_first8: div.secondary_first8,
+            primary_view_digest_first8: div.primary_summary,
+            secondary_view_digest_first8: div.secondary_summary,
             request_id: request_id.to_owned(),
         }),
         Err(FetchContractWasmHashError::Unavailable { source, .. }) => {
@@ -4752,8 +4812,8 @@ pub(crate) async fn fetch_observed_wasm_hash(
         }
         // Belt-and-braces guard, not a live path: `scaddress_to_strkey` above
         // already produced a valid C-strkey, so the primitive's own address
-        // parse cannot realistically reject it.  Kept for #[non_exhaustive]
-        // safety; maps to the same variant scaddress_to_strkey itself returns.
+        // parse cannot realistically reject it.  Maps to the same variant
+        // scaddress_to_strkey itself returns.
         Err(FetchContractWasmHashError::InvalidAddress { reason, .. }) => {
             Err(SaError::AuthEntryConstructionFailed {
                 stage: "auth_payload",
@@ -5914,7 +5974,7 @@ mod tests {
         // Key A: contract address with all-0x11 hash bytes.
         // Key B: contract address with all-0x22 hash bytes.
         //
-        // stellar-xdr 27: ScAddress::Contract takes ContractId(Hash(...))
+        // stellar-xdr 28: ScAddress::Contract takes ContractId(Hash(...))
         // (ContractId is a newtype over Hash introduced in Protocol-22).
         let addr_a = ScAddress::Contract(ContractId(Hash([0x11u8; 32])));
         let addr_b = ScAddress::Contract(ContractId(Hash([0x22u8; 32])));
@@ -5943,7 +6003,7 @@ mod tests {
         let hash_b = [0xbbu8; 32];
 
         // Build LedgerEntryData::ContractData(ContractInstance{Wasm(hash)}) XDR.
-        // stellar-xdr 27: ScVal::ContractInstance takes ScContractInstance directly
+        // stellar-xdr 28: ScVal::ContractInstance takes ScContractInstance directly
         // (not Box<ScContractInstance>).
         let make_contract_instance_xdr = |wasm_hash: [u8; 32]| -> String {
             let instance = ScContractInstance {
@@ -6270,7 +6330,7 @@ mod tests {
         });
 
         // ── Path A: network primitive ────────────────────────────────────────
-        // Expected: WasmHashFetch::Sac — the explicit SAC tri-state variant.
+        // Expected: WasmHashFetch::Sac — the explicit SAC variant.
         let server_a = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/"))
@@ -6326,6 +6386,147 @@ mod tests {
         // Both parsers agree: this is NOT a plain WASM hash.
         // Network → Sac (explicit); smart-account → None (Wasm arm skipped).
         // Neither returns a 32-byte hash, confirming no false-positive extraction.
+    }
+
+    // ── fetch_observed_wasm_hash: external reference and malformed entries ──
+
+    const EXTERNAL_REF_CONTRACT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+    const EXTERNAL_REF_OWNER: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
+    fn external_ref_responder(
+        resolved: [u8; 32],
+    ) -> stellar_agent_test_support::KeyedLedgerEntriesResponder {
+        use stellar_agent_test_support::{KeyedLedgerEntriesResponder, xdr_fixtures};
+
+        KeyedLedgerEntriesResponder::new()
+            .with_entry(xdr_fixtures::ledger_entry_from_response_json(
+                &xdr_fixtures::external_ref_instance_ledger_entries_json(
+                    EXTERNAL_REF_CONTRACT,
+                    EXTERNAL_REF_OWNER,
+                    b"verifier",
+                ),
+            ))
+            .with_entry(xdr_fixtures::ledger_entry_from_response_json(
+                &xdr_fixtures::executable_tag_ledger_entries_json(
+                    EXTERNAL_REF_OWNER,
+                    b"verifier",
+                    resolved,
+                ),
+            ))
+    }
+
+    fn external_ref_contract_scaddress() -> ScAddress {
+        ScAddress::Contract(stellar_xdr::ContractId(stellar_xdr::Hash(
+            stellar_strkey::Contract::from_string(EXTERNAL_REF_CONTRACT)
+                .expect("contract")
+                .0,
+        )))
+    }
+
+    /// An external-reference contract is refused with
+    /// `ContractInstanceUnsupported { reason: ExternalRefExecutable }` for the
+    /// supplied contract kind, even when its tag entry resolves to an
+    /// allowlisted verifier hash. It is never mapped to `None`, which callers
+    /// would turn into the zero hash.
+    #[tokio::test]
+    async fn fetch_observed_wasm_hash_refuses_external_ref_for_each_kind() {
+        let allowlisted = crate::VERIFIER_ALLOWLIST[0].wasm_hash;
+        for kind in [ContractKind::Verifier, ContractKind::Policy] {
+            let server1 = external_ref_responder(allowlisted).serve().await;
+            let primary = StellarRpcClient::new(&server1.uri()).expect("client");
+            let server2 = external_ref_responder(allowlisted).serve().await;
+            let secondary = StellarRpcClient::new(&server2.uri()).expect("client");
+
+            let result = fetch_observed_wasm_hash(
+                &primary,
+                &secondary,
+                &external_ref_contract_scaddress(),
+                kind,
+                7,
+                "CSMART...ACCNT",
+                "req-1",
+            )
+            .await;
+
+            let Err(SaError::ContractInstanceUnsupported {
+                rule_id,
+                contract_kind,
+                contract_address_redacted,
+                reason,
+                request_id,
+                ..
+            }) = result
+            else {
+                panic!("expected ContractInstanceUnsupported for {kind}; got {result:?}");
+            };
+            assert_eq!(reason, AdminOrOwnerKey::ExternalRefExecutable);
+            assert_eq!(contract_kind, kind);
+            assert_eq!(rule_id, 7);
+            assert_eq!(request_id, "req-1");
+            assert_eq!(contract_address_redacted.as_str(), "CAAAA...AD2KM");
+        }
+    }
+
+    /// A malformed instance entry is refused with reason `UndecodableInstance`,
+    /// never read as absent.
+    #[tokio::test]
+    async fn fetch_observed_wasm_hash_refuses_malformed_entry_as_undecodable_instance() {
+        use stellar_agent_test_support::{KeyedLedgerEntriesResponder, xdr_fixtures};
+
+        let mut instance = xdr_fixtures::ledger_entry_from_response_json(
+            &xdr_fixtures::contract_instance_ledger_entries_json(EXTERNAL_REF_CONTRACT, [1; 32]),
+        );
+        instance["xdr"] = serde_json::Value::String("AAAA////".to_owned());
+        let responder = KeyedLedgerEntriesResponder::new().with_entry(instance);
+        let server1 = responder.clone().serve().await;
+        let primary = StellarRpcClient::new(&server1.uri()).expect("client");
+        let server2 = responder.serve().await;
+        let secondary = StellarRpcClient::new(&server2.uri()).expect("client");
+
+        let result = fetch_observed_wasm_hash(
+            &primary,
+            &secondary,
+            &external_ref_contract_scaddress(),
+            ContractKind::Verifier,
+            7,
+            "CSMART...ACCNT",
+            "req-1",
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(SaError::ContractInstanceUnsupported {
+                    reason: AdminOrOwnerKey::UndecodableInstance,
+                    contract_kind: ContractKind::Verifier,
+                    ..
+                })
+            ),
+            "expected ContractInstanceUnsupported(UndecodableInstance); got {result:?}"
+        );
+    }
+
+    /// The batch fetch extracts Wasm hashes only: an external-reference
+    /// instance yields `None` (no allowlist match), never the owner's resolved
+    /// hash.
+    #[tokio::test]
+    async fn fetch_contract_wasm_hashes_yields_none_for_external_ref() {
+        let server = external_ref_responder(crate::VERIFIER_ALLOWLIST[0].wasm_hash)
+            .serve()
+            .await;
+        let client = StellarRpcClient::new(&server.uri()).expect("client");
+        let key = LedgerKey::ContractData(stellar_xdr::LedgerKeyContractData {
+            contract: external_ref_contract_scaddress(),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: stellar_xdr::ContractDataDurability::Persistent,
+        });
+
+        let results = fetch_contract_wasm_hashes(&client, &[key])
+            .await
+            .expect("batch fetch succeeds");
+
+        assert_eq!(results, vec![None]);
     }
 
     // ── extract_u32_return ────────────────────────────────────────────────────

@@ -110,5 +110,6 @@ pub use submit::{
     submit_transaction_and_wait,
 };
 pub use wasm_hash::{
-    FetchContractWasmHashError, WasmHashDivergenceError, WasmHashFetch, fetch_contract_wasm_hash,
+    ExternalRefExecutable, FetchContractWasmHashError, MalformedEntryReason,
+    WasmHashDivergenceError, WasmHashFetch, executable_tag_ledger_key, fetch_contract_wasm_hash,
 };

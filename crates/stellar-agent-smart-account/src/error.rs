@@ -30,8 +30,8 @@ use stellar_agent_core::observability::RedactedStrkey;
 ///
 /// `Admin` and `Owner` populate the `admin_or_owner_key` field on
 /// [`SaError::VerifierMutable`] and [`SaError::PolicyMutable`].
-/// `UndecodableInstance` and `NonWasmExecutable` populate the `reason` field on
-/// [`SaError::ContractInstanceUnsupported`].
+/// `UndecodableInstance`, `NonWasmExecutable` and `ExternalRefExecutable`
+/// populate the `reason` field on [`SaError::ContractInstanceUnsupported`].
 ///
 /// # Wire format
 ///
@@ -48,6 +48,11 @@ pub enum AdminOrOwnerKey {
     UndecodableInstance,
     /// The instance executable is not Wasm.
     NonWasmExecutable,
+    /// The instance executable is a CAP-85 external reference: the owner
+    /// named in the instance decides, and can change at any time, which Wasm
+    /// runs, so no hash pinned at install time describes the code that runs
+    /// at signing time.
+    ExternalRefExecutable,
 }
 
 impl AdminOrOwnerKey {
@@ -55,12 +60,16 @@ impl AdminOrOwnerKey {
     ///
     /// An existing instance that does not decode as a Wasm contract instance
     /// has no Wasm hash to pin, and the signing-time drift check compares
-    /// against the zero hash, so a later code change stays invisible.
+    /// against the zero hash, so a later code change stays invisible. An
+    /// external-reference executable has an owner-mutable hash, so a pin
+    /// taken at install time says nothing about the code that runs later.
     /// Rule install refuses such a contract with no override.
     #[must_use]
     pub fn is_unpinnable_instance(self) -> bool {
         match self {
-            Self::UndecodableInstance | Self::NonWasmExecutable => true,
+            Self::UndecodableInstance | Self::NonWasmExecutable | Self::ExternalRefExecutable => {
+                true
+            }
             Self::Admin | Self::Owner => false,
         }
     }
@@ -73,6 +82,7 @@ impl std::fmt::Display for AdminOrOwnerKey {
             Self::Owner => f.write_str("Owner"),
             Self::UndecodableInstance => f.write_str("undecodable instance"),
             Self::NonWasmExecutable => f.write_str("non-Wasm executable"),
+            Self::ExternalRefExecutable => f.write_str("owner-managed external reference"),
         }
     }
 }
@@ -400,10 +410,15 @@ pub enum SaError {
     ///
     /// Fired at rule-install time when `managers::verifiers::detect_contract_mutability`
     /// finds an existing instance entry that does not decode as contract-instance
-    /// data or whose executable is not Wasm. Such a contract has no Wasm hash to
-    /// pin, and the signing-time drift check cannot observe a change to its code.
-    /// No flag overrides this refusal; `--accept-mutable-verifier` covers only
-    /// [`SaError::VerifierMutable`] and [`SaError::PolicyMutable`].
+    /// data or whose executable is not Wasm, and whenever the verifier or policy
+    /// Wasm-hash fetch (install-time identification and signing-time drift)
+    /// finds an undecodable instance or an external-reference executable. Such
+    /// a contract has no Wasm hash the wallet can pin: the signing-time drift
+    /// check cannot observe a change to its code, and an external reference's
+    /// owner can repoint it at any time. No flag overrides this refusal;
+    /// `--accept-mutable-verifier` covers only [`SaError::VerifierMutable`] and
+    /// [`SaError::PolicyMutable`], and `--accept-unknown-verifier` covers only
+    /// an allowlist miss.
     ///
     /// # Forensic spine
     ///
@@ -432,8 +447,8 @@ pub enum SaError {
         /// MUST be redacted at the call site via
         /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
         contract_address_redacted: RedactedStrkey,
-        /// Instance shape that prevents pinning (`UndecodableInstance` or
-        /// `NonWasmExecutable`).
+        /// Instance shape that prevents pinning (`UndecodableInstance`,
+        /// `NonWasmExecutable` or `ExternalRefExecutable`).
         reason: AdminOrOwnerKey,
         /// Per-request correlation identifier (UUIDv4).
         request_id: String,
@@ -4399,6 +4414,7 @@ mod tests {
         "Owner",
         "undecodable instance",
         "non-Wasm executable",
+        "owner-managed external reference",
     ];
 
     #[test]
@@ -4408,6 +4424,7 @@ mod tests {
             AdminOrOwnerKey::Owner,
             AdminOrOwnerKey::UndecodableInstance,
             AdminOrOwnerKey::NonWasmExecutable,
+            AdminOrOwnerKey::ExternalRefExecutable,
         ]
         .iter()
         .map(std::string::ToString::to_string)
@@ -4428,6 +4445,7 @@ mod tests {
         assert!(!AdminOrOwnerKey::Owner.is_unpinnable_instance());
         assert!(AdminOrOwnerKey::UndecodableInstance.is_unpinnable_instance());
         assert!(AdminOrOwnerKey::NonWasmExecutable.is_unpinnable_instance());
+        assert!(AdminOrOwnerKey::ExternalRefExecutable.is_unpinnable_instance());
     }
 
     /// Verifies that every `stage: "<literal>"` emit site in the crate's

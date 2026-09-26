@@ -6,7 +6,7 @@
 //!
 //! # Why this is not a tautology
 //!
-//! The wallet substrate (`encode_context_rule_ids`) uses `stellar-xdr 27`
+//! The wallet substrate (`encode_context_rule_ids`) uses `stellar-xdr 28`
 //! to encode `ScVal::Vec(...)`. The on-chain canonical uses `soroban-sdk 26.1.0`'s
 //! `Vec::to_xdr` (which pulls `stellar-xdr 26.0.1` — the two crates coexist in
 //! the same binary via Cargo's semver deduplication). Both SHOULD produce the same bytes because
@@ -52,7 +52,7 @@ fn auth_digest_parity_with_onchain_canonical() {
         .collect();
 
     // ── Wallet-substrate computation ──────────────────────────────────────────
-    // encode_context_rule_ids uses stellar-xdr 27 to build
+    // encode_context_rule_ids uses stellar-xdr 28 to build
     // ScVal::Vec(Some(ScVec([ScVal::U32(id), ...]))) and serialise to XDR.
     let rule_ids_xdr = encode_context_rule_ids(&rule_ids_typed)
         .expect("encode_context_rule_ids must not fail for a bounded Vec<u32>");
@@ -89,7 +89,7 @@ fn auth_digest_parity_with_onchain_canonical() {
         "wallet substrate and on-chain canonical produced different auth digests.\n\
          wallet:   {}\n\
          onchain:  {}\n\
-         This indicates an XDR serialisation drift between stellar-xdr 27 \
+         This indicates an XDR serialisation drift between stellar-xdr 28 \
          (wallet substrate) and soroban-sdk 26.x Vec::to_xdr (on-chain canonical).",
         wallet_digest
             .as_bytes()

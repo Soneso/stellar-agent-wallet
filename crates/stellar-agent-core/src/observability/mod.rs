@@ -80,7 +80,9 @@
 //!   are silently skipped in `FieldCollector` so they do not appear in output.
 
 pub mod redact;
-pub use redact::redact_strkey_first5_last5;
+pub use redact::{
+    UNTRUSTED_DISPLAY_MAX_BYTES, redact_strkey_first5_last5, untrusted_display_bounded,
+};
 
 use std::fmt as std_fmt;
 use std::ops::Deref;

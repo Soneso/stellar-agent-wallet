@@ -49,9 +49,9 @@ use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilde
 use stellar_rpc_client::Client;
 use stellar_xdr as xdr_curr;
 use stellar_xdr::{
-    AccountId, BytesM, ContractId, HostFunction, InvokeContractArgs, InvokeHostFunctionOp, Limits,
-    Operation, OperationBody, PublicKey, ReadXdr, ScAddress, ScBytes, ScMap, ScMapEntry, ScString,
-    ScSymbol, ScVal, ScVec, SorobanAuthorizationEntry, SorobanCredentials, Uint256, VecM, WriteXdr,
+    BytesM, HostFunction, InvokeContractArgs, InvokeHostFunctionOp, Limits, Operation,
+    OperationBody, ReadXdr, ScAddress, ScBytes, ScMap, ScMapEntry, ScString, ScSymbol, ScVal,
+    ScVec, SorobanAuthorizationEntry, SorobanCredentials, VecM, WriteXdr,
 };
 use tracing::warn;
 
@@ -4847,27 +4847,17 @@ pub(crate) fn sa_error_to_invocation_result(
 
 /// Renders an [`ScAddress`] as the canonical Stellar strkey form.
 ///
-/// `stellar_strkey` 0.0.16 returns `heapless::String<56>` from `to_string()`;
-/// we explicitly convert to `std::string::String` via `as_str().to_owned()`
-/// to avoid the `Display` shadow that would otherwise pick up the heapless
-/// rendering at call sites.
+/// Delegates to [`stellar_agent_core::sc_address::scaddress_to_strkey`]; an
+/// address variant with no account or contract strkey form maps to
+/// [`SaError::AuthEntryConstructionFailed`] at stage `auth_payload`, naming
+/// the variant only.
 pub(crate) fn scaddress_to_strkey(addr: &ScAddress) -> Result<String, SaError> {
-    match addr {
-        ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))) => {
-            let pk = stellar_strkey::ed25519::PublicKey(*bytes);
-            Ok(pk.to_string().as_str().to_owned())
-        }
-        ScAddress::Contract(ContractId(stellar_xdr::Hash(bytes))) => {
-            let c = stellar_strkey::Contract(*bytes);
-            Ok(c.to_string().as_str().to_owned())
-        }
-        other => Err(SaError::AuthEntryConstructionFailed {
+    stellar_agent_core::sc_address::scaddress_to_strkey(addr).map_err(|e| {
+        SaError::AuthEntryConstructionFailed {
             stage: "auth_payload",
-            redacted_reason: format!(
-                "unsupported ScAddress variant for strkey rendering: {other:?}"
-            ),
-        }),
-    }
+            redacted_reason: format!("unsupported ScAddress variant for strkey rendering: {e}"),
+        }
+    })
 }
 
 /// Converts a `stellar_xdr::ScAddress` to its canonical strkey, returning
@@ -4879,26 +4869,10 @@ pub(crate) fn scaddress_to_strkey(addr: &ScAddress) -> Result<String, SaError> {
 /// These unusual variants should never appear as admin-key holders in well-formed
 /// OZ contracts, but the sentinel avoids a panic in adversarial inputs.
 ///
-/// `stellar_strkey` 0.0.16 returns `heapless::String<56>` from `to_string()`;
-/// we convert to `std::string::String` via `as_str().to_owned()` to avoid the
-/// `Display` shadow — mirrors [`scaddress_to_strkey`].
+/// Delegates to [`stellar_agent_core::sc_address::scaddress_to_strkey`].
 pub(crate) fn xdr_scaddress_to_strkey_or_sentinel(addr: &xdr_curr::ScAddress) -> String {
-    match addr {
-        xdr_curr::ScAddress::Account(xdr_curr::AccountId(
-            xdr_curr::PublicKey::PublicKeyTypeEd25519(bytes),
-        )) => stellar_strkey::ed25519::PublicKey(bytes.0)
-            .to_string()
-            .as_str()
-            .to_owned(),
-        xdr_curr::ScAddress::Contract(xdr_curr::ContractId(xdr_curr::Hash(bytes))) => {
-            stellar_strkey::Contract(*bytes)
-                .to_string()
-                .as_str()
-                .to_owned()
-        }
-        // MuxedAccount, ClaimableBalance, LiquidityPool: not valid admin-key holders.
-        _ => "[unknown-address-type]".to_owned(),
-    }
+    stellar_agent_core::sc_address::scaddress_to_strkey(addr)
+        .unwrap_or_else(|_| "[unknown-address-type]".to_owned())
 }
 
 /// Builds a `LedgerKey::ContractData` key for a contract's instance entry.
@@ -4937,6 +4911,7 @@ mod tests {
 
     use super::*;
     use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
+    use stellar_xdr::{AccountId, ContractId, PublicKey, Uint256};
 
     fn manager_for_test() -> ContextRuleManager {
         ContextRuleManager::new(ContextRuleManagerConfig {
@@ -6234,6 +6209,62 @@ mod tests {
         let err = rule_context_from_context_type_scval(&bogus)
             .expect_err("16-byte CreateContract payload must fail closed");
         assert!(matches!(err, SaError::DeploymentFailed { .. }));
+    }
+
+    /// `rule_context_from_context_type_scval` refuses a `CreateContract`
+    /// context whose payload is the CAP-85 SCVal form of an external-reference
+    /// executable, `Vec([Symbol("ExternalRef"), Map(owner, tag)])`: a
+    /// `CreateContract` rule context is only ever a 32-byte Wasm hash.
+    #[test]
+    fn rule_context_decode_create_contract_external_ref_payload_fails_closed() {
+        let external_ref = ScVal::Vec(Some(ScVec(
+            vec![
+                ScVal::Symbol(ScSymbol::try_from("ExternalRef").unwrap()),
+                ScVal::Map(Some(ScMap(
+                    vec![
+                        ScMapEntry {
+                            key: ScVal::Symbol(ScSymbol::try_from("executable_owner").unwrap()),
+                            val: ScVal::Address(ScAddress::Contract(stellar_xdr::ContractId(
+                                stellar_xdr::Hash([0x0c; 32]),
+                            ))),
+                        },
+                        ScMapEntry {
+                            key: ScVal::Symbol(ScSymbol::try_from("tag").unwrap()),
+                            val: ScVal::String(ScString(b"v1".to_vec().try_into().unwrap())),
+                        },
+                    ]
+                    .try_into()
+                    .unwrap(),
+                ))),
+            ]
+            .try_into()
+            .unwrap(),
+        )));
+        let context = ScVal::Vec(Some(ScVec(
+            vec![
+                ScVal::Symbol(ScSymbol::try_from("CreateContract").unwrap()),
+                external_ref,
+            ]
+            .try_into()
+            .unwrap(),
+        )));
+
+        let err = rule_context_from_context_type_scval(&context)
+            .expect_err("an external-reference CreateContract payload must fail closed");
+
+        let SaError::DeploymentFailed {
+            phase,
+            redacted_reason,
+        } = err
+        else {
+            panic!("expected DeploymentFailed; got {err:?}");
+        };
+        assert_eq!(phase, "simulate");
+        assert!(
+            redacted_reason
+                .starts_with("decode context_type: CreateContract vec[1]: expected Bytes"),
+            "{redacted_reason}"
+        );
     }
 
     // ── OZ SpendingLimitError symbolic-name tests ─────────────────────────────
@@ -7907,13 +7938,9 @@ mod tests {
     // ── scaddress_to_strkey: unsupported variant path ─────────────────────────
 
     /// `scaddress_to_strkey` returns `AuthEntryConstructionFailed` for an
-    /// `ScAddress::MuxedAccount` — a variant present in the stellar-xdr v27
-    /// `ScAddress` union but not representable as a plain G- or C-strkey.
-    ///
-    /// Exercises lines 4200-4205 (the `other =>` arm of `scaddress_to_strkey`).
-    /// `MuxedEd25519Account` carries a mux-id + ed25519 key and is valid XDR
-    /// but `stellar_strkey` does not have a `Contract::from` or `PublicKey::from`
-    /// for it.
+    /// `ScAddress::MuxedAccount` — a variant present in the stellar-xdr v28
+    /// `ScAddress` union but not an account or contract principal. The reason
+    /// names the variant and carries none of the address bytes.
     #[test]
     fn scaddress_to_strkey_muxed_account_returns_error() {
         use stellar_xdr::{MuxedEd25519Account, Uint256};
@@ -7922,15 +7949,18 @@ mod tests {
             ed25519: Uint256([0x0A_u8; 32]),
         });
         let err = scaddress_to_strkey(&addr).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                SaError::AuthEntryConstructionFailed {
-                    stage: "auth_payload",
-                    ..
-                }
-            ),
-            "MuxedAccount must return AuthEntryConstructionFailed(auth_payload); got {err:?}"
+        let SaError::AuthEntryConstructionFailed {
+            stage,
+            redacted_reason,
+        } = err
+        else {
+            panic!("MuxedAccount must return AuthEntryConstructionFailed; got {err:?}");
+        };
+        assert_eq!(stage, "auth_payload");
+        assert_eq!(
+            redacted_reason,
+            "unsupported ScAddress variant for strkey rendering: \
+             address variant MuxedAccount has no account or contract strkey form"
         );
     }
 
@@ -7939,8 +7969,6 @@ mod tests {
     /// `xdr_scaddress_to_strkey_or_sentinel` returns `"[unknown-address-type]"`
     /// for an `ScAddress::MuxedAccount`, which is not representable as a plain
     /// G- or C-strkey.
-    ///
-    /// Exercises the `_ => "[unknown-address-type]"` arm at line 4236.
     #[test]
     fn xdr_scaddress_to_strkey_or_sentinel_muxed_account_returns_sentinel() {
         use stellar_xdr::{MuxedEd25519Account, Uint256};

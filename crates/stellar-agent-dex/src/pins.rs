@@ -111,7 +111,8 @@ pub const SOROSWAP_ROUTER_ADDRESS_PUBNET: &str =
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DexPinError {
-    /// The pin-verify gate failed (WASM hash drift, absent, SAC, or fetch error).
+    /// The pin-verify gate failed (WASM hash drift, absent, SAC, an
+    /// owner-managed external-reference executable, or fetch error).
     ///
     /// The inner [`PinVerifyError`] carries full diagnostic context but never
     /// leaks a full address or hash in `Display`.
@@ -152,7 +153,8 @@ pub enum DexPinError {
         network: String,
     },
 
-    /// The two-RPC WASM-hash fetch failed (network error, invalid address, or divergence).
+    /// The two-RPC WASM-hash fetch failed (network error, invalid address,
+    /// malformed ledger entry, or divergence).
     #[error("Soroswap router WASM-hash fetch failed for {router_redacted}: {reason}")]
     FetchFailed {
         /// Redacted router address (first-5-last-5).
@@ -197,8 +199,11 @@ pub enum DexPinError {
 /// Returns [`DexPinError`] when:
 /// - The supplied router address does not match the pinned address for the network.
 /// - The pin sentinel is all-zeros (pubnet TBD).
-/// - The WASM-hash fetch fails (network error, invalid address, or divergence).
-/// - The on-chain WASM hash does not match the pin.
+/// - The WASM-hash fetch fails (network error, invalid address, malformed
+///   ledger entry, or divergence).
+/// - The on-chain WASM hash does not match the pin, or the router's
+///   executable is not an ordinary Wasm executable (SAC, owner-managed
+///   external reference, or absent).
 pub async fn verify_soroswap_router_wasm(
     router_address: &str,
     network: &str,
@@ -237,12 +242,18 @@ pub async fn verify_soroswap_router_wasm(
                 reason: "RPC fetch unavailable".to_owned(),
             });
         }
+        Err(FetchContractWasmHashError::Malformed { reason, .. }) => {
+            return Err(DexPinError::FetchFailed {
+                router_redacted: redact_strkey_first5_last5(router_address),
+                reason: format!("malformed ledger entry: {reason}"),
+            });
+        }
         Err(FetchContractWasmHashError::Divergent(e)) => {
             return Err(DexPinError::FetchFailed {
                 router_redacted: redact_strkey_first5_last5(router_address),
                 reason: format!(
                     "two-RPC divergence: primary={} secondary={}",
-                    e.primary_first8, e.secondary_first8
+                    e.primary_summary, e.secondary_summary
                 ),
             });
         }
@@ -532,6 +543,94 @@ mod tests {
             result,
             Err(DexPinError::RouterAddressMismatch { .. })
         ));
+    }
+
+    // ── Router executable shapes (mocked getLedgerEntries) ─────────────────
+
+    const OWNER: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
+    /// The router's executable is an external reference whose tag entry
+    /// currently holds exactly the pinned router hash; the gate refuses with
+    /// DeFi's external-reference error.
+    #[tokio::test]
+    async fn verify_router_wasm_external_ref_refuses_with_pin_verify_failed() {
+        use stellar_agent_test_support::{KeyedLedgerEntriesResponder, xdr_fixtures};
+
+        let responder = KeyedLedgerEntriesResponder::new()
+            .with_entry(xdr_fixtures::ledger_entry_from_response_json(
+                &xdr_fixtures::external_ref_instance_ledger_entries_json(
+                    SOROSWAP_ROUTER_ADDRESS_TESTNET,
+                    OWNER,
+                    b"router",
+                ),
+            ))
+            .with_entry(xdr_fixtures::ledger_entry_from_response_json(
+                &xdr_fixtures::executable_tag_ledger_entries_json(
+                    OWNER,
+                    b"router",
+                    SOROSWAP_ROUTER_WASM_HASH_TESTNET,
+                ),
+            ));
+        let server = responder.serve().await;
+        let rpc = StellarRpcClient::new(&server.uri()).expect("client constructs");
+
+        let result = verify_soroswap_router_wasm(
+            SOROSWAP_ROUTER_ADDRESS_TESTNET,
+            "stellar:testnet",
+            &rpc,
+            None,
+        )
+        .await;
+
+        let Err(DexPinError::PinVerifyFailed { inner, .. }) = result else {
+            panic!("expected PinVerifyFailed; got {result:?}");
+        };
+        let PinVerifyError::ExternalRef {
+            owner_redacted,
+            tag,
+            wire_code,
+            ..
+        } = inner
+        else {
+            panic!("expected PinVerifyError::ExternalRef; got {inner:?}");
+        };
+        assert_eq!(wire_code, stellar_agent_defi::pins::WIRE_CODE_EXTERNAL_REF);
+        assert_eq!(owner_redacted, "GAAAA...AAWHF");
+        assert_eq!(tag, "router");
+    }
+
+    #[tokio::test]
+    async fn verify_router_wasm_malformed_instance_carries_the_reason() {
+        use stellar_agent_test_support::{KeyedLedgerEntriesResponder, xdr_fixtures};
+
+        let mut instance = xdr_fixtures::ledger_entry_from_response_json(
+            &xdr_fixtures::contract_instance_ledger_entries_json(
+                SOROSWAP_ROUTER_ADDRESS_TESTNET,
+                SOROSWAP_ROUTER_WASM_HASH_TESTNET,
+            ),
+        );
+        instance["xdr"] = serde_json::Value::String("AAAA////".to_owned());
+        let server = KeyedLedgerEntriesResponder::new()
+            .with_entry(instance)
+            .serve()
+            .await;
+        let rpc = StellarRpcClient::new(&server.uri()).expect("client constructs");
+
+        let result = verify_soroswap_router_wasm(
+            SOROSWAP_ROUTER_ADDRESS_TESTNET,
+            "stellar:testnet",
+            &rpc,
+            None,
+        )
+        .await;
+
+        let Err(DexPinError::FetchFailed { reason, .. }) = result else {
+            panic!("expected FetchFailed; got {result:?}");
+        };
+        assert_eq!(
+            reason,
+            "malformed ledger entry: contract instance entry does not decode"
+        );
     }
 
     #[test]

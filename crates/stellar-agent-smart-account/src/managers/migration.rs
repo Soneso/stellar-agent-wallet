@@ -102,6 +102,7 @@ use crate::managers::signers::{SignersManager, simulate_read_only};
 use crate::managers::verifiers::{MutabilityStatus, detect_contract_mutability};
 use crate::verifier_allowlist::{VERIFIER_ALLOWLIST, VerifierAuditStatus};
 use stellar_agent_core::audit_log::entry::AuditEntry;
+use stellar_agent_core::audit_log::schema::ContractKind;
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_network::Signer;
 
@@ -939,6 +940,7 @@ impl<'a> MigrationPlanner<'a> {
             self.signers_manager.primary_rpc_client(),
             self.signers_manager.secondary_rpc_client(),
             &to_verifier_addr,
+            ContractKind::Verifier,
             0,
             &smart_account_redacted,
             request_id,
@@ -1240,6 +1242,7 @@ impl<'a> MigrationPlanner<'a> {
                     self.signers_manager.primary_rpc_client(),
                     self.signers_manager.secondary_rpc_client(),
                     &ext.verifier_addr,
+                    ContractKind::Verifier,
                     rule_id,
                     smart_account_redacted,
                     request_id,

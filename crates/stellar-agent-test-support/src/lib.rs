@@ -58,10 +58,10 @@ pub mod xdr_fixtures;
 
 mod bip39_english;
 
-#[cfg(feature = "wiremock-helpers")]
-pub use echo_id_responder::EchoIdResponder;
 #[cfg(feature = "test-helpers")]
 pub use echo_id_responder::SubmissionEchoResponder;
+#[cfg(feature = "wiremock-helpers")]
+pub use echo_id_responder::{EchoIdResponder, KeyedLedgerEntriesResponder};
 pub use env_guard::{ProfileEnvVarGuard, StellarAgentHomeGuard};
 pub use log_capture::{CaptureWriter, RedactionStrictSubscriber, with_captured_logs};
 pub use secret_patterns::assert_no_secret_bytes;

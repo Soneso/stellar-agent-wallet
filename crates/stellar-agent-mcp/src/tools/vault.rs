@@ -401,7 +401,8 @@ impl WalletServer {
                         strategy.is_blend_strategy = is_blend_strategy(&hash, &args.chain_id);
                     }
                     Ok(_) | Err(_) => {
-                        // SAC, absent, or fetch failure → not a Blend strategy.
+                        // SAC, external reference, absent, or fetch failure → not a
+                        // Blend strategy (detection is by pinned Wasm hash only).
                         strategy.is_blend_strategy = false;
                     }
                 }

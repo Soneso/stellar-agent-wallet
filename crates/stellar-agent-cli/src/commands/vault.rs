@@ -1273,10 +1273,11 @@ mod tests {
     }
 
     /// Answers every `getLedgerEntries` request with the same fixed vault
-    /// instance entry, so the ordered trust gate's four independent reads
-    /// (WASM-pin, upgradable-flag, roles, assets — all against the SAME
-    /// `LedgerKeyContractInstance`) all resolve successfully.
+    /// instance entry under its own instance key, so the ordered trust gate's
+    /// four independent reads (WASM-pin, upgradable-flag, roles, assets — all
+    /// against the SAME `LedgerKeyContractInstance`) all resolve successfully.
     struct VaultInstanceResponder {
+        key_xdr: String,
         entry_xdr: String,
     }
 
@@ -1297,7 +1298,7 @@ mod tests {
             let result = match method {
                 "getLedgerEntries" => serde_json::json!({
                     "entries": [{
-                        "key": "unused-by-the-decoder",
+                        "key": self.key_xdr,
                         "xdr": self.entry_xdr,
                         "lastModifiedLedgerSeq": 1000
                     }],
@@ -1334,12 +1335,12 @@ mod tests {
 
         let vault_c = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
         let asset_c = "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN";
-        let (_key_xdr, entry_xdr) =
+        let (key_xdr, entry_xdr) =
             defindex_vault_instance_key_and_entry_xdr(vault_c, DEFINDEX_VAULT_WASM_HASH, asset_c);
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(VaultInstanceResponder { entry_xdr })
+            .respond_with(VaultInstanceResponder { key_xdr, entry_xdr })
             .mount(&server)
             .await;
         let rpc_url = server.uri();
@@ -1408,12 +1409,12 @@ mod tests {
 
         let vault_c = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
         let asset_c = "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN";
-        let (_key_xdr, entry_xdr) =
+        let (key_xdr, entry_xdr) =
             defindex_vault_instance_key_and_entry_xdr(vault_c, DEFINDEX_VAULT_WASM_HASH, asset_c);
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(VaultInstanceResponder { entry_xdr })
+            .respond_with(VaultInstanceResponder { key_xdr, entry_xdr })
             .mount(&server)
             .await;
         let rpc_url = server.uri();

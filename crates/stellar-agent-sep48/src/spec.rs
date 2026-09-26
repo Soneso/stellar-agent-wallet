@@ -257,8 +257,10 @@ pub(crate) async fn fetch_wasm_bytes(
 /// # Errors
 ///
 /// Returns [`Sep48Error::RpcFetchFailure`] when the response has no entries,
-/// the entry is not a contract instance, or the executable is a native
-/// (`StellarAsset`) rather than a WASM contract.
+/// the entry is not a contract instance, the executable is a native
+/// (`StellarAsset`) rather than a WASM contract, or the executable is an
+/// owner-managed external reference (the owner chooses, and can change, the
+/// Wasm that runs, so no spec read now describes it).
 fn extract_wasm_hash_from_instance_response(
     resp: &stellar_agent_network::GetLedgerEntriesResponse,
     contract_strkey: &str,
@@ -300,6 +302,21 @@ fn extract_wasm_hash_from_instance_response(
                     redact_strkey(contract_strkey)
                 ),
             }),
+            ScVal::ContractInstance(ScContractInstance {
+                executable: ContractExecutable::ExternalRef(external),
+                ..
+            }) => {
+                let external = stellar_agent_network::ExternalRefExecutable::from_xdr(external);
+                Err(Sep48Error::RpcFetchFailure {
+                    reason: format!(
+                        "contract {} executable is an external reference managed by {} under \
+                         tag \"{}\"; its code is owner-managed and has no fixed Wasm spec",
+                        redact_strkey(contract_strkey),
+                        external.owner_redacted(),
+                        external.tag_display(),
+                    ),
+                })
+            }
             _ => Err(Sep48Error::RpcFetchFailure {
                 reason: format!(
                     "unexpected ContractData val shape for contract {}",
@@ -545,6 +562,34 @@ mod tests {
     ///
     /// Uses a `ContractCode` entry for the instance step since it is easy to
     /// construct and is unambiguously not `ContractData`.
+    /// A contract whose instance executable is a CAP-85 external reference is
+    /// refused with a reason naming the owner-managed executable (redacted
+    /// owner, bounded tag), not as an unexpected shape.
+    #[test]
+    fn extract_wasm_hash_external_ref_instance_names_owner_managed_executable() {
+        use stellar_agent_test_support::xdr_fixtures;
+
+        const OWNER: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+        let entry = xdr_fixtures::ledger_entry_from_response_json(
+            &xdr_fixtures::external_ref_instance_ledger_entries_json(CONTRACT, OWNER, b"token\n"),
+        );
+        let resp = make_resp_with_entry(entry["xdr"].as_str().expect("xdr"));
+
+        let result = extract_wasm_hash_from_instance_response(&resp, CONTRACT);
+
+        let Err(Sep48Error::RpcFetchFailure { reason }) = result else {
+            panic!("expected RpcFetchFailure; got {result:?}");
+        };
+        assert_eq!(
+            reason,
+            format!(
+                "contract {} executable is an external reference managed by GAAAA...AAWHF \
+                 under tag \"token\\n\"; its code is owner-managed and has no fixed Wasm spec",
+                redact_strkey(CONTRACT)
+            )
+        );
+    }
+
     #[test]
     fn extract_wasm_hash_non_contract_data_entry_returns_error() {
         let xdr = contract_code_as_wrong_instance_type_xdr();

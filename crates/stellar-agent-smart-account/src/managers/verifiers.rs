@@ -236,7 +236,10 @@ impl PinResult {
 /// - [`SaError::PolicyMutable`] — policy has a non-zero admin key and
 ///   `accept_mutable_verifier` is `false`.
 /// - [`SaError::ContractInstanceUnsupported`]: a verifier or policy instance
-///   is undecodable or has a non-Wasm executable; no flag overrides it.
+///   is undecodable, has a non-Wasm executable, or has an owner-managed
+///   external-reference executable; no flag overrides it. An external
+///   reference is refused by the verifier or policy identification step,
+///   before any override flag is consulted.
 /// - [`SaError::VerifierWasmNotInAllowlist`] — verifier wasm hash not in
 ///   allowlist and `accept_unknown_verifier` is `false`.
 /// - [`SaError::PolicyWasmNotInAllowlist`] — policy wasm hash not in
@@ -318,12 +321,15 @@ pub async fn pin_referenced_contracts(
                         signers_manager.primary_rpc_client(),
                         signers_manager.secondary_rpc_client(),
                         &verifier_addr,
+                        ContractKind::Verifier,
                         rule_id,
                         smart_account_redacted,
                         &request_id,
                     )
                     .await?
-                    .unwrap_or([0u8; 32]); // absent entry ⇒ zero sentinel (edge case)
+                    // An absent or SAC contract pins the zero hash; the fetch
+                    // refuses an external reference or a malformed entry.
+                    .unwrap_or([0u8; 32]);
 
                     unknown_override = true;
                     let verifier_redacted = redact_strkey_first5_last5(&verifier_strkey);
@@ -493,12 +499,15 @@ pub async fn pin_referenced_contracts(
                         signers_manager.primary_rpc_client(),
                         signers_manager.secondary_rpc_client(),
                         &policy.policy_address,
+                        ContractKind::Policy,
                         rule_id,
                         smart_account_redacted,
                         &request_id,
                     )
                     .await?
-                    .unwrap_or([0u8; 32]); // absent entry ⇒ zero sentinel (edge case)
+                    // An absent or SAC contract pins the zero hash; the fetch
+                    // refuses an external reference or a malformed entry.
+                    .unwrap_or([0u8; 32]);
 
                     unknown_override = true;
                     let policy_redacted = redact_strkey_first5_last5(&policy_strkey);
@@ -873,14 +882,16 @@ pub(crate) async fn verify_pinned_verifier_against_chain(
             signers_manager.primary_rpc_client(),
             signers_manager.secondary_rpc_client(),
             &verifier_addr,
+            ContractKind::Verifier,
             rule_id,
             smart_account_redacted,
             request_id,
         )
         .await?;
-        // If the contract is absent, use zero-sentinel so comparison against
-        // a zero pin (from accept-unknown-verifier path that stored zero due to
-        // an absent contract) passes cleanly.
+        // An absent or SAC contract observes the zero hash, so it compares
+        // equal to a zero pin stored by the accept-unknown-verifier path. An
+        // external reference or malformed entry is refused by the fetch and
+        // never reaches this comparison.
         let hash = maybe_hash.unwrap_or([0u8; 32]);
         wasm_hash_cache.insert(verifier_cache_key, hash);
         hash
@@ -1041,15 +1052,17 @@ pub(crate) async fn verify_pinned_policy_against_chain(
             signers_manager.primary_rpc_client(),
             signers_manager.secondary_rpc_client(),
             &policy_addr,
+            ContractKind::Policy,
             rule_id,
             smart_account_redacted,
             request_id,
         )
         .await?;
 
-        // If the contract is absent, use zero-sentinel so comparison against
-        // a zero pin (from accept-unknown-verifier path that stored zero due to
-        // an absent contract) passes cleanly.
+        // An absent or SAC contract observes the zero hash, so it compares
+        // equal to a zero pin stored by the accept-unknown-verifier path. An
+        // external reference or malformed entry is refused by the fetch and
+        // never reaches this comparison.
         let hash = maybe_hash.unwrap_or([0u8; 32]);
 
         // Log if hash not in allowlist (informational — signing continues if hash matches pin).
@@ -1156,6 +1169,7 @@ async fn identify_policy_wasm_hash(
     signers_manager
         .identify_contract_wasm_hash(
             policy_addr,
+            ContractKind::Policy,
             THRESHOLD_POLICY_WASM_HASHES,
             rule_id,
             smart_account_redacted,
@@ -1248,7 +1262,8 @@ pub enum MutabilityStatus {
 ///   storage has no active admin key.
 /// - `Ok(MutabilityStatus::Mutable { admin_or_owner_key, holder_redacted })` —
 ///   an active admin key or an unreadable instance. The typed reason distinguishes
-///   undecodable instance data and non-Wasm executables from admin storage keys.
+///   undecodable instance data, non-Wasm executables and owner-managed external
+///   references from admin storage keys.
 ///
 /// # Errors
 ///
@@ -1374,7 +1389,7 @@ enum InstanceStorage {
 /// `LedgerEntryResult` struct.
 /// `LedgerEntryResult.key` contains `LedgerKey` XDR, used for position matching.
 ///
-/// `ScContractInstance.storage` is `Option<ScMap>` per `stellar-xdr` v27.0.0
+/// `ScContractInstance.storage` is `Option<ScMap>` per `stellar-xdr` v28.0.0
 /// `xdr/curr/Stellar-contract.x` `SCContractInstance` definition.
 async fn fetch_contract_instance_storage(
     client: &StellarRpcClient,
@@ -1441,6 +1456,12 @@ async fn fetch_contract_instance_storage(
                     })
                 }
                 ContractExecutable::StellarAsset => unreadable(AdminOrOwnerKey::NonWasmExecutable),
+                // The owner of an external reference decides, and can change,
+                // which Wasm runs; there is no hash to pin and the instance
+                // storage says nothing about the owner's authority.
+                ContractExecutable::ExternalRef(_) => {
+                    unreadable(AdminOrOwnerKey::ExternalRefExecutable)
+                }
             },
             Ok(_) | Err(_) => unreadable(AdminOrOwnerKey::UndecodableInstance),
         };
@@ -2904,29 +2925,35 @@ mod tests {
         );
     }
 
-    /// A CAP-85 instance with an external executable reference (XDR
-    /// discriminant 2: owner `ScAddress` and tag `ScString`) is classified as
-    /// an undecodable instance.
+    /// A CAP-85 instance whose executable is an external reference (owner
+    /// `ScAddress` and tag `ScString`) is classified as an owner-managed
+    /// external reference: its code is chosen by the owner, so the storage
+    /// probe cannot establish immutability.
     #[tokio::test]
     async fn detect_mutability_external_ref_executable_is_mutable() {
-        use base64::Engine as _;
+        use stellar_xdr::{
+            ContractExecutable, ContractExecutableExternalRef, LedgerEntryData, ReadXdr, ScString,
+            WriteXdr,
+        };
         let contract = ScAddress::Contract(ContractId(Hash([0x0b; 32])));
-        let wasm_entry = base64::engine::general_purpose::STANDARD
-            .decode(build_contract_instance_entry_xdr_no_storage(&contract))
-            .expect("fixture is base64");
-        let mut wasm_executable = vec![0, 0, 0, 0];
-        wasm_executable.extend_from_slice(&[0x42; 32]);
-        let start = wasm_entry
-            .windows(wasm_executable.len())
-            .position(|window| window == wasm_executable.as_slice())
-            .expect("fixture carries a Wasm executable");
-        let mut external_ref = vec![0, 0, 0, 2, 0, 0, 0, 1];
-        external_ref.extend_from_slice(&[0x0c; 32]);
-        external_ref.extend_from_slice(&[0, 0, 0, 2, b'v', b'1', 0, 0]);
-        let mut entry = wasm_entry[..start].to_vec();
-        entry.extend_from_slice(&external_ref);
-        entry.extend_from_slice(&wasm_entry[start + wasm_executable.len()..]);
-        let entry = base64::engine::general_purpose::STANDARD.encode(entry);
+        let mut entry = LedgerEntryData::from_xdr_base64(
+            build_contract_instance_entry_xdr_no_storage(&contract),
+            stellar_xdr::Limits::none(),
+        )
+        .expect("fixture decodes");
+        let LedgerEntryData::ContractData(ref mut data) = entry else {
+            panic!("fixture must be contract data");
+        };
+        let ScVal::ContractInstance(ref mut instance) = data.val else {
+            panic!("fixture must be a contract instance");
+        };
+        instance.executable = ContractExecutable::ExternalRef(ContractExecutableExternalRef {
+            executable_owner: ScAddress::Contract(ContractId(Hash([0x0c; 32]))),
+            tag: ScString(b"v1".to_vec().try_into().expect("tag")),
+        });
+        let entry = entry
+            .to_xdr_base64(stellar_xdr::Limits::none())
+            .expect("external-reference instance encodes");
         let server = instance_rpc(&contract, Some(&entry)).await;
         let rpc = StellarRpcClient::new(&server.uri()).expect("RPC client");
         let status = detect_contract_mutability(&rpc, &rpc, &contract, 6, "CAAAA...ABSC4", "probe")
@@ -2935,8 +2962,8 @@ mod tests {
         assert_eq!(
             status,
             MutabilityStatus::Mutable {
-                admin_or_owner_key: AdminOrOwnerKey::UndecodableInstance,
-                holder_redacted: "undecodable instance".to_owned(),
+                admin_or_owner_key: AdminOrOwnerKey::ExternalRefExecutable,
+                holder_redacted: "owner-managed external reference".to_owned(),
             }
         );
     }
@@ -2990,7 +3017,10 @@ mod tests {
         use crate::managers::rules::{ContextRulePolicy, RuleContext};
         use crate::managers::signers::SignersManagerConfig;
 
-        let smart_account = ScAddress::Contract(ContractId(Hash([0x0c; 32])));
+        // The all-zero contract address redacts to the `CAAAA...ABSC4` passed
+        // as `smart_account_redacted` below, so forensic fields agree whether
+        // a refusal derives them from the address or takes the passed string.
+        let smart_account = ScAddress::Contract(ContractId(Hash([0u8; 32])));
         let server = instance_rpc(contract, Some(entry_xdr)).await;
         let directory = tempfile::tempdir().unwrap();
         let audit_path = directory.path().join("audit.jsonl");
