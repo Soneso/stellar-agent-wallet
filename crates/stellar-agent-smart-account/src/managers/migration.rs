@@ -945,18 +945,18 @@ impl<'a> MigrationPlanner<'a> {
 
         // Observe the destination verifier's executable (two-RPC
         // consultation, an external reference resolved at each endpoint).
-        // Rule ID 0 is a synthetic sentinel — not a real context-rule ID; used
-        // only for forensic error fields. A contract with no code the wallet
-        // can pin (an unresolved external reference, a malformed entry) is
-        // refused with its typed `ContractInstanceUnsupported`; any other
-        // fetch failure is a plan-build failure.
+        // The destination belongs to no rule yet, so a refusal carries no
+        // rule id. A contract with no code the wallet can pin (an unresolved
+        // external reference, a malformed entry) is refused with its typed
+        // `ContractInstanceUnsupported`; any other fetch failure is a
+        // plan-build failure.
         let observation = self
             .signers_manager
             .observe_contract(
                 &to_verifier_addr,
                 ContractKind::Verifier,
                 verifier_hash_allowlisted,
-                0,
+                None,
                 &smart_account_redacted,
                 request_id,
             )
@@ -1092,7 +1092,7 @@ impl<'a> MigrationPlanner<'a> {
         // migrate to.
         if !same_executable_reference(&observation.observed, &mutability)? {
             return Err(SaError::ContractInstanceUnsupported {
-                rule_id: 0,
+                rule_id: None,
                 contract_kind: ContractKind::Verifier,
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted.clone(),
@@ -1296,7 +1296,7 @@ impl<'a> MigrationPlanner<'a> {
                     self.signers_manager.secondary_rpc_client(),
                     &ext.verifier_addr,
                     ContractKind::Verifier,
-                    rule_id,
+                    Some(rule_id),
                     smart_account_redacted,
                     request_id,
                 )

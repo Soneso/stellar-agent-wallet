@@ -550,9 +550,8 @@ pub enum CredentialsError {
     /// The WebAuthn ceremony is aborted BEFORE any `bridge_local_addr` I/O,
     /// so no browser window is opened and no passkey tap is requested.
     ///
-    /// The operator may bypass with `accept_single_verifier = true` (the
-    /// `--accept-single-verifier` CLI flag), which emits a
-    /// `SaVerifierDiversificationOverride` audit row and proceeds.
+    /// The caller may bypass with `accept_single_verifier = true`, which emits
+    /// a `SaVerifierDiversificationOverride` audit row and proceeds.
     #[error("verifier diversification check refused passkey signing: {source}")]
     DiversificationRequired {
         /// The wrapped `SaError::VerifierDiversificationRequired` carrying the
@@ -1594,8 +1593,6 @@ impl CredentialsManager {
         // before proceeding.  When `false` (default), the trigger refuses
         // signing with `CredentialsError::DiversificationRequired` on all
         // single-verifier high-value or Undetermined-criteria rules.
-        //
-        // CLI flag: `--accept-single-verifier`.
         accept_single_verifier: bool,
     ) -> Result<SignWithPasskeyOutcome, CredentialsError> {
         // Audit emission must fire on EVERY terminal path,

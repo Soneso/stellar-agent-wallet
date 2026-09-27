@@ -87,7 +87,7 @@ async fn verifier_unknown_wasm_hash_rejected_without_override() {
         smart_account,
         ZERO_CONTRACT_REDACTED,
         &definition,
-        0,
+        None,
         SOURCE_G,
         false, // accept_mutable_verifier
         false, // accept_unknown_verifier — MUST refuse unknown hash

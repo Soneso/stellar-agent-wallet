@@ -1889,9 +1889,9 @@ mod tests {
     /// break here rather than as a mysterious production false-abort.
     #[test]
     fn c7_auth_entry_byte_identity_round_trip() {
-        // Uses stellar_xdr::curr types directly to avoid cross-version type
-        // incompatibility with stellar_xdr (stellar-xdr 25.x vs 26.x).
-        // stellar_xdr is a direct dep of stellar-agent-smart-account.
+        // Uses the workspace `stellar_xdr` types, a direct dependency of
+        // stellar-agent-smart-account, so every value below shares one XDR
+        // type family.
         use stellar_xdr::{
             ContractId, Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp, Limits, Memo,
             MuxedAccount, Operation, OperationBody, Preconditions, ScAddress, ScSymbol,

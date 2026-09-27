@@ -804,6 +804,7 @@ async fn unresolved_external_ref_destination_is_refused_as_unsupported() {
         matches!(
             err,
             SaError::ContractInstanceUnsupported {
+                rule_id: None,
                 reason: stellar_agent_smart_account::AdminOrOwnerKey::ExternalRefUnresolved,
                 ..
             }
@@ -969,6 +970,7 @@ async fn destination_changing_executable_between_identification_and_probe_is_ref
         matches!(
             err,
             SaError::ContractInstanceUnsupported {
+                rule_id: None,
                 reason: stellar_agent_smart_account::AdminOrOwnerKey::ExecutableChanged,
                 ..
             }

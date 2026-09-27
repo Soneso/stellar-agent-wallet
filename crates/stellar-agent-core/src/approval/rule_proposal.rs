@@ -107,6 +107,19 @@ pub enum RuleProposalContextType {
     },
 }
 
+impl RuleProposalContextType {
+    /// Returns the variant name (`"Default"`, `"CallContract"` or
+    /// `"CreateContract"`), which carries no field value.
+    #[must_use]
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::CallContract { .. } => "CallContract",
+            Self::CreateContract { .. } => "CreateContract",
+        }
+    }
+}
+
 /// Discriminator for [`RuleProposalSigner`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -548,6 +561,19 @@ mod tests {
             false,
             false,
         )
+    }
+
+    #[test]
+    fn context_type_variant_name_names_each_variant_without_field_values() {
+        assert_eq!(RuleProposalContextType::Default.variant_name(), "Default");
+        let call = RuleProposalContextType::CallContract {
+            contract: C_ADDR.to_owned(),
+        };
+        assert_eq!(call.variant_name(), "CallContract");
+        let create = RuleProposalContextType::CreateContract {
+            wasm_hash_hex: "ab".repeat(32),
+        };
+        assert_eq!(create.variant_name(), "CreateContract");
     }
 
     #[test]

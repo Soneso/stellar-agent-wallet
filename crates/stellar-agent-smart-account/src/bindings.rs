@@ -76,7 +76,7 @@ pub const WASM: &[u8] =
 // WASM IS this crate compiled to `wasm32v1-none`. Off-chain code importing
 // the types from the Rust crate gets byte-layout identity with the on-chain
 // XDR encoding by construction (same `#[contracttype]` proc-macro, same
-// stellar-xdr 25.x dependency chain).
+// soroban-sdk stellar-xdr dependency chain).
 pub use stellar_accounts::smart_account::{
     AuthPayload, ContextRule, ContextRuleEntry, ContextRuleType, Signer, SmartAccountError,
 };

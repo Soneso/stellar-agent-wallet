@@ -300,7 +300,7 @@ impl ReceiptStatus {
 /// `getTransaction` poll handle — stellar-rpc indexes a fee-bump by both outer
 /// and inner hash, `stellar-rpc db/transaction.go:102-107`).
 /// `max_time` = absolute unix seconds from `TimeBounds.maxTime`
-/// (`rs-stellar-xdr 26.0.1 curr/generated.rs:35620`); `0` means unbounded.
+/// (`TimeBounds` in `Stellar-transaction.x`); `0` means unbounded.
 /// For the fee-bump path this is the INNER tx's `maxTime` (a fee-bump has no
 /// `cond` of its own per CAP-15).
 ///
@@ -380,8 +380,8 @@ pub struct SubmissionReceipt {
     ///
     /// `0` means no time bound (`Preconditions::None` or unbounded).
     ///
-    /// Cited: `rs-stellar-xdr 26.0.1 curr/generated.rs:35620`
-    /// (`TimeBounds { min_time: TimePoint(u64), max_time: TimePoint(u64) }`).
+    /// Cited: `TimeBounds { minTime: TimePoint, maxTime: TimePoint }` in
+    /// `Stellar-transaction.x`, with `TimePoint` a `uint64`.
     ///
     /// A resubmit after `max_time` is structurally safe because the network
     /// rejects the original as `tx_too_late`.

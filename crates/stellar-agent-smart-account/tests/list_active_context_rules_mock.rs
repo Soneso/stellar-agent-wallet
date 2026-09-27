@@ -255,7 +255,8 @@ async fn t2_dense_scan_all_returned() {
 ///
 /// The decoder at `rules.rs` requires the canonical soroban ABI encoding:
 /// `ScVal::Map([{Symbol("None"), Void} | {Symbol("Some"), U32(n)}])` is incorrect;
-/// the canonical encoding per `soroban-env-common/src/option.rs:3-16` is:
+/// the canonical encoding per the soroban-env-common
+/// `TryFromVal<E, Val> for Option<T>` conversion is:
 ///   - `None` → `ScVal::Void`
 ///   - `Some(n)` → `ScVal::U32(n)` (the inner type's raw ABI directly)
 ///
@@ -322,7 +323,7 @@ async fn t2b_valid_until_some_decoded_correctly() {
         Some(999_999),
         "valid_until must be Some(999_999) — canonical ScVal::U32(n) ABI; \
          got {:?}. If this fails, the decoder is using the wrong enum-variant map \
-         encoding instead of the canonical soroban-env-common/src/option.rs ABI.",
+         encoding instead of the canonical host Option<T> ABI.",
         result.rules[0].valid_until
     );
 }

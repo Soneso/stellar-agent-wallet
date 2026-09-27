@@ -74,8 +74,8 @@ fn contract_instance_key_xdr(addr: &ScAddress) -> String {
 ///
 /// # Byte-layout citation
 ///
-/// `ScContractInstance.storage: Option<ScMap>` — `xdr/curr/Stellar-contract.x`
-/// `SCContractInstance` (stellar-xdr v26.0.0).
+/// `ScContractInstance.storage: Option<ScMap>`, per `SCContractInstance` in
+/// `Stellar-contract.x`.
 /// `stellar-rpc-client` (rs-stellar-rpc-client) confirms the response
 /// `.xdr` field contains `LedgerEntryData` (not `LedgerEntry`).
 fn contract_instance_entry_xdr_with_admin(

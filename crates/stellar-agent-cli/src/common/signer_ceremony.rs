@@ -220,6 +220,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     #[allow(
         unsafe_code,
         reason = "test-only process environment mutation; the variable name is unique to this test"
@@ -273,6 +274,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     #[allow(unsafe_code, reason = "test-only process environment mutation")]
     async fn invalid_s_strkey_is_refused() {
         let var = unique_var("INVALID");
@@ -373,6 +375,7 @@ mod tests {
     /// derive successfully end to end through
     /// [`resolve_software_signer_from_env`].
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     #[allow(
         unsafe_code,
         reason = "test-only process environment mutation; the variable name is unique to this test"

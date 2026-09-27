@@ -162,7 +162,7 @@ async fn accept_mutable_verifier_succeeds_and_emits_override_audit_row() {
         smart_account,
         ZERO_CONTRACT_REDACTED,
         &definition,
-        0,
+        None,
         SOURCE_G,
         true,  // accept_mutable_verifier — MUST succeed
         false, // accept_unknown_verifier
@@ -206,5 +206,15 @@ async fn accept_mutable_verifier_succeeds_and_emits_override_audit_row() {
     assert_eq!(
         override_entry.request_id, request_id,
         "SaMutableContractOverride row must carry the same request_id"
+    );
+    // The row is written before install, so it names no rule and joins its
+    // SaContextRuleCreated row through request_id.
+    assert!(
+        matches!(
+            &override_entry.event_kind,
+            EventKind::SaMutableContractOverride { rule_id: None, .. }
+        ),
+        "a pre-install override row carries no rule id: {:?}",
+        override_entry.event_kind
     );
 }

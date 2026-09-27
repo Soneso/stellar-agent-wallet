@@ -295,8 +295,11 @@ impl PinResult {
 /// - `rule_definition` — the rule to be installed.
 /// - `smart_account_redacted` — pre-computed first-5-last-5 of the smart-account
 ///   strkey, used for every audit field and error.
-/// - `rule_id` — placeholder `0` (pre-install; rule ID not yet assigned on-chain).
-///   Used only for forensic audit fields.
+/// - `rule_id`: `None` before install, when the rule has no on-chain id yet.
+///   The override rows and the `VerifierMutable`, `PolicyMutable` and
+///   `ContractInstanceUnsupported` refusals carry it as is; the refusals
+///   whose rule id is a plain `u32` (`VerifierWasmNotInAllowlist`,
+///   `PolicyWasmNotInAllowlist`, `NetworkRpcDivergence`) carry 0 for `None`.
 /// - `source_account_strkey`: accepted and unused; identification needs no
 ///   source account.
 /// - `accept_mutable_verifier` — when `true`, contracts with an active admin
@@ -339,7 +342,7 @@ pub async fn pin_referenced_contracts(
     smart_account: ScAddress,
     smart_account_redacted: &str,
     rule_definition: &ContextRuleDefinition,
-    rule_id: u32,
+    rule_id: Option<u32>,
     source_account_strkey: &str,
     accept_mutable_verifier: bool,
     accept_unknown_verifier: bool,
@@ -423,11 +426,21 @@ struct PinContext<'a> {
     signers_manager: &'a SignersManager,
     audit_writer: Option<&'a Arc<Mutex<AuditWriter>>>,
     smart_account_redacted: &'a str,
-    rule_id: u32,
+    /// `None` before install, when the rule has no on-chain id yet.
+    rule_id: Option<u32>,
     accept_mutable_verifier: bool,
     accept_unknown_verifier: bool,
     chain_id: &'a str,
     request_id: &'a str,
+}
+
+impl PinContext<'_> {
+    /// Rule id for the refusals whose rule id is a plain `u32`
+    /// (`VerifierWasmNotInAllowlist`, `PolicyWasmNotInAllowlist`,
+    /// `NetworkRpcDivergence`): 0 when the rule has no on-chain id yet.
+    fn plain_rule_id(&self) -> u32 {
+        self.rule_id.unwrap_or(0)
+    }
 }
 
 /// The pin of one verifier or policy contract.
@@ -476,7 +489,7 @@ async fn pin_contract(
         let observed_hash_first8 = observation.observed_hash_first8();
         if !context.accept_unknown_verifier {
             return Err(kind.not_in_allowlist_error(
-                rule_id,
+                context.plain_rule_id(),
                 smart_account_redacted,
                 observed_hash_first8,
                 request_id,
@@ -543,7 +556,7 @@ async fn pin_contract(
         signers_manager.primary_rpc_client(),
         signers_manager.secondary_rpc_client(),
         contract_addr,
-        rule_id,
+        context.plain_rule_id(),
         smart_account_redacted,
         request_id,
     )
@@ -735,7 +748,7 @@ impl PinnedKind {
 
     fn mutable_error(
         self,
-        rule_id: u32,
+        rule_id: Option<u32>,
         smart_account_redacted: &str,
         contract_redacted: &str,
         admin_or_owner_key: AdminOrOwnerKey,
@@ -768,7 +781,7 @@ impl PinnedKind {
 
 fn unsupported_instance(
     contract_kind: ContractKind,
-    rule_id: u32,
+    rule_id: Option<u32>,
     smart_account_redacted: &str,
     contract_redacted: &str,
     reason: AdminOrOwnerKey,
@@ -986,7 +999,7 @@ async fn observe_with_cache(
         signers_manager.secondary_rpc_client(),
         contract_addr,
         contract_kind,
-        rule_id,
+        Some(rule_id),
         smart_account_redacted,
         request_id,
     )
@@ -1568,6 +1581,9 @@ enum InstanceStorage {
 /// Returns observations aligned with `keys`. `None` means no matching entry.
 /// A present entry retains its storage bytes or a typed failure reason and
 /// the original entry XDR, so two-RPC agreement includes unreadable instances.
+/// A response entry whose key does not decode makes every position
+/// `Unreadable` with [`AdminOrOwnerKey::UndecodableInstance`], because the
+/// response cannot be aligned with the request.
 ///
 /// # Why raw bytes?
 ///
@@ -1582,8 +1598,8 @@ enum InstanceStorage {
 /// `LedgerEntryResult` struct.
 /// `LedgerEntryResult.key` contains `LedgerKey` XDR, used for position matching.
 ///
-/// `ScContractInstance.storage` is `Option<ScMap>` per `stellar-xdr` v28.0.0
-/// `xdr/curr/Stellar-contract.x` `SCContractInstance` definition.
+/// `ScContractInstance.storage` is `Option<ScMap>` per the `SCContractInstance`
+/// definition in `Stellar-contract.x`.
 async fn fetch_contract_instance_storage(
     client: &StellarRpcClient,
     keys: &[LedgerKey],
@@ -1609,12 +1625,18 @@ async fn fetch_contract_instance_storage(
 
     for entry_result in &raw_entries {
         // Decode the response key to match it against our request keys by position.
-        let response_key = match XdrLedgerKey::from_xdr_base64(
+        // A response with an undecodable key cannot be aligned with the
+        // request, so no requested position can be read as absent: every
+        // position records the entry as an undecodable instance.
+        let Ok(response_key) = XdrLedgerKey::from_xdr_base64(
             &entry_result.key,
             stellar_agent_xdr_limits::untrusted_decode_limits(entry_result.key.len()),
-        ) {
-            Ok(k) => k,
-            Err(_) => continue, // skip malformed key — safe, only loses one entry
+        ) else {
+            let unaligned = InstanceStorage::Unreadable {
+                reason: AdminOrOwnerKey::UndecodableInstance,
+                entry_xdr: entry_result.xdr.clone(),
+            };
+            return Ok(vec![Some(unaligned); keys.len()]);
         };
 
         let Some(pos) = keys.iter().position(|k| k == &response_key) else {
@@ -2217,7 +2239,7 @@ mod tests {
     #[test]
     fn emit_override_row_without_writer_fails_closed_when_override_requested() {
         let entry = AuditEntry::new_sa_mutable_contract_override(
-            7,
+            Some(7),
             RedactedStrkey::from_already_redacted("CAAAA...ABSC4"),
             RedactedStrkey::from_already_redacted("CBBBB...BBBBB"),
             ContractKind::Verifier,
@@ -2686,7 +2708,7 @@ mod tests {
         let arc = Arc::new(Mutex::new(writer));
 
         let entry = AuditEntry::new_sa_mutable_contract_override(
-            1,
+            Some(1),
             RedactedStrkey::from_already_redacted("CAAAA...12345"),
             RedactedStrkey::from_already_redacted("CBBBB...67890"),
             ContractKind::Verifier,
@@ -2709,7 +2731,7 @@ mod tests {
     #[test]
     fn emit_override_row_without_writer_ok_when_not_override_requested() {
         let entry = AuditEntry::new_sa_mutable_contract_override(
-            5,
+            Some(5),
             RedactedStrkey::from_already_redacted("CAAAA...ABSC4"),
             RedactedStrkey::from_already_redacted("CCCCC...CCCCC"),
             ContractKind::Policy,
@@ -2752,7 +2774,7 @@ mod tests {
         assert!(arc.is_poisoned(), "mutex must be poisoned after the panic");
 
         let entry = AuditEntry::new_sa_mutable_contract_override(
-            9,
+            Some(9),
             RedactedStrkey::from_already_redacted("CAAAA...ABSC4"),
             RedactedStrkey::from_already_redacted("CDDDD...DDDDD"),
             ContractKind::Verifier,
@@ -2794,7 +2816,7 @@ mod tests {
         assert!(arc.is_poisoned(), "mutex must be poisoned");
 
         let entry = AuditEntry::new_sa_mutable_contract_override(
-            10,
+            Some(10),
             RedactedStrkey::from_already_redacted("CAAAA...ABSC4"),
             RedactedStrkey::from_already_redacted("CEEEE...EEEEE"),
             ContractKind::Policy,
@@ -3083,14 +3105,11 @@ mod tests {
         );
     }
 
-    /// `detect_contract_mutability` skips a response entry whose key is malformed
-    /// (not valid XDR).  The malformed entry is ignored and the result is
-    /// `Immutable` (the key is absent after skipping).
-    ///
-    /// This covers the `Err(_) => continue` branch in `fetch_contract_instance_storage`
-    /// that fires when `XdrLedgerKey::from_xdr_base64` fails.
+    /// A response entry whose key is not base64 `LedgerKey` XDR cannot be
+    /// aligned with the request, so `detect_contract_mutability` classifies
+    /// the contract as `Mutable` with `UndecodableInstance`.
     #[tokio::test]
-    async fn detect_mutability_skips_malformed_response_key() {
+    async fn detect_mutability_malformed_response_key_is_undecodable_instance() {
         use wiremock::{
             Mock, MockServer,
             matchers::{method, path},
@@ -3127,14 +3146,18 @@ mod tests {
             "req-malformed-key",
         )
         .await
-        .expect("malformed key must be skipped, not errored");
+        .expect("a malformed response key has a mutability classification");
 
-        // After skipping the malformed entry, no key resolved → absent → Immutable.
         assert_eq!(
             result,
-            MutabilityStatus::Immutable,
-            "malformed response key must be skipped; result is Immutable"
+            MutabilityStatus::Mutable {
+                admin_or_owner_key: AdminOrOwnerKey::UndecodableInstance,
+                holder_redacted: "undecodable instance".to_owned(),
+                executable_ref: None,
+            },
+            "a malformed response key must fail closed as Mutable"
         );
+        assert!(AdminOrOwnerKey::UndecodableInstance.is_unpinnable_instance());
     }
 
     /// A matching entry with undecodable instance data is classified as mutable.
@@ -3515,7 +3538,7 @@ mod tests {
             smart_account,
             "CAAAA...ABSC4",
             &definition,
-            6,
+            None,
             "unused",
             accept_mutable_verifier,
             true,
@@ -3569,7 +3592,7 @@ mod tests {
                 else {
                     panic!("wrong install refusal: {error:?}");
                 };
-                assert_eq!(*rule_id, 6);
+                assert_eq!(*rule_id, None, "a pre-install refusal names no rule");
                 assert_eq!(*actual_kind, contract_kind);
                 assert_eq!(*actual_reason, reason);
                 assert_eq!(smart_account_redacted.as_str(), "CAAAA...ABSC4");

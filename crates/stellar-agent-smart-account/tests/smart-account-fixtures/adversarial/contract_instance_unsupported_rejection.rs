@@ -65,8 +65,8 @@ fn smart_account_addr() -> ScAddress {
 ///
 /// # Byte-layout citation
 ///
-/// `ContractExecutableType` discriminants in stellar-xdr v26.0.1
-/// `src/curr/generated.rs:11504-11505`: `Wasm = 0`, `StellarAsset = 1`.
+/// `ContractExecutableType` in `Stellar-contract.x`:
+/// `CONTRACT_EXECUTABLE_WASM = 0`, `CONTRACT_EXECUTABLE_STELLAR_ASSET = 1`.
 fn non_wasm_instance_xdr(contract: &ScAddress) -> String {
     LedgerEntryData::ContractData(ContractDataEntry {
         ext: ExtensionPoint::V0,
@@ -181,7 +181,7 @@ async fn unpinnable_instance_rejected_regardless_of_mutable_override() {
                     smart_account_addr(),
                     ZERO_CONTRACT_REDACTED,
                     &definition,
-                    0,
+                    None,
                     SOURCE_G,
                     accept_mutable_verifier,
                     true, // accept_unknown_verifier: reach the mutability step
@@ -204,6 +204,7 @@ async fn unpinnable_instance_rejected_regardless_of_mutable_override() {
                     matches!(
                         &error,
                         SaError::ContractInstanceUnsupported {
+                            rule_id: None,
                             contract_kind: actual_kind,
                             reason: actual_reason,
                             ..
@@ -306,7 +307,7 @@ async fn external_ref_without_live_tag_entry_rejected_before_any_override() {
                 smart_account_addr(),
                 ZERO_CONTRACT_REDACTED,
                 &definition,
-                0,
+                None,
                 SOURCE_G,
                 accept_mutable_verifier,
                 accept_unknown_verifier,
@@ -329,6 +330,7 @@ async fn external_ref_without_live_tag_entry_rejected_before_any_override() {
                 matches!(
                     &error,
                     SaError::ContractInstanceUnsupported {
+                        rule_id: None,
                         contract_kind: actual_kind,
                         reason: AdminOrOwnerKey::ExternalRefUnresolved,
                         ..

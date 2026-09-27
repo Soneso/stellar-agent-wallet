@@ -85,6 +85,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Verifier and policy installation refuses an undecodable instance entry while
   identifying the contract, before any override flag applies, so no override
   audit row is written for it.
+- Smart-account rule-context decode errors name the variant of an unexpected
+  ledger value and never render the value itself, and an unknown
+  context-type tag renders escaped and bounded, so a large or hostile
+  payload yields a short reason. `scval_variant_name` moves to
+  `stellar_agent_core::scval`; `stellar_agent_defi::simulate` no longer
+  exports it.
+- The panic hook logs at most 256 bytes of the panic message, followed by
+  the `...[TRUNCATED]` marker when it is cut. Secret strkeys are redacted on
+  the full message before the cut, so no fragment of a strkey that straddles
+  the limit is logged.
+- The contract-instance mutability probe treats a response entry whose key
+  does not decode as an undecodable instance at every requested position, so
+  rule installation refuses the contract with
+  `sa.contract_instance_unsupported`. The multicall router Wasm-hash fetch
+  reads only the entry returned under the requested instance key and
+  refuses a response whose key does not decode or that has no entry under
+  that key.
+- `smart-account rules verify-pins` names external-reference executables:
+  `observed_verifier_executable` and `observed_policy_executable` hold the
+  bounded summary of each observed external reference (or `no code`),
+  aligned with the observed first-8 lists, and
+  `pinned_verifier_executable_refs` and `pinned_policy_executable_refs`
+  carry the pinned owner and tag, aligned with the pinned first-8 lists.
+  The four fields are omitted when empty.
+- The passkey signing diversification gate counts parties, not pins: each
+  distinct Wasm hash is one party, and all external-reference verifiers whose
+  tags one owner manages are one party together. A high-value rule whose
+  pinned verifiers belong to one party requires the `accept_single_verifier`
+  opt-in of `sign_with_passkey_rule`.
+- `SaMutableContractOverride`, `SaUnknownContractOverride`,
+  `sa.verifier_mutable`, `sa.policy_mutable` and
+  `sa.contract_instance_unsupported` carry `rule_id` only when the rule has
+  an on-chain id. Rows and refusals raised before install omit it and join
+  their `SaContextRuleCreated` row through `request_id`, and the refusal
+  message omits the rule. A present `rule_id` of 0 on an override row names
+  no rule. The audit-entry constructors and `pin_referenced_contracts` take
+  the rule id as `Option<u32>`.
 
 ## [0.1.0-alpha.8] - 2026-09-25
 

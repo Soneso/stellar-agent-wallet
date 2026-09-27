@@ -28,9 +28,9 @@
 //! # Why low-S off-chain
 //!
 //! The on-chain OpenZeppelin verifier calls
-//! `e.crypto().secp256r1_verify(...)` which delegates to the Soroban host
-//! at `soroban-env-host-25.0.1/src/crypto/mod.rs:91-109`
-//! (`secp256r1_verify_signature` → `p256::ecdsa::VerifyingKey::verify_prehash`).
+//! `e.crypto().secp256r1_verify(...)` which delegates to the Soroban host's
+//! `secp256r1_verify_signature` (soroban-env-host crypto module), which calls
+//! `p256::ecdsa::VerifyingKey::verify_prehash`.
 //! `verify_prehash` accepts both low-S and high-S signatures — low-S is
 //! NOT enforced on-chain at this surface. The wallet
 //! enforces low-S off-chain as malleability hardening (a high-S signature

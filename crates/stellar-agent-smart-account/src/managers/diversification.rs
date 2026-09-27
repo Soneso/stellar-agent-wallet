@@ -8,14 +8,17 @@
 //!
 //! A rule fires the diversification gate when **all** of the following hold:
 //!
-//! 1. The rule has exactly **one** distinct pinned verifier wasm hash (read from
-//!    the audit-log-derived `PinnedHashesRecord`).
+//! 1. The rule's pinned verifiers (read from the audit-log-derived
+//!    `PinnedHashesRecord`) belong to at most **one** party: a Wasm pin is one
+//!    party per distinct first-8, and the external-reference pins that share an
+//!    `owner_redacted` are one party together.
 //! 2. The rule's policy criteria evaluates to **either** `Stroops(n)` where
 //!    `n > HIGH_VALUE_THRESHOLD_STROOPS`, **or** `Undetermined`.
 //!
 //! Condition 2 is fail-CLOSED: `Undetermined` is treated as "above threshold".
-//! Operators with unknown criteria shapes must use `--accept-single-verifier`
-//! to opt out.
+//! Callers with unknown criteria shapes opt out through the
+//! `accept_single_verifier` argument of
+//! [`crate::managers::credentials::CredentialsManager::sign_with_passkey_rule`].
 //!
 //! # Implementation notes
 //!
@@ -48,11 +51,13 @@ use stellar_agent_core::audit_log::reader::PinnedHashesRecord;
 // is currently `pub(crate)`, so this is intentionally a no-op outside the crate.
 #[non_exhaustive]
 pub(crate) enum DiversificationCheck {
-    /// Rule has ≥2 distinct pinned verifier wasm hashes, OR the value threshold
-    /// is at or below `HIGH_VALUE_THRESHOLD_STROOPS`. Signing proceeds normally.
+    /// Rule's pinned verifiers belong to at least two parties, OR the value
+    /// threshold is at or below `HIGH_VALUE_THRESHOLD_STROOPS`. Signing
+    /// proceeds normally.
     NotRequired,
-    /// Single-verifier on a high-value or undetermined-value rule. Signing
-    /// refuses unless the operator passes `--accept-single-verifier`.
+    /// Single-party verifiers on a high-value or undetermined-value rule.
+    /// Signing refuses unless the caller sets the `accept_single_verifier`
+    /// opt-in of `sign_with_passkey_rule`.
     ///
     /// # Forensic fields
     ///
@@ -66,7 +71,9 @@ pub(crate) enum DiversificationCheck {
         ///
         /// Pre-redacted at the call site via `redact_first5_last5`.
         smart_account_redacted: String,
-        /// First-8-hex of the sole pinned verifier wasm hash for this rule.
+        /// First-8-hex of the first pinned verifier of this rule. When several
+        /// pins collapse to one party (external references under one owner),
+        /// this is the first pin's first-8; empty when no pin is recorded.
         verifier_hash_first8: String,
         /// Observed per-tx value threshold extracted from policy criteria.
         ///
@@ -105,15 +112,37 @@ impl DiversificationCheck {
 ///
 /// # Trigger conditions
 ///
-/// - If `pinned_verifier_first8.len() >= 2`: `NotRequired` (≥2 hashes implies
-///   diversity, regardless of value threshold).
+/// - If the pinned verifiers belong to at least two parties: `NotRequired`
+///   (diversity satisfied, regardless of value threshold).
 /// - If `extract_value_threshold(criteria)` returns `Stroops(n)` where
 ///   `n <= HIGH_VALUE_THRESHOLD_STROOPS`: `NotRequired` (low-value rule).
-/// - Otherwise (single verifier AND high-value or `Undetermined`): `Required`.
+/// - Otherwise (one party AND high-value or `Undetermined`): `Required`.
 ///   Includes:
-///   - `Stroops(n)` with `n > HIGH_VALUE_THRESHOLD_STROOPS` AND single verifier.
+///   - `Stroops(n)` with `n > HIGH_VALUE_THRESHOLD_STROOPS` AND one party.
 ///   - `Undetermined` (fail-CLOSED: unknown criteria treated as high-value).
-///   - Empty `pinned_verifier_first8` (no baseline → treated as single-verifier).
+///   - Empty `pinned_verifier_first8` (no baseline, zero parties).
+///
+/// # Parties
+///
+/// A party is whoever decides which verifier code runs. A Wasm pin counts
+/// once per distinct first-8. External-reference pins count once per
+/// `owner_redacted` of their [`ExecutableRefPin`], because one owner manages
+/// every tag it holds: two references whose tags one owner manages are one
+/// party. The redacted form can collide for two distinct owners, which only
+/// counts fewer parties and makes the gate stricter. A pin whose
+/// `owner_redacted` is the unsupported-address placeholder groups with every
+/// other such pin into one party, the same stricter direction.
+///
+/// # Observable effect
+///
+/// `verify_pinned_verifier_against_chain` refuses every rule with more than
+/// one pinned verifier (`MultiplePinnedHashesUnsupported`) after this gate
+/// runs in `sign_with_passkey_rule`. For a two-pin rule the party count
+/// therefore decides which refusal fires first, and whether a
+/// `SaVerifierDiversificationOverride` row is written under the
+/// `accept_single_verifier` opt-in; it promises no signing outcome.
+///
+/// [`ExecutableRefPin`]: stellar_agent_core::audit_log::schema::ExecutableRefPin
 pub(crate) fn check_diversification_required(
     rule_id: u32,
     smart_account_redacted: &str,
@@ -123,10 +152,10 @@ pub(crate) fn check_diversification_required(
     // The gate runs before signer-set divergence and wasm-hash drift checks so
     // the cheapest local refusal fires first. If gate ordering ever becomes
     // load-bearing for forensic-row sequence, enforce it via a dedicated gate.
-    let verifier_count = pinned_hashes.pinned_verifier_first8.len();
+    let parties = verifier_party_count(pinned_hashes);
 
-    // Condition 1: ≥2 distinct pinned verifier hashes → diversity satisfied.
-    if verifier_count >= 2 {
+    // Condition 1: pins from at least two parties → diversity satisfied.
+    if parties >= 2 {
         return DiversificationCheck::NotRequired;
     }
 
@@ -167,6 +196,31 @@ pub(crate) fn check_diversification_required(
     }
 }
 
+/// One party that decides which pinned verifier code runs.
+#[derive(PartialEq, Eq, Hash)]
+enum VerifierParty<'a> {
+    /// A Wasm pin, identified by its first-8.
+    Wasm(&'a str),
+    /// The owner of one or more external-reference pins, by its redacted form.
+    ReferenceOwner(&'a str),
+}
+
+/// Counts the distinct parties behind the pinned verifiers of `pinned_hashes`.
+fn verifier_party_count(pinned_hashes: &PinnedHashesRecord) -> usize {
+    pinned_hashes
+        .pinned_verifier_first8
+        .iter()
+        .enumerate()
+        .map(
+            |(position, first8)| match pinned_hashes.verifier_executable_ref(position) {
+                Some(pin) => VerifierParty::ReferenceOwner(pin.owner_redacted.as_str()),
+                None => VerifierParty::Wasm(first8.as_str()),
+            },
+        )
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -182,6 +236,8 @@ mod tests {
 
     use super::*;
     use stellar_agent_core::audit_log::reader::PinnedHashesRecord;
+    use stellar_agent_core::audit_log::schema::ExecutableRefPin;
+    use stellar_agent_core::observability::RedactedStrkey;
 
     // ── Fixture helpers ───────────────────────────────────────────────────────
 
@@ -201,6 +257,34 @@ mod tests {
 
     fn pinned_none() -> PinnedHashesRecord {
         PinnedHashesRecord::default()
+    }
+
+    /// An external-reference pin under `owner_redacted` with `tag`.
+    fn reference_pin(owner_redacted: &str, tag: &str, first8: &str) -> ExecutableRefPin {
+        ExecutableRefPin {
+            owner_redacted: RedactedStrkey::from_already_redacted(owner_redacted),
+            tag: tag.to_owned(),
+            ref_key_hex: format!("{tag:0>64}"),
+            resolved_hash_first8: first8.to_owned(),
+        }
+    }
+
+    /// Verifier pins at the given first-8 values, each with its optional
+    /// external-reference pin at the same position.
+    fn pinned_with_refs(pins: Vec<(&str, Option<ExecutableRefPin>)>) -> PinnedHashesRecord {
+        let (first8, refs): (Vec<String>, Vec<Option<ExecutableRefPin>>) = pins
+            .into_iter()
+            .map(|(first8, pin)| (first8.to_owned(), pin))
+            .unzip();
+        PinnedHashesRecord {
+            pinned_verifier_first8: first8,
+            pinned_verifier_executable_refs: refs,
+            ..Default::default()
+        }
+    }
+
+    fn high_value_criteria() -> ScVal {
+        criteria_with_value_threshold(HIGH_VALUE_THRESHOLD_STROOPS.saturating_add(1))
     }
 
     /// Build a `ScVal::Map` with a single schema-anticipation key `value_threshold`
@@ -358,6 +442,80 @@ mod tests {
             ),
             "Required.verifier_hash_first8 must equal pinned_verifier_first8[0]; \
              got: {result:?}"
+        );
+    }
+
+    // ── Parties: external references group by owner ───────────────────────────
+
+    /// Two external-reference verifiers whose tags one owner manages are one
+    /// party, so a high-value rule requires diversification, carrying the
+    /// first pin's first-8.
+    #[test]
+    fn two_references_under_one_owner_are_one_party() {
+        let pinned = pinned_with_refs(vec![
+            (
+                "aaaaaaaaaaaaaaaa",
+                Some(reference_pin("GAAAA...AAWHF", "v1", "aaaaaaaaaaaaaaaa")),
+            ),
+            (
+                "bbbbbbbbbbbbbbbb",
+                Some(reference_pin("GAAAA...AAWHF", "v2", "bbbbbbbbbbbbbbbb")),
+            ),
+        ]);
+        let result =
+            check_diversification_required(7, "CAAAA...AAAAA", &pinned, &high_value_criteria());
+        assert!(
+            matches!(
+                &result,
+                DiversificationCheck::Required { rule_id: 7, verifier_hash_first8, .. }
+                    if verifier_hash_first8 == "aaaaaaaaaaaaaaaa"
+            ),
+            "two references under one owner must return Required; got: {result:?}"
+        );
+    }
+
+    /// One external-reference pin and one Wasm pin are two parties.
+    #[test]
+    fn one_reference_and_one_wasm_pin_are_two_parties() {
+        let pinned = pinned_with_refs(vec![
+            (
+                "aaaaaaaaaaaaaaaa",
+                Some(reference_pin("GAAAA...AAWHF", "v1", "aaaaaaaaaaaaaaaa")),
+            ),
+            ("cccccccccccccccc", None),
+        ]);
+        let result =
+            check_diversification_required(8, "CAAAA...AAAAA", &pinned, &high_value_criteria());
+        assert_eq!(result, DiversificationCheck::NotRequired);
+    }
+
+    /// Two external references under different owners are two parties.
+    #[test]
+    fn two_references_under_different_owners_are_two_parties() {
+        let pinned = pinned_with_refs(vec![
+            (
+                "aaaaaaaaaaaaaaaa",
+                Some(reference_pin("GAAAA...AAWHF", "v1", "aaaaaaaaaaaaaaaa")),
+            ),
+            (
+                "aaaaaaaaaaaaaaaa",
+                Some(reference_pin("GBBBB...BBBBB", "v1", "aaaaaaaaaaaaaaaa")),
+            ),
+        ]);
+        let result =
+            check_diversification_required(9, "CAAAA...AAAAA", &pinned, &high_value_criteria());
+        assert_eq!(result, DiversificationCheck::NotRequired);
+    }
+
+    /// Two Wasm pins with the same first-8 are one party.
+    #[test]
+    fn two_wasm_pins_with_one_first8_are_one_party() {
+        let pinned = pinned_two("aabbccdd", "aabbccdd");
+        let result =
+            check_diversification_required(10, "CAAAA...AAAAA", &pinned, &high_value_criteria());
+        assert!(
+            matches!(result, DiversificationCheck::Required { rule_id: 10, .. }),
+            "two pins of one Wasm hash must return Required; got: {result:?}"
         );
     }
 }

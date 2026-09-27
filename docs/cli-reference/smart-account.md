@@ -147,6 +147,8 @@ Flags:
 - `--rpc-url <URL>` (optional) — when omitted, defaults to the testnet RPC on testnet and the mainnet RPC default on mainnet.
 - Shared: `--profile`, signer-source group, `--network`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
 
+Envelope: `{ smart_account, rule_id, verifier_pin_status, policy_pin_status, pinned_verifier_first8, pinned_policy_first8, observed_verifier_first8, observed_policy_first8, observed_verifier_executable?, observed_policy_executable?, pinned_verifier_executable_refs?, pinned_policy_executable_refs?, mutable_override, unknown_override, unavailable_reason?, chain_id }`. `observed_*_executable` is aligned with `observed_*_first8`: an entry is the bounded summary of an external-reference executable (owner, tag and resolved hash) or `no code`, and `null` for a plain WASM executable. `pinned_*_executable_refs` is aligned with `pinned_*_first8`: an entry is the pinned external reference (`owner_redacted`, `tag`, `ref_key_hex`, `resolved_hash_first8`) and `null` for a position pinned by its WASM hash. The four fields are omitted when empty.
+
 ```bash
 stellar-agent smart-account rules verify-pins \
   --account CABC...WXYZ \

@@ -7,8 +7,6 @@
 //!   to an arbitrary contract function and returns the raw `ScVal` result.
 //! - [`decode_i128_scval`] — decodes `ScVal::I128(Int128Parts {hi, lo})` to
 //!   `i128`.
-//! - [`scval_variant_name`] — returns a non-sensitive variant name string for
-//!   an `ScVal`, used in error messages to avoid logging full values.
 //!
 //! # Design rationale
 //!
@@ -18,16 +16,15 @@
 //! reconstruction from `Int128Parts`. This module is the single authoritative
 //! implementation; both call sites delegate here.
 //!
-//! The `scval_variant_name` kept here is the complete copy, covering all 23
-//! stable `ScVal` variants including `Error`, `Timepoint`, `Duration`, `U256`,
-//! `I256`, `Bytes`, `LedgerKeyNonce`, `ContractInstance`, and `ExecutableTag`.
+//! Error messages name an unexpected `ScVal` by its variant through
+//! [`stellar_agent_core::scval::scval_variant_name`] and never render the
+//! value itself.
 //!
 //! # ABI provenance
 //!
 //! `i128` return values encode as `ScVal::I128(Int128Parts { hi: i64, lo: u64 })`
-//! per stellar-xdr `generated.rs` at the `Int128Parts` definition;
-//! reconstruction matches `int128_helpers::i128_from_pieces`
-//! (`scval_conversions.rs:214`).
+//! per the `Int128Parts` definition in `Stellar-contract.x`; reconstruction
+//! matches the soroban-env-common `int128_helpers::i128_from_pieces`.
 //!
 //! The dummy source account for read-only simulate is the all-zeros G-strkey
 //! `GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF`; its 32-byte
@@ -40,6 +37,7 @@
 //! Test servers (wiremock loopback) are reached via `http://`, which is permitted
 //! by the upstream client without any opt-in.
 
+use stellar_agent_core::scval::scval_variant_name;
 use stellar_agent_xdr_limits::untrusted_decode_limits;
 use stellar_rpc_client::Client;
 use stellar_xdr::{
@@ -239,9 +237,9 @@ pub async fn simulate_invoke_returning_scval(
 /// # ABI provenance
 ///
 /// `i128` return values from Soroban contracts encode as `ScVal::I128` with
-/// `Int128Parts { hi: i64, lo: u64 }` per the stellar-xdr `Int128Parts`
-/// definition; reconstruction matches `int128_helpers::i128_from_pieces`
-/// (`scval_conversions.rs:214`).
+/// `Int128Parts { hi: i64, lo: u64 }` per the `Int128Parts` definition in
+/// `Stellar-contract.x`; reconstruction matches the soroban-env-common
+/// `int128_helpers::i128_from_pieces`.
 ///
 /// # Errors
 ///
@@ -258,43 +256,6 @@ pub fn decode_i128_scval(val: &ScVal) -> Result<i128, SimulateError> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// scval_variant_name
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Returns a non-sensitive discriminant name string for a `ScVal`.
-///
-/// Used in error messages to avoid logging the full value, which may contain
-/// addresses or other sensitive data.  Covers all 23 stable variants.
-#[must_use]
-pub fn scval_variant_name(val: &ScVal) -> &'static str {
-    match val {
-        ScVal::Bool(_) => "Bool",
-        ScVal::Void => "Void",
-        ScVal::Error(_) => "Error",
-        ScVal::U32(_) => "U32",
-        ScVal::I32(_) => "I32",
-        ScVal::U64(_) => "U64",
-        ScVal::I64(_) => "I64",
-        ScVal::Timepoint(_) => "Timepoint",
-        ScVal::Duration(_) => "Duration",
-        ScVal::U128(_) => "U128",
-        ScVal::I128(_) => "I128",
-        ScVal::U256(_) => "U256",
-        ScVal::I256(_) => "I256",
-        ScVal::Bytes(_) => "Bytes",
-        ScVal::String(_) => "String",
-        ScVal::Symbol(_) => "Symbol",
-        ScVal::Vec(_) => "Vec",
-        ScVal::Map(_) => "Map",
-        ScVal::Address(_) => "Address",
-        ScVal::LedgerKeyContractInstance => "LedgerKeyContractInstance",
-        ScVal::LedgerKeyNonce(_) => "LedgerKeyNonce",
-        ScVal::ContractInstance(_) => "ContractInstance",
-        ScVal::ExecutableTag(_) => "ExecutableTag",
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -307,7 +268,7 @@ mod tests {
         reason = "test-only fixture construction"
     )]
 
-    use stellar_xdr::{Int128Parts, ScVal, UInt128Parts};
+    use stellar_xdr::{Int128Parts, ScVal};
 
     use super::*;
 
@@ -353,138 +314,6 @@ mod tests {
         assert!(
             matches!(result2, Err(SimulateError::DecodeFailed { .. })),
             "U64 must return DecodeFailed"
-        );
-    }
-
-    // ── scval_variant_name ───────────────────────────────────────────────────
-
-    /// Asserts the exact discriminant name string for ALL 23 stable `ScVal`
-    /// variants.  A constant-returning implementation would be caught because
-    /// at most one variant can return any single string.
-    #[test]
-    fn scval_variant_name_exact_name_for_all_23_variants() {
-        use stellar_xdr::{
-            ContractExecutable, Duration, Int256Parts, ScAddress, ScBytes, ScContractInstance,
-            ScError, ScErrorCode, ScMap, ScNonceKey, ScString, ScVec, TimePoint, UInt256Parts,
-            Uint256,
-        };
-
-        // Bool
-        assert_eq!(scval_variant_name(&ScVal::Bool(true)), "Bool");
-        assert_eq!(scval_variant_name(&ScVal::Bool(false)), "Bool");
-        // Void
-        assert_eq!(scval_variant_name(&ScVal::Void), "Void");
-        // Error — ScError is an enum; use the Value(ScErrorCode) variant.
-        assert_eq!(
-            scval_variant_name(&ScVal::Error(ScError::Value(ScErrorCode::InvalidInput))),
-            "Error"
-        );
-        // U32
-        assert_eq!(scval_variant_name(&ScVal::U32(0)), "U32");
-        // I32
-        assert_eq!(scval_variant_name(&ScVal::I32(0)), "I32");
-        // U64
-        assert_eq!(scval_variant_name(&ScVal::U64(0)), "U64");
-        // I64
-        assert_eq!(scval_variant_name(&ScVal::I64(0)), "I64");
-        // Timepoint
-        assert_eq!(
-            scval_variant_name(&ScVal::Timepoint(TimePoint(0))),
-            "Timepoint"
-        );
-        // Duration
-        assert_eq!(
-            scval_variant_name(&ScVal::Duration(Duration(0))),
-            "Duration"
-        );
-        // U128
-        assert_eq!(
-            scval_variant_name(&ScVal::U128(UInt128Parts { hi: 0, lo: 0 })),
-            "U128"
-        );
-        // I128
-        assert_eq!(
-            scval_variant_name(&ScVal::I128(Int128Parts { hi: 0, lo: 0 })),
-            "I128"
-        );
-        // U256
-        assert_eq!(
-            scval_variant_name(&ScVal::U256(UInt256Parts {
-                hi_hi: 0,
-                hi_lo: 0,
-                lo_hi: 0,
-                lo_lo: 0,
-            })),
-            "U256"
-        );
-        // I256
-        assert_eq!(
-            scval_variant_name(&ScVal::I256(Int256Parts {
-                hi_hi: 0,
-                hi_lo: 0,
-                lo_hi: 0,
-                lo_lo: 0,
-            })),
-            "I256"
-        );
-        // Bytes
-        assert_eq!(
-            scval_variant_name(&ScVal::Bytes(ScBytes(vec![].try_into().unwrap()))),
-            "Bytes"
-        );
-        // String
-        assert_eq!(
-            scval_variant_name(&ScVal::String(ScString("x".try_into().unwrap()))),
-            "String"
-        );
-        // Symbol
-        assert_eq!(
-            scval_variant_name(&ScVal::Symbol(ScSymbol("x".try_into().unwrap()))),
-            "Symbol"
-        );
-        // Vec (None)
-        assert_eq!(scval_variant_name(&ScVal::Vec(None)), "Vec");
-        // Vec (Some empty)
-        assert_eq!(
-            scval_variant_name(&ScVal::Vec(Some(ScVec(vec![].try_into().unwrap())))),
-            "Vec"
-        );
-        // Map (None)
-        assert_eq!(scval_variant_name(&ScVal::Map(None)), "Map");
-        // Map (Some empty)
-        assert_eq!(
-            scval_variant_name(&ScVal::Map(Some(ScMap(vec![].try_into().unwrap())))),
-            "Map"
-        );
-        // Address — use an all-zero Ed25519 public key (account address).
-        assert_eq!(
-            scval_variant_name(&ScVal::Address(ScAddress::Account(stellar_xdr::AccountId(
-                stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32],))
-            )))),
-            "Address"
-        );
-        // LedgerKeyContractInstance (unit variant — no inner value).
-        assert_eq!(
-            scval_variant_name(&ScVal::LedgerKeyContractInstance),
-            "LedgerKeyContractInstance"
-        );
-        // LedgerKeyNonce — ScVal::LedgerKeyNonce(ScNonceKey { nonce: i64 }).
-        assert_eq!(
-            scval_variant_name(&ScVal::LedgerKeyNonce(ScNonceKey { nonce: 0 })),
-            "LedgerKeyNonce"
-        );
-        // ContractInstance
-        assert_eq!(
-            scval_variant_name(&ScVal::ContractInstance(ScContractInstance {
-                executable: ContractExecutable::StellarAsset,
-                storage: None,
-            })),
-            "ContractInstance"
-        );
-        // ExecutableTag (CAP-85 external-reference tag key).
-        assert_eq!(
-            scval_variant_name(&ScVal::ExecutableTag(ScString("tag".try_into().unwrap()))),
-            "ExecutableTag"
         );
     }
 

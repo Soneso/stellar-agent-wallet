@@ -21,7 +21,8 @@
 //! (`rs-soroban-sdk/soroban-sdk-macros/src/derive_enum_map.rs` @ `dcbea44`).
 //!
 //! `PriceData` fields, alphabetically: `price` < `timestamp`.
-//! Return type `Option<PriceData>` per `soroban-env-common/src/option.rs:3-16`:
+//! Return type `Option<PriceData>` per the soroban-env-common
+//! `TryFromVal<E, Val> for Option<T>` conversion:
 //! - `ScVal::Void` for `None`.
 //! - Raw `PriceData` `ScVal::Map(...)` for `Some`.
 //!
@@ -189,7 +190,8 @@ pub async fn query_reflector_lastprice(
 ///
 /// # ABI provenance
 ///
-/// `Option<PriceData>` per `soroban-env-common/src/option.rs:3-16`:
+/// `Option<PriceData>` per the soroban-env-common
+/// `TryFromVal<E, Val> for Option<T>` conversion:
 /// - `ScVal::Void` → `None`.
 /// - Raw `PriceData` `ScVal::Map(...)` → `Some(PriceData)`.
 ///
@@ -222,7 +224,7 @@ pub(crate) fn decode_price_data(val: &stellar_xdr::ScVal) -> Result<(i128, u64),
                                 return Err(ReflectorError::DecodeFailed {
                                     reason: format!(
                                         "timestamp field is not U64: got {}",
-                                        crate::simulate::scval_variant_name(other)
+                                        stellar_agent_core::scval::scval_variant_name(other)
                                     ),
                                 });
                             }

@@ -1046,6 +1046,7 @@ impl AuditEntry {
     /// `--accept-mutable-verifier` is set.  Records the acknowledgement with an
     /// ISO-8601 timestamp. `executable_ref` names the owner and tag of an
     /// external-reference executable and is `None` for a storage key.
+    /// `rule_id` is `None` for a row written before install.
     ///
     /// # Redaction
     ///
@@ -1058,7 +1059,7 @@ impl AuditEntry {
         reason = "irreducible audit-field set for contract override telemetry"
     )]
     pub fn new_sa_mutable_contract_override(
-        rule_id: u32,
+        rule_id: Option<u32>,
         smart_account_redacted: impl Into<RedactedStrkey>,
         contract_address_redacted: impl Into<RedactedStrkey>,
         contract_kind: ContractKind,
@@ -1097,7 +1098,8 @@ impl AuditEntry {
     /// Emitted by `managers::verifiers::pin_referenced_contracts` when a
     /// referenced verifier or policy contract's wasm hash is NOT in the
     /// compile-time allowlist AND `--accept-unknown-verifier` is set.  Records
-    /// the acknowledgement with an ISO-8601 timestamp.
+    /// the acknowledgement with an ISO-8601 timestamp. `rule_id` is `None`
+    /// for a row written before install.
     ///
     /// # Redaction
     ///
@@ -1109,7 +1111,7 @@ impl AuditEntry {
         reason = "irreducible audit-field set for contract override telemetry"
     )]
     pub fn new_sa_unknown_contract_override(
-        rule_id: u32,
+        rule_id: Option<u32>,
         smart_account_redacted: impl Into<RedactedStrkey>,
         contract_address_redacted: impl Into<RedactedStrkey>,
         contract_kind: ContractKind,
@@ -5428,7 +5430,7 @@ mod tests {
         use crate::audit_log::schema::ContractKind;
 
         let entry = AuditEntry::new_sa_mutable_contract_override(
-            0u32,
+            None,
             RedactedStrkey::from_already_redacted("CDABC...12345"),
             RedactedStrkey::from_already_redacted("CVER1...VERIF"),
             ContractKind::Verifier,
@@ -5456,13 +5458,18 @@ mod tests {
                 entry.event_kind
             );
         };
-        assert_eq!(*rule_id, 0u32);
+        assert_eq!(*rule_id, None);
         assert_eq!(smart_account_redacted, "CDABC...12345");
         assert_eq!(contract_address_redacted, "CVER1...VERIF");
         assert_eq!(*contract_kind, ContractKind::Verifier);
         assert_eq!(override_acknowledged_at, "2026-06-20T10:00:00.000Z");
         assert_eq!(*executable_owner_redacted, None);
         assert_eq!(*executable_tag, None);
+        let json = serde_json::to_string(&entry).expect("must serialise");
+        assert!(
+            !json.contains("rule_id"),
+            "an absent rule_id is omitted: {json}"
+        );
     }
 
     #[test]
@@ -5477,7 +5484,7 @@ mod tests {
         )
         .expect("pin builds");
         let entry = AuditEntry::new_sa_mutable_contract_override(
-            0u32,
+            None,
             RedactedStrkey::from_already_redacted("CDABC...12345"),
             RedactedStrkey::from_already_redacted("CVER1...VERIF"),
             ContractKind::Verifier,
@@ -5511,7 +5518,7 @@ mod tests {
         use crate::audit_log::schema::ContractKind;
 
         let entry = AuditEntry::new_sa_mutable_contract_override(
-            2u32,
+            Some(2),
             RedactedStrkey::from_already_redacted("CDABC...12345"),
             RedactedStrkey::from_already_redacted("CPOLI...CYCON"),
             ContractKind::Policy,
@@ -5523,10 +5530,14 @@ mod tests {
         let json = serde_json::to_string(&entry).expect("must serialise");
         assert!(json.contains(r#""kind":"sa_mutable_contract_override""#));
         assert!(json.contains(r#""contract_kind":"policy""#));
+        assert!(json.contains(r#""rule_id":2"#));
         let back: AuditEntry = serde_json::from_str(&json).expect("must deserialise");
         assert!(matches!(
             back.event_kind,
-            EventKind::SaMutableContractOverride { .. }
+            EventKind::SaMutableContractOverride {
+                rule_id: Some(2),
+                ..
+            }
         ));
     }
 
@@ -5535,7 +5546,7 @@ mod tests {
         use crate::audit_log::schema::ContractKind;
 
         let entry = AuditEntry::new_sa_unknown_contract_override(
-            0u32,
+            None,
             RedactedStrkey::from_already_redacted("CDABC...12345"),
             RedactedStrkey::from_already_redacted("CUNKO...NWASM"),
             ContractKind::Policy,
@@ -5560,9 +5571,14 @@ mod tests {
                 entry.event_kind
             );
         };
-        assert_eq!(*rule_id, 0u32);
+        assert_eq!(*rule_id, None);
         assert_eq!(smart_account_redacted, "CDABC...12345");
         assert_eq!(contract_address_redacted, "CUNKO...NWASM");
+        let json = serde_json::to_string(&entry).expect("must serialise");
+        assert!(
+            !json.contains("rule_id"),
+            "an absent rule_id is omitted: {json}"
+        );
         assert_eq!(*contract_kind, ContractKind::Policy);
         assert_eq!(override_acknowledged_at, "2026-06-20T12:00:00.000Z");
         assert_eq!(observed_hash_first8, "aabbccdd");

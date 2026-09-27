@@ -106,6 +106,12 @@ impl std::fmt::Display for AdminOrOwnerKey {
     }
 }
 
+/// Renders an optional rule id as a ` for rule <id>` Display suffix, or
+/// nothing when absent.
+fn rule_suffix(rule_id: &Option<u32>) -> String {
+    rule_id.map_or_else(String::new, |rule_id| format!(" for rule {rule_id}"))
+}
+
 /// Renders an optional bounded detail as a parenthesised Display suffix, or
 /// nothing when absent.
 fn paren_suffix(detail: &Option<String>) -> String {
@@ -388,15 +394,19 @@ pub enum SaError {
     /// through `stellar_agent_core::observability::redact_strkey_first5_last5`
     /// at the call site.  `admin_or_owner_key` is a typed storage key, not secret.
     #[error(
-        "verifier contract is mutable for rule {rule_id}: \
+        "verifier contract is mutable{}: \
          contract={contract_address_redacted}, reason={admin_or_owner_key}{}; \
          --accept-mutable-verifier is required",
+        rule_suffix(.rule_id),
         paren_suffix(.detail)
     )]
     #[serde(rename = "sa.verifier_mutable")]
     VerifierMutable {
-        /// Context-rule identifier for which mutability was detected.
-        rule_id: u32,
+        /// Context-rule identifier for which mutability was detected; absent
+        /// when the refusal is raised before install, when the rule has no
+        /// on-chain id yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_id: Option<u32>,
         /// Redacted smart-account contract address (first-5-last-5 C-strkey).
         ///
         /// MUST be redacted at the call site via
@@ -435,15 +445,19 @@ pub enum SaError {
     /// through `stellar_agent_core::observability::redact_strkey_first5_last5`
     /// at the call site.
     #[error(
-        "policy contract is mutable for rule {rule_id}: \
+        "policy contract is mutable{}: \
          contract={contract_address_redacted}, reason={admin_or_owner_key}{}; \
          --accept-mutable-verifier is required",
+        rule_suffix(.rule_id),
         paren_suffix(.detail)
     )]
     #[serde(rename = "sa.policy_mutable")]
     PolicyMutable {
-        /// Context-rule identifier for which mutability was detected.
-        rule_id: u32,
+        /// Context-rule identifier for which mutability was detected; absent
+        /// when the refusal is raised before install, when the rule has no
+        /// on-chain id yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_id: Option<u32>,
         /// Redacted smart-account contract address (first-5-last-5 C-strkey).
         ///
         /// MUST be redacted at the call site via
@@ -489,14 +503,18 @@ pub enum SaError {
     /// at the call site.  `contract_kind` and `reason` are typed closed sets,
     /// not secret.
     #[error(
-        "{contract_kind} contract instance is unsupported for rule {rule_id}: \
+        "{contract_kind} contract instance is unsupported{}: \
          contract={contract_address_redacted}, reason={reason}; \
-         the wallet cannot pin this contract's code"
+         the wallet cannot pin this contract's code",
+        rule_suffix(.rule_id)
     )]
     #[serde(rename = "sa.contract_instance_unsupported")]
     ContractInstanceUnsupported {
-        /// Context-rule identifier for which the instance was probed.
-        rule_id: u32,
+        /// Context-rule identifier for which the instance was probed; absent
+        /// when the refusal is raised before install, when the rule has no
+        /// on-chain id yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_id: Option<u32>,
         /// Whether the contract is referenced as a verifier or a policy.
         contract_kind: ContractKind,
         /// Redacted smart-account contract address (first-5-last-5 C-strkey).
@@ -1623,9 +1641,10 @@ pub enum SaError {
     /// USD-equivalent 10,000 as a compile-time stroop constant in
     /// `managers/policies.rs`).
     ///
-    /// The operator may bypass with `--accept-single-verifier` (per-invocation
-    /// opt-in); that path emits `EventKind::SaVerifierDiversificationOverride`
-    /// and returns `Ok(...)` instead.
+    /// The `accept_single_verifier` opt-in of `sign_with_passkey_rule`
+    /// (per-invocation) bypasses the refusal; that path emits
+    /// `EventKind::SaVerifierDiversificationOverride` and returns `Ok(...)`
+    /// instead.
     ///
     /// # Forensic spine
     ///
@@ -2721,7 +2740,7 @@ mod tests {
             (
                 "sa.verifier_mutable",
                 SaError::VerifierMutable {
-                    rule_id: 3,
+                    rule_id: Some(3),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     contract_address_redacted: RedactedStrkey::from_already_redacted(
                         "CBBBB...YYYYY",
@@ -2734,7 +2753,7 @@ mod tests {
             (
                 "sa.policy_mutable",
                 SaError::PolicyMutable {
-                    rule_id: 4,
+                    rule_id: Some(4),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     contract_address_redacted: RedactedStrkey::from_already_redacted(
                         "CBBBB...YYYYY",
@@ -2747,7 +2766,7 @@ mod tests {
             (
                 "sa.contract_instance_unsupported",
                 SaError::ContractInstanceUnsupported {
-                    rule_id: 4,
+                    rule_id: Some(4),
                     contract_kind: ContractKind::Verifier,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     contract_address_redacted: RedactedStrkey::from_already_redacted(
@@ -3343,7 +3362,7 @@ mod tests {
             (
                 "sa.verifier_mutable",
                 SaError::VerifierMutable {
-                    rule_id: 3,
+                    rule_id: Some(3),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     contract_address_redacted: RedactedStrkey::from_already_redacted(
                         "CBBBB...YYYYY",
@@ -3363,7 +3382,7 @@ mod tests {
             (
                 "sa.policy_mutable",
                 SaError::PolicyMutable {
-                    rule_id: 4,
+                    rule_id: Some(4),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     contract_address_redacted: RedactedStrkey::from_already_redacted(
                         "CBBBB...YYYYY",
@@ -3425,7 +3444,7 @@ mod tests {
             (
                 "sa.verifier_mutable",
                 SaError::VerifierMutable {
-                    rule_id: 3,
+                    rule_id: Some(3),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     contract_address_redacted: RedactedStrkey::from_already_redacted(
                         "CBBBB...YYYYY",
@@ -3446,7 +3465,7 @@ mod tests {
             (
                 "sa.policy_mutable",
                 SaError::PolicyMutable {
-                    rule_id: 4,
+                    rule_id: Some(4),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     contract_address_redacted: RedactedStrkey::from_already_redacted(
                         "CBBBB...YYYYY",
@@ -3467,7 +3486,7 @@ mod tests {
             (
                 "sa.contract_instance_unsupported",
                 SaError::ContractInstanceUnsupported {
-                    rule_id: 4,
+                    rule_id: Some(4),
                     contract_kind: ContractKind::Policy,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     contract_address_redacted: RedactedStrkey::from_already_redacted(
@@ -3989,13 +4008,14 @@ mod tests {
         }
     }
 
-    /// `detail` and `observed_executable` are omitted from the context when
-    /// `None`, serialised when `Some`, and appended to the Display in
-    /// parentheses only when present.
+    /// `detail`, `observed_executable` and the optional `rule_id` are omitted
+    /// from the context when `None` and serialised when `Some`; a present
+    /// detail is appended to the Display in parentheses and a present rule id
+    /// as ` for rule <id>`.
     #[test]
     fn optional_detail_fields_serialise_and_render_only_when_present() {
         let mutable = |detail: Option<&str>| SaError::VerifierMutable {
-            rule_id: 3,
+            rule_id: Some(3),
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
             contract_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
             admin_or_owner_key: AdminOrOwnerKey::ExternalRefExecutable,
@@ -4046,6 +4066,69 @@ mod tests {
             "policy wasm-hash drift detected for rule 2: \
              pinned=1111111111111111, observed=1111111111111111 (wasm)"
         );
+
+        // The optional rule id of the pre-install refusals.
+        let verifier_mutable = |rule_id: Option<u32>| SaError::VerifierMutable {
+            rule_id,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            contract_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
+            admin_or_owner_key: AdminOrOwnerKey::Admin,
+            detail: None,
+            request_id: "req".to_owned(),
+        };
+        let policy_mutable = |rule_id: Option<u32>| SaError::PolicyMutable {
+            rule_id,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            contract_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
+            admin_or_owner_key: AdminOrOwnerKey::Owner,
+            detail: None,
+            request_id: "req".to_owned(),
+        };
+        let unsupported = |rule_id: Option<u32>| SaError::ContractInstanceUnsupported {
+            rule_id,
+            contract_kind: ContractKind::Policy,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            contract_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
+            reason: AdminOrOwnerKey::UndecodableInstance,
+            request_id: "req".to_owned(),
+        };
+        // A constructor for one rule id, then the Display without and with it.
+        type RuleIdCase = (fn(Option<u32>) -> SaError, &'static str, &'static str);
+        let cases: [RuleIdCase; 3] = [
+            (
+                verifier_mutable,
+                "verifier contract is mutable: contract=CBBBB...YYYYY, reason=Admin; \
+                 --accept-mutable-verifier is required",
+                "verifier contract is mutable for rule 7: contract=CBBBB...YYYYY, \
+                 reason=Admin; --accept-mutable-verifier is required",
+            ),
+            (
+                policy_mutable,
+                "policy contract is mutable: contract=CBBBB...YYYYY, reason=Owner; \
+                 --accept-mutable-verifier is required",
+                "policy contract is mutable for rule 7: contract=CBBBB...YYYYY, \
+                 reason=Owner; --accept-mutable-verifier is required",
+            ),
+            (
+                unsupported,
+                "policy contract instance is unsupported: contract=CBBBB...YYYYY, \
+                 reason=undecodable instance; the wallet cannot pin this contract's code",
+                "policy contract instance is unsupported for rule 7: \
+                 contract=CBBBB...YYYYY, reason=undecodable instance; \
+                 the wallet cannot pin this contract's code",
+            ),
+        ];
+        for (build, display_none, display_some) in cases {
+            let none = build(None);
+            let json = serde_json::to_value(&none).unwrap();
+            assert!(json["context"].get("rule_id").is_none(), "{json}");
+            assert_eq!(none.to_string(), display_none);
+
+            let some = build(Some(7));
+            let json = serde_json::to_value(&some).unwrap();
+            assert_eq!(json["context"]["rule_id"], 7, "{json}");
+            assert_eq!(some.to_string(), display_some);
+        }
     }
 
     /// Verifies the wire-code closed set has no duplicates and covers every variant.
@@ -4095,7 +4178,7 @@ mod tests {
                 request_id: "test-req-multi-003".to_owned(),
             },
             SaError::VerifierMutable {
-                rule_id: 3,
+                rule_id: Some(3),
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 contract_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
                 admin_or_owner_key: AdminOrOwnerKey::Admin,
@@ -4103,7 +4186,7 @@ mod tests {
                 request_id: "test-req-mut-001".to_owned(),
             },
             SaError::PolicyMutable {
-                rule_id: 4,
+                rule_id: Some(4),
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 contract_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
                 admin_or_owner_key: AdminOrOwnerKey::Owner,
@@ -4111,7 +4194,7 @@ mod tests {
                 request_id: "test-req-mut-002".to_owned(),
             },
             SaError::ContractInstanceUnsupported {
-                rule_id: 4,
+                rule_id: Some(4),
                 contract_kind: ContractKind::Verifier,
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 contract_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),

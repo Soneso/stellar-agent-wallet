@@ -958,8 +958,8 @@ pub enum EventKind {
         ///   `SaPolicyHashDrift` row is emitted (no hash mismatch was detected).
         /// - `"failure:verifier_diversification_required"` — the diversification
         ///   enforce-default trigger fired because the rule references a single
-        ///   verifier wasm hash on a high-value account AND the operator did not
-        ///   pass `--accept-single-verifier`.
+        ///   verifier party on a high-value account AND the caller did not set
+        ///   the `accept_single_verifier` opt-in of `sign_with_passkey_rule`.
         /// - `"failure:invalid_rule_ids"` — caller supplied an empty or otherwise
         ///   invalid context-rule ID set (`CredentialsError::InvalidRuleIds`).
         /// - `"failure:audit_writer_poisoned"` — the shared audit-writer mutex
@@ -1307,21 +1307,23 @@ pub enum EventKind {
     /// Per-invocation request correlation ID is carried by the top-level
     /// `AuditEntry::request_id` field (common to all event kinds).
     ///
-    /// **Note:** `rule_id = 0` is a placeholder because this row is emitted
-    /// by `pin_referenced_contracts` pre-install (no on-chain rule_id assigned
-    /// yet). Correlate with the post-install `SaContextRuleCreated` row via the
-    /// shared `request_id` UUID.
+    /// `pin_referenced_contracts` emits this row before install, when the
+    /// rule has no on-chain id yet, so `rule_id` is absent. A present
+    /// `rule_id` of 0 on this row names no rule; the row joins its
+    /// `SaContextRuleCreated` row through `request_id`.
     ///
     /// # Backward compatibility
     ///
-    /// `executable_owner_redacted` and `executable_tag` default to `None`, so
-    /// rows without them keep deserialising. Every other field carries no
-    /// `#[serde(default)]`: tampered or malformed wire input missing one MUST
-    /// fail deserialisation, not silently default.
+    /// `rule_id`, `executable_owner_redacted` and `executable_tag` default to
+    /// `None`, so rows without them keep deserialising. Every other field
+    /// carries no `#[serde(default)]`: tampered or malformed wire input
+    /// missing one MUST fail deserialisation, not silently default.
     ///
     SaMutableContractOverride {
-        /// Context-rule identifier to which the overridden contract belongs.
-        rule_id: u32,
+        /// Context-rule identifier to which the overridden contract belongs;
+        /// absent on a row written before install.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_id: Option<u32>,
         /// Target smart-account C-strkey, redacted first-5-last-5.
         smart_account_redacted: RedactedStrkey,
         /// Redacted address of the mutable contract, first-5-last-5 C-strkey.
@@ -1365,20 +1367,22 @@ pub enum EventKind {
     /// Per-invocation request correlation ID is carried by the top-level
     /// `AuditEntry::request_id` field (common to all event kinds).
     ///
-    /// **Note:** `rule_id = 0` is a placeholder because this row is emitted
-    /// by `pin_referenced_contracts` pre-install (no on-chain rule_id assigned
-    /// yet). Correlate with the post-install `SaContextRuleCreated` row via the
-    /// shared `request_id` UUID.
+    /// `pin_referenced_contracts` emits this row before install, when the
+    /// rule has no on-chain id yet, so `rule_id` is absent. A present
+    /// `rule_id` of 0 on this row names no rule; the row joins its
+    /// `SaContextRuleCreated` row through `request_id`.
     ///
     /// # Backward compatibility
     ///
-    /// No `#[serde(default)]` on fields — this variant has no legacy entries that
-    /// predate it. Tampered or malformed wire input (missing field) MUST fail
-    /// deserialisation, not silently default.
+    /// `rule_id` defaults to `None`, so rows without it keep deserialising.
+    /// Every other field carries no `#[serde(default)]`: tampered or malformed
+    /// wire input missing one MUST fail deserialisation, not silently default.
     ///
     SaUnknownContractOverride {
-        /// Context-rule identifier to which the overridden contract belongs.
-        rule_id: u32,
+        /// Context-rule identifier to which the overridden contract belongs;
+        /// absent on a row written before install.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_id: Option<u32>,
         /// Target smart-account C-strkey, redacted first-5-last-5.
         smart_account_redacted: RedactedStrkey,
         /// Redacted address of the contract with the unknown wasm hash,
@@ -1465,14 +1469,15 @@ pub enum EventKind {
         tx_hash_redacted: String,
     },
 
-    /// Operator explicitly accepted single-verifier signing on a high-value
-    /// account via `--accept-single-verifier`.
+    /// Caller explicitly accepted single-verifier signing on a high-value
+    /// account through the `accept_single_verifier` opt-in of
+    /// `sign_with_passkey_rule`.
     ///
     /// Emitted when the diversification enforce-default trigger would have fired
-    /// (`SaError::VerifierDiversificationRequired`) but the operator passes
-    /// `--accept-single-verifier`.  The audit row is the forensic record — the
-    /// operator's explicit acknowledgement of reduced diversification is persisted
-    /// regardless of the signing outcome.
+    /// (`SaError::VerifierDiversificationRequired`) but the caller sets the
+    /// `accept_single_verifier` opt-in.  The audit row is the forensic record:
+    /// the caller's explicit acknowledgement of reduced diversification is
+    /// persisted regardless of the signing outcome.
     ///
     /// # Redaction
     ///
@@ -3760,7 +3765,7 @@ mod tests {
     #[test]
     fn event_kind_sa_mutable_contract_override_round_trip() {
         let ev = EventKind::SaMutableContractOverride {
-            rule_id: 9,
+            rule_id: Some(9),
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
             contract_address_redacted: RedactedStrkey::from_already_redacted("CEFFE...11111"),
             contract_kind: ContractKind::Verifier,
@@ -3812,7 +3817,7 @@ mod tests {
     #[test]
     fn event_kind_sa_mutable_contract_override_round_trip_with_executable_ref() {
         let ev = EventKind::SaMutableContractOverride {
-            rule_id: 0,
+            rule_id: None,
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
             contract_address_redacted: RedactedStrkey::from_already_redacted("CEFFE...11111"),
             contract_kind: ContractKind::Policy,
@@ -3828,6 +3833,40 @@ mod tests {
             "{s}"
         );
         assert!(s.contains("\"executable_tag\":\"policy-v1\""), "{s}");
+        assert!(!s.contains("rule_id"), "an absent rule_id is omitted: {s}");
+    }
+
+    /// Missing-field: an override row without `rule_id` reads it as `None`;
+    /// a row carrying `rule_id` 0 reads it as `Some(0)` and re-serialises the
+    /// same bytes.
+    #[test]
+    fn event_kind_override_rows_missing_rule_id_default_none() {
+        let mutable = r#"{"kind":"sa_mutable_contract_override","smart_account_redacted":"CAAAA...ZZZZZ","contract_address_redacted":"CEFFE...11111","contract_kind":"verifier","override_acknowledged_at":"2026-05-19T10:00:00Z"}"#;
+        let unknown = r#"{"kind":"sa_unknown_contract_override","smart_account_redacted":"CAAAA...ZZZZZ","contract_address_redacted":"CFFFF...22222","contract_kind":"policy","override_acknowledged_at":"2026-05-19T11:00:00Z","observed_hash_first8":"deadbeef"}"#;
+        for json in [mutable, unknown] {
+            let back: EventKind = serde_json::from_str(json).unwrap();
+            let (EventKind::SaMutableContractOverride { rule_id, .. }
+            | EventKind::SaUnknownContractOverride { rule_id, .. }) = &back
+            else {
+                panic!("expected an override row, got {back:?}");
+            };
+            assert_eq!(*rule_id, None, "{json}");
+            assert_eq!(serde_json::to_string(&back).unwrap(), json);
+
+            let with_zero = json.replacen(
+                r#""smart_account_redacted""#,
+                r#""rule_id":0,"smart_account_redacted""#,
+                1,
+            );
+            let back: EventKind = serde_json::from_str(&with_zero).unwrap();
+            let (EventKind::SaMutableContractOverride { rule_id, .. }
+            | EventKind::SaUnknownContractOverride { rule_id, .. }) = &back
+            else {
+                panic!("expected an override row, got {back:?}");
+            };
+            assert_eq!(*rule_id, Some(0), "{with_zero}");
+            assert_eq!(serde_json::to_string(&back).unwrap(), with_zero);
+        }
     }
 
     /// Missing-field: override rows without the executable fields read them
@@ -3854,7 +3893,7 @@ mod tests {
     #[test]
     fn event_kind_sa_unknown_contract_override_round_trip() {
         let ev = EventKind::SaUnknownContractOverride {
-            rule_id: 10,
+            rule_id: Some(10),
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
             contract_address_redacted: RedactedStrkey::from_already_redacted("CFFFF...22222"),
             contract_kind: ContractKind::Policy,

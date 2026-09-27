@@ -64,8 +64,8 @@ fn owner_holder_xdr_address() -> stellar_xdr::ScAddress {
 ///
 /// # Byte-layout citation
 ///
-/// `ScContractInstance.storage: Option<ScMap>` — `xdr/curr/Stellar-contract.x`
-/// `SCContractInstance` (stellar-xdr v26.0.0).  Owner key encoding:
+/// `ScContractInstance.storage: Option<ScMap>`, per `SCContractInstance` in
+/// `Stellar-contract.x`.  Owner key encoding:
 /// `OwnableStorageKey::Owner` encodes on-wire as
 /// `ScVal::Vec([Symbol("Owner")])`.
 /// `soroban-sdk-macros` `derive_enum.rs` (`map_empty_variant` + `TryFrom<&Enum> for ScVal`).
@@ -152,7 +152,7 @@ async fn policy_with_owner_key_rejected_without_override() {
         smart_account,
         ZERO_CONTRACT_REDACTED,
         &definition,
-        0,
+        None,
         SOURCE_G,
         false, // accept_mutable_verifier — MUST refuse
         false, // accept_unknown_verifier
@@ -162,7 +162,7 @@ async fn policy_with_owner_key_rejected_without_override() {
     .await;
 
     assert!(
-        matches!(result, Err(SaError::PolicyMutable { .. })),
+        matches!(result, Err(SaError::PolicyMutable { rule_id: None, .. })),
         "mutable policy must be refused without accept_mutable_verifier; got: {result:?}"
     );
     assert_eq!(

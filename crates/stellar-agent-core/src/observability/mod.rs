@@ -1852,10 +1852,24 @@ fn resolve_ansi(is_tty: bool, no_color: bool) -> bool {
     is_tty && !no_color
 }
 
+/// Maximum byte length of the panic message the panic hook logs, excluding
+/// the `...[TRUNCATED]` marker appended to a longer message.
+pub(crate) const PANIC_MESSAGE_MAX_BYTES: usize = 256;
+
 /// Install the panic hook.
 ///
 /// Routes panic payloads through `tracing::error!` so that Layer 2 redaction
 /// applies to the panic message before any bytes are written to stderr.
+///
+/// # Message bound
+///
+/// The logged `panic_message` field is at most [`PANIC_MESSAGE_MAX_BYTES`]
+/// bytes plus the `...[TRUNCATED]` marker. The hook renders the payload
+/// through `format_display_capped`, which redacts S, T and X strkeys on the
+/// full payload before it cuts at the cap, so a secret strkey that straddles
+/// the cap is replaced whole and no fragment of it survives the cut. A cut
+/// message carries `panic_message_truncated = true` on the event; the field
+/// is absent when the message fits, as the layer's `truncated` flag is.
 ///
 /// The default Rust panic hook is deliberately NOT invoked after
 /// `tracing::error!`.  The default hook writes the raw panic payload to stderr,
@@ -1876,13 +1890,14 @@ fn resolve_ansi(is_tty: bool, no_color: bool) -> bool {
 /// stack frames reach stderr unredacted.
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
-        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
-            (*s).to_owned()
+        let payload: &str = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s
         } else if let Some(s) = info.payload().downcast_ref::<String>() {
-            s.clone()
+            s.as_str()
         } else {
-            "(non-string panic payload)".to_owned()
+            "(non-string panic payload)"
         };
+        let (msg, truncated) = format_display_capped(&payload, PANIC_MESSAGE_MAX_BYTES);
 
         let backtrace = std::backtrace::Backtrace::capture().to_string();
 
@@ -1893,6 +1908,7 @@ fn install_panic_hook() {
         tracing::error!(
             target: "stellar_agent_core::observability::panic",
             panic_message = %msg,
+            panic_message_truncated = truncated.then_some(true),
             location = %loc,
             backtrace = %backtrace,
             "panic"
