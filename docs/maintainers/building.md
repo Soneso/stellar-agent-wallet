@@ -266,6 +266,46 @@ those variables, so the multicall happy path runs only where a router
 deployment is available; the driver surfaces such self-skips as skip markers
 in the run summary so a green leg stays explicit about what did not execute.
 
+#### CAP-85 external-reference suites
+
+Two live suites prove the wallet's handling of contracts whose executable is a
+CAP-85 external reference, a Wasm hash that the owning contract can repoint:
+
+- `stellar-agent-smart-account` / `cap85_external_ref_testnet_acceptance`
+  (feature `testnet-integration`): invocation through the reference and its
+  footprint, the rule-install refusal and pin, a transfer signed through a
+  rule whose verifier is the reference, drift detection after a repoint on
+  the passkey signing path and in `verify_rule_wasm_pins`, the SEP-48 spec
+  fetch, and the DeFi and DeFindex pin gates.
+- `stellar-agent-cli` / `cap85_external_ref_cli_testnet_acceptance` (feature
+  `testnet-acceptance`): `smart-account rules create` refusing and then
+  pinning the reference, and `smart-account rules verify-pins` reporting
+  drift after the repoint, through the `stellar-agent` binary.
+
+Both suites deploy a beacon contract that owns the executable reference,
+deploys the reference contract and repoints it. Its source is the independent
+Cargo workspace `contracts/cap85-beacon/` (excluded from the wallet
+workspace, `publish = false`). The built Wasm, its build record and the build
+script live in
+`crates/stellar-agent-smart-account/vendor/cap85-beacon/v0.1.0/`; the
+smart-account crate embeds it as `cap85_beacon::CAP85_BEACON_WASM` under the
+`test-helpers` feature and in its own unit-test build, where the digest test
+runs, and pins its SHA-256 in `build.rs`.
+
+To rebuild the beacon, install stellar-cli 28.1.0 and the `wasm32v1-none`
+target, then run:
+
+```bash
+crates/stellar-agent-smart-account/vendor/cap85-beacon/v0.1.0/build.sh
+```
+
+The script builds with `stellar contract build --locked`, copies the Wasm into
+the vendor directory, and prints the rustc, stellar-cli and soroban-sdk
+versions, the optimizer state and version, and the SHA-256. When the digest
+changes, update `REFERENCE.md` in the vendor directory, the
+`cap85_beacon.wasm` row of `WASM_PINS` in the crate's `build.rs`, and
+`CAP85_BEACON_WASM_SHA256` in `src/cap85_beacon.rs` together.
+
 ## Review process
 
 A fixed reviewer team checks every change against the

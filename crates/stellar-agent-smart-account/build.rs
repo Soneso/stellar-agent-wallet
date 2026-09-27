@@ -76,6 +76,14 @@ const WASM_PINS: &[WasmPin] = &[
         path: "vendor/oz-weighted-threshold-policy/v0.7.2/multisig_weighted_threshold_policy_example.wasm",
         expected_sha256: "e3d8cc5ab9668526d5cf2bab17ee42e84ee4b972ba7cca8d3a37b2ed8d9baee3",
     },
+    // CAP-85 executable-reference beacon v0.1.0 WASM, built from
+    // contracts/cap85-beacon/. Test infrastructure embedded by
+    // cap85_beacon.rs::CAP85_BEACON_WASM under the test-helpers feature.
+    WasmPin {
+        label: "cap85_beacon.wasm",
+        path: "vendor/cap85-beacon/v0.1.0/cap85_beacon.wasm",
+        expected_sha256: "b3495f664a6c6a3bf52daf0089f3790670b2033d78e02a53f0fa765521e51813",
+    },
 ];
 
 fn main() {
@@ -112,7 +120,7 @@ fn verify_wasm_pin(manifest_dir: &Path, pin: &WasmPin) -> Result<(), String> {
     Err(format!(
         "WASM SHA-256 mismatch for {} at {}: expected {}, got {}. \
          Re-vendor the WASM, update the matching *_WASM_SHA256 const and \
-         PROVENANCE.md, then rebuild.",
+         the artefact's provenance record, then rebuild.",
         pin.label,
         path.display(),
         pin.expected_sha256,

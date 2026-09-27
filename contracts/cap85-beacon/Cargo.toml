@@ -1,0 +1,32 @@
+# Test-infrastructure contract for the CAP-85 external-reference testnet
+# acceptance suites. It is an independent workspace (not a member of the
+# wallet workspace) so its Soroban toolchain and lockfile stay separate; the
+# built artefact is vendored under
+# crates/stellar-agent-smart-account/vendor/cap85-beacon/v0.1.0/.
+[workspace]
+resolver = "2"
+
+[package]
+name = "cap85-beacon"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Executable-reference beacon contract used by the CAP-85 testnet acceptance suites."
+
+[lib]
+crate-type = ["lib", "cdylib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = "=28.0.0"
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true

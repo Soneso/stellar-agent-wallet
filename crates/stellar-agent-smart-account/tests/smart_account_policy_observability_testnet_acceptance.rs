@@ -69,7 +69,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
-use common::{TESTNET_FRIENDBOT_URL, TESTNET_PASSPHRASE, TESTNET_RPC_URL, fund_via_friendbot};
+use common::{
+    TESTNET_FRIENDBOT_URL, TESTNET_PASSPHRASE, TESTNET_RPC_URL, XLM_SAC_TESTNET,
+    build_sac_transfer_invoke, fetch_testnet_sequence, fund_via_friendbot, sign_testnet_envelope,
+    submit_testnet_signed_xdr, transfer_host_function,
+};
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest as _, Sha256};
@@ -111,7 +115,7 @@ use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilde
 use stellar_rpc_client::Client;
 use stellar_xdr::{
     AccountId, BytesM, ContractExecutable, ContractIdPreimage, ContractIdPreimageFromAddress,
-    CreateContractArgsV2, Hash, HostFunction, Int128Parts, InvokeHostFunctionOp, LedgerKey,
+    CreateContractArgsV2, Hash, HostFunction, InvokeHostFunctionOp, LedgerKey,
     LedgerKeyContractCode, Limits, Operation, OperationBody, PublicKey as XdrPublicKey, ScAddress,
     ScMap, ScMapEntry, ScSymbol, ScVal, SorobanAuthorizationEntry, Uint256, VecM, WriteXdr,
 };
@@ -126,14 +130,6 @@ use zeroize::Zeroizing;
 const CHAIN_ID: &str = "stellar:testnet";
 const TIMEOUT_SECS: u64 = 120;
 const FEE_STROOPS: u32 = 1_000_000;
-
-/// Known-answer XLM SAC on testnet (SEP-41 native-asset contract).
-///
-/// Source: `soroswap-core/public/tokens.json:testnet:assets[0]:contract`;
-/// independently verified via `stellar contract id asset --asset native
-/// --network testnet`. Matches the constant used in
-/// `smart_account_delegation_testnet_acceptance.rs`.
-const XLM_SAC_TESTNET: &str = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
 
 /// Initial spending limit `L` (5 XLM, in stroops).
 const LIMIT_L: i128 = 50_000_000;
@@ -555,99 +551,6 @@ fn encode_simple_threshold_params(threshold: u32) -> ScVal {
     ScVal::Map(Some(ScMap(
         vec![entry].try_into().expect("single-entry map fits ScMap"),
     )))
-}
-
-/// Builds the SEP-41 `transfer(from, to, amount)` `HostFunction::InvokeContract`
-/// invocation for a SAC — the ONLY shape the OZ spending-limit policy's
-/// `enforce` accepts.
-fn transfer_host_function(
-    sac: ScAddress,
-    from: ScAddress,
-    to: ScAddress,
-    amount: i128,
-) -> HostFunction {
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "canonical i128 -> Int128Parts split: hi = high 64 bits, lo = low 64 bits"
-    )]
-    let amount_parts = Int128Parts {
-        hi: (amount >> 64) as i64,
-        lo: amount as u64,
-    };
-    let args: VecM<ScVal> = vec![
-        ScVal::Address(from),
-        ScVal::Address(to),
-        ScVal::I128(amount_parts),
-    ]
-    .try_into()
-    .expect("3-element transfer args vec fits VecM<ScVal>");
-    let function_name =
-        ScSymbol::try_from("transfer").expect("\"transfer\" fits ScSymbol (<=32 bytes)");
-    HostFunction::InvokeContract(stellar_xdr::InvokeContractArgs {
-        contract_address: sac,
-        function_name,
-        args,
-    })
-}
-
-/// Builds the `InvokeContractArgs` for `fund_sac_balance`'s SAC-transfer
-/// callback — plain structural strkey parsing, no network access.
-#[allow(
-    clippy::result_large_err,
-    reason = "SaError is the crate's production error type; this test-only builder \
-              surfaces it unchanged rather than introducing a narrower local error type"
-)]
-fn build_sac_transfer_invoke(
-    sac_contract: &str,
-    from: &str,
-    to: &str,
-    amount: i128,
-) -> Result<stellar_xdr::InvokeContractArgs, SaError> {
-    let contract_address = parse_c_strkey_to_smart_account(sac_contract)?;
-    let from_sc = parse_g_strkey_to_signer_address(from)?;
-    let to_sc = parse_c_strkey_to_smart_account(to)?;
-    let HostFunction::InvokeContract(invoke_args) =
-        transfer_host_function(contract_address, from_sc, to_sc, amount)
-    else {
-        unreachable!("transfer_host_function always returns InvokeContract");
-    };
-    Ok(invoke_args)
-}
-
-/// Fetches an account's current sequence number via the testnet RPC.
-async fn fetch_testnet_sequence(
-    account_id: String,
-) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-    let rpc_client = StellarRpcClient::new(TESTNET_RPC_URL)?;
-    let account = fetch_account(&rpc_client, &account_id, &[]).await?;
-    Ok(account.sequence_number)
-}
-
-/// Signs an unsigned envelope XDR with a raw ed25519 seed.
-async fn sign_testnet_envelope(
-    unsigned_xdr: String,
-    funder_seed: Zeroizing<[u8; 32]>,
-    network_passphrase: String,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let signer = SoftwareSigningKey::new_from_zeroizing(funder_seed);
-    Ok(attach_signature(&unsigned_xdr, &signer, &network_passphrase).await?)
-}
-
-/// Submits a signed envelope XDR and waits for confirmation.
-async fn submit_testnet_signed_xdr(
-    signed_xdr: String,
-) -> Result<stellar_agent_network::submit::SubmissionResult, Box<dyn std::error::Error + Send + Sync>>
-{
-    let rpc_client = StellarRpcClient::new(TESTNET_RPC_URL)?;
-    Ok(submit_transaction_and_wait(
-        &rpc_client,
-        &signed_xdr,
-        Duration::from_secs(TIMEOUT_SECS),
-        TESTNET_PASSPHRASE,
-        Some(stellar_agent_network::submit::SubmissionSignerKind::Software),
-        None,
-    )
-    .await?)
 }
 
 /// Fetches the current testnet ledger sequence via `getLatestLedger`.

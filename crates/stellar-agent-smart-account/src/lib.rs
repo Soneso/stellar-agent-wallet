@@ -29,6 +29,8 @@
 )]
 
 pub mod bindings;
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod cap85_beacon;
 pub mod deployment;
 pub mod ed25519_verifier;
 pub mod error;

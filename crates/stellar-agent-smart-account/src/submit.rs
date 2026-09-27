@@ -19,7 +19,9 @@
 //!
 //! # Step ordering
 //!
-//! 1. Pre-flight: wasm-hash-drift-check (passthrough when no wasm pin is in args).
+//! 1. Pre-flight: argument guards and the source-account fetch. No wasm-hash
+//!    drift check runs: [`SubmitInvokeArgs`] carries no pin, so a caller that
+//!    must refuse a drifted verifier or policy checks it before calling.
 //! 2. Simulate: primary RPC; harvest `latestLedger`.
 //! 3. Required-check enforcement + `Option<*Check>` dispatch.
 //! 4. Cross-RPC simulate check (passthrough when `secondary_rpc_url` is `None`
@@ -471,8 +473,10 @@ pub struct SubmitInvokeArgs<'a> {
 ///
 /// # Step ordering
 ///
-/// 1. **Pre-flight**: wasm-hash-drift-check when pinned.
-///    Passthrough when no wasm pin is present in [`SubmitInvokeArgs`].
+/// 1. **Pre-flight**: argument guards and the source-account fetch. No
+///    wasm-hash drift check runs: [`SubmitInvokeArgs`] carries no pin, so a
+///    caller that must refuse a drifted verifier or policy checks it before
+///    calling.
 /// 2. **Simulate**: primary RPC; harvest `latestLedger`.
 /// 3. **Required-check enforcement + `Option<*Check>` dispatch**: for each
 ///    name in `args.required_checks`, the corresponding `Option<*Check>` MUST
