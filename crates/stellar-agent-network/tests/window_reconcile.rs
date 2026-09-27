@@ -333,6 +333,64 @@ async fn success_confirms_the_reservation_and_finalizes_the_receipt() {
     assert_eq!(receipt.ledger, Some(1_500));
 }
 
+/// A `SUCCESS` answer whose result meta the wallet cannot decode (a
+/// `TransactionMeta` with discriminant 99) settles the reservation from its
+/// status, ledger and `createdAt`, read as received.
+#[tokio::test]
+#[serial]
+async fn success_with_undecodable_meta_confirms_the_reservation() {
+    let now = now_ms();
+    let fx = fixture("reconcile-success-undecodable-meta");
+    let source = account_id_for_seed([0x13; 32]);
+    let res = reservation(&"a9".repeat(32), &source, 7, due_since(now));
+    fx.take_reservation(now, &res, 500);
+
+    let counts = MethodCounts::default();
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "getTransaction",
+        json!({
+            "status": "SUCCESS",
+            "latestLedger": 2_000,
+            "oldestLedger": 1,
+            "ledger": 1_500,
+            "createdAt": (now / 1_000).to_string(),
+            "resultMetaXdr": "AAAAYw==",
+        }),
+        &counts,
+    )
+    .await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+
+    let report = fx
+        .window
+        .reconcile_due(
+            &fx.profile,
+            &client,
+            Some(&fx.receipts),
+            now,
+            RECONCILE_BUDGET,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.confirmed, 1,
+        "a SUCCESS answer confirms whatever its meta: {report:?}"
+    );
+    assert!(
+        fx.window
+            .pending_reservations(&fx.profile)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(fx.window_total(now), (500, 1));
+    let receipt = fx.receipts.get(&res.id).unwrap().unwrap();
+    assert_eq!(receipt.status, ReceiptStatus::Success);
+    assert_eq!(receipt.ledger, Some(1_500));
+}
+
 /// Confirmed spend is dated from the applying ledger's close time, not from
 /// the clock at settlement: a ledger two days old leaves the one-day window
 /// as soon as the reservation confirms.

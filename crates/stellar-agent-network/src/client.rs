@@ -5,8 +5,13 @@
 //! and transaction submissions.  Horizon REST is not used; all data access
 //! routes through Stellar RPC.
 
+use jsonrpsee_core::ClientError;
+use jsonrpsee_core::client::ClientT;
+use jsonrpsee_core::params::ObjectParams;
 use stellar_agent_core::error::{NetworkError, WalletError};
-use stellar_rpc_client::{Client, GetHealthResponse, GetLedgerEntriesResponse};
+use stellar_rpc_client::{
+    Client, GetHealthResponse, GetLedgerEntriesResponse, GetTransactionResponseRaw,
+};
 use stellar_xdr::LedgerKey;
 use tokio::time::Instant;
 
@@ -14,6 +19,7 @@ use crate::fees::FeeStatsView;
 use crate::redact::redact_url_authority;
 use crate::retry::{RetryPolicy, is_retryable_send_error, retry_with_backoff};
 use crate::submit::MAINNET_PASSPHRASE;
+use crate::transaction_record::TransactionRecord;
 
 /// What the endpoint reports about one transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,10 +177,11 @@ impl StellarRpcClient {
     /// Asks the endpoint what became of one transaction.
     ///
     /// Returns the `getTransaction` status string (`SUCCESS`, `FAILED`,
-    /// `NOT_FOUND`) and the ledger it confirmed in, when there is one. This is
-    /// the read a reconciliation surface makes on a transaction hash it holds;
-    /// callers inside this crate that also need the result XDR use the inner
-    /// client directly.
+    /// `NOT_FOUND`) and the ledger it confirmed in, when there is one, both
+    /// read as received through [`Self::get_transaction_raw`]. No XDR field
+    /// of the response is decoded, so the answer does not depend on the
+    /// endpoint's result or meta encoding. This is the read a reconciliation
+    /// surface makes on a transaction hash it holds.
     ///
     /// # Errors
     ///
@@ -191,18 +198,67 @@ impl StellarRpcClient {
                 reason: format!("transaction hash is not 32 hex-encoded bytes: {e}"),
             }
         })?;
-        let response = self
-            .inner
-            .get_transaction(&stellar_xdr::Hash(bytes))
+        let record = self.get_transaction_raw(&stellar_xdr::Hash(bytes)).await?;
+        Ok(TransactionStatusView {
+            status: record.status().to_owned(),
+            ledger: record.ledger(),
+        })
+    }
+
+    /// Fetches one transaction via `getTransaction` without decoding any XDR.
+    ///
+    /// The response is read into a [`TransactionRecord`]: status, ledger,
+    /// created-at and transaction hash as received, and the XDR fields decoded
+    /// only by the accessor that needs them, under the wallet's untrusted
+    /// decode limits.
+    ///
+    /// # Errors
+    ///
+    /// [`NetworkError::RpcUnreachable`] when the request fails or the response
+    /// body is not a `getTransaction` result. The `url` field is
+    /// authority-only.
+    pub async fn get_transaction_raw(
+        &self,
+        hash: &stellar_xdr::Hash,
+    ) -> Result<TransactionRecord, NetworkError> {
+        self.get_transaction_record(hash)
             .await
             .map_err(|e| NetworkError::RpcUnreachable {
                 url: self.redacted_url(),
                 reason: format!("getTransaction failed: {e}"),
-            })?;
-        Ok(TransactionStatusView {
-            status: response.status,
-            ledger: response.ledger,
-        })
+            })
+    }
+
+    /// Issues `getTransaction` through the RPC client's JSON-RPC transport
+    /// and deserializes the raw response, decoding no XDR.
+    ///
+    /// The `hash` parameter is inserted the way `stellar-rpc-client` inserts
+    /// it (64 lowercase hex). Every failure is a jsonrpsee
+    /// [`ClientError`](jsonrpsee_core::ClientError) wrapped as
+    /// [`stellar_rpc_client::Error::JsonRpc`]: a transport failure, a JSON-RPC
+    /// error object, or a body that does not deserialize (`ParseError`). The
+    /// poll loops classify errors with
+    /// [`crate::retry::is_retryable_poll_error`], which treats every
+    /// `JsonRpc` error as retryable.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the poll loops classify this error with is_retryable_poll_error, which takes the RPC client's own error type"
+    )]
+    pub(crate) async fn get_transaction_record(
+        &self,
+        hash: &stellar_xdr::Hash,
+    ) -> Result<TransactionRecord, stellar_rpc_client::Error> {
+        let mut params = ObjectParams::new();
+        params
+            .insert("hash", hash)
+            .map_err(|e| stellar_rpc_client::Error::JsonRpc(ClientError::ParseError(e)))?;
+        let raw: GetTransactionResponseRaw = self
+            .inner
+            .client()
+            .request("getTransaction", params)
+            .await
+            .map_err(stellar_rpc_client::Error::JsonRpc)?;
+        Ok(TransactionRecord::from_raw(raw))
     }
 
     /// Asks the endpoint which network it serves and requires the answer to be

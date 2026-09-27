@@ -26,14 +26,16 @@
 //! KMP Stellar SDK `SorobanContractParser.kt`: splits `metaEntries["sep"]` on
 //! `,`, trims, deduplicates. This module mirrors that logic.
 //!
-//! # WASM fetch path
+//! # Wasm fetch path
 //!
-//! The WASM bytes are fetched via the crate-private `spec::fetch_wasm_bytes`.
-//! NOTE: The in-process SPEC_CACHE stores parsed `Vec<ScSpecEntry>` (not raw
-//! WASM bytes), so `discover_claimed_seps` fetches the WASM independently of
-//! the SEP-48 spec path. The two caches are separate: SPEC_CACHE covers the
-//! SEP-48 spec-section parse; the SEP-47 discovery path always re-fetches
-//! WASM bytes from the RPC on a cache miss.
+//! [`discover_claimed_seps`] reads the claim from the code the contract runs
+//! now, through the same two crate-private steps as the SEP-48 spec path:
+//! `spec::resolve_wasm_hash` resolves the Wasm hash per call (through the
+//! owner's executable-tag entry for a CAP-85 external reference), and
+//! `spec::fetch_wasm_bytes_by_hash` fetches the code entry returned under that
+//! hash's key and verifies the bytes against the hash. Discovery keeps no
+//! cache: the SEP-48 spec cache holds parsed spec entries per Wasm hash, not
+//! Wasm bytes, so every discovery call fetches the code.
 //!
 //! # Unverified-claim notice
 //!
@@ -46,9 +48,9 @@ use crate::error::Sep48Error;
 
 /// Discovers which SEPs a contract claims to implement.
 ///
-/// Fetches the contract WASM and reads the `contractmetav0` `sep` meta entry
-/// per SEP-47. The result is a sorted, deduplicated list of SEP identifier
-/// strings with leading zeros stripped.
+/// Resolves the Wasm the contract runs now, fetches it and reads the
+/// `contractmetav0` `sep` meta entry per SEP-47. The result is a sorted,
+/// deduplicated list of SEP identifier strings with leading zeros stripped.
 ///
 /// # Arguments
 ///
@@ -68,13 +70,17 @@ use crate::error::Sep48Error;
 ///
 /// # Errors
 ///
-/// - [`Sep48Error::InvalidContractAddress`] — invalid C-strkey.
-/// - [`Sep48Error::RpcFetchFailure`] — WASM fetch failed.
+/// - [`Sep48Error::InvalidContractAddress`]: invalid C-strkey.
+/// - [`Sep48Error::RpcFetchFailure`]: the Wasm hash could not be resolved
+///   (absent contract, Stellar Asset Contract, external reference with no
+///   live tag entry, or a failed fetch) or the code fetch failed.
 pub async fn discover_claimed_seps(
     rpc_url: &str,
     contract_strkey: &str,
 ) -> Result<Vec<String>, Sep48Error> {
-    let wasm_bytes = crate::spec::fetch_wasm_bytes(rpc_url, contract_strkey).await?;
+    let client = crate::spec::rpc_client(rpc_url)?;
+    let wasm_hash = crate::spec::resolve_wasm_hash(&client, contract_strkey).await?;
+    let wasm_bytes = crate::spec::fetch_wasm_bytes_by_hash(&client, &wasm_hash).await?;
     let seps = extract_seps_from_wasm(&wasm_bytes);
     Ok(seps)
 }

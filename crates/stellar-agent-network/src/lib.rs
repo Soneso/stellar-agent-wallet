@@ -57,6 +57,7 @@ pub mod signing;
 pub mod simulation_audit;
 pub mod submission_record;
 pub mod submit;
+mod transaction_record;
 pub mod wasm_hash;
 
 pub use counterparty::fetch::build_bounded_https_client;
@@ -109,6 +110,7 @@ pub use submit::{
     SubmissionResult, SubmissionSignerKind, envelope_hash_hex, redact_tx_hash,
     submit_transaction_and_wait,
 };
+pub use transaction_record::TransactionRecord;
 pub use wasm_hash::{
     ExternalRefExecutable, FetchContractWasmHashError, MalformedEntryReason,
     WasmHashDivergenceError, WasmHashFetch, executable_tag_ledger_key, fetch_contract_wasm_hash,

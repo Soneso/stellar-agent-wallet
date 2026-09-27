@@ -22,6 +22,7 @@ use subtle::ConstantTimeEq as _;
 
 use crate::policy_state::WindowStoreError;
 use crate::policy_state::lock::WindowStoreLock;
+use crate::transaction_record::TransactionRecord;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -1091,7 +1092,7 @@ impl PersistedWindowStore {
         if !pass.charge() {
             return Ok(Settlement::KeptPending);
         }
-        let response = match client.inner.get_transaction(&tx_hash).await {
+        let record = match client.get_transaction_record(&tx_hash).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!(
@@ -1103,40 +1104,42 @@ impl PersistedWindowStore {
             }
         };
 
-        if response.status == "NOT_FOUND" {
+        if record.status() == "NOT_FOUND" {
             return self
                 .settle_not_found(profile, client, receipts, reservation, pass)
                 .await;
         }
-        self.settle_chain_answer(profile, receipts, reservation, &response)
+        self.settle_chain_answer(profile, receipts, reservation, &record)
     }
 
     /// Applies a definitive transaction answer to the reservation and receipt.
+    ///
+    /// A `SUCCESS` answer confirms from its status, ledger and created-at as
+    /// received; only a `FAILED` answer's result XDR is decoded, for its
+    /// failure code.
     fn settle_chain_answer(
         &self,
         profile: &Profile,
         receipts: Option<&ReceiptStore>,
         reservation: &WindowReservation,
-        response: &stellar_rpc_client::GetTransactionResponse,
+        record: &TransactionRecord,
     ) -> Result<Settlement, WindowStoreError> {
-        match response.status.as_str() {
+        match record.status() {
             "SUCCESS" => {
-                self.confirm(profile, &reservation.id, response.created_at)?;
+                self.confirm(profile, &reservation.id, record.created_at())?;
                 finalize_receipt(
                     receipts,
                     reservation,
                     ReceiptStatus::Success,
-                    response.ledger,
+                    record.ledger(),
                 );
                 Ok(Settlement::Confirmed {
-                    ledger: response.ledger,
+                    ledger: record.ledger(),
                 })
             }
             "FAILED" => {
                 self.release(profile, &reservation.id)?;
-                let code = crate::submit::map_failed_result(response.result.as_ref())
-                    .code()
-                    .to_owned();
+                let code = crate::submit::map_failed_record(record).code().to_owned();
                 finalize_receipt(
                     receipts,
                     reservation,
@@ -1241,18 +1244,21 @@ impl PersistedWindowStore {
         if !pass.charge() {
             return Ok(Settlement::KeptPending);
         }
-        let response = match client.inner.get_transaction(&stellar_xdr::Hash(hash)).await {
-            Ok(response) => response,
+        let record = match client
+            .get_transaction_record(&stellar_xdr::Hash(hash))
+            .await
+        {
+            Ok(record) => record,
             Err(e) => {
                 tracing::debug!(error = %crate::retry::truncate_error_display(&e),
                     "window reconcile: confirmation query failed; reservation stands");
                 return Ok(Settlement::KeptPending);
             }
         };
-        if response.status == "NOT_FOUND" {
+        if record.status() == "NOT_FOUND" {
             return self.release_as_ambiguous(profile, receipts, reservation);
         }
-        self.settle_chain_answer(profile, receipts, reservation, &response)
+        self.settle_chain_answer(profile, receipts, reservation, &record)
     }
 
     /// Releases a reservation whose transaction can no longer apply, recording

@@ -67,15 +67,20 @@ result values, and transaction data; the wallet decodes those fields with
 `untrusted_decode_limits(encoded.len())`, bounding depth to 500 and length to
 the encoded input size.
 
-Reconciliation reads `get_transaction` from `stellar-rpc-client`, which decodes
-the response metadata, events, envelope, and result inside the client and hands
-the wallet values that are already decoded. Those decodes bound XDR depth to
-500 but carry no length bound, and there is no point at which the wallet can
-impose its own, so reconciliation relies on the configured endpoint at that
-boundary. The test at
+Reconciliation reads `getTransaction` raw through the wallet's
+`StellarRpcClient::get_transaction_raw`. Status, ledger and transaction hash
+are taken as received, and the wallet decodes the envelope itself with
+`untrusted_decode_limits(encoded.len())`, bounding depth to 500 and length to
+the encoded input size. An envelope that does not decode is refused as
+`mpp.reconciliation_unavailable`. The result meta is never decoded, so an
+answer whose meta the wallet's XDR cannot decode still reconciles. Of the
+typed calls the wallet still makes through `stellar-rpc-client`, only
+`sendTransaction` decodes XDR inside the client, for its error result, bounded
+in depth to 500 with no length bound. The test at
 `crates/stellar-agent-mpp/tests/rpc_decode_boundary.rs` holds the inventory of
-those decode sites in the pinned version and fails when the locked version
-changes, so a bump reinspects them.
+the wallet's `getTransaction` decode sites and of that remaining client-side
+decode in the pinned version, and fails when the locked version changes, so a
+bump reinspects them.
 
 ## Fingerprints and approval binding
 

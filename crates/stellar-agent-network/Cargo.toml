@@ -40,6 +40,13 @@ testnet-acceptance = ["test-helpers"]
 [dependencies]
 stellar-agent-core = { workspace = true }
 stellar-agent-xdr-limits = { workspace = true }
+# jsonrpsee-core issues the raw `getTransaction` request through the RPC
+# client's transport (`ClientT::request`, behind the `client` feature) and
+# builds Error::JsonRpc fixtures in retry.rs unit tests. The pin must match the
+# version stellar-rpc-client resolves (jsonrpsee 0.26) so the two resolve to
+# one crate instance and the `From` impl on `stellar_rpc_client::Error`
+# applies; otherwise two distinct `ClientError` types exist in the binary.
+jsonrpsee-core = { version = "=0.26.0", features = ["client"] }
 # Opt-in headless keyring store: init_platform_keyring_store dispatches
 # here when STELLAR_AGENT_KEYRING_BACKEND is set.
 stellar-agent-headless-keyring = { workspace = true }
@@ -101,11 +108,6 @@ stellar-agent-test-support = { path = "../stellar-agent-test-support", features 
 stellar-agent-headless-keyring = { path = "../stellar-agent-headless-keyring", features = ["test-helpers"] }
 wiremock = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "test-util"] }
-# jsonrpsee-core builds Error::JsonRpc fixtures in retry.rs unit tests. The pin
-# must match the version stellar-rpc-client resolves (jsonrpsee 0.26) so the two
-# resolve to one crate instance and the `From` impl on `stellar_rpc_client::Error`
-# applies; otherwise two distinct `ClientError` types exist in the binary.
-jsonrpsee-core = "=0.26.0"
 # CaptureWriter-backed subscriber in redaction_audit.rs.
 tracing-subscriber = { workspace = true }
 # ledger-apdu provides the APDUAnswer / APDUCommand types used in hardware

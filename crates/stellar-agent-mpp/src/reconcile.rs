@@ -5,7 +5,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
-use stellar_rpc_client::Client;
+use stellar_agent_network::StellarRpcClient;
 use stellar_xdr::{
     FeeBumpTransactionInnerTx, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization,
     HostFunction, Limits, Memo, MuxedAccount, OperationBody, Preconditions, PublicKey, ScVal,
@@ -50,9 +50,13 @@ pub trait ReconciliationRpc: Send + Sync {
     ) -> Result<TransactionObservation, MppError>;
 }
 
-/// Production reconciliation RPC backed by `stellar-rpc-client`.
+/// Production reconciliation RPC backed by the wallet's Stellar RPC client.
+///
+/// Reads `getTransaction` raw: status, ledger and transaction hash are taken
+/// as received, and only the envelope is decoded, under the wallet's
+/// untrusted-decode limits. The result meta is never decoded.
 pub struct StellarReconciliationRpc {
-    client: Client,
+    client: StellarRpcClient,
 }
 
 impl StellarReconciliationRpc {
@@ -63,7 +67,7 @@ impl StellarReconciliationRpc {
     /// Returns `mpp.reconciliation_unavailable` when the URL is invalid.
     pub fn new(rpc_url: &str) -> Result<Self, MppError> {
         Ok(Self {
-            client: Client::new(rpc_url).map_err(|_error| unavailable())?,
+            client: StellarRpcClient::new(rpc_url).map_err(|_error| unavailable())?,
         })
     }
 }
@@ -74,22 +78,23 @@ impl ReconciliationRpc for StellarReconciliationRpc {
         &self,
         transaction_hash: &[u8; 32],
     ) -> Result<TransactionObservation, MppError> {
-        let response = self
+        let record = self
             .client
-            .get_transaction(&stellar_xdr::Hash(*transaction_hash))
+            .get_transaction_raw(&stellar_xdr::Hash(*transaction_hash))
             .await
             .map_err(|_error| unavailable())?;
-        let status = match response.status.as_str() {
+        let status = match record.status() {
             "SUCCESS" => TransactionStatus::Success,
             "FAILED" => TransactionStatus::Failed,
             "NOT_FOUND" => TransactionStatus::NotFound,
             _ => return Err(unavailable()),
         };
+        let envelope = record.envelope().map_err(|_error| envelope_undecodable())?;
         Ok(TransactionObservation {
             status,
-            ledger: response.ledger,
-            transaction_hash: response.tx_hash,
-            envelope: response.envelope,
+            ledger: record.ledger(),
+            transaction_hash: record.tx_hash().map(str::to_owned),
+            envelope,
         })
     }
 }
@@ -354,6 +359,13 @@ const fn unavailable() -> MppError {
     MppError::new(
         MppErrorCode::ReconciliationUnavailable,
         "ledger reconciliation could not verify the MPP transaction",
+    )
+}
+
+const fn envelope_undecodable() -> MppError {
+    MppError::new(
+        MppErrorCode::ReconciliationUnavailable,
+        "the ledger's transaction envelope could not be decoded",
     )
 }
 
@@ -682,6 +694,84 @@ mod tests {
         .await
         .expect_err("server source and signature are one verified unit");
         assert_eq!(error.code(), "mpp.reconciliation_unavailable");
+        assert_eq!(
+            state.load(&id).expect("state").status(),
+            AuthorizationStatus::Authorized
+        );
+    }
+
+    /// Serves one `getTransaction` answer for `HASH`, the way the configured
+    /// endpoint would.
+    async fn serve_transaction(answer: serde_json::Value) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "method": "getTransaction",
+                "params": {"hash": HASH},
+            })))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(answer))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The production RPC reconciles a SUCCESS answer whose result meta is a
+    /// `TransactionMeta` with discriminant 99: status, ledger and hash are
+    /// read as received and only the envelope is decoded.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn production_rpc_reconciles_with_undecodable_meta() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let (_directory, state, id, envelope) = authorized_fixture("raw-meta").await;
+        let server = serve_transaction(serde_json::json!({
+            "status": "SUCCESS",
+            "txHash": HASH,
+            "ledger": 1_234,
+            "createdAt": "1700000000",
+            "envelopeXdr": envelope.to_xdr_base64(Limits::none()).expect("envelope XDR"),
+            "resultMetaXdr": "AAAAYw==",
+        }))
+        .await;
+        let rpc = StellarReconciliationRpc::new(&server.uri()).expect("rpc");
+
+        let result = reconcile_transaction(&state, &id, HASH, NOW + 2, &rpc)
+            .await
+            .expect("an answer whose meta does not decode still reconciles");
+
+        assert_eq!(result.outcome, "settled");
+        assert_eq!(result.ledger, 1_234);
+        assert_eq!(
+            state.load(&id).expect("state").status(),
+            AuthorizationStatus::Settled
+        );
+    }
+
+    /// An envelope the wallet cannot decode is refused with the typed
+    /// reconciliation refusal naming the envelope, and nothing is recorded.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn production_rpc_refuses_an_undecodable_envelope() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let (_directory, state, id, _envelope) = authorized_fixture("raw-envelope").await;
+        let server = serve_transaction(serde_json::json!({
+            "status": "SUCCESS",
+            "txHash": HASH,
+            "ledger": 1_234,
+            "createdAt": "1700000000",
+            "envelopeXdr": "AAAA",
+        }))
+        .await;
+        let rpc = StellarReconciliationRpc::new(&server.uri()).expect("rpc");
+
+        let error = reconcile_transaction(&state, &id, HASH, NOW + 2, &rpc)
+            .await
+            .expect_err("an undecodable envelope cannot be verified");
+
+        assert_eq!(error.code(), "mpp.reconciliation_unavailable");
+        assert_eq!(
+            error.message(),
+            "the ledger's transaction envelope could not be decoded"
+        );
         assert_eq!(
             state.load(&id).expect("state").status(),
             AuthorizationStatus::Authorized

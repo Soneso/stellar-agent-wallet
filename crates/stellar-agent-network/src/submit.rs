@@ -54,6 +54,7 @@ use crate::retry::{
 };
 use crate::signing::verify_binding::{reject_v0_envelope, verify_signature_network_binding};
 use crate::submission_record::{SubmissionIntent, SubmissionOutcome, SubmissionRecorder};
+use crate::transaction_record::TransactionRecord;
 
 // Mainnet network passphrase (canonical; same constant used by friendbot.rs).
 // `pub(crate)` so every in-crate write path (idempotent_submit's retention
@@ -331,20 +332,25 @@ pub async fn submit_transaction_and_wait(
 
     // Poll until SUCCESS, FAILED, or timeout.
     //
-    // Transient `JsonRpc(_)` errors from `get_transaction` are treated like
-    // `NOT_FOUND` — log at debug level and fall through to the deadline check
-    // + POLL_INTERVAL sleep.  This prevents a transient rate-limit from
+    // Each poll reads the raw `getTransaction` answer: status, ledger and
+    // created-at are read as received, and the result XDR is decoded only for
+    // a `FAILED` transaction, so an answer whose meta the wallet cannot
+    // decode still confirms.
+    //
+    // Transient `JsonRpc(_)` errors from `get_transaction_record` are treated
+    // like `NOT_FOUND`: log at debug level and fall through to the deadline
+    // check + POLL_INTERVAL sleep.  This prevents a transient rate-limit from
     // aborting the entire submission while preserving the hard timeout bound.
-    // A retryable poll error never `continue`s past the deadline check — the
+    // A retryable poll error never `continue`s past the deadline check: the
     // loop terminates on timeout even if every poll errors.
     //
     // Keep in sync with the poll loop in `idempotent_submit.rs`: any change to
     // retryable-error treatment here must be mirrored there.
 
     loop {
-        let poll_result = client.inner.get_transaction(&tx_hash).await;
+        let poll_result = client.get_transaction_record(&tx_hash).await;
 
-        let response = match poll_result {
+        let record = match poll_result {
             Ok(r) => r,
             Err(ref e) if is_retryable_poll_error(e) => {
                 // Treat transient transport error as NOT_FOUND: log at debug
@@ -356,7 +362,7 @@ pub async fn submit_transaction_and_wait(
                     tx_hash = %redacted,
                     rpc_url = %url_authority,
                     error = %truncate_error_display(e),
-                    "submit_transaction_and_wait: transient get_transaction error \
+                    "submit_transaction_and_wait: transient getTransaction error \
                      (treating as NOT_FOUND, continuing poll)"
                 );
                 // Fall through to deadline check below.
@@ -392,9 +398,9 @@ pub async fn submit_transaction_and_wait(
             }
         };
 
-        match response.status.as_str() {
+        match record.status() {
             "SUCCESS" => {
-                let ledger = response.ledger.unwrap_or(0);
+                let ledger = record.ledger().unwrap_or(0);
                 tracing::info!(
                     tx_hash = %redacted,
                     ledger,
@@ -405,7 +411,7 @@ pub async fn submit_transaction_and_wait(
                         &intent,
                         &SubmissionOutcome::Success {
                             ledger,
-                            created_at: response.created_at,
+                            created_at: record.created_at(),
                         },
                     )
                     .await;
@@ -418,7 +424,7 @@ pub async fn submit_transaction_and_wait(
             }
 
             "FAILED" => {
-                let err = map_failed_result(response.result.as_ref());
+                let err = map_failed_record(&record);
                 tracing::warn!(
                     tx_hash = %redacted,
                     error = %err,
@@ -810,6 +816,30 @@ fn map_rpc_error_generic(
     }
 }
 
+/// Maps a `FAILED` `getTransaction` answer to its typed [`WalletError`].
+///
+/// Decodes the answer's result XDR and delegates to [`map_failed_result`].
+/// A result that does not decode yields [`LedgerError::OpFailed`] with op
+/// `unknown` and a reason naming the undecodable result, the variant
+/// [`map_failed_result`] gives an absent result, so the stable code stays
+/// `ledger.op_failed`. The reason is the display of the typed decode error
+/// [`TransactionRecord::result`] returns: wallet-formatted text around the
+/// XDR decoder's own error message, which carries no bytes from the response,
+/// so its length is bounded by construction. A `FAILED` status is definitive either way: the
+/// transaction did not apply, and the caller neither retries nor waits.
+///
+/// Every `FAILED` arm that reads a `getTransaction` answer calls this, so the
+/// returned error and a receipt's `Failed { code }` derive from one path.
+pub(crate) fn map_failed_record(record: &TransactionRecord) -> WalletError {
+    match record.result() {
+        Ok(result) => map_failed_result(result.as_ref()),
+        Err(e) => WalletError::Ledger(LedgerError::OpFailed {
+            op: "unknown".to_owned(),
+            result_code: format!("undecodable result XDR: {e}"),
+        }),
+    }
+}
+
 /// Maps a `getTransaction` FAILED response's `TransactionResult` to a typed
 /// [`WalletError`].
 ///
@@ -832,11 +862,10 @@ fn map_rpc_error_generic(
 /// `TransactionResultResult::TxFeeBumpInnerSuccess(pair)` maps defensively to
 /// `OpFailed` — the inner tx applied, so this is not a rejection path.
 ///
-/// Exported `pub(crate)` so the retention-aware poll loop in
-/// `idempotent_submit::submit_with_retention_poll` and the stale-Pending
-/// recovery path in `handle_stale_pending` both use the same mapping,
-/// ensuring the receipt's `Failed { code }` string and the returned
-/// `WalletError` are always derived from the same XDR path.
+/// Every `FAILED` arm reaches this through [`map_failed_record`], which
+/// decodes the answer's result XDR first, so the receipt's `Failed { code }`
+/// string and the returned `WalletError` are always derived from the same
+/// XDR path.
 pub(crate) fn map_failed_result(result: Option<&TransactionResult>) -> WalletError {
     let Some(result) = result else {
         return WalletError::Ledger(LedgerError::OpFailed {

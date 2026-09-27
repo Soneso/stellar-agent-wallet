@@ -44,9 +44,11 @@ proptest.workspace = true
 rand_core.workspace = true
 reqwest.workspace = true
 serial_test.workspace = true
-# State tests use the in-memory keyring without enabling live-test helpers.
-stellar-agent-test-support = { path = "../stellar-agent-test-support" }
+# State tests use the in-memory keyring; reconciliation tests serve mocked
+# Stellar RPC answers through its wiremock responders.
+stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["wiremock-helpers"] }
 tokio.workspace = true
+wiremock = { workspace = true }
 zeroize.workspace = true
 
 [lints]

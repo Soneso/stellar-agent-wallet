@@ -39,13 +39,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Protocol 28 crate versions: `stellar-xdr` 28.0.0, `stellar-baselib` 0.6.0,
   `stellar-rpc-client` 28.0.0, `soroban-spec-tools` 28.0.0 and
   `stellar-ledger` 28.0.0.
+- SEP-48 argument previews and SEP-47 discovery read the code a contract
+  runs now. An external-reference contract resolves through its owner's
+  executable-tag entry; one with no live tag entry is refused with a message
+  naming the owner and the tag. The parsed spec is cached per Wasm hash: every
+  call resolves the contract's current Wasm hash first, so a contract whose
+  code changes returns the spec of its new code, and contracts running the
+  same code share one cached spec and one code fetch.
+  Only the code entry returned under the requested hash is read, and code
+  whose bytes do not hash to it is refused and not cached.
+- Transaction status reads no longer decode the result meta. Status, ledger
+  and created-at are read as received, so a transaction whose meta the
+  wallet's XDR cannot decode still confirms. The result is decoded only for
+  a failed transaction; a failed result that does not decode is reported as
+  `ledger.op_failed` naming the undecodable result. Contract events and the
+  envelope are decoded on demand under the wallet's untrusted-decode bounds:
+  timelock event confirmation reads contract events independently of the
+  meta and fails closed on an event that does not decode, and MPP
+  reconciliation refuses an undecodable envelope with
+  `mpp.reconciliation_unavailable`.
 - The wallet refuses a contract whose executable is an owner-managed external
   reference, even when the owner's tag entry currently holds the expected
   hash, because the owner can repoint it at any time. DeFi pin checks refuse
   with `defi.pin.external_ref`. DeFindex vault, Soroswap router and multicall
-  router checks, post-deploy verification and SEP-48 argument previews refuse
-  with a message naming the owner and the tag. Smart-account verifier and
-  policy installation treats such a contract as mutable: it refuses with
+  router checks and post-deploy verification refuse with a message naming the
+  owner and the tag. Smart-account verifier and policy installation treats
+  such a contract as mutable: it refuses with
   `sa.verifier_mutable` / `sa.policy_mutable`, reason
   `owner-managed external reference`, naming the owner and the tag, unless
   `--accept-mutable-verifier` is set, and then pins the owner, the tag and

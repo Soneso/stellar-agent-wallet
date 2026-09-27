@@ -12,7 +12,7 @@
 //!      unknown (belt-and-braces).
 //!    - Else: polls `getTransaction(tx_hash)` once.
 //!    - If terminal → finalises the receipt and returns it.
-//!    - If `FAILED` → decodes `TransactionResult` XDR via `map_failed_result`,
+//!    - If `FAILED` → decodes `TransactionResult` XDR via `map_failed_record`,
 //!      finalises as `Failed { code }`.
 //!    - If `NOT_FOUND` and `max_time` not yet elapsed → resubmits.
 //!    - If `NOT_FOUND` and `max_time` elapsed → finalises as `Ambiguous`.
@@ -54,7 +54,7 @@
 //!
 //! Retention horizon source: `get_health()` → `GetHealthResponse { latest_ledger,
 //! oldest_ledger, ledger_retention_window }` (stellar-rpc-client).  NOT
-//! `getTransaction` — the `GetTransactionResponse` does not carry retention
+//! `getTransaction`: a `getTransaction` answer does not carry retention
 //! information.
 //!
 //! # Re-org reconciliation
@@ -84,7 +84,7 @@
 //! # Lock discipline
 //!
 //! The [`ReceiptStore`] lock is **never** held across an `.await`.  All
-//! `.await` calls (`submit_transaction_and_wait`, `get_transaction`,
+//! `.await` calls (`submit_transaction_and_wait`, `get_transaction_record`,
 //! `get_health`, `tokio::time::sleep`) happen outside the lock.  The lock is
 //! acquired only for the in-memory `HashMap` read/write + file-persist step.
 
@@ -104,7 +104,7 @@ use crate::retry::{
     truncate_error_display,
 };
 // bytes_to_hex: canonical pub(crate) definition from submit.rs.
-use crate::submit::{SubmissionResult, bytes_to_hex, map_failed_result, redact_tx_hash};
+use crate::submit::{SubmissionResult, bytes_to_hex, map_failed_record, redact_tx_hash};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Poll configuration
@@ -560,14 +560,14 @@ async fn handle_stale_pending(
         }));
     }
 
-    // Parse the stored tx_hash as bytes for getTransaction.
-    // `stellar-rpc-client::StellarRpcClient::get_transaction` takes `&stellar_xdr::Hash`.
+    // Parse the stored tx_hash as bytes for getTransaction. The answer is
+    // read raw: status and ledger as received, the result XDR decoded only
+    // for a FAILED transaction.
     let tx_hash_bytes = hex_to_hash32(&receipt.tx_hash)?;
     let tx_hash_obj = stellar_xdr::Hash(tx_hash_bytes);
 
-    let response = client
-        .inner
-        .get_transaction(&tx_hash_obj)
+    let record = client
+        .get_transaction_record(&tx_hash_obj)
         .await
         .map_err(|e| {
             WalletError::Network(NetworkError::RpcUnreachable {
@@ -576,9 +576,9 @@ async fn handle_stale_pending(
             })
         })?;
 
-    match response.status.as_str() {
+    match record.status() {
         "SUCCESS" => {
-            let ledger = response.ledger.unwrap_or(0);
+            let ledger = record.ledger().unwrap_or(0);
             store
                 .finalize(envelope_hash, ReceiptStatus::Success, Some(ledger))
                 .map_err(|e| {
@@ -597,18 +597,14 @@ async fn handle_stale_pending(
         "FAILED" => {
             // Decode the on-chain TransactionResult XDR to produce an accurate
             // `Failed { code }` receipt.  The RPC definitively reported FAILED,
-            // so the receipt is always Failed — when the result field is absent
-            // (older RPC responses may omit it), `map_failed_result(None)`
-            // yields the generic `ledger.op_failed` code rather than demoting
-            // the definitive FAILED to Ambiguous.
+            // so the receipt is always Failed: when the result field is absent
+            // or does not decode, `map_failed_record` yields the generic
+            // `ledger.op_failed` code.
             //
-            // `map_failed_result` takes `Option<&TransactionResult>` and returns
-            // the typed `WalletError`; `response.result.as_ref()` maps
-            // `Option<TransactionResult>` → `Option<&TransactionResult>` without
-            // cloning.  The resulting `WalletError::code()` is the stable wire
-            // code stored in `Failed { code }` — the same path as the winner path
-            // in `submit_with_retention_poll`, keeping both paths consistent.
-            let err = map_failed_result(response.result.as_ref());
+            // The resulting `WalletError::code()` is the stable wire code
+            // stored in `Failed { code }`, the same path as the winner path in
+            // `submit_with_retention_poll`, keeping both paths consistent.
+            let err = map_failed_record(&record);
             let code = err.code().to_owned();
             tracing::warn!(
                 envelope_hash = %redact_envelope_hash(envelope_hash),
@@ -619,7 +615,7 @@ async fn handle_stale_pending(
                 .finalize(
                     envelope_hash,
                     ReceiptStatus::Failed { code },
-                    response.ledger,
+                    record.ledger(),
                 )
                 .map_err(|e| {
                     WalletError::Internal(
@@ -1093,8 +1089,13 @@ pub(crate) async fn submit_with_retention_poll(
 
     // Poll until SUCCESS, FAILED, timeout, or retention-window closure.
     //
-    // Transient `JsonRpc(_)` errors from `get_transaction` are treated like
-    // `NOT_FOUND` — log at debug and fall through to the deadline check +
+    // Each poll reads the raw `getTransaction` answer: status and ledger are
+    // read as received, and the result XDR is decoded only for a `FAILED`
+    // transaction, so an answer whose meta the wallet cannot decode still
+    // confirms.
+    //
+    // Transient `JsonRpc(_)` errors from `get_transaction_record` are treated
+    // like `NOT_FOUND`: log at debug and fall through to the deadline check +
     // RETENTION_POLL_INTERVAL sleep.  This prevents a transient 429 from
     // aborting the entire submission.
     //
@@ -1104,9 +1105,9 @@ pub(crate) async fn submit_with_retention_poll(
     // Keep in sync with the poll loop in submit.rs: any change to the
     // retryable-error treatment here must be mirrored there.
     loop {
-        let poll_result = client.inner.get_transaction(&tx_hash_obj).await;
+        let poll_result = client.get_transaction_record(&tx_hash_obj).await;
 
-        let response = match poll_result {
+        let record = match poll_result {
             Ok(r) => r,
             Err(ref e) if is_retryable_poll_error(e) => {
                 // Treat transient transport error as NOT_FOUND: log at debug
@@ -1119,7 +1120,7 @@ pub(crate) async fn submit_with_retention_poll(
                     tx_hash = %redacted_tx,
                     rpc_url = %url_authority,
                     error = %truncate_error_display(e),
-                    "submit_with_retention_poll: transient get_transaction error \
+                    "submit_with_retention_poll: transient getTransaction error \
                      (treating as NOT_FOUND, continuing poll)"
                 );
                 // Fall through to deadline check below.
@@ -1159,9 +1160,9 @@ pub(crate) async fn submit_with_retention_poll(
             }
         };
 
-        match response.status.as_str() {
+        match record.status() {
             "SUCCESS" => {
-                let ledger = response.ledger.unwrap_or(0);
+                let ledger = record.ledger().unwrap_or(0);
                 tracing::info!(
                     envelope_hash = %redacted,
                     tx_hash = %redacted_tx,
@@ -1184,18 +1185,15 @@ pub(crate) async fn submit_with_retention_poll(
             }
 
             "FAILED" => {
-                // Map the FAILED result via the shared map_failed_result (same
-                // path as submit_transaction_and_wait in submit.rs).
-                //
-                // response.result carries the Option<TransactionResult> XDR,
-                // so we can decode the real on-chain failure code rather than
-                // hardcoding a fallback.
+                // Map the FAILED answer via the shared map_failed_record (same
+                // path as submit_transaction_and_wait in submit.rs), which
+                // decodes the answer's result XDR to the real on-chain failure
+                // code.
                 //
                 // Both this path and the stale-Pending recovery path in
-                // handle_stale_pending call map_failed_result with the same
-                // response.result field, ensuring consistent Failed{code}
-                // receipts wherever the result XDR is available.
-                let err = map_failed_result(response.result.as_ref());
+                // handle_stale_pending call map_failed_record, ensuring
+                // consistent Failed{code} receipts.
+                let err = map_failed_record(&record);
                 let code = err.code().to_owned();
                 tracing::warn!(
                     envelope_hash = %redacted,
@@ -1582,9 +1580,8 @@ pub async fn reconcile_receipt(
     let tx_hash_bytes = hex_to_hash32(&receipt.tx_hash)?;
     let tx_hash_obj = stellar_xdr::Hash(tx_hash_bytes);
 
-    let response = client
-        .inner
-        .get_transaction(&tx_hash_obj)
+    let record = client
+        .get_transaction_record(&tx_hash_obj)
         .await
         .map_err(|e| {
             WalletError::Network(NetworkError::RpcUnreachable {
@@ -1593,7 +1590,7 @@ pub async fn reconcile_receipt(
             })
         })?;
 
-    match response.status.as_str() {
+    match record.status() {
         "SUCCESS" => {
             // Transaction still present — no re-org.
             // Clear any first-miss anchor that may have been set by a prior

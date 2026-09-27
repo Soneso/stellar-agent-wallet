@@ -28,6 +28,8 @@ thiserror             = { workspace = true }
 stellar-agent-network = { workspace = true }
 stellar-agent-xdr-limits = { workspace = true }
 tracing               = { workspace = true }
+# Verifies that fetched contract code hashes to the requested Wasm hash.
+sha2                  = { workspace = true }
 
 [dev-dependencies]
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["wiremock-helpers", "test-helpers"] }
@@ -37,7 +39,6 @@ soroban-spec-tools = { workspace = true }
 stellar-xdr        = { workspace = true }
 serde_json         = { workspace = true }
 wiremock           = { workspace = true }
-sha2               = { workspace = true }
 
 [lints]
 workspace = true
