@@ -24,9 +24,12 @@ use stellar_baselib::{
     transaction::{Transaction, TransactionBehavior},
     transaction_builder::{TransactionBuilder, TransactionBuilderBehavior},
     xdr::{
-        AccountId, ClaimPredicate, HashIdPreimage, HashIdPreimageOperationId, HostFunction,
-        InvokeContractArgs, InvokeHostFunctionOp, Limits, Operation, OperationBody, PublicKey,
-        SequenceNumber, SorobanAuthorizationEntry, SorobanCredentials, Uint256, VecM, WriteXdr,
+        AccountId, BytesM, ClaimPredicate, ContractExecutable, ContractId, ContractIdPreimage,
+        ContractIdPreimageFromAddress, CreateContractArgsV2, Hash, HashIdPreimage,
+        HashIdPreimageContractId, HashIdPreimageOperationId, HostFunction, InvokeContractArgs,
+        InvokeHostFunctionOp, LedgerKey, LedgerKeyContractCode, Limits, Operation, OperationBody,
+        PublicKey, ScAddress, ScBytes, ScSymbol, ScVal, SequenceNumber, SorobanAuthorizationEntry,
+        SorobanCredentials, SorobanTransactionData, Uint256, VecM, WriteXdr,
     },
 };
 use stellar_rpc_client::Client;
@@ -558,6 +561,401 @@ where
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
     ))
+}
+
+/// Outcome of a source-account-authorized invocation submitted by
+/// [`invoke_as_source_account`].
+pub struct SourceAccountInvocation<R> {
+    /// The invocation's return value as the simulation reported it.
+    pub return_value: ScVal,
+    /// The caller's submission result for the confirmed transaction.
+    pub submission: R,
+    /// The simulation's Soroban transaction data (footprint and resources),
+    /// attached unchanged to the submitted transaction.
+    pub transaction_data: SorobanTransactionData,
+}
+
+/// Outcome of [`upload_and_create_contract`].
+pub struct UploadedContract<R> {
+    /// The created contract's C-strkey.
+    pub contract: String,
+    /// SHA-256 of the uploaded Wasm, the hash the contract's executable names.
+    pub wasm_hash: [u8; 32],
+    /// The upload transaction's submission result; `None` when a live code
+    /// entry for `wasm_hash` already existed and no upload was submitted.
+    pub upload: Option<R>,
+    /// The create transaction's submission result.
+    pub create: R,
+}
+
+/// Returns the C-strkey of the contract `deployer` creates with `salt` on the
+/// network named by `network_passphrase`: the SHA-256 of the
+/// `HashIdPreimage::ContractId` preimage over the network id and
+/// `ContractIdPreimage::Address { deployer, salt }`.
+///
+/// # Errors
+///
+/// Returns an error when the preimage cannot be XDR-encoded.
+pub fn derive_contract_address(
+    deployer: &ScAddress,
+    salt: &[u8; 32],
+    network_passphrase: &str,
+) -> TestnetHelperResult<String> {
+    let network_id: [u8; 32] = Sha256::digest(network_passphrase.as_bytes()).into();
+    let preimage = HashIdPreimage::ContractId(HashIdPreimageContractId {
+        network_id: Hash(network_id),
+        contract_id_preimage: ContractIdPreimage::Address(ContractIdPreimageFromAddress {
+            address: deployer.clone(),
+            salt: Uint256(*salt),
+        }),
+    });
+    let preimage_xdr = preimage
+        .to_xdr(Limits::none())
+        .map_err(|e| TestnetHelperError::new(format!("contract-id preimage encode: {e}")))?;
+    let contract_id: [u8; 32] = Sha256::digest(&preimage_xdr).into();
+    Ok(format!("{}", stellar_strkey::Contract(contract_id)))
+}
+
+/// Parses a C-strkey into its `ScAddress::Contract`.
+///
+/// # Errors
+///
+/// Returns an error when `contract` is not a valid contract strkey.
+pub fn contract_scaddress(contract: &str) -> TestnetHelperResult<ScAddress> {
+    let parsed = stellar_strkey::Contract::from_string(contract)
+        .map_err(|e| TestnetHelperError::new(format!("invalid contract strkey: {e}")))?;
+    Ok(ScAddress::Contract(ContractId(Hash(parsed.0))))
+}
+
+/// Parses a G-strkey into its `ScAddress::Account`.
+///
+/// # Errors
+///
+/// Returns an error when `account` is not a valid ed25519 account strkey.
+pub fn account_scaddress(account: &str) -> TestnetHelperResult<ScAddress> {
+    let parsed = stellar_strkey::ed25519::PublicKey::from_string(account)
+        .map_err(|e| TestnetHelperError::new(format!("invalid account strkey: {e}")))?;
+    Ok(ScAddress::Account(AccountId(
+        PublicKey::PublicKeyTypeEd25519(Uint256(parsed.0)),
+    )))
+}
+
+/// Invokes `function_name` on `contract` with `args` in a transaction whose
+/// source account `source_g` is the only authorizer, and waits for it to
+/// confirm.
+///
+/// The transaction is simulated once; every authorization entry the
+/// simulation requires must carry source-account credentials, which the
+/// envelope signature satisfies, so a call needing any other authorizer is
+/// refused before signing. The simulation's transaction data and resource fee
+/// are attached unchanged. This drives contract functions that no wallet verb
+/// reaches, such as test-infrastructure contracts.
+///
+/// Callers inject `fetch_sequence`, `sign_envelope` and `submit_signed_xdr`,
+/// the dependency-injection style [`fund_sac_balance`] uses, so this module
+/// takes no dependency on the wallet crates that use it in their tests.
+///
+/// # Errors
+///
+/// Returns an error when the contract strkey is invalid, the sequence fetch,
+/// simulation, signing or submission fails, the simulation reports an error
+/// or a required restoration, or it requires a non-source-account
+/// authorization.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "acceptance helper keeps test-specific network hooks explicit at call sites"
+)]
+pub async fn invoke_as_source_account<F, FFut, S, SFut, Sub, SubFut, R>(
+    rpc_url: &str,
+    network_passphrase: &str,
+    source_g: &str,
+    source_seed: &Zeroizing<[u8; 32]>,
+    contract: &str,
+    function_name: &str,
+    args: Vec<ScVal>,
+    fetch_sequence: F,
+    sign_envelope: S,
+    submit_signed_xdr: Sub,
+) -> TestnetHelperResult<SourceAccountInvocation<R>>
+where
+    F: Fn(&str) -> FFut,
+    FFut: Future<Output = TestnetHelperResult<i64>>,
+    S: FnOnce(String, Zeroizing<[u8; 32]>, &str) -> SFut,
+    SFut: Future<Output = TestnetHelperResult<String>>,
+    Sub: FnOnce(String) -> SubFut,
+    SubFut: Future<Output = TestnetHelperResult<R>>,
+{
+    let function_name = ScSymbol::try_from(function_name)
+        .map_err(|()| TestnetHelperError::new("function name is not a Soroban symbol"))?;
+    let args: VecM<ScVal> = args
+        .try_into()
+        .map_err(|_| TestnetHelperError::new("invocation arguments exceed the XDR vector bound"))?;
+    let host_function = HostFunction::InvokeContract(InvokeContractArgs {
+        contract_address: contract_scaddress(contract)?,
+        function_name,
+        args,
+    });
+    submit_source_authorized(
+        rpc_url,
+        network_passphrase,
+        source_g,
+        source_seed,
+        host_function,
+        &fetch_sequence,
+        sign_envelope,
+        submit_signed_xdr,
+    )
+    .await
+}
+
+/// Uploads `wasm` (skipped when a live code entry for its hash already
+/// exists) and creates a contract from it with `CreateContractV2`, deployer
+/// `deployer_g`, `salt` and `constructor_args`, in two source-account-signed
+/// transactions.
+///
+/// The created address is checked against [`derive_contract_address`] and
+/// the upload's returned hash against the Wasm's SHA-256.
+///
+/// # Errors
+///
+/// Returns an error when any RPC call, simulation, signing or submission
+/// fails, or when the upload or create return value differs from the
+/// locally derived hash or address.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "acceptance helper keeps test-specific network hooks explicit at call sites"
+)]
+pub async fn upload_and_create_contract<F, FFut, S, SFut, Sub, SubFut, R>(
+    rpc_url: &str,
+    network_passphrase: &str,
+    deployer_g: &str,
+    deployer_seed: &Zeroizing<[u8; 32]>,
+    wasm: &[u8],
+    salt: [u8; 32],
+    constructor_args: Vec<ScVal>,
+    fetch_sequence: F,
+    sign_envelope: S,
+    submit_signed_xdr: Sub,
+) -> TestnetHelperResult<UploadedContract<R>>
+where
+    F: Fn(&str) -> FFut,
+    FFut: Future<Output = TestnetHelperResult<i64>>,
+    S: Fn(String, Zeroizing<[u8; 32]>, &str) -> SFut,
+    SFut: Future<Output = TestnetHelperResult<String>>,
+    Sub: Fn(String) -> SubFut,
+    SubFut: Future<Output = TestnetHelperResult<R>>,
+{
+    let wasm_hash: [u8; 32] = Sha256::digest(wasm).into();
+    let client = Client::new(rpc_url).map_err(|e| TestnetHelperError::new(e.to_string()))?;
+
+    let code_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+        hash: Hash(wasm_hash),
+    });
+    let code_entries = retry_rpc!(client.get_ledger_entries(std::slice::from_ref(&code_key)))
+        .map_err(|e| TestnetHelperError::new(e.to_string()))?;
+    let latest_ledger = u32::try_from(code_entries.latest_ledger).map_err(|_| {
+        TestnetHelperError::new(format!(
+            "getLedgerEntries returned latest ledger {} outside the u32 range",
+            code_entries.latest_ledger
+        ))
+    })?;
+    let code_live = code_entries
+        .entries
+        .unwrap_or_default()
+        .iter()
+        .any(|entry| {
+            entry
+                .live_until_ledger_seq_ledger_seq
+                .is_some_and(|live_until| live_until >= latest_ledger)
+        });
+
+    let upload = if code_live {
+        None
+    } else {
+        let wasm_bytes: BytesM = wasm
+            .to_vec()
+            .try_into()
+            .map_err(|_| TestnetHelperError::new("Wasm exceeds the XDR bytes bound"))?;
+        let uploaded = submit_source_authorized(
+            rpc_url,
+            network_passphrase,
+            deployer_g,
+            deployer_seed,
+            HostFunction::UploadContractWasm(wasm_bytes),
+            &fetch_sequence,
+            &sign_envelope,
+            &submit_signed_xdr,
+        )
+        .await?;
+        let expected_return =
+            ScVal::Bytes(ScBytes(wasm_hash.to_vec().try_into().map_err(|_| {
+                TestnetHelperError::new("hash exceeds the XDR bytes bound")
+            })?));
+        if uploaded.return_value != expected_return {
+            return Err(Box::new(TestnetHelperError::new(
+                "upload returned a hash other than the Wasm's SHA-256",
+            )));
+        }
+        Some(uploaded.submission)
+    };
+
+    let deployer = account_scaddress(deployer_g)?;
+    let expected_contract = derive_contract_address(&deployer, &salt, network_passphrase)?;
+    let constructor_args: VecM<ScVal> = constructor_args
+        .try_into()
+        .map_err(|_| TestnetHelperError::new("constructor arguments exceed the XDR bound"))?;
+    let created = submit_source_authorized(
+        rpc_url,
+        network_passphrase,
+        deployer_g,
+        deployer_seed,
+        HostFunction::CreateContractV2(CreateContractArgsV2 {
+            contract_id_preimage: ContractIdPreimage::Address(ContractIdPreimageFromAddress {
+                address: deployer,
+                salt: Uint256(salt),
+            }),
+            executable: ContractExecutable::Wasm(Hash(wasm_hash)),
+            constructor_args,
+        }),
+        &fetch_sequence,
+        &sign_envelope,
+        &submit_signed_xdr,
+    )
+    .await?;
+    if created.return_value != ScVal::Address(contract_scaddress(&expected_contract)?) {
+        return Err(Box::new(TestnetHelperError::new(
+            "create returned an address other than the derived contract address",
+        )));
+    }
+
+    Ok(UploadedContract {
+        contract: expected_contract,
+        wasm_hash,
+        upload,
+        create: created.submission,
+    })
+}
+
+/// Simulates `host_function` from `source_g`, attaches the simulation's
+/// source-account authorization entries, transaction data and resource fee,
+/// signs, and submits once.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared body of the source-account helpers; the hooks stay explicit"
+)]
+async fn submit_source_authorized<F, FFut, S, SFut, Sub, SubFut, R>(
+    rpc_url: &str,
+    network_passphrase: &str,
+    source_g: &str,
+    source_seed: &Zeroizing<[u8; 32]>,
+    host_function: HostFunction,
+    fetch_sequence: &F,
+    sign_envelope: S,
+    submit_signed_xdr: Sub,
+) -> TestnetHelperResult<SourceAccountInvocation<R>>
+where
+    F: Fn(&str) -> FFut,
+    FFut: Future<Output = TestnetHelperResult<i64>>,
+    S: FnOnce(String, Zeroizing<[u8; 32]>, &str) -> SFut,
+    SFut: Future<Output = TestnetHelperResult<String>>,
+    Sub: FnOnce(String) -> SubFut,
+    SubFut: Future<Output = TestnetHelperResult<R>>,
+{
+    let client = Client::new(rpc_url).map_err(|e| TestnetHelperError::new(e.to_string()))?;
+    let sequence = retry_rpc!(fetch_sequence(source_g))?;
+
+    let simulate_op = Operation {
+        source_account: None,
+        body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+            host_function: host_function.clone(),
+            auth: VecM::default(),
+        }),
+    };
+    let mut simulate_account = BaselibAccount::new(source_g, &sequence.to_string())
+        .map_err(|e| TestnetHelperError::new(e.to_string()))?;
+    let mut simulate_builder =
+        TransactionBuilder::new(&mut simulate_account, network_passphrase, None);
+    simulate_builder.fee(BASE_FEE);
+    simulate_builder.add_operation(simulate_op);
+    let simulate_envelope = simulate_builder
+        .build_for_simulation()
+        .to_envelope()
+        .map_err(|e| TestnetHelperError::new(e.to_string()))?;
+    let simulation = retry_rpc!(client.simulate_transaction_envelope(&simulate_envelope, None))
+        .map_err(|e| TestnetHelperError::new(e.to_string()))?;
+
+    if let Some(err) = simulation.error {
+        return Err(Box::new(TestnetHelperError::new(format!(
+            "simulation returned an error: {err}"
+        ))));
+    }
+    if simulation.restore_preamble.is_some() {
+        return Err(Box::new(TestnetHelperError::new(
+            "simulation requires restoring archived entries first",
+        )));
+    }
+    let resource_fee = u32::try_from(simulation.min_resource_fee).map_err(|_| {
+        TestnetHelperError::new(format!(
+            "min_resource_fee {} overflows u32",
+            simulation.min_resource_fee
+        ))
+    })?;
+    let transaction_data = simulation
+        .transaction_data()
+        .map_err(|e| TestnetHelperError::new(e.to_string()))?;
+    let result = simulation
+        .results()
+        .map_err(|e| TestnetHelperError::new(e.to_string()))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| TestnetHelperError::new("simulation returned no result"))?;
+    if result
+        .auth
+        .iter()
+        .any(|entry| !matches!(entry.credentials, SorobanCredentials::SourceAccount))
+    {
+        return Err(Box::new(TestnetHelperError::new(
+            "simulation requires an authorization other than the source account's",
+        )));
+    }
+    let auth: VecM<SorobanAuthorizationEntry> = result
+        .auth
+        .try_into()
+        .map_err(|_| TestnetHelperError::new("authorization entries exceed the XDR bound"))?;
+
+    let final_op = Operation {
+        source_account: None,
+        body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+            host_function,
+            auth,
+        }),
+    };
+    let mut final_account = BaselibAccount::new(source_g, &sequence.to_string())
+        .map_err(|e| TestnetHelperError::new(e.to_string()))?;
+    let mut final_builder = TransactionBuilder::new(&mut final_account, network_passphrase, None);
+    final_builder.fee(BASE_FEE.saturating_add(resource_fee));
+    final_builder.add_operation(final_op);
+    let mut final_tx = final_builder.build_for_simulation();
+    final_tx.soroban_data = Some(transaction_data.clone());
+    let unsigned_xdr = final_tx
+        .to_envelope()
+        .map_err(|e| TestnetHelperError::new(e.to_string()))?
+        .to_xdr_base64(Limits::none())
+        .map_err(|e| TestnetHelperError::new(format!("envelope XDR encode: {e}")))?;
+
+    let signed_xdr = sign_envelope(
+        unsigned_xdr,
+        Zeroizing::new(**source_seed),
+        network_passphrase,
+    )
+    .await?;
+    let submission = submit_signed_xdr(signed_xdr).await?;
+
+    Ok(SourceAccountInvocation {
+        return_value: result.xdr,
+        submission,
+        transaction_data,
+    })
 }
 
 /// Bound on existence-check polls per confirm-wait round in

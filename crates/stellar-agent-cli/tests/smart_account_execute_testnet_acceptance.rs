@@ -134,12 +134,9 @@ fn fresh_keypair() -> (String, Zeroizing<[u8; 32]>, [u8; 32]) {
 
 /// Encodes a 32-byte seed as an S-strkey.
 fn s_strkey_from_seed(seed: &[u8; 32]) -> String {
-    stellar_strkey::ed25519::PrivateKey::from_payload(seed)
-        .expect("32-byte seed encodes as S-strkey")
-        .as_unredacted()
-        .to_string()
-        .as_str()
-        .to_owned()
+    let secret = stellar_strkey::ed25519::PrivateKey::from_payload(seed)
+        .expect("32-byte seed encodes as S-strkey");
+    format!("{}", secret.as_unredacted())
 }
 
 async fn fund_via_friendbot(g_strkey: &str) {

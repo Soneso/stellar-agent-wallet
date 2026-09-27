@@ -135,6 +135,10 @@ required-features = ["testnet-integration"]
 name = "smart_account_ergonomics_testnet_acceptance"
 required-features = ["testnet-integration"]
 
+[[test]]
+name = "cap85_external_ref_testnet_acceptance"
+required-features = ["testnet-integration"]
+
 [dependencies]
 bon = { workspace = true }
 stellar-accounts = { workspace = true }
@@ -215,6 +219,16 @@ stellar-agent-mcp = { path = "../stellar-agent-mcp", features = ["test-helpers"]
 keyring-core = { workspace = true }
 # rmcp: inspects CallToolResult from the MCP-dispatch leg.
 rmcp = { workspace = true }
+# CAP-85 external-reference acceptance suite: the SEP-48 spec fetch, the DeFi
+# sign-time pin gate and the DeFindex vault pin gate run against a live
+# external-reference contract. Path-only dev-only back-edges (defindex depends
+# on this crate normally); cargo strips path-only dev-dependencies at publish.
+stellar-agent-sep48 = { path = "../stellar-agent-sep48" }
+stellar-agent-defi = { path = "../stellar-agent-defi" }
+stellar-agent-defindex = { path = "../stellar-agent-defindex" }
+# Offline parse of the vendored verifier specs the SEP-48 proof compares the
+# live fetch against.
+soroban-spec-tools = { workspace = true }
 
 [lints]
 workspace = true

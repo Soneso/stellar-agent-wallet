@@ -67,22 +67,18 @@
 
 mod common;
 
-use std::error::Error;
 use std::path::Path;
 use std::time::Duration;
 
-use common::{TESTNET_FRIENDBOT_URL, TESTNET_PASSPHRASE, TESTNET_RPC_URL, fund_via_friendbot};
+use common::{
+    TESTNET_FRIENDBOT_URL, TESTNET_PASSPHRASE, TESTNET_RPC_URL, XLM_SAC_TESTNET,
+    build_sac_transfer_invoke, fetch_testnet_sequence, fund_via_friendbot, sign_testnet_envelope,
+    submit_testnet_signed_xdr, transfer_host_function, xlm_stroops_balance,
+};
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
-use stellar_agent_core::StellarAmount;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
-use stellar_agent_network::submit::{
-    SubmissionResult, SubmissionSignerKind, submit_transaction_and_wait,
-};
-use stellar_agent_network::{
-    Signer, SoftwareSigningKey, StellarRpcClient, fetch_account,
-    signing::envelope_signing::attach_signature,
-};
+use stellar_agent_network::{Signer, SoftwareSigningKey, StellarRpcClient, fetch_account};
 use stellar_agent_smart_account::deployment::{
     DeployerKeypair, DeploymentArgs, Ed25519VerifierDeployArgs,
     ResolvedFeePerOp as DeployResolvedFeePerOp, SpendingLimitPolicyDeployArgs,
@@ -106,22 +102,15 @@ use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilde
 use stellar_rpc_client::Client;
 use stellar_xdr::{
     ContractExecutable, ContractIdPreimage, ContractIdPreimageFromAddress, CreateContractArgsV2,
-    Hash, HostFunction, Int128Parts, InvokeContractArgs, InvokeHostFunctionOp, Operation,
-    OperationBody, ScAddress, ScString, ScSymbol, ScVal, SorobanAuthorizedFunction,
-    SorobanCredentials, StringM, Uint256, VecM,
+    Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp, Operation, OperationBody,
+    ScString, ScSymbol, ScVal, SorobanAuthorizedFunction, SorobanCredentials, StringM, Uint256,
+    VecM,
 };
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 const CHAIN_ID: &str = "stellar:testnet";
 const TIMEOUT_SECS: u64 = 120;
-
-/// Known-answer XLM SAC on testnet (SEP-41 native-asset contract).
-///
-/// Source: `soroswap-core/public/tokens.json:testnet:assets[0]:contract`;
-/// independently verified via `stellar contract id asset --asset native
-/// --network testnet`. Also a known-answer test in `stellar-agent-dex/src/sac.rs`.
-const XLM_SAC_TESTNET: &str = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
 
 /// Spending limit installed on the CallContract rule (5 XLM, in stroops).
 const SPENDING_LIMIT_STROOPS: i128 = 50_000_000;
@@ -263,115 +252,6 @@ async fn deploy_verifier_and_policy(registry_path: &Path) -> (String, String) {
         verifier_result.verifier_address,
         policy_result.policy_address,
     )
-}
-
-/// Builds the SEP-41 `transfer(from, to, amount)` `HostFunction::InvokeContract`
-/// invocation for a SAC — the ONLY shape the OZ spending-limit policy's
-/// `enforce` accepts (`spending_limit.rs:222-292`, SHA `a9c4216`).
-fn transfer_host_function(
-    sac: ScAddress,
-    from: ScAddress,
-    to: ScAddress,
-    amount: i128,
-) -> HostFunction {
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "canonical i128 -> Int128Parts split: hi = high 64 bits, lo = low 64 bits"
-    )]
-    let amount_parts = Int128Parts {
-        hi: (amount >> 64) as i64,
-        lo: amount as u64,
-    };
-    let args: VecM<ScVal> = vec![
-        ScVal::Address(from),
-        ScVal::Address(to),
-        ScVal::I128(amount_parts),
-    ]
-    .try_into()
-    .expect("3-element transfer args vec fits VecM<ScVal>");
-    let function_name =
-        ScSymbol::try_from("transfer").expect("\"transfer\" fits ScSymbol (<=32 bytes)");
-    HostFunction::InvokeContract(InvokeContractArgs {
-        contract_address: sac,
-        function_name,
-        args,
-    })
-}
-
-/// Builds the `InvokeContractArgs` for [`fund_sac_balance`]'s SAC-transfer
-/// callback — plain structural strkey parsing, no network access.
-#[allow(
-    clippy::result_large_err,
-    reason = "SaError is the crate's production error type; this test-only builder \
-              surfaces it unchanged rather than introducing a narrower local error type"
-)]
-fn build_sac_transfer_invoke(
-    sac_contract: &str,
-    from: &str,
-    to: &str,
-    amount: i128,
-) -> Result<InvokeContractArgs, SaError> {
-    let contract_address = parse_c_strkey_to_smart_account(sac_contract)?;
-    let from_sc = parse_g_strkey_to_signer_address(from)?;
-    let to_sc = parse_c_strkey_to_smart_account(to)?;
-    let HostFunction::InvokeContract(invoke_args) =
-        transfer_host_function(contract_address, from_sc, to_sc, amount)
-    else {
-        unreachable!("transfer_host_function always returns InvokeContract");
-    };
-    Ok(invoke_args)
-}
-
-/// Fetches an account's current sequence number via the testnet RPC.
-async fn fetch_testnet_sequence(account_id: String) -> Result<i64, Box<dyn Error + Send + Sync>> {
-    let rpc_client = StellarRpcClient::new(TESTNET_RPC_URL)?;
-    let account = fetch_account(&rpc_client, &account_id, &[]).await?;
-    Ok(account.sequence_number)
-}
-
-/// Signs an unsigned envelope XDR with a raw ed25519 seed.
-async fn sign_testnet_envelope(
-    unsigned_xdr: String,
-    funder_seed: Zeroizing<[u8; 32]>,
-    network_passphrase: String,
-) -> Result<String, Box<dyn Error + Send + Sync>> {
-    let signer = SoftwareSigningKey::new_from_zeroizing(funder_seed);
-    Ok(attach_signature(&unsigned_xdr, &signer, &network_passphrase).await?)
-}
-
-/// Submits a signed envelope XDR and waits for confirmation.
-async fn submit_testnet_signed_xdr(
-    signed_xdr: String,
-) -> Result<SubmissionResult, Box<dyn Error + Send + Sync>> {
-    let rpc_client = StellarRpcClient::new(TESTNET_RPC_URL)?;
-    Ok(submit_transaction_and_wait(
-        &rpc_client,
-        &signed_xdr,
-        Duration::from_secs(TIMEOUT_SECS),
-        TESTNET_PASSPHRASE,
-        Some(SubmissionSignerKind::Software),
-        None,
-    )
-    .await?)
-}
-
-/// Returns the classic native (XLM) balance of `g_strkey`, in exact stroops.
-///
-/// Reads the ledger-derived `AccountView.balances` (not Horizon); native SAC
-/// balance for a G-account IS the classic XLM balance.
-async fn xlm_stroops_balance(g_strkey: &str) -> i64 {
-    let rpc_client = StellarRpcClient::new(TESTNET_RPC_URL).expect("testnet RPC URL must be valid");
-    let account = fetch_account(&rpc_client, g_strkey, &[])
-        .await
-        .expect("fetch_account must succeed");
-    let native = account
-        .balances
-        .iter()
-        .find(|b| b.asset.asset_type == "native")
-        .expect("account must have a native balance entry");
-    StellarAmount::parse_with_unit(&format!("{} XLM", native.balance))
-        .expect("native balance decimal string must parse as a StellarAmount")
-        .as_stroops()
 }
 
 /// Full bounded-agent-delegation flow: deploy substrate, scope an agent
