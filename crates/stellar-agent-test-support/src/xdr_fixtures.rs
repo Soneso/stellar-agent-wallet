@@ -28,6 +28,8 @@
 //! - [`executable_tag_ledger_entries_json`] — the owner's persistent
 //!   `ScVal::ExecutableTag` entry holding a 32-byte Wasm hash;
 //!   [`executable_tag_ledger_entries_json_with_value`] takes any value.
+//! - [`contract_code_ledger_entries_json`]: a `ContractCode` entry holding
+//!   given bytes under a given code hash key.
 //! - [`ledger_entry_from_response_json`] — extracts the single entry object
 //!   from one of the response bodies above, for a keyed responder.
 //!
@@ -405,6 +407,54 @@ pub fn executable_tag_ledger_entries_json_with_value(
         key: ScVal::ExecutableTag(sc_string(tag)),
         durability: ContractDataDurability::Persistent,
         val: value,
+    });
+
+    single_entry_response_json(&key, &entry_data)
+}
+
+/// Builds a JSON-RPC `getLedgerEntries` response body containing a single
+/// `ContractCode` entry holding `code`, under the key
+/// `LedgerKey::ContractCode { hash: key_hash }`.
+///
+/// The entry's own `hash` field is `key_hash` too. A caller passes the
+/// SHA-256 of `code` for a well-formed entry, or any other hash for an entry
+/// whose bytes do not match its key.
+///
+/// # Panics
+///
+/// Panics if XDR encoding fails.
+#[must_use]
+pub fn contract_code_ledger_entries_json(key_hash: [u8; 32], code: &[u8]) -> String {
+    use stellar_xdr::{
+        ContractCodeCostInputs, ContractCodeEntry, ContractCodeEntryExt, ContractCodeEntryV1,
+        ExtensionPoint, Hash, LedgerEntryData, LedgerKey, LedgerKeyContractCode,
+    };
+
+    let key = LedgerKey::ContractCode(LedgerKeyContractCode {
+        hash: Hash(key_hash),
+    });
+    let entry_data = LedgerEntryData::ContractCode(ContractCodeEntry {
+        ext: ContractCodeEntryExt::V1(ContractCodeEntryV1 {
+            ext: ExtensionPoint::V0,
+            cost_inputs: ContractCodeCostInputs {
+                ext: ExtensionPoint::V0,
+                n_instructions: 0,
+                n_functions: 0,
+                n_globals: 0,
+                n_table_entries: 0,
+                n_types: 0,
+                n_data_segments: 0,
+                n_elem_segments: 0,
+                n_imports: 0,
+                n_exports: 0,
+                n_data_segment_bytes: 0,
+            },
+        }),
+        hash: Hash(key_hash),
+        code: code
+            .to_vec()
+            .try_into()
+            .unwrap_or_else(|_| panic!("code exceeds the BytesM length bound")),
     });
 
     single_entry_response_json(&key, &entry_data)

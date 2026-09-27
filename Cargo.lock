@@ -4955,6 +4955,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "wiremock",
  "zeroize",
 ]
 

@@ -1,20 +1,26 @@
-//! Contract WASM fetch and SEP-48 spec-section parse.
+//! Contract Wasm fetch and SEP-48 spec-section parse.
 //!
 //! # Overview
 //!
-//! This module fetches a contract's WASM bytes from the Stellar RPC layer and
-//! parses the embedded `contractspecv0` custom section into a
-//! [`soroban_spec_tools::Spec`] value. The parsed entries are cached in memory
-//! (per-contract-id) so repeated calls for the same contract do not re-fetch
-//! from the network.
+//! This module resolves the Wasm a contract currently runs, fetches the Wasm
+//! bytes from the Stellar RPC layer and parses the embedded `contractspecv0`
+//! custom section into a [`soroban_spec_tools::Spec`] value. Parsed entries are
+//! cached in memory per Wasm hash.
 //!
 //! # Fetch path
 //!
-//! 1. Look up `LedgerKey::ContractData { key: ScVal::LedgerKeyContractInstance }` for
-//!    the contract address via `getLedgerEntries` to obtain the WASM hash.
-//! 2. Look up `LedgerKey::ContractCode { hash }` to obtain the raw WASM bytes.
-//! 3. Parse via `soroban_spec_tools::Spec::from_wasm` (wraps `soroban_spec::read::from_wasm`
-//!    which reads the `contractspecv0` custom section).
+//! 1. Resolve the contract's executable through
+//!    [`stellar_agent_network::fetch_contract_wasm_hash`]: one
+//!    `getLedgerEntries` for the contract instance, and one more for the
+//!    owner's executable-tag entry when the executable is a CAP-85 external
+//!    reference. The result is the 32-byte hash of the Wasm the contract runs
+//!    now.
+//! 2. On a cache miss for that hash, look up `LedgerKey::ContractCode { hash }`
+//!    to obtain the Wasm bytes, keep only the entry returned under that key,
+//!    and verify that the bytes hash to it.
+//! 3. Parse via `soroban_spec_tools::Spec::from_wasm` (wraps
+//!    `soroban_spec::read::from_wasm`, which reads the `contractspecv0` custom
+//!    section).
 //!
 //! # SEP-48 specification
 //!
@@ -24,46 +30,51 @@
 //!
 //! # Cache semantics
 //!
-//! `SPEC_CACHE` stores the parsed `Vec<ScSpecEntry>` keyed on the contract
-//! C-strkey — it is SEP-48 spec-path only. The SEP-47 discovery path
-//! ([`crate::discovery`]) fetches WASM bytes independently via
-//! `fetch_wasm_bytes`; it does NOT share this cache (which stores parsed
-//! spec entries, not raw WASM bytes). Upstream contract specs are treated as
-//! trusted: the typed preview is a non-authoritative display and does not
-//! validate spec semantics beyond the bounded XDR parse.
+//! `SPEC_CACHE` stores the parsed `Vec<ScSpecEntry>` keyed on the lowercase hex
+//! of the Wasm hash. The code behind a contract can change while the process
+//! runs (an owner repointing an executable tag, or a contract upgrading its own
+//! Wasm), so every call resolves the instance first and only the parsed spec
+//! per hash is cached. Contracts running the same code share one entry and one
+//! code fetch. A code fetch whose bytes do not hash to the requested key is
+//! refused and nothing is cached. The SEP-47 discovery path
+//! ([`crate::discovery`]) resolves and fetches through the same two steps but
+//! parses a different section and does not read this cache.
+//!
+//! Upstream contract specs are treated as trusted: the typed preview is a
+//! non-authoritative display and does not validate spec semantics beyond the
+//! bounded XDR parse.
 //!
 //! # KMP reference
 //!
 //! KMP Stellar SDK `SorobanContractParser.kt`: `parseContractSpec` reads
-//! `contractspecv0` and iterates `SCSpecEntryXdr` — same section name and parse
-//! loop this module delegates to `soroban_spec_tools`.
+//! `contractspecv0` and iterates `SCSpecEntryXdr`, the same section name and
+//! parse loop this module delegates to `soroban_spec_tools`.
 
 use std::{collections::HashMap, sync::Mutex};
 
-use stellar_agent_network::redact_rpc_error;
-use stellar_agent_xdr_limits::untrusted_decode_limits;
-use stellar_xdr::{
-    ContractDataDurability, ContractExecutable, ContractId, Hash, LedgerEntryData, LedgerKey,
-    LedgerKeyContractCode, LedgerKeyContractData, ReadXdr, ScAddress, ScContractInstance, ScVal,
+use sha2::{Digest, Sha256};
+use stellar_agent_network::{
+    FetchContractWasmHashError, StellarRpcClient, WasmHashFetch, fetch_contract_wasm_hash,
+    redact_rpc_error,
 };
+use stellar_agent_xdr_limits::untrusted_decode_limits;
+use stellar_xdr::{Hash, LedgerEntryData, LedgerKey, LedgerKeyContractCode, ReadXdr};
 
 use soroban_spec_tools::Spec;
 
 use crate::error::Sep48Error;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// In-process spec cache (fetch-once-per-contract per process lifetime)
+// In-process spec cache (one parsed spec per Wasm hash per process lifetime)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// In-process cache of parsed [`Spec`] entries, keyed on the contract C-strkey.
+/// In-process cache of parsed [`Spec`] entries, keyed on the lowercase hex of
+/// the Wasm hash.
 ///
-/// The cache is process-global but lock-protected. Each entry maps a contract
-/// address string to the parsed `Vec<ScSpecEntry>` so we pay the RPC cost once
-/// per contract-id per process lifetime.
-///
-/// Upstream contract specs are treated as trusted: the typed preview is
-/// non-authoritative and does not validate spec semantics beyond the bounded
-/// XDR parse. The cache persists for the lifetime of the process with no TTL.
+/// The cache is process-global but lock-protected. A Wasm hash names immutable
+/// code, so an entry never goes stale; which hash a contract runs is resolved
+/// on every call and is never cached. The cache persists for the lifetime of
+/// the process with no TTL.
 static SPEC_CACHE: Mutex<Option<HashMap<String, Vec<stellar_xdr::ScSpecEntry>>>> = Mutex::new(None);
 
 fn with_cache<F, T>(f: F) -> T
@@ -81,48 +92,14 @@ where
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LedgerKey construction helpers
+// Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Constructs the `LedgerKey::ContractData` key for a contract instance.
-///
-/// Per Soroban host semantics, the contract-instance entry lives at:
-/// `ContractData { contract: ScAddress::Contract(id), key: ScVal::LedgerKeyContractInstance,
-///  durability: Persistent }`.
-///
-/// # Errors
-///
-/// Returns [`Sep48Error::InvalidContractAddress`] when `contract_strkey` is not
-/// a valid C-strkey.
-fn contract_instance_ledger_key(contract_strkey: &str) -> Result<LedgerKey, Sep48Error> {
-    let contract_id = parse_contract_id(contract_strkey)?;
-    Ok(LedgerKey::ContractData(LedgerKeyContractData {
-        contract: ScAddress::Contract(contract_id),
-        key: ScVal::LedgerKeyContractInstance,
-        durability: ContractDataDurability::Persistent,
-    }))
-}
-
-/// Constructs the `LedgerKey::ContractCode` key for a WASM hash.
+/// Constructs the `LedgerKey::ContractCode` key for a Wasm hash.
 fn contract_code_ledger_key(wasm_hash: &[u8; 32]) -> LedgerKey {
     LedgerKey::ContractCode(LedgerKeyContractCode {
         hash: Hash(*wasm_hash),
     })
-}
-
-/// Parses a C-strkey string into a [`ContractId`].
-///
-/// # Errors
-///
-/// Returns [`Sep48Error::InvalidContractAddress`] if the string is not a valid
-/// C-strkey.
-fn parse_contract_id(contract_strkey: &str) -> Result<ContractId, Sep48Error> {
-    stellar_strkey::Contract::from_string(contract_strkey)
-        .map(|c| ContractId(Hash(c.0)))
-        .map_err(|_| {
-            let redacted = redact_strkey(contract_strkey);
-            Sep48Error::InvalidContractAddress { addr: redacted }
-        })
 }
 
 /// Applies first-5-last-5 redaction to a strkey for use in error messages.
@@ -136,38 +113,73 @@ fn redact_strkey(s: &str) -> String {
     format!("{}...{}", &s[..5], &s[s.len() - 5..])
 }
 
+/// Returns the lowercase hex of `bytes`.
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Returns the lowercase hex of the first 8 bytes of a Wasm hash, the form
+/// used in refusal reasons.
+fn hash_first8(hash: &[u8; 32]) -> String {
+    hex_lower(&hash[..8])
+}
+
+/// Builds the RPC client for `rpc_url`.
+///
+/// # Errors
+///
+/// Returns [`Sep48Error::RpcFetchFailure`] when the URL is rejected; the
+/// reason passes through [`redact_rpc_error`].
+pub(crate) fn rpc_client(rpc_url: &str) -> Result<StellarRpcClient, Sep48Error> {
+    StellarRpcClient::new(rpc_url).map_err(|e| Sep48Error::RpcFetchFailure {
+        reason: redact_rpc_error(&format!("RPC client construction failed: {e}")),
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Public API: fetch_contract_spec
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Fetches the SEP-48 contract spec for the given contract address.
 ///
-/// The spec is fetched from the Stellar RPC layer and cached in memory for the
-/// lifetime of the process (fetch-once-per-contract per process).
+/// Every call resolves the Wasm the contract runs now; the parsed spec is
+/// cached per Wasm hash for the lifetime of the process, so a contract whose
+/// code changes (an upgrade, or an external reference whose owner repoints its
+/// tag) returns the spec of its current code.
 ///
 /// # Fetch path
 ///
-/// 1. Resolve the contract instance entry via `getLedgerEntries` to obtain the
-///    WASM hash (`ContractExecutable::Wasm`).
-/// 2. Fetch the WASM bytes via a second `getLedgerEntries` call on
-///    `LedgerKey::ContractCode`.
+/// 1. Resolve the Wasm hash the contract runs now through
+///    [`stellar_agent_network::fetch_contract_wasm_hash`] against this one
+///    endpoint: one `getLedgerEntries`, or two for an external reference,
+///    which resolves through its owner's executable-tag entry.
+/// 2. On a cache miss, fetch the Wasm bytes for that hash with one more
+///    `getLedgerEntries` on `LedgerKey::ContractCode` and verify them against
+///    the hash.
 /// 3. Parse via `soroban_spec_tools::Spec::from_wasm`, which reads the
-///    `contractspecv0` WASM custom section.
+///    `contractspecv0` Wasm custom section.
 ///
 /// # Errors
 ///
-/// - [`Sep48Error::InvalidContractAddress`] — invalid C-strkey.
-/// - [`Sep48Error::RpcFetchFailure`] — `getLedgerEntries` call failed.
-/// - [`Sep48Error::WasmParseFailure`] — WASM bytes present but spec parse failed.
-/// - [`Sep48Error::SpecSectionMissing`] — no `contractspecv0` section in WASM.
+/// - [`Sep48Error::InvalidContractAddress`]: invalid C-strkey.
+/// - [`Sep48Error::RpcFetchFailure`]: a `getLedgerEntries` call failed, the
+///   contract has no Wasm to read (absent, a Stellar Asset Contract, or an
+///   external reference with no live tag entry), or the code entry is missing
+///   or does not match its hash.
+/// - [`Sep48Error::WasmParseFailure`]: Wasm bytes present but spec parse failed.
+/// - [`Sep48Error::SpecSectionMissing`]: no `contractspecv0` section in the Wasm.
 pub async fn fetch_contract_spec(
     rpc_url: &str,
     contract_strkey: &str,
 ) -> Result<Vec<stellar_xdr::ScSpecEntry>, Sep48Error> {
-    // Fast path: cache hit.
-    if let Some(entries) = with_cache(|c| c.get(contract_strkey).cloned()) {
+    let client = rpc_client(rpc_url)?;
+    let wasm_hash = resolve_wasm_hash(&client, contract_strkey).await?;
+    let cache_key = hex_lower(&wasm_hash);
+
+    if let Some(entries) = with_cache(|c| c.get(&cache_key).cloned()) {
         tracing::debug!(
             contract = %redact_strkey(contract_strkey),
+            wasm_hash = %hash_first8(&wasm_hash),
             "sep48: spec cache hit"
         );
         return Ok(entries);
@@ -175,10 +187,11 @@ pub async fn fetch_contract_spec(
 
     tracing::debug!(
         contract = %redact_strkey(contract_strkey),
-        "sep48: fetching contract spec from RPC"
+        wasm_hash = %hash_first8(&wasm_hash),
+        "sep48: fetching contract code from RPC"
     );
 
-    let wasm_bytes = fetch_wasm_bytes(rpc_url, contract_strkey).await?;
+    let wasm_bytes = fetch_wasm_bytes_by_hash(&client, &wasm_hash).await?;
 
     let entries = Spec::from_wasm(&wasm_bytes)
         .map(|spec| spec.0.unwrap_or_default())
@@ -195,206 +208,168 @@ pub async fn fetch_contract_spec(
         return Err(Sep48Error::SpecSectionMissing);
     }
 
-    // Populate cache.
-    with_cache(|c| c.insert(contract_strkey.to_owned(), entries.clone()));
+    with_cache(|c| c.insert(cache_key, entries.clone()));
 
     Ok(entries)
 }
 
-/// Fetches the raw WASM bytes for a contract address via two `getLedgerEntries`
-/// calls: one for the instance (to get the WASM hash) and one for the code entry.
+/// Resolves the 32-byte hash of the Wasm `contract_strkey` runs now.
 ///
-/// Exposed as `pub(crate)` so [`crate::discovery`] can reuse it for SEP-47
-/// claim-discovery without re-fetching the WASM via a second RPC path.
-///
-/// # Errors
-///
-/// - [`Sep48Error::InvalidContractAddress`] — invalid C-strkey.
-/// - [`Sep48Error::RpcFetchFailure`] — either `getLedgerEntries` call failed or
-///   the entries were not found / had unexpected shapes.
-pub(crate) async fn fetch_wasm_bytes(
-    rpc_url: &str,
-    contract_strkey: &str,
-) -> Result<Vec<u8>, Sep48Error> {
-    use stellar_agent_network::StellarRpcClient;
-
-    let client = StellarRpcClient::new(rpc_url).map_err(|e| Sep48Error::RpcFetchFailure {
-        // redact_rpc_error strips the full RPC URL from display strings.
-        reason: redact_rpc_error(&format!("RPC client construction failed: {e}")),
-    })?;
-
-    // ── Step 1: fetch contract instance to get WASM hash ─────────────────────
-    let instance_key = contract_instance_ledger_key(contract_strkey)?;
-    let instance_resp = client
-        .get_ledger_entries(&[instance_key])
-        .await
-        .map_err(|e| Sep48Error::RpcFetchFailure {
-            reason: redact_rpc_error(&format!("getLedgerEntries(instance) failed: {e}")),
-        })?;
-
-    let wasm_hash = extract_wasm_hash_from_instance_response(&instance_resp, contract_strkey)?;
-
-    // ── Step 2: fetch contract code (WASM bytes) ──────────────────────────────
-    let code_key = contract_code_ledger_key(&wasm_hash);
-    let code_resp =
-        client
-            .get_ledger_entries(&[code_key])
-            .await
-            .map_err(|e| Sep48Error::RpcFetchFailure {
-                reason: redact_rpc_error(&format!("getLedgerEntries(code) failed: {e}")),
-            })?;
-
-    extract_wasm_bytes_from_code_response(&code_resp, contract_strkey)
-}
-
-/// Extracts the WASM hash from a `getLedgerEntries` response for a contract
-/// instance entry.
-///
-/// Uses `stellar_rpc_client::GetLedgerEntriesResponse` (re-exported from
-/// `stellar-agent-network`) whose `LedgerEntryResult.xdr` is a public field,
-/// unlike `soroban_client::LedgerEntryResult` whose field is private.
+/// Delegates to [`fetch_contract_wasm_hash`] with no secondary endpoint: the
+/// typed preview and the SEP-47 discovery result are non-authoritative
+/// displays, so one endpoint is consulted. The profile may carry a secondary
+/// endpoint; it is not used here. An external reference resolves through its
+/// owner's executable-tag entry at the same endpoint.
 ///
 /// # Errors
 ///
-/// Returns [`Sep48Error::RpcFetchFailure`] when the response has no entries,
-/// the entry is not a contract instance, the executable is a native
-/// (`StellarAsset`) rather than a WASM contract, or the executable is an
-/// owner-managed external reference (the owner chooses, and can change, the
-/// Wasm that runs, so no spec read now describes it).
-fn extract_wasm_hash_from_instance_response(
-    resp: &stellar_agent_network::GetLedgerEntriesResponse,
+/// - [`Sep48Error::InvalidContractAddress`]: invalid C-strkey.
+/// - [`Sep48Error::RpcFetchFailure`]: the contract is absent, is a Stellar
+///   Asset Contract, or is an external reference with no live tag entry; or
+///   the fetch failed, in which case the reason is the fetch error passed
+///   through [`redact_rpc_error`].
+pub(crate) async fn resolve_wasm_hash(
+    client: &StellarRpcClient,
     contract_strkey: &str,
 ) -> Result<[u8; 32], Sep48Error> {
-    let entries = resp
-        .entries
-        .as_deref()
-        .ok_or_else(|| Sep48Error::RpcFetchFailure {
+    match fetch_contract_wasm_hash(client, None, contract_strkey).await {
+        Ok(WasmHashFetch::Wasm(hash)) => Ok(hash),
+        Ok(WasmHashFetch::ExternalRef(external)) => match external.resolved {
+            Some(hash) => {
+                tracing::debug!(
+                    contract = %redact_strkey(contract_strkey),
+                    owner = %external.owner_redacted(),
+                    tag = %external.tag_display(),
+                    "sep48: external-reference executable resolved through the owner's tag entry"
+                );
+                Ok(hash)
+            }
+            None => Err(Sep48Error::RpcFetchFailure {
+                reason: format!(
+                    "contract {} executable is an external reference managed by {} under \
+                     tag \"{}\" with no live tag entry",
+                    redact_strkey(contract_strkey),
+                    external.owner_redacted(),
+                    external.tag_display(),
+                ),
+            }),
+        },
+        Ok(WasmHashFetch::Sac) => Err(Sep48Error::RpcFetchFailure {
+            reason: format!(
+                "contract {} is a Stellar Asset Contract (SAC), not a Wasm contract",
+                redact_strkey(contract_strkey)
+            ),
+        }),
+        Ok(WasmHashFetch::Absent) => Err(Sep48Error::RpcFetchFailure {
             reason: format!(
                 "no instance ledger entry for contract {}",
                 redact_strkey(contract_strkey)
             ),
-        })?;
-
-    let entry = entries.first().ok_or_else(|| Sep48Error::RpcFetchFailure {
-        reason: format!(
-            "empty instance ledger entries for contract {}",
-            redact_strkey(contract_strkey)
-        ),
-    })?;
-
-    // `LedgerEntryResult.xdr` is a base64-encoded `LedgerEntryData`. The XDR
-    // originates from the network (untrusted source); bounded depth+len limits
-    // guard against stack exhaustion and oversized allocations.
-    let entry_data = parse_ledger_entry_xdr(&entry.xdr, contract_strkey)?;
-
-    match entry_data {
-        LedgerEntryData::ContractData(cd) => match &cd.val {
-            ScVal::ContractInstance(ScContractInstance {
-                executable: ContractExecutable::Wasm(Hash(bytes)),
-                ..
-            }) => Ok(*bytes),
-            ScVal::ContractInstance(ScContractInstance {
-                executable: ContractExecutable::StellarAsset,
-                ..
-            }) => Err(Sep48Error::RpcFetchFailure {
-                reason: format!(
-                    "contract {} is a Stellar Asset Contract (SAC), not a Wasm contract",
-                    redact_strkey(contract_strkey)
-                ),
-            }),
-            ScVal::ContractInstance(ScContractInstance {
-                executable: ContractExecutable::ExternalRef(external),
-                ..
-            }) => {
-                let external = stellar_agent_network::ExternalRefExecutable::from_xdr(external);
-                Err(Sep48Error::RpcFetchFailure {
-                    reason: format!(
-                        "contract {} executable is an external reference managed by {} under \
-                         tag \"{}\"; its code is owner-managed and has no fixed Wasm spec",
-                        redact_strkey(contract_strkey),
-                        external.owner_redacted(),
-                        external.tag_display(),
-                    ),
-                })
-            }
-            _ => Err(Sep48Error::RpcFetchFailure {
-                reason: format!(
-                    "unexpected ContractData val shape for contract {}",
-                    redact_strkey(contract_strkey)
-                ),
-            }),
-        },
-        _ => Err(Sep48Error::RpcFetchFailure {
+        }),
+        Ok(_) => Err(Sep48Error::RpcFetchFailure {
             reason: format!(
-                "unexpected ledger entry type (not ContractData) for contract {}",
+                "contract {} executable is not a Wasm executable this path reads",
                 redact_strkey(contract_strkey)
             ),
+        }),
+        Err(FetchContractWasmHashError::InvalidAddress { .. }) => {
+            Err(Sep48Error::InvalidContractAddress {
+                addr: redact_strkey(contract_strkey),
+            })
+        }
+        Err(e) => Err(Sep48Error::RpcFetchFailure {
+            reason: redact_rpc_error(&e.to_string()),
         }),
     }
 }
 
-/// Extracts the raw WASM bytes from a `getLedgerEntries` response for a
-/// `ContractCode` entry.
+/// Fetches the Wasm bytes stored under `LedgerKey::ContractCode { hash }`.
+///
+/// Only the returned entry whose own key is the requested key is read, and
+/// its bytes must hash to `wasm_hash`.
 ///
 /// # Errors
 ///
-/// Returns [`Sep48Error::RpcFetchFailure`] when the response has no entries or
-/// the entry has an unexpected shape.
+/// Returns [`Sep48Error::RpcFetchFailure`] when the `getLedgerEntries` call
+/// fails (reason through [`redact_rpc_error`]) or the response fails
+/// [`extract_wasm_bytes_from_code_response`].
+pub(crate) async fn fetch_wasm_bytes_by_hash(
+    client: &StellarRpcClient,
+    wasm_hash: &[u8; 32],
+) -> Result<Vec<u8>, Sep48Error> {
+    let code_key = contract_code_ledger_key(wasm_hash);
+    let code_resp = client
+        .get_ledger_entries(std::slice::from_ref(&code_key))
+        .await
+        .map_err(|e| Sep48Error::RpcFetchFailure {
+            reason: redact_rpc_error(&format!("getLedgerEntries(code) failed: {e}")),
+        })?;
+
+    extract_wasm_bytes_from_code_response(&code_resp, &code_key, wasm_hash)
+}
+
+/// Extracts the Wasm bytes of the `ContractCode` entry returned under
+/// `code_key` and verifies that they hash to `wasm_hash`.
+///
+/// Returned keys and entry data come from the network and decode under
+/// [`untrusted_decode_limits`]. Entries under any other key are ignored.
+///
+/// # Errors
+///
+/// Returns [`Sep48Error::RpcFetchFailure`] when a returned key does not
+/// decode, no entry is returned under `code_key`, that entry does not decode
+/// or is not a `ContractCode` entry, or its bytes do not hash to `wasm_hash`.
 fn extract_wasm_bytes_from_code_response(
     resp: &stellar_agent_network::GetLedgerEntriesResponse,
-    contract_strkey: &str,
+    code_key: &LedgerKey,
+    wasm_hash: &[u8; 32],
 ) -> Result<Vec<u8>, Sep48Error> {
-    let entries = resp
-        .entries
-        .as_deref()
-        .ok_or_else(|| Sep48Error::RpcFetchFailure {
-            reason: format!(
-                "no code ledger entry for contract {}",
-                redact_strkey(contract_strkey)
-            ),
-        })?;
+    let hash_display = hash_first8(wasm_hash);
+    let mut matched = None;
+    for entry in resp.entries.as_deref().unwrap_or_default() {
+        let entry_key =
+            LedgerKey::from_xdr_base64(&entry.key, untrusted_decode_limits(entry.key.len()))
+                .map_err(|_| Sep48Error::RpcFetchFailure {
+                    reason: format!(
+                        "code ledger entry key does not decode (requested Wasm hash {hash_display})"
+                    ),
+                })?;
+        if &entry_key == code_key {
+            matched = Some(entry);
+            break;
+        }
+    }
 
-    let entry = entries.first().ok_or_else(|| Sep48Error::RpcFetchFailure {
-        reason: format!(
-            "empty code ledger entries for contract {}",
-            redact_strkey(contract_strkey)
-        ),
+    let entry = matched.ok_or_else(|| Sep48Error::RpcFetchFailure {
+        reason: format!("no code ledger entry for Wasm hash {hash_display}"),
     })?;
 
-    let entry_data = parse_ledger_entry_xdr(&entry.xdr, contract_strkey)?;
+    let entry_data =
+        LedgerEntryData::from_xdr_base64(&entry.xdr, untrusted_decode_limits(entry.xdr.len()))
+            .map_err(|e| Sep48Error::RpcFetchFailure {
+                reason: format!("malformed LedgerEntryData XDR for Wasm hash {hash_display}: {e}"),
+            })?;
 
-    match entry_data {
-        LedgerEntryData::ContractCode(cc) => Ok(cc.code.into_vec()),
-        _ => Err(Sep48Error::RpcFetchFailure {
+    let LedgerEntryData::ContractCode(cc) = entry_data else {
+        return Err(Sep48Error::RpcFetchFailure {
             reason: format!(
-                "unexpected ledger entry type (not ContractCode) for contract {}",
-                redact_strkey(contract_strkey)
+                "unexpected ledger entry type (not ContractCode) for Wasm hash {hash_display}"
             ),
-        }),
-    }
-}
+        });
+    };
 
-/// Parses a base64-encoded XDR `LedgerEntryData` string.
-///
-/// The XDR originates from the RPC network layer (untrusted on-chain source);
-/// bounded depth and length limits prevent stack exhaustion and oversized
-/// allocations. Passing the base64 string length is safe: the decoded byte
-/// count is strictly smaller, so valid input is never rejected.
-///
-/// # Errors
-///
-/// Returns [`Sep48Error::RpcFetchFailure`] when the XDR parse fails.
-fn parse_ledger_entry_xdr(
-    xdr_base64: &str,
-    contract_strkey: &str,
-) -> Result<LedgerEntryData, Sep48Error> {
-    let limits = untrusted_decode_limits(xdr_base64.len());
-    LedgerEntryData::from_xdr_base64(xdr_base64, limits).map_err(|e| Sep48Error::RpcFetchFailure {
-        reason: format!(
-            "malformed LedgerEntryData XDR for contract {}: {e}",
-            redact_strkey(contract_strkey)
-        ),
-    })
+    let code = cc.code.into_vec();
+    let actual: [u8; 32] = Sha256::digest(&code).into();
+    if &actual != wasm_hash {
+        return Err(Sep48Error::RpcFetchFailure {
+            reason: format!(
+                "code hash mismatch: the code entry for Wasm hash {hash_display} hashes to {}",
+                hash_first8(&actual)
+            ),
+        });
+    }
+
+    Ok(code)
 }
 
 #[cfg(test)]
@@ -416,35 +391,34 @@ mod tests {
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     const CONTRACT: &str = "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA";
+    const WASM: &[u8] = b"\x00asm\x01\x00\x00\x00";
 
-    fn make_resp_with_entry(xdr: &str) -> GetLedgerEntriesResponse {
+    fn sha256(data: &[u8]) -> [u8; 32] {
+        Sha256::digest(data).into()
+    }
+
+    fn key_b64(key: &LedgerKey) -> String {
+        key.to_xdr_base64(Limits::none()).unwrap()
+    }
+
+    fn make_resp(entries: Option<Vec<(String, String)>>) -> GetLedgerEntriesResponse {
         GetLedgerEntriesResponse {
-            entries: Some(vec![LedgerEntryResult {
-                key: "dummy".to_owned(),
-                xdr: xdr.to_owned(),
-                last_modified_ledger: 1,
-                live_until_ledger_seq_ledger_seq: None,
-            }]),
+            entries: entries.map(|list| {
+                list.into_iter()
+                    .map(|(key, xdr)| LedgerEntryResult {
+                        key,
+                        xdr,
+                        last_modified_ledger: 1,
+                        live_until_ledger_seq_ledger_seq: None,
+                    })
+                    .collect()
+            }),
             latest_ledger: 100,
         }
     }
 
-    fn make_resp_null_entries() -> GetLedgerEntriesResponse {
-        GetLedgerEntriesResponse {
-            entries: None,
-            latest_ledger: 100,
-        }
-    }
-
-    fn make_resp_empty_entries() -> GetLedgerEntriesResponse {
-        GetLedgerEntriesResponse {
-            entries: Some(vec![]),
-            latest_ledger: 100,
-        }
-    }
-
-    fn contract_data_xdr_with_val(val: ScVal) -> String {
-        let entry = LedgerEntryData::ContractData(ContractDataEntry {
+    fn contract_data_bool_xdr() -> String {
+        LedgerEntryData::ContractData(ContractDataEntry {
             ext: ExtensionPoint::V0,
             contract: ScAddress::Contract(ContractId(Hash(
                 stellar_strkey::Contract::from_string(CONTRACT)
@@ -453,28 +427,15 @@ mod tests {
             ))),
             key: ScVal::LedgerKeyContractInstance,
             durability: ContractDataDurability::Persistent,
-            val,
-        });
-        entry.to_xdr_base64(Limits::none()).unwrap()
-    }
-
-    /// Returns a base64-XDR `LedgerEntryData::ContractCode` for use as a
-    /// "wrong type" response in the instance-step (expects ContractData).
-    fn contract_code_as_wrong_instance_type_xdr() -> String {
-        contract_code_xdr(b"\x00asm\x01\x00\x00\x00")
-    }
-
-    /// Returns a base64-XDR `LedgerEntryData::ContractData` with a Boolean val
-    /// for use as a "wrong type" response in the code-step (expects ContractCode).
-    fn contract_data_as_wrong_code_type_xdr() -> String {
-        contract_data_xdr_with_val(ScVal::Bool(false))
+            val: ScVal::Bool(false),
+        })
+        .to_xdr_base64(Limits::none())
+        .unwrap()
     }
 
     fn contract_code_xdr(code: &[u8]) -> String {
-        use sha2::{Digest, Sha256};
-        let hash = Hash(Sha256::digest(code).into());
         let code_bytes: stellar_xdr::BytesM = code.try_into().unwrap();
-        let entry = LedgerEntryData::ContractCode(ContractCodeEntry {
+        LedgerEntryData::ContractCode(ContractCodeEntry {
             ext: ContractCodeEntryExt::V1(ContractCodeEntryV1 {
                 ext: ExtensionPoint::V0,
                 cost_inputs: ContractCodeCostInputs {
@@ -491,213 +452,125 @@ mod tests {
                     n_data_segment_bytes: 0,
                 },
             }),
-            hash,
+            hash: Hash(sha256(code)),
             code: code_bytes,
-        });
-        entry.to_xdr_base64(Limits::none()).unwrap()
+        })
+        .to_xdr_base64(Limits::none())
+        .unwrap()
     }
 
-    // ── extract_wasm_hash_from_instance_response ──────────────────────────────
-
-    /// `entries: None` in the GetLedgerEntriesResponse hits the
-    /// `no instance ledger entry` error path (as_deref() → None → ok_or_else).
-    #[test]
-    fn extract_wasm_hash_null_entries_returns_no_instance_error() {
-        let resp = make_resp_null_entries();
-        let result = extract_wasm_hash_from_instance_response(&resp, CONTRACT);
-        match &result {
-            Err(Sep48Error::RpcFetchFailure { reason }) => {
-                assert!(
-                    reason.contains("no instance ledger entry"),
-                    "null entries must produce 'no instance ledger entry' reason, got: {reason}"
-                );
-            }
-            other => {
-                panic!("null entries must return RpcFetchFailure(no instance ...), got: {other:?}")
-            }
-        }
-    }
-
-    /// `entries: Some([])` hits the `empty instance ledger entries` path
-    /// (entries.first() → None → ok_or_else).
-    #[test]
-    fn extract_wasm_hash_empty_entries_returns_empty_instance_error() {
-        let resp = make_resp_empty_entries();
-        let result = extract_wasm_hash_from_instance_response(&resp, CONTRACT);
-        match &result {
-            Err(Sep48Error::RpcFetchFailure { reason }) => {
-                assert!(
-                    reason.contains("empty instance ledger entries"),
-                    "empty entries must produce 'empty instance ledger entries' reason, got: {reason}"
-                );
-            }
-            other => panic!(
-                "empty entries must return RpcFetchFailure(empty instance ...), got: {other:?}"
-            ),
-        }
-    }
-
-    /// `ContractData` entry whose `val` is neither `ContractInstance(Wasm)` nor
-    /// `ContractInstance(StellarAsset)` hits the `unexpected ContractData val shape`
-    /// catch-all arm.
-    #[test]
-    fn extract_wasm_hash_unexpected_contract_data_val_returns_error() {
-        // Use ScVal::Bool — a value that doesn't match either ContractInstance arm.
-        let xdr = contract_data_xdr_with_val(ScVal::Bool(true));
-        let resp = make_resp_with_entry(&xdr);
-        let result = extract_wasm_hash_from_instance_response(&resp, CONTRACT);
-        match &result {
-            Err(Sep48Error::RpcFetchFailure { reason }) => {
-                assert!(
-                    reason.contains("unexpected ContractData val shape"),
-                    "non-ContractInstance val must produce 'unexpected ContractData val shape' reason, got: {reason}"
-                );
-            }
-            other => panic!("unexpected val shape must return RpcFetchFailure, got: {other:?}"),
-        }
-    }
-
-    /// A `LedgerEntryData` variant that is not `ContractData` hits the
-    /// `unexpected ledger entry type (not ContractData)` catch-all arm.
-    ///
-    /// Uses a `ContractCode` entry for the instance step since it is easy to
-    /// construct and is unambiguously not `ContractData`.
-    /// A contract whose instance executable is a CAP-85 external reference is
-    /// refused with a reason naming the owner-managed executable (redacted
-    /// owner, bounded tag), not as an unexpected shape.
-    #[test]
-    fn extract_wasm_hash_external_ref_instance_names_owner_managed_executable() {
-        use stellar_agent_test_support::xdr_fixtures;
-
-        const OWNER: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
-        let entry = xdr_fixtures::ledger_entry_from_response_json(
-            &xdr_fixtures::external_ref_instance_ledger_entries_json(CONTRACT, OWNER, b"token\n"),
-        );
-        let resp = make_resp_with_entry(entry["xdr"].as_str().expect("xdr"));
-
-        let result = extract_wasm_hash_from_instance_response(&resp, CONTRACT);
-
-        let Err(Sep48Error::RpcFetchFailure { reason }) = result else {
-            panic!("expected RpcFetchFailure; got {result:?}");
-        };
-        assert_eq!(
-            reason,
-            format!(
-                "contract {} executable is an external reference managed by GAAAA...AAWHF \
-                 under tag \"token\\n\"; its code is owner-managed and has no fixed Wasm spec",
-                redact_strkey(CONTRACT)
-            )
-        );
-    }
-
-    #[test]
-    fn extract_wasm_hash_non_contract_data_entry_returns_error() {
-        let xdr = contract_code_as_wrong_instance_type_xdr();
-        let resp = make_resp_with_entry(&xdr);
-        let result = extract_wasm_hash_from_instance_response(&resp, CONTRACT);
-        match &result {
-            Err(Sep48Error::RpcFetchFailure { reason }) => {
-                assert!(
-                    reason.contains("unexpected ledger entry type (not ContractData)"),
-                    "non-ContractData entry must produce 'unexpected ledger entry type' reason, got: {reason}"
-                );
-            }
-            other => panic!("non-ContractData must return RpcFetchFailure, got: {other:?}"),
+    fn expect_reason(result: Result<Vec<u8>, Sep48Error>) -> String {
+        match result {
+            Err(Sep48Error::RpcFetchFailure { reason }) => reason,
+            other => panic!("expected RpcFetchFailure, got: {other:?}"),
         }
     }
 
     // ── extract_wasm_bytes_from_code_response ─────────────────────────────────
 
-    /// `entries: None` in the code-step response hits the
-    /// `no code ledger entry` path.
+    /// `entries: None` names the missing code entry.
     #[test]
     fn extract_wasm_bytes_null_code_entries_returns_error() {
-        let resp = make_resp_null_entries();
-        let result = extract_wasm_bytes_from_code_response(&resp, CONTRACT);
-        match &result {
-            Err(Sep48Error::RpcFetchFailure { reason }) => {
-                assert!(
-                    reason.contains("no code ledger entry"),
-                    "null code entries must produce 'no code ledger entry' reason, got: {reason}"
-                );
-            }
-            other => panic!("null code entries must return RpcFetchFailure, got: {other:?}"),
-        }
+        let hash = sha256(WASM);
+        let key = contract_code_ledger_key(&hash);
+        let reason = expect_reason(extract_wasm_bytes_from_code_response(
+            &make_resp(None),
+            &key,
+            &hash,
+        ));
+        assert_eq!(
+            reason,
+            format!("no code ledger entry for Wasm hash {}", hash_first8(&hash))
+        );
     }
 
-    /// `entries: Some([])` in the code-step response hits the
-    /// `empty code ledger entries` path.
+    /// `entries: Some([])` names the missing code entry.
     #[test]
     fn extract_wasm_bytes_empty_code_entries_returns_error() {
-        let resp = make_resp_empty_entries();
-        let result = extract_wasm_bytes_from_code_response(&resp, CONTRACT);
-        match &result {
-            Err(Sep48Error::RpcFetchFailure { reason }) => {
-                assert!(
-                    reason.contains("empty code ledger entries"),
-                    "empty code entries must produce 'empty code ledger entries' reason, got: {reason}"
-                );
-            }
-            other => panic!("empty code entries must return RpcFetchFailure, got: {other:?}"),
-        }
+        let hash = sha256(WASM);
+        let key = contract_code_ledger_key(&hash);
+        let reason = expect_reason(extract_wasm_bytes_from_code_response(
+            &make_resp(Some(vec![])),
+            &key,
+            &hash,
+        ));
+        assert!(
+            reason.starts_with("no code ledger entry for Wasm hash "),
+            "got: {reason}"
+        );
     }
 
-    /// A `LedgerEntryData` variant that is not `ContractCode` in the code-step
-    /// response hits the `unexpected ledger entry type (not ContractCode)` arm.
-    ///
-    /// Uses a `ContractData` entry for the code step since it is easy to construct
-    /// and is unambiguously not `ContractCode`.
+    /// A returned key that does not decode as a `LedgerKey` is a refusal.
+    #[test]
+    fn extract_wasm_bytes_undecodable_key_returns_error() {
+        let hash = sha256(WASM);
+        let key = contract_code_ledger_key(&hash);
+        let resp = make_resp(Some(vec![("dummy".to_owned(), contract_code_xdr(WASM))]));
+        let reason = expect_reason(extract_wasm_bytes_from_code_response(&resp, &key, &hash));
+        assert!(
+            reason.starts_with("code ledger entry key does not decode"),
+            "got: {reason}"
+        );
+    }
+
+    /// An entry under the requested key that is not `ContractCode` is refused.
     #[test]
     fn extract_wasm_bytes_non_contract_code_entry_returns_error() {
-        let xdr = contract_data_as_wrong_code_type_xdr();
-        let resp = make_resp_with_entry(&xdr);
-        let result = extract_wasm_bytes_from_code_response(&resp, CONTRACT);
-        match &result {
-            Err(Sep48Error::RpcFetchFailure { reason }) => {
-                assert!(
-                    reason.contains("unexpected ledger entry type (not ContractCode)"),
-                    "non-ContractCode entry must produce expected reason, got: {reason}"
-                );
-            }
-            other => panic!("non-ContractCode entry must return RpcFetchFailure, got: {other:?}"),
-        }
+        let hash = sha256(WASM);
+        let key = contract_code_ledger_key(&hash);
+        let resp = make_resp(Some(vec![(key_b64(&key), contract_data_bool_xdr())]));
+        let reason = expect_reason(extract_wasm_bytes_from_code_response(&resp, &key, &hash));
+        assert!(
+            reason.contains("unexpected ledger entry type (not ContractCode)"),
+            "got: {reason}"
+        );
     }
 
-    /// A valid `ContractCode` entry in the code-step response is decoded
-    /// correctly and the raw WASM bytes are returned.
+    /// Entry data under the requested key that does not decode is refused.
     #[test]
-    fn extract_wasm_bytes_valid_code_entry_returns_bytes() {
-        let wasm = b"\x00asm\x01\x00\x00\x00";
-        let xdr = contract_code_xdr(wasm);
-        let resp = make_resp_with_entry(&xdr);
-        let result = extract_wasm_bytes_from_code_response(&resp, CONTRACT);
+    fn extract_wasm_bytes_malformed_entry_xdr_returns_error() {
+        let hash = sha256(WASM);
+        let key = contract_code_ledger_key(&hash);
+        let resp = make_resp(Some(vec![(key_b64(&key), "not-valid-xdr".to_owned())]));
+        let reason = expect_reason(extract_wasm_bytes_from_code_response(&resp, &key, &hash));
         assert!(
-            result.is_ok(),
-            "valid ContractCode entry must succeed, got: {result:?}"
+            reason.starts_with("malformed LedgerEntryData XDR for Wasm hash "),
+            "got: {reason}"
         );
+    }
+
+    /// The entry under the requested key is selected even when an entry under
+    /// another key precedes it.
+    #[test]
+    fn extract_wasm_bytes_selects_the_entry_under_the_requested_key() {
+        let hash = sha256(WASM);
+        let key = contract_code_ledger_key(&hash);
+        let other_key = contract_code_ledger_key(&[7u8; 32]);
+        let resp = make_resp(Some(vec![
+            (key_b64(&other_key), contract_data_bool_xdr()),
+            (key_b64(&key), contract_code_xdr(WASM)),
+        ]));
+        let bytes = extract_wasm_bytes_from_code_response(&resp, &key, &hash)
+            .expect("the entry under the requested key must be read");
+        assert_eq!(bytes, WASM.to_vec());
+    }
+
+    /// Bytes that do not hash to the requested hash are refused.
+    #[test]
+    fn extract_wasm_bytes_hash_mismatch_returns_error() {
+        let requested = [9u8; 32];
+        let key = contract_code_ledger_key(&requested);
+        let resp = make_resp(Some(vec![(key_b64(&key), contract_code_xdr(WASM))]));
+        let reason = expect_reason(extract_wasm_bytes_from_code_response(
+            &resp, &key, &requested,
+        ));
         assert_eq!(
-            result.unwrap(),
-            wasm.to_vec(),
-            "returned bytes must match the original WASM"
-        );
-    }
-
-    #[test]
-    fn parse_valid_contract_id() {
-        // Testnet USDC SAC C-strkey.
-        let result = parse_contract_id("CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA");
-        assert!(
-            result.is_ok(),
-            "valid C-strkey must parse successfully: {result:?}"
-        );
-    }
-
-    #[test]
-    fn parse_invalid_contract_id_returns_error() {
-        let result = parse_contract_id("not-a-valid-strkey");
-        assert!(
-            matches!(result, Err(Sep48Error::InvalidContractAddress { .. })),
-            "invalid strkey must return InvalidContractAddress"
+            reason,
+            format!(
+                "code hash mismatch: the code entry for Wasm hash {} hashes to {}",
+                hash_first8(&requested),
+                hash_first8(&sha256(WASM))
+            )
         );
     }
 
@@ -713,45 +586,8 @@ mod tests {
         assert_eq!(redacted, "CBIEL...QDAMA", "must emit first-5 ... last-5");
     }
 
-    /// Verifies that `fetch_contract_spec` wires `redact_rpc_error` into its
-    /// error path: when an RPC failure occurs and the RPC URL contains userinfo
-    /// credentials, neither the scheme nor the credentials appear in the
-    /// `Sep48Error::RpcFetchFailure` reason string.
-    ///
-    /// This proves sep48's own error path applies redaction, not just that the
-    /// underlying `redact_rpc_error` function works correctly.
-    #[tokio::test]
-    async fn fetch_contract_spec_rpc_error_reason_is_redacted() {
-        // Bind then drop to get a closed port — the connection attempt fails,
-        // producing a RpcFetchFailure whose reason flows through redact_rpc_error.
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            l.local_addr().expect("addr").port()
-        };
-        // URL with userinfo (basic-auth credentials) and a secret-bearing path.
-        let secret_url = format!("http://admin:s3cr3t@127.0.0.1:{port}/soroban/rpc?token=SEC");
-
-        let result = fetch_contract_spec(&secret_url, CONTRACT).await;
-
-        let reason = match result {
-            Err(Sep48Error::RpcFetchFailure { reason }) => reason,
-            Err(Sep48Error::InvalidContractAddress { .. }) => {
-                // CONTRACT is a valid strkey; this branch should not be reached.
-                panic!("unexpected InvalidContractAddress for a valid strkey");
-            }
-            other => panic!("expected RpcFetchFailure, got: {other:?}"),
-        };
-        assert!(
-            !reason.contains("s3cr3t"),
-            "userinfo credentials must not appear in redacted error reason: {reason}"
-        );
-        assert!(
-            !reason.contains("token=SEC"),
-            "secret-bearing query must not appear in redacted error reason: {reason}"
-        );
-        assert!(
-            !reason.to_ascii_lowercase().contains("http://admin"),
-            "scheme+userinfo must not appear in redacted error reason: {reason}"
-        );
+    #[test]
+    fn hex_lower_renders_lowercase_pairs() {
+        assert_eq!(hex_lower(&[0x00, 0xab, 0x0f, 0xff]), "00ab0fff");
     }
 }

@@ -3,12 +3,20 @@
 //! `stellar_sep48_preview_invocation` and `stellar_sep47_discover` both call
 //! into `stellar-agent-sep48`'s RPC fetch path
 //! (`fetch_contract_spec`/`discover_claimed_seps`, which share the same
-//! `fetch_wasm_bytes` two-step `getLedgerEntries` flow). These tests mock that
-//! RPC to force each documented business-error arm and assert the full
-//! envelope shape (`ok:false`, the documented wire code, a non-empty
-//! `request_id`, `is_error == Some(true)`), mirroring the offline RPC-path
-//! coverage already established at the `stellar-agent-sep48` crate level in
-//! `spec_rpc_coverage.rs`.
+//! resolve-then-fetch-code `getLedgerEntries` flow). These tests serve that
+//! RPC through a keyed responder, each entry under its real ledger key, to
+//! force each documented business-error arm and assert the full envelope
+//! shape (`ok:false`, the documented wire code, a non-empty `request_id`,
+//! `is_error == Some(true)`), mirroring the offline RPC-path coverage at the
+//! `stellar-agent-sep48` crate level in `spec_rpc_coverage.rs`.
+//!
+//! The SEP-48 spec cache is process-global and keyed by Wasm hash, so a spec
+//! cached by one test would be observed by any other test in this binary
+//! that fetches code with the same hash. Every test that fetches code
+//! therefore appends a custom section carrying its own seed string to the
+//! fixture Wasm, which gives it code with a hash no other test uses. Seeds
+//! carry a `sep48_sep47_envelope_shape/` prefix so they are also distinct
+//! from the seeds in the sep48 crate's own tests.
 
 #![allow(
     clippy::unwrap_used,
@@ -17,25 +25,19 @@
     reason = "test-only; panics and unwraps acceptable in integration tests"
 )]
 
-use serde_json::json;
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_mcp::server::{Sep47DiscoverArgs, Sep48PreviewInvocationArgs, WalletServer};
-use stellar_agent_test_support::EchoIdResponder;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer};
+use stellar_agent_test_support::{KeyedLedgerEntriesResponder, xdr_fixtures};
 
 mod common;
 
-// The SEP-41 token fixture WASM, already committed for `stellar-agent-sep48`'s
-// own offline RPC-path coverage; has a valid `contractspecv0` section with an
+// The SEP-41 token fixture Wasm, committed for `stellar-agent-sep48`'s own
+// offline RPC-path coverage; has a valid `contractspecv0` section with an
 // `approve` function.
 const WASM_BYTES: &[u8] =
     include_bytes!("../../stellar-agent-sep48/tests/fixtures/sep41_token.wasm");
 
-/// A valid, fixed C-strkey used as the target contract for every test in this
-/// file. Each test mounts its own isolated `MockServer`, so cross-test
-/// `SPEC_CACHE` collisions (the process-global cache in `spec.rs`, keyed on
-/// contract strkey) are avoided by using a distinct seed per test instead.
+/// A valid contract C-strkey seeded by `seed`.
 fn contract_strkey(seed: u8) -> String {
     stellar_strkey::Contract([seed; 32])
         .to_string()
@@ -48,68 +50,23 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
 }
 
-/// Builds the base64-encoded `LedgerEntryData::ContractCode` XDR containing
-/// `wasm_bytes`.
-fn build_code_xdr(wasm_bytes: &[u8]) -> String {
-    use stellar_xdr::{
-        BytesM, ContractCodeCostInputs, ContractCodeEntry, ContractCodeEntryExt,
-        ContractCodeEntryV1, ExtensionPoint, Hash, LedgerEntryData, Limits, WriteXdr,
-    };
-    let hash = Hash(sha256(wasm_bytes));
-    let code: BytesM = wasm_bytes.try_into().unwrap();
-    let entry = LedgerEntryData::ContractCode(ContractCodeEntry {
-        ext: ContractCodeEntryExt::V1(ContractCodeEntryV1 {
-            ext: ExtensionPoint::V0,
-            cost_inputs: ContractCodeCostInputs {
-                ext: ExtensionPoint::V0,
-                n_instructions: 0,
-                n_functions: 0,
-                n_globals: 0,
-                n_table_entries: 0,
-                n_types: 0,
-                n_data_segments: 0,
-                n_elem_segments: 0,
-                n_imports: 0,
-                n_exports: 0,
-                n_data_segment_bytes: 0,
-            },
-        }),
-        hash,
-        code,
-    });
-    entry.to_xdr_base64(Limits::none()).unwrap()
-}
-
-/// Builds a contract-instance `LedgerEntryData::ContractData` XDR for the
-/// given contract strkey.
-fn build_instance_xdr_for(wasm_hash: [u8; 32], contract: &str) -> String {
-    use stellar_xdr::{
-        ContractDataDurability, ContractDataEntry, ContractExecutable, ContractId, ExtensionPoint,
-        Hash, LedgerEntryData, Limits, ScAddress, ScContractInstance, ScVal, WriteXdr,
-    };
-    let instance = LedgerEntryData::ContractData(ContractDataEntry {
-        ext: ExtensionPoint::V0,
-        contract: ScAddress::Contract(ContractId(Hash(
-            stellar_strkey::Contract::from_string(contract)
-                .expect("valid strkey")
-                .0,
-        ))),
-        key: ScVal::LedgerKeyContractInstance,
-        durability: ContractDataDurability::Persistent,
-        val: ScVal::ContractInstance(ScContractInstance {
-            executable: ContractExecutable::Wasm(Hash(wasm_hash)),
-            storage: None,
-        }),
-    });
-    instance.to_xdr_base64(Limits::none()).unwrap()
-}
-
-/// Wraps a single XDR string into a `getLedgerEntries` JSON-RPC result.
-fn ledger_entries_result(xdr: &str) -> serde_json::Value {
-    json!({
-        "entries": [{"xdr": xdr, "key": "dummy", "lastModifiedLedgerSeq": 1}],
-        "latestLedger": 100
-    })
+/// Returns `wasm` with a trailing custom section carrying `seed`, so the
+/// result has a hash unique to `seed` and parses to the same spec.
+fn seeded(wasm: &[u8], seed: &str) -> Vec<u8> {
+    let name = b"test_seed";
+    let data = format!("sep48_sep47_envelope_shape/{seed}");
+    let body_len = 1 + name.len() + data.len();
+    assert!(
+        body_len < 0x80,
+        "seed section must fit one-byte LEB128 sizes"
+    );
+    let mut out = wasm.to_vec();
+    out.push(0x00);
+    out.push(u8::try_from(body_len).unwrap());
+    out.push(u8::try_from(name.len()).unwrap());
+    out.extend_from_slice(name);
+    out.extend_from_slice(data.as_bytes());
+    out
 }
 
 fn testnet_profile_with_rpc(rpc_url: &str) -> Profile {
@@ -125,22 +82,13 @@ fn testnet_profile_with_rpc(rpc_url: &str) -> Profile {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// `stellar_sep48_preview_invocation` returns the full business-error envelope
-/// with wire code `sep48.spec_fetch_failed` when the on-chain instance lookup
-/// comes back with an empty `entries` list — the cheapest honest way to force
+/// with wire code `sep48.spec_fetch_failed` when the endpoint returns no
+/// instance entry for the contract, the cheapest honest way to force
 /// `fetch_contract_spec`'s RPC-fetch failure without a live network.
 #[tokio::test]
 async fn preview_invocation_empty_instance_entries_returns_spec_fetch_failed_envelope() {
     let contract = contract_strkey(20);
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/"))
-        .respond_with(EchoIdResponder::new(json!({
-            "entries": [],
-            "latestLedger": 100
-        })))
-        .mount(&mock_server)
-        .await;
+    let mock_server = KeyedLedgerEntriesResponder::new().serve().await;
 
     let profile = testnet_profile_with_rpc(&mock_server.uri());
     let server = WalletServer::new(profile).expect("WalletServer::new");
@@ -173,25 +121,17 @@ async fn preview_invocation_empty_instance_entries_returns_spec_fetch_failed_env
 #[tokio::test]
 async fn preview_invocation_unknown_function_returns_render_failed_envelope() {
     let contract = contract_strkey(21);
-    let wasm_hash = sha256(WASM_BYTES);
-    let instance_xdr = build_instance_xdr_for(wasm_hash, &contract);
-    let code_xdr = build_code_xdr(WASM_BYTES);
+    let wasm = seeded(WASM_BYTES, "unknown_function");
+    let wasm_hash = sha256(&wasm);
 
-    let mock_server = MockServer::start().await;
-
-    // First call: getLedgerEntries(instance) → ContractData with WASM hash.
-    Mock::given(method("POST"))
-        .and(path("/"))
-        .respond_with(EchoIdResponder::new(ledger_entries_result(&instance_xdr)))
-        .up_to_n_times(1)
-        .mount(&mock_server)
-        .await;
-
-    // Second call: getLedgerEntries(code) → ContractCode with WASM bytes.
-    Mock::given(method("POST"))
-        .and(path("/"))
-        .respond_with(EchoIdResponder::new(ledger_entries_result(&code_xdr)))
-        .mount(&mock_server)
+    let mock_server = KeyedLedgerEntriesResponder::new()
+        .with_entry(xdr_fixtures::ledger_entry_from_response_json(
+            &xdr_fixtures::contract_instance_ledger_entries_json(&contract, wasm_hash),
+        ))
+        .with_entry(xdr_fixtures::ledger_entry_from_response_json(
+            &xdr_fixtures::contract_code_ledger_entries_json(wasm_hash, &wasm),
+        ))
+        .serve()
         .await;
 
     let profile = testnet_profile_with_rpc(&mock_server.uri());
@@ -222,23 +162,14 @@ async fn preview_invocation_unknown_function_returns_render_failed_envelope() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// `stellar_sep47_discover` returns the full business-error envelope with wire
-/// code `sep47.discovery_failed` when the on-chain instance lookup comes back
-/// empty. `discover_claimed_seps` delegates to the same `fetch_wasm_bytes` as
-/// `fetch_contract_spec`, so the identical empty-entries mock forces the same
+/// code `sep47.discovery_failed` when the endpoint returns no instance entry.
+/// `discover_claimed_seps` resolves the Wasm hash through the same step as
+/// `fetch_contract_spec`, so the identical empty responder forces the same
 /// underlying `Sep48Error::RpcFetchFailure`.
 #[tokio::test]
 async fn discover_empty_instance_entries_returns_discovery_failed_envelope() {
     let contract = contract_strkey(22);
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/"))
-        .respond_with(EchoIdResponder::new(json!({
-            "entries": [],
-            "latestLedger": 100
-        })))
-        .mount(&mock_server)
-        .await;
+    let mock_server = KeyedLedgerEntriesResponder::new().serve().await;
 
     let profile = testnet_profile_with_rpc(&mock_server.uri());
     let server = WalletServer::new(profile).expect("WalletServer::new");

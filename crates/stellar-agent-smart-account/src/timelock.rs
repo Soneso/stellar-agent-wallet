@@ -30,7 +30,8 @@
 //!    produce different operation_ids.
 //! 3. **Event-emission integrity** — every submit path cross-confirms the
 //!    expected OZ event (`OperationScheduled`, `OperationCancelled`,
-//!    `OperationExecuted`) in the transaction meta before returning `Ok`.
+//!    `OperationExecuted`) in the transaction's contract events before
+//!    returning `Ok`.
 //! 4. **`execute()` ready-window race** — pre-check `get_operation_state`
 //!    cross-RPC before submitting; fail-CLOSED if not `Ready`.
 //! 5. **`list_pending` cross-RPC** — query both RPCs; divergence returns
@@ -58,12 +59,12 @@ use stellar_agent_core::{
     observability::{RedactedStrkey, redact_strkey_first5_last5},
     rpc_budget::{SequentialRpcBudget, bound_stage},
 };
-use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::signing::Signer;
+use stellar_agent_network::{StellarRpcClient, TransactionRecord};
 use stellar_baselib::account::{Account as BaselibAccount, AccountBehavior};
 use stellar_baselib::transaction::TransactionBehavior;
 use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilderBehavior};
-use stellar_rpc_client::{Client, GetTransactionResponse};
+use stellar_rpc_client::Client;
 use stellar_xdr::{
     AccountId, BytesM, ContractEventBody, ContractEventV0, Hash, HostFunction, InvokeContractArgs,
     InvokeHostFunctionOp, Operation, OperationBody, ScAddress, ScSymbol, ScVal, ScVec, VecM,
@@ -972,12 +973,13 @@ fn emit_executed_audit(
 /// in callers) and an RPC-divergence failure (propagated as
 /// `SaError::NetworkRpcDivergence` — dual-RPC defence-in-depth).
 enum CrossConfirmError {
-    /// The expected event was not found in the transaction meta (at least one RPC).
+    /// The expected event was not found in the transaction's contract events (at
+    /// least one RPC), or an endpoint's contract events do not decode.
     EventMissing(String),
     /// Primary and secondary RPCs returned divergent event presence for the same tx.
     ///
     /// A compromised primary RPC that accepted `sendTransaction` could return doctored
-    /// `getTransaction` meta without the expected event, causing the wallet to treat a
+    /// `getTransaction` events without the expected event, causing the wallet to treat a
     /// successfully-scheduled operation as failed and retry with a new salt — duplicate
     /// ops, fee waste, DoS. Requiring event presence on BOTH RPCs closes this vector.
     ///
@@ -993,11 +995,18 @@ enum CrossConfirmError {
 /// Verifies that a submitted transaction emitted the expected OZ timelock event
 /// on BOTH primary and secondary RPCs concurrently.
 ///
-/// Fetches the transaction meta via `stellar_rpc_client::Client::get_transaction` on
-/// BOTH RPCs concurrently (via `tokio::join!`). The expected event MUST be present
-/// in BOTH responses. If either RPC fails to confirm the event, or if the two RPCs
-/// disagree (event present in primary but not secondary, or vice-versa), returns
-/// the appropriate [`CrossConfirmError`].
+/// Fetches the transaction via
+/// [`StellarRpcClient::get_transaction_raw`] on BOTH RPCs concurrently (via
+/// `tokio::join!`) and reads each answer's per-operation contract events from
+/// `events.contractEventsXdr` through [`TransactionRecord::contract_events`],
+/// decoded under the wallet's untrusted-decode limits. The event read does
+/// not depend on the result meta decoding. An event that does not decode is a
+/// typed error that fails the cross-confirmation closed as
+/// [`CrossConfirmError::EventMissing`] naming the endpoint and the event's
+/// position. The expected event MUST be
+/// present in BOTH responses. If either RPC fails to confirm the event, or if
+/// the two RPCs disagree (event present in primary but not secondary, or
+/// vice-versa), returns the appropriate [`CrossConfirmError`].
 ///
 /// For each event in each transaction response, checks:
 ///
@@ -1032,8 +1041,8 @@ enum CrossConfirmError {
 ///
 /// # Errors
 ///
-/// - [`CrossConfirmError::EventMissing`] — event not found on at least one RPC or
-///   tx fetch failed.
+/// - [`CrossConfirmError::EventMissing`]: event not found on at least one RPC,
+///   tx fetch failed, or an endpoint's contract events do not decode.
 /// - [`CrossConfirmError::Divergence`] — primary and secondary RPCs disagree on
 ///   event presence; wraps a [`SaError::NetworkRpcDivergence`].
 #[allow(clippy::too_many_arguments)]
@@ -1064,14 +1073,14 @@ async fn cross_confirm_event(
             })?;
 
     let build_server = |url: &str| {
-        Client::new(url)
+        StellarRpcClient::new(url)
             .map_err(|e| format!("RPC Client construction for event confirmation failed: {e}"))
     };
 
     let primary_server = build_server(primary_rpc).map_err(CrossConfirmError::EventMissing)?;
     let secondary_server = build_server(secondary_rpc).map_err(CrossConfirmError::EventMissing)?;
 
-    // stellar-rpc-client get_transaction takes &Hash (XDR), not &str.
+    // get_transaction_raw takes &Hash (XDR), not &str.
     // Convert hex tx_hash string → [u8; 32] → Hash.
     let tx_hash_bytes: [u8; 32] = hex::decode(tx_hash)
         .ok()
@@ -1081,32 +1090,39 @@ async fn cross_confirm_event(
         })?;
     let tx_hash_xdr = Hash(tx_hash_bytes);
 
-    // Fetch transaction meta from both RPCs concurrently.
+    // Fetch the transaction from both RPCs concurrently.
     let (primary_result, secondary_result) = tokio::join!(
-        primary_server.get_transaction(&tx_hash_xdr),
-        secondary_server.get_transaction(&tx_hash_xdr),
+        primary_server.get_transaction_raw(&tx_hash_xdr),
+        secondary_server.get_transaction_raw(&tx_hash_xdr),
     );
 
-    let primary_response = primary_result.map_err(|e| {
-        CrossConfirmError::EventMissing(format!("primary get_transaction failed: {e}"))
+    let primary_record = primary_result.map_err(|e| {
+        CrossConfirmError::EventMissing(format!("primary getTransaction failed: {e}"))
     })?;
-    let secondary_response = secondary_result.map_err(|e| {
-        CrossConfirmError::EventMissing(format!("secondary get_transaction failed: {e}"))
+    let secondary_record = secondary_result.map_err(|e| {
+        CrossConfirmError::EventMissing(format!("secondary getTransaction failed: {e}"))
     })?;
 
-    // Check event presence on both RPCs.
-    let primary_found = event_present_in_response(
-        &primary_response,
+    // Check event presence on both RPCs. Contract events that do not decode
+    // fail the confirmation closed.
+    let primary_found = event_present_in_record(
+        &primary_record,
         &expected_contract_bytes,
         &expected_topic_symbol,
         expected_operation_id,
-    );
-    let secondary_found = event_present_in_response(
-        &secondary_response,
+    )
+    .map_err(|e| {
+        CrossConfirmError::EventMissing(format!("primary contract events do not decode: {e}"))
+    })?;
+    let secondary_found = event_present_in_record(
+        &secondary_record,
         &expected_contract_bytes,
         &expected_topic_symbol,
         expected_operation_id,
-    );
+    )
+    .map_err(|e| {
+        CrossConfirmError::EventMissing(format!("secondary contract events do not decode: {e}"))
+    })?;
 
     match (primary_found, secondary_found) {
         (true, true) => {
@@ -1138,7 +1154,7 @@ async fn cross_confirm_event(
         (false, true) => {
             // (false, true): primary drops the event; secondary confirms it.
             // Most likely scenario: a compromised primary that accepted `sendTransaction`
-            // but doctored `getTransaction` meta to omit the event. Fail-CLOSED.
+            // but doctored `getTransaction` events to omit the event. Fail-CLOSED.
             Err(CrossConfirmError::Divergence {
                 sa_err: make_event_confirm_divergence_error(
                     false, // primary_present
@@ -1162,7 +1178,7 @@ async fn cross_confirm_event(
                 tx_hash.to_owned()
             };
             Err(CrossConfirmError::EventMissing(format!(
-                "event '{event_kind}' with operation_id {} not found in tx meta for tx {tx_redacted} \
+                "event '{event_kind}' with operation_id {} not found in the contract events of tx {tx_redacted} \
                  (checked primary and secondary RPCs)",
                 expected_operation_id.redacted()
             )))
@@ -1284,27 +1300,31 @@ fn emit_timelock_divergence_audit(
     }
 }
 
-/// Checks whether the expected timelock event is present in a `getTransaction` response.
+/// Checks whether the expected timelock event is present in a `getTransaction` answer.
 ///
-/// Returns `true` if the event with the given `expected_topic_symbol` (snake_case),
+/// Returns `Ok(true)` if the event with the given `expected_topic_symbol` (snake_case),
 /// matching `expected_contract_bytes`, and carrying the expected `operation_id` bytes
-/// in `topic[1]` is found in the response. Returns `false` if the response contains
-/// no events or the event is absent.
+/// in `topic[1]` is found in the answer's contract events. Returns `Ok(false)` if the
+/// answer carries no events or the event is absent.
 ///
-/// Used by [`cross_confirm_event`] to check both primary and secondary RPC responses
+/// Used by [`cross_confirm_event`] to check both primary and secondary RPC answers
 /// independently before comparing them.
-fn event_present_in_response(
-    tx_response: &GetTransactionResponse,
+///
+/// # Errors
+///
+/// The typed decode error from [`TransactionRecord::contract_events`] when any
+/// contract event in the answer does not decode.
+fn event_present_in_record(
+    record: &TransactionRecord,
     expected_contract_bytes: &[u8; 32],
     expected_topic_symbol: &str,
     expected_operation_id: &TimelockOperationId,
-) -> bool {
-    // stellar-rpc-client GetTransactionResponse exposes events.contract_events:
-    // Vec<Vec<ContractEvent>> (outer = per-op, inner = events for that op).
-    let contract_events_by_op = &tx_response.events.contract_events;
+) -> Result<bool, stellar_agent_core::error::NetworkError> {
+    // Vec<Vec<ContractEvent>>: outer = per-op, inner = events for that op.
+    let contract_events_by_op = record.contract_events()?;
 
     // Flatten across all operations (we expect exactly one InvokeHostFunction op).
-    for events_for_op in contract_events_by_op {
+    for events_for_op in &contract_events_by_op {
         for event in events_for_op {
             // Check contract_id matches the timelock contract.
             // Hash is stellar_xdr::Hash(Uint256([u8;32])); compare inner bytes.
@@ -1337,12 +1357,12 @@ fn event_present_in_response(
             };
             // ScBytes implements as_slice() → &[u8].
             if op_id_bytes.as_slice() == expected_operation_id.as_bytes() {
-                return true;
+                return Ok(true);
             }
         }
     }
 
-    false
+    Ok(false)
 }
 
 /// Converts a PascalCase event name to snake_case for OZ event topic matching.
@@ -1398,7 +1418,7 @@ const FN_EXECUTE: &str = "execute";
 /// # Event cross-confirmation
 ///
 /// After submission, the presence of an `OperationScheduled` event in the
-/// transaction meta is verified on both primary and secondary RPCs concurrently
+/// transaction's contract events is verified on both primary and secondary RPCs concurrently
 /// via `cross_confirm_event`.
 ///
 /// # Errors
@@ -1698,7 +1718,7 @@ pub async fn schedule_upgrade(
 /// # Event cross-confirmation
 ///
 /// After submission, the presence of an `OperationCancelled` event in the
-/// transaction meta is verified. If absent, returns
+/// transaction's contract events is verified. If absent, returns
 /// [`SaError::TimelockCancelFailed`] with reason `EventConfirmationMissing`.
 ///
 /// # Errors
@@ -1924,7 +1944,7 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
 /// # Event cross-confirmation
 ///
 /// After submission, the presence of an `OperationExecuted` event in the
-/// transaction meta is verified. If absent, returns
+/// transaction's contract events is verified. If absent, returns
 /// [`SaError::TimelockExecuteFailed`] with reason `EventConfirmationMissing`.
 ///
 /// # Errors
@@ -3158,6 +3178,135 @@ mod tests {
                 "expected SaError::TimelockListPendingFailed, got: {:?}",
                 other
             ),
+        }
+    }
+
+    // ── cross_confirm_event over getTransaction answers ─────────────────────
+
+    /// Timelock contract the cross-confirmation fixtures emit from.
+    const EVENT_TIMELOCK: &str = "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526";
+    /// Transaction hash the fixtures confirm.
+    const EVENT_TX_HASH: &str = "abababababababababababababababababababababababababababababababab";
+
+    /// Base64 of an `OperationScheduled` event for `operation_id` emitted by
+    /// [`EVENT_TIMELOCK`].
+    fn scheduled_event_b64(operation_id: &TimelockOperationId) -> String {
+        use stellar_xdr::{
+            ContractEvent, ContractEventBody, ContractEventType, ContractEventV0, ContractId,
+            ExtensionPoint, Limits, ScBytes, ScSymbol, WriteXdr,
+        };
+        let contract = stellar_strkey::Contract::from_string(EVENT_TIMELOCK).expect("strkey");
+        ContractEvent {
+            ext: ExtensionPoint::V0,
+            contract_id: Some(ContractId(Hash(contract.0))),
+            type_: ContractEventType::Contract,
+            body: ContractEventBody::V0(ContractEventV0 {
+                topics: vec![
+                    ScVal::Symbol(ScSymbol("operation_scheduled".try_into().expect("symbol"))),
+                    ScVal::Bytes(ScBytes(
+                        operation_id
+                            .as_bytes()
+                            .to_vec()
+                            .try_into()
+                            .expect("32 bytes"),
+                    )),
+                ]
+                .try_into()
+                .expect("topics"),
+                data: ScVal::Void,
+            }),
+        }
+        .to_xdr_base64(Limits::none())
+        .expect("event XDR")
+    }
+
+    /// Serves a SUCCESS `getTransaction` answer carrying `events` as its
+    /// `contractEventsXdr` and a result meta with discriminant 99, which the
+    /// current XDR cannot decode.
+    async fn serve_events(events: serde_json::Value) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "method": "getTransaction",
+            })))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                serde_json::json!({
+                    "status": "SUCCESS",
+                    "txHash": EVENT_TX_HASH,
+                    "ledger": 900,
+                    "createdAt": "1700000000",
+                    "resultMetaXdr": "AAAAYw==",
+                    "events": {"contractEventsXdr": events},
+                }),
+            ))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The expected event in `contractEventsXdr` confirms on both endpoints
+    /// even though neither answer's meta decodes.
+    #[tokio::test]
+    async fn cross_confirm_event_reads_contract_events_independent_of_meta() {
+        let operation_id = TimelockOperationId::from_bytes([0x5a; 32]);
+        let events = serde_json::json!([[scheduled_event_b64(&operation_id)]]);
+        let primary = serve_events(events.clone()).await;
+        let secondary = serve_events(events).await;
+
+        let outcome = cross_confirm_event(
+            "OperationScheduled",
+            EVENT_TX_HASH,
+            &operation_id,
+            EVENT_TIMELOCK,
+            &primary.uri(),
+            &secondary.uri(),
+            "req-events",
+        )
+        .await;
+
+        match outcome {
+            Ok(()) => {}
+            Err(CrossConfirmError::EventMissing(reason)) => {
+                panic!("the event must confirm on both endpoints: {reason}")
+            }
+            Err(CrossConfirmError::Divergence { .. }) => {
+                panic!("the event must confirm on both endpoints, not diverge")
+            }
+        }
+    }
+
+    /// An event in `contractEventsXdr` that does not decode fails the
+    /// cross-confirmation closed with the typed decode error, even when the
+    /// expected event precedes it and the other endpoint confirms.
+    #[tokio::test]
+    async fn cross_confirm_event_undecodable_event_fails_closed() {
+        let operation_id = TimelockOperationId::from_bytes([0x5b; 32]);
+        let good = scheduled_event_b64(&operation_id);
+        let primary = serve_events(serde_json::json!([[good.clone(), "AAAA"]])).await;
+        let secondary = serve_events(serde_json::json!([[good]])).await;
+
+        let outcome = cross_confirm_event(
+            "OperationScheduled",
+            EVENT_TX_HASH,
+            &operation_id,
+            EVENT_TIMELOCK,
+            &primary.uri(),
+            &secondary.uri(),
+            "req-undecodable",
+        )
+        .await;
+
+        match outcome {
+            Err(CrossConfirmError::EventMissing(reason)) => assert_eq!(
+                reason,
+                "primary contract events do not decode: RPC method 'getTransaction' returned \
+                 a malformed response: contractEventsXdr[0][1] does not decode: failed to fill \
+                 whole buffer"
+            ),
+            Ok(()) => panic!("an undecodable event must fail the confirmation"),
+            Err(CrossConfirmError::Divergence { .. }) => {
+                panic!("an undecodable event is a typed error, not a divergence")
+            }
         }
     }
 }
