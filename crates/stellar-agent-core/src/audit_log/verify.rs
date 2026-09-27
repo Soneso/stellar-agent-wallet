@@ -1696,7 +1696,7 @@ mod tests {
                 observed_executable: None,
             },
             EventKind::SaMutableContractOverride {
-                rule_id: 3,
+                rule_id: Some(3),
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CDABC...12345"),
                 contract_address_redacted: RedactedStrkey::from_already_redacted("CDABC...99999"),
                 contract_kind: ContractKind::Verifier,
@@ -1705,7 +1705,7 @@ mod tests {
                 executable_tag: None,
             },
             EventKind::SaUnknownContractOverride {
-                rule_id: 4,
+                rule_id: Some(4),
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CDABC...12345"),
                 contract_address_redacted: RedactedStrkey::from_already_redacted("CEEEE...88888"),
                 contract_kind: ContractKind::Policy,

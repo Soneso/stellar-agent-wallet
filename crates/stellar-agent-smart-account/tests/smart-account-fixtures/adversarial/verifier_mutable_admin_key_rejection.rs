@@ -62,8 +62,8 @@ fn admin_holder_xdr_address() -> stellar_xdr::ScAddress {
 ///
 /// # Byte-layout citation
 ///
-/// `ScContractInstance.storage: Option<ScMap>` — `xdr/curr/Stellar-contract.x`
-/// `SCContractInstance` (stellar-xdr v26.0.0).  Admin key encoding:
+/// `ScContractInstance.storage: Option<ScMap>`, per `SCContractInstance` in
+/// `Stellar-contract.x`.  Admin key encoding:
 /// `AccessControlStorageKey::Admin` encodes on-wire as
 /// `ScVal::Vec([Symbol("Admin")])`.
 /// `soroban-sdk-macros` `derive_enum.rs` (`map_empty_variant` + `TryFrom<&Enum> for ScVal`).
@@ -143,7 +143,7 @@ async fn verifier_with_admin_key_rejected_without_override() {
         smart_account,
         ZERO_CONTRACT_REDACTED,
         &definition,
-        0,
+        None,
         SOURCE_G,
         false, // accept_mutable_verifier — MUST refuse
         false, // accept_unknown_verifier
@@ -153,7 +153,7 @@ async fn verifier_with_admin_key_rejected_without_override() {
     .await;
 
     assert!(
-        matches!(result, Err(SaError::VerifierMutable { .. })),
+        matches!(result, Err(SaError::VerifierMutable { rule_id: None, .. })),
         "mutable verifier must be refused without accept_mutable_verifier; got: {result:?}"
     );
     assert_eq!(

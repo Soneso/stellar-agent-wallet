@@ -1093,6 +1093,7 @@ mod tests {
     /// With no `--verifier` and no registry entry, resolution fails closed
     /// naming the deploy verb.
     #[test]
+    #[serial]
     fn validate_inputs_missing_verifier_fails_closed_naming_deploy_verb() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let _home = StellarAgentHomeGuard::new(dir.path());

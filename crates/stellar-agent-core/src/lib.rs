@@ -140,6 +140,9 @@ pub mod protocol_consts;
 /// ([`sc_address::scaddress_to_strkey`]).
 pub mod sc_address;
 
+/// Variant names for XDR `ScVal` values ([`scval::scval_variant_name`]).
+pub mod scval;
+
 /// Shared timestamp formatting helpers (ISO-8601 UTC, epoch decomposition).
 pub mod timefmt;
 

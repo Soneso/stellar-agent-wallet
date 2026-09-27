@@ -34,8 +34,9 @@
 //! The slippage re-verify re-fetches the on-chain quote before signing and
 //! fails closed.
 
+use stellar_agent_core::scval::scval_variant_name;
 use stellar_agent_defi::simulate::{
-    SimulateError, decode_i128_scval, scval_variant_name, simulate_invoke_returning_scval,
+    SimulateError, decode_i128_scval, simulate_invoke_returning_scval,
 };
 use stellar_xdr::ScVal;
 use tracing::debug;

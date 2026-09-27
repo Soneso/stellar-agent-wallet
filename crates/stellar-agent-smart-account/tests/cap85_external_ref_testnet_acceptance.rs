@@ -712,13 +712,14 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
                 &format!("owner {beacon_redacted}, tag \"{TAG}\""),
                 "the refusal must name the redacted beacon and the tag"
             );
+            assert_eq!(rule_id, None, "a pre-install refusal names no rule");
             rule_id
         }
         other => panic!(
             "expected VerifierMutable {{ ExternalRefExecutable, detail: Some(..) }}; got {other:?}"
         ),
     };
-    record(TEST, "refused-rule-id", &refused_rule_id.to_string());
+    record(TEST, "refused-rule-id", &format!("{refused_rule_id:?}"));
     let overrides_after_refusal = read_audit_entries(&audit_log_path)
         .into_iter()
         .filter(|entry| {
@@ -731,7 +732,7 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     assert_eq!(
         overrides_after_refusal, 0,
         "a refused install must write no SaMutableContractOverride row (refused rule id \
-         {refused_rule_id})"
+         {refused_rule_id:?})"
     );
 
     // ── Proof 2: install with the override pins the reference ───────────────
@@ -805,7 +806,15 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
             executable_tag,
             ..
         } => {
-            record(TEST, "override-row-rule-id", &override_rule_id.to_string());
+            record(
+                TEST,
+                "override-row-rule-id",
+                &format!("{override_rule_id:?}"),
+            );
+            assert_eq!(
+                *override_rule_id, None,
+                "a pre-install override row names no rule"
+            );
             assert_eq!(contract_address_redacted.as_str(), proxy_redacted);
             assert_eq!(*contract_kind, ContractKind::Verifier);
             assert_eq!(

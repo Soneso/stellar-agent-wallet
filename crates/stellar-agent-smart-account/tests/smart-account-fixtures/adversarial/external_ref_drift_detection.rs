@@ -27,7 +27,9 @@ use stellar_xdr::{AccountId, ContractId, Hash, PublicKey, ScAddress, ScString, U
 use uuid::Uuid;
 
 use super::rpc_mock_helpers::{
-    KNOWN_WASM_HASH, ZERO_CONTRACT_REDACTED, manager_one_url, tmp_audit_writer,
+    KNOWN_WASM_HASH, SOURCE_G, ZERO_CONTRACT_REDACTED, account_entry_xdr, account_key_xdr,
+    build_context_rule_external_signers_xdr, build_context_rule_scval_xdr, build_simulate_response,
+    manager_one_url, signer_set_n_of_n, tmp_audit_writer,
 };
 
 // ── Fixture values ────────────────────────────────────────────────────────────
@@ -477,4 +479,201 @@ async fn zero_pin_against_an_unresolved_reference_is_drift() {
             &reference_summary("verifier-v1", "unset"),
         );
     }
+}
+
+// ── verify_rule_wasm_pins report ──────────────────────────────────────────────
+
+/// Answers `simulateTransaction` with `simulate_result` and every other
+/// request through `ledger`.
+struct RuleAndLedgerResponder {
+    ledger: KeyedLedgerEntriesResponder,
+    simulate_result: serde_json::Value,
+}
+
+impl wiremock::Respond for RuleAndLedgerResponder {
+    fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).unwrap_or(serde_json::json!({}));
+        if body["method"] != "simulateTransaction" {
+            return self.ledger.respond(request);
+        }
+        wiremock::ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": body.get("id").cloned().unwrap_or(serde_json::json!(1)),
+                "result": self.simulate_result,
+            }))
+            .insert_header("content-type", "application/json")
+    }
+}
+
+/// Runs `verify_rule_wasm_pins` for a rule of `kind` that references
+/// `contract_addr()` and whose created row pins `pinned_first8` with
+/// `pinned_ref`, against `live`.
+async fn verify_pins_report(
+    kind: Kind,
+    pinned_first8: String,
+    pinned_ref: Option<ExecutableRefPin>,
+    live: KeyedLedgerEntriesResponder,
+) -> stellar_agent_smart_account::managers::rules::VerifyPinsResult {
+    use stellar_agent_smart_account::managers::rules::{
+        ContextRuleManager, ContextRuleManagerConfig,
+    };
+
+    let rule_xdr = match kind {
+        Kind::Verifier => {
+            build_context_rule_external_signers_xdr(RULE_ID, &[0], &contract_addr(), &[0xbb; 32])
+        }
+        Kind::Policy => {
+            build_context_rule_scval_xdr(RULE_ID, &signer_set_n_of_n(0), &[contract_addr()])
+        }
+    };
+    let ledger = live.with_entry(serde_json::json!({
+        "key": account_key_xdr(SOURCE_G),
+        "xdr": account_entry_xdr(SOURCE_G, 100),
+        "lastModifiedLedgerSeq": 100,
+    }));
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(RuleAndLedgerResponder {
+            ledger,
+            simulate_result: build_simulate_response(&rule_xdr),
+        })
+        .mount(&server)
+        .await;
+
+    let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
+    let (verifier_first8, verifier_refs, policy_first8, policy_refs) = match kind {
+        Kind::Verifier => (vec![pinned_first8], vec![pinned_ref], vec![], vec![]),
+        Kind::Policy => (vec![], vec![], vec![pinned_first8], vec![pinned_ref]),
+    };
+    audit_writer
+        .lock()
+        .expect("audit writer")
+        .write_entry(AuditEntry::new_sa_context_rule_created(
+            ZERO_CONTRACT_REDACTED,
+            RULE_ID,
+            "default",
+            1,
+            u32::from(kind == Kind::Policy),
+            None,
+            "stellar:testnet",
+            "req-created",
+            verifier_first8,
+            policy_first8,
+            true,
+            false,
+            verifier_refs,
+            policy_refs,
+        ))
+        .expect("created row writes");
+
+    let signers_manager = Arc::new(manager_one_url(
+        &server.uri(),
+        Arc::clone(&audit_writer),
+        audit_log_path,
+    ));
+    let manager = ContextRuleManager::new(
+        ContextRuleManagerConfig::new(
+            server.uri(),
+            "Test SDF Network ; September 2015".to_owned(),
+            std::time::Duration::from_secs(5),
+            "stellar:testnet".to_owned(),
+        )
+        .with_signers_manager(signers_manager)
+        .with_audit_writer(audit_writer),
+    )
+    .expect("ContextRuleManager::new");
+
+    manager
+        .verify_rule_wasm_pins(
+            ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+            RULE_ID,
+            SOURCE_G,
+            "req-verify-pins",
+        )
+        .await
+        .expect("verify_rule_wasm_pins returns a report")
+}
+
+/// A rule pinned to an external reference reports the pin and the observed
+/// reference summary, aligned with the first-8 lists, for a verifier and for
+/// a policy.
+#[tokio::test]
+async fn verify_pins_reports_the_pinned_and_observed_external_reference() {
+    use stellar_agent_smart_account::managers::rules::PinStatus;
+
+    for kind in [Kind::Verifier, Kind::Policy] {
+        let resolved = if kind == Kind::Policy {
+            KNOWN_WASM_HASH
+        } else {
+            VERIFIER_ALLOWLIST[0].wasm_hash
+        };
+        let pin = pin_for(TAG, resolved);
+        let report = verify_pins_report(
+            kind,
+            first8(&resolved),
+            Some(pin.clone()),
+            live_reference(TAG, Some(resolved)),
+        )
+        .await;
+
+        let summary = format!(
+            "external reference owner GAAAA...AAWHF tag \"verifier-v1\" resolved {}",
+            first8(&resolved)
+        );
+        let (
+            status,
+            observed_first8,
+            observed_executable,
+            pinned_refs,
+            other_executable,
+            other_refs,
+        ) = match kind {
+            Kind::Verifier => (
+                &report.verifier_pin_status,
+                &report.observed_verifier_first8,
+                &report.observed_verifier_executable,
+                &report.pinned_verifier_executable_refs,
+                &report.observed_policy_executable,
+                &report.pinned_policy_executable_refs,
+            ),
+            Kind::Policy => (
+                &report.policy_pin_status,
+                &report.observed_policy_first8,
+                &report.observed_policy_executable,
+                &report.pinned_policy_executable_refs,
+                &report.observed_verifier_executable,
+                &report.pinned_verifier_executable_refs,
+            ),
+        };
+        assert_eq!(*status, PinStatus::Match, "{kind:?}");
+        assert_eq!(observed_first8, &vec![first8(&resolved)], "{kind:?}");
+        assert_eq!(observed_executable, &vec![Some(summary)], "{kind:?}");
+        assert_eq!(pinned_refs, &vec![Some(pin)], "{kind:?}");
+        assert!(other_executable.is_empty(), "{kind:?}");
+        assert!(other_refs.is_empty(), "{kind:?}");
+    }
+}
+
+/// A reference pin against live Wasm code reports drift, the pin, and `None`
+/// for the observed Wasm executable at the drifted position.
+#[tokio::test]
+async fn verify_pins_reports_live_wasm_against_a_reference_pin_as_none() {
+    use stellar_agent_smart_account::managers::rules::PinStatus;
+
+    let resolved = VERIFIER_ALLOWLIST[0].wasm_hash;
+    let pin = pin_for(TAG, resolved);
+    let report = verify_pins_report(
+        Kind::Verifier,
+        first8(&resolved),
+        Some(pin.clone()),
+        live_wasm(resolved),
+    )
+    .await;
+
+    assert_eq!(report.verifier_pin_status, PinStatus::Drift);
+    assert_eq!(report.observed_verifier_first8, vec![first8(&resolved)]);
+    assert_eq!(report.observed_verifier_executable, vec![None]);
+    assert_eq!(report.pinned_verifier_executable_refs, vec![Some(pin)]);
 }

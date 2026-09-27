@@ -33,8 +33,9 @@
 //!
 //! Because neither key exists in any OZ v0.7.2 contract, the extractor currently
 //! returns `Undetermined` for all real on-chain policy storage, which correctly
-//! triggers the fail-CLOSED enforce-default path: operators with unknown policy
-//! shapes use `--accept-single-verifier` to opt out.
+//! triggers the fail-CLOSED enforce-default path: callers with unknown policy
+//! shapes opt out through the `accept_single_verifier` argument of
+//! `sign_with_passkey_rule`.
 //!
 //! A follow-up tracks updating the extractor once OZ ships a canonical per-transaction
 //! value-cap policy type.
@@ -42,8 +43,8 @@
 //! # Fail-CLOSED discipline
 //!
 //! `Undetermined` is treated AS IF above the high-value threshold. Unknown criteria
-//! shape conservatively enforces diversification. Operators must explicitly opt out
-//! via `--accept-single-verifier`.
+//! shape conservatively enforces diversification. Callers opt out explicitly
+//! through the `accept_single_verifier` argument of `sign_with_passkey_rule`.
 
 use stellar_xdr::{Int128Parts, ScMap, ScSymbol, ScVal};
 
@@ -88,8 +89,9 @@ const KEY_MAX_STROOPS: &[u8] = b"max_stroops";
 /// # Fail-CLOSED discipline
 ///
 /// The diversification enforce-default trigger treats `Undetermined` AS IF
-/// above the high-value threshold — the operator must explicitly opt out via
-/// `--accept-single-verifier` to proceed. This is the safe-by-default posture:
+/// above the high-value threshold; the caller must opt out explicitly through
+/// the `accept_single_verifier` argument of `sign_with_passkey_rule` to
+/// proceed. This is the safe-by-default posture:
 /// unknown criteria shape is conservatively assumed to be high-value.
 ///
 /// # Note on `i64` vs `i128`
@@ -141,7 +143,8 @@ pub(crate) enum ValueThresholdResult {
 ///
 /// Because no OZ v0.7.2 contract emits the recognised keys, this extractor
 /// returns `Undetermined` for all real on-chain policy storage in v0.7.2.
-/// That correctly routes operators to the `--accept-single-verifier` opt-out.
+/// That routes callers to the `accept_single_verifier` opt-in of
+/// `sign_with_passkey_rule`.
 ///
 /// # Fail-CLOSED contract
 ///

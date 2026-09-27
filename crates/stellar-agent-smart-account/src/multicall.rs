@@ -38,6 +38,7 @@ use stellar_agent_core::policy::v1::PolicyEngineV1;
 use stellar_agent_core::policy::v1::bundle::{BundleStateOverlay, BundleView, decompose_bundle};
 use stellar_agent_core::policy::{Decision, DenyReason};
 use stellar_agent_core::profile::schema::Profile;
+use stellar_agent_core::scval::scval_variant_name;
 use stellar_agent_network::signing::Signer;
 
 use crate::SaError;
@@ -871,13 +872,11 @@ pub(crate) fn cross_rpc_compare_wasm_hashes(
 /// `SaError::MulticallFailed { phase: "rpc_divergence", .. }` on any RPC
 /// failure.
 ///
-/// # Canonical source
-///
-/// The `LedgerKeyContractData { key: ScVal::LedgerKeyContractInstance, ... }`
-/// pattern is cited from
-/// `crates/stellar-agent-smart-account/src/deployment/deploy.rs:1258-1265`
-/// (local reference; mirrors the soroban-env-host `data_helper.rs` contract
-/// instance lookup pattern).
+/// The instance entry is requested under the key built by
+/// [`crate::managers::rules::contract_instance_key`]. Only a returned entry
+/// whose own key decodes, under the untrusted-decode limits, to that
+/// requested key is read; a returned key that does not decode, or no entry
+/// under the requested key, refuses.
 ///
 /// Uses `stellar_rpc_client::Client` (not `stellar_agent_network::StellarRpcClient`)
 /// to keep XDR type families consistent — both use the same stellar-xdr version
@@ -890,8 +889,7 @@ pub(crate) async fn fetch_wasm_hash_via_rpc(
 ) -> Result<String, SaError> {
     use stellar_rpc_client::Client;
     use stellar_xdr::{
-        ContractDataDurability, ContractExecutable, ContractId, Hash, LedgerEntryData, LedgerKey,
-        LedgerKeyContractData, ReadXdr, ScAddress, ScVal,
+        ContractExecutable, ContractId, Hash, LedgerEntryData, LedgerKey, ReadXdr, ScAddress, ScVal,
     };
 
     let rpc_err = |detail: String| SaError::MulticallFailed {
@@ -911,27 +909,34 @@ pub(crate) async fn fetch_wasm_hash_via_rpc(
         .map_err(|e| rpc_err(format!("invalid multicall router address strkey: {e}")))?;
     let contract_scaddr = ScAddress::Contract(ContractId(Hash(c_strkey.0)));
 
-    // Build the `ContractData { key: LedgerKeyContractInstance }` ledger key.
-    // Mirrors deploy.rs:1258-1263 (local SHA).
-    let instance_key = LedgerKey::ContractData(LedgerKeyContractData {
-        contract: contract_scaddr,
-        key: ScVal::LedgerKeyContractInstance,
-        durability: ContractDataDurability::Persistent,
-    });
+    let instance_key = crate::managers::rules::contract_instance_key(&contract_scaddr);
 
-    let resp = tokio::time::timeout(timeout, server.get_ledger_entries(&[instance_key]))
-        .await
-        .map_err(|_| {
-            rpc_err("get_ledger_entries timed out for contract instance fetch".to_owned())
-        })?
-        .map_err(|e| {
-            rpc_err(format!(
-                "get_ledger_entries failed for contract instance fetch: {e}"
-            ))
-        })?;
+    let resp = tokio::time::timeout(
+        timeout,
+        server.get_ledger_entries(std::slice::from_ref(&instance_key)),
+    )
+    .await
+    .map_err(|_| rpc_err("get_ledger_entries timed out for contract instance fetch".to_owned()))?
+    .map_err(|e| {
+        rpc_err(format!(
+            "get_ledger_entries failed for contract instance fetch: {e}"
+        ))
+    })?;
 
     let entries = resp.entries.unwrap_or_default();
-    let entry = entries.first().ok_or_else(|| {
+    let mut matching = None;
+    for candidate in &entries {
+        let returned_key = LedgerKey::from_xdr_base64(
+            &candidate.key,
+            stellar_agent_xdr_limits::untrusted_decode_limits(candidate.key.len()),
+        )
+        .map_err(|_| rpc_err("RPC returned a malformed ledger key".to_owned()))?;
+        if returned_key == instance_key {
+            matching = Some(candidate);
+            break;
+        }
+    }
+    let entry = matching.ok_or_else(|| {
         rpc_err("RPC returned no contract-instance entry for multicall router address".to_owned())
     })?;
 
@@ -1736,7 +1741,8 @@ fn validate_soroban_symbol(s: &str) -> Result<&str, String> {
 /// - Negative `v` (i64::MIN ≤ v < 0): `hi = -1` (all-1-bits high word),
 ///   `lo = v as u64` (two's complement bit pattern).
 ///
-/// This matches the `Int128Parts` encoding in `soroban-env-common`.
+/// This matches the `Int128Parts { hi, lo }` definition in
+/// `Stellar-contract.x`.
 ///
 /// # Errors
 ///
@@ -1763,7 +1769,7 @@ fn json_args_to_scval_vec(args_json: &serde_json::Value, idx: usize) -> Result<S
                 } else if let Some(v) = n.as_i64() {
                     // Negative value: sign-extend to 128-bit two's complement.
                     // hi = -1 (all 1-bits) when v < 0; lo = v as u64 (bit pattern).
-                    // Canonical source: soroban-env-common `val.rs` Int128Parts encoding.
+                    // Canonical source: `Int128Parts { hi, lo }` in `Stellar-contract.x`.
                     ScVal::I128(Int128Parts {
                         hi: -1_i64,
                         lo: v as u64,
@@ -1859,7 +1865,7 @@ fn build_inner_results(
             ));
         }
         other => {
-            let observed_discriminant = scval_discriminant_name(other);
+            let observed_discriminant = scval_variant_name(other);
             return Err(post_verify_err(
                 format!(
                     "router return value is not ScVal::Vec; got discriminant {}",
@@ -1903,38 +1909,6 @@ fn build_inner_results(
     }
 
     Ok(results)
-}
-
-/// Returns a human-readable discriminant name for a `ScVal` variant.
-///
-/// Used in `post_submit_verification` error messages to identify the
-/// unexpected ScVal shape without leaking full XDR content.
-fn scval_discriminant_name(scval: &ScVal) -> &'static str {
-    match scval {
-        ScVal::Bool(_) => "Bool",
-        ScVal::Void => "Void",
-        ScVal::Error(_) => "Error",
-        ScVal::U32(_) => "U32",
-        ScVal::I32(_) => "I32",
-        ScVal::U64(_) => "U64",
-        ScVal::I64(_) => "I64",
-        ScVal::Timepoint(_) => "Timepoint",
-        ScVal::Duration(_) => "Duration",
-        ScVal::U128(_) => "U128",
-        ScVal::I128(_) => "I128",
-        ScVal::U256(_) => "U256",
-        ScVal::I256(_) => "I256",
-        ScVal::Bytes(_) => "Bytes",
-        ScVal::String(_) => "String",
-        ScVal::Symbol(_) => "Symbol",
-        ScVal::Vec(_) => "Vec",
-        ScVal::Map(_) => "Map",
-        ScVal::Address(_) => "Address",
-        ScVal::LedgerKeyContractInstance => "LedgerKeyContractInstance",
-        ScVal::LedgerKeyNonce(_) => "LedgerKeyNonce",
-        ScVal::ContractInstance(_) => "ContractInstance",
-        ScVal::ExecutableTag(_) => "ExecutableTag",
-    }
 }
 
 /// Maps a `SaError` wire-code to the closest `MulticallFailed` phase string.
@@ -3568,61 +3542,116 @@ wasm_sha256 = "{drifted_sha}"
         );
     }
 
-    // ── scval_discriminant_name ───────────────────────────────────────────────
+    const ROUTER_UNDER_TEST: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
 
-    /// `scval_discriminant_name` returns the correct name for every ScVal variant
-    /// that appears in the match arms (spot-check all branches).
-    #[test]
-    fn scval_discriminant_name_covers_all_named_variants() {
-        use stellar_xdr::{
-            Int128Parts, ScBytes, ScError, ScErrorCode, ScString, ScSymbol, ScVal, TimePoint,
-            UInt128Parts,
+    /// The base64 instance ledger key of `ROUTER_UNDER_TEST`.
+    fn router_instance_key_b64() -> String {
+        use stellar_agent_test_support::xdr_fixtures;
+        xdr_fixtures::ledger_entry_from_response_json(
+            &xdr_fixtures::contract_instance_ledger_entries_json(ROUTER_UNDER_TEST, [0x11; 32]),
+        )["key"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// An instance entry returned under the requested key yields its hash.
+    #[tokio::test]
+    async fn fetch_wasm_hash_via_rpc_reads_the_entry_under_the_requested_key() {
+        use stellar_agent_test_support::{KeyedLedgerEntriesResponder, xdr_fixtures};
+
+        let server = KeyedLedgerEntriesResponder::new()
+            .with_entry(xdr_fixtures::ledger_entry_from_response_json(
+                &xdr_fixtures::contract_instance_ledger_entries_json(ROUTER_UNDER_TEST, [0x11; 32]),
+            ))
+            .serve()
+            .await;
+
+        let hash = fetch_wasm_hash_via_rpc(
+            &server.uri(),
+            ROUTER_UNDER_TEST,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(hash, "11".repeat(32));
+    }
+
+    /// An instance entry whose own key names another contract is ignored even
+    /// when the endpoint returns it for the requested key, and the fetch
+    /// refuses.
+    #[tokio::test]
+    async fn fetch_wasm_hash_via_rpc_ignores_an_entry_returned_under_another_key() {
+        use stellar_agent_test_support::{KeyedLedgerEntriesResponder, xdr_fixtures};
+
+        const OTHER: &str = "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526";
+        let foreign_entry = xdr_fixtures::ledger_entry_from_response_json(
+            &xdr_fixtures::contract_instance_ledger_entries_json(OTHER, [0x22; 32]),
+        );
+        assert_ne!(
+            foreign_entry["key"].as_str().unwrap(),
+            router_instance_key_b64()
+        );
+        let server = KeyedLedgerEntriesResponder::new()
+            .with_entry_for_key(router_instance_key_b64(), foreign_entry)
+            .serve()
+            .await;
+
+        let result = fetch_wasm_hash_via_rpc(
+            &server.uri(),
+            ROUTER_UNDER_TEST,
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+
+        let Err(SaError::MulticallFailed {
+            phase,
+            redacted_reason,
+            post_submit_kind,
+        }) = result
+        else {
+            panic!("expected MulticallFailed; got {result:?}");
         };
+        assert_eq!(phase, "rpc_divergence");
+        assert_eq!(post_submit_kind, None);
+        assert_eq!(
+            redacted_reason,
+            "RPC returned no contract-instance entry for multicall router address"
+        );
+    }
 
-        let cases: &[(&str, ScVal)] = &[
-            ("Bool", ScVal::Bool(true)),
-            ("Void", ScVal::Void),
-            // ScError is an enum: Value(ScErrorCode) variant.
-            (
-                "Error",
-                ScVal::Error(ScError::Value(ScErrorCode::InvalidInput)),
-            ),
-            ("U32", ScVal::U32(0)),
-            ("I32", ScVal::I32(0)),
-            ("U64", ScVal::U64(0)),
-            ("I64", ScVal::I64(0)),
-            ("Timepoint", ScVal::Timepoint(TimePoint(0))),
-            ("Duration", ScVal::Duration(stellar_xdr::Duration(0))),
-            ("U128", ScVal::U128(UInt128Parts { hi: 0, lo: 0 })),
-            ("I128", ScVal::I128(Int128Parts { hi: 0, lo: 0 })),
-            ("Bytes", ScVal::Bytes(ScBytes(vec![].try_into().unwrap()))),
-            (
-                "String",
-                ScVal::String(ScString(b"".as_slice().try_into().unwrap())),
-            ),
-            (
-                "Symbol",
-                ScVal::Symbol(ScSymbol(b"".as_slice().try_into().unwrap())),
-            ),
-            (
-                "ExecutableTag",
-                ScVal::ExecutableTag(ScString(b"tag".as_slice().try_into().unwrap())),
-            ),
-            ("Vec", ScVal::Vec(None)),
-            ("Map", ScVal::Map(None)),
-            (
-                "LedgerKeyContractInstance",
-                ScVal::LedgerKeyContractInstance,
-            ),
-        ];
+    /// A returned entry whose key is not base64 `LedgerKey` XDR refuses the
+    /// fetch.
+    #[tokio::test]
+    async fn fetch_wasm_hash_via_rpc_refuses_an_undecodable_returned_key() {
+        use stellar_agent_test_support::{KeyedLedgerEntriesResponder, xdr_fixtures};
 
-        for (expected_name, scval) in cases {
-            assert_eq!(
-                scval_discriminant_name(scval),
-                *expected_name,
-                "scval_discriminant_name mismatch for {expected_name}"
-            );
-        }
+        let mut entry = xdr_fixtures::ledger_entry_from_response_json(
+            &xdr_fixtures::contract_instance_ledger_entries_json(ROUTER_UNDER_TEST, [0x11; 32]),
+        );
+        entry["key"] = serde_json::json!("!!!INVALID-XDR-BASE64!!!");
+        let server = KeyedLedgerEntriesResponder::new()
+            .with_entry_for_key(router_instance_key_b64(), entry)
+            .serve()
+            .await;
+
+        let result = fetch_wasm_hash_via_rpc(
+            &server.uri(),
+            ROUTER_UNDER_TEST,
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+
+        let Err(SaError::MulticallFailed {
+            phase,
+            redacted_reason,
+            ..
+        }) = result
+        else {
+            panic!("expected MulticallFailed; got {result:?}");
+        };
+        assert_eq!(phase, "rpc_divergence");
+        assert_eq!(redacted_reason, "RPC returned a malformed ledger key");
     }
 
     // ── build_inner_results — ScVal::Vec(None) path ───────────────────────────

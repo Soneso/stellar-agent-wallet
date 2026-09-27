@@ -214,7 +214,7 @@ pub fn contract_instance_entry_xdr(contract: &ScAddress, wasm_hash: [u8; 32]) ->
 ///
 /// Produces a well-formed ScVal that `parse_context_rule_summary` can decode:
 /// `context_type` = `ScVal::Vec([Symbol("Default")])`, `name` = `ScVal::String("rule-{id}")`,
-/// `valid_until` = `ScVal::Void` (None variant, canonical soroban-env-common/src/option.rs:3-16).
+/// `valid_until` = `ScVal::Void` (None variant, canonical host `Option<T>` ABI).
 ///
 /// The `signer_ids`, `signers`, and `policies` fields are fully populated from
 /// the supplied arguments.
@@ -326,7 +326,8 @@ pub fn build_context_rule_scval_xdr(
         val: vec_or_void(signer_scvals),
     };
     // valid_until: soroban `Option<u32>` None variant.
-    // Canonical ABI per soroban-env-common/src/option.rs:3-16:
+    // Canonical ABI per the soroban-env-common
+    // `TryFromVal<E, Val> for Option<T>` conversion:
     //   None  → ScVal::Void
     //   Some(n) → ScVal::U32(n)
     // The canonical `Option<u32>` ABI uses ScVal::Void for None and ScVal::U32(n) for Some(n),
@@ -362,12 +363,13 @@ pub fn build_context_rule_scval_xdr(
 /// - `None` → `ScVal::Void`
 /// - `Some(n)` → `ScVal::U32(n)`
 ///
-/// Canonical citation: `soroban-env-common/src/option.rs:3-16`.
+/// Canonical citation: the soroban-env-common
+/// `TryFromVal<E, Val> for Option<T>` conversion.
 ///
 /// # Byte-layout citation
 ///
 /// `stellar-accounts-0.7.2/src/smart_account/storage.rs:153-174` (SHA `a9c4216`);
-/// `soroban-env-common/src/option.rs:3-16`.
+/// the soroban-env-common `TryFromVal<E, Val> for Option<T>` conversion.
 pub fn build_context_rule_scval_xdr_with_valid_until(
     rule_id: u32,
     signers: &ObservedSignerSet,
@@ -572,7 +574,7 @@ pub fn build_context_rule_external_signers_xdr(
         val: vec_or_void(signer_scvals),
     };
     // valid_until: canonical None ABI = ScVal::Void.
-    // soroban-env-common/src/option.rs:3-16.
+    // Host `Option<T>` ABI (soroban-env-common `TryFromVal<E, Val> for Option<T>`).
     let valid_until_entry = ScMapEntry {
         key: sym(b"valid_until"),
         val: ScVal::Void, // None variant

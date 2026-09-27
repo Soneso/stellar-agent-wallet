@@ -214,7 +214,7 @@ async fn pin_with<R: Respond + 'static>(
         smart_account_addr(),
         ZERO_CONTRACT_REDACTED,
         &definition_for(kind),
-        0,
+        None,
         SOURCE_G,
         accept_mutable_verifier,
         accept_unknown_verifier,
@@ -252,11 +252,12 @@ async fn external_ref_refused_without_accept_mutable_verifier() {
 
         let error = result.expect_err(&format!("{kind}: must refuse"));
         let expected_detail = format!("owner {OWNER_REDACTED}, tag \"verifier-v1\"");
-        let (key, detail) = match (&error, kind) {
+        let (key, detail, rule_id) = match (&error, kind) {
             (
                 SaError::VerifierMutable {
                     admin_or_owner_key,
                     detail,
+                    rule_id,
                     ..
                 },
                 ContractKind::Verifier,
@@ -265,12 +266,14 @@ async fn external_ref_refused_without_accept_mutable_verifier() {
                 SaError::PolicyMutable {
                     admin_or_owner_key,
                     detail,
+                    rule_id,
                     ..
                 },
                 ContractKind::Policy,
-            ) => (*admin_or_owner_key, detail.clone()),
+            ) => (*admin_or_owner_key, detail.clone(), *rule_id),
             _ => panic!("{kind}: expected the mutable refusal; got {error:?}"),
         };
+        assert_eq!(rule_id, None, "{kind}: a pre-install refusal names no rule");
         assert_eq!(key, AdminOrOwnerKey::ExternalRefExecutable, "{kind}");
         assert_eq!(detail.as_deref(), Some(expected_detail.as_str()), "{kind}");
         let message = error.to_string();
@@ -314,7 +317,7 @@ async fn external_ref_installs_with_accept_mutable_verifier() {
             smart_account_addr(),
             ZERO_CONTRACT_REDACTED,
             &definition,
-            0,
+            None,
             SOURCE_G,
             true,
             false,
@@ -351,6 +354,7 @@ async fn external_ref_installs_with_accept_mutable_verifier() {
             .collect();
         assert_eq!(overrides.len(), 1, "{kind}");
         let EventKind::SaMutableContractOverride {
+            rule_id,
             contract_kind,
             executable_owner_redacted,
             executable_tag,
@@ -359,6 +363,7 @@ async fn external_ref_installs_with_accept_mutable_verifier() {
         else {
             unreachable!("filtered on SaMutableContractOverride");
         };
+        assert_eq!(*rule_id, None, "{kind}: a pre-install row names no rule");
         assert_eq!(*contract_kind, kind);
         assert_eq!(
             executable_owner_redacted.as_ref().map(|o| o.as_str()),
@@ -490,8 +495,12 @@ async fn external_ref_outside_allowlist_needs_both_flags() {
         assert!(
             entries.iter().any(|e| matches!(
                 &e.event_kind,
-                EventKind::SaUnknownContractOverride { observed_hash_first8, contract_kind, .. }
-                    if observed_hash_first8 == "d1d1d1d1d1d1d1d1" && *contract_kind == kind
+                EventKind::SaUnknownContractOverride {
+                    rule_id: None,
+                    observed_hash_first8,
+                    contract_kind,
+                    ..
+                } if observed_hash_first8 == "d1d1d1d1d1d1d1d1" && *contract_kind == kind
             )),
             "{kind}: unknown override row"
         );
@@ -547,6 +556,7 @@ async fn probe_observing_a_different_executable_is_refused_as_executable_changed
                 matches!(
                     &error,
                     SaError::ContractInstanceUnsupported {
+                        rule_id: None,
                         reason: AdminOrOwnerKey::ExecutableChanged,
                         contract_kind,
                         ..

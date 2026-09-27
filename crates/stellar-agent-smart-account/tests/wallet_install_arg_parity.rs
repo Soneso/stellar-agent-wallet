@@ -78,8 +78,8 @@ fn wallet_scval_to_xdr_bytes(scval: &ScVal) -> Vec<u8> {
 /// Asserts byte-equality between the wallet's `encode_option_u32(Some(n))`
 /// shape and soroban-sdk's `Option::<u32>::Some(n)` Val ABI encoding.
 ///
-/// Cross-reference: `soroban-env-common-25.0.1/src/option.rs:3-16` —
-/// `Option<T>::try_from_val` checks `val.is_void()` for `None` and
+/// Cross-reference: the soroban-env-common
+/// `TryFromVal<E, Val> for Option<T>` conversion checks `val.is_void()` for `None` and
 /// otherwise delegates to `T::try_from_val(env, val)` for `Some(_)`. The
 /// raw inner-type ABI is what gets serialised.
 #[test]
@@ -100,7 +100,7 @@ fn option_u32_some_parity_with_onchain_canonical() {
 
     assert_eq!(
         wallet_xdr, onchain_xdr,
-        "Option<u32>::Some(n) wire shape diverges between wallet (stellar-xdr 28) \
+        "Option<u32>::Some(n) wire shape diverges between wallet (workspace stellar-xdr) \
          and on-chain canonical (soroban-sdk).\n\
          wallet:  {wallet_xdr:02x?}\n\
          onchain: {onchain_xdr:02x?}"

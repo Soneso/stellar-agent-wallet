@@ -326,7 +326,7 @@ Every verb's exact flags, the mainnet-refusal matrix, signer-kind discriminators
 | `rules set-name` | Rename a rule |
 | `rules set-valid-until` | Change a rule's expiry ledger |
 | `rules delete` | Remove a rule |
-| `rules verify-pins` | Verify pinned verifier/policy WASM hashes vs on-chain (drift; read-only, exit `1` on drift) |
+| `rules verify-pins` | Verify pinned verifier/policy WASM hashes vs on-chain (drift; read-only, exit `1` on drift); names pinned and observed external-reference executables |
 | `rules add-policy` | Attach a policy (`--kind raw`/`spending-limit`/`simple-threshold`/`weighted-threshold`); cap 5 |
 | `rules remove-policy` | Detach a policy by id |
 | `rules list` / `list-rules` | Enumerate active rules by on-chain scan (read-only, mainnet OK) |

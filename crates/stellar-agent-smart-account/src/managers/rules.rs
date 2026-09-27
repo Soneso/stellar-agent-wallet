@@ -38,8 +38,12 @@ use std::time::Duration;
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::health::AuditWriterHealthHandle;
+use stellar_agent_core::audit_log::schema::ExecutableRefPin;
 use stellar_agent_core::audit_log::writer::AuditWriter;
-use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
+use stellar_agent_core::observability::{
+    RedactedStrkey, redact_strkey_first5_last5, untrusted_display_bounded,
+};
+use stellar_agent_core::scval::scval_variant_name;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::signing::Signer;
 use stellar_agent_network::{StellarRpcClient, fetch_account};
@@ -453,6 +457,29 @@ pub struct VerifyPinsResult {
     pub observed_verifier_first8: Vec<String>,
     /// Observed live policy wasm hashes (first 8 bytes hex each) from chain.
     pub observed_policy_first8: Vec<String>,
+    /// Observed executable of each verifier, aligned with
+    /// `observed_verifier_first8`: the bounded
+    /// [`crate::managers::signers::ObservedExecutable::summary`] of an external
+    /// reference (owner, tag and resolved hash) or `"no code"`, and `None`
+    /// for a plain Wasm executable. Omitted from JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_verifier_executable: Vec<Option<String>>,
+    /// Observed executable of each policy, aligned with
+    /// `observed_policy_first8`, in the form of
+    /// `observed_verifier_executable`. Omitted from JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_policy_executable: Vec<Option<String>>,
+    /// Executable-reference pins from the audit log, aligned with
+    /// `pinned_verifier_first8`; empty when no pinned verifier is an external
+    /// reference, `None` at a position pinned by its Wasm hash. Omitted from
+    /// JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
+    /// Executable-reference pins from the audit log, aligned with
+    /// `pinned_policy_first8`, in the form of
+    /// `pinned_verifier_executable_refs`. Omitted from JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
     /// Install-time mutable-contract override flag, sourced from the
     /// `SaContextRuleCreated` audit row. `false` for pre-Block-B rules.
     pub mutable_override: bool,
@@ -777,7 +804,7 @@ impl ContextRuleManager {
                 smart_account.clone(),
                 &smart_account_redacted,
                 &rule_definition,
-                0, // placeholder rule_id — assigned on-chain; 0 is correct pre-install
+                None, // the rule has no on-chain id before install
                 &source_account_strkey,
                 accept_mutable_verifier,
                 accept_unknown_verifier,
@@ -1004,7 +1031,7 @@ impl ContextRuleManager {
                 smart_account.clone(),
                 &smart_account_redacted,
                 &rule_definition,
-                0, // placeholder rule_id — assigned on-chain; 0 is correct pre-install
+                None, // the rule has no on-chain id before install
                 source_account_strkey,
                 accept_mutable_verifier,
                 accept_unknown_verifier,
@@ -1690,8 +1717,9 @@ impl ContextRuleManager {
         match result.return_val {
             ScVal::U32(policy_id) => Ok((policy_id, result.tx_hash)),
             other => Err(auth_payload_err(format!(
-                "add_policy return value is not ScVal::U32 (got {other:?}); \
-                 expected u32 policy_id per OZ mod.rs:440 SHA a9c4216"
+                "add_policy return value is not ScVal::U32 (got {}); \
+                 expected u32 policy_id per OZ mod.rs:440 SHA a9c4216",
+                scval_variant_name(&other)
             ))),
         }
     }
@@ -1949,7 +1977,8 @@ impl ContextRuleManager {
             other => Err(SaError::DeploymentFailed {
                 phase: "simulate",
                 redacted_reason: format!(
-                    "get_context_rules_count return is not ScVal::U32 (got {other:?})"
+                    "get_context_rules_count return is not ScVal::U32 (got {})",
+                    scval_variant_name(&other)
                 ),
             }),
         }
@@ -2361,6 +2390,10 @@ impl ContextRuleManager {
                     pinned_policy_first8: vec![],
                     observed_verifier_first8: vec![],
                     observed_policy_first8: vec![],
+                    observed_verifier_executable: vec![],
+                    observed_policy_executable: vec![],
+                    pinned_verifier_executable_refs: vec![],
+                    pinned_policy_executable_refs: vec![],
                     mutable_override: false,
                     unknown_override: false,
                     unavailable_wire_code: None,
@@ -2378,91 +2411,107 @@ impl ContextRuleManager {
         let mut unavailable_wire_code: Option<&'static str> = None;
 
         // Verify each verifier address.
-        let (verifier_pin_status, observed_verifier_first8) = if verifier_addrs.is_empty() {
-            (PinStatus::NoContracts, vec![])
-        } else {
-            let mut status = PinStatus::Match;
-            let mut observed: Vec<String> = Vec::new();
-            for verifier_addr in verifier_addrs {
-                let cache_key = scaddress_cache_key(&verifier_addr)?;
-                match crate::managers::verifiers::verify_pinned_verifier_against_chain(
-                    sm,
-                    verifier_addr.clone(),
-                    rule_id,
-                    &smart_account_redacted,
-                    request_id,
-                    &mut wasm_hash_cache,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        // Observed effective hash for the envelope (already
-                        // cached); the check passed, so no code reads as the
-                        // zero hash the pin holds.
-                        if let Some(executable) = wasm_hash_cache.get(&cache_key) {
-                            let h = executable.effective_hash().unwrap_or([0u8; 32]);
-                            observed.push(h[..8].iter().map(|b| format!("{b:02x}")).collect());
+        let (verifier_pin_status, observed_verifier_first8, observed_verifier_executable) =
+            if verifier_addrs.is_empty() {
+                (PinStatus::NoContracts, vec![], vec![])
+            } else {
+                let mut status = PinStatus::Match;
+                let mut observed: Vec<String> = Vec::new();
+                let mut observed_executable: Vec<Option<String>> = Vec::new();
+                for verifier_addr in verifier_addrs {
+                    let cache_key = scaddress_cache_key(&verifier_addr)?;
+                    match crate::managers::verifiers::verify_pinned_verifier_against_chain(
+                        sm,
+                        verifier_addr.clone(),
+                        rule_id,
+                        &smart_account_redacted,
+                        request_id,
+                        &mut wasm_hash_cache,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            // Observed effective hash for the envelope (already
+                            // cached); the check passed, so no code reads as the
+                            // zero hash the pin holds.
+                            if let Some(executable) = wasm_hash_cache.get(&cache_key) {
+                                let h = executable.effective_hash().unwrap_or([0u8; 32]);
+                                observed.push(h[..8].iter().map(|b| format!("{b:02x}")).collect());
+                                observed_executable.push(non_wasm_executable_summary(executable));
+                            }
                         }
-                    }
-                    Err(SaError::VerifierHashDrift {
-                        observed_hash_first8,
-                        ..
-                    }) => {
-                        status = PinStatus::Drift;
-                        observed.push(observed_hash_first8);
-                    }
-                    Err(ref e) => {
-                        if unavailable_wire_code.is_none() {
-                            unavailable_wire_code = Some(e.wire_code());
+                        Err(SaError::VerifierHashDrift {
+                            observed_hash_first8,
+                            ..
+                        }) => {
+                            status = PinStatus::Drift;
+                            observed.push(observed_hash_first8);
+                            observed_executable.push(
+                                wasm_hash_cache
+                                    .get(&cache_key)
+                                    .and_then(non_wasm_executable_summary),
+                            );
                         }
-                        status = PinStatus::Unavailable;
+                        Err(ref e) => {
+                            if unavailable_wire_code.is_none() {
+                                unavailable_wire_code = Some(e.wire_code());
+                            }
+                            status = PinStatus::Unavailable;
+                        }
                     }
                 }
-            }
-            (status, observed)
-        };
+                (status, observed, observed_executable)
+            };
 
         // Verify each policy address.
-        let (policy_pin_status, observed_policy_first8) = if policy_addrs.is_empty() {
-            (PinStatus::NoContracts, vec![])
-        } else {
-            let mut status = PinStatus::Match;
-            let mut observed: Vec<String> = Vec::new();
-            for policy_addr in policy_addrs {
-                let cache_key = scaddress_cache_key(&policy_addr)?;
-                match crate::managers::verifiers::verify_pinned_policy_against_chain(
-                    sm,
-                    policy_addr.clone(),
-                    rule_id,
-                    &smart_account_redacted,
-                    request_id,
-                    &mut wasm_hash_cache,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        if let Some(executable) = wasm_hash_cache.get(&cache_key) {
-                            let h = executable.effective_hash().unwrap_or([0u8; 32]);
-                            observed.push(h[..8].iter().map(|b| format!("{b:02x}")).collect());
+        let (policy_pin_status, observed_policy_first8, observed_policy_executable) =
+            if policy_addrs.is_empty() {
+                (PinStatus::NoContracts, vec![], vec![])
+            } else {
+                let mut status = PinStatus::Match;
+                let mut observed: Vec<String> = Vec::new();
+                let mut observed_executable: Vec<Option<String>> = Vec::new();
+                for policy_addr in policy_addrs {
+                    let cache_key = scaddress_cache_key(&policy_addr)?;
+                    match crate::managers::verifiers::verify_pinned_policy_against_chain(
+                        sm,
+                        policy_addr.clone(),
+                        rule_id,
+                        &smart_account_redacted,
+                        request_id,
+                        &mut wasm_hash_cache,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            if let Some(executable) = wasm_hash_cache.get(&cache_key) {
+                                let h = executable.effective_hash().unwrap_or([0u8; 32]);
+                                observed.push(h[..8].iter().map(|b| format!("{b:02x}")).collect());
+                                observed_executable.push(non_wasm_executable_summary(executable));
+                            }
                         }
-                    }
-                    Err(SaError::PolicyHashDrift {
-                        observed_hash_first8,
-                        ..
-                    }) => {
-                        status = PinStatus::Drift;
-                        observed.push(observed_hash_first8);
-                    }
-                    Err(ref e) => {
-                        if unavailable_wire_code.is_none() {
-                            unavailable_wire_code = Some(e.wire_code());
+                        Err(SaError::PolicyHashDrift {
+                            observed_hash_first8,
+                            ..
+                        }) => {
+                            status = PinStatus::Drift;
+                            observed.push(observed_hash_first8);
+                            observed_executable.push(
+                                wasm_hash_cache
+                                    .get(&cache_key)
+                                    .and_then(non_wasm_executable_summary),
+                            );
                         }
-                        status = PinStatus::Unavailable;
+                        Err(ref e) => {
+                            if unavailable_wire_code.is_none() {
+                                unavailable_wire_code = Some(e.wire_code());
+                            }
+                            status = PinStatus::Unavailable;
+                        }
                     }
                 }
-            }
-            (status, observed)
-        };
+                (status, observed, observed_executable)
+            };
 
         // Only emit unavailable_wire_code when at least one status is Unavailable.
         let wire_code = if verifier_pin_status == PinStatus::Unavailable
@@ -2482,6 +2531,10 @@ impl ContextRuleManager {
             pinned_policy_first8: pin_record.pinned_policy_first8,
             observed_verifier_first8,
             observed_policy_first8,
+            observed_verifier_executable,
+            observed_policy_executable,
+            pinned_verifier_executable_refs: pin_record.pinned_verifier_executable_refs,
+            pinned_policy_executable_refs: pin_record.pinned_policy_executable_refs,
             mutable_override: pin_record.mutable_override,
             unknown_override: pin_record.unknown_override,
             unavailable_wire_code: wire_code,
@@ -3071,10 +3124,9 @@ pub use stellar_xdr::ScAddress as SmartAccountAddress;
 /// Parses a C-strkey (smart-account contract address) into the on-chain
 /// `ScAddress::Contract` form used by all manager methods.
 ///
-/// Caller-facing helper that hides the cross-crate XDR-version dance: the
-/// manager API speaks `stellar_xdr::ScAddress` (stellar-xdr 25.x via
-/// soroban-sdk), while CLI / MCP callers should not need to import that
-/// version directly. This function is the canonical entry point.
+/// Caller-facing helper: the manager API speaks `stellar_xdr::ScAddress`,
+/// while CLI / MCP callers should not need to import the XDR crate
+/// directly. This function is the canonical entry point.
 ///
 /// # Errors
 ///
@@ -3248,16 +3300,16 @@ fn build_add_context_rule_args(def: &ContextRuleDefinition) -> Result<Vec<ScVal>
     // 5. policies: Map<Address, Val>.
     //
     // The Soroban host validates every `ScVal::Map` for strictly ascending key
-    // order (`rs-stellar-xdr/src/curr/scval_validations.rs:69`: `w[0].key <
-    // w[1].key`).  Callers provide policies in arbitrary insertion order, so
-    // we sort by key before constructing the `ScMap`.  `ScVal` derives `Ord`
-    // (`generated.rs:12776`) — the derived ordering matches the host's XDR
+    // order (the stellar-xdr `ScMap` validation compares adjacent keys with a
+    // strict `<`).  Callers provide policies in arbitrary insertion order, so
+    // we sort by key before constructing the `ScMap`.  The generated stellar-xdr
+    // `ScVal` type derives `Ord`; the derived ordering matches the host's XDR
     // discriminant + content ordering for `ScVal::Address` (discriminant 18,
     // per `ScValType` enum order; two `Address` values compare by their inner
     // `ScAddress` bytes).
     //
     // Duplicate-key detection: the Soroban host rejects maps with duplicate
-    // keys at simulate time (`scval_validations.rs:69` uses strict `<`).
+    // keys at simulate time (the `ScMap` validation's strict `<`).
     // Duplicate addresses also trigger `DuplicatePolicy` on-chain
     // (`storage.rs:1119-1121`, SHA `a9c4216`).  Both layers enforce uniqueness;
     // the sort here does not merge duplicates — a duplicate will produce
@@ -3419,12 +3471,12 @@ pub fn context_rule_definition_from_snapshot(
             })?;
             RuleContext::CreateContract { wasm_hash }
         }
-        // `RuleProposalContextType` is `#[non_exhaustive]` (defined in
-        // stellar-agent-core); a future variant fails closed here rather than
-        // silently falling through to a default.
+        // `RuleProposalContextType` is `#[non_exhaustive]` in
+        // stellar-agent-core; a variant this match does not name is refused.
         other => {
             return Err(err(format!(
-                "context_type: unrecognised RuleProposalContextType variant {other:?}"
+                "context_type: unrecognised RuleProposalContextType variant {}",
+                other.variant_name()
             )));
         }
     };
@@ -3512,7 +3564,7 @@ pub fn context_rule_definition_from_snapshot(
 /// - `Some(n)` → `ScVal::U32(n)`
 /// - `None` → `ScVal::Void`
 ///
-/// Cross-reference: `soroban-env-common-25.0.1/src/option.rs:3-16` —
+/// Cross-reference: the soroban-env-common host conversion
 /// `impl<E: Env, T> TryFromVal<E, Val> for Option<T>` checks
 /// `val.is_void()` and returns `None`, otherwise delegates to
 /// `T::try_from_val(env, val)` (i.e. the inner type's raw ABI).
@@ -3628,14 +3680,20 @@ fn rule_context_from_context_type_scval(context_type: &ScVal) -> Result<RuleCont
     let elems = match context_type {
         ScVal::Vec(Some(ScVec(elems))) => elems,
         other => {
-            return Err(parse_err(format!("expected ScVal::Vec, got {other:?}")));
+            return Err(parse_err(format!(
+                "expected ScVal::Vec, got {}",
+                scval_variant_name(other)
+            )));
         }
     };
 
     let tag = match elems.first() {
         Some(ScVal::Symbol(s)) => s.to_utf8_string_lossy(),
         Some(other) => {
-            return Err(parse_err(format!("vec[0]: expected Symbol, got {other:?}")));
+            return Err(parse_err(format!(
+                "vec[0]: expected Symbol, got {}",
+                scval_variant_name(other)
+            )));
         }
         None => {
             return Err(parse_err("context_type vec is empty".to_owned()));
@@ -3664,7 +3722,8 @@ fn rule_context_from_context_type_scval(context_type: &ScVal) -> Result<RuleCont
                     contract: addr.clone(),
                 }),
                 other => Err(parse_err(format!(
-                    "CallContract vec[1]: expected Address, got {other:?}"
+                    "CallContract vec[1]: expected Address, got {}",
+                    scval_variant_name(other)
                 ))),
             }
         }
@@ -3686,11 +3745,15 @@ fn rule_context_from_context_type_scval(context_type: &ScVal) -> Result<RuleCont
                     Ok(RuleContext::CreateContract { wasm_hash })
                 }
                 other => Err(parse_err(format!(
-                    "CreateContract vec[1]: expected Bytes, got {other:?}"
+                    "CreateContract vec[1]: expected Bytes, got {}",
+                    scval_variant_name(other)
                 ))),
             }
         }
-        other => Err(parse_err(format!("unknown context_type variant '{other}'"))),
+        other => Err(parse_err(format!(
+            "unknown context_type variant \"{}\"",
+            untrusted_display_bounded(other.as_bytes())
+        ))),
     }
 }
 
@@ -3725,7 +3788,10 @@ pub fn decode_context_type_from_scval(rule_scval: &ScVal) -> Result<RuleContext,
     let entries = match rule_scval {
         ScVal::Map(Some(ScMap(e))) => e.as_slice(),
         other => {
-            return Err(parse_err(format!("expected ScVal::Map, got {other:?}")));
+            return Err(parse_err(format!(
+                "expected ScVal::Map, got {}",
+                scval_variant_name(other)
+            )));
         }
     };
 
@@ -4081,7 +4147,8 @@ fn parse_context_rule_id_from_return(scval: &ScVal) -> Result<u32, SaError> {
             return Err(SaError::DeploymentFailed {
                 phase: "submit",
                 redacted_reason: format!(
-                    "add_context_rule return is not ScVal::Map (got {other:?})"
+                    "add_context_rule return is not ScVal::Map (got {})",
+                    scval_variant_name(other)
                 ),
             });
         }
@@ -4120,15 +4187,16 @@ fn parse_context_rule_id_from_return(scval: &ScVal) -> Result<u32, SaError> {
 /// - `signer_ids`: `ScVal::Vec(Some(ScVec([...])))` — ignored here
 /// - `signers`: `ScVal::Vec(Some(ScVec([...])))` — `ScVec` len = signer count
 /// - `valid_until`: soroban `Option<u32>` uses the **standard-library `Option`**
-///   host ABI, NOT the `#[contracttype]` enum-variant encoding. Per
-///   `soroban-env-common/src/option.rs:3-16` (canonical citation):
+///   host ABI, NOT the `#[contracttype]` enum-variant encoding. Per the
+///   soroban-env-common `TryFromVal<E, Val> for Option<T>` conversion:
 ///   `None` → `ScVal::Void`; `Some(n)` → `ScVal::U32(n)` (the inner type's
 ///   raw ABI directly, without any Map or Vec wrapping). The existing wallet
 ///   encoder at `rules.rs:encode_option_u32` already uses this canonical shape.
 ///
 /// Byte-layout canonical citation: OZ `storage.rs:152-174` (SHA `a9c4216`) for
-/// the `ContextRule` struct field layout; `soroban-env-common/src/option.rs:3-16`
-/// for the `Option<u32>` host-ABI encoding.
+/// the `ContextRule` struct field layout; the soroban-env-common
+/// `TryFromVal<E, Val> for Option<T>` conversion for the `Option<u32>`
+/// host-ABI encoding.
 ///
 /// # Errors
 ///
@@ -4143,7 +4211,10 @@ fn parse_context_rule_summary(scval: ScVal, rule_id: u32) -> Result<ContextRuleS
     let entries = match scval {
         ScVal::Map(Some(ScMap(ref e))) => e.clone(),
         other => {
-            return Err(parse_err(format!("expected ScVal::Map, got {other:?}")));
+            return Err(parse_err(format!(
+                "expected ScVal::Map, got {}",
+                scval_variant_name(&other)
+            )));
         }
     };
 
@@ -4168,7 +4239,8 @@ fn parse_context_rule_summary(scval: ScVal, rule_id: u32) -> Result<ContextRuleS
                     }
                     other => {
                         return Err(parse_err(format!(
-                            "name field: expected ScVal::String, got {other:?}"
+                            "name field: expected ScVal::String, got {}",
+                            scval_variant_name(other)
                         )));
                     }
                 });
@@ -4184,19 +4256,22 @@ fn parse_context_rule_summary(scval: ScVal, rule_id: u32) -> Result<ContextRuleS
                             "CreateContract" => "create_contract",
                             other => {
                                 return Err(parse_err(format!(
-                                    "context_type: unknown variant '{other}'"
+                                    "context_type: unknown variant \"{}\"",
+                                    untrusted_display_bounded(other.as_bytes())
                                 )));
                             }
                         },
                         other => {
                             return Err(parse_err(format!(
-                                "context_type vec[0]: expected Symbol, got {other:?}"
+                                "context_type vec[0]: expected Symbol, got {}",
+                                scval_variant_name(other)
                             )));
                         }
                     },
                     other => {
                         return Err(parse_err(format!(
-                            "context_type: expected ScVal::Vec, got {other:?}"
+                            "context_type: expected ScVal::Vec, got {}",
+                            scval_variant_name(other)
                         )));
                     }
                 });
@@ -4209,7 +4284,8 @@ fn parse_context_rule_summary(scval: ScVal, rule_id: u32) -> Result<ContextRuleS
                     ScVal::Vec(None) => 0,
                     other => {
                         return Err(parse_err(format!(
-                            "signers: expected ScVal::Vec, got {other:?}"
+                            "signers: expected ScVal::Vec, got {}",
+                            scval_variant_name(other)
                         )));
                     }
                 });
@@ -4222,7 +4298,8 @@ fn parse_context_rule_summary(scval: ScVal, rule_id: u32) -> Result<ContextRuleS
                     ScVal::Vec(None) => 0,
                     other => {
                         return Err(parse_err(format!(
-                            "policies: expected ScVal::Vec, got {other:?}"
+                            "policies: expected ScVal::Vec, got {}",
+                            scval_variant_name(other)
                         )));
                     }
                 });
@@ -4230,7 +4307,8 @@ fn parse_context_rule_summary(scval: ScVal, rule_id: u32) -> Result<ContextRuleS
             "valid_until" => {
                 // soroban `Option<u32>` uses the standard-library host ABI, NOT
                 // the `#[contracttype]` enum-variant encoding.
-                // Canonical source: `soroban-env-common/src/option.rs:3-16`:
+                // Canonical source: the soroban-env-common
+                // `TryFromVal<E, Val> for Option<T>` conversion:
                 //   None  → Val::VOID  → ScVal::Void
                 //   Some(t) → t.try_into_val(env) → for u32: ScVal::U32(n)
                 // The encoder at `encode_option_u32` already uses this shape
@@ -4240,8 +4318,8 @@ fn parse_context_rule_summary(scval: ScVal, rule_id: u32) -> Result<ContextRuleS
                     ScVal::Void => None,
                     other => {
                         return Err(parse_err(format!(
-                            "valid_until: expected ScVal::U32 (Some) or ScVal::Void (None) \
-                             per soroban-env-common/src/option.rs:3-16; got {other:?}"
+                            "valid_until: expected ScVal::U32 (Some) or ScVal::Void (None); got {}",
+                            scval_variant_name(other)
                         )));
                     }
                 });
@@ -4308,7 +4386,10 @@ pub fn decode_signer_count_from_scval(scval: &ScVal) -> Result<u32, SaError> {
     let entries = match scval {
         ScVal::Map(Some(ScMap(e))) => e.as_slice(),
         other => {
-            return Err(parse_err(format!("expected ScVal::Map, got {other:?}")));
+            return Err(parse_err(format!(
+                "expected ScVal::Map, got {}",
+                scval_variant_name(other)
+            )));
         }
     };
 
@@ -4327,7 +4408,8 @@ pub fn decode_signer_count_from_scval(scval: &ScVal) -> Result<u32, SaError> {
                 }),
                 ScVal::Vec(None) => Ok(0),
                 other => Err(parse_err(format!(
-                    "signer_ids: expected ScVal::Vec, got {other:?}"
+                    "signer_ids: expected ScVal::Vec, got {}",
+                    scval_variant_name(other)
                 ))),
             };
         }
@@ -4374,7 +4456,10 @@ pub fn decode_policy_count_from_scval(scval: &ScVal) -> Result<u32, SaError> {
     let entries = match scval {
         ScVal::Map(Some(ScMap(e))) => e.as_slice(),
         other => {
-            return Err(parse_err(format!("expected ScVal::Map, got {other:?}")));
+            return Err(parse_err(format!(
+                "expected ScVal::Map, got {}",
+                scval_variant_name(other)
+            )));
         }
     };
 
@@ -4393,7 +4478,8 @@ pub fn decode_policy_count_from_scval(scval: &ScVal) -> Result<u32, SaError> {
                 }),
                 ScVal::Vec(None) => Ok(0),
                 other => Err(parse_err(format!(
-                    "policy_ids: expected ScVal::Vec, got {other:?}"
+                    "policy_ids: expected ScVal::Vec, got {}",
+                    scval_variant_name(other)
                 ))),
             };
         }
@@ -4414,7 +4500,7 @@ pub fn decode_policy_count_from_scval(scval: &ScVal) -> Result<u32, SaError> {
 ///
 /// # Byte-layout citation
 ///
-/// `soroban-env-common/src/option.rs:3-16` (soroban-env-common 25.0.1):
+/// The soroban-env-common `TryFromVal<E, Val> for Option<T>` conversion:
 /// - `None`  → `Val::VOID` → `ScVal::Void`
 /// - `Some(t)` → `t.try_into_val(env)` → for `u32`: `ScVal::U32(n)`
 ///
@@ -4441,7 +4527,10 @@ pub fn extract_valid_until_from_rule_scval(scval: &ScVal) -> Result<Option<u32>,
     let entries = match scval {
         ScVal::Map(Some(ScMap(e))) => e.as_slice(),
         other => {
-            return Err(parse_err(format!("expected ScVal::Map, got {other:?}")));
+            return Err(parse_err(format!(
+                "expected ScVal::Map, got {}",
+                scval_variant_name(other)
+            )));
         }
     };
 
@@ -4451,15 +4540,16 @@ pub fn extract_valid_until_from_rule_scval(scval: &ScVal) -> Result<Option<u32>,
             _ => continue,
         };
         if key_sym.as_str() == "valid_until" {
-            // `Option<u32>` wire shape per soroban-env-common/src/option.rs:3-16:
+            // `Option<u32>` wire shape per the soroban-env-common
+            // `TryFromVal<E, Val> for Option<T>` conversion:
             //   None  → ScVal::Void
             //   Some(n) → ScVal::U32(n)
             return match &entry.val {
                 ScVal::U32(n) => Ok(Some(*n)),
                 ScVal::Void => Ok(None),
                 other => Err(parse_err(format!(
-                    "valid_until: expected ScVal::U32 (Some) or ScVal::Void (None) \
-                     per soroban-env-common/src/option.rs:3-16; got {other:?}"
+                    "valid_until: expected ScVal::U32 (Some) or ScVal::Void (None); got {}",
+                    scval_variant_name(other)
                 ))),
             };
         }
@@ -4877,10 +4967,22 @@ pub(crate) fn xdr_scaddress_to_strkey_or_sentinel(addr: &xdr_curr::ScAddress) ->
         .unwrap_or_else(|_| "[unknown-address-type]".to_owned())
 }
 
+/// Returns the bounded summary of an observed executable for the
+/// verify-pins report, or `None` for a plain Wasm executable, whose hash the
+/// first-8 list already carries.
+fn non_wasm_executable_summary(
+    executable: &crate::managers::signers::ObservedExecutable,
+) -> Option<String> {
+    match executable {
+        crate::managers::signers::ObservedExecutable::Wasm(_) => None,
+        other => Some(other.summary()),
+    }
+}
+
 /// Builds a `LedgerKey::ContractData` key for a contract's instance entry.
 ///
 /// Encodes the `LedgerKeyContractInstance` ledger key for `getLedgerEntries`.
-/// Layout per `stellar-xdr` v26.0.0 `xdr/curr/src/ledger.x` `LedgerKeyContractData`:
+/// Layout per `LedgerKeyContractData` in `Stellar-ledger-entries.x`:
 /// - `contract`: the target contract's `ScAddress`.
 /// - `key`: `ScVal::LedgerKeyContractInstance`.
 /// - `durability`: `ContractDataDurability::Persistent`.
@@ -5182,8 +5284,8 @@ mod tests {
     /// Pins the standard soroban-sdk `Option<u32>::Some(n)` Val ABI:
     /// raw `ScVal::U32(n)` (no wrapping enum tag — the `Vec([Symbol(_)])`
     /// shape is for `#[contracttype]` enums, NOT for the std library
-    /// `Option<T>`). Cross-reference:
-    /// `soroban-env-common-25.0.1/src/option.rs:3-16`.
+    /// `Option<T>`). Cross-reference: the soroban-env-common
+    /// `TryFromVal<E, Val> for Option<T>` conversion.
     #[test]
     fn encode_option_u32_some_round_trip() {
         let scval = encode_option_u32(Some(123_456)).unwrap();
@@ -6269,6 +6371,69 @@ mod tests {
         );
     }
 
+    /// A `CreateContract` context whose payload is a 10 KiB `ScVal::String`
+    /// yields a reason under 256 bytes that names the payload's variant and
+    /// carries none of its bytes.
+    #[test]
+    fn rule_context_decode_large_string_payload_reason_is_bounded() {
+        let payload = "Z".repeat(10 * 1024);
+        let context = ScVal::Vec(Some(ScVec(
+            vec![
+                ScVal::Symbol(ScSymbol::try_from("CreateContract").unwrap()),
+                ScVal::String(ScString(payload.as_bytes().to_vec().try_into().unwrap())),
+            ]
+            .try_into()
+            .unwrap(),
+        )));
+
+        let err = rule_context_from_context_type_scval(&context)
+            .expect_err("a String CreateContract payload must fail closed");
+
+        let SaError::DeploymentFailed {
+            phase,
+            redacted_reason,
+        } = err
+        else {
+            panic!("expected DeploymentFailed");
+        };
+        assert_eq!(phase, "simulate");
+        assert!(
+            redacted_reason.len() < 256,
+            "reason is {} bytes",
+            redacted_reason.len()
+        );
+        assert_eq!(
+            redacted_reason,
+            "decode context_type: CreateContract vec[1]: expected Bytes, got String"
+        );
+        assert!(!redacted_reason.contains("ZZZZ"));
+    }
+
+    /// An unknown context-type tag renders through the bounded untrusted
+    /// renderer, so a control character in the ledger symbol is escaped.
+    #[test]
+    fn rule_context_decode_unknown_tag_is_rendered_escaped() {
+        let bogus = ScVal::Vec(Some(ScVec(
+            vec![ScVal::Symbol(ScSymbol(
+                b"Bad\ntag".to_vec().try_into().unwrap(),
+            ))]
+            .try_into()
+            .unwrap(),
+        )));
+        let err = rule_context_from_context_type_scval(&bogus)
+            .expect_err("unknown variant must fail closed");
+        let SaError::DeploymentFailed {
+            redacted_reason, ..
+        } = err
+        else {
+            panic!("expected DeploymentFailed");
+        };
+        assert_eq!(
+            redacted_reason,
+            "decode context_type: unknown context_type variant \"Bad\\ntag\""
+        );
+    }
+
     // ── OZ SpendingLimitError symbolic-name tests ─────────────────────────────
 
     /// `oz_spending_limit_policy_error_name` maps the OZ `SpendingLimitError`
@@ -6415,8 +6580,7 @@ mod tests {
     /// - `durability = Persistent`
     /// - `contract = the input ScAddress`
     ///
-    /// Layout per `stellar-xdr` v27 `xdr/curr/src/ledger.x`
-    /// `LedgerKeyContractData`.
+    /// Layout per `LedgerKeyContractData` in `Stellar-ledger-entries.x`.
     #[test]
     fn contract_instance_key_builds_correct_ledger_key() {
         use stellar_xdr::{ContractDataDurability, LedgerKey};
@@ -6665,7 +6829,7 @@ mod tests {
     /// per the Soroban host's strictly-ascending-key invariant.
     ///
     /// The Soroban host validates `ScVal::Map` for strict ascending key order
-    /// (`rs-stellar-xdr/src/curr/scval_validations.rs:69`). When policies are
+    /// (the stellar-xdr `ScMap` validation). When policies are
     /// supplied in a non-sorted order, the encoder must sort them before
     /// constructing the `ScMap`.
     ///
@@ -6717,7 +6881,8 @@ mod tests {
     /// `build_add_context_rule_args` encodes `valid_until = Some(n)` as arg[2]
     /// = `ScVal::U32(n)` per the `Option<u32>` host ABI.
     ///
-    /// Canonical source: `soroban-env-common/src/option.rs:3-16`; arg position
+    /// Canonical source: the soroban-env-common
+    /// `TryFromVal<E, Val> for Option<T>` conversion; arg position
     /// per OZ `mod.rs:238-248` SHA `a9c4216`.
     #[test]
     fn build_add_context_rule_args_encodes_valid_until_some() {
@@ -7405,6 +7570,68 @@ mod tests {
         );
     }
 
+    // ── VerifyPinsResult wire shape ───────────────────────────────────────────
+
+    /// A `VerifyPinsResult` without the four executable fields deserialises
+    /// with them empty, empty fields are omitted on serialise, and populated
+    /// fields round-trip.
+    #[test]
+    fn verify_pins_result_executable_fields_default_empty_and_skip_when_empty() {
+        const JSON_WITHOUT_EXECUTABLE_FIELDS: &str = r#"{
+            "smart_account": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "rule_id": 2,
+            "verifier_pin_status": "match",
+            "policy_pin_status": "no_contracts",
+            "pinned_verifier_first8": ["ab12cd34"],
+            "pinned_policy_first8": [],
+            "observed_verifier_first8": ["ab12cd34"],
+            "observed_policy_first8": [],
+            "mutable_override": false,
+            "unknown_override": false
+        }"#;
+        const EXECUTABLE_FIELDS: [&str; 4] = [
+            "observed_verifier_executable",
+            "observed_policy_executable",
+            "pinned_verifier_executable_refs",
+            "pinned_policy_executable_refs",
+        ];
+
+        let mut result: VerifyPinsResult =
+            serde_json::from_str(JSON_WITHOUT_EXECUTABLE_FIELDS).unwrap();
+        assert!(result.observed_verifier_executable.is_empty());
+        assert!(result.observed_policy_executable.is_empty());
+        assert!(result.pinned_verifier_executable_refs.is_empty());
+        assert!(result.pinned_policy_executable_refs.is_empty());
+
+        let json = serde_json::to_value(&result).unwrap();
+        for field in EXECUTABLE_FIELDS {
+            assert!(json.get(field).is_none(), "{field} must be omitted: {json}");
+        }
+
+        let pin = ExecutableRefPin {
+            owner_redacted: RedactedStrkey::from_already_redacted("GAAAA...AAWHF"),
+            tag: "verifier-v1".to_owned(),
+            ref_key_hex: "ab".repeat(32),
+            resolved_hash_first8: "ab12cd34ab12cd34".to_owned(),
+        };
+        result.observed_verifier_executable = vec![Some("no code".to_owned())];
+        result.observed_policy_executable = vec![None];
+        result.pinned_verifier_executable_refs = vec![Some(pin.clone())];
+        result.pinned_policy_executable_refs = vec![None];
+        let json = serde_json::to_string(&result).unwrap();
+        // `unavailable_wire_code` borrows `&'static str`, so the round-trip
+        // input must live for `'static`.
+        let back: VerifyPinsResult =
+            serde_json::from_str(Box::leak(json.into_boxed_str())).unwrap();
+        assert_eq!(
+            back.observed_verifier_executable,
+            vec![Some("no code".to_owned())]
+        );
+        assert_eq!(back.observed_policy_executable, vec![None]);
+        assert_eq!(back.pinned_verifier_executable_refs, vec![Some(pin)]);
+        assert_eq!(back.pinned_policy_executable_refs, vec![None]);
+    }
+
     // ── verify_rule_wasm_pins path tests ─────────────────────────────────────
     //
     // Mock-based tests for the three non-network paths of `verify_rule_wasm_pins`
@@ -7530,7 +7757,7 @@ mod tests {
     ///
     /// # Byte-layout citation
     ///
-    /// `soroban-env-common/src/option.rs:3-16`:
+    /// The soroban-env-common `TryFromVal<E, Val> for Option<T>` conversion:
     ///   `None → ScVal::Void`, `Some(n) → ScVal::U32(n)`.
     /// OZ `storage.rs:159` SHA `a9c4216`: `valid_until: Option<u32>`.
     fn synthetic_rule_scval_with_valid_until(valid_until: Option<u32>) -> ScVal {
@@ -7940,8 +8167,8 @@ mod tests {
     // ── scaddress_to_strkey: unsupported variant path ─────────────────────────
 
     /// `scaddress_to_strkey` returns `AuthEntryConstructionFailed` for an
-    /// `ScAddress::MuxedAccount` — a variant present in the stellar-xdr v28
-    /// `ScAddress` union but not an account or contract principal. The reason
+    /// `ScAddress::MuxedAccount`, a variant of the `SCAddress` union in
+    /// `Stellar-contract.x` but not an account or contract principal. The reason
     /// names the variant and carries none of the address bytes.
     #[test]
     fn scaddress_to_strkey_muxed_account_returns_error() {

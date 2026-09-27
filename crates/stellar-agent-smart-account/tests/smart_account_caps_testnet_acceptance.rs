@@ -464,7 +464,7 @@ fn encode_threshold_params_h2(threshold: u32) -> ScVal {
 /// even when the same deployer and the same WASM are used, which is required
 /// for the 5-policy rule (5 distinct policy contracts) where the on-chain
 /// `ScMap<Address, Val>` key uniqueness constraint (enforced by the Soroban
-/// host — rs-stellar-xdr `scval_validations.rs`, `validate_scmap`) would
+/// host through the stellar-xdr `ScMap` validation) would
 /// reject a map with duplicate `Address` keys.
 ///
 /// # Idempotence
@@ -480,9 +480,9 @@ fn encode_threshold_params_h2(threshold: u32) -> ScVal {
 ///   `policies: &Map<Address, Val>` — a Soroban Map, whose keys are unique
 ///   by construction. The wallet's off-chain `ScVal::Map` encoding for the
 ///   policies argument therefore MUST NOT contain duplicate `Address` keys.
-/// - `rs-stellar-xdr/src/curr/scval_validations.rs:58-75`: the Soroban host
-///   validates every `ScVal::Map` for strict ascending key order; duplicate
-///   keys fail with `Error::Invalid` at the simulate phase.
+/// - The stellar-xdr `ScMap` validation: the Soroban host validates every
+///   `ScVal::Map` for strict ascending key order; duplicate keys fail with
+///   `Error::Invalid` at the simulate phase.
 /// - OZ `storage.rs:1119-1121` SHA `a9c4216`: `add_policy` also rejects
 ///   duplicate addresses via `DuplicatePolicy` panic, making a second
 ///   `add_policy(same_addr)` call on any rule impossible.
@@ -693,7 +693,7 @@ async fn deploy_threshold_policy_with_salt(
 /// `Map<Address, Val>` (OZ `storage.rs:632-638` SHA `a9c4216`), whose keys
 /// must be unique. The wallet's off-chain encoding as `ScVal::Map` is validated
 /// by the Soroban host for strict ascending key order with no duplicates
-/// (`scval_validations.rs:58-75`); passing 5 entries with the same `Address`
+/// (the stellar-xdr `ScMap` validation); passing 5 entries with the same `Address`
 /// key would fail at the simulate phase with `Error::Invalid`.
 ///
 /// The 5 deployments share the same WASM bytes (upload is idempotent) but
@@ -736,7 +736,7 @@ async fn deploy_five_distinct_threshold_policies_h2(
 /// `Map<Address, Val>` (OZ `storage.rs:632-638` SHA `a9c4216`). The wallet
 /// encodes this off-chain as `ScVal::Map` (rules.rs `build_add_context_rule_args`).
 /// The Soroban host validates every `ScVal::Map` for strict ascending key order
-/// with no duplicate keys (rs-stellar-xdr `scval_validations.rs`, `validate_scmap`).
+/// with no duplicate keys (the stellar-xdr `ScMap` validation).
 /// Passing 5 entries with the same `Address` key would fail at the simulate
 /// phase with `Error::Invalid` — the rule would never be installed and the
 /// test's precondition guard at step 5 would never pass.
@@ -761,8 +761,8 @@ async fn deploy_five_distinct_threshold_policies_h2(
 /// - OZ `storage.rs:171` SHA `a9c4216`: `ContextRuleEntry.policy_ids: Vec<u32>`.
 /// - OZ `storage.rs:632-638` SHA `a9c4216`: `add_context_rule` takes
 ///   `policies: &Map<Address, Val>` — Soroban Map with unique Address keys.
-/// - `scval_validations.rs:58-75`: Soroban host rejects `ScVal::Map` with
-///   duplicate keys.
+/// - The stellar-xdr `ScMap` validation: the Soroban host rejects
+///   `ScVal::Map` with duplicate keys.
 /// - OZ `storage.rs:1119-1121` SHA `a9c4216`: `add_policy` panics with
 ///   `DuplicatePolicy` when the same address is already registered in the rule.
 ///
@@ -799,7 +799,8 @@ async fn h2_6th_policy_refused() {
     // so the resulting addresses are distinct. This is required because the
     // `policies` arg to OZ `add_context_rule` is `Map<Address, Val>`; the
     // wallet's ScVal::Map encoding is validated by the Soroban host for strict
-    // ascending key order with no duplicate keys (scval_validations.rs:58-75).
+    // ascending key order with no duplicate keys (the stellar-xdr `ScMap`
+    // validation).
     // Using 5 entries with the same Address key would fail at simulate.
     let policy_strkeys =
         deploy_five_distinct_threshold_policies_h2(&operator_g, operator_signer.as_ref()).await;
@@ -824,7 +825,7 @@ async fn h2_6th_policy_refused() {
 
     // ── Step 4: Install a 5-policy rule with 5 DISTINCT addresses ────────────
     // Using distinct addresses satisfies the Soroban ScVal::Map uniqueness
-    // constraint (scval_validations.rs:58-75) and the on-chain Map<Address, Val>
+    // constraint (the stellar-xdr `ScMap` validation) and the on-chain Map<Address, Val>
     // semantics of the `policies` argument to `add_context_rule`
     // (OZ storage.rs:632-638 SHA `a9c4216`).
     let threshold_params = encode_threshold_params_h2(1);

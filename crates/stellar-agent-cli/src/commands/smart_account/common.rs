@@ -692,6 +692,7 @@ mod tests {
     /// from the seed, end to end through the mlock ceremony (unlock, derive,
     /// dispose).
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     #[allow(
         unsafe_code,
         reason = "test-only process environment mutation; the variable name is unique to this test"
@@ -758,6 +759,7 @@ mod tests {
     /// `validation.secret_env_invalid`, naming the variable but never echoing
     /// its value.
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     #[allow(
         unsafe_code,
         reason = "test-only process environment mutation; the variable name is unique to this test"

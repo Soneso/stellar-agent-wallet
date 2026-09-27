@@ -561,8 +561,8 @@ async fn q2_insufficient_signers_fails_before_rpc() {
 ///
 /// The OpenZeppelin smart-account contract's on-chain `__check_auth` enforces
 /// the 2-of-3 threshold at invocation time. The per-signer auth-entry XDR shape
-/// is `HashIdPreimageSorobanAuthorization` from stellar-xdr 27
-/// `curr/src/generated.rs`.
+/// is `HashIdPreimage::SorobanAuthorization`
+/// (`HashIdPreimageSorobanAuthorization`) in `Stellar-transaction.x`.
 ///
 /// # Acceptance
 ///
@@ -639,8 +639,8 @@ async fn q1_and_q3_two_of_three_quorum_invocation_accepted() {
     // The OpenZeppelin threshold policy exposes
     // `get_threshold(context_rule_id: u32, smart_account: Address)`.
     //
-    // Per-signer auth-entry XDR shape: `HashIdPreimageSorobanAuthorization` from
-    // stellar-xdr 27 `curr/src/generated.rs`.
+    // Per-signer auth-entry XDR shape: `HashIdPreimage::SorobanAuthorization`
+    // (`HashIdPreimageSorobanAuthorization`) in `Stellar-transaction.x`.
 
     let policy_addr =
         parse_c_strkey_to_smart_account(&policy_strkey).expect("policy C-strkey must parse");

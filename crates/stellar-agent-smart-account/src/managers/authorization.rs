@@ -370,9 +370,8 @@ impl QuorumError {
 /// [`build_authorization_entry`]
 /// + [`complete_authorization_entry`][crate::managers::auth_entry::complete_authorization_entry]
 ///   substrate.
-///   The `HashIdPreimage::SorobanAuthorization` XDR preimage matches
-///   `stellar-xdr 27 src/curr/generated.rs` `HashIdPreimage` and
-///   `HashIdPreimageSorobanAuthorization`.
+///   The XDR preimage is `HashIdPreimage::SorobanAuthorization`
+///   (`HashIdPreimageSorobanAuthorization`) in `Stellar-transaction.x`.
 ///
 /// # Signer matching
 ///
@@ -660,8 +659,8 @@ async fn collect_group_entries(
     // args, rule_ids, simulation nonce, expiry) are identical for all signers
     // in this group.
     //
-    // Canonical byte-layout source: stellar-xdr 27
-    // `HashIdPreimageSorobanAuthorization` in src/curr/generated.rs.
+    // Canonical byte-layout source: `HashIdPreimage::SorobanAuthorization`
+    // (`HashIdPreimageSorobanAuthorization`) in `Stellar-transaction.x`.
     let partial: PartialSorobanAuthorizationEntry = build_authorization_entry(
         auth_scaddr.clone(),
         function_name.clone(),
@@ -709,8 +708,8 @@ async fn collect_group_entries(
     // the quorum needs their own delegated entry by the same logic.
     // XDR shape: SorobanAuthorizationEntry with SorobanCredentials::Address whose
     // address is the signer's G-key; signature over the standard Soroban
-    // HashIdPreimage::SorobanAuthorization preimage (stellar-xdr 27
-    // HashIdPreimageSorobanAuthorization).
+    // HashIdPreimage::SorobanAuthorization preimage
+    // (`HashIdPreimageSorobanAuthorization` in `Stellar-transaction.x`).
     let mut entries: Vec<SorobanAuthorizationEntry> = Vec::with_capacity(1 + qualifying.len());
     entries.push(smart_account_entry);
 

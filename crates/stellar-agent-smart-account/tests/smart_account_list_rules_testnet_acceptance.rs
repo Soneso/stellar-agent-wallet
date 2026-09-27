@@ -441,7 +441,8 @@ async fn h1_list_rules_across_sparse_id_gap_on_testnet() {
 ///
 /// The `valid_until` decoder correctly handles the canonical soroban `Option<u32>` ABI:
 /// - `None` → `ScVal::Void`
-/// - `Some(n)` → `ScVal::U32(n)` (soroban-env-common/src/option.rs:3-16)
+/// - `Some(n)` → `ScVal::U32(n)` (soroban-env-common
+///   `TryFromVal<E, Val> for Option<T>`)
 ///
 /// This testnet test installs a rule with `Some(valid_until)` and verifies the
 /// live RPC response is decoded correctly end-to-end.
@@ -458,7 +459,8 @@ async fn h1_list_rules_across_sparse_id_gap_on_testnet() {
 /// - `enumeration.rules[1].valid_until == Some(LARGE_FUTURE_LEDGER)`.
 /// - `enumeration.rules[0].valid_until == None` (bootstrap rule is permanent).
 ///
-/// The decoder regression-lock relies on `soroban-env-common/src/option.rs:3-16`.
+/// The decoder regression-lock relies on the soroban-env-common
+/// `TryFromVal<E, Val> for Option<T>` conversion.
 #[tokio::test]
 async fn h2_valid_until_some_decoded_correctly_on_testnet() {
     // A far-future ledger sequence — large enough that it will not be reached
@@ -536,7 +538,7 @@ async fn h2_valid_until_some_decoded_correctly_on_testnet() {
         Some(LARGE_FUTURE_LEDGER),
         "decoder regression-lock: valid_until must be Some({LARGE_FUTURE_LEDGER}); \
          got {:?}. If this fails, the decoder is using the wrong encoding — \
-         it should accept ScVal::U32(n) directly per soroban-env-common/src/option.rs:3-16.",
+         it should accept ScVal::U32(n) directly per the host Option<T> ABI.",
         result.rules[1].valid_until
     );
 

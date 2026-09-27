@@ -3536,7 +3536,7 @@ impl SignersManager {
                 &verifier_addr,
                 ContractKind::Verifier,
                 verifier_hash_allowlisted,
-                rule_id,
+                Some(rule_id),
                 &smart_account_redacted,
                 &request_id,
             )
@@ -3568,6 +3568,8 @@ impl SignersManager {
     /// hash; no code is never allowlisted.
     ///
     /// `contract_kind` names the role of `contract_addr` in a refusal.
+    /// `rule_id` is `None` before install, when the rule has no on-chain id
+    /// yet; see [`fetch_observed_executable`] for how each refusal carries it.
     ///
     /// # Errors
     ///
@@ -3581,7 +3583,7 @@ impl SignersManager {
         contract_addr: &ScAddress,
         contract_kind: ContractKind,
         is_allowlisted: impl Fn(&[u8; 32]) -> bool,
-        rule_id: u32,
+        rule_id: Option<u32>,
         smart_account_redacted: &str,
         request_id: &str,
     ) -> Result<ContractObservation, SaError> {
@@ -4620,9 +4622,10 @@ pub(crate) async fn fetch_contract_wasm_hashes(
 ///
 /// Both the entry key and the entry data come from an untrusted RPC response
 /// and are decoded under the depth- and length-bounded untrusted-decode
-/// limits. A returned entry whose key or data does not decode, or whose key
-/// was not requested, is skipped, so its position reads `None` like a
-/// missing entry.
+/// limits. A returned entry whose data does not decode is skipped, so its
+/// position reads `None` like a missing entry. A returned entry whose key
+/// does not decode or was not requested reads as `None`, which never matches
+/// an allowlist, so identification fails closed.
 async fn fetch_entries_by_key(
     client: &StellarRpcClient,
     keys: &[LedgerKey],
@@ -4837,6 +4840,9 @@ impl ContractObservation {
 /// its own policy to the observation.
 ///
 /// `contract_kind` names the role of `contract_addr` in a refusal.
+/// `rule_id` is `None` before install, when the rule has no on-chain id yet:
+/// a `ContractInstanceUnsupported` refusal then carries no rule id, and a
+/// `NetworkRpcDivergence`, whose rule id is a plain `u32`, carries 0.
 ///
 /// # Errors
 ///
@@ -4859,7 +4865,7 @@ pub(crate) async fn fetch_observed_executable(
     secondary: &StellarRpcClient,
     contract_addr: &ScAddress,
     contract_kind: ContractKind,
-    rule_id: u32,
+    rule_id: Option<u32>,
     smart_account_redacted: &str,
     request_id: &str,
 ) -> Result<ObservedExecutable, SaError> {
@@ -4899,7 +4905,7 @@ pub(crate) async fn fetch_observed_executable(
             Err(unsupported(AdminOrOwnerKey::UndecodableInstance))
         }
         Err(FetchContractWasmHashError::Divergent(div)) => Err(SaError::NetworkRpcDivergence {
-            rule_id,
+            rule_id: rule_id.unwrap_or(0),
             smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
             primary_view_digest_first8: div.primary_summary,
             secondary_view_digest_first8: div.secondary_summary,
@@ -6075,8 +6081,8 @@ mod tests {
         // Key A: contract address with all-0x11 hash bytes.
         // Key B: contract address with all-0x22 hash bytes.
         //
-        // stellar-xdr 28: ScAddress::Contract takes ContractId(Hash(...))
-        // (ContractId is a newtype over Hash introduced in Protocol-22).
+        // ScAddress::Contract takes ContractId(Hash(...)); `ContractId` is a
+        // newtype over `Hash` in `Stellar-contract.x`.
         let addr_a = ScAddress::Contract(ContractId(Hash([0x11u8; 32])));
         let addr_b = ScAddress::Contract(ContractId(Hash([0x22u8; 32])));
 
@@ -6104,7 +6110,7 @@ mod tests {
         let hash_b = [0xbbu8; 32];
 
         // Build LedgerEntryData::ContractData(ContractInstance{Wasm(hash)}) XDR.
-        // stellar-xdr 28: ScVal::ContractInstance takes ScContractInstance directly
+        // ScVal::ContractInstance takes ScContractInstance directly
         // (not Box<ScContractInstance>).
         let make_contract_instance_xdr = |wasm_hash: [u8; 32]| -> String {
             let instance = ScContractInstance {
@@ -6258,7 +6264,7 @@ mod tests {
     /// - **Match** case: a shared `[0xde; 32]` WASM hash that both parsers
     ///   accept and agree on (this function).
     /// - **Non-Wasm / SAC** case: a `ContractExecutable::StellarAsset` instance
-    ///   (verified at `stellar-xdr-27/src/curr/generated.rs:11616-11618`);
+    ///   (`ContractExecutable::StellarAsset` in `Stellar-contract.x`);
     ///   the network primitive returns `WasmHashFetch::Sac` and the multi-key
     ///   primitive returns `None` — both agree "not a plain WASM hash"
     ///   (`wasm_hash_parse_parity_network_vs_smart_account_sac`).
@@ -6380,8 +6386,8 @@ mod tests {
     /// the other.
     ///
     /// The fixture is a `getLedgerEntries` response whose `executable` field is
-    /// `ContractExecutable::StellarAsset` (verified at
-    /// `stellar-xdr-27/src/curr/generated.rs:11616-11618`).  Both parsers
+    /// `ContractExecutable::StellarAsset` (the `ContractExecutable` union in
+    /// `Stellar-contract.x`).  Both parsers
     /// must agree it is NOT a plain WASM hash:
     ///
     /// - **Network primitive** (`fetch_contract_wasm_hash`) → `WasmHashFetch::Sac`
@@ -6412,8 +6418,8 @@ mod tests {
 
         // Build the SAC fixture: a contract instance whose executable is
         // ContractExecutable::StellarAsset (not Wasm).
-        // Verified at stellar-xdr-27/src/curr/generated.rs:11616-11618:
-        //   pub enum ContractExecutable { Wasm(Hash), StellarAsset }
+        // `ContractExecutable::StellarAsset` is the Stellar Asset Contract arm
+        // of the `ContractExecutable` union in `Stellar-contract.x`.
         let fixture_json = sac_instance_ledger_entries_json(TEST_CONTRACT);
         let fixture_result: serde_json::Value =
             serde_json::from_str(&fixture_json).expect("fixture is valid JSON");
@@ -6564,7 +6570,7 @@ mod tests {
                 &secondary,
                 &external_ref_contract_scaddress(),
                 kind,
-                7,
+                Some(7),
                 "CSMART...ACCNT",
                 "req-1",
             )
@@ -6609,7 +6615,7 @@ mod tests {
             &secondary,
             &external_ref_contract_scaddress(),
             ContractKind::Verifier,
-            7,
+            Some(7),
             "CSMART...ACCNT",
             "req-1",
         )
@@ -6664,7 +6670,7 @@ mod tests {
                 &external_ref_contract_scaddress(),
                 ContractKind::Verifier,
                 verifier_hash_allowlisted,
-                7,
+                Some(7),
                 "CSMART...ACCNT",
                 "req-1",
             )
@@ -6697,7 +6703,7 @@ mod tests {
                 &external_ref_contract_scaddress(),
                 ContractKind::Policy,
                 policy_hash_allowlisted,
-                7,
+                Some(7),
                 "CSMART...ACCNT",
                 "req-1",
             )
@@ -6734,7 +6740,7 @@ mod tests {
                     &external_ref_contract_scaddress(),
                     kind,
                     |_| true,
-                    7,
+                    Some(7),
                     "CSMART...ACCNT",
                     "req-1",
                 )
@@ -6752,7 +6758,7 @@ mod tests {
             };
             assert_eq!(reason, AdminOrOwnerKey::ExternalRefUnresolved);
             assert_eq!(contract_kind, kind);
-            assert_eq!(rule_id, 7);
+            assert_eq!(rule_id, Some(7));
             assert_eq!(request_id, "req-1");
             assert_eq!(contract_address_redacted.as_str(), "CAAAA...AD2KM");
         }

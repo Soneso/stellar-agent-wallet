@@ -533,8 +533,10 @@ pub struct CreateArgs {
     /// `sa.contract_instance_unsupported` regardless of this flag.
     ///
     /// When set, the install proceeds AND the audit log emits
-    /// `SaMutableContractOverride { kind, rule_id, contract_address_redacted }`,
-    /// naming the owner and tag of an external reference.
+    /// `SaMutableContractOverride { contract_kind, contract_address_redacted }`,
+    /// naming the owner and tag of an external reference. The row is written
+    /// before the rule has an on-chain id, so it carries no `rule_id` and
+    /// joins its `SaContextRuleCreated` row through `request_id`.
     /// The JSON envelope reflects `mutable_override: true`.
     #[arg(long)]
     pub accept_mutable_verifier: bool,
@@ -548,7 +550,10 @@ pub struct CreateArgs {
     /// prevents silent use of custom or unaudited verifier / policy contracts.
     ///
     /// When set, the install proceeds AND the audit log emits
-    /// `SaUnknownContractOverride { kind, rule_id, contract_address_redacted }`.
+    /// `SaUnknownContractOverride { contract_kind, contract_address_redacted,
+    /// observed_hash_first8 }`. The row is written before the rule has an
+    /// on-chain id, so it carries no `rule_id` and joins its
+    /// `SaContextRuleCreated` row through `request_id`.
     /// The JSON envelope reflects `unknown_override: true`.
     #[arg(long)]
     pub accept_unknown_verifier: bool,
@@ -1600,6 +1605,29 @@ pub struct VerifyPinsResult {
     pub observed_verifier_first8: Vec<String>,
     /// Observed live policy wasm hashes first-8-hex (from chain).
     pub observed_policy_first8: Vec<String>,
+    /// Observed executable of each verifier, aligned with
+    /// `observed_verifier_first8`: the bounded summary of an external
+    /// reference (owner, tag and resolved hash) or `"no code"`, and `null` for
+    /// a plain Wasm executable. Omitted when no verifier was observed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_verifier_executable: Vec<Option<String>>,
+    /// Observed executable of each policy, aligned with
+    /// `observed_policy_first8`, in the form of
+    /// `observed_verifier_executable`. Omitted when no policy was observed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_policy_executable: Vec<Option<String>>,
+    /// Executable-reference pins (owner, tag, tag-key digest, resolved
+    /// first-8) from the audit log, aligned with `pinned_verifier_first8`,
+    /// `null` at a position pinned by its Wasm hash. Omitted when no pinned
+    /// verifier is an external reference.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
+    /// Executable-reference pins from the audit log, aligned with
+    /// `pinned_policy_first8`, in the form of
+    /// `pinned_verifier_executable_refs`. Omitted when no pinned policy is an
+    /// external reference.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
     /// Install-time mutable-contract override flag, sourced from the
     /// `SaContextRuleCreated` audit row. `false` for rules installed before
     /// override tracking was added.
@@ -1627,6 +1655,10 @@ impl VerifyPinsResult {
             pinned_policy_first8: sa.pinned_policy_first8,
             observed_verifier_first8: sa.observed_verifier_first8,
             observed_policy_first8: sa.observed_policy_first8,
+            observed_verifier_executable: sa.observed_verifier_executable,
+            observed_policy_executable: sa.observed_policy_executable,
+            pinned_verifier_executable_refs: sa.pinned_verifier_executable_refs,
+            pinned_policy_executable_refs: sa.pinned_policy_executable_refs,
             mutable_override: sa.mutable_override,
             unknown_override: sa.unknown_override,
             unavailable_reason: sa.unavailable_wire_code.map(str::to_owned),
@@ -4245,6 +4277,10 @@ mod tests {
             pinned_policy_first8: vec!["ef56gh78".to_owned()],
             observed_verifier_first8: vec!["ab12cd34".to_owned()],
             observed_policy_first8: vec!["ef56gh78".to_owned()],
+            observed_verifier_executable: vec![],
+            observed_policy_executable: vec![],
+            pinned_verifier_executable_refs: vec![],
+            pinned_policy_executable_refs: vec![],
             mutable_override: false,
             unknown_override: false,
             unavailable_reason: None,
@@ -4271,6 +4307,101 @@ mod tests {
         );
         // unavailable_reason is skipped when None.
         assert!(!json.contains("unavailable_reason"));
+        // The executable fields are skipped when empty.
+        for field in [
+            "observed_verifier_executable",
+            "observed_policy_executable",
+            "pinned_verifier_executable_refs",
+            "pinned_policy_executable_refs",
+        ] {
+            assert!(!json.contains(field), "{field} must be omitted: {json}");
+        }
+    }
+
+    /// A verifier pinned to an external reference reports the pin and the
+    /// observed reference summary, aligned with the first-8 lists.
+    #[test]
+    fn verify_pins_result_carries_external_reference_executables() {
+        let pin = ExecutableRefPin {
+            owner_redacted:
+                stellar_agent_core::observability::RedactedStrkey::from_already_redacted(
+                    "GAAAA...AAWHF",
+                ),
+            tag: "verifier-v1".to_owned(),
+            ref_key_hex: "ab".repeat(32),
+            resolved_hash_first8: "0102030405060708".to_owned(),
+        };
+        let summary = "external reference owner GAAAA...AAWHF tag \"verifier-v1\" \
+                       resolved 0102030405060708";
+        let result = VerifyPinsResult {
+            smart_account: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+            rule_id: 3,
+            verifier_pin_status: PinStatus::Match,
+            policy_pin_status: PinStatus::Match,
+            pinned_verifier_first8: vec!["0102030405060708".to_owned()],
+            pinned_policy_first8: vec!["ef56ab78".to_owned()],
+            observed_verifier_first8: vec!["0102030405060708".to_owned()],
+            observed_policy_first8: vec!["ef56ab78".to_owned()],
+            observed_verifier_executable: vec![Some(summary.to_owned())],
+            observed_policy_executable: vec![None],
+            pinned_verifier_executable_refs: vec![Some(pin.clone())],
+            pinned_policy_executable_refs: vec![],
+            mutable_override: true,
+            unknown_override: false,
+            unavailable_reason: None,
+            chain_id: "stellar:testnet".to_owned(),
+        };
+
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            json["observed_verifier_executable"],
+            serde_json::json!([summary])
+        );
+        assert_eq!(
+            json["observed_policy_executable"],
+            serde_json::json!([null])
+        );
+        assert_eq!(
+            json["pinned_verifier_executable_refs"][0]["tag"],
+            "verifier-v1"
+        );
+        assert_eq!(
+            json["pinned_verifier_executable_refs"][0]["owner_redacted"],
+            "GAAAA...AAWHF"
+        );
+        assert!(json.get("pinned_policy_executable_refs").is_none());
+
+        let round_trip: VerifyPinsResult = serde_json::from_value(json).unwrap();
+        assert_eq!(round_trip.pinned_verifier_executable_refs, vec![Some(pin)]);
+        assert_eq!(
+            round_trip.observed_verifier_executable,
+            vec![Some(summary.to_owned())]
+        );
+        assert_eq!(round_trip.observed_policy_executable, vec![None]);
+        assert!(round_trip.pinned_policy_executable_refs.is_empty());
+    }
+
+    /// An envelope without the executable fields deserialises with them empty.
+    #[test]
+    fn verify_pins_result_without_executable_fields_deserialises_empty() {
+        let json = serde_json::json!({
+            "smart_account": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "rule_id": 2,
+            "verifier_pin_status": "match",
+            "policy_pin_status": "no_contracts",
+            "pinned_verifier_first8": ["ab12cd34"],
+            "pinned_policy_first8": [],
+            "observed_verifier_first8": ["ab12cd34"],
+            "observed_policy_first8": [],
+            "mutable_override": false,
+            "unknown_override": false,
+            "chain_id": "stellar:testnet",
+        });
+        let result: VerifyPinsResult = serde_json::from_value(json).unwrap();
+        assert!(result.observed_verifier_executable.is_empty());
+        assert!(result.observed_policy_executable.is_empty());
+        assert!(result.pinned_verifier_executable_refs.is_empty());
+        assert!(result.pinned_policy_executable_refs.is_empty());
     }
 
     #[test]
@@ -4284,6 +4415,10 @@ mod tests {
             pinned_policy_first8: vec![],
             observed_verifier_first8: vec![],
             observed_policy_first8: vec![],
+            observed_verifier_executable: vec![],
+            observed_policy_executable: vec![],
+            pinned_verifier_executable_refs: vec![],
+            pinned_policy_executable_refs: vec![],
             mutable_override: false,
             unknown_override: false,
             unavailable_reason: Some("sa.network_rpc_divergence".to_owned()),
@@ -4314,6 +4449,10 @@ mod tests {
             pinned_policy_first8: vec![],
             observed_verifier_first8: vec!["bbbbbbbb".to_owned()],
             observed_policy_first8: vec![],
+            observed_verifier_executable: vec![],
+            observed_policy_executable: vec![],
+            pinned_verifier_executable_refs: vec![],
+            pinned_policy_executable_refs: vec![],
             mutable_override: false,
             unknown_override: false,
             unavailable_reason: None,
@@ -4624,6 +4763,10 @@ mod tests {
             pinned_policy_first8: vec![],
             observed_verifier_first8: vec!["deadbeef".to_owned()],
             observed_policy_first8: vec![],
+            observed_verifier_executable: vec![],
+            observed_policy_executable: vec![],
+            pinned_verifier_executable_refs: vec![],
+            pinned_policy_executable_refs: vec![],
             mutable_override: false,
             unknown_override: true,
             unavailable_reason: None,
