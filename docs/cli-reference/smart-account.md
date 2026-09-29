@@ -20,6 +20,18 @@ The write verbs use the shared signer-source group: exactly one of `--signer-sec
 export WALLET_SK="S..."   # source-account secret key; pass the var name, never the secret
 ```
 
+## Pinned-hash drift check
+
+`smart-account rules create` pins every verifier and policy contract a rule references: the audit log records each contract's hash (and, for a CAP-85 external reference, its owner, its tag and the hash the tag resolves to) in the rule's `SaContextRuleCreated` row. Every verb that signs a transaction authorized by a rule checks that rule against its pin record before anything is simulated or signed: `smart-account execute`, `smart-account multicall`, the `smart-account rules` and `smart-account signers` write verbs, and `smart-account migrate-verifier`, which checks the migrating rule's policies and skips its verifiers (see that verb). For each authorizing rule other than `0`, the wallet fetches the rule's verifier and policy addresses from chain and compares each live contract with its pin:
+
+- A changed hash, a repointed or different external reference, or a changed executable kind refuses with `sa.verifier_hash_drift` / `sa.policy_hash_drift` and writes a `SaVerifierHashDrift` / `SaPolicyHashDrift` audit row carrying the command's request id.
+- A check that cannot run refuses with `sa.pin_check_unavailable`; its message leads with the inner wire code: an RPC failure or divergence, an audit-log integrity error, an instance the wallet cannot read, or a record with more than one verifier or policy pin (`sa.multiple_pinned_hashes_unsupported`).
+- A rule without a pin record, such as one installed outside the wallet, is not checked. Rule `0`, the bootstrap rule, has no pins and is never checked.
+
+Nothing is sent when the check refuses. `smart-account multicall` reports the refusal as `sa.multicall_failed` at phase `policy_gate`, naming the inner code. A write verb whose `--auth-rule-id` names a rule other than `0` needs the rule's pin record to match, so a rule whose verifier or policy changed outside the wallet (an upgraded contract, a repointed reference, a signer or policy changed through another client) is refused for its own administration too; authorize the repair through rule `0`, or reinstall the rule.
+
+The pin record is the newest `SaContextRuleCreated` or `SaContextRulePinsUpdated` row for the rule. `smart-account migrate-verifier`, `smart-account signers add` / `signers batch-add` and `smart-account rules add-policy` / `rules remove-policy` write a `SaContextRulePinsUpdated` row when they change the verifier or policy set of a pinned rule (see those verbs), so the check follows the wallet's own changes. `smart-account rules verify-pins` runs the same comparison on demand without signing.
+
 ---
 
 ## `smart-account rules` — context-rule lifecycle
@@ -42,7 +54,7 @@ Flags:
 - `--signer-ed25519 <HEX_PUBKEY_64>` — a first-class External-Ed25519 signer (a raw 32-byte ed25519 public key). Repeatable. The recommended shape for an autonomous agent's own key (see [Agent delegation](../agent-delegation.md)) — no funded classic account is required. Encodes the same on-chain shape as [`signers add --signer-ed25519`](#smart-account-signers-add).
 - `--verifier <C_STRKEY>` — Ed25519-verifier contract override for `--signer-ed25519`. Omitted, it resolves from the verifier registry (populated by `smart-account deploy-ed25519-verifier`), failing closed if none is registered.
 - `--accept-no-delegated-fallback` — acknowledge an External-only rule (no delegated ed25519-G-key fallback). Required when only `--signer-webauthn` and/or `--signer-ed25519` signers are given; without it the command refuses with `validation.passkey_only_rule_no_delegated_fallback` after printing a stderr warning.
-- `--accept-mutable-verifier`: proceed even if a referenced verifier or policy contract is mutable: it has an admin/owner key, or its executable is an owner-managed external reference (reason `owner-managed external reference`). The envelope reports `mutable_override: true`. For an external reference the pin records the owner, the tag and the hash the tag resolves to, and the envelope lists them in `pinned_verifier_executable_refs` / `pinned_policy_executable_refs`; signing refuses with `sa.verifier_hash_drift` / `sa.policy_hash_drift` when the owner repoints the tag, the reference changes or the executable kind changes. `--accept-unknown-verifier` is also required when the resolved hash is not in the allowlist. A referenced contract that is an external reference with no live tag entry (reason `external reference with no live tag entry`), whose instance is undecodable (`undecodable instance`), has a non-Wasm executable (`non-Wasm executable`), or whose executable changed while it was being identified (`executable changed during install`) is refused with `sa.contract_instance_unsupported` whether or not this flag or `--accept-unknown-verifier` is set, because the wallet cannot pin its code.
+- `--accept-mutable-verifier`: proceed even if a referenced verifier or policy contract is mutable: it has an admin/owner key, or its executable is an owner-managed external reference (reason `owner-managed external reference`). The envelope reports `mutable_override: true`. For an external reference the pin records the owner, the tag and the hash the tag resolves to, and the envelope lists them in `pinned_verifier_executable_refs` / `pinned_policy_executable_refs`. When the owner repoints the tag, the reference changes or the executable kind changes, the [pinned-hash drift check](#pinned-hash-drift-check) refuses signing under the rule with `sa.verifier_hash_drift` / `sa.policy_hash_drift`: in `execute`, `multicall`, the rule and signer write verbs, and `migrate-verifier` for the rule's policies. A check that cannot run refuses with `sa.pin_check_unavailable`. `--accept-unknown-verifier` is also required when the resolved hash is not in the allowlist. A referenced contract that is an external reference with no live tag entry (reason `external reference with no live tag entry`), whose instance is undecodable (`undecodable instance`), has a non-Wasm executable (`non-Wasm executable`), or whose executable changed while it was being identified (`executable changed during install`) is refused with `sa.contract_instance_unsupported` whether or not this flag or `--accept-unknown-verifier` is set, because the wallet cannot pin its code.
 - `--accept-unknown-verifier`: proceed even if a referenced verifier or policy WASM hash (for an external reference, the hash its tag resolves to) is not in the allowlist. The envelope reports `unknown_override: true`.
 - `--auth-rule-id <U32>` — authorizing rule id(s). Repeatable. Default `[0]` (the bootstrap rule installed at deploy time).
 - `--valid-until <LEDGER>` — expiry ledger sequence, or `none` for a permanent rule. Default `none`.
@@ -180,7 +192,13 @@ Flags:
 - `--weighted-signer-delegated <G_STRKEY=WEIGHT>` — one Delegated (ed25519) signer-weight pair (`--kind weighted-threshold`). Repeatable.
 - `--weighted-signer-webauthn <CREDENTIAL_NAME=WEIGHT>` — one External WebAuthn signer-weight pair, resolved by credential name from the passkeys registry (`--kind weighted-threshold`). Repeatable.
 - `--auth-rule-id <U32>` (optional) — authorizing rule id(s). Repeatable. Defaults to `--rule-id`.
+- `--accept-mutable-verifier`: pin a policy that is mutable (admin/owner key, or an owner-managed external reference). Applies only as described under "Pin record" below; the audit log then emits `SaMutableContractOverride` carrying the rule id.
+- `--accept-unknown-verifier`: pin a policy whose hash is outside the policy allowlist (the simple-threshold, weighted-threshold and spending-limit Wasms the wallet vendors). Same scope; the audit log then emits `SaUnknownContractOverride` carrying the rule id.
 - Shared: `--profile`, signer-source group, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
+
+The add signs under `--auth-rule-id`, so that rule passes the [pinned-hash drift check](#pinned-hash-drift-check) first.
+
+**Pin record.** When the rule has a pin record and the policy is not already attached to it, the add keeps the record in step with the rule's policies. Before submission the policy is identified and probed as `rules create` probes one: a hash outside the policy allowlist fails with `sa.policy_wasm_not_in_allowlist` and a mutable contract with `sa.policy_mutable` unless the matching flag above is set, and an unpinnable instance fails with `sa.contract_instance_unsupported` regardless. After the add confirms, a `SaContextRulePinsUpdated` row (reason `policy_added`) records the policy pins with the new pin appended, so later signing under the rule checks the policy too. A record with two policy pins is refused by every checked signing verb with `sa.pin_check_unavailable` (inner code `sa.multiple_pinned_hashes_unsupported`), the same outcome as a rule installed with two policies. A rule without a pin record stays unpinned: nothing is probed and no row is written.
 
 ```bash
 stellar-agent smart-account rules add-policy \
@@ -223,6 +241,8 @@ Flags:
 - `--policy-id <U32>` (required) — on-chain policy id to remove.
 - `--auth-rule-id <U32>` (optional) — authorizing rule id(s). Repeatable. Defaults to `--rule-id`.
 - Shared: `--profile`, signer-source group, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
+
+The removal signs under `--auth-rule-id`, so that rule passes the [pinned-hash drift check](#pinned-hash-drift-check) first. When the rule has a pin record, the wallet resolves `--policy-id` to the policy's address and observes its hash before submission; after the removal confirms, a `SaContextRulePinsUpdated` row (reason `policy_removed`) records the policy pins without the pin equal to that hash. When the policy is the rule's only policy and the record holds a single policy pin, that pin is dropped even when the policy no longer matches it or cannot be read; the rule then has no policy and no policy pin, and a later `rules add-policy` pins its policy afresh. Otherwise, when no pin equals the hash or the policy cannot be read, no row is written. The removal proceeds in every case.
 
 ```bash
 stellar-agent smart-account rules remove-policy \
@@ -336,7 +356,13 @@ Exactly one of the following signer-source forms is required (mutually exclusive
 Plus:
 
 - `--signer-key-data <HEX>` — raw hex key-data for an external signer; required with, and only valid with, `--signer-external`.
+- `--accept-mutable-verifier`: pin a new verifier that is mutable (admin/owner key, or an owner-managed external reference). Applies only as described under "Pin record" below; the audit log then emits `SaMutableContractOverride` carrying the rule id.
+- `--accept-unknown-verifier`: pin a new verifier whose hash is outside the verifier allowlist. Same scope; the audit log then emits `SaUnknownContractOverride` carrying the rule id.
 - Shared: `--profile`, signer-source group, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`.
+
+The add signs under `--rule-id`, so the rule passes the [pinned-hash drift check](#pinned-hash-drift-check) first.
+
+**Pin record.** When the new signer is `External` (`--signer-ed25519`, `--signer-external`, `--signer-webauthn`) and the rule has a pin record, the add keeps the record in step with the rule's verifiers. Before submission, a verifier address the rule does not already use is identified and probed as `rules create` probes one: a hash outside the allowlist fails with `sa.verifier_wasm_not_in_allowlist` and a mutable contract with `sa.verifier_mutable` unless the matching flag above is set, and an unpinnable instance fails with `sa.contract_instance_unsupported` regardless. After the add confirms, a `SaContextRulePinsUpdated` row (reason `signer_added`) records the verifier pins, one per distinct verifier address: a signer on a verifier the rule already uses leaves them unchanged, a signer on a new verifier appends its pin. A record with two verifier pins is refused by every checked signing verb with `sa.pin_check_unavailable` (inner code `sa.multiple_pinned_hashes_unsupported`), the same outcome as a rule installed with two verifiers. A rule without a pin record stays unpinned: nothing is probed and no row is written.
 
 ```bash
 stellar-agent smart-account signers add \
@@ -439,6 +465,9 @@ Flags (each repeatable, any combination, at least one signer required across all
 - `--signer-delegated <G_STRKEY>` — one Delegated (ed25519) signer per occurrence.
 - `--signer-webauthn <CREDENTIAL_NAME>` — one WebAuthn passkey signer (resolved from the profile's passkey registry) per occurrence.
 - `--signer-ed25519 <HEX_PUBKEY_64>` — one first-class External-Ed25519 signer per occurrence; `--verifier <C_STRKEY>` (optional) overrides the verifier used for ALL `--signer-ed25519` entries in the call.
+- `--accept-mutable-verifier`, `--accept-unknown-verifier`: as on `signers add`.
+
+The batch keeps the rule's pin record in step exactly as `signers add` does (see "Pin record" there): every distinct new verifier address the rule does not already use is probed before submission, and one `SaContextRulePinsUpdated` row (reason `signer_added`) records the resulting verifier pins after the batch confirms.
 
 ```bash
 stellar-agent smart-account signers batch-add \
@@ -475,6 +504,8 @@ Flags:
 
 On success the envelope carries `status: "submitted"`, `contract`, `function`, `arg_count`, `auth_rule_ids`, `rule_signer_pubkey_first8` (never the full key or seed), `verifier_address`, and `tx_hash`. On-chain refusals (spending-limit cap, scope mismatch, expired rule) surface through the same typed `SaError` wire codes and message annotations (e.g. `[OZ:SpendingLimitExceeded]`, `[OZ:UnvalidatedContext]`) every other smart-account write verb renders.
 
+Before anything is simulated or signed, every `--auth-rule-id` other than `0` goes through the [pinned-hash drift check](#pinned-hash-drift-check) against the pin record in the profile's audit log: a verifier or policy that differs from its pin refuses with `sa.verifier_hash_drift` / `sa.policy_hash_drift`, and a check that cannot run refuses with `sa.pin_check_unavailable`. The check reads and fetches through the same `--rpc-url` / `--secondary-rpc-url` endpoints as the submission.
+
 ```bash
 stellar-agent smart-account execute \
   --account CABC...WXYZ \
@@ -507,6 +538,8 @@ Flags:
 - `--fee <STROOPS>` — per-op base fee in stroops (default 100). Unlike the deploy verb, `auto[:pNN]` is rejected here.
 - Signer-source flags are required (one of `--signer-secret-env` or `--sign-with-ledger`); `--account-index <INDEX>` defaults to `0`.
 - Shared: `--network`, `--rpc-url`, `--timeout-seconds`, `--profile`.
+
+A `--rule-id` other than `0` goes through the [pinned-hash drift check](#pinned-hash-drift-check) before the bundle is simulated; a refusal surfaces as `sa.multicall_failed` at phase `policy_gate`, naming the inner code.
 
 ```bash
 stellar-agent smart-account multicall \
@@ -583,6 +616,8 @@ stellar-agent smart-account deploy-policy \
 Builds and optionally executes a plan that moves all `External` signers from one verifier to another across every context rule on a smart-account. Dry-run is read-only and renders the plan as JSON; without `--dry-run` it signs and submits `remove_signer` / `add_signer` pairs. Mainnet dry-run is allowed (read-only); mainnet submit is structurally refused (`network.mainnet_write_forbidden`).
 
 Pre-flight gates (fail-closed): the destination verifier hash must be in the allowlist, its audit status must be `Audited`, `Provisional`, or `Unaudited`, and the destination contract must be immutable.
+
+Both transactions of each pair sign under the migrating rule. The [pinned-hash drift check](#pinned-hash-drift-check) runs on that rule's policies, refusing with `sa.policy_hash_drift` or `sa.pin_check_unavailable`, and skips its verifiers: the gates above already vetted the destination, and the source verifier may be the drifted contract being replaced. After each pair confirms on a rule with a pin record, a `SaContextRulePinsUpdated` row (reason `verifier_migrated`) names the destination verifier's hash as the rule's verifier pin, with the policy pins unchanged, so later signing under the rule checks against the destination. A rule without a pin record stays unpinned and no row is written.
 
 Flags:
 

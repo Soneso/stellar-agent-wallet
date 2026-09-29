@@ -515,6 +515,9 @@ impl DefiAdapter for DexSwapAdapter {
             SubmitInvokeArgs::builder()
                 .target_contract(router_address)
                 .auth_address(&trade_args.from_address)
+                // Rule 0 only: the bootstrap rule has no pins, so the
+                // submission carries no pinned-hash drift check (`pin_check`
+                // stays `None`); any other rule would be refused without one.
                 .auth_rule_ids(&[ContextRuleId::new(0)])
                 .host_function(host_function)
                 .signer(signer)

@@ -28,8 +28,10 @@
 //! - `install_pins_the_reference_and_signing_detects_the_repoint` (proofs
 //!   2, 3): the wallet observes the reference; rule install refuses the
 //!   mutable proxy without the override and pins owner, tag and resolved hash
-//!   with it; a transfer signed through the rule confirms; after the repoint
-//!   the passkey signing path and `verify_rule_wasm_pins` both report drift.
+//!   with it; a transfer signed through the rule with the pinned-hash drift
+//!   check confirms; after the repoint `submit_signed_invoke` through the
+//!   rule, the passkey signing path and `verify_rule_wasm_pins` all report
+//!   drift.
 //! - `spec_follows_the_repoint_and_defi_gates_refuse_the_reference` (proofs
 //!   4, 5): the SEP-48 spec fetch returns the spec of the Wasm the tag names,
 //!   before and after the repoint, and the beacon's `get_ref` returns the
@@ -39,10 +41,9 @@
 //!   parse of both vendored verifiers, the reference values proof 4 compares
 //!   the live fetch against.
 //!
-//! The `smart-account execute` path (`submit_signed_invoke` with an
-//! `Ed25519RuleSigner`) runs no drift check; this suite proves drift on the
-//! passkey signing path and on `verify_rule_wasm_pins`, the two paths that
-//! run one.
+//! The execute path (`submit_signed_invoke` with an `Ed25519RuleSigner` and a
+//! `PinCheck`) is the path `smart-account execute` takes; its CLI proof is
+//! `cap85_external_ref_cli_testnet_acceptance`.
 //!
 //! Each test prints `CAP85-RECORD <test> <item> <value>` lines with every
 //! testnet address and transaction hash it produced.
@@ -111,7 +112,7 @@ use stellar_agent_smart_account::managers::rules::{
 use stellar_agent_smart_account::managers::signers::{SignersManager, SignersManagerConfig};
 use stellar_agent_smart_account::simple_threshold_policy::build_simple_threshold_install_param;
 use stellar_agent_smart_account::submit::{
-    Ed25519RuleSigner, SubmitInvokeArgs, submit_signed_invoke,
+    Ed25519RuleSigner, PinCheck, SubmitInvokeArgs, submit_signed_invoke,
 };
 use stellar_agent_smart_account::webauthn_verifier::WEBAUTHN_VERIFIER_WASM;
 use stellar_agent_test_support::testnet_helpers::{
@@ -877,6 +878,7 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
         parse_g_strkey_to_signer_address(&recipient_g).expect("recipient G-strkey parses");
     let balance_before = xlm_stroops_balance(&recipient_g).await;
     let rule_ids = vec![ContextRuleId::new(rule_id)];
+    let transfer_request_id = rid();
     let transfer = submit_signed_invoke(
         SubmitInvokeArgs::builder()
             .target_contract(XLM_SAC_TESTNET)
@@ -885,7 +887,7 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
             .host_function(transfer_host_function(
                 parse_c_strkey_to_smart_account(XLM_SAC_TESTNET).expect("XLM SAC parses"),
                 smart_account_sc.clone(),
-                recipient_sc,
+                recipient_sc.clone(),
                 TRANSFER_STROOPS,
             ))
             .signer(bootstrap_signer.as_ref())
@@ -899,6 +901,11 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
             .timeout(TIMEOUT)
             .op_label("cap85_proxy_verified_transfer")
             .emit_observability_logs(true)
+            .pin_check(PinCheck {
+                signers_manager: &signers_manager,
+                request_id: &transfer_request_id,
+                migrating_rule: None,
+            })
             .build(),
     )
     .await
@@ -918,6 +925,83 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     let expected_observed = format!(
         "external reference owner {beacon_redacted} tag \"{TAG}\" resolved {}",
         first8_hex(&fixture.webauthn_hash)
+    );
+
+    // ── Proof 3: the execute path refuses on drift before signing ──────────
+    let drift_request_id = rid();
+    let execute_refusal = submit_signed_invoke(
+        SubmitInvokeArgs::builder()
+            .target_contract(XLM_SAC_TESTNET)
+            .auth_address(smart_account.as_str())
+            .auth_rule_ids(&rule_ids)
+            .host_function(transfer_host_function(
+                parse_c_strkey_to_smart_account(XLM_SAC_TESTNET).expect("XLM SAC parses"),
+                smart_account_sc.clone(),
+                recipient_sc,
+                TRANSFER_STROOPS,
+            ))
+            .signer(bootstrap_signer.as_ref())
+            .ed25519_rule_signer(Ed25519RuleSigner {
+                signer: agent_signer.as_ref(),
+                verifier: fixture.proxy_sc.clone(),
+            })
+            .primary_rpc_url(TESTNET_RPC_URL)
+            .network_passphrase(TESTNET_PASSPHRASE)
+            .chain_id(CHAIN_ID)
+            .timeout(TIMEOUT)
+            .op_label("cap85_proxy_transfer_after_repoint")
+            .emit_observability_logs(true)
+            .pin_check(PinCheck {
+                signers_manager: &signers_manager,
+                request_id: &drift_request_id,
+                migrating_rule: None,
+            })
+            .build(),
+    )
+    .await
+    .expect_err("a transfer through the repointed reference must be refused before signing");
+    match execute_refusal {
+        SaError::VerifierHashDrift {
+            rule_id: drift_rule_id,
+            ref deploy_address_redacted,
+            ref pinned_hash_first8,
+            ref observed_hash_first8,
+            observed_executable: Some(ref observed_executable),
+            ref request_id,
+            ..
+        } => {
+            assert_eq!(drift_rule_id, rule_id);
+            assert_eq!(deploy_address_redacted.as_str(), proxy_redacted);
+            assert_eq!(pinned_hash_first8, &first8_hex(&fixture.ed25519_hash));
+            assert_eq!(observed_hash_first8, &first8_hex(&fixture.webauthn_hash));
+            assert_eq!(observed_executable, &expected_observed);
+            assert_eq!(request_id, &drift_request_id);
+        }
+        other => panic!(
+            "expected VerifierHashDrift {{ observed_executable: Some(..) }} from the execute \
+             path; got {other:?}"
+        ),
+    }
+    let execute_drift_rows: Vec<AuditEntry> = read_audit_entries(&audit_log_path)
+        .into_iter()
+        .filter(|entry| {
+            entry.request_id == drift_request_id
+                && matches!(
+                    entry.event_kind,
+                    EventKind::SaVerifierHashDrift { rule_id: r, .. } if r == rule_id
+                )
+        })
+        .collect();
+    assert_eq!(
+        execute_drift_rows.len(),
+        1,
+        "exactly one SaVerifierHashDrift row carries the execute path's request id"
+    );
+    record(TEST, "execute-drift-request-id", &drift_request_id);
+    let recipient_after_refusal = xlm_stroops_balance(&recipient_g).await;
+    assert_eq!(
+        recipient_after_refusal, balance_after,
+        "the refused transfer must move nothing"
     );
 
     // ── Proof 3a: the passkey signing path refuses on drift ─────────────────
@@ -965,16 +1049,30 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     }
 
     let entries = read_audit_entries(&audit_log_path);
+    let assertion_row = entries
+        .iter()
+        .find(|entry| {
+            matches!(
+                &entry.event_kind,
+                EventKind::PasskeyAssertion { result, .. } if result == "failure:verifier_hash_drift"
+            )
+        })
+        .expect("PasskeyAssertion(failure:verifier_hash_drift) row");
     let drift_rows: Vec<&AuditEntry> = entries
         .iter()
         .filter(|entry| {
-            matches!(
-                entry.event_kind,
-                EventKind::SaVerifierHashDrift { rule_id: r, .. } if r == rule_id
-            )
+            entry.request_id == assertion_row.request_id
+                && matches!(
+                    entry.event_kind,
+                    EventKind::SaVerifierHashDrift { rule_id: r, .. } if r == rule_id
+                )
         })
         .collect();
-    assert_eq!(drift_rows.len(), 1, "exactly one SaVerifierHashDrift row");
+    assert_eq!(
+        drift_rows.len(),
+        1,
+        "exactly one SaVerifierHashDrift row carries the passkey assertion's request id"
+    );
     let drift_row = drift_rows[0];
     match &drift_row.event_kind {
         EventKind::SaVerifierHashDrift {
@@ -994,19 +1092,6 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
         }
         other => panic!("filtered to SaVerifierHashDrift; got {other:?}"),
     }
-    let assertion_row = entries
-        .iter()
-        .find(|entry| {
-            matches!(
-                &entry.event_kind,
-                EventKind::PasskeyAssertion { result, .. } if result == "failure:verifier_hash_drift"
-            )
-        })
-        .expect("PasskeyAssertion(failure:verifier_hash_drift) row");
-    assert_eq!(
-        drift_row.request_id, assertion_row.request_id,
-        "the drift row and the assertion row must share the request id"
-    );
 
     // ── Proof 3b: verify_rule_wasm_pins reports drift ───────────────────────
     let pins = manager

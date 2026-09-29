@@ -47,7 +47,8 @@ use wiremock::{
 };
 
 use super::rpc_mock_helpers::{
-    SorobanRpcDispatcher, build_ledger_entries_account, manager_two_url, tmp_audit_writer,
+    SorobanRpcDispatcher, build_context_rule_external_signers_xdr, build_ledger_entries_account,
+    build_simulate_response, manager_two_url, tmp_audit_writer,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -138,7 +139,12 @@ fn mock_signer_g() -> String {
 ///
 /// 1. `getLedgerEntries` → account entry for the source G-key (so `fetch_account`
 ///    succeeds and the source-account sequence is available).
-/// 2. `simulateTransaction` → `{"error": "mock-rpc-simulate-error", "latestLedger": 1000}`.
+/// 2. The first `simulateTransaction` is the pinned-hash drift check's
+///    `get_context_rule` read of the migrating rule, answered with the rule;
+///    the rule has no pin record in the fixture's audit log, so the check
+///    passes.
+/// 3. Every later `simulateTransaction` →
+///    `{"error": "mock-rpc-simulate-error", "latestLedger": 1000}`.
 ///    This causes `submit_signed_invoke` to return
 ///    `SaError::DeploymentFailed { phase: "simulate", ... }`, which
 ///    `submit_migration_step` re-maps to `VerifierMigrationFailed { phase: "submit_simulate" }`.
@@ -171,9 +177,19 @@ async fn submit_returns_simulate_failure_on_first_step_when_rpc_simulate_errors(
         "latestLedger": 1000
     });
 
+    let rule_resp = build_simulate_response(&build_context_rule_external_signers_xdr(
+        1,
+        &[10],
+        &addr(0x05),
+        &[0x04; 65],
+    ));
+
     Mock::given(method("POST"))
         .and(path("/"))
-        .respond_with(SorobanRpcDispatcher::new(account_resp, simulate_resp))
+        .respond_with(SorobanRpcDispatcher::new_multi_simulate(
+            account_resp,
+            vec![rule_resp, simulate_resp],
+        ))
         .mount(&server)
         .await;
 

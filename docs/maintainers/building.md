@@ -274,13 +274,17 @@ CAP-85 external reference, a Wasm hash that the owning contract can repoint:
 - `stellar-agent-smart-account` / `cap85_external_ref_testnet_acceptance`
   (feature `testnet-integration`): invocation through the reference and its
   footprint, the rule-install refusal and pin, a transfer signed through a
-  rule whose verifier is the reference, drift detection after a repoint on
-  the passkey signing path and in `verify_rule_wasm_pins`, the SEP-48 spec
-  fetch, and the DeFi and DeFindex pin gates.
+  rule whose verifier is the reference with the pinned-hash drift check,
+  drift detection after a repoint on the execute path
+  (`submit_signed_invoke`), the passkey signing path and in
+  `verify_rule_wasm_pins`, the SEP-48 spec fetch, and the DeFi and DeFindex
+  pin gates.
 - `stellar-agent-cli` / `cap85_external_ref_cli_testnet_acceptance` (feature
   `testnet-acceptance`): `smart-account rules create` refusing and then
-  pinning the reference, and `smart-account rules verify-pins` reporting
-  drift after the repoint, through the `stellar-agent` binary.
+  pinning the reference, `smart-account execute` confirming through the rule
+  and then refusing with `sa.verifier_hash_drift` after the repoint, and
+  `smart-account rules verify-pins` reporting drift after the repoint,
+  through the `stellar-agent` binary.
 
 Both suites deploy a beacon contract that owns the executable reference,
 deploys the reference contract and repoints it. Its source is the independent

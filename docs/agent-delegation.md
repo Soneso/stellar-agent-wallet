@@ -146,6 +146,11 @@ rule's context type is not `call-contract` — a spending limit is only
 meaningful against a scoped contract, and the OpenZeppelin policy contract
 itself rejects both conditions the same way.
 
+Because `rules create` pinned the rule, the wallet probes the policy against
+the policy allowlist before submitting and, once the add confirms, pins its
+hash in a `SaContextRulePinsUpdated` audit row, so every later signing verb
+under the rule checks the policy as well.
+
 ## Submitting an agent-signed call
 
 Everything above sets the delegation UP; `smart-account execute` is how the

@@ -617,6 +617,31 @@ pub struct AddArgs {
     )]
     pub verifier: Option<String>,
 
+    /// Opt-in to pinning a new verifier that is mutable: it has an admin /
+    /// owner storage key, or its executable is an owner-managed external
+    /// reference.
+    ///
+    /// Applies only when the rule has a pin record (it was installed by the
+    /// wallet) and a new `External` signer references a verifier address the
+    /// rule does not already use. That verifier is identified and probed as
+    /// `rules create` probes one; a mutable verifier fails with
+    /// `sa.verifier_mutable` unless this flag is set, in which case the add
+    /// proceeds and the audit log emits `SaMutableContractOverride` carrying
+    /// the rule id. The flag does not admit an unpinnable instance
+    /// (`sa.contract_instance_unsupported`).
+    #[arg(long)]
+    pub accept_mutable_verifier: bool,
+
+    /// Opt-in to pinning a new verifier whose wasm hash is outside the
+    /// verifier allowlist.
+    ///
+    /// Applies under the same conditions as `--accept-mutable-verifier`; an
+    /// unknown hash fails with `sa.verifier_wasm_not_in_allowlist` unless
+    /// this flag is set, in which case the add proceeds and the audit log
+    /// emits `SaUnknownContractOverride` carrying the rule id.
+    #[arg(long)]
+    pub accept_unknown_verifier: bool,
+
     /// Profile name for audit-log path resolution and credential store lookup
     /// (used by `--signer-webauthn`).
     #[arg(long, value_name = "NAME")]
@@ -1168,6 +1193,8 @@ async fn add_run(args: &AddArgs) -> i32 {
             new_signer_pubkey,
             ctx.signer.as_ref(),
             request_id.clone(),
+            args.accept_mutable_verifier,
+            args.accept_unknown_verifier,
         )
         .await
     {
@@ -1805,6 +1832,16 @@ pub struct BatchAddArgs {
     #[arg(long = "verifier", value_name = "C_STRKEY")]
     pub verifier: Option<String>,
 
+    /// Same as `--accept-mutable-verifier` on `smart-account signers add`,
+    /// for every new verifier the batch pins.
+    #[arg(long)]
+    pub accept_mutable_verifier: bool,
+
+    /// Same as `--accept-unknown-verifier` on `smart-account signers add`,
+    /// for every new verifier the batch pins.
+    #[arg(long)]
+    pub accept_unknown_verifier: bool,
+
     /// Profile name for audit-log path resolution and credential store lookup.
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
@@ -1943,6 +1980,8 @@ async fn batch_add_run(args: &BatchAddArgs) -> i32 {
             new_signers,
             ctx.signer.as_ref(),
             request_id.clone(),
+            args.accept_mutable_verifier,
+            args.accept_unknown_verifier,
         )
         .await
     {
@@ -2544,6 +2583,48 @@ mod tests {
         assert!(parsed.args.signer_webauthn.is_none());
     }
 
+    /// The two pin overrides default to `false` on `signers add` and
+    /// `signers batch-add`, and each flag sets only its own field.
+    #[test]
+    fn add_and_batch_add_parse_the_pin_override_flags() {
+        let base = [
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rule-id",
+            "1",
+            "--signer-delegated",
+            SIMULATE_SENTINEL_G,
+            "--signer-secret-env",
+            "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
+        ];
+        let parsed = AddArgsHarness::parse_from(base);
+        assert!(!parsed.args.accept_mutable_verifier);
+        assert!(!parsed.args.accept_unknown_verifier);
+
+        let parsed =
+            AddArgsHarness::parse_from(base.iter().copied().chain(["--accept-mutable-verifier"]));
+        assert!(parsed.args.accept_mutable_verifier);
+        assert!(!parsed.args.accept_unknown_verifier);
+
+        let parsed =
+            AddArgsHarness::parse_from(base.iter().copied().chain(["--accept-unknown-verifier"]));
+        assert!(!parsed.args.accept_mutable_verifier);
+        assert!(parsed.args.accept_unknown_verifier);
+
+        let parsed = BatchAddArgsHarness::parse_from(base);
+        assert!(!parsed.args.accept_mutable_verifier);
+        assert!(!parsed.args.accept_unknown_verifier);
+
+        let parsed = BatchAddArgsHarness::parse_from(
+            base.iter()
+                .copied()
+                .chain(["--accept-mutable-verifier", "--accept-unknown-verifier"]),
+        );
+        assert!(parsed.args.accept_mutable_verifier);
+        assert!(parsed.args.accept_unknown_verifier);
+    }
+
     /// `--new-signer` alias must still parse so existing scripts continue to work.
     #[test]
     fn add_args_parse_legacy_new_signer_alias() {
@@ -3076,6 +3157,8 @@ mod tests {
             signer_webauthn: None,
             signer_ed25519: Some(hex_pubkey.to_owned()),
             verifier,
+            accept_mutable_verifier: false,
+            accept_unknown_verifier: false,
             profile: None,
             signer_source: SignerSourceFlags {
                 signer_secret_env: Some("__STELLAR_AGENT_SIGNERS_ED25519_DUMMY".to_owned()),

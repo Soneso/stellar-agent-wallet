@@ -62,6 +62,10 @@ required-features = ["test-helpers"]
 name = "deploy_smart_account_collective_budget_mock"
 required-features = ["test-helpers"]
 
+[[test]]
+name = "execute_path_drift_check_mock"
+required-features = ["test-helpers"]
+
 # testnet acceptance tests: each requires the testnet-integration feature.
 [[test]]
 name = "deploy_c_testnet_acceptance"

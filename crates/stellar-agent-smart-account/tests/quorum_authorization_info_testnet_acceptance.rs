@@ -45,6 +45,9 @@
     reason = "test-only; panics are acceptable in testnet acceptance tests"
 )]
 
+#[path = "common/pin_check_manager.rs"]
+mod pin_check_manager;
+
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -69,7 +72,7 @@ use stellar_agent_smart_account::managers::rules::{
     ContextRuleSignerInput, parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
 use stellar_agent_smart_account::signers::policy_identification::THRESHOLD_POLICY_WASM;
-use stellar_agent_smart_account::submit::{SubmitInvokeArgs, submit_signed_invoke};
+use stellar_agent_smart_account::submit::{PinCheck, SubmitInvokeArgs, submit_signed_invoke};
 use stellar_baselib::account::{Account as BaselibAccount, AccountBehavior};
 use stellar_baselib::transaction::{Transaction, TransactionBehavior};
 use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilderBehavior};
@@ -667,6 +670,17 @@ async fn q1_and_q3_two_of_three_quorum_invocation_accepted() {
     };
     let host_function = HostFunction::InvokeContract(invoke);
 
+    // The rule was installed through a manager that writes no audit rows, so
+    // it has no pin record; the drift check fetches the rule and passes it.
+    let pin_dir = tempfile::tempdir().expect("temporary audit directory");
+    let pin_manager = pin_check_manager::pin_check_manager(
+        TESTNET_RPC_URL,
+        TESTNET_RPC_URL,
+        "quorum-acceptance",
+        pin_dir.path(),
+    );
+    let pin_request_id = rid();
+
     let result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
             .target_contract(&sa_strkey)
@@ -683,6 +697,11 @@ async fn q1_and_q3_two_of_three_quorum_invocation_accepted() {
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .op_label("execute_get_threshold_2of3")
             .emit_observability_logs(true)
+            .pin_check(PinCheck {
+                signers_manager: &pin_manager,
+                request_id: &pin_request_id,
+                migrating_rule: None,
+            })
             .build(),
     )
     .await;

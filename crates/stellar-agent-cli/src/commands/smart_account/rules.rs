@@ -522,10 +522,15 @@ pub struct CreateArgs {
     /// against that.
     ///
     /// For an external reference the pin records the owner, the tag and the
-    /// hash the tag resolves to; signing refuses when the owner repoints the
-    /// tag, the reference changes or the executable kind changes.
-    /// `--accept-unknown-verifier` is also required when the resolved hash is
-    /// outside the allowlist.
+    /// hash the tag resolves to. When the owner repoints the tag, the
+    /// reference changes or the executable kind changes, the pinned-hash
+    /// drift check refuses signing under the rule with
+    /// `sa.verifier_hash_drift` / `sa.policy_hash_drift` before anything is
+    /// simulated: in `smart-account execute`, `smart-account multicall`, the
+    /// rule and signer write verbs, and `smart-account migrate-verifier` for
+    /// the rule's policies. A check that cannot run refuses with
+    /// `sa.pin_check_unavailable`. `--accept-unknown-verifier` is also
+    /// required when the resolved hash is outside the allowlist.
     ///
     /// The flag does not admit an external reference with no live tag entry,
     /// an undecodable instance or a non-Wasm executable: the wallet cannot
@@ -542,7 +547,8 @@ pub struct CreateArgs {
     pub accept_mutable_verifier: bool,
 
     /// Opt-in to installing a rule whose verifier wasm-hash is not in the
-    /// `VERIFIER_ALLOWLIST` / `THRESHOLD_POLICY_WASM_HASHES` allowlists.
+    /// verifier allowlist (`VERIFIER_ALLOWLIST`) or among the policy Wasms the
+    /// wallet vendors (simple-threshold, weighted-threshold, spending-limit).
     ///
     /// By default (`false`), `smart-account rules create` fails with
     /// `sa.verifier_wasm_not_in_allowlist` / `sa.policy_wasm_not_in_allowlist`
@@ -1869,6 +1875,29 @@ pub struct AddPolicyArgs {
           num_args = 1.., action = clap::ArgAction::Append)]
     pub weighted_signer_webauthn: Vec<String>,
 
+    /// Opt-in to pinning a policy that is mutable: it has an admin / owner
+    /// storage key, or its executable is an owner-managed external reference.
+    ///
+    /// Applies only when the rule has a pin record (it was installed by the
+    /// wallet) and the policy is not already attached to it. The policy is
+    /// identified and probed as `rules create` probes one; a mutable policy
+    /// fails with `sa.policy_mutable` unless this flag is set, in which case
+    /// the add proceeds and the audit log emits `SaMutableContractOverride`
+    /// carrying the rule id. The flag does not admit an unpinnable instance
+    /// (`sa.contract_instance_unsupported`).
+    #[arg(long)]
+    pub accept_mutable_verifier: bool,
+
+    /// Opt-in to pinning a policy whose wasm hash is outside the policy
+    /// allowlist.
+    ///
+    /// Applies under the same conditions as `--accept-mutable-verifier`; an
+    /// unknown hash fails with `sa.policy_wasm_not_in_allowlist` unless this
+    /// flag is set, in which case the add proceeds and the audit log emits
+    /// `SaUnknownContractOverride` carrying the rule id.
+    #[arg(long)]
+    pub accept_unknown_verifier: bool,
+
     /// Auth rule-id(s) whose signers authorise this operation. Default: the
     /// `--rule-id` value (the rule being modified is also the authorising rule).
     #[arg(long = "auth-rule-id", value_name = "U32",
@@ -2533,6 +2562,8 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
             ctx.signer.as_ref(),
             None,
             request_id.clone(),
+            args.accept_mutable_verifier,
+            args.accept_unknown_verifier,
         )
         .await
     {
@@ -4611,6 +4642,40 @@ mod tests {
     /// An unrecognised `--kind` value is a clap grammar error, not a runtime
     /// refusal — the four valid values are `raw`, `spending-limit`,
     /// `simple-threshold`, `weighted-threshold`.
+    /// The two pin overrides default to `false` on `rules add-policy`, and
+    /// each flag sets only its own field.
+    #[test]
+    fn add_policy_args_parse_the_pin_override_flags() {
+        let base = [
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rule-id",
+            "3",
+            "--kind",
+            "simple-threshold",
+            "--threshold",
+            "1",
+            "--signer-secret-env",
+            "__STELLAR_AGENT_RULES_TEST_DUMMY_VAR",
+        ];
+        let parsed = AddPolicyArgsHarness::parse_from(base);
+        assert!(!parsed.args.accept_mutable_verifier);
+        assert!(!parsed.args.accept_unknown_verifier);
+
+        let parsed = AddPolicyArgsHarness::parse_from(
+            base.iter().copied().chain(["--accept-mutable-verifier"]),
+        );
+        assert!(parsed.args.accept_mutable_verifier);
+        assert!(!parsed.args.accept_unknown_verifier);
+
+        let parsed = AddPolicyArgsHarness::parse_from(
+            base.iter().copied().chain(["--accept-unknown-verifier"]),
+        );
+        assert!(!parsed.args.accept_mutable_verifier);
+        assert!(parsed.args.accept_unknown_verifier);
+    }
+
     #[test]
     fn add_policy_args_unknown_kind_is_grammar_error() {
         let result = AddPolicyArgsHarness::try_parse_from([
@@ -5218,6 +5283,8 @@ mod tests {
             threshold: None,
             weighted_signer_delegated: vec![],
             weighted_signer_webauthn: vec![],
+            accept_mutable_verifier: false,
+            accept_unknown_verifier: false,
             auth_rule_id: vec![],
             profile: None,
             signer_source: SignerSourceFlags {

@@ -98,7 +98,9 @@ use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::health::AuditWriterHealthHandle;
 use stellar_agent_core::audit_log::reader::{AuditReader, PinnedHashesRecord};
 use stellar_agent_core::audit_log::schema::ContractKind;
-use stellar_agent_core::audit_log::schema::{ExecutableRefPin, executable_refs_or_empty};
+use stellar_agent_core::audit_log::schema::{
+    ExecutableRefPin, PinsUpdateReason, executable_refs_or_empty,
+};
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_network::{ExternalRefExecutable, StellarRpcClient};
@@ -250,7 +252,8 @@ impl PinResult {
 /// 1. **Identification**: `SignersManager::observe_contract` fetches the
 ///    executable (two-RPC, an external reference resolved at each endpoint)
 ///    and matches its effective hash against `VERIFIER_ALLOWLIST` (verifier)
-///    or `THRESHOLD_POLICY_WASM_HASHES` (policy). An external reference with
+///    or the vendored policy Wasms (policy: simple-threshold,
+///    weighted-threshold and spending-limit). An external reference with
 ///    no live tag entry is refused with `SaError::ContractInstanceUnsupported`
 ///    before any override flag is consulted. An allowlist miss returns
 ///    `SaError::VerifierWasmNotInAllowlist` / `SaError::PolicyWasmNotInAllowlist`
@@ -398,7 +401,7 @@ pub async fn pin_referenced_contracts(
 
     // ── Step 2: policies attached to the rule ────────────────────────────────
     // The rule does not exist on-chain yet, so each policy is identified by
-    // its address against `THRESHOLD_POLICY_WASM_HASHES`.
+    // its address against the vendored policy Wasms.
     let mut seen_policy_strkeys: std::collections::HashSet<String> = Default::default();
     for policy in &rule_definition.policies {
         if !seen_policy_strkeys.insert(xdr_scaddress_to_strkey_or_sentinel(&policy.policy_address))
@@ -417,6 +420,140 @@ pub async fn pin_referenced_contracts(
     }
 
     Ok(result)
+}
+
+// ── Pin-record updates after a wallet mutation ────────────────────────────────
+
+/// The pin of a verifier or policy a wallet mutation adds to an existing
+/// rule.
+#[derive(Clone, Debug)]
+pub(crate) struct AddedContractPin {
+    /// First-8 hex of the contract's effective hash.
+    pub(crate) hash_first8: String,
+    /// Pin of an external-reference executable; `None` otherwise.
+    pub(crate) executable_ref: Option<ExecutableRefPin>,
+    /// The mutable-contract override was applied.
+    pub(crate) mutable_override: bool,
+    /// The unknown-hash override was applied.
+    pub(crate) unknown_override: bool,
+}
+
+/// Identifies, probes and pins `contract` of `kind` for rule `rule_id` with
+/// the checks rule install applies ([`pin_referenced_contracts`]): an
+/// allowlist miss refuses unless `accept_unknown_verifier` is set, a mutable
+/// contract refuses unless `accept_mutable_verifier` is set, an unpinnable
+/// instance refuses regardless, and an applied override writes its override
+/// row through the manager's audit writer carrying `rule_id`.
+///
+/// # Errors
+///
+/// The refusals of [`pin_referenced_contracts`] for one contract of `kind`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one contract's pin context: manager, rule, overrides, provenance, kind"
+)]
+pub(crate) async fn pin_added_contract(
+    signers_manager: &SignersManager,
+    contract: &ScAddress,
+    kind: PinnedKind,
+    rule_id: u32,
+    smart_account_redacted: &str,
+    accept_mutable_verifier: bool,
+    accept_unknown_verifier: bool,
+    chain_id: &str,
+    request_id: &str,
+) -> Result<AddedContractPin, SaError> {
+    let audit_writer = signers_manager.audit_writer();
+    let context = PinContext {
+        signers_manager,
+        audit_writer: Some(&audit_writer),
+        smart_account_redacted,
+        rule_id: Some(rule_id),
+        accept_mutable_verifier,
+        accept_unknown_verifier,
+        chain_id,
+        request_id,
+    };
+    let pinned = pin_contract(&context, contract, kind).await?;
+    Ok(AddedContractPin {
+        hash_first8: hash_first8_hex(&pinned.hash),
+        executable_ref: pinned.executable_ref,
+        mutable_override: pinned.mutable_override,
+        unknown_override: pinned.unknown_override,
+    })
+}
+
+/// Appends `pin` to one kind's pin lists of a record: its first-8 to
+/// `first8` and its executable-reference pin to the aligned `refs`, which
+/// stays empty while no pin of the kind is a reference and is otherwise
+/// aligned with `first8`, and folds its override flags into the record's.
+pub(crate) fn append_pin(
+    first8: &mut Vec<String>,
+    refs: &mut Vec<Option<ExecutableRefPin>>,
+    mutable_override: &mut bool,
+    unknown_override: &mut bool,
+    pin: AddedContractPin,
+) {
+    if !refs.is_empty() || pin.executable_ref.is_some() {
+        refs.resize(first8.len(), None);
+        refs.push(pin.executable_ref);
+    }
+    first8.push(pin.hash_first8);
+    *mutable_override |= pin.mutable_override;
+    *unknown_override |= pin.unknown_override;
+}
+
+/// Writes `record` as the `SaContextRulePinsUpdated` row of rule `rule_id`
+/// through the manager's audit writer.
+///
+/// Runs after the mutation confirmed on-chain, so a failed write cannot undo
+/// it: the failure is logged, and a poisoned writer marks the session
+/// degraded. The rule then keeps its previous pin record, which the drift
+/// check compares against the new live verifier or policy set and refuses on.
+pub(crate) fn write_pins_updated_row(
+    signers_manager: &SignersManager,
+    smart_account_redacted: &str,
+    rule_id: u32,
+    reason: PinsUpdateReason,
+    record: &PinnedHashesRecord,
+    request_id: &str,
+) {
+    let entry = AuditEntry::new_sa_context_rule_pins_updated(
+        smart_account_redacted,
+        rule_id,
+        reason,
+        signers_manager.chain_id(),
+        request_id,
+        record.pinned_verifier_first8.clone(),
+        record.pinned_policy_first8.clone(),
+        record.mutable_override,
+        record.unknown_override,
+        record.pinned_verifier_executable_refs.clone(),
+        record.pinned_policy_executable_refs.clone(),
+    );
+    let writer_arc = signers_manager.audit_writer();
+    match writer_arc.lock() {
+        Ok(mut writer) => {
+            if let Err(e) = writer.write_entry(entry) {
+                warn!(
+                    error = %e,
+                    rule_id,
+                    reason = %reason,
+                    "SaContextRulePinsUpdated audit write failed; the rule keeps its \
+                     previous pin record"
+                );
+            }
+        }
+        Err(_poison) => {
+            signers_manager.mark_audit_writer_degraded();
+            warn!(
+                target: "stellar_agent::audit",
+                rule_id,
+                reason = %reason,
+                "audit-writer mutex poisoned; SaContextRulePinsUpdated row dropped"
+            );
+        }
+    }
 }
 
 // ── Private helpers for pin_referenced_contracts ──────────────────────────────
@@ -701,7 +838,7 @@ fn tag_key_digest(
 /// and the audit-schema `ContractKind` (which is `#[non_exhaustive]`) is only
 /// produced from it, never matched with a wildcard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PinnedKind {
+pub(crate) enum PinnedKind {
     Verifier,
     Policy,
 }
@@ -896,9 +1033,10 @@ pub(crate) fn scaddress_cache_key(addr: &ScAddress) -> Result<Vec<u8>, SaError> 
 ///
 /// # Returns
 ///
-/// - `Ok(Some(record))` — the rule's `SaContextRuleCreated` row was found;
-///   the returned [`PinnedHashesRecord`] carries first-8-hex strings of the
-///   pinned hashes plus install-time override flags.
+/// - `Ok(Some(record))`: the rule's pin record, its newest
+///   `SaContextRuleCreated` or `SaContextRulePinsUpdated` row, was found; the
+///   returned [`PinnedHashesRecord`] carries first-8-hex strings of the
+///   pinned hashes plus the override flags.
 /// - `Ok(None)` — no matching rule entry found; drift-detection is skipped.
 ///
 /// # Errors
@@ -1011,8 +1149,9 @@ async fn observe_with_cache(
 /// Verify a rule's pinned verifier against the live on-chain contract at
 /// signing time.
 ///
-/// Reads the pin from the audit log (the `SaContextRuleCreated` entry for
-/// `rule_id`), fetches the live executable via
+/// Reads the pin from the audit log (the newest `SaContextRuleCreated` or
+/// `SaContextRulePinsUpdated` row for `rule_id`), fetches the live executable
+/// via
 /// [`fetch_observed_executable`][crate::managers::signers::fetch_observed_executable]
 /// (two-RPC, no allowlist enforcement; drift detection compares against the
 /// pin only; allowlist enforcement belongs at install time), and compares
@@ -1069,13 +1208,12 @@ pub(crate) async fn verify_pinned_verifier_against_chain(
     let Some(record) =
         read_pinned_hashes_for_rule(signers_manager, rule_id, smart_account_redacted)?
     else {
-        // No SaContextRuleCreated row found — rule was installed via a
-        // non-wallet path or before wasm-hash pinning was introduced.
-        // The wallet does not pin against non-wallet installs; skip drift-detect.
+        // No pin record: the rule was installed outside the wallet, and the
+        // wallet does not pin against non-wallet installs; skip drift-detect.
         debug!(
             rule_id,
             verifier_redacted = %verifier_redacted,
-            "verify_pinned_verifier_against_chain: no SaContextRuleCreated row for rule_id; \
+            "verify_pinned_verifier_against_chain: no pin record for rule_id; \
              drift-detection skipped (rule may have been installed without a pinned record)"
         );
         return Ok(());
@@ -1213,7 +1351,7 @@ pub(crate) async fn verify_pinned_policy_against_chain(
         debug!(
             rule_id,
             policy_redacted = %policy_redacted,
-            "verify_pinned_policy_against_chain: no SaContextRuleCreated row for rule_id; \
+            "verify_pinned_policy_against_chain: no pin record for rule_id; \
              drift-detection skipped"
         );
         return Ok(());

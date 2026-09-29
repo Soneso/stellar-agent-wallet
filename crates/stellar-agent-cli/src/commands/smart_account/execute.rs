@@ -31,6 +31,17 @@
 //! against the bootstrap rule and fail on-chain with `NotAllowed` (3223)
 //! instead of surfacing the caller's mistake up front.
 //!
+//! # Pinned-hash drift check
+//!
+//! Before anything is simulated or signed, every authorizing rule other than
+//! rule 0 is checked against its pin record in the profile's audit log: the
+//! rule's live verifier and policy contracts must match the hashes (and, for
+//! a CAP-85 external reference, the owner, tag and resolved hash) pinned when
+//! the rule was installed or last updated by the wallet. Drift refuses with
+//! `sa.verifier_hash_drift` / `sa.policy_hash_drift`; a check that cannot run
+//! refuses with `sa.pin_check_unavailable`. A rule without a pin record
+//! signs unchecked.
+//!
 //! # Mainnet defence
 //!
 //! Structurally refused (`network.mainnet_write_forbidden`) before any RPC
@@ -62,7 +73,7 @@ use stellar_agent_network::submit::redact_tx_hash;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::rules::parse_c_strkey_to_smart_account;
 use stellar_agent_smart_account::submit::{
-    Ed25519RuleSigner, SubmitInvokeArgs, submit_signed_invoke,
+    Ed25519RuleSigner, PinCheck, SubmitInvokeArgs, submit_signed_invoke,
 };
 use stellar_agent_smart_account::verifiers::VerifierRegistry;
 use stellar_xdr::{HostFunction, InvokeContractArgs, Limits, ReadXdr as _, ScSymbol, ScVal, VecM};
@@ -70,8 +81,8 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
-    SignerSourceFlags, network_to_chain_id, open_profile_audit_writer, resolve_signer,
-    wrap_sa_error,
+    SignerSourceFlags, construct_signers_manager_from_fields, network_to_chain_id,
+    open_profile_audit_writer, resolve_signer, wrap_sa_error,
 };
 use crate::common::network::TargetNetwork;
 use crate::common::render::{render_json, sanitize_for_table};
@@ -385,12 +396,32 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     // key is touched or anything is submitted. A persisted profile whose
     // audit chain key is unminted refuses here (audit.chain_key_unavailable);
     // the SAME writer is reused for every post-confirm row below.
-    let (profile, audit_writer) = match open_profile_audit_writer(&resolved_profile) {
-        Ok((profile, writer, _path)) => (profile, Some(writer)),
+    let (profile, audit_writer, audit_log_path) = match open_profile_audit_writer(&resolved_profile)
+    {
+        Ok((profile, writer, path)) => (profile, writer, path),
         Err(e) => {
             return emit_error(&e, args.output, &request_id);
         }
     };
+
+    // The pinned-hash drift check of every authorizing rule reads the rule's
+    // pin record from this profile's audit log and fetches the live
+    // verifier and policy contracts through the same RPC endpoints the
+    // submission uses.
+    let signers_manager = match construct_signers_manager_from_fields(
+        &profile_name,
+        network_passphrase,
+        network_to_chain_id(args.network),
+        &args.rpc_url,
+        args.secondary_rpc_url.as_deref().unwrap_or(&args.rpc_url),
+        Duration::from_secs(args.timeout_seconds),
+        Arc::clone(&audit_writer),
+        &audit_log_path,
+    ) {
+        Ok(manager) => manager,
+        Err(e) => return emit_error(&e, args.output, &request_id),
+    };
+    let audit_writer = Some(audit_writer);
 
     // ── Rule-signer key ceremony (shared mlock ceremony) ─────────────────────
     // Funded-source verification is SKIPPED: a rule key has no on-chain
@@ -523,6 +554,11 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
             .op_label("execute")
             .emit_observability_logs(true)
             .submission_recorder(&recorder)
+            .pin_check(PinCheck {
+                signers_manager: &signers_manager,
+                request_id: &request_id,
+                migrating_rule: None,
+            })
             .build(),
     )
     .await;

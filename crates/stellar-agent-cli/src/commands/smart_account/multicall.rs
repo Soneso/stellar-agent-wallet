@@ -65,8 +65,8 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
-    SignerSourceFlags, emit_multicall_registry_error, emit_sa_error, network_to_chain_id,
-    open_profile_audit_writer,
+    SignerSourceFlags, construct_signers_manager_from_fields, emit_multicall_registry_error,
+    emit_sa_error, network_to_chain_id, open_profile_audit_writer,
 };
 use crate::common::network::TargetNetwork;
 use crate::common::profile_access::{
@@ -259,13 +259,15 @@ pub async fn run(args: &MulticallArgs) -> i32 {
     // key is touched or the bundle is submitted. A persisted profile whose
     // audit chain key is unminted refuses here (audit.chain_key_unavailable);
     // the SAME writer is reused for the post-confirm rows.
-    let audit_writer = match open_profile_audit_writer(&resolved_profile) {
-        Ok((_profile, writer, _path)) => Some(writer),
+    let (profile_audit_writer, audit_log_path) = match open_profile_audit_writer(&resolved_profile)
+    {
+        Ok((_profile, writer, path)) => (writer, path),
         Err(e) => {
             render_json(&Envelope::<()>::err(&e));
             return 1;
         }
     };
+    let audit_writer = Some(Arc::clone(&profile_audit_writer));
 
     // Resolve signer.
     let (signer, mlock_degradation) = {
@@ -383,6 +385,26 @@ pub async fn run(args: &MulticallArgs) -> i32 {
     // Build a minimal profile for policy evaluation.
     let profile = build_minimal_profile(args.network, secondary_rpc_url.clone());
 
+    // The pinned-hash drift check of the authorizing rule reads the rule's
+    // pin record from this profile's audit log and fetches the live verifier
+    // and policy contracts through the submission's RPC endpoints.
+    let signers_manager = match construct_signers_manager_from_fields(
+        &profile_name,
+        &network_passphrase,
+        &chain_id,
+        &args.rpc_url,
+        &secondary_rpc_url,
+        Duration::from_secs(args.timeout_seconds),
+        profile_audit_writer,
+        &audit_log_path,
+    ) {
+        Ok(manager) => manager,
+        Err(e) => {
+            render_json(&Envelope::<()>::err(&e));
+            return 1;
+        }
+    };
+
     let request_id = Uuid::new_v4().to_string();
 
     if let Some(writer) = &audit_writer {
@@ -435,6 +457,7 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         fee,
         chain_id: &chain_id,
         request_id: &request_id,
+        signers_manager: &signers_manager,
     };
 
     match submit_multicall_bundle(submit_args, &registry).await {

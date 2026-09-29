@@ -22,16 +22,21 @@
 //!
 //! **`d3_migrate_verifier_on_chain_submit`**
 //!
-//! Deploys a fresh smart account, two OZ WebAuthn verifier instances (same WASM,
-//! different addresses), and a threshold-policy.  Installs a context rule with
-//! one External signer pointing to verifier-A.  Calls `MigrationPlan::submit` to
-//! execute the remove+add pair on-chain (verifier-A → verifier-B).  Asserts the
-//! submit result has no failure, the audit log contains one `SaVerifierMigrated`
-//! row, and the post-migration on-chain `ContextRule` satisfies seven decoded
-//! invariants: External verifier address, pubkey preservation, policies list
-//! preservation, Delegated signer address preservation, policy_ids
-//! preservation, and Delegated signer on-chain id invariance across the
-//! remove+add pair.
+//! Deploys a fresh smart account, an OZ WebAuthn v0.7.2 verifier (verifier-A),
+//! an OZ WebAuthn v0.7.1 verifier (verifier-B: a different allowlisted Wasm with
+//! the same key-data format), and a threshold-policy.  Installs, through a rule
+//! manager that pins, a context rule with one External signer pointing to
+//! verifier-A.  Calls `MigrationPlan::submit` to execute the remove+add pair
+//! on-chain (verifier-A → verifier-B).  Asserts the submit result has no
+//! failure, the audit log contains one `SaVerifierMigrated` row and one
+//! `SaContextRulePinsUpdated` row naming verifier-B's hash, the post-migration
+//! on-chain `ContextRule` satisfies seven decoded invariants (External verifier
+//! address, pubkey preservation, policies list preservation, Delegated signer
+//! address preservation, policy_ids preservation, and Delegated signer on-chain
+//! id invariance across the remove+add pair), a transfer signed by the rule's
+//! Delegated co-signer through `submit_signed_invoke` with the pinned-hash
+//! drift check confirms, and `verify_rule_wasm_pins` reports a match against
+//! verifier-B's hash.
 //!
 //! # Gating
 //!
@@ -52,12 +57,16 @@
     reason = "test-only; panics and diagnostic output are acceptable in testnet acceptance tests"
 )]
 
+mod common;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use sha2::{Digest as _, Sha256};
+use stellar_agent_core::audit_log::entry::AuditEntry;
+use stellar_agent_core::audit_log::schema::{EventKind, PinsUpdateReason};
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
@@ -73,12 +82,15 @@ use stellar_agent_smart_account::managers::migration::MigrationPlanner;
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRulePolicy,
-    ContextRuleSignerInput, parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
+    ContextRuleSignerInput, PinStatus, parse_c_strkey_to_smart_account,
+    parse_g_strkey_to_signer_address,
 };
 use stellar_agent_smart_account::managers::signers::{SignersManager, SignersManagerConfig};
 use stellar_agent_smart_account::signers::policy_identification::THRESHOLD_POLICY_WASM;
+use stellar_agent_smart_account::submit::{PinCheck, SubmitInvokeArgs, submit_signed_invoke};
 use stellar_agent_smart_account::verifier_allowlist::{VERIFIER_ALLOWLIST, VerifierAuditStatus};
 use stellar_agent_smart_account::{DecodedOnChainSigner, decode_signer_scval_full};
+use stellar_agent_test_support::testnet_helpers::fund_sac_balance;
 use stellar_agent_test_support::verifier_registry::fresh_verifier_registry_tempdir;
 use stellar_baselib::account::{Account as BaselibAccount, AccountBehavior};
 use stellar_baselib::transaction::{Transaction, TransactionBehavior};
@@ -115,9 +127,46 @@ const OZ_WEBAUTHN_VERIFIER_HASH: [u8; 32] = [
     0x2f, 0xec, 0x56, 0x6b, 0x15, 0x14, 0x21, 0xf9, 0x91, 0xc3, 0xb4, 0xe2, 0x48, 0xeb, 0xb1, 0xf7,
 ];
 
+/// Vendored OZ WebAuthn verifier v0.7.1 Wasm (`VERIFIER_ALLOWLIST[1]`,
+/// SHA-256 `678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a`,
+/// verified at `vendor/oz-webauthn-verifier/v0.7.1/PROVENANCE.md`).
+///
+/// d3 migrates to a verifier deployed from these bytes: an allowlisted,
+/// immutable Wasm whose hash differs from verifier-A's v0.7.2 hash, so the
+/// migration changes the rule's pin. The destination must accept the rule's
+/// WebAuthn key blob, because `add_signer` canonicalizes the key through the
+/// destination verifier; the v0.7.1 WebAuthn verifier takes the same 65-byte
+/// key plus optional credential id, the Ed25519 verifier takes 32 bytes only.
+const OZ_WEBAUTHN_VERIFIER_V071_WASM: &[u8] =
+    include_bytes!("../vendor/oz-webauthn-verifier/v0.7.1/multisig_webauthn_verifier_example.wasm");
+
+/// XLM funded into d3's smart-account SAC balance (0.5 XLM).
+const D3_FUND_STROOPS: i128 = 5_000_000;
+
+/// XLM d3 transfers through the migrated rule (0.1 XLM).
+const D3_TRANSFER_STROOPS: i128 = 1_000_000;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// First-8 hex of a 32-byte hash, as the pin records store it.
+fn first8_hex(hash: &[u8; 32]) -> String {
+    hex::encode(&hash[..8])
+}
+
+/// Reads every audit entry `log_path` holds.
+fn read_audit_entries(log_path: &std::path::Path) -> Vec<AuditEntry> {
+    use std::io::BufRead as _;
+    let file = std::fs::File::open(log_path).expect("audit log must be readable");
+    std::io::BufReader::new(file)
+        .lines()
+        .map(|line| {
+            serde_json::from_str(&line.expect("audit line must be valid UTF-8"))
+                .expect("audit line must parse as an AuditEntry")
+        })
+        .collect()
+}
 
 /// Generates a fresh ed25519 keypair and returns
 /// `(g_strkey, DeployerKeypair::SecretEnv { signer })`.
@@ -1412,32 +1461,41 @@ async fn d3_migrate_verifier_on_chain_submit() {
         va_result.status,
     );
 
-    // ── 3. Deploy verifier-B (same WASM, different deployer → different address) ──
+    // ── 3. Deploy verifier-B from the v0.7.1 WebAuthn Wasm ──────────────────
 
-    let (vb_deployer_g, vb_deployer_kp) = fresh_deployer();
+    let vb_signing_key = SigningKey::generate(&mut OsRng);
+    let vb_seed = Zeroizing::new(vb_signing_key.to_bytes());
+    let vb_deployer_g = format!(
+        "{}",
+        stellar_strkey::ed25519::PublicKey(vb_signing_key.verifying_key().to_bytes())
+    );
     fund_via_friendbot(&vb_deployer_g).await;
-
-    let (_vb_registry_dir, vb_registry_path) = fresh_verifier_registry_tempdir("D-3 verifier-B");
-
-    let vb_result = deploy_webauthn_verifier(
-        WebAuthnVerifierDeployArgs {
-            deployer: vb_deployer_kp,
-            network_passphrase: TESTNET_PASSPHRASE.to_owned(),
-            rpc_url: TESTNET_RPC_URL.to_owned(),
-            timeout: Duration::from_secs(TIMEOUT_SECS),
-            fee: ResolvedFeePerOp {
-                stroops: FEE_STROOPS,
-                percentile_label: "explicit".to_owned(),
-            },
-            dry_run: false,
-            registry_path_override: Some(vb_registry_path),
-        },
-        None,
+    let mut vb_salt = [0u8; 32];
+    rand_core::RngCore::fill_bytes(&mut OsRng, &mut vb_salt);
+    let vb_uploaded = common::upload_and_create_contract(
+        OZ_WEBAUTHN_VERIFIER_V071_WASM,
+        &vb_deployer_g,
+        &vb_seed,
+        vb_salt,
+        vec![],
     )
     .await
-    .expect("deploy_webauthn_verifier (verifier-B) must succeed");
+    .expect("verifier-B (WebAuthn v0.7.1) upload and create must succeed");
+    assert_eq!(
+        vb_uploaded.wasm_hash, VERIFIER_ALLOWLIST[1].wasm_hash,
+        "verifier-B must run the allowlisted WebAuthn v0.7.1 Wasm"
+    );
+    assert_ne!(
+        vb_uploaded.wasm_hash, OZ_WEBAUTHN_VERIFIER_HASH,
+        "verifier-B must run a Wasm other than verifier-A's"
+    );
+    let verifier_b_hash = vb_uploaded.wasm_hash;
+    eprintln!(
+        "D3-RECORD verifier-b-create-tx {}",
+        vb_uploaded.create.tx_hash
+    );
 
-    let verifier_b_strkey = vb_result.verifier_address.clone();
+    let verifier_b_strkey = vb_uploaded.contract.clone();
     let verifier_b_addr: ScAddress =
         parse_c_strkey_to_smart_account(&verifier_b_strkey).expect("parse verifier-B C-strkey");
 
@@ -1446,11 +1504,7 @@ async fn d3_migrate_verifier_on_chain_submit() {
         "verifier-A and verifier-B must have different addresses (different deployers)"
     );
 
-    eprintln!(
-        "verifier-B at {} (status={})",
-        &verifier_b_strkey[..8],
-        vb_result.status,
-    );
+    eprintln!("verifier-B at {}", &verifier_b_strkey[..8]);
 
     // ── 4. Deploy threshold-policy WASM ──────────────────────────────────────
 
@@ -1510,7 +1564,38 @@ async fn d3_migrate_verifier_on_chain_submit() {
         )],
     );
 
-    let rule_manager = fresh_rule_manager();
+    // The rule manager pins: it shares the SignersManager and the audit log
+    // the migration uses, so the install writes the rule's pin record there.
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let audit_log_path = tmp_dir.path().join("audit.jsonl");
+    let audit_writer = Arc::new(Mutex::new(
+        AuditWriter::open(audit_log_path.clone(), None).expect("AuditWriter::open"),
+    ));
+    let manager = Arc::new(
+        SignersManager::new(SignersManagerConfig::new(
+            TESTNET_RPC_URL.to_owned(),
+            TESTNET_RPC_URL.to_owned(),
+            Arc::clone(&audit_writer),
+            audit_log_path.clone(),
+            TESTNET_PASSPHRASE.to_owned(),
+            "d3-test".to_owned(),
+            Duration::from_secs(TIMEOUT_SECS),
+            CHAIN_ID.to_owned(),
+        ))
+        .expect("SignersManager::new must succeed"),
+    );
+    let rule_manager = ContextRuleManager::new(
+        ContextRuleManagerConfig::new(
+            TESTNET_RPC_URL.to_owned(),
+            TESTNET_PASSPHRASE.to_owned(),
+            Duration::from_secs(TIMEOUT_SECS),
+            CHAIN_ID.to_owned(),
+        )
+        .with_audit_writer(Arc::clone(&audit_writer))
+        .with_signers_manager(Arc::clone(&manager)),
+    )
+    .expect("ContextRuleManager::new must succeed");
+
     let install_out = rule_manager
         .install_rule(
             smart_account_addr.clone(),
@@ -1525,27 +1610,18 @@ async fn d3_migrate_verifier_on_chain_submit() {
         .await
         .expect("install_rule must succeed on testnet");
     let new_rule_id = install_out.rule_id;
+    eprintln!("D3-RECORD install-tx {}", install_out.tx_hash);
+    assert_eq!(
+        install_out.pin_result.pinned_verifier_hashes_first8(),
+        vec![first8_hex(&OZ_WEBAUTHN_VERIFIER_HASH)],
+        "the install must pin verifier-A's hash"
+    );
+    let pinned_policy_first8 = install_out.pin_result.pinned_policy_hashes_first8();
+    assert_eq!(pinned_policy_first8.len(), 1, "the install pins the policy");
 
     eprintln!("External signer rule installed as rule_id={new_rule_id}");
 
-    // ── 6. Build SignersManager + establish baseline for new rule ────────────
-
-    let tmp_dir = tempfile::tempdir().expect("tempdir");
-    let audit_log_path = tmp_dir.path().join("audit.jsonl");
-    let audit_writer = Arc::new(Mutex::new(
-        AuditWriter::open(audit_log_path.clone(), None).expect("AuditWriter::open"),
-    ));
-    let manager = SignersManager::new(SignersManagerConfig::new(
-        TESTNET_RPC_URL.to_owned(),
-        TESTNET_RPC_URL.to_owned(),
-        audit_writer,
-        audit_log_path.clone(),
-        TESTNET_PASSPHRASE.to_owned(),
-        "d3-test".to_owned(),
-        Duration::from_secs(TIMEOUT_SECS),
-        CHAIN_ID.to_owned(),
-    ))
-    .expect("SignersManager::new must succeed");
+    // ── 6. Establish baseline for new rule ───────────────────────────────────
 
     let baseline_rid = uuid::Uuid::new_v4().to_string();
     let baseline = manager
@@ -1986,11 +2062,160 @@ async fn d3_migrate_verifier_on_chain_submit() {
         decoded.policy_ids.len(),
     );
 
+    // ── A transfer through the migrated rule passes the drift check ──────────
+    //
+    // Signed by the rule's Delegated co-signer (the rule is 1-of-2), so
+    // verifier-B's `verify` is not called; the drift check compares
+    // verifier-B and the policy against the rewritten pin record before
+    // anything is simulated.
+    let funded = fund_sac_balance(
+        "d3-migrate-verifier",
+        TESTNET_RPC_URL,
+        TESTNET_PASSPHRASE,
+        TESTNET_FRIENDBOT_URL,
+        common::XLM_SAC_TESTNET,
+        &smart_account_strkey,
+        D3_FUND_STROOPS,
+        common::build_sac_transfer_invoke,
+        |account_id| common::fetch_testnet_sequence(account_id.to_owned()),
+        |unsigned_xdr, seed, network_passphrase| {
+            common::sign_testnet_envelope(unsigned_xdr, seed, network_passphrase.to_owned())
+        },
+        common::submit_testnet_signed_xdr,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("SAC funding of the smart account must succeed: {e}"));
+    eprintln!("D3-RECORD fund-sac-tx {}", funded.tx_hash);
+
+    let (recipient_g, _recipient_signer) = fresh_signer();
+    fund_via_friendbot(&recipient_g).await;
+    let recipient_sc =
+        parse_g_strkey_to_signer_address(&recipient_g).expect("recipient G-strkey parses");
+    let balance_before = common::xlm_stroops_balance(&recipient_g).await;
+    let transfer_rule_ids = vec![ContextRuleId::new(new_rule_id)];
+    let transfer_request_id = uuid::Uuid::new_v4().to_string();
+    let transfer = submit_signed_invoke(
+        SubmitInvokeArgs::builder()
+            .target_contract(common::XLM_SAC_TESTNET)
+            .auth_address(smart_account_strkey.as_str())
+            .auth_rule_ids(&transfer_rule_ids)
+            .host_function(common::transfer_host_function(
+                parse_c_strkey_to_smart_account(common::XLM_SAC_TESTNET)
+                    .expect("XLM SAC C-strkey parses"),
+                smart_account_addr.clone(),
+                recipient_sc,
+                D3_TRANSFER_STROOPS,
+            ))
+            .signer(signer_box.as_ref())
+            .primary_rpc_url(TESTNET_RPC_URL)
+            .network_passphrase(TESTNET_PASSPHRASE)
+            .chain_id(CHAIN_ID)
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .op_label("d3_transfer_after_migration")
+            .emit_observability_logs(true)
+            .pin_check(PinCheck {
+                signers_manager: &manager,
+                request_id: &transfer_request_id,
+                migrating_rule: None,
+            })
+            .build(),
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "a transfer through the migrated rule must pass the drift check and confirm; \
+             got {}: {e}",
+            e.wire_code()
+        )
+    });
+    eprintln!("D3-RECORD transfer-tx {}", transfer.tx_hash);
+    let balance_after = common::xlm_stroops_balance(&recipient_g).await;
+    assert_eq!(
+        balance_after - balance_before,
+        i64::try_from(D3_TRANSFER_STROOPS).expect("fits i64"),
+        "the recipient must receive exactly the transferred amount"
+    );
+    let drift_rows = read_audit_entries(&audit_log_path)
+        .into_iter()
+        .filter(|entry| {
+            matches!(
+                entry.event_kind,
+                EventKind::SaVerifierHashDrift { .. } | EventKind::SaPolicyHashDrift { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        drift_rows, 0,
+        "no drift row is written for the migrated rule"
+    );
+
+    // ── Pin record: the migration rewrote it to name verifier-B ──────────────
+    let pins_updated: Vec<AuditEntry> = read_audit_entries(&audit_log_path)
+        .into_iter()
+        .filter(|entry| {
+            matches!(
+                entry.event_kind,
+                EventKind::SaContextRulePinsUpdated { rule_id, .. } if rule_id == new_rule_id
+            )
+        })
+        .collect();
+    assert_eq!(
+        pins_updated.len(),
+        1,
+        "one SaContextRulePinsUpdated row per confirmed migration pair"
+    );
+    assert_eq!(pins_updated[0].request_id, submit_request_id);
+    match &pins_updated[0].event_kind {
+        EventKind::SaContextRulePinsUpdated {
+            pinned_verifier_wasm_hashes_first8,
+            pinned_policy_wasm_hashes_first8,
+            pinned_verifier_executable_refs,
+            reason,
+            ..
+        } => {
+            assert_eq!(
+                pinned_verifier_wasm_hashes_first8,
+                &vec![first8_hex(&verifier_b_hash)],
+                "the pin record must name verifier-B's hash"
+            );
+            assert_eq!(
+                pinned_policy_wasm_hashes_first8, &pinned_policy_first8,
+                "the policy pins must be unchanged"
+            );
+            assert!(pinned_verifier_executable_refs.is_empty());
+            assert_eq!(*reason, PinsUpdateReason::VerifierMigrated);
+        }
+        other => panic!("filtered to SaContextRulePinsUpdated; got {other:?}"),
+    }
+
+    // ── verify_rule_wasm_pins matches verifier-B's hash ──────────────────────
+    let pins = rule_manager
+        .verify_rule_wasm_pins(
+            smart_account_addr.clone(),
+            new_rule_id,
+            &signer_g,
+            &uuid::Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("verify_rule_wasm_pins must return a report");
+    assert_eq!(pins.verifier_pin_status, PinStatus::Match);
+    assert_eq!(
+        pins.pinned_verifier_first8,
+        vec![first8_hex(&verifier_b_hash)]
+    );
+    assert_eq!(
+        pins.observed_verifier_first8,
+        vec![first8_hex(&verifier_b_hash)]
+    );
+    assert_eq!(pins.policy_pin_status, PinStatus::Match);
+
     eprintln!(
         "d3 PASS: migration complete — verifier address changed from {} to {}; \
          remove+add pair confirmed on-chain; 1 SaVerifierMigrated audit row; \
+         1 SaContextRulePinsUpdated row naming verifier-B's hash; \
          on-chain ContextRule verifier-B address + Delegated invariant + \
-         policies preservation + Delegated signer-id invariance verified",
+         policies preservation + Delegated signer-id invariance verified; \
+         transfer through the migrated rule confirmed; verify-pins match",
         &verifier_a_strkey[..8],
         &verifier_b_strkey[..8],
     );

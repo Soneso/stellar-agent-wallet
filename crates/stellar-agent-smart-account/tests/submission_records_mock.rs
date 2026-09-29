@@ -49,6 +49,9 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 #[path = "smart-account-fixtures/adversarial/rpc_mock_helpers.rs"]
 mod rpc_helpers;
 
+#[path = "common/pin_check_manager.rs"]
+mod pin_check_manager;
+
 const PASSPHRASE: &str = "Test SDF Network ; September 2015";
 const PROFILE: &str = "submission-records-mock";
 const SEED: [u8; 32] = [0x43; 32];
@@ -258,6 +261,10 @@ impl Fixture {
         url: &str,
     ) -> Result<stellar_agent_smart_account::multicall::MulticallResult, SaError> {
         let signer = SoftwareSigningKey::new_from_bytes(SEED);
+        // The bundle signs under rule 0, which the pinned-hash drift check
+        // never fetches or reads.
+        let signers_manager =
+            pin_check_manager::pin_check_manager(url, url, PROFILE, self._root.path());
         submit_multicall_bundle(
             MulticallSubmitArgs {
                 smart_account: &contract(0x44),
@@ -274,6 +281,7 @@ impl Fixture {
                 fee: ResolvedFeePerOp::default(),
                 chain_id: "stellar:testnet",
                 request_id: "multicall-record",
+                signers_manager: &signers_manager,
             },
             &self.registry,
         )

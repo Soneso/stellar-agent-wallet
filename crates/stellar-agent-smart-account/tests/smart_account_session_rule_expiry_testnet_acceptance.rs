@@ -357,7 +357,9 @@ async fn h_1_revocation_audit_log_timeline() {
             sa_addr.clone(),
             rule_id,
             Some(revocation_ledger),
-            vec![ContextRuleId::new(rule_id)],
+            // Rule 0 authorizes: this manager has no signers manager, so an
+            // authorizing rule other than 0 is refused before signing.
+            vec![ContextRuleId::new(0)],
             signer_box.as_ref(),
             None,
             rid(),
@@ -512,7 +514,9 @@ async fn h_2_post_revocation_new_sign_refused() {
             sa_addr.clone(),
             rule_id,
             Some(revocation_ledger),
-            vec![ContextRuleId::new(rule_id)],
+            // Rule 0 authorizes: this manager has no signers manager, so an
+            // authorizing rule other than 0 is refused before signing.
+            vec![ContextRuleId::new(0)],
             signer_box.as_ref(),
             None,
             rid(),
@@ -555,10 +559,14 @@ async fn h_2_post_revocation_new_sign_refused() {
             rule_id,
             dummy_policy_addr,
             stellar_xdr::ScVal::Void, // install_param
-            vec![ContextRuleId::new(rule_id)],
+            // Rule 0 authorizes: this manager has no signers manager, so an
+            // authorizing rule other than 0 is refused before signing.
+            vec![ContextRuleId::new(0)],
             signer_box.as_ref(),
             None, // audit_writer (per-call override)
             rid(),
+            false, // accept_mutable_verifier
+            false, // accept_unknown_verifier
         )
         .await;
 
