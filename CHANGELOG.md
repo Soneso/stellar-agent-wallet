@@ -87,9 +87,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   confirms, a `SaContextRulePinsUpdated` row (reason `policy_added`) appends
   its pin. After a removal confirms, the row (reason `policy_removed`) drops
   the pin equal to the removed policy's hash, or the single pin of a rule's
-  only policy even when the policy no longer matches it or cannot be read.
+  only policy even when the policy differs from its pin or cannot be read.
   A second policy pin yields a record every checked signing verb refuses, as
   for a rule installed with two policies. `ContextRuleManager::add_policy` takes the two override flags.
+- A rule whose pin record holds policy pins while the rule has no policy on
+  chain is refused before signing with the new `sa.pinned_policy_absent`,
+  and `smart-account rules verify-pins` reports its policy status as
+  `drift`. `rules add-policy` on a pinned rule with no policy on chain
+  replaces the policy pins with the added policy's pin, so an add authorized
+  under rule `0` repairs the rule.
 - The policy pin allowlist accepts every policy Wasm the wallet vendors: the
   simple-threshold, weighted-threshold and spending-limit policies. It
   applies to `rules create` and `rules add-policy`.
@@ -180,6 +186,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   message omits the rule. A present `rule_id` of 0 on an override row names
   no rule. The audit-entry constructors and `pin_referenced_contracts` take
   the rule id as `Option<u32>`.
+
+### Fixed
+
+- The startup advisory and `smart-account list-verifiers` render verifier
+  hashes in the 16-character first-8 form of the pin records.
 
 ## [0.1.0-alpha.8] - 2026-09-25
 

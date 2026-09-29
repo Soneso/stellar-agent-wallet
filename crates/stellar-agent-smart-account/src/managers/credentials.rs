@@ -516,6 +516,9 @@ pub enum CredentialsError {
     /// actual drift was detected): this variant indicates the drift check could
     /// not run at all — for example, because the on-chain rule was not found or
     /// an RPC error occurred while fetching the rule's verifier/policy addresses.
+    /// It also carries `SaError::PinnedPolicyAbsent`, the refusal of a rule
+    /// whose pin record holds policy pins while the rule has no policy on
+    /// chain, for which no drift row is written.
     ///
     /// The WebAuthn ceremony is aborted (fail-closed) BEFORE any bridge I/O.
     /// No `SaVerifierHashDrift` / `SaPolicyHashDrift` audit row is emitted
@@ -2075,8 +2078,9 @@ impl CredentialsManager {
                 // produce CredentialsError::WasmHashDrift, which must be paired
                 // with a SaVerifier/PolicyHashDrift audit row.  Infrastructure failures
                 // (NetworkRpcDivergence, DeploymentFailed, MultiplePinnedHashesUnsupported,
-                // AuditLog) route to DriftCheckUnavailable — no drift audit row is
-                // emitted for those (none was written by verify_pinned_*).
+                // AuditLog) and PinnedPolicyAbsent route to DriftCheckUnavailable: no
+                // drift audit row is emitted for those (none was written by
+                // verify_pinned_* or verify_policy_pins_present).
                 for verifier_addr in verifier_addrs {
                     if let Err(sa_err) =
                         crate::managers::verifiers::verify_pinned_verifier_against_chain(
@@ -2100,11 +2104,11 @@ impl CredentialsManager {
                 }
 
                 // Policy drift-detection — one call per policy address.
-                for policy_addr in policy_addrs {
+                for policy_addr in &policy_addrs {
                     if let Err(sa_err) =
                         crate::managers::verifiers::verify_pinned_policy_against_chain(
                             sm,
-                            policy_addr,
+                            policy_addr.clone(),
                             rule_id,
                             &smart_account_redacted,
                             &divergence_request_id,
@@ -2120,6 +2124,24 @@ impl CredentialsManager {
                             Some(divergence_request_id),
                         );
                     }
+                }
+
+                // A rule with no policy on chain whose record pins policies is
+                // refused; `drift_err_route` routes the refusal to
+                // DriftCheckUnavailable because no drift row is written for it.
+                if let Err(sa_err) = crate::managers::verifiers::verify_policy_pins_present(
+                    sm,
+                    rule_id,
+                    &smart_account_redacted,
+                    &divergence_request_id,
+                    &policy_addrs,
+                ) {
+                    return (
+                        Err(drift_err_route(sa_err)),
+                        String::new(),
+                        String::new(),
+                        Some(divergence_request_id),
+                    );
                 }
             }
         } else {
@@ -2529,9 +2551,10 @@ fn encode_auth_digest_hex(auth_digest: &[u8; 32]) -> String {
 /// return `SaError::VerifierHashDrift` or `SaError::PolicyHashDrift`
 /// respectively.  All other `SaError` variants from those functions
 /// (infrastructure failures: `NetworkRpcDivergence`, `DeploymentFailed`,
-/// `MultiplePinnedHashesUnsupported`, `AuditLog`) do NOT emit a drift row,
-/// so wrapping them in `WasmHashDrift` would break the result-tag ↔
-/// audit-row join that operator tooling relies on.
+/// `MultiplePinnedHashesUnsupported`, `AuditLog`) and `PinnedPolicyAbsent`
+/// from `verify_policy_pins_present` do NOT emit a drift row, so wrapping
+/// them in `WasmHashDrift` would break the result-tag ↔ audit-row join that
+/// operator tooling relies on.
 ///
 /// This function enforces the invariant at a single call site rather than
 /// repeating the match in every loop.
@@ -4042,6 +4065,36 @@ registered_at_unix_ms = 1700000000000
         assert!(
             matches!(source.as_ref(), crate::SaError::PolicyHashDrift { .. }),
             "inner source must be PolicyHashDrift: {source:?}"
+        );
+    }
+
+    /// A rule with policy pins and no policy on chain writes no drift row, so
+    /// its refusal routes to `DriftCheckUnavailable` with the refusal as the
+    /// source.
+    #[test]
+    fn drift_err_route_pinned_policy_absent_routes_to_drift_check_unavailable() {
+        use stellar_agent_core::observability::RedactedStrkey;
+
+        let sa_err = crate::SaError::PinnedPolicyAbsent {
+            rule_id: 4,
+            pinned_count: 1,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AAAAA"),
+            request_id: "req-id-absent".to_owned(),
+        };
+        let result = drift_err_route(sa_err);
+        let CredentialsError::DriftCheckUnavailable { ref source } = result else {
+            panic!("PinnedPolicyAbsent must route to DriftCheckUnavailable: {result:?}");
+        };
+        assert!(
+            matches!(
+                source.as_ref(),
+                crate::SaError::PinnedPolicyAbsent {
+                    rule_id: 4,
+                    pinned_count: 1,
+                    ..
+                }
+            ),
+            "inner source must be PinnedPolicyAbsent: {source:?}"
         );
     }
 

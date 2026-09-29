@@ -126,7 +126,7 @@ pub mod profile;
 
 pub mod smart_account;
 
-/// Typed hex-codec helpers (`encode`, `decode_hex32`).
+/// Typed hex-codec helpers (`encode`, `decode_hex32`, `wasm_hash_first8_hex`).
 ///
 /// Canonical hex encoding/decoding used by the deployment module, CLI, and
 /// test helpers.

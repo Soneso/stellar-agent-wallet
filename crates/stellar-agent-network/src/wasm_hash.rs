@@ -67,6 +67,7 @@ use stellar_xdr::{
 
 use crate::StellarRpcClient;
 use stellar_agent_core::error::NetworkError;
+use stellar_agent_core::hex::wasm_hash_first8_hex;
 use stellar_agent_core::observability::untrusted_display_bounded;
 use stellar_agent_core::sc_address::scaddress_redacted;
 
@@ -171,7 +172,7 @@ impl ExternalRefExecutable {
     pub fn resolved_first8(&self) -> String {
         self.resolved
             .as_ref()
-            .map_or_else(|| "<unset>".to_owned(), first8_hex)
+            .map_or_else(|| "<unset>".to_owned(), wasm_hash_first8_hex)
     }
 
     /// Returns the ledger key of the owner's executable-tag entry.
@@ -562,7 +563,7 @@ fn contract_instance_ledger_key(
 /// identify the exact mismatch without leaking full hashes or addresses.
 fn wasm_hash_fetch_summary(fetch: &WasmHashFetch) -> String {
     match fetch {
-        WasmHashFetch::Wasm(hash) => first8_hex(hash),
+        WasmHashFetch::Wasm(hash) => wasm_hash_first8_hex(hash),
         WasmHashFetch::Sac => "<SAC>".to_owned(),
         WasmHashFetch::ExternalRef(external) => format!(
             "external-ref(owner={} tag=\"{}\" resolved={})",
@@ -572,11 +573,6 @@ fn wasm_hash_fetch_summary(fetch: &WasmHashFetch) -> String {
         ),
         WasmHashFetch::Absent => "<Absent>".to_owned(),
     }
-}
-
-/// Returns lower-case hex of the first 8 bytes of `hash`.
-fn first8_hex(hash: &[u8; 32]) -> String {
-    hash[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Redacts a strkey to first-5-last-5 characters for safe error reporting.

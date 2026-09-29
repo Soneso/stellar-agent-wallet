@@ -379,8 +379,11 @@ pub(crate) struct ExpiryCheck {
 pub enum PinStatus {
     /// All pinned first-8-hex values match the live on-chain hashes.
     Match,
-    /// At least one pinned hash does not match the live hash;
-    /// corresponds to `SaError::VerifierHashDrift` / `PolicyHashDrift`.
+    /// At least one pinned hash does not match the live hash, which
+    /// corresponds to `SaError::VerifierHashDrift` / `PolicyHashDrift`; or,
+    /// for the policy half, the pin record holds policy pins while the rule
+    /// has no policy on chain, which corresponds to
+    /// `SaError::PinnedPolicyAbsent` (the observed list is then empty).
     Drift,
     /// Infrastructure error prevented comparison; no drift audit row emitted.
     Unavailable,
@@ -687,8 +690,9 @@ impl ContextRuleManager {
     /// # Errors
     ///
     /// - [`SaError::VerifierHashDrift`] / [`SaError::PolicyHashDrift`] /
-    ///   [`SaError::PinCheckUnavailable`]: the pinned-hash drift check of a
-    ///   non-zero rule in `auth_rule_ids` refused before signing.
+    ///   [`SaError::PinnedPolicyAbsent`] / [`SaError::PinCheckUnavailable`]:
+    ///   the pinned-hash drift check of a non-zero rule in `auth_rule_ids`
+    ///   refused before signing.
     /// - [`SaError::SignersManagerNotConfigured`]: a non-zero rule in
     ///   `auth_rule_ids` and no signers manager configured.
     /// - [`SaError::AuthEntryConstructionFailed`] — construction-time XDR
@@ -1592,7 +1596,10 @@ impl ContextRuleManager {
     ///   [`SaError::ContractInstanceUnsupported`] regardless, and an applied
     ///   override writes its override row carrying the rule id;
     /// - after the add confirms, a `SaContextRulePinsUpdated` row (reason
-    ///   `policy_added`) records the policy pins with the new pin appended.
+    ///   `policy_added`) records the policy pins with the new pin appended;
+    /// - with no live policy on the rule, the row replaces the policy pins
+    ///   with the added policy's pin, so it pins exactly the policy set the
+    ///   add produces.
     ///
     /// A record with more than one policy pin is refused by every checked
     /// signing verb with `sa.pin_check_unavailable`
@@ -1606,8 +1613,9 @@ impl ContextRuleManager {
     ///   [`SaError::ContractInstanceUnsupported`]: the policy of a pinned
     ///   rule was refused under "Pin record".
     /// - [`SaError::VerifierHashDrift`] / [`SaError::PolicyHashDrift`] /
-    ///   [`SaError::PinCheckUnavailable`]: the pinned-hash drift check of a
-    ///   non-zero rule in `auth_rule_ids` refused before signing.
+    ///   [`SaError::PinnedPolicyAbsent`] / [`SaError::PinCheckUnavailable`]:
+    ///   the pinned-hash drift check of a non-zero rule in `auth_rule_ids`
+    ///   refused before signing.
     /// - [`SaError::SignersManagerNotConfigured`]: a non-zero rule in
     ///   `auth_rule_ids` and no signers manager configured.
     /// - [`SaError::AuthEntryConstructionFailed`] — transport/XDR failure.
@@ -1862,14 +1870,18 @@ impl ContextRuleManager {
     /// so a later `add_policy` pins its policy afresh. Otherwise, when no pin
     /// equals the observed hash or the observation fails, nothing is written;
     /// a record with two or more policy pins is refused by every checked
-    /// signing verb whatever it holds. An observation that fails does not
-    /// stop the removal, which is how an unreadable policy is detached.
+    /// signing verb whatever it holds. Removing the last policy under such a
+    /// record leaves the rule refused with [`SaError::PinnedPolicyAbsent`]
+    /// until an `add_policy` authorized under rule 0 re-pins a policy or the
+    /// rule is reinstalled. An observation that fails does not stop the
+    /// removal, which is how an unreadable policy is detached.
     ///
     /// # Errors
     ///
     /// - [`SaError::VerifierHashDrift`] / [`SaError::PolicyHashDrift`] /
-    ///   [`SaError::PinCheckUnavailable`]: the pinned-hash drift check of a
-    ///   non-zero rule in `auth_rule_ids` refused before signing.
+    ///   [`SaError::PinnedPolicyAbsent`] / [`SaError::PinCheckUnavailable`]:
+    ///   the pinned-hash drift check of a non-zero rule in `auth_rule_ids`
+    ///   refused before signing.
     /// - [`SaError::SignersManagerNotConfigured`]: a non-zero rule in
     ///   `auth_rule_ids` and no signers manager configured.
     /// - [`SaError::AuthEntryConstructionFailed`] — transport/XDR failure.
@@ -2057,7 +2069,8 @@ impl ContextRuleManager {
     /// Returns `None` without a signers manager or a pin record. Otherwise
     /// the returned record is the current one, with a pin appended for
     /// `policy_address` when the policy is not already live on the rule,
-    /// probed here, before submission.
+    /// probed here, before submission. When the rule has no live policy, the
+    /// record's policy pins are replaced by that pin.
     async fn plan_policy_add_pin_update(
         &self,
         smart_account: &ScAddress,
@@ -2102,6 +2115,14 @@ impl ContextRuleManager {
             request_id,
         )
         .await?;
+        if live_policies.is_empty() {
+            // With no live policy, the record's policy pins describe no
+            // policy of the rule; the row pins exactly the policy set the
+            // add produces. The override flags stay, since they record
+            // overrides applied to the rule's contracts.
+            record.pinned_policy_first8.clear();
+            record.pinned_policy_executable_refs.clear();
+        }
         crate::managers::verifiers::append_pin(
             &mut record.pinned_policy_first8,
             &mut record.pinned_policy_executable_refs,
@@ -2651,7 +2672,8 @@ impl ContextRuleManager {
     /// 2. For each verifier address calls
     ///    `verify_pinned_verifier_against_chain`.
     /// 3. For each policy address calls
-    ///    `verify_pinned_policy_against_chain`.
+    ///    `verify_pinned_policy_against_chain`; with no policy address, calls
+    ///    `verify_policy_pins_present`.
     /// 4. Reads the pinned first-8-hex strings from the audit log via
     ///    `AuditReader::find_latest_context_rule_pinned_hashes` for the
     ///    envelope.
@@ -2661,14 +2683,18 @@ impl ContextRuleManager {
     /// - `"match"` — no drift detected.
     /// - `"drift"` — `SaError::VerifierHashDrift` / `PolicyHashDrift`
     ///   returned; a paired `SaVerifierHashDrift` / `SaPolicyHashDrift` audit
-    ///   row was emitted.
+    ///   row was emitted. For the policy half also: the rule has no policy on
+    ///   chain while its pin record holds policy pins
+    ///   (`SaError::PinnedPolicyAbsent`, no audit row); the observed policy
+    ///   list is then empty.
     /// - `"unavailable"` — any other `SaError` (infrastructure failure; no
     ///   drift audit row emitted).
     /// - `"no_pin"` — no `SaContextRuleCreated` audit row exists for this
     ///   rule (rule was installed before wasm-hash pinning landed, or via
     ///   non-wallet path).
     /// - `"no_contracts"` — the on-chain rule has no verifier / policy
-    ///   contracts (Delegated-only rule).
+    ///   contracts (Delegated-only rule) and, for the policy half, the pin
+    ///   record holds no policy pin.
     ///
     /// # Requires `signers_manager`
     ///
@@ -2781,7 +2807,7 @@ impl ContextRuleManager {
                             // zero hash the pin holds.
                             if let Some(executable) = wasm_hash_cache.get(&cache_key) {
                                 let h = executable.effective_hash().unwrap_or([0u8; 32]);
-                                observed.push(h[..8].iter().map(|b| format!("{b:02x}")).collect());
+                                observed.push(crate::managers::signers::hash_first8_hex(&h));
                                 observed_executable.push(non_wasm_executable_summary(executable));
                             }
                         }
@@ -2811,7 +2837,24 @@ impl ContextRuleManager {
         // Verify each policy address.
         let (policy_pin_status, observed_policy_first8, observed_policy_executable) =
             if policy_addrs.is_empty() {
-                (PinStatus::NoContracts, vec![], vec![])
+                match crate::managers::verifiers::verify_policy_pins_present(
+                    sm,
+                    rule_id,
+                    &smart_account_redacted,
+                    request_id,
+                    &policy_addrs,
+                ) {
+                    Ok(()) => (PinStatus::NoContracts, vec![], vec![]),
+                    Err(SaError::PinnedPolicyAbsent { .. }) => (PinStatus::Drift, vec![], vec![]),
+                    // A read failure of the record is not drift; the status is
+                    // unavailable with its code.
+                    Err(ref e) => {
+                        if unavailable_wire_code.is_none() {
+                            unavailable_wire_code = Some(e.wire_code());
+                        }
+                        (PinStatus::Unavailable, vec![], vec![])
+                    }
+                }
             } else {
                 let mut status = PinStatus::Match;
                 let mut observed: Vec<String> = Vec::new();
@@ -2831,7 +2874,7 @@ impl ContextRuleManager {
                         Ok(()) => {
                             if let Some(executable) = wasm_hash_cache.get(&cache_key) {
                                 let h = executable.effective_hash().unwrap_or([0u8; 32]);
-                                observed.push(h[..8].iter().map(|b| format!("{b:02x}")).collect());
+                                observed.push(crate::managers::signers::hash_first8_hex(&h));
                                 observed_executable.push(non_wasm_executable_summary(executable));
                             }
                         }
@@ -5234,6 +5277,9 @@ pub(crate) fn sa_error_to_invocation_result(
         // Multi-hash guard fires before any signing attempt; signing aborted
         // fail-closed.
         | SaError::MultiplePinnedHashesUnsupported { .. }
+        // Policy pins with no policy on chain refuse before any signing
+        // attempt.
+        | SaError::PinnedPolicyAbsent { .. }
         // The pre-signing drift check could not run; nothing was signed.
         | SaError::PinCheckUnavailable { .. }
         // Verifier diversification pre-submission refusals.

@@ -573,6 +573,8 @@ impl SignersManager {
     ///
     /// - [`SaError::PolicyHashDrift`]: a policy of the rule differs from the
     ///   rule's pin record.
+    /// - [`SaError::PinnedPolicyAbsent`]: the rule's pin record holds policy
+    ///   pins while the rule has no policy on chain.
     /// - [`SaError::PinCheckUnavailable`]: the drift check could not run.
     /// - [`SaError::VerifierMigrationFailed`] with `phase: "submit_simulate"` — simulation
     ///   of the migration `HostFunction` failed.
@@ -630,13 +632,15 @@ impl SignersManager {
         )
         .await
         .map_err(|e| {
-            // A drift refusal and an unavailable drift check keep their own
-            // wire codes: nothing was simulated, and the operator's next step
-            // is to inspect the contract or the audit log, not the migration.
+            // The drift check's refusals and an unavailable drift check keep
+            // their own wire codes: nothing was simulated, and the operator's
+            // next step is to inspect the contract or the audit log, not the
+            // migration.
             if matches!(
                 e,
                 SaError::VerifierHashDrift { .. }
                     | SaError::PolicyHashDrift { .. }
+                    | SaError::PinnedPolicyAbsent { .. }
                     | SaError::PinCheckUnavailable { .. }
             ) {
                 return e;
@@ -1233,8 +1237,8 @@ impl SignersManager {
     ///   [`SaError::ContractInstanceUnsupported`]: a new verifier of a pinned
     ///   rule was refused under "Pin record".
     /// - [`SaError::VerifierHashDrift`] / [`SaError::PolicyHashDrift`] /
-    ///   [`SaError::PinCheckUnavailable`]: the pinned-hash drift check of the
-    ///   rule refused before signing.
+    ///   [`SaError::PinnedPolicyAbsent`] / [`SaError::PinCheckUnavailable`]:
+    ///   the pinned-hash drift check of the rule refused before signing.
     /// - [`SaError::ContextRuleCapsExceeded`] — signer count would exceed `MAX_SIGNERS`.
     /// - [`SaError::ThresholdUnreachable`] — threshold invariant violated.
     /// - [`SaError::SignerSetMissingBaseline`] — no audit-log baseline.
@@ -2027,7 +2031,7 @@ impl SignersManager {
         for (opt_hash, policy_addr) in primary_hashes.iter().zip(context_rule.policies.iter()) {
             let Some(hash) = opt_hash else { continue };
             debug!(
-                policy_wasm_hash_first8 = %hash[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                policy_wasm_hash_first8 = %hash_first8_hex(hash),
                 "identify_threshold_policy: observed policy wasm hash"
             );
             if THRESHOLD_POLICY_WASM_HASHES
@@ -2230,7 +2234,7 @@ impl SignersManager {
         for (opt_hash, policy_addr) in primary_hashes.iter().zip(context_rule.policies.iter()) {
             let Some(hash) = opt_hash else { continue };
             debug!(
-                policy_wasm_hash_first8 = %hash[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                policy_wasm_hash_first8 = %hash_first8_hex(hash),
                 "identify_spending_limit_policy: observed policy wasm hash"
             );
             if hash == &allowed_hash {
@@ -2487,7 +2491,7 @@ impl SignersManager {
         for (opt_hash, policy_addr) in primary_hashes.iter().zip(context_rule.policies.iter()) {
             let Some(hash) = opt_hash else { continue };
             debug!(
-                policy_wasm_hash_first8 = %hash[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                policy_wasm_hash_first8 = %hash_first8_hex(hash),
                 "identify_weighted_threshold_policy: observed policy wasm hash"
             );
             if WEIGHTED_THRESHOLD_POLICY_WASM_HASHES
@@ -3250,8 +3254,8 @@ impl SignersManager {
     ///   [`SaError::ContractInstanceUnsupported`]: a new verifier of a pinned
     ///   rule was refused under "Pin record".
     /// - [`SaError::VerifierHashDrift`] / [`SaError::PolicyHashDrift`] /
-    ///   [`SaError::PinCheckUnavailable`]: the pinned-hash drift check of the
-    ///   rule refused before signing.
+    ///   [`SaError::PinnedPolicyAbsent`] / [`SaError::PinCheckUnavailable`]:
+    ///   the pinned-hash drift check of the rule refused before signing.
     #[allow(
         clippy::too_many_arguments,
         reason = "signer + auth + audit arg set plus the two pin overrides rule install takes"
@@ -5057,11 +5061,8 @@ pub(crate) fn policy_hash_allowlisted(hash: &[u8; 32]) -> bool {
         || hex::encode(hash) == crate::spending_limit_policy::SPENDING_LIMIT_POLICY_WASM_SHA256
 }
 
-/// Returns lower-case hex of the first 8 bytes of `hash`, the first-8
-/// projection the audit rows, pins and errors carry.
-pub(crate) fn hash_first8_hex(hash: &[u8; 32]) -> String {
-    hash[..8].iter().map(|b| format!("{b:02x}")).collect()
-}
+/// The first-8 projection of a hash the audit rows, pins and errors carry.
+pub(crate) use stellar_agent_core::hex::wasm_hash_first8_hex as hash_first8_hex;
 
 /// Identification result of one verifier or policy contract: the observed
 /// executable, its effective hash, and whether that hash is allowlisted.

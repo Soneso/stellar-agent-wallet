@@ -134,13 +134,9 @@ pub async fn verify_defindex_vault_wasm(
             if on_chain_hash == DEFINDEX_VAULT_WASM_HASH {
                 Ok(())
             } else {
-                let first8: String = on_chain_hash[..8]
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect();
                 Err(DefindexPinError::HashMismatch {
                     vault_redacted: redact_strkey_first5_last5(vault_address),
-                    on_chain_first8: first8,
+                    on_chain_first8: stellar_agent_core::hex::wasm_hash_first8_hex(&on_chain_hash),
                 })
             }
         }
@@ -415,11 +411,14 @@ mod tests {
     fn hash_mismatch_display_shows_only_first8() {
         let err = DefindexPinError::HashMismatch {
             vault_redacted: "CBMVK…ZDWHN".to_owned(),
-            on_chain_first8: "f345228d".to_owned(),
+            on_chain_first8: "f345228dca59c660".to_owned(),
         };
         let display = err.to_string();
         // Must show first-8 hash
-        assert!(display.contains("f345228d"), "must show first-8 hash");
+        assert!(
+            display.contains("f345228dca59c660"),
+            "must show first-8 hash"
+        );
         // Must NOT show full hash
         assert!(
             !display.contains("f345228dca59c6605789620e9ec62ff4847a0927c33dac7581a955fe746016be"),

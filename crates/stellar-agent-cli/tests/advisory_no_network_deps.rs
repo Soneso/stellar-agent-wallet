@@ -143,6 +143,7 @@ const ADVISORY_CALL_CLOSURE: &[&str] = &[
     "crates/stellar-agent-core/src/audit_log/reader.rs",
     "crates/stellar-agent-core/src/audit_log/schema.rs",
     "crates/stellar-agent-core/src/audit_log/writer.rs",
+    "crates/stellar-agent-core/src/hex.rs",
     "crates/stellar-agent-core/src/observability/mod.rs",
     "crates/stellar-agent-core/src/observability/redact.rs",
     "crates/stellar-agent-smart-account/src/verifier_allowlist.rs",

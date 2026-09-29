@@ -414,16 +414,55 @@ pub enum SaError {
         request_id: String,
     },
 
+    /// The rule's pin record holds policy pins while the rule has no policy on
+    /// chain.
+    ///
+    /// Fired at signing time by the pinned-hash drift check, and reported as
+    /// a `drift` policy status by `verify_rule_wasm_pins`. The pin record is
+    /// the wallet's knowledge of the rule's shape: a policy removed outside
+    /// the wallet changes what the rule authorizes, so the rule is refused
+    /// before anything is signed. An `add_policy` authorized under rule 0,
+    /// which replaces the stale pins with the added policy's pin, or a
+    /// reinstall of the rule clears the state.
+    ///
+    /// # Forensic spine
+    ///
+    /// `smart_account_redacted` MUST be passed through
+    /// `stellar_agent_core::observability::redact_strkey_first5_last5`
+    /// at the call site.
+    #[error(
+        "pin record holds {pinned_count} policy pin(s) for rule {rule_id} but the rule has no \
+         policy on chain"
+    )]
+    #[serde(rename = "sa.pinned_policy_absent")]
+    PinnedPolicyAbsent {
+        /// Context-rule identifier whose record holds the policy pins.
+        rule_id: u32,
+        /// Number of policy pins in the record (always > 0 when this variant
+        /// fires).
+        pinned_count: usize,
+        /// Redacted smart-account contract address (first-5-last-5 C-strkey).
+        ///
+        /// MUST be redacted at the call site via
+        /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
+        smart_account_redacted: RedactedStrkey,
+        /// Per-request correlation identifier (UUIDv4).
+        request_id: String,
+    },
+
     /// The pre-signing drift check of a rule-authorized submission could not
     /// run to a verdict.
     ///
     /// Fired by `submit::submit_signed_invoke` when fetching a rule's
     /// verifier and policy addresses, or checking one of them against the
-    /// rule's pin record, fails for any reason other than detected drift: an
-    /// RPC failure or divergence, an audit-log integrity error, a pin record
-    /// with more than one verifier or policy pin
+    /// rule's pin record, fails for any reason other than a refusal the check
+    /// reached: an RPC failure or divergence, an audit-log integrity error, a
+    /// pin record with more than one verifier or policy pin
     /// (`sa.multiple_pinned_hashes_unsupported`), an unpinnable instance, or
-    /// the check exceeding the pre-submit budget. Nothing is signed.
+    /// the check exceeding the pre-submit budget. Nothing is signed. The
+    /// check's own refusals, [`SaError::VerifierHashDrift`],
+    /// [`SaError::PolicyHashDrift`] and [`SaError::PinnedPolicyAbsent`],
+    /// propagate as themselves and are never folded into this variant.
     ///
     /// `reason` is the inner error's wire code, a colon and its Display,
     /// capped at [`PIN_CHECK_REASON_MAX_BYTES`] bytes.
@@ -2643,6 +2682,7 @@ impl SaError {
             Self::VerifierHashDrift { .. } => "sa.verifier_hash_drift",
             Self::PolicyHashDrift { .. } => "sa.policy_hash_drift",
             Self::MultiplePinnedHashesUnsupported { .. } => "sa.multiple_pinned_hashes_unsupported",
+            Self::PinnedPolicyAbsent { .. } => "sa.pinned_policy_absent",
             Self::PinCheckUnavailable { .. } => "sa.pin_check_unavailable",
             Self::VerifierMutable { .. } => "sa.verifier_mutable",
             Self::PolicyMutable { .. } => "sa.policy_mutable",
@@ -2869,6 +2909,15 @@ mod tests {
                     count: 3,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     request_id: "test-req-multi-001".to_owned(),
+                },
+            ),
+            (
+                "sa.pinned_policy_absent",
+                SaError::PinnedPolicyAbsent {
+                    rule_id: 7,
+                    pinned_count: 1,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    request_id: "test-req-policy-absent-001".to_owned(),
                 },
             ),
             (
@@ -3616,6 +3665,21 @@ mod tests {
                 ],
             ),
             (
+                "sa.pinned_policy_absent",
+                SaError::PinnedPolicyAbsent {
+                    rule_id: 77,
+                    pinned_count: 2,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    request_id: "test-req-policy-absent-002".to_owned(),
+                },
+                &[
+                    "rule_id",
+                    "pinned_count",
+                    "smart_account_redacted",
+                    "request_id",
+                ],
+            ),
+            (
                 "sa.pin_check_unavailable",
                 SaError::PinCheckUnavailable {
                     rule_id: 77,
@@ -4265,6 +4329,21 @@ mod tests {
         }
     }
 
+    /// The absent-policy refusal names the pin count and the rule.
+    #[test]
+    fn pinned_policy_absent_display_names_the_count_and_the_rule() {
+        let err = SaError::PinnedPolicyAbsent {
+            rule_id: 3,
+            pinned_count: 2,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            request_id: "req".to_owned(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "pin record holds 2 policy pin(s) for rule 3 but the rule has no policy on chain"
+        );
+    }
+
     /// The pin-check reason leads with the inner wire code, carries the
     /// inner Display, and is capped at `PIN_CHECK_REASON_MAX_BYTES`.
     #[test]
@@ -4337,6 +4416,12 @@ mod tests {
                 count: 4,
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 request_id: "test-req-multi-003".to_owned(),
+            },
+            SaError::PinnedPolicyAbsent {
+                rule_id: 88,
+                pinned_count: 1,
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                request_id: "test-req-policy-absent-003".to_owned(),
             },
             SaError::PinCheckUnavailable {
                 rule_id: 88,
@@ -4704,6 +4789,7 @@ mod tests {
             "sa.verifier_hash_drift",
             "sa.policy_hash_drift",
             "sa.multiple_pinned_hashes_unsupported",
+            "sa.pinned_policy_absent",
             "sa.pin_check_unavailable",
             "sa.verifier_mutable",
             "sa.policy_mutable",
@@ -4802,7 +4888,7 @@ mod tests {
             );
         }
 
-        assert_eq!(seen.len(), 74, "closed set must have exactly 74 wire codes");
+        assert_eq!(seen.len(), 75, "closed set must have exactly 75 wire codes");
     }
 
     /// Verifies the sub-code closed set is exhaustively matched by tests.

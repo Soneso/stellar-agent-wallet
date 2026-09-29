@@ -1,6 +1,7 @@
 //! Typed hex-codec helpers.
 //!
-//! Centralises `encode` / `decode_hex32` for deployment, CLI, and test helpers.
+//! Centralises `encode` / `decode_hex32` for deployment, CLI, and test helpers,
+//! and `wasm_hash_first8_hex`, the first-8 rendering of a Wasm hash.
 //! No external `hex` crate is used; the implementation is self-contained to
 //! preserve the typed-error discipline and avoid an additional dependency.
 
@@ -107,6 +108,28 @@ pub fn decode_hex32(hex: &str) -> Result<[u8; 32], HexDecodeError> {
         out[i] = (hi << 4) | lo;
     }
     Ok(out)
+}
+
+/// Renders the first 8 bytes of a 32-byte Wasm hash as 16 lowercase hex
+/// characters.
+///
+/// This is the encoding of every `*_first8` value in the smart-account pin
+/// records, the drift errors and the CLI envelopes; a pinned value and a hash
+/// compared against it are both rendered here, so they compare equal exactly
+/// when the 8-byte prefixes do.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::hex::wasm_hash_first8_hex;
+///
+/// let mut hash = [0u8; 32];
+/// hash[..8].copy_from_slice(&[0x67, 0x80, 0x06, 0x90, 0x9b, 0x50, 0xc6, 0xc3]);
+/// assert_eq!(wasm_hash_first8_hex(&hash), "678006909b50c6c3");
+/// ```
+#[must_use]
+pub fn wasm_hash_first8_hex(hash: &[u8; 32]) -> String {
+    encode(&hash[..8])
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
@@ -270,6 +293,15 @@ mod tests {
         let s = format!("{err}");
         assert!(s.contains('z'), "char must appear: {s}");
         assert!(s.contains('5'), "offset must appear: {s}");
+    }
+
+    // ── wasm_hash_first8_hex ──────────────────────────────────────────────────
+
+    #[test]
+    fn wasm_hash_first8_hex_renders_the_first_8_bytes_as_16_characters() {
+        let rendered = wasm_hash_first8_hex(&[0xAB; 32]);
+        assert_eq!(rendered, "abababababababab");
+        assert_eq!(rendered.len(), 16);
     }
 
     // ── redact_hex_first8_last8 ───────────────────────────────────────────────
