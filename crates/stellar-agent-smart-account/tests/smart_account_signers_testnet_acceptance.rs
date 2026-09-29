@@ -1079,6 +1079,8 @@ async fn b7_add_external_signer_to_existing_rule() {
             external_pubkey,
             signer_box.as_ref(),
             rid(),
+            false, // accept_mutable_verifier
+            false, // accept_unknown_verifier
         )
         .await
         .expect("add_signer (External) must succeed on testnet");
@@ -1321,6 +1323,8 @@ async fn b8_add_webauthn_signer_to_existing_rule() {
             webauthn_pubkey,
             signer_box.as_ref(),
             rid(),
+            false, // accept_mutable_verifier
+            false, // accept_unknown_verifier
         )
         .await
         .expect("add_signer (WebAuthn External) must succeed on testnet");

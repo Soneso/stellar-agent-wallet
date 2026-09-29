@@ -94,7 +94,10 @@
 //! `2 × N × M` sequential transactions. Audit cadence is one `SaVerifierMigrated`
 //! row per signer-step pair, emitted only after the post-remove `add_signer`
 //! transaction succeeds. The emitted tx-hash field is the first-8-last-8
-//! redaction of the confirmed add-signing transaction hash.
+//! redaction of the confirmed add-signing transaction hash. For a rule with a
+//! pin record, each pair is followed by a `SaContextRulePinsUpdated` row
+//! naming the destination verifier as the rule's verifier pin, so the
+//! signing-time drift check does not refuse the rule the migration changed.
 
 use stellar_xdr::{
     HostFunction, InvokeContractArgs, ScAddress, ScBytes, ScSymbol, ScVal, ScVec, VecM,
@@ -112,7 +115,7 @@ use crate::managers::verifiers::{
 };
 use crate::verifier_allowlist::{VERIFIER_ALLOWLIST, VerifierAuditStatus};
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::schema::ContractKind;
+use stellar_agent_core::audit_log::schema::{ContractKind, PinsUpdateReason};
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_network::Signer;
 
@@ -368,6 +371,13 @@ impl MigrationPlan {
     /// 1. Simulate + sign + submit the `remove_signer` [`HostFunction`].
     /// 2. Simulate + sign + submit the `add_signer` [`HostFunction`].
     /// 3. Emit one `SaVerifierMigrated` audit row per signer step.
+    /// 4. When the rule has a pin record, emit a `SaContextRulePinsUpdated`
+    ///    row (reason `verifier_migrated`) naming the destination verifier's
+    ///    hash as the rule's verifier pin, with the policy pins unchanged.
+    ///
+    /// Both steps sign under the migrating rule with the pinned-hash drift
+    /// check: the rule's policies are checked against its pin record, its
+    /// verifiers are not (see [`crate::submit::PinCheck::migrating_rule`]).
     ///
     /// Returns a [`MigrationSubmitResult`] describing the outcome.  On partial
     /// failure, `failed_step_index` and `failed_step_error` are set so the
@@ -395,6 +405,8 @@ impl MigrationPlan {
     ///
     /// # Errors
     ///
+    /// - [`SaError::PolicyHashDrift`] / [`SaError::PinCheckUnavailable`]: the
+    ///   drift check of the migrating rule refused a step before signing.
     /// - [`SaError::VerifierMigrationFailed`] with `phase: "submit_simulate"` —
     ///   on simulation failure of any step.
     /// - [`SaError::VerifierMigrationFailed`] with `phase: "submit_send"` —
@@ -643,6 +655,17 @@ impl MigrationPlan {
                     }
                 }
 
+                // Step 4: keep the rule's pin record in step with its live
+                // verifier set, so the signing-time drift check compares the
+                // rule against the destination verifier.
+                write_migrated_pin_record(
+                    signers_manager,
+                    &smart_account_redacted,
+                    rule.rule_id,
+                    &to_hash_first8,
+                    request_id,
+                );
+
                 successful_steps.push(SignerStepSubmitOutcome {
                     rule_id: rule.rule_id,
                     signer_id: step.signer_id,
@@ -665,6 +688,60 @@ impl MigrationPlan {
 }
 
 // ── Submit internal helpers ───────────────────────────────────────────────────
+
+/// Writes the `SaContextRulePinsUpdated` row (reason `verifier_migrated`) of
+/// rule `rule_id` after a migration pair confirmed, when the rule has a pin
+/// record.
+///
+/// The row carries the rule's current record with its verifier pins
+/// replaced by the destination's hash `to_hash_first8` and no
+/// executable-reference pin: the migration preflight identified the
+/// destination, required it in the allowlist and refused a mutable one,
+/// which includes every external reference. The policy pins and override
+/// flags are unchanged. A rule without a pin record stays unpinned and no
+/// row is written.
+///
+/// The pair already confirmed on-chain, so a failure to read the record is
+/// logged, and the rule keeps its previous record, which the drift check
+/// compares against the new live verifier set and refuses on.
+fn write_migrated_pin_record(
+    signers_manager: &SignersManager,
+    smart_account_redacted: &str,
+    rule_id: u32,
+    to_hash_first8: &str,
+    request_id: &str,
+) {
+    match crate::managers::verifiers::read_pinned_hashes_for_rule(
+        signers_manager,
+        rule_id,
+        smart_account_redacted,
+    ) {
+        Ok(Some(mut record)) => {
+            record.pinned_verifier_first8 = vec![to_hash_first8.to_owned()];
+            record.pinned_verifier_executable_refs = Vec::new();
+            crate::managers::verifiers::write_pins_updated_row(
+                signers_manager,
+                smart_account_redacted,
+                rule_id,
+                PinsUpdateReason::VerifierMigrated,
+                &record,
+                request_id,
+            );
+        }
+        Ok(None) => debug!(
+            rule_id,
+            request_id,
+            "MigrationPlan::submit: the rule has no pin record; no pin update is written"
+        ),
+        Err(e) => warn!(
+            rule_id,
+            error = %e,
+            request_id,
+            "MigrationPlan::submit: pin record unreadable after a confirmed migration pair; \
+             SaContextRulePinsUpdated row not written"
+        ),
+    }
+}
 
 /// Extracts the `entrypoint` (`&'static str`) and `invoke_args` (`Vec<ScVal>`) from
 /// a pre-formed `HostFunction::InvokeContract`.

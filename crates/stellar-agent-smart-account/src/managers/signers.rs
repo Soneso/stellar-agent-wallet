@@ -50,7 +50,8 @@ use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::AuditLogIntegrityError;
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::health::{AuditWriterHealth, AuditWriterHealthHandle};
-use stellar_agent_core::audit_log::schema::ContractKind;
+use stellar_agent_core::audit_log::reader::PinnedHashesRecord;
+use stellar_agent_core::audit_log::schema::{ContractKind, PinsUpdateReason};
 use stellar_agent_core::audit_log::signer_set::{
     BaselineReason, ObservedSignerSet, SignerPubkey, compute_signer_set_digest,
     format_digest_first8_last8,
@@ -78,7 +79,7 @@ use crate::SaError;
 use crate::error::AdminOrOwnerKey;
 use crate::managers::rules::{
     BASE_FEE_STROOPS, ExpiryCheck, augment_with_oz_error_name, contract_instance_key,
-    scaddress_to_strkey,
+    parse_c_strkey_to_smart_account, scaddress_to_strkey,
 };
 use crate::signers::policy_identification::THRESHOLD_POLICY_WASM_HASHES;
 use crate::signers::types::{
@@ -560,14 +561,24 @@ impl SignersManager {
     ///
     /// `entrypoint` MUST be one of `"remove_signer"` or `"add_signer"`.
     ///
+    /// The step signs under `rule_id` alone, with the pinned-hash drift check
+    /// marking `rule_id` as the migrating rule: the rule's policies are
+    /// checked against its pin record, its verifiers are not. The migration
+    /// preflight already identified, allowlisted and probed the destination
+    /// verifier, and the remove step signs while the source verifier, which
+    /// may be the drifted contract the migration moves away from, is still
+    /// live.
+    ///
     /// # Errors
     ///
+    /// - [`SaError::PolicyHashDrift`]: a policy of the rule differs from the
+    ///   rule's pin record.
+    /// - [`SaError::PinCheckUnavailable`]: the drift check could not run.
     /// - [`SaError::VerifierMigrationFailed`] with `phase: "submit_simulate"` — simulation
     ///   of the migration `HostFunction` failed.
-    /// - [`SaError::VerifierMigrationFailed`] with `phase: "submit_send"` — `sendTransaction`
-    ///   failed after simulation succeeded.
-    /// - [`SaError::AuthEntryConstructionFailed`] — signer public-key fetch or auth-entry
-    ///   construction failed.
+    /// - [`SaError::VerifierMigrationFailed`] with `phase: "submit_send"`: every
+    ///   other failure of the step, including `sendTransaction` failing after
+    ///   simulation succeeded.
     ///
     /// # Implements
     ///
@@ -612,9 +623,24 @@ impl SignersManager {
             // allowed even if the rule is near-expired (the operator is
             // replacing the verifier, not adding a new session credential).
             None,
+            request_id,
+            // The verifier check of the migrating rule is skipped; its policy
+            // check runs. See `PinCheck::migrating_rule`.
+            Some(rule_id),
         )
         .await
         .map_err(|e| {
+            // A drift refusal and an unavailable drift check keep their own
+            // wire codes: nothing was simulated, and the operator's next step
+            // is to inspect the contract or the audit log, not the migration.
+            if matches!(
+                e,
+                SaError::VerifierHashDrift { .. }
+                    | SaError::PolicyHashDrift { .. }
+                    | SaError::PinCheckUnavailable { .. }
+            ) {
+                return e;
+            }
             // Classify the error phase: simulate vs send.
             // `submit_signed_invoke` uses `SaError::DeploymentFailed` internally
             // for both phases.  We re-map to `VerifierMigrationFailed` with the
@@ -1162,7 +1188,32 @@ impl SignersManager {
     ///    [`SaError::ThresholdUnreachable`] if the add would create an
     ///    unreachable threshold state.
     /// 3. Constructs and submits a single `InvokeHostFunctionOp` transaction.
-    /// 4. Emits `SaSignerAdded` audit row.
+    /// 4. Emits `SaSignerAdded` audit row, and the `SaContextRulePinsUpdated`
+    ///    row described under "Pin record".
+    ///
+    /// # Pin record
+    ///
+    /// When a new signer is `External` and the rule has a pin record (the
+    /// newest `SaContextRuleCreated` or `SaContextRulePinsUpdated` row), the
+    /// add keeps the record in step with the rule's live verifier set, so
+    /// the signing-time drift check does not refuse the rule the wallet
+    /// itself changed:
+    ///
+    /// - before submission, each new verifier address not already live on
+    ///   the rule is identified and probed with the checks rule install
+    ///   applies: an allowlist miss refuses unless `accept_unknown_verifier`
+    ///   is set, a mutable contract refuses unless `accept_mutable_verifier`
+    ///   is set, and an applied override writes its override row;
+    /// - after the add confirms, a `SaContextRulePinsUpdated` row (reason
+    ///   `signer_added`) records the verifier pins deduplicated by address:
+    ///   a signer on a verifier already live leaves the list unchanged, a
+    ///   signer on a new verifier appends its pin.
+    ///
+    /// A record with more than one verifier pin is refused by every checked
+    /// signing verb with `sa.pin_check_unavailable`
+    /// (`sa.multiple_pinned_hashes_unsupported`), the outcome for a rule
+    /// installed with two verifiers. A rule without a pin record stays
+    /// unpinned: nothing is observed and no row is written.
     ///
     /// # Arguments
     ///
@@ -1172,9 +1223,18 @@ impl SignersManager {
     /// - `new_signer_pubkey` — pubkey envelope for the audit-log row.
     /// - `signer` — the ed25519 signer for auth-entry signing + fee envelope.
     /// - `request_id` — caller-supplied UUID for audit-log correlation.
+    /// - `accept_mutable_verifier` / `accept_unknown_verifier`: the overrides
+    ///   `rules create` takes, applied to a new verifier pinned under
+    ///   "Pin record".
     ///
     /// # Errors
     ///
+    /// - [`SaError::VerifierWasmNotInAllowlist`] / [`SaError::VerifierMutable`] /
+    ///   [`SaError::ContractInstanceUnsupported`]: a new verifier of a pinned
+    ///   rule was refused under "Pin record".
+    /// - [`SaError::VerifierHashDrift`] / [`SaError::PolicyHashDrift`] /
+    ///   [`SaError::PinCheckUnavailable`]: the pinned-hash drift check of the
+    ///   rule refused before signing.
     /// - [`SaError::ContextRuleCapsExceeded`] — signer count would exceed `MAX_SIGNERS`.
     /// - [`SaError::ThresholdUnreachable`] — threshold invariant violated.
     /// - [`SaError::SignerSetMissingBaseline`] — no audit-log baseline.
@@ -1191,7 +1251,7 @@ impl SignersManager {
     /// before submission to prevent unreachable configurations.
     #[allow(
         clippy::too_many_arguments,
-        reason = "irreducible signer + auth + audit arg set"
+        reason = "signer + auth + audit arg set plus the two pin overrides rule install takes"
     )]
     pub async fn add_signer(
         &self,
@@ -1201,6 +1261,8 @@ impl SignersManager {
         new_signer_pubkey: SignerPubkey,
         signer: &(dyn Signer + Send + Sync),
         request_id: String,
+        accept_mutable_verifier: bool,
+        accept_unknown_verifier: bool,
     ) -> Result<u32, SaError> {
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
@@ -1218,11 +1280,15 @@ impl SignersManager {
                 new_signer_pubkey.clone(),
                 signer,
                 &request_id,
+                PinOverrides {
+                    accept_mutable_verifier,
+                    accept_unknown_verifier,
+                },
             )
             .await;
 
         match &outcome {
-            Ok((signer_id, resulting)) => {
+            Ok((signer_id, resulting, pin_update)) => {
                 let pubkeys_first8 = pubkeys_first8(&resulting.signer_pubkeys);
                 match self.audit_writer.lock() {
                     Ok(mut writer) => {
@@ -1256,6 +1322,16 @@ impl SignersManager {
                         );
                     }
                 }
+                if let Some(record) = pin_update {
+                    crate::managers::verifiers::write_pins_updated_row(
+                        self,
+                        &smart_account_redacted,
+                        rule_id,
+                        PinsUpdateReason::SignerAdded,
+                        record,
+                        &request_id,
+                    );
+                }
             }
             Err(err) => {
                 warn!(
@@ -1267,7 +1343,7 @@ impl SignersManager {
             }
         }
 
-        outcome.map(|(signer_id, _)| signer_id)
+        outcome.map(|(signer_id, _, _)| signer_id)
     }
 
     // ── remove_signer ─────────────────────────────────────────────────────────
@@ -1788,6 +1864,8 @@ impl SignersManager {
                 Some(ExpiryCheck {
                     rule_id: expiry_rule_id,
                 }),
+                request_id,
+                None,
             )
             .await?;
 
@@ -2840,6 +2918,8 @@ impl SignersManager {
                 Some(ExpiryCheck {
                     rule_id: expiry_rule_id,
                 }),
+                request_id,
+                None,
             )
             .await?;
 
@@ -3092,6 +3172,8 @@ impl SignersManager {
                 Some(ExpiryCheck {
                     rule_id: expiry_rule_id,
                 }),
+                request_id,
+                None,
             )
             .await?;
 
@@ -3116,7 +3198,8 @@ impl SignersManager {
     /// 2. Submits `batch_add_signer(rule_id, signers)` as a single
     ///    `InvokeHostFunctionOp`.
     /// 3. Emits one `SaSignerAdded` row per signer (reusing the existing
-    ///    audit kind) plus the raw-invocation row.
+    ///    audit kind) plus the raw-invocation row, and the
+    ///    `SaContextRulePinsUpdated` row described under "Pin record".
     ///
     /// The single-signer `add_signer` verb and its arg contract are
     /// unchanged; this is an additive verb for the batch case.
@@ -3142,6 +3225,13 @@ impl SignersManager {
     /// identification (when it does run) precedes any `batch_add_signer`
     /// submission, so refusal leaves no partial on-chain state.
     ///
+    /// # Pin record
+    ///
+    /// The batch keeps a pinned rule's pin record in step as
+    /// [`Self::add_signer`] does (see "Pin record" there), for every distinct
+    /// new verifier address among the batch's `External` signers, and writes
+    /// one `SaContextRulePinsUpdated` row after the batch confirms.
+    ///
     /// # Errors
     ///
     /// - [`SaError::BatchSignerAddRefused`] — the batch is empty (nothing to
@@ -3156,6 +3246,16 @@ impl SignersManager {
     ///   result-fetch; reachable only when a baseline already exists but the
     ///   rule's policy set changed since (see above).
     /// - [`SaError::DeploymentFailed`] — submission or on-chain rejection.
+    /// - [`SaError::VerifierWasmNotInAllowlist`] / [`SaError::VerifierMutable`] /
+    ///   [`SaError::ContractInstanceUnsupported`]: a new verifier of a pinned
+    ///   rule was refused under "Pin record".
+    /// - [`SaError::VerifierHashDrift`] / [`SaError::PolicyHashDrift`] /
+    ///   [`SaError::PinCheckUnavailable`]: the pinned-hash drift check of the
+    ///   rule refused before signing.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "signer + auth + audit arg set plus the two pin overrides rule install takes"
+    )]
     pub async fn batch_add_signers(
         &self,
         smart_account: ScAddress,
@@ -3163,6 +3263,8 @@ impl SignersManager {
         new_signers: Vec<(ScVal, SignerPubkey)>,
         signer: &(dyn Signer + Send + Sync),
         request_id: String,
+        accept_mutable_verifier: bool,
+        accept_unknown_verifier: bool,
     ) -> Result<Vec<u32>, SaError> {
         if new_signers.is_empty() {
             return Err(SaError::BatchSignerAddRefused {
@@ -3184,11 +3286,15 @@ impl SignersManager {
                 new_signers,
                 signer,
                 &request_id,
+                PinOverrides {
+                    accept_mutable_verifier,
+                    accept_unknown_verifier,
+                },
             )
             .await;
 
         match &outcome {
-            Ok((signer_ids, resulting)) => {
+            Ok((signer_ids, resulting, pin_update)) => {
                 let pubkeys_first8 = pubkeys_first8(&resulting.signer_pubkeys);
                 match self.audit_writer.lock() {
                     Ok(mut writer) => {
@@ -3228,6 +3334,16 @@ impl SignersManager {
                         );
                     }
                 }
+                if let Some(record) = pin_update {
+                    crate::managers::verifiers::write_pins_updated_row(
+                        self,
+                        &smart_account_redacted,
+                        rule_id,
+                        PinsUpdateReason::SignerAdded,
+                        record,
+                        &request_id,
+                    );
+                }
             }
             Err(err) => {
                 warn!(
@@ -3239,9 +3355,10 @@ impl SignersManager {
             }
         }
 
-        outcome.map(|(signer_ids, _)| signer_ids)
+        outcome.map(|(signer_ids, _, _)| signer_ids)
     }
 
+    #[allow(clippy::too_many_arguments, reason = "irreducible inner arg set")]
     async fn batch_add_signers_locked_inner(
         &self,
         smart_account: ScAddress,
@@ -3250,7 +3367,8 @@ impl SignersManager {
         new_signers: Vec<(ScVal, SignerPubkey)>,
         signer: &(dyn Signer + Send + Sync),
         request_id: &str,
-    ) -> Result<(Vec<u32>, ObservedSignerSet), SaError> {
+        overrides: PinOverrides,
+    ) -> Result<(Vec<u32>, ObservedSignerSet, Option<PinnedHashesRecord>), SaError> {
         let source_pubkey =
             signer
                 .public_key()
@@ -3311,6 +3429,17 @@ impl SignersManager {
             )
             .await?;
 
+        let pin_update = self
+            .plan_signer_add_pin_update(
+                &smart_account,
+                rule_id,
+                smart_account_redacted,
+                new_signers.iter().map(|(_, pubkey)| pubkey),
+                overrides,
+                request_id,
+            )
+            .await?;
+
         let auth_rule_ids = vec![ContextRuleId::from(rule_id)];
         self.submit_single_op(
             smart_account.clone(),
@@ -3322,6 +3451,7 @@ impl SignersManager {
             signer,
             &source_pubkey_strkey,
             Some(ExpiryCheck { rule_id }),
+            request_id,
         )
         .await?;
 
@@ -3349,7 +3479,7 @@ impl SignersManager {
             .copied()
             .collect();
 
-        Ok((new_signer_ids, resulting))
+        Ok((new_signer_ids, resulting, pin_update))
     }
 
     // ── classify_rule_policies ─────────────────────────────────────────────────
@@ -3964,7 +4094,8 @@ impl SignersManager {
 
     /// Core logic for `add_signer` (called inside the per-rule mutex).
     ///
-    /// Returns `(assigned_signer_id, resulting_ObservedSignerSet)`.
+    /// Returns `(assigned_signer_id, resulting_ObservedSignerSet,
+    /// pin_record_to_write)`.
     #[allow(clippy::too_many_arguments, reason = "irreducible inner arg set")]
     async fn add_signer_locked_inner(
         &self,
@@ -3975,7 +4106,8 @@ impl SignersManager {
         new_signer_pubkey: SignerPubkey,
         signer: &(dyn Signer + Send + Sync),
         request_id: &str,
-    ) -> Result<(u32, ObservedSignerSet), SaError> {
+        overrides: PinOverrides,
+    ) -> Result<(u32, ObservedSignerSet, Option<PinnedHashesRecord>), SaError> {
         let source_pubkey =
             signer
                 .public_key()
@@ -4038,6 +4170,17 @@ impl SignersManager {
             )
             .await?;
 
+        let pin_update = self
+            .plan_signer_add_pin_update(
+                &smart_account,
+                rule_id,
+                smart_account_redacted,
+                std::iter::once(&new_signer_pubkey),
+                overrides,
+                request_id,
+            )
+            .await?;
+
         // Single-op: add_signer.
         // `add_signer` calls `e.current_contract_address().require_auth()`;
         // auth entry is credentialed for the smart account (= contract).
@@ -4058,6 +4201,7 @@ impl SignersManager {
                 // Refuses with `SaError::RuleExpired` when `valid_until <
                 // latest_ledger`.
                 Some(ExpiryCheck { rule_id }),
+                request_id,
             )
             .await?;
 
@@ -4073,7 +4217,95 @@ impl SignersManager {
             )
             .await?;
 
-        Ok((assigned_id, resulting))
+        Ok((assigned_id, resulting, pin_update))
+    }
+
+    /// Computes the pin record a signer add writes for rule `rule_id` once
+    /// the add confirms; see "Pin record" on [`Self::add_signer`].
+    ///
+    /// Returns `None` when no new signer is `External` or the rule has no pin
+    /// record. Otherwise the returned record is the current one with a pin
+    /// appended for each distinct new verifier address that is not already
+    /// live on the rule, each identified and probed here, before submission.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::AuditLog`]: the pin record could not be read.
+    /// - [`SaError::DeploymentFailed`] / [`SaError::AuthEntryConstructionFailed`]:
+    ///   the rule's live verifier addresses could not be fetched.
+    /// - The refusals of `pin_added_contract` for a new verifier.
+    async fn plan_signer_add_pin_update<'p>(
+        &self,
+        smart_account: &ScAddress,
+        rule_id: u32,
+        smart_account_redacted: &str,
+        new_signer_pubkeys: impl Iterator<Item = &'p SignerPubkey>,
+        overrides: PinOverrides,
+        request_id: &str,
+    ) -> Result<Option<PinnedHashesRecord>, SaError> {
+        let mut new_verifiers: Vec<&str> = Vec::new();
+        for pubkey in new_signer_pubkeys {
+            if let SignerPubkey::External {
+                verifier_contract, ..
+            } = pubkey
+                && !new_verifiers.contains(&verifier_contract.as_str())
+            {
+                new_verifiers.push(verifier_contract);
+            }
+        }
+        if new_verifiers.is_empty() {
+            return Ok(None);
+        }
+        let Some(mut record) = crate::managers::verifiers::read_pinned_hashes_for_rule(
+            self,
+            rule_id,
+            smart_account_redacted,
+        )?
+        else {
+            debug!(
+                rule_id,
+                "signer add: the rule has no pin record; no pin update is written"
+            );
+            return Ok(None);
+        };
+
+        let (live_verifiers, _) = self
+            .fetch_verifier_and_policy_addresses(smart_account.clone(), rule_id, None)
+            .await?;
+        let live_verifier_strkeys: Vec<String> = live_verifiers
+            .iter()
+            .map(scaddress_to_strkey)
+            .collect::<Result<_, _>>()?;
+
+        for verifier_strkey in new_verifiers {
+            if live_verifier_strkeys
+                .iter()
+                .any(|live| live == verifier_strkey)
+            {
+                continue;
+            }
+            let verifier = parse_c_strkey_to_smart_account(verifier_strkey)?;
+            let pin = crate::managers::verifiers::pin_added_contract(
+                self,
+                &verifier,
+                crate::managers::verifiers::PinnedKind::Verifier,
+                rule_id,
+                smart_account_redacted,
+                overrides.accept_mutable_verifier,
+                overrides.accept_unknown_verifier,
+                &self.chain_id,
+                request_id,
+            )
+            .await?;
+            crate::managers::verifiers::append_pin(
+                &mut record.pinned_verifier_first8,
+                &mut record.pinned_verifier_executable_refs,
+                &mut record.mutable_override,
+                &mut record.unknown_override,
+                pin,
+            );
+        }
+        Ok(Some(record))
     }
 
     /// Core logic for `remove_signer` (called inside the per-rule mutex).
@@ -4150,6 +4382,7 @@ impl SignersManager {
             &source_pubkey_strkey,
             // Expiry check at signing-path entry.
             Some(ExpiryCheck { rule_id }),
+            request_id,
         )
         .await?;
 
@@ -4277,6 +4510,7 @@ impl SignersManager {
             &source_pubkey_strkey,
             // Expiry check at signing-path entry.
             Some(ExpiryCheck { rule_id }),
+            request_id,
         )
         .await?;
 
@@ -4319,6 +4553,7 @@ impl SignersManager {
         signer: &(dyn Signer + Send + Sync),
         source_pubkey_strkey: &str,
         expiry_check: Option<ExpiryCheck>,
+        request_id: &str,
     ) -> Result<ScVal, SaError> {
         self.submit_signed_invoke(
             contract,
@@ -4330,6 +4565,8 @@ impl SignersManager {
             source_pubkey_strkey,
             entrypoint,
             expiry_check,
+            request_id,
+            None,
         )
         .await
         .map(|result| result.return_val)
@@ -4351,6 +4588,11 @@ impl SignersManager {
     /// to the six call sites in this file; the leading `_` discards the value
     /// at the binding site without a `let _ =` drop statement.
     ///
+    /// Every call runs the pinned-hash drift check through this manager
+    /// ([`crate::submit::PinCheck`]) with `request_id`; `migrating_rule`
+    /// names the rule whose verifier check is skipped, and only
+    /// [`Self::submit_migration_step`] sets it.
+    ///
     /// # Implements
     ///
     /// Atomic signer-threshold update — delegated to free function.
@@ -4371,6 +4613,8 @@ impl SignersManager {
         _source_pubkey_strkey: &str,
         op_label: &'static str,
         expiry_check: Option<ExpiryCheck>,
+        request_id: &str,
+        migrating_rule: Option<u32>,
     ) -> Result<crate::submit::SubmitInvokeResult, SaError> {
         // Convert ScAddress → C-strkey for the free function.
         let contract_strkey = scaddress_to_strkey(&contract)?;
@@ -4412,6 +4656,11 @@ impl SignersManager {
                 .timeout(self.timeout)
                 .op_label(op_label)
                 .maybe_expiry_check(expiry_check)
+                .pin_check(crate::submit::PinCheck {
+                    signers_manager: self,
+                    request_id,
+                    migrating_rule,
+                })
                 .build(),
         )
         .await
@@ -4419,6 +4668,14 @@ impl SignersManager {
 }
 
 // ── Free helpers ──────────────────────────────────────────────────────────────
+
+/// The overrides `rules create` takes, applied to a verifier a signer add
+/// pins for an existing rule.
+#[derive(Clone, Copy, Debug)]
+struct PinOverrides {
+    accept_mutable_verifier: bool,
+    accept_unknown_verifier: bool,
+}
 
 /// Pre-flight threshold + count invariant check.
 ///
@@ -4787,12 +5044,17 @@ pub(crate) fn verifier_hash_allowlisted(hash: &[u8; 32]) -> bool {
         .any(|entry| &entry.wasm_hash == hash)
 }
 
-/// Returns `true` when `hash` is one of the
-/// [`THRESHOLD_POLICY_WASM_HASHES`] a rule-install policy pin accepts.
+/// Returns `true` when `hash` is a policy Wasm the wallet vendors, the set a
+/// policy pin accepts without the unknown-hash override: the simple-threshold
+/// hashes ([`THRESHOLD_POLICY_WASM_HASHES`]), the weighted-threshold hashes
+/// ([`WEIGHTED_THRESHOLD_POLICY_WASM_HASHES`]) and the spending-limit hash
+/// ([`crate::spending_limit_policy::SPENDING_LIMIT_POLICY_WASM_SHA256`]).
 pub(crate) fn policy_hash_allowlisted(hash: &[u8; 32]) -> bool {
     THRESHOLD_POLICY_WASM_HASHES
         .iter()
+        .chain(WEIGHTED_THRESHOLD_POLICY_WASM_HASHES)
         .any(|allowed| allowed == hash)
+        || hex::encode(hash) == crate::spending_limit_policy::SPENDING_LIMIT_POLICY_WASM_SHA256
 }
 
 /// Returns lower-case hex of the first 8 bytes of `hash`, the first-8
@@ -5569,6 +5831,28 @@ mod tests {
     use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
 
     use super::*;
+
+    /// A policy pin accepts every policy Wasm the wallet vendors without the
+    /// unknown-hash override, and nothing else.
+    #[test]
+    fn policy_hash_allowlisted_accepts_the_vendored_policy_wasms_only() {
+        let spending_limit: [u8; 32] =
+            hex::decode(crate::spending_limit_policy::SPENDING_LIMIT_POLICY_WASM_SHA256)
+                .expect("hex")
+                .try_into()
+                .expect("32 bytes");
+        for hash in THRESHOLD_POLICY_WASM_HASHES
+            .iter()
+            .chain(WEIGHTED_THRESHOLD_POLICY_WASM_HASHES)
+            .chain(std::iter::once(&spending_limit))
+        {
+            assert!(policy_hash_allowlisted(hash), "{}", hash_first8_hex(hash));
+        }
+        assert!(!policy_hash_allowlisted(&[0xdd; 32]));
+        assert!(!policy_hash_allowlisted(
+            &crate::VERIFIER_ALLOWLIST[0].wasm_hash
+        ));
+    }
 
     // ── compute_post_op_invariant ─────────────────────────────────────────────
 
@@ -7905,6 +8189,8 @@ mod tests {
                 Vec::new(),
                 &UnreachableSigner,
                 "req-empty-batch".to_owned(),
+                false,
+                false,
             )
             .await;
 

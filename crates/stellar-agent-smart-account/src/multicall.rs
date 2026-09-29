@@ -209,6 +209,10 @@ pub struct MulticallSubmitArgs<'a> {
     /// `submit_multicall_bundle` call.  All audit rows emitted in a single
     /// bundle submission share this `request_id` for forensic correlation.
     pub request_id: &'a str,
+    /// Signers manager for the pinned-hash drift check of `rule_id`
+    /// ([`crate::submit::PinCheck`]); its audit writer holds the rule's pin
+    /// record. Rule 0 is never checked.
+    pub signers_manager: &'a crate::managers::signers::SignersManager,
 }
 
 /// Builds the durable record from the same bundle view the policy gate evaluated.
@@ -516,7 +520,7 @@ impl MulticallRegistry {
                 if registry.partial_load_warnings.len() < WARNING_CAP {
                     registry.partial_load_warnings.push(RegistryLoadWarning {
                         network_safename: safename.clone(),
-                        reason: truncate_warning(
+                        reason: crate::error::truncate_to_byte_cap(
                             &format!("invalid C-strkey address: {}", raw.address),
                             WARNING_TEXT_CAP,
                         ),
@@ -534,7 +538,7 @@ impl MulticallRegistry {
                 if registry.partial_load_warnings.len() < WARNING_CAP {
                     registry.partial_load_warnings.push(RegistryLoadWarning {
                         network_safename: safename.clone(),
-                        reason: truncate_warning(
+                        reason: crate::error::truncate_to_byte_cap(
                             &format!("invalid SHA-256 hex: {}", raw.wasm_sha256),
                             WARNING_TEXT_CAP,
                         ),
@@ -552,7 +556,7 @@ impl MulticallRegistry {
                 if registry.partial_load_warnings.len() < WARNING_CAP {
                     registry.partial_load_warnings.push(RegistryLoadWarning {
                         network_safename: safename.clone(),
-                        reason: truncate_warning(
+                        reason: crate::error::truncate_to_byte_cap(
                             &format!(
                                 "wasm_sha256 {} != MULTICALL_WASM_SHA256 {}; \
                                  lookup will refuse (update wasm_sha256 after re-vendoring)",
@@ -1540,6 +1544,11 @@ pub async fn submit_multicall_bundle(
             .required_checks(&["multicall"])
             .multicall_check(multicall_check)
             .submission_recorder(&recorder)
+            .pin_check(crate::submit::PinCheck {
+                signers_manager: args.signers_manager,
+                request_id: args.request_id,
+                migrating_rule: None,
+            })
             .build(),
     )
     .await;
@@ -1947,6 +1956,11 @@ fn map_sa_error_to_multicall_phase(err: &SaError) -> &'static str {
             // SubmitCheckMissing fires BEFORE any I/O (fail-CLOSED programming gate).
             "build"
         }
+        "sa.verifier_hash_drift" | "sa.policy_hash_drift" | "sa.pin_check_unavailable" => {
+            // The pinned-hash drift check refuses before simulation: a wallet
+            // security gate on the authorizing rule, not a network failure.
+            "policy_gate"
+        }
         "sa.horizon_exceeded" | "sa.rule_expired" => {
             // Session-rule horizon + expiry checks fire at the policy-gate stage
             // (after simulate, before signing). They are session-policy checks,
@@ -2100,20 +2114,6 @@ fn check_numeric_tolerance(
         });
     }
     Ok(())
-}
-
-/// Truncates a warning message to `max_bytes` bytes, appending `"..."` if truncated.
-fn truncate_warning(msg: &str, max_bytes: usize) -> String {
-    if msg.len() <= max_bytes {
-        return msg.to_owned();
-    }
-    // Truncate at a char boundary.
-    let truncated = &msg[..msg
-        .char_indices()
-        .take_while(|(idx, _)| *idx < max_bytes.saturating_sub(3))
-        .last()
-        .map_or(0, |(idx, c)| idx + c.len_utf8())];
-    format!("{truncated}...")
 }
 
 /// Validates whether `s` is a valid 64-char lowercase hex SHA-256.
@@ -2662,25 +2662,6 @@ wasm_sha256 = "267e94a092df01fa02ad4edf8320a98bd65e4d4d6575254ac9521cb65727f3d4"
         assert!(validate_soroban_symbol("fn name").is_err()); // space not allowed
     }
 
-    // ── truncate_warning ──────────────────────────────────────────────────────
-
-    #[test]
-    fn truncate_warning_short_strings_unchanged() {
-        let s = "short warning";
-        assert_eq!(truncate_warning(s, 256), s);
-    }
-
-    #[test]
-    fn truncate_warning_long_strings_truncated_with_ellipsis() {
-        let long = "x".repeat(300);
-        let result = truncate_warning(&long, 256);
-        assert!(result.len() <= 256, "truncated string must be ≤ 256 bytes");
-        assert!(
-            result.ends_with("..."),
-            "truncated string must end with '...'"
-        );
-    }
-
     // ── From<&MulticallRegistryEntry> for RawMulticallEntry ───────────────────
 
     /// `From<&MulticallRegistryEntry>` produces a `RawMulticallEntry` with
@@ -3176,6 +3157,48 @@ wasm_sha256 = "{drifted_sha}"
             current: 200,
         };
         assert_eq!(map_sa_error_to_multicall_phase(&err), "policy_gate");
+    }
+
+    /// A drift refusal and an unavailable drift check map to
+    /// `"policy_gate"`: both refuse before simulation.
+    #[test]
+    fn map_sa_error_to_phase_pin_check_refusals_map_to_policy_gate() {
+        use stellar_agent_core::observability::RedactedStrkey;
+        let redacted = || RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ");
+        let refusals = [
+            SaError::VerifierHashDrift {
+                rule_id: 2,
+                smart_account_redacted: redacted(),
+                deploy_address_redacted: redacted(),
+                pinned_hash_first8: "aabbccdd".to_owned(),
+                observed_hash_first8: "11223344".to_owned(),
+                observed_executable: None,
+                request_id: "req".to_owned(),
+            },
+            SaError::PolicyHashDrift {
+                rule_id: 2,
+                smart_account_redacted: redacted(),
+                deploy_address_redacted: redacted(),
+                pinned_hash_first8: "aabbccdd".to_owned(),
+                observed_hash_first8: "11223344".to_owned(),
+                observed_executable: None,
+                request_id: "req".to_owned(),
+            },
+            SaError::PinCheckUnavailable {
+                rule_id: 2,
+                smart_account_redacted: redacted(),
+                reason: "sa.deployment_failed: rpc unreachable".to_owned(),
+                request_id: "req".to_owned(),
+            },
+        ];
+        for err in &refusals {
+            assert_eq!(
+                map_sa_error_to_multicall_phase(err),
+                "policy_gate",
+                "{}",
+                err.wire_code()
+            );
+        }
     }
 
     /// `MulticallFailed` (nested) maps to `"submit"`.

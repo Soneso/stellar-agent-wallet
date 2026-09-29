@@ -162,8 +162,9 @@ impl fmt::Display for ContractKind {
 /// can refuse when the owner repoints the tag, the instance names a different
 /// reference, or the executable is no longer a reference.
 ///
-/// Carried by [`EventKind::SaContextRuleCreated`] beside the first-8 hash
-/// lists, and by the rule-install JSON envelopes.
+/// Carried by [`EventKind::SaContextRuleCreated`] and
+/// [`EventKind::SaContextRulePinsUpdated`] beside the first-8 hash lists, and
+/// by the rule-install JSON envelopes.
 ///
 /// # Rendering
 ///
@@ -234,8 +235,9 @@ impl ExecutableRefPin {
 /// Returns `refs` unchanged when at least one entry is a pin, or an empty
 /// list when every entry is `None`.
 ///
-/// An executable-reference list on a `SaContextRuleCreated` row or an
-/// install envelope is either aligned with its first-8 list or absent;
+/// An executable-reference list on a `SaContextRuleCreated` or
+/// `SaContextRulePinsUpdated` row or an install envelope is either aligned
+/// with its first-8 list or absent;
 /// recording an all-`None` list as empty keeps rules without an external
 /// reference in the shape older readers know.
 #[must_use]
@@ -251,6 +253,44 @@ pub fn executable_refs_or_empty(
 
 fn lower_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// ── PinsUpdateReason ──────────────────────────────────────────────────────────
+
+/// The wallet mutation that changed a pinned rule's live verifier or policy
+/// set.
+///
+/// Carried by [`EventKind::SaContextRulePinsUpdated`]. The pin record of a
+/// rule is the newest `SaContextRuleCreated` or `SaContextRulePinsUpdated`
+/// row for it; this reason records which wallet verb wrote the newer one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum PinsUpdateReason {
+    /// `smart-account migrate-verifier` replaced the rule's External signers
+    /// on the source verifier with signers on the destination verifier.
+    #[serde(rename = "verifier_migrated")]
+    VerifierMigrated,
+    /// `smart-account signers add` or `signers batch-add` added an External
+    /// signer to the rule.
+    #[serde(rename = "signer_added")]
+    SignerAdded,
+    /// `smart-account rules add-policy` attached a policy to the rule.
+    #[serde(rename = "policy_added")]
+    PolicyAdded,
+    /// `smart-account rules remove-policy` detached a policy from the rule.
+    #[serde(rename = "policy_removed")]
+    PolicyRemoved,
+}
+
+impl fmt::Display for PinsUpdateReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::VerifierMigrated => f.write_str("verifier_migrated"),
+            Self::SignerAdded => f.write_str("signer_added"),
+            Self::PolicyAdded => f.write_str("policy_added"),
+            Self::PolicyRemoved => f.write_str("policy_removed"),
+        }
+    }
 }
 
 // ── VerifierAdvisoryKind ──────────────────────────────────────────────────────
@@ -717,6 +757,61 @@ pub enum EventKind {
         /// defaulting rules as `pinned_verifier_executable_refs`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
+    },
+
+    /// A pinned context rule's pin record, rewritten after a wallet mutation
+    /// changed the rule's live verifier or policy set.
+    ///
+    /// Written by `smart-account migrate-verifier` after each confirmed
+    /// `add_signer` step, by `smart-account signers add` / `signers batch-add`
+    /// after an External signer is added, and by `smart-account rules
+    /// add-policy` / `rules remove-policy` after a policy is attached or
+    /// detached, only when the rule already has a pin record. The signing-time drift check reads the
+    /// newest `SaContextRuleCreated` or `SaContextRulePinsUpdated` row for
+    /// `(rule_id, smart_account)` as the rule's pin record, so this row
+    /// carries the whole record: both first-8 lists, their aligned
+    /// executable-reference lists and the override flags. The outer entry's
+    /// `request_id` correlates it with the mutation's other rows.
+    ///
+    /// # Field redaction
+    ///
+    /// `smart_account` is the C-strkey form, redacted first-5-last-5. The
+    /// first-8 hashes are public on-chain identifiers.
+    ///
+    /// # Backward compatibility
+    ///
+    /// Every field except the two executable-reference lists is required: no
+    /// older row of this kind exists, and a row missing one fails
+    /// deserialisation. The executable-reference lists follow the
+    /// `SaContextRuleCreated` shape, written empty when no pinned contract is
+    /// an external reference.
+    SaContextRulePinsUpdated {
+        /// Smart-account C-strkey, redacted first-5-last-5.
+        smart_account: String,
+        /// Public on-chain rule identifier.
+        rule_id: u32,
+        /// First-8-hex of each pinned verifier hash, one entry per distinct
+        /// verifier address.
+        pinned_verifier_wasm_hashes_first8: Vec<String>,
+        /// First-8-hex of each pinned policy hash.
+        pinned_policy_wasm_hashes_first8: Vec<String>,
+        /// `true` when any pin in the record was established under
+        /// `--accept-mutable-verifier`.
+        mutable_override: bool,
+        /// `true` when any pin in the record was established under
+        /// `--accept-unknown-verifier`.
+        unknown_override: bool,
+        /// Executable-reference pins aligned by position with
+        /// `pinned_verifier_wasm_hashes_first8`, with the shape and defaulting
+        /// rules of the `SaContextRuleCreated` field of the same name.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
+        /// Executable-reference pins aligned by position with
+        /// `pinned_policy_wasm_hashes_first8`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
+        /// The wallet mutation that wrote this record.
+        reason: PinsUpdateReason,
     },
 
     /// Smart-account context-rule deletion event.
@@ -2786,7 +2881,7 @@ pub enum EventKind {
 /// the test stays green, leaving the new variant unpinned by any tag assertion.
 /// Closing that would need the count derived from the enum itself, which needs a
 /// derive macro this workspace does not carry.
-pub const EVENT_KIND_VARIANT_COUNT: usize = 64;
+pub const EVENT_KIND_VARIANT_COUNT: usize = 65;
 
 /// Why an [`EventKind::AuditTipAnchored`] row was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3329,6 +3424,98 @@ mod tests {
             "{s}"
         );
         assert!(s.contains("pinned_policy_executable_refs"), "{s}");
+    }
+
+    /// Round-trip: `SaContextRulePinsUpdated` with both reasons, aligned
+    /// executable-reference pins and the override flags.
+    #[test]
+    fn event_kind_sa_context_rule_pins_updated_round_trip() {
+        let verifier_pin = executable_ref_pin_fixture(b"verifier", [0xaau8; 32]);
+        for reason in [
+            PinsUpdateReason::SignerAdded,
+            PinsUpdateReason::VerifierMigrated,
+            PinsUpdateReason::PolicyAdded,
+            PinsUpdateReason::PolicyRemoved,
+        ] {
+            let ev = EventKind::SaContextRulePinsUpdated {
+                smart_account: "CDABC...XYZ12".to_owned(),
+                rule_id: 6,
+                pinned_verifier_wasm_hashes_first8: vec![
+                    "1111111111111111".to_owned(),
+                    "aaaaaaaaaaaaaaaa".to_owned(),
+                ],
+                pinned_policy_wasm_hashes_first8: vec!["bbbbbbbbbbbbbbbb".to_owned()],
+                mutable_override: true,
+                unknown_override: false,
+                pinned_verifier_executable_refs: vec![None, Some(verifier_pin.clone())],
+                pinned_policy_executable_refs: vec![],
+                reason,
+            };
+            let s = serde_json::to_string(&ev).unwrap();
+            let back: EventKind = serde_json::from_str(&s).unwrap();
+            assert_eq!(ev, back);
+            assert!(
+                s.contains("\"kind\":\"sa_context_rule_pins_updated\""),
+                "{s}"
+            );
+            assert!(s.contains(&format!("\"reason\":\"{reason}\"")), "{s}");
+            assert!(
+                !s.contains("pinned_policy_executable_refs"),
+                "an empty reference list is skipped: {s}"
+            );
+        }
+        assert_eq!(PinsUpdateReason::SignerAdded.to_string(), "signer_added");
+        assert_eq!(
+            PinsUpdateReason::VerifierMigrated.to_string(),
+            "verifier_migrated"
+        );
+        assert_eq!(PinsUpdateReason::PolicyAdded.to_string(), "policy_added");
+        assert_eq!(
+            PinsUpdateReason::PolicyRemoved.to_string(),
+            "policy_removed"
+        );
+    }
+
+    /// `SaContextRulePinsUpdated` with a missing required field or an unknown
+    /// reason fails to deserialise; the executable-reference lists default
+    /// to empty.
+    #[test]
+    fn event_kind_sa_context_rule_pins_updated_missing_fields_fail() {
+        let complete = r#"{"kind":"sa_context_rule_pins_updated","smart_account":"CDABC...XYZ12","rule_id":1,"pinned_verifier_wasm_hashes_first8":["aabbccdd00112233"],"pinned_policy_wasm_hashes_first8":[],"mutable_override":false,"unknown_override":false,"reason":"signer_added"}"#;
+        let back: EventKind = serde_json::from_str(complete).unwrap();
+        let EventKind::SaContextRulePinsUpdated {
+            pinned_verifier_executable_refs,
+            pinned_policy_executable_refs,
+            reason,
+            ..
+        } = &back
+        else {
+            panic!("expected SaContextRulePinsUpdated, got {back:?}");
+        };
+        assert!(pinned_verifier_executable_refs.is_empty());
+        assert!(pinned_policy_executable_refs.is_empty());
+        assert_eq!(*reason, PinsUpdateReason::SignerAdded);
+
+        for field in [
+            "smart_account",
+            "rule_id",
+            "pinned_verifier_wasm_hashes_first8",
+            "pinned_policy_wasm_hashes_first8",
+            "mutable_override",
+            "unknown_override",
+            "reason",
+        ] {
+            let mut value: serde_json::Value = serde_json::from_str(complete).unwrap();
+            value.as_object_mut().unwrap().remove(field);
+            let result: Result<EventKind, _> = serde_json::from_value(value);
+            assert!(
+                result.is_err(),
+                "a row without `{field}` must fail deserialisation"
+            );
+        }
+
+        let unknown_reason = complete.replace("signer_added", "rule_renamed");
+        assert!(serde_json::from_str::<EventKind>(&unknown_reason).is_err());
     }
 
     /// Missing-field: rows without the executable-reference lists read them as

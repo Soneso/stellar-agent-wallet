@@ -103,7 +103,8 @@ pub fn run_startup_advisory(audit_log_path: &Path) -> AdvisoryResult {
 /// 1. If the audit-log file is absent or empty, return early.
 /// 2. Open an `AuditWriter` to drive `AuditReader` construction and
 ///    advisory-row emission.
-/// 3. Scan all `SaContextRuleCreated` rows (deduplicated most-recent-per-rule).
+/// 3. Scan every rule's pin record: the newest `SaContextRuleCreated` or
+///    `SaContextRulePinsUpdated` row per rule.
 /// 4. For each rule, deduplicate `pinned_verifier_first8` before iterating.
 /// 5. For any hash matching a `Revoked` or `Retired` allowlist entry, emit one
 ///    `[advisory]` stderr line and one `SaVerifierAllowlistAdvisory` audit row.
@@ -154,9 +155,9 @@ fn advisory_impl(audit_log_path: &Path, allowlist: &[VerifierAllowlistEntry]) ->
         }
     };
 
-    // ── 2. Scan ALL SaContextRuleCreated rows via AuditReader ────────────────
+    // ── 2. Scan every rule's pin record (newest created or pins-updated row) ──
     let reader = AuditReader::new(Arc::clone(&writer), None);
-    let all_rules = match reader.scan_all_context_rule_created() {
+    let all_rules = match reader.scan_all_context_rule_pin_records() {
         Ok(rows) => rows,
         Err(e) => {
             warn!(

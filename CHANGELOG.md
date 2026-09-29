@@ -33,8 +33,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `sa.contract_instance_unsupported` has the reasons
   `external reference with no live tag entry` and
   `executable changed during install`.
+- The `SaContextRulePinsUpdated` audit row records a pinned rule's whole pin
+  record after a wallet mutation changed its verifiers or policies: both first-8 hash
+  lists, their aligned executable-reference lists, the override flags and a
+  `reason` (`verifier_migrated`, `signer_added`, `policy_added` or
+  `policy_removed`); the entry's request id
+  joins it to the mutation's other rows. A rule's pin record is the newest
+  `SaContextRuleCreated` or `SaContextRulePinsUpdated` row for it; logs
+  without the new row read as before.
 
 ### Changed
+
+- Every smart-account operation authorized by a context rule other than `0`
+  checks that rule against its pin record before anything is simulated or
+  signed: `smart-account execute`, `smart-account multicall`, the
+  `smart-account rules` and `smart-account signers` write verbs,
+  `smart-account migrate-verifier` (the migrating rule's policies only) and
+  the `stellar_rule_create_commit` MCP tool. A live verifier or policy that
+  differs from its pin refuses with `sa.verifier_hash_drift` /
+  `sa.policy_hash_drift` and writes the drift audit row with the operation's
+  request id. A check that cannot run (RPC failure, audit-log integrity
+  error, a record with more than one verifier or policy pin, an unreadable
+  instance) refuses with the new `sa.pin_check_unavailable`, whose reason
+  leads with the inner wire code. A rule without a pin record is not
+  checked; rule `0` never is. `multicall` reports these refusals as
+  `sa.multicall_failed` at phase `policy_gate`. In the library,
+  `SubmitInvokeArgs` takes `pin_check` and refuses a non-zero rule without
+  one (stage `pin_check_required`); `MulticallSubmitArgs` takes
+  `signers_manager`; a `ContextRuleManager` without a signers manager
+  refuses a non-zero authorizing rule with
+  `sa.signers_manager_not_configured`; a `multicall_check` without
+  `"multicall"` in `required_checks` is refused with stage
+  `multicall_check_undeclared` in every build.
+- `smart-account migrate-verifier` and `smart-account signers add` /
+  `signers batch-add` keep a pinned rule's pin record in step. After each
+  confirmed migration pair, a `SaContextRulePinsUpdated` row names the
+  destination verifier's hash as the rule's verifier pin. An External signer
+  added on a verifier the rule does not use yet is identified and probed
+  first, under the allowlist and mutability rules of `rules create` and its
+  new `--accept-mutable-verifier` / `--accept-unknown-verifier` flags on
+  `signers add` and `signers batch-add`; after the add confirms, the row
+  records one verifier pin per distinct verifier address. A second distinct
+  verifier yields a two-pin record, which every checked signing verb refuses
+  with `sa.pin_check_unavailable` (`sa.multiple_pinned_hashes_unsupported`),
+  as for a rule installed with two verifiers. A rule without a pin record
+  stays unpinned. `SignersManager::add_signer` and `batch_add_signers` take
+  the two override flags.
+- `smart-account rules add-policy` and `rules remove-policy` keep a pinned
+  rule's policy pins in step. A policy the rule does not hold yet is probed
+  first, under the policy allowlist and the mutability rules of
+  `rules create`, with the new `--accept-mutable-verifier` /
+  `--accept-unknown-verifier` flags on `rules add-policy`; after the add
+  confirms, a `SaContextRulePinsUpdated` row (reason `policy_added`) appends
+  its pin. After a removal confirms, the row (reason `policy_removed`) drops
+  the pin equal to the removed policy's hash, or the single pin of a rule's
+  only policy even when the policy no longer matches it or cannot be read.
+  A second policy pin yields a record every checked signing verb refuses, as
+  for a rule installed with two policies. `ContextRuleManager::add_policy` takes the two override flags.
+- The policy pin allowlist accepts every policy Wasm the wallet vendors: the
+  simple-threshold, weighted-threshold and spending-limit policies. It
+  applies to `rules create` and `rules add-policy`.
 
 - Protocol 28 crate versions: `stellar-xdr` 28.0.0, `stellar-baselib` 0.6.0,
   `stellar-rpc-client` 28.0.0, `soroban-spec-tools` 28.0.0 and

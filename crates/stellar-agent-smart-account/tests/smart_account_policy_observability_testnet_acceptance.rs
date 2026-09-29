@@ -106,7 +106,7 @@ use stellar_agent_smart_account::managers::spending_limit_data::compute_spending
 use stellar_agent_smart_account::signers::policy_identification::THRESHOLD_POLICY_WASM;
 use stellar_agent_smart_account::spending_limit_policy::build_spending_limit_install_param;
 use stellar_agent_smart_account::submit::{
-    Ed25519RuleSigner, SubmitInvokeArgs, submit_signed_invoke,
+    Ed25519RuleSigner, PinCheck, SubmitInvokeArgs, submit_signed_invoke,
 };
 use stellar_agent_test_support::keyring_mock;
 use stellar_baselib::account::{Account as BaselibAccount, AccountBehavior};
@@ -790,6 +790,14 @@ async fn policy_observability_full_flow_testnet_acceptance() {
     );
 
     // ── Step 3: agent-signed transfer of A (under the limit) — MUST succeed ──
+    // The rule manager writes no audit rows, so the rule has no pin record in
+    // this log and the drift check fetches the rule and passes it.
+    let pin_request_id = rid();
+    let pin_check = || PinCheck {
+        signers_manager: &signers_mgr,
+        request_id: &pin_request_id,
+        migrating_rule: None,
+    };
     let rule_ids = vec![ContextRuleId::new(rule_id)];
     let transfer_a_result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
@@ -813,6 +821,7 @@ async fn policy_observability_full_flow_testnet_acceptance() {
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .op_label("policy_observability_agent_transfer_a")
             .emit_observability_logs(true)
+            .pin_check(pin_check())
             .build(),
     )
     .await
@@ -950,6 +959,7 @@ async fn policy_observability_full_flow_testnet_acceptance() {
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .op_label("policy_observability_squeeze_transfer")
             .emit_observability_logs(true)
+            .pin_check(pin_check())
             .build(),
     )
     .await

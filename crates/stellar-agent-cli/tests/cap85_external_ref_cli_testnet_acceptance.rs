@@ -21,7 +21,11 @@
 //! 2. The same command with `--accept-mutable-verifier` installs the rule and
 //!    reports the pinned reference: tag `"verifier"`, the redacted beacon and
 //!    the first 8 bytes of the ed25519 verifier hash.
-//! 3. After the beacon repoints the tag at the WebAuthn verifier,
+//! 3. `smart-account execute` signs a transfer through the rule with the
+//!    agent's key and confirms: the pinned-hash drift check passes.
+//! 4. After the beacon repoints the tag at the WebAuthn verifier,
+//!    `smart-account execute` through the rule exits non-zero with
+//!    `sa.verifier_hash_drift` before signing, and
 //!    `smart-account rules verify-pins` reports `verifier_pin_status:
 //!    "drift"` and exits 1.
 //!
@@ -64,12 +68,18 @@ use stellar_agent_smart_account::deployment::{
     deploy_webauthn_verifier,
 };
 use stellar_agent_smart_account::ed25519_verifier::ED25519_VERIFIER_WASM;
+use stellar_agent_smart_account::managers::rules::{
+    parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
+};
 use stellar_agent_smart_account::webauthn_verifier::WEBAUTHN_VERIFIER_WASM;
 use stellar_agent_test_support::testnet_helpers::{
     SourceAccountInvocation, account_scaddress, contract_scaddress, derive_contract_address,
-    invoke_as_source_account, upload_and_create_contract,
+    fund_sac_balance, invoke_as_source_account, upload_and_create_contract,
 };
-use stellar_xdr::{BytesM, ScBytes, ScString, ScVal, StringM};
+use stellar_xdr::{
+    BytesM, Int128Parts, InvokeContractArgs, Limits, ScBytes, ScString, ScSymbol, ScVal, StringM,
+    WriteXdr as _,
+};
 use zeroize::Zeroizing;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -88,6 +98,13 @@ const XLM_SAC_TESTNET: &str = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2
 const TAG: &str = "verifier";
 
 const FEE_PAYER_ENV_VAR: &str = "CAP85_CLI_ACCEPTANCE_FEE_PAYER";
+const RULE_SIGNER_ENV_VAR: &str = "CAP85_CLI_ACCEPTANCE_RULE_SIGNER";
+
+/// XLM funded into the smart account's SAC balance (1 XLM).
+const SMART_ACCOUNT_FUND_STROOPS: i128 = 10_000_000;
+
+/// XLM each `smart-account execute` transfer moves (0.1 XLM).
+const TRANSFER_STROOPS: i128 = 1_000_000;
 const TIMEOUT: Duration = Duration::from_secs(120);
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -200,6 +217,48 @@ async fn submit_testnet_signed_xdr(
         None,
     )
     .await?)
+}
+
+fn i128_scval(amount: i128) -> ScVal {
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "canonical i128 -> Int128Parts split: hi = high 64 bits, lo = low 64 bits"
+    )]
+    ScVal::I128(Int128Parts {
+        hi: (amount >> 64) as i64,
+        lo: amount as u64,
+    })
+}
+
+fn scval_b64(val: &ScVal) -> String {
+    val.to_xdr_base64(Limits::none())
+        .expect("ScVal XDR encoding must succeed")
+}
+
+/// Builds the SAC `transfer(from, to, amount)` invocation `fund_sac_balance`
+/// submits from its funder account.
+#[allow(
+    clippy::result_large_err,
+    reason = "SaError is the crate's production error type; this test-only builder \
+              surfaces it unchanged"
+)]
+fn transfer_invoke_args(
+    sac: &str,
+    from: &str,
+    to: &str,
+    amount: i128,
+) -> Result<InvokeContractArgs, stellar_agent_smart_account::error::SaError> {
+    Ok(InvokeContractArgs {
+        contract_address: parse_c_strkey_to_smart_account(sac)?,
+        function_name: ScSymbol::try_from("transfer").expect("\"transfer\" fits ScSymbol"),
+        args: vec![
+            ScVal::Address(parse_g_strkey_to_signer_address(from)?),
+            ScVal::Address(parse_c_strkey_to_smart_account(to)?),
+            i128_scval(amount),
+        ]
+        .try_into()
+        .expect("3-element transfer args vec fits VecM<ScVal>"),
+    })
 }
 
 /// Invokes a beacon function as its admin.
@@ -504,7 +563,82 @@ async fn rules_create_pins_the_reference_and_verify_pins_reports_the_repoint() {
     );
     assert_eq!(envelope["data"]["mutable_override"].as_bool(), Some(true));
 
-    // ── Repoint, then verify-pins reports drift ─────────────────────────────
+    // ── execute through the pinned rule: the drift check passes ─────────────
+    let funded: SubmissionResult = fund_sac_balance(
+        "cap85-cli-acceptance",
+        TESTNET_RPC_URL,
+        TESTNET_PASSPHRASE,
+        TESTNET_FRIENDBOT_URL,
+        XLM_SAC_TESTNET,
+        &smart_account,
+        SMART_ACCOUNT_FUND_STROOPS,
+        transfer_invoke_args,
+        |account_id| fetch_testnet_sequence(account_id.to_owned()),
+        |unsigned_xdr, seed, network_passphrase| {
+            sign_testnet_envelope(unsigned_xdr, seed, network_passphrase.to_owned())
+        },
+        submit_testnet_signed_xdr,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("SAC funding of the smart account must succeed: {e}"));
+    record("fund-sac-tx", &funded.tx_hash);
+    let (recipient_g, _recipient_seed) = fresh_keypair();
+    fund_via_friendbot(&recipient_g).await;
+    let smart_account_arg = scval_b64(&ScVal::Address(
+        contract_scaddress(&smart_account).expect("smart-account C-strkey parses"),
+    ));
+    let recipient_arg = scval_b64(&ScVal::Address(
+        account_scaddress(&recipient_g).expect("recipient G-strkey parses"),
+    ));
+    let amount_arg = scval_b64(&i128_scval(TRANSFER_STROOPS));
+    let rule_id_arg = rule_id.to_string();
+    let agent_s_strkey = s_strkey_from_seed(&agent_seed);
+    let execute_env = [
+        (FEE_PAYER_ENV_VAR, bootstrap_s_strkey.as_str()),
+        (RULE_SIGNER_ENV_VAR, agent_s_strkey.as_str()),
+    ];
+    let execute_args = [
+        "smart-account",
+        "execute",
+        "--account",
+        smart_account.as_str(),
+        "--contract",
+        XLM_SAC_TESTNET,
+        "--function",
+        "transfer",
+        "--arg",
+        smart_account_arg.as_str(),
+        "--arg",
+        recipient_arg.as_str(),
+        "--arg",
+        amount_arg.as_str(),
+        "--auth-rule-id",
+        rule_id_arg.as_str(),
+        "--rule-signer-ed25519-secret-env",
+        RULE_SIGNER_ENV_VAR,
+        "--verifier",
+        proxy.as_str(),
+        "--signer-secret-env",
+        FEE_PAYER_ENV_VAR,
+        "--network",
+        "testnet",
+        "--rpc-url",
+        TESTNET_RPC_URL,
+    ];
+    let (code, envelope, stdout, stderr) =
+        run_cli(tmp.path(), &keyring_key, &execute_args, &execute_env);
+    assert_eq!(
+        code, 0,
+        "execute through the pinned rule must confirm before the repoint; \
+         stdout={stdout} stderr={stderr}"
+    );
+    let execute_tx = envelope["data"]["tx_hash"]
+        .as_str()
+        .unwrap_or_else(|| panic!("tx_hash missing from envelope: {envelope}"));
+    assert_eq!(execute_tx.len(), 64, "tx_hash must be a 32-byte hex digest");
+    record("execute-before-repoint-tx", execute_tx);
+
+    // ── Repoint, then execute refuses on drift and verify-pins reports it ───
     let repointed = invoke_beacon(
         &beacon.contract,
         "publish",
@@ -515,7 +649,25 @@ async fn rules_create_pins_the_reference_and_verify_pins_reports_the_repoint() {
     .await;
     record("repoint-webauthn-tx", &repointed.submission.tx_hash);
 
-    let rule_id_arg = rule_id.to_string();
+    let (code, envelope, stdout, stderr) =
+        run_cli(tmp.path(), &keyring_key, &execute_args, &execute_env);
+    assert_ne!(
+        code, 0,
+        "execute through the repointed reference must fail; stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(
+        envelope["error"]["code"].as_str(),
+        Some("sa.verifier_hash_drift"),
+        "execute must refuse with sa.verifier_hash_drift after the repoint: {envelope}"
+    );
+    let message = envelope["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&format!("pinned={}", hex::encode(&ed25519_hash[..8])))
+            && message.contains(&format!("observed={}", hex::encode(&webauthn_hash[..8]))),
+        "the drift refusal must name the pinned and observed hashes: {message}"
+    );
+    record("execute-after-repoint-code", "sa.verifier_hash_drift");
+
     let (code, envelope, stdout, stderr) = run_cli(
         tmp.path(),
         &keyring_key,

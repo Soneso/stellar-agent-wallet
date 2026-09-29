@@ -19,9 +19,13 @@
 //!
 //! # Step ordering
 //!
-//! 1. Pre-flight: argument guards and the source-account fetch. No wasm-hash
-//!    drift check runs: [`SubmitInvokeArgs`] carries no pin, so a caller that
-//!    must refuse a drifted verifier or policy checks it before calling.
+//! 1. Pre-flight: argument guards, then the pinned-hash drift check, then the
+//!    source-account fetch. For every distinct non-zero rule in
+//!    `auth_rule_ids` the drift check compares the rule's live verifier and
+//!    policy contracts against the rule's pin record (see [`PinCheck`]) and
+//!    refuses before anything is simulated or signed. Rule 0, the bootstrap
+//!    rule, has no pins and is never checked; a submission under rule 0 only
+//!    may omit the check.
 //! 2. Simulate: primary RPC; harvest `latestLedger`.
 //! 3. Required-check enforcement + `Option<*Check>` dispatch.
 //! 4. Cross-RPC simulate check (passthrough when `secondary_rpc_url` is `None`
@@ -30,7 +34,10 @@
 //! 6. Submit: send signed envelope.
 //! 7. Return `Result<SubmitInvokeResult, SaError>` to caller.
 
+use std::collections::HashMap;
+
 use sha2::{Digest as _, Sha256};
+use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::signing::Signer;
 use stellar_agent_network::signing::envelope_signing::attach_signature;
@@ -46,6 +53,7 @@ use stellar_xdr::{
 use tracing::info;
 
 use crate::SaError;
+use crate::error::pin_check_reason;
 use crate::managers::auth_entry::{
     AuthorizationSimulation, PartialSorobanAuthorizationEntry, PreSubmitBudget,
     bound_pre_submit_stage, build_authorization_entry,
@@ -58,6 +66,10 @@ use crate::managers::rules::{
     check_rule_not_expired_standalone, fingerprint_invocation, locate_smart_account_auth_entry,
     parse_c_strkey_to_smart_account, parse_min_resource_fee, passphrase_fingerprint,
     resimulate_with_signed_auth, scaddress_to_strkey, validate_latest_ledger,
+};
+use crate::managers::signers::SignersManager;
+use crate::managers::verifiers::{
+    verify_pinned_policy_against_chain, verify_pinned_verifier_against_chain,
 };
 use crate::signing::divergence::{
     EnvelopeContext, FeeEnvelopeContext, NetworkContext, SequenceContext, SimulationContext,
@@ -163,6 +175,63 @@ pub struct Ed25519RuleSigner<'a> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// PinCheck
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Inputs of the pre-signing drift check [`submit_signed_invoke`] runs for
+/// every distinct non-zero rule in [`SubmitInvokeArgs::auth_rule_ids`].
+///
+/// For each such rule the check fetches the rule's verifier and policy
+/// addresses from chain through [`SignersManager`], then compares each live
+/// executable against the rule's pin record: the newest
+/// `SaContextRuleCreated` or `SaContextRulePinsUpdated` row in the audit log
+/// of `signers_manager`. One per-call cache of observed executables is shared
+/// across the rules, so a contract referenced by several rules is fetched
+/// once. The smart account and its redaction are derived inside
+/// [`submit_signed_invoke`] from `auth_address` (or `target_contract`), never
+/// from the caller.
+///
+/// Outcomes, all before any simulation or signature:
+///
+/// - drift refuses with [`SaError::VerifierHashDrift`] or
+///   [`SaError::PolicyHashDrift`], and the check writes a
+///   `SaVerifierHashDrift` / `SaPolicyHashDrift` row carrying `request_id`;
+/// - any other failure of the address fetch or of a check (RPC failure or
+///   divergence, audit-log integrity error, a record with more than one
+///   verifier or policy pin, an unpinnable instance, the pre-submit budget
+///   elapsing) refuses with [`SaError::PinCheckUnavailable`] carrying the
+///   inner error's wire code;
+/// - a rule without a pin record, or without pins of a kind, passes that
+///   part of the check (the check skips it with a debug line).
+///
+/// The execute path does not run the verifier diversification gate: a rule
+/// with two pinned verifiers already refuses here through
+/// `sa.multiple_pinned_hashes_unsupported`, and the gate's value-threshold
+/// semantics, with its `accept_single_verifier` opt-in, belong to
+/// `sign_with_passkey_rule`.
+#[derive(Clone, Copy)]
+pub struct PinCheck<'a> {
+    /// Manager whose RPC clients fetch the rule and the live executables and
+    /// whose audit writer holds the pin records and receives drift rows.
+    pub signers_manager: &'a SignersManager,
+    /// Correlation id carried by drift rows and refusals.
+    pub request_id: &'a str,
+    /// The rule a verifier migration is rewriting, whose verifier check is
+    /// skipped; its policy check still runs.
+    ///
+    /// The migration's own preflight identifies, allowlists and probes the
+    /// destination verifier, and its remove step signs while the source
+    /// verifier, which may be the drifted contract the migration moves away
+    /// from, is still live. `Some(id)` is accepted only when `auth_rule_ids`
+    /// is exactly `[id]`; any other combination is refused with
+    /// [`SaError::AuthEntryConstructionFailed`] at stage
+    /// `"migrating_rule_mismatch"`, so only a submission signed under the
+    /// migrating rule alone carries the exemption. Every other caller passes
+    /// `None`.
+    pub migrating_rule: Option<u32>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ResolvedFeePerOp
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -263,6 +332,12 @@ pub struct SubmitInvokeResult {
 ///   recommended-agent-signer doctrine on [`Ed25519RuleSigner`]) pass:
 ///   - `ed25519_rule_signer: Some(Ed25519RuleSigner { signer, verifier })`
 ///   - `authorization: None` (mutually exclusive; see [`Ed25519RuleSigner`])
+/// - `pin_check` ([`PinCheck`]): `signers.rs` callers pass the manager
+///   itself, with `migrating_rule: Some(rule_id)` only on the migration step;
+///   `rules.rs` callers pass their configured manager and refuse a non-zero
+///   rule without one; `smart-account execute` and the multicall submit pass
+///   a manager built from the profile; the DeFi adapters sign under rule 0
+///   only and pass `None`.
 const EMPTY_REQUIRED_CHECKS: &[&str] = &[];
 
 /// Arguments for [`submit_signed_invoke`].
@@ -294,6 +369,9 @@ pub struct SubmitInvokeArgs<'a> {
 
     /// Context-rule IDs used for building `SimulationContext` +
     /// `EnvelopeContext`. One entry per auth-entry the caller expects.
+    ///
+    /// Every distinct non-zero entry is drift-checked before simulation; see
+    /// [`Self::pin_check`].
     pub auth_rule_ids: &'a [ContextRuleId],
 
     /// Pre-built host function (caller builds `HostFunction::InvokeContract`).
@@ -320,15 +398,16 @@ pub struct SubmitInvokeArgs<'a> {
     pub chain_id: &'a str,
 
     /// RPC budget, spent as two independent per-phase budgets. All pre-submit
-    /// RPC stages (initial fetch, initial simulate, re-fetch, re-simulate)
-    /// share ONE collective deadline of this duration, armed once at the first
-    /// pre-submit call; the submit-and-confirm poll then spends its own
-    /// separate budget of this same duration, so the base rule-install path
-    /// worst case is ~2x this value of wall clock. The optional intervening
-    /// checks (rule-expiry, multicall cross-RPC verification) run outside the
-    /// collective pre-submit deadline but consume wall clock after it is armed;
-    /// they carry their own separate budgets, so the ~2x figure describes the
-    /// base path only.
+    /// RPC stages (the pinned-hash drift check of each checked rule, initial
+    /// fetch, initial simulate, re-fetch, re-simulate) share ONE collective
+    /// deadline of this duration, armed once before the first of them; the
+    /// submit-and-confirm poll then spends its own separate budget of this
+    /// same duration, so the base rule-install path worst case is ~2x this
+    /// value of wall clock. The optional intervening checks (rule-expiry,
+    /// multicall cross-RPC verification) run outside the collective
+    /// pre-submit deadline but consume wall clock after it is armed; they
+    /// carry their own separate budgets, so the ~2x figure describes the base
+    /// path only.
     pub timeout: std::time::Duration,
 
     /// Per-operation fee (stroops). [`ResolvedFeePerOp::default()`] applies
@@ -458,6 +537,15 @@ pub struct SubmitInvokeArgs<'a> {
     /// unrecorded submit behaviour — administration verbs and deployment
     /// stages, which move no operator-capped value, leave this unset.
     pub submission_recorder: Option<&'a dyn stellar_agent_network::SubmissionRecorder>,
+
+    /// Pinned-hash drift check inputs; see [`PinCheck`].
+    ///
+    /// `None` is accepted only when every entry of `auth_rule_ids` is rule 0,
+    /// the bootstrap rule, which has no pins. A submission naming any other
+    /// rule without a check is refused before any network I/O with
+    /// [`SaError::AuthEntryConstructionFailed`] at stage
+    /// `"pin_check_required"`.
+    pub pin_check: Option<PinCheck<'a>>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -473,10 +561,11 @@ pub struct SubmitInvokeArgs<'a> {
 ///
 /// # Step ordering
 ///
-/// 1. **Pre-flight**: argument guards and the source-account fetch. No
-///    wasm-hash drift check runs: [`SubmitInvokeArgs`] carries no pin, so a
-///    caller that must refuse a drifted verifier or policy checks it before
-///    calling.
+/// 1. **Pre-flight**: argument guards, then the pinned-hash drift check of
+///    every distinct non-zero rule in `auth_rule_ids` (see [`PinCheck`]),
+///    then the source-account fetch. Rule 0 is never checked, and a
+///    submission under rule 0 only may pass `pin_check: None`; any other
+///    submission without a check is refused before network I/O.
 /// 2. **Simulate**: primary RPC; harvest `latestLedger`.
 /// 3. **Required-check enforcement + `Option<*Check>` dispatch**: for each
 ///    name in `args.required_checks`, the corresponding `Option<*Check>` MUST
@@ -500,14 +589,21 @@ pub struct SubmitInvokeArgs<'a> {
 ///
 /// # Errors
 ///
+/// - [`SaError::VerifierHashDrift`] / [`SaError::PolicyHashDrift`]: a live
+///   verifier or policy of a checked rule differs from the rule's pin record.
+/// - [`SaError::PinCheckUnavailable`]: the drift check of a rule could not
+///   run to a verdict.
 /// - [`SaError::SubmitCheckMissing`] — a name in `required_checks` maps to a
 ///   `None` `Option<*Check>` field.
 /// - [`SaError::HorizonExceeded`] — `valid_until - latest_ledger > max_horizon`.
 /// - [`SaError::RuleExpired`] — `valid_until < latest_ledger` for the expiry
 ///   check rule_id.
-/// - [`SaError::AuthEntryConstructionFailed`] — pubkey fetch, XDR encoding,
-///   simulate, or auth-entry construction failure, or a pre-submit RPC stage
-///   exceeding the collective pre-submit deadline (`args.timeout`).
+/// - [`SaError::AuthEntryConstructionFailed`]: an argument guard refused
+///   (stages `"pin_check_required"`, `"migrating_rule_mismatch"`,
+///   `"multicall_check_undeclared"`, `"ed25519_rule_signer_quorum_guard"`),
+///   or a pubkey fetch, XDR encoding, simulate, or auth-entry construction
+///   failure, or a pre-submit RPC stage exceeding the collective pre-submit
+///   deadline (`args.timeout`).
 /// - [`SaError::DeploymentFailed`] — simulate error, envelope build, or
 ///   submission failure.
 /// - [`SaError::RuleIdMismatch`] / [`SaError::SimulationDivergence`] — from
@@ -521,7 +617,7 @@ pub struct SubmitInvokeArgs<'a> {
 pub async fn submit_signed_invoke(
     args: SubmitInvokeArgs<'_>,
 ) -> Result<SubmitInvokeResult, SaError> {
-    assert_submit_invoke_args_invariants(&args);
+    validate_submit_invoke_args(&args)?;
 
     // ── Signing-path mutual-exclusivity guard — execute FIRST before any I/O ──
     // `ed25519_rule_signer` (External-Ed25519, no G-key sub-entry) and
@@ -613,21 +709,35 @@ pub async fn submit_signed_invoke(
         .map_err(|e| auth_payload_err(format!("StellarRpcClient construction failed: {e}")))?;
 
     // Pre-submit deadline: a single absolute instant, armed once here, binds
-    // the collective wall-clock budget of the FOUR unconditional pre-submit
-    // RPC stages this path always runs — the initial account fetch, the
-    // initial simulate, and the re-fetch + re-simulate inside
-    // `resimulate_with_signed_auth` (see `PreSubmitBudget` /
-    // `bound_pre_submit_stage`). Those four share this SAME deadline rather
-    // than each re-arming a fresh `args.timeout` window. The optional
-    // intervening checks (the rule-expiry check and the multicall cross-RPC
-    // verification, including its secondary-RPC simulate) are NOT bounded by
-    // this deadline — they run after it is armed and carry their own budgets.
-    // The final submit+poll stage (`submit_transaction_and_wait`) likewise
-    // keeps its own, separate `args.timeout` budget.
+    // the collective wall-clock budget of the pre-submit RPC stages: the
+    // pinned-hash drift check of each checked rule (stage "pin_check"), then
+    // the FOUR unconditional stages this path always runs: the initial
+    // account fetch, the initial simulate, and the re-fetch + re-simulate
+    // inside `resimulate_with_signed_auth` (see `PreSubmitBudget` /
+    // `bound_pre_submit_stage`). They share this SAME deadline rather than
+    // each re-arming a fresh `args.timeout` window. The optional intervening
+    // checks (the rule-expiry check and the multicall cross-RPC verification,
+    // including its secondary-RPC simulate) are NOT bounded by this deadline:
+    // they run after it is armed and carry their own budgets. The final
+    // submit+poll stage (`submit_transaction_and_wait`) likewise keeps its
+    // own, separate `args.timeout` budget.
     let pre_submit_budget = PreSubmitBudget {
         deadline: tokio::time::Instant::now() + args.timeout,
         total: args.timeout,
     };
+
+    // ── Step 1: pinned-hash drift check, before anything is simulated ──────
+    // `validate_submit_invoke_args` refused a submission naming a non-zero
+    // rule without a check, so `None` here means rule 0 only.
+    if let Some(pin_check) = &args.pin_check {
+        run_pin_check(
+            pin_check,
+            args.auth_rule_ids,
+            &auth_scaddr,
+            pre_submit_budget,
+        )
+        .await?;
+    }
 
     let source_view = bound_pre_submit_stage(
         pre_submit_budget,
@@ -1416,36 +1526,183 @@ pub(crate) fn map_submit_error(
     }
 }
 
-/// Asserts the [`SubmitInvokeArgs`] cross-field invariant that a caller which
-/// supplies `multicall_check: Some(_)` also declares `"multicall"` in
-/// `required_checks`.
+/// Refuses a [`SubmitInvokeArgs`] whose fields contradict each other,
+/// before any network I/O.
 ///
-/// # Release-mode semantics
+/// - `multicall_check: Some(_)` requires `"multicall"` in `required_checks`,
+///   so the required-check enforcement always covers a multicall submission
+///   (stage `"multicall_check_undeclared"`).
+/// - `pin_check: None` is accepted only when every entry of `auth_rule_ids`
+///   is rule 0, the bootstrap rule with no pins (stage
+///   `"pin_check_required"`).
+/// - `pin_check.migrating_rule: Some(id)` is accepted only when
+///   `auth_rule_ids` is exactly `[id]` (stage `"migrating_rule_mismatch"`).
 ///
-/// This is a `debug_assert!` and compiles to nothing in release builds. The
-/// substantive production-side guarantee against the inverse misuse comes from
-/// **Step 4** (cross-RPC trust-anchor block at `submit_signed_invoke`),
-/// which runs unconditionally whenever `multicall_check.is_some() &&
-/// secondary_rpc_url.is_some()` and enforces network-passphrase + bundle-
-/// descriptor consistency. The debug assertion exists as a tripwire to catch
-/// programming errors at test-time before they reach a production binary.
+/// # Errors
 ///
-/// In single-RPC release builds (`secondary_rpc_url: None`), Step 4 does not
-/// fire AND the debug assertion is compiled out, so a misconfigured caller
-/// (`multicall_check: Some(_)` without `"multicall"` in `required_checks`)
-/// would silently degrade to a non-multicall submit without `check_required`
-/// firing. Library callers MUST construct `SubmitInvokeArgs` via the
-/// `bon::Builder` and pair `.multicall_check(...)` with
-/// `.required_checks(&["multicall"])`. The internal wallet caller in
-/// [`crate::multicall::submit_multicall_bundle`] does this correctly.
+/// [`SaError::AuthEntryConstructionFailed`] at the stage named above.
+fn validate_submit_invoke_args(args: &SubmitInvokeArgs<'_>) -> Result<(), SaError> {
+    if args.multicall_check.is_some() && !args.required_checks.contains(&"multicall") {
+        return Err(SaError::AuthEntryConstructionFailed {
+            stage: "multicall_check_undeclared",
+            redacted_reason: format!(
+                "{}: multicall_check requires \"multicall\" in required_checks",
+                args.op_label
+            ),
+        });
+    }
+    match &args.pin_check {
+        None => {
+            if let Some(rule_id) = args
+                .auth_rule_ids
+                .iter()
+                .map(ContextRuleId::as_u32)
+                .find(|id| *id != 0)
+            {
+                return Err(SaError::AuthEntryConstructionFailed {
+                    stage: "pin_check_required",
+                    redacted_reason: format!(
+                        "{}: rule {rule_id} is authorized without a pinned-hash drift check; \
+                         only rule 0 may sign without one",
+                        args.op_label
+                    ),
+                });
+            }
+        }
+        Some(PinCheck {
+            migrating_rule: Some(migrating_rule),
+            ..
+        }) => {
+            if args.auth_rule_ids != [ContextRuleId::new(*migrating_rule)] {
+                return Err(SaError::AuthEntryConstructionFailed {
+                    stage: "migrating_rule_mismatch",
+                    redacted_reason: format!(
+                        "{}: the verifier-check exemption for migrating rule {migrating_rule} \
+                         requires auth_rule_ids to be exactly [{migrating_rule}]",
+                        args.op_label
+                    ),
+                });
+            }
+        }
+        Some(PinCheck {
+            migrating_rule: None,
+            ..
+        }) => {}
+    }
+    Ok(())
+}
+
+/// Runs the pinned-hash drift check of every distinct non-zero rule in
+/// `auth_rule_ids`, in order, each bounded by `budget` as stage
+/// `"pin_check"`; see [`PinCheck`] for the outcomes.
 ///
-/// Debug-mode tripwire that surfaces programming errors at test time.
-fn assert_submit_invoke_args_invariants(args: &SubmitInvokeArgs<'_>) {
-    debug_assert!(
-        args.multicall_check.is_none() || args.required_checks.contains(&"multicall"),
-        "SubmitInvokeArgs invariant: multicall_check requires required_checks to contain \
-         \"multicall\""
-    );
+/// # Errors
+///
+/// - [`SaError::VerifierHashDrift`] / [`SaError::PolicyHashDrift`] unchanged
+///   from the check.
+/// - [`SaError::PinCheckUnavailable`] for every other failure, including the
+///   budget elapsing.
+/// - [`SaError::ScAddressEncodingFailed`] when the smart account has no
+///   strkey form.
+async fn run_pin_check(
+    pin_check: &PinCheck<'_>,
+    auth_rule_ids: &[ContextRuleId],
+    smart_account: &ScAddress,
+    budget: PreSubmitBudget,
+) -> Result<(), SaError> {
+    let smart_account_redacted = redact_strkey_first5_last5(&scaddress_to_strkey(smart_account)?);
+    let mut rule_ids: Vec<u32> = Vec::with_capacity(auth_rule_ids.len());
+    for rule_id in auth_rule_ids.iter().map(ContextRuleId::as_u32) {
+        if rule_id != 0 && !rule_ids.contains(&rule_id) {
+            rule_ids.push(rule_id);
+        }
+    }
+
+    let mut cache = HashMap::new();
+    for rule_id in rule_ids {
+        let outcome = bound_pre_submit_stage(
+            budget,
+            "pin_check",
+            check_rule_pins(
+                pin_check,
+                smart_account,
+                rule_id,
+                &smart_account_redacted,
+                &mut cache,
+            ),
+        )
+        .await;
+        let inner = match outcome {
+            Ok(Ok(())) => continue,
+            Ok(Err(
+                drift @ (SaError::VerifierHashDrift { .. } | SaError::PolicyHashDrift { .. }),
+            )) => {
+                return Err(drift);
+            }
+            Ok(Err(inner)) | Err(inner) => inner,
+        };
+        tracing::warn!(
+            rule_id,
+            smart_account = %smart_account_redacted,
+            error_code = inner.wire_code(),
+            "pinned-hash drift check could not run; refusing before signing"
+        );
+        return Err(SaError::PinCheckUnavailable {
+            rule_id,
+            smart_account_redacted: RedactedStrkey::from_already_redacted(
+                smart_account_redacted.as_str(),
+            ),
+            reason: pin_check_reason(&inner),
+            request_id: pin_check.request_id.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Checks one rule: fetches its verifier and policy addresses, then compares
+/// each verifier (unless the rule is the migrating rule) and each policy
+/// against the rule's pin record, sharing `cache` across calls.
+async fn check_rule_pins(
+    pin_check: &PinCheck<'_>,
+    smart_account: &ScAddress,
+    rule_id: u32,
+    smart_account_redacted: &str,
+    cache: &mut HashMap<Vec<u8>, crate::managers::signers::ObservedExecutable>,
+) -> Result<(), SaError> {
+    let manager = pin_check.signers_manager;
+    let (verifier_addrs, policy_addrs) = manager
+        .fetch_verifier_and_policy_addresses(smart_account.clone(), rule_id, None)
+        .await?;
+    if pin_check.migrating_rule == Some(rule_id) {
+        tracing::debug!(
+            rule_id,
+            "pinned-hash drift check: verifier check skipped for the migrating rule"
+        );
+    } else {
+        for verifier_addr in verifier_addrs {
+            verify_pinned_verifier_against_chain(
+                manager,
+                verifier_addr,
+                rule_id,
+                smart_account_redacted,
+                pin_check.request_id,
+                cache,
+            )
+            .await?;
+        }
+    }
+    for policy_addr in policy_addrs {
+        verify_pinned_policy_against_chain(
+            manager,
+            policy_addr,
+            rule_id,
+            smart_account_redacted,
+            pin_check.request_id,
+            cache,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1789,10 +2046,10 @@ mod tests {
         assert!(check_required(&args, "multicall", hf_kind).is_ok());
     }
 
-    #[cfg(debug_assertions)]
+    /// `multicall_check: Some(_)` without `"multicall"` in `required_checks`
+    /// is refused with a typed error in every build profile.
     #[test]
-    #[should_panic(expected = "multicall_check requires required_checks")]
-    fn submit_invariant_panics_when_multicall_check_is_undeclared() {
+    fn submit_guard_refuses_an_undeclared_multicall_check() {
         let mc = MulticallCheck {
             registry_entry_address: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                 .to_owned(),
@@ -1801,15 +2058,24 @@ mod tests {
             network_passphrase: "Test SDF Network ; September 2015".to_owned(),
         };
         let args = minimal_args(Some(mc), &[]);
-        assert_submit_invoke_args_invariants(&args);
+        let err = validate_submit_invoke_args(&args).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SaError::AuthEntryConstructionFailed {
+                    stage: "multicall_check_undeclared",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
-    /// Positive companion to [`submit_invariant_panics_when_multicall_check_is_undeclared`].
-    /// `multicall_check: Some(_)` paired with `"multicall"` in `required_checks`
-    /// satisfies the invariant; no panic.
-    #[cfg(debug_assertions)]
+    /// Positive companion: `multicall_check: Some(_)` paired with
+    /// `"multicall"` in `required_checks`, and no multicall check at all,
+    /// both pass the guard.
     #[test]
-    fn submit_invariant_holds_when_multicall_check_is_declared() {
+    fn submit_guard_accepts_a_declared_or_absent_multicall_check() {
         let mc = MulticallCheck {
             registry_entry_address: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                 .to_owned(),
@@ -1817,18 +2083,8 @@ mod tests {
                 "267e94a092df01fa02ad4edf8320a98bd65e4d4d6575254ac9521cb65727f3d4".to_owned(),
             network_passphrase: "Test SDF Network ; September 2015".to_owned(),
         };
-        let args = minimal_args(Some(mc), &["multicall"]);
-        // Must not panic; the invariant holds when the check is declared.
-        assert_submit_invoke_args_invariants(&args);
-    }
-
-    /// The invariant also holds in the trivial case: no multicall check,
-    /// no multicall declaration in required_checks.
-    #[cfg(debug_assertions)]
-    #[test]
-    fn submit_invariant_holds_when_no_multicall_check() {
-        let args = minimal_args(None, &[]);
-        assert_submit_invoke_args_invariants(&args);
+        validate_submit_invoke_args(&minimal_args(Some(mc), &["multicall"])).unwrap();
+        validate_submit_invoke_args(&minimal_args(None, &[])).unwrap();
     }
 
     /// `check_required` with `required_checks = &["multicall"]` and

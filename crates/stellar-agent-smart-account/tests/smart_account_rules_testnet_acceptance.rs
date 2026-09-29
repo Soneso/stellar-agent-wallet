@@ -48,13 +48,19 @@
 //!   `self.audit_writer = Some(arc)` (the production CLI pattern) emits both
 //!   a `SaContextRuleCreated` row AND a `SaRawInvocation(Success)` row on the
 //!   audit log via the `self.audit_writer` fallback path.
+//! - A rule mutation authorized by the rule itself runs in the production
+//!   shape: a manager built `with_signers_manager` over the shared audit log,
+//!   a rule with a simple-threshold policy baselined through `list_signers`,
+//!   and `update_name` under that rule passing the signer-set divergence
+//!   check and the pinned-hash drift check.
 
 #![cfg(feature = "testnet-integration")]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    reason = "test-only"
+    clippy::print_stderr,
+    reason = "test-only; the testnet identifiers print for the run record"
 )]
 
 mod common;
@@ -68,19 +74,22 @@ use common::{TESTNET_PASSPHRASE, TESTNET_RPC_URL, fund_via_friendbot};
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::schema::{EventKind, SaInvocationResult};
+use stellar_agent_core::audit_log::schema::{EventKind, PinsUpdateReason, SaInvocationResult};
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::{Signer, SoftwareSigningKey};
 use stellar_agent_smart_account::deployment::{
-    DeployerKeypair, DeploymentArgs, ResolvedFeePerOp, deploy_smart_account,
+    DeployerKeypair, DeploymentArgs, PolicyDeployArgs, PolicyDeployKind, ResolvedFeePerOp,
+    deploy_policy, deploy_smart_account,
 };
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
-    ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRuleSignerInput,
-    parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
+    ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRulePolicy,
+    ContextRuleSignerInput, parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
+use stellar_agent_smart_account::managers::signers::{SignersManager, SignersManagerConfig};
+use stellar_agent_smart_account::simple_threshold_policy::build_simple_threshold_install_param;
 use tempfile::TempDir;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -278,9 +287,9 @@ async fn full_metadata_only_lifecycle_on_testnet() {
 
     // ── install a fresh rule ──────────────────────────────────────────
     // Build the rule definition: a delegated signer = signer_g (re-using
-    // the bootstrap signer is not required, but simplifies the test —
-    // the same signer authorises both the install AND the new rule's
-    // own subsequent operations).
+    // the bootstrap signer is not required, but simplifies the test). The
+    // bootstrap rule authorises the install and the rule's subsequent
+    // operations.
     let signer_addr = parse_g_strkey_to_signer_address(&signer_g)
         .expect("signer G-strkey must parse to ScAddress");
     // OZ `MAX_NAME_SIZE = 20` bytes — name must fit.
@@ -335,7 +344,9 @@ async fn full_metadata_only_lifecycle_on_testnet() {
     );
 
     // ── rename ────────────────────────────────────────────────────────
-    let auth_rule_ids = vec![ContextRuleId::new(rule_id)];
+    // Rule 0 authorizes: this manager has no signers manager, so an
+    // authorizing rule other than 0 is refused before signing.
+    let auth_rule_ids = vec![ContextRuleId::new(0)];
     manager
         .update_name(
             smart_account.clone(),
@@ -368,7 +379,9 @@ async fn full_metadata_only_lifecycle_on_testnet() {
     // `smart_account_session_rule_horizon_testnet_acceptance.rs`; here we use an
     // uncapped manager to avoid the cap interfering with the lifecycle test.
     let uncapped_manager = fresh_manager_uncapped();
-    let auth_rule_ids = vec![ContextRuleId::new(rule_id)];
+    // Rule 0 authorizes: this manager has no signers manager, so an
+    // authorizing rule other than 0 is refused before signing.
+    let auth_rule_ids = vec![ContextRuleId::new(0)];
     uncapped_manager
         .update_valid_until(
             smart_account.clone(),
@@ -391,7 +404,9 @@ async fn full_metadata_only_lifecycle_on_testnet() {
     );
 
     // ── clear expiry (the clear-expiry carve-out) ───────────────────────────────
-    let auth_rule_ids = vec![ContextRuleId::new(rule_id)];
+    // Rule 0 authorizes: this manager has no signers manager, so an
+    // authorizing rule other than 0 is refused before signing.
+    let auth_rule_ids = vec![ContextRuleId::new(0)];
     uncapped_manager
         .update_valid_until(
             smart_account.clone(),
@@ -414,7 +429,9 @@ async fn full_metadata_only_lifecycle_on_testnet() {
     );
 
     // ── delete the rule ───────────────────────────────────────────────
-    let auth_rule_ids = vec![ContextRuleId::new(rule_id)];
+    // Rule 0 authorizes: this manager has no signers manager, so an
+    // authorizing rule other than 0 is refused before signing.
+    let auth_rule_ids = vec![ContextRuleId::new(0)];
     manager
         .delete_rule(
             smart_account.clone(),
@@ -708,7 +725,9 @@ async fn e2_metadata_updates_emit_typed_forensic_rows() {
             smart_account.clone(),
             rule_id,
             "e2-renamed".to_owned(), // 10 bytes, within OZ MAX_NAME_SIZE = 20
-            vec![ContextRuleId::new(rule_id)],
+            // Rule 0 authorizes: this manager has no signers manager, so an
+            // authorizing rule other than 0 is refused before signing.
+            vec![ContextRuleId::new(0)],
             signer_box.as_ref(),
             None,
             rename_request_id.clone(),
@@ -724,7 +743,9 @@ async fn e2_metadata_updates_emit_typed_forensic_rows() {
             smart_account.clone(),
             rule_id,
             None,
-            vec![ContextRuleId::new(rule_id)],
+            // Rule 0 authorizes: this manager has no signers manager, so an
+            // authorizing rule other than 0 is refused before signing.
+            vec![ContextRuleId::new(0)],
             signer_box.as_ref(),
             None,
             expiry_request_id.clone(),
@@ -825,5 +846,295 @@ async fn e2_metadata_updates_emit_typed_forensic_rows() {
         raw_ok_count, 3,
         "each of install/rename/expiry-clear must emit a SaRawInvocation(sa.ok) row; \
          found {raw_ok_count}"
+    );
+}
+
+/// A rule renamed under its own authority through the production manager
+/// shape: the `ContextRuleManager` carries a signers manager on the same
+/// audit log, as `SmartAccountContext::context_rule_manager` builds it.
+///
+/// 1. Deploy a smart account and a simple-threshold policy.
+/// 2. Install a Default rule whose sole signer is the bootstrap signer, with
+///    the policy at threshold 1, authorized by rule 0. The install pins the
+///    policy's Wasm hash in `SaContextRuleCreated`.
+/// 3. Baseline the rule's signer set with `list_signers`.
+/// 4. Rename the rule with `auth_rule_ids = [rule_id]`: the divergence check
+///    compares the live signer set against the baseline, and the drift check
+///    compares the live policy hash against the pin, before signing.
+/// 5. Assert one `SaContextRuleNameUpdated` row carrying the rename's request
+///    id and no `SaVerifierHashDrift` / `SaPolicyHashDrift` row.
+/// 6. Write a `SaContextRulePinsUpdated` row whose policy pin differs from
+///    the deployed policy, rename again under `[rule_id]`, and assert the
+///    rename is refused with `PolicyHashDrift` for the rule and one
+///    `SaPolicyHashDrift` row carrying that rename's request id.
+#[tokio::test(flavor = "multi_thread")]
+async fn e3_self_authorized_rename_through_the_production_manager_shape() {
+    let (signer_g, signer_box) = fresh_signer();
+    fund_via_friendbot(&signer_g).await;
+
+    let smart_account_strkey = deploy_fresh_smart_account_with_initial_signer(&signer_g).await;
+    let smart_account = parse_c_strkey_to_smart_account(&smart_account_strkey)
+        .expect("deployed C-strkey must parse");
+
+    let (policy_deployer_g, policy_deployer) = fresh_deployer_keypair();
+    fund_via_friendbot(&policy_deployer_g).await;
+    let registry_dir = tempfile::tempdir().expect("tempdir must succeed");
+    let policy = deploy_policy(
+        PolicyDeployArgs {
+            kind: PolicyDeployKind::SimpleThreshold,
+            deployer: policy_deployer,
+            network_passphrase: TESTNET_PASSPHRASE.to_owned(),
+            rpc_url: TESTNET_RPC_URL.to_owned(),
+            timeout: Duration::from_secs(120),
+            fee: ResolvedFeePerOp {
+                stroops: 1_000_000,
+                percentile_label: "explicit".to_owned(),
+            },
+            dry_run: false,
+            registry_path_override: Some(registry_dir.path().join("networks.toml")),
+        },
+        None,
+    )
+    .await
+    .expect("threshold-policy deployment must succeed on testnet");
+    let policy_sc =
+        parse_c_strkey_to_smart_account(&policy.policy_address).expect("policy C-strkey parses");
+
+    let (audit_arc, log_path, _temp_dir) = tmp_audit_writer();
+    let signers_manager = Arc::new(
+        SignersManager::new(SignersManagerConfig::new(
+            TESTNET_RPC_URL.to_owned(),
+            TESTNET_RPC_URL.to_owned(),
+            Arc::clone(&audit_arc),
+            log_path.clone(),
+            TESTNET_PASSPHRASE.to_owned(),
+            "rules-acceptance".to_owned(),
+            Duration::from_secs(120),
+            CHAIN_ID.to_owned(),
+        ))
+        .expect("SignersManager::new must succeed"),
+    );
+    let manager = ContextRuleManager::new(
+        ContextRuleManagerConfig::new(
+            TESTNET_RPC_URL.to_owned(),
+            TESTNET_PASSPHRASE.to_owned(),
+            Duration::from_secs(120),
+            CHAIN_ID.to_owned(),
+        )
+        .with_audit_writer(Arc::clone(&audit_arc))
+        .with_signers_manager(Arc::clone(&signers_manager)),
+    )
+    .expect("manager construction with a signers manager must succeed");
+
+    let signer_addr = parse_g_strkey_to_signer_address(&signer_g)
+        .expect("signer G-strkey must parse to ScAddress");
+    let definition = ContextRuleDefinition::new(
+        RuleContext::Default,
+        "e3-self-auth".to_owned(),
+        None,
+        vec![ContextRuleSignerInput::Delegated {
+            address: signer_addr,
+        }],
+        vec![ContextRulePolicy::new(
+            policy_sc,
+            build_simple_threshold_install_param(1).expect("threshold param builds"),
+        )],
+    );
+    let installed = manager
+        .install_rule(
+            smart_account.clone(),
+            definition,
+            vec![ContextRuleId::new(0)],
+            signer_box.as_ref(),
+            None,
+            rid(),
+            false,
+            false,
+        )
+        .await
+        .expect("install_rule with a vendored threshold policy must succeed");
+    let rule_id = installed.rule_id;
+    assert_ne!(
+        rule_id, 0,
+        "the installed rule must not be the bootstrap rule"
+    );
+    eprintln!(
+        "e3: smart account {smart_account_strkey}, policy {} (deploy tx {}), \
+         rule {rule_id} installed in tx {}",
+        policy.policy_address,
+        policy.tx_hash.as_deref().unwrap_or("already deployed"),
+        installed.tx_hash
+    );
+
+    let baseline = signers_manager
+        .list_signers(smart_account.clone(), rule_id, Some(&signer_g), rid())
+        .await
+        .expect("list_signers must baseline the rule");
+    assert_eq!(
+        baseline.threshold, 1,
+        "the baseline must read the policy's threshold"
+    );
+
+    let rename_request_id = rid();
+    manager
+        .update_name(
+            smart_account.clone(),
+            rule_id,
+            "e3-renamed".to_owned(),
+            vec![ContextRuleId::new(rule_id)],
+            signer_box.as_ref(),
+            None,
+            rename_request_id.clone(),
+        )
+        .await
+        .expect("a rename authorized by the rule itself must pass both checks and confirm");
+
+    let entries = read_audit_entries(&log_path);
+
+    let (created_smart_account, created_verifier_pins, created_policy_pins) = entries
+        .iter()
+        .find_map(|e| match &e.event_kind {
+            EventKind::SaContextRuleCreated {
+                smart_account,
+                rule_id: rid,
+                pinned_verifier_wasm_hashes_first8,
+                pinned_policy_wasm_hashes_first8,
+                ..
+            } if *rid == rule_id => Some((
+                smart_account.clone(),
+                pinned_verifier_wasm_hashes_first8.clone(),
+                pinned_policy_wasm_hashes_first8.clone(),
+            )),
+            _ => None,
+        })
+        .expect("install_rule must write SaContextRuleCreated for the rule");
+    // The pin is the hash's first 8 bytes, 16 hex characters.
+    let deployed_policy_first8 = policy.policy_wasm_sha256[..16].to_owned();
+    assert_eq!(
+        created_policy_pins,
+        vec![deployed_policy_first8.clone()],
+        "the install must pin the deployed policy's Wasm hash"
+    );
+
+    let name_rows: Vec<_> = entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.event_kind,
+                EventKind::SaContextRuleNameUpdated { rule_id: rid, .. } if *rid == rule_id
+            )
+        })
+        .collect();
+    assert_eq!(
+        name_rows.len(),
+        1,
+        "exactly one SaContextRuleNameUpdated row for rule_id={rule_id}; found {}",
+        name_rows.len()
+    );
+    assert_eq!(
+        name_rows[0].request_id, rename_request_id,
+        "the name row must carry the rename's request id"
+    );
+
+    let drift_rows = entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.event_kind,
+                EventKind::SaVerifierHashDrift { .. } | EventKind::SaPolicyHashDrift { .. }
+            )
+        })
+        .count();
+    assert_eq!(drift_rows, 0, "an unchanged rule must write no drift row");
+
+    // A pin record whose policy pin differs from the deployed policy: the
+    // next rename under the rule's own authority is refused before signing.
+    let wrong_policy_first8 = "0101010101010101".to_owned();
+    assert_ne!(wrong_policy_first8, deployed_policy_first8);
+    audit_arc
+        .lock()
+        .expect("audit writer lock")
+        .write_entry(AuditEntry::new_sa_context_rule_pins_updated(
+            created_smart_account,
+            rule_id,
+            PinsUpdateReason::PolicyAdded,
+            CHAIN_ID,
+            rid(),
+            created_verifier_pins,
+            vec![wrong_policy_first8.clone()],
+            false,
+            false,
+            vec![],
+            vec![],
+        ))
+        .expect("the pins-updated row must be written");
+
+    let drift_request_id = rid();
+    let err = manager
+        .update_name(
+            smart_account.clone(),
+            rule_id,
+            "e3-renamed-again".to_owned(),
+            vec![ContextRuleId::new(rule_id)],
+            signer_box.as_ref(),
+            None,
+            drift_request_id.clone(),
+        )
+        .await
+        .expect_err("a rename under a rule whose policy differs from its pin must be refused");
+    match &err {
+        SaError::PolicyHashDrift {
+            rule_id: drift_rule_id,
+            pinned_hash_first8,
+            observed_hash_first8,
+            ..
+        } => {
+            assert_eq!(*drift_rule_id, rule_id);
+            assert_eq!(pinned_hash_first8, &wrong_policy_first8);
+            assert_eq!(observed_hash_first8, &deployed_policy_first8);
+        }
+        other => panic!("expected PolicyHashDrift for rule {rule_id}; got {other:?}"),
+    }
+    eprintln!("e3: rename {drift_request_id} under rule {rule_id} refused: {err}");
+
+    drop(manager);
+    let entries = read_audit_entries(&log_path);
+    let policy_drift_rows: Vec<_> = entries
+        .iter()
+        .filter(|e| matches!(&e.event_kind, EventKind::SaPolicyHashDrift { .. }))
+        .collect();
+    assert_eq!(
+        policy_drift_rows.len(),
+        1,
+        "exactly one SaPolicyHashDrift row; found {}",
+        policy_drift_rows.len()
+    );
+    assert_eq!(
+        policy_drift_rows[0].request_id, drift_request_id,
+        "the drift row must carry the refused rename's request id"
+    );
+    match &policy_drift_rows[0].event_kind {
+        EventKind::SaPolicyHashDrift {
+            rule_id: row_rule_id,
+            pinned_hash_first8,
+            ..
+        } => {
+            assert_eq!(*row_rule_id, rule_id);
+            assert_eq!(pinned_hash_first8, &wrong_policy_first8);
+        }
+        other => panic!("expected SaPolicyHashDrift; got {other:?}"),
+    }
+    let renamed_again = entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.event_kind,
+                EventKind::SaContextRuleNameUpdated { rule_id: rid, .. } if *rid == rule_id
+            )
+        })
+        .count();
+    assert_eq!(
+        renamed_again, 1,
+        "the refused rename must write no name row"
     );
 }

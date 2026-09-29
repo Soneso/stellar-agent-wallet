@@ -575,7 +575,9 @@ async fn h3_add_policy_increments_count_and_emits_audit_row() {
     let mut audit_writer = audit_writer_arc.lock().expect("audit writer lock");
     let request_id = rid();
 
-    let auth_rule_ids = vec![ContextRuleId::new(rule_id)];
+    // Rule 0 authorizes: this manager has no signers manager, so an
+    // authorizing rule other than 0 is refused before signing.
+    let auth_rule_ids = vec![ContextRuleId::new(0)];
 
     let add_policy_result = rule_manager
         .add_policy(
@@ -587,6 +589,8 @@ async fn h3_add_policy_increments_count_and_emits_audit_row() {
             signer_box.as_ref(),
             Some(&mut *audit_writer),
             request_id.clone(),
+            false, // accept_mutable_verifier
+            false, // accept_unknown_verifier
         )
         .await;
     drop(audit_writer); // release the lock before reading the log
@@ -809,10 +813,14 @@ async fn h4_remove_policy_decrements_count_and_emits_audit_row() {
             rule_id,
             policy_addr_b.clone(),
             threshold_params.clone(),
-            vec![ContextRuleId::new(rule_id)],
+            // Rule 0 authorizes: this manager has no signers manager, so an
+            // authorizing rule other than 0 is refused before signing.
+            vec![ContextRuleId::new(0)],
             signer_box.as_ref(),
             None,
             rid(),
+            false, // accept_mutable_verifier
+            false, // accept_unknown_verifier
         )
         .await
         .expect("[h4] add_policy(policy_addr_b) must succeed (establishing policy_count=2)");
@@ -845,7 +853,9 @@ async fn h4_remove_policy_decrements_count_and_emits_audit_row() {
             sa_addr.clone(),
             rule_id,
             policy_id_to_remove,
-            vec![ContextRuleId::new(rule_id)],
+            // Rule 0 authorizes: this manager has no signers manager, so an
+            // authorizing rule other than 0 is refused before signing.
+            vec![ContextRuleId::new(0)],
             signer_box.as_ref(),
             Some(&mut *audit_writer),
             request_id.clone(),
@@ -1115,10 +1125,14 @@ async fn h5_add_policy_type_mismatched_install_param_no_success_audit() {
             rule_id,
             policy_addr_b,
             mismatched_param,
-            vec![ContextRuleId::new(rule_id)],
+            // Rule 0 authorizes: this manager has no signers manager, so an
+            // authorizing rule other than 0 is refused before signing.
+            vec![ContextRuleId::new(0)],
             signer_box.as_ref(),
             Some(&mut *audit_writer),
             request_id.clone(),
+            false, // accept_mutable_verifier
+            false, // accept_unknown_verifier
         )
         .await;
     drop(audit_writer); // release lock before reading

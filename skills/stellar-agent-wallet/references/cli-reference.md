@@ -327,26 +327,26 @@ Every verb's exact flags, the mainnet-refusal matrix, signer-kind discriminators
 | `rules set-valid-until` | Change a rule's expiry ledger |
 | `rules delete` | Remove a rule |
 | `rules verify-pins` | Verify pinned verifier/policy WASM hashes vs on-chain (drift; read-only, exit `1` on drift); names pinned and observed external-reference executables |
-| `rules add-policy` | Attach a policy (`--kind raw`/`spending-limit`/`simple-threshold`/`weighted-threshold`); cap 5 |
-| `rules remove-policy` | Detach a policy by id |
+| `rules add-policy` | Attach a policy (`--kind raw`/`spending-limit`/`simple-threshold`/`weighted-threshold`); cap 5; on a pinned rule the new policy is probed and pinned (`--accept-mutable-verifier` / `--accept-unknown-verifier`) |
+| `rules remove-policy` | Detach a policy by id; on a pinned rule its pin is dropped |
 | `rules list` / `list-rules` | Enumerate active rules by on-chain scan (read-only, mainnet OK) |
 | `rules get-spending-limit` | Read an installed spending-limit policy's rolling-window budget (read-only; amounts are decimal strings) |
 | `rules set-spending-limit` | Retune a spending-limit cap without resetting history. `--auth-rule-id` default 0: the retuned CallContract rule cannot authorize its own retune — name an admin-capable rule. Period is immutable |
 | `signers list` | Read the on-chain signer set; baselines if none |
 | `signers refresh` | Re-anchor the signer-set baseline |
-| `signers add` | Add one signer (cap 15). `--signer-ed25519` is the recommended agent-key shape |
+| `signers add` | Add one signer (cap 15). `--signer-ed25519` is the recommended agent-key shape. On a pinned rule, writes `SaContextRulePinsUpdated` for an External signer; `--accept-mutable-verifier` / `--accept-unknown-verifier` apply to a new verifier |
 | `signers remove` | Remove a signer; refuses if it would drop below threshold |
 | `signers set-threshold` | Change a simple-threshold policy's threshold (authorizer is `--rule-id`) |
 | `signers set-weighted-threshold` | Change a weighted-threshold policy's threshold (use an admin `--auth-rule-id` when `--rule-id` is scoped) |
 | `signers set-signer-weight` | Change one signer's weight in a weighted-threshold policy |
-| `signers batch-add` | Add multiple signers in one transaction (cap 15). Result-fetch needs a simple-threshold policy on the rule |
-| `execute` | Submit one `CallContract` invocation authorized by a rule and signed by an External-Ed25519 rule signer — the delegation verb; `--auth-rule-id` has NO default; no MCP equivalent |
+| `signers batch-add` | Add multiple signers in one transaction (cap 15). Result-fetch needs a simple-threshold policy on the rule. Pin-record update and override flags as `signers add` |
+| `execute` | Submit one `CallContract` invocation authorized by a rule and signed by an External-Ed25519 rule signer (the delegation verb); `--auth-rule-id` has NO default; no MCP equivalent. Refuses before signing with `sa.verifier_hash_drift` / `sa.policy_hash_drift` when a rule's verifier or policy differs from its pin, `sa.pin_check_unavailable` when the check cannot run |
 | `multicall` | Submit an atomic 1–50-invocation bundle through the registered router; requires `--secondary-rpc-url` (flag or profile, else a typed error) |
 | `deploy-webauthn-verifier` | Deploy the OZ WebAuthn-verifier WASM; idempotent; testnet only |
 | `deploy-ed25519-verifier` | Deploy the OZ Ed25519-verifier WASM (backs `--signer-ed25519`); testnet only |
 | `deploy-spending-limit-policy` | Deploy the OZ spending-limit-policy WASM (per-network singleton); testnet only |
 | `deploy-policy` | Deploy any of the three OZ policy contracts via one `--kind`; recommended; testnet only |
-| `migrate-verifier` | Move all External signers from one verifier to another across rules; mainnet submit refused, mainnet dry-run allowed |
+| `migrate-verifier` | Move all External signers from one verifier to another across rules; mainnet submit refused, mainnet dry-run allowed. Checks each migrating rule's policies before signing; writes `SaContextRulePinsUpdated` naming the destination for a pinned rule |
 | `list-verifiers` | Enumerate the compile-time verifier allowlist and audit-status taxonomy (read-only, no network) |
 | `register-multicall` / `unregister-multicall` | Edit the local multicall-router registry |
 | `timelock schedule` / `cancel` / `execute` / `list-pending` | OpenZeppelin upgrade-timelock lifecycle; write verbs refuse `mainnet`, `list-pending` is read-only |

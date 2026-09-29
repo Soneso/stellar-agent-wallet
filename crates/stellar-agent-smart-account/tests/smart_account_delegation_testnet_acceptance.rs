@@ -66,6 +66,8 @@
 )]
 
 mod common;
+#[path = "common/pin_check_manager.rs"]
+mod pin_check_manager;
 
 use std::path::Path;
 use std::time::Duration;
@@ -93,7 +95,7 @@ use stellar_agent_smart_account::managers::rules::{
 };
 use stellar_agent_smart_account::spending_limit_policy::build_spending_limit_install_param;
 use stellar_agent_smart_account::submit::{
-    Ed25519RuleSigner, SubmitInvokeArgs, submit_signed_invoke,
+    Ed25519RuleSigner, PinCheck, SubmitInvokeArgs, submit_signed_invoke,
 };
 use stellar_agent_test_support::testnet_helpers::fund_sac_balance;
 use stellar_baselib::account::{Account as BaselibAccount, AccountBehavior};
@@ -354,6 +356,8 @@ async fn agent_delegation_full_flow_testnet_acceptance() {
             bootstrap_signer_box.as_ref(),
             None,
             rid(),
+            false, // accept_mutable_verifier
+            false, // accept_unknown_verifier
         )
         .await
         .expect("attaching the spending-limit policy must succeed on testnet");
@@ -384,6 +388,21 @@ async fn agent_delegation_full_flow_testnet_acceptance() {
     let recipient_scaddr =
         parse_g_strkey_to_signer_address(&recipient_g).expect("recipient G-strkey must parse");
 
+    // The rule manager in this suite writes no audit rows, so the rule has no
+    // pin record and the check fetches the rule and passes it.
+    let pin_manager = pin_check_manager::pin_check_manager(
+        TESTNET_RPC_URL,
+        TESTNET_RPC_URL,
+        "delegation-acceptance",
+        tmp.path(),
+    );
+    let pin_request_id = rid();
+    let pin_check = || PinCheck {
+        signers_manager: &pin_manager,
+        request_id: &pin_request_id,
+        migrating_rule: None,
+    };
+
     // ── Step 5: agent-signed transfer UNDER the limit — MUST succeed ────────
     let balance_before = xlm_stroops_balance(&recipient_g).await;
     let rule_ids_ok = vec![ContextRuleId::new(rule_id)];
@@ -409,6 +428,7 @@ async fn agent_delegation_full_flow_testnet_acceptance() {
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .op_label("delegation_agent_transfer_within_limit")
             .emit_observability_logs(true)
+            .pin_check(pin_check())
             .build(),
     )
     .await
@@ -455,6 +475,7 @@ async fn agent_delegation_full_flow_testnet_acceptance() {
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .op_label("delegation_agent_transfer_over_limit")
             .emit_observability_logs(true)
+            .pin_check(pin_check())
             .build(),
     )
     .await
@@ -520,6 +541,7 @@ async fn agent_delegation_full_flow_testnet_acceptance() {
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .op_label("delegation_agent_scope_violation")
             .emit_observability_logs(true)
+            .pin_check(pin_check())
             .build(),
     )
     .await

@@ -156,7 +156,7 @@ use stellar_agent_smart_account::managers::signers::{
     build_delegated_signer_scval, build_external_signer_scval,
 };
 use stellar_agent_smart_account::signers::policy_identification::THRESHOLD_POLICY_WASM;
-use stellar_agent_smart_account::submit::{SubmitInvokeArgs, submit_signed_invoke};
+use stellar_agent_smart_account::submit::{PinCheck, SubmitInvokeArgs, submit_signed_invoke};
 use stellar_agent_smart_account::verifiers::VerifierRegistry;
 use stellar_agent_smart_account::weighted_threshold_policy::{
     WEIGHTED_THRESHOLD_POLICY_WASM_SHA256, WeightedThresholdSignerInput,
@@ -991,6 +991,14 @@ async fn weighted_threshold_enforcement_proof_testnet_acceptance() {
     let (audit_writer, audit_log_path, _audit_dir) = tmp_audit_writer();
     let signers_mgr = fresh_signers_manager(audit_writer, audit_log_path.clone());
     let auth_rule_ids = vec![ContextRuleId::new(rule_id)];
+    // The rule manager writes no audit rows, so the rule has no pin record in
+    // this log and the drift check fetches the rule and passes it.
+    let pin_request_id = rid();
+    let pin_check = || PinCheck {
+        signers_manager: &signers_mgr,
+        request_id: &pin_request_id,
+        migrating_rule: None,
+    };
 
     // ── single-signer auth succeeds at threshold 1 ───────────────────────────
     let read_threshold_fn = execute_host_function(
@@ -1014,6 +1022,7 @@ async fn weighted_threshold_enforcement_proof_testnet_acceptance() {
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .op_label("wt_enforce_single_signer_at_threshold_1")
             .emit_observability_logs(true)
+            .pin_check(pin_check())
             .build(),
     )
     .await;
@@ -1149,6 +1158,7 @@ async fn weighted_threshold_enforcement_proof_testnet_acceptance() {
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .op_label("wt_enforce_single_signer_at_threshold_2")
             .emit_observability_logs(true)
+            .pin_check(pin_check())
             .build(),
     )
     .await
@@ -1198,6 +1208,7 @@ async fn weighted_threshold_enforcement_proof_testnet_acceptance() {
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .op_label("wt_enforce_dual_signer_at_threshold_2")
             .emit_observability_logs(true)
+            .pin_check(pin_check())
             .build(),
     )
     .await;
@@ -1371,6 +1382,8 @@ async fn deploy_c_external_ed25519_genesis_testnet_acceptance() {
             },
             admin_signer.as_ref(),
             rid(),
+            false, // accept_mutable_verifier
+            false, // accept_unknown_verifier
         )
         .await
         .expect("add_signer (Delegated fallback co-signer) must succeed");
@@ -1490,6 +1503,8 @@ async fn batch_add_delegated_signers_testnet_acceptance() {
             batch_signers,
             admin_signer.as_ref(),
             rid(),
+            false, // accept_mutable_verifier
+            false, // accept_unknown_verifier
         )
         .await
         .expect("batch_add_signers (3 Delegated signers) must succeed in one transaction");
@@ -1727,6 +1742,8 @@ async fn weighted_threshold_negatives_testnet_acceptance() {
             )],
             bootstrap_signer.as_ref(),
             rid(),
+            false, // accept_mutable_verifier
+            false, // accept_unknown_verifier
         )
         .await
         .expect_err(
@@ -2247,6 +2264,8 @@ async fn deploy_c_webauthn_genesis_and_batch_add_testnet_acceptance() {
             batch_signers,
             admin_signer.as_ref(),
             rid(),
+            false, // accept_mutable_verifier
+            false, // accept_unknown_verifier
         )
         .await
         .expect("batch_add_signers (3 signer kinds) must succeed in one transaction");

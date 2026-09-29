@@ -46,8 +46,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::schema::{
-    ContractKind, EventKind, ExecutableRefPin, KeyPurpose, PolicyDecision, ValueLegRecord,
-    VerifierAdvisoryKind, executable_refs_or_empty,
+    ContractKind, EventKind, ExecutableRefPin, KeyPurpose, PinsUpdateReason, PolicyDecision,
+    ValueLegRecord, VerifierAdvisoryKind, executable_refs_or_empty,
 };
 use crate::error::ValidationError;
 use crate::observability::RedactedStrkey;
@@ -687,6 +687,72 @@ impl AuditEntry {
                 pinned_policy_executable_refs: executable_refs_or_empty(
                     pinned_policy_executable_refs,
                 ),
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
+    /// Constructs a `SaContextRulePinsUpdated` audit entry.
+    ///
+    /// Emitted by `smart-account migrate-verifier`, `signers add` /
+    /// `signers batch-add` and `rules add-policy` / `rules remove-policy`
+    /// after a wallet mutation changed the live verifier or policy set of a
+    /// rule that already has a pin record. The row carries the
+    /// rule's whole pin record; the drift check reads the newest
+    /// `SaContextRuleCreated` or `SaContextRulePinsUpdated` row as the pin.
+    ///
+    /// The executable-reference lists are aligned by position with the
+    /// first-8 lists; a list whose entries are all `None` is recorded as
+    /// empty, as on `SaContextRuleCreated`.
+    ///
+    /// # Redaction
+    ///
+    /// `smart_account` MUST be pre-redacted at the call site to first-5-last-5
+    /// form via `redact_strkey_first5_last5`.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "irreducible audit-field set; mirrors new_sa_context_rule_created"
+    )]
+    pub fn new_sa_context_rule_pins_updated(
+        smart_account: impl Into<String>,
+        rule_id: u32,
+        reason: PinsUpdateReason,
+        chain_id: impl IntoOptionalChainId,
+        request_id: impl Into<String>,
+        pinned_verifier_wasm_hashes_first8: Vec<String>,
+        pinned_policy_wasm_hashes_first8: Vec<String>,
+        mutable_override: bool,
+        unknown_override: bool,
+        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
+        pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "sa.context_rule_pins_updated".to_owned(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::SaContextRulePinsUpdated {
+                smart_account: smart_account.into(),
+                rule_id,
+                pinned_verifier_wasm_hashes_first8,
+                pinned_policy_wasm_hashes_first8,
+                mutable_override,
+                unknown_override,
+                pinned_verifier_executable_refs: executable_refs_or_empty(
+                    pinned_verifier_executable_refs,
+                ),
+                pinned_policy_executable_refs: executable_refs_or_empty(
+                    pinned_policy_executable_refs,
+                ),
+                reason,
             },
             previous_entry_hash: String::new(),
         }
@@ -6756,6 +6822,74 @@ mod tests {
         };
         assert_eq!(pinned_verifier_executable_refs, &vec![None, Some(pin)]);
         assert!(pinned_policy_executable_refs.is_empty());
+    }
+
+    /// `new_sa_context_rule_pins_updated` plumbs every field through, records
+    /// an all-`None` reference list empty, carries the request id on the
+    /// outer entry, and round-trips through JSON.
+    #[test]
+    fn sa_context_rule_pins_updated_constructor_plumbs_fields() {
+        use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
+
+        let pin = ExecutableRefPin::new(
+            &ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+            &ScString(b"v2".to_vec().try_into().expect("tag fits")),
+            &[0xcdu8; 32],
+        )
+        .expect("pin builds");
+        let entry = AuditEntry::new_sa_context_rule_pins_updated(
+            "CDABC...12345",
+            4u32,
+            PinsUpdateReason::VerifierMigrated,
+            "stellar:testnet",
+            "req-pins-updated",
+            vec!["cdcdcdcdcdcdcdcd".to_owned()],
+            vec!["bbbbbbbbbbbbbbbb".to_owned()],
+            true,
+            false,
+            vec![Some(pin.clone())],
+            vec![None],
+        );
+        assert_eq!(entry.tool, "sa.context_rule_pins_updated");
+        assert_eq!(entry.request_id, "req-pins-updated");
+        assert_eq!(entry.chain_id.as_deref(), Some("stellar:testnet"));
+        let EventKind::SaContextRulePinsUpdated {
+            smart_account,
+            rule_id,
+            pinned_verifier_wasm_hashes_first8,
+            pinned_policy_wasm_hashes_first8,
+            mutable_override,
+            unknown_override,
+            pinned_verifier_executable_refs,
+            pinned_policy_executable_refs,
+            reason,
+        } = &entry.event_kind
+        else {
+            panic!(
+                "expected SaContextRulePinsUpdated; got: {:?}",
+                entry.event_kind
+            );
+        };
+        assert_eq!(smart_account, "CDABC...12345");
+        assert_eq!(*rule_id, 4);
+        assert_eq!(
+            pinned_verifier_wasm_hashes_first8,
+            &vec!["cdcdcdcdcdcdcdcd".to_owned()]
+        );
+        assert_eq!(
+            pinned_policy_wasm_hashes_first8,
+            &vec!["bbbbbbbbbbbbbbbb".to_owned()]
+        );
+        assert!(*mutable_override);
+        assert!(!*unknown_override);
+        assert_eq!(pinned_verifier_executable_refs, &vec![Some(pin)]);
+        assert!(pinned_policy_executable_refs.is_empty());
+        assert_eq!(*reason, PinsUpdateReason::VerifierMigrated);
+
+        let json = serde_json::to_string(&entry).expect("must serialise");
+        let back: AuditEntry = serde_json::from_str(&json).expect("must deserialise");
+        assert_eq!(back.event_kind, entry.event_kind);
+        assert_eq!(back.request_id, "req-pins-updated");
     }
 
     #[test]

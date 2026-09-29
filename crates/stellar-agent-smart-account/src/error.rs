@@ -120,6 +120,42 @@ fn paren_suffix(detail: &Option<String>) -> String {
         .map_or_else(String::new, |detail| format!(" ({detail})"))
 }
 
+/// Byte cap of [`SaError::PinCheckUnavailable`]'s `reason`.
+pub const PIN_CHECK_REASON_MAX_BYTES: usize = 256;
+
+/// Returns `msg` unchanged when it fits in `max_bytes` bytes, otherwise its
+/// longest prefix ending on a character boundary followed by `"..."`, the
+/// whole at most `max_bytes` bytes. A cap too small to hold the ellipsis
+/// yields an empty string.
+///
+/// Bounds an error text that embeds an inner error's Display, which can
+/// carry RPC-supplied bytes of any length.
+pub(crate) fn truncate_to_byte_cap(msg: &str, max_bytes: usize) -> String {
+    const ELLIPSIS: &str = "...";
+    if msg.len() <= max_bytes {
+        return msg.to_owned();
+    }
+    if max_bytes < ELLIPSIS.len() {
+        return String::new();
+    }
+    let mut end = max_bytes - ELLIPSIS.len();
+    while end > 0 && !msg.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{ELLIPSIS}", &msg[..end])
+}
+
+/// Builds the `reason` of [`SaError::PinCheckUnavailable`] from the error
+/// that stopped the check: its wire code, a colon and its Display, capped at
+/// [`PIN_CHECK_REASON_MAX_BYTES`] bytes. The wire code comes first so the cap
+/// never removes it.
+pub(crate) fn pin_check_reason(inner: &SaError) -> String {
+    truncate_to_byte_cap(
+        &format!("{}: {inner}", inner.wire_code()),
+        PIN_CHECK_REASON_MAX_BYTES,
+    )
+}
+
 /// Typed post-submit verification failure kind for multicall bundles.
 ///
 /// Stored inside [`SaError::MulticallFailed`] when
@@ -378,6 +414,41 @@ pub enum SaError {
         request_id: String,
     },
 
+    /// The pre-signing drift check of a rule-authorized submission could not
+    /// run to a verdict.
+    ///
+    /// Fired by `submit::submit_signed_invoke` when fetching a rule's
+    /// verifier and policy addresses, or checking one of them against the
+    /// rule's pin record, fails for any reason other than detected drift: an
+    /// RPC failure or divergence, an audit-log integrity error, a pin record
+    /// with more than one verifier or policy pin
+    /// (`sa.multiple_pinned_hashes_unsupported`), an unpinnable instance, or
+    /// the check exceeding the pre-submit budget. Nothing is signed.
+    ///
+    /// `reason` is the inner error's wire code, a colon and its Display,
+    /// capped at [`PIN_CHECK_REASON_MAX_BYTES`] bytes.
+    ///
+    /// # Forensic spine
+    ///
+    /// `smart_account_redacted` MUST be passed through
+    /// `stellar_agent_core::observability::redact_strkey_first5_last5`
+    /// at the call site.
+    #[error(
+        "pin check unavailable for rule {rule_id} (smart_account={smart_account_redacted}): \
+         {reason}; nothing was signed"
+    )]
+    #[serde(rename = "sa.pin_check_unavailable")]
+    PinCheckUnavailable {
+        /// Context-rule identifier whose check could not run.
+        rule_id: u32,
+        /// Redacted smart-account contract address (first-5-last-5 C-strkey).
+        smart_account_redacted: RedactedStrkey,
+        /// The inner error's wire code and bounded Display.
+        reason: String,
+        /// Per-request correlation identifier (UUIDv4).
+        request_id: String,
+    },
+
     /// Verifier contract has an active admin key or an owner-managed
     /// executable (mutable).
     ///
@@ -577,12 +648,13 @@ pub enum SaError {
         request_id: String,
     },
 
-    /// Policy wasm hash is not in the `THRESHOLD_POLICY_WASM_HASHES` allowlist (fail-closed).
+    /// Policy wasm hash is not a policy Wasm the wallet vendors (fail closed).
     ///
-    /// Parallel to [`SaError::VerifierWasmNotInAllowlist`] for the threshold-policy
-    /// contract path.  Fired at rule-install time when the policy contract's
-    /// deployed wasm hash does not match any entry in the compile-time
-    /// `THRESHOLD_POLICY_WASM_HASHES` allowlist.
+    /// Parallel to [`SaError::VerifierWasmNotInAllowlist`] for policies.
+    /// Fired when the policy contract's deployed wasm hash is not the hash of
+    /// a vendored policy Wasm (simple-threshold, weighted-threshold,
+    /// spending-limit): when a rule is installed with the policy, and when
+    /// the policy is added to a rule that has a pin record.
     ///
     /// # Forensic spine
     ///
@@ -595,9 +667,9 @@ pub enum SaError {
     /// `observed_hash_first8 = "none"` signals that the ledger entry for the
     /// policy contract is absent or not a deployed contract instance.
     /// A hex value signals that the contract IS deployed but its wasm hash is
-    /// not in the wallet's `THRESHOLD_POLICY_WASM_HASHES` allowlist.
+    /// not the hash of a vendored policy Wasm.
     #[error(
-        "policy wasm hash not in THRESHOLD_POLICY_WASM_HASHES allowlist for rule {rule_id}: \
+        "policy wasm hash is not a policy Wasm the wallet vendors, for rule {rule_id}: \
          observed={observed_hash_first8}"
     )]
     #[serde(rename = "sa.policy_wasm_not_in_allowlist")]
@@ -1377,7 +1449,7 @@ pub enum SaError {
     /// operator-forensic attribution surface that the `simulation.divergence.*`
     /// sub-codes were carved out to provide.
     ///
-    /// # Stage set (closed — 7 values)
+    /// # Stage set (closed; `ALL_AUTH_ENTRY_STAGES`)
     ///
     /// - `"context_rule_ids"` — `encode_context_rule_ids(rule_ids).to_xdr(env)`
     ///   failure (the `EncodeContextRuleIdsError` arm). Surfaces from the
@@ -1407,6 +1479,15 @@ pub enum SaError {
     ///   Surfaces from `submit.rs`.
     /// - `"quorum_signatures"` — quorum-signature collection failure (too few
     ///   registered signers could sign). Surfaces from `submit.rs`.
+    /// - `"pin_check_required"`: a submission authorized by a rule other than
+    ///   rule 0 carries no pinned-hash drift check. Surfaces from `submit.rs`
+    ///   before any network I/O.
+    /// - `"migrating_rule_mismatch"`: a drift check that exempts a migrating
+    ///   rule's verifiers names authorizing rules other than exactly that
+    ///   rule. Surfaces from `submit.rs` before any network I/O.
+    /// - `"multicall_check_undeclared"`: a multicall check without
+    ///   `"multicall"` in the declared required checks. Surfaces from
+    ///   `submit.rs` before any network I/O.
     ///
     /// # Security
     ///
@@ -1420,7 +1501,7 @@ pub enum SaError {
     AuthEntryConstructionFailed {
         /// Construction stage at which the failure occurred.
         ///
-        /// Closed compile-time 7-value set — see variant-level rustdoc for the
+        /// Closed compile-time set; see the variant-level rustdoc for the
         /// full enumeration. The field uses `&'static str` for zero-allocation
         /// construction on the error path; the audit-log consumer allocates an
         /// owned `String` at write time.
@@ -2175,6 +2256,9 @@ pub(crate) const ALL_AUTH_ENTRY_STAGES: &[&str] = &[
     "quorum_signatures",
     "ed25519_rule_signer_quorum_guard",
     "rule_proposal_digest",
+    "pin_check_required",
+    "migrating_rule_mismatch",
+    "multicall_check_undeclared",
 ];
 
 /// Which unresolved-submission condition [`SaError::SubmissionUnresolved`]
@@ -2559,6 +2643,7 @@ impl SaError {
             Self::VerifierHashDrift { .. } => "sa.verifier_hash_drift",
             Self::PolicyHashDrift { .. } => "sa.policy_hash_drift",
             Self::MultiplePinnedHashesUnsupported { .. } => "sa.multiple_pinned_hashes_unsupported",
+            Self::PinCheckUnavailable { .. } => "sa.pin_check_unavailable",
             Self::VerifierMutable { .. } => "sa.verifier_mutable",
             Self::PolicyMutable { .. } => "sa.policy_mutable",
             Self::ContractInstanceUnsupported { .. } => "sa.contract_instance_unsupported",
@@ -2784,6 +2869,15 @@ mod tests {
                     count: 3,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     request_id: "test-req-multi-001".to_owned(),
+                },
+            ),
+            (
+                "sa.pin_check_unavailable",
+                SaError::PinCheckUnavailable {
+                    rule_id: 7,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    reason: "sa.deployment_failed: rpc unreachable".to_owned(),
+                    request_id: "test-req-pin-check-001".to_owned(),
                 },
             ),
             (
@@ -3522,6 +3616,16 @@ mod tests {
                 ],
             ),
             (
+                "sa.pin_check_unavailable",
+                SaError::PinCheckUnavailable {
+                    rule_id: 77,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    reason: "sa.audit_log: audit log parse error".to_owned(),
+                    request_id: "test-req-pin-check-002".to_owned(),
+                },
+                &["rule_id", "smart_account_redacted", "reason", "request_id"],
+            ),
+            (
                 "sa.verifier_wasm_not_in_allowlist",
                 SaError::VerifierWasmNotInAllowlist {
                     rule_id: 5,
@@ -4131,6 +4235,63 @@ mod tests {
         }
     }
 
+    /// A text within the cap is returned unchanged; a longer one is cut on
+    /// a character boundary and suffixed with `"..."`, the whole never
+    /// exceeding the cap, for single-byte and multi-byte text alike.
+    #[test]
+    fn truncate_to_byte_cap_bounds_the_text_on_a_char_boundary() {
+        assert_eq!(truncate_to_byte_cap("short warning", 256), "short warning");
+        let exact = "x".repeat(256);
+        assert_eq!(truncate_to_byte_cap(&exact, 256), exact);
+
+        let long = "x".repeat(300);
+        let cut = truncate_to_byte_cap(&long, 256);
+        assert_eq!(cut.len(), 256);
+        assert!(cut.ends_with("..."));
+
+        // Four-byte characters: the boundary search must step back so the
+        // result stays within the cap and is valid UTF-8.
+        let wide = "\u{1F600}".repeat(100);
+        for cap in [256, 255, 254, 253, 10, 4, 3] {
+            let cut = truncate_to_byte_cap(&wide, cap);
+            assert!(cut.len() <= cap, "cap {cap}: {} bytes", cut.len());
+            assert!(cut.ends_with("..."), "cap {cap}");
+        }
+
+        // A cap that cannot hold the ellipsis yields an empty string.
+        for cap in [0, 1, 2] {
+            assert_eq!(truncate_to_byte_cap(&long, cap), "", "cap {cap}");
+            assert_eq!(truncate_to_byte_cap(&wide, cap), "", "cap {cap}");
+        }
+    }
+
+    /// The pin-check reason leads with the inner wire code, carries the
+    /// inner Display, and is capped at `PIN_CHECK_REASON_MAX_BYTES`.
+    #[test]
+    fn pin_check_reason_carries_the_inner_code_and_is_capped() {
+        let inner = SaError::MultiplePinnedHashesUnsupported {
+            kind: "verifier",
+            rule_id: 3,
+            count: 2,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            request_id: "req".to_owned(),
+        };
+        let reason = pin_check_reason(&inner);
+        assert!(
+            reason.starts_with("sa.multiple_pinned_hashes_unsupported: multiple pinned verifier"),
+            "{reason}"
+        );
+
+        let long = SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason: "r".repeat(1_000),
+        };
+        let reason = pin_check_reason(&long);
+        assert!(reason.starts_with("sa.deployment_failed: "), "{reason}");
+        assert!(reason.len() <= PIN_CHECK_REASON_MAX_BYTES);
+        assert!(reason.ends_with("..."));
+    }
+
     /// Verifies the wire-code closed set has no duplicates and covers every variant.
     ///
     /// The `match` arms below are exhaustive — adding a variant without updating
@@ -4176,6 +4337,12 @@ mod tests {
                 count: 4,
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 request_id: "test-req-multi-003".to_owned(),
+            },
+            SaError::PinCheckUnavailable {
+                rule_id: 88,
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                reason: "sa.deployment_failed: rpc unreachable".to_owned(),
+                request_id: "test-req-pin-check-003".to_owned(),
             },
             SaError::VerifierMutable {
                 rule_id: Some(3),
@@ -4537,6 +4704,7 @@ mod tests {
             "sa.verifier_hash_drift",
             "sa.policy_hash_drift",
             "sa.multiple_pinned_hashes_unsupported",
+            "sa.pin_check_unavailable",
             "sa.verifier_mutable",
             "sa.policy_mutable",
             "sa.contract_instance_unsupported",
@@ -4634,7 +4802,7 @@ mod tests {
             );
         }
 
-        assert_eq!(seen.len(), 73, "closed set must have exactly 73 wire codes");
+        assert_eq!(seen.len(), 74, "closed set must have exactly 74 wire codes");
     }
 
     /// Verifies the sub-code closed set is exhaustively matched by tests.
@@ -4913,12 +5081,12 @@ mod tests {
             stray_literals.join("\n")
         );
 
-        // Also assert that ALL_AUTH_ENTRY_STAGES has the expected 9 entries
+        // Also assert that ALL_AUTH_ENTRY_STAGES has the expected 12 entries
         // so a silent truncation of the const is caught.
         assert_eq!(
             ALL_AUTH_ENTRY_STAGES.len(),
-            9,
-            "ALL_AUTH_ENTRY_STAGES must contain exactly 9 entries"
+            12,
+            "ALL_AUTH_ENTRY_STAGES must contain exactly 12 entries"
         );
     }
 

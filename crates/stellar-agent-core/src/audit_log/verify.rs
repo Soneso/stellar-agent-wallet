@@ -767,7 +767,9 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
                 // No rotation-handoff tracking needed; the hash-chain is
                 // maintained by the surrounding hash check.
             }
-            EventKind::SaContextRuleCreated { .. } | EventKind::SaContextRuleDeleted { .. } => {
+            EventKind::SaContextRuleCreated { .. }
+            | EventKind::SaContextRulePinsUpdated { .. }
+            | EventKind::SaContextRuleDeleted { .. } => {
                 // No rotation-handoff tracking needed; the hash-chain is
                 // maintained by the surrounding hash check.
             }
@@ -1466,8 +1468,8 @@ mod tests {
     use crate::audit_log::{
         entry::{AuditEntry, IntoOptionalChainId, NewToolInvocation},
         schema::{
-            ContractKind, EVENT_KIND_VARIANT_COUNT, KeyPurpose, PolicyDecision, TipAnchorReason,
-            ValueActionKind, ValueLegRecord, VerifierAdvisoryKind,
+            ContractKind, EVENT_KIND_VARIANT_COUNT, KeyPurpose, PinsUpdateReason, PolicyDecision,
+            TipAnchorReason, ValueActionKind, ValueLegRecord, VerifierAdvisoryKind,
         },
         writer::{
             AuditWriter, ROTATION_THRESHOLD_BYTES, ROTATION_WINDOW_RETRY_ATTEMPTS,
@@ -1489,6 +1491,7 @@ mod tests {
             EventKind::SaRawInvocation { .. } => "sa_raw_invocation",
             EventKind::SmartAccountDeployed { .. } => "smart_account_deployed",
             EventKind::SaContextRuleCreated { .. } => "sa_context_rule_created",
+            EventKind::SaContextRulePinsUpdated { .. } => "sa_context_rule_pins_updated",
             EventKind::SaContextRuleDeleted { .. } => "sa_context_rule_deleted",
             EventKind::PasskeyRegistered { .. } => "passkey_registered",
             EventKind::PasskeyAssertion { .. } => "passkey_assertion",
@@ -1598,6 +1601,17 @@ mod tests {
                 unknown_override: false,
                 pinned_verifier_executable_refs: vec![],
                 pinned_policy_executable_refs: vec![],
+            },
+            EventKind::SaContextRulePinsUpdated {
+                smart_account: "CDABC...12345".to_owned(),
+                rule_id: 1,
+                pinned_verifier_wasm_hashes_first8: vec!["aabbccdd00112233".to_owned()],
+                pinned_policy_wasm_hashes_first8: vec![],
+                mutable_override: false,
+                unknown_override: false,
+                pinned_verifier_executable_refs: vec![],
+                pinned_policy_executable_refs: vec![],
+                reason: PinsUpdateReason::SignerAdded,
             },
             EventKind::SaContextRuleDeleted {
                 smart_account: "CDABC...12345".to_owned(),
@@ -2245,6 +2259,7 @@ mod tests {
                 "sa_raw_invocation",
                 "smart_account_deployed",
                 "sa_context_rule_created",
+                "sa_context_rule_pins_updated",
                 "sa_context_rule_deleted",
                 "passkey_registered",
                 "passkey_assertion",

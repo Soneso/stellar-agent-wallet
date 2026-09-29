@@ -49,6 +49,9 @@
     reason = "test-only; panics and diagnostic output are acceptable in testnet acceptance tests"
 )]
 
+#[path = "common/pin_check_manager.rs"]
+mod pin_check_manager;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -409,6 +412,12 @@ async fn h1_happy_path_3_transfer_bundle() {
     let policy_engine = policy_engine_allow_all();
 
     // ── Step 6: Submit the multicall bundle ───────────────────────────────────
+    let signers_manager = pin_check_manager::pin_check_manager(
+        TESTNET_RPC_URL,
+        &secondary_rpc_url,
+        "multicall-acceptance",
+        data_root.path(),
+    );
     let result = submit_multicall_bundle(
         MulticallSubmitArgs {
             smart_account: &sa_strkey,
@@ -425,6 +434,7 @@ async fn h1_happy_path_3_transfer_bundle() {
             fee: ResolvedFeePerOp::default(),
             chain_id: CHAIN_ID,
             request_id: "h1-happy-path-3-transfer",
+            signers_manager: &signers_manager,
         },
         &registry,
     )
@@ -552,6 +562,12 @@ async fn h2_per_period_cap_deny_at_inner_3() {
             fee: ResolvedFeePerOp::default(),
             chain_id: CHAIN_ID,
             request_id: "h2-per-period-cap-deny",
+            signers_manager: &pin_check_manager::pin_check_manager(
+                TESTNET_RPC_URL,
+                TESTNET_RPC_URL,
+                "multicall-acceptance",
+                data_root.path(),
+            ),
         },
         &empty_registry,
     )
@@ -648,6 +664,12 @@ async fn h3_bundle_aggregate_cap_deny() {
             fee: ResolvedFeePerOp::default(),
             chain_id: CHAIN_ID,
             request_id: "h3-bundle-aggregate-cap-deny",
+            signers_manager: &pin_check_manager::pin_check_manager(
+                TESTNET_RPC_URL,
+                TESTNET_RPC_URL,
+                "multicall-acceptance",
+                data_root.path(),
+            ),
         },
         &empty_registry,
     )

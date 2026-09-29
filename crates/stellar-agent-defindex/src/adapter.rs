@@ -381,6 +381,9 @@ impl DefindexVaultAdapter {
             SubmitInvokeArgs::builder()
                 .target_contract(&deposit_args.vault_address)
                 .auth_address(&deposit_args.from_address)
+                // Rule 0 only: the bootstrap rule has no pins, so the
+                // submission carries no pinned-hash drift check (`pin_check`
+                // stays `None`); any other rule would be refused without one.
                 .auth_rule_ids(&[ContextRuleId::new(0)])
                 .host_function(host_function)
                 .signer(signer)
@@ -549,6 +552,9 @@ impl DefindexVaultAdapter {
             SubmitInvokeArgs::builder()
                 .target_contract(&withdraw_args.vault_address)
                 .auth_address(&withdraw_args.from_address)
+                // Rule 0 only: the bootstrap rule has no pins, so the
+                // submission carries no pinned-hash drift check (`pin_check`
+                // stays `None`); any other rule would be refused without one.
                 .auth_rule_ids(&[ContextRuleId::new(0)])
                 .host_function(host_function)
                 .signer(signer)
