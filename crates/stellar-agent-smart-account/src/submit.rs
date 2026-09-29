@@ -70,6 +70,7 @@ use crate::managers::rules::{
 use crate::managers::signers::SignersManager;
 use crate::managers::verifiers::{
     verify_pinned_policy_against_chain, verify_pinned_verifier_against_chain,
+    verify_policy_pins_present,
 };
 use crate::signing::divergence::{
     EnvelopeContext, FeeEnvelopeContext, NetworkContext, SequenceContext, SimulationContext,
@@ -196,6 +197,8 @@ pub struct Ed25519RuleSigner<'a> {
 /// - drift refuses with [`SaError::VerifierHashDrift`] or
 ///   [`SaError::PolicyHashDrift`], and the check writes a
 ///   `SaVerifierHashDrift` / `SaPolicyHashDrift` row carrying `request_id`;
+/// - a rule with no policy on chain whose pin record holds policy pins
+///   refuses with [`SaError::PinnedPolicyAbsent`] (no drift row);
 /// - any other failure of the address fetch or of a check (RPC failure or
 ///   divergence, audit-log integrity error, a record with more than one
 ///   verifier or policy pin, an unpinnable instance, the pre-submit budget
@@ -591,6 +594,8 @@ pub struct SubmitInvokeArgs<'a> {
 ///
 /// - [`SaError::VerifierHashDrift`] / [`SaError::PolicyHashDrift`]: a live
 ///   verifier or policy of a checked rule differs from the rule's pin record.
+/// - [`SaError::PinnedPolicyAbsent`]: a checked rule's pin record holds
+///   policy pins while the rule has no policy on chain.
 /// - [`SaError::PinCheckUnavailable`]: the drift check of a rule could not
 ///   run to a verdict.
 /// - [`SaError::SubmitCheckMissing`] — a name in `required_checks` maps to a
@@ -1598,8 +1603,8 @@ fn validate_submit_invoke_args(args: &SubmitInvokeArgs<'_>) -> Result<(), SaErro
 ///
 /// # Errors
 ///
-/// - [`SaError::VerifierHashDrift`] / [`SaError::PolicyHashDrift`] unchanged
-///   from the check.
+/// - [`SaError::VerifierHashDrift`] / [`SaError::PolicyHashDrift`] /
+///   [`SaError::PinnedPolicyAbsent`] unchanged from the check.
 /// - [`SaError::PinCheckUnavailable`] for every other failure, including the
 ///   budget elapsing.
 /// - [`SaError::ScAddressEncodingFailed`] when the smart account has no
@@ -1635,9 +1640,11 @@ async fn run_pin_check(
         let inner = match outcome {
             Ok(Ok(())) => continue,
             Ok(Err(
-                drift @ (SaError::VerifierHashDrift { .. } | SaError::PolicyHashDrift { .. }),
+                refusal @ (SaError::VerifierHashDrift { .. }
+                | SaError::PolicyHashDrift { .. }
+                | SaError::PinnedPolicyAbsent { .. }),
             )) => {
-                return Err(drift);
+                return Err(refusal);
             }
             Ok(Err(inner)) | Err(inner) => inner,
         };
@@ -1659,9 +1666,11 @@ async fn run_pin_check(
     Ok(())
 }
 
-/// Checks one rule: fetches its verifier and policy addresses, then compares
+/// Checks one rule: fetches its verifier and policy addresses, compares
 /// each verifier (unless the rule is the migrating rule) and each policy
-/// against the rule's pin record, sharing `cache` across calls.
+/// against the rule's pin record, sharing `cache` across calls, then
+/// refuses a rule with no policy on chain whose record pins policies. The
+/// migrating-rule exemption covers the verifiers only.
 async fn check_rule_pins(
     pin_check: &PinCheck<'_>,
     smart_account: &ScAddress,
@@ -1691,10 +1700,10 @@ async fn check_rule_pins(
             .await?;
         }
     }
-    for policy_addr in policy_addrs {
+    for policy_addr in &policy_addrs {
         verify_pinned_policy_against_chain(
             manager,
-            policy_addr,
+            policy_addr.clone(),
             rule_id,
             smart_account_redacted,
             pin_check.request_id,
@@ -1702,7 +1711,13 @@ async fn check_rule_pins(
         )
         .await?;
     }
-    Ok(())
+    verify_policy_pins_present(
+        manager,
+        rule_id,
+        smart_account_redacted,
+        pin_check.request_id,
+        &policy_addrs,
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

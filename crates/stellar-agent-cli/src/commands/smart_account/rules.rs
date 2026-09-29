@@ -528,9 +528,11 @@ pub struct CreateArgs {
     /// `sa.verifier_hash_drift` / `sa.policy_hash_drift` before anything is
     /// simulated: in `smart-account execute`, `smart-account multicall`, the
     /// rule and signer write verbs, and `smart-account migrate-verifier` for
-    /// the rule's policies. A check that cannot run refuses with
-    /// `sa.pin_check_unavailable`. `--accept-unknown-verifier` is also
-    /// required when the resolved hash is outside the allowlist.
+    /// the rule's policies. A rule whose record holds policy pins while the
+    /// rule has no policy on chain refuses with `sa.pinned_policy_absent`, and
+    /// a check that cannot run with `sa.pin_check_unavailable`.
+    /// `--accept-unknown-verifier` is also required when the resolved hash is
+    /// outside the allowlist.
     ///
     /// The flag does not admit an external reference with no live tag entry,
     /// an undecodable instance or a non-Wasm executable: the wallet cannot

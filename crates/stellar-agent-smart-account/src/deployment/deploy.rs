@@ -550,8 +550,8 @@ pub(crate) fn verify_post_deploy_wasm_hash(
         // First-8 hex of both observed and expected are included in `redacted_reason`
         // for operator triage (distinguishes RPC-substitution from salt-collision
         // deployment scenarios). The C-strkey is redacted first-5-last-5.
-        let observed_first8 = to_hex(&observed_wasm_hash[..4]);
-        let expected_first8 = to_hex(&expected_wasm_hash[..4]);
+        let observed_first8 = stellar_agent_core::hex::wasm_hash_first8_hex(&observed_wasm_hash);
+        let expected_first8 = stellar_agent_core::hex::wasm_hash_first8_hex(&expected_wasm_hash);
         let sa_redacted =
             stellar_agent_core::observability::redact_strkey_first5_last5(derived_smart_account);
         return Err(SaError::DeploymentFailed {
@@ -1534,12 +1534,12 @@ mod tests {
         );
         // first-8 hex of [0u8; 32]
         assert!(
-            redacted_reason.contains("00000000"),
+            redacted_reason.contains("0000000000000000"),
             "redacted_reason should carry observed first-8 hex: {redacted_reason}"
         );
-        // first-8 hex of the expected hash (12345678...)
+        // first-8 hex of the expected hash (1234567890abcdef...)
         assert!(
-            redacted_reason.contains("12345678"),
+            redacted_reason.contains("1234567890abcdef"),
             "redacted_reason should carry expected first-8 hex: {redacted_reason}"
         );
     }

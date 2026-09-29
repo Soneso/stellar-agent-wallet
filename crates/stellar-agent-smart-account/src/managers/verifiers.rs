@@ -1458,6 +1458,61 @@ pub(crate) async fn verify_pinned_policy_against_chain(
     })
 }
 
+/// Checks that a rule whose pin record pins policies shows policies on chain.
+///
+/// A rule whose record pins policies must show those policies on chain; a
+/// rule with policy pins and no policy on chain is refused before signing.
+/// The record is the wallet's knowledge of the rule's shape, and a policy
+/// removed outside the wallet changes what the rule authorizes. Verifier
+/// presence is not checked here: signer-set changes are covered by the
+/// signer-set baseline on the signer verbs, and the wallet's own
+/// `signers remove` writes no pin update, so a verifier-presence rule would
+/// refuse a rule the wallet itself changed.
+///
+/// `policy_addrs` are the rule's live policy addresses. When it is not
+/// empty this returns `Ok(())` without reading the record: the per-policy
+/// check [`verify_pinned_policy_against_chain`] reads and compares it.
+///
+/// # Errors
+///
+/// - [`SaError::PinnedPolicyAbsent`]: `policy_addrs` is empty and the
+///   rule's pin record holds at least one policy pin.
+/// - [`SaError::AuditLog`]: the pin record could not be read.
+pub(crate) fn verify_policy_pins_present(
+    signers_manager: &SignersManager,
+    rule_id: u32,
+    smart_account_redacted: &str,
+    request_id: &str,
+    policy_addrs: &[ScAddress],
+) -> Result<(), SaError> {
+    if !policy_addrs.is_empty() {
+        return Ok(());
+    }
+    let pinned_count =
+        read_pinned_hashes_for_rule(signers_manager, rule_id, smart_account_redacted)?
+            .map_or(0, |record| record.pinned_policy_first8.len());
+    if pinned_count == 0 {
+        debug!(
+            rule_id,
+            "verify_policy_pins_present: no policy on chain and no policy pin in the record"
+        );
+        return Ok(());
+    }
+    warn!(
+        rule_id,
+        smart_account_redacted,
+        pinned_count,
+        "verify_policy_pins_present: the pin record holds policy pins but the rule has no \
+         policy on chain; aborting signing"
+    );
+    Err(SaError::PinnedPolicyAbsent {
+        rule_id,
+        pinned_count,
+        smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
+        request_id: request_id.to_owned(),
+    })
+}
+
 /// Writes a drift row through the shared writer. A write failure is logged;
 /// a poisoned writer marks the session degraded. Signing is refused by the
 /// caller either way.

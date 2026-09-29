@@ -10,14 +10,14 @@
 //! {
 //!   "entries": [
 //!     {
-//!       "wasm_hash_first8": "9427e3dd",
+//!       "wasm_hash_first8": "9427e3dd71fb2911",
 //!       "wasm_hash_full": "9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7",
 //!       "audit_status": "provisional",
 //!       "attested_by": "OpenZeppelin",
 //!       "attested_at": "2026-07-04"
 //!     },
 //!     {
-//!       "wasm_hash_first8": "67800690",
+//!       "wasm_hash_first8": "678006909b50c6c3",
 //!       "wasm_hash_full": "678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a",
 //!       "audit_status": "provisional",
 //!       "attested_by": "OpenZeppelin",
@@ -48,6 +48,7 @@ use clap::Args;
 use serde::{Deserialize, Serialize};
 
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
+use stellar_agent_core::hex::wasm_hash_first8_hex;
 use stellar_agent_smart_account::verifier_allowlist::{VERIFIER_ALLOWLIST, VerifierAuditStatus};
 
 use crate::common::render::render_json;
@@ -89,7 +90,8 @@ pub struct ListVerifiersArgs {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ListVerifiersEntry {
-    /// First-8-hex of the wasm hash (lower-case).
+    /// First 8 bytes of the wasm hash as 16 lower-case hex characters, the
+    /// form the pin records carry.
     pub wasm_hash_first8: String,
 
     /// Full 64-char lower-case hex of the wasm hash.
@@ -154,10 +156,7 @@ impl ListVerifiersResult {
         let entries: Vec<ListVerifiersEntry> = VERIFIER_ALLOWLIST
             .iter()
             .map(|entry| {
-                let wasm_hash_first8 = entry.wasm_hash[..4]
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect();
+                let wasm_hash_first8 = wasm_hash_first8_hex(&entry.wasm_hash);
                 let wasm_hash_full: String =
                     entry.wasm_hash.iter().map(|b| format!("{b:02x}")).collect();
 
@@ -371,7 +370,7 @@ mod tests {
         // Index 0: canonical OZ WebAuthn verifier v0.7.2.
         let oz = &result.entries[0];
         assert_eq!(oz.audit_status, "provisional");
-        assert_eq!(oz.wasm_hash_first8, "9427e3dd");
+        assert_eq!(oz.wasm_hash_first8, "9427e3dd71fb2911");
         assert_eq!(
             oz.wasm_hash_full,
             "9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7"
@@ -387,7 +386,7 @@ mod tests {
         // Index 1: legacy OZ WebAuthn verifier v0.7.1 (still recognised).
         let legacy = &result.entries[1];
         assert_eq!(legacy.audit_status, "provisional");
-        assert_eq!(legacy.wasm_hash_first8, "67800690");
+        assert_eq!(legacy.wasm_hash_first8, "678006909b50c6c3");
         assert_eq!(
             legacy.wasm_hash_full,
             "678006909b50c6c365c033f137197e910d8396a2c68e9281327a2ed7dbf4b27a"
@@ -424,7 +423,7 @@ mod tests {
     fn list_verifiers_entry_audited_wire_format() {
         // Validates the audited-variant JSON envelope wire shape.
         let entry = ListVerifiersEntry {
-            wasm_hash_first8: "9427e3dd".to_owned(),
+            wasm_hash_first8: "9427e3dd71fb2911".to_owned(),
             wasm_hash_full: "9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7"
                 .to_owned(),
             audit_status: "audited".to_owned(),
@@ -468,7 +467,7 @@ mod tests {
     fn list_verifiers_entry_provisional_wire_format() {
         // Validates the provisional-variant JSON envelope wire shape.
         let entry = ListVerifiersEntry {
-            wasm_hash_first8: "9427e3dd".to_owned(),
+            wasm_hash_first8: "9427e3dd71fb2911".to_owned(),
             wasm_hash_full: "9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7"
                 .to_owned(),
             audit_status: "provisional".to_owned(),
@@ -520,7 +519,7 @@ mod tests {
     #[test]
     fn list_verifiers_entry_revoked_wire_format() {
         let entry = ListVerifiersEntry {
-            wasm_hash_first8: "aabbccdd".to_owned(),
+            wasm_hash_first8: "aabbccdd00112233".to_owned(),
             wasm_hash_full: "aabbccdd0011223344556677889900112233445566778899001122334455667788"
                 .to_owned(),
             audit_status: "revoked".to_owned(),
@@ -557,7 +556,7 @@ mod tests {
     fn list_verifiers_entry_retired_wire_format() {
         // Per the rotation policy: `reason` field is omitted for retired entries.
         let entry = ListVerifiersEntry {
-            wasm_hash_first8: "aabbccdd".to_owned(),
+            wasm_hash_first8: "aabbccdd00112233".to_owned(),
             wasm_hash_full: "aabbccdd0011223344556677889900112233445566778899001122334455667788"
                 .to_owned(),
             audit_status: "retired".to_owned(),
@@ -587,7 +586,7 @@ mod tests {
     #[test]
     fn list_verifiers_entry_unaudited_wire_format() {
         let entry = ListVerifiersEntry {
-            wasm_hash_first8: "11223344".to_owned(),
+            wasm_hash_first8: "1122334455667788".to_owned(),
             wasm_hash_full: "11223344556677889900aabbccddee0011223344556677889900aabbccddee00"
                 .to_owned(),
             audit_status: "unaudited".to_owned(),

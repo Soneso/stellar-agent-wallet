@@ -1927,6 +1927,8 @@ fn build_inner_results(
 /// - `"sa.auth_entry_construction_failed"` → `"sign"` (auth-entry assembly failure).
 /// - `"sa.submit_check_missing"` → `"build"` (programming-gate; fires before any I/O).
 /// - `"sa.horizon_exceeded"` / `"sa.rule_expired"` / `"sa.simulation_divergence"` → `"policy_gate"`.
+/// - `"sa.verifier_hash_drift"` / `"sa.policy_hash_drift"` / `"sa.pinned_policy_absent"` /
+///   `"sa.pin_check_unavailable"` → `"policy_gate"` (the pinned-hash drift check).
 /// - `"sa.multicall_failed"` (nested) → `"submit"` (double-wrap, catches re-entrant errors).
 /// - Other (unrecognised) → `"submit"` as last resort.
 fn map_sa_error_to_multicall_phase(err: &SaError) -> &'static str {
@@ -1956,7 +1958,10 @@ fn map_sa_error_to_multicall_phase(err: &SaError) -> &'static str {
             // SubmitCheckMissing fires BEFORE any I/O (fail-CLOSED programming gate).
             "build"
         }
-        "sa.verifier_hash_drift" | "sa.policy_hash_drift" | "sa.pin_check_unavailable" => {
+        "sa.verifier_hash_drift"
+        | "sa.policy_hash_drift"
+        | "sa.pinned_policy_absent"
+        | "sa.pin_check_unavailable" => {
             // The pinned-hash drift check refuses before simulation: a wallet
             // security gate on the authorizing rule, not a network failure.
             "policy_gate"
@@ -3159,8 +3164,8 @@ wasm_sha256 = "{drifted_sha}"
         assert_eq!(map_sa_error_to_multicall_phase(&err), "policy_gate");
     }
 
-    /// A drift refusal and an unavailable drift check map to
-    /// `"policy_gate"`: both refuse before simulation.
+    /// A drift refusal, a pinned policy absent from chain and an unavailable
+    /// drift check map to `"policy_gate"`: all refuse before simulation.
     #[test]
     fn map_sa_error_to_phase_pin_check_refusals_map_to_policy_gate() {
         use stellar_agent_core::observability::RedactedStrkey;
@@ -3182,6 +3187,12 @@ wasm_sha256 = "{drifted_sha}"
                 pinned_hash_first8: "aabbccdd".to_owned(),
                 observed_hash_first8: "11223344".to_owned(),
                 observed_executable: None,
+                request_id: "req".to_owned(),
+            },
+            SaError::PinnedPolicyAbsent {
+                rule_id: 2,
+                pinned_count: 1,
+                smart_account_redacted: redacted(),
                 request_id: "req".to_owned(),
             },
             SaError::PinCheckUnavailable {

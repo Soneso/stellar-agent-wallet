@@ -258,10 +258,7 @@ impl MigrationPlan {
     /// Returns 16 lower-hex characters (8 bytes × 2 chars/byte).
     #[must_use]
     pub fn from_hash_first8(&self) -> String {
-        self.from_hash[..8]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
+        stellar_agent_core::hex::wasm_hash_first8_hex(&self.from_hash)
     }
 
     /// First-8 hex chars of `to_hash` for envelope display.
@@ -269,10 +266,7 @@ impl MigrationPlan {
     /// Returns 16 lower-hex characters (8 bytes × 2 chars/byte).
     #[must_use]
     pub fn to_hash_first8(&self) -> String {
-        self.to_hash[..8]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
+        stellar_agent_core::hex::wasm_hash_first8_hex(&self.to_hash)
     }
 
     /// Total number of on-chain transactions required to execute this plan.
@@ -405,8 +399,9 @@ impl MigrationPlan {
     ///
     /// # Errors
     ///
-    /// - [`SaError::PolicyHashDrift`] / [`SaError::PinCheckUnavailable`]: the
-    ///   drift check of the migrating rule refused a step before signing.
+    /// - [`SaError::PolicyHashDrift`] / [`SaError::PinnedPolicyAbsent`] /
+    ///   [`SaError::PinCheckUnavailable`]: the drift check of the migrating
+    ///   rule refused a step before signing.
     /// - [`SaError::VerifierMigrationFailed`] with `phase: "submit_simulate"` —
     ///   on simulation failure of any step.
     /// - [`SaError::VerifierMigrationFailed`] with `phase: "submit_send"` —
@@ -1064,7 +1059,7 @@ impl<'a> MigrationPlanner<'a> {
             }
         })?;
 
-        let to_hash_first8: String = to_hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+        let to_hash_first8 = stellar_agent_core::hex::wasm_hash_first8_hex(&to_hash);
 
         // Pre-flight 1: destination hash must be in VERIFIER_ALLOWLIST.
         let allowlist_entry = VERIFIER_ALLOWLIST
@@ -1270,8 +1265,8 @@ impl<'a> MigrationPlanner<'a> {
         to_verifier_addr: &ScAddress,
         request_id: &str,
     ) -> Result<(Vec<RuleMigration>, usize, Vec<u32>), SaError> {
-        let from_hash_first8: String = from_hash[..8].iter().map(|b| format!("{b:02x}")).collect();
-        let to_hash_first8: String = to_hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+        let from_hash_first8 = stellar_agent_core::hex::wasm_hash_first8_hex(&from_hash);
+        let to_hash_first8 = stellar_agent_core::hex::wasm_hash_first8_hex(&to_hash);
 
         // ── Stage 1: sparse-ID-safe enumeration via list_active_context_rules ──
         //

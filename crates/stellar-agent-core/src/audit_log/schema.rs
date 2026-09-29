@@ -210,7 +210,7 @@ impl ExecutableRefPin {
             ),
             tag: crate::observability::untrusted_display_bounded(tag.0.as_vec()),
             ref_key_hex: lower_hex(&ref_key),
-            resolved_hash_first8: lower_hex(&resolved[..8]),
+            resolved_hash_first8: crate::hex::wasm_hash_first8_hex(resolved),
         })
     }
 

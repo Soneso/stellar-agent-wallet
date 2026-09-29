@@ -340,7 +340,7 @@ Every verb's exact flags, the mainnet-refusal matrix, signer-kind discriminators
 | `signers set-weighted-threshold` | Change a weighted-threshold policy's threshold (use an admin `--auth-rule-id` when `--rule-id` is scoped) |
 | `signers set-signer-weight` | Change one signer's weight in a weighted-threshold policy |
 | `signers batch-add` | Add multiple signers in one transaction (cap 15). Result-fetch needs a simple-threshold policy on the rule. Pin-record update and override flags as `signers add` |
-| `execute` | Submit one `CallContract` invocation authorized by a rule and signed by an External-Ed25519 rule signer (the delegation verb); `--auth-rule-id` has NO default; no MCP equivalent. Refuses before signing with `sa.verifier_hash_drift` / `sa.policy_hash_drift` when a rule's verifier or policy differs from its pin, `sa.pin_check_unavailable` when the check cannot run |
+| `execute` | Submit one `CallContract` invocation authorized by a rule and signed by an External-Ed25519 rule signer (the delegation verb); `--auth-rule-id` has NO default; no MCP equivalent. Refuses before signing with `sa.verifier_hash_drift` / `sa.policy_hash_drift` when a rule's verifier or policy differs from its pin, `sa.pinned_policy_absent` when the rule's record holds policy pins while the rule has no policy on chain, `sa.pin_check_unavailable` when the check cannot run |
 | `multicall` | Submit an atomic 1–50-invocation bundle through the registered router; requires `--secondary-rpc-url` (flag or profile, else a typed error) |
 | `deploy-webauthn-verifier` | Deploy the OZ WebAuthn-verifier WASM; idempotent; testnet only |
 | `deploy-ed25519-verifier` | Deploy the OZ Ed25519-verifier WASM (backs `--signer-ed25519`); testnet only |

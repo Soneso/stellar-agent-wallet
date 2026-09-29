@@ -44,7 +44,9 @@ use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::migration::{
     MigrationPlan, RuleMigration, SignerMigrationStep,
 };
-use stellar_agent_smart_account::managers::rules::{ContextRuleManager, ContextRuleManagerConfig};
+use stellar_agent_smart_account::managers::rules::{
+    ContextRuleManager, ContextRuleManagerConfig, PinStatus,
+};
 use stellar_agent_smart_account::managers::signers::{SignersManager, SignersManagerConfig};
 use stellar_agent_smart_account::submit::{
     PinCheck, SubmitInvokeArgs, SubmitInvokeResult, submit_signed_invoke,
@@ -530,6 +532,7 @@ impl Harness {
         verifier_first8: Vec<String>,
         policy_first8: Vec<String>,
         verifier_refs: Vec<Option<ExecutableRefPin>>,
+        policy_refs: Vec<Option<ExecutableRefPin>>,
     ) {
         self.write(AuditEntry::new_sa_context_rule_created(
             smart_account_redacted(),
@@ -545,7 +548,7 @@ impl Harness {
             false,
             false,
             verifier_refs,
-            vec![],
+            policy_refs,
         ));
     }
 
@@ -683,6 +686,7 @@ async fn verifier_drift_refuses_before_simulation_with_the_callers_request_id() 
         vec![FOREIGN_FIRST8.to_owned()],
         vec![first8(&KNOWN_WASM_HASH)],
         vec![],
+        vec![],
     );
 
     let err = h
@@ -728,6 +732,7 @@ async fn policy_drift_refuses_before_simulation_with_the_callers_request_id() {
         1,
         vec![first8(&webauthn_hash())],
         vec![FOREIGN_FIRST8.to_owned()],
+        vec![],
         vec![],
     );
 
@@ -780,6 +785,7 @@ async fn a_repointed_external_reference_refuses_with_the_observed_executable() {
         vec![first8(&webauthn_hash())],
         vec![],
         vec![Some(reference_pin(webauthn_hash()))],
+        vec![],
     );
 
     let err = h.submit(&[1], Some("req-ref-drift")).await.unwrap_err();
@@ -820,6 +826,7 @@ async fn an_rpc_failure_during_the_check_refuses_and_sends_nothing() {
         vec![first8(&webauthn_hash())],
         vec![first8(&KNOWN_WASM_HASH)],
         vec![],
+        vec![],
     );
     h.fail_reads_of(&verifier_v());
 
@@ -852,6 +859,7 @@ async fn multiple_pins_and_an_audit_integrity_error_refuse_as_unavailable() {
         vec![first8(&webauthn_hash()), first8(&ed25519_hash())],
         vec![first8(&KNOWN_WASM_HASH)],
         vec![],
+        vec![],
     );
     let err = h.submit(&[1], Some("req-multi")).await.unwrap_err();
     match &err {
@@ -867,6 +875,7 @@ async fn multiple_pins_and_an_audit_integrity_error_refuse_as_unavailable() {
         1,
         vec![first8(&webauthn_hash())],
         vec![first8(&KNOWN_WASM_HASH)],
+        vec![],
         vec![],
     );
     std::fs::OpenOptions::new()
@@ -919,6 +928,7 @@ async fn a_newer_pins_updated_row_is_the_record_the_check_reads() {
         vec![first8(&webauthn_hash())],
         vec![first8(&KNOWN_WASM_HASH)],
         vec![],
+        vec![],
     );
     h.write(AuditEntry::new_sa_context_rule_pins_updated(
         smart_account_redacted(),
@@ -952,8 +962,8 @@ async fn a_verifier_shared_by_two_rules_is_observed_once() {
         )
         .with_entry(wasm_instance(&verifier_v(), webauthn_hash()));
     let h = Harness::new(chain).await;
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![]);
-    h.pin_created(2, vec![first8(&webauthn_hash())], vec![], vec![]);
+    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(2, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
 
     h.submit_invocation("pair", &[1, 2], Some("req-shared"))
         .await
@@ -1068,6 +1078,7 @@ async fn signer_add_harness(pinned: bool) -> Harness {
             1,
             vec![first8(&webauthn_hash())],
             vec![first8(&KNOWN_WASM_HASH)],
+            vec![],
             vec![],
         );
     }
@@ -1268,7 +1279,7 @@ fn migration_plan(from: [u8; 32], to: [u8; 32]) -> MigrationPlan {
 }
 
 /// The migration steps sign under the migrating rule with its verifier
-/// check skipped: a verifier that no longer matches the pin does not stop
+/// check skipped: a verifier that differs from the pin does not stop
 /// the migration away from it, and the confirmed pair writes the record
 /// naming the destination.
 #[tokio::test]
@@ -1278,6 +1289,7 @@ async fn a_migration_skips_the_verifier_check_of_the_migrating_rule() {
         1,
         vec![FOREIGN_FIRST8.to_owned()],
         vec![first8(&KNOWN_WASM_HASH)],
+        vec![],
         vec![],
     );
     let signer = SoftwareSigningKey::new_from_bytes(SEED);
@@ -1314,6 +1326,7 @@ async fn a_migration_still_checks_the_migrating_rules_policies() {
         1,
         vec![first8(&webauthn_hash())],
         vec![FOREIGN_FIRST8.to_owned()],
+        vec![],
         vec![],
     );
     let signer = SoftwareSigningKey::new_from_bytes(SEED);
@@ -1498,7 +1511,7 @@ fn policy_pins_of(entry: &AuditEntry) -> (Vec<String>, bool, PinsUpdateReason) {
 #[tokio::test]
 async fn a_policy_added_to_a_pinned_rule_is_pinned_and_checked() {
     let h = policy_harness(vec![]).await;
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![]);
+    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
     h.after_send(1, rule_one_with_policies(vec![policy_p()]));
     add_policy(&h, &policy_p(), "req-policy-add", false)
         .await
@@ -1531,6 +1544,7 @@ async fn a_second_policy_writes_two_pins_and_the_next_verb_refuses() {
         1,
         vec![first8(&webauthn_hash())],
         vec![first8(&KNOWN_WASM_HASH)],
+        vec![],
         vec![],
     );
     h.after_send(1, rule_one_with_policies(vec![policy_p(), policy_q()]));
@@ -1566,7 +1580,7 @@ async fn a_second_policy_writes_two_pins_and_the_next_verb_refuses() {
 #[tokio::test]
 async fn an_unknown_new_policy_needs_the_override() {
     let h = policy_harness(vec![]).await;
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![]);
+    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
     let err = add_policy(&h, &policy_r(), "req-policy-unknown", false)
         .await
         .unwrap_err();
@@ -1624,6 +1638,7 @@ async fn removing_the_pinned_policy_clears_its_pin() {
         vec![first8(&webauthn_hash())],
         vec![first8(&KNOWN_WASM_HASH)],
         vec![],
+        vec![],
     );
     h.after_send(1, rule_one_with_policies(vec![]));
     remove_policy(&h, 0, "req-policy-remove").await.unwrap();
@@ -1648,7 +1663,7 @@ async fn removing_the_pinned_policy_clears_its_pin() {
 }
 
 /// The single pin of a rule's only policy is dropped on removal even when
-/// the policy no longer matches it, so a replacement policy gets a one-pin
+/// the policy differs from its pin, so a replacement policy gets a one-pin
 /// record the next verb accepts.
 #[tokio::test]
 async fn removing_a_drifted_only_policy_drops_its_pin() {
@@ -1657,6 +1672,7 @@ async fn removing_a_drifted_only_policy_drops_its_pin() {
         1,
         vec![first8(&webauthn_hash())],
         vec![first8(&KNOWN_WASM_HASH)],
+        vec![],
         vec![],
     );
     h.set_entry(wasm_instance(&policy_p(), [0xab; 32]));
@@ -1695,6 +1711,7 @@ async fn removing_an_unreadable_only_policy_confirms_and_drops_its_pin() {
         vec![first8(&webauthn_hash())],
         vec![first8(&KNOWN_WASM_HASH)],
         vec![],
+        vec![],
     );
     h.fail_reads_of(&policy_p());
     h.after_send(1, rule_one_with_policies(vec![]));
@@ -1719,6 +1736,7 @@ async fn removing_one_of_two_policies_drops_the_pin_of_its_hash() {
         1,
         vec![first8(&webauthn_hash())],
         vec![first8(&KNOWN_WASM_HASH), first8(&spending_limit_hash())],
+        vec![],
         vec![],
     );
     h.after_send(1, rule_one_with_policies(vec![policy_p()]));
@@ -1746,6 +1764,7 @@ async fn removing_an_unpinned_policy_beside_a_pinned_one_keeps_the_pin() {
         vec![first8(&webauthn_hash())],
         vec![first8(&KNOWN_WASM_HASH)],
         vec![],
+        vec![],
     );
     h.after_send(1, rule_one_with_policies(vec![policy_p()]));
     remove_policy(&h, 1, "req-remove-unpinned").await.unwrap();
@@ -1764,7 +1783,8 @@ async fn removing_an_unpinned_policy_beside_a_pinned_one_keeps_the_pin() {
 
 /// A record with two policy pins, neither equal to the removed policy's
 /// hash, is left as it is even when the policy is the rule's only one: the
-/// removal confirms and writes no row.
+/// removal confirms and writes no row, and the next verb refuses the rule,
+/// which holds two policy pins and no policy.
 #[tokio::test]
 async fn removing_a_policy_no_pin_of_two_matches_writes_no_row() {
     let h = policy_harness(vec![policy_r()]).await;
@@ -1773,11 +1793,264 @@ async fn removing_a_policy_no_pin_of_two_matches_writes_no_row() {
         vec![first8(&webauthn_hash())],
         vec![first8(&KNOWN_WASM_HASH), first8(&spending_limit_hash())],
         vec![],
+        vec![],
     );
     h.after_send(1, rule_one_with_policies(vec![]));
     remove_policy(&h, 0, "req-remove-under-two-pins")
         .await
         .unwrap();
     assert_eq!(h.sends(), 1);
+    assert!(h.pins_updated_rows().is_empty());
+
+    let err = h
+        .submit(&[1], Some("req-after-remove-under-two-pins"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SaError::PinnedPolicyAbsent {
+                rule_id: 1,
+                pinned_count: 2,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(h.sends(), 1);
+}
+
+// ── Policy pins with no policy on chain ───────────────────────────────────────
+
+/// A record pinning a policy on a rule with no policy on chain refuses the
+/// submission with the caller's request id before its invocation is
+/// simulated; nothing is sent and no drift row is written.
+#[tokio::test]
+async fn a_policy_pin_with_no_live_policy_refuses_and_sends_nothing() {
+    let h = policy_harness(vec![]).await;
+    h.pin_created(
+        1,
+        vec![first8(&webauthn_hash())],
+        vec![first8(&KNOWN_WASM_HASH)],
+        vec![],
+        vec![],
+    );
+    let err = h.submit(&[1], Some("req-policy-absent")).await.unwrap_err();
+    match &err {
+        SaError::PinnedPolicyAbsent {
+            rule_id: 1,
+            pinned_count: 1,
+            smart_account_redacted: redacted,
+            request_id,
+        } => {
+            assert_eq!(redacted.as_str(), smart_account_redacted());
+            assert_eq!(request_id, "req-policy-absent");
+        }
+        other => panic!("expected PinnedPolicyAbsent; got {other:?}"),
+    }
+    assert_eq!(err.wire_code(), "sa.pinned_policy_absent");
+    assert_eq!(h.sends(), 0);
+    assert!(!h.simulated("noop"));
+    assert!(!h.rows().iter().any(|e| matches!(
+        e.event_kind,
+        EventKind::SaPolicyHashDrift { .. } | EventKind::SaVerifierHashDrift { .. }
+    )));
+}
+
+/// A record without policy pins on a rule with no policy on chain signs.
+#[tokio::test]
+async fn a_rule_without_policies_or_policy_pins_signs() {
+    let h = policy_harness(vec![]).await;
+    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.submit(&[1], Some("req-no-policy")).await.unwrap();
+    assert_eq!(h.sends(), 1);
+}
+
+/// A policy added to a rule with no policy on chain replaces the record's
+/// stale policy pin with its own, and the next verb signs.
+#[tokio::test]
+async fn a_policy_added_with_no_live_policy_replaces_a_stale_pin() {
+    let h = policy_harness(vec![]).await;
+    h.pin_created(
+        1,
+        vec![first8(&webauthn_hash())],
+        vec![first8(&KNOWN_WASM_HASH)],
+        vec![],
+        vec![],
+    );
+    h.after_send(1, rule_one_with_policies(vec![policy_q()]));
+    add_policy(&h, &policy_q(), "req-repin", false)
+        .await
+        .unwrap();
+
+    let rows = h.pins_updated_rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].request_id, "req-repin");
+    let (policies, _, reason) = policy_pins_of(&rows[0]);
+    assert_eq!(policies, vec![first8(&spending_limit_hash())]);
+    assert_eq!(reason, PinsUpdateReason::PolicyAdded);
+    assert_eq!(h.sends(), 1);
+
+    h.submit(&[1], Some("req-after-repin")).await.unwrap();
+    assert_eq!(h.sends(), 2);
+}
+
+/// The same repair from the two-pin record a removal of the last policy
+/// leaves: the add pins exactly the added policy, and the next verb signs.
+#[tokio::test]
+async fn a_policy_added_after_the_last_of_two_pinned_policies_replaces_both_pins() {
+    let h = policy_harness(vec![]).await;
+    h.pin_created(
+        1,
+        vec![first8(&webauthn_hash())],
+        vec![first8(&KNOWN_WASM_HASH), first8(&spending_limit_hash())],
+        vec![],
+        vec![],
+    );
+    h.after_send(1, rule_one_with_policies(vec![policy_p()]));
+    add_policy(&h, &policy_p(), "req-repin-two", false)
+        .await
+        .unwrap();
+
+    let rows = h.pins_updated_rows();
+    assert_eq!(rows.len(), 1);
+    let (policies, _, reason) = policy_pins_of(&rows[0]);
+    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(reason, PinsUpdateReason::PolicyAdded);
+
+    h.submit(&[1], Some("req-after-repin-two")).await.unwrap();
+    assert_eq!(h.sends(), 2);
+}
+
+/// A policy added to a rule with no policy on chain drops the stale policy
+/// pin's executable reference with it: a Wasm policy replacing a pinned
+/// external reference leaves the reference list empty, and the next verb
+/// signs.
+#[tokio::test]
+async fn a_policy_added_with_no_live_policy_drops_a_stale_reference_pin() {
+    let h = policy_harness(vec![]).await;
+    h.pin_created(
+        1,
+        vec![first8(&webauthn_hash())],
+        vec![first8(&KNOWN_WASM_HASH)],
+        vec![],
+        vec![Some(reference_pin(KNOWN_WASM_HASH))],
+    );
+    h.after_send(1, rule_one_with_policies(vec![policy_q()]));
+    add_policy(&h, &policy_q(), "req-repin-reference", false)
+        .await
+        .unwrap();
+
+    let rows = h.pins_updated_rows();
+    assert_eq!(rows.len(), 1);
+    match &rows[0].event_kind {
+        EventKind::SaContextRulePinsUpdated {
+            rule_id: 1,
+            pinned_policy_wasm_hashes_first8,
+            pinned_policy_executable_refs,
+            reason,
+            ..
+        } => {
+            assert_eq!(
+                pinned_policy_wasm_hashes_first8,
+                &vec![first8(&spending_limit_hash())]
+            );
+            assert!(
+                pinned_policy_executable_refs.is_empty(),
+                "{pinned_policy_executable_refs:?}"
+            );
+            assert_eq!(*reason, PinsUpdateReason::PolicyAdded);
+        }
+        other => panic!("expected SaContextRulePinsUpdated for rule 1; got {other:?}"),
+    }
+
+    h.submit(&[1], Some("req-after-repin-reference"))
+        .await
+        .unwrap();
+    assert_eq!(h.sends(), 2);
+}
+
+/// `verify-pins` reports a pinned policy with no policy on chain as policy
+/// drift with no observed policy, beside the matching verifier.
+#[tokio::test]
+async fn verify_pins_reports_drift_for_a_policy_pin_with_no_live_policy() {
+    let h = policy_harness(vec![]).await;
+    h.pin_created(
+        1,
+        vec![first8(&webauthn_hash())],
+        vec![first8(&KNOWN_WASM_HASH)],
+        vec![],
+        vec![],
+    );
+    let result = h
+        .rule_manager()
+        .verify_rule_wasm_pins(
+            smart_account(),
+            1,
+            &account_id_for_seed(SEED),
+            "req-verify-absent",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.verifier_pin_status, PinStatus::Match);
+    assert_eq!(result.policy_pin_status, PinStatus::Drift);
+    assert!(result.observed_policy_first8.is_empty());
+    assert!(result.observed_policy_executable.is_empty());
+    assert_eq!(result.pinned_policy_first8, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(result.unavailable_wire_code, None);
+    assert_eq!(h.sends(), 0);
+}
+
+/// A migration checks the migrating rule's policy pins for presence: a
+/// record pinning a policy on a rule with no policy on chain refuses the
+/// first step with its own code, unwrapped.
+#[tokio::test]
+async fn a_migration_refuses_a_rule_whose_pinned_policy_is_absent() {
+    let chain = Chain::default()
+        .with_rule(
+            1,
+            rule(
+                1,
+                vec![
+                    delegated_signer(),
+                    external_signer(&verifier_v(), &[0x11; 32]),
+                ],
+                vec![],
+            ),
+        )
+        .with_entry(wasm_instance(&verifier_v(), webauthn_hash()))
+        .with_entry(wasm_instance(&verifier_w(), ed25519_hash()));
+    let h = Harness::new(chain).await;
+    write_baseline(
+        &h.audit,
+        1,
+        &smart_account_redacted(),
+        &signer_set_n_of_n(2),
+    );
+    h.pin_created(
+        1,
+        vec![first8(&webauthn_hash())],
+        vec![first8(&KNOWN_WASM_HASH)],
+        vec![],
+        vec![],
+    );
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+    let result = migration_plan(webauthn_hash(), ed25519_hash())
+        .submit(&signer, &h.manager, "req-migrate-absent")
+        .await;
+    assert_eq!(result.failed_step_index, Some(0));
+    assert!(
+        matches!(
+            result.failed_step_error,
+            Some(SaError::PinnedPolicyAbsent {
+                rule_id: 1,
+                pinned_count: 1,
+                ..
+            })
+        ),
+        "{:?}",
+        result.failed_step_error
+    );
+    assert_eq!(h.sends(), 0);
     assert!(h.pins_updated_rows().is_empty());
 }

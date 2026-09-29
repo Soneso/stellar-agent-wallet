@@ -583,19 +583,9 @@ pub const WIRE_CODE_DIVERGENT: &str = "defi.pin.divergent";
 // of this file.  That function is the canonical implementation shared across
 // all workspace crates.
 
-/// Returns the first 8 bytes of a 32-byte hash as lowercase hex (16 chars).
-///
-/// Used for log and error surfaces per the WASM-hash redaction rule (first-8 hex).
-///
-/// This is intentionally local to this crate.
-/// `stellar_agent_core::hex::redact_hex_first8_last8` operates on hex strings
-/// (not raw bytes) and returns first-8-last-8.  The sign-time gate requires
-/// first-8-only from raw `[u8; 32]` bytes, which has no matching core
-/// primitive.
-#[must_use]
-pub(crate) fn hash_first8_hex(hash: &[u8; 32]) -> String {
-    hash[..8].iter().map(|b| format!("{b:02x}")).collect()
-}
+/// The first 8 bytes of a 32-byte hash as lowercase hex (16 chars), the
+/// first-8 form the log and error surfaces carry.
+pub(crate) use stellar_agent_core::hex::wasm_hash_first8_hex as hash_first8_hex;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
