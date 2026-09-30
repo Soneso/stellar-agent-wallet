@@ -1,14 +1,19 @@
 //! SEP-43 `signAuthEntry` method dispatch.
 //!
-//! Signs a base64 XDR `HashIdPreimage::SorobanAuthorization` preimage with the
+//! Signs the base64 XDR `HashIdPreimage` of an authorization entry with the
 //! active profile's signing key and returns the base64 raw signature plus the
-//! signer's address.
+//! signer's address. The preimage is envelope type 9 (`SorobanAuthorization`)
+//! or type 10 (`SorobanAuthorizationWithAddress`, CAP-71); every other
+//! preimage case is refused. The preimage does not carry the credential arm: a
+//! type 10 preimage is signed only when it is bound to the signing key's
+//! `ScAddress::Account`, whichever credential type the entry uses, and a
+//! preimage bound to any other address is refused with `InvalidAddress`.
 //!
 //! Reference: SEP-43 v1.2.1 `signAuthEntry`. Wallets-Kit canonical response
 //! shape `{ signedAuthEntry: string; signerAddress?: string }`, where
 //! `signedAuthEntry` is the base64-encoded 64-byte ed25519 signature over
-//! `SHA256(preimage)`. The requester assembles the signature into the final
-//! `SorobanAuthorizationEntry`.
+//! `SHA256(preimage)` of the received bytes. The requester assembles the
+//! signature into the final `SorobanAuthorizationEntry`.
 
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_network::signing::Signer;
@@ -17,8 +22,8 @@ use crate::{address::validate_strkey, error::Sep43Error, signing::sign_soroban_a
 
 /// Dispatches the SEP-43 `signAuthEntry` method.
 ///
-/// Signs the `preimage_xdr` (a base64 `HashIdPreimage::SorobanAuthorization`)
-/// with the active profile signer and returns
+/// Signs the `preimage_xdr` (the base64 `HashIdPreimage` of the entry,
+/// envelope type 9 or 10) with the active profile signer and returns
 /// `{ "signedAuthEntry": "<base64 signature>", "signerAddress": "G..." }`.
 ///
 /// # Argument validation
@@ -30,16 +35,18 @@ use crate::{address::validate_strkey, error::Sep43Error, signing::sign_soroban_a
 ///
 /// # Errors
 ///
-/// - [`Sep43Error::InvalidNetworkPassphrase`] — passphrase mismatch, or the
+/// - [`Sep43Error::InvalidNetworkPassphrase`]: passphrase mismatch, or the
 ///   preimage's `network_id` does not match the active network.
-/// - [`Sep43Error::InvalidAddress`] — provided `address` is not a valid strkey
-///   or does not match the signing key.
-/// - [`Sep43Error::InvalidXdr`] — `preimage_xdr` is not valid base64 or not a
+/// - [`Sep43Error::InvalidAddress`]: provided `address` is not a valid strkey
+///   or does not match the signing key, or a type 10 preimage is bound to an
+///   address other than the signing key's account.
+/// - [`Sep43Error::InvalidXdr`]: `preimage_xdr` is not valid base64 or not a
 ///   well-formed `HashIdPreimage`.
-/// - [`Sep43Error::MalformedAuthEntry`] — the preimage is not the
-///   `SorobanAuthorization` variant.
-/// - [`Sep43Error::UserRejected`] — signer user-rejection.
-/// - [`Sep43Error::SignerUnavailable`] — signer wallet-state error.
+/// - [`Sep43Error::MalformedAuthEntry`]: the preimage is neither envelope
+///   type 9 (`SorobanAuthorization`) nor type 10
+///   (`SorobanAuthorizationWithAddress`).
+/// - [`Sep43Error::UserRejected`]: signer user-rejection.
+/// - [`Sep43Error::SignerUnavailable`]: signer wallet-state error.
 ///
 /// # Panics
 ///
@@ -84,6 +91,7 @@ pub async fn dispatch(
     let signature_b64 = sign_soroban_auth_entry(
         preimage_xdr,
         signer,
+        &signer_pubkey,
         &profile.network_passphrase,
         network_passphrase,
     )
@@ -227,6 +235,66 @@ mod tests {
             .expect("signature must verify against SHA256(preimage_bytes)");
 
         assert!(signer_addr.starts_with('G'), "signer addr: {signer_addr}");
+    }
+
+    /// SUCCESS on a CAP-71 envelope type 10 preimage bound to the signing
+    /// key's account: dispatch returns the signature and the signer address,
+    /// and the signature verifies over `SHA256(preimage_bytes)`.
+    #[tokio::test]
+    async fn dispatch_case_10_preimage_returns_signed_auth_entry_and_signer_address() {
+        use ed25519_dalek::{Signature, VerifyingKey};
+        use stellar_xdr::{
+            AccountId, ContractId, Hash, HashIdPreimage,
+            HashIdPreimageSorobanAuthorizationWithAddress, Limits, PublicKey, ScAddress,
+            SorobanAuthorizedFunction, SorobanAuthorizedInvocation, Uint256, WriteXdr,
+        };
+
+        let key = SoftwareSigningKey::new_from_bytes([0x83u8; 32]);
+        let pk = key.public_key().await.unwrap();
+        let preimage_b64 = HashIdPreimage::SorobanAuthorizationWithAddress(
+            HashIdPreimageSorobanAuthorizationWithAddress {
+                network_id: Hash(Sha256::digest(TESTNET.as_bytes()).into()),
+                nonce: 99999,
+                signature_expiration_ledger: 10000,
+                address: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                    pk.0,
+                )))),
+                invocation: SorobanAuthorizedInvocation {
+                    function: SorobanAuthorizedFunction::ContractFn(
+                        stellar_xdr::InvokeContractArgs {
+                            contract_address: ScAddress::Contract(ContractId(Hash([0xAAu8; 32]))),
+                            function_name: "test_fn".try_into().expect("short fn name"),
+                            args: vec![].try_into().expect("empty args"),
+                        },
+                    ),
+                    sub_invocations: vec![].try_into().expect("empty sub-invocations"),
+                },
+            },
+        )
+        .to_xdr_base64(Limits::none())
+        .expect("type 10 preimage must encode");
+
+        let result = dispatch(&testnet_profile(), &key, &preimage_b64, None, None)
+            .await
+            .expect("dispatch must sign a type 10 preimage bound to the signing key");
+
+        let sig: [u8; 64] = base64::engine::general_purpose::STANDARD
+            .decode(result["signedAuthEntry"].as_str().unwrap())
+            .expect("signedAuthEntry must be valid base64")
+            .try_into()
+            .expect("signedAuthEntry must be 64 bytes");
+        let preimage_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&preimage_b64)
+            .expect("preimage must be valid base64");
+        let digest: [u8; 32] = Sha256::digest(&preimage_bytes).into();
+        VerifyingKey::from_bytes(&pk.0)
+            .expect("signer pubkey must be valid ed25519")
+            .verify_strict(&digest, &Signature::from_bytes(&sig))
+            .expect("signature must verify against SHA256(preimage_bytes)");
+        assert_eq!(
+            result["signerAddress"].as_str().unwrap(),
+            pk.to_string().as_str()
+        );
     }
 
     #[tokio::test]

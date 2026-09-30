@@ -996,9 +996,10 @@ impl ServerHandler for WalletServer {
              stellar_sep43_sign_transaction (SEP-43 signTransaction: signs a \
              TransactionEnvelope XDR, returns signedTxXdr + signerAddress, \
              NOT destructive — does not submit); \
-             stellar_sep43_sign_auth_entry (SEP-43 signAuthEntry: signs a \
-             SorobanAuthorizationEntry XDR for G-key credentials, returns \
-             signedAuthEntry + signerAddress, NOT destructive — does not submit); \
+             stellar_sep43_sign_auth_entry (SEP-43 signAuthEntry: signs the \
+             base64 HashIdPreimage of a Soroban authorization entry, envelope \
+             type 9 or 10, for the signing G-key, returns the raw signature as \
+             signedAuthEntry + signerAddress, NOT destructive, does not submit); \
              stellar_sep43_sign_message (SEP-43 signMessage: signs an arbitrary \
              UTF-8 message via sha256(message) then ed25519, returns \
              signedMessage (hex) + signerAddress, NOT destructive); \

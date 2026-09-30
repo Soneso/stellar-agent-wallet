@@ -501,7 +501,7 @@ decimal strings, not JSON numbers.
 | `stellar_sep43_get_address` | Return the active wallet address. | Read-only. |
 | `stellar_sep43_get_network` | Return the active network name and passphrase. | Read-only. |
 | `stellar_sep43_sign_transaction` | Sign a `TransactionEnvelope` XDR; return `signedTxXdr` and `signerAddress`. | Signs; no submit. Audit pre-flight + `opaque_payload_signed` row. |
-| `stellar_sep43_sign_auth_entry` | Sign a `SorobanAuthorizationEntry` XDR for G-key credentials; return `signedAuthEntry` and `signerAddress`. | Signs; no submit. Audit pre-flight + `opaque_payload_signed` row. |
+| `stellar_sep43_sign_auth_entry` | Sign the base64 `HashIdPreimage` of a Soroban authorization entry (envelope type 9, or type 10 bound to the signing key's account); return the raw signature as `signedAuthEntry` and `signerAddress`. | Signs; no submit. Audit pre-flight + `opaque_payload_signed` row. |
 | `stellar_sep43_sign_message` | Sign an arbitrary UTF-8 message via `sha256(message)` then ed25519; return `signedMessage` (hex) and `signerAddress`. | Signs; no submit. |
 | `stellar_sep43_sign_and_submit_transaction` | Sign a `TransactionEnvelope` XDR, submit, poll until confirmed; return `signedTxXdr`, `txHash`, `status`. | Signs and submits; policy gate. |
 
@@ -514,7 +514,10 @@ Arguments:
   `network_passphrase` and optional `address` (G-strkey signer; must match the
   enrolled signer when supplied).
 - `stellar_sep43_sign_auth_entry`: required `chain_id`, required `auth_entry_xdr`
-  (base64); optional `network_passphrase`, optional `address`.
+  (the base64 `HashIdPreimage` of the authorization entry, envelope type 9 or
+  10; a type 10 preimage must be bound to the signing key's account); optional
+  `network_passphrase`, optional `address`. Returns the raw signature the
+  requester assembles into the entry.
 - `stellar_sep43_sign_message`: required `chain_id`, required `message` (UTF-8
   string); optional `network_passphrase`, optional `address`.
 

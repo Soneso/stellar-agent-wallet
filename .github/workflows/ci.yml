@@ -142,6 +142,18 @@ jobs:
       - run: corepack enable
       - run: .github/scripts/test-mpp-interop.sh
 
+  sdk-v17-interop:
+    name: stellar-sdk v17 preimage interop
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24.5.0
+      - run: corepack enable
+      - run: .github/scripts/test-sdk-v17-interop.sh
+
   release-contracts:
     name: release contracts
     runs-on: ubuntu-latest

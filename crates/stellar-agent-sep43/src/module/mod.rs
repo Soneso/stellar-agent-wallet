@@ -62,24 +62,31 @@ pub trait ModuleAdapter: Send + Sync {
         address: Option<&str>,
     ) -> Result<serde_json::Value, Sep43Error>;
 
-    /// Signs a base64-encoded `HashIdPreimage::SorobanAuthorization` preimage.
+    /// Signs the base64-encoded `HashIdPreimage` of an authorization entry.
     ///
     /// Per SEP-43 v1.2.1 `signAuthEntry`. Returns
     /// `{ "signedAuthEntry": String, "signerAddress"?: String }`, where
     /// `signedAuthEntry` is the base64-encoded 64-byte ed25519 signature over
-    /// `SHA256(preimage_bytes)`.  The caller assembles the signature into the
-    /// final `SorobanAuthorizationEntry`.
+    /// `SHA256(preimage_bytes)` of the received bytes.  The caller assembles the
+    /// signature into the final `SorobanAuthorizationEntry`.
     ///
     /// # Arguments
     ///
-    /// - `preimage_xdr` — base64-encoded `HashIdPreimage::SorobanAuthorization`
-    ///   preimage (not a full `SorobanAuthorizationEntry`).
-    /// - `network_passphrase` — optional; must match profile if provided.
-    /// - `address` — optional; validated against the active address if provided.
+    /// - `preimage_xdr`: base64-encoded `HashIdPreimage` of the entry (not a
+    ///   full `SorobanAuthorizationEntry`): envelope type 9
+    ///   (`SorobanAuthorization`) or type 10 (`SorobanAuthorizationWithAddress`,
+    ///   CAP-71); every other preimage case is refused. The preimage does not
+    ///   carry the credential arm: a type 10 preimage is signed only when it
+    ///   is bound to the signing key's `ScAddress::Account`, whichever
+    ///   credential type the entry uses, and a preimage bound to any other
+    ///   address is refused with `InvalidAddress`.
+    /// - `network_passphrase`: optional; must match profile if provided.
+    /// - `address`: optional; validated against the active address if provided.
     ///
     /// # Errors
     ///
-    /// Returns [`Sep43Error`] on XDR decode failure, wrong preimage variant,
+    /// Returns [`Sep43Error`] on XDR decode failure, a preimage case other than
+    /// envelope type 9 or 10, a type 10 preimage bound to another address,
     /// passphrase mismatch, or signer error.
     async fn sign_auth_entry(
         &self,

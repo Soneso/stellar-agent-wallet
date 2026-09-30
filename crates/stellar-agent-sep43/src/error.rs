@@ -209,12 +209,14 @@ pub enum Sep43Error {
     #[error("missing address: the active profile has no enrolled signing account")]
     MissingAddress,
 
-    /// The decoded `HashIdPreimage` is a valid but non-`SorobanAuthorization` variant.
+    /// The decoded `HashIdPreimage` is not a Soroban authorization preimage.
     ///
-    /// Returned when the input decodes as a `HashIdPreimage` but the inner
-    /// variant is not `SorobanAuthorization` (e.g. `Transaction`, `RevokeId`,
-    /// etc.).  A full `SorobanAuthorizationEntry` or any other non-`HashIdPreimage`
-    /// XDR structure returns [`Self::InvalidXdr`] instead of this variant.
+    /// Returned when the input decodes as a `HashIdPreimage` that is neither
+    /// `SorobanAuthorization` (envelope type 9) nor
+    /// `SorobanAuthorizationWithAddress` (envelope type 10), for example
+    /// `OpId` or `ContractId`.  A full `SorobanAuthorizationEntry` or any other
+    /// non-`HashIdPreimage` XDR structure returns [`Self::InvalidXdr`] instead
+    /// of this variant.
     ///
     /// Maps to SEP-43 error code `-3`.
     #[error("malformed auth entry: {detail}")]

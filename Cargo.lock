@@ -5079,11 +5079,14 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "ed25519-dalek",
+ "rand_core 0.6.4",
  "serde_json",
+ "serial_test",
  "sha2 0.11.0",
  "stellar-agent-core",
  "stellar-agent-network",
  "stellar-agent-sep53",
+ "stellar-agent-soroban-auth",
  "stellar-agent-test-support",
  "stellar-agent-xdr-limits",
  "stellar-strkey 0.0.18",
@@ -5233,6 +5236,17 @@ dependencies = [
  "webauthn-rs-core",
  "wiremock",
  "zeroize",
+]
+
+[[package]]
+name = "stellar-agent-soroban-auth"
+version = "0.1.0-alpha.9"
+dependencies = [
+ "serde_json",
+ "sha2 0.11.0",
+ "stellar-strkey 0.0.18",
+ "stellar-xdr 28.0.0",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

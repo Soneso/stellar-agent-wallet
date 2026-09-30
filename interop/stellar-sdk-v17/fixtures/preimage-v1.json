@@ -1,0 +1,13 @@
+{
+  "credentialType": "address",
+  "envelopeType": 9,
+  "networkPassphrase": "Test SDF Network ; September 2015",
+  "nonce": 305419896,
+  "signatureExpirationLedger": 9999,
+  "address": "GBCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIZCA",
+  "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+  "functionName": "test_invoke",
+  "args": [],
+  "preimageXdr": "AAAACc7gMC1ZhE0yvcqRXIID3USzP7t+3BkFHqN6vt8o7NRyAAAAABI0VngAACcPAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAt0ZXN0X2ludm9rZQAAAAAAAAAAAA==",
+  "payloadHex": "8342ba9ef21d83707eac0f45fbdf82300caec51cac145873055bbe4f56faa77b"
+}

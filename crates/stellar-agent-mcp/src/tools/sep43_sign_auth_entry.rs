@@ -1,7 +1,8 @@
-//! `stellar_sep43_sign_auth_entry` MCP tool — SEP-43 `signAuthEntry`.
+//! `stellar_sep43_sign_auth_entry` MCP tool: SEP-43 `signAuthEntry`.
 //!
-//! Signs a base64-encoded `SorobanAuthorizationEntry` XDR and returns the
-//! signed entry with the signer's address.
+//! Signs the base64 `HashIdPreimage` of a Soroban authorization entry
+//! (envelope type 9 or 10) and returns the raw signature, which the requester
+//! assembles into the entry, with the signer's address.
 //!
 //! Per `sep-0043.md` lines :77-89.
 
@@ -23,17 +24,21 @@ use crate::server::WalletServer;
 ///
 /// # Schema
 ///
-/// - `chain_id` — CAIP-2 chain identifier.
-/// - `auth_entry_xdr` — base64-encoded `SorobanAuthorizationEntry` XDR.
-/// - `network_passphrase` — optional; if provided must match profile.
-/// - `address` — optional signer address; if provided must match active signer.
+/// - `chain_id`: CAIP-2 chain identifier.
+/// - `auth_entry_xdr`: the base64 `HashIdPreimage` of the authorization entry
+///   (envelope type 9 or 10).
+/// - `network_passphrase`: optional; if provided must match profile.
+/// - `address`: optional signer address; if provided must match active signer.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(crate = "rmcp::serde")]
 pub struct Sep43SignAuthEntryArgs {
     /// CAIP-2 chain identifier (e.g. `"stellar:testnet"`).
     pub chain_id: String,
 
-    /// Base64-encoded `SorobanAuthorizationEntry` XDR to sign.
+    /// The base64 `HashIdPreimage` of the authorization entry to sign:
+    /// envelope type 9 (`SorobanAuthorization`) or type 10
+    /// (`SorobanAuthorizationWithAddress`, bound to the signing key's
+    /// account).
     pub auth_entry_xdr: String,
 
     /// Optional Stellar network passphrase override.
@@ -53,17 +58,23 @@ pub struct Sep43SignAuthEntryArgs {
 // Tool router impl block
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Signs a `SorobanAuthorizationEntry` XDR (SEP-43 `signAuthEntry`).
+/// Signs the `HashIdPreimage` of a Soroban authorization entry (SEP-43
+/// `signAuthEntry`).
 ///
-/// Loads the signer from the profile's default keyring entry and computes the
-/// `HashIdPreimage::SorobanAuthorization` signing payload.
+/// Loads the signer from the profile's default keyring entry and signs the
+/// SHA-256 of the received preimage bytes. The preimage is envelope type 9
+/// (`SorobanAuthorization`) or type 10 (`SorobanAuthorizationWithAddress`); a
+/// type 10 preimage must be bound to the signing key's account.
 ///
-/// Returns `{ "signedAuthEntry": "...", "signerAddress": "G..." }` on success.
+/// Returns `{ "signedAuthEntry": "...", "signerAddress": "G..." }` on success,
+/// where `signedAuthEntry` is the base64 raw 64-byte signature the requester
+/// assembles into the entry.
 ///
 /// # Tool annotations
 ///
-/// - `readOnlyHint = false` — creates a signature over the auth entry.
-/// - `destructiveHint = false` — auth-entry signing does not submit.
+/// - `readOnlyHint = false`: creates a signature over the authorization
+///   preimage.
+/// - `destructiveHint = false`: auth-entry signing does not submit.
 ///
 /// # SEP-43 reference
 ///
@@ -73,8 +84,11 @@ pub struct Sep43SignAuthEntryArgs {
 ///
 /// Returns a tool-level error when:
 /// - `chain_id` does not match the profile.
-/// - `auth_entry_xdr` is not a valid base64 `SorobanAuthorizationEntry`.
-/// - The entry credentials are not `SorobanCredentials::Address`.
+/// - `auth_entry_xdr` is not a valid base64 `HashIdPreimage`.
+/// - The preimage is neither envelope type 9 nor type 10
+///   (`sep43.malformed_auth_entry`).
+/// - A type 10 preimage is bound to an address other than the signing key's
+///   account (`sep43.invalid_address`).
 /// - `network_passphrase` does not match the profile.
 /// - The keyring entry for the signer cannot be loaded.
 ///
@@ -98,8 +112,13 @@ impl WalletServer {
     )]
     #[tool(
         name = "stellar_sep43_sign_auth_entry",
-        description = "Sign a SorobanAuthorizationEntry XDR (SEP-43 signAuthEntry). \
-                       Returns { signedAuthEntry: string, signerAddress: string }. \
+        description = "Sign the authorization preimage of a Soroban auth entry \
+                       (SEP-43 signAuthEntry). auth_entry_xdr is the base64 \
+                       HashIdPreimage of the entry, envelope type 9 \
+                       (SorobanAuthorization) or 10 (SorobanAuthorizationWithAddress, \
+                       bound to the signing key's account). Returns { signedAuthEntry: \
+                       string, signerAddress: string }, where signedAuthEntry is the \
+                       base64 raw signature to assemble into the entry. \
                        read_only_hint=false; destructive_hint=false.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]

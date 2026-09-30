@@ -1,0 +1,29 @@
+[package]
+name = "stellar-agent-soroban-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "CAP-71 Soroban authorization-entry preimage builder and signature-payload hashing for the Stellar agent wallet. Internal to the stellar-agent workspace; no API stability promise."
+readme = "README.md"
+keywords = ["stellar", "soroban", "authorization", "wallet", "xdr"]
+categories = ["cryptography::cryptocurrencies", "encoding"]
+
+[lib]
+name = "stellar_agent_soroban_auth"
+path = "src/lib.rs"
+
+[dependencies]
+stellar-xdr = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Parsing and strkey decoding of the SDK fixture inputs in
+# tests/sdk_preimage_fixtures.rs.
+serde_json = { workspace = true }
+stellar-strkey = { workspace = true }
+
+[lints]
+workspace = true

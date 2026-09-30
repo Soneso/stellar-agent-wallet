@@ -28,7 +28,7 @@ if [ "$#" -eq 1 ]; then
   MODE="check"
 fi
 
-TIER0="stellar-agent-loopback-http stellar-agent-mcp-macros stellar-agent-sep5 stellar-agent-test-support stellar-agent-toolsets stellar-agent-windows-identity stellar-agent-xdr-limits"
+TIER0="stellar-agent-loopback-http stellar-agent-mcp-macros stellar-agent-sep5 stellar-agent-soroban-auth stellar-agent-test-support stellar-agent-toolsets stellar-agent-windows-identity stellar-agent-xdr-limits"
 TIER1="stellar-agent-core stellar-agent-headless-keyring stellar-agent-sep10 stellar-agent-sep45"
 TIER2="stellar-agent-network stellar-agent-toolsets-install"
 TIER3="stellar-agent-anchor stellar-agent-claimable stellar-agent-defi stellar-agent-nonce stellar-agent-pool stellar-agent-sep48 stellar-agent-sep53 stellar-agent-sep7 stellar-agent-smart-account stellar-agent-stablecoin stellar-agent-toolsets-runtime stellar-agent-x402-identity"

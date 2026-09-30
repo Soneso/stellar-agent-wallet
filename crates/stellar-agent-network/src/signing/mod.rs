@@ -173,12 +173,16 @@ pub trait Signer: Send + Sync {
     ///
     /// # Payload contract
     ///
-    /// The `payload` MUST be the standard Soroban auth-entry signing
-    /// payload: `sha256(HashIdPreimage::SorobanAuthorization { network_id,
-    /// nonce, signature_expiration_ledger, invocation }.to_xdr())`. This is
-    /// the payload signed by SorobanAuthorizationEntry credentials of type
-    /// `SorobanCredentials::Address` whose `address` is a Stellar account
-    /// (G-key).
+    /// The `payload` MUST be the SHA-256 of the XDR of a Soroban
+    /// authorization preimage for an entry whose credential `address` is a
+    /// Stellar account (G-key):
+    ///
+    /// - `HashIdPreimage::SorobanAuthorization { network_id, nonce,
+    ///   signature_expiration_ledger, invocation }` (envelope type 9) for
+    ///   `SorobanCredentials::Address`;
+    /// - `HashIdPreimage::SorobanAuthorizationWithAddress { network_id, nonce,
+    ///   signature_expiration_ledger, address, invocation }` (envelope type
+    ///   10, CAP-71) for `SorobanCredentials::AddressV2`.
     ///
     /// # Distinct from sibling primitives
     ///
@@ -187,11 +191,12 @@ pub trait Signer: Send + Sync {
     /// - [`Signer::sign_auth_digest`] signs an OZ smart-account auth-digest
     ///   that binds context-rule IDs into the standard Soroban
     ///   signature_payload.
-    /// - This method signs the standard Soroban auth-entry signature_payload
-    ///   (no rule-ID binding); used for the secondary "Delegated G-key"
-    ///   auth entry that OZ smart accounts require alongside the
-    ///   smart-account entry whenever the validating context rule includes
-    ///   `Signer::Delegated(addr)` where `addr` is a Stellar G-key.
+    /// - This method signs the Soroban auth-entry signature_payload of a
+    ///   G-key address entry (no rule-ID binding), including the secondary
+    ///   "Delegated G-key" auth entry that OZ smart accounts require
+    ///   alongside the smart-account entry whenever the validating context
+    ///   rule includes `Signer::Delegated(addr)` where `addr` is a Stellar
+    ///   G-key.
     ///
     /// All three methods MUST NOT be substituted for each other.
     /// Cryptographically the primitive is identical (32-byte ed25519 sign
@@ -199,14 +204,16 @@ pub trait Signer: Send + Sync {
     ///
     /// Sanctioned call sites:
     ///
-    /// - **Primary:** `build_and_sign_delegated_g_key_entry` in
-    ///   `stellar_agent_smart_account::managers::rules` — the Delegated G-key
-    ///   auth-entry path in the OZ smart-account manager.
-    /// - **Secondary — SEP-43 `signAuthEntry`:**
-    ///   `stellar_agent_sep43::signing::sign_soroban_auth_entry` —
-    ///   the SEP-43 G-key auth-entry signing path. The preimage is
-    ///   `HashIdPreimage::SorobanAuthorization` per SEP-45 / SEP-43
-    ///   cross-protocol convention. The ed25519 primitive is identical.
+    /// - `stellar_agent_sep43::signing::sign_soroban_auth_entry`: the SEP-43
+    ///   `signAuthEntry` G-key path, which signs the hash of the received
+    ///   preimage bytes (either envelope type). The x402 and MPP payment
+    ///   paths reach this method through it.
+    /// - `build_and_sign_delegated_g_key_entry` in
+    ///   `stellar_agent_smart_account::managers::auth_entry`: the Delegated
+    ///   G-key auth entry in the OZ smart-account manager.
+    /// - The per-entry signing loop in
+    ///   `stellar_agent_smart_account::timelock_submit`: the G-key address
+    ///   entries of a timelock operation.
     ///
     /// # Errors
     ///
