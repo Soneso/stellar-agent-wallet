@@ -3,9 +3,10 @@
 //!
 //! Both tools are read-only (`read_only_hint = true`, `destructive_hint =
 //! false`): no signing, no submission, no write-tool authority is conferred.
-//! Identification failure or an absent policy degrades the response to a
-//! metadata-only shape (`identified_kind: "unknown"`) rather than failing the
-//! call — a read tool must not hard-fail because a policy is unidentifiable.
+//! An unidentifiable policy is reported as `identified_kind: "unknown"`, and
+//! an unreadable spending-limit budget leaves out the budget block. A rule the
+//! wallet cannot read in full, such as one holding a signer it cannot decode,
+//! refuses `stellar_rules_get` with the decoder's wire code.
 //!
 //! # Point-in-time caveat
 //!
@@ -409,9 +410,11 @@ impl WalletServer {
     /// Reads a single context rule's metadata, policy classification, and
     /// (when identifiable) spending-limit budget snapshot (read-only).
     ///
-    /// Identification failure or an absent policy degrades the response to
-    /// the metadata-only shape (`identified_kind: "unknown"`, no
-    /// `spending_limit` block) rather than failing the call.
+    /// A policy whose Wasm hash is unrecognised or unobservable is reported as
+    /// `identified_kind: "unknown"`, and a spending-limit budget that cannot
+    /// be read leaves out the `spending_limit` block. A failure to read the
+    /// rule itself, including a rule holding a signer the wallet cannot
+    /// decode, refuses the call with the error's wire code.
     #[mcp_tool_item(
         name = "stellar_rules_get",
         destructive_hint = false,
@@ -529,12 +532,13 @@ impl WalletServer {
 
         let expires_in_ledgers = summary.valid_until.map(|v| v.saturating_sub(as_of_ledger));
 
-        // Policy classification degrades to an empty policies list on error —
-        // a read tool must not hard-fail because policy classification failed.
-        let classified: Vec<(stellar_xdr::ScAddress, PolicyIdentifiedKind)> = signers_manager
+        let classified: Vec<(stellar_xdr::ScAddress, PolicyIdentifiedKind)> = match signers_manager
             .classify_rule_policies(smart_account, args.rule_id, Some(INTEROP_DEPLOYER_G))
             .await
-            .unwrap_or_default();
+        {
+            Ok(classified) => classified,
+            Err(err) => return Ok(sa_error_result(&err)),
+        };
 
         // A non-Contract policy address fails LOUD rather than degrading: OZ
         // policies are always contracts, so this shape is structurally
@@ -708,6 +712,7 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
+        clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
     use super::*;
@@ -885,6 +890,156 @@ mod tests {
         assert_eq!(
             value["spending_limit"].as_str().expect("string"),
             "170141183460469231731687303715884105727"
+        );
+    }
+
+    // ── stellar_rules_get refuses a rule it cannot read in full ───────────────
+
+    /// A rule map for rule `0` with one `Delegated` signer and one signer whose
+    /// tag is `Future`, a `Signer` variant the wallet does not know.
+    fn rule_with_an_unknown_signer() -> stellar_xdr::ScVal {
+        use stellar_xdr::{
+            AccountId, ContractId, Hash, PublicKey, ScAddress, ScMap, ScMapEntry, ScString,
+            ScSymbol, ScVal, ScVec, Uint256,
+        };
+        let sym = |s: &str| ScVal::Symbol(ScSymbol::try_from(s).expect("symbol fits"));
+        let list = |items: Vec<ScVal>| ScVal::Vec(Some(ScVec(items.try_into().expect("fits"))));
+        let delegated = list(vec![
+            sym("Delegated"),
+            ScVal::Address(ScAddress::Account(AccountId(
+                PublicKey::PublicKeyTypeEd25519(Uint256([0x11; 32])),
+            ))),
+        ]);
+        let unknown = list(vec![
+            sym("Future"),
+            ScVal::Address(ScAddress::Contract(ContractId(Hash([0x22; 32])))),
+        ]);
+        let entry = |key: &str, val: ScVal| ScMapEntry { key: sym(key), val };
+        let entries: Vec<ScMapEntry> = vec![
+            entry("context_type", list(vec![sym("Default")])),
+            entry("id", ScVal::U32(0)),
+            entry(
+                "name",
+                ScVal::String(ScString(b"rule-0".to_vec().try_into().expect("fits"))),
+            ),
+            entry("policies", list(vec![])),
+            entry("policy_ids", list(vec![])),
+            entry("signer_ids", list(vec![ScVal::U32(0), ScVal::U32(1)])),
+            entry("signers", list(vec![delegated, unknown])),
+            entry("valid_until", ScVal::Void),
+        ];
+        ScVal::Map(Some(ScMap(entries.try_into().expect("fits"))))
+    }
+
+    /// Mock Soroban RPC for `stellar_rules_get`: serves the source account for
+    /// `getLedgerEntries` and answers `simulateTransaction` by the invoked
+    /// function name (`get_context_rules_count` returns `1`,
+    /// `get_context_rule` returns [`rule_with_an_unknown_signer`]).
+    struct RuleReadResponder;
+
+    impl wiremock::Respond for RuleReadResponder {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            use stellar_xdr::{
+                HostFunction, Limits, OperationBody, ReadXdr, ScVal, TransactionEnvelope, WriteXdr,
+            };
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("JSON-RPC body");
+            let id = body["id"].clone();
+            let result = match body["method"].as_str().unwrap_or("") {
+                "getLedgerEntries" => json!({
+                    "entries": [{
+                        "key": stellar_agent_test_support::xdr_fixtures::account_ledger_key_xdr(
+                            INTEROP_DEPLOYER_G,
+                        ),
+                        "xdr": stellar_agent_test_support::xdr_fixtures::account_entry_xdr(
+                            INTEROP_DEPLOYER_G,
+                            100_000_000,
+                            0,
+                        ),
+                        "lastModifiedLedgerSeq": 100
+                    }],
+                    "latestLedger": 1000
+                }),
+                "simulateTransaction" => {
+                    let envelope = TransactionEnvelope::from_xdr_base64(
+                        body["params"]["transaction"].as_str().expect("transaction"),
+                        Limits::none(),
+                    )
+                    .expect("transaction envelope decodes");
+                    let TransactionEnvelope::Tx(tx) = envelope else {
+                        panic!("expected a v1 transaction envelope");
+                    };
+                    let OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
+                        panic!("expected an InvokeHostFunction operation");
+                    };
+                    let HostFunction::InvokeContract(args) = &op.host_function else {
+                        panic!("expected an InvokeContract host function");
+                    };
+                    let returned = match args.function_name.0.as_slice() {
+                        b"get_context_rules_count" => ScVal::U32(1),
+                        b"get_context_rule" => rule_with_an_unknown_signer(),
+                        other => panic!("unexpected simulated function {other:?}"),
+                    };
+                    json!({
+                        "transactionData": "",
+                        "minResourceFee": "0",
+                        "results": [{
+                            "auth": [],
+                            "xdr": returned.to_xdr_base64(Limits::none()).expect("encodes")
+                        }],
+                        "latestLedger": 1000
+                    })
+                }
+                other => panic!("unexpected JSON-RPC method {other}"),
+            };
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+        }
+    }
+
+    /// `stellar_rules_get` refuses a rule holding a signer the wallet cannot
+    /// decode with the decoder's `sa.deployment_failed`, and never reports
+    /// the rule with an empty policy list.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn stellar_rules_get_refuses_a_rule_with_an_undecodable_signer() {
+        use stellar_agent_core::profile::schema::Profile;
+        use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
+
+        let home = tempfile::tempdir().expect("temp home");
+        let _home_guard = StellarAgentHomeGuard::new(home.path());
+        keyring_mock::install().expect("mock keyring store");
+
+        let rpc = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(RuleReadResponder)
+            .mount(&rpc)
+            .await;
+
+        let mut profile = Profile::builder_testnet("svc", INTEROP_DEPLOYER_G, "n-svc", "n-acct")
+            .with_noop_engine()
+            .build();
+        profile.rpc_url = rpc.uri();
+        let server = WalletServer::new(profile).expect("WalletServer::new");
+
+        let result = server
+            .call_stellar_rules_get(StellarRulesGetArgs {
+                chain_id: "stellar:testnet".to_owned(),
+                smart_account: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                    .to_owned(),
+                rule_id: 0,
+            })
+            .await
+            .expect("the refusal is a tool-level result");
+
+        let (code, message, _) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "sa.deployment_failed", "{message}");
+        assert!(
+            message.contains(
+                "get_context_rule: signer at index 1 (id 1) is not a recognised Signer: \
+                 unknown signer tag \"Future\""
+            ),
+            "{message}"
         );
     }
 }

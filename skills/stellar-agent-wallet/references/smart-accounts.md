@@ -78,6 +78,8 @@ The wallet maps to three OpenZeppelin signer kinds. `smart-account signers list`
 | `webauthn` | WebAuthn passkey signer (verifier-backed) | `--signer-webauthn <CRED>`, resolved from the profile passkey registry; verifier address read from the verifier registry |
 | `external` | Custom external-verifier signer, or a first-class external Ed25519 signer | `--signer-external <C>` with `--signer-key-data <HEX>`, or `--signer-ed25519 <HEX_PUBKEY_64>` (typed; verifier resolves from the registry unless `--verifier <C>` overrides it). The recommended signer shape for an autonomous agent's own key: no funded classic account required, HSM/keyring-holdable, cheap rotation. |
 
+A rule holding a signer the wallet cannot decode (an unknown kind, a malformed signer, or a delegated signer with a contract address) is refused for every operation with `sa.deployment_failed`, and the reason names the signer's index; delete it with `smart-account rules delete --rule-id N --auth-rule-id M`, where rule `M` is one the wallet can read.
+
 ## Signer-set and threshold lifecycle
 
 All `smart-account signers` verbs take `--account <C>` and `--rule-id <U32>` (both required), the signer-source group, `--profile`, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`. None accept `--output`. All structurally refuse `mainnet` (including `list` and `refresh`). `list` and `refresh` require a signer source because the manager needs a source account to assemble the read envelope.

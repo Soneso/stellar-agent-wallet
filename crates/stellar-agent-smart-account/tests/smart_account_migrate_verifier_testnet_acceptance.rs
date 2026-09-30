@@ -741,9 +741,13 @@ async fn fetch_rule_decoded(smart_account_addr: &ScAddress, rule_id: u32) -> Dec
     let mut delegated_ids: Vec<u32> = Vec::new();
 
     for (sv, &signer_id) in signers_scvals.iter().zip(signer_ids_decoded.iter()) {
-        let Some(decoded_signer) = decode_signer_scval_full(sv) else {
-            // Unknown or malformed variant — skip silently (future OZ extension).
-            continue;
+        // Every signer of the rule must decode; the wallet refuses a rule
+        // holding a signer it cannot represent.
+        let decoded_signer = match decode_signer_scval_full(sv) {
+            Ok(decoded_signer) => decoded_signer,
+            Err(e) => {
+                panic!("rule {rule_id} signer id {signer_id} is not a recognised Signer: {e}")
+            }
         };
         match decoded_signer {
             DecodedOnChainSigner::Delegated {

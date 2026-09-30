@@ -14,6 +14,7 @@
 //! | [`audit_log_baseline_reconstruction`] | Most-recent row dictates reconstruction |
 //! | [`audit_log_wholesale_replacement`] | HMAC sidecar mismatch on swapped log |
 //! | [`signer_set_divergence_out_of_band`] | `SignerSetDiverged` (both RPCs agree; stale baseline) |
+//! | [`signer_set_undecodable_signer`] | `DeploymentFailed` for a rule holding an undecodable signer; no baseline row |
 //! | [`rpc_divergence_before`] | `NetworkRpcDivergence` before `SignerSetDiverged` |
 //! | [`threshold_policy_not_installed`] | `ThresholdPolicyNotInstalled` on empty policies |
 //! | [`threshold_policy_identification_zero_match`] | `ThresholdPolicyIdentificationFailed` |
@@ -90,6 +91,9 @@ mod threshold_brick;
 
 #[path = "smart-account-fixtures/adversarial/signer_set_divergence_out_of_band.rs"]
 mod signer_set_divergence_out_of_band;
+
+#[path = "smart-account-fixtures/adversarial/signer_set_undecodable_signer.rs"]
+mod signer_set_undecodable_signer;
 
 #[path = "smart-account-fixtures/adversarial/rpc_divergence_before.rs"]
 mod rpc_divergence_before;

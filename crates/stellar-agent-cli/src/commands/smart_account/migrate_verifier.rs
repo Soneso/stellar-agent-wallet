@@ -295,11 +295,10 @@ pub struct MigrateVerifierResult {
     /// Non-empty when `total_transaction_count > 2`.  Contains the
     /// inter-transaction failure-mode advisory.
     pub warnings: Vec<String>,
-    /// Number of context rules that were fetched but could not be decoded
-    /// during the `plan_build` phase.
-    ///
-    /// `0` on a clean run.  Non-zero means at least one rule was silently
-    /// skipped.
+    /// Number of rule IDs the enumeration skipped during the `plan_build`
+    /// phase: IDs whose `get_rule` simulation failed, plus deleted or
+    /// unallocated IDs below the scan bound. A rule the wallet cannot read in
+    /// full refuses the plan and is never counted here.
     pub rules_skipped_count: usize,
 }
 
