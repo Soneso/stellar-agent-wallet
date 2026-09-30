@@ -29,8 +29,23 @@
 //!
 //! Only `SignersManager::list_signers` (first-observation) and
 //! `SignersManager::refresh_signer_baseline` (always) may construct
-//! `EventKind::SaSignerSetBaselined`.  A CI gate enforces this single-caller
-//! invariant: only these two functions may emit `SaSignerSetBaselined`.
+//! `EventKind::SaSignerSetBaselined`.  The CI gate
+//! `.github/scripts/check-no-direct-sasignersetbaselined-emit.sh` enforces
+//! this over the production code of every crate:
+//!
+//! 1. `AuditEntry::new_sa_signer_set_baselined` is called exactly once, inside
+//!    `SignersManager::emit_baseline`;
+//! 2. `emit_baseline` is called exactly twice, once from `list_signers` and
+//!    once from `refresh_signer_baseline`;
+//! 3. no code outside `stellar-agent-core`'s `audit_log/entry.rs` constructs
+//!    `SaSignerSetBaselined`, with any path prefix (pattern matches are
+//!    allowed);
+//! 4. `BaselineReason::first_observation`, `explicit_refresh`,
+//!    `FirstObservation` and `ExplicitRefresh` are used only from
+//!    `list_signers` and `refresh_signer_baseline` (pattern matches are
+//!    allowed);
+//! 5. no `use` statement outside `entry.rs` and `schema.rs` imports through
+//!    `EventKind::` or renames `EventKind`.
 //!
 //! # Implements
 //!
@@ -57,7 +72,9 @@ use stellar_agent_core::audit_log::signer_set::{
 };
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
-use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
+use stellar_agent_core::observability::{
+    RedactedStrkey, redact_strkey_first5_last5, untrusted_display_bounded,
+};
 use stellar_agent_core::scval::scval_variant_name;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_core::timefmt::now_unix_ms;
@@ -5571,10 +5588,33 @@ impl OnChainContextRule {
 /// explicit RPC client on the first policy address and overwrite `threshold`
 /// before returning the value to the user.
 ///
+/// # Complete signer set
+///
+/// An observed signer set describes every signer the rule holds. The map
+/// must carry both `signer_ids` and `signers` as `Vec`s; the two lists are
+/// parallel, so they must have the same length, every id must be a `u32` and
+/// every signer must decode through [`decode_signer_scval_full`]. A signer the
+/// wallet cannot represent (an unknown `Signer` variant, a malformed encoding,
+/// or a `Delegated` signer whose address is a contract) refuses the
+/// observation, so every read of the rule's signer set fails closed: the
+/// baseline comparison, `signers list` and `signers refresh`, the signer verbs
+/// and their post-submit reads, policy identification for threshold,
+/// spending-limit and weighted-threshold policies, the executable pin check on
+/// every rule-authorized signing verb, the passkey path and the policy
+/// classification of the MCP `stellar_rules_get` tool. Every signer of the
+/// rule can authorize its transactions, so the baseline, the threshold
+/// arithmetic and the operator's view each need all of them.
+/// Such a rule is removed with `smart-account rules delete`, authorized by a
+/// rule the wallet can read; the delete reads only its authorizing rules.
+///
 /// # Errors
 ///
 /// Returns [`SaError::DeploymentFailed`] (phase `"simulate"`) if the `ScVal`
-/// cannot be decoded as a `ContextRule`.
+/// cannot be decoded as a `ContextRule`: not a map, no `id`, a missing or
+/// non-`Vec` `signer_ids` or `signers` field, a `signer_ids` item that is not
+/// a `u32`, `signer_ids` and `signers` of different lengths, or a signer that
+/// does not decode. The reason names the offending field or index and never
+/// renders the value.
 fn decode_context_rule_scval(val: ScVal) -> Result<OnChainContextRule, SaError> {
     // The simulation returns a ScVal::Map for a contracttype struct.
     // We extract id, signers, signer_ids, policies.
@@ -5595,9 +5635,14 @@ fn decode_context_rule_scval(val: ScVal) -> Result<OnChainContextRule, SaError> 
     // This round-trips the on-chain #[contracttype] encoding without re-encoding risk.
     let raw_scval = val;
 
+    let refuse = |redacted_reason: String| SaError::DeploymentFailed {
+        phase: "simulate",
+        redacted_reason,
+    };
+
     let mut id: Option<u32> = None;
-    let mut signer_ids: Vec<u32> = vec![];
-    let mut signers_scvals: Vec<ScVal> = vec![];
+    let mut signer_ids: Option<Vec<u32>> = None;
+    let mut signers_scvals: Option<Vec<ScVal>> = None;
     let mut policies: Vec<ScAddress> = vec![];
 
     for entry in map.iter() {
@@ -5613,20 +5658,24 @@ fn decode_context_rule_scval(val: ScVal) -> Result<OnChainContextRule, SaError> 
                 }
             }
             "signer_ids" => {
-                if let ScVal::Vec(Some(v)) = &entry.val {
-                    for item in v.iter() {
-                        if let ScVal::U32(n) = item {
-                            signer_ids.push(*n);
-                        }
-                    }
+                let items = context_rule_list_items(&entry.val, "signer_ids")
+                    .map_err(|e| refuse(format!("get_context_rule: {e}")))?;
+                let mut ids = Vec::with_capacity(items.len());
+                for (i, item) in items.into_iter().enumerate() {
+                    let ScVal::U32(n) = item else {
+                        return Err(refuse(format!(
+                            "get_context_rule: signer_ids[{i}] is not a u32: {}",
+                            scval_variant_name(item)
+                        )));
+                    };
+                    ids.push(*n);
                 }
+                signer_ids = Some(ids);
             }
             "signers" => {
-                if let ScVal::Vec(Some(v)) = &entry.val {
-                    for item in v.iter() {
-                        signers_scvals.push(item.clone());
-                    }
-                }
+                let items = context_rule_list_items(&entry.val, "signers")
+                    .map_err(|e| refuse(format!("get_context_rule: {e}")))?;
+                signers_scvals = Some(items.into_iter().cloned().collect());
             }
             "policy_ids" | "policies" => {
                 if let ScVal::Vec(Some(v)) = &entry.val {
@@ -5645,16 +5694,37 @@ fn decode_context_rule_scval(val: ScVal) -> Result<OnChainContextRule, SaError> 
         phase: "simulate",
         redacted_reason: "get_context_rule: missing 'id' field in ContextRule map".to_owned(),
     })?;
+    let signer_ids = signer_ids.ok_or_else(|| {
+        refuse("get_context_rule: missing 'signer_ids' field in ContextRule map".to_owned())
+    })?;
+    let signers_scvals = signers_scvals.ok_or_else(|| {
+        refuse("get_context_rule: missing 'signers' field in ContextRule map".to_owned())
+    })?;
 
-    // Decode signers from signer ScVals. The OZ `Signer` contracttype is:
-    //   Delegated(Address) → ScVal::Vec([Symbol("Delegated"), Address])
-    //   External(Address, Bytes) → ScVal::Vec([Symbol("External"), Address, Bytes])
-    // We match signer_ids by index position (parallel slice).
+    // `signer_ids[i]` is the id of `signers[i]` (OZ keeps the two lists
+    // parallel), so a length mismatch leaves a signer without an id or an id
+    // without a signer.
+    if signer_ids.len() != signers_scvals.len() {
+        return Err(refuse(format!(
+            "get_context_rule: signer_ids has {} entries and signers has {}",
+            signer_ids.len(),
+            signers_scvals.len()
+        )));
+    }
+
     let signers: Vec<(u32, SignerPubkey)> = signer_ids
         .iter()
         .zip(signers_scvals.iter())
-        .filter_map(|(sid, sv)| decode_signer_scval(sv).map(|pk| (*sid, pk)))
-        .collect();
+        .enumerate()
+        .map(|(i, (sid, sv))| {
+            decode_signer_scval(sv).map(|pk| (*sid, pk)).map_err(|e| {
+                refuse(format!(
+                    "get_context_rule: signer at index {i} (id {sid}) is not a recognised \
+                         Signer: {e}"
+                ))
+            })
+        })
+        .collect::<Result<_, _>>()?;
 
     // Threshold placeholder: callers that need the real threshold MUST override
     // this value by calling `fetch_threshold` with an explicit RPC client on
@@ -5673,6 +5743,27 @@ fn decode_context_rule_scval(val: ScVal) -> Result<OnChainContextRule, SaError> 
     })
 }
 
+/// Returns the items of a `ContextRule` list field (`signer_ids`, `signers`).
+///
+/// An absent `Vec` body (`ScVal::Vec(None)`) is an empty list.
+///
+/// # Errors
+///
+/// Returns `"{field} is not a Vec: {variant}"` when the value is not an
+/// `ScVal::Vec`; the caller prefixes its own context.
+pub(crate) fn context_rule_list_items<'a>(
+    val: &'a ScVal,
+    field: &str,
+) -> Result<Vec<&'a ScVal>, String> {
+    match val {
+        ScVal::Vec(list) => Ok(list.iter().flat_map(|l| l.iter()).collect()),
+        other => Err(format!(
+            "{field} is not a Vec: {}",
+            scval_variant_name(other)
+        )),
+    }
+}
+
 /// Full-fidelity decoded representation of an OZ on-chain `Signer` variant.
 ///
 /// Produced by [`decode_signer_scval_full`] from a `Signer` `#[contracttype]`
@@ -5682,11 +5773,10 @@ fn decode_context_rule_scval(val: ScVal) -> Result<OnChainContextRule, SaError> 
 ///
 /// Decoded from the OZ stellar-accounts v0.7.2 `Signer` contracttype.
 ///
-/// This type is always compiled.  It is accessible outside the crate only via
-/// the `#[cfg(any(test, feature = "test-helpers"))]`-gated re-export in
-/// `src/lib.rs`.  Production callers within this crate reach it through
-/// `decode_signer_scval`, which projects the result to [`SignerPubkey`].
-#[cfg_attr(not(any(test, feature = "test-helpers")), allow(dead_code))]
+/// Production callers within this crate reach it through
+/// `decode_signer_scval`, which projects the result to [`SignerPubkey`], and
+/// through the verifier-migration planner, which keeps the full `key_data` to
+/// rebuild the signer.
 pub enum DecodedOnChainSigner {
     /// `Signer::Delegated(Address)` — a G-strkey ed25519 keypair.
     ///
@@ -5709,6 +5799,9 @@ pub enum DecodedOnChainSigner {
     External {
         /// Verifier contract C-strkey (e.g. `"CABC..."` prefix).
         verifier_strkey: String,
+        /// The verbatim verifier `ScAddress` (always `ScAddress::Contract`),
+        /// for callers that rebuild the signer ScVal.
+        verifier_address: ScAddress,
         /// Full public-key byte blob.  NOT truncated — production callers
         /// derive `key_data_first16: [u8; 16]` at the call site; test callers
         /// use the full blob for byte-exact equality assertions.
@@ -5716,91 +5809,153 @@ pub enum DecodedOnChainSigner {
     },
 }
 
+/// Reason an OZ `Signer` ScVal does not decode to a [`DecodedOnChainSigner`].
+///
+/// One variant per refusal. The `Display` text names the offending shape
+/// (an `ScVal` variant name, an item count or the tag bounded to
+/// [`stellar_agent_core::observability::UNTRUSTED_DISPLAY_MAX_BYTES`] bytes)
+/// and never renders an address, a key blob or an unbounded value, so it is
+/// safe inside a redacted error reason.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum SignerDecodeError {
+    /// The signer is not an `ScVal::Vec`.
+    #[error("expected ScVal::Vec, got {variant}")]
+    NotAVec {
+        /// Variant name of the value, from `scval_variant_name`.
+        variant: &'static str,
+    },
+    /// The `Vec` has fewer than two items (a tag and a payload).
+    #[error("expected at least 2 items, got {count}")]
+    TooFewItems {
+        /// Number of items in the `Vec`.
+        count: usize,
+    },
+    /// The first item, the variant tag, is not an `ScVal::Symbol`.
+    #[error("tag is not a Symbol: {variant}")]
+    TagNotASymbol {
+        /// Variant name of the tag item, from `scval_variant_name`.
+        variant: &'static str,
+    },
+    /// The tag names neither `Delegated` nor `External`.
+    #[error("unknown signer tag \"{tag}\"")]
+    UnknownTag {
+        /// The tag bytes rendered through `untrusted_display_bounded`.
+        tag: String,
+    },
+    /// A `Delegated` signer's address is not an account (G) address.
+    #[error("Delegated signer address is not an account address")]
+    DelegatedAddressNotAnAccount,
+    /// An `External` signer has fewer than three items (tag, verifier, key data).
+    #[error("External signer expected 3 items, got {count}")]
+    ExternalTooFewItems {
+        /// Number of items in the `Vec`.
+        count: usize,
+    },
+    /// An `External` signer's verifier item is not an `ScVal::Address`.
+    #[error("External verifier is not an Address: {variant}")]
+    ExternalVerifierNotAnAddress {
+        /// Variant name of the verifier item, from `scval_variant_name`.
+        variant: &'static str,
+    },
+    /// An `External` signer's verifier address is not a contract (C) address.
+    #[error("External verifier address is not a contract address")]
+    ExternalVerifierNotAContract,
+    /// An `External` signer's key data item is not an `ScVal::Bytes`.
+    #[error("External key data is not Bytes: {variant}")]
+    ExternalKeyDataNotBytes {
+        /// Variant name of the key data item, from `scval_variant_name`.
+        variant: &'static str,
+    },
+}
+
 /// Full-fidelity decode of an OZ `Signer` ScVal — the single decode site for
 /// all OZ `Signer` variant routing and field extraction.
 ///
-/// Both production callers (which project to [`SignerPubkey`] via
-/// `decode_signer_scval`) and test-helper callers (which need the full
-/// `key_data` for byte-exact equality assertions) route through this function.
-/// A future OZ change to the `Signer` enum encoding requires updating only
-/// this function — production and test paths pick up the change automatically.
+/// Production callers (`decode_signer_scval`, which projects to
+/// [`SignerPubkey`], and the verifier-migration planner) and test-helper
+/// callers (which need the full `key_data` for byte-exact equality
+/// assertions) route through this function, so a change to the OZ `Signer`
+/// encoding is made here once.
 ///
 /// The OZ stellar-accounts v0.7.2 `Signer` contracttype encodes as:
 /// - `Delegated(Address)` → `ScVal::Vec([Symbol("Delegated"), Address(pubkey_addr)])`
 /// - `External(Address, Bytes)` → `ScVal::Vec([Symbol("External"), Address(verifier), Bytes(key_data)])`
 ///
-/// Returns `None` for any unknown variant or malformed ScVal so callers can
-/// silently skip unknown future OZ signer variants without panicking.
+/// A signer the wallet cannot represent refuses the observation: every rule
+/// read requires the whole signer set, so a caller propagates the error and
+/// never drops the signer.
 ///
-/// This function is always compiled.  It is accessible outside the crate only
-/// via the `#[cfg(any(test, feature = "test-helpers"))]`-gated re-export in
-/// `src/lib.rs`.  Production use within this crate goes through `decode_signer_scval`.
+/// # Errors
 ///
-/// # Returns
-///
-/// `Some(DecodedOnChainSigner)` on successful decode of a recognised OZ
-/// `Signer` variant; `None` on malformed `ScVal` or an unknown variant tag
-/// (callers that panic on `None` are integration tests; production callers
-/// silently skip unknown variants for forward-compat).
-#[cfg_attr(not(any(test, feature = "test-helpers")), allow(dead_code))]
-pub fn decode_signer_scval_full(val: &ScVal) -> Option<DecodedOnChainSigner> {
-    let vec = match val {
-        ScVal::Vec(Some(v)) => v,
-        _ => return None,
+/// Returns the [`SignerDecodeError`] variant naming the first malformed part:
+/// a value that is not a `Vec`, a `Vec` shorter than its variant requires, a
+/// tag that is not a `Symbol` or names an unknown variant, a `Delegated`
+/// address that is not an account, or an `External` verifier that is not a
+/// contract address or key data that is not `Bytes`.
+pub fn decode_signer_scval_full(val: &ScVal) -> Result<DecodedOnChainSigner, SignerDecodeError> {
+    let ScVal::Vec(vec) = val else {
+        return Err(SignerDecodeError::NotAVec {
+            variant: scval_variant_name(val),
+        });
     };
-    let items: Vec<&ScVal> = vec.iter().collect();
+    // An absent `Vec` body (`ScVal::Vec(None)`) holds zero items.
+    let items: Vec<&ScVal> = vec.iter().flat_map(|v| v.iter()).collect();
     if items.len() < 2 {
-        return None;
+        return Err(SignerDecodeError::TooFewItems { count: items.len() });
     }
 
-    let tag = match items[0] {
-        ScVal::Symbol(s) => std::str::from_utf8(s.as_slice()).unwrap_or("").to_owned(),
-        _ => return None,
+    let ScVal::Symbol(tag) = items[0] else {
+        return Err(SignerDecodeError::TagNotASymbol {
+            variant: scval_variant_name(items[0]),
+        });
     };
 
-    match tag.as_str() {
-        "Delegated" => {
-            // Delegated(Address) — the address is a G-strkey ed25519 account.
-            // OZ `Signer::Delegated(Address)`.
+    match tag.as_slice() {
+        b"Delegated" => {
+            // OZ `Signer::Delegated(Address)`; the address is a G-strkey
+            // ed25519 account.
             match items[1] {
                 ScVal::Address(addr @ ScAddress::Account(acc)) => {
                     let pubkey = match &acc.0 {
                         PublicKey::PublicKeyTypeEd25519(Uint256(bytes)) => *bytes,
                     };
-                    Some(DecodedOnChainSigner::Delegated {
+                    Ok(DecodedOnChainSigner::Delegated {
                         pubkey,
                         signer_address: addr.clone(),
                     })
                 }
-                _ => None,
+                _ => Err(SignerDecodeError::DelegatedAddressNotAnAccount),
             }
         }
-        "External" => {
+        b"External" => {
             if items.len() < 3 {
-                return None;
+                return Err(SignerDecodeError::ExternalTooFewItems { count: items.len() });
             }
             // OZ `Signer::External(Address, Bytes)`.
-            let verifier_addr = match items[1] {
-                ScVal::Address(addr) => addr,
-                _ => return None,
+            let ScVal::Address(verifier_address) = items[1] else {
+                return Err(SignerDecodeError::ExternalVerifierNotAnAddress {
+                    variant: scval_variant_name(items[1]),
+                });
             };
-            // Encode verifier as C-strkey.
-            let verifier_strkey = match verifier_addr {
-                ScAddress::Contract(ContractId(Hash(bytes))) => {
-                    format!("{}", stellar_strkey::Contract(*bytes))
-                }
-                _ => return None,
+            let ScAddress::Contract(ContractId(Hash(bytes))) = verifier_address else {
+                return Err(SignerDecodeError::ExternalVerifierNotAContract);
             };
-            let key_data = match items[2] {
-                ScVal::Bytes(ScBytes(bytes)) => bytes.as_slice().to_vec(),
-                _ => return None,
+            let verifier_strkey = format!("{}", stellar_strkey::Contract(*bytes));
+            let ScVal::Bytes(ScBytes(key_data)) = items[2] else {
+                return Err(SignerDecodeError::ExternalKeyDataNotBytes {
+                    variant: scval_variant_name(items[2]),
+                });
             };
-            Some(DecodedOnChainSigner::External {
+            Ok(DecodedOnChainSigner::External {
                 verifier_strkey,
-                key_data,
+                verifier_address: verifier_address.clone(),
+                key_data: key_data.as_slice().to_vec(),
             })
         }
-        _ => None,
+        other => Err(SignerDecodeError::UnknownTag {
+            tag: untrusted_display_bounded(other),
+        }),
     }
 }
 
@@ -5812,12 +5967,12 @@ pub fn decode_signer_scval_full(val: &ScVal) -> Option<DecodedOnChainSigner> {
 /// Test-helper consumers that need the full `key_data` call
 /// [`decode_signer_scval_full`] directly (enabled via `features = ["test-helpers"]`).
 ///
-/// The OZ `Signer` contracttype encodes as:
-/// - `Delegated(Address)` → `ScVal::Vec([Symbol("Delegated"), Address(pubkey_addr)])`
-/// - `External(Address, Bytes)` → `ScVal::Vec([Symbol("External"), Address(verifier), Bytes(key_data)])`
-fn decode_signer_scval(val: &ScVal) -> Option<SignerPubkey> {
+/// # Errors
+///
+/// Returns the [`SignerDecodeError`] from [`decode_signer_scval_full`].
+fn decode_signer_scval(val: &ScVal) -> Result<SignerPubkey, SignerDecodeError> {
     match decode_signer_scval_full(val)? {
-        DecodedOnChainSigner::Delegated { pubkey, .. } => Some(SignerPubkey::Ed25519 { pubkey }),
+        DecodedOnChainSigner::Delegated { pubkey, .. } => Ok(SignerPubkey::Ed25519 { pubkey }),
         DecodedOnChainSigner::External {
             verifier_strkey,
             key_data,
@@ -5829,7 +5984,7 @@ fn decode_signer_scval(val: &ScVal) -> Option<SignerPubkey> {
                 arr[..len].copy_from_slice(&key_data[..len]);
                 arr
             };
-            Some(SignerPubkey::External {
+            Ok(SignerPubkey::External {
                 verifier_contract: verifier_strkey,
                 key_data_first16,
             })
@@ -6278,9 +6433,11 @@ pub(crate) mod tests {
         let sym = ScVal::Symbol(ScSymbol::try_from("Delegated").unwrap());
         let vec_val = ScVal::Vec(Some(ScVec(VecM::try_from(vec![sym, addr]).unwrap())));
 
-        let pk = decode_signer_scval(&vec_val);
-        assert!(pk.is_some(), "should decode Delegated signer");
-        assert_eq!(pk.unwrap(), SignerPubkey::Ed25519 { pubkey });
+        assert_eq!(
+            decode_signer_scval(&vec_val),
+            Ok(SignerPubkey::Ed25519 { pubkey }),
+            "should decode Delegated signer"
+        );
     }
 
     #[test]
@@ -6297,21 +6454,23 @@ pub(crate) mod tests {
         assert_eq!(xdr, expected);
         assert_eq!(
             decode_signer_scval(&val),
-            Some(SignerPubkey::Ed25519 { pubkey: [0; 32] })
+            Ok(SignerPubkey::Ed25519 { pubkey: [0; 32] })
         );
     }
 
     #[test]
-    fn decode_signer_scval_unknown_tag_returns_none() {
+    fn decode_signer_scval_refuses_an_unknown_tag() {
         use stellar_xdr::{AccountId, ScAddress, ScSymbol, ScVec, Uint256};
         let sym = ScVal::Symbol(ScSymbol::try_from("UnknownTag").unwrap());
         let addr = ScVal::Address(ScAddress::Account(AccountId(
             PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32])),
         )));
         let vec_val = ScVal::Vec(Some(ScVec(VecM::try_from(vec![sym, addr]).unwrap())));
-        assert!(
-            decode_signer_scval(&vec_val).is_none(),
-            "unknown tag must return None"
+        assert_eq!(
+            decode_signer_scval(&vec_val),
+            Err(SignerDecodeError::UnknownTag {
+                tag: "UnknownTag".to_owned()
+            })
         );
     }
 
@@ -7216,8 +7375,9 @@ pub(crate) mod tests {
         ))
     }
 
-    /// Asserts a `DeploymentFailed` reason is bounded, names the `String`
-    /// variant and carries no byte of the payload.
+    /// Asserts a `DeploymentFailed` reason at phase `simulate` is bounded,
+    /// equals `expected` and carries no byte of the `large_string_scval`
+    /// payload.
     fn assert_bounded_string_reason(err: SaError, expected: &str) {
         let SaError::DeploymentFailed {
             phase,
@@ -7290,14 +7450,21 @@ pub(crate) mod tests {
             .expect("build_external_signer_scval must succeed for valid inputs");
 
         // The produced ScVal must decode via decode_signer_scval_full to External.
-        let decoded = decode_signer_scval_full(&val)
-            .expect("decode_signer_scval_full must return Some for a well-formed External ScVal");
+        let Ok(decoded) = decode_signer_scval_full(&val) else {
+            panic!("decode_signer_scval_full must decode a well-formed External ScVal");
+        };
 
         match decoded {
             DecodedOnChainSigner::External {
                 verifier_strkey,
+                verifier_address,
                 key_data: decoded_key,
             } => {
+                assert_eq!(
+                    verifier_address,
+                    ScAddress::Contract(ContractId(Hash([0x77u8; 32]))),
+                    "verifier_address must be the verbatim verifier ScAddress"
+                );
                 // The verifier strkey must be the canonical encoding of the all-0x77 hash.
                 // Use format!("{}", ...) to obtain a std::string::String (stellar_strkey
                 // Display produces a heapless::String via to_string(), which does not
@@ -7329,7 +7496,9 @@ pub(crate) mod tests {
             "build_external_signer_scval with empty key_data must succeed"
         );
         // Verify the decoded form has an empty key blob.
-        let decoded = decode_signer_scval_full(&result.unwrap()).unwrap();
+        let Ok(decoded) = decode_signer_scval_full(&result.unwrap()) else {
+            panic!("an empty-key External ScVal must decode");
+        };
         if let DecodedOnChainSigner::External { key_data, .. } = decoded {
             assert!(key_data.is_empty(), "decoded key_data must be empty");
         } else {
@@ -7339,60 +7508,66 @@ pub(crate) mod tests {
 
     // ── decode_signer_scval_full ──────────────────────────────────────────────
 
-    /// `decode_signer_scval_full` must return `None` for a non-Vec ScVal.
+    /// `decode_signer_scval_full` refuses a value that is not a `ScVal::Vec`,
+    /// naming its variant.
     #[test]
-    fn decode_signer_scval_full_returns_none_for_non_vec() {
-        assert!(
-            decode_signer_scval_full(&ScVal::Void).is_none(),
-            "ScVal::Void must return None"
+    fn decode_signer_scval_full_refuses_a_non_vec() {
+        assert_eq!(
+            decode_signer_scval_full(&ScVal::Void).err(),
+            Some(SignerDecodeError::NotAVec { variant: "Void" })
         );
-        assert!(
-            decode_signer_scval_full(&ScVal::U32(1)).is_none(),
-            "ScVal::U32 must return None"
+        assert_eq!(
+            decode_signer_scval_full(&ScVal::U32(1)).err(),
+            Some(SignerDecodeError::NotAVec { variant: "U32" })
         );
     }
 
-    /// `decode_signer_scval_full` must return `None` for a Vec with fewer than
-    /// 2 elements (minimum required: tag + at least one payload field).
+    /// `decode_signer_scval_full` refuses a Vec with fewer than 2 elements
+    /// (minimum required: tag + at least one payload field); an absent Vec
+    /// body counts as zero elements.
     #[test]
-    fn decode_signer_scval_full_returns_none_for_short_vec() {
+    fn decode_signer_scval_full_refuses_a_short_vec() {
         use stellar_xdr::{ScSymbol, ScVec};
 
-        // Empty vec.
+        assert_eq!(
+            decode_signer_scval_full(&ScVal::Vec(None)).err(),
+            Some(SignerDecodeError::TooFewItems { count: 0 })
+        );
+
         let empty = ScVal::Vec(Some(ScVec(VecM::try_from(vec![]).unwrap())));
-        assert!(
-            decode_signer_scval_full(&empty).is_none(),
-            "empty Vec must return None"
+        assert_eq!(
+            decode_signer_scval_full(&empty).err(),
+            Some(SignerDecodeError::TooFewItems { count: 0 })
         );
 
         // Vec with exactly 1 element (symbol only, no payload).
         let sym = ScVal::Symbol(ScSymbol::try_from("Delegated").unwrap());
         let one_elem = ScVal::Vec(Some(ScVec(VecM::try_from(vec![sym]).unwrap())));
-        assert!(
-            decode_signer_scval_full(&one_elem).is_none(),
-            "1-element Vec must return None"
+        assert_eq!(
+            decode_signer_scval_full(&one_elem).err(),
+            Some(SignerDecodeError::TooFewItems { count: 1 })
         );
     }
 
-    /// `decode_signer_scval_full` must return `None` when the first element is
-    /// not a Symbol (unknown tag type).
+    /// `decode_signer_scval_full` refuses a Vec whose first element, the
+    /// variant tag, is not a Symbol.
     #[test]
-    fn decode_signer_scval_full_returns_none_when_first_elem_not_symbol() {
+    fn decode_signer_scval_full_refuses_a_non_symbol_tag() {
         use stellar_xdr::ScVec;
 
         let elem0 = ScVal::U32(42); // not a Symbol
         let elem1 = ScVal::U32(0);
         let vec_val = ScVal::Vec(Some(ScVec(VecM::try_from(vec![elem0, elem1]).unwrap())));
-        assert!(
-            decode_signer_scval_full(&vec_val).is_none(),
-            "non-Symbol first element must return None"
+        assert_eq!(
+            decode_signer_scval_full(&vec_val).err(),
+            Some(SignerDecodeError::TagNotASymbol { variant: "U32" })
         );
     }
 
-    /// `decode_signer_scval_full` must return `None` for the `External` variant
-    /// when fewer than 3 elements are present (missing `Bytes` payload).
+    /// `decode_signer_scval_full` refuses the `External` variant when fewer
+    /// than 3 elements are present (missing `Bytes` payload).
     #[test]
-    fn decode_signer_scval_full_external_returns_none_for_two_elem_vec() {
+    fn decode_signer_scval_full_refuses_a_two_item_external() {
         use stellar_xdr::{AccountId, ScAddress, ScSymbol, ScVec, Uint256};
 
         let sym = ScVal::Symbol(ScSymbol::try_from("External").unwrap());
@@ -7401,32 +7576,32 @@ pub(crate) mod tests {
             PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32])),
         )));
         let two_elem = ScVal::Vec(Some(ScVec(VecM::try_from(vec![sym, addr]).unwrap())));
-        assert!(
-            decode_signer_scval_full(&two_elem).is_none(),
-            "2-element External vec must return None (missing Bytes)"
+        assert_eq!(
+            decode_signer_scval_full(&two_elem).err(),
+            Some(SignerDecodeError::ExternalTooFewItems { count: 2 })
         );
     }
 
-    /// `decode_signer_scval_full` must return `None` for `Delegated` when the
-    /// second element is not a `ScAddress::Account` (e.g. a Contract address).
+    /// `decode_signer_scval_full` refuses a `Delegated` signer whose address is
+    /// a contract: `SignerPubkey` has no contract-address delegated form, so
+    /// the wallet cannot represent it.
     #[test]
-    fn decode_signer_scval_full_delegated_non_account_address_returns_none() {
+    fn decode_signer_scval_full_refuses_a_delegated_contract_address() {
         use stellar_xdr::{ContractId, Hash, ScAddress, ScSymbol, ScVec};
 
         let sym = ScVal::Symbol(ScSymbol::try_from("Delegated").unwrap());
-        // Contract address (not Account) — invalid for Delegated.
         let addr = ScVal::Address(ScAddress::Contract(ContractId(Hash([0x11u8; 32]))));
         let vec_val = ScVal::Vec(Some(ScVec(VecM::try_from(vec![sym, addr]).unwrap())));
-        assert!(
-            decode_signer_scval_full(&vec_val).is_none(),
-            "Delegated with Contract address must return None"
+        assert_eq!(
+            decode_signer_scval_full(&vec_val).err(),
+            Some(SignerDecodeError::DelegatedAddressNotAnAccount)
         );
     }
 
-    /// `decode_signer_scval_full` for `External` must return `None` when the
-    /// third element is not `ScVal::Bytes`.
+    /// `decode_signer_scval_full` refuses an `External` signer whose third
+    /// element is not `ScVal::Bytes`.
     #[test]
-    fn decode_signer_scval_full_external_non_bytes_payload_returns_none() {
+    fn decode_signer_scval_full_refuses_external_non_bytes_key_data() {
         use stellar_xdr::{ContractId, Hash, ScAddress, ScSymbol, ScVec};
 
         let sym = ScVal::Symbol(ScSymbol::try_from("External").unwrap());
@@ -7435,16 +7610,16 @@ pub(crate) mod tests {
         let vec_val = ScVal::Vec(Some(ScVec(
             VecM::try_from(vec![sym, addr, not_bytes]).unwrap(),
         )));
-        assert!(
-            decode_signer_scval_full(&vec_val).is_none(),
-            "External with non-Bytes third element must return None"
+        assert_eq!(
+            decode_signer_scval_full(&vec_val).err(),
+            Some(SignerDecodeError::ExternalKeyDataNotBytes { variant: "U32" })
         );
     }
 
-    /// `decode_signer_scval_full` for `External` must return `None` when the
-    /// second element is not an `ScVal::Address` (e.g. a U32).
+    /// `decode_signer_scval_full` refuses an `External` signer whose second
+    /// element is not an `ScVal::Address`.
     #[test]
-    fn decode_signer_scval_full_external_non_address_second_elem_returns_none() {
+    fn decode_signer_scval_full_refuses_external_non_address_verifier() {
         use stellar_xdr::{ScBytes, ScSymbol, ScVec};
 
         let sym = ScVal::Symbol(ScSymbol::try_from("External").unwrap());
@@ -7453,10 +7628,78 @@ pub(crate) mod tests {
         let vec_val = ScVal::Vec(Some(ScVec(
             VecM::try_from(vec![sym, not_addr, bytes]).unwrap(),
         )));
-        assert!(
-            decode_signer_scval_full(&vec_val).is_none(),
-            "External with non-Address second element must return None"
+        assert_eq!(
+            decode_signer_scval_full(&vec_val).err(),
+            Some(SignerDecodeError::ExternalVerifierNotAnAddress { variant: "U32" })
         );
+    }
+
+    /// `decode_signer_scval_full` refuses an `External` signer whose verifier
+    /// address is an account, not a contract.
+    #[test]
+    fn decode_signer_scval_full_refuses_external_account_verifier() {
+        use stellar_xdr::{AccountId, ScAddress, ScBytes, ScSymbol, ScVec, Uint256};
+
+        let sym = ScVal::Symbol(ScSymbol::try_from("External").unwrap());
+        let account = ScVal::Address(ScAddress::Account(AccountId(
+            PublicKey::PublicKeyTypeEd25519(Uint256([0x33u8; 32])),
+        )));
+        let bytes = ScVal::Bytes(ScBytes(vec![0x01, 0x02].try_into().unwrap()));
+        let vec_val = ScVal::Vec(Some(ScVec(
+            VecM::try_from(vec![sym, account, bytes]).unwrap(),
+        )));
+        assert_eq!(
+            decode_signer_scval_full(&vec_val).err(),
+            Some(SignerDecodeError::ExternalVerifierNotAContract)
+        );
+    }
+
+    /// Every `SignerDecodeError` renders a fixed text around its bounded field.
+    #[test]
+    fn signer_decode_error_display_names_the_shape() {
+        let cases = [
+            (
+                SignerDecodeError::NotAVec { variant: "Map" },
+                "expected ScVal::Vec, got Map",
+            ),
+            (
+                SignerDecodeError::TooFewItems { count: 1 },
+                "expected at least 2 items, got 1",
+            ),
+            (
+                SignerDecodeError::TagNotASymbol { variant: "U32" },
+                "tag is not a Symbol: U32",
+            ),
+            (
+                SignerDecodeError::UnknownTag {
+                    tag: "Future".to_owned(),
+                },
+                "unknown signer tag \"Future\"",
+            ),
+            (
+                SignerDecodeError::DelegatedAddressNotAnAccount,
+                "Delegated signer address is not an account address",
+            ),
+            (
+                SignerDecodeError::ExternalTooFewItems { count: 2 },
+                "External signer expected 3 items, got 2",
+            ),
+            (
+                SignerDecodeError::ExternalVerifierNotAnAddress { variant: "U32" },
+                "External verifier is not an Address: U32",
+            ),
+            (
+                SignerDecodeError::ExternalVerifierNotAContract,
+                "External verifier address is not a contract address",
+            ),
+            (
+                SignerDecodeError::ExternalKeyDataNotBytes { variant: "Void" },
+                "External key data is not Bytes: Void",
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.to_string(), expected);
+        }
     }
 
     // ── decode_context_rule_scval ─────────────────────────────────────────────
@@ -7571,71 +7814,247 @@ pub(crate) mod tests {
         assert_eq!(rule.policies[0], policy_addr, "policy address must match");
     }
 
-    /// `decode_context_rule_scval` must silently skip unknown signer ScVals
-    /// (via `decode_signer_scval` returning `None`) and only include decodable signers
-    /// in the resulting `signers` vec.
-    ///
-    /// OZ forward-compat: a future signer variant unknown to this client must not
-    /// cause a parse failure — it is silently dropped.
+    /// Builds a `ContextRule` map with id `7` and the given parallel lists.
+    fn rule_with_signer_lists(signer_ids: Vec<ScVal>, signers: Vec<ScVal>) -> ScVal {
+        use stellar_xdr::ScVec;
+        rule_with_entries(vec![
+            (
+                "signer_ids",
+                ScVal::Vec(Some(ScVec(signer_ids.try_into().unwrap()))),
+            ),
+            (
+                "signers",
+                ScVal::Vec(Some(ScVec(signers.try_into().unwrap()))),
+            ),
+        ])
+    }
+
+    /// A `Delegated` signer for the ed25519 key `[byte; 32]`.
+    fn delegated_signer(byte: u8) -> ScVal {
+        use stellar_xdr::{AccountId, ScAddress, ScSymbol, ScVec, Uint256};
+        ScVal::Vec(Some(ScVec(
+            vec![
+                ScVal::Symbol(ScSymbol::try_from("Delegated").unwrap()),
+                ScVal::Address(ScAddress::Account(AccountId(
+                    PublicKey::PublicKeyTypeEd25519(Uint256([byte; 32])),
+                ))),
+            ]
+            .try_into()
+            .unwrap(),
+        )))
+    }
+
+    /// A two-item signer whose tag is `tag`.
+    fn tagged_signer(tag: ScSymbol) -> ScVal {
+        use stellar_xdr::{ContractId, Hash, ScAddress, ScVec};
+        ScVal::Vec(Some(ScVec(
+            vec![
+                ScVal::Symbol(tag),
+                ScVal::Address(ScAddress::Contract(ContractId(Hash([0x44u8; 32])))),
+            ]
+            .try_into()
+            .unwrap(),
+        )))
+    }
+
+    /// Returns the `DeploymentFailed` reason of a refused rule decode.
+    fn refused_rule_reason(val: ScVal) -> String {
+        match decode_context_rule_scval(val) {
+            Err(SaError::DeploymentFailed {
+                phase,
+                redacted_reason,
+            }) => {
+                assert_eq!(phase, "simulate");
+                redacted_reason
+            }
+            Err(other) => panic!("expected DeploymentFailed, got {other:?}"),
+            Ok(rule) => panic!(
+                "expected a refusal, got a rule with {} signers",
+                rule.signers.len()
+            ),
+        }
+    }
+
+    /// A signer with an unknown `Signer` tag refuses the whole rule: the
+    /// observed set must hold every signer of the rule, and the reason names
+    /// the signer's index, its id and the tag.
     #[test]
-    fn decode_context_rule_scval_skips_unknown_signer_scval() {
-        use stellar_xdr::{AccountId, ScAddress, ScMap, ScMapEntry, ScSymbol, ScVec, Uint256};
-
-        let pubkey = [0xaau8; 32];
-        let delegated_sym = ScVal::Symbol(ScSymbol::try_from("Delegated").unwrap());
-        let delegated_addr = ScVal::Address(ScAddress::Account(AccountId(
-            PublicKey::PublicKeyTypeEd25519(Uint256(pubkey)),
-        )));
-        let valid_signer = ScVal::Vec(Some(ScVec(
-            vec![delegated_sym, delegated_addr].try_into().unwrap(),
-        )));
-
-        // An unknown signer: ScVal::Void (decode_signer_scval returns None).
-        let unknown_signer = ScVal::Void;
-
-        let id_key = ScVal::Symbol(ScSymbol::try_from("id").unwrap());
-        let id_val = ScVal::U32(7);
-        let signer_ids_key = ScVal::Symbol(ScSymbol::try_from("signer_ids").unwrap());
-        // Two signer_ids: [0, 1] — one for the valid signer, one for the unknown.
-        let signer_ids_val = ScVal::Vec(Some(ScVec(
-            vec![ScVal::U32(0), ScVal::U32(1)].try_into().unwrap(),
-        )));
-        let signers_key = ScVal::Symbol(ScSymbol::try_from("signers").unwrap());
-        // signers vec: [valid_signer, unknown_signer]
-        let signers_val = ScVal::Vec(Some(ScVec(
-            vec![valid_signer, unknown_signer].try_into().unwrap(),
-        )));
-
-        let map_entries: Vec<ScMapEntry> = vec![
-            ScMapEntry {
-                key: id_key,
-                val: id_val,
-            },
-            ScMapEntry {
-                key: signer_ids_key,
-                val: signer_ids_val,
-            },
-            ScMapEntry {
-                key: signers_key,
-                val: signers_val,
-            },
-        ];
-        let sc_map = ScMap(map_entries.try_into().unwrap());
-        let val = ScVal::Map(Some(sc_map));
-
-        let rule = decode_context_rule_scval(val).expect("must succeed even with unknown signer");
-        // Only the valid signer (index 0) must appear in the decoded signers list.
-        // The unknown signer (index 1) is silently skipped by filter_map.
-        assert_eq!(
-            rule.signers.len(),
-            1,
-            "only valid signers must appear; unknown signer must be silently skipped"
+    fn decode_context_rule_scval_refuses_an_unknown_signer() {
+        let val = rule_with_signer_lists(
+            vec![ScVal::U32(0), ScVal::U32(1)],
+            vec![
+                delegated_signer(0xaa),
+                tagged_signer(ScSymbol::try_from("Future").unwrap()),
+            ],
         );
-        assert_eq!(rule.signers[0].0, 0u32, "signer_id must be 0");
         assert_eq!(
-            rule.signers[0].1,
-            SignerPubkey::Ed25519 { pubkey },
-            "signer pubkey must be the delegated key"
+            refused_rule_reason(val),
+            "get_context_rule: signer at index 1 (id 1) is not a recognised Signer: \
+             unknown signer tag \"Future\""
+        );
+    }
+
+    /// `signer_ids` and `signers` of different lengths refuse the rule; equal
+    /// lists decode every signer with its id.
+    #[test]
+    fn decode_context_rule_scval_refuses_unequal_signer_lists() {
+        let rule = decode_context_rule_scval(rule_with_signer_lists(
+            vec![ScVal::U32(4), ScVal::U32(9)],
+            vec![delegated_signer(0xaa), delegated_signer(0xbb)],
+        ))
+        .expect("equal lists of decodable signers must decode");
+        assert_eq!(
+            rule.signers,
+            vec![
+                (4, SignerPubkey::Ed25519 { pubkey: [0xaa; 32] }),
+                (9, SignerPubkey::Ed25519 { pubkey: [0xbb; 32] }),
+            ]
+        );
+
+        let more_ids = rule_with_signer_lists(
+            vec![ScVal::U32(0), ScVal::U32(1), ScVal::U32(2)],
+            vec![delegated_signer(0xaa), delegated_signer(0xbb)],
+        );
+        assert_eq!(
+            refused_rule_reason(more_ids),
+            "get_context_rule: signer_ids has 3 entries and signers has 2"
+        );
+
+        let more_signers = rule_with_signer_lists(
+            vec![ScVal::U32(0)],
+            vec![delegated_signer(0xaa), delegated_signer(0xbb)],
+        );
+        assert_eq!(
+            refused_rule_reason(more_signers),
+            "get_context_rule: signer_ids has 1 entries and signers has 2"
+        );
+    }
+
+    /// A `signer_ids` item that is not a `u32` refuses the rule, naming its
+    /// index and variant.
+    #[test]
+    fn decode_context_rule_scval_refuses_a_non_u32_signer_id() {
+        let val = rule_with_signer_lists(
+            vec![ScVal::U32(0), ScVal::I32(1)],
+            vec![delegated_signer(0xaa), delegated_signer(0xbb)],
+        );
+        assert_eq!(
+            refused_rule_reason(val),
+            "get_context_rule: signer_ids[1] is not a u32: I32"
+        );
+    }
+
+    /// Builds a `ContextRule` map with id `7` and the given extra entries.
+    fn rule_with_entries(entries: Vec<(&str, ScVal)>) -> ScVal {
+        use stellar_xdr::{ScMap, ScMapEntry};
+        let mut map_entries = vec![ScMapEntry {
+            key: ScVal::Symbol(ScSymbol::try_from("id").unwrap()),
+            val: ScVal::U32(7),
+        }];
+        for (key, val) in entries {
+            map_entries.push(ScMapEntry {
+                key: ScVal::Symbol(ScSymbol::try_from(key).unwrap()),
+                val,
+            });
+        }
+        ScVal::Map(Some(ScMap(map_entries.try_into().unwrap())))
+    }
+
+    /// A map without a `signer_ids` or a `signers` key refuses the rule: an
+    /// absent list is not an empty one.
+    #[test]
+    fn decode_context_rule_scval_refuses_a_missing_signer_list() {
+        let empty = || ScVal::Vec(Some(stellar_xdr::ScVec(VecM::default())));
+        assert_eq!(
+            refused_rule_reason(rule_with_entries(vec![("signers", empty())])),
+            "get_context_rule: missing 'signer_ids' field in ContextRule map"
+        );
+        assert_eq!(
+            refused_rule_reason(rule_with_entries(vec![("signer_ids", empty())])),
+            "get_context_rule: missing 'signers' field in ContextRule map"
+        );
+    }
+
+    /// A `signer_ids` or `signers` value that is not a `Vec` refuses the rule,
+    /// naming its variant; `Vec(None)` is an empty list.
+    #[test]
+    fn decode_context_rule_scval_refuses_a_non_vec_signer_list() {
+        assert_eq!(
+            refused_rule_reason(rule_with_entries(vec![
+                ("signer_ids", ScVal::U32(1)),
+                ("signers", ScVal::Vec(None)),
+            ])),
+            "get_context_rule: signer_ids is not a Vec: U32"
+        );
+        assert_eq!(
+            refused_rule_reason(rule_with_entries(vec![
+                ("signer_ids", ScVal::Vec(None)),
+                ("signers", large_string_scval()),
+            ])),
+            "get_context_rule: signers is not a Vec: String"
+        );
+        let rule = decode_context_rule_scval(rule_with_entries(vec![
+            ("signer_ids", ScVal::Vec(None)),
+            ("signers", ScVal::Vec(None)),
+        ]))
+        .expect("absent Vec bodies are empty lists");
+        assert!(rule.signers.is_empty());
+    }
+
+    /// A `Delegated` signer whose address is a contract refuses the rule:
+    /// `SignerPubkey` has no form for it.
+    #[test]
+    fn decode_context_rule_scval_refuses_a_delegated_contract_address() {
+        use stellar_xdr::{ContractId, Hash, ScAddress, ScVec};
+
+        let delegated_contract = ScVal::Vec(Some(ScVec(
+            vec![
+                ScVal::Symbol(ScSymbol::try_from("Delegated").unwrap()),
+                ScVal::Address(ScAddress::Contract(ContractId(Hash([0x55u8; 32])))),
+            ]
+            .try_into()
+            .unwrap(),
+        )));
+        let val = rule_with_signer_lists(
+            vec![ScVal::U32(3), ScVal::U32(8)],
+            vec![delegated_signer(0xaa), delegated_contract],
+        );
+        assert_eq!(
+            refused_rule_reason(val),
+            "get_context_rule: signer at index 1 (id 8) is not a recognised Signer: \
+             Delegated signer address is not an account address"
+        );
+    }
+
+    /// An unknown tag renders through `untrusted_display_bounded`: a 32-byte
+    /// tag of control characters yields a bounded, escaped reason.
+    #[test]
+    fn decode_context_rule_scval_large_unknown_tag_reason_is_bounded() {
+        let tag = ScSymbol::try_from(vec![0x1bu8; 32]).expect("32 bytes fit an ScSymbol");
+        let val = rule_with_signer_lists(vec![ScVal::U32(0)], vec![tagged_signer(tag)]);
+        let Err(err) = decode_context_rule_scval(val) else {
+            panic!("an unknown tag must fail closed");
+        };
+        let expected = format!(
+            "get_context_rule: signer at index 0 (id 0) is not a recognised Signer: \
+             unknown signer tag \"{}...\"",
+            r"\u{1b}".repeat(10)
+        );
+        assert_bounded_string_reason(err, &expected);
+    }
+
+    /// A signer that is a large non-`Vec` value is named by its variant and
+    /// never rendered.
+    #[test]
+    fn decode_context_rule_scval_large_non_vec_signer_reason_is_bounded() {
+        let val = rule_with_signer_lists(vec![ScVal::U32(0)], vec![large_string_scval()]);
+        let Err(err) = decode_context_rule_scval(val) else {
+            panic!("a String signer must fail closed");
+        };
+        assert_bounded_string_reason(
+            err,
+            "get_context_rule: signer at index 0 (id 0) is not a recognised Signer: \
+             expected ScVal::Vec, got String",
         );
     }
 

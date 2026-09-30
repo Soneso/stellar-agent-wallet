@@ -13,6 +13,7 @@
 //! | [`unresolved_external_ref_destination_is_refused_as_unsupported`] | wiremock planner invocation | `sa.contract_instance_unsupported` (`ExternalRefUnresolved`) |
 //! | [`source_scan_plans_signer_whose_verifier_reference_resolves_to_from_hash`] | wiremock planner invocation | source scan reads a reference's resolved hash |
 //! | [`destination_changing_executable_between_identification_and_probe_is_refused`] | wiremock planner invocation | `sa.contract_instance_unsupported` (`ExecutableChanged`) |
+//! | [`a_rule_with_an_undecodable_signer_refuses_the_plan`] | wiremock planner invocation | `VerifierMigrationFailed { phase: "plan_build" }` naming the rule and the undecodable signer |
 //!
 //! All tests are end-to-end [`MigrationPlanner::build`] invocations against a
 //! wiremock HTTP server.
@@ -53,10 +54,10 @@ use wiremock::{
 };
 
 use super::rpc_mock_helpers::{
-    SOURCE_G, SorobanRpcDispatcher, account_entry_xdr, account_key_xdr,
+    SOURCE_G, SorobanRpcDispatcher, account_entry_xdr, account_key_xdr, append_signer_to_rule_xdr,
     build_context_rule_external_signers_xdr, build_ledger_entries_account_and_contract,
     build_simulate_response, contract_instance_key_xdr, entries_for_requested_keys,
-    manager_two_url, tmp_audit_writer,
+    manager_two_url, tmp_audit_writer, unknown_tag_signer_scval,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -683,6 +684,84 @@ async fn t9_sparse_id_migration_planner() {
         "rules_skipped_count must be >= 1 (gap at ID 1); got {}",
         plan.rules_skipped_count
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// a rule the wallet cannot read in full refuses the plan
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `MigrationPlanner::build` refuses the whole plan when one enumerated rule
+/// holds a signer the wallet cannot decode, naming the rule, the signer's
+/// index and id and the decoder's reason. The plan never reports success
+/// while that rule's External signers still point at the source verifier.
+///
+/// # Mock sequence
+///
+/// `simulateTransaction`: `get_context_rules_count` returns `2`, `get_rule(0)`
+/// and `get_rule(1)` return the two rules, then `get_context_rule(0)` and
+/// `get_context_rule(1)` return them again. Rule 0 holds one External signer
+/// (id `10`); rule 1 holds one External signer (id `20`) and a signer with id
+/// `21` whose tag is unknown.
+#[tokio::test]
+async fn a_rule_with_an_undecodable_signer_refuses_the_plan() {
+    let server = MockServer::start().await;
+    let smart_account = addr(0x01);
+    let dest_addr = addr(0xCD);
+    let key_data = [0xABu8; 32];
+
+    let rule_0_xdr = build_context_rule_external_signers_xdr(0, &[10], &dest_addr, &key_data);
+    let rule_1_xdr = append_signer_to_rule_xdr(
+        &build_context_rule_external_signers_xdr(1, &[20], &dest_addr, &key_data),
+        21,
+        &unknown_tag_signer_scval(),
+    );
+    let ledger_resp =
+        build_ledger_entries_account_and_contract(SOURCE_G, &dest_addr, OZ_VERIFIER_HASH);
+    let sim_responses = vec![
+        build_simulate_response(&u32_xdr(2)),
+        build_simulate_response(&rule_0_xdr),
+        build_simulate_response(&rule_1_xdr),
+        build_simulate_response(&rule_0_xdr),
+        build_simulate_response(&rule_1_xdr),
+    ];
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(SorobanRpcDispatcher::new_multi_simulate(
+            ledger_resp,
+            sim_responses,
+        ))
+        .mount(&server)
+        .await;
+
+    let (manager, _tmp_dir) = manager_with_server(&server).await;
+    let result = MigrationPlanner::new(&manager)
+        .with_max_scan_id(10)
+        .build(
+            smart_account,
+            OZ_VERIFIER_HASH,
+            dest_addr,
+            &Uuid::new_v4().to_string(),
+        )
+        .await;
+
+    let err = match result {
+        Err(err) => err,
+        Ok(plan) => panic!(
+            "the plan must be refused; got {} affected rules and rules_skipped_count {}",
+            plan.affected_rules.len(),
+            plan.rules_skipped_count
+        ),
+    };
+    let SaError::VerifierMigrationFailed { phase, detail, .. } = &err else {
+        panic!("expected VerifierMigrationFailed, got {err:?}");
+    };
+    assert_eq!(*phase, "plan_build");
+    assert_eq!(
+        detail,
+        "get_context_rule(1): signer at index 1 (id 21) is not a recognised Signer: \
+         unknown signer tag \"Future\""
+    );
+    assert_eq!(err.wire_code(), "sa.verifier_migration_failed");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

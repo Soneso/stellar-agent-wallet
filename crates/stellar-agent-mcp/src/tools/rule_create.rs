@@ -111,8 +111,9 @@ fn default_auth_rule_ids() -> Vec<u32> {
 
 /// One signer entry in `stellar_rule_create`'s `signers` array.
 ///
-/// - `delegated`: a G-strkey (ed25519-keyed delegate) or C-strkey
-///   (contract-mediated signer).
+/// - `delegated`: a G-strkey (ed25519-keyed delegate). A contract-address
+///   delegated signer is refused: the wallet reads a rule's signer set in
+///   full, and a C-strkey delegated signer has no representation in it.
 /// - `external`: raw escape hatch — an explicit verifier C-strkey and
 ///   hex-encoded `pubkey_data`, passed through unresolved (mirrors the
 ///   `raw` policy-kind precedent: a typed convenience path plus a raw
@@ -123,9 +124,9 @@ fn default_auth_rule_ids() -> Vec<u32> {
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 #[serde(crate = "rmcp::serde", tag = "kind", rename_all = "snake_case")]
 pub enum RuleCreateSignerArg {
-    /// Delegated (built-in ed25519, or contract-mediated) signer.
+    /// Delegated (built-in ed25519) signer.
     Delegated {
-        /// G-strkey or C-strkey.
+        /// G-strkey.
         address: String,
     },
     /// Raw `External` signer: explicit verifier + hex pubkey_data.
@@ -405,14 +406,18 @@ fn resolve_signers(
             RuleCreateSignerArg::Delegated { address } => {
                 has_delegated = true;
                 let is_proposer = address == &agent_g;
-                let sc_addr = parse_g_strkey_to_signer_address(address)
-                    .or_else(|_| parse_c_strkey_to_smart_account(address))
-                    .map_err(|e| {
-                        rmcp::ErrorData::invalid_params(
-                            format!("signers[{idx}].address: invalid G/C-strkey: {e}"),
-                            None,
-                        )
-                    })?;
+                let sc_addr = parse_g_strkey_to_signer_address(address).map_err(|e| {
+                    let reason = if parse_c_strkey_to_smart_account(address).is_ok() {
+                        "a contract-address delegated signer is not supported; pass a G-strkey"
+                            .to_owned()
+                    } else {
+                        format!("invalid G-strkey: {e}")
+                    };
+                    rmcp::ErrorData::invalid_params(
+                        format!("signers[{idx}].address: {reason}"),
+                        None,
+                    )
+                })?;
                 typed.push(ContextRuleSignerInput::Delegated { address: sc_addr });
                 snapshot.push(RuleProposalSigner::delegated(address.clone(), is_proposer));
             }
@@ -846,7 +851,7 @@ impl WalletServer {
         name = "stellar_rule_create",
         description = "Resolve and simulate an agent-proposed add_context_rule installation \
                        (propose step). Testnet-only — refuses chain_id=stellar:mainnet. \
-                       Signers accept delegated (G/C-strkey), external (raw \
+                       Signers accept delegated (G-strkey), external (raw \
                        verifier+pubkey hex), or webauthn (passkey credential name, resolved to \
                        bytes at propose time). Policies accept raw (address+XDR) or \
                        spending_limit (typed). Returns {approval_nonce, expires_at_unix_ms, \
@@ -1844,14 +1849,25 @@ mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
-    fn resolve_signers_delegated_accepts_c_strkey() {
+    fn resolve_signers_delegated_refuses_a_c_strkey() {
         let server = test_server();
-        let signers = vec![RuleCreateSignerArg::Delegated {
-            address: TEST_SMART_ACCOUNT.to_owned(),
-        }];
-        let resolved = resolve_signers(&signers, &server).unwrap();
-        assert_eq!(resolved.snapshot.len(), 1);
-        assert!(!resolved.snapshot[0].is_proposer);
+        let signers = vec![
+            RuleCreateSignerArg::Delegated {
+                address: TEST_G.to_owned(),
+            },
+            RuleCreateSignerArg::Delegated {
+                address: TEST_SMART_ACCOUNT.to_owned(),
+            },
+        ];
+        let Err(err) = resolve_signers(&signers, &server) else {
+            panic!("a C-strkey delegated signer must be refused");
+        };
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert_eq!(
+            err.message,
+            "signers[1].address: a contract-address delegated signer is not supported; \
+             pass a G-strkey"
+        );
     }
 
     #[test]
@@ -1862,7 +1878,12 @@ mod tests {
             address: "not-a-strkey".to_owned(),
         }];
         let err = resolve_signers(&signers, &server).unwrap_err();
-        assert!(err.message.contains("invalid G/C-strkey"));
+        assert!(
+            err.message
+                .starts_with("signers[0].address: invalid G-strkey: "),
+            "{}",
+            err.message
+        );
     }
 
     #[test]

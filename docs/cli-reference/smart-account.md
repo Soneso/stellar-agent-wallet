@@ -32,6 +32,8 @@ Nothing is sent when the check refuses. `smart-account multicall` reports the re
 
 The pin record is the newest `SaContextRuleCreated` or `SaContextRulePinsUpdated` row for the rule. `smart-account migrate-verifier`, `smart-account signers add` / `signers batch-add` and `smart-account rules add-policy` / `rules remove-policy` write a `SaContextRulePinsUpdated` row when they change the verifier or policy set of a pinned rule (see those verbs), so the check follows the wallet's own changes. `smart-account rules verify-pins` runs the same comparison on demand without signing.
 
+Every read of a rule's signer set decodes the whole set. A rule holding a signer the wallet cannot decode (an unknown signer kind, a malformed signer, or a delegated signer with a contract address) is refused for every operation that reads it, including this check and the signer-set baseline, with `sa.deployment_failed` and the signer's index in the reason. Remove such a rule with `smart-account rules delete --rule-id N --auth-rule-id M`, where rule `M` is one the wallet can read; `--auth-rule-id` defaults to the deleted rule.
+
 ---
 
 ## `smart-account rules` — context-rule lifecycle
@@ -322,7 +324,7 @@ Manages the signer set and threshold of a context rule. All verbs take `--accoun
 
 ### `smart-account signers list`
 
-Reads the on-chain signer set for a rule and, if no prior baseline exists for the `(rule_id, account)` pair, writes a `SaSignerSetBaselined` audit row to anchor future divergence detection. Submits no on-chain transaction, but is state-changing on the audit log. Testnet only.
+Reads the on-chain signer set for a rule and, if no prior baseline exists for the `(rule_id, account)` pair, writes a `SaSignerSetBaselined` audit row to anchor future divergence detection. Submits no on-chain transaction, but is state-changing on the audit log. Testnet only. A rule holding a signer the wallet cannot decode is refused with `sa.deployment_failed` naming the signer's index, and no baseline is written; delete it with `smart-account rules delete --rule-id N` authorized by a rule the wallet can read (see [pinned-hash drift check](#pinned-hash-drift-check)).
 
 The envelope reports `signer_count`, `threshold`, the `signer_ids`, and a parallel `signer_kinds` list.
 
@@ -335,7 +337,7 @@ stellar-agent smart-account signers list \
 
 ### `smart-account signers refresh`
 
-Unconditionally writes a fresh `SaSignerSetBaselined` audit row (re-anchor after an intentional out-of-band signer change). State-changing on the audit log only. Testnet only. Same flags as `list`.
+Unconditionally writes a fresh `SaSignerSetBaselined` audit row (re-anchor after an intentional out-of-band signer change). State-changing on the audit log only. Testnet only. Same flags as `list`. A rule holding a signer the wallet cannot decode cannot be re-anchored: `refresh` refuses it like `list`, with the signer's index in the reason.
 
 ```bash
 stellar-agent smart-account signers refresh \
@@ -618,6 +620,8 @@ stellar-agent smart-account deploy-policy \
 Builds and optionally executes a plan that moves all `External` signers from one verifier to another across every context rule on a smart-account. Dry-run is read-only and renders the plan as JSON; without `--dry-run` it signs and submits `remove_signer` / `add_signer` pairs. Mainnet dry-run is allowed (read-only); mainnet submit is structurally refused (`network.mainnet_write_forbidden`).
 
 Pre-flight gates (fail-closed): the destination verifier hash must be in the allowlist, its audit status must be `Audited`, `Provisional`, or `Unaudited`, and the destination contract must be immutable.
+
+The plan reads every active rule's signer set in full. A rule holding a signer the wallet cannot decode refuses the whole plan, dry-run included, with `sa.verifier_migration_failed` at phase `plan_build`; the reason names the rule, the signer's index and why it does not decode. Delete that rule (see [pinned-hash drift check](#pinned-hash-drift-check)), then migrate.
 
 Both transactions of each pair sign under the migrating rule. The [pinned-hash drift check](#pinned-hash-drift-check) runs on that rule's policies, refusing with `sa.policy_hash_drift`, `sa.pinned_policy_absent` or `sa.pin_check_unavailable`, and skips its verifiers: the gates above already vetted the destination, and the source verifier may be the drifted contract being replaced. After each pair confirms on a rule with a pin record, a `SaContextRulePinsUpdated` row (reason `verifier_migrated`) names the destination verifier's hash as the rule's verifier pin, with the policy pins unchanged, so later signing under the rule checks against the destination. A rule without a pin record stays unpinned and no row is written.
 

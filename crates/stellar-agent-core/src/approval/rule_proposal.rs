@@ -124,7 +124,7 @@ impl RuleProposalContextType {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleProposalSignerKind {
-    /// Built-in ed25519 (or contract-mediated) delegated signer.
+    /// Built-in ed25519 delegated signer.
     Delegated,
     /// External signer verified by a verifier contract (e.g. WebAuthn).
     External,
@@ -140,9 +140,8 @@ pub enum RuleProposalSignerKind {
 pub struct RuleProposalSigner {
     /// Which signer shape this entry carries.
     pub kind: RuleProposalSignerKind,
-    /// `Delegated` signer's on-chain address (G- or C-strkey — an
-    /// ed25519-keyed delegate uses a G-strkey, a contract-mediated signer
-    /// uses a C-strkey). `None` for `External`.
+    /// `Delegated` signer's on-chain address, a G-strkey. `None` for
+    /// `External`.
     pub address: Option<String>,
     /// `External` signer's verifier-contract C-strkey. `None` for `Delegated`.
     pub verifier: Option<String>,
@@ -388,20 +387,6 @@ fn validate_strkey_shape(s: &str, prefix: char, field: &str) -> Result<(), Strin
     }
 }
 
-/// Validates that `s` is a G-strkey or a C-strkey (a `Delegated` signer's
-/// `address` may be either — an ed25519-keyed delegate uses a G-strkey, a
-/// contract-mediated signer uses a C-strkey).
-fn validate_g_or_c_strkey(s: &str, field: &str) -> Result<(), String> {
-    if validate_strkey_shape(s, 'G', field).is_ok() || validate_strkey_shape(s, 'C', field).is_ok()
-    {
-        Ok(())
-    } else {
-        Err(format!(
-            "{field} must be a valid G-strkey or C-strkey (56 chars)"
-        ))
-    }
-}
-
 /// Runs all [`ContextRuleProposalSnapshot`] field invariants and returns the
 /// first failing reason.
 ///
@@ -492,7 +477,10 @@ fn validate_rule_proposal_signer(signer: &RuleProposalSigner) -> Result<(), Stri
             let Some(address) = &signer.address else {
                 return Err("Delegated signer must carry `address`".to_owned());
             };
-            validate_g_or_c_strkey(address, "address")?;
+            // A `Delegated` signer is an ed25519 account. The wallet reads a
+            // rule's signer set in full and has no representation for a
+            // contract-address delegated signer, so a C-strkey is refused.
+            validate_strkey_shape(address, 'G', "address")?;
             if signer.verifier.is_some() || signer.pubkey_data.is_some() {
                 return Err(
                     "Delegated signer must not carry `verifier` or `pubkey_data`".to_owned(),
@@ -618,6 +606,22 @@ mod tests {
             .map(|_| RuleProposalSigner::delegated(G_ADDR.to_owned(), false))
             .collect();
         assert!(validate_context_rule_proposal_snapshot(&s).is_err());
+    }
+
+    /// A `Delegated` signer's address must be a G-strkey; a C-strkey is
+    /// refused with the signer's index.
+    #[test]
+    fn rejects_delegated_signer_with_a_c_strkey_address() {
+        let mut s = valid_snapshot();
+        s.signers
+            .push(RuleProposalSigner::delegated(C_ADDR.to_owned(), false));
+        assert_eq!(
+            validate_context_rule_proposal_snapshot(&s),
+            Err(
+                "signers[1]: address must be a valid G-strkey (56 chars, ^G[A-Z2-7]{55}$)"
+                    .to_owned()
+            )
+        );
     }
 
     #[test]

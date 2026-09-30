@@ -192,6 +192,8 @@ cargo test -p stellar-agent-cli -p stellar-agent-mcp
 bash .github/scripts/publish-crates.sh --check
 bash .github/scripts/test-publish-crates-check.sh
 bash .github/scripts/package-skill.sh --check
+bash .github/scripts/check-no-direct-sasignersetbaselined-emit.sh
+bash .github/scripts/test-check-no-direct-sasignersetbaselined-emit.sh
 ```
 
 Release preparation must bump the workspace and every internal dependency pin

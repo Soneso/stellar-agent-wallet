@@ -108,7 +108,8 @@ use crate::SaError;
 use crate::error::MIGRATION_PHASES;
 use crate::managers::rules::{ContextRuleManager, ContextRuleManagerConfig, scaddress_to_strkey};
 use crate::managers::signers::{
-    SignersManager, fetch_observed_executable, simulate_read_only, verifier_hash_allowlisted,
+    DecodedOnChainSigner, SignersManager, context_rule_list_items, decode_signer_scval_full,
+    fetch_observed_executable, simulate_read_only, verifier_hash_allowlisted,
 };
 use crate::managers::verifiers::{
     MutabilityStatus, detect_contract_mutability, same_executable_reference,
@@ -234,12 +235,12 @@ pub struct MigrationPlan {
     /// provided by re-running `MigrationPlanner::build` after a partial failure —
     /// already-migrated signers no longer match `from_hash`.
     pub warnings: Vec<String>,
-    /// Number of context rules that were fetched but could not be decoded during the
-    /// `plan_build` phase (e.g., malformed `get_context_rule` simulation result).
+    /// Number of rule IDs the enumeration skipped during the `plan_build`
+    /// phase: IDs whose `get_rule` simulation failed, plus deleted or
+    /// unallocated IDs below the scan bound.
     ///
-    /// `0` on a clean run.  Non-zero means at least one rule was silently skipped.
-    /// Operators should investigate skipped rules and re-run after resolving the
-    /// underlying decode error before executing a migration submit.
+    /// A rule the enumeration returns but the wallet cannot read in full is
+    /// never counted here; it refuses the plan.
     pub rules_skipped_count: usize,
     /// Rule IDs present in the local audit log as installed but absent from the
     /// on-chain enumeration returned by `list_active_context_rules`.
@@ -1197,13 +1198,16 @@ impl<'a> MigrationPlanner<'a> {
                 request_id,
             )
             .await
-            .map_err(|e| SaError::VerifierMigrationFailed {
-                phase: MIGRATION_PHASES[2], // "plan_build"
-                smart_account_redacted: RedactedStrkey::from_already_redacted(
-                    smart_account_redacted.clone(),
-                ),
-                detail: format!("rule-signer inventory failed: {e}"),
-                request_id: request_id.to_owned(),
+            .map_err(|e| match e {
+                e @ SaError::VerifierMigrationFailed { .. } => e,
+                other => SaError::VerifierMigrationFailed {
+                    phase: MIGRATION_PHASES[2], // "plan_build"
+                    smart_account_redacted: RedactedStrkey::from_already_redacted(
+                        smart_account_redacted.clone(),
+                    ),
+                    detail: format!("rule-signer inventory failed: {other}"),
+                    request_id: request_id.to_owned(),
+                },
             })?;
 
         let total_tx: usize = affected_rules.iter().map(|r| r.transaction_count()).sum();
@@ -1246,17 +1250,18 @@ impl<'a> MigrationPlanner<'a> {
     /// `enumeration.rules_skipped` reflects IDs in `[0, max_scan_id)` that
     /// returned `Ok(None)` from `get_rule` — deleted or unallocated IDs.
     ///
-    /// # Stage 2: per-rule skip count
+    /// # Stage 2: per-rule inventory
     ///
-    /// `rules_skipped_count` additionally counts rules whose
-    /// `fetch_external_signers_for_rule` call failed (decode error).
-    /// [`MigrationPlan::submit`] re-checks before submitting.
+    /// Every enumerated rule is read in full through
+    /// `fetch_external_signers_for_rule`; a rule that cannot be read or decoded
+    /// refuses the plan with that call's `VerifierMigrationFailed`.
     ///
     /// Returns `(affected_rules, rules_skipped_count, audit_log_missing)` on success.
     ///
-    /// Returns a `SaError` (already wrapped by the caller into
-    /// `VerifierMigrationFailed { phase: "plan_build" }`) on RPC failure in the
-    /// count-fetch, enumeration, or wasm-hash-fetch phases.
+    /// Returns a `SaError` on RPC failure in the count-fetch, enumeration, rule
+    /// read or wasm-hash-fetch phases, and on a rule the wallet cannot decode.
+    /// The caller passes a `VerifierMigrationFailed` through unchanged and
+    /// wraps any other error as `VerifierMigrationFailed { phase: "plan_build" }`.
     async fn collect_affected_rules(
         &self,
         smart_account: &ScAddress,
@@ -1319,43 +1324,30 @@ impl<'a> MigrationPlanner<'a> {
         // ── Stage 2: per-rule External-signer inventory ───────────────────────
 
         let mut affected: Vec<RuleMigration> = Vec::new();
-        // rules_skipped accumulates stage-1 anomalous skip count + stage-1
-        // legitimate-gap count + stage-2 decode-failure count.  The sum
-        // semantics (anomalous + gaps) are preserved for backwards-compat with
-        // the migrate-verifier dry-run envelope; the on-chain authoritative count
-        // is in enumeration.active_count_on_chain for any caller needing that
+        // rules_skipped is the stage-1 anomalous skip count plus the stage-1
+        // legitimate-gap count, as the migrate-verifier dry-run envelope
+        // reports it; the on-chain authoritative count is in
+        // enumeration.active_count_on_chain for any caller needing that
         // distinction.
-        let mut rules_skipped: usize = enumeration
+        let rules_skipped: usize = enumeration
             .rules_skipped
             .saturating_add(enumeration.gaps_seen);
 
         for summary in &enumeration.rules {
             let rule_id = summary.rule_id;
 
-            // Fetch full External signer data for this rule.
-            let external_signers = match self
+            // Fetch full External signer data for this rule. A rule the
+            // wallet cannot read in full refuses the whole plan: a plan that
+            // left it out would report success while that rule's External
+            // signers still point at the old verifier.
+            let external_signers = self
                 .fetch_external_signers_for_rule(
                     smart_account,
                     smart_account_redacted,
                     rule_id,
                     request_id,
                 )
-                .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        smart_account = %smart_account_redacted,
-                        rule_id,
-                        error = %e,
-                        request_id,
-                        "MigrationPlanner: get_context_rule failed for rule {rule_id}; skipping"
-                    );
-                    // Defensive skip in dry-run mode; the submit path re-checks before submitting.
-                    rules_skipped = rules_skipped.saturating_add(1);
-                    continue;
-                }
-            };
+                .await?;
 
             let mut steps: Vec<SignerMigrationStep> = Vec::new();
 
@@ -1519,7 +1511,18 @@ impl<'a> MigrationPlanner<'a> {
 ///
 /// Parses the `signer_ids` and `signers` fields of the `ContextRule` `ScVal::Map`
 /// and returns [`ExternalSignerData`] for each `External(Address, Bytes)` signer.
-/// `Delegated` signers are silently skipped (not affected by verifier migration).
+/// `Delegated` signers are not returned (verifier migration does not touch
+/// them). Every signer is decoded through [`decode_signer_scval_full`], and a
+/// rule is planned whole or not at all: a rule the wallet cannot read in full
+/// refuses the rule, and the planner refuses the whole plan with this error.
+///
+/// # Errors
+///
+/// Returns [`SaError::VerifierMigrationFailed`] at phase `plan_build` for a
+/// value that is not a map, a missing or non-`Vec` `signer_ids` or `signers`
+/// field, a `signer_ids` item that is not a `u32`, unequal `signer_ids` and
+/// `signers` lengths, or a signer that does not decode; the detail names the
+/// rule and the offending field or index.
 ///
 /// # Byte-layout citation
 ///
@@ -1549,8 +1552,15 @@ fn decode_external_signers_from_context_rule(
         }
     };
 
-    let mut signer_ids: Vec<u32> = Vec::new();
-    let mut signers_scvals: Vec<ScVal> = Vec::new();
+    let refuse = |detail: String| SaError::VerifierMigrationFailed {
+        phase: MIGRATION_PHASES[2],
+        smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
+        detail,
+        request_id: request_id.to_owned(),
+    };
+
+    let mut signer_ids: Option<Vec<u32>> = None;
+    let mut signers_scvals: Option<Vec<ScVal>> = None;
 
     for entry in map.iter() {
         let key = match &entry.key {
@@ -1559,82 +1569,74 @@ fn decode_external_signers_from_context_rule(
         };
         match key.as_str() {
             "signer_ids" => {
-                if let ScVal::Vec(Some(v)) = &entry.val {
-                    for item in v.iter() {
-                        if let ScVal::U32(n) = item {
-                            signer_ids.push(*n);
-                        }
-                    }
+                let items = context_rule_list_items(&entry.val, "signer_ids")
+                    .map_err(|e| refuse(format!("get_context_rule({rule_id}): {e}")))?;
+                let mut ids = Vec::with_capacity(items.len());
+                for (i, item) in items.into_iter().enumerate() {
+                    let ScVal::U32(n) = item else {
+                        return Err(refuse(format!(
+                            "get_context_rule({rule_id}): signer_ids[{i}] is not a u32: {}",
+                            scval_variant_name(item)
+                        )));
+                    };
+                    ids.push(*n);
                 }
+                signer_ids = Some(ids);
             }
             "signers" => {
-                if let ScVal::Vec(Some(v)) = &entry.val {
-                    for item in v.iter() {
-                        signers_scvals.push(item.clone());
-                    }
-                }
+                let items = context_rule_list_items(&entry.val, "signers")
+                    .map_err(|e| refuse(format!("get_context_rule({rule_id}): {e}")))?;
+                signers_scvals = Some(items.into_iter().cloned().collect());
             }
             _ => {}
         }
     }
 
-    // Match signer_ids to signer ScVals by index position (parallel slice).
-    // OZ parallel `signer_ids` / `signers` array alignment:
+    let signer_ids = signer_ids.ok_or_else(|| {
+        refuse(format!(
+            "get_context_rule({rule_id}): missing 'signer_ids' field in ContextRule map"
+        ))
+    })?;
+    let signers_scvals = signers_scvals.ok_or_else(|| {
+        refuse(format!(
+            "get_context_rule({rule_id}): missing 'signers' field in ContextRule map"
+        ))
+    })?;
+
+    // `signer_ids[i]` is the id of `signers[i]`. OZ parallel `signer_ids` /
+    // `signers` array alignment:
     // `packages/accounts/src/smart_account/storage.rs:155-174` (SHA `a9c4216`).
-    let result: Vec<ExternalSignerData> = signer_ids
-        .into_iter()
-        .zip(signers_scvals)
-        .filter_map(|(sid, sval)| decode_external_signer_scval(sid, sval))
-        .collect();
+    if signer_ids.len() != signers_scvals.len() {
+        return Err(refuse(format!(
+            "get_context_rule({rule_id}): signer_ids has {} entries and signers has {}",
+            signer_ids.len(),
+            signers_scvals.len()
+        )));
+    }
+
+    let mut result: Vec<ExternalSignerData> = Vec::new();
+    for (i, (signer_id, sval)) in signer_ids.into_iter().zip(signers_scvals).enumerate() {
+        match decode_signer_scval_full(&sval) {
+            Ok(DecodedOnChainSigner::External {
+                verifier_address,
+                key_data,
+                ..
+            }) => result.push(ExternalSignerData {
+                signer_id,
+                verifier_addr: verifier_address,
+                key_data_full: key_data,
+            }),
+            Ok(DecodedOnChainSigner::Delegated { .. }) => {}
+            Err(e) => {
+                return Err(refuse(format!(
+                    "get_context_rule({rule_id}): signer at index {i} (id {signer_id}) is not a \
+                     recognised Signer: {e}"
+                )));
+            }
+        }
+    }
 
     Ok(result)
-}
-
-/// Decodes a single `Signer::External(Address, Bytes)` from an OZ `Signer` ScVal.
-///
-/// Returns `None` for `Delegated` signers (not affected by verifier migration)
-/// and for unrecognised variant tags.
-///
-/// # Byte-layout citation
-///
-/// `Signer::External(Address, Bytes)` ScVal:
-/// `ScVal::Vec([Symbol("External"), Address(verifier_addr), Bytes(key_data)])`
-/// `packages/accounts/src/smart_account/storage.rs:96-102` (SHA `a9c4216`).
-fn decode_external_signer_scval(signer_id: u32, val: ScVal) -> Option<ExternalSignerData> {
-    let items = match val {
-        ScVal::Vec(Some(v)) => v,
-        _ => return None,
-    };
-    let items: Vec<&ScVal> = items.iter().collect();
-
-    if items.len() < 3 {
-        return None;
-    }
-
-    let tag = match items[0] {
-        ScVal::Symbol(s) => std::str::from_utf8(s.as_slice()).unwrap_or("").to_owned(),
-        _ => return None,
-    };
-
-    if tag != "External" {
-        return None; // Delegated or unknown — not affected by verifier migration
-    }
-
-    let verifier_addr = match items[1] {
-        ScVal::Address(a) => a.clone(),
-        _ => return None,
-    };
-
-    let key_data_full = match items[2] {
-        ScVal::Bytes(ScBytes(b)) => b.as_slice().to_vec(),
-        _ => return None,
-    };
-
-    Some(ExternalSignerData {
-        signer_id,
-        verifier_addr,
-        key_data_full,
-    })
 }
 
 /// Builds a `HostFunction::InvokeContract` for a direct call on a Soroban contract.
@@ -1886,36 +1888,6 @@ mod tests {
         }
     }
 
-    /// `decode_external_signer_scval` returns `None` for `Delegated` signers.
-    #[test]
-    fn decode_external_signer_returns_none_for_delegated() {
-        let addr = ScVal::Address(ScAddress::Contract(ContractId(Hash([0u8; 32]))));
-        let tag = ScVal::Symbol(ScSymbol::try_from("Delegated").unwrap());
-        let vec_inner: VecM<ScVal> = vec![tag, addr].try_into().unwrap();
-        let val = ScVal::Vec(Some(ScVec(vec_inner)));
-        assert!(
-            decode_external_signer_scval(0, val).is_none(),
-            "Delegated signer must return None"
-        );
-    }
-
-    /// `decode_external_signer_scval` extracts full `key_data_full` for External signers.
-    ///
-    /// Validates that the full 65 bytes are preserved (not truncated to 16 like
-    /// `SignerPubkey::External.key_data_first16`).
-    #[test]
-    fn decode_external_signer_preserves_full_key_data() {
-        let verifier_addr = ScAddress::Contract(ContractId(Hash([0x42u8; 32])));
-        let key_data = vec![0xAAu8; 65]; // 65 bytes — longer than 16-byte truncation
-        let val = build_external_signer_scval(&verifier_addr, &key_data).unwrap();
-        let ext = decode_external_signer_scval(7, val).expect("must decode");
-        assert_eq!(ext.signer_id, 7);
-        assert_eq!(
-            ext.key_data_full, key_data,
-            "full key_data must be preserved without truncation"
-        );
-    }
-
     // ── extract_invoke_args ───────────────────────────────────────────────────
 
     /// `extract_invoke_args` returns `("remove_signer", args)` for a
@@ -2085,136 +2057,6 @@ mod tests {
         );
     }
 
-    // ── decode_external_signer_scval edge cases ───────────────────────────────
-
-    /// `decode_external_signer_scval` returns `None` for a non-Vec `ScVal` input.
-    ///
-    /// The OZ `Signer` ScVal is always a `ScVal::Vec`; other discriminants are
-    /// never valid and must be silently dropped.
-    #[test]
-    fn decode_external_signer_returns_none_for_non_vec_input() {
-        // ScVal::U32 is a scalar, never a valid Signer encoding.
-        assert!(
-            decode_external_signer_scval(0, ScVal::U32(42)).is_none(),
-            "ScVal::U32 must return None (not a Vec)"
-        );
-        // ScVal::Bool is similarly invalid.
-        assert!(
-            decode_external_signer_scval(0, ScVal::Bool(true)).is_none(),
-            "ScVal::Bool must return None (not a Vec)"
-        );
-    }
-
-    /// `decode_external_signer_scval` returns `None` for a `ScVal::Vec` with fewer
-    /// than 3 elements.
-    ///
-    /// The `Signer::External(Address, Bytes)` encoding requires exactly 3 elements:
-    /// `[Symbol("External"), Address, Bytes]`. Truncated inputs must be rejected.
-    #[test]
-    fn decode_external_signer_returns_none_for_short_vec() {
-        // Single-element vec (just the tag).
-        let tag = ScVal::Symbol(ScSymbol::try_from("External").unwrap());
-        let one_elem: VecM<ScVal> = vec![tag.clone()].try_into().unwrap();
-        assert!(
-            decode_external_signer_scval(0, ScVal::Vec(Some(ScVec(one_elem)))).is_none(),
-            "1-element vec must return None"
-        );
-
-        // Two-element vec (tag + address, missing key bytes).
-        let addr = ScVal::Address(ScAddress::Contract(ContractId(Hash([0u8; 32]))));
-        let two_elem: VecM<ScVal> = vec![tag, addr].try_into().unwrap();
-        assert!(
-            decode_external_signer_scval(0, ScVal::Vec(Some(ScVec(two_elem)))).is_none(),
-            "2-element vec must return None"
-        );
-    }
-
-    /// `decode_external_signer_scval` returns `None` when the first element is not
-    /// a `Symbol`.
-    ///
-    /// Malformed encoding where the discriminant is a `U32` instead of a `Symbol`
-    /// must be silently dropped.
-    #[test]
-    fn decode_external_signer_returns_none_for_non_symbol_tag() {
-        let addr = ScAddress::Contract(ContractId(Hash([0u8; 32])));
-        // First element is U32(0) instead of Symbol("External").
-        let bad_tag = ScVal::U32(0);
-        let key_bytes: stellar_xdr::BytesM = vec![0x01u8].try_into().unwrap();
-        let items: VecM<ScVal> = vec![
-            bad_tag,
-            ScVal::Address(addr),
-            ScVal::Bytes(ScBytes(key_bytes)),
-        ]
-        .try_into()
-        .unwrap();
-        let val = ScVal::Vec(Some(ScVec(items)));
-        assert!(
-            decode_external_signer_scval(0, val).is_none(),
-            "non-Symbol first element must return None"
-        );
-    }
-
-    /// `decode_external_signer_scval` returns `None` when items[1] is not an `Address`.
-    ///
-    /// The second element of `Signer::External` must be the verifier contract address.
-    /// A `U32` in place of the address must be silently dropped.
-    #[test]
-    fn decode_external_signer_returns_none_for_non_address_verifier() {
-        let tag = ScVal::Symbol(ScSymbol::try_from("External").unwrap());
-        let key_bytes: stellar_xdr::BytesM = vec![0x01u8].try_into().unwrap();
-        // Second element is U32 instead of Address.
-        let items: VecM<ScVal> = vec![
-            tag,
-            ScVal::U32(999), // wrong type for verifier address
-            ScVal::Bytes(ScBytes(key_bytes)),
-        ]
-        .try_into()
-        .unwrap();
-        let val = ScVal::Vec(Some(ScVec(items)));
-        assert!(
-            decode_external_signer_scval(0, val).is_none(),
-            "non-Address second element must return None"
-        );
-    }
-
-    /// `decode_external_signer_scval` returns `None` when items[2] is not `Bytes`.
-    ///
-    /// The third element of `Signer::External` must be the raw key bytes.
-    /// A `Symbol` in place of the bytes must be silently dropped.
-    #[test]
-    fn decode_external_signer_returns_none_for_non_bytes_key_data() {
-        let tag = ScVal::Symbol(ScSymbol::try_from("External").unwrap());
-        let addr = ScAddress::Contract(ContractId(Hash([0x42u8; 32])));
-        // Third element is a Symbol instead of Bytes.
-        let bad_key = ScVal::Symbol(ScSymbol::try_from("not_bytes").unwrap());
-        let items: VecM<ScVal> = vec![tag, ScVal::Address(addr), bad_key].try_into().unwrap();
-        let val = ScVal::Vec(Some(ScVec(items)));
-        assert!(
-            decode_external_signer_scval(0, val).is_none(),
-            "non-Bytes third element must return None"
-        );
-    }
-
-    /// `decode_external_signer_scval` returns `None` for an unknown tag string.
-    ///
-    /// OZ `Signer` only has `"External"` and `"Delegated"` variants (SHA `a9c4216`).
-    /// Any other tag (e.g., a future extension) must be silently skipped by the
-    /// migration planner, which only affects `External` signers.
-    #[test]
-    fn decode_external_signer_returns_none_for_unknown_tag() {
-        let tag = ScVal::Symbol(ScSymbol::try_from("Unknown").unwrap());
-        let addr = ScAddress::Contract(ContractId(Hash([0x11u8; 32])));
-        let key_bytes: stellar_xdr::BytesM = vec![0xFFu8; 32].try_into().unwrap();
-        let items: VecM<ScVal> = vec![tag, ScVal::Address(addr), ScVal::Bytes(ScBytes(key_bytes))]
-            .try_into()
-            .unwrap();
-        let val = ScVal::Vec(Some(ScVec(items)));
-        assert!(
-            decode_external_signer_scval(0, val).is_none(),
-            "unknown tag must return None"
-        );
-    }
-
     // ── decode_external_signers_from_context_rule ─────────────────────────────
 
     /// `decode_external_signers_from_context_rule` returns `Err` when the input
@@ -2329,7 +2171,9 @@ mod tests {
 
         // Build Delegated signer ScVal: ScVal::Vec([Symbol("Delegated"), Address]).
         let del_tag = ScVal::Symbol(ScSymbol::try_from("Delegated").unwrap());
-        let del_addr = ScVal::Address(ScAddress::Contract(ContractId(Hash([0xDDu8; 32]))));
+        let del_addr = ScVal::Address(ScAddress::Account(stellar_xdr::AccountId(
+            stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256([0xDDu8; 32])),
+        )));
         let del_inner: VecM<ScVal> = vec![del_tag, del_addr].try_into().unwrap();
         let delegated_scval = ScVal::Vec(Some(ScVec(del_inner)));
 
@@ -2373,16 +2217,24 @@ mod tests {
 
     /// `decode_external_signers_from_context_rule` ignores map entries whose key
     /// is not a `Symbol` (e.g. a `U32` key).
-    ///
-    /// Non-Symbol map keys must be silently skipped rather than panicking.
     #[test]
     fn decode_external_signers_ignores_non_symbol_map_keys() {
         use stellar_xdr::{ScMap, ScMapEntry};
-        // A map with one entry whose key is U32 (not a Symbol).
-        let entries: Vec<ScMapEntry> = vec![ScMapEntry {
-            key: ScVal::U32(0), // not a Symbol — must be ignored
-            val: ScVal::U32(42),
-        }];
+        let empty = || ScVal::Vec(Some(ScVec(VecM::default())));
+        let entries: Vec<ScMapEntry> = vec![
+            ScMapEntry {
+                key: ScVal::U32(0),
+                val: ScVal::U32(42),
+            },
+            ScMapEntry {
+                key: ScVal::Symbol(ScSymbol::try_from("signer_ids").unwrap()),
+                val: empty(),
+            },
+            ScMapEntry {
+                key: ScVal::Symbol(ScSymbol::try_from("signers").unwrap()),
+                val: empty(),
+            },
+        ];
         let scmap: ScMap = entries.try_into().unwrap();
         let val = ScVal::Map(Some(scmap));
         let result =
@@ -2391,6 +2243,204 @@ mod tests {
         assert!(
             result.is_empty(),
             "non-Symbol map keys produce no ExternalSignerData"
+        );
+    }
+
+    /// Builds a `ContextRule`-shaped map holding only `signer_ids` and `signers`.
+    fn signer_lists_map(signer_ids: Vec<ScVal>, signers: Vec<ScVal>) -> ScVal {
+        use stellar_xdr::ScMapEntry;
+        let entries: Vec<ScMapEntry> = vec![
+            ScMapEntry {
+                key: ScVal::Symbol(ScSymbol::try_from("signer_ids").unwrap()),
+                val: ScVal::Vec(Some(ScVec(signer_ids.try_into().unwrap()))),
+            },
+            ScMapEntry {
+                key: ScVal::Symbol(ScSymbol::try_from("signers").unwrap()),
+                val: ScVal::Vec(Some(ScVec(signers.try_into().unwrap()))),
+            },
+        ];
+        ScVal::Map(Some(entries.try_into().unwrap()))
+    }
+
+    /// Returns the `VerifierMigrationFailed` phase and detail of `result`.
+    fn migration_failure(
+        result: Result<Vec<ExternalSignerData>, SaError>,
+    ) -> (&'static str, String) {
+        match result {
+            Err(SaError::VerifierMigrationFailed { phase, detail, .. }) => (phase, detail),
+            Err(other) => panic!("expected VerifierMigrationFailed, got {other:?}"),
+            Ok(signers) => panic!("expected a refusal, got {} signers", signers.len()),
+        }
+    }
+
+    /// `signer_ids` and `signers` of different lengths refuse the rule: the
+    /// lists are parallel, so the plan cannot pair every signer with its id.
+    #[test]
+    fn decode_external_signers_refuses_unequal_signer_lists() {
+        let verifier_addr = ScAddress::Contract(ContractId(Hash([0x42u8; 32])));
+        let external = build_external_signer_scval(&verifier_addr, &[0xBBu8; 33]).unwrap();
+        let val = signer_lists_map(
+            vec![ScVal::U32(10), ScVal::U32(20)],
+            vec![external.clone(), external],
+        );
+        assert_eq!(
+            decode_external_signers_from_context_rule(val, 5, "C_TESTT...TTEST", "req-006")
+                .map(|v| v.len())
+                .ok(),
+            Some(2),
+            "equal lists of two External signers decode both"
+        );
+
+        let external = build_external_signer_scval(&verifier_addr, &[0xBBu8; 33]).unwrap();
+        let val = signer_lists_map(
+            vec![ScVal::U32(10), ScVal::U32(20), ScVal::U32(30)],
+            vec![external.clone(), external],
+        );
+        let (phase, detail) = migration_failure(decode_external_signers_from_context_rule(
+            val,
+            5,
+            "C_TESTT...TTEST",
+            "req-006",
+        ));
+        assert_eq!(phase, "plan_build");
+        assert_eq!(
+            detail,
+            "get_context_rule(5): signer_ids has 3 entries and signers has 2"
+        );
+    }
+
+    /// A `signer_ids` item that is not a `u32` refuses the rule, naming its
+    /// index and variant.
+    #[test]
+    fn decode_external_signers_refuses_a_non_u32_signer_id() {
+        let verifier_addr = ScAddress::Contract(ContractId(Hash([0x42u8; 32])));
+        let external = build_external_signer_scval(&verifier_addr, &[0xBBu8; 33]).unwrap();
+        let val = signer_lists_map(
+            vec![ScVal::U32(10), ScVal::I32(20)],
+            vec![external.clone(), external],
+        );
+        let (phase, detail) = migration_failure(decode_external_signers_from_context_rule(
+            val,
+            5,
+            "C_TESTT...TTEST",
+            "req-010",
+        ));
+        assert_eq!(phase, "plan_build");
+        assert_eq!(
+            detail,
+            "get_context_rule(5): signer_ids[1] is not a u32: I32"
+        );
+    }
+
+    /// A map without a `signer_ids` or a `signers` key refuses the rule; an
+    /// absent list is not an empty one.
+    #[test]
+    fn decode_external_signers_refuses_a_missing_signer_list() {
+        use stellar_xdr::ScMapEntry;
+        let only = |key: &str| {
+            let entries: Vec<ScMapEntry> = vec![ScMapEntry {
+                key: ScVal::Symbol(ScSymbol::try_from(key).unwrap()),
+                val: ScVal::Vec(Some(ScVec(VecM::default()))),
+            }];
+            ScVal::Map(Some(entries.try_into().unwrap()))
+        };
+        let (phase, detail) = migration_failure(decode_external_signers_from_context_rule(
+            only("signers"),
+            8,
+            "C_TESTT...TTEST",
+            "req-008",
+        ));
+        assert_eq!(phase, "plan_build");
+        assert_eq!(
+            detail,
+            "get_context_rule(8): missing 'signer_ids' field in ContextRule map"
+        );
+        let (_, detail) = migration_failure(decode_external_signers_from_context_rule(
+            only("signer_ids"),
+            8,
+            "C_TESTT...TTEST",
+            "req-008",
+        ));
+        assert_eq!(
+            detail,
+            "get_context_rule(8): missing 'signers' field in ContextRule map"
+        );
+    }
+
+    /// A `signer_ids` or `signers` value that is not a `Vec` refuses the rule,
+    /// naming its variant; `Vec(None)` is an empty list.
+    #[test]
+    fn decode_external_signers_refuses_a_non_vec_signer_list() {
+        use stellar_xdr::ScMapEntry;
+        let map = |signer_ids: ScVal, signers: ScVal| {
+            let entries: Vec<ScMapEntry> = vec![
+                ScMapEntry {
+                    key: ScVal::Symbol(ScSymbol::try_from("signer_ids").unwrap()),
+                    val: signer_ids,
+                },
+                ScMapEntry {
+                    key: ScVal::Symbol(ScSymbol::try_from("signers").unwrap()),
+                    val: signers,
+                },
+            ];
+            ScVal::Map(Some(entries.try_into().unwrap()))
+        };
+        let (phase, detail) = migration_failure(decode_external_signers_from_context_rule(
+            map(ScVal::U32(1), ScVal::Vec(None)),
+            9,
+            "C_TESTT...TTEST",
+            "req-009",
+        ));
+        assert_eq!(phase, "plan_build");
+        assert_eq!(detail, "get_context_rule(9): signer_ids is not a Vec: U32");
+        let (_, detail) = migration_failure(decode_external_signers_from_context_rule(
+            map(ScVal::Vec(None), ScVal::Void),
+            9,
+            "C_TESTT...TTEST",
+            "req-009",
+        ));
+        assert_eq!(detail, "get_context_rule(9): signers is not a Vec: Void");
+        assert_eq!(
+            decode_external_signers_from_context_rule(
+                map(ScVal::Vec(None), ScVal::Vec(None)),
+                9,
+                "C_TESTT...TTEST",
+                "req-009",
+            )
+            .map(|v| v.len())
+            .ok(),
+            Some(0),
+            "absent Vec bodies are empty lists"
+        );
+    }
+
+    /// A signer that does not decode refuses the rule with its index and the
+    /// decoder's reason; the plan never covers part of a rule.
+    #[test]
+    fn decode_external_signers_refuses_an_undecodable_signer() {
+        let verifier_addr = ScAddress::Contract(ContractId(Hash([0x42u8; 32])));
+        let external = build_external_signer_scval(&verifier_addr, &[0xBBu8; 33]).unwrap();
+        let unknown: VecM<ScVal> = vec![
+            ScVal::Symbol(ScSymbol::try_from("Future").unwrap()),
+            ScVal::Address(verifier_addr),
+        ]
+        .try_into()
+        .unwrap();
+        let val = signer_lists_map(
+            vec![ScVal::U32(10), ScVal::U32(20)],
+            vec![external, ScVal::Vec(Some(ScVec(unknown)))],
+        );
+        let (phase, detail) = migration_failure(decode_external_signers_from_context_rule(
+            val,
+            6,
+            "C_TESTT...TTEST",
+            "req-007",
+        ));
+        assert_eq!(phase, "plan_build");
+        assert_eq!(
+            detail,
+            "get_context_rule(6): signer at index 1 (id 20) is not a recognised Signer: \
+             unknown signer tag \"Future\""
         );
     }
 

@@ -199,6 +199,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or chain id; `PinResult` gains `pending_overrides`, the overrides the
   install writes once it confirms. The audit-entry constructors take the
   rule id as `Option<u32>`, and rows without it keep reading.
+- Every read of a rule's signer set decodes the whole set. A rule holding a
+  signer the wallet cannot decode (an unknown signer kind, a malformed
+  signer, or a delegated signer with a contract address), a missing or
+  non-list `signer_ids` or `signers` field, a `signer_ids` entry that is not
+  a `u32`, or `signer_ids` and `signers` lists of different lengths is
+  refused with `sa.deployment_failed`, and the reason names the offending
+  field or index. This covers `smart-account signers list` and `refresh`,
+  the signer-set baseline and divergence checks, the signer verbs, policy
+  identification, the pinned-hash drift check, passkey signing and the MCP
+  `stellar_rules_get` tool. `smart-account migrate-verifier` refuses the
+  whole plan with `sa.verifier_migration_failed` at phase `plan_build`,
+  naming the rule; `rules_skipped_count` counts only rule IDs the
+  enumeration skipped. Delete such a rule with `smart-account rules delete`,
+  authorized by a rule the wallet can read.
+  `decode_signer_scval_full` returns `Result<DecodedOnChainSigner,
+  SignerDecodeError>`, and `DecodedOnChainSigner::External` gains
+  `verifier_address`.
+- `stellar_rule_create` accepts a delegated signer as a G-strkey only; a
+  C-strkey delegated signer is refused with `invalid_params` naming its
+  index. A pending rule proposal whose delegated signer is a C-strkey fails
+  validation when the approval store loads it, and approving it refuses.
 
 ### Fixed
 

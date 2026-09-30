@@ -151,6 +151,8 @@ jobs:
       - run: .github/scripts/test-publish-crates-check.sh
       - run: .github/scripts/publish-crates.sh --check
       - run: .github/scripts/package-skill.sh --check
+      - run: bash .github/scripts/check-no-direct-sasignersetbaselined-emit.sh
+      - run: bash .github/scripts/test-check-no-direct-sasignersetbaselined-emit.sh
 
   windows-storage:
     name: windows-storage

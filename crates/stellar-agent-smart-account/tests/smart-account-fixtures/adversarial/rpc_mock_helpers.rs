@@ -13,6 +13,8 @@
 //! - `write_baseline_for_observed` — writes a `SaSignerSetBaselined` audit entry.
 //! - `zero_sc_address` / `zero_policy_sc_address` — helper addresses.
 //! - `signer_set_n_of_n` — builds an `ObservedSignerSet` with N identical Ed25519 signers.
+//! - `append_signer_to_rule_xdr` / `unknown_tag_signer_scval`: a rule holding a signer the
+//!   wallet cannot decode.
 //!
 //! All helpers are `pub` so they can be referenced from `#[path]`-included sub-modules.
 //!
@@ -597,6 +599,58 @@ pub fn build_context_rule_external_signers_xdr(
     scval
         .to_xdr_base64(Limits::none())
         .expect("ContextRule ScVal::Map (External) must encode to XDR")
+}
+
+/// Returns `rule_xdr` (a `ContextRule` map in XDR base64) with `signer_id`
+/// appended to its `signer_ids` list and `signer` appended to its `signers`
+/// list.
+///
+/// Used by fixtures that serve a rule holding a signer the wallet cannot
+/// decode, built on top of a rule from [`build_context_rule_scval_xdr`] or
+/// [`build_context_rule_external_signers_xdr`].
+pub fn append_signer_to_rule_xdr(rule_xdr: &str, signer_id: u32, signer: &ScVal) -> String {
+    use stellar_xdr::ReadXdr;
+    let map = match ScVal::from_xdr_base64(rule_xdr, Limits::none()).expect("rule XDR decodes") {
+        ScVal::Map(Some(map)) => Some(map),
+        _ => None,
+    }
+    .expect("a ContextRule is an ScVal::Map");
+    let entries: Vec<ScMapEntry> = map
+        .iter()
+        .cloned()
+        .map(|mut entry| {
+            let appended = match &entry.key {
+                ScVal::Symbol(key) if key.as_slice() == b"signer_ids" => {
+                    Some(ScVal::U32(signer_id))
+                }
+                ScVal::Symbol(key) if key.as_slice() == b"signers" => Some(signer.clone()),
+                _ => None,
+            };
+            if let (Some(item), ScVal::Vec(Some(list))) = (appended, &entry.val) {
+                let mut items: Vec<ScVal> = list.iter().cloned().collect();
+                items.push(item);
+                entry.val = ScVal::Vec(Some(ScVec(items.try_into().expect("list fits"))));
+            }
+            entry
+        })
+        .collect();
+    ScVal::Map(Some(ScMap(entries.try_into().expect("ScMap entries fit"))))
+        .to_xdr_base64(Limits::none())
+        .expect("rule encodes")
+}
+
+/// A two-item `Signer`-shaped value whose tag is `Future`, a variant the
+/// wallet does not know.
+pub fn unknown_tag_signer_scval() -> ScVal {
+    let items: VecM<ScVal> = vec![
+        ScVal::Symbol(ScSymbol(
+            b"Future".to_vec().try_into().expect("tag fits in ScSymbol"),
+        )),
+        ScVal::Address(ScAddress::Contract(ContractId(Hash([0x77u8; 32])))),
+    ]
+    .try_into()
+    .expect("signer Vec fits");
+    ScVal::Vec(Some(ScVec(items)))
 }
 
 /// Builds a `ScVal::U32(threshold)` XDR base64 — the return value of `get_threshold`.

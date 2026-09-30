@@ -3130,9 +3130,10 @@ pub enum ContextRuleSignerInput {
     /// digests; for ed25519 keys this is `ScAddress::Account(...)` derived
     /// from the signer's G-strkey.
     Delegated {
-        /// Signer address (typically `ScAddress::Account(...)` for an
-        /// ed25519-keyed delegate, or `ScAddress::Contract(...)` for a
-        /// contract-mediated signer).
+        /// Signer address: a G-strkey account, `ScAddress::Account(...)`
+        /// derived from the signer's G-strkey. The wallet has no
+        /// representation for a contract-address delegated signer and
+        /// refuses to read a rule holding one.
         address: ScAddress,
     },
     /// An external signer with custom verification (e.g. WebAuthn-via-verifier).
@@ -3762,9 +3763,9 @@ pub fn compute_context_rule_proposal_sha256(
 /// the digest for [`stellar_agent_core::approval::PendingApprovalStore::verify_rule_proposal_gate`]
 /// and so [`ContextRuleManager::install_rule`] can be called with it.
 ///
-/// A `Delegated` signer's `address` may be either a G-strkey (ed25519-keyed
-/// delegate) or a C-strkey (contract-mediated signer) — both are tried, G
-/// first.
+/// A `Delegated` signer's `address` must be a G-strkey: the wallet reads a
+/// rule's signer set in full and has no representation for a
+/// contract-address delegated signer, so a C-strkey is refused.
 ///
 /// # Errors
 ///
@@ -3819,11 +3820,7 @@ pub fn context_rule_definition_from_snapshot(
                     .address
                     .as_deref()
                     .ok_or_else(|| err(format!("signers[{idx}]: Delegated missing address")))?;
-                // Try G-strkey (ed25519-keyed delegate) first, then C-strkey
-                // (contract-mediated signer) — see rules.rs module docs on
-                // `ContextRuleSignerInput::Delegated`.
                 let address = parse_g_strkey_to_signer_address(address_str)
-                    .or_else(|_| parse_c_strkey_to_smart_account(address_str))
                     .map_err(|e| err(format!("signers[{idx}].address: {e}")))?;
                 ContextRuleSignerInput::Delegated { address }
             }
@@ -5530,6 +5527,41 @@ mod tests {
     use super::*;
     use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
     use stellar_xdr::{AccountId, ContractId, PublicKey, Uint256};
+
+    /// `context_rule_definition_from_snapshot` refuses a `Delegated` signer
+    /// whose address is a C-strkey and names the signer's index.
+    #[test]
+    fn context_rule_definition_from_snapshot_refuses_a_c_strkey_delegated_signer() {
+        use stellar_agent_core::approval::{
+            ContextRuleProposalSnapshot, RuleProposalContextType, RuleProposalSigner,
+        };
+        let c_strkey = stellar_strkey::Contract([0x42; 32]).to_string();
+        let snapshot = ContextRuleProposalSnapshot::new(
+            RuleProposalContextType::Default,
+            "spend-daily".to_owned(),
+            None,
+            vec![
+                RuleProposalSigner::delegated(SIMULATE_SENTINEL_G.to_owned(), true),
+                RuleProposalSigner::delegated(c_strkey.as_str().to_owned(), false),
+            ],
+            vec![],
+            vec![0],
+            false,
+            false,
+        );
+        let Err(SaError::AuthEntryConstructionFailed {
+            stage,
+            redacted_reason,
+        }) = context_rule_definition_from_snapshot(&snapshot)
+        else {
+            panic!("a C-strkey delegated signer must be refused");
+        };
+        assert_eq!(stage, "rule_proposal_digest");
+        assert!(
+            redacted_reason.starts_with("signers[1].address: "),
+            "{redacted_reason}"
+        );
+    }
 
     fn manager_for_test() -> ContextRuleManager {
         ContextRuleManager::new(ContextRuleManagerConfig {

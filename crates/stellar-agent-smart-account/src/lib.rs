@@ -57,17 +57,18 @@ pub use managers::migration::{
 pub use submit::{MulticallCheck, ResolvedFeePerOp};
 pub use verifier_allowlist::{VERIFIER_ALLOWLIST, VerifierAllowlistEntry, VerifierAuditStatus};
 
-// Full-fidelity OZ `Signer` ScVal decoder — always compiled at `pub` in
-// `managers/signers.rs` (with `#[cfg_attr(not(any(test, feature = "test-helpers")), allow(dead_code))]`
-// to silence dead-code warnings on the externally-unused fields when the
-// feature is off); out-of-crate visibility is gated here so integration tests
-// compiled with `features = ["test-helpers"]` can import from the crate root
-// without exposing the types in production builds.
+// Full-fidelity OZ `Signer` ScVal decoder, always compiled at `pub` in
+// `managers/signers.rs`; the crate-root re-export is gated here so
+// integration tests compiled with `features = ["test-helpers"]` import it
+// from the crate root. The decoder returns `SignerDecodeError` for a signer
+// the wallet cannot represent, and every read of a rule's signer set refuses
+// the observation on that error: an observed signer set always holds every
+// signer of the rule.
 //
 // Gate visibility at the re-export, not the definition — `#[doc(hidden)] pub fn`
 // leaks the symbol into public rustdoc.
 #[cfg(any(test, feature = "test-helpers"))]
-pub use managers::signers::{DecodedOnChainSigner, decode_signer_scval_full};
+pub use managers::signers::{DecodedOnChainSigner, SignerDecodeError, decode_signer_scval_full};
 
 // `derive_schedule_salt` in `timelock.rs` is split into a private `_impl`
 // (always compiled, used by the production call site) and a feature-gated
