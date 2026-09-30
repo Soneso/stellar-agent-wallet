@@ -353,9 +353,10 @@ pub async fn commit_sponsored(
     let preimage_xdr = preimage
         .to_xdr_base64(Limits::none())
         .map_err(|_error| signing_error())?;
-    let signature = sign_soroban_auth_entry(&preimage_xdr, signer, network_passphrase, None)
-        .await
-        .map_err(|_error| signing_error())?;
+    let signature =
+        sign_soroban_auth_entry(&preimage_xdr, signer, &signer_key, network_passphrase, None)
+            .await
+            .map_err(|_error| signing_error())?;
     let signature: [u8; 64] = STANDARD
         .decode(signature)
         .map_err(|_error| signing_error())?

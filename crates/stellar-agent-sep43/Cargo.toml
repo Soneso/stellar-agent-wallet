@@ -13,9 +13,14 @@ categories = ["cryptography::cryptocurrencies"]
 [lib]
 name = "stellar_agent_sep43"
 
+[features]
+# Gates the live SEP-43 interop suite against the released JavaScript SDK
+# (tests/sep43_sdk_v17_interop_testnet_acceptance.rs); no library code.
+testnet-acceptance = []
+
 [dependencies]
-# Canonical Stellar XDR encode/decode — TransactionEnvelope + SorobanAuthorizationEntry
-# parsing for signTransaction + signAuthEntry methods.
+# Canonical Stellar XDR encode/decode: TransactionEnvelope parsing for
+# signTransaction and HashIdPreimage parsing for signAuthEntry.
 stellar-xdr = { workspace = true }
 
 # Canonical Stellar strkey encode/decode — G/C/M-key validation and
@@ -44,6 +49,10 @@ stellar-agent-core = { workspace = true }
 # XDR decode limits for untrusted preimage input.
 stellar-agent-xdr-limits = { workspace = true }
 
+# Soroban authorization preimage accessor (network_id and bound address) for
+# the signAuthEntry preimage checks.
+stellar-agent-soroban-auth = { workspace = true }
+
 # Signer trait: sign_tx_payload + sign_soroban_address_auth_payload.
 stellar-agent-network = { workspace = true }
 
@@ -56,6 +65,10 @@ stellar-agent-test-support = { path = "../stellar-agent-test-support", features 
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # Independent ed25519 verification of produced signatures in tests.
 ed25519-dalek = { workspace = true }
+# Run-local payer and source keys of the live interop suite.
+rand_core = { workspace = true }
+# Serializes the live interop suite against other testnet suites.
+serial_test = { workspace = true }
 
 [lints]
 workspace = true

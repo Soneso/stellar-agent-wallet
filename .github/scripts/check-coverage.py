@@ -49,6 +49,7 @@ FLOORS = {
     "stellar-agent-sep53": 93,
     "stellar-agent-sep7": 93,
     "stellar-agent-smart-account": 67,
+    "stellar-agent-soroban-auth": 95,
     "stellar-agent-stablecoin": 96,
     "stellar-agent-test-support": 92,
     "stellar-agent-toolsets": 93,

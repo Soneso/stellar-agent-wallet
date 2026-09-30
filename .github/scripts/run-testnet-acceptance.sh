@@ -113,6 +113,7 @@ check_suite_completeness() {
 SUITES=(
   "stellar-agent-sep10 testnet-integration sep10_round_trip_testnet_acceptance"
   "stellar-agent-sep10 testnet-integration sep10_replay_adversarial"
+  "stellar-agent-sep43 testnet-acceptance sep43_sdk_v17_interop_testnet_acceptance"
   "stellar-agent-sep48 testnet-acceptance sep48_preview_testnet_acceptance"
   "stellar-agent-sep7 testnet-acceptance sep7_testnet_acceptance"
   "stellar-agent-anchor testnet-acceptance anchor_testnet_acceptance"

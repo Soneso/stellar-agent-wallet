@@ -28,6 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value types, `SignerSetView` and `SignerSetViewPayload` are re-exported from
   `stellar_agent_core::audit_log` and `stellar_agent_smart_account::signers`;
   the digest functions and domain constants from `stellar_agent_core::audit_log`.
+- SEP-43 `signAuthEntry` signs CAP-71 envelope type 10
+  (`SorobanAuthorizationWithAddress`) preimages, the preimages
+  `@stellar/stellar-sdk` v17 builds for `SorobanCredentials::AddressV2`
+  entries, beside envelope type 9 (`SorobanAuthorization`). A type 10
+  preimage must be bound to the signing key's `ScAddress::Account`; a preimage
+  bound to another account, a contract or a muxed account is refused with
+  `sep43.invalid_address` before any signing. Every other preimage case is
+  refused with `sep43.malformed_auth_entry`.
+- The `stellar-agent-soroban-auth` crate maps a `SorobanCredentials` arm to its
+  authorization preimage version, builds the envelope type 9 or type 10
+  preimage, and hashes it into the signature payload.
 
 ### Changed
 
@@ -38,6 +49,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   row with a malformed snapshot is an audit parse error. The signer-set
   checks of the signing verbs compare version-1 rows, and a rule whose newest
   state row is version 2 refuses with `sa.audit_log`.
+- `stellar_agent_sep43::signing::sign_soroban_auth_entry` takes the expected
+  signer's public key after the signer. The key must be the signer's own; the
+  function checks a type 10 preimage's address against it.
+
+### Fixed
+
+- The `stellar_sep43_sign_auth_entry` MCP tool, its server instructions and
+  the skill references described the `auth_entry_xdr` argument as a full
+  `SorobanAuthorizationEntry`. They describe it as the base64 `HashIdPreimage`
+  of the entry, which is what the tool signs, and the result as the raw
+  signature the requester assembles into the entry.
 
 ## [0.1.0-alpha.9] - 2026-09-30
 

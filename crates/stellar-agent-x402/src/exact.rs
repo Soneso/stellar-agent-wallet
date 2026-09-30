@@ -199,15 +199,13 @@ pub async fn create_payment(
     // no PublicKey(pk.0) re-wrap needed.
     // to_string() on stellar_strkey types returns heapless::String<56>;
     // as_str().to_owned() converts to std::String.
-    let payer_strkey: String = signer
+    let payer_key = signer
         .public_key()
         .await
         .map_err(|e| X402Error::RpcSimulateFailed {
             detail: format!("signer public_key fetch failed: {e}"),
-        })?
-        .to_string()
-        .as_str()
-        .to_owned();
+        })?;
+    let payer_strkey: String = payer_key.to_string().as_str().to_owned();
 
     let invoke_args = build_sac_transfer_invoke(
         &requirements.asset,
@@ -340,6 +338,7 @@ pub async fn create_payment(
     let raw_signature_b64 = sign_soroban_auth_entry(
         &preimage_xdr,
         signer,
+        &payer_key,
         network_passphrase,
         None, // no override — passphrase already validated above
     )

@@ -10,7 +10,7 @@ churn.
 
 Facts that apply to every crate:
 
-- All 35 crates are published on crates.io at the shared workspace version.
+- All 36 crates are published on crates.io at the shared workspace version.
   Cargo requires every dependency of a published crate to be published, so
   internal crates are published too; their tier and description say what
   that does and does not mean.
@@ -77,6 +77,7 @@ Facts that apply to every crate:
 | `stellar-agent-toolsets-install` | 3 | toolset install and attestation | testnet-first |
 | `stellar-agent-toolsets-runtime` | 3 | toolset invocation runtime | testnet-first |
 | `stellar-agent-mcp-macros` | internal | proc-macros for the MCP registry | n/a |
+| `stellar-agent-soroban-auth` | internal | Soroban authorization preimages and signature payloads | n/a |
 | `stellar-agent-test-support` | internal | test harness and fixtures | n/a |
 | `stellar-agent-windows-identity` | internal | Win32 SID / DPAPI wrappers | n/a |
 | `stellar-agent-xdr-limits` | internal | XDR decode bounds | n/a |
@@ -111,4 +112,4 @@ may evolve under Level 2 rules without external coordination.
 - Cargo feature groups for the binaries (see above).
 - Facade crates: one public approval API over the approval crates, a
   toolsets umbrella, a SEP umbrella. Recorded here so the current many-crate
-  surface is understood as layout, not as 35 independent commitments.
+  surface is understood as layout, not as 36 independent commitments.

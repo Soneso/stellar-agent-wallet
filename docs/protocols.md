@@ -53,8 +53,7 @@ All write and signing paths are testnet-only in this alpha: every signing comman
 - **Side:** Agent/wallet (signer) side. Surfaced as five MCP tools (`stellar_sep43_get_address`, `stellar_sep43_sign_transaction`, `stellar_sep43_sign_auth_entry`, `stellar_sep43_sign_message`, `stellar_sep43_get_network`).
 - **Refusals and constraints:**
   - Does not implement the optional `submit`/`submitUrl` options of `signTransaction`; transactions are returned signed, never submitted.
-  - No multi-signer quorum. `sign_auth_entry` signs a single-signer `HashIdPreimage::SorobanAuthorization` preimage with one ed25519 G-key and returns the raw signature; the requester assembles the credentials.
-  - The Protocol-23 `SorobanAuthorizationWithAddress` preimage variant is refused.
+  - No multi-signer quorum. `sign_auth_entry` signs the base64 `HashIdPreimage` of a single-signer authorization entry with one ed25519 G-key and returns the raw signature; the requester assembles the credentials. Both Soroban authorization preimage types are signed for the wallet's own G-key: envelope type 9 (`SorobanAuthorization`) and envelope type 10 (`SorobanAuthorizationWithAddress`, CAP-71). The preimage does not carry the credential arm: a type 10 preimage is signed only when it is bound to the signing key's `ScAddress::Account`, whichever credential type the entry uses, and a preimage bound to any other address is refused with `sep43.invalid_address`. Every other preimage case is refused with `sep43.malformed_auth_entry`.
   - Opens no HTTP/HTTPS connections; interop is stdio via MCP only.
 
 ### SEP-45 — Web Authentication for Contract Accounts

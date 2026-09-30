@@ -38,11 +38,17 @@
 //!
 //! - Does NOT implement the optional `submit`/`submitUrl` opts of
 //!   `signTransaction` (transactions are returned signed, not submitted).
-//! - Does NOT implement multi-signer quorum; the `sign_auth_entry` path signs a
-//!   single-signer `HashIdPreimage::SorobanAuthorization` preimage with one
-//!   ed25519 G-key and returns the raw signature (the requester assembles the
-//!   credentials). The Protocol-23 `SorobanAuthorizationWithAddress` preimage
-//!   variant is not supported and is refused.
+//! - Does NOT implement multi-signer quorum; the `sign_auth_entry` path signs
+//!   the base64 `HashIdPreimage` of a single-signer authorization entry with
+//!   one ed25519 G-key and returns the raw 64-byte signature over the SHA-256
+//!   of the received bytes (the requester assembles the credentials). Envelope
+//!   type 9 (`SorobanAuthorization`) and type 10
+//!   (`SorobanAuthorizationWithAddress`, CAP-71) preimages are signed, and
+//!   every other preimage case is refused. The preimage does not carry the
+//!   credential arm: a type 10 preimage is signed only when it is bound to the
+//!   signing key's `ScAddress::Account`, whichever credential type the entry
+//!   uses, and a preimage bound to any other address is refused with
+//!   `InvalidAddress`.
 //! - Does NOT open any HTTP/HTTPS connections (interop is stdio-based via MCP).
 //!
 //! # Module overview
