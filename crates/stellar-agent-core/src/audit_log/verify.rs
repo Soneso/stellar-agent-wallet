@@ -787,23 +787,15 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
                 // No rotation-handoff tracking needed; the hash-chain is
                 // maintained by the surrounding hash check.
             }
-            EventKind::SaSignerAdded { .. } => {
-                // No rotation-handoff tracking needed; the hash-chain is
-                // maintained by the surrounding hash check.
-            }
-            EventKind::SaSignerRemoved { .. } => {
-                // No rotation-handoff tracking needed; the hash-chain is
-                // maintained by the surrounding hash check.
-            }
-            EventKind::SaThresholdChanged { .. } => {
-                // No rotation-handoff tracking needed; the hash-chain is
-                // maintained by the surrounding hash check.
-            }
-            EventKind::SaSignerSetDiverged { .. } => {
-                // No rotation-handoff tracking needed; the hash-chain is
-                // maintained by the surrounding hash check.
-            }
-            EventKind::SaSignerSetBaselined { .. } => {
+            EventKind::SaSignerAdded { .. }
+            | EventKind::SaSignerRemoved { .. }
+            | EventKind::SaThresholdChanged { .. }
+            | EventKind::SaSignerSetDiverged { .. }
+            | EventKind::SaSignerSetBaselined { .. }
+            | EventKind::SaSignerSetBaselinedV2 { .. }
+            | EventKind::SaSignerAddedV2 { .. }
+            | EventKind::SaSignerRemovedV2 { .. }
+            | EventKind::SaThresholdChangedV2 { .. } => {
                 // No rotation-handoff tracking needed; the hash-chain is
                 // maintained by the surrounding hash check.
             }
@@ -1500,6 +1492,10 @@ mod tests {
             EventKind::SaThresholdChanged { .. } => "sa_threshold_changed",
             EventKind::SaSignerSetDiverged { .. } => "sa_signer_set_diverged",
             EventKind::SaSignerSetBaselined { .. } => "sa_signer_set_baselined",
+            EventKind::SaSignerSetBaselinedV2 { .. } => "sa_signer_set_baselined_v2",
+            EventKind::SaSignerAddedV2 { .. } => "sa_signer_added_v2",
+            EventKind::SaSignerRemovedV2 { .. } => "sa_signer_removed_v2",
+            EventKind::SaThresholdChangedV2 { .. } => "sa_threshold_changed_v2",
             EventKind::SaVerifierHashDrift { .. } => "sa_verifier_hash_drift",
             EventKind::SaPolicyHashDrift { .. } => "sa_policy_hash_drift",
             EventKind::SaMutableContractOverride { .. } => "sa_mutable_contract_override",
@@ -1556,6 +1552,22 @@ mod tests {
             EventKind::MppStateAdopted { .. } => "mpp_state_adopted",
             EventKind::MppStateReset { .. } => "mpp_state_reset",
             EventKind::AuditTipAnchored { .. } => "audit_tip_anchored",
+        }
+    }
+
+    fn v2_snapshot_fixture() -> crate::audit_log::signer_set::SignerSetSnapshotV2 {
+        use crate::audit_log::signer_set::{
+            SignerEntryV2, SignerIdentityV2, SignerSetSnapshotV2, ThresholdObservation,
+        };
+        SignerSetSnapshotV2 {
+            signers: vec![SignerEntryV2 {
+                id: 0,
+                identity: SignerIdentityV2::Ed25519 { pubkey: [0u8; 32] },
+            }],
+            threshold: Some(ThresholdObservation {
+                policy: [0x22u8; 32],
+                threshold: 1,
+            }),
         }
     }
 
@@ -1691,6 +1703,37 @@ mod tests {
                 observed_at_unix_ms: 1_700_000_000_000,
                 baseline_reason: crate::audit_log::signer_set::BaselineReason::FirstObservation,
                 prev_chain_tip_hash: [0u8; 32],
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CDABC...12345"),
+            },
+            EventKind::SaSignerSetBaselinedV2 {
+                rule_id: 1,
+                snapshot: v2_snapshot_fixture(),
+                observed_at_ledger_seq: 1_000,
+                observed_at_unix_ms: 1_700_000_000_000,
+                baseline_reason: crate::audit_log::signer_set::BaselineReason::ConfirmedInstall,
+                prev_chain_tip_hash: [0u8; 32],
+                account_digest: [0x11u8; 32],
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CDABC...12345"),
+            },
+            EventKind::SaSignerAddedV2 {
+                rule_id: 1,
+                signer_id: 1,
+                snapshot: v2_snapshot_fixture(),
+                account_digest: [0x11u8; 32],
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CDABC...12345"),
+            },
+            EventKind::SaSignerRemovedV2 {
+                rule_id: 1,
+                signer_id: 2,
+                snapshot: v2_snapshot_fixture(),
+                account_digest: [0x11u8; 32],
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CDABC...12345"),
+            },
+            EventKind::SaThresholdChangedV2 {
+                rule_id: 1,
+                previous_threshold: None,
+                snapshot: v2_snapshot_fixture(),
+                account_digest: [0x11u8; 32],
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CDABC...12345"),
             },
             EventKind::SaVerifierHashDrift {
@@ -2268,6 +2311,10 @@ mod tests {
                 "sa_threshold_changed",
                 "sa_signer_set_diverged",
                 "sa_signer_set_baselined",
+                "sa_signer_set_baselined_v2",
+                "sa_signer_added_v2",
+                "sa_signer_removed_v2",
+                "sa_threshold_changed_v2",
                 "sa_verifier_hash_drift",
                 "sa_policy_hash_drift",
                 "sa_mutable_contract_override",

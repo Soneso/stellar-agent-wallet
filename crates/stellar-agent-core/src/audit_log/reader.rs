@@ -2,8 +2,8 @@
 //!
 //! Provides [`AuditReader`] — a read-side companion to [`AuditWriter`] that
 //! scans the rotated log-file chain in reverse-chronological order to find the
-//! most-recent signer-set state row for a given `(rule_id, smart_account)`
-//! pair.
+//! most-recent signer-set state row for a rule of a smart account, of either
+//! row version.
 //!
 //! # Shared-mutex discipline
 //!
@@ -77,7 +77,7 @@ use super::{
     chain::{ZERO_BLOCK_HASH, compute_entry_hash},
     entry::AuditEntry,
     schema::{EventKind, ExecutableRefPin, ValueLegRecord},
-    signer_set::{ObservedSignerSet, SignerSetStatePayload},
+    signer_set::{ObservedSignerSet, SignerSetSnapshotV2, SignerSetView, SignerSetViewPayload},
     verify::VerifyError,
     writer::{AuditWriter, is_rotated_sibling, wait_out_transient_rotation_window},
 };
@@ -323,7 +323,7 @@ pub type AuditLogIntegrityError = VerifyError;
 /// intra-process reader/writer races.
 ///
 /// Obtain via [`AuditReader::new`]; then call
-/// [`AuditReader::find_latest_signer_set_state`] to scan the rotated log chain.
+/// [`AuditReader::find_latest_signer_set_view`] to scan the rotated log chain.
 pub struct AuditReader {
     /// Shared writer mutex — acquired for the full duration of each scan.
     ///
@@ -396,13 +396,27 @@ impl AuditReader {
         Ok(false)
     }
 
-    /// Scans the rotated chain backwards for the most-recent row matching
-    /// `(rule_id, smart_account_redacted)` whose event kind is one of
-    /// `SaSignerAdded`, `SaSignerRemoved`, `SaThresholdChanged`, or
-    /// `SaSignerSetBaselined`.
+    /// Scans the rotated chain backwards for the most-recent signer-set state
+    /// row of rule `rule_id` of one smart account, of either row version.
     ///
-    /// Reconstructs [`ObservedSignerSet`] from the most-recent matching row's
-    /// `resulting_*` / `observed_*` payload fields.
+    /// A version-1 row (`SaSignerAdded`, `SaSignerRemoved`,
+    /// `SaThresholdChanged`, `SaSignerSetBaselined`) matches on
+    /// `(rule_id, smart_account_redacted)` and is returned as
+    /// [`SignerSetView::V1`], reconstructed from its `resulting_*` /
+    /// `observed_*` fields. A version-2 row (`SaSignerAddedV2`,
+    /// `SaSignerRemovedV2`, `SaThresholdChangedV2`, `SaSignerSetBaselinedV2`)
+    /// matches on `(rule_id, account_digest)` and is returned as
+    /// [`SignerSetView::V2`]. The keys differ because a version-1 row names
+    /// the account only by its first-5-last-5 redacted strkey, which many
+    /// accounts share and which names no network, while a version-2 row
+    /// carries the account digest of the network passphrase and the full
+    /// strkey (`signer_set::account_digest`), which binds exactly one account
+    /// on one network.
+    ///
+    /// Every version-2 state row the scan parses, for any rule or account,
+    /// must pass [`super::signer_set::SignerSetSnapshotV2::validate`]; a row
+    /// that fails is a [`AuditLogIntegrityError::ParseError`] at its line,
+    /// as a malformed JSON line is.
     ///
     /// # Scan semantics
     ///
@@ -413,11 +427,12 @@ impl AuditReader {
     ///
     /// # Returns
     ///
-    /// - `Ok(Some(payload))` — matching row found; `payload.row_hash` is the
+    /// - `Ok(Some(payload))`: matching row found; `payload.row_hash()` is the
     ///   SHA-256 of the canonical JSON body of the row (body with
     ///   `previous_entry_hash = ""`), suitable for binding into
-    ///   `FrozenChainStateTuple`.
-    /// - `Ok(None)` — full rotated-chain traversal completed cleanly with no
+    ///   `FrozenChainStateTuple`, and `payload.file()` / `payload.line()` name
+    ///   the row.
+    /// - `Ok(None)`: full rotated-chain traversal completed cleanly with no
     ///   matching row (reserved for "no baseline"; never silently masks integrity
     ///   errors).
     ///
@@ -432,8 +447,9 @@ impl AuditReader {
     /// - [`AuditLogIntegrityError::HmacSidecarMissing`] — HMAC key provided
     ///   but per-file sidecar is absent (integrity violation).
     /// - [`AuditLogIntegrityError::ParseError`] — a log line could not be
-    ///   parsed as an [`AuditEntry`]. Includes torn-tail scenarios where the
-    ///   active file's last line is incomplete (a truncated write produces an
+    ///   parsed as an [`AuditEntry`], or a version-2 state row carries a
+    ///   malformed snapshot. Includes torn-tail scenarios where the active
+    ///   file's last line is incomplete (a truncated write produces an
     ///   unparseable line).
     /// - [`AuditLogIntegrityError::Io`] — ambient filesystem failure.
     ///
@@ -444,11 +460,12 @@ impl AuditReader {
     /// writer thread panicked while holding the lock — the audit log is in an
     /// unknown state; process restart is the only safe recovery). The Io error
     /// message describes the lock-poisoned condition.
-    pub fn find_latest_signer_set_state(
+    pub fn find_latest_signer_set_view(
         &self,
         rule_id: u32,
         smart_account_redacted: &str,
-    ) -> Result<Option<SignerSetStatePayload>, AuditLogIntegrityError> {
+        account_digest: &[u8; 32],
+    ) -> Result<Option<SignerSetViewPayload>, AuditLogIntegrityError> {
         // Acquire the writer mutex for the full duration of the scan.
         // If the mutex is poisoned (a prior writer thread panicked), propagate
         // as AuditLogIntegrityError::Io so callers get a structured typed error
@@ -479,7 +496,7 @@ impl AuditReader {
         // through to rotated-sibling data as if it were the most-recent state.
         let has_rotated_siblings = files_newest_first.len() > 1;
 
-        let mut best: Option<SignerSetStatePayload> = None;
+        let mut best: Option<SignerSetViewPayload> = None;
 
         for path in &files_newest_first {
             if !path.exists() {
@@ -529,8 +546,11 @@ impl AuditReader {
             };
             let file_result = scan_file_for_signer_set(
                 path,
-                rule_id,
-                smart_account_redacted,
+                SignerSetKey {
+                    rule_id,
+                    smart_account_redacted,
+                    account_digest,
+                },
                 hmac_key,
                 expected_first_row_prev,
             )?;
@@ -571,12 +591,12 @@ impl AuditReader {
     ///
     /// # Integrity contract
     ///
-    /// Integrity errors propagate the same as `find_latest_signer_set_state` —
+    /// Integrity errors propagate the same as `find_latest_signer_set_view`;
     /// `Ok(None)` is NEVER used to mask an integrity failure.
     ///
     /// # Errors
     ///
-    /// Same error variants as [`AuditReader::find_latest_signer_set_state`]:
+    /// Same error variants as [`AuditReader::find_latest_signer_set_view`]:
     /// `ChainBroken`, `RotationGap`, `HmacMismatch`, `HmacSidecarMissing`,
     /// `ParseError`, `Io`.
     pub fn find_latest_context_rule_pinned_hashes(
@@ -673,7 +693,7 @@ impl AuditReader {
     ///
     /// # Errors
     ///
-    /// Same integrity error variants as [`AuditReader::find_latest_signer_set_state`]:
+    /// Same integrity error variants as [`AuditReader::find_latest_signer_set_view`]:
     /// `ChainBroken`, `RotationGap`, `HmacMismatch`, `HmacSidecarMissing`,
     /// `ParseError`, `Io`.
     pub fn scan_all_context_rule_pin_records(
@@ -773,7 +793,7 @@ impl AuditReader {
     ///
     /// # Errors
     ///
-    /// Same variants as [`AuditReader::find_latest_signer_set_state`].
+    /// Same variants as [`AuditReader::find_latest_signer_set_view`].
     pub fn find_installed_context_rule_ids(
         &self,
         sa_address_redacted: &str,
@@ -1069,18 +1089,22 @@ fn scan_files_newest_first(log_path: &Path) -> Result<Vec<PathBuf>, AuditLogInte
 /// `ParseError`. There is no leniency difference between active and rotated files.
 fn scan_file_for_signer_set(
     path: &Path,
-    rule_id: u32,
-    smart_account_redacted: &str,
+    key: SignerSetKey<'_>,
     hmac_key: Option<&[u8; 32]>,
     expected_first_row_prev: Option<&str>,
-) -> Result<Option<SignerSetStatePayload>, AuditLogIntegrityError> {
+) -> Result<Option<SignerSetViewPayload>, AuditLogIntegrityError> {
     use super::chain::verify_chain_root;
     use super::writer::hmac_sidecar_path;
 
     let file = open_regular_file(path)?;
     let reader = BufReader::new(file);
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_owned();
 
-    let mut best: Option<SignerSetStatePayload> = None;
+    let mut best: Option<SignerSetViewPayload> = None;
     let mut is_first_entry = true;
     // Thread the hash computed from each row into the next row's chain check.
     // Starts as `None` until the first row is parsed; from row 2 onward this
@@ -1102,6 +1126,18 @@ fn scan_file_for_signer_set(
                 line: line_number,
                 detail: e.to_string(),
             })?;
+
+        // A version-2 snapshot that breaks its structural rules is refused
+        // like an unparseable line, for every rule and account, so every
+        // reader of the file sees the same verdict.
+        if let Some(snapshot) = v2_snapshot(&entry.event_kind)
+            && let Err(e) = snapshot.validate()
+        {
+            return Err(AuditLogIntegrityError::ParseError {
+                line: line_number,
+                detail: e.to_string(),
+            });
+        }
 
         // Verify chain-root HMAC on the first entry of each file when a key is
         // provided. This authenticates the chain root without a full chain walk,
@@ -1204,37 +1240,64 @@ fn scan_file_for_signer_set(
         prev_computed_hash = Some(current_hash);
 
         // Check if this entry is a signer-set state row for our target.
-        if let Some(state) =
-            extract_observed_signer_set(&entry.event_kind, rule_id, smart_account_redacted)
-        {
-            best = Some(SignerSetStatePayload::new(state, row_hash));
+        if let Some(view) = extract_signer_set_view(&entry.event_kind, key) {
+            best = Some(SignerSetViewPayload::new(
+                view,
+                row_hash,
+                line_number,
+                file_name.clone(),
+            ));
         }
     }
 
     Ok(best)
 }
 
-/// Extracts an [`ObservedSignerSet`] from a signer-set event kind if it
-/// matches `(rule_id, smart_account_redacted)`.
+/// The keys a signer-set state row is matched on: the rule, the redacted
+/// account for version-1 rows and the account digest for version-2 rows.
+#[derive(Clone, Copy)]
+struct SignerSetKey<'a> {
+    rule_id: u32,
+    smart_account_redacted: &'a str,
+    account_digest: &'a [u8; 32],
+}
+
+/// The snapshot of a version-2 signer-set state row, for any rule or account.
+fn v2_snapshot(kind: &EventKind) -> Option<&SignerSetSnapshotV2> {
+    match kind {
+        EventKind::SaSignerSetBaselinedV2 { snapshot, .. }
+        | EventKind::SaSignerAddedV2 { snapshot, .. }
+        | EventKind::SaSignerRemovedV2 { snapshot, .. }
+        | EventKind::SaThresholdChangedV2 { snapshot, .. } => Some(snapshot),
+        _ => None,
+    }
+}
+
+/// Extracts the [`SignerSetView`] of a signer-set state row that matches
+/// `key`: a version-1 row on `(rule_id, smart_account_redacted)`, a
+/// version-2 row on `(rule_id, account_digest)`.
 ///
-/// Returns `None` if the event is not a signer-set event or does not match
-/// the filter.
+/// Returns `None` if the event is not a signer-set state row or does not
+/// match its key.
 ///
 /// # Validation contract
 ///
-/// The returned `ObservedSignerSet` is structurally valid: deserialization
-/// enforces the variant tag and field shapes (JSON type correctness). However,
+/// A returned version-2 snapshot has passed
+/// [`SignerSetSnapshotV2::validate`] in the scan. A returned version-1
+/// state is structurally valid as deserialized: deserialization enforces the
+/// variant tag and field shapes (JSON type correctness). However,
 /// the `External` variant's `verifier_contract` C-strkey is NOT validated as a
 /// well-formed strkey here — that validation happens downstream in
 /// [`signer_set::signer_pubkey_canonical_body`] when the canonical body is
 /// computed. Consumers that call `signer_pubkey_canonical_body` on values
 /// derived from this function must handle the
 /// [`signer_set::SignerSetCanonicalBodyError`] error path.
-fn extract_observed_signer_set(
-    kind: &EventKind,
-    rule_id: u32,
-    smart_account_redacted: &str,
-) -> Option<ObservedSignerSet> {
+fn extract_signer_set_view(kind: &EventKind, key: SignerSetKey<'_>) -> Option<SignerSetView> {
+    let SignerSetKey {
+        rule_id,
+        smart_account_redacted,
+        account_digest,
+    } = key;
     match kind {
         EventKind::SaSignerAdded {
             rule_id: rid,
@@ -1244,12 +1307,14 @@ fn extract_observed_signer_set(
             resulting_signer_ids,
             resulting_signer_pubkeys,
             ..
-        } if *rid == rule_id && sa == smart_account_redacted => Some(ObservedSignerSet {
-            signer_count: *resulting_signer_count,
-            threshold: *resulting_threshold,
-            signer_ids: resulting_signer_ids.clone(),
-            signer_pubkeys: resulting_signer_pubkeys.clone(),
-        }),
+        } if *rid == rule_id && sa == smart_account_redacted => {
+            Some(SignerSetView::V1(ObservedSignerSet {
+                signer_count: *resulting_signer_count,
+                threshold: *resulting_threshold,
+                signer_ids: resulting_signer_ids.clone(),
+                signer_pubkeys: resulting_signer_pubkeys.clone(),
+            }))
+        }
         EventKind::SaSignerRemoved {
             rule_id: rid,
             smart_account_redacted: sa,
@@ -1258,12 +1323,14 @@ fn extract_observed_signer_set(
             resulting_signer_ids,
             resulting_signer_pubkeys,
             ..
-        } if *rid == rule_id && sa == smart_account_redacted => Some(ObservedSignerSet {
-            signer_count: *resulting_signer_count,
-            threshold: *resulting_threshold,
-            signer_ids: resulting_signer_ids.clone(),
-            signer_pubkeys: resulting_signer_pubkeys.clone(),
-        }),
+        } if *rid == rule_id && sa == smart_account_redacted => {
+            Some(SignerSetView::V1(ObservedSignerSet {
+                signer_count: *resulting_signer_count,
+                threshold: *resulting_threshold,
+                signer_ids: resulting_signer_ids.clone(),
+                signer_pubkeys: resulting_signer_pubkeys.clone(),
+            }))
+        }
         EventKind::SaThresholdChanged {
             rule_id: rid,
             smart_account_redacted: sa,
@@ -1272,12 +1339,14 @@ fn extract_observed_signer_set(
             resulting_signer_ids,
             resulting_signer_pubkeys,
             ..
-        } if *rid == rule_id && sa == smart_account_redacted => Some(ObservedSignerSet {
-            signer_count: *resulting_signer_count,
-            threshold: *resulting_threshold,
-            signer_ids: resulting_signer_ids.clone(),
-            signer_pubkeys: resulting_signer_pubkeys.clone(),
-        }),
+        } if *rid == rule_id && sa == smart_account_redacted => {
+            Some(SignerSetView::V1(ObservedSignerSet {
+                signer_count: *resulting_signer_count,
+                threshold: *resulting_threshold,
+                signer_ids: resulting_signer_ids.clone(),
+                signer_pubkeys: resulting_signer_pubkeys.clone(),
+            }))
+        }
         EventKind::SaSignerSetBaselined {
             rule_id: rid,
             smart_account_redacted: sa,
@@ -1286,12 +1355,40 @@ fn extract_observed_signer_set(
             observed_signer_ids,
             observed_signer_pubkeys,
             ..
-        } if *rid == rule_id && sa == smart_account_redacted => Some(ObservedSignerSet {
-            signer_count: *observed_signer_count,
-            threshold: *observed_threshold,
-            signer_ids: observed_signer_ids.clone(),
-            signer_pubkeys: observed_signer_pubkeys.clone(),
-        }),
+        } if *rid == rule_id && sa == smart_account_redacted => {
+            Some(SignerSetView::V1(ObservedSignerSet {
+                signer_count: *observed_signer_count,
+                threshold: *observed_threshold,
+                signer_ids: observed_signer_ids.clone(),
+                signer_pubkeys: observed_signer_pubkeys.clone(),
+            }))
+        }
+        EventKind::SaSignerSetBaselinedV2 {
+            rule_id: rid,
+            account_digest: digest,
+            snapshot,
+            ..
+        }
+        | EventKind::SaSignerAddedV2 {
+            rule_id: rid,
+            account_digest: digest,
+            snapshot,
+            ..
+        }
+        | EventKind::SaSignerRemovedV2 {
+            rule_id: rid,
+            account_digest: digest,
+            snapshot,
+            ..
+        }
+        | EventKind::SaThresholdChangedV2 {
+            rule_id: rid,
+            account_digest: digest,
+            snapshot,
+            ..
+        } if *rid == rule_id && digest == account_digest => {
+            Some(SignerSetView::V2(snapshot.clone()))
+        }
         _ => None,
     }
 }
@@ -1902,7 +1999,10 @@ mod tests {
     use crate::audit_log::{
         entry::{AuditEntry, NewToolInvocation},
         schema::PolicyDecision,
-        signer_set::{BaselineReason, SignerPubkey},
+        signer_set::{
+            BaselineReason, SignerEntryV2, SignerIdentityV2, SignerPubkey, SignerSetSnapshotV2,
+            ThresholdObservation,
+        },
         writer::{
             AuditWriter, ROTATION_WINDOW_RETRY_ATTEMPTS, install_rotation_window_retry_observer,
         },
@@ -2097,6 +2197,18 @@ mod tests {
         }
     }
 
+    /// The account digest passed where a test writes only version-1 rows,
+    /// which the reader keys on the redacted account.
+    const NO_DIGEST: [u8; 32] = [0u8; 32];
+
+    /// The version-1 state of a payload; panics on a version-2 view.
+    fn v1_state(payload: &SignerSetViewPayload) -> &ObservedSignerSet {
+        match payload.view() {
+            SignerSetView::V1(state) => state,
+            SignerSetView::V2(_) => panic!("expected a version-1 view, got {payload:?}"),
+        }
+    }
+
     // ── Helper: write an EventKind entry to a writer ──────────────────────────
 
     fn write_event(writer: &mut AuditWriter, kind: EventKind) {
@@ -2115,7 +2227,7 @@ mod tests {
     // ── 1. Basic find in active file ──────────────────────────────────────────
 
     #[test]
-    fn find_latest_signer_set_state_returns_most_recent_in_active_file() {
+    fn find_latest_signer_set_view_returns_most_recent_in_active_file() {
         let dir = TempDir::new().unwrap();
         let path = tmp_log(&dir);
         let writer = open_writer(path.clone());
@@ -2129,23 +2241,23 @@ mod tests {
 
         let reader = AuditReader::new(Arc::clone(&writer), None);
         let result = reader
-            .find_latest_signer_set_state(1, "CDABC...12345")
+            .find_latest_signer_set_view(1, "CDABC...12345", &NO_DIGEST)
             .unwrap();
 
         let payload = result.expect("should find the most-recent row");
         assert_eq!(
-            payload.state().signer_count,
+            v1_state(&payload).signer_count,
             3,
             "should return the most-recent row"
         );
-        assert_eq!(payload.state().threshold, 2);
+        assert_eq!(v1_state(&payload).threshold, 2);
         assert_ne!(*payload.row_hash(), [0u8; 32], "row_hash must be non-zero");
     }
 
     // ── 2. Returns None when no matching row ──────────────────────────────────
 
     #[test]
-    fn find_latest_signer_set_state_returns_none_for_unmatched_rule() {
+    fn find_latest_signer_set_view_returns_none_for_unmatched_rule() {
         let dir = TempDir::new().unwrap();
         let path = tmp_log(&dir);
         let writer = open_writer(path.clone());
@@ -2158,13 +2270,13 @@ mod tests {
         let reader = AuditReader::new(Arc::clone(&writer), None);
         // Different rule_id — should not match.
         let result = reader
-            .find_latest_signer_set_state(99, "CDABC...12345")
+            .find_latest_signer_set_view(99, "CDABC...12345", &NO_DIGEST)
             .unwrap();
         assert!(result.is_none(), "should return None for unmatched rule_id");
     }
 
     #[test]
-    fn find_latest_signer_set_state_returns_none_for_unmatched_smart_account() {
+    fn find_latest_signer_set_view_returns_none_for_unmatched_smart_account() {
         let dir = TempDir::new().unwrap();
         let path = tmp_log(&dir);
         let writer = open_writer(path.clone());
@@ -2176,7 +2288,7 @@ mod tests {
 
         let reader = AuditReader::new(Arc::clone(&writer), None);
         let result = reader
-            .find_latest_signer_set_state(1, "COTHER...OTHER")
+            .find_latest_signer_set_view(1, "COTHER...OTHER", &NO_DIGEST)
             .unwrap();
         assert!(
             result.is_none(),
@@ -2187,7 +2299,7 @@ mod tests {
     // ── 3. Finds baseline row in a rotated file ───────────────────────────────
 
     #[test]
-    fn find_latest_signer_set_state_discovers_baseline_in_rotated_file() {
+    fn find_latest_signer_set_view_discovers_baseline_in_rotated_file() {
         let dir = TempDir::new().unwrap();
         let path = tmp_log(&dir);
         let writer = open_writer(path.clone());
@@ -2204,17 +2316,17 @@ mod tests {
 
         let reader = AuditReader::new(Arc::clone(&writer), None);
         let result = reader
-            .find_latest_signer_set_state(1, "CDABC...12345")
+            .find_latest_signer_set_view(1, "CDABC...12345", &NO_DIGEST)
             .unwrap();
 
         let payload = result.expect("should find baseline row in rotated file");
-        assert_eq!(payload.state().signer_count, 2);
+        assert_eq!(v1_state(&payload).signer_count, 2);
     }
 
     // ── 4. Torn-tail returns integrity error not None ─────────────────────────
 
     #[test]
-    fn find_latest_signer_set_state_torn_tail_returns_parse_error_not_none() {
+    fn find_latest_signer_set_view_torn_tail_returns_parse_error_not_none() {
         let dir = TempDir::new().unwrap();
         let path = tmp_log(&dir);
         let writer = open_writer(path.clone());
@@ -2252,7 +2364,7 @@ mod tests {
         }
 
         let reader = AuditReader::new(Arc::clone(&writer), None);
-        let result = reader.find_latest_signer_set_state(1, "CDABC...12345");
+        let result = reader.find_latest_signer_set_view(1, "CDABC...12345", &NO_DIGEST);
 
         // Must return an error, NOT Ok(None).
         assert!(
@@ -2300,7 +2412,7 @@ mod tests {
         // sees fully-written entries (no torn lines).
         let reader = AuditReader::new(Arc::clone(&writer), None);
         for _ in 0..100 {
-            let result = reader.find_latest_signer_set_state(1, "CDABC...12345");
+            let result = reader.find_latest_signer_set_view(1, "CDABC...12345", &NO_DIGEST);
             assert!(
                 result.is_ok(),
                 "reader saw a torn / parse-error state under concurrent write: {result:?}"
@@ -2312,7 +2424,7 @@ mod tests {
 
         // After all writes complete, the reader must see a valid row.
         let final_result = reader
-            .find_latest_signer_set_state(1, "CDABC...12345")
+            .find_latest_signer_set_view(1, "CDABC...12345", &NO_DIGEST)
             .unwrap();
         assert!(
             final_result.is_some(),
@@ -2467,7 +2579,7 @@ mod tests {
         }
 
         let reader = AuditReader::new(Arc::clone(&writer), None);
-        let result = reader.find_latest_signer_set_state(1, "CDABC...12345");
+        let result = reader.find_latest_signer_set_view(1, "CDABC...12345", &NO_DIGEST);
 
         // Must return exactly ChainBroken: the tamper mutates body bytes that
         // survive JSON parsing, so the chain-hash check fires — not ParseError.
@@ -2518,7 +2630,7 @@ mod tests {
         });
 
         let reader = AuditReader::new(Arc::clone(&writer), None);
-        let result = reader.find_latest_signer_set_state(1, "CDABC...12345");
+        let result = reader.find_latest_signer_set_view(1, "CDABC...12345", &NO_DIGEST);
 
         match result {
             Err(AuditLogIntegrityError::RotationGap { .. }) => {
@@ -2545,7 +2657,7 @@ mod tests {
     ///
     /// This drives `collect_files_newest_first` directly — the reader's
     /// tolerance entry point — because the public reader API
-    /// (`find_latest_signer_set_state`) requires a live `Arc<Mutex<AuditWriter>>`
+    /// (`find_latest_signer_set_view`) requires a live `Arc<Mutex<AuditWriter>>`
     /// for the scan's duration, which necessarily holds the sidecar lock and so
     /// cannot reach the unheld-lock branch.
     #[test]
@@ -2636,12 +2748,12 @@ mod tests {
         });
 
         let reader = AuditReader::new(Arc::clone(&writer), None);
-        let result = reader.find_latest_signer_set_state(1, "CDABC...12345");
+        let result = reader.find_latest_signer_set_view(1, "CDABC...12345", &NO_DIGEST);
 
         let payload = result
             .expect("transient rotation-window absence must not surface as RotationGap")
             .expect("row must still be found once the active file reappears");
-        assert_eq!(payload.state().signer_count, 3);
+        assert_eq!(v1_state(&payload).signer_count, 3);
         assert_eq!(
             *observed_attempts.borrow(),
             vec![0, 1],
@@ -2854,10 +2966,10 @@ mod tests {
         }
     }
 
-    // ── 10. SaSignerAdded is picked up by find_latest_signer_set_state ────────
+    // ── 10. SaSignerAdded is picked up by find_latest_signer_set_view ────────
 
     #[test]
-    fn find_latest_signer_set_state_picks_up_signer_added_event() {
+    fn find_latest_signer_set_view_picks_up_signer_added_event() {
         let dir = TempDir::new().unwrap();
         let path = tmp_log(&dir);
         let writer = open_writer(path.clone());
@@ -2871,27 +2983,27 @@ mod tests {
 
         let reader = AuditReader::new(Arc::clone(&writer), None);
         let result = reader
-            .find_latest_signer_set_state(1, "CDABC...12345")
+            .find_latest_signer_set_view(1, "CDABC...12345", &NO_DIGEST)
             .unwrap();
 
         let payload = result.expect("should find signer-added event");
         assert_eq!(
-            payload.state().signer_count,
+            v1_state(&payload).signer_count,
             3,
             "SaSignerAdded resulting count must be returned"
         );
-        assert_eq!(payload.state().threshold, 2);
+        assert_eq!(v1_state(&payload).threshold, 2);
         assert_eq!(
-            payload.state().signer_ids.len(),
+            v1_state(&payload).signer_ids.len(),
             3,
             "signer_ids length must match resulting_signer_count"
         );
     }
 
-    // ── 11. SaSignerRemoved is picked up by find_latest_signer_set_state ──────
+    // ── 11. SaSignerRemoved is picked up by find_latest_signer_set_view ──────
 
     #[test]
-    fn find_latest_signer_set_state_picks_up_signer_removed_event() {
+    fn find_latest_signer_set_view_picks_up_signer_removed_event() {
         let dir = TempDir::new().unwrap();
         let path = tmp_log(&dir);
         let writer = open_writer(path.clone());
@@ -2904,21 +3016,21 @@ mod tests {
 
         let reader = AuditReader::new(Arc::clone(&writer), None);
         let payload = reader
-            .find_latest_signer_set_state(1, "CDABC...12345")
+            .find_latest_signer_set_view(1, "CDABC...12345", &NO_DIGEST)
             .unwrap()
             .expect("should find signer-removed event");
 
         assert_eq!(
-            payload.state().signer_count,
+            v1_state(&payload).signer_count,
             2,
             "SaSignerRemoved resulting count must be returned"
         );
     }
 
-    // ── 12. SaThresholdChanged is picked up by find_latest_signer_set_state ───
+    // ── 12. SaThresholdChanged is picked up by find_latest_signer_set_view ───
 
     #[test]
-    fn find_latest_signer_set_state_picks_up_threshold_changed_event() {
+    fn find_latest_signer_set_view_picks_up_threshold_changed_event() {
         let dir = TempDir::new().unwrap();
         let path = tmp_log(&dir);
         let writer = open_writer(path.clone());
@@ -2931,17 +3043,17 @@ mod tests {
 
         let reader = AuditReader::new(Arc::clone(&writer), None);
         let payload = reader
-            .find_latest_signer_set_state(1, "CDABC...12345")
+            .find_latest_signer_set_view(1, "CDABC...12345", &NO_DIGEST)
             .unwrap()
             .expect("should find threshold-changed event");
 
         assert_eq!(
-            payload.state().threshold,
+            v1_state(&payload).threshold,
             2,
             "SaThresholdChanged resulting threshold must be returned"
         );
         assert_eq!(
-            payload.state().signer_count,
+            v1_state(&payload).signer_count,
             2,
             "signer count must be unchanged by threshold change"
         );
@@ -4061,11 +4173,11 @@ mod tests {
         let reader = AuditReader::new(Arc::clone(&writer), None);
 
         let ss = reader
-            .find_latest_signer_set_state(1, "CDABC...12345")
+            .find_latest_signer_set_view(1, "CDABC...12345", &NO_DIGEST)
             .unwrap();
         assert!(
             ss.is_none(),
-            "empty log: find_latest_signer_set_state must be None"
+            "empty log: find_latest_signer_set_view must be None"
         );
 
         let pins = reader
@@ -4103,7 +4215,7 @@ mod tests {
 
     #[test]
     fn row_hash_is_body_only_sha256_not_chain_link_hash() {
-        // The SignerSetStatePayload.row_hash is SHA-256(canonical_body with
+        // The SignerSetViewPayload row_hash is SHA-256(canonical_body with
         // previous_entry_hash=""), NOT the chain-link hash which also covers
         // the previous_entry_hash bytes. For the first row in a fresh log the
         // chain-link hash equals SHA-256(body || ZERO_BLOCK_HASH_bytes), but the
@@ -4124,7 +4236,7 @@ mod tests {
 
         // Query returns the most-recent row.
         let payload = reader
-            .find_latest_signer_set_state(1, "CDABC...12345")
+            .find_latest_signer_set_view(1, "CDABC...12345", &NO_DIGEST)
             .unwrap()
             .expect("must find a row");
 
@@ -4139,7 +4251,7 @@ mod tests {
         assert_eq!(payload.row_hash().len(), 32, "row_hash must be 32 bytes");
 
         // The state fields must match the most-recent entry's payload.
-        assert_eq!(payload.state().signer_count, 3);
+        assert_eq!(v1_state(&payload).signer_count, 3);
     }
 
     // ── 32. scan_all_context_rule_pin_records: newest-file-first ordering ──────────
@@ -4240,7 +4352,7 @@ mod tests {
         symlink(&target, &path).unwrap();
 
         // scan_file_for_signer_set calls open_regular_file which rejects symlinks.
-        // We drive it through find_latest_signer_set_state. The writer is never
+        // We drive it through find_latest_signer_set_view. The writer is never
         // opened on this path (path doesn't exist as a real file), so we construct
         // the writer separately on a different path and then manually create a
         // reader pointing at the symlink path.
@@ -4264,8 +4376,11 @@ mod tests {
 
         let result = scan_file_for_signer_set(
             &path, // symlink to non-existent target
-            1,
-            "CDABC...12345",
+            SignerSetKey {
+                rule_id: 1,
+                smart_account_redacted: "CDABC...12345",
+                account_digest: &NO_DIGEST,
+            },
             None,
             None,
         );
@@ -4294,10 +4409,10 @@ mod tests {
         assert_eq!(chain[0], path, "first element must be the active path");
     }
 
-    // ── 36. find_latest_signer_set_state: active-file-only, no rotated files ───
+    // ── 36. find_latest_signer_set_view: active-file-only, no rotated files ───
 
     #[test]
-    fn find_latest_signer_set_state_no_rows_no_rotated_files_returns_none() {
+    fn find_latest_signer_set_view_no_rows_no_rotated_files_returns_none() {
         let dir = TempDir::new().unwrap();
         let path = tmp_log(&dir);
         // Open writer; do NOT write anything.
@@ -4305,7 +4420,7 @@ mod tests {
 
         let reader = AuditReader::new(Arc::clone(&writer), None);
         let result = reader
-            .find_latest_signer_set_state(1, "CDABC...12345")
+            .find_latest_signer_set_view(1, "CDABC...12345", &NO_DIGEST)
             .unwrap();
 
         assert!(
@@ -4382,7 +4497,7 @@ mod tests {
 
         {
             let reader = AuditReader::new(Arc::clone(&writer), None);
-            let result = reader.find_latest_signer_set_state(1, "CDABC...12345");
+            let result = reader.find_latest_signer_set_view(1, "CDABC...12345", &NO_DIGEST);
 
             // Must return ChainBroken — NOT Ok(None) (which would hide the tamper)
             // and NOT Ok(Some(...)) (which would return unmodified signer-set state
@@ -4395,11 +4510,321 @@ mod tests {
                 Ok(None) => panic!("single-row tamper must not return Ok(None)"),
                 Ok(Some(p)) => panic!(
                     "single-row tamper must not return Ok(Some(...)): signer_count={}",
-                    p.state().signer_count
+                    v1_state(&p).signer_count
                 ),
                 Err(other) => panic!("expected ChainBroken, got: {other:?}"),
             }
         }
+    }
+
+    // ── Version-2 state rows ──────────────────────────────────────────────────
+
+    const READER_DIGEST: [u8; 32] = [0xd1; 32];
+    const OTHER_DIGEST: [u8; 32] = [0xd2; 32];
+
+    /// A version-2 snapshot of `signer_count` Ed25519 signers with ids
+    /// `0..signer_count` and a threshold observation of `threshold`.
+    fn ed25519_snapshot(signer_count: u32, threshold: u32) -> SignerSetSnapshotV2 {
+        SignerSetSnapshotV2 {
+            signers: (0..signer_count)
+                .map(|id| SignerEntryV2 {
+                    id,
+                    identity: SignerIdentityV2::Ed25519 {
+                        pubkey: [u8::try_from(id).unwrap() + 1; 32],
+                    },
+                })
+                .collect(),
+            threshold: Some(ThresholdObservation {
+                policy: [0x77; 32],
+                threshold,
+            }),
+        }
+    }
+
+    fn baselined_v2_event(
+        rule_id: u32,
+        sa_redacted: &str,
+        account_digest: [u8; 32],
+        snapshot: SignerSetSnapshotV2,
+    ) -> EventKind {
+        EventKind::SaSignerSetBaselinedV2 {
+            rule_id,
+            snapshot,
+            observed_at_ledger_seq: 1_000,
+            observed_at_unix_ms: 1_700_000_000_000,
+            baseline_reason: BaselineReason::confirmed_install(),
+            prev_chain_tip_hash: [0u8; 32],
+            account_digest,
+            smart_account_redacted: RedactedStrkey::from_already_redacted(sa_redacted),
+        }
+    }
+
+    /// The version-2 snapshot of a payload; panics on a version-1 view.
+    fn v2_state(payload: &SignerSetViewPayload) -> &SignerSetSnapshotV2 {
+        match payload.view() {
+            SignerSetView::V2(snapshot) => snapshot,
+            SignerSetView::V1(_) => panic!("expected a version-2 view, got {payload:?}"),
+        }
+    }
+
+    #[test]
+    fn find_latest_signer_set_view_returns_v2_baseline_with_line_and_file() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        {
+            let mut w = writer.lock().unwrap();
+            write_event(&mut w, baselined_event(9, "CDABC...12345", 1, 1));
+            write_event(
+                &mut w,
+                baselined_v2_event(1, "CDABC...12345", READER_DIGEST, ed25519_snapshot(2, 2)),
+            );
+            write_event(&mut w, baselined_event(8, "CDABC...12345", 1, 1));
+        }
+
+        let reader = AuditReader::new(Arc::clone(&writer), None);
+        let payload = reader
+            .find_latest_signer_set_view(1, "CDABC...12345", &READER_DIGEST)
+            .unwrap()
+            .expect("the v2 baseline row is found");
+        assert_eq!(payload.view().version(), 2);
+        assert_eq!(v2_state(&payload), &ed25519_snapshot(2, 2));
+        assert_eq!(payload.line(), 2);
+        assert_eq!(payload.file(), "audit.jsonl");
+        assert_ne!(*payload.row_hash(), [0u8; 32]);
+    }
+
+    #[test]
+    fn find_latest_signer_set_view_newer_v2_row_wins_over_older_v1_row() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        {
+            let mut w = writer.lock().unwrap();
+            write_event(&mut w, baselined_event(1, "CDABC...12345", 2, 2));
+            write_event(
+                &mut w,
+                baselined_v2_event(1, "CDABC...12345", READER_DIGEST, ed25519_snapshot(3, 2)),
+            );
+        }
+
+        let reader = AuditReader::new(Arc::clone(&writer), None);
+        let payload = reader
+            .find_latest_signer_set_view(1, "CDABC...12345", &READER_DIGEST)
+            .unwrap()
+            .unwrap();
+        assert_eq!(v2_state(&payload).signer_count(), 3);
+        assert_eq!(payload.line(), 2);
+    }
+
+    #[test]
+    fn find_latest_signer_set_view_newer_v1_row_wins_over_older_v2_row() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        {
+            let mut w = writer.lock().unwrap();
+            write_event(
+                &mut w,
+                baselined_v2_event(1, "CDABC...12345", READER_DIGEST, ed25519_snapshot(3, 2)),
+            );
+            write_event(&mut w, baselined_event(1, "CDABC...12345", 2, 2));
+        }
+
+        let reader = AuditReader::new(Arc::clone(&writer), None);
+        let payload = reader
+            .find_latest_signer_set_view(1, "CDABC...12345", &READER_DIGEST)
+            .unwrap()
+            .unwrap();
+        assert_eq!(payload.view().version(), 1);
+        assert_eq!(v1_state(&payload).signer_count, 2);
+        assert_eq!(payload.line(), 2);
+    }
+
+    /// A version-2 row is keyed on the account digest: a newer row with the
+    /// same rule and redacted account but another digest belongs to another
+    /// account or network and is skipped.
+    #[test]
+    fn find_latest_signer_set_view_skips_v2_row_with_another_account_digest() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        {
+            let mut w = writer.lock().unwrap();
+            write_event(&mut w, baselined_event(1, "CDABC...12345", 2, 1));
+            write_event(
+                &mut w,
+                baselined_v2_event(1, "CDABC...12345", OTHER_DIGEST, ed25519_snapshot(4, 3)),
+            );
+        }
+
+        let reader = AuditReader::new(Arc::clone(&writer), None);
+        let payload = reader
+            .find_latest_signer_set_view(1, "CDABC...12345", &READER_DIGEST)
+            .unwrap()
+            .unwrap();
+        assert_eq!(payload.view().version(), 1, "{payload:?}");
+        assert_eq!(v1_state(&payload).signer_count, 2);
+        assert_eq!(payload.line(), 1);
+    }
+
+    /// A version-1 row is keyed on the redacted account: a newer row for
+    /// another redacted account is skipped and the older version-2 row with
+    /// the reader's digest is returned.
+    #[test]
+    fn find_latest_signer_set_view_skips_v1_row_for_another_redacted_account() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        {
+            let mut w = writer.lock().unwrap();
+            write_event(
+                &mut w,
+                baselined_v2_event(1, "CDABC...12345", READER_DIGEST, ed25519_snapshot(2, 1)),
+            );
+            write_event(&mut w, baselined_event(1, "COTHE...OTHER", 5, 5));
+        }
+
+        let reader = AuditReader::new(Arc::clone(&writer), None);
+        let payload = reader
+            .find_latest_signer_set_view(1, "CDABC...12345", &READER_DIGEST)
+            .unwrap()
+            .unwrap();
+        assert_eq!(v2_state(&payload), &ed25519_snapshot(2, 1));
+        assert_eq!(payload.line(), 1);
+    }
+
+    /// A version-2 row is keyed on the rule as well as the account digest: a
+    /// newer row for another rule with the reader's digest is skipped, and
+    /// each rule reads its own newest row.
+    #[test]
+    fn find_latest_signer_set_view_keys_v2_rows_on_the_rule() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        {
+            let mut w = writer.lock().unwrap();
+            write_event(&mut w, baselined_event(1, "CDABC...12345", 2, 1));
+            write_event(
+                &mut w,
+                baselined_v2_event(2, "CDABC...12345", READER_DIGEST, ed25519_snapshot(3, 2)),
+            );
+        }
+
+        let reader = AuditReader::new(Arc::clone(&writer), None);
+        let rule_1 = reader
+            .find_latest_signer_set_view(1, "CDABC...12345", &READER_DIGEST)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rule_1.line(), 1, "{rule_1:?}");
+        assert_eq!(v1_state(&rule_1).signer_count, 2);
+
+        let rule_2 = reader
+            .find_latest_signer_set_view(2, "CDABC...12345", &READER_DIGEST)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rule_2.line(), 2, "{rule_2:?}");
+        assert_eq!(v2_state(&rule_2), &ed25519_snapshot(3, 2));
+    }
+
+    /// A version-2 row with duplicate signer ids is an integrity error for
+    /// every reader of the file, including one looking for another rule.
+    #[test]
+    fn find_latest_signer_set_view_refuses_v2_row_with_duplicate_ids_for_another_rule() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        let mut duplicate = ed25519_snapshot(2, 1);
+        duplicate.signers[1].id = duplicate.signers[0].id;
+        {
+            let mut w = writer.lock().unwrap();
+            write_event(&mut w, baselined_event(1, "CDABC...12345", 2, 1));
+            write_event(
+                &mut w,
+                baselined_v2_event(7, "CDABC...12345", OTHER_DIGEST, duplicate),
+            );
+        }
+
+        let reader = AuditReader::new(Arc::clone(&writer), None);
+        match reader.find_latest_signer_set_view(1, "CDABC...12345", &READER_DIGEST) {
+            Err(AuditLogIntegrityError::ParseError { line, detail }) => {
+                assert_eq!(line, 2);
+                assert!(detail.contains("duplicate signer id"), "{detail}");
+            }
+            other => panic!("expected ParseError at line 2, got {other:?}"),
+        }
+    }
+
+    /// A version-2 row whose snapshot omits the `threshold` key does not
+    /// deserialize and is an integrity error at its line.
+    #[test]
+    fn find_latest_signer_set_view_refuses_v2_row_without_threshold_key() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        {
+            let mut w = writer.lock().unwrap();
+            write_event(&mut w, baselined_event(1, "CDABC...12345", 2, 1));
+            write_event(
+                &mut w,
+                baselined_v2_event(1, "CDABC...12345", READER_DIGEST, ed25519_snapshot(2, 1)),
+            );
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        let mut row: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&lines[1]).unwrap();
+        let removed = row
+            .get_mut("snapshot")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|snapshot| snapshot.remove("threshold"));
+        assert!(removed.is_some(), "the row spells the threshold key");
+        lines[1] = serde_json::to_string(&row).unwrap();
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let reader = AuditReader::new(Arc::clone(&writer), None);
+        match reader.find_latest_signer_set_view(1, "CDABC...12345", &READER_DIGEST) {
+            Err(AuditLogIntegrityError::ParseError { line, detail }) => {
+                assert_eq!(line, 2);
+                assert!(detail.contains("missing field `threshold`"), "{detail}");
+            }
+            other => panic!("expected ParseError at line 2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn find_latest_signer_set_view_discovers_v2_row_in_rotated_file() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        {
+            let mut w = writer.lock().unwrap();
+            write_event(&mut w, baselined_event(1, "CDABC...12345", 1, 1));
+            write_event(
+                &mut w,
+                baselined_v2_event(1, "CDABC...12345", READER_DIGEST, ed25519_snapshot(2, 2)),
+            );
+            w.force_rotate_for_test().unwrap();
+            write_event(
+                &mut w,
+                baselined_v2_event(1, "CDABC...12345", OTHER_DIGEST, ed25519_snapshot(1, 1)),
+            );
+        }
+        let rotated: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|name| is_rotated_sibling("audit.jsonl", name))
+            .collect();
+        assert_eq!(rotated.len(), 1, "{rotated:?}");
+
+        let reader = AuditReader::new(Arc::clone(&writer), None);
+        let payload = reader
+            .find_latest_signer_set_view(1, "CDABC...12345", &READER_DIGEST)
+            .unwrap()
+            .expect("the v2 row in the rotated file is found");
+        assert_eq!(v2_state(&payload), &ed25519_snapshot(2, 2));
+        assert_eq!(payload.file(), rotated[0]);
+        assert_eq!(payload.line(), 2);
     }
 }
 

@@ -58,5 +58,7 @@ pub use types::{
 /// audit-log substrate self-contained.  Re-exported here for downstream
 /// consumer convenience.
 pub use stellar_agent_core::audit_log::signer_set::{
-    BaselineReason, ObservedSignerSet, SignerPubkey, SignerSetStatePayload,
+    BaselineReason, ObservedSignerSet, SignerEntryV2, SignerIdentityV2, SignerPubkey,
+    SignerSetSnapshotV2, SignerSetStatePayload, SignerSetView, SignerSetViewPayload,
+    ThresholdObservation,
 };
