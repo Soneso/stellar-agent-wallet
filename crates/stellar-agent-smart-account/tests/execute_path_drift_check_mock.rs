@@ -165,6 +165,36 @@ fn reference_pin(resolved: [u8; 32]) -> ExecutableRefPin {
     .expect("pin builds")
 }
 
+/// An instance entry under the instance key of `addr` whose data does not
+/// decode as `LedgerEntryData`.
+fn undecodable_instance(addr: &ScAddress) -> Value {
+    json!({
+        "key": rpc_mock_helpers::contract_instance_key_xdr(addr),
+        "xdr": "bm90dmFsaWR4ZHI=",
+        "lastModifiedLedgerSeq": 100
+    })
+}
+
+/// The kinds of the rows written under `request_id`, in log order, each
+/// override row with its rule id.
+fn row_kinds(rows: &[AuditEntry], request_id: &str) -> Vec<String> {
+    rows.iter()
+        .filter(|e| e.request_id == request_id)
+        .map(|e| match &e.event_kind {
+            EventKind::SaUnknownContractOverride { rule_id, .. } => {
+                format!("unknown_override(rule {rule_id:?})")
+            }
+            EventKind::SaMutableContractOverride { rule_id, .. } => {
+                format!("mutable_override(rule {rule_id:?})")
+            }
+            other => serde_json::to_value(other).unwrap()["kind"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        })
+        .collect()
+}
+
 // ── Context rules ─────────────────────────────────────────────────────────────
 
 fn symbol(s: &str) -> ScVal {
@@ -1202,7 +1232,13 @@ async fn an_unknown_new_verifier_needs_the_override() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, SaError::VerifierWasmNotInAllowlist { rule_id: 1, .. }),
+        matches!(
+            err,
+            SaError::VerifierWasmNotInAllowlist {
+                rule_id: Some(1),
+                ..
+            }
+        ),
         "{err:?}"
     );
     assert_eq!(h.sends(), 0);
@@ -1246,6 +1282,81 @@ async fn a_signer_add_on_an_unpinned_rule_writes_no_row() {
         .unwrap();
     assert!(h.pins_updated_rows().is_empty());
     assert_eq!(h.sends(), 1);
+}
+
+/// A confirmed signer add on an unknown verifier under the override writes
+/// `SaSignerAdded`, then the override row naming the rule, then the
+/// pins-updated row.
+#[tokio::test]
+async fn a_signer_add_writes_the_override_row_between_the_add_and_the_pins() {
+    let h = signer_add_harness(true).await;
+    add_external_signer(&h, &contract(0x22), "req-add-order", true)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        row_kinds(&h.rows(), "req-add-order"),
+        vec![
+            "sa_signer_added",
+            "unknown_override(rule Some(1))",
+            "sa_context_rule_pins_updated",
+        ]
+    );
+}
+
+/// A batch whose first new verifier is admitted under the unknown-hash
+/// override and whose second is undecodable refuses before submission, and
+/// the override applied to the first is written nowhere.
+#[tokio::test]
+async fn a_refused_batch_writes_no_override_row_for_an_admitted_verifier() {
+    let h = signer_add_harness(true).await;
+    let undecodable = contract(0x23);
+    h.set_entry(undecodable_instance(&undecodable));
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+
+    let err = h
+        .manager
+        .batch_add_signers(
+            smart_account(),
+            1,
+            vec![
+                (
+                    external_signer(&contract(0x22), &[0x33; 32]),
+                    external_pubkey(&contract(0x22)),
+                ),
+                (
+                    external_signer(&undecodable, &[0x34; 32]),
+                    external_pubkey(&undecodable),
+                ),
+            ],
+            &signer,
+            "req-batch-refused".to_owned(),
+            false,
+            true,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            SaError::ContractInstanceUnsupported {
+                rule_id: Some(1),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(h.sends(), 0);
+    assert!(
+        !h.rows().iter().any(|e| matches!(
+            e.event_kind,
+            EventKind::SaUnknownContractOverride { .. }
+                | EventKind::SaMutableContractOverride { .. }
+        )),
+        "a refused batch writes no override row"
+    );
+    assert!(h.pins_updated_rows().is_empty());
 }
 
 // ── Verifier migration ────────────────────────────────────────────────────────
@@ -1585,7 +1696,13 @@ async fn an_unknown_new_policy_needs_the_override() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, SaError::PolicyWasmNotInAllowlist { rule_id: 1, .. }),
+        matches!(
+            err,
+            SaError::PolicyWasmNotInAllowlist {
+                rule_id: Some(1),
+                ..
+            }
+        ),
         "{err:?}"
     );
     assert_eq!(h.sends(), 0);
@@ -1626,6 +1743,29 @@ async fn a_policy_add_on_an_unpinned_rule_writes_no_row() {
         .unwrap();
     assert!(h.pins_updated_rows().is_empty());
     assert_eq!(h.sends(), 1);
+}
+
+/// A confirmed policy add of an unknown policy under the override writes
+/// `SaPolicyAdded`, the raw-invocation row, then the override row naming the
+/// rule, then the pins-updated row.
+#[tokio::test]
+async fn a_policy_add_writes_the_override_row_after_the_raw_invocation() {
+    let h = policy_harness(vec![]).await;
+    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.after_send(1, rule_one_with_policies(vec![policy_r()]));
+    add_policy(&h, &policy_r(), "req-policy-order", true)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        row_kinds(&h.rows(), "req-policy-order"),
+        vec![
+            "sa_policy_added",
+            "sa_raw_invocation",
+            "unknown_override(rule Some(1))",
+            "sa_context_rule_pins_updated",
+        ]
+    );
 }
 
 /// Removing the pinned policy clears its pin, and a later add of a policy
@@ -1968,6 +2108,45 @@ async fn a_policy_added_with_no_live_policy_drops_a_stale_reference_pin() {
         .await
         .unwrap();
     assert_eq!(h.sends(), 2);
+}
+
+/// `verify-pins` reports a verifier that cannot be read as unavailable and a
+/// drifted policy as drift, and names the verifier's failure code although
+/// a policy failure is recorded after it: the first failure code, verifiers
+/// before policies, whatever each kind's final status.
+#[tokio::test]
+async fn verify_pins_names_the_verifier_failure_beside_a_drifted_policy() {
+    let undecodable_policy = contract(0x33);
+    let h = policy_harness(vec![undecodable_policy.clone(), policy_p()]).await;
+    h.set_entry(undecodable_instance(&undecodable_policy));
+    h.pin_created(
+        1,
+        vec![first8(&webauthn_hash())],
+        vec![FOREIGN_FIRST8.to_owned()],
+        vec![],
+        vec![],
+    );
+    h.fail_reads_of(&verifier_v());
+
+    let result = h
+        .rule_manager()
+        .verify_rule_wasm_pins(
+            smart_account(),
+            1,
+            &account_id_for_seed(SEED),
+            "req-verify-merge",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.verifier_pin_status, PinStatus::Unavailable);
+    assert_eq!(result.policy_pin_status, PinStatus::Drift);
+    assert!(result.observed_verifier_first8.is_empty());
+    assert_eq!(
+        result.observed_policy_first8,
+        vec![first8(&KNOWN_WASM_HASH)]
+    );
+    assert_eq!(result.unavailable_wire_code, Some("sa.deployment_failed"));
+    assert_eq!(h.sends(), 0);
 }
 
 /// `verify-pins` reports a pinned policy with no policy on chain as policy

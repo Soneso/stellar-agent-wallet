@@ -110,7 +110,10 @@ async fn stale_primary_current_secondary_returns_rpc_divergence() {
     assert!(
         matches!(
             result,
-            Err(SaError::NetworkRpcDivergence { rule_id: 1, .. })
+            Err(SaError::NetworkRpcDivergence {
+                rule_id: Some(1),
+                ..
+            })
         ),
         "stale primary matching baseline must still return NetworkRpcDivergence; got: {result:?}"
     );

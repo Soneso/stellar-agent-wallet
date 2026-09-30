@@ -1376,12 +1376,12 @@ pub enum EventKind {
         observed_executable: Option<String>,
     },
 
-    /// A mutable-contract override was acknowledged at rule-install time.
+    /// A mutable-contract override was acknowledged.
     ///
-    /// Emitted when `ContextRuleManager::install_rule` detects that a referenced
-    /// verifier or policy contract has a non-zero `Admin` or `Owner` storage key
-    /// or an owner-managed external-reference executable, AND the operator has
-    /// passed `--accept-mutable-verifier`.  The audit row records the
+    /// Written when a rule install or a verifier or policy add admits a
+    /// referenced contract that has a non-zero `Admin` or `Owner` storage key
+    /// or an owner-managed external-reference executable, because the
+    /// operator passed `--accept-mutable-verifier`.  The audit row records the
     /// acknowledgement with an ISO-8601 timestamp so the forensic trail is
     /// complete.
     ///
@@ -1402,10 +1402,10 @@ pub enum EventKind {
     /// Per-invocation request correlation ID is carried by the top-level
     /// `AuditEntry::request_id` field (common to all event kinds).
     ///
-    /// `pin_referenced_contracts` emits this row before install, when the
-    /// rule has no on-chain id yet, so `rule_id` is absent. A present
-    /// `rule_id` of 0 on this row names no rule; the row joins its
-    /// `SaContextRuleCreated` row through `request_id`.
+    /// The row carries the rule id and the operation's `request_id`, and is
+    /// written after the rule install or the verifier or policy add confirms,
+    /// before the row that records the rule's pins. A refused operation
+    /// writes none.
     ///
     /// # Backward compatibility
     ///
@@ -1416,7 +1416,7 @@ pub enum EventKind {
     ///
     SaMutableContractOverride {
         /// Context-rule identifier to which the overridden contract belongs;
-        /// absent on a row written before install.
+        /// absent on rows written by earlier wallet versions.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rule_id: Option<u32>,
         /// Target smart-account C-strkey, redacted first-5-last-5.
@@ -1443,12 +1443,12 @@ pub enum EventKind {
         executable_tag: Option<String>,
     },
 
-    /// An unknown-wasm-hash override was acknowledged at rule-install time.
+    /// An unknown-wasm-hash override was acknowledged.
     ///
-    /// Emitted when `ContextRuleManager::install_rule` detects that a referenced
-    /// verifier or policy contract's wasm hash is NOT in the compile-time
+    /// Written when a rule install or a verifier or policy add admits a
+    /// referenced contract whose wasm hash is NOT in the compile-time
     /// allowlist (`VERIFIER_ALLOWLIST` / `THRESHOLD_POLICY_WASM_HASHES`),
-    /// AND the operator has passed `--accept-unknown-verifier` (fail-closed by
+    /// because the operator passed `--accept-unknown-verifier` (fail closed by
     /// default with opt-in).  The audit row records the acknowledgement and the
     /// `observed_hash_first8` for forensic correlation.
     ///
@@ -1462,10 +1462,10 @@ pub enum EventKind {
     /// Per-invocation request correlation ID is carried by the top-level
     /// `AuditEntry::request_id` field (common to all event kinds).
     ///
-    /// `pin_referenced_contracts` emits this row before install, when the
-    /// rule has no on-chain id yet, so `rule_id` is absent. A present
-    /// `rule_id` of 0 on this row names no rule; the row joins its
-    /// `SaContextRuleCreated` row through `request_id`.
+    /// The row carries the rule id and the operation's `request_id`, and is
+    /// written after the rule install or the verifier or policy add confirms,
+    /// before the row that records the rule's pins. A refused operation
+    /// writes none.
     ///
     /// # Backward compatibility
     ///
@@ -1475,7 +1475,7 @@ pub enum EventKind {
     ///
     SaUnknownContractOverride {
         /// Context-rule identifier to which the overridden contract belongs;
-        /// absent on a row written before install.
+        /// absent on rows written by earlier wallet versions.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rule_id: Option<u32>,
         /// Target smart-account C-strkey, redacted first-5-last-5.

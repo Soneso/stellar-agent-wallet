@@ -890,8 +890,8 @@ async fn t6_cross_confirm_event_divergence_rejection() {
             ..
         }) => {
             assert_eq!(
-                rule_id, 0,
-                "NetworkRpcDivergence rule_id must be 0 (timelock queries are not rule-scoped)"
+                rule_id, None,
+                "NetworkRpcDivergence on a timelock query carries no rule id"
             );
             assert_eq!(
                 err_request_id, request_id_cancel,

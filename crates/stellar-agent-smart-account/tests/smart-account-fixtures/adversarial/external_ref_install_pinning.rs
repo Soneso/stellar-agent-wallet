@@ -7,22 +7,23 @@
 //!
 //! - refuse it without `accept_mutable_verifier` with `sa.verifier_mutable` /
 //!   `sa.policy_mutable`, reason `owner-managed external reference`, and a
-//!   detail naming the owner and the tag, writing no override row;
-//! - admit it with `accept_mutable_verifier`, write a
-//!   `SaMutableContractOverride` row naming the owner and the tag, and pin the
-//!   resolved hash together with an `ExecutableRefPin` at the same position;
+//!   detail naming the owner and the tag;
+//! - admit it with `accept_mutable_verifier`, return a pending mutable
+//!   override naming the owner and the tag, and pin the resolved hash
+//!   together with an `ExecutableRefPin` at the same position;
 //! - require `accept_unknown_verifier` as well when the resolved hash is
-//!   outside the allowlist, writing both override rows;
+//!   outside the allowlist, returning both pending overrides;
 //! - refuse with `sa.contract_instance_unsupported`, reason
 //!   `executable changed during install`, when the mutability probe observes a
 //!   different executable than identification.
+//!
+//! Pinning writes no audit row in any case: the install writes the override
+//! rows after it confirms.
 
-use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use stellar_agent_core::audit_log::AuditReader;
-use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::{ContractKind, EventKind, ExecutableRefPin};
 use stellar_agent_smart_account::VERIFIER_ALLOWLIST;
 use stellar_agent_smart_account::error::{AdminOrOwnerKey, SaError};
@@ -30,7 +31,9 @@ use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRulePolicy, ContextRuleSignerInput,
 };
-use stellar_agent_smart_account::managers::verifiers::{PinResult, pin_referenced_contracts};
+use stellar_agent_smart_account::managers::verifiers::{
+    PendingOverride, PendingOverrideKind, PinResult, pin_referenced_contracts,
+};
 use stellar_agent_test_support::{KeyedLedgerEntriesResponder, xdr_fixtures};
 use stellar_xdr::{AccountId, ContractId, Hash, PublicKey, ScAddress, ScString, ScVal, Uint256};
 use uuid::Uuid;
@@ -161,42 +164,50 @@ fn definition_for(kind: ContractKind) -> ContextRuleDefinition {
     )
 }
 
-fn read_audit_entries(log_path: &std::path::Path) -> Vec<AuditEntry> {
-    let Ok(file) = std::fs::File::open(log_path) else {
-        return Vec::new();
-    };
-    BufReader::new(file)
-        .lines()
-        .map(|line| line.expect("audit log line must be readable"))
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str::<AuditEntry>(line.trim()).expect("audit row must parse"))
-        .collect()
+/// Asserts the audit log holds no row: pinning writes nothing.
+fn assert_no_audit_row(log_path: &std::path::Path, case: &str) {
+    let audit_log = std::fs::read_to_string(log_path).unwrap_or_default();
+    assert!(
+        audit_log.is_empty(),
+        "{case}: pinning writes no audit row: {audit_log}"
+    );
 }
 
-fn count_rows(entries: &[AuditEntry], pred: impl Fn(&EventKind) -> bool) -> usize {
-    entries.iter().filter(|e| pred(&e.event_kind)).count()
-}
-
-fn is_mutable_override(kind: &EventKind) -> bool {
-    matches!(kind, EventKind::SaMutableContractOverride { .. })
-}
-
-fn is_unknown_override(kind: &EventKind) -> bool {
-    matches!(kind, EventKind::SaUnknownContractOverride { .. })
-}
-
-fn is_rule_created(kind: &EventKind) -> bool {
-    matches!(kind, EventKind::SaContextRuleCreated { .. })
+/// Returns `true` when `pending` is exactly one mutable override for the
+/// contract of `kind`, naming `pin`'s owner and tag.
+fn is_one_mutable_override(
+    pending: &[PendingOverride],
+    kind: ContractKind,
+    pin: &ExecutableRefPin,
+) -> bool {
+    matches!(
+        pending,
+        [PendingOverride {
+            kind: PendingOverrideKind::Mutable {
+                executable_ref: Some(executable_ref),
+            },
+            contract_kind,
+            ..
+        }] if *contract_kind == kind
+            && executable_ref.owner_redacted.as_str() == OWNER_REDACTED
+            && executable_ref.tag == "verifier-v1"
+            && executable_ref == pin
+    )
 }
 
 /// Runs `pin_referenced_contracts` for one contract of `kind` against
-/// `responder`, returning the result and the audit rows written.
+/// `responder` with a signers manager that holds an audit writer, asserts
+/// that the audit log stays empty, and returns the result.
+#[allow(
+    clippy::result_large_err,
+    reason = "the helper returns the pinning API's typed error for assertions"
+)]
 async fn pin_with<R: Respond + 'static>(
     responder: R,
     kind: ContractKind,
     accept_mutable_verifier: bool,
     accept_unknown_verifier: bool,
-) -> (Result<PinResult, SaError>, Vec<AuditEntry>) {
+) -> Result<PinResult, SaError> {
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
         .respond_with(responder)
@@ -210,7 +221,6 @@ async fn pin_with<R: Respond + 'static>(
     );
     let result = pin_referenced_contracts(
         &manager,
-        Some(&audit_writer),
         smart_account_addr(),
         ZERO_CONTRACT_REDACTED,
         &definition_for(kind),
@@ -218,11 +228,11 @@ async fn pin_with<R: Respond + 'static>(
         SOURCE_G,
         accept_mutable_verifier,
         accept_unknown_verifier,
-        "stellar:testnet",
         Uuid::new_v4().to_string(),
     )
     .await;
-    (result, read_audit_entries(&audit_log_path))
+    assert_no_audit_row(&audit_log_path, &format!("{kind}"));
+    result
 }
 
 fn expected_pin(tag: &[u8], resolved: [u8; 32]) -> ExecutableRefPin {
@@ -238,11 +248,11 @@ fn expected_pin(tag: &[u8], resolved: [u8; 32]) -> ExecutableRefPin {
 
 /// Without `accept_mutable_verifier`, an external reference whose resolved
 /// hash is allowlisted is refused as mutable with a detail naming the owner
-/// and the tag, and no audit row of any pin kind is written.
+/// and the tag.
 #[tokio::test]
 async fn external_ref_refused_without_accept_mutable_verifier() {
     for kind in [ContractKind::Verifier, ContractKind::Policy] {
-        let (result, entries) = pin_with(
+        let result = pin_with(
             external_ref_responder(TAG, allowlisted_hash(kind)),
             kind,
             false,
@@ -282,17 +292,14 @@ async fn external_ref_refused_without_accept_mutable_verifier() {
                 && message.contains(&expected_detail),
             "{kind}: {message}"
         );
-
-        assert_eq!(count_rows(&entries, is_mutable_override), 0, "{kind}");
-        assert_eq!(count_rows(&entries, is_unknown_override), 0, "{kind}");
-        assert_eq!(count_rows(&entries, is_rule_created), 0, "{kind}");
     }
 }
 
 /// With `accept_mutable_verifier`, the external reference installs: the
-/// override row names the owner and the tag, the pin carries the resolved
-/// hash and an `ExecutableRefPin` at the same position, and the created row
-/// built from the pin records both and reads back through the audit reader.
+/// pending override names the owner and the tag, pinning writes no row, the
+/// pin carries the resolved hash and an `ExecutableRefPin` at the same
+/// position, and the created row built from the pin records both and reads
+/// back through the audit reader.
 #[tokio::test]
 async fn external_ref_installs_with_accept_mutable_verifier() {
     for kind in [ContractKind::Verifier, ContractKind::Policy] {
@@ -313,7 +320,6 @@ async fn external_ref_installs_with_accept_mutable_verifier() {
 
         let pin_result = pin_referenced_contracts(
             &manager,
-            Some(&audit_writer),
             smart_account_addr(),
             ZERO_CONTRACT_REDACTED,
             &definition,
@@ -321,7 +327,6 @@ async fn external_ref_installs_with_accept_mutable_verifier() {
             SOURCE_G,
             true,
             false,
-            "stellar:testnet",
             request_id.clone(),
         )
         .await
@@ -346,32 +351,12 @@ async fn external_ref_installs_with_accept_mutable_verifier() {
         assert_eq!(hashes, &vec![(contract_addr(), resolved)], "{kind}");
         assert_eq!(refs, &vec![Some(pin.clone())], "{kind}");
 
-        let entries = read_audit_entries(&audit_log_path);
-        assert_eq!(count_rows(&entries, is_unknown_override), 0, "{kind}");
-        let overrides: Vec<&AuditEntry> = entries
-            .iter()
-            .filter(|e| is_mutable_override(&e.event_kind))
-            .collect();
-        assert_eq!(overrides.len(), 1, "{kind}");
-        let EventKind::SaMutableContractOverride {
-            rule_id,
-            contract_kind,
-            executable_owner_redacted,
-            executable_tag,
-            ..
-        } = &overrides[0].event_kind
-        else {
-            unreachable!("filtered on SaMutableContractOverride");
-        };
-        assert_eq!(*rule_id, None, "{kind}: a pre-install row names no rule");
-        assert_eq!(*contract_kind, kind);
-        assert_eq!(
-            executable_owner_redacted.as_ref().map(|o| o.as_str()),
-            Some(OWNER_REDACTED),
-            "{kind}"
+        assert!(
+            is_one_mutable_override(&pin_result.pending_overrides, kind, &pin),
+            "{kind}: {:?}",
+            pin_result.pending_overrides
         );
-        assert_eq!(executable_tag.as_deref(), Some("verifier-v1"), "{kind}");
-        assert_eq!(overrides[0].request_id, request_id, "{kind}");
+        assert_no_audit_row(&audit_log_path, &format!("{kind}"));
 
         // The created row records the resolved first-8 and the pin at the
         // same position, and the reader returns them.
@@ -436,8 +421,7 @@ async fn external_ref_outside_allowlist_needs_both_flags() {
     let unknown = [0xd1u8; 32];
     for kind in [ContractKind::Verifier, ContractKind::Policy] {
         // Only the mutable flag: the allowlist miss refuses first.
-        let (result, entries) =
-            pin_with(external_ref_responder(TAG, unknown), kind, true, false).await;
+        let result = pin_with(external_ref_responder(TAG, unknown), kind, true, false).await;
         let error = result.expect_err(&format!("{kind}: allowlist miss must refuse"));
         assert!(
             matches!(
@@ -448,13 +432,10 @@ async fn external_ref_outside_allowlist_needs_both_flags() {
             ),
             "{kind}: {error:?}"
         );
-        assert_eq!(count_rows(&entries, is_unknown_override), 0, "{kind}");
-        assert_eq!(count_rows(&entries, is_mutable_override), 0, "{kind}");
 
-        // Only the unknown flag: the unknown row is written, then the
-        // reference is refused as mutable.
-        let (result, entries) =
-            pin_with(external_ref_responder(TAG, unknown), kind, false, true).await;
+        // Only the unknown flag: the reference is refused as mutable, and the
+        // unknown-hash override applied before the refusal is written nowhere.
+        let result = pin_with(external_ref_responder(TAG, unknown), kind, false, true).await;
         let error = result.expect_err(&format!("{kind}: mutable must refuse"));
         assert!(
             matches!(
@@ -475,12 +456,9 @@ async fn external_ref_outside_allowlist_needs_both_flags() {
             ),
             "{kind}: {error:?}"
         );
-        assert_eq!(count_rows(&entries, is_unknown_override), 1, "{kind}");
-        assert_eq!(count_rows(&entries, is_mutable_override), 0, "{kind}");
 
-        // Both flags: installs, with both rows and the pin.
-        let (result, entries) =
-            pin_with(external_ref_responder(TAG, unknown), kind, true, true).await;
+        // Both flags: installs, with both pending overrides and the pin.
+        let result = pin_with(external_ref_responder(TAG, unknown), kind, true, true).await;
         let pin_result = result.unwrap_or_else(|e| panic!("{kind}: both flags install: {e}"));
         assert!(
             pin_result.mutable_override && pin_result.unknown_override,
@@ -491,20 +469,29 @@ async fn external_ref_outside_allowlist_needs_both_flags() {
         } else {
             &pin_result.pinned_verifier_executable_refs
         };
-        assert_eq!(refs, &vec![Some(expected_pin(TAG, unknown))], "{kind}");
+        let pin = expected_pin(TAG, unknown);
+        assert_eq!(refs, &vec![Some(pin.clone())], "{kind}");
+        let [unknown_override, mutable_override] = pin_result.pending_overrides.as_slice() else {
+            panic!(
+                "{kind}: two pending overrides: {:?}",
+                pin_result.pending_overrides
+            );
+        };
         assert!(
-            entries.iter().any(|e| matches!(
-                &e.event_kind,
-                EventKind::SaUnknownContractOverride {
-                    rule_id: None,
-                    observed_hash_first8,
+            matches!(
+                unknown_override,
+                PendingOverride {
+                    kind: PendingOverrideKind::Unknown { observed_hash_first8 },
                     contract_kind,
                     ..
                 } if observed_hash_first8 == "d1d1d1d1d1d1d1d1" && *contract_kind == kind
-            )),
-            "{kind}: unknown override row"
+            ),
+            "{kind}: {unknown_override:?}"
         );
-        assert_eq!(count_rows(&entries, is_mutable_override), 1, "{kind}");
+        assert!(
+            is_one_mutable_override(std::slice::from_ref(mutable_override), kind, &pin),
+            "{kind}: {mutable_override:?}"
+        );
     }
 }
 
@@ -550,7 +537,7 @@ async fn probe_observing_a_different_executable_is_refused_as_executable_changed
                 switch_after: 2,
                 instance_requests: AtomicUsize::new(0),
             };
-            let (result, entries) = pin_with(responder, kind, true, true).await;
+            let result = pin_with(responder, kind, true, true).await;
             let error = result.expect_err(&format!("{kind}, {case}: must refuse"));
             assert!(
                 matches!(
@@ -569,11 +556,6 @@ async fn probe_observing_a_different_executable_is_refused_as_executable_changed
                     .to_string()
                     .contains("executable changed during install"),
                 "{kind}, {case}: {error}"
-            );
-            assert_eq!(
-                count_rows(&entries, is_mutable_override),
-                0,
-                "{kind}, {case}: no mutable override row"
             );
         }
     }

@@ -55,7 +55,8 @@ use wiremock::{
 use super::rpc_mock_helpers::{
     SOURCE_G, SorobanRpcDispatcher, account_entry_xdr, account_key_xdr,
     build_context_rule_external_signers_xdr, build_ledger_entries_account_and_contract,
-    build_simulate_response, contract_instance_key_xdr, manager_two_url, tmp_audit_writer,
+    build_simulate_response, contract_instance_key_xdr, entries_for_requested_keys,
+    manager_two_url, tmp_audit_writer,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -869,11 +870,11 @@ async fn source_scan_plans_signer_whose_verifier_reference_resolves_to_from_hash
     assert_eq!(plan.total_transaction_count(), 2);
 }
 
-/// Serves `before` to every `getLedgerEntries` request until
-/// `switch_after` requests have asked for `instance_key`, then `after`, so
-/// the destination's identification (one instance request per endpoint)
-/// and its mutability probe (one more per endpoint) observe different
-/// executables. `simulateTransaction` is answered with `simulate`.
+/// Serves the entries of `before` a `getLedgerEntries` request names until
+/// `switch_after` requests have asked for `instance_key`, then those of
+/// `after`, so the destination's identification (one instance request per
+/// endpoint) and its mutability probe (one more per endpoint) observe
+/// different executables. `simulateTransaction` is answered with `simulate`.
 struct SwitchingLedgerDispatcher {
     before: serde_json::Value,
     after: serde_json::Value,
@@ -899,11 +900,12 @@ impl wiremock::Respond for SwitchingLedgerDispatcher {
                 } else {
                     self.instance_requests.load(Ordering::SeqCst) <= self.switch_after
                 };
-                if served_before {
-                    self.before.clone()
+                let response = if served_before {
+                    &self.before
                 } else {
-                    self.after.clone()
-                }
+                    &self.after
+                };
+                entries_for_requested_keys(response, &body)
             }
             Some("simulateTransaction") => self.simulate.clone(),
             _ => serde_json::json!({}),

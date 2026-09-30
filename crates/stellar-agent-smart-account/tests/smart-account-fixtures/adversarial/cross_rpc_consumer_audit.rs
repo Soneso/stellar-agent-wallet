@@ -140,7 +140,8 @@ fn workspace_root() -> PathBuf {
 }
 
 /// Counts source-line occurrences of the `SaError::NetworkRpcDivergence`
-/// variant constructor in `file_path` relative to workspace root. Filters
+/// variant constructor in `file_path` relative to workspace root, reading
+/// the lines before the file's `#[cfg(test)]` unit-test module. Filters
 /// out rustdoc + line-comment + string-literal-looking lines to avoid
 /// false positives on the doc-link form `[`SaError::NetworkRpcDivergence`]`.
 ///
@@ -157,6 +158,10 @@ fn count_emit_sites(workspace: &Path, file_path: &str) -> usize {
         fs::read_to_string(&full).unwrap_or_else(|e| panic!("read {full:?} failed: {e}"));
     contents
         .lines()
+        // Production code only: the unit-test module that follows the
+        // `#[cfg(test)]` attribute holds destructuring patterns, which rustfmt
+        // lays out in the constructor shape.
+        .take_while(|line| line.trim() != "#[cfg(test)]")
         .filter(|line| {
             let trimmed = line.trim_start();
             // Skip rustdoc + line comments + block-comment continuations.

@@ -1106,13 +1106,13 @@ impl AuditEntry {
 
     /// Constructs a `SaMutableContractOverride` audit entry.
     ///
-    /// Emitted by `managers::verifiers::pin_referenced_contracts` when a
-    /// referenced verifier or policy contract has a non-zero Admin / Owner storage
-    /// key or an owner-managed external-reference executable AND
-    /// `--accept-mutable-verifier` is set.  Records the acknowledgement with an
-    /// ISO-8601 timestamp. `executable_ref` names the owner and tag of an
-    /// external-reference executable and is `None` for a storage key.
-    /// `rule_id` is `None` for a row written before install.
+    /// Written after a rule install or a verifier or policy add confirms, for
+    /// each referenced verifier or policy contract that has a non-zero Admin /
+    /// Owner storage key or an owner-managed external-reference executable
+    /// and was admitted under `--accept-mutable-verifier`.  Records the
+    /// acknowledgement with an ISO-8601 timestamp. `executable_ref` names the
+    /// owner and tag of an external-reference executable and is `None` for a
+    /// storage key.
     ///
     /// # Redaction
     ///
@@ -1161,11 +1161,11 @@ impl AuditEntry {
 
     /// Constructs a `SaUnknownContractOverride` audit entry.
     ///
-    /// Emitted by `managers::verifiers::pin_referenced_contracts` when a
-    /// referenced verifier or policy contract's wasm hash is NOT in the
-    /// compile-time allowlist AND `--accept-unknown-verifier` is set.  Records
-    /// the acknowledgement with an ISO-8601 timestamp. `rule_id` is `None`
-    /// for a row written before install.
+    /// Written after a rule install or a verifier or policy add confirms, for
+    /// each referenced verifier or policy contract whose wasm hash is NOT in
+    /// the compile-time allowlist and was admitted under
+    /// `--accept-unknown-verifier`.  Records the acknowledgement with an
+    /// ISO-8601 timestamp.
     ///
     /// # Redaction
     ///

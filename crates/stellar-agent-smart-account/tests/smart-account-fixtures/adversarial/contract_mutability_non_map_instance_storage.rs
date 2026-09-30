@@ -86,7 +86,7 @@ async fn non_map_instance_storage_returns_mutable() {
         &rpc,
         &rpc,
         &contract,
-        43,
+        Some(43),
         "CAAAA...ABSC4",
         "fixture-request-id",
     )

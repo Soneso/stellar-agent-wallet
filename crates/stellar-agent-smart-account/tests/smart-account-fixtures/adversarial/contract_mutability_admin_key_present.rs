@@ -168,7 +168,7 @@ async fn admin_key_present_returns_mutable() {
         &rpc,
         &rpc,
         &contract,
-        42,
+        Some(42),
         "CAAAA...ABSC4",
         "fixture-request-id",
     )
@@ -212,7 +212,7 @@ async fn admin_key_present_returns_mutable() {
 #[test]
 fn contract_mutability_rpc_divergence_wire_code_is_consistent() {
     let err = SaError::NetworkRpcDivergence {
-        rule_id: 42,
+        rule_id: Some(42),
         smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ABSC4"),
         primary_view_digest_first8: "aabbccdd".to_owned(),
         secondary_view_digest_first8: "11223344".to_owned(),

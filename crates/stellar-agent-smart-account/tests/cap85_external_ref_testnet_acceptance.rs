@@ -781,8 +781,25 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     );
 
     let entries = read_audit_entries(&audit_log_path);
-    // The override row is written before the rule has an on-chain id; the
-    // install request id is what joins it to the SaContextRuleCreated row.
+    // The override row is written after the install confirms, carrying the
+    // installed rule's id: the install's rows are the override row, then
+    // SaContextRuleCreated, then the `sa.ok` raw-invocation row.
+    let install_rows: Vec<&EventKind> = entries
+        .iter()
+        .filter(|entry| entry.request_id == install_request_id)
+        .map(|entry| &entry.event_kind)
+        .collect();
+    assert!(
+        matches!(
+            install_rows.as_slice(),
+            [
+                EventKind::SaMutableContractOverride { .. },
+                EventKind::SaContextRuleCreated { .. },
+                EventKind::SaRawInvocation { wire_code, .. },
+            ] if wire_code == "sa.ok"
+        ),
+        "the install writes the override row, the created row, then sa.ok: {install_rows:?}"
+    );
     let overrides: Vec<&AuditEntry> = entries
         .iter()
         .filter(|entry| {
@@ -813,8 +830,9 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
                 &format!("{override_rule_id:?}"),
             );
             assert_eq!(
-                *override_rule_id, None,
-                "a pre-install override row names no rule"
+                *override_rule_id,
+                Some(rule_id),
+                "the override row names the installed rule"
             );
             assert_eq!(contract_address_redacted.as_str(), proxy_redacted);
             assert_eq!(*contract_kind, ContractKind::Verifier);

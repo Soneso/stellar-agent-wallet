@@ -46,7 +46,9 @@ pub enum AdminOrOwnerKey {
     Admin,
     /// `Ownable::Owner` storage key (OZ ownable/storage.rs).
     Owner,
-    /// A returned entry cannot be decoded as contract-instance data.
+    /// A returned entry cannot be decoded as contract-instance data, or
+    /// cannot be matched to a requested key, whether its key does not decode
+    /// or was not requested.
     UndecodableInstance,
     /// The instance executable is not Wasm.
     NonWasmExecutable,
@@ -595,7 +597,9 @@ pub enum SaError {
     ///
     /// Fired at rule-install time when `managers::verifiers::detect_contract_mutability`
     /// finds an existing instance entry that does not decode as contract-instance
-    /// data or whose executable is not Wasm, when identification finds an
+    /// data or whose executable is not Wasm, or a response entry that cannot be
+    /// matched to a requested key, whether its key does not decode or was not
+    /// requested (reason `UndecodableInstance`); when identification finds an
     /// external reference whose owner holds no live tag entry, and when the
     /// identification fetch and the mutability probe observe different
     /// executables; and whenever the verifier or policy executable fetch
@@ -668,13 +672,17 @@ pub enum SaError {
     /// A hex value signals that the contract IS deployed but its wasm hash is
     /// not in the wallet's `VERIFIER_ALLOWLIST`.
     #[error(
-        "verifier wasm hash not in VERIFIER_ALLOWLIST for rule {rule_id}: \
-         observed={observed_hash_first8}"
+        "verifier wasm hash not in VERIFIER_ALLOWLIST{}: \
+         observed={observed_hash_first8}",
+        rule_suffix(.rule_id)
     )]
     #[serde(rename = "sa.verifier_wasm_not_in_allowlist")]
     VerifierWasmNotInAllowlist {
-        /// Context-rule identifier for which the allowlist check failed.
-        rule_id: u32,
+        /// Context-rule identifier for which the allowlist check failed;
+        /// absent when the refusal is raised before install, when the rule
+        /// has no on-chain id yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_id: Option<u32>,
         /// Redacted smart-account contract address (first-5-last-5 C-strkey).
         ///
         /// MUST be redacted at the call site via
@@ -708,13 +716,17 @@ pub enum SaError {
     /// A hex value signals that the contract IS deployed but its wasm hash is
     /// not the hash of a vendored policy Wasm.
     #[error(
-        "policy wasm hash is not a policy Wasm the wallet vendors, for rule {rule_id}: \
-         observed={observed_hash_first8}"
+        "policy wasm hash is not a policy Wasm the wallet vendors{}: \
+         observed={observed_hash_first8}",
+        rule_suffix(.rule_id)
     )]
     #[serde(rename = "sa.policy_wasm_not_in_allowlist")]
     PolicyWasmNotInAllowlist {
-        /// Context-rule identifier for which the allowlist check failed.
-        rule_id: u32,
+        /// Context-rule identifier for which the allowlist check failed;
+        /// absent when the refusal is raised before install, when the rule
+        /// has no on-chain id yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_id: Option<u32>,
         /// Redacted smart-account contract address (first-5-last-5 C-strkey).
         ///
         /// MUST be redacted at the call site via
@@ -1706,14 +1718,18 @@ pub enum SaError {
     /// `smart_account_redacted` MUST be pre-redacted (first-5-last-5 C-strkey)
     /// at the call site.
     #[error(
-        "network RPC divergence on rule {rule_id}: \
+        "network RPC divergence{}: \
          primary view first8 {primary_view_digest_first8}, \
-         secondary first8 {secondary_view_digest_first8}"
+         secondary first8 {secondary_view_digest_first8}",
+        rule_suffix(.rule_id)
     )]
     #[serde(rename = "network.rpc_divergence")]
     NetworkRpcDivergence {
-        /// Context-rule identifier for which the divergence was detected.
-        rule_id: u32,
+        /// Context-rule identifier for which the divergence was detected;
+        /// absent when the divergence is observed before a rule exists or on
+        /// a query that is not scoped to a rule (timelock queries).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_id: Option<u32>,
         /// Redacted smart-account contract address (first-5-last-5 C-strkey).
         smart_account_redacted: RedactedStrkey,
         /// First-8 hex chars of the primary RPC's view digest.
@@ -2932,7 +2948,7 @@ mod tests {
             (
                 "sa.verifier_wasm_not_in_allowlist",
                 SaError::VerifierWasmNotInAllowlist {
-                    rule_id: 5,
+                    rule_id: Some(5),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     observed_hash_first8: "deadbeef".to_owned(),
                     request_id: "test-req-allow-001".to_owned(),
@@ -2941,7 +2957,7 @@ mod tests {
             (
                 "sa.policy_wasm_not_in_allowlist",
                 SaError::PolicyWasmNotInAllowlist {
-                    rule_id: 6,
+                    rule_id: Some(6),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     observed_hash_first8: "cafebabe".to_owned(),
                     request_id: "test-req-allow-002".to_owned(),
@@ -3692,7 +3708,7 @@ mod tests {
             (
                 "sa.verifier_wasm_not_in_allowlist",
                 SaError::VerifierWasmNotInAllowlist {
-                    rule_id: 5,
+                    rule_id: Some(5),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     observed_hash_first8: "deadbeef".to_owned(),
                     request_id: "test-req-allow-001".to_owned(),
@@ -3707,7 +3723,7 @@ mod tests {
             (
                 "sa.policy_wasm_not_in_allowlist",
                 SaError::PolicyWasmNotInAllowlist {
-                    rule_id: 6,
+                    rule_id: Some(6),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     observed_hash_first8: "cafebabe".to_owned(),
                     request_id: "test-req-allow-002".to_owned(),
@@ -4260,9 +4276,28 @@ mod tests {
             reason: AdminOrOwnerKey::UndecodableInstance,
             request_id: "req".to_owned(),
         };
+        let verifier_not_allowlisted = |rule_id: Option<u32>| SaError::VerifierWasmNotInAllowlist {
+            rule_id,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            observed_hash_first8: "deadbeef".to_owned(),
+            request_id: "req".to_owned(),
+        };
+        let policy_not_allowlisted = |rule_id: Option<u32>| SaError::PolicyWasmNotInAllowlist {
+            rule_id,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            observed_hash_first8: "cafebabe".to_owned(),
+            request_id: "req".to_owned(),
+        };
+        let rpc_divergence = |rule_id: Option<u32>| SaError::NetworkRpcDivergence {
+            rule_id,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            primary_view_digest_first8: "aabbccdd".to_owned(),
+            secondary_view_digest_first8: "11223344".to_owned(),
+            request_id: "req".to_owned(),
+        };
         // A constructor for one rule id, then the Display without and with it.
         type RuleIdCase = (fn(Option<u32>) -> SaError, &'static str, &'static str);
-        let cases: [RuleIdCase; 3] = [
+        let cases: [RuleIdCase; 6] = [
             (
                 verifier_mutable,
                 "verifier contract is mutable: contract=CBBBB...YYYYY, reason=Admin; \
@@ -4284,6 +4319,24 @@ mod tests {
                 "policy contract instance is unsupported for rule 7: \
                  contract=CBBBB...YYYYY, reason=undecodable instance; \
                  the wallet cannot pin this contract's code",
+            ),
+            (
+                verifier_not_allowlisted,
+                "verifier wasm hash not in VERIFIER_ALLOWLIST: observed=deadbeef",
+                "verifier wasm hash not in VERIFIER_ALLOWLIST for rule 7: observed=deadbeef",
+            ),
+            (
+                policy_not_allowlisted,
+                "policy wasm hash is not a policy Wasm the wallet vendors: observed=cafebabe",
+                "policy wasm hash is not a policy Wasm the wallet vendors for rule 7: \
+                 observed=cafebabe",
+            ),
+            (
+                rpc_divergence,
+                "network RPC divergence: primary view first8 aabbccdd, \
+                 secondary first8 11223344",
+                "network RPC divergence for rule 7: primary view first8 aabbccdd, \
+                 secondary first8 11223344",
             ),
         ];
         for (build, display_none, display_some) in cases {
@@ -4454,13 +4507,13 @@ mod tests {
                 request_id: "test-req-unsupported-001".to_owned(),
             },
             SaError::VerifierWasmNotInAllowlist {
-                rule_id: 5,
+                rule_id: Some(5),
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 observed_hash_first8: "deadbeef".to_owned(),
                 request_id: "test-req-allow-001".to_owned(),
             },
             SaError::PolicyWasmNotInAllowlist {
-                rule_id: 6,
+                rule_id: Some(6),
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 observed_hash_first8: "cafebabe".to_owned(),
                 request_id: "test-req-allow-002".to_owned(),
@@ -4683,7 +4736,7 @@ mod tests {
                 request_id: "test-req-004".to_owned(),
             },
             SaError::NetworkRpcDivergence {
-                rule_id: 4,
+                rule_id: Some(4),
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 primary_view_digest_first8: "aabbccdd".to_owned(),
                 secondary_view_digest_first8: "11223344".to_owned(),
@@ -5429,7 +5482,7 @@ mod tests {
     #[test]
     fn network_rpc_divergence_round_trip() {
         let err = SaError::NetworkRpcDivergence {
-            rule_id: 1,
+            rule_id: Some(1),
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
             primary_view_digest_first8: "aabbccdd".to_owned(),
             secondary_view_digest_first8: "11223344".to_owned(),

@@ -117,6 +117,7 @@ use crate::verifier_allowlist::{VERIFIER_ALLOWLIST, VerifierAuditStatus};
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::{ContractKind, PinsUpdateReason};
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
+use stellar_agent_core::scval::scval_variant_name;
 use stellar_agent_network::Signer;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -1115,7 +1116,7 @@ impl<'a> MigrationPlanner<'a> {
             self.signers_manager.primary_rpc_client(),
             self.signers_manager.secondary_rpc_client(),
             &to_verifier_addr,
-            0,
+            None,
             &smart_account_redacted,
             request_id,
         )
@@ -1539,7 +1540,10 @@ fn decode_external_signers_from_context_rule(
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted,
                 ),
-                detail: format!("get_context_rule({rule_id}): expected ScVal::Map, got {other:?}"),
+                detail: format!(
+                    "get_context_rule({rule_id}): expected ScVal::Map, got {}",
+                    scval_variant_name(&other)
+                ),
                 request_id: request_id.to_owned(),
             });
         }

@@ -91,17 +91,14 @@
 //!
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::health::AuditWriterHealthHandle;
 use stellar_agent_core::audit_log::reader::{AuditReader, PinnedHashesRecord};
 use stellar_agent_core::audit_log::schema::ContractKind;
 use stellar_agent_core::audit_log::schema::{
     ExecutableRefPin, PinsUpdateReason, executable_refs_or_empty,
 };
-use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_network::{ExternalRefExecutable, StellarRpcClient};
 use stellar_xdr::{LedgerKey, ScAddress, ScVal};
@@ -124,7 +121,8 @@ use crate::{AdminOrOwnerKey, SaError};
 /// Carries the pinned wasm hashes, the executable-reference pins aligned with
 /// them, and the mutability/unknown override flags, embedded into the
 /// `EventKind::SaContextRuleCreated` audit row by
-/// `ContextRuleManager::install_rule`.
+/// `ContextRuleManager::install_rule`, and the overrides applied while
+/// pinning, which the install writes as override rows once it confirms.
 ///
 /// # Redaction
 ///
@@ -154,16 +152,20 @@ pub struct PinResult {
     pub pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
     /// `true` if `accept_mutable_verifier` was set and a mutable contract
     /// was pinned anyway.
-    /// Per-contract identification of which specific verifier/policy contract
-    /// triggered the override is in the `SaMutableContractOverride` audit rows;
+    /// The contracts the override admitted are named in `pending_overrides`;
     /// this field is the rule-level aggregate.
     pub mutable_override: bool,
     /// `true` if `accept_unknown_verifier` was set and an unknown-wasm-hash
     /// contract was pinned anyway.
-    /// Per-contract identification of which specific verifier/policy contract
-    /// triggered the override is in the `SaUnknownContractOverride` audit rows;
+    /// The contracts the override admitted are named in `pending_overrides`;
     /// this field is the rule-level aggregate.
     pub unknown_override: bool,
+    /// One entry per contract an override admitted, verifiers first, in
+    /// pinning order. The install writes each as a
+    /// `SaMutableContractOverride` or `SaUnknownContractOverride` row
+    /// carrying the new rule's id after the install confirms, before the
+    /// `SaContextRuleCreated` row; a refused install writes none.
+    pub pending_overrides: Vec<PendingOverride>,
 }
 
 impl PinResult {
@@ -240,6 +242,84 @@ impl PinResult {
     }
 }
 
+// ── Pending overrides ─────────────────────────────────────────────────────────
+
+/// An override applied while pinning one contract, recorded in the audit log
+/// once the operation that pins the contract confirms.
+///
+/// The pin step writes nothing, so a refused operation leaves no override
+/// row, and a row written after confirmation carries the rule id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PendingOverride {
+    /// Which override admitted the contract, with its row-specific field.
+    pub kind: PendingOverrideKind,
+    /// Redacted address of the admitted contract (first-5-last-5 C-strkey).
+    pub contract_redacted: RedactedStrkey,
+    /// Whether the admitted contract is a verifier or a policy.
+    pub contract_kind: ContractKind,
+}
+
+/// The override a [`PendingOverride`] records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PendingOverrideKind {
+    /// `accept_unknown_verifier` admitted a contract whose effective hash is
+    /// outside the allowlist; written as `SaUnknownContractOverride`.
+    Unknown {
+        /// First-8 hex of the observed effective hash, or `none` for a
+        /// contract with no code.
+        observed_hash_first8: String,
+    },
+    /// `accept_mutable_verifier` admitted a mutable contract; written as
+    /// `SaMutableContractOverride`.
+    Mutable {
+        /// Pin of the contract's external-reference executable, naming its
+        /// owner and tag; `None` for an admin or owner storage key.
+        executable_ref: Option<ExecutableRefPin>,
+    },
+}
+
+impl PendingOverride {
+    /// Builds the override row for rule `rule_id`, acknowledged now.
+    fn audit_entry(
+        &self,
+        smart_account_redacted: &str,
+        rule_id: u32,
+        chain_id: &str,
+        request_id: &str,
+    ) -> AuditEntry {
+        let acknowledged_at = stellar_agent_core::timefmt::current_iso8601_utc();
+        let smart_account_redacted = RedactedStrkey::from_already_redacted(smart_account_redacted);
+        match &self.kind {
+            PendingOverrideKind::Unknown {
+                observed_hash_first8,
+            } => AuditEntry::new_sa_unknown_contract_override(
+                Some(rule_id),
+                smart_account_redacted,
+                self.contract_redacted.clone(),
+                self.contract_kind,
+                acknowledged_at,
+                observed_hash_first8.as_str(),
+                chain_id,
+                request_id,
+            ),
+            PendingOverrideKind::Mutable { executable_ref } => {
+                AuditEntry::new_sa_mutable_contract_override(
+                    Some(rule_id),
+                    smart_account_redacted,
+                    self.contract_redacted.clone(),
+                    self.contract_kind,
+                    acknowledged_at,
+                    executable_ref.as_ref(),
+                    chain_id,
+                    request_id,
+                )
+            }
+        }
+    }
+}
+
 // ── pin_referenced_contracts ──────────────────────────────────────────────────
 
 /// Pin all verifier and policy contracts referenced by a rule definition.
@@ -257,9 +337,9 @@ impl PinResult {
 ///    no live tag entry is refused with `SaError::ContractInstanceUnsupported`
 ///    before any override flag is consulted. An allowlist miss returns
 ///    `SaError::VerifierWasmNotInAllowlist` / `SaError::PolicyWasmNotInAllowlist`
-///    UNLESS `accept_unknown_verifier` is set, in which case an
-///    `EventKind::SaUnknownContractOverride` row is written and the effective
-///    hash (zero for no code) is pinned with `unknown_override = true`.
+///    UNLESS `accept_unknown_verifier` is set, in which case an unknown-hash
+///    [`PendingOverride`] is recorded and the effective hash (zero for no
+///    code) is pinned with `unknown_override = true`.
 ///
 /// 2. **Mutability detection**: [`detect_contract_mutability`] (two-RPC
 ///    instance probe). An existing instance that is undecodable or has a
@@ -271,9 +351,9 @@ impl PinResult {
 ///    is refused the same way (reason `ExecutableChanged`). An active admin
 ///    or owner key, or an external-reference executable, returns
 ///    `SaError::VerifierMutable` / `SaError::PolicyMutable` UNLESS
-///    `accept_mutable_verifier` is set, in which case an
-///    `EventKind::SaMutableContractOverride` row is written (naming the owner
-///    and tag of an external reference) and `mutable_override = true`.
+///    `accept_mutable_verifier` is set, in which case a mutable
+///    [`PendingOverride`] is recorded (naming the owner and tag of an
+///    external reference) and `mutable_override = true`.
 ///
 /// 3. **Pin**: the effective hash is pinned; an external reference also
 ///    records an [`ExecutableRefPin`] (owner, tag, tag-key digest and resolved
@@ -281,39 +361,34 @@ impl PinResult {
 ///    when the owner repoints the tag, the reference changes or the executable
 ///    kind changes.
 ///
-/// Override audit rows are emitted via the shared `audit_writer` BEFORE the
-/// install transaction is submitted, and carry the same `request_id` as the
-/// subsequent `SaContextRuleCreated` row for forensic correlation.
+/// Nothing is written to the audit log. The applied overrides are returned in
+/// [`PinResult::pending_overrides`], which the install writes as override
+/// rows carrying the new rule's id once it confirms, so a refused install
+/// leaves no override row.
 ///
-/// Returns a [`PinResult`] with all pinned hashes, executable-reference pins
-/// and override flags.
+/// Returns a [`PinResult`] with all pinned hashes, executable-reference pins,
+/// override flags and pending overrides.
 ///
 /// # Arguments
 ///
 /// - `signers_manager`: provides `observe_contract` and the RPC clients for
 ///   `detect_contract_mutability`.
-/// - `audit_writer` — shared writer for override-row emission.
 /// - `smart_account`: accepted and unused; the audit fields use
 ///   `smart_account_redacted`.
 /// - `rule_definition` — the rule to be installed.
 /// - `smart_account_redacted` — pre-computed first-5-last-5 of the smart-account
 ///   strkey, used for every audit field and error.
 /// - `rule_id`: `None` before install, when the rule has no on-chain id yet.
-///   The override rows and the `VerifierMutable`, `PolicyMutable` and
-///   `ContractInstanceUnsupported` refusals carry it as is; the refusals
-///   whose rule id is a plain `u32` (`VerifierWasmNotInAllowlist`,
-///   `PolicyWasmNotInAllowlist`, `NetworkRpcDivergence`) carry 0 for `None`.
+///   Every refusal carries it as is, so a refusal raised before a rule
+///   exists carries no rule id.
 /// - `source_account_strkey`: accepted and unused; identification needs no
 ///   source account.
 /// - `accept_mutable_verifier` — when `true`, contracts with an active admin
-///   key or an external-reference executable proceed with an override audit
-///   row instead of returning an error. It does not admit an unpinnable
-///   instance.
+///   key or an external-reference executable proceed with a pending override
+///   instead of returning an error. It does not admit an unpinnable instance.
 /// - `accept_unknown_verifier`: when `true`, contracts whose effective hash
-///   is outside the allowlist proceed with an override audit row instead of
+///   is outside the allowlist proceed with a pending override instead of
 ///   returning an error.
-/// - `chain_id` — network identifier forwarded to override audit-row constructors
-///   for testnet-vs-mainnet provenance (e.g. `"stellar:testnet"`).
 /// - `request_id` — caller-supplied UUID for forensic correlation.
 ///
 /// # Errors
@@ -333,15 +408,13 @@ impl PinResult {
 /// - [`SaError::DeploymentFailed`] — RPC fetch failed.
 /// - [`SaError::ScAddressEncodingFailed`]: an external reference's tag key
 ///   cannot be XDR-encoded for its digest.
-/// - [`SaError::AuditLog`]: an override row could not be written.
 ///
 #[allow(
     clippy::too_many_arguments,
-    reason = "irreducible param set: smart-account context + rule + two override flags + audit + chain_id + request_id"
+    reason = "irreducible param set: smart-account context + rule + two override flags + request_id"
 )]
 pub async fn pin_referenced_contracts(
     signers_manager: &SignersManager,
-    audit_writer: Option<&Arc<Mutex<AuditWriter>>>,
     smart_account: ScAddress,
     smart_account_redacted: &str,
     rule_definition: &ContextRuleDefinition,
@@ -349,7 +422,6 @@ pub async fn pin_referenced_contracts(
     source_account_strkey: &str,
     accept_mutable_verifier: bool,
     accept_unknown_verifier: bool,
-    chain_id: &str,
     request_id: String,
 ) -> Result<PinResult, SaError> {
     // Accepted and unused: identification reads only the referenced
@@ -358,12 +430,10 @@ pub async fn pin_referenced_contracts(
 
     let context = PinContext {
         signers_manager,
-        audit_writer,
         smart_account_redacted,
         rule_id,
         accept_mutable_verifier,
         accept_unknown_verifier,
-        chain_id,
         request_id: &request_id,
     };
 
@@ -374,6 +444,7 @@ pub async fn pin_referenced_contracts(
         pinned_policy_executable_refs: Vec::new(),
         mutable_override: false,
         unknown_override: false,
+        pending_overrides: Vec::new(),
     };
 
     // ── Step 1: verifiers referenced by External signers ─────────────────────
@@ -391,6 +462,7 @@ pub async fn pin_referenced_contracts(
         let pinned = pin_contract(&context, verifier, PinnedKind::Verifier).await?;
         result.mutable_override |= pinned.mutable_override;
         result.unknown_override |= pinned.unknown_override;
+        result.pending_overrides.extend(pinned.pending_overrides);
         result
             .pinned_verifier_wasm_hashes
             .push((verifier.clone(), pinned.hash));
@@ -411,6 +483,7 @@ pub async fn pin_referenced_contracts(
         let pinned = pin_contract(&context, &policy.policy_address, PinnedKind::Policy).await?;
         result.mutable_override |= pinned.mutable_override;
         result.unknown_override |= pinned.unknown_override;
+        result.pending_overrides.extend(pinned.pending_overrides);
         result
             .pinned_policy_wasm_hashes
             .push((policy.policy_address.clone(), pinned.hash));
@@ -436,21 +509,24 @@ pub(crate) struct AddedContractPin {
     pub(crate) mutable_override: bool,
     /// The unknown-hash override was applied.
     pub(crate) unknown_override: bool,
+    /// The overrides applied to the contract, written once the mutation
+    /// confirms.
+    pub(crate) pending_overrides: Vec<PendingOverride>,
 }
 
 /// Identifies, probes and pins `contract` of `kind` for rule `rule_id` with
 /// the checks rule install applies ([`pin_referenced_contracts`]): an
 /// allowlist miss refuses unless `accept_unknown_verifier` is set, a mutable
-/// contract refuses unless `accept_mutable_verifier` is set, an unpinnable
-/// instance refuses regardless, and an applied override writes its override
-/// row through the manager's audit writer carrying `rule_id`.
+/// contract refuses unless `accept_mutable_verifier` is set, and an
+/// unpinnable instance refuses regardless. An applied override is returned
+/// as a pending override; nothing is written to the audit log.
 ///
 /// # Errors
 ///
 /// The refusals of [`pin_referenced_contracts`] for one contract of `kind`.
 #[allow(
     clippy::too_many_arguments,
-    reason = "one contract's pin context: manager, rule, overrides, provenance, kind"
+    reason = "one contract's pin context: manager, rule, overrides, request, kind"
 )]
 pub(crate) async fn pin_added_contract(
     signers_manager: &SignersManager,
@@ -460,18 +536,14 @@ pub(crate) async fn pin_added_contract(
     smart_account_redacted: &str,
     accept_mutable_verifier: bool,
     accept_unknown_verifier: bool,
-    chain_id: &str,
     request_id: &str,
 ) -> Result<AddedContractPin, SaError> {
-    let audit_writer = signers_manager.audit_writer();
     let context = PinContext {
         signers_manager,
-        audit_writer: Some(&audit_writer),
         smart_account_redacted,
         rule_id: Some(rule_id),
         accept_mutable_verifier,
         accept_unknown_verifier,
-        chain_id,
         request_id,
     };
     let pinned = pin_contract(&context, contract, kind).await?;
@@ -480,27 +552,55 @@ pub(crate) async fn pin_added_contract(
         executable_ref: pinned.executable_ref,
         mutable_override: pinned.mutable_override,
         unknown_override: pinned.unknown_override,
+        pending_overrides: pinned.pending_overrides,
     })
 }
 
-/// Appends `pin` to one kind's pin lists of a record: its first-8 to
-/// `first8` and its executable-reference pin to the aligned `refs`, which
-/// stays empty while no pin of the kind is a reference and is otherwise
-/// aligned with `first8`, and folds its override flags into the record's.
-pub(crate) fn append_pin(
-    first8: &mut Vec<String>,
-    refs: &mut Vec<Option<ExecutableRefPin>>,
-    mutable_override: &mut bool,
-    unknown_override: &mut bool,
-    pin: AddedContractPin,
-) {
-    if !refs.is_empty() || pin.executable_ref.is_some() {
-        refs.resize(first8.len(), None);
-        refs.push(pin.executable_ref);
+/// The pin record a wallet mutation writes for a rule once it confirms, and
+/// the overrides applied while pinning the contracts it adds.
+#[derive(Clone, Debug)]
+pub(crate) struct PlannedPinUpdate {
+    /// The record the `SaContextRulePinsUpdated` row carries.
+    pub(crate) record: PinnedHashesRecord,
+    /// The overrides written, as override rows, before that row.
+    pub(crate) pending_overrides: Vec<PendingOverride>,
+}
+
+impl PlannedPinUpdate {
+    /// An update that writes `record` unchanged, with no override.
+    pub(crate) fn unchanged(record: PinnedHashesRecord) -> Self {
+        Self {
+            record,
+            pending_overrides: Vec::new(),
+        }
     }
-    first8.push(pin.hash_first8);
-    *mutable_override |= pin.mutable_override;
-    *unknown_override |= pin.unknown_override;
+
+    /// Appends `pin` to the record's pin lists of `kind`: its first-8 to the
+    /// first-8 list and its executable-reference pin to the aligned reference
+    /// list, which stays empty while no pin of the kind is a reference and is
+    /// otherwise aligned with the first-8 list. Folds its override flags into
+    /// the record's and queues its pending overrides.
+    pub(crate) fn append_pin(&mut self, kind: PinnedKind, pin: AddedContractPin) {
+        let record = &mut self.record;
+        let (first8, refs) = match kind {
+            PinnedKind::Verifier => (
+                &mut record.pinned_verifier_first8,
+                &mut record.pinned_verifier_executable_refs,
+            ),
+            PinnedKind::Policy => (
+                &mut record.pinned_policy_first8,
+                &mut record.pinned_policy_executable_refs,
+            ),
+        };
+        if !refs.is_empty() || pin.executable_ref.is_some() {
+            refs.resize(first8.len(), None);
+            refs.push(pin.executable_ref);
+        }
+        first8.push(pin.hash_first8);
+        record.mutable_override |= pin.mutable_override;
+        record.unknown_override |= pin.unknown_override;
+        self.pending_overrides.extend(pin.pending_overrides);
+    }
 }
 
 /// Writes `record` as the `SaContextRulePinsUpdated` row of rule `rule_id`
@@ -556,28 +656,63 @@ pub(crate) fn write_pins_updated_row(
     }
 }
 
+/// Writes one override row per entry of `pending`, in order, for rule
+/// `rule_id` through the manager's audit writer, each acknowledged now with
+/// the manager's chain id and `request_id`.
+///
+/// Runs after the operation that applied the overrides confirmed on-chain,
+/// so a failed write cannot undo it: the failure is logged with the rule id,
+/// and a poisoned writer marks the session degraded.
+pub(crate) fn write_pending_override_rows(
+    signers_manager: &SignersManager,
+    smart_account_redacted: &str,
+    rule_id: u32,
+    request_id: &str,
+    pending: &[PendingOverride],
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let writer_arc = signers_manager.audit_writer();
+    let Ok(mut writer) = writer_arc.lock() else {
+        signers_manager.mark_audit_writer_degraded();
+        warn!(
+            target: "stellar_agent::audit",
+            rule_id,
+            count = pending.len(),
+            "audit-writer mutex poisoned; override rows dropped"
+        );
+        return;
+    };
+    for pending_override in pending {
+        let entry = pending_override.audit_entry(
+            smart_account_redacted,
+            rule_id,
+            signers_manager.chain_id(),
+            request_id,
+        );
+        if let Err(e) = writer.write_entry(entry) {
+            warn!(
+                error = %e,
+                rule_id,
+                contract_kind = %pending_override.contract_kind,
+                "override audit write failed after the operation confirmed"
+            );
+        }
+    }
+}
+
 // ── Private helpers for pin_referenced_contracts ──────────────────────────────
 
 /// Install-wide inputs shared by every per-contract pin.
 struct PinContext<'a> {
     signers_manager: &'a SignersManager,
-    audit_writer: Option<&'a Arc<Mutex<AuditWriter>>>,
     smart_account_redacted: &'a str,
     /// `None` before install, when the rule has no on-chain id yet.
     rule_id: Option<u32>,
     accept_mutable_verifier: bool,
     accept_unknown_verifier: bool,
-    chain_id: &'a str,
     request_id: &'a str,
-}
-
-impl PinContext<'_> {
-    /// Rule id for the refusals whose rule id is a plain `u32`
-    /// (`VerifierWasmNotInAllowlist`, `PolicyWasmNotInAllowlist`,
-    /// `NetworkRpcDivergence`): 0 when the rule has no on-chain id yet.
-    fn plain_rule_id(&self) -> u32 {
-        self.rule_id.unwrap_or(0)
-    }
 }
 
 /// The pin of one verifier or policy contract.
@@ -592,10 +727,13 @@ struct PinnedContract {
     mutable_override: bool,
     /// The unknown-hash override was applied.
     unknown_override: bool,
+    /// The overrides applied, unknown-hash before mutable.
+    pending_overrides: Vec<PendingOverride>,
 }
 
 /// Identifies, probes and pins one verifier or policy contract; see
-/// [`pin_referenced_contracts`] for the steps and errors.
+/// [`pin_referenced_contracts`] for the steps and errors. Writes nothing:
+/// an applied override is returned as a pending override.
 async fn pin_contract(
     context: &PinContext<'_>,
     contract_addr: &ScAddress,
@@ -621,12 +759,13 @@ async fn pin_contract(
         )
         .await?;
 
+    let mut pending_overrides = Vec::new();
     let mut unknown_override = false;
     if !observation.allowlisted {
         let observed_hash_first8 = observation.observed_hash_first8();
         if !context.accept_unknown_verifier {
             return Err(kind.not_in_allowlist_error(
-                context.plain_rule_id(),
+                rule_id,
                 smart_account_redacted,
                 observed_hash_first8,
                 request_id,
@@ -641,24 +780,13 @@ async fn pin_contract(
             "pin_referenced_contracts: unknown {contract_kind} wasm hash; \
              proceeding with --accept-unknown-verifier override"
         );
-        let override_entry = AuditEntry::new_sa_unknown_contract_override(
-            rule_id,
-            RedactedStrkey::from_already_redacted(smart_account_redacted),
-            RedactedStrkey::from_already_redacted(&contract_redacted),
+        pending_overrides.push(PendingOverride {
+            kind: PendingOverrideKind::Unknown {
+                observed_hash_first8,
+            },
+            contract_redacted: RedactedStrkey::from_already_redacted(&contract_redacted),
             contract_kind,
-            stellar_agent_core::timefmt::current_iso8601_utc(),
-            &observed_hash_first8,
-            context.chain_id,
-            request_id,
-        );
-        let health = signers_manager.health_handle();
-        emit_override_row(
-            context.audit_writer,
-            override_entry,
-            "pin_referenced_contracts: SaUnknownContractOverride",
-            true,
-            Some(&health),
-        )?;
+        });
     }
 
     // The pin of an external reference is taken from the identification
@@ -693,7 +821,7 @@ async fn pin_contract(
         signers_manager.primary_rpc_client(),
         signers_manager.secondary_rpc_client(),
         contract_addr,
-        context.plain_rule_id(),
+        rule_id,
         smart_account_redacted,
         request_id,
     )
@@ -766,24 +894,13 @@ async fn pin_contract(
             "pin_referenced_contracts: mutable {contract_kind} contract; \
              proceeding with --accept-mutable-verifier override"
         );
-        let override_entry = AuditEntry::new_sa_mutable_contract_override(
-            rule_id,
-            RedactedStrkey::from_already_redacted(smart_account_redacted),
-            RedactedStrkey::from_already_redacted(&contract_redacted),
+        pending_overrides.push(PendingOverride {
+            kind: PendingOverrideKind::Mutable {
+                executable_ref: executable_ref.clone(),
+            },
+            contract_redacted: RedactedStrkey::from_already_redacted(&contract_redacted),
             contract_kind,
-            stellar_agent_core::timefmt::current_iso8601_utc(),
-            executable_ref.as_ref(),
-            context.chain_id,
-            request_id,
-        );
-        let health = signers_manager.health_handle();
-        emit_override_row(
-            context.audit_writer,
-            override_entry,
-            "pin_referenced_contracts: SaMutableContractOverride",
-            true,
-            Some(&health),
-        )?;
+        });
     }
 
     Ok(PinnedContract {
@@ -791,6 +908,7 @@ async fn pin_contract(
         executable_ref,
         mutable_override,
         unknown_override,
+        pending_overrides,
     })
 }
 
@@ -860,7 +978,7 @@ impl PinnedKind {
 
     fn not_in_allowlist_error(
         self,
-        rule_id: u32,
+        rule_id: Option<u32>,
         smart_account_redacted: &str,
         observed_hash_first8: String,
         request_id: &str,
@@ -932,86 +1050,6 @@ fn unsupported_instance(
         reason,
         request_id: request_id.to_owned(),
     }
-}
-
-/// Emits an override audit row via the shared `Arc<Mutex<AuditWriter>>` fallback,
-/// propagating write failures fail-closed.
-///
-/// Returns `Ok(())` when the write succeeds or when `audit_writer` is `None`
-/// (the test-only / dry-run path where no writer is configured).  Returns
-/// `Err(SaError::AuditLog(...))` when the writer is present but the write fails —
-/// the caller must propagate this error before proceeding with the install.
-///
-/// # Writer routing constraint
-///
-/// Override rows for mutable and unknown-wasm contracts are emitted via the
-/// `self.audit_writer` fallback arc only, NOT via the per-method
-/// `Option<&mut AuditWriter>`.  Routing the per-method writer through the async
-/// boundary of `pin_referenced_contracts` would require lifetime gymnastics that
-/// outweigh the benefit: production code always configures `self.audit_writer`
-/// via `with_audit_writer` as part of the same construction step that wires
-/// `with_signers_manager`.  A `debug_assert!` in `install_rule` catches any
-/// developer-time regression where an override flag is set but `self.audit_writer`
-/// is `None`.
-///
-/// # Errors
-///
-/// - [`SaError::AuditLog`] — write to the audit log failed (I/O or chain-hash
-///   error), OR the mutex is poisoned and `override_requested` is `true`.
-fn emit_override_row(
-    audit_writer: Option<&Arc<Mutex<AuditWriter>>>,
-    entry: AuditEntry,
-    op_label: &'static str,
-    override_requested: bool,
-    health: Option<&AuditWriterHealthHandle>,
-) -> Result<(), SaError> {
-    if let Some(arc) = audit_writer {
-        match arc.lock() {
-            Ok(mut guard) => {
-                if let Err(e) = guard.write_entry(entry) {
-                    warn!(error = %e, op = %op_label, "pin_referenced_contracts: audit write failed");
-                    // Route WriterError through VerifyError::Io so SaError::AuditLog can carry it.
-                    // WriterError is not directly convertible to AuditLogIntegrityError (VerifyError)
-                    // because WriterError has additional variants (Hash, Serialise, PartialRotation)
-                    // that do not correspond 1:1.  Display-string roundtrip via other() is
-                    // intentional: it preserves the human-readable message for the wire
-                    // `sa.audit_log` envelope while keeping the type system clean.
-                    let io_err = std::io::Error::other(e.to_string());
-                    return Err(SaError::AuditLog(
-                        stellar_agent_core::audit_log::AuditLogIntegrityError::Io(io_err),
-                    ));
-                }
-            }
-            Err(_poison) => {
-                // Mutex poisoned: mark session degraded, warn, and treat as audit-log
-                // failure (mutex poisoned; override audit row cannot be written).
-                if let Some(h) = health {
-                    h.mark_degraded();
-                }
-                warn!(
-                    target: "stellar_agent::audit",
-                    op = %op_label,
-                    "audit-writer mutex poisoned; override audit row dropped"
-                );
-                if override_requested {
-                    let io_err = std::io::Error::other(format!(
-                        "{op_label}: audit writer poisoned; override row not written"
-                    ));
-                    return Err(SaError::AuditLog(
-                        stellar_agent_core::audit_log::AuditLogIntegrityError::Io(io_err),
-                    ));
-                }
-                return Ok(());
-            }
-        }
-    } else if override_requested {
-        return Err(SaError::AuditLog(
-            stellar_agent_core::audit_log::AuditLogIntegrityError::Io(std::io::Error::other(
-                format!("{op_label}: override requested but no audit writer configured"),
-            )),
-        ));
-    }
-    Ok(())
 }
 
 pub(crate) fn scaddress_cache_key(addr: &ScAddress) -> Result<Vec<u8>, SaError> {
@@ -1639,14 +1677,15 @@ pub enum MutabilityStatus {
 /// # Errors
 ///
 /// - [`SaError::NetworkRpcDivergence`] — primary and secondary RPC disagree on
-///   the contract's instance storage.
+///   the contract's instance storage. The refusal carries `rule_id`, which is
+///   `None` when the probe runs before the rule has an on-chain id.
 /// - [`SaError::DeploymentFailed`] (phase `"simulate"`) — either RPC fetch fails
 ///   or the storage bytes cannot be decoded.
 pub async fn detect_contract_mutability(
     primary: &StellarRpcClient,
     secondary: &StellarRpcClient,
     contract_addr: &ScAddress,
-    rule_id: u32,
+    rule_id: Option<u32>,
     smart_account_redacted: &str,
     request_id: &str,
 ) -> Result<MutabilityStatus, SaError> {
@@ -1774,7 +1813,8 @@ enum InstanceStorage {
 /// Returns observations aligned with `keys`. `None` means no matching entry.
 /// A present entry retains its storage bytes or a typed failure reason and
 /// the original entry XDR, so two-RPC agreement includes unreadable instances.
-/// A response entry whose key does not decode makes every position
+/// A response entry that cannot be matched to a requested key, whether its
+/// key does not decode or was not requested, makes every position
 /// `Unreadable` with [`AdminOrOwnerKey::UndecodableInstance`], because the
 /// response cannot be aligned with the request.
 ///
@@ -1817,23 +1857,23 @@ async fn fetch_contract_instance_storage(
         std::collections::HashMap::new();
 
     for entry_result in &raw_entries {
-        // Decode the response key to match it against our request keys by position.
-        // A response with an undecodable key cannot be aligned with the
+        // Match the response key against the request keys by position. A
+        // response entry that matches no requested key, because its key does
+        // not decode or was not requested, cannot be aligned with the
         // request, so no requested position can be read as absent: every
         // position records the entry as an undecodable instance.
-        let Ok(response_key) = XdrLedgerKey::from_xdr_base64(
+        let pos = XdrLedgerKey::from_xdr_base64(
             &entry_result.key,
             stellar_agent_xdr_limits::untrusted_decode_limits(entry_result.key.len()),
-        ) else {
+        )
+        .ok()
+        .and_then(|response_key| keys.iter().position(|k| k == &response_key));
+        let Some(pos) = pos else {
             let unaligned = InstanceStorage::Unreadable {
                 reason: AdminOrOwnerKey::UndecodableInstance,
                 entry_xdr: entry_result.xdr.clone(),
             };
             return Ok(vec![Some(unaligned); keys.len()]);
-        };
-
-        let Some(pos) = keys.iter().position(|k| k == &response_key) else {
-            continue; // response entry not in our request — skip
         };
 
         let unreadable = |reason| InstanceStorage::Unreadable {
@@ -2024,6 +2064,9 @@ mod tests {
         reason = "test-only; asserts via expect/unwrap/panic are intentional"
     )]
 
+    use std::sync::{Arc, Mutex};
+
+    use stellar_agent_core::audit_log::writer::AuditWriter;
     use stellar_xdr::{ContractId, Hash};
 
     use super::*;
@@ -2183,6 +2226,7 @@ mod tests {
             pinned_policy_executable_refs: vec![None],
             mutable_override: true,
             unknown_override: false,
+            pending_overrides: vec![],
         };
         assert_eq!(result.verifier_executable_refs(), vec![None, Some(pin)]);
         assert!(result.policy_executable_refs().is_empty());
@@ -2429,23 +2473,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn emit_override_row_without_writer_fails_closed_when_override_requested() {
-        let entry = AuditEntry::new_sa_mutable_contract_override(
-            Some(7),
-            RedactedStrkey::from_already_redacted("CAAAA...ABSC4"),
-            RedactedStrkey::from_already_redacted("CBBBB...BBBBB"),
-            ContractKind::Verifier,
-            "2026-05-20T00:00:00Z",
-            None,
-            "stellar:testnet",
-            "req-override",
-        );
-
-        let err = emit_override_row(None, entry, "test override row", true, None).unwrap_err();
-        assert_eq!(err.wire_code(), "sa.audit_log");
-    }
-
     // ── detect_contract_mutability async integration tests ────────────────────
 
     /// `MutabilityStatus::Immutable` when both RPCs return a contract instance
@@ -2483,7 +2510,7 @@ mod tests {
             &rpc,
             &rpc,
             &contract_addr_clone,
-            1,
+            Some(1),
             "CAAAA...ABSC4",
             "test-request-id",
         )
@@ -2531,7 +2558,7 @@ mod tests {
             &rpc,
             &rpc,
             &contract_addr,
-            1,
+            Some(1),
             "CAAAA...ABSC4",
             "test-request-id",
         )
@@ -2601,7 +2628,7 @@ mod tests {
             &primary_rpc,
             &secondary_rpc,
             &contract_addr,
-            1,
+            Some(1),
             "CAAAA...ABSC4",
             "test-request-id",
         )
@@ -2610,7 +2637,10 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(SaError::NetworkRpcDivergence { rule_id: 1, .. })
+                Err(SaError::NetworkRpcDivergence {
+                    rule_id: Some(1),
+                    ..
+                })
             ),
             "diverging RPCs must return NetworkRpcDivergence; got {result:?}"
         );
@@ -2763,6 +2793,7 @@ mod tests {
             pinned_policy_executable_refs: vec![],
             mutable_override: false,
             unknown_override: false,
+            pending_overrides: vec![],
         };
 
         let result = pin.pinned_verifier_hashes_first8();
@@ -2803,6 +2834,7 @@ mod tests {
             pinned_policy_executable_refs: vec![],
             mutable_override: false,
             unknown_override: false,
+            pending_overrides: vec![],
         };
 
         let result = pin.pinned_policy_hashes_first8();
@@ -2824,6 +2856,7 @@ mod tests {
             pinned_policy_executable_refs: vec![],
             mutable_override: false,
             unknown_override: false,
+            pending_overrides: vec![],
         };
         assert!(
             pin.pinned_verifier_hashes_first8().is_empty(),
@@ -2883,147 +2916,116 @@ mod tests {
         assert_eq!(key1, key2, "same address must produce identical cache keys");
     }
 
-    // ── emit_override_row additional path tests ───────────────────────────────
+    // ── write_pending_override_rows ────────────────────────────────────────────
 
-    /// `emit_override_row` succeeds when a real `AuditWriter` is provided and
-    /// the entry can be written (no I/O error).
-    #[test]
-    fn emit_override_row_with_real_writer_succeeds() {
-        use std::sync::{Arc, Mutex};
+    /// A signers manager over an unroutable RPC whose audit log lives in
+    /// `directory`; returns the manager and the log path.
+    fn manager_with_log(directory: &tempfile::TempDir) -> (SignersManager, std::path::PathBuf) {
+        use crate::managers::signers::SignersManagerConfig;
 
-        use stellar_agent_core::audit_log::entry::AuditEntry;
-        use stellar_agent_core::audit_log::schema::ContractKind;
-        use stellar_agent_core::audit_log::writer::AuditWriter;
-
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("audit").join("test.jsonl");
-        let writer = AuditWriter::open(path, None).expect("AuditWriter::open");
-        let arc = Arc::new(Mutex::new(writer));
-
-        let entry = AuditEntry::new_sa_mutable_contract_override(
-            Some(1),
-            RedactedStrkey::from_already_redacted("CAAAA...12345"),
-            RedactedStrkey::from_already_redacted("CBBBB...67890"),
-            ContractKind::Verifier,
-            "2026-06-23T00:00:00Z",
-            None,
-            "stellar:testnet",
-            "req-emit-test",
-        );
-
-        let result = emit_override_row(Some(&arc), entry, "test-op", true, None);
-
-        assert!(
-            result.is_ok(),
-            "emit_override_row with real writer must succeed; got {result:?}"
-        );
+        let audit_path = directory.path().join("audit.jsonl");
+        let writer = Arc::new(Mutex::new(
+            AuditWriter::open(audit_path.clone(), None).unwrap(),
+        ));
+        let manager = SignersManager::new(SignersManagerConfig::new(
+            "http://127.0.0.1:9".to_owned(),
+            "http://127.0.0.1:9".to_owned(),
+            writer,
+            audit_path.clone(),
+            "Test SDF Network ; September 2015".to_owned(),
+            "probe".to_owned(),
+            std::time::Duration::from_secs(5),
+            "stellar:testnet".to_owned(),
+        ))
+        .unwrap();
+        (manager, audit_path)
     }
 
-    /// `emit_override_row` returns `Ok(())` when no writer is provided AND
-    /// `override_requested` is `false` — the non-override, no-writer path.
-    #[test]
-    fn emit_override_row_without_writer_ok_when_not_override_requested() {
-        let entry = AuditEntry::new_sa_mutable_contract_override(
-            Some(5),
-            RedactedStrkey::from_already_redacted("CAAAA...ABSC4"),
-            RedactedStrkey::from_already_redacted("CCCCC...CCCCC"),
-            ContractKind::Policy,
-            "2026-06-23T00:00:00Z",
-            None,
-            "stellar:testnet",
-            "req-no-override",
-        );
-
-        // override_requested=false + no writer → Ok(())
-        let result = emit_override_row(None, entry, "test-no-override", false, None);
-        assert!(
-            result.is_ok(),
-            "emit_override_row with no writer and no override must return Ok(())"
-        );
+    fn pending_overrides() -> Vec<PendingOverride> {
+        vec![
+            PendingOverride {
+                kind: PendingOverrideKind::Unknown {
+                    observed_hash_first8: "dddddddddddddddd".to_owned(),
+                },
+                contract_redacted: RedactedStrkey::from_already_redacted("CBBBB...BBBBB"),
+                contract_kind: ContractKind::Verifier,
+            },
+            PendingOverride {
+                kind: PendingOverrideKind::Mutable {
+                    executable_ref: None,
+                },
+                contract_redacted: RedactedStrkey::from_already_redacted("CCCCC...CCCCC"),
+                contract_kind: ContractKind::Policy,
+            },
+        ]
     }
 
-    /// `emit_override_row` returns `SaError::AuditLog` when the mutex is
-    /// poisoned and `override_requested` is `true`.
-    ///
-    /// The poisoned-mutex path must fail closed (not silently swallow the error)
-    /// because an override audit row that cannot be written is a security gap.
+    /// Each pending override is written in order as its override row, naming
+    /// the rule, the contract and the request.
     #[test]
-    fn emit_override_row_with_poisoned_mutex_fails_closed_when_override_requested() {
-        use std::sync::{Arc, Mutex};
+    fn pending_override_rows_carry_the_rule_id_in_order() {
+        use stellar_agent_core::audit_log::schema::EventKind;
 
-        use stellar_agent_core::audit_log::writer::AuditWriter;
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, audit_path) = manager_with_log(&directory);
 
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("audit").join("poison.jsonl");
-        let writer = AuditWriter::open(path, None).expect("AuditWriter::open");
-        let arc: Arc<Mutex<AuditWriter>> = Arc::new(Mutex::new(writer));
+        write_pending_override_rows(&manager, "CAAAA...ABSC4", 7, "req-7", &pending_overrides());
 
-        // Poison the mutex by panicking inside a lock guard.
-        let arc_clone = Arc::clone(&arc);
+        let rows: Vec<AuditEntry> = std::fs::read_to_string(&audit_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().all(|row| row.request_id == "req-7"));
+        assert!(
+            rows.iter()
+                .all(|row| row.chain_id.as_deref() == Some("stellar:testnet"))
+        );
+        assert!(matches!(
+            &rows[0].event_kind,
+            EventKind::SaUnknownContractOverride {
+                rule_id: Some(7),
+                contract_address_redacted,
+                contract_kind: ContractKind::Verifier,
+                observed_hash_first8,
+                ..
+            } if contract_address_redacted.as_str() == "CBBBB...BBBBB"
+                && observed_hash_first8 == "dddddddddddddddd"
+        ));
+        assert!(matches!(
+            &rows[1].event_kind,
+            EventKind::SaMutableContractOverride {
+                rule_id: Some(7),
+                contract_address_redacted,
+                contract_kind: ContractKind::Policy,
+                executable_owner_redacted: None,
+                executable_tag: None,
+                ..
+            } if contract_address_redacted.as_str() == "CCCCC...CCCCC"
+        ));
+    }
+
+    /// A poisoned audit writer drops the rows and marks the session
+    /// degraded; the confirmed operation is not failed.
+    #[test]
+    fn pending_override_rows_on_a_poisoned_writer_mark_the_session_degraded() {
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, audit_path) = manager_with_log(&directory);
+        let writer = manager.audit_writer();
         let _ = std::panic::catch_unwind(|| {
-            let _guard = arc_clone.lock().unwrap();
+            let _guard = writer.lock().unwrap();
             panic!("intentional poison");
         });
-        assert!(arc.is_poisoned(), "mutex must be poisoned after the panic");
+        assert!(manager.audit_writer().is_poisoned());
 
-        let entry = AuditEntry::new_sa_mutable_contract_override(
-            Some(9),
-            RedactedStrkey::from_already_redacted("CAAAA...ABSC4"),
-            RedactedStrkey::from_already_redacted("CDDDD...DDDDD"),
-            ContractKind::Verifier,
-            "2026-06-23T00:00:00Z",
-            None,
-            "stellar:testnet",
-            "req-poison",
-        );
+        write_pending_override_rows(&manager, "CAAAA...ABSC4", 7, "req-7", &pending_overrides());
 
-        let result = emit_override_row(Some(&arc), entry, "test-poison", true, None);
-
-        let err = result.expect_err("poisoned mutex + override_requested must fail closed");
-        assert_eq!(
-            err.wire_code(),
-            "sa.audit_log",
-            "wire_code must be sa.audit_log on poisoned mutex"
-        );
-    }
-
-    /// `emit_override_row` returns `Ok(())` when the mutex is poisoned but
-    /// `override_requested` is `false` — the non-override poisoned-mutex path
-    /// does NOT fail the caller.
-    #[test]
-    fn emit_override_row_with_poisoned_mutex_ok_when_not_override_requested() {
-        use std::sync::{Arc, Mutex};
-
-        use stellar_agent_core::audit_log::writer::AuditWriter;
-
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("audit").join("poison2.jsonl");
-        let writer = AuditWriter::open(path, None).expect("AuditWriter::open");
-        let arc: Arc<Mutex<AuditWriter>> = Arc::new(Mutex::new(writer));
-
-        let arc_clone = Arc::clone(&arc);
-        let _ = std::panic::catch_unwind(|| {
-            let _guard = arc_clone.lock().unwrap();
-            panic!("intentional poison");
-        });
-        assert!(arc.is_poisoned(), "mutex must be poisoned");
-
-        let entry = AuditEntry::new_sa_mutable_contract_override(
-            Some(10),
-            RedactedStrkey::from_already_redacted("CAAAA...ABSC4"),
-            RedactedStrkey::from_already_redacted("CEEEE...EEEEE"),
-            ContractKind::Policy,
-            "2026-06-23T00:00:00Z",
-            None,
-            "stellar:testnet",
-            "req-poison-ok",
-        );
-
-        // override_requested=false + poisoned mutex → Ok(())
-        let result = emit_override_row(Some(&arc), entry, "test-poison-no-override", false, None);
+        assert!(manager.audit_writer_degraded());
         assert!(
-            result.is_ok(),
-            "poisoned mutex with override_requested=false must return Ok(())"
+            std::fs::read_to_string(&audit_path)
+                .unwrap_or_default()
+                .is_empty()
         );
     }
 
@@ -3180,7 +3182,7 @@ mod tests {
             &rpc,
             &rpc,
             &contract_addr,
-            2,
+            Some(2),
             "CAAAA...ABSC4",
             "req-non-wasm",
         )
@@ -3228,7 +3230,7 @@ mod tests {
             &rpc,
             &rpc,
             &contract_addr,
-            3,
+            Some(3),
             "CAAAA...ABSC4",
             "req-absent",
         )
@@ -3279,7 +3281,7 @@ mod tests {
             &rpc,
             &rpc,
             &contract_addr,
-            4,
+            Some(4),
             "CAAAA...ABSC4",
             "req-owner-key",
         )
@@ -3334,7 +3336,7 @@ mod tests {
             &rpc,
             &rpc,
             &contract_addr,
-            5,
+            Some(5),
             "CAAAA...ABSC4",
             "req-malformed-key",
         )
@@ -3387,7 +3389,7 @@ mod tests {
             &rpc,
             &rpc,
             &contract_addr,
-            6,
+            Some(6),
             "CAAAA...ABSC4",
             "req-malformed-xdr",
         )
@@ -3451,9 +3453,10 @@ mod tests {
         let entry = non_wasm_instance_entry_xdr(&contract);
         let server = instance_rpc(&contract, Some(&entry)).await;
         let rpc = StellarRpcClient::new(&server.uri()).unwrap();
-        let status = detect_contract_mutability(&rpc, &rpc, &contract, 6, "CAAAA...ABSC4", "probe")
-            .await
-            .unwrap();
+        let status =
+            detect_contract_mutability(&rpc, &rpc, &contract, Some(6), "CAAAA...ABSC4", "probe")
+                .await
+                .unwrap();
         assert_eq!(
             status,
             MutabilityStatus::Mutable {
@@ -3476,9 +3479,10 @@ mod tests {
         .unwrap();
         let server = instance_rpc(&contract, Some(&entry)).await;
         let rpc = StellarRpcClient::new(&server.uri()).unwrap();
-        let status = detect_contract_mutability(&rpc, &rpc, &contract, 6, "CAAAA...ABSC4", "probe")
-            .await
-            .unwrap();
+        let status =
+            detect_contract_mutability(&rpc, &rpc, &contract, Some(6), "CAAAA...ABSC4", "probe")
+                .await
+                .unwrap();
         assert_eq!(
             status,
             MutabilityStatus::Mutable {
@@ -3509,9 +3513,10 @@ mod tests {
         .expect("ContractData XDR must encode");
         let server = instance_rpc(&contract, Some(&entry)).await;
         let rpc = StellarRpcClient::new(&server.uri()).expect("RPC client");
-        let status = detect_contract_mutability(&rpc, &rpc, &contract, 6, "CAAAA...ABSC4", "probe")
-            .await
-            .expect("map contract data has a mutability classification");
+        let status =
+            detect_contract_mutability(&rpc, &rpc, &contract, Some(6), "CAAAA...ABSC4", "probe")
+                .await
+                .expect("map contract data has a mutability classification");
         assert_eq!(
             status,
             MutabilityStatus::Mutable {
@@ -3572,7 +3577,7 @@ mod tests {
             &primary,
             &secondary,
             &contract,
-            6,
+            Some(6),
             "CAAAA...ABSC4",
             "probe",
         )
@@ -3622,7 +3627,7 @@ mod tests {
                 &primary,
                 &secondary,
                 &contract,
-                6,
+                Some(6),
                 "CAAAA...ABSC4",
                 "probe",
             )
@@ -3651,7 +3656,7 @@ mod tests {
                 &primary_rpc,
                 &secondary_rpc,
                 &contract,
-                6,
+                Some(6),
                 "CAAAA...ABSC4",
                 "probe",
             )
@@ -3667,13 +3672,11 @@ mod tests {
         }
     }
 
-    /// Audit-log substring that identifies a `SaMutableContractOverride` row.
-    const MUTABLE_OVERRIDE_ROW: &str = r#""kind":"sa_mutable_contract_override""#;
-
     /// Pins a rule that references `contract` as its only verifier or policy,
     /// against a mocked RPC that serves `entry_xdr` as the contract's instance
-    /// entry.  Unknown Wasm hashes are accepted so the probe reaches the
-    /// mutability step.  Returns the pin outcome and the audit-log contents.
+    /// entry, with a signers manager that holds an audit writer.  Unknown Wasm
+    /// hashes are accepted so the probe reaches the mutability step.  Returns
+    /// the pin outcome and the audit-log contents.
     async fn pin_single_contract(
         contract: &ScAddress,
         entry_xdr: &str,
@@ -3727,7 +3730,6 @@ mod tests {
         );
         let outcome = pin_referenced_contracts(
             &manager,
-            Some(&writer),
             smart_account,
             "CAAAA...ABSC4",
             &definition,
@@ -3735,7 +3737,6 @@ mod tests {
             "unused",
             accept_mutable_verifier,
             true,
-            "stellar:testnet",
             "probe".to_owned(),
         )
         .await;
@@ -3745,7 +3746,7 @@ mod tests {
 
     /// An undecodable instance and a non-Wasm executable are refused with
     /// `sa.contract_instance_unsupported` with and without
-    /// `accept_mutable_verifier`, and no mutable-override row is written.
+    /// `accept_mutable_verifier`, and pinning writes no audit row.
     async fn assert_unpinnable_instance_refused(contract_kind: ContractKind) {
         let contract = ScAddress::Contract(ContractId(Hash([0x0b; 32])));
         let contract_redacted =
@@ -3812,8 +3813,8 @@ mod tests {
                     serde_json::to_value(contract_kind).unwrap()
                 );
                 assert!(
-                    !audit_log.contains(MUTABLE_OVERRIDE_ROW),
-                    "no mutable-override row may be written for an unpinnable instance"
+                    audit_log.is_empty(),
+                    "pinning writes no audit row: {audit_log}"
                 );
             }
         }
@@ -3830,7 +3831,8 @@ mod tests {
     }
 
     /// A contract with an active `Admin` key is refused as mutable without the
-    /// flag and admitted with it, writing a mutable-override row.
+    /// flag and admitted with it, returning a pending mutable override and
+    /// writing no audit row.
     #[tokio::test]
     async fn install_admin_key_contract_admitted_only_with_mutable_override() {
         let contract = ScAddress::Contract(ContractId(Hash([0x0b; 32])));
@@ -3848,25 +3850,50 @@ mod tests {
                 error.to_string().contains("--accept-mutable-verifier"),
                 "{error}"
             );
-            assert!(!audit_log.contains(MUTABLE_OVERRIDE_ROW));
+            assert!(audit_log.is_empty(), "{audit_log}");
 
             let (outcome, audit_log) =
                 pin_single_contract(&contract, &entry_xdr, contract_kind, true).await;
             let pin = outcome.expect("the override admits an admin-key contract");
             assert!(pin.mutable_override);
+            // The fixture's Wasm hash is outside the allowlist, which the
+            // helper admits, so the unknown-hash override precedes the
+            // mutable one.
+            let contract_redacted = RedactedStrkey::from_already_redacted(
+                redact_strkey_first5_last5(&xdr_scaddress_to_strkey_or_sentinel(&contract)),
+            );
+            assert_eq!(
+                pin.pending_overrides,
+                vec![
+                    PendingOverride {
+                        kind: PendingOverrideKind::Unknown {
+                            observed_hash_first8: "4242424242424242".to_owned(),
+                        },
+                        contract_redacted: contract_redacted.clone(),
+                        contract_kind,
+                    },
+                    PendingOverride {
+                        kind: PendingOverrideKind::Mutable {
+                            executable_ref: None,
+                        },
+                        contract_redacted,
+                        contract_kind,
+                    },
+                ]
+            );
             assert!(
-                audit_log.contains(MUTABLE_OVERRIDE_ROW),
-                "the override must write a mutable-override row"
+                audit_log.is_empty(),
+                "pinning writes no audit row; the caller writes it after confirmation: {audit_log}"
             );
         }
     }
 
-    /// `detect_contract_mutability` skips a response entry whose key decodes to
-    /// a valid `LedgerKey` but does not match any key in the request set.
-    ///
-    /// This covers the `None => continue` branch for `keys.iter().position(...)`.
+    /// A response entry whose key decodes to a valid `LedgerKey` that was not
+    /// requested cannot be aligned with the request, so the requested
+    /// instance is an undecodable instance: an unpinnable, mutable
+    /// classification.
     #[tokio::test]
-    async fn detect_mutability_skips_response_entry_not_in_request_set() {
+    async fn detect_mutability_unrequested_response_key_is_undecodable_instance() {
         use wiremock::{
             Mock, MockServer,
             matchers::{method, path},
@@ -3900,18 +3927,29 @@ mod tests {
             &rpc,
             &rpc,
             &contract_addr,
-            7,
+            Some(7),
             "CAAAA...ABSC4",
             "req-unrelated-entry",
         )
         .await
-        .expect("unrelated entry must be skipped, not errored");
+        .expect("an unrequested response key has a mutability classification");
 
-        // The entry for `other_addr` is not in our request set → skipped → Immutable.
         assert_eq!(
             result,
-            MutabilityStatus::Immutable,
-            "response entry not in request set must be skipped; result is Immutable"
+            MutabilityStatus::Mutable {
+                admin_or_owner_key: AdminOrOwnerKey::UndecodableInstance,
+                holder_redacted: "undecodable instance".to_owned(),
+                executable_ref: None,
+            },
+            "an unrequested response key must fail closed as an undecodable instance"
+        );
+        assert!(
+            matches!(
+                result,
+                MutabilityStatus::Mutable { admin_or_owner_key, .. }
+                    if admin_or_owner_key.is_unpinnable_instance()
+            ),
+            "the classification must be unpinnable: {result:?}"
         );
     }
 

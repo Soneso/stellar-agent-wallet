@@ -149,23 +149,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Verifier and policy installation refuses an undecodable instance entry while
   identifying the contract, before any override flag applies, so no override
   audit row is written for it.
-- Smart-account rule-context decode errors name the variant of an unexpected
-  ledger value and never render the value itself, and an unknown
-  context-type tag renders escaped and bounded, so a large or hostile
-  payload yields a short reason. `scval_variant_name` moves to
-  `stellar_agent_core::scval`; `stellar_agent_defi::simulate` no longer
-  exports it.
+- Errors that describe an unexpected ledger value name its variant through
+  `stellar_agent_core::scval::scval_variant_name` and never render the value
+  itself: in `stellar-agent-smart-account` for rule-context, signer-weight,
+  threshold, migration and timelock reads, and in `stellar-agent-defindex`
+  for vault storage and role reads. An unknown context-type tag renders
+  escaped and bounded, so a large or hostile payload yields a short reason.
+  `scval_variant_name` moves to `stellar_agent_core::scval`;
+  `stellar_agent_defi::simulate` no longer exports it.
 - The panic hook logs at most 256 bytes of the panic message, followed by
   the `...[TRUNCATED]` marker when it is cut. Secret strkeys are redacted on
   the full message before the cut, so no fragment of a strkey that straddles
   the limit is logged.
 - The contract-instance mutability probe treats a response entry whose key
-  does not decode as an undecodable instance at every requested position, so
-  rule installation refuses the contract with
-  `sa.contract_instance_unsupported`. The multicall router Wasm-hash fetch
-  reads only the entry returned under the requested instance key and
-  refuses a response whose key does not decode or that has no entry under
-  that key.
+  does not decode, or that was returned under a key the wallet did not
+  request, as an undecodable instance at every requested position, so rule
+  installation refuses the contract with `sa.contract_instance_unsupported`.
+  The multicall router Wasm-hash fetch reads only the entry returned under
+  the requested instance key and refuses a response whose key does not
+  decode or that has no entry under that key.
 - `smart-account rules verify-pins` names external-reference executables:
   `observed_verifier_executable` and `observed_policy_executable` hold the
   bounded summary of each observed external reference (or `no code`),
@@ -178,14 +180,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tags one owner manages are one party together. A high-value rule whose
   pinned verifiers belong to one party requires the `accept_single_verifier`
   opt-in of `sign_with_passkey_rule`.
-- `SaMutableContractOverride`, `SaUnknownContractOverride`,
-  `sa.verifier_mutable`, `sa.policy_mutable` and
-  `sa.contract_instance_unsupported` carry `rule_id` only when the rule has
-  an on-chain id. Rows and refusals raised before install omit it and join
-  their `SaContextRuleCreated` row through `request_id`, and the refusal
-  message omits the rule. A present `rule_id` of 0 on an override row names
-  no rule. The audit-entry constructors and `pin_referenced_contracts` take
-  the rule id as `Option<u32>`.
+- `sa.verifier_mutable`, `sa.policy_mutable`,
+  `sa.contract_instance_unsupported`, `sa.verifier_wasm_not_in_allowlist`,
+  `sa.policy_wasm_not_in_allowlist` and `network.rpc_divergence` carry
+  `rule_id` only when the refusal names a rule. A refusal raised while a rule
+  is being installed, before it has an on-chain id, and a divergence on a
+  query no rule scopes (a timelock query) omit it, and the message omits the
+  rule. `detect_contract_mutability` and `pin_referenced_contracts` take the
+  rule id as `Option<u32>`.
+- `SaMutableContractOverride` and `SaUnknownContractOverride` are written
+  after the rule install or the verifier or policy add confirms, carry the
+  rule id and the operation's `request_id`, and precede the row that records
+  the rule's pins: `SaContextRuleCreated` on install,
+  `SaContextRulePinsUpdated` on an add. A refused operation writes no
+  override row, and proposing a rule through `stellar_rule_create` writes
+  none; the rows are written when the rule is installed.
+  `pin_referenced_contracts` writes no audit row and takes no audit writer
+  or chain id; `PinResult` gains `pending_overrides`, the overrides the
+  install writes once it confirms. The audit-entry constructors take the
+  rule id as `Option<u32>`, and rows without it keep reading.
 
 ### Fixed
 
