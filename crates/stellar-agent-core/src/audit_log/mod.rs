@@ -128,9 +128,11 @@ pub use schema::{
     PolicyDecision, TipAnchorReason, ValueActionKind, ValueLegRecord, executable_refs_or_empty,
 };
 pub use signer_set::{
-    BaselineReason, DOMAIN_SA_SIGNER_SET_V1, ObservedSignerSet, SignerPubkey,
-    SignerSetStatePayload, compute_signer_set_digest, format_digest_first8_last8,
-    signer_pubkey_canonical_body,
+    BaselineReason, DOMAIN_SA_ACCOUNT_ID_V1, DOMAIN_SA_SIGNER_SET_V1, DOMAIN_SA_SIGNER_SET_V2,
+    ObservedSignerSet, SignerEntryV2, SignerIdentityV2, SignerPubkey, SignerSetSnapshotV2,
+    SignerSetStatePayload, SignerSetView, SignerSetViewPayload, ThresholdObservation,
+    account_digest, compute_signer_set_digest, compute_signer_set_digest_v2,
+    format_digest_first8_last8, signer_pubkey_canonical_body,
 };
 pub use tip_anchor::{
     KeyedAuditAccess, TipAnchor, TipAnchorParseError, TipAnchorStore, TipAnchorStoreError,

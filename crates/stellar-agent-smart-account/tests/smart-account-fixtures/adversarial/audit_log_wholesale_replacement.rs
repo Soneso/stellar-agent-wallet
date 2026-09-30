@@ -4,7 +4,7 @@
 //! hash chain (an audit log from a different rule / smart account, integrity-clean
 //! per its own chain check). Asserts that the divergence-check path refuses because
 //! the most-recent state row in the replacement log was written for a DIFFERENT
-//! `smart_account_redacted` value, so `find_latest_signer_set_state` returns `None`
+//! `smart_account_redacted` value, so `find_latest_signer_set_view` returns `None`
 //! for the queried `(rule_id, smart_account_redacted)` pair → `SignerSetMissingBaseline`.
 //!
 //! Note: the full HMAC-sidecar binding (binding the chain's HMAC root to a
@@ -91,9 +91,9 @@ fn write_baseline(
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 /// A wholesale-replaced log written for a DIFFERENT smart account is not matched
-/// by `find_latest_signer_set_state` for the victim account → `SignerSetMissingBaseline`.
+/// by `find_latest_signer_set_view` for the victim account → `SignerSetMissingBaseline`.
 ///
-/// This validates the `smart_account_redacted` filter in `find_latest_signer_set_state`:
+/// This validates the `smart_account_redacted` filter in `find_latest_signer_set_view`:
 /// even if the replacement chain is integrity-clean, the reader returns `None` for
 /// the victim's `(rule_id, smart_account_redacted)` pair because it does not appear
 /// in the attacker's log.

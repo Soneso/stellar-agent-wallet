@@ -1104,6 +1104,178 @@ impl AuditEntry {
         }
     }
 
+    /// Constructs a `SaSignerSetBaselinedV2` audit entry.
+    ///
+    /// A baseline row is written only through `SignersManager::emit_baseline`;
+    /// the repository gate `check-no-direct-sasignersetbaselined-emit.sh`
+    /// confines every call of this constructor to that function.
+    ///
+    /// `observed_at_ledger_seq` is the ledger sequence the observation was
+    /// read at. `prev_chain_tip_hash` MUST be sourced from
+    /// `AuditWriter::current_chain_tip()` inside the same write critical
+    /// section. `account_digest` is `signer_set::account_digest` of the
+    /// manager's network passphrase and the full smart-account C-strkey;
+    /// `smart_account_redacted` MUST already be redacted first-5-last-5.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "irreducible per-entry constructor surface"
+    )]
+    #[must_use]
+    pub fn new_sa_signer_set_baselined_v2(
+        rule_id: u32,
+        snapshot: &super::signer_set::SignerSetSnapshotV2,
+        observed_at_ledger_seq: u32,
+        observed_at_unix_ms: u64,
+        baseline_reason: super::signer_set::BaselineReason,
+        prev_chain_tip_hash: [u8; 32],
+        account_digest: [u8; 32],
+        smart_account_redacted: impl Into<RedactedStrkey>,
+        chain_id: impl IntoOptionalChainId,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "sa.signer_set_baselined".to_owned(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec!["rule_id".to_owned()],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::SaSignerSetBaselinedV2 {
+                rule_id,
+                snapshot: snapshot.clone(),
+                observed_at_ledger_seq,
+                observed_at_unix_ms,
+                baseline_reason,
+                prev_chain_tip_hash,
+                account_digest,
+                smart_account_redacted: smart_account_redacted.into(),
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
+    /// Constructs a `SaSignerAddedV2` audit entry.
+    ///
+    /// `snapshot` is the rule's signer set after the addition. `account_digest`
+    /// is `signer_set::account_digest` of the manager's network passphrase
+    /// and the full smart-account C-strkey; `smart_account_redacted` MUST
+    /// already be redacted first-5-last-5.
+    #[must_use]
+    pub fn new_sa_signer_added_v2(
+        rule_id: u32,
+        signer_id: u32,
+        snapshot: &super::signer_set::SignerSetSnapshotV2,
+        account_digest: [u8; 32],
+        smart_account_redacted: impl Into<RedactedStrkey>,
+        chain_id: impl IntoOptionalChainId,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self::signer_set_state_v2(
+            "sa.signer_added",
+            EventKind::SaSignerAddedV2 {
+                rule_id,
+                signer_id,
+                snapshot: snapshot.clone(),
+                account_digest,
+                smart_account_redacted: smart_account_redacted.into(),
+            },
+            chain_id,
+            request_id,
+        )
+    }
+
+    /// Constructs a `SaSignerRemovedV2` audit entry.
+    ///
+    /// `snapshot` is the rule's signer set after the removal. `account_digest`
+    /// is `signer_set::account_digest` of the manager's network passphrase
+    /// and the full smart-account C-strkey; `smart_account_redacted` MUST
+    /// already be redacted first-5-last-5.
+    #[must_use]
+    pub fn new_sa_signer_removed_v2(
+        rule_id: u32,
+        signer_id: u32,
+        snapshot: &super::signer_set::SignerSetSnapshotV2,
+        account_digest: [u8; 32],
+        smart_account_redacted: impl Into<RedactedStrkey>,
+        chain_id: impl IntoOptionalChainId,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self::signer_set_state_v2(
+            "sa.signer_removed",
+            EventKind::SaSignerRemovedV2 {
+                rule_id,
+                signer_id,
+                snapshot: snapshot.clone(),
+                account_digest,
+                smart_account_redacted: smart_account_redacted.into(),
+            },
+            chain_id,
+            request_id,
+        )
+    }
+
+    /// Constructs a `SaThresholdChangedV2` audit entry.
+    ///
+    /// `previous_threshold` is the observation before the change and
+    /// `snapshot` the rule's signer set and observation after it; either
+    /// observation may be `None`. `account_digest` is
+    /// `signer_set::account_digest` of the manager's network passphrase and
+    /// the full smart-account C-strkey; `smart_account_redacted` MUST already
+    /// be redacted first-5-last-5.
+    #[must_use]
+    pub fn new_sa_threshold_changed_v2(
+        rule_id: u32,
+        previous_threshold: Option<super::signer_set::ThresholdObservation>,
+        snapshot: &super::signer_set::SignerSetSnapshotV2,
+        account_digest: [u8; 32],
+        smart_account_redacted: impl Into<RedactedStrkey>,
+        chain_id: impl IntoOptionalChainId,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self::signer_set_state_v2(
+            "sa.threshold_changed",
+            EventKind::SaThresholdChangedV2 {
+                rule_id,
+                previous_threshold,
+                snapshot: snapshot.clone(),
+                account_digest,
+                smart_account_redacted: smart_account_redacted.into(),
+            },
+            chain_id,
+            request_id,
+        )
+    }
+
+    /// The common envelope of the version-2 signer-set mutation rows: the
+    /// v1 sibling's `tool` string and no argument keys.
+    fn signer_set_state_v2(
+        tool: &str,
+        event_kind: EventKind,
+        chain_id: impl IntoOptionalChainId,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.to_owned(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind,
+            previous_entry_hash: String::new(),
+        }
+    }
+
     /// Constructs a `SaMutableContractOverride` audit entry.
     ///
     /// Written after a rule install or a verifier or policy add confirms, for
@@ -5888,6 +6060,242 @@ mod tests {
             back.event_kind,
             EventKind::SaSignerSetBaselined { .. }
         ));
+    }
+
+    // ── Version-2 signer-set rows ─────────────────────────────────────────────
+
+    /// The published Vector B snapshot: one External signer over the 40-byte
+    /// key data `00 01 .. 27` and one DelegatedContract signer, with a
+    /// threshold observation.
+    fn vector_b_snapshot() -> crate::audit_log::signer_set::SignerSetSnapshotV2 {
+        use crate::audit_log::signer_set::{
+            SignerEntryV2, SignerIdentityV2, SignerSetSnapshotV2, ThresholdObservation,
+        };
+        use sha2::{Digest, Sha256};
+        let key_data: Vec<u8> = (0u8..40).collect();
+        SignerSetSnapshotV2 {
+            signers: vec![
+                SignerEntryV2 {
+                    id: 3,
+                    identity: SignerIdentityV2::External {
+                        verifier: [0x33; 32],
+                        key_data_sha256: Sha256::digest(&key_data).into(),
+                        key_data_len: 40,
+                    },
+                },
+                SignerEntryV2 {
+                    id: 7,
+                    identity: SignerIdentityV2::DelegatedContract {
+                        contract: [0x44; 32],
+                    },
+                },
+            ],
+            threshold: Some(ThresholdObservation {
+                policy: [0x55; 32],
+                threshold: 2,
+            }),
+        }
+    }
+
+    const VECTOR_ACCOUNT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+    const VECTOR_PASSPHRASE: &str = "Test SDF Network ; September 2015";
+
+    #[test]
+    fn sa_signer_set_baselined_v2_constructor_shape() {
+        use crate::audit_log::signer_set::{BaselineReason, account_digest};
+
+        let snapshot = vector_b_snapshot();
+        let digest = account_digest(VECTOR_PASSPHRASE, VECTOR_ACCOUNT);
+        let entry = AuditEntry::new_sa_signer_set_baselined_v2(
+            9,
+            &snapshot,
+            1234,
+            1_700_000_000_000,
+            BaselineReason::confirmed_install(),
+            [0xab; 32],
+            digest,
+            RedactedStrkey::from_already_redacted("CAAAA...AD2KM"),
+            "stellar:testnet",
+            "req-baseline-v2-001",
+        );
+        assert_eq!(entry.tool, "sa.signer_set_baselined");
+        assert_eq!(entry.arg_keys, vec!["rule_id"]);
+        assert_eq!(entry.chain_id.as_deref(), Some("stellar:testnet"));
+        assert_eq!(entry.request_id, "req-baseline-v2-001");
+        assert!(matches!(entry.policy_decision, PolicyDecision::Allow));
+        assert!(entry.previous_entry_hash.is_empty());
+        let EventKind::SaSignerSetBaselinedV2 {
+            rule_id,
+            snapshot: row_snapshot,
+            observed_at_ledger_seq,
+            observed_at_unix_ms,
+            baseline_reason,
+            prev_chain_tip_hash,
+            account_digest: row_digest,
+            smart_account_redacted,
+        } = &entry.event_kind
+        else {
+            panic!(
+                "expected SaSignerSetBaselinedV2; got: {:?}",
+                entry.event_kind
+            );
+        };
+        assert_eq!(*rule_id, 9);
+        assert_eq!(row_snapshot, &snapshot);
+        assert_eq!(
+            *observed_at_ledger_seq, 1234,
+            "the caller's ledger sequence"
+        );
+        assert_eq!(*observed_at_unix_ms, 1_700_000_000_000);
+        assert_eq!(*baseline_reason, BaselineReason::ConfirmedInstall);
+        assert_eq!(*prev_chain_tip_hash, [0xab; 32]);
+        assert_eq!(*row_digest, digest);
+        assert_eq!(smart_account_redacted, "CAAAA...AD2KM");
+    }
+
+    /// The wire shape of a version-2 baseline row, pinned by text: Vector B,
+    /// reason `confirmed_install`, ledger 1234, the account-digest vector.
+    #[test]
+    fn sa_signer_set_baselined_v2_wire_shape_is_pinned() {
+        use crate::audit_log::signer_set::{BaselineReason, account_digest};
+
+        let entry = AuditEntry::new_sa_signer_set_baselined_v2(
+            9,
+            &vector_b_snapshot(),
+            1234,
+            1_700_000_000_000,
+            BaselineReason::ConfirmedInstall,
+            [0x00; 32],
+            account_digest(VECTOR_PASSPHRASE, VECTOR_ACCOUNT),
+            RedactedStrkey::from_already_redacted("CAAAA...AD2KM"),
+            "stellar:testnet",
+            "req-baseline-v2-wire",
+        );
+        let expected = concat!(
+            r#"{"kind":"sa_signer_set_baselined_v2","rule_id":9,"snapshot":{"signers":["#,
+            r#"{"id":3,"identity":{"kind":"external","#,
+            r#""verifier":"3333333333333333333333333333333333333333333333333333333333333333","#,
+            r#""key_data_sha256":"5faa4eec3611556812c2d74b437c8c49add3f910f10063d801441f7d75cd5e3b","#,
+            r#""key_data_len":40}},"#,
+            r#"{"id":7,"identity":{"kind":"delegated_contract","#,
+            r#""contract":"4444444444444444444444444444444444444444444444444444444444444444"}}],"#,
+            r#""threshold":{"policy":"5555555555555555555555555555555555555555555555555555555555555555","#,
+            r#""threshold":2}},"#,
+            r#""observed_at_ledger_seq":1234,"observed_at_unix_ms":1700000000000,"#,
+            r#""baseline_reason":"confirmed_install","#,
+            r#""prev_chain_tip_hash":"0000000000000000000000000000000000000000000000000000000000000000","#,
+            r#""account_digest":"bd188dc1cf49dca11c897fd86800c78d77c30d72d212bffa8031fa950cc49407","#,
+            r#""smart_account_redacted":"CAAAA...AD2KM"}"#,
+        );
+        assert_eq!(serde_json::to_string(&entry.event_kind).unwrap(), expected);
+
+        // The whole entry re-serializes byte-identically, which the audit
+        // chain's body hash requires.
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: AuditEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    #[test]
+    fn sa_signer_added_v2_constructor_shape() {
+        let snapshot = vector_b_snapshot();
+        let entry = AuditEntry::new_sa_signer_added_v2(
+            7,
+            7,
+            &snapshot,
+            [0xee; 32],
+            RedactedStrkey::from_already_redacted("CDABC...12345"),
+            "stellar:testnet",
+            "req-signer-add-v2",
+        );
+        assert_eq!(entry.tool, "sa.signer_added");
+        assert!(entry.arg_keys.is_empty());
+        assert_eq!(entry.request_id, "req-signer-add-v2");
+        let EventKind::SaSignerAddedV2 {
+            rule_id,
+            signer_id,
+            snapshot: row_snapshot,
+            account_digest,
+            smart_account_redacted,
+        } = &entry.event_kind
+        else {
+            panic!("expected SaSignerAddedV2; got: {:?}", entry.event_kind);
+        };
+        assert_eq!((*rule_id, *signer_id), (7, 7));
+        assert_eq!(row_snapshot, &snapshot);
+        assert_eq!(*account_digest, [0xee; 32]);
+        assert_eq!(smart_account_redacted, "CDABC...12345");
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains(r#""kind":"sa_signer_added_v2""#), "{json}");
+        let back: AuditEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    #[test]
+    fn sa_signer_removed_v2_constructor_shape() {
+        let snapshot = vector_b_snapshot();
+        let entry = AuditEntry::new_sa_signer_removed_v2(
+            3,
+            5,
+            &snapshot,
+            [0xee; 32],
+            RedactedStrkey::from_already_redacted("CDABC...12345"),
+            "stellar:testnet",
+            "req-signer-rem-v2",
+        );
+        assert_eq!(entry.tool, "sa.signer_removed");
+        assert!(entry.arg_keys.is_empty());
+        let EventKind::SaSignerRemovedV2 {
+            rule_id,
+            signer_id,
+            snapshot: row_snapshot,
+            ..
+        } = &entry.event_kind
+        else {
+            panic!("expected SaSignerRemovedV2; got: {:?}", entry.event_kind);
+        };
+        assert_eq!((*rule_id, *signer_id), (3, 5));
+        assert_eq!(row_snapshot, &snapshot);
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains(r#""kind":"sa_signer_removed_v2""#), "{json}");
+        let back: AuditEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    #[test]
+    fn sa_threshold_changed_v2_constructor_shape() {
+        let snapshot = vector_b_snapshot();
+        let entry = AuditEntry::new_sa_threshold_changed_v2(
+            4,
+            None,
+            &snapshot,
+            [0xee; 32],
+            RedactedStrkey::from_already_redacted("CDABC...12345"),
+            "stellar:testnet",
+            "req-thresh-v2",
+        );
+        assert_eq!(entry.tool, "sa.threshold_changed");
+        assert!(entry.arg_keys.is_empty());
+        let EventKind::SaThresholdChangedV2 {
+            rule_id,
+            previous_threshold,
+            snapshot: row_snapshot,
+            ..
+        } = &entry.event_kind
+        else {
+            panic!("expected SaThresholdChangedV2; got: {:?}", entry.event_kind);
+        };
+        assert_eq!(*rule_id, 4);
+        assert_eq!(*previous_threshold, None);
+        assert_eq!(row_snapshot.threshold, snapshot.threshold);
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(
+            json.contains(r#""kind":"sa_threshold_changed_v2""#),
+            "{json}"
+        );
+        assert!(json.contains(r#""previous_threshold":null"#), "{json}");
+        let back: AuditEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
     }
 
     // ── SaPolicyAdded / SaPolicyRemoved ───────────────────────────────────────

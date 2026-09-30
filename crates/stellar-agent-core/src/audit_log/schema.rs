@@ -1258,7 +1258,7 @@ pub enum EventKind {
         /// Full public-key envelopes for reconstruction.
         ///
         /// Stored locally in the audit log for baseline reconstruction by
-        /// `AuditReader::find_latest_signer_set_state`.
+        /// `AuditReader::find_latest_signer_set_view`.
         observed_signer_pubkeys: Vec<SignerPubkey>,
         /// Info-level redacted first-8-hex summaries.
         observed_signer_pubkeys_first8: Vec<String>,
@@ -1287,6 +1287,134 @@ pub enum EventKind {
         /// input (missing field) silently produce `smart_account_redacted = ""`
         /// so audit queries with `smart_account_redacted=""` would match all
         /// entries — a silent data-integrity hole.
+        smart_account_redacted: RedactedStrkey,
+    },
+
+    /// A version-2 signer-set baseline was recorded for a context rule.
+    ///
+    /// Records the rule's full signer identities and its simple-threshold
+    /// observation (`null` when the rule has none) as observed at
+    /// `observed_at_ledger_seq`. Written only through
+    /// `SignersManager::emit_baseline`; the repository gate
+    /// `check-no-direct-sasignersetbaselined-emit.sh` enforces that invariant.
+    /// Read by `AuditReader::find_latest_signer_set_view`, which keys this row
+    /// on `(rule_id, account_digest)`.
+    ///
+    /// # TOCTOU anchor (`prev_chain_tip_hash`)
+    ///
+    /// `prev_chain_tip_hash` MUST be sourced from
+    /// `AuditWriter::current_chain_tip()` inside the same write critical
+    /// section.
+    ///
+    /// # Redaction
+    ///
+    /// `smart_account_redacted` is first-5-last-5 and serves display and
+    /// filtering. The snapshot carries full identities for comparison and is
+    /// written only to the local audit log, never to a network endpoint.
+    ///
+    SaSignerSetBaselinedV2 {
+        /// Context rule ID being baselined.
+        rule_id: u32,
+        /// The observed signer set and threshold observation.
+        snapshot: super::signer_set::SignerSetSnapshotV2,
+        /// Ledger sequence at which the on-chain state was read.
+        observed_at_ledger_seq: u32,
+        /// Unix timestamp (milliseconds) when the observation was made.
+        observed_at_unix_ms: u64,
+        /// Reason this baseline was recorded.
+        baseline_reason: BaselineReason,
+        /// SHA-256 of the most recently written audit entry at emission time,
+        /// as 64 lowercase hex characters.
+        ///
+        /// Binds the baseline to a chain tip so a stale baseline cannot be
+        /// replayed ahead of newer signer-set rows.
+        #[serde(with = "super::signer_set::hex32")]
+        prev_chain_tip_hash: [u8; 32],
+        /// The account digest (`signer_set::account_digest`) of the network
+        /// passphrase and the full smart-account C-strkey, as 64 lowercase
+        /// hex characters; the reader's account key for this row.
+        #[serde(with = "super::signer_set::hex32")]
+        account_digest: [u8; 32],
+        /// Smart-account C-strkey, redacted first-5-last-5.
+        smart_account_redacted: RedactedStrkey,
+    },
+
+    /// A signer was added to a context rule; version-2 state row.
+    ///
+    /// Records the rule's full signer set after the change. Read by
+    /// `AuditReader::find_latest_signer_set_view`, which keys this row on
+    /// `(rule_id, account_digest)`.
+    ///
+    /// # Redaction
+    ///
+    /// See `SaSignerSetBaselinedV2`; the same discipline applies.
+    ///
+    SaSignerAddedV2 {
+        /// Context rule ID the signer was added to.
+        rule_id: u32,
+        /// Signer ID the smart-account contract assigned.
+        signer_id: u32,
+        /// The signer set and threshold observation after the change.
+        snapshot: super::signer_set::SignerSetSnapshotV2,
+        /// The account digest, as 64 lowercase hex characters.
+        #[serde(with = "super::signer_set::hex32")]
+        account_digest: [u8; 32],
+        /// Smart-account C-strkey, redacted first-5-last-5.
+        smart_account_redacted: RedactedStrkey,
+    },
+
+    /// A signer was removed from a context rule; version-2 state row.
+    ///
+    /// Records the rule's full signer set after the change. Read by
+    /// `AuditReader::find_latest_signer_set_view`, which keys this row on
+    /// `(rule_id, account_digest)`.
+    ///
+    /// # Redaction
+    ///
+    /// See `SaSignerSetBaselinedV2`; the same discipline applies.
+    ///
+    SaSignerRemovedV2 {
+        /// Context rule ID the signer was removed from.
+        rule_id: u32,
+        /// Signer ID that was removed.
+        signer_id: u32,
+        /// The signer set and threshold observation after the change.
+        snapshot: super::signer_set::SignerSetSnapshotV2,
+        /// The account digest, as 64 lowercase hex characters.
+        #[serde(with = "super::signer_set::hex32")]
+        account_digest: [u8; 32],
+        /// Smart-account C-strkey, redacted first-5-last-5.
+        smart_account_redacted: RedactedStrkey,
+    },
+
+    /// A context rule's threshold observation changed; version-2 state row.
+    ///
+    /// Records the threshold observation before the change and the rule's
+    /// full signer set after it; the resulting threshold is
+    /// `snapshot.threshold`. Either side may be `null`, which records that no
+    /// simple-threshold policy was observed. Read by
+    /// `AuditReader::find_latest_signer_set_view`, which keys this row on
+    /// `(rule_id, account_digest)`.
+    ///
+    /// # Redaction
+    ///
+    /// See `SaSignerSetBaselinedV2`; the same discipline applies.
+    ///
+    SaThresholdChangedV2 {
+        /// Context rule ID whose threshold observation changed.
+        rule_id: u32,
+        /// The threshold observation before the change.
+        ///
+        /// Required on the wire: `null` records that no simple-threshold
+        /// policy was observed, and a row without the key is refused.
+        #[serde(deserialize_with = "super::signer_set::hex32::required_threshold")]
+        previous_threshold: Option<super::signer_set::ThresholdObservation>,
+        /// The signer set and threshold observation after the change.
+        snapshot: super::signer_set::SignerSetSnapshotV2,
+        /// The account digest, as 64 lowercase hex characters.
+        #[serde(with = "super::signer_set::hex32")]
+        account_digest: [u8; 32],
+        /// Smart-account C-strkey, redacted first-5-last-5.
         smart_account_redacted: RedactedStrkey,
     },
 
@@ -2881,7 +3009,7 @@ pub enum EventKind {
 /// the test stays green, leaving the new variant unpinned by any tag assertion.
 /// Closing that would need the count derived from the enum itself, which needs a
 /// derive macro this workspace does not carry.
-pub const EVENT_KIND_VARIANT_COUNT: usize = 65;
+pub const EVENT_KIND_VARIANT_COUNT: usize = 69;
 
 /// Why an [`EventKind::AuditTipAnchored`] row was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3731,6 +3859,204 @@ mod tests {
             err_msg.contains("smart_account_redacted"),
             "error message must name the missing field; got: {err_msg}"
         );
+    }
+
+    fn v2_snapshot_for_schema_tests() -> crate::audit_log::signer_set::SignerSetSnapshotV2 {
+        use crate::audit_log::signer_set::{
+            SignerEntryV2, SignerIdentityV2, SignerSetSnapshotV2, ThresholdObservation,
+        };
+        SignerSetSnapshotV2 {
+            signers: vec![
+                SignerEntryV2 {
+                    id: 0,
+                    identity: SignerIdentityV2::Ed25519 { pubkey: [0x11; 32] },
+                },
+                SignerEntryV2 {
+                    id: 4,
+                    identity: SignerIdentityV2::External {
+                        verifier: [0x22; 32],
+                        key_data_sha256: [0x33; 32],
+                        key_data_len: 65,
+                    },
+                },
+            ],
+            threshold: Some(ThresholdObservation {
+                policy: [0x44; 32],
+                threshold: 2,
+            }),
+        }
+    }
+
+    /// Serializes `ev`, deserializes it back, and asserts equality and a
+    /// byte-identical second serialization.
+    fn assert_round_trips_byte_identically(ev: &EventKind) -> String {
+        let s = serde_json::to_string(ev).unwrap();
+        let back: EventKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(&back, ev);
+        assert_eq!(serde_json::to_string(&back).unwrap(), s);
+        s
+    }
+
+    /// Removes `field` from the serialized object of `ev`.
+    fn json_without(ev: &EventKind, field: &str) -> String {
+        let mut obj: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&serde_json::to_string(ev).unwrap()).unwrap();
+        assert!(obj.remove(field).is_some(), "{field} is on the row");
+        serde_json::to_string(&obj).unwrap()
+    }
+
+    fn baselined_v2_for_schema_tests() -> EventKind {
+        use crate::audit_log::signer_set::BaselineReason;
+        EventKind::SaSignerSetBaselinedV2 {
+            rule_id: 5,
+            snapshot: v2_snapshot_for_schema_tests(),
+            observed_at_ledger_seq: 99,
+            observed_at_unix_ms: 1_700_000_000_123,
+            baseline_reason: BaselineReason::ConfirmedInstall,
+            prev_chain_tip_hash: [0xdd; 32],
+            account_digest: [0xee; 32],
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CDABC...33333"),
+        }
+    }
+
+    /// Round-trip for `SaSignerSetBaselinedV2`; its 32-byte fields are hex.
+    #[test]
+    fn event_kind_sa_signer_set_baselined_v2_round_trip() {
+        let s = assert_round_trips_byte_identically(&baselined_v2_for_schema_tests());
+        assert!(
+            s.starts_with(r#"{"kind":"sa_signer_set_baselined_v2","#),
+            "{s}"
+        );
+        assert!(
+            s.contains(&format!(r#""prev_chain_tip_hash":"{}""#, "dd".repeat(32))),
+            "{s}"
+        );
+        assert!(
+            s.contains(&format!(r#""account_digest":"{}""#, "ee".repeat(32))),
+            "{s}"
+        );
+        assert!(
+            s.contains(r#""baseline_reason":"confirmed_install""#),
+            "{s}"
+        );
+    }
+
+    /// Round-trip for `SaSignerAddedV2`.
+    #[test]
+    fn event_kind_sa_signer_added_v2_round_trip() {
+        let s = assert_round_trips_byte_identically(&EventKind::SaSignerAddedV2 {
+            rule_id: 5,
+            signer_id: 4,
+            snapshot: v2_snapshot_for_schema_tests(),
+            account_digest: [0xee; 32],
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CDABC...33333"),
+        });
+        assert!(s.starts_with(r#"{"kind":"sa_signer_added_v2","#), "{s}");
+    }
+
+    /// Round-trip for `SaSignerRemovedV2`.
+    #[test]
+    fn event_kind_sa_signer_removed_v2_round_trip() {
+        let s = assert_round_trips_byte_identically(&EventKind::SaSignerRemovedV2 {
+            rule_id: 5,
+            signer_id: 2,
+            snapshot: v2_snapshot_for_schema_tests(),
+            account_digest: [0xee; 32],
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CDABC...33333"),
+        });
+        assert!(s.starts_with(r#"{"kind":"sa_signer_removed_v2","#), "{s}");
+    }
+
+    /// Round-trip for `SaThresholdChangedV2` with an absent and a present
+    /// previous observation.
+    #[test]
+    fn event_kind_sa_threshold_changed_v2_round_trip() {
+        use crate::audit_log::signer_set::ThresholdObservation;
+        for previous_threshold in [
+            None,
+            Some(ThresholdObservation {
+                policy: [0x44; 32],
+                threshold: 1,
+            }),
+        ] {
+            let absent = previous_threshold.is_none();
+            let s = assert_round_trips_byte_identically(&EventKind::SaThresholdChangedV2 {
+                rule_id: 5,
+                previous_threshold,
+                snapshot: v2_snapshot_for_schema_tests(),
+                account_digest: [0xee; 32],
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CDABC...33333"),
+            });
+            assert!(
+                s.starts_with(r#"{"kind":"sa_threshold_changed_v2","#),
+                "{s}"
+            );
+            assert_eq!(s.contains(r#""previous_threshold":null"#), absent, "{s}");
+        }
+    }
+
+    /// Every field of the version-2 rows is required; a row missing one is
+    /// refused, including the `Option` threshold fields spelled `null` when
+    /// absent.
+    #[test]
+    fn event_kind_v2_rows_refuse_a_missing_field() {
+        let baselined = baselined_v2_for_schema_tests();
+        for field in [
+            "rule_id",
+            "snapshot",
+            "observed_at_ledger_seq",
+            "observed_at_unix_ms",
+            "baseline_reason",
+            "prev_chain_tip_hash",
+            "account_digest",
+            "smart_account_redacted",
+        ] {
+            let err = serde_json::from_str::<EventKind>(&json_without(&baselined, field))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(field), "{field}: {err}");
+        }
+
+        let threshold_changed = EventKind::SaThresholdChangedV2 {
+            rule_id: 5,
+            previous_threshold: None,
+            snapshot: v2_snapshot_for_schema_tests(),
+            account_digest: [0xee; 32],
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CDABC...33333"),
+        };
+        let err = serde_json::from_str::<EventKind>(&json_without(
+            &threshold_changed,
+            "previous_threshold",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("missing field `previous_threshold`"), "{err}");
+
+        // The snapshot's own `threshold` key is required inside a row too.
+        let mut obj: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&serde_json::to_string(&baselined).unwrap()).unwrap();
+        let snapshot = obj
+            .get_mut("snapshot")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        assert!(snapshot.remove("threshold").is_some());
+        let err = serde_json::from_str::<EventKind>(&serde_json::to_string(&obj).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing field `threshold`"), "{err}");
+    }
+
+    /// A 32-byte row field spelled with uppercase hex is refused, so each
+    /// value has one accepted spelling.
+    #[test]
+    fn event_kind_v2_row_refuses_uppercase_hex() {
+        let s = serde_json::to_string(&baselined_v2_for_schema_tests()).unwrap();
+        let upper = s.replace(&"ee".repeat(32), &"EE".repeat(32));
+        assert_ne!(upper, s);
+        let err = serde_json::from_str::<EventKind>(&upper)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("uppercase"), "{err}");
     }
 
     /// Round-trip for the `PasskeyRegistered` variant.

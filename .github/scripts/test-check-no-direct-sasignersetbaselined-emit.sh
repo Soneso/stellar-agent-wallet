@@ -107,6 +107,12 @@ inject "$SIGNERS" '^    async fn fetch_context_rule_primary[(]' \
   '        let _row = AuditEntry::new_sa_signer_set_baselined(rule_id);'
 expect_fail "extra constructor call" "FAIL (a):" "(in fn fetch_context_rule_primary)"
 
+# (a) A version-2 constructor call outside fn emit_baseline.
+reset_ws
+inject "$SIGNERS" '^    async fn fetch_context_rule_primary[(]' \
+  '        let _row = AuditEntry::new_sa_signer_set_baselined_v2(rule_id);'
+expect_fail "version-2 constructor call" "FAIL (a):" "(in fn fetch_context_rule_primary)"
+
 # (b) An emit_baseline call in another function.
 reset_ws
 inject "$SIGNERS" '^    async fn fetch_signer_set[(]' \
@@ -122,6 +128,17 @@ inject "$VERIFIERS" '^pub async fn pin_referenced_contracts[(]' \
     '        signer_count: 1,' \
     '    };')"
 expect_fail "construction in verifiers.rs" "FAIL (c):" "at $VERIFIERS:"
+
+# (c) A version-2 struct-literal construction in another module.
+reset_ws
+inject "$VERIFIERS" '^pub async fn pin_referenced_contracts[(]' \
+  "$(printf '%s\n' \
+    '    let _kind = EventKind::SaSignerSetBaselinedV2 {' \
+    '        rule_id,' \
+    '        signer_count: 1,' \
+    '    };')"
+expect_fail "version-2 construction in verifiers.rs" "FAIL (c): SaSignerSetBaselinedV2" \
+  "at $VERIFIERS:"
 
 # (c) Trailing comments inside the braces are not code: neither `...` nor a
 # comment ending in `, ..` makes a construction a rest pattern.
@@ -181,6 +198,24 @@ inject_before_line "crates/stellar-agent-core/src/audit_log/schema.rs" '#[cfg(te
 expect_fail "second bare construction in the schema module" "FAIL (c):" \
   "at crates/stellar-agent-core/src/audit_log/schema.rs:"
 
+# (c) The schema module exempts each variant's definition once: a second bare
+# `SaSignerSetBaselinedV2 {` construction after the version-2 definition fails
+# although the version-1 definition was also exempted.
+reset_ws
+inject_before_line "crates/stellar-agent-core/src/audit_log/schema.rs" '#[cfg(test)]' \
+  "$(printf '%s\n' \
+    'impl EventKind {' \
+    '    pub fn forged_bare_v2() -> Self {' \
+    '        use EventKind::SaSignerSetBaselinedV2;' \
+    '        SaSignerSetBaselinedV2 {' \
+    '            rule_id: 1,' \
+    '            account_digest: [0; 32],' \
+    '        }' \
+    '    }' \
+    '}')"
+expect_fail "second bare version-2 construction in the schema module" \
+  "FAIL (c): SaSignerSetBaselinedV2" "at crates/stellar-agent-core/src/audit_log/schema.rs:"
+
 # (c) An `==` after the closing brace is a comparison, not a pattern `=`.
 reset_ws
 inject "$VERIFIERS" '^pub async fn pin_referenced_contracts[(]' \
@@ -202,6 +237,12 @@ reset_ws
 inject "$SIGNERS" '^    async fn fetch_signer_set[(]' \
   '        let _reason = BaselineReason::first_observation();'
 expect_fail "BaselineReason call" "FAIL (d):" "(in fn fetch_signer_set)"
+
+# (d) The confirmed-install constructor in another function.
+reset_ws
+inject "$SIGNERS" '^    async fn fetch_signer_set[(]' \
+  '        let _reason = BaselineReason::confirmed_install();'
+expect_fail "confirmed_install call" "FAIL (d):" "(in fn fetch_signer_set)"
 
 # (d) A `const fn` and an `extern "C" fn` are functions of their own: a call
 # inside one placed within `list_signers` is not attributed to it.
@@ -225,6 +266,17 @@ printf '%s\n' \
   '}' >"$WS/crates/stellar-agent-mcp/src/forged_reason.rs"
 expect_fail "direct BaselineReason variant" "FAIL (d):" \
   "at crates/stellar-agent-mcp/src/forged_reason.rs:4"
+
+# (d) The confirmed-install variant constructed directly.
+reset_ws
+printf '%s\n' \
+  'use stellar_agent_core::audit_log::signer_set::BaselineReason;' \
+  '' \
+  'pub fn forged_install_reason() -> BaselineReason {' \
+  '    BaselineReason::ConfirmedInstall' \
+  '}' >"$WS/crates/stellar-agent-mcp/src/forged_install_reason.rs"
+expect_fail "direct ConfirmedInstall variant" "FAIL (d):" \
+  "at crates/stellar-agent-mcp/src/forged_install_reason.rs:4"
 
 # The walk covers every crate: a construction in a new MCP source file.
 reset_ws
@@ -320,6 +372,7 @@ reset_ws
 inject "$VERIFIERS" '^pub async fn pin_referenced_contracts[(]' \
   "$(printf '%s\n' \
     '    let _baselined = matches!(kind, EventKind::SaSignerSetBaselined { .. });' \
+    '    let _baselined_v2 = matches!(kind, EventKind::SaSignerSetBaselinedV2 { .. });' \
     '    match kind {' \
     '        EventKind::SaSignerSetBaselined { rule_id } => {}' \
     '        EventKind::SaSignerSetBaselined { rule_id } | EventKind::Other => {}' \
@@ -333,6 +386,10 @@ inject "$VERIFIERS" '^pub async fn pin_referenced_contracts[(]' \
     '    match reason {' \
     '        BaselineReason::FirstObservation => {}' \
     '        BaselineReason::ExplicitRefresh | _ => {}' \
+    '    }' \
+    '    match reason {' \
+    '        BaselineReason::ConfirmedInstall => {}' \
+    '        _ => {}' \
     '    }')"
 expect_pass "production pattern match"
 

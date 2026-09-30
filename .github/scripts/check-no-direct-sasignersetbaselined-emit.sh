@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Single-caller gate for the `SaSignerSetBaselined` audit row.
+# Single-caller gate for the `SaSignerSetBaselined` and `SaSignerSetBaselinedV2`
+# audit rows.
 #
 # A signer-set baseline is the anchor of divergence detection, so only
 # `SignersManager::list_signers` (first observation) and
@@ -23,22 +24,27 @@
 # Assertions (each failure prints one line naming the offending file:line and
 # exits 1):
 #   (a) exactly one call `new_sa_signer_set_baselined(`, inside `fn
-#       emit_baseline` of the signers manager;
+#       emit_baseline` of the signers manager, and every call
+#       `new_sa_signer_set_baselined_v2(` inside that same function (none is
+#       also accepted);
 #   (b) exactly two calls `emit_baseline(`, one inside `fn list_signers` and
 #       one inside `fn refresh_signer_baseline` of the signers manager;
-#   (c) no construction `SaSignerSetBaselined { .. }`, with any path prefix,
-#       outside the audit-entry module; the variant definition in the schema
-#       module is exempt. An occurrence is a pattern when its braces end in a
+#   (c) no construction `SaSignerSetBaselined { .. }` or
+#       `SaSignerSetBaselinedV2 { .. }`, with any path prefix, outside the
+#       audit-entry module; each variant's definition in the schema module is
+#       exempt once. An occurrence is a pattern when its braces end in a
 #       rest pattern (`..` after `{` or `,`) or the first token after the
 #       closing brace is `=>`, `|`, `if` or `=`, and a construction otherwise.
 #       The match requires the opening brace on the same line as the variant
 #       name, which `cargo fmt` guarantees for code that passes the CI fmt job;
 #   (d) no use of `BaselineReason::first_observation()`,
-#       `BaselineReason::explicit_refresh()`, `BaselineReason::FirstObservation`
-#       or `BaselineReason::ExplicitRefresh` (or the `Self::` forms) outside
-#       `fn list_signers` and `fn refresh_signer_baseline` of the signers
-#       manager and outside the module that defines `BaselineReason`; a
-#       variant followed by `=>` or `|` is a pattern and allowed;
+#       `BaselineReason::explicit_refresh()`,
+#       `BaselineReason::confirmed_install()`, `BaselineReason::FirstObservation`,
+#       `BaselineReason::ExplicitRefresh` or `BaselineReason::ConfirmedInstall`
+#       (or the `Self::` forms) outside `fn list_signers` and
+#       `fn refresh_signer_baseline` of the signers manager and outside the
+#       module that defines `BaselineReason`; a variant followed by `=>` or
+#       `|` is a pattern and allowed;
 #   (e) no `use` statement importing through `EventKind::` or renaming
 #       `EventKind as`, outside the audit-entry and schema modules, so every
 #       construction in (c) is spelled with a visible path.
@@ -114,8 +120,9 @@ function next_text(k, col, prod_end,    rest) {
   return rest
 }
 
-# Classifies the `SaSignerSetBaselined {` occurrence whose opening brace is
-# at column `col` of line `i`: returns "pattern" or "construction".
+# Classifies the `SaSignerSetBaselined {` or `SaSignerSetBaselinedV2 {`
+# occurrence whose opening brace is at column `col` of line `i`: returns
+# "pattern" or "construction".
 function classify(i, col, prod_end,    depth, text, k, line, c, ch, start) {
   depth = 0
   text = ""
@@ -152,7 +159,7 @@ function verdict(text, rest) {
 BEGIN {
   files = 0
   na = 0; nb = 0
-  a_bad = ""; b_bad = ""; c_bad = ""; d_bad = ""; e_bad = ""
+  a_bad = ""; a2_bad = ""; b_bad = ""; c_bad = ""; c_variant = ""; d_bad = ""; e_bad = ""
   a_locs = ""; b_locs = ""
   b_list = 0; b_refresh = 0
   while ((getline f < list) > 0) {
@@ -166,7 +173,7 @@ BEGIN {
     close(f)
     prod_end = test_cut(n)
     cur = ""
-    schema_definition_seen = 0
+    split("", seen)
     in_use = 0
     use_text = ""
     for (i = 1; i < prod_end; i++) {
@@ -181,6 +188,10 @@ BEGIN {
         if (a_bad == "" && !(f == signers && cur == "emit_baseline")) a_bad = loc(f, i, cur)
       }
 
+      if (def == "" && a2_bad == "" && line ~ /new_sa_signer_set_baselined_v2[(]/) {
+        if (!(f == signers && cur == "emit_baseline")) a2_bad = loc(f, i, cur)
+      }
+
       if (def == "" && line ~ /emit_baseline[(]/) {
         nb++
         b_locs = b_locs (b_locs == "" ? "" : ", ") f ":" i
@@ -192,11 +203,14 @@ BEGIN {
       if (f != entry && c_bad == "") {
         offset = 0
         rest = line
-        while (match(rest, /(^|[^A-Za-z0-9_])SaSignerSetBaselined[[:space:]]*[{]/)) {
+        while (match(rest, /(^|[^A-Za-z0-9_])SaSignerSetBaselined(V2)?[[:space:]]*[{]/)) {
           col = offset + RSTART + RLENGTH - 1
-          definition = (f == schema && !schema_definition_seen && line ~ /^[[:space:]]*SaSignerSetBaselined[[:space:]]*[{][[:space:]]*$/)
-          if (definition) schema_definition_seen = 1
-          else if (classify(i, col, prod_end) == "construction") { c_bad = f ":" i; break }
+          variant = substr(rest, RSTART, RLENGTH)
+          sub(/^[^A-Za-z0-9_]/, "", variant)
+          sub(/[[:space:]]*[{]$/, "", variant)
+          definition = (f == schema && !seen[variant] && line ~ ("^[[:space:]]*" variant "[[:space:]]*[{][[:space:]]*$"))
+          if (definition) seen[variant] = 1
+          else if (classify(i, col, prod_end) == "construction") { c_bad = f ":" i; c_variant = variant; break }
           offset = col
           rest = substr(line, col + 1)
         }
@@ -205,7 +219,7 @@ BEGIN {
       if (f != signer_set && d_bad == "") {
         offset = 0
         rest = line
-        while (match(rest, /(BaselineReason|Self)::(first_observation[(][)]|explicit_refresh[(][)]|FirstObservation|ExplicitRefresh)/)) {
+        while (match(rest, /(BaselineReason|Self)::(first_observation[(][)]|explicit_refresh[(][)]|confirmed_install[(][)]|FirstObservation|ExplicitRefresh|ConfirmedInstall)/)) {
           hit = substr(rest, RSTART, RLENGTH)
           before = RSTART > 1 ? substr(rest, RSTART - 1, 1) : ""
           after_char = substr(rest, RSTART + RLENGTH, 1)
@@ -246,6 +260,10 @@ BEGIN {
     print "FAIL (a): new_sa_signer_set_baselined( is called outside fn emit_baseline of " signers " at " a_bad
     exit 1
   }
+  if (a2_bad != "") {
+    print "FAIL (a): new_sa_signer_set_baselined_v2( is called outside fn emit_baseline of " signers " at " a2_bad
+    exit 1
+  }
   if (na != 1) {
     print "FAIL (a): expected exactly one new_sa_signer_set_baselined( call, found " na (na ? " at " a_locs : "")
     exit 1
@@ -259,7 +277,7 @@ BEGIN {
     exit 1
   }
   if (c_bad != "") {
-    print "FAIL (c): SaSignerSetBaselined is constructed outside " entry " at " c_bad
+    print "FAIL (c): " c_variant " is constructed outside " entry " at " c_bad
     exit 1
   }
   if (d_bad != "") {
@@ -270,6 +288,6 @@ BEGIN {
     print "FAIL (e): a use statement imports through EventKind:: or renames EventKind outside " entry " and " schema " at " e_bad
     exit 1
   }
-  print name ": ok (" files " files; SaSignerSetBaselined is written only through emit_baseline from list_signers and refresh_signer_baseline)"
+  print name ": ok (" files " files; SaSignerSetBaselined and SaSignerSetBaselinedV2 are written only through emit_baseline from list_signers and refresh_signer_baseline)"
 }
 '

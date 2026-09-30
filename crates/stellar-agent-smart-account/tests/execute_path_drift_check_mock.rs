@@ -34,8 +34,12 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use stellar_agent_core::audit_log::entry::AuditEntry;
+use stellar_agent_core::audit_log::reader::AuditLogIntegrityError;
 use stellar_agent_core::audit_log::schema::{EventKind, ExecutableRefPin, PinsUpdateReason};
-use stellar_agent_core::audit_log::signer_set::SignerPubkey;
+use stellar_agent_core::audit_log::signer_set::{
+    BaselineReason, SignerEntryV2, SignerIdentityV2, SignerPubkey, SignerSetSnapshotV2,
+    account_digest,
+};
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
@@ -1302,6 +1306,74 @@ async fn a_signer_add_writes_the_override_row_between_the_add_and_the_pins() {
             "sa_context_rule_pins_updated",
         ]
     );
+}
+
+/// A signer add on a rule whose newest state row is version 2 refuses with
+/// the audit-log error naming that row, before any RPC and without writing a
+/// row: this build compares version-1 baselines only, and a version-2 row is
+/// never read as a missing baseline.
+#[tokio::test]
+async fn a_signer_add_over_a_version_2_state_row_refuses_before_any_rpc() {
+    let h = signer_add_harness(true).await;
+    let snapshot = SignerSetSnapshotV2 {
+        signers: vec![
+            SignerEntryV2 {
+                id: 0,
+                identity: SignerIdentityV2::Ed25519 { pubkey: [0x01; 32] },
+            },
+            SignerEntryV2 {
+                id: 1,
+                identity: SignerIdentityV2::Ed25519 { pubkey: [0x02; 32] },
+            },
+        ],
+        threshold: None,
+    };
+    {
+        let mut writer = h.audit.lock().unwrap();
+        let tip = writer.current_chain_tip();
+        writer
+            .write_entry(AuditEntry::new_sa_signer_set_baselined_v2(
+                1,
+                &snapshot,
+                1_234,
+                1_700_000_000_000,
+                BaselineReason::confirmed_install(),
+                tip,
+                account_digest(PASSPHRASE, &strkey(&smart_account())),
+                stellar_agent_core::observability::RedactedStrkey::from_already_redacted(
+                    smart_account_redacted(),
+                ),
+                CHAIN_ID,
+                "req-v2-baseline",
+            ))
+            .unwrap();
+    }
+    let rows_before = h.rows().len();
+
+    let err = add_external_signer(&h, &verifier_v(), "req-add-over-v2", false)
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.wire_code(), "sa.audit_log", "{err:?}");
+    match &err {
+        SaError::AuditLog(AuditLogIntegrityError::ParseError { line, detail }) => {
+            assert_eq!(*line, rows_before, "the v2 row is the last row");
+            assert_eq!(
+                detail,
+                &format!(
+                    "signer-set state row audit.jsonl:{rows_before} is version 2; \
+                     this build compares version 1 rows only"
+                )
+            );
+        }
+        other => panic!("expected the version-2 refusal; got {other:?}"),
+    }
+    for log in [&h.primary_log, &h.secondary_log] {
+        assert!(log.ledger_keys.lock().unwrap().is_empty());
+        assert!(log.simulated.lock().unwrap().is_empty());
+        assert_eq!(log.sends.load(Ordering::SeqCst), 0);
+    }
+    assert_eq!(h.rows().len(), rows_before, "the refusal writes no row");
 }
 
 /// A batch whose first new verifier is admitted under the unknown-hash

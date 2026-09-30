@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Four audit event kinds record a version-2 signer-set state:
+  `SaSignerSetBaselinedV2`, `SaSignerAddedV2`, `SaSignerRemovedV2` and
+  `SaThresholdChangedV2`. Each row carries every signer's full identity (an
+  Ed25519 key, an External verifier with the SHA-256 and length of its key
+  data, or a delegated contract), a threshold observation that is `null` when
+  the rule has no simple-threshold policy, and an account digest that binds
+  the smart account to its network passphrase. Their 32-byte fields are
+  lowercase hex. The snapshot is the value type `SignerSetSnapshotV2`, built
+  from `SignerEntryV2`, `SignerIdentityV2` and `ThresholdObservation`;
+  `SignerSetSnapshotV2::validate` refuses unsorted or duplicate signer ids and
+  empty External key data with `SignerSetCanonicalBodyError::MalformedSnapshotV2`.
+  `AuditEntry::new_sa_signer_set_baselined_v2`, `new_sa_signer_added_v2`,
+  `new_sa_signer_removed_v2` and `new_sa_threshold_changed_v2` construct the
+  rows. `compute_signer_set_digest_v2` hashes a snapshot under the domain
+  `sa.signer_set.v2.divergence`, `account_digest` hashes the account under
+  `sa.account_id.v1`, and `BaselineReason` gains `ConfirmedInstall`. The four
+  value types, `SignerSetView` and `SignerSetViewPayload` are re-exported from
+  `stellar_agent_core::audit_log` and `stellar_agent_smart_account::signers`;
+  the digest functions and domain constants from `stellar_agent_core::audit_log`.
+
+### Changed
+
+- `AuditReader::find_latest_signer_set_view` replaces
+  `find_latest_signer_set_state`. It takes the account digest beside the
+  redacted account and returns the newest state row of either version as a
+  versioned `SignerSetView`, with the file and line of the row. A version-2
+  row with a malformed snapshot is an audit parse error. The signer-set
+  checks of the signing verbs compare version-1 rows, and a rule whose newest
+  state row is version 2 refuses with `sa.audit_log`.
+
 ## [0.1.0-alpha.9] - 2026-09-30
 
 ### Added

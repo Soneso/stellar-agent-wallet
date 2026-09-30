@@ -2,7 +2,7 @@
 //!
 //! Authors a sequence of audit rows (`SaSignerSetBaselined` → `SaSignerAdded` →
 //! `SaThresholdChanged` → `SaSignerRemoved`) for a rule and asserts that
-//! `AuditReader::find_latest_signer_set_state` returns the `ObservedSignerSet`
+//! `AuditReader::find_latest_signer_set_view` returns the `ObservedSignerSet`
 //! reconstructed from the MOST-RECENT row only (not the baseline row).
 //!
 //! Property check: regardless of row insertion order (baseline first, then
@@ -13,11 +13,21 @@ use std::sync::{Arc, Mutex};
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::reader::AuditReader;
-use stellar_agent_core::audit_log::signer_set::{BaselineReason, ObservedSignerSet, SignerPubkey};
+use stellar_agent_core::audit_log::signer_set::{
+    BaselineReason, ObservedSignerSet, SignerPubkey, SignerSetView, SignerSetViewPayload,
+};
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::RedactedStrkey;
 use tempfile::TempDir;
 use uuid::Uuid;
+
+/// The version-1 state of a payload; panics on a version-2 view.
+fn v1_state(payload: &SignerSetViewPayload) -> &ObservedSignerSet {
+    match payload.view() {
+        SignerSetView::V1(state) => state,
+        SignerSetView::V2(_) => panic!("expected a version-1 view, got {payload:?}"),
+    }
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -129,12 +139,12 @@ fn baseline_only_returns_baseline_state() {
 
     let reader = AuditReader::new(Arc::clone(&writer), None);
     let payload = reader
-        .find_latest_signer_set_state(RULE_ID, SMART_ACCOUNT_REDACTED)
+        .find_latest_signer_set_view(RULE_ID, SMART_ACCOUNT_REDACTED, &[0u8; 32])
         .unwrap()
         .unwrap();
 
-    assert_eq!(payload.state().signer_count, 1);
-    assert_eq!(payload.state().threshold, 1);
+    assert_eq!(v1_state(&payload).signer_count, 1);
+    assert_eq!(v1_state(&payload).threshold, 1);
 }
 
 /// After `SaSignerAdded`, the `SaSignerAdded` row dictates (signer_count=2).
@@ -163,17 +173,17 @@ fn most_recent_row_dictates_after_add() {
 
     let reader = AuditReader::new(Arc::clone(&writer), None);
     let payload = reader
-        .find_latest_signer_set_state(RULE_ID, SMART_ACCOUNT_REDACTED)
+        .find_latest_signer_set_view(RULE_ID, SMART_ACCOUNT_REDACTED, &[0u8; 32])
         .unwrap()
         .unwrap();
 
     assert_eq!(
-        payload.state().signer_count,
+        v1_state(&payload).signer_count,
         2,
         "signer_count must reflect SaSignerAdded"
     );
-    assert_eq!(payload.state().threshold, 1);
-    assert_eq!(payload.state().signer_ids, vec![0, 1]);
+    assert_eq!(v1_state(&payload).threshold, 1);
+    assert_eq!(v1_state(&payload).signer_ids, vec![0, 1]);
 }
 
 /// After baseline → SaSignerAdded → SaThresholdChanged, threshold change dictates.
@@ -210,16 +220,16 @@ fn most_recent_row_dictates_after_threshold_change() {
 
     let reader = AuditReader::new(Arc::clone(&writer), None);
     let payload = reader
-        .find_latest_signer_set_state(RULE_ID, SMART_ACCOUNT_REDACTED)
+        .find_latest_signer_set_view(RULE_ID, SMART_ACCOUNT_REDACTED, &[0u8; 32])
         .unwrap()
         .unwrap();
 
     assert_eq!(
-        payload.state().threshold,
+        v1_state(&payload).threshold,
         2,
         "threshold must reflect SaThresholdChanged"
     );
-    assert_eq!(payload.state().signer_count, 2);
+    assert_eq!(v1_state(&payload).signer_count, 2);
 }
 
 /// Full sequence: baseline → add → threshold-change → remove.
@@ -274,20 +284,20 @@ fn most_recent_row_dictates_after_remove() {
 
     let reader = AuditReader::new(Arc::clone(&writer), None);
     let payload = reader
-        .find_latest_signer_set_state(RULE_ID, SMART_ACCOUNT_REDACTED)
+        .find_latest_signer_set_view(RULE_ID, SMART_ACCOUNT_REDACTED, &[0u8; 32])
         .unwrap()
         .unwrap();
 
     assert_eq!(
-        payload.state().signer_count,
+        v1_state(&payload).signer_count,
         1,
         "signer_count must reflect remove"
     );
-    assert_eq!(payload.state().threshold, 1);
-    assert_eq!(payload.state().signer_ids, vec![0]);
+    assert_eq!(v1_state(&payload).threshold, 1);
+    assert_eq!(v1_state(&payload).signer_ids, vec![0]);
 }
 
-/// `find_latest_signer_set_state` returns `None` for a rule ID that has no rows,
+/// `find_latest_signer_set_view` returns `None` for a rule ID that has no rows,
 /// even when other rules have rows in the same log.
 #[test]
 fn missing_rule_returns_none_not_wrong_state() {
@@ -303,7 +313,7 @@ fn missing_rule_returns_none_not_wrong_state() {
 
     let reader = AuditReader::new(Arc::clone(&writer), None);
     let payload = reader
-        .find_latest_signer_set_state(42, SMART_ACCOUNT_REDACTED)
+        .find_latest_signer_set_view(42, SMART_ACCOUNT_REDACTED, &[0u8; 32])
         .unwrap();
 
     assert!(
@@ -340,15 +350,15 @@ fn per_rule_isolation_in_same_log() {
     let reader = AuditReader::new(Arc::clone(&writer), None);
 
     let r1 = reader
-        .find_latest_signer_set_state(1, SMART_ACCOUNT_REDACTED)
+        .find_latest_signer_set_view(1, SMART_ACCOUNT_REDACTED, &[0u8; 32])
         .unwrap()
         .unwrap();
-    assert_eq!(r1.state().signer_count, 1, "rule 1 must return 1-of-1");
+    assert_eq!(v1_state(&r1).signer_count, 1, "rule 1 must return 1-of-1");
 
     let r2 = reader
-        .find_latest_signer_set_state(2, SMART_ACCOUNT_REDACTED)
+        .find_latest_signer_set_view(2, SMART_ACCOUNT_REDACTED, &[0u8; 32])
         .unwrap()
         .unwrap();
-    assert_eq!(r2.state().signer_count, 3, "rule 2 must return 3-of-2");
-    assert_eq!(r2.state().threshold, 2);
+    assert_eq!(v1_state(&r2).signer_count, 3, "rule 2 must return 3-of-2");
+    assert_eq!(v1_state(&r2).threshold, 2);
 }

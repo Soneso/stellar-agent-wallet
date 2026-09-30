@@ -856,7 +856,8 @@ impl SignersManager {
 
         // Check whether a prior baseline exists. If not, emit SaSignerSetBaselined.
         // AuditLogIntegrityError must propagate — never silently reinterpreted as Ok(None).
-        let prior = self.read_audit_log_baseline(rule_id, &smart_account_redacted)?;
+        let prior =
+            self.read_audit_log_baseline(rule_id, &smart_account_strkey, &smart_account_redacted)?;
 
         if prior.is_none() {
             // First observation: emit SaSignerSetBaselined.
@@ -1079,7 +1080,8 @@ impl SignersManager {
         let _guard = mutex.lock().await;
 
         // Step 1: audit-log read (before any RPC call).
-        let baseline = self.read_audit_log_baseline(rule_id, &smart_account_redacted)?;
+        let baseline =
+            self.read_audit_log_baseline(rule_id, &smart_account_strkey, &smart_account_redacted)?;
 
         let state_payload = baseline.ok_or_else(|| SaError::SignerSetMissingBaseline {
             rule_id,
@@ -1300,6 +1302,7 @@ impl SignersManager {
             .add_signer_locked_inner(
                 smart_account.clone(),
                 rule_id,
+                &smart_account_strkey,
                 &smart_account_redacted,
                 new_signer,
                 new_signer_pubkey.clone(),
@@ -1431,6 +1434,7 @@ impl SignersManager {
             .remove_signer_locked_inner(
                 smart_account.clone(),
                 rule_id,
+                &smart_account_strkey,
                 &smart_account_redacted,
                 signer_id,
                 signer,
@@ -1541,6 +1545,7 @@ impl SignersManager {
             .set_threshold_locked_inner(
                 smart_account.clone(),
                 rule_id,
+                &smart_account_strkey,
                 &smart_account_redacted,
                 new_threshold,
                 signer,
@@ -3317,6 +3322,7 @@ impl SignersManager {
             .batch_add_signers_locked_inner(
                 smart_account.clone(),
                 rule_id,
+                &smart_account_strkey,
                 &smart_account_redacted,
                 new_signers,
                 signer,
@@ -3405,6 +3411,7 @@ impl SignersManager {
         &self,
         smart_account: ScAddress,
         rule_id: u32,
+        smart_account_strkey: &str,
         smart_account_redacted: &str,
         new_signers: Vec<(ScVal, SignerPubkey)>,
         signer: &(dyn Signer + Send + Sync),
@@ -3422,7 +3429,7 @@ impl SignersManager {
         let source_pubkey_strkey = stellar_strkey::ed25519::PublicKey(source_pubkey.0).to_string();
 
         let baseline = self
-            .read_audit_log_baseline(rule_id, smart_account_redacted)?
+            .read_audit_log_baseline(rule_id, smart_account_strkey, smart_account_redacted)?
             .ok_or_else(|| SaError::SignerSetMissingBaseline {
                 rule_id,
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
@@ -3818,24 +3825,51 @@ impl SignersManager {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    /// Reads the audit-log baseline for `(rule_id, smart_account_redacted)`.
+    /// Reads the version-1 audit-log baseline of rule `rule_id` of the smart
+    /// account `smart_account_strkey`.
     ///
-    /// `AuditLogIntegrityError` MUST propagate — never silently reinterpreted as
-    /// `Ok(None)`.  This function is a thin wrapper that enforces this contract
-    /// via the return type.
+    /// The reader matches a version-1 state row on `smart_account_redacted`
+    /// and a version-2 state row on the account digest of this manager's
+    /// network passphrase and `smart_account_strkey`. This manager compares
+    /// version-1 state only: when the newest matching state row is version 2
+    /// the read refuses with `AuditLogIntegrityError::ParseError` naming the
+    /// row, which callers propagate as `sa.audit_log`; a version-2 row is
+    /// never read as a missing baseline.
+    ///
+    /// `AuditLogIntegrityError` MUST propagate; it is never reinterpreted as
+    /// `Ok(None)`.
     fn read_audit_log_baseline(
         &self,
         rule_id: u32,
+        smart_account_strkey: &str,
         smart_account_redacted: &str,
     ) -> Result<
         Option<stellar_agent_core::audit_log::signer_set::SignerSetStatePayload>,
         AuditLogIntegrityError,
     > {
+        use stellar_agent_core::audit_log::signer_set::{SignerSetView, account_digest};
+
         let reader = stellar_agent_core::audit_log::reader::AuditReader::new(
             Arc::clone(&self.audit_writer),
             None,
         );
-        reader.find_latest_signer_set_state(rule_id, smart_account_redacted)
+        let digest = account_digest(&self.network_passphrase, smart_account_strkey);
+        let Some(payload) =
+            reader.find_latest_signer_set_view(rule_id, smart_account_redacted, &digest)?
+        else {
+            return Ok(None);
+        };
+        match payload.view() {
+            SignerSetView::V1(_) => Ok(payload.into_v1()),
+            SignerSetView::V2(_) => Err(AuditLogIntegrityError::ParseError {
+                line: payload.line(),
+                detail: format!(
+                    "signer-set state row {}:{} is version 2; this build compares version 1 rows only",
+                    payload.file(),
+                    payload.line()
+                ),
+            }),
+        }
     }
 
     /// Emits a `SaSignerSetBaselined` audit row.
@@ -4144,6 +4178,7 @@ impl SignersManager {
         &self,
         smart_account: ScAddress,
         rule_id: u32,
+        smart_account_strkey: &str,
         smart_account_redacted: &str,
         new_signer: ScVal,
         new_signer_pubkey: SignerPubkey,
@@ -4163,7 +4198,7 @@ impl SignersManager {
 
         // Read baseline signer set for pre-flight invariant check.
         let baseline = self
-            .read_audit_log_baseline(rule_id, smart_account_redacted)?
+            .read_audit_log_baseline(rule_id, smart_account_strkey, smart_account_redacted)?
             .ok_or_else(|| SaError::SignerSetMissingBaseline {
                 rule_id,
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
@@ -4353,6 +4388,7 @@ impl SignersManager {
         &self,
         smart_account: ScAddress,
         rule_id: u32,
+        smart_account_strkey: &str,
         smart_account_redacted: &str,
         signer_id: u32,
         signer: &(dyn Signer + Send + Sync),
@@ -4370,7 +4406,7 @@ impl SignersManager {
 
         // Read baseline.
         let baseline = self
-            .read_audit_log_baseline(rule_id, smart_account_redacted)?
+            .read_audit_log_baseline(rule_id, smart_account_strkey, smart_account_redacted)?
             .ok_or_else(|| SaError::SignerSetMissingBaseline {
                 rule_id,
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
@@ -4439,10 +4475,12 @@ impl SignersManager {
     }
 
     /// Core logic for `set_threshold` (called inside the per-rule mutex).
+    #[allow(clippy::too_many_arguments, reason = "irreducible inner arg set")]
     async fn set_threshold_locked_inner(
         &self,
         smart_account: ScAddress,
         rule_id: u32,
+        smart_account_strkey: &str,
         smart_account_redacted: &str,
         new_threshold: u32,
         signer: &(dyn Signer + Send + Sync),
@@ -4460,7 +4498,7 @@ impl SignersManager {
 
         // Read baseline for old_threshold.
         let baseline = self
-            .read_audit_log_baseline(rule_id, smart_account_redacted)?
+            .read_audit_log_baseline(rule_id, smart_account_strkey, smart_account_redacted)?
             .ok_or_else(|| SaError::SignerSetMissingBaseline {
                 rule_id,
                 smart_account_redacted: RedactedStrkey::from_already_redacted(

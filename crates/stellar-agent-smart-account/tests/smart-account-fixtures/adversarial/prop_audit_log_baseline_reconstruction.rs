@@ -1,7 +1,7 @@
 //! Adversarial fixture: property tests for audit-log baseline reconstruction.
 //!
 //! Property: for any N-entry sequence of `SaSignerSetBaselined` rows with
-//! distinct `(rule_id, smart_account_redacted)` pairs, `find_latest_signer_set_state`
+//! distinct `(rule_id, smart_account_redacted)` pairs, `find_latest_signer_set_view`
 //! always returns the MOST RECENT row for the queried pair, or `None` for an
 //! unqueried pair.
 //!
@@ -12,15 +12,25 @@
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::reader::AuditReader;
-use stellar_agent_core::audit_log::signer_set::{BaselineReason, ObservedSignerSet, SignerPubkey};
+use stellar_agent_core::audit_log::signer_set::{
+    BaselineReason, ObservedSignerSet, SignerPubkey, SignerSetView, SignerSetViewPayload,
+};
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::RedactedStrkey;
 use uuid::Uuid;
 
+/// The version-1 state of a payload; panics on a version-2 view.
+fn v1_state(payload: &SignerSetViewPayload) -> &ObservedSignerSet {
+    match payload.view() {
+        SignerSetView::V1(state) => state,
+        SignerSetView::V2(_) => panic!("expected a version-1 view, got {payload:?}"),
+    }
+}
+
 // ── Property tests ────────────────────────────────────────────────────────────
 
 proptest::proptest! {
-    /// Property: `find_latest_signer_set_state` returns the most-recent row
+    /// Property: `find_latest_signer_set_view` returns the most-recent row
     /// for a queried `(rule_id, smart_account_redacted)` pair.
     ///
     /// Strategy: write between 1 and 8 baseline rows for rule_id 1 and the
@@ -68,7 +78,7 @@ proptest::proptest! {
         let reader = AuditReader::new(writer2, None);
 
         let result = reader
-            .find_latest_signer_set_state(1, "CAAAA...AD2KM")
+            .find_latest_signer_set_view(1, "CAAAA...AD2KM", &[0u8; 32])
             .expect("integrity check must pass");
 
         let payload = result.expect("most-recent row must be present");
@@ -76,15 +86,15 @@ proptest::proptest! {
         // The last row written has threshold = row_count.
         let expected_threshold = u32::try_from(row_count).unwrap_or(1);
         proptest::prop_assert_eq!(
-            payload.state().threshold,
+            v1_state(&payload).threshold,
             expected_threshold,
             "expected most-recent row threshold {}, got {}",
             expected_threshold,
-            payload.state().threshold
+            v1_state(&payload).threshold
         );
     }
 
-    /// Property: `find_latest_signer_set_state` returns `None` for a pair
+    /// Property: `find_latest_signer_set_view` returns `None` for a pair
     /// that was never written, even if other pairs exist in the log.
     #[test]
     fn prop_unqueried_pair_returns_none(
@@ -127,7 +137,7 @@ proptest::proptest! {
 
         // Query rule_id 1 — never written.
         let result = reader
-            .find_latest_signer_set_state(1, "CAAAA...AD2KM")
+            .find_latest_signer_set_view(1, "CAAAA...AD2KM", &[0u8; 32])
             .expect("integrity check must pass");
 
         proptest::prop_assert!(
@@ -136,7 +146,7 @@ proptest::proptest! {
         );
     }
 
-    /// Property: `find_latest_signer_set_state` is independent per
+    /// Property: `find_latest_signer_set_view` is independent per
     /// `smart_account_redacted` label; writing for account A does not populate
     /// the result for account B.
     #[test]
@@ -184,7 +194,7 @@ proptest::proptest! {
 
         // Account A must be present.
         let a_result = reader
-            .find_latest_signer_set_state(1, account_a)
+            .find_latest_signer_set_view(1, account_a, &[0u8; 32])
             .expect("integrity must pass");
         proptest::prop_assert!(
             a_result.is_some(),
@@ -197,7 +207,7 @@ proptest::proptest! {
         // the same path would fail with FileLocked while writer2 is alive.
         let reader2 = AuditReader::new(writer2_clone, None);
         let b_result = reader2
-            .find_latest_signer_set_state(1, account_b)
+            .find_latest_signer_set_view(1, account_b, &[0u8; 32])
             .expect("integrity must pass");
         proptest::prop_assert!(
             b_result.is_none(),
