@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.9] - 2026-09-30
+
 ### Added
 
 - The contract Wasm-hash fetch resolves Protocol 28 external-reference
@@ -40,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `policy_removed`); the entry's request id
   joins it to the mutation's other rows. A rule's pin record is the newest
   `SaContextRuleCreated` or `SaContextRulePinsUpdated` row for it; logs
-  without the new row read as before.
+  without the new row keep reading.
 
 ### Changed
 
@@ -99,12 +101,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The policy pin allowlist accepts every policy Wasm the wallet vendors: the
   simple-threshold, weighted-threshold and spending-limit policies. It
   applies to `rules create` and `rules add-policy`.
-
 - Protocol 28 crate versions: `stellar-xdr` 28.0.0, `stellar-baselib` 0.6.0,
   `stellar-rpc-client` 28.0.0, `soroban-spec-tools` 28.0.0 and
   `stellar-ledger` 28.0.0.
 - SEP-48 argument previews and SEP-47 discovery read the code a contract
-  runs now. An external-reference contract resolves through its owner's
+  currently runs. An external-reference contract resolves through its owner's
   executable-tag entry; one with no live tag entry is refused with a message
   naming the owner and the tag. The parsed spec is cached per Wasm hash: every
   call resolves the contract's current Wasm hash first, so a contract whose
@@ -112,7 +113,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same code share one cached spec and one code fetch.
   Only the code entry returned under the requested hash is read, and code
   whose bytes do not hash to it is refused and not cached.
-- Transaction status reads no longer decode the result meta. Status, ledger
+- Transaction status reads do not decode the result meta. Status, ledger
   and created-at are read as received, so a transaction whose meta the
   wallet's XDR cannot decode still confirms. The result is decoded only for
   a failed transaction; a failed result that does not decode is reported as
@@ -156,7 +157,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for vault storage and role reads. An unknown context-type tag renders
   escaped and bounded, so a large or hostile payload yields a short reason.
   `scval_variant_name` moves to `stellar_agent_core::scval`;
-  `stellar_agent_defi::simulate` no longer exports it.
+  `stellar_agent_defi::simulate` does not export it.
 - The panic hook logs at most 256 bytes of the panic message, followed by
   the `...[TRUNCATED]` marker when it is cut. Secret strkeys are redacted on
   the full message before the cut, so no fragment of a strkey that straddles
@@ -1807,7 +1808,8 @@ policy engine, operator-approval spine, and tamper-evident audit log.
 - An agent integration guide (`docs/agents.md`) and capability-isolation example
   toolsets under `examples/toolsets/`.
 
-[Unreleased]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.8...HEAD
+[Unreleased]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.9...HEAD
+[0.1.0-alpha.9]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.8...v0.1.0-alpha.9
 [0.1.0-alpha.8]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.7...v0.1.0-alpha.8
 [0.1.0-alpha.7]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.6...v0.1.0-alpha.7
 [0.1.0-alpha.6]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.5...v0.1.0-alpha.6
