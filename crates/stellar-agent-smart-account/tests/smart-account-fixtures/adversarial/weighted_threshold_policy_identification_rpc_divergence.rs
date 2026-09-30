@@ -85,7 +85,10 @@ async fn policy_hash_rpc_disagreement_returns_rpc_divergence() {
     assert!(
         matches!(
             result,
-            Err(SaError::NetworkRpcDivergence { rule_id: 1, .. })
+            Err(SaError::NetworkRpcDivergence {
+                rule_id: Some(1),
+                ..
+            })
         ),
         "policy hash disagreement must return NetworkRpcDivergence; got: {result:?}"
     );
@@ -102,7 +105,7 @@ async fn policy_hash_rpc_disagreement_returns_rpc_divergence() {
 #[test]
 fn network_rpc_divergence_wire_code_is_consistent() {
     let policy_id_divergence = SaError::NetworkRpcDivergence {
-        rule_id: 1,
+        rule_id: Some(1),
         smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AD2KM"),
         primary_view_digest_first8: "aabb0011".to_owned(),
         secondary_view_digest_first8: "ccdd9922".to_owned(),

@@ -3,21 +3,22 @@
 //! Scenario: the verifier contract has a non-zero `Admin` storage key (mutable),
 //! but `accept_mutable_verifier = true` is set.  `pin_referenced_contracts` MUST:
 //! 1. Succeed (return `Ok(PinResult)` with `mutable_override = true`).
-//! 2. Emit a `SaMutableContractOverride` audit row BEFORE returning.
-//! 3. The override row's `request_id` matches the caller-supplied UUID.
-//!
-//! This validates the "accept-mutable-verifier override emits audit row" path
-//! (override path with operator-supplied flag).
+//! 2. Return one pending mutable override naming the verifier, which the
+//!    install writes as its `SaMutableContractOverride` row after it
+//!    confirms.
+//! 3. Write no audit row itself, although the signers manager holds a
+//!    writer: a refused install leaves no override row.
 
-use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 
-use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::schema::{ContractKind, EventKind};
+use stellar_agent_core::audit_log::schema::ContractKind;
+use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_smart_account::VERIFIER_ALLOWLIST;
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{ContextRuleDefinition, ContextRuleSignerInput};
-use stellar_agent_smart_account::managers::verifiers::pin_referenced_contracts;
+use stellar_agent_smart_account::managers::verifiers::{
+    PendingOverride, PendingOverrideKind, pin_referenced_contracts,
+};
 use stellar_xdr::{
     ContractDataDurability, ContractDataEntry, ContractExecutable, ContractId, ExtensionPoint,
     Hash, ScAddress, ScContractInstance, ScMap, ScMapEntry, ScSymbol, ScVal, ScVec,
@@ -99,32 +100,13 @@ fn mutable_verifier_ledger_entries(verifier: &ScAddress) -> serde_json::Value {
     })
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn read_audit_entries(log_path: &std::path::Path) -> Vec<AuditEntry> {
-    let file = std::fs::File::open(log_path).expect("audit log must be readable");
-    let reader = BufReader::new(file);
-    let mut entries = Vec::new();
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<AuditEntry>(trimmed) {
-            entries.push(entry);
-        }
-    }
-    entries
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-/// With `accept_mutable_verifier = true`, installing a rule whose verifier has
-/// a non-zero `Admin` storage key must succeed, return `PinResult { mutable_override: true }`,
-/// AND emit a `SaMutableContractOverride` audit row with the same `request_id`.
+/// With `accept_mutable_verifier = true`, pinning a rule whose verifier has a
+/// non-zero `Admin` storage key succeeds with `mutable_override: true` and one
+/// pending mutable override naming the verifier, and writes no audit row.
 #[tokio::test]
-async fn accept_mutable_verifier_succeeds_and_emits_override_audit_row() {
+async fn accept_mutable_verifier_succeeds_with_a_pending_override_and_writes_no_row() {
     let verifier = verifier_addr();
     let smart_account = smart_account_addr();
     let ledger_entries = mutable_verifier_ledger_entries(&verifier);
@@ -154,11 +136,8 @@ async fn accept_mutable_verifier_succeeds_and_emits_override_audit_row() {
         vec![],
     );
 
-    let request_id = Uuid::new_v4().to_string();
-
     let result = pin_referenced_contracts(
         &manager,
-        Some(&audit_writer),
         smart_account,
         ZERO_CONTRACT_REDACTED,
         &definition,
@@ -166,8 +145,7 @@ async fn accept_mutable_verifier_succeeds_and_emits_override_audit_row() {
         SOURCE_G,
         true,  // accept_mutable_verifier — MUST succeed
         false, // accept_unknown_verifier
-        "stellar:testnet",
-        request_id.clone(),
+        Uuid::new_v4().to_string(),
     )
     .await;
 
@@ -187,34 +165,31 @@ async fn accept_mutable_verifier_succeeds_and_emits_override_audit_row() {
         "pinned_verifier_wasm_hashes must be non-empty after successful pin"
     );
 
-    // SaMutableContractOverride audit row must be emitted.
-    let entries = read_audit_entries(&audit_log_path);
-    let override_row = entries.iter().find(|e| {
-        matches!(
-            &e.event_kind,
-            EventKind::SaMutableContractOverride { contract_kind, .. }
-                if *contract_kind == ContractKind::Verifier
-        )
-    });
+    // The override is pending: one mutable entry naming the verifier, with
+    // no external reference for an admin storage key.
+    let verifier_redacted = redact_strkey_first5_last5(
+        &stellar_agent_core::sc_address::scaddress_to_strkey(&verifier).expect("verifier strkey"),
+    );
     assert!(
-        override_row.is_some(),
-        "SaMutableContractOverride audit row (contract_kind='verifier') must be emitted"
+        matches!(
+            pin_result.pending_overrides.as_slice(),
+            [PendingOverride {
+                kind: PendingOverrideKind::Mutable {
+                    executable_ref: None,
+                },
+                contract_redacted,
+                contract_kind: ContractKind::Verifier,
+                ..
+            }] if contract_redacted.as_str() == verifier_redacted
+        ),
+        "one pending mutable override for the verifier: {:?}",
+        pin_result.pending_overrides
     );
 
-    // Verify request_id correlation.
-    let override_entry = override_row.unwrap();
-    assert_eq!(
-        override_entry.request_id, request_id,
-        "SaMutableContractOverride row must carry the same request_id"
-    );
-    // The row is written before install, so it names no rule and joins its
-    // SaContextRuleCreated row through request_id.
+    // Pinning writes nothing; the install writes the row after it confirms.
+    let audit_log = std::fs::read_to_string(&audit_log_path).unwrap_or_default();
     assert!(
-        matches!(
-            &override_entry.event_kind,
-            EventKind::SaMutableContractOverride { rule_id: None, .. }
-        ),
-        "a pre-install override row carries no rule id: {:?}",
-        override_entry.event_kind
+        audit_log.is_empty(),
+        "pinning writes no audit row: {audit_log}"
     );
 }

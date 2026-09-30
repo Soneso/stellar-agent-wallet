@@ -62,7 +62,9 @@ use tracing::warn;
 
 use crate::SaError;
 use crate::managers::signers::SignersManager;
-use crate::managers::verifiers::{pin_referenced_contracts, scaddress_cache_key};
+use crate::managers::verifiers::{
+    PinnedKind, PlannedPinUpdate, pin_referenced_contracts, scaddress_cache_key,
+};
 use crate::signing::divergence::AuthContextFingerprint;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -661,19 +663,28 @@ impl ContextRuleManager {
     ///   pays the source-account envelope signature.
     /// - `audit_writer` — optional audit-log handle. On success two rows
     ///   emit (`SaContextRuleCreated` + `SaRawInvocation`); on failure one
-    ///   row emits (`SaRawInvocation`). `None` skips emission entirely
-    ///   (developer / dry-run paths).
+    ///   row emits (`SaRawInvocation`). `None` writes them through the
+    ///   manager's configured audit writer, if any.
     /// - `request_id` — caller-supplied UUID for forensic correlation across
-    ///   the (success: 2 rows) / (failure: 1 row) emission set.
+    ///   every row the install writes.
     /// - `accept_mutable_verifier` — when `true`, mutable verifier / policy
     ///   contracts do NOT block install; a `SaMutableContractOverride` audit
-    ///   row is emitted instead.  Defaults to `false` (fail-closed) in
+    ///   row records each one instead.  Defaults to `false` (fail closed) in
     ///   production.  The CLI wires this via `--accept-mutable-verifier`.
     /// - `accept_unknown_verifier` — when `true`, verifier / policy contracts
     ///   whose wasm hash is NOT in the compile-time allowlist do NOT block
-    ///   install; a `SaUnknownContractOverride` audit row is emitted instead.
-    ///   Defaults to `false` (fail-closed) in production.  The CLI wires this
-    ///   via `--accept-unknown-verifier`.
+    ///   install; a `SaUnknownContractOverride` audit row records each one
+    ///   instead.  Defaults to `false` (fail closed) in production.  The CLI
+    ///   wires this via `--accept-unknown-verifier`.
+    ///
+    /// # Override rows
+    ///
+    /// The override rows carry the installed rule's id and the install's
+    /// `request_id`, and are written through the signers manager's audit
+    /// writer after the install confirms, before the `SaContextRuleCreated`
+    /// row. A refused install writes no override row: a refusal before
+    /// submission leaves only the `PreSubmissionRefused` `SaRawInvocation`
+    /// row, which records no override flag.
     ///
     /// # Refusal path
     ///
@@ -794,21 +805,8 @@ impl ContextRuleManager {
         // Runs AFTER divergence check, BEFORE install_rule_inner submission.
         // Identifies + verifies all verifier and policy contracts referenced
         // by the rule definition.  Refuses mutable / unknown-wasm contracts
-        // unless the corresponding override flag is set.
-        //
-        // Override-row writer constraint: pin_referenced_contracts emits
-        // SaMutableContractOverride / SaUnknownContractOverride via
-        // self.audit_writer (the Arc<Mutex<AuditWriter>> fallback).  Per-method
-        // writer (Option<&mut AuditWriter>) is not threaded through the async
-        // boundary.  Production callers always configure self.audit_writer via
-        // with_audit_writer (the same construction path that wires
-        // with_signers_manager), so override rows land in the correct writer.
-        // The debug_assert below catches any developer-time regression.
-        debug_assert!(
-            !(accept_mutable_verifier || accept_unknown_verifier) || self.audit_writer.is_some(),
-            "install_rule: override flag set but self.audit_writer is None; \
-             override audit rows will be silently dropped (writer-routing bug)"
-        );
+        // unless the corresponding override flag is set; an applied override
+        // is returned pending and written once the install confirms.
         //
         // When signers_manager is None (test-only escape hatch), the pin check
         // is skipped with a warn! log — same pattern as the divergence check.
@@ -816,7 +814,6 @@ impl ContextRuleManager {
         let pin_result = if let Some(ref sm) = self.signers_manager {
             let pin = pin_referenced_contracts(
                 sm,
-                self.audit_writer.as_ref(),
                 smart_account.clone(),
                 &smart_account_redacted,
                 &rule_definition,
@@ -824,7 +821,6 @@ impl ContextRuleManager {
                 &source_account_strkey,
                 accept_mutable_verifier,
                 accept_unknown_verifier,
-                &self.chain_id,
                 request_id.clone(),
             )
             .await;
@@ -862,6 +858,7 @@ impl ContextRuleManager {
                 pinned_policy_executable_refs: vec![],
                 mutable_override: false,
                 unknown_override: false,
+                pending_overrides: vec![],
             }
         };
 
@@ -881,6 +878,15 @@ impl ContextRuleManager {
         // production CLI pattern).
         match &outcome {
             Ok((rule_id, _tx_hash)) => {
+                if let Some(sm) = self.signers_manager.as_deref() {
+                    crate::managers::verifiers::write_pending_override_rows(
+                        sm,
+                        &smart_account_redacted,
+                        *rule_id,
+                        &request_id,
+                        &pin_result.pending_overrides,
+                    );
+                }
                 let created = pin_result.context_rule_created_entry(
                     &smart_account_redacted,
                     *rule_id,
@@ -998,16 +1004,14 @@ impl ContextRuleManager {
     /// still runs again, independently, at actual COMMIT time inside the
     /// unchanged `install_rule`.
     ///
-    /// Unlike `install_rule`, this method emits NO audit rows of its own:
-    /// nothing is installed by a simulate call, so no `SaContextRuleCreated`
-    /// / `SaRawInvocation` row would be accurate. `pin_referenced_contracts`
-    /// may still emit `SaMutableContractOverride` / `SaUnknownContractOverride`
-    /// override rows if the caller sets the corresponding override flag and
-    /// a mutable/unknown contract is identified — these describe an
-    /// on-chain-state FACT (independent of whether the proposal is ever
-    /// approved) and reuse the SAME check `install_rule` runs at commit,
-    /// which will emit its own override rows tied to the commit's own
-    /// `request_id` if the proposal is later approved and installed.
+    /// This method writes NO audit row: nothing is installed by a simulate
+    /// call. An override the pin check applies is reported in
+    /// [`crate::managers::verifiers::PinResult::pending_overrides`] and the
+    /// aggregate flags only; the
+    /// `SaMutableContractOverride` / `SaUnknownContractOverride` rows are
+    /// written once, by `install_rule` at commit, after the install
+    /// confirms, carrying the installed rule's id and the commit's
+    /// `request_id`.
     ///
     /// # Arguments
     ///
@@ -1046,7 +1050,6 @@ impl ContextRuleManager {
         let pin_result = if let Some(ref sm) = self.signers_manager {
             pin_referenced_contracts(
                 sm,
-                self.audit_writer.as_ref(),
                 smart_account.clone(),
                 &smart_account_redacted,
                 &rule_definition,
@@ -1054,7 +1057,6 @@ impl ContextRuleManager {
                 source_account_strkey,
                 accept_mutable_verifier,
                 accept_unknown_verifier,
-                &self.chain_id,
                 request_id.clone(),
             )
             .await?
@@ -1071,6 +1073,7 @@ impl ContextRuleManager {
                 pinned_policy_executable_refs: vec![],
                 mutable_override: false,
                 unknown_override: false,
+                pending_overrides: vec![],
             }
         };
 
@@ -1593,10 +1596,12 @@ impl ContextRuleManager {
     ///   `accept_unknown_verifier` is set, a mutable contract refuses with
     ///   [`SaError::PolicyMutable`] unless `accept_mutable_verifier` is set,
     ///   an unpinnable instance refuses with
-    ///   [`SaError::ContractInstanceUnsupported`] regardless, and an applied
-    ///   override writes its override row carrying the rule id;
-    /// - after the add confirms, a `SaContextRulePinsUpdated` row (reason
-    ///   `policy_added`) records the policy pins with the new pin appended;
+    ///   [`SaError::ContractInstanceUnsupported`] regardless;
+    /// - after the add confirms, an applied override writes its override row
+    ///   carrying the rule id, after the `SaRawInvocation` row; a refused add
+    ///   writes none;
+    /// - then a `SaContextRulePinsUpdated` row (reason `policy_added`)
+    ///   records the policy pins with the new pin appended;
     /// - with no live policy on the rule, the row replaces the policy pins
     ///   with the added policy's pin, so it pins exactly the policy set the
     ///   add produces.
@@ -1742,8 +1747,19 @@ impl ContextRuleManager {
                     raw,
                     "add_policy: SaRawInvocation",
                 );
+                if let (Some(update), Some(sm)) =
+                    (pin_update.as_ref(), self.signers_manager.as_deref())
+                {
+                    crate::managers::verifiers::write_pending_override_rows(
+                        sm,
+                        &smart_account_redacted,
+                        rule_id,
+                        &request_id,
+                        &update.pending_overrides,
+                    );
+                }
                 self.write_policy_pins_updated_row(
-                    pin_update.as_ref(),
+                    pin_update.as_ref().map(|update| &update.record),
                     &smart_account_redacted,
                     rule_id,
                     stellar_agent_core::audit_log::schema::PinsUpdateReason::PolicyAdded,
@@ -1785,7 +1801,7 @@ impl ContextRuleManager {
         request_id: &str,
         accept_mutable_verifier: bool,
         accept_unknown_verifier: bool,
-    ) -> Result<(u32, String, Option<PinnedHashesRecord>), SaError> {
+    ) -> Result<(u32, String, Option<PlannedPinUpdate>), SaError> {
         let auth_payload_err = |reason: String| SaError::AuthEntryConstructionFailed {
             stage: "auth_payload",
             redacted_reason: reason,
@@ -2069,8 +2085,9 @@ impl ContextRuleManager {
     /// Returns `None` without a signers manager or a pin record. Otherwise
     /// the returned record is the current one, with a pin appended for
     /// `policy_address` when the policy is not already live on the rule,
-    /// probed here, before submission. When the rule has no live policy, the
-    /// record's policy pins are replaced by that pin.
+    /// probed here, before submission, and the overrides applied to it
+    /// pending. When the rule has no live policy, the record's policy pins
+    /// are replaced by that pin.
     async fn plan_policy_add_pin_update(
         &self,
         smart_account: &ScAddress,
@@ -2079,13 +2096,13 @@ impl ContextRuleManager {
         accept_mutable_verifier: bool,
         accept_unknown_verifier: bool,
         request_id: &str,
-    ) -> Result<Option<PinnedHashesRecord>, SaError> {
+    ) -> Result<Option<PlannedPinUpdate>, SaError> {
         let Some(signers_manager) = self.signers_manager.as_deref() else {
             return Ok(None);
         };
         let smart_account_redacted =
             redact_strkey_first5_last5(&scaddress_to_strkey(smart_account)?);
-        let Some(mut record) = crate::managers::verifiers::read_pinned_hashes_for_rule(
+        let Some(record) = crate::managers::verifiers::read_pinned_hashes_for_rule(
             signers_manager,
             rule_id,
             &smart_account_redacted,
@@ -2100,18 +2117,18 @@ impl ContextRuleManager {
         let (_, live_policies) = signers_manager
             .fetch_verifier_and_policy_addresses(smart_account.clone(), rule_id, None)
             .await?;
+        let mut update = PlannedPinUpdate::unchanged(record);
         if live_policies.contains(policy_address) {
-            return Ok(Some(record));
+            return Ok(Some(update));
         }
         let pin = crate::managers::verifiers::pin_added_contract(
             signers_manager,
             policy_address,
-            crate::managers::verifiers::PinnedKind::Policy,
+            PinnedKind::Policy,
             rule_id,
             &smart_account_redacted,
             accept_mutable_verifier,
             accept_unknown_verifier,
-            &self.chain_id,
             request_id,
         )
         .await?;
@@ -2120,17 +2137,11 @@ impl ContextRuleManager {
             // policy of the rule; the row pins exactly the policy set the
             // add produces. The override flags stay, since they record
             // overrides applied to the rule's contracts.
-            record.pinned_policy_first8.clear();
-            record.pinned_policy_executable_refs.clear();
+            update.record.pinned_policy_first8.clear();
+            update.record.pinned_policy_executable_refs.clear();
         }
-        crate::managers::verifiers::append_pin(
-            &mut record.pinned_policy_first8,
-            &mut record.pinned_policy_executable_refs,
-            &mut record.mutable_override,
-            &mut record.unknown_override,
-            pin,
-        );
-        Ok(Some(record))
+        update.append_pin(PinnedKind::Policy, pin);
+        Ok(Some(update))
     }
 
     /// Computes the pin record a policy removal writes for rule `rule_id`
@@ -2779,133 +2790,36 @@ impl ContextRuleManager {
             Vec<u8>,
             crate::managers::signers::ObservedExecutable,
         > = std::collections::HashMap::new();
-        let mut unavailable_wire_code: Option<&'static str> = None;
 
-        // Verify each verifier address.
-        let (verifier_pin_status, observed_verifier_first8, observed_verifier_executable) =
-            if verifier_addrs.is_empty() {
-                (PinStatus::NoContracts, vec![], vec![])
-            } else {
-                let mut status = PinStatus::Match;
-                let mut observed: Vec<String> = Vec::new();
-                let mut observed_executable: Vec<Option<String>> = Vec::new();
-                for verifier_addr in verifier_addrs {
-                    let cache_key = scaddress_cache_key(&verifier_addr)?;
-                    match crate::managers::verifiers::verify_pinned_verifier_against_chain(
-                        sm,
-                        verifier_addr.clone(),
-                        rule_id,
-                        &smart_account_redacted,
-                        request_id,
-                        &mut wasm_hash_cache,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            // Observed effective hash for the envelope (already
-                            // cached); the check passed, so no code reads as the
-                            // zero hash the pin holds.
-                            if let Some(executable) = wasm_hash_cache.get(&cache_key) {
-                                let h = executable.effective_hash().unwrap_or([0u8; 32]);
-                                observed.push(crate::managers::signers::hash_first8_hex(&h));
-                                observed_executable.push(non_wasm_executable_summary(executable));
-                            }
-                        }
-                        Err(SaError::VerifierHashDrift {
-                            observed_hash_first8,
-                            ..
-                        }) => {
-                            status = PinStatus::Drift;
-                            observed.push(observed_hash_first8);
-                            observed_executable.push(
-                                wasm_hash_cache
-                                    .get(&cache_key)
-                                    .and_then(non_wasm_executable_summary),
-                            );
-                        }
-                        Err(ref e) => {
-                            if unavailable_wire_code.is_none() {
-                                unavailable_wire_code = Some(e.wire_code());
-                            }
-                            status = PinStatus::Unavailable;
-                        }
-                    }
-                }
-                (status, observed, observed_executable)
-            };
+        let verifier = verify_kind_pins(
+            PinnedKind::Verifier,
+            verifier_addrs,
+            sm,
+            rule_id,
+            &smart_account_redacted,
+            request_id,
+            &mut wasm_hash_cache,
+        )
+        .await?;
+        let policy = verify_kind_pins(
+            PinnedKind::Policy,
+            policy_addrs,
+            sm,
+            rule_id,
+            &smart_account_redacted,
+            request_id,
+            &mut wasm_hash_cache,
+        )
+        .await?;
 
-        // Verify each policy address.
-        let (policy_pin_status, observed_policy_first8, observed_policy_executable) =
-            if policy_addrs.is_empty() {
-                match crate::managers::verifiers::verify_policy_pins_present(
-                    sm,
-                    rule_id,
-                    &smart_account_redacted,
-                    request_id,
-                    &policy_addrs,
-                ) {
-                    Ok(()) => (PinStatus::NoContracts, vec![], vec![]),
-                    Err(SaError::PinnedPolicyAbsent { .. }) => (PinStatus::Drift, vec![], vec![]),
-                    // A read failure of the record is not drift; the status is
-                    // unavailable with its code.
-                    Err(ref e) => {
-                        if unavailable_wire_code.is_none() {
-                            unavailable_wire_code = Some(e.wire_code());
-                        }
-                        (PinStatus::Unavailable, vec![], vec![])
-                    }
-                }
-            } else {
-                let mut status = PinStatus::Match;
-                let mut observed: Vec<String> = Vec::new();
-                let mut observed_executable: Vec<Option<String>> = Vec::new();
-                for policy_addr in policy_addrs {
-                    let cache_key = scaddress_cache_key(&policy_addr)?;
-                    match crate::managers::verifiers::verify_pinned_policy_against_chain(
-                        sm,
-                        policy_addr.clone(),
-                        rule_id,
-                        &smart_account_redacted,
-                        request_id,
-                        &mut wasm_hash_cache,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            if let Some(executable) = wasm_hash_cache.get(&cache_key) {
-                                let h = executable.effective_hash().unwrap_or([0u8; 32]);
-                                observed.push(crate::managers::signers::hash_first8_hex(&h));
-                                observed_executable.push(non_wasm_executable_summary(executable));
-                            }
-                        }
-                        Err(SaError::PolicyHashDrift {
-                            observed_hash_first8,
-                            ..
-                        }) => {
-                            status = PinStatus::Drift;
-                            observed.push(observed_hash_first8);
-                            observed_executable.push(
-                                wasm_hash_cache
-                                    .get(&cache_key)
-                                    .and_then(non_wasm_executable_summary),
-                            );
-                        }
-                        Err(ref e) => {
-                            if unavailable_wire_code.is_none() {
-                                unavailable_wire_code = Some(e.wire_code());
-                            }
-                            status = PinStatus::Unavailable;
-                        }
-                    }
-                }
-                (status, observed, observed_executable)
-            };
-
-        // Only emit unavailable_wire_code when at least one status is Unavailable.
-        let wire_code = if verifier_pin_status == PinStatus::Unavailable
-            || policy_pin_status == PinStatus::Unavailable
+        // The first failure code, verifiers before policies, is reported only
+        // when a final status is Unavailable.
+        let wire_code = if verifier.status == PinStatus::Unavailable
+            || policy.status == PinStatus::Unavailable
         {
-            unavailable_wire_code
+            verifier
+                .unavailable_wire_code
+                .or(policy.unavailable_wire_code)
         } else {
             None
         };
@@ -2913,14 +2827,14 @@ impl ContextRuleManager {
         Ok(VerifyPinsResult {
             smart_account: smart_account_strkey,
             rule_id,
-            verifier_pin_status,
-            policy_pin_status,
+            verifier_pin_status: verifier.status,
+            policy_pin_status: policy.status,
             pinned_verifier_first8: pin_record.pinned_verifier_first8,
             pinned_policy_first8: pin_record.pinned_policy_first8,
-            observed_verifier_first8,
-            observed_policy_first8,
-            observed_verifier_executable,
-            observed_policy_executable,
+            observed_verifier_first8: verifier.observed_first8,
+            observed_policy_first8: policy.observed_first8,
+            observed_verifier_executable: verifier.observed_executable,
+            observed_policy_executable: policy.observed_executable,
             pinned_verifier_executable_refs: pin_record.pinned_verifier_executable_refs,
             pinned_policy_executable_refs: pin_record.pinned_policy_executable_refs,
             mutable_override: pin_record.mutable_override,
@@ -5422,6 +5336,149 @@ pub(crate) fn scaddress_to_strkey(addr: &ScAddress) -> Result<String, SaError> {
 pub(crate) fn xdr_scaddress_to_strkey_or_sentinel(addr: &xdr_curr::ScAddress) -> String {
     stellar_agent_core::sc_address::scaddress_to_strkey(addr)
         .unwrap_or_else(|_| "[unknown-address-type]".to_owned())
+}
+
+/// One kind's half of the verify-pins report.
+struct KindPinReport {
+    /// Last-wins status over the kind's addresses: each address sets
+    /// `Match`, `Drift` or `Unavailable` in turn.
+    status: PinStatus,
+    /// Observed first-8 of each address that matched or drifted.
+    observed_first8: Vec<String>,
+    /// Bounded summary aligned with `observed_first8`; `None` for a plain
+    /// Wasm executable.
+    observed_executable: Vec<Option<String>>,
+    /// Wire code of the kind's first failure that is not drift, recorded
+    /// whatever the final status.
+    unavailable_wire_code: Option<&'static str>,
+}
+
+/// Verifies the pins of one kind for [`ContextRuleManager::verify_rule_wasm_pins`].
+///
+/// Each address is checked against the rule's pin record through the kind's
+/// check function. The kind's drift refusal sets `Drift` and records the
+/// observed hash; any other refusal sets `Unavailable` and records its wire
+/// code if none is recorded yet. With no address, a verifier half is
+/// `NoContracts`; a policy half is `NoContracts` when the pin record holds no
+/// policy pin, `Drift` when it does ([`SaError::PinnedPolicyAbsent`]), and
+/// `Unavailable` when the record cannot be read.
+///
+/// # Errors
+///
+/// [`SaError::ScAddressEncodingFailed`] when an address cannot be encoded
+/// as a cache key.
+async fn verify_kind_pins(
+    kind: PinnedKind,
+    addrs: Vec<ScAddress>,
+    signers_manager: &SignersManager,
+    rule_id: u32,
+    smart_account_redacted: &str,
+    request_id: &str,
+    wasm_hash_cache: &mut std::collections::HashMap<
+        Vec<u8>,
+        crate::managers::signers::ObservedExecutable,
+    >,
+) -> Result<KindPinReport, SaError> {
+    let mut report = KindPinReport {
+        status: PinStatus::Match,
+        observed_first8: Vec::new(),
+        observed_executable: Vec::new(),
+        unavailable_wire_code: None,
+    };
+
+    if addrs.is_empty() {
+        report.status = match kind {
+            PinnedKind::Verifier => PinStatus::NoContracts,
+            PinnedKind::Policy => match crate::managers::verifiers::verify_policy_pins_present(
+                signers_manager,
+                rule_id,
+                smart_account_redacted,
+                request_id,
+                &addrs,
+            ) {
+                Ok(()) => PinStatus::NoContracts,
+                Err(SaError::PinnedPolicyAbsent { .. }) => PinStatus::Drift,
+                // A read failure of the record is not drift; the status is
+                // unavailable with its code.
+                Err(e) => {
+                    report.unavailable_wire_code = Some(e.wire_code());
+                    PinStatus::Unavailable
+                }
+            },
+        };
+        return Ok(report);
+    }
+
+    for addr in addrs {
+        let cache_key = scaddress_cache_key(&addr)?;
+        let outcome = match kind {
+            PinnedKind::Verifier => {
+                crate::managers::verifiers::verify_pinned_verifier_against_chain(
+                    signers_manager,
+                    addr,
+                    rule_id,
+                    smart_account_redacted,
+                    request_id,
+                    wasm_hash_cache,
+                )
+                .await
+            }
+            PinnedKind::Policy => {
+                crate::managers::verifiers::verify_pinned_policy_against_chain(
+                    signers_manager,
+                    addr,
+                    rule_id,
+                    smart_account_redacted,
+                    request_id,
+                    wasm_hash_cache,
+                )
+                .await
+            }
+        };
+        match (kind, outcome) {
+            (_, Ok(())) => {
+                // Observed effective hash for the envelope (already cached);
+                // the check passed, so no code reads as the zero hash the pin
+                // holds.
+                if let Some(executable) = wasm_hash_cache.get(&cache_key) {
+                    let h = executable.effective_hash().unwrap_or([0u8; 32]);
+                    report
+                        .observed_first8
+                        .push(crate::managers::signers::hash_first8_hex(&h));
+                    report
+                        .observed_executable
+                        .push(non_wasm_executable_summary(executable));
+                }
+            }
+            (
+                PinnedKind::Verifier,
+                Err(SaError::VerifierHashDrift {
+                    observed_hash_first8,
+                    ..
+                }),
+            )
+            | (
+                PinnedKind::Policy,
+                Err(SaError::PolicyHashDrift {
+                    observed_hash_first8,
+                    ..
+                }),
+            ) => {
+                report.status = PinStatus::Drift;
+                report.observed_first8.push(observed_hash_first8);
+                report.observed_executable.push(
+                    wasm_hash_cache
+                        .get(&cache_key)
+                        .and_then(non_wasm_executable_summary),
+                );
+            }
+            (_, Err(e)) => {
+                report.unavailable_wire_code = report.unavailable_wire_code.or(Some(e.wire_code()));
+                report.status = PinStatus::Unavailable;
+            }
+        }
+    }
+    Ok(report)
 }
 
 /// Returns the bounded summary of an observed executable for the

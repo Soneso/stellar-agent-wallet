@@ -83,7 +83,6 @@ async fn verifier_unknown_wasm_hash_rejected_without_override() {
 
     let result = pin_referenced_contracts(
         &manager,
-        Some(&audit_writer),
         smart_account,
         ZERO_CONTRACT_REDACTED,
         &definition,
@@ -91,7 +90,6 @@ async fn verifier_unknown_wasm_hash_rejected_without_override() {
         SOURCE_G,
         false, // accept_mutable_verifier
         false, // accept_unknown_verifier — MUST refuse unknown hash
-        "stellar:testnet",
         Uuid::new_v4().to_string(),
     )
     .await;
@@ -100,10 +98,25 @@ async fn verifier_unknown_wasm_hash_rejected_without_override() {
         matches!(result, Err(SaError::VerifierWasmNotInAllowlist { .. })),
         "unknown-wasm verifier must be refused without accept_unknown_verifier; got: {result:?}"
     );
+    let error = result.unwrap_err();
     assert_eq!(
-        result.unwrap_err().wire_code(),
+        error.wire_code(),
         "sa.verifier_wasm_not_in_allowlist",
         "wire_code must be 'sa.verifier_wasm_not_in_allowlist'"
+    );
+    // The rule has no on-chain id before install, so the refusal names none.
+    assert!(
+        matches!(
+            error,
+            SaError::VerifierWasmNotInAllowlist { rule_id: None, .. }
+        ),
+        "a pre-install refusal carries no rule id: {error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .starts_with("verifier wasm hash not in VERIFIER_ALLOWLIST: "),
+        "{error}"
     );
 }
 
@@ -114,7 +127,7 @@ async fn verifier_unknown_wasm_hash_rejected_without_override() {
 #[test]
 fn verifier_wasm_not_in_allowlist_wire_code_is_consistent() {
     let err = SaError::VerifierWasmNotInAllowlist {
-        rule_id: 0,
+        rule_id: None,
         smart_account_redacted: RedactedStrkey::from_already_redacted(ZERO_CONTRACT_REDACTED),
         observed_hash_first8: "dddddddd".to_owned(),
         request_id: Uuid::new_v4().to_string(),

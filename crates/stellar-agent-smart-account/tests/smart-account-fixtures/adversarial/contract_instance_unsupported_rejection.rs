@@ -8,22 +8,23 @@
 //! `pin_referenced_contracts` MUST return
 //! `SaError::ContractInstanceUnsupported` with
 //! `wire_code = "sa.contract_instance_unsupported"` whatever override flags
-//! are set, and MUST NOT emit a `SaMutableContractOverride` audit row.
+//! are set, and MUST write no audit row.
 //!
-//! Where the refusal happens decides which override rows can exist:
+//! Where the refusal happens:
 //!
 //! - A Stellar Asset Contract instance has no Wasm hash, so identification
-//!   reports an allowlist miss; with `accept_unknown_verifier` the install
-//!   records the unknown-hash override and the mutability probe then refuses.
+//!   reports an allowlist miss; with `accept_unknown_verifier` the pin
+//!   applies the unknown-hash override and the mutability probe then
+//!   refuses, so the refused install writes no override row.
 //! - An undecodable instance and an unresolved external reference are
 //!   refused by identification itself, before either override flag is
-//!   consulted, so no override row of either kind is written.
+//!   consulted.
 
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::schema::{ContractKind, EventKind};
+use stellar_agent_core::audit_log::schema::ContractKind;
 use stellar_agent_smart_account::error::{AdminOrOwnerKey, SaError};
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
@@ -110,23 +111,20 @@ fn read_audit_entries(log_path: &std::path::Path) -> Vec<AuditEntry> {
 
 /// Both instance shapes, for both contract kinds, with and without
 /// `accept_mutable_verifier`, are refused with
-/// `sa.contract_instance_unsupported` and write no mutable-override row.
-/// The SAC instance reaches the mutability probe through the unknown-hash
-/// override; the undecodable instance is refused at identification, before
-/// any override row.
+/// `sa.contract_instance_unsupported` and write no audit row. The SAC
+/// instance reaches the mutability probe through the unknown-hash override;
+/// the undecodable instance is refused at identification.
 #[tokio::test]
 async fn unpinnable_instance_rejected_regardless_of_mutable_override() {
     let contract = contract_addr();
-    for (entry_xdr, reason, expect_unknown_override_row) in [
+    for (entry_xdr, reason) in [
         (
             UNDECODABLE_ENTRY_XDR.to_owned(),
             AdminOrOwnerKey::UndecodableInstance,
-            false,
         ),
         (
             non_wasm_instance_xdr(&contract),
             AdminOrOwnerKey::NonWasmExecutable,
-            true,
         ),
     ] {
         for contract_kind in [ContractKind::Verifier, ContractKind::Policy] {
@@ -177,7 +175,6 @@ async fn unpinnable_instance_rejected_regardless_of_mutable_override() {
 
                 let result = pin_referenced_contracts(
                     &manager,
-                    Some(&audit_writer),
                     smart_account_addr(),
                     ZERO_CONTRACT_REDACTED,
                     &definition,
@@ -185,7 +182,6 @@ async fn unpinnable_instance_rejected_regardless_of_mutable_override() {
                     SOURCE_G,
                     accept_mutable_verifier,
                     true, // accept_unknown_verifier: reach the mutability step
-                    "stellar:testnet",
                     Uuid::new_v4().to_string(),
                 )
                 .await;
@@ -213,21 +209,9 @@ async fn unpinnable_instance_rejected_regardless_of_mutable_override() {
                     "{case}: {error:?}"
                 );
 
-                let entries = read_audit_entries(&audit_log_path);
-                assert_eq!(
-                    entries.iter().any(|e| matches!(
-                        e.event_kind,
-                        EventKind::SaUnknownContractOverride { .. }
-                    )),
-                    expect_unknown_override_row,
-                    "{case}: unknown-hash override row presence"
-                );
                 assert!(
-                    !entries.iter().any(|e| matches!(
-                        e.event_kind,
-                        EventKind::SaMutableContractOverride { .. }
-                    )),
-                    "{case}: no mutable-override row may be written"
+                    read_audit_entries(&audit_log_path).is_empty(),
+                    "{case}: a refused pin writes no audit row"
                 );
             }
         }
@@ -238,8 +222,7 @@ async fn unpinnable_instance_rejected_regardless_of_mutable_override() {
 /// with no live tag entry is refused with
 /// `ContractInstanceUnsupported { reason: ExternalRefUnresolved }` whatever
 /// override flags are set. The refusal comes from identification, before
-/// either override branch, so no override row of either kind is written and
-/// no pin is returned.
+/// either override branch; no audit row is written and no pin is returned.
 #[tokio::test]
 async fn external_ref_without_live_tag_entry_rejected_before_any_override() {
     use stellar_agent_test_support::{KeyedLedgerEntriesResponder, xdr_fixtures};
@@ -303,7 +286,6 @@ async fn external_ref_without_live_tag_entry_rejected_before_any_override() {
 
             let result = pin_referenced_contracts(
                 &manager,
-                Some(&audit_writer),
                 smart_account_addr(),
                 ZERO_CONTRACT_REDACTED,
                 &definition,
@@ -311,7 +293,6 @@ async fn external_ref_without_live_tag_entry_rejected_before_any_override() {
                 SOURCE_G,
                 accept_mutable_verifier,
                 accept_unknown_verifier,
-                "stellar:testnet",
                 Uuid::new_v4().to_string(),
             )
             .await;
@@ -345,14 +326,9 @@ async fn external_ref_without_live_tag_entry_rejected_before_any_override() {
                 "{case}: {error}"
             );
 
-            let entries = read_audit_entries(&audit_log_path);
             assert!(
-                !entries.iter().any(|e| matches!(
-                    e.event_kind,
-                    EventKind::SaUnknownContractOverride { .. }
-                        | EventKind::SaMutableContractOverride { .. }
-                )),
-                "{case}: no override row of either kind may be written"
+                read_audit_entries(&audit_log_path).is_empty(),
+                "{case}: a refused pin writes no audit row"
             );
         }
     }

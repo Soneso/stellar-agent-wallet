@@ -61,6 +61,7 @@
 //! vault contract (the DeFindex vault IS its own dfToken/SEP-41 contract).
 //! All other functions in this module use `getLedgerEntries`.
 
+use stellar_agent_core::scval::scval_variant_name;
 use stellar_agent_network::StellarRpcClient;
 use stellar_agent_xdr_limits::untrusted_decode_limits;
 use stellar_strkey::Contract;
@@ -237,7 +238,10 @@ pub async fn read_vault_upgradable_flag(
             return match &entry.val {
                 ScVal::Bool(b) => Ok(*b),
                 other => Err(VaultStorageFetchError::XdrError {
-                    reason: format!("DataKey::Upgradable value is not ScVal::Bool: {other:?}"),
+                    reason: format!(
+                        "DataKey::Upgradable value is not ScVal::Bool: {}",
+                        scval_variant_name(other)
+                    ),
                 }),
             };
         }
@@ -367,7 +371,10 @@ pub async fn read_vault_assets(
                 }
                 other => {
                     return Err(VaultStorageFetchError::XdrError {
-                        reason: format!("DataKey::TotalAssets value is not ScVal::U32: {other:?}"),
+                        reason: format!(
+                            "DataKey::TotalAssets value is not ScVal::U32: {}",
+                            scval_variant_name(other)
+                        ),
                     });
                 }
             }
@@ -513,7 +520,10 @@ fn decode_asset_strategy_set_scval(
         ScVal::Map(Some(m)) => m,
         other => {
             return Err(VaultStorageFetchError::XdrError {
-                reason: format!("AssetStrategySet: expected ScMap; got {other:?}"),
+                reason: format!(
+                    "AssetStrategySet: expected ScMap; got {}",
+                    scval_variant_name(other)
+                ),
             });
         }
     };
@@ -538,7 +548,10 @@ fn decode_asset_strategy_set_scval(
         }
         other => {
             return Err(VaultStorageFetchError::XdrError {
-                reason: format!("AssetStrategySet: 'strategies' is not ScVec; got {other:?}"),
+                reason: format!(
+                    "AssetStrategySet: 'strategies' is not ScVec; got {}",
+                    scval_variant_name(other)
+                ),
             });
         }
     };
@@ -572,7 +585,10 @@ fn decode_strategy_scval(val: &ScVal) -> Result<WalletStrategy, VaultStorageFetc
         ScVal::Map(Some(m)) => m,
         other => {
             return Err(VaultStorageFetchError::XdrError {
-                reason: format!("Strategy: expected ScMap; got {other:?}"),
+                reason: format!(
+                    "Strategy: expected ScMap; got {}",
+                    scval_variant_name(other)
+                ),
             });
         }
     };
@@ -586,7 +602,10 @@ fn decode_strategy_scval(val: &ScVal) -> Result<WalletStrategy, VaultStorageFetc
         Some(ScVal::String(s)) => String::from_utf8_lossy(&s.0).into_owned(),
         Some(other) => {
             return Err(VaultStorageFetchError::XdrError {
-                reason: format!("Strategy: 'name' is not ScVal::String; got {other:?}"),
+                reason: format!(
+                    "Strategy: 'name' is not ScVal::String; got {}",
+                    scval_variant_name(other)
+                ),
             });
         }
         None => String::new(),
@@ -599,7 +618,10 @@ fn decode_strategy_scval(val: &ScVal) -> Result<WalletStrategy, VaultStorageFetc
         Some(ScVal::Bool(b)) => *b,
         Some(other) => {
             return Err(VaultStorageFetchError::XdrError {
-                reason: format!("Strategy: 'paused' is not ScVal::Bool; got {other:?}"),
+                reason: format!(
+                    "Strategy: 'paused' is not ScVal::Bool; got {}",
+                    scval_variant_name(other)
+                ),
             });
         }
         // Absent = not paused (safe default — strategy is active).
@@ -628,7 +650,10 @@ fn find_address_in_scmap(
     match entry.map(|e| &e.val) {
         Some(ScVal::Address(sc_addr)) => sc_address_to_strkey(sc_addr),
         Some(other) => Err(VaultStorageFetchError::XdrError {
-            reason: format!("'{key_name}' is not ScVal::Address; got {other:?}"),
+            reason: format!(
+                "'{key_name}' is not ScVal::Address; got {}",
+                scval_variant_name(other)
+            ),
         }),
         None => Err(VaultStorageFetchError::XdrError {
             reason: format!("'{key_name}' absent from ScMap"),
@@ -885,7 +910,7 @@ fn parse_holder_address_to_scval(
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
@@ -894,6 +919,39 @@ mod tests {
     )]
 
     use super::*;
+
+    /// A 10 KiB `ScVal::String` payload: an untrusted ledger value far larger
+    /// than any error reason may be.
+    pub(crate) fn large_string_scval() -> ScVal {
+        let payload = "Z".repeat(10 * 1024);
+        ScVal::String(stellar_xdr::ScString(
+            payload
+                .into_bytes()
+                .try_into()
+                .expect("10 KiB fits an ScString"),
+        ))
+    }
+
+    /// Asserts an `XdrError` reason is bounded, equals `expected` and carries
+    /// no byte of the payload.
+    pub(crate) fn assert_bounded_reason(err: VaultStorageFetchError, expected: &str) {
+        let VaultStorageFetchError::XdrError { reason } = err else {
+            panic!("expected XdrError, got {err:?}");
+        };
+        assert!(reason.len() < 256, "reason is {} bytes", reason.len());
+        assert_eq!(reason, expected);
+        assert!(!reason.contains("ZZZZ"));
+    }
+
+    /// `decode_strategy_scval` names the variant of an unexpected strategy
+    /// value and never renders the value, so a large payload yields a short
+    /// reason.
+    #[test]
+    fn decode_strategy_scval_large_string_payload_reason_is_bounded() {
+        let err = decode_strategy_scval(&large_string_scval())
+            .expect_err("a String strategy value must fail closed");
+        assert_bounded_reason(err, "Strategy: expected ScMap; got String");
+    }
 
     // ── check_asset_count DoS bound ──────────────────────────────────────────
 

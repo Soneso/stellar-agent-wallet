@@ -540,10 +540,11 @@ pub struct CreateArgs {
     /// `sa.contract_instance_unsupported` regardless of this flag.
     ///
     /// When set, the install proceeds AND the audit log emits
-    /// `SaMutableContractOverride { contract_kind, contract_address_redacted }`,
-    /// naming the owner and tag of an external reference. The row is written
-    /// before the rule has an on-chain id, so it carries no `rule_id` and
-    /// joins its `SaContextRuleCreated` row through `request_id`.
+    /// `SaMutableContractOverride { rule_id, contract_kind,
+    /// contract_address_redacted }`, naming the owner and tag of an external
+    /// reference. The row carries the new rule's id and is written after the
+    /// install confirms, before the `SaContextRuleCreated` row; a refused
+    /// install writes none.
     /// The JSON envelope reflects `mutable_override: true`.
     #[arg(long)]
     pub accept_mutable_verifier: bool,
@@ -558,10 +559,10 @@ pub struct CreateArgs {
     /// prevents silent use of custom or unaudited verifier / policy contracts.
     ///
     /// When set, the install proceeds AND the audit log emits
-    /// `SaUnknownContractOverride { contract_kind, contract_address_redacted,
-    /// observed_hash_first8 }`. The row is written before the rule has an
-    /// on-chain id, so it carries no `rule_id` and joins its
-    /// `SaContextRuleCreated` row through `request_id`.
+    /// `SaUnknownContractOverride { rule_id, contract_kind,
+    /// contract_address_redacted, observed_hash_first8 }`. The row carries the
+    /// new rule's id and is written after the install confirms, before the
+    /// `SaContextRuleCreated` row; a refused install writes none.
     /// The JSON envelope reflects `unknown_override: true`.
     #[arg(long)]
     pub accept_unknown_verifier: bool,

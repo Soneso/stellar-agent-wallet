@@ -101,7 +101,7 @@ async fn non_address_admin_value_returns_mutable() {
         &rpc,
         &rpc,
         &contract,
-        42,
+        Some(42),
         "CAAAA...ABSC4",
         "fixture-request-id",
     )

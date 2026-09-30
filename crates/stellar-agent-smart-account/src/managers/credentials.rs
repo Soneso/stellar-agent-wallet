@@ -4104,7 +4104,7 @@ registered_at_unix_ms = 1700000000000
 
         // NetworkRpcDivergence is an infrastructure failure, not an actual drift event.
         let sa_err = crate::SaError::NetworkRpcDivergence {
-            rule_id: 3,
+            rule_id: Some(3),
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AAAAA"),
             primary_view_digest_first8: "11111111".to_owned(),
             secondary_view_digest_first8: "22222222".to_owned(),

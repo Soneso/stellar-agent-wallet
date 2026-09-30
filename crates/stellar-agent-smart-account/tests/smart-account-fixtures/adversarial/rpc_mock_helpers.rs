@@ -731,12 +731,37 @@ pub fn build_ledger_entries_empty() -> serde_json::Value {
     })
 }
 
+/// Returns the `getLedgerEntries` result `response` holding only the entries
+/// whose key the JSON-RPC `request` names, in response order: a Soroban RPC
+/// never returns an entry under a key the request does not name. A result
+/// without an `entries` array is returned unchanged.
+pub fn entries_for_requested_keys(
+    response: &serde_json::Value,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    let requested: Vec<&str> = request["params"]["keys"]
+        .as_array()
+        .map(|keys| keys.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+    let mut filtered = response.clone();
+    if let Some(entries) = filtered["entries"].as_array_mut() {
+        entries.retain(|entry| {
+            entry["key"]
+                .as_str()
+                .is_some_and(|key| requested.contains(&key))
+        });
+    }
+    filtered
+}
+
 // ── SorobanRpcDispatcher ──────────────────────────────────────────────────────
 
 /// A `wiremock::Respond` implementation that dispatches by JSON-RPC `method`.
 ///
 /// Routes `getLedgerEntries` and `simulateTransaction` to separately-configurable
-/// canned responses. The `simulateTransaction` response can be set to a sequence
+/// canned responses. A `getLedgerEntries` request is answered with the canned
+/// entries whose keys it names ([`entries_for_requested_keys`]). The
+/// `simulateTransaction` response can be set to a sequence
 /// of responses (first call, second call, ...) to handle the two separate
 /// `simulate_read_only` calls (one for `get_context_rule`, one for `get_threshold`).
 pub struct SorobanRpcDispatcher {
@@ -785,7 +810,7 @@ impl Respond for SorobanRpcDispatcher {
             .unwrap_or("");
 
         let result = match method {
-            "getLedgerEntries" => self.ledger_entries.clone(),
+            "getLedgerEntries" => entries_for_requested_keys(&self.ledger_entries, &body),
             "simulateTransaction" => {
                 let idx = self
                     .simulate_call

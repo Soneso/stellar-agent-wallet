@@ -36,6 +36,7 @@
 //! it is **delegated** and the wallet emits a disclosure warning.
 
 use stellar_agent_core::observability::redact_strkey_first5_last5;
+use stellar_agent_core::scval::scval_variant_name;
 use stellar_agent_network::StellarRpcClient;
 use stellar_agent_xdr_limits::untrusted_decode_limits;
 use stellar_strkey::Contract;
@@ -265,7 +266,10 @@ fn extract_address_from_map(
                     Ok(Some(strkey))
                 }
                 other => Err(VaultStorageFetchError::XdrError {
-                    reason: format!("role '{variant_name}' value is not ScVal::Address: {other:?}"),
+                    reason: format!(
+                        "role '{variant_name}' value is not ScVal::Address: {}",
+                        scval_variant_name(other)
+                    ),
                 }),
             };
         }
@@ -287,6 +291,26 @@ mod tests {
     )]
 
     use super::*;
+    use crate::storage::tests::{assert_bounded_reason, large_string_scval};
+
+    /// `extract_address_from_map` names the variant of an unexpected role
+    /// value and never renders the value, so a large payload yields a short
+    /// reason.
+    #[test]
+    fn extract_address_from_map_large_string_payload_reason_is_bounded() {
+        let storage_map = stellar_xdr::ScMap(
+            vec![stellar_xdr::ScMapEntry {
+                key: build_unit_variant_scval_key("Manager").unwrap(),
+                val: large_string_scval(),
+            }]
+            .try_into()
+            .unwrap(),
+        );
+
+        let err = extract_address_from_map(&storage_map, "Manager")
+            .expect_err("a String role value must fail closed");
+        assert_bounded_reason(err, "role 'Manager' value is not ScVal::Address: String");
+    }
 
     const DEPOSITOR: &str = "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD";
     const THIRD_PARTY: &str = "CCEBVDYM32YNYCVNRXQKDFFPISJJCV557CDZEIRBEE4NCV4KHPQ44HGF";

@@ -148,7 +148,6 @@ async fn policy_with_owner_key_rejected_without_override() {
 
     let result = pin_referenced_contracts(
         &manager,
-        Some(&audit_writer),
         smart_account,
         ZERO_CONTRACT_REDACTED,
         &definition,
@@ -156,7 +155,6 @@ async fn policy_with_owner_key_rejected_without_override() {
         SOURCE_G,
         false, // accept_mutable_verifier — MUST refuse
         false, // accept_unknown_verifier
-        "stellar:testnet",
         Uuid::new_v4().to_string(),
     )
     .await;

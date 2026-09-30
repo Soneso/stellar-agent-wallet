@@ -55,29 +55,30 @@
 //! - `install_rule_refuses_mutable_verifier_without_override` —
 //!   Deploy the OZ v0.7.2 timelock-controller contract (has `AccessControlStorageKey::Admin`
 //!   in instance storage via its constructor; wasm hash NOT in `VERIFIER_ALLOWLIST`).
-//!   Pass `accept_unknown_verifier = true` (bypasses allowlist check, emits
-//!   `SaUnknownContractOverride`) AND `accept_mutable_verifier = false` (default).
-//!   The mutability check fires after the allowlist override and returns
-//!   `SaError::VerifierMutable` — confirming the fail-closed path for contracts
-//!   that have an admin key.
+//!   Pass `accept_unknown_verifier = true` (bypasses the allowlist check) AND
+//!   `accept_mutable_verifier = false` (default).  The mutability check fires
+//!   after the allowlist override and returns `SaError::VerifierMutable`,
+//!   confirming the fail closed path for contracts that have an admin key. The
+//!   refused install writes no override row.
 //!
-//! - `accept_mutable_verifier_override_emits_audit_row` —
+//! - `accept_mutable_verifier_override_writes_no_row_for_a_failed_install`:
 //!   Same timelock-controller verifier with `accept_unknown_verifier = true` AND
-//!   `accept_mutable_verifier = true`.  Both override rows are emitted pre-submit:
-//!   `SaUnknownContractOverride` (allowlist bypass) + `SaMutableContractOverride`
-//!   (admin-key override).  `install_rule` then reaches `install_rule_inner` and
-//!   the simulate call traps (`DeploymentFailed { phase: "simulate" }`) because the
-//!   timelock has no `batch_canonicalize_key`.  Verifies the override audit rows are
-//!   emitted correctly and the override path reaches the on-chain boundary.
+//!   `accept_mutable_verifier = true`.  The pin check admits it, `install_rule`
+//!   reaches `install_rule_inner` and the simulate call traps
+//!   (`DeploymentFailed { phase: "simulate" }`) because the timelock has no
+//!   `batch_canonicalize_key`.  The failed install writes no override row; the
+//!   pin check alone returns both overrides pending, the unknown-hash one with
+//!   the real observed hash.
 //!
-//! - `accept_unknown_verifier_override_emits_audit_row` —
+//! - `accept_unknown_verifier_override_writes_no_row_for_a_failed_install`:
 //!   Use the deployed smart-account's own C-address as an unknown verifier (its
 //!   WASM is NOT in `VERIFIER_ALLOWLIST`; also has NO admin key, so it is immutable).
 //!   Pass `accept_unknown_verifier = true` and `accept_mutable_verifier = false`.
-//!   `SaUnknownContractOverride` is emitted pre-submit and `install_rule` reaches
-//!   the simulate boundary, where it traps (`DeploymentFailed { phase: "simulate" }`)
-//!   because the SA has no `batch_canonicalize_key`.  Asserts `observed_hash_first8`
-//!   is non-empty (real on-chain wasm hash stored, not zero sentinel).
+//!   `install_rule` reaches the simulate boundary, where it traps
+//!   (`DeploymentFailed { phase: "simulate" }`) because the SA has no
+//!   `batch_canonicalize_key`, and writes no override row.  The pin check alone
+//!   returns the pending unknown-hash override with a non-zero observed hash
+//!   (real on-chain wasm hash, not zero sentinel).
 //!
 //! # Gating
 //!
@@ -125,6 +126,9 @@ use stellar_agent_smart_account::managers::rules::{
     ContextRuleSignerInput, parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
 use stellar_agent_smart_account::managers::signers::{SignersManager, SignersManagerConfig};
+use stellar_agent_smart_account::managers::verifiers::{
+    PendingOverride, PendingOverrideKind, pin_referenced_contracts,
+};
 use stellar_agent_smart_account::signers::policy_identification::THRESHOLD_POLICY_WASM;
 use stellar_baselib::account::{Account as BaselibAccount, AccountBehavior};
 use stellar_baselib::transaction::{Transaction, TransactionBehavior};
@@ -228,6 +232,37 @@ fn read_audit_entries(log_path: &std::path::Path) -> Vec<AuditEntry> {
 /// Constructs a `SignersManager` using the same testnet endpoint for both
 /// primary and secondary RPC.  Degrades to single-RPC consultation (both
 /// responses agree trivially) — acceptable for testnet acceptance.
+/// Asserts that the install with `request_id` wrote only its failure
+/// `SaRawInvocation` row, carrying `wire_code`, and that the log holds no
+/// override row: override rows are written only after an install confirms.
+fn assert_failed_install_wrote_no_override_row(
+    entries: &[AuditEntry],
+    request_id: &str,
+    wire_code: &str,
+) {
+    assert!(
+        !entries.iter().any(|e| matches!(
+            e.event_kind,
+            EventKind::SaUnknownContractOverride { .. }
+                | EventKind::SaMutableContractOverride { .. }
+        )),
+        "a failed install writes no override row: {entries:?}"
+    );
+    let install_rows: Vec<&EventKind> = entries
+        .iter()
+        .filter(|e| e.request_id == request_id)
+        .map(|e| &e.event_kind)
+        .collect();
+    assert!(
+        !install_rows.is_empty()
+            && install_rows.iter().all(|kind| matches!(
+                kind,
+                EventKind::SaRawInvocation { wire_code: code, .. } if code == wire_code
+            )),
+        "the failed install writes its {wire_code} raw-invocation row only: {install_rows:?}"
+    );
+}
+
 fn fresh_signers_manager(
     audit_writer: Arc<Mutex<AuditWriter>>,
     audit_log_path: PathBuf,
@@ -1629,10 +1664,11 @@ async fn deploy_mutable_contract_for_verifier_test(
 /// `accept_unknown_verifier = true` is needed to bypass the allowlist check
 /// and reach the mutability detection path.
 ///
-/// With `accept_unknown_verifier = true`, the unknown-verifier path emits a
-/// `SaUnknownContractOverride` row and continues.  Then mutability detection
-/// finds the `Admin` key and — because `accept_mutable_verifier = false` —
-/// returns `SaError::VerifierMutable`.
+/// With `accept_unknown_verifier = true`, the unknown-verifier path applies
+/// its override and continues.  Then mutability detection finds the `Admin`
+/// key and, because `accept_mutable_verifier = false`, returns
+/// `SaError::VerifierMutable`.  The refused install writes its
+/// `PreSubmissionRefused` raw-invocation row and no override row.
 ///
 /// `detect_contract_mutability` fetches the contract instance entry via
 /// `getLedgerEntries` (no `InvokeHostFunction`) and returns `SaError::VerifierMutable`
@@ -1681,7 +1717,7 @@ async fn install_rule_refuses_mutable_verifier_without_override() {
 
     // Build a rule definition with the timelock-controller as an External verifier.
     // The wallet will (1) find the WASM hash NOT in VERIFIER_ALLOWLIST →
-    //   accept_unknown_verifier=true bypasses this → emits SaUnknownContractOverride.
+    //   accept_unknown_verifier=true admits it with a pending override.
     // Then (2) detect_contract_mutability finds Admin key →
     //   accept_mutable_verifier=false → VerifierMutable.
     let definition = ContextRuleDefinition::new(
@@ -1731,93 +1767,46 @@ async fn install_rule_refuses_mutable_verifier_without_override() {
         }
     }
 
-    // ── SaUnknownContractOverride row must have been emitted (allowlist bypass) ─
+    // ── The refused install writes no override row ───────────────────────────
     //
-    // The accept_unknown_verifier=true path emits SaUnknownContractOverride BEFORE
-    // the mutability check fires VerifierMutable.  Both rows should be present.
+    // The unknown-hash override applied before the refusal is pending only;
+    // override rows are written after an install confirms.
     drop(manager);
     drop(sm);
 
     let entries = read_audit_entries(&audit_log_path);
-
-    let unknown_override_row = entries.iter().find(|e| {
-        matches!(
-            &e.event_kind,
-            EventKind::SaUnknownContractOverride { contract_kind, .. }
-                if *contract_kind == ContractKind::Verifier
-        )
-    });
-    assert!(
-        unknown_override_row.is_some(),
-        "SaUnknownContractOverride (verifier) must be emitted before \
-         VerifierMutable fires (allowlist bypass row)"
-    );
-
-    // Verify the unknown-override row shares the request_id.
-    let override_entry = unknown_override_row.unwrap();
-    assert_eq!(
-        override_entry.request_id, request_id,
-        "SaUnknownContractOverride row must carry the request_id from install_rule"
-    );
-
-    // ── observed_hash_first8 must be non-zero ────────────────────────────────
-    //
-    // The real observed hash must be stored in the override row, not a zero sentinel.
-    if let EventKind::SaUnknownContractOverride {
-        observed_hash_first8,
-        ..
-    } = &override_entry.event_kind
-    {
-        assert_ne!(
-            observed_hash_first8, "0000000000000000",
-            "SaUnknownContractOverride.observed_hash_first8 must be the real \
-             on-chain timelock-controller wasm hash (not zero sentinel)"
-        );
-        assert_eq!(
-            observed_hash_first8.len(),
-            16,
-            "observed_hash_first8 must be 16 hex chars (8 bytes first8)"
-        );
-    } else {
-        panic!("override_entry.event_kind must be SaUnknownContractOverride");
-    }
+    assert_failed_install_wrote_no_override_row(&entries, &request_id, "sa.verifier_mutable");
 }
 
-// ── accept_mutable_verifier_override_emits_audit_row ─────────────────────────
+// ── accept_mutable_verifier_override_writes_no_row_for_a_failed_install ──────
 
-/// Verify that `install_rule` emits `SaMutableContractOverride` when:
+/// Verify the override rows of an install that fails after the pin check when:
 /// 1. The verifier has a non-zero `Admin` key in instance storage (mutable).
 /// 2. `accept_unknown_verifier = true` (bypasses WASM allowlist check).
-/// 3. `accept_mutable_verifier = true` (allows mutable contract with audit row).
+/// 3. `accept_mutable_verifier = true` (allows the mutable contract).
 ///
 /// # Setup
 ///
 /// Same timelock-controller verifier as the refusal test.  With both override flags set:
-/// - `SaUnknownContractOverride` row emitted (allowlist bypass path).
-/// - `SaMutableContractOverride` row emitted (admin-key override path).
+/// - the pin check admits the contract with both overrides pending;
 /// - `install_rule` reaches `install_rule_inner` (simulate / submit), where the
 ///   on-chain `add_context_rule` call traps because the timelock-controller lacks
 ///   `batch_canonicalize_key` — the contract is a mutable fixture, NOT a real Verifier.
 ///
 /// # Assertions
 ///
-/// - `SaUnknownContractOverride` audit row emitted (pre-submit, allowlist bypass).
-/// - `SaMutableContractOverride` audit row emitted (pre-submit, admin-key override).
-/// - Both override rows share the same `request_id`.
 /// - `install_rule` returns `Err(SaError::DeploymentFailed { phase: "simulate", .. })` —
 ///   the on-chain simulate traps because the timelock has no `batch_canonicalize_key`.
 ///   This confirms the override path reaches the on-chain boundary and fails there, not
-///   earlier.  A full success leg requires a genuine mutable Verifier WASM; the
-///   mocking/adversarial fixture for that leg is
-///   `adversarial/accept_mutable_verifier_override_audit_row.rs`.
+///   earlier.
+/// - The failed install writes its failure raw-invocation row and no override row.
+/// - The pin check alone, against the live contract, returns the unknown-hash
+///   override carrying the real observed hash, then the mutable override.
 ///
-/// `SaMutableContractOverride` + `SaUnknownContractOverride` are emitted by the
-/// pre-submit `getLedgerEntries` path, before any `InvokeHostFunction` is submitted.
-/// Verifying these rows confirms the override-path audit-trail logic works.  The
-/// `DeploymentFailed { phase: "simulate" }` outcome confirms the override path correctly
-/// proceeds past the pin check and reaches the on-chain boundary.
+/// The ordering of the override rows of a confirmed install is covered live by
+/// `cap85_external_ref_testnet_acceptance.rs` and offline by the mock suites.
 #[tokio::test(flavor = "multi_thread")]
-async fn accept_mutable_verifier_override_emits_audit_row() {
+async fn accept_mutable_verifier_override_writes_no_row_for_a_failed_install() {
     let (sa_signer_g, sa_signer_box) = fresh_signer();
     fund_via_friendbot(&sa_signer_g).await;
 
@@ -1863,8 +1852,8 @@ async fn accept_mutable_verifier_override_emits_audit_row() {
     let request_id = rid();
     let result = manager
         .install_rule(
-            sa_addr,
-            definition,
+            sa_addr.clone(),
+            definition.clone(),
             vec![ContextRuleId::new(0)],
             signer_box.as_ref(),
             None,
@@ -1907,75 +1896,75 @@ async fn accept_mutable_verifier_override_emits_audit_row() {
         }
     }
 
-    // ── Pre-submit audit rows must be present ─────────────────────────────────
-    //
-    // Both override rows are emitted by pin_referenced_contracts (the pre-submit
-    // getLedgerEntries path) before install_rule_inner is called.  They are
-    // present regardless of the on-chain simulate outcome.
+    // ── The failed install writes no override row ────────────────────────────
+    let entries = read_audit_entries(&audit_log_path);
+    assert_failed_install_wrote_no_override_row(&entries, &request_id, "sa.deployment_failed");
+
+    // ── The pin check alone returns both overrides pending ───────────────────
+    let pin = pin_referenced_contracts(
+        &sm,
+        sa_addr,
+        &redact_strkey_first5_last5(&sa_strkey),
+        &definition,
+        None,
+        &sa_signer_g,
+        true,
+        true,
+        rid(),
+    )
+    .await
+    .expect("the pin check admits the contract under both flags");
+    assert!(pin.mutable_override && pin.unknown_override);
+    assert!(
+        matches!(
+            pin.pending_overrides.as_slice(),
+            [
+                PendingOverride {
+                    kind: PendingOverrideKind::Unknown { observed_hash_first8 },
+                    contract_kind: ContractKind::Verifier,
+                    ..
+                },
+                PendingOverride {
+                    kind: PendingOverrideKind::Mutable { executable_ref: None },
+                    contract_kind: ContractKind::Verifier,
+                    ..
+                },
+            ] if observed_hash_first8.len() == 16 && observed_hash_first8 != "0000000000000000"
+        ),
+        "both overrides pending, the unknown one with the real hash: {:?}",
+        pin.pending_overrides
+    );
     drop(manager);
     drop(sm);
-
-    let entries = read_audit_entries(&audit_log_path);
-
-    // SaMutableContractOverride (admin-key override path).
-    let mutable_override_row = entries.iter().find(|e| {
-        matches!(
-            &e.event_kind,
-            EventKind::SaMutableContractOverride { contract_kind, .. }
-                if *contract_kind == ContractKind::Verifier
-        )
-    });
-    assert!(
-        mutable_override_row.is_some(),
-        "SaMutableContractOverride (contract_kind='verifier') must be emitted \
-         (pre-submit, Admin key detected, accept_mutable_verifier=true)"
-    );
-
-    // SaUnknownContractOverride (allowlist bypass path).
-    let unknown_override_row = entries.iter().find(|e| {
-        matches!(
-            &e.event_kind,
-            EventKind::SaUnknownContractOverride { contract_kind, .. }
-                if *contract_kind == ContractKind::Verifier
-        )
-    });
-    assert!(
-        unknown_override_row.is_some(),
-        "SaUnknownContractOverride (verifier) must also be emitted \
-         (timelock WASM not in VERIFIER_ALLOWLIST; allowlist bypass fired first)"
-    );
-
-    // ── request_id correlation ────────────────────────────────────────────────
-    let mutable_entry = mutable_override_row.unwrap();
     assert_eq!(
-        mutable_entry.request_id, request_id,
-        "SaMutableContractOverride row must carry the request_id from install_rule"
+        read_audit_entries(&audit_log_path).len(),
+        entries.len(),
+        "the pin check writes no audit row"
     );
 }
 
-// ── accept_unknown_verifier_override_emits_audit_row ─────────────────────────
+// ── accept_unknown_verifier_override_writes_no_row_for_a_failed_install ──────
 
-/// Verify that `install_rule` emits `SaUnknownContractOverride`
-/// when the verifier's wasm hash is NOT in `VERIFIER_ALLOWLIST` and
+/// Verify the unknown-hash override of an install that fails after the pin
+/// check, when the verifier's wasm hash is NOT in `VERIFIER_ALLOWLIST` and
 /// `accept_unknown_verifier = true`.
 ///
 /// The verifier in this test is the deployed smart-account's own C-address.
 /// The OZ smart-account WASM hash is NOT in `VERIFIER_ALLOWLIST` (which only
 /// contains the OZ webauthn-verifier-example WASM hash).  The smart-account
 /// contract also has NO `Admin` or `Owner` key in instance storage, so the
-/// mutability check returns `Immutable` — only `SaUnknownContractOverride` fires.
+/// mutability check returns `Immutable`; only the unknown-hash override applies.
 ///
 /// # Assertions
 ///
-/// - `SaUnknownContractOverride` audit row emitted with `contract_kind = "verifier"`.
-/// - `observed_hash_first8` is non-empty and non-zero (real on-chain hash stored).
 /// - `install_rule` returns `Err(SaError::DeploymentFailed { phase: "simulate", .. })` —
 ///   the on-chain simulate traps because the SA has no `batch_canonicalize_key`.
+/// - The failed install writes its failure raw-invocation row and no override row.
+/// - The pin check alone returns one pending unknown-hash override with
+///   `contract_kind = "verifier"` and the real, non-zero observed hash.
 ///
-/// The `SaContextRuleCreated` row (which would carry `unknown_override = true`) is NOT
-/// emitted when `install_rule` fails at simulate phase; that row is only emitted on
-/// success.  The audit-trail correctness for the success path is verified by the
-/// `adversarial/accept_mutable_verifier_override_audit_row.rs` fixture (mock RPC).
+/// No `SaContextRuleCreated` row or override row is written when
+/// `install_rule` fails at simulate phase; both are written only on success.
 ///
 /// # Reference cross-check
 ///
@@ -1986,11 +1975,10 @@ async fn accept_mutable_verifier_override_emits_audit_row() {
 ///   — real hash fetched without allowlist enforcement.
 ///
 /// The SA has no Admin key so `mutable_override=false`; the unknown-override path alone
-/// fires.  The `SaUnknownContractOverride` row is emitted pre-submit (getLedgerEntries
-/// only).  The subsequent simulate trap confirms the override path reaches the on-chain
-/// boundary.  That is the full scope of this test.
+/// applies.  The subsequent simulate trap confirms the override path reaches the on-chain
+/// boundary.
 #[tokio::test(flavor = "multi_thread")]
-async fn accept_unknown_verifier_override_emits_audit_row() {
+async fn accept_unknown_verifier_override_writes_no_row_for_a_failed_install() {
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
@@ -2032,7 +2020,7 @@ async fn accept_unknown_verifier_override_emits_audit_row() {
     let result = manager
         .install_rule(
             sa_addr.clone(),
-            definition,
+            definition.clone(),
             vec![ContextRuleId::new(0)],
             signer_box.as_ref(),
             None,
@@ -2070,52 +2058,45 @@ async fn accept_unknown_verifier_override_emits_audit_row() {
         }
     }
 
-    // ── SaUnknownContractOverride row must be present (pre-submit) ────────────
+    // ── The failed install writes no override row ────────────────────────────
+    let entries = read_audit_entries(&audit_log_path);
+    assert_failed_install_wrote_no_override_row(&entries, &request_id, "sa.deployment_failed");
+
+    // ── The pin check alone returns the unknown-hash override pending ────────
+    //
+    // The real on-chain WASM hash must be carried, not a zero sentinel.  This
+    // is the regression gate for `fetch_observed_executable`.
+    let pin = pin_referenced_contracts(
+        &sm,
+        sa_addr,
+        &redact_strkey_first5_last5(&sa_strkey),
+        &definition,
+        None,
+        &signer_g,
+        false,
+        true,
+        rid(),
+    )
+    .await
+    .expect("the pin check admits the unknown verifier");
+    assert!(pin.unknown_override && !pin.mutable_override);
+    assert!(
+        matches!(
+            pin.pending_overrides.as_slice(),
+            [PendingOverride {
+                kind: PendingOverrideKind::Unknown { observed_hash_first8 },
+                contract_kind: ContractKind::Verifier,
+                ..
+            }] if observed_hash_first8.len() == 16 && observed_hash_first8 != "0000000000000000"
+        ),
+        "one pending unknown-hash override with the real hash: {:?}",
+        pin.pending_overrides
+    );
     drop(manager);
     drop(sm);
-
-    let entries = read_audit_entries(&audit_log_path);
-
-    let unknown_row = entries.iter().find(|e| {
-        matches!(
-            &e.event_kind,
-            EventKind::SaUnknownContractOverride { contract_kind, .. }
-                if *contract_kind == ContractKind::Verifier
-        )
-    });
-    assert!(
-        unknown_row.is_some(),
-        "SaUnknownContractOverride (contract_kind='verifier') must be emitted \
-         (pre-submit getLedgerEntries path; accept_unknown_verifier=true)"
-    );
-
-    // ── request_id correlation ────────────────────────────────────────────────
-    let unknown_entry = unknown_row.unwrap();
     assert_eq!(
-        unknown_entry.request_id, request_id,
-        "SaUnknownContractOverride row must carry the request_id from install_rule"
+        read_audit_entries(&audit_log_path).len(),
+        entries.len(),
+        "the pin check writes no audit row"
     );
-
-    // ── observed_hash_first8 must be non-zero ─────────────────────────────────
-    //
-    // The real on-chain WASM hash must be stored in the override row, not a zero
-    // sentinel.  This is the regression gate for `fetch_observed_executable`.
-    if let EventKind::SaUnknownContractOverride {
-        observed_hash_first8,
-        ..
-    } = &unknown_entry.event_kind
-    {
-        assert_ne!(
-            observed_hash_first8, "0000000000000000",
-            "observed_hash_first8 must be the real on-chain WASM hash, \
-             not a zero sentinel"
-        );
-        assert_eq!(
-            observed_hash_first8.len(),
-            16,
-            "observed_hash_first8 must be 16 hex chars (8 bytes, first-8 of SHA-256)"
-        );
-    } else {
-        panic!("unknown_entry.event_kind must be SaUnknownContractOverride");
-    }
 }

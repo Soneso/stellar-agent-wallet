@@ -58,6 +58,7 @@ use stellar_agent_core::{
     audit_log::{entry::AuditEntry, writer::AuditWriter},
     observability::{RedactedStrkey, redact_strkey_first5_last5},
     rpc_budget::{SequentialRpcBudget, bound_stage},
+    scval::scval_variant_name,
 };
 use stellar_agent_network::signing::Signer;
 use stellar_agent_network::{StellarRpcClient, TransactionRecord};
@@ -543,7 +544,7 @@ pub(crate) async fn query_operation_state_cross_rpc(
             .map(|b| format!("{b:02x}"))
             .collect();
         return Err(SaError::NetworkRpcDivergence {
-            rule_id: 0, // Timelock queries are not rule-scoped; use sentinel 0.
+            rule_id: None,
             smart_account_redacted: RedactedStrkey::from_already_redacted(
                 redact_strkey_first5_last5(timelock_contract_strkey),
             ),
@@ -729,10 +730,23 @@ async fn query_operation_ready_ledger(
 
     match return_val {
         ScVal::U32(n) => Ok(n),
-        other => Err(format!(
-            "get_operation_ledger returned unexpected ScVal: {other:?}"
+        other => Err(unexpected_return_reason(
+            "get_operation_ledger",
+            "U32",
+            &other,
         )),
     }
+}
+
+/// Reason for a contract call whose return value has an unexpected shape.
+///
+/// The value is untrusted ledger data of unbounded size, so the reason names
+/// only its variant through [`scval_variant_name`], never its contents.
+fn unexpected_return_reason(call: &str, expected: &str, value: &ScVal) -> String {
+    format!(
+        "{call} returned unexpected ScVal (expected {expected}): {}",
+        scval_variant_name(value)
+    )
 }
 
 // ── Audit emission helpers ────────────────────────────────────────────────────
@@ -1224,7 +1238,7 @@ fn make_event_confirm_divergence_error(
     let primary_first8 = compute_digest(primary_present);
     let secondary_first8 = compute_digest(secondary_present);
     SaError::NetworkRpcDivergence {
-        rule_id: 0, // Timelock queries are not rule-scoped; use sentinel 0.
+        rule_id: None,
         smart_account_redacted: RedactedStrkey::from_already_redacted(redact_strkey_first5_last5(
             timelock_contract_strkey,
         )),
@@ -1632,9 +1646,7 @@ pub async fn schedule_upgrade(
         other => {
             return Err(SaError::TimelockScheduleFailed {
                 failure_reason: TimelockScheduleFailureReason::Other,
-                redacted_reason: format!(
-                    "schedule returned unexpected ScVal (expected 32-byte Bytes): {other:?}"
-                ),
+                redacted_reason: unexpected_return_reason("schedule", "32-byte Bytes", other),
                 request_id: request_id.to_owned(),
             });
         }
@@ -2786,8 +2798,10 @@ async fn simulate_hash_operation(
             }
             other => Err(SaError::TimelockExecuteFailed {
                 failure_reason: TimelockExecuteFailureReason::SimulationFailed,
-                redacted_reason: format!(
-                    "{label} hash_operation returned unexpected ScVal: {other:?}"
+                redacted_reason: unexpected_return_reason(
+                    &format!("{label} hash_operation"),
+                    "32-byte Bytes",
+                    &other,
                 ),
                 operation_id_redacted: "unknown".to_owned(),
                 request_id: request_id.to_owned(),
@@ -2811,7 +2825,7 @@ async fn simulate_hash_operation(
             .map(|b| format!("{b:02x}"))
             .collect();
         return Err(SaError::NetworkRpcDivergence {
-            rule_id: 0, // Timelock queries are not rule-scoped; use sentinel 0.
+            rule_id: None,
             smart_account_redacted: RedactedStrkey::from_already_redacted(
                 redact_strkey_first5_last5(timelock_contract_strkey),
             ),
@@ -2887,6 +2901,22 @@ mod tests {
     #![allow(clippy::panic, reason = "test-only: panics are correct failure mode")]
 
     use super::*;
+
+    /// The reason for an unexpected return value names its variant and never
+    /// renders the value, so a 10 KiB ledger payload yields a short reason.
+    #[test]
+    fn unexpected_return_reason_large_string_payload_is_bounded() {
+        let value = crate::managers::signers::tests::large_string_scval();
+
+        let reason = unexpected_return_reason("get_operation_ledger", "U32", &value);
+
+        assert!(reason.len() < 256, "reason is {} bytes", reason.len());
+        assert_eq!(
+            reason,
+            "get_operation_ledger returned unexpected ScVal (expected U32): String"
+        );
+        assert!(!reason.contains("ZZZZ"));
+    }
 
     #[test]
     fn timelock_operation_id_hex_roundtrip() {

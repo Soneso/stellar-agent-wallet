@@ -50,7 +50,6 @@ use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::AuditLogIntegrityError;
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::health::{AuditWriterHealth, AuditWriterHealthHandle};
-use stellar_agent_core::audit_log::reader::PinnedHashesRecord;
 use stellar_agent_core::audit_log::schema::{ContractKind, PinsUpdateReason};
 use stellar_agent_core::audit_log::signer_set::{
     BaselineReason, ObservedSignerSet, SignerPubkey, compute_signer_set_digest,
@@ -59,6 +58,7 @@ use stellar_agent_core::audit_log::signer_set::{
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
+use stellar_agent_core::scval::scval_variant_name;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_network::signing::Signer;
@@ -81,6 +81,7 @@ use crate::managers::rules::{
     BASE_FEE_STROOPS, ExpiryCheck, augment_with_oz_error_name, contract_instance_key,
     parse_c_strkey_to_smart_account, scaddress_to_strkey,
 };
+use crate::managers::verifiers::PlannedPinUpdate;
 use crate::signers::policy_identification::THRESHOLD_POLICY_WASM_HASHES;
 use crate::signers::types::{
     FrozenChainStateTuple, PolicyIdentifiedKind, ThresholdAffectingOp, WasmHashSummary,
@@ -824,7 +825,7 @@ impl SignersManager {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>();
             return Err(SaError::NetworkRpcDivergence {
-                rule_id,
+                rule_id: Some(rule_id),
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted.clone(),
                 ),
@@ -952,7 +953,7 @@ impl SignersManager {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>();
             return Err(SaError::NetworkRpcDivergence {
-                rule_id,
+                rule_id: Some(rule_id),
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted.clone(),
                 ),
@@ -1121,7 +1122,7 @@ impl SignersManager {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>();
             return Err(SaError::NetworkRpcDivergence {
-                rule_id,
+                rule_id: Some(rule_id),
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted.clone(),
                 ),
@@ -1192,8 +1193,8 @@ impl SignersManager {
     ///    [`SaError::ThresholdUnreachable`] if the add would create an
     ///    unreachable threshold state.
     /// 3. Constructs and submits a single `InvokeHostFunctionOp` transaction.
-    /// 4. Emits `SaSignerAdded` audit row, and the `SaContextRulePinsUpdated`
-    ///    row described under "Pin record".
+    /// 4. Emits `SaSignerAdded` audit row, then the override rows and the
+    ///    `SaContextRulePinsUpdated` row described under "Pin record".
     ///
     /// # Pin record
     ///
@@ -1206,9 +1207,12 @@ impl SignersManager {
     /// - before submission, each new verifier address not already live on
     ///   the rule is identified and probed with the checks rule install
     ///   applies: an allowlist miss refuses unless `accept_unknown_verifier`
-    ///   is set, a mutable contract refuses unless `accept_mutable_verifier`
-    ///   is set, and an applied override writes its override row;
-    /// - after the add confirms, a `SaContextRulePinsUpdated` row (reason
+    ///   is set, and a mutable contract refuses unless
+    ///   `accept_mutable_verifier` is set;
+    /// - after the add confirms, each applied override writes its override
+    ///   row carrying the rule id, after the `SaSignerAdded` row; a refused
+    ///   add writes none;
+    /// - then a `SaContextRulePinsUpdated` row (reason
     ///   `signer_added`) records the verifier pins deduplicated by address:
     ///   a signer on a verifier already live leaves the list unchanged, a
     ///   signer on a new verifier appends its pin.
@@ -1326,13 +1330,20 @@ impl SignersManager {
                         );
                     }
                 }
-                if let Some(record) = pin_update {
+                if let Some(update) = pin_update {
+                    crate::managers::verifiers::write_pending_override_rows(
+                        self,
+                        &smart_account_redacted,
+                        rule_id,
+                        &request_id,
+                        &update.pending_overrides,
+                    );
                     crate::managers::verifiers::write_pins_updated_row(
                         self,
                         &smart_account_redacted,
                         rule_id,
                         PinsUpdateReason::SignerAdded,
-                        record,
+                        &update.record,
                         &request_id,
                     );
                 }
@@ -2008,7 +2019,7 @@ impl SignersManager {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>();
             return Err(SaError::NetworkRpcDivergence {
-                rule_id,
+                rule_id: Some(rule_id),
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted.clone(),
                 ),
@@ -2213,7 +2224,7 @@ impl SignersManager {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>();
             return Err(SaError::NetworkRpcDivergence {
-                rule_id,
+                rule_id: Some(rule_id),
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted,
                 ),
@@ -2471,7 +2482,7 @@ impl SignersManager {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>();
             return Err(SaError::NetworkRpcDivergence {
-                rule_id,
+                rule_id: Some(rule_id),
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted,
                 ),
@@ -2674,7 +2685,8 @@ impl SignersManager {
                 return Err(SaError::DeploymentFailed {
                     phase: "simulate",
                     redacted_reason: format!(
-                        "get_signer_weights: expected ScVal::Map return, got {other:?}"
+                        "get_signer_weights: expected ScVal::Map return, got {}",
+                        scval_variant_name(&other)
                     ),
                 });
             }
@@ -3202,7 +3214,7 @@ impl SignersManager {
     /// 2. Submits `batch_add_signer(rule_id, signers)` as a single
     ///    `InvokeHostFunctionOp`.
     /// 3. Emits one `SaSignerAdded` row per signer (reusing the existing
-    ///    audit kind) plus the raw-invocation row, and the
+    ///    audit kind), then the override rows and the
     ///    `SaContextRulePinsUpdated` row described under "Pin record".
     ///
     /// The single-signer `add_signer` verb and its arg contract are
@@ -3233,8 +3245,10 @@ impl SignersManager {
     ///
     /// The batch keeps a pinned rule's pin record in step as
     /// [`Self::add_signer`] does (see "Pin record" there), for every distinct
-    /// new verifier address among the batch's `External` signers, and writes
-    /// one `SaContextRulePinsUpdated` row after the batch confirms.
+    /// new verifier address among the batch's `External` signers. After the
+    /// batch confirms it writes the override rows of every new verifier, then
+    /// one `SaContextRulePinsUpdated` row; a refusal of any new verifier
+    /// refuses the batch and writes no override row.
     ///
     /// # Errors
     ///
@@ -3338,13 +3352,20 @@ impl SignersManager {
                         );
                     }
                 }
-                if let Some(record) = pin_update {
+                if let Some(update) = pin_update {
+                    crate::managers::verifiers::write_pending_override_rows(
+                        self,
+                        &smart_account_redacted,
+                        rule_id,
+                        &request_id,
+                        &update.pending_overrides,
+                    );
                     crate::managers::verifiers::write_pins_updated_row(
                         self,
                         &smart_account_redacted,
                         rule_id,
                         PinsUpdateReason::SignerAdded,
-                        record,
+                        &update.record,
                         &request_id,
                     );
                 }
@@ -3372,7 +3393,7 @@ impl SignersManager {
         signer: &(dyn Signer + Send + Sync),
         request_id: &str,
         overrides: PinOverrides,
-    ) -> Result<(Vec<u32>, ObservedSignerSet, Option<PinnedHashesRecord>), SaError> {
+    ) -> Result<(Vec<u32>, ObservedSignerSet, Option<PlannedPinUpdate>), SaError> {
         let source_pubkey =
             signer
                 .public_key()
@@ -3678,7 +3699,7 @@ impl SignersManager {
 
         if !observation.allowlisted {
             return Err(SaError::VerifierWasmNotInAllowlist {
-                rule_id,
+                rule_id: Some(rule_id),
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted,
                 ),
@@ -4014,8 +4035,9 @@ impl SignersManager {
             other => Err(SaError::DeploymentFailed {
                 phase: "simulate",
                 redacted_reason: format!(
-                    "get_threshold ({}): expected ScVal::U32, got {other:?}",
-                    self.rpc_source_kind(rpc_client)
+                    "get_threshold ({}): expected ScVal::U32, got {}",
+                    self.rpc_source_kind(rpc_client),
+                    scval_variant_name(&other)
                 ),
             }),
         }
@@ -4111,7 +4133,7 @@ impl SignersManager {
         signer: &(dyn Signer + Send + Sync),
         request_id: &str,
         overrides: PinOverrides,
-    ) -> Result<(u32, ObservedSignerSet, Option<PinnedHashesRecord>), SaError> {
+    ) -> Result<(u32, ObservedSignerSet, Option<PlannedPinUpdate>), SaError> {
         let source_pubkey =
             signer
                 .public_key()
@@ -4230,7 +4252,9 @@ impl SignersManager {
     /// Returns `None` when no new signer is `External` or the rule has no pin
     /// record. Otherwise the returned record is the current one with a pin
     /// appended for each distinct new verifier address that is not already
-    /// live on the rule, each identified and probed here, before submission.
+    /// live on the rule, each identified and probed here, before submission,
+    /// and the overrides applied to them pending. A refusal of any new
+    /// verifier refuses the add, and no override row is written for it.
     ///
     /// # Errors
     ///
@@ -4246,7 +4270,7 @@ impl SignersManager {
         new_signer_pubkeys: impl Iterator<Item = &'p SignerPubkey>,
         overrides: PinOverrides,
         request_id: &str,
-    ) -> Result<Option<PinnedHashesRecord>, SaError> {
+    ) -> Result<Option<PlannedPinUpdate>, SaError> {
         let mut new_verifiers: Vec<&str> = Vec::new();
         for pubkey in new_signer_pubkeys {
             if let SignerPubkey::External {
@@ -4260,7 +4284,7 @@ impl SignersManager {
         if new_verifiers.is_empty() {
             return Ok(None);
         }
-        let Some(mut record) = crate::managers::verifiers::read_pinned_hashes_for_rule(
+        let Some(record) = crate::managers::verifiers::read_pinned_hashes_for_rule(
             self,
             rule_id,
             smart_account_redacted,
@@ -4281,6 +4305,7 @@ impl SignersManager {
             .map(scaddress_to_strkey)
             .collect::<Result<_, _>>()?;
 
+        let mut update = PlannedPinUpdate::unchanged(record);
         for verifier_strkey in new_verifiers {
             if live_verifier_strkeys
                 .iter()
@@ -4297,19 +4322,12 @@ impl SignersManager {
                 smart_account_redacted,
                 overrides.accept_mutable_verifier,
                 overrides.accept_unknown_verifier,
-                &self.chain_id,
                 request_id,
             )
             .await?;
-            crate::managers::verifiers::append_pin(
-                &mut record.pinned_verifier_first8,
-                &mut record.pinned_verifier_executable_refs,
-                &mut record.mutable_override,
-                &mut record.unknown_override,
-                pin,
-            );
+            update.append_pin(crate::managers::verifiers::PinnedKind::Verifier, pin);
         }
-        Ok(Some(record))
+        Ok(Some(update))
     }
 
     /// Core logic for `remove_signer` (called inside the per-rule mutex).
@@ -5104,8 +5122,8 @@ impl ContractObservation {
 ///
 /// `contract_kind` names the role of `contract_addr` in a refusal.
 /// `rule_id` is `None` before install, when the rule has no on-chain id yet:
-/// a `ContractInstanceUnsupported` refusal then carries no rule id, and a
-/// `NetworkRpcDivergence`, whose rule id is a plain `u32`, carries 0.
+/// a `ContractInstanceUnsupported` or `NetworkRpcDivergence` refusal raised
+/// before a rule exists carries no rule id.
 ///
 /// # Errors
 ///
@@ -5168,7 +5186,7 @@ pub(crate) async fn fetch_observed_executable(
             Err(unsupported(AdminOrOwnerKey::UndecodableInstance))
         }
         Err(FetchContractWasmHashError::Divergent(div)) => Err(SaError::NetworkRpcDivergence {
-            rule_id: rule_id.unwrap_or(0),
+            rule_id,
             smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
             primary_view_digest_first8: div.primary_summary,
             secondary_view_digest_first8: div.secondary_summary,
@@ -5204,7 +5222,10 @@ fn extract_u32_return(val: &ScVal, context: &str) -> Result<u32, SaError> {
         ScVal::U32(n) => Ok(*n),
         other => Err(SaError::DeploymentFailed {
             phase: "simulate",
-            redacted_reason: format!("{context}: expected ScVal::U32 return, got {other:?}"),
+            redacted_reason: format!(
+                "{context}: expected ScVal::U32 return, got {}",
+                scval_variant_name(other)
+            ),
         }),
     }
 }
@@ -5563,7 +5584,10 @@ fn decode_context_rule_scval(val: ScVal) -> Result<OnChainContextRule, SaError> 
         other => {
             return Err(SaError::DeploymentFailed {
                 phase: "simulate",
-                redacted_reason: format!("get_context_rule: expected ScVal::Map, got {other:?}"),
+                redacted_reason: format!(
+                    "get_context_rule: expected ScVal::Map, got {}",
+                    scval_variant_name(other)
+                ),
             });
         }
     };
@@ -5816,7 +5840,7 @@ fn decode_signer_scval(val: &ScVal) -> Option<SignerPubkey> {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(
         clippy::expect_used,
         clippy::panic,
@@ -7178,6 +7202,58 @@ mod tests {
             }
             other => panic!("expected DeploymentFailed, got: {other:?}"),
         }
+    }
+
+    /// A 10 KiB `ScVal::String` payload: an untrusted ledger value far larger
+    /// than any error reason may be.
+    pub(crate) fn large_string_scval() -> ScVal {
+        let payload = "Z".repeat(10 * 1024);
+        ScVal::String(stellar_xdr::ScString(
+            payload
+                .into_bytes()
+                .try_into()
+                .expect("10 KiB fits an ScString"),
+        ))
+    }
+
+    /// Asserts a `DeploymentFailed` reason is bounded, names the `String`
+    /// variant and carries no byte of the payload.
+    fn assert_bounded_string_reason(err: SaError, expected: &str) {
+        let SaError::DeploymentFailed {
+            phase,
+            redacted_reason,
+        } = err
+        else {
+            panic!("expected DeploymentFailed, got {err:?}");
+        };
+        assert_eq!(phase, "simulate");
+        assert!(
+            redacted_reason.len() < 256,
+            "reason is {} bytes",
+            redacted_reason.len()
+        );
+        assert_eq!(redacted_reason, expected);
+        assert!(!redacted_reason.contains("ZZZZ"));
+    }
+
+    /// `extract_u32_return` names the variant of an unexpected return value
+    /// and never renders the value, so a large payload yields a short reason.
+    #[test]
+    fn extract_u32_return_large_string_payload_reason_is_bounded() {
+        let err = extract_u32_return(&large_string_scval(), "add_signer")
+            .expect_err("a String return must fail closed");
+        assert_bounded_string_reason(err, "add_signer: expected ScVal::U32 return, got String");
+    }
+
+    /// `decode_context_rule_scval` names the variant of an unexpected rule
+    /// value and never renders the value, so a large payload yields a short
+    /// reason.
+    #[test]
+    fn decode_context_rule_scval_large_string_payload_reason_is_bounded() {
+        let Err(err) = decode_context_rule_scval(large_string_scval()) else {
+            panic!("a String rule value must fail closed");
+        };
+        assert_bounded_string_reason(err, "get_context_rule: expected ScVal::Map, got String");
     }
 
     /// `extract_u32_return` error path: `ScVal::Bool` (another non-U32 variant)
