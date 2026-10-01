@@ -35,12 +35,15 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::health::AuditWriterHealthHandle;
 use stellar_agent_core::audit_log::reader::PinnedHashesRecord;
 use stellar_agent_core::audit_log::schema::ExecutableRefPin;
-use stellar_agent_core::audit_log::signer_set::{SignerIdentityV2, ThresholdObservation};
+use stellar_agent_core::audit_log::signer_set::{
+    SignerIdentityV2, SignerSetView, ThresholdObservation,
+};
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::{
     RedactedStrkey, redact_strkey_first5_last5, untrusted_display_bounded,
@@ -62,7 +65,7 @@ use stellar_xdr::{
 use tracing::warn;
 
 use crate::SaError;
-use crate::managers::signers::{ConfirmedThresholdChange, SignersManager};
+use crate::managers::signers::{BorrowedRuleLocks, ConfirmedThresholdChange, SignersManager};
 use crate::managers::verifiers::{
     PinnedKind, PlannedPinUpdate, pin_referenced_contracts, scaddress_cache_key,
 };
@@ -105,10 +108,14 @@ pub struct ContextRuleManagerConfig {
     /// The [`SignersManager`] that observes rules through both RPC
     /// endpoints, pins their contracts and records their signer-set state.
     ///
-    /// With a manager, `verify_signer_set_against_chain` runs for every
-    /// non-zero `auth_rule_id` of a signing call before anything is
-    /// submitted, and any divergence refuses the operation. Rule 0, the
-    /// bootstrap rule, is exempt from the check.
+    /// With a manager, every signing call is checked in the submit path
+    /// ([`crate::submit::submit_signed_invoke`]): for each `auth_rule_id`
+    /// other than rule 0, the rule's lock is held, its signer-set baseline is
+    /// read, its pinned contracts are checked and its signer set is compared
+    /// with the chain before anything is simulated or signed, and any
+    /// refusal refuses the operation. Rule 0, the bootstrap rule, is exempt
+    /// from the rule lock, the signer-set check and the pin check; it has no
+    /// pins, and the submit path never reads a baseline for it.
     ///
     /// Without one, [`ContextRuleManager::install_rule`],
     /// [`ContextRuleManager::simulate_install_rule`],
@@ -284,7 +291,7 @@ pub struct ContextRuleManager {
     timeout: Duration,
     chain_id: String,
     rpc_client: StellarRpcClient,
-    /// Optional divergence-check handle.
+    /// The manager the submit path checks the auth rules through.
     signers_manager: Option<Arc<SignersManager>>,
     audit_writer: Option<Arc<Mutex<AuditWriter>>>,
     /// Session-rule horizon cap from config.
@@ -609,97 +616,6 @@ impl ContextRuleManager {
             })
     }
 
-    // ─── Divergence-check helper ──────────────────────────────────────────────
-
-    /// Runs the per-signing divergence check for every `auth_rule_id` in
-    /// `auth_rule_ids` BEFORE submitting any transaction.
-    ///
-    /// - If `self.signers_manager` is `None`, logs `warn!` and returns
-    ///   `Ok(())`. A manager without a signers manager serves rename, expiry
-    ///   update and delete authorized by rule 0 alone, which reach this
-    ///   check; [`Self::submit_signed_invoke`] refuses any other auth rule
-    ///   before signing.
-    /// - If any `auth_rule_id == 0` (bootstrap rule), that rule is skipped with
-    ///   `warn!` — the bootstrap rule has no threshold-policy by definition.
-    /// - On any divergence error the check returns the `SaError` immediately;
-    ///   the outer method refuses the operation before any signing bytes are
-    ///   produced.
-    ///
-    /// # Errors
-    ///
-    /// - [`SaError::SignerSetDiverged`] — on-chain state mismatches audit-log baseline.
-    /// - [`SaError::SignerSetMissingBaseline`] — no baseline row for the rule.
-    /// - [`SaError::NetworkRpcDivergence`] — primary and secondary RPC disagree.
-    /// - [`SaError::AuditLog`] — audit-log integrity violation.
-    /// - [`SaError::DeploymentFailed`] (`phase = "simulate"`) — the collective
-    ///   wall-clock budget for the whole loop elapsed before every
-    ///   `auth_rule_id` was checked (see `deploy_budget` below).
-    async fn check_divergence_for_auth_rule_ids(
-        &self,
-        smart_account: ScAddress,
-        auth_rule_ids: &[ContextRuleId],
-        source_account_strkey: &str,
-        request_id: &str,
-    ) -> Result<(), SaError> {
-        let Some(ref sm) = self.signers_manager else {
-            warn!(
-                auth_rule_count = auth_rule_ids.len(),
-                "ContextRuleManager: no signers manager; the divergence check covers \
-                 no auth rule, and a submission under a rule other than rule 0 refuses \
-                 before signing"
-            );
-            return Ok(());
-        };
-
-        // `auth_rule_ids` is capped at 50 by the caller, but each entry costs
-        // several RPC round-trips (the two-endpoint rule reads, one executable
-        // read per policy and the two-endpoint threshold read of the signer-set
-        // observation), each individually bounded at 60s by the transport;
-        // with no shared deadline the whole loop could cost a multiple of
-        // 50 x 60s. Reuses `self.timeout` (the manager's
-        // configured RPC timeout — the flow's existing caller-facing budget),
-        // mirroring `list_active_context_rules`'s `scan_budget` above.
-        let divergence_budget =
-            stellar_agent_core::rpc_budget::SequentialRpcBudget::new(self.timeout);
-
-        for rule_id_obj in auth_rule_ids {
-            let rule_id = rule_id_obj.as_u32();
-
-            // Bootstrap rule (id == 0) has no threshold-policy by definition.
-            if rule_id == 0 {
-                warn!(
-                    rule_id,
-                    "ContextRuleManager: auth_rule_id == 0 (bootstrap rule); \
-                     divergence check skipped — bootstrap rule has no threshold-policy"
-                );
-                continue;
-            }
-
-            stellar_agent_core::rpc_budget::bound_stage(
-                divergence_budget,
-                "verify_signer_set_against_chain",
-                sm.verify_signer_set_against_chain(
-                    smart_account.clone(),
-                    rule_id,
-                    Some(source_account_strkey),
-                    request_id.to_owned(),
-                ),
-            )
-            .await
-            .map_err(|elapsed| SaError::DeploymentFailed {
-                phase: "simulate",
-                redacted_reason: format!(
-                    "check_divergence_for_auth_rule_ids: collective budget of {}s \
-                     elapsed during {}; the RPC endpoint may be slow or unreachable",
-                    elapsed.total_secs, elapsed.stage
-                ),
-            })?
-            .map(|_frozen| ())?;
-        }
-
-        Ok(())
-    }
-
     /// Installs a new context rule on the smart-account contract via OZ
     /// `add_context_rule`, and records the confirmed rule as its signer-set
     /// baseline. Returns the assigned `rule_id`.
@@ -740,20 +656,21 @@ impl ContextRuleManager {
     /// 1. Requires a signers manager: without one the install refuses with
     ///    [`SaError::SignersManagerNotConfigured`], carrying no rule id,
     ///    before any RPC.
-    /// 2. Runs the divergence check of every non-zero rule in
-    ///    `auth_rule_ids`.
-    /// 3. Pins every referenced verifier and policy contract.
-    /// 4. Derives the state the definition authorizes. The signers'
+    /// 2. Pins every referenced verifier and policy contract.
+    /// 3. Derives the state the definition authorizes. The signers'
     ///    version-2 identities are decoded from the bytes the submission
     ///    carries. The threshold is the install parameter of the one policy
     ///    whose pinned executable is the simple-threshold policy.
-    /// 5. Signs and submits `add_context_rule`.
-    /// 6. Reads the new rule's id from the confirmed return value and writes
+    /// 4. Signs and submits `add_context_rule`. The submit path first runs
+    ///    the checks of every rule other than rule 0 in `auth_rule_ids`: the
+    ///    rule lock, the signer-set baseline read, the pinned-hash drift
+    ///    check and the signer-set comparison.
+    /// 5. Reads the new rule's id from the confirmed return value and writes
     ///    the override rows and the `SaContextRuleCreated` row.
-    /// 7. Observes the new rule through both endpoints, requires the
+    /// 6. Observes the new rule through both endpoints, requires the
     ///    authorized state and records it as a `SaSignerSetBaselinedV2` row
     ///    with reason `confirmed_install`.
-    /// 8. Writes the `sa.ok` `SaRawInvocation` row.
+    /// 7. Writes the `sa.ok` `SaRawInvocation` row.
     ///
     /// The pin record precedes the baseline because the rule exists on chain
     /// whatever the baseline step returns. Every refusal writes one
@@ -790,8 +707,10 @@ impl ContextRuleManager {
     ///   [`SaError::PinnedPolicyAbsent`] / [`SaError::PinCheckUnavailable`]:
     ///   the pinned-hash drift check of a non-zero rule in `auth_rule_ids`
     ///   refused before signing.
-    /// - [`SaError::SignerSetDiverged`] / [`SaError::SignerSetMissingBaseline`]:
-    ///   the divergence check of a non-zero rule in `auth_rule_ids` refused.
+    /// - [`SaError::SignerSetDiverged`] / [`SaError::SignerSetMissingBaseline`] /
+    ///   [`SaError::NetworkRpcDivergence`] / [`SaError::AuditLog`]: the
+    ///   signer-set check of a non-zero rule in `auth_rule_ids` refused
+    ///   before signing.
     /// - [`SaError::AuthEntryConstructionFailed`] — construction-time XDR
     ///   encode failures, an `External` signer with empty or oversized key
     ///   data, or RPC simulate/prepare failures.
@@ -862,43 +781,13 @@ impl ContextRuleManager {
             }
         };
 
-        // Per-operation divergence check BEFORE any signing or transaction submission.
         let source_account_strkey = signer
             .public_key()
             .await
             .map(|pk| pk.to_string())
             .unwrap_or_default();
-        if let Err(e) = self
-            .check_divergence_for_auth_rule_ids(
-                smart_account.clone(),
-                &auth_rule_ids,
-                &source_account_strkey,
-                &request_id,
-            )
-            .await
-        {
-            // Emit a failure audit row before propagating.  Falls back to
-            // self.audit_writer when the per-method parameter is None (the
-            // production CLI pattern).
-            let raw = AuditEntry::new_sa_raw_invocation(
-                &smart_account_redacted,
-                e.wire_code(),
-                None,
-                auth_rule_ids_count,
-                stellar_agent_core::audit_log::schema::SaInvocationResult::PreSubmissionRefused,
-                &self.chain_id,
-                &request_id,
-            );
-            self.write_audit_entry(
-                audit_writer.as_deref_mut(),
-                raw,
-                "install_rule: SaRawInvocation (divergence)",
-            );
-            return Err(e);
-        }
 
-        // Wasm-hash pin check, after the divergence check and before the
-        // submission. Identifies and verifies every verifier and policy
+        // Wasm-hash pin check, before the submission. Identifies and verifies every verifier and policy
         // contract the definition references, and refuses mutable or
         // unknown-wasm contracts unless the matching override flag is set.
         // An applied override is returned pending and written once the
@@ -1103,6 +992,8 @@ impl ContextRuleManager {
             horizon_check,
             None, // no expiry check: rule not yet created, no rule_id to check
             request_id,
+            // No lock is held: the submit path locks and checks the auth rules.
+            None,
         )
         .await
     }
@@ -1242,38 +1133,6 @@ impl ContextRuleManager {
         mut audit_writer: Option<&mut AuditWriter>,
         request_id: String,
     ) -> Result<(), SaError> {
-        // Per-operation divergence check.
-        let source_account_strkey = signer
-            .public_key()
-            .await
-            .map(|pk| pk.to_string())
-            .unwrap_or_default();
-        if let Err(e) = self
-            .check_divergence_for_auth_rule_ids(
-                smart_account.clone(),
-                &auth_rule_ids,
-                &source_account_strkey,
-                &request_id,
-            )
-            .await
-        {
-            // Falls back to self.audit_writer when per-method parameter is
-            // None (the production CLI pattern).
-            let health = self.signers_manager.as_ref().map(|sm| sm.health_handle());
-            emit_metadata_update_audit(
-                Some(&e),
-                &smart_account,
-                &auth_rule_ids,
-                audit_writer.as_deref_mut(),
-                self.audit_writer.as_ref(),
-                &self.chain_id,
-                &request_id,
-                "update_name",
-                health.as_ref(),
-            );
-            return Err(e);
-        }
-
         let health = self.signers_manager.as_ref().map(|sm| sm.health_handle());
         let new_name_audit = name.clone();
         let outcome = self
@@ -1347,6 +1206,8 @@ impl ContextRuleManager {
             None, // no horizon check for name-only updates
             None, // no expiry check for name-only updates (non-signing-path)
             request_id,
+            // No lock is held: the submit path locks and checks the auth rules.
+            None,
         )
         .await?;
         Ok(())
@@ -1387,38 +1248,6 @@ impl ContextRuleManager {
         mut audit_writer: Option<&mut AuditWriter>,
         request_id: String,
     ) -> Result<(), SaError> {
-        // Per-operation divergence check.
-        let source_account_strkey = signer
-            .public_key()
-            .await
-            .map(|pk| pk.to_string())
-            .unwrap_or_default();
-        if let Err(e) = self
-            .check_divergence_for_auth_rule_ids(
-                smart_account.clone(),
-                &auth_rule_ids,
-                &source_account_strkey,
-                &request_id,
-            )
-            .await
-        {
-            // Falls back to self.audit_writer when per-method parameter is
-            // None (the production CLI pattern).
-            let health = self.signers_manager.as_ref().map(|sm| sm.health_handle());
-            emit_metadata_update_audit(
-                Some(&e),
-                &smart_account,
-                &auth_rule_ids,
-                audit_writer.as_deref_mut(),
-                self.audit_writer.as_ref(),
-                &self.chain_id,
-                &request_id,
-                "update_valid_until",
-                health.as_ref(),
-            );
-            return Err(e);
-        }
-
         let health = self.signers_manager.as_ref().map(|sm| sm.health_handle());
         let outcome = self
             .update_valid_until_inner(
@@ -1503,6 +1332,8 @@ impl ContextRuleManager {
             // already-expired rule is intentionally permitted.
             None,
             request_id,
+            // No lock is held: the submit path locks and checks the auth rules.
+            None,
         )
         .await?;
         Ok(())
@@ -1542,41 +1373,6 @@ impl ContextRuleManager {
                     stage: "auth_payload",
                     redacted_reason: "auth_rule_ids count exceeds u32".to_owned(),
                 })?;
-
-        // Per-operation divergence check BEFORE any signing or transaction submission.
-        let source_account_strkey = signer
-            .public_key()
-            .await
-            .map(|pk| pk.to_string())
-            .unwrap_or_default();
-        if let Err(e) = self
-            .check_divergence_for_auth_rule_ids(
-                smart_account.clone(),
-                &auth_rule_ids,
-                &source_account_strkey,
-                &request_id,
-            )
-            .await
-        {
-            // Emit a failure audit row before propagating.  Falls back to
-            // self.audit_writer when the per-method parameter is None (the
-            // production CLI pattern).
-            let raw = AuditEntry::new_sa_raw_invocation(
-                &smart_account_redacted,
-                e.wire_code(),
-                None,
-                auth_rule_ids_count,
-                stellar_agent_core::audit_log::schema::SaInvocationResult::PreSubmissionRefused,
-                &self.chain_id,
-                &request_id,
-            );
-            self.write_audit_entry(
-                audit_writer.as_deref_mut(),
-                raw,
-                "delete_rule: SaRawInvocation (divergence)",
-            );
-            return Err(e);
-        }
 
         let outcome = self
             .delete_rule_inner(
@@ -1660,6 +1456,8 @@ impl ContextRuleManager {
             None, // no horizon check for delete operations
             None, // no expiry check: delete is a destructive revocation alternative
             request_id,
+            // No lock is held: the submit path locks and checks the auth rules.
+            None,
         )
         .await?;
         Ok(())
@@ -1699,9 +1497,11 @@ impl ContextRuleManager {
     /// # Sequence
     ///
     /// The add requires a signers manager and refuses without one before any
-    /// RPC. It then runs the divergence check of every non-zero rule in
-    /// `auth_rule_ids`, and observes the policy's executable through both
-    /// RPC endpoints to decide whether it is the simple-threshold policy.
+    /// RPC. It observes the policy's executable through both RPC endpoints
+    /// to decide whether it is the simple-threshold policy. The submit path
+    /// runs the checks of every rule other than rule 0 in `auth_rule_ids`
+    /// before signing: the rule lock, the signer-set baseline read, the
+    /// pinned-hash drift check and the signer-set comparison.
     ///
     /// # Simple-threshold policy
     ///
@@ -1852,37 +1652,11 @@ impl ContextRuleManager {
                 }
             };
 
-        // Per-operation divergence check.
         let source_account_strkey = signer
             .public_key()
             .await
             .map(|pk| pk.to_string())
             .unwrap_or_default();
-        if let Err(e) = self
-            .check_divergence_for_auth_rule_ids(
-                smart_account.clone(),
-                &auth_rule_ids,
-                &source_account_strkey,
-                &request_id,
-            )
-            .await
-        {
-            let raw = AuditEntry::new_sa_raw_invocation(
-                &smart_account_redacted,
-                e.wire_code(),
-                None,
-                auth_rule_ids_count,
-                stellar_agent_core::audit_log::schema::SaInvocationResult::PreSubmissionRefused,
-                &self.chain_id,
-                &request_id,
-            );
-            self.write_audit_entry(
-                audit_writer.as_deref_mut(),
-                raw,
-                "add_policy: SaRawInvocation (divergence)",
-            );
-            return Err(e);
-        }
 
         let outcome = self
             .add_policy_confirmed(
@@ -2044,25 +1818,27 @@ impl ContextRuleManager {
             install_param,
         ];
         let target = smart_account.clone();
-        let submit = move || {
-            self.submit_signed_invoke(
-                target,
-                "add_policy",
-                invoke_args,
-                auth_rule_ids,
-                signer,
-                "add_policy",
-                None, // no horizon check for policy install
-                // Expiry check at signing-path entry.
-                // Refuses with `SaError::RuleExpired` when `valid_until <
-                // latest_ledger` (OZ `storage.rs:280-285` SHA `a9c4216`).
-                Some(ExpiryCheck { rule_id }),
-                request_id,
-            )
-        };
 
         let Some(expected_threshold) = expected_threshold else {
-            let submitted = submit().await?;
+            // No lock is held: the submit path locks and checks the auth
+            // rules.
+            let submitted = self
+                .submit_signed_invoke(
+                    target,
+                    "add_policy",
+                    invoke_args,
+                    auth_rule_ids,
+                    signer,
+                    "add_policy",
+                    None, // no horizon check for policy install
+                    // Expiry check at signing-path entry.
+                    // Refuses with `SaError::RuleExpired` when `valid_until <
+                    // latest_ledger` (OZ `storage.rs:280-285` SHA `a9c4216`).
+                    Some(ExpiryCheck { rule_id }),
+                    request_id,
+                    None,
+                )
+                .await?;
             // OZ `add_policy` returns `u32` (the assigned policy_id) per
             // `mod.rs:440` + `storage.rs:1143` SHA `a9c4216`. The transaction
             // confirmed whatever the return value is, so a value without a
@@ -2108,10 +1884,26 @@ impl ContextRuleManager {
                 smart_account_strkey,
                 smart_account_redacted,
                 rule_id,
+                auth_rule_ids,
                 policy_address,
                 expected_threshold,
                 Some(source_account_strkey),
-                submit,
+                move |locked| {
+                    Box::pin(self.submit_signed_invoke(
+                        target,
+                        "add_policy",
+                        invoke_args,
+                        auth_rule_ids,
+                        signer,
+                        "add_policy",
+                        None, // no horizon check for policy install
+                        // Expiry check at signing-path entry (OZ
+                        // `storage.rs:280-285` SHA `a9c4216`).
+                        Some(ExpiryCheck { rule_id }),
+                        request_id,
+                        Some(locked.rule_locks()),
+                    ))
+                },
                 request_id,
             )
             .await?;
@@ -2163,12 +1955,13 @@ impl ContextRuleManager {
     /// # Sequence
     ///
     /// The removal requires a signers manager and refuses without one before
-    /// any RPC. It then runs the divergence check of every non-zero rule in
-    /// `auth_rule_ids` and reads the rule to resolve `policy_id` to its
-    /// address. It observes the policy's executable through both RPC
-    /// endpoints to decide whether it is the simple-threshold policy. A
-    /// missing rule and a policy id the rule does not hold each refuse before
-    /// submission.
+    /// any RPC. It reads the rule to resolve `policy_id` to its address and
+    /// observes the policy's executable through both RPC endpoints to decide
+    /// whether it is the simple-threshold policy. A missing rule and a
+    /// policy id the rule does not hold each refuse before submission. The
+    /// submit path runs the checks of every rule other than rule 0 in
+    /// `auth_rule_ids` before signing: the rule lock, the signer-set baseline
+    /// read, the pinned-hash drift check and the signer-set comparison.
     ///
     /// # Simple-threshold policy
     ///
@@ -2294,37 +2087,11 @@ impl ContextRuleManager {
                 }
             };
 
-        // Per-operation divergence check.
         let source_account_strkey = signer
             .public_key()
             .await
             .map(|pk| pk.to_string())
             .unwrap_or_default();
-        if let Err(e) = self
-            .check_divergence_for_auth_rule_ids(
-                smart_account.clone(),
-                &auth_rule_ids,
-                &source_account_strkey,
-                &request_id,
-            )
-            .await
-        {
-            let raw = AuditEntry::new_sa_raw_invocation(
-                &smart_account_redacted,
-                e.wire_code(),
-                None,
-                auth_rule_ids_count,
-                stellar_agent_core::audit_log::schema::SaInvocationResult::PreSubmissionRefused,
-                &self.chain_id,
-                &request_id,
-            );
-            self.write_audit_entry(
-                audit_writer.as_deref_mut(),
-                raw,
-                "remove_policy: SaRawInvocation (divergence)",
-            );
-            return Err(e);
-        }
 
         let outcome = self
             .remove_policy_confirmed(
@@ -2471,23 +2238,25 @@ impl ContextRuleManager {
             .await?;
         let invoke_args = vec![ScVal::U32(rule_id), ScVal::U32(policy_id)];
         let target = smart_account.clone();
-        let submit = move || {
-            self.submit_signed_invoke(
-                target,
-                "remove_policy",
-                invoke_args,
-                auth_rule_ids,
-                signer,
-                "remove_policy",
-                None, // no horizon check for policy removal
-                // Expiry check at signing-path entry.
-                Some(ExpiryCheck { rule_id }),
-                request_id,
-            )
-        };
 
         if !observation.allowlisted {
-            let submitted = submit().await?;
+            // No lock is held: the submit path locks and checks the auth
+            // rules.
+            let submitted = self
+                .submit_signed_invoke(
+                    target,
+                    "remove_policy",
+                    invoke_args,
+                    auth_rule_ids,
+                    signer,
+                    "remove_policy",
+                    None, // no horizon check for policy removal
+                    // Expiry check at signing-path entry.
+                    Some(ExpiryCheck { rule_id }),
+                    request_id,
+                    None,
+                )
+                .await?;
             return Ok(PolicyRemoveConfirmed {
                 tx_hash: submitted.tx_hash,
                 pin_update,
@@ -2505,9 +2274,24 @@ impl ContextRuleManager {
                 smart_account_strkey,
                 smart_account_redacted,
                 rule_id,
+                auth_rule_ids,
                 &rule_policy.address,
                 Some(source_account_strkey),
-                submit,
+                move |locked| {
+                    Box::pin(self.submit_signed_invoke(
+                        target,
+                        "remove_policy",
+                        invoke_args,
+                        auth_rule_ids,
+                        signer,
+                        "remove_policy",
+                        None, // no horizon check for policy removal
+                        // Expiry check at signing-path entry.
+                        Some(ExpiryCheck { rule_id }),
+                        request_id,
+                        Some(locked.rule_locks()),
+                    ))
+                },
                 request_id,
             )
             .await?;
@@ -2857,7 +2641,10 @@ impl ContextRuleManager {
     /// 1. Fetch `active_count` via [`Self::get_rules_count`].
     /// 2. Early-exit with an empty enumeration if `active_count == 0`.
     /// 3. Scan `rule_id in 0..max_scan_id` calling [`Self::get_rule`].
-    ///    - `Ok(Some(scval))` → parse the summary; increment `returned`.
+    ///    - `Ok(Some(scval))` → parse the summary; with an `audit_writer`,
+    ///      read the rule's signer-set baseline state ([`BaselineState`]) in
+    ///      one audit-log scan and check the scan budget after it; increment
+    ///      `returned`.
     ///    - `Ok(None)` → gap (deleted or never allocated); increment `skipped`.
     ///    - `Err(_)` → propagate immediately.
     ///    - Early-exit when `returned + skipped >= active_count` (enough IDs
@@ -2875,19 +2662,21 @@ impl ContextRuleManager {
     /// # Errors
     ///
     /// - [`SaError::DeploymentFailed`] (`phase = "simulate"`) — any RPC failure
-    ///   during the scan, or `max_scan_id` exhausted before all active rules
-    ///   were found.
+    ///   during the scan, `max_scan_id` exhausted before all active rules
+    ///   were found, or the scan budget (`timeout`) elapsed, the baseline
+    ///   reads included.
     /// - [`SaError::AuditLog`] — audit-log integrity violation during the
     ///   audit-log cross-check (integrity errors MUST NOT be silently mapped
-    ///   to `Ok`).
+    ///   to `Ok`). An integrity error during one rule's baseline read is not
+    ///   an error: that rule reports [`BaselineState::Unreadable`].
     pub async fn list_active_context_rules(
         &self,
         smart_account: ScAddress,
         source_account_strkey: &str,
         max_scan_id: u32,
     ) -> Result<ActiveContextRuleEnumeration, SaError> {
-        let smart_account_redacted =
-            redact_strkey_first5_last5(&scaddress_to_strkey(&smart_account)?);
+        let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
+        let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
         // ── Step 1: fetch active rule count ───────────────────────────────────
         let active_count = self
@@ -2932,6 +2721,15 @@ impl ContextRuleManager {
         // value.
         let mut scanned_id_range_end: u32 = 0;
         let mut budget_elapsed = false;
+        // Each summarized rule's baseline state comes from one scan of the
+        // audit log, when the manager has a writer.
+        let baseline_reader = self.audit_writer.as_ref().map(|writer| {
+            stellar_agent_core::audit_log::reader::AuditReader::new(Arc::clone(writer), None)
+        });
+        let smart_account_digest = stellar_agent_core::audit_log::signer_set::account_digest(
+            &self.network_passphrase,
+            &smart_account_strkey,
+        );
 
         for rule_id in 0..max_scan_id {
             // Early-exit when all active rules are found.
@@ -2979,9 +2777,27 @@ impl ContextRuleManager {
             };
             match scval_opt {
                 Some(scval) => {
-                    let summary = parse_context_rule_summary(scval, rule_id)?;
+                    let mut summary = parse_context_rule_summary(scval, rule_id)?;
+                    let scanned = baseline_reader.as_ref().map(|reader| {
+                        BaselineState::read(
+                            reader,
+                            rule_id,
+                            &smart_account_redacted,
+                            &smart_account_digest,
+                        )
+                    });
+                    if let Some(baseline) = scanned {
+                        summary.baseline = baseline;
+                    }
                     rules.push(summary);
                     returned += 1;
+                    // The baseline read is a synchronous audit-log scan the
+                    // budget's timeout cannot interrupt; the deadline is
+                    // checked after it.
+                    if scanned.is_some() && tokio::time::Instant::now() >= scan_budget.deadline {
+                        budget_elapsed = true;
+                        break;
+                    }
                 }
                 None => {
                     // Recognised sparse gap (ContextRuleNotFound) — counted
@@ -3264,16 +3080,20 @@ impl ContextRuleManager {
     /// Builds the `HostFunction` from `entrypoint` + `invoke_args`, constructs
     /// a [`crate::submit::SubmitInvokeArgs`], and calls the free function.
     ///
-    /// The pinned-hash drift check runs through the configured signers
-    /// manager with `request_id` ([`crate::submit::PinCheck`]). Without a
-    /// signers manager, a submission authorized by any rule other than rule 0
-    /// is refused with [`SaError::SignersManagerNotConfigured`] before
-    /// anything is simulated or signed; a submission under rule 0 only needs
-    /// no check.
+    /// The pre-submission checks of every rule other than rule 0 in
+    /// `auth_rule_ids` (the rule locks, the signer-set baseline read, the
+    /// pinned-hash drift check and the signer-set comparison) run through
+    /// the configured signers manager with `request_id`
+    /// ([`crate::submit::PinCheck`]). `rule_locks` is the held-lock context
+    /// of a caller that holds the locks of those rules, `None` otherwise.
+    /// Without a signers manager, a submission authorized by any rule other
+    /// than rule 0 is refused with [`SaError::SignersManagerNotConfigured`]
+    /// before anything is simulated or signed; a submission under rule 0
+    /// only needs no check.
     #[allow(
         clippy::too_many_arguments,
-        reason = "horizon_check and expiry_check params are additive to the pre-existing arg \
-                  set; the free function carries the full body"
+        reason = "horizon_check, expiry_check and rule_locks params are additive to the \
+                  pre-existing arg set; the free function carries the full body"
     )]
     async fn submit_signed_invoke(
         &self,
@@ -3286,6 +3106,7 @@ impl ContextRuleManager {
         horizon_check: Option<HorizonCheck>,
         expiry_check: Option<ExpiryCheck>,
         request_id: &str,
+        rule_locks: Option<&BorrowedRuleLocks<'_>>,
     ) -> Result<crate::submit::SubmitInvokeResult, SaError> {
         // Convert smart_account ScAddress → C-strkey so the free function can
         // call `parse_c_strkey_to_smart_account` uniformly.
@@ -3350,6 +3171,7 @@ impl ContextRuleManager {
                 .maybe_horizon_check(horizon_check)
                 .maybe_expiry_check(expiry_check)
                 .maybe_pin_check(pin_check)
+                .maybe_rule_locks(rule_locks)
                 .build(),
         )
         .await
@@ -3773,6 +3595,75 @@ pub struct ContextRuleSummary {
     /// Optional ledger sequence at which the rule expires. `None` means
     /// permanent (OZ `valid_until` field, `storage.rs:159`, SHA `a9c4216`).
     pub valid_until: Option<u32>,
+    /// The rule's signer-set baseline in the manager's audit log; see
+    /// [`BaselineState`].
+    pub baseline: BaselineState,
+}
+
+/// The signer-set baseline a rule has in the audit log, as
+/// [`ContextRuleManager::list_active_context_rules`] reports it.
+///
+/// Every signature under a rule other than rule 0 needs the rule's
+/// baseline: a rule reporting [`BaselineState::None`] refuses with
+/// `sa.signer_set_missing_baseline` until one `signers list --rule-id N`
+/// records it. Rule 0 reports its own state like any rule; the signing path
+/// never reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum BaselineState {
+    /// The manager has no audit writer, so the log was not read.
+    Unknown,
+    /// The log holds no signer-set state row for the rule.
+    None,
+    /// The newest state row is version 1.
+    V1,
+    /// The newest state row is version 2.
+    V2,
+    /// The log could not be read for the rule (an integrity error).
+    Unreadable,
+}
+
+impl BaselineState {
+    /// The state's serialized name: `unknown`, `none`, `v1`, `v2` or
+    /// `unreadable`.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::None => "none",
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+            Self::Unreadable => "unreadable",
+        }
+    }
+
+    /// The state of rule `rule_id` read through `reader`: the version of its
+    /// newest signer-set state row, `None` without one, `Unreadable` on an
+    /// integrity error.
+    fn read(
+        reader: &stellar_agent_core::audit_log::reader::AuditReader,
+        rule_id: u32,
+        smart_account_redacted: &str,
+        account_digest: &[u8; 32],
+    ) -> Self {
+        match reader.find_latest_signer_set_view(rule_id, smart_account_redacted, account_digest) {
+            Ok(None) => Self::None,
+            Ok(Some(payload)) => match payload.view() {
+                SignerSetView::V1(_) => Self::V1,
+                SignerSetView::V2(_) => Self::V2,
+            },
+            Err(e) => {
+                warn!(
+                    rule_id,
+                    smart_account = %smart_account_redacted,
+                    error = %e,
+                    "list_active_context_rules: the rule's signer-set baseline is unreadable"
+                );
+                Self::Unreadable
+            }
+        }
+    }
 }
 
 /// Output of [`ContextRuleManager::list_active_context_rules`].
@@ -5227,6 +5118,7 @@ fn parse_context_rule_summary(scval: ScVal, rule_id: u32) -> Result<ContextRuleS
         policy_count: policy_count
             .ok_or_else(|| parse_err("missing 'policies' field".to_owned()))?,
         valid_until: valid_until.flatten(),
+        baseline: BaselineState::Unknown,
     })
 }
 
@@ -5452,10 +5344,11 @@ pub fn extract_valid_until_from_rule_scval(scval: &ScVal) -> Result<Option<u32>,
 /// that has access to an RPC URL and network passphrase but not a full
 /// [`ContextRuleManager`] instance.
 ///
-/// Called from `SignersManager::submit_signed_invoke` (three signing-path
-/// inner methods: `add_signer_locked_inner`, `remove_signer_locked_inner`,
-/// `set_threshold_locked_inner`) via the `ExpiryCheck` struct threaded
-/// through `submit_single_op`.
+/// Called from [`crate::submit::submit_signed_invoke`] for every caller
+/// that passes an `ExpiryCheck`: the signer verbs through
+/// `SignersManager::submit_single_op`, the admin verbs through
+/// `SignersManager::submit_signed_invoke`, and the policy verbs through
+/// `ContextRuleManager::submit_signed_invoke`.
 ///
 /// Equivalent to [`ContextRuleManager::check_rule_not_expired`] but takes
 /// raw RPC-URL and passphrase parameters instead of `&self`.

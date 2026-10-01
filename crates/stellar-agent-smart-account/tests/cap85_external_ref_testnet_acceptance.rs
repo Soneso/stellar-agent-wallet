@@ -949,6 +949,9 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     );
 
     // ── Proof 3: the execute path refuses on drift before signing ──────────
+    // The rule's install baseline is in this log, so the baseline read
+    // passes; the pin check after it refuses, and the signer-set comparison
+    // never runs.
     let drift_request_id = rid();
     let execute_refusal = submit_signed_invoke(
         SubmitInvokeArgs::builder()

@@ -100,7 +100,7 @@ use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRulePolicy, ContextRuleSignerInput,
     RuleContext, parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
-use stellar_agent_smart_account::managers::signers::SignersManager;
+use stellar_agent_smart_account::managers::signers::{PreviousBaseline, SignersManager};
 use stellar_agent_smart_account::managers::spending_limit_data::compute_spending_window;
 use stellar_agent_smart_account::signers::policy_identification::THRESHOLD_POLICY_WASM;
 use stellar_agent_smart_account::spending_limit_policy::build_spending_limit_install_param;
@@ -791,7 +791,19 @@ async fn policy_observability_full_flow_testnet_acceptance() {
     // The install recorded its rows in the rule manager's own audit log, so
     // this log holds no pin record of the rule and the drift check fetches
     // the rule and passes it. The rule's two policies would make a pin record
-    // refuse every checked verb, which this test does not exercise.
+    // refuse every checked verb, which this test does not exercise. This log
+    // holds no signer-set state row of the rule either: one `signers list`
+    // records the first observation, which each transfer below compares the
+    // chain with before signing.
+    let first_observation = signers_mgr
+        .list_signers(smart_account_sc.clone(), rule_id, Some(&operator_g), rid())
+        .await
+        .expect("the first observation of the rule must be recorded");
+    assert_eq!(
+        first_observation.baseline,
+        PreviousBaseline::None,
+        "the separate log holds no prior state row of the rule"
+    );
     let pin_request_id = rid();
     let pin_check = || PinCheck {
         signers_manager: &signers_mgr,

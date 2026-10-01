@@ -1920,15 +1920,33 @@ fn build_inner_results(
     Ok(results)
 }
 
+/// The `sa.auth_entry_construction_failed` stages the rule checks of the
+/// submit path raise: the rule locks and the signer-set steps.
+const RULE_CHECK_STAGES: &[&str] = &[
+    "rule_lock",
+    "rule_lock_missing",
+    "rule_locks_without_pin_check",
+    "baseline_read",
+    "signer_set_compare",
+];
+
 /// Maps a `SaError` wire-code to the closest `MulticallFailed` phase string.
 ///
 /// Phase mappings:
 /// - `"sa.deployment_failed"` with `phase = "simulate"` or `phase = "submit"` → that phase.
-/// - `"sa.auth_entry_construction_failed"` → `"sign"` (auth-entry assembly failure).
+/// - `"sa.auth_entry_construction_failed"` at a rule-check stage (`rule_lock`,
+///   `rule_lock_missing`, `rule_locks_without_pin_check`, `baseline_read`,
+///   `signer_set_compare`) → `"policy_gate"`; at any other stage → `"sign"`
+///   (auth-entry assembly failure).
 /// - `"sa.submit_check_missing"` → `"build"` (programming-gate; fires before any I/O).
 /// - `"sa.horizon_exceeded"` / `"sa.rule_expired"` / `"sa.simulation_divergence"` → `"policy_gate"`.
 /// - `"sa.verifier_hash_drift"` / `"sa.policy_hash_drift"` / `"sa.pinned_policy_absent"` /
 ///   `"sa.pin_check_unavailable"` → `"policy_gate"` (the pinned-hash drift check).
+/// - `"sa.signer_set_missing_baseline"` / `"sa.signer_set_baseline_legacy"` /
+///   `"sa.signer_set_diverged"` / `"sa.audit_log"` / `"network.rpc_divergence"` /
+///   `"sa.threshold_policy_not_installed"` /
+///   `"sa.threshold_policy_identification_failed"` / `"sa.threshold_read_failed"`
+///   → `"policy_gate"` (the signer-set check of the authorizing rule).
 /// - `"sa.multicall_failed"` (nested) → `"submit"` (double-wrap, catches re-entrant errors).
 /// - Other (unrecognised) → `"submit"` as last resort.
 fn map_sa_error_to_multicall_phase(err: &SaError) -> &'static str {
@@ -1948,6 +1966,17 @@ fn map_sa_error_to_multicall_phase(err: &SaError) -> &'static str {
             }
         }
         "sa.auth_entry_construction_failed"
+            if matches!(
+                err,
+                SaError::AuthEntryConstructionFailed { stage, .. }
+                    if RULE_CHECK_STAGES.contains(stage)
+            ) =>
+        {
+            // The rule locks and the signer-set steps of the authorizing
+            // rule refuse before simulation, as the pin check does.
+            "policy_gate"
+        }
+        "sa.auth_entry_construction_failed"
         | "sa.rule_id_mismatch"
         | "sa.simulation_divergence" => {
             // Auth-entry construction and context-rule divergence checks fire at the
@@ -1964,6 +1993,18 @@ fn map_sa_error_to_multicall_phase(err: &SaError) -> &'static str {
         | "sa.pin_check_unavailable" => {
             // The pinned-hash drift check refuses before simulation: a wallet
             // security gate on the authorizing rule, not a network failure.
+            "policy_gate"
+        }
+        "sa.signer_set_missing_baseline"
+        | "sa.signer_set_baseline_legacy"
+        | "sa.signer_set_diverged"
+        | "sa.audit_log"
+        | "network.rpc_divergence"
+        | "sa.threshold_policy_not_installed"
+        | "sa.threshold_policy_identification_failed"
+        | "sa.threshold_read_failed" => {
+            // The signer-set check of the authorizing rule refuses before
+            // simulation: a wallet security gate, like the pin check.
             "policy_gate"
         }
         "sa.horizon_exceeded" | "sa.rule_expired" => {
@@ -3209,6 +3250,125 @@ wasm_sha256 = "{drifted_sha}"
                 "{}",
                 err.wire_code()
             );
+        }
+    }
+
+    /// The signer-set refusals of the authorizing rule map to
+    /// `"policy_gate"`: each refuses before simulation.
+    #[test]
+    fn map_sa_error_to_phase_signer_set_refusals_map_to_policy_gate() {
+        use stellar_agent_core::audit_log::AuditLogIntegrityError;
+        use stellar_agent_core::audit_log::signer_set::{SignerSetSnapshotV2, SignerSetView};
+        use stellar_agent_core::observability::RedactedStrkey;
+
+        use crate::signers::types::WasmHashSummary;
+
+        let redacted = || RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ");
+        let view = || {
+            SignerSetView::V2(SignerSetSnapshotV2 {
+                signers: vec![],
+                threshold: None,
+            })
+        };
+        let refusals = [
+            SaError::SignerSetMissingBaseline {
+                rule_id: 2,
+                smart_account_redacted: redacted(),
+                request_id: "req".to_owned(),
+            },
+            SaError::SignerSetBaselineLegacy {
+                rule_id: 2,
+                smart_account_redacted: redacted(),
+                request_id: "req".to_owned(),
+            },
+            SaError::SignerSetDiverged {
+                rule_id: 2,
+                expected: view(),
+                observed: view(),
+                tx_hash: None,
+                smart_account_redacted: redacted(),
+                request_id: "req".to_owned(),
+            },
+            SaError::AuditLog(AuditLogIntegrityError::ParseError {
+                line: 3,
+                detail: "malformed row".to_owned(),
+            }),
+            SaError::NetworkRpcDivergence {
+                rule_id: Some(2),
+                smart_account_redacted: redacted(),
+                primary_view_digest_first8: "11111111".to_owned(),
+                secondary_view_digest_first8: "22222222".to_owned(),
+                request_id: "req".to_owned(),
+            },
+            SaError::ThresholdPolicyNotInstalled {
+                rule_id: 2,
+                smart_account_redacted: redacted(),
+                request_id: "req".to_owned(),
+            },
+            SaError::ThresholdPolicyIdentificationFailed {
+                rule_id: 2,
+                smart_account_redacted: redacted(),
+                observed_wasm_hashes_summary: WasmHashSummary::new(0, None).unwrap(),
+                request_id: "req".to_owned(),
+            },
+            SaError::ThresholdReadFailed {
+                rule_id: 2,
+                smart_account_redacted: redacted(),
+                source_kind: "primary",
+                request_id: "req".to_owned(),
+            },
+        ];
+        let codes: Vec<&str> = refusals.iter().map(SaError::wire_code).collect();
+        assert_eq!(
+            codes,
+            [
+                "sa.signer_set_missing_baseline",
+                "sa.signer_set_baseline_legacy",
+                "sa.signer_set_diverged",
+                "sa.audit_log",
+                "network.rpc_divergence",
+                "sa.threshold_policy_not_installed",
+                "sa.threshold_policy_identification_failed",
+                "sa.threshold_read_failed",
+            ]
+        );
+        for err in &refusals {
+            assert_eq!(
+                map_sa_error_to_multicall_phase(err),
+                "policy_gate",
+                "{}",
+                err.wire_code()
+            );
+        }
+    }
+
+    /// The rule-lock and signer-set stages of an auth-entry construction
+    /// failure map to `"policy_gate"`; every other stage stays `"sign"`.
+    #[test]
+    fn map_sa_error_to_phase_rule_check_stages_map_to_policy_gate() {
+        for stage in [
+            "rule_lock",
+            "rule_lock_missing",
+            "rule_locks_without_pin_check",
+            "baseline_read",
+            "signer_set_compare",
+        ] {
+            let err = SaError::AuthEntryConstructionFailed {
+                stage,
+                redacted_reason: "test".to_owned(),
+            };
+            assert_eq!(
+                map_sa_error_to_multicall_phase(&err),
+                "policy_gate",
+                "{stage}"
+            );
+        }
+        for stage in ["auth_payload", "pin_check_required", "quorum_signatures"] {
+            let err = SaError::AuthEntryConstructionFailed {
+                stage,
+                redacted_reason: "test".to_owned(),
+            };
+            assert_eq!(map_sa_error_to_multicall_phase(&err), "sign", "{stage}");
         }
     }
 

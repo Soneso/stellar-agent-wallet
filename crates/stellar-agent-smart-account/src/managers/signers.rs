@@ -30,9 +30,14 @@
 //! # Architecture
 //!
 //! Each public `async` method is a thin outer function that:
-//! 1. Acquires the per-rule mutex (non-reentrant; fails on double-lock attempt).
+//! 1. Acquires its rule locks through one `acquire_rule_locks` call, bounded
+//!    by the manager's timeout: the target rule, and for a verb that signs
+//!    under other rules, those rules too. A lock not acquired in time
+//!    refuses at stage `rule_lock`.
 //! 2. Delegates to `*_locked_inner` which compares, submits, observes and
-//!    validates.
+//!    validates. The submission receives the held locks and the verb's own
+//!    comparison as a `BorrowedRuleLocks` context; the submit path compares
+//!    every other rule the submission is signed under and acquires no lock.
 //! 3. Writes the audit-log state row inside the write critical section
 //!    (`write_state_row`). A signer add also writes its pin rows once its
 //!    transaction confirms: after the state row, or before a refusal that
@@ -116,6 +121,7 @@ use crate::error::{
     AdminOrOwnerKey, BASELINE_WRITE_STAGE_OBSERVE, BASELINE_WRITE_STAGE_WRITE,
     baseline_observe_reason, baseline_write_reason,
 };
+use crate::managers::auth_entry::PreSubmitBudget;
 use crate::managers::rules::{
     BASE_FEE_STROOPS, ExpectedInstallState, ExpiryCheck, augment_with_oz_error_name,
     contract_instance_key, scaddress_to_strkey,
@@ -222,19 +228,14 @@ type RuleMutexMap = Mutex<HashMap<RuleMutexKey, RuleMutexInner>>;
 /// with the rule's state row, its submission and its row write never
 /// interleave with another call's.
 ///
-/// The acquire sites are the manager's verbs and entries that read or write
-/// a rule's state row, and the policy-configuration verbs that change the
-/// rule on chain:
-///
-/// - `list_signers`, `refresh_signer_baseline` and
-///   `verify_signer_set_against_chain`;
-/// - `add_signer`, `remove_signer`, `set_threshold` and `batch_add_signers`;
-/// - `baseline_confirmed_install`, `attach_threshold_policy` and
-///   `detach_threshold_policy`;
-/// - `set_spending_limit`, `set_weighted_threshold` and `set_signer_weight`.
-///
-/// Each acquires the lock once and holds it for the whole call; nothing
-/// called under the lock acquires it again.
+/// Every holder takes its locks through
+/// [`SignersManager::acquire_rule_locks`] (or its single-rule form
+/// [`SignersManager::acquire_rule_lock`]): one call, one set of rules,
+/// acquired in ascending rule-id order under a deadline. Nothing that runs
+/// under a held guard acquires a lock again. Two holders whose sets overlap
+/// therefore acquire their common rules in the same order and cannot
+/// deadlock, and a waiter that does not get a lock before its deadline
+/// refuses at stage `rule_lock`.
 static RULE_MUTEX_REGISTRY: OnceLock<RuleMutexMap> = OnceLock::new();
 
 fn rule_mutex_registry() -> &'static RuleMutexMap {
@@ -271,6 +272,181 @@ fn rule_mutex_acquire(
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
     )
 }
+
+/// A held lock on one rule of one smart account, from
+/// [`SignersManager::acquire_rule_locks`] or
+/// [`SignersManager::acquire_rule_lock`].
+///
+/// The guard carries the lock's full key: the audit-log path, the rule id
+/// and the account strkey. A function that takes a `&RuleLockGuard` reads
+/// the rule and the account from it, so the guard is the proof that the
+/// caller holds the lock of the rule it works on. Dropping the guard
+/// releases the lock.
+pub(crate) struct RuleLockGuard {
+    key: RuleMutexKey,
+    /// The owned guard of the rule's mutex, held for its drop.
+    _held: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl RuleLockGuard {
+    /// The locked rule.
+    pub(crate) fn rule_id(&self) -> u32 {
+        self.key.1
+    }
+
+    /// The smart account whose rule is locked, as its C-strkey.
+    pub(crate) fn smart_account_strkey(&self) -> &str {
+        &self.key.2
+    }
+
+    /// The smart account whose rule is locked, redacted first-5-last-5.
+    pub(crate) fn smart_account_redacted(&self) -> String {
+        redact_strkey_first5_last5(&self.key.2)
+    }
+
+    /// The audit log of the manager that took the lock.
+    pub(crate) fn audit_log_path(&self) -> &std::path::Path {
+        &self.key.0
+    }
+}
+
+/// The guard in `guards` for rule `rule_id` of the smart account
+/// `smart_account_strkey`, if any.
+pub(crate) fn find_rule_guard<'g>(
+    guards: &'g [RuleLockGuard],
+    smart_account_strkey: &str,
+    rule_id: u32,
+) -> Option<&'g RuleLockGuard> {
+    guards.iter().find(|guard| {
+        guard.rule_id() == rule_id && guard.smart_account_strkey() == smart_account_strkey
+    })
+}
+
+/// The refusal of a rule whose lock the caller does not hold: the one error
+/// of stage `rule_lock_missing`.
+pub(crate) fn rule_lock_missing(rule_id: u32) -> SaError {
+    SaError::AuthEntryConstructionFailed {
+        stage: "rule_lock_missing",
+        redacted_reason: format!(
+            "rule {rule_id}: the submission names an auth rule the caller holds no lock for"
+        ),
+    }
+}
+
+/// The guard of rule `rule_id` in a holder's own acquisition.
+///
+/// # Errors
+///
+/// [`rule_lock_missing`] when `guards` holds no lock for the rule.
+fn held_guard<'g>(
+    guards: &'g [RuleLockGuard],
+    smart_account_strkey: &str,
+    rule_id: u32,
+) -> Result<&'g RuleLockGuard, SaError> {
+    find_rule_guard(guards, smart_account_strkey, rule_id).ok_or_else(|| rule_lock_missing(rule_id))
+}
+
+/// The rules a holder locks: its target and the distinct non-zero rules
+/// its submission is signed under. Rule 0 among the latter is not compared
+/// and needs no lock.
+fn holder_lock_set(
+    target_rule_id: u32,
+    auth_rule_ids: &[ContextRuleId],
+) -> impl Iterator<Item = u32> + '_ {
+    std::iter::once(target_rule_id).chain(
+        auth_rule_ids
+            .iter()
+            .map(ContextRuleId::as_u32)
+            .filter(|rule_id| *rule_id != 0),
+    )
+}
+
+/// Logs the wait of one rule-lock acquisition on the `sa_submit_timing`
+/// debug span.
+fn log_rule_lock_wait(started: std::time::Instant) {
+    debug!(
+        target: "sa_submit_timing",
+        stage = "rule_lock",
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "sa_submit_timing: pre-submit stage elapsed"
+    );
+}
+
+/// The locks a holder took through one [`SignersManager::acquire_rule_locks`]
+/// call, with the comparisons it ran under them, lent to
+/// [`crate::submit::submit_signed_invoke`].
+///
+/// The context is built only in this module, from the guards of one
+/// acquisition and the [`ComparedState`]s of the holder's own comparisons;
+/// a `ComparedState` exists only as the result of a comparison. The free
+/// function acquires no lock when it is handed a context: it refuses a
+/// submission naming a rule the context holds no guard for, on the
+/// submission's account and in the log of the manager that checks it, and it
+/// reads and compares every named rule the context did not compare.
+pub(crate) struct BorrowedRuleLocks<'a> {
+    guards: &'a [RuleLockGuard],
+    compared: &'a [ComparedState],
+}
+
+/// Builds the held-lock context of `guards` and `compared`.
+fn borrowed<'a>(
+    guards: &'a [RuleLockGuard],
+    compared: &'a [ComparedState],
+) -> BorrowedRuleLocks<'a> {
+    BorrowedRuleLocks { guards, compared }
+}
+
+impl<'a> BorrowedRuleLocks<'a> {
+    /// The held guard for rule `rule_id` of the smart account
+    /// `smart_account_strkey`, if the context holds one. A guard for another
+    /// account never matches.
+    pub(crate) fn guard_for(
+        &self,
+        smart_account_strkey: &str,
+        rule_id: u32,
+    ) -> Option<&'a RuleLockGuard> {
+        find_rule_guard(self.guards, smart_account_strkey, rule_id)
+    }
+
+    /// The holder's comparison of rule `rule_id`, if it ran one.
+    pub(crate) fn compared_for(&self, rule_id: u32) -> Option<&'a ComparedState> {
+        self.compared
+            .iter()
+            .find(|compared| compared.rule_id() == rule_id)
+    }
+}
+
+/// The held-lock context a threshold-policy entry hands the submission it
+/// runs under its locks.
+///
+/// `'l` is the life of the context, which the entry owns; `'env` is the life
+/// of the borrows the submission captures. The type records that `'env`
+/// outlives `'l`, so a submission closure that borrows its caller's data can
+/// return a future tied to the context.
+pub(crate) struct LockedSubmission<'l, 'env> {
+    rule_locks: &'l BorrowedRuleLocks<'l>,
+    _env: std::marker::PhantomData<&'l &'env ()>,
+}
+
+impl<'l> LockedSubmission<'l, '_> {
+    /// Hands `rule_locks` to a submission.
+    fn new(rule_locks: &'l BorrowedRuleLocks<'l>) -> Self {
+        Self {
+            rule_locks,
+            _env: std::marker::PhantomData,
+        }
+    }
+
+    /// The held-lock context to pass to the submission.
+    pub(crate) fn rule_locks(&self) -> &'l BorrowedRuleLocks<'l> {
+        self.rule_locks
+    }
+}
+
+/// The submission a threshold-policy entry runs under its locks.
+pub(crate) type LockedSubmitFuture<'l> = std::pin::Pin<
+    Box<dyn Future<Output = Result<crate::submit::SubmitInvokeResult, SaError>> + Send + 'l>,
+>;
 
 // ── SignersManagerConfig ──────────────────────────────────────────────────────
 
@@ -399,9 +575,13 @@ impl SignersManagerConfig {
 ///
 /// # Non-reentrant rule mutex
 ///
-/// Every method that reads or writes a rule's signer-set state acquires a
-/// per-rule `tokio::sync::Mutex` before any network I/O, preventing TOCTOU
-/// races between the divergence check and the transaction submission.
+/// Every method that reads or writes a rule's signer-set state, and every
+/// verb that signs under a rule, acquires the per-rule `tokio::sync::Mutex`
+/// of each rule it compares before any network I/O, and holds it until its
+/// rows are written. A comparison and the submission it guards therefore
+/// never interleave with another call on the same rule. The lock wait is
+/// bounded by the manager's timeout; a lock not acquired in time refuses
+/// with [`SaError::AuthEntryConstructionFailed`] at stage `rule_lock`.
 ///
 /// # Implements
 ///
@@ -570,6 +750,12 @@ impl SignersManager {
         self.network_passphrase.clone()
     }
 
+    /// Returns the audit log this manager writes and keys its rule locks by.
+    #[must_use]
+    pub(crate) fn audit_log_path(&self) -> &std::path::Path {
+        &self.audit_log_path
+    }
+
     /// Returns the configured submission timeout.
     ///
     /// `pub(crate)` — used by [`crate::managers::migration::MigrationPlanner`] to
@@ -614,7 +800,10 @@ impl SignersManager {
     /// preflight already identified, allowlisted and probed the destination
     /// verifier, and the remove step signs while the source verifier, which
     /// may be the drifted contract the migration moves away from, is still
-    /// live.
+    /// live. The submit path also skips the signer-set baseline read and
+    /// comparison of the migrating rule, which it still locks: the remove
+    /// step changes the signer set the add step signs under, and the
+    /// migration writes no signer-set state row between them.
     ///
     /// # Errors
     ///
@@ -673,9 +862,11 @@ impl SignersManager {
             // replacing the verifier, not adding a new session credential).
             None,
             request_id,
-            // The verifier check of the migrating rule is skipped; its policy
-            // check runs. See `PinCheck::migrating_rule`.
-            Some(rule_id),
+            // The verifier check and the signer-set steps of the migrating
+            // rule are skipped; its policy check runs. See
+            // `PinCheck::migrating_rule`.
+            Some(crate::submit::MigratingRule::new(rule_id)),
+            None,
         )
         .await
         .map_err(|e| {
@@ -753,6 +944,107 @@ impl SignersManager {
         Ok((verifier_addrs, rule.policies))
     }
 
+    // ── Rule locks ────────────────────────────────────────────────────────────
+
+    /// Acquires the locks of `rule_ids` on the smart account
+    /// `smart_account_strkey`, sorted ascending and deduplicated, one at a
+    /// time in that order, each wait bounded by `budget.deadline`.
+    ///
+    /// Rule 0 is locked like any other rule when it is named. The submit
+    /// path names only the rules it compares, which never include rule 0.
+    /// The total wait is logged on the `sa_submit_timing` debug span as stage
+    /// `rule_lock`.
+    ///
+    /// # Errors
+    ///
+    /// [`SaError::AuthEntryConstructionFailed`] at stage `rule_lock` when a
+    /// lock is not acquired before the deadline; the locks already taken are
+    /// released.
+    pub(crate) async fn acquire_rule_locks(
+        &self,
+        smart_account_strkey: &str,
+        rule_ids: impl IntoIterator<Item = u32>,
+        budget: PreSubmitBudget,
+    ) -> Result<Vec<RuleLockGuard>, SaError> {
+        let mut rule_ids: Vec<u32> = rule_ids.into_iter().collect();
+        rule_ids.sort_unstable();
+        rule_ids.dedup();
+        let started = std::time::Instant::now();
+        let mut guards = Vec::with_capacity(rule_ids.len());
+        let mut outcome = Ok(());
+        for rule_id in rule_ids {
+            match self
+                .lock_rule_before(smart_account_strkey, rule_id, budget.deadline)
+                .await
+            {
+                Ok(guard) => guards.push(guard),
+                Err(refusal) => {
+                    outcome = Err(refusal);
+                    break;
+                }
+            }
+        }
+        log_rule_lock_wait(started);
+        outcome.map(|()| guards)
+    }
+
+    /// Acquires the lock of rule `rule_id` on the smart account
+    /// `smart_account_strkey`, the single-rule form of
+    /// [`Self::acquire_rule_locks`].
+    ///
+    /// # Errors
+    ///
+    /// [`SaError::AuthEntryConstructionFailed`] at stage `rule_lock` when the
+    /// lock is not acquired before `budget.deadline`.
+    pub(crate) async fn acquire_rule_lock(
+        &self,
+        smart_account_strkey: &str,
+        rule_id: u32,
+        budget: PreSubmitBudget,
+    ) -> Result<RuleLockGuard, SaError> {
+        let started = std::time::Instant::now();
+        let outcome = self
+            .lock_rule_before(smart_account_strkey, rule_id, budget.deadline)
+            .await;
+        log_rule_lock_wait(started);
+        outcome
+    }
+
+    /// Waits for the lock of one rule until `deadline`.
+    async fn lock_rule_before(
+        &self,
+        smart_account_strkey: &str,
+        rule_id: u32,
+        deadline: tokio::time::Instant,
+    ) -> Result<RuleLockGuard, SaError> {
+        let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, smart_account_strkey);
+        let held = tokio::time::timeout_at(deadline, mutex.lock_owned())
+            .await
+            .map_err(|_elapsed| SaError::AuthEntryConstructionFailed {
+                stage: "rule_lock",
+                redacted_reason: format!(
+                    "rule {rule_id}: the rule lock was not acquired within its budget"
+                ),
+            })?;
+        Ok(RuleLockGuard {
+            key: (
+                self.audit_log_path.clone(),
+                rule_id,
+                smart_account_strkey.to_owned(),
+            ),
+            _held: held,
+        })
+    }
+
+    /// The budget a holder's lock wait runs under: the manager's timeout from
+    /// now.
+    fn lock_budget(&self) -> PreSubmitBudget {
+        PreSubmitBudget {
+            deadline: tokio::time::Instant::now() + self.timeout,
+            total: self.timeout,
+        }
+    }
+
     // ── list_signers ──────────────────────────────────────────────────────────
 
     /// Lists the current signer set of a context rule and compares it with
@@ -797,7 +1089,9 @@ impl SignersManager {
     ///   the rule holds a signer the wallet cannot decode.
     /// - [`SaError::BaselineWriteFailed`] (stage `write`): the first
     ///   observation's baseline row was not written.
-    /// - [`SaError::AuthEntryConstructionFailed`] — RPC or XDR construction failure.
+    /// - [`SaError::AuthEntryConstructionFailed`]: RPC or XDR construction
+    ///   failure, or the rule's lock was not acquired within the manager's
+    ///   timeout (stage `rule_lock`).
     ///
     /// # Implements
     ///
@@ -814,10 +1108,11 @@ impl SignersManager {
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
-        // Per-rule mutex acquire — prevents race between read-side baseline
-        // write and concurrent mutating ops.
-        let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, &smart_account_strkey);
-        let _guard = mutex.lock().await;
+        // The rule's lock serializes the first-observation baseline write with
+        // every other comparison and mutation of the rule.
+        let _guard = self
+            .acquire_rule_lock(&smart_account_strkey, rule_id, self.lock_budget())
+            .await?;
 
         // The state row is read before the observation: an audit-log integrity
         // failure refuses without any RPC.
@@ -948,9 +1243,9 @@ impl SignersManager {
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
-        // Per-rule mutex acquire.
-        let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, &smart_account_strkey);
-        let _guard = mutex.lock().await;
+        let _guard = self
+            .acquire_rule_lock(&smart_account_strkey, rule_id, self.lock_budget())
+            .await?;
 
         let prior =
             self.read_signer_set_view(rule_id, &smart_account_strkey, &smart_account_redacted)?;
@@ -1052,8 +1347,8 @@ impl SignersManager {
 
     /// Checks the on-chain signer set against the audit-log baseline.
     ///
-    /// Acquires the rule's lock, then compares (see
-    /// `compare_signer_set_locked`):
+    /// Acquires the rule's lock, bounded by the manager's timeout, then
+    /// compares (see `verify_signer_set_locked`):
     ///
     /// 1. **Audit-log read**: loads the newest signer-set state row of either
     ///    snapshot version. Returns [`SaError::SignerSetMissingBaseline`] if no
@@ -1073,29 +1368,19 @@ impl SignersManager {
     /// observed view in the row's version, the smallest `latestLedger` the
     /// observation's reads reported and the matched row's hash.
     ///
-    /// **TOCTOU semantics.** The `FrozenChainStateTuple` is a data-only
-    /// tamper-evidence anchor — it captures the audit-log expectation hash at
-    /// the moment of the divergence check.  It does NOT retain the per-rule
-    /// mutex beyond this call's scope.  The cross-call TOCTOU window is closed
-    /// by two independent mechanisms:
-    ///
-    /// 1. **Per-rule mutex at the next acquire site** — any concurrent
-    ///    `add_signer` / `remove_signer` / `set_threshold` call on the same
-    ///    `(rule_id, smart_account)` pair serialises behind the same mutex
-    ///    registry and cannot interleave between the divergence check and the
-    ///    subsequent signing call.
-    /// 2. **Re-simulate at submit time** — `submit_signed_invoke`
-    ///    re-simulates the transaction before submitting; if the on-chain state
-    ///    has changed since the divergence check, the re-simulation diverges
-    ///    and the submission is refused.
+    /// The submit path runs the same two steps for every rule a submission
+    /// is signed under, under the rule's lock, through
+    /// [`crate::submit::submit_signed_invoke`]; this entry is the standalone
+    /// form of that check. The `FrozenChainStateTuple` is a data-only record
+    /// of the comparison and does not retain the rule's lock: a later call on
+    /// the same rule compares again under its own lock.
     ///
     /// # Arguments
     ///
     /// - `smart_account` — the smart-account contract's [`ScAddress`].
     /// - `rule_id` — the context rule to verify.
     /// - `source_account_strkey` — `Some(G...)` for a real fee-paying account,
-    ///   or `None` when no fee-payer is available (e.g. read-only divergence
-    ///   checks called from `sign_with_passkey_rule_inner`).  When `None`, the
+    ///   or `None` when no fee-payer is available. When `None`, the
     ///   underlying simulations use [`SIMULATE_SENTINEL_G`] with sequence
     ///   number `"0"`.
     /// - `request_id` — caller-supplied UUID for audit-log correlation.
@@ -1112,13 +1397,14 @@ impl SignersManager {
     /// - [`SaError::DeploymentFailed`]: a read failed, or a version-1
     ///   baseline meets a signer it has no representation for.
     /// - [`SaError::AuthEntryConstructionFailed`]: RPC or XDR construction
-    ///   failure.
+    ///   failure, or the rule's lock was not acquired within the manager's
+    ///   timeout (stage `rule_lock`).
     ///
     /// # Implements
     ///
-    /// Atomic signer-threshold update: divergence detection is a precondition
-    /// for any signer-set mutation, ensuring every change is anchored against
-    /// a verified on-chain state.
+    /// Atomic signer-threshold update: the comparison anchors a signature
+    /// under the rule against the recorded signer set, and the same check
+    /// guards every submission signed under a rule other than rule 0.
     pub async fn verify_signer_set_against_chain(
         &self,
         smart_account: ScAddress,
@@ -1129,22 +1415,18 @@ impl SignersManager {
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
-        // Per-rule mutex acquire — prevents TOCTOU between audit-log read and
-        // on-chain comparison when a concurrent mutating op is in flight.
-        let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, &smart_account_strkey);
-        let _guard = mutex.lock().await;
-
+        let guard = self
+            .acquire_rule_lock(&smart_account_strkey, rule_id, self.lock_budget())
+            .await?;
         let compared = self
-            .compare_signer_set_locked(
-                &smart_account,
-                &smart_account_strkey,
-                &smart_account_redacted,
-                rule_id,
-                source_account_strkey,
+            .verify_signer_set_locked(
+                &guard,
                 V1Handling::Compare,
+                source_account_strkey,
                 &request_id,
             )
             .await?;
+        drop(guard);
 
         let now_ms = i64::try_from(now_unix_ms().unwrap_or(0)).unwrap_or(i64::MAX);
 
@@ -1152,15 +1434,15 @@ impl SignersManager {
             profile = %self.profile_name,
             rule_id,
             smart_account = %smart_account_redacted,
-            observed = %compared.view,
-            ledger = compared.observation.ledger,
+            observed = %compared.view(),
+            ledger = compared.ledger(),
             "verify_signer_set_against_chain: on-chain matches baseline"
         );
 
         Ok(FrozenChainStateTuple::new(
-            compared.view,
-            (compared.observation.ledger, now_ms),
-            compared.row_hash,
+            compared.view().clone(),
+            (compared.ledger(), now_ms),
+            *compared.row_hash(),
             rule_id,
         ))
     }
@@ -1284,14 +1566,16 @@ impl SignersManager {
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
-        // Per-rule mutex acquire (non-reentrant; authorised acquire site).
-        let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, &smart_account_strkey);
-        let _guard = mutex.lock().await;
+        // The target is the only rule the add signs under.
+        let guards = self
+            .acquire_rule_locks(&smart_account_strkey, [rule_id], self.lock_budget())
+            .await?;
 
         let outcome = self
             .add_signer_locked_inner(
                 smart_account,
                 rule_id,
+                &guards,
                 &smart_account_strkey,
                 &smart_account_redacted,
                 new_signer,
@@ -1375,14 +1659,16 @@ impl SignersManager {
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
-        // Per-rule mutex acquire.
-        let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, &smart_account_strkey);
-        let _guard = mutex.lock().await;
+        // The target is the only rule the removal signs under.
+        let guards = self
+            .acquire_rule_locks(&smart_account_strkey, [rule_id], self.lock_budget())
+            .await?;
 
         let outcome = self
             .remove_signer_locked_inner(
                 smart_account,
                 rule_id,
+                &guards,
                 &smart_account_strkey,
                 &smart_account_redacted,
                 signer_id,
@@ -1467,14 +1753,16 @@ impl SignersManager {
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
-        // Per-rule mutex acquire.
-        let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, &smart_account_strkey);
-        let _guard = mutex.lock().await;
+        // The target is the only rule the change signs under.
+        let guards = self
+            .acquire_rule_locks(&smart_account_strkey, [rule_id], self.lock_budget())
+            .await?;
 
         let outcome = self
             .set_threshold_locked_inner(
                 smart_account,
                 rule_id,
+                &guards,
                 &smart_account_strkey,
                 &smart_account_redacted,
                 new_threshold,
@@ -1528,6 +1816,7 @@ impl SignersManager {
     /// # Errors
     ///
     /// - [`SaError::BaselineWriteFailed`] with the transaction hash: the
+    ///   rule's lock was not acquired within the manager's timeout or the
     ///   confirmed rule was not observed (stage `observe`), or the row was
     ///   not written (stage `write`).
     /// - [`SaError::InstallStateMismatch`] with the rule id and the
@@ -1549,8 +1838,20 @@ impl SignersManager {
         source_account_strkey: &str,
         request_id: &str,
     ) -> Result<(), SaError> {
-        let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, smart_account_strkey);
-        let _guard = mutex.lock().await;
+        // The install confirmed: a lock not acquired in time leaves the rule
+        // unobserved, which is a stage-`observe` failure carrying the hash.
+        let _guard = self
+            .acquire_rule_lock(smart_account_strkey, rule_id, self.lock_budget())
+            .await
+            .map_err(|cause| {
+                observe_failed_after(
+                    rule_id,
+                    smart_account_redacted,
+                    &submitted.tx_hash,
+                    &cause,
+                    request_id,
+                )
+            })?;
 
         let observation = self
             .observe_confirmed(
@@ -1594,7 +1895,9 @@ impl SignersManager {
     /// Attaches the simple-threshold policy `policy` to rule `rule_id`
     /// through `submit`, and records the threshold the attach sets.
     ///
-    /// Acquires the rule's lock, then:
+    /// Acquires, in one acquisition, the locks of the rule and of the
+    /// distinct non-zero rules in `auth_rule_ids`, the rules the attach is
+    /// signed under, then:
     ///
     /// 1. Compares the chain with the rule's version-2 state row, as
     ///    [`Self::add_signer`] does. A missing row refuses with
@@ -1604,7 +1907,10 @@ impl SignersManager {
     /// 2. Refuses with [`SaError::ThresholdPolicyIdentificationFailed`] when
     ///    the rule already has a simple-threshold policy: the only change an
     ///    attach records is from no threshold to one.
-    /// 3. Runs `submit`, which signs and submits the `add_policy` invocation.
+    /// 3. Runs `submit` with the held locks and the comparison of step 1;
+    ///    it signs and submits the `add_policy` invocation, and the submit
+    ///    path compares every auth rule other than the target under the
+    ///    held locks.
     /// 4. Reads the assigned policy id from the confirmed return value.
     /// 5. Observes the rule after confirmation and requires the signers
     ///    unchanged and the threshold `expected_threshold` on `policy`.
@@ -1631,51 +1937,51 @@ impl SignersManager {
     /// [`SaError::SignerSetDiverged`] with the transaction hash.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the account identity, the rule, the policy and its threshold, the source \
-                  account, the submission and the correlation id"
+        reason = "the account identity, the rule and its auth rules, the policy and its \
+                  threshold, the source account, the submission and the correlation id"
     )]
-    pub(crate) async fn attach_threshold_policy<Fut>(
+    pub(crate) async fn attach_threshold_policy<'env>(
         &self,
         smart_account: &ScAddress,
         smart_account_strkey: &str,
         smart_account_redacted: &str,
         rule_id: u32,
+        auth_rule_ids: &[ContextRuleId],
         policy: &ScAddress,
         expected_threshold: u32,
         source_account_strkey: Option<&str>,
-        submit: impl FnOnce() -> Fut,
+        submit: impl for<'l> FnOnce(LockedSubmission<'l, 'env>) -> LockedSubmitFuture<'l>,
         request_id: &str,
-    ) -> Result<ConfirmedThresholdChange<Option<u32>>, SaError>
-    where
-        Fut: Future<Output = Result<crate::submit::SubmitInvokeResult, SaError>>,
-    {
-        let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, smart_account_strkey);
-        let _guard = mutex.lock().await;
-
-        let compared = self
-            .compare_signer_set_locked(
-                smart_account,
+    ) -> Result<ConfirmedThresholdChange<Option<u32>>, SaError> {
+        let guards = self
+            .acquire_rule_locks(
                 smart_account_strkey,
-                smart_account_redacted,
-                rule_id,
-                source_account_strkey,
-                V1Handling::RefuseLegacy,
-                request_id,
+                holder_lock_set(rule_id, auth_rule_ids),
+                self.lock_budget(),
             )
             .await?;
-        if compared.observation.snapshot.threshold.is_some() {
+
+        let compared = [self
+            .verify_signer_set_locked(
+                held_guard(&guards, smart_account_strkey, rule_id)?,
+                V1Handling::RefuseLegacy,
+                source_account_strkey,
+                request_id,
+            )
+            .await?];
+        if compared[0].snapshot().threshold.is_some() {
             return Err(SaError::ThresholdPolicyIdentificationFailed {
                 rule_id,
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted,
                 ),
-                observed_wasm_hashes_summary: compared.observation.policy_hashes,
+                observed_wasm_hashes_summary: compared[0].policy_hashes().clone(),
                 request_id: request_id.to_owned(),
             });
         }
-        let before = compared.observation.snapshot;
 
-        let submitted = submit().await?;
+        let rule_locks = borrowed(&guards, &compared);
+        let submitted = submit(LockedSubmission::new(&rule_locks)).await?;
         let policy_id = match extract_u32_return(&submitted.return_val, "add_policy") {
             Ok(policy_id) => policy_id,
             Err(cause) => {
@@ -1694,7 +2000,7 @@ impl SignersManager {
             }
         };
         let intended = SignerSetSnapshotV2 {
-            signers: before.signers,
+            signers: compared[0].snapshot().signers.clone(),
             threshold: Some(ThresholdObservation {
                 policy: contract_address_bytes(policy),
                 threshold: expected_threshold,
@@ -1723,9 +2029,10 @@ impl SignersManager {
     /// Detaches the simple-threshold policy `policy` from rule `rule_id`
     /// through `submit`, and records the threshold change.
     ///
-    /// Acquires the rule's lock and compares the chain with the rule's
-    /// version-2 state row, as [`Self::attach_threshold_policy`] does. Two
-    /// deltas are recorded:
+    /// Acquires the locks of the rule and of the distinct non-zero rules in
+    /// `auth_rule_ids`, compares the chain with the rule's version-2 state
+    /// row and runs `submit` with the held locks, as
+    /// [`Self::attach_threshold_policy`] does. Two deltas are recorded:
     ///
     /// - The rule has one simple-threshold policy. It must be `policy`, else
     ///   the call refuses with [`SaError::ThresholdPolicyIdentificationFailed`]
@@ -1742,7 +2049,11 @@ impl SignersManager {
     ///   hash. After confirmation the signers must equal the state row's and
     ///   the threshold must be the other policy's. The row records no
     ///   previous threshold, since none was observable, and the other
-    ///   policy's threshold as the resulting one.
+    ///   policy's threshold as the resulting one. The held-lock context of
+    ///   this case carries no comparison, so the submit path compares the
+    ///   rule again when it is among `auth_rule_ids`, and that comparison
+    ///   refuses the two-policy rule: the repair is authorized through
+    ///   another rule, such as rule 0.
     ///
     /// Any other identification failure, three or more matching policies
     /// included, refuses unchanged. The threshold row precedes the policy,
@@ -1766,39 +2077,39 @@ impl SignersManager {
     /// hash.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the account identity, the rule, the policy, the source account, the \
-                  submission and the correlation id"
+        reason = "the account identity, the rule and its auth rules, the policy, the source \
+                  account, the submission and the correlation id"
     )]
-    pub(crate) async fn detach_threshold_policy<Fut>(
+    pub(crate) async fn detach_threshold_policy<'env>(
         &self,
         smart_account: &ScAddress,
         smart_account_strkey: &str,
         smart_account_redacted: &str,
         rule_id: u32,
+        auth_rule_ids: &[ContextRuleId],
         policy: &ScAddress,
         source_account_strkey: Option<&str>,
-        submit: impl FnOnce() -> Fut,
+        submit: impl for<'l> FnOnce(LockedSubmission<'l, 'env>) -> LockedSubmitFuture<'l>,
         request_id: &str,
-    ) -> Result<ConfirmedThresholdChange<()>, SaError>
-    where
-        Fut: Future<Output = Result<crate::submit::SubmitInvokeResult, SaError>>,
-    {
-        let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, smart_account_strkey);
-        let _guard = mutex.lock().await;
+    ) -> Result<ConfirmedThresholdChange<()>, SaError> {
+        let guards = self
+            .acquire_rule_locks(
+                smart_account_strkey,
+                holder_lock_set(rule_id, auth_rule_ids),
+                self.lock_budget(),
+            )
+            .await?;
 
         let compared = match self
-            .compare_signer_set_locked(
-                smart_account,
-                smart_account_strkey,
-                smart_account_redacted,
-                rule_id,
-                source_account_strkey,
+            .verify_signer_set_locked(
+                held_guard(&guards, smart_account_strkey, rule_id)?,
                 V1Handling::RefuseLegacy,
+                source_account_strkey,
                 request_id,
             )
             .await
         {
-            Ok(compared) => compared,
+            Ok(compared) => [compared],
             Err(identification @ SaError::ThresholdPolicyIdentificationFailed { .. }) => {
                 return self
                     .detach_one_of_two_threshold_policies(
@@ -1806,6 +2117,7 @@ impl SignersManager {
                         smart_account_strkey,
                         smart_account_redacted,
                         rule_id,
+                        &guards,
                         policy,
                         source_account_strkey,
                         submit,
@@ -1817,9 +2129,8 @@ impl SignersManager {
             Err(other) => return Err(other),
         };
         let detached = contract_address_bytes(policy);
-        if !compared
-            .observation
-            .snapshot
+        let before = compared[0].snapshot();
+        if !before
             .threshold
             .as_ref()
             .is_some_and(|threshold| threshold.policy == detached)
@@ -1829,15 +2140,15 @@ impl SignersManager {
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted,
                 ),
-                observed_wasm_hashes_summary: compared.observation.policy_hashes,
+                observed_wasm_hashes_summary: compared[0].policy_hashes().clone(),
                 request_id: request_id.to_owned(),
             });
         }
-        let before = compared.observation.snapshot;
 
-        let submitted = submit().await?;
+        let rule_locks = borrowed(&guards, &compared);
+        let submitted = submit(LockedSubmission::new(&rule_locks)).await?;
         let intended = SignerSetSnapshotV2 {
-            signers: before.signers,
+            signers: before.signers.clone(),
             threshold: None,
         };
         let recorded = self
@@ -1849,7 +2160,7 @@ impl SignersManager {
                 source_account_strkey,
                 &submitted,
                 intended,
-                before.threshold,
+                before.threshold.clone(),
                 request_id,
             )
             .await;
@@ -1861,30 +2172,29 @@ impl SignersManager {
     }
 
     /// The detach of one of two simple-threshold policies of
-    /// [`Self::detach_threshold_policy`]. The caller holds the rule's lock,
-    /// and its comparison refused with `identification`, which is returned
+    /// [`Self::detach_threshold_policy`]. The caller holds `guards`, the
+    /// locks of the rule and its auth rules, and nothing here acquires a
+    /// lock; its comparison refused with `identification`, which is returned
     /// unchanged unless exactly two attached policies match and one of them
     /// is `policy`.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the account identity, the rule, the policy, the source account, the \
-                  submission, the comparison's refusal and the correlation id"
+        reason = "the account identity, the rule and its held locks, the policy, the source \
+                  account, the submission, the comparison's refusal and the correlation id"
     )]
-    async fn detach_one_of_two_threshold_policies<Fut>(
+    async fn detach_one_of_two_threshold_policies<'env>(
         &self,
         smart_account: &ScAddress,
         smart_account_strkey: &str,
         smart_account_redacted: &str,
         rule_id: u32,
+        guards: &[RuleLockGuard],
         policy: &ScAddress,
         source_account_strkey: Option<&str>,
-        submit: impl FnOnce() -> Fut,
+        submit: impl for<'l> FnOnce(LockedSubmission<'l, 'env>) -> LockedSubmitFuture<'l>,
         identification: SaError,
         request_id: &str,
-    ) -> Result<ConfirmedThresholdChange<()>, SaError>
-    where
-        Fut: Future<Output = Result<crate::submit::SubmitInvokeResult, SaError>>,
-    {
+    ) -> Result<ConfirmedThresholdChange<()>, SaError> {
         // The comparison read the state row before any RPC and refused a
         // missing or version-1 row, so the row is version 2.
         let baseline = match self
@@ -1963,7 +2273,8 @@ impl SignersManager {
             });
         }
 
-        let submitted = submit().await?;
+        let rule_locks = borrowed(guards, &[]);
+        let submitted = submit(LockedSubmission::new(&rule_locks)).await?;
         let recorded = self
             .record_one_of_two_detached(
                 smart_account,
@@ -2240,15 +2551,22 @@ impl SignersManager {
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
-        // Per-rule mutex acquire.
-        let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, &smart_account_strkey);
-        let _guard = mutex.lock().await;
+        // The target and the admin rules the call signs under; the submit
+        // path compares the admin rules under these locks.
+        let guards = self
+            .acquire_rule_locks(
+                &smart_account_strkey,
+                holder_lock_set(rule_id, auth_rule_ids),
+                self.lock_budget(),
+            )
+            .await?;
 
         let outcome = self
             .set_spending_limit_locked_inner(
                 smart_account.clone(),
                 rule_id,
                 auth_rule_ids,
+                &guards,
                 new_limit,
                 signer,
                 &request_id,
@@ -2315,11 +2633,17 @@ impl SignersManager {
     /// Core logic for `set_spending_limit` (called inside the per-rule mutex).
     ///
     /// Returns `(old_limit, period_ledgers, policy_addr, tx_hash)` on success.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the account, the target rule, its auth rules and their held locks, the new \
+                  value, the signer and the correlation id"
+    )]
     async fn set_spending_limit_locked_inner(
         &self,
         smart_account: ScAddress,
         rule_id: u32,
         auth_rule_ids: &[ContextRuleId],
+        guards: &[RuleLockGuard],
         new_limit: i128,
         signer: &(dyn Signer + Send + Sync),
         request_id: &str,
@@ -2436,6 +2760,7 @@ impl SignersManager {
                 }),
                 request_id,
                 None,
+                Some(&borrowed(guards, &[])),
             )
             .await?;
 
@@ -3137,14 +3462,22 @@ impl SignersManager {
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
-        let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, &smart_account_strkey);
-        let _guard = mutex.lock().await;
+        // The target and the admin rules the call signs under; the submit
+        // path compares the admin rules under these locks.
+        let guards = self
+            .acquire_rule_locks(
+                &smart_account_strkey,
+                holder_lock_set(rule_id, auth_rule_ids),
+                self.lock_budget(),
+            )
+            .await?;
 
         let outcome = self
             .set_weighted_threshold_locked_inner(
                 smart_account.clone(),
                 rule_id,
                 auth_rule_ids,
+                &guards,
                 new_threshold,
                 signer,
                 &request_id,
@@ -3206,11 +3539,17 @@ impl SignersManager {
         outcome.map(|_| ())
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the account, the target rule, its auth rules and their held locks, the new \
+                  value, the signer and the correlation id"
+    )]
     async fn set_weighted_threshold_locked_inner(
         &self,
         smart_account: ScAddress,
         rule_id: u32,
         auth_rule_ids: &[ContextRuleId],
+        guards: &[RuleLockGuard],
         new_threshold: u32,
         signer: &(dyn Signer + Send + Sync),
         request_id: &str,
@@ -3310,6 +3649,7 @@ impl SignersManager {
                 }),
                 request_id,
                 None,
+                Some(&borrowed(guards, &[])),
             )
             .await?;
 
@@ -3370,14 +3710,22 @@ impl SignersManager {
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
         let signer_identity_redacted = redact_weighted_signer_identity(&target_signer);
 
-        let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, &smart_account_strkey);
-        let _guard = mutex.lock().await;
+        // The target and the admin rules the call signs under; the submit
+        // path compares the admin rules under these locks.
+        let guards = self
+            .acquire_rule_locks(
+                &smart_account_strkey,
+                holder_lock_set(rule_id, auth_rule_ids),
+                self.lock_budget(),
+            )
+            .await?;
 
         let outcome = self
             .set_signer_weight_locked_inner(
                 smart_account.clone(),
                 rule_id,
                 auth_rule_ids,
+                &guards,
                 target_signer,
                 new_weight,
                 signer,
@@ -3451,6 +3799,7 @@ impl SignersManager {
         smart_account: ScAddress,
         rule_id: u32,
         auth_rule_ids: &[ContextRuleId],
+        guards: &[RuleLockGuard],
         target_signer: crate::weighted_threshold_policy::WeightedThresholdSignerInput,
         new_weight: u32,
         signer: &(dyn Signer + Send + Sync),
@@ -3564,6 +3913,7 @@ impl SignersManager {
                 }),
                 request_id,
                 None,
+                Some(&borrowed(guards, &[])),
             )
             .await?;
 
@@ -3652,13 +4002,16 @@ impl SignersManager {
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
-        let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, &smart_account_strkey);
-        let _guard = mutex.lock().await;
+        // The target is the only rule the batch signs under.
+        let guards = self
+            .acquire_rule_locks(&smart_account_strkey, [rule_id], self.lock_budget())
+            .await?;
 
         let outcome = self
             .batch_add_signers_locked_inner(
                 smart_account,
                 rule_id,
+                &guards,
                 &smart_account_strkey,
                 &smart_account_redacted,
                 new_signers,
@@ -3696,6 +4049,7 @@ impl SignersManager {
         &self,
         smart_account: ScAddress,
         rule_id: u32,
+        guards: &[RuleLockGuard],
         smart_account_strkey: &str,
         smart_account_redacted: &str,
         new_signers: Vec<ScVal>,
@@ -3719,18 +4073,15 @@ impl SignersManager {
             .map(DecodedOnChainSigner::to_identity_v2)
             .collect();
 
-        let compared = self
-            .compare_signer_set_locked(
-                &smart_account,
-                smart_account_strkey,
-                smart_account_redacted,
-                rule_id,
-                Some(&source_pubkey_strkey),
+        let compared = [self
+            .verify_signer_set_locked(
+                held_guard(guards, smart_account_strkey, rule_id)?,
                 V1Handling::RefuseLegacy,
+                Some(&source_pubkey_strkey),
                 request_id,
             )
-            .await?;
-        let before = compared.observation.snapshot;
+            .await?];
+        let before = compared[0].snapshot();
 
         let current_signer_count = before.signer_count();
         let batch_len = u32::try_from(new_signers.len()).unwrap_or(u32::MAX);
@@ -3761,7 +4112,7 @@ impl SignersManager {
             .plan_signer_add_pin_update(
                 rule_id,
                 smart_account_redacted,
-                &before,
+                before,
                 &external_verifiers(added.iter()),
                 overrides,
                 request_id,
@@ -3781,6 +4132,7 @@ impl SignersManager {
                 &source_pubkey_strkey,
                 Some(ExpiryCheck { rule_id }),
                 request_id,
+                &borrowed(guards, &compared),
             )
             .await?;
 
@@ -3790,7 +4142,7 @@ impl SignersManager {
                 rule_id,
                 smart_account_redacted,
                 &source_pubkey_strkey,
-                &before,
+                before,
                 identities,
                 submitted,
                 request_id,
@@ -4183,45 +4535,42 @@ impl SignersManager {
         reader.find_latest_signer_set_view(rule_id, smart_account_redacted, &digest)
     }
 
-    /// Compares the chain with the rule's audit-log state. The caller holds
-    /// the rule's lock; this function acquires none.
+    /// Reads the newest signer-set state row of the rule `guard` locks, of
+    /// either snapshot version. No RPC.
     ///
-    /// Reads the newest state row once, before any RPC: no row refuses with
-    /// [`SaError::SignerSetMissingBaseline`], and a version-1 row refuses
-    /// with [`SaError::SignerSetBaselineLegacy`] when `on_v1` is
-    /// [`V1Handling::RefuseLegacy`]. It then observes the signer set in
-    /// version 2 and classifies it against the row in the row's version
-    /// ([`classify_against`]). A changed set writes the `SaSignerSetDiverged`
-    /// row and refuses with [`SaError::SignerSetDiverged`] without a
-    /// transaction hash; a version-1 row without a comparable projection
-    /// refuses with the projection's error.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "account identity, rule, source, version handling and correlation id"
-    )]
-    async fn compare_signer_set_locked(
+    /// The rule, the account and its redaction come from the guard, which
+    /// proves the caller holds the rule's lock; this function acquires none.
+    /// The read is a synchronous audit-log scan; a caller under a deadline
+    /// checks it after the read.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::SignerSetMissingBaseline`]: the rule has no state row.
+    /// - [`SaError::SignerSetBaselineLegacy`]: the newest row is version 1
+    ///   and `on_v1` is [`V1Handling::RefuseLegacy`].
+    /// - [`SaError::AuditLog`]: audit-log integrity violation.
+    pub(crate) async fn read_baseline_locked(
         &self,
-        smart_account: &ScAddress,
-        smart_account_strkey: &str,
-        smart_account_redacted: &str,
-        rule_id: u32,
-        source_account_strkey: Option<&str>,
+        guard: &RuleLockGuard,
         on_v1: V1Handling,
         request_id: &str,
-    ) -> Result<ComparedState, SaError> {
+    ) -> Result<BaselineRead, SaError> {
+        let rule_id = guard.rule_id();
+        let smart_account_redacted = guard.smart_account_redacted();
         let payload = self
-            .read_signer_set_view(rule_id, smart_account_strkey, smart_account_redacted)?
+            .read_signer_set_view(
+                rule_id,
+                guard.smart_account_strkey(),
+                &smart_account_redacted,
+            )?
             .ok_or_else(|| SaError::SignerSetMissingBaseline {
                 rule_id,
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
-                    smart_account_redacted,
+                    smart_account_redacted.as_str(),
                 ),
                 request_id: request_id.to_owned(),
             })?;
-        let expected = payload.view().clone();
-        let row_hash = *payload.row_hash();
-
-        if on_v1 == V1Handling::RefuseLegacy && matches!(expected, SignerSetView::V1(_)) {
+        if on_v1 == V1Handling::RefuseLegacy && matches!(payload.view(), SignerSetView::V1(_)) {
             return Err(SaError::SignerSetBaselineLegacy {
                 rule_id,
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
@@ -4230,10 +4579,54 @@ impl SignersManager {
                 request_id: request_id.to_owned(),
             });
         }
+        Ok(BaselineRead { payload, rule_id })
+    }
+
+    /// Compares the chain with `baseline`, the state row of the rule `guard`
+    /// locks.
+    ///
+    /// Observes the signer set in version 2 through both endpoints and
+    /// classifies it against the row in the row's version
+    /// ([`classify_against`]). A changed set writes the `SaSignerSetDiverged`
+    /// row and refuses with [`SaError::SignerSetDiverged`] without a
+    /// transaction hash; a version-1 row without a comparable projection
+    /// refuses with the projection's error. A [`ComparedState`] is produced
+    /// only here.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::DeploymentFailed`] (phase `simulate`): `baseline` was read
+    ///   for another rule than the one `guard` locks.
+    /// - [`SaError::SignerSetDiverged`]: the chain differs from the row.
+    /// - The observation errors of [`Self::list_signers`] and the version-1
+    ///   projection errors of [`Self::verify_signer_set_against_chain`].
+    pub(crate) async fn compare_locked(
+        &self,
+        guard: &RuleLockGuard,
+        baseline: BaselineRead,
+        source_account_strkey: Option<&str>,
+        request_id: &str,
+    ) -> Result<ComparedState, SaError> {
+        let rule_id = guard.rule_id();
+        if baseline.rule_id != rule_id {
+            return Err(SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: format!(
+                    "signer-set comparison: the state row of rule {} was presented for rule \
+                     {rule_id}",
+                    baseline.rule_id
+                ),
+            });
+        }
+        let smart_account_redacted = guard.smart_account_redacted();
+        let smart_account =
+            crate::managers::rules::parse_c_strkey_to_smart_account(guard.smart_account_strkey())?;
+        let expected = baseline.payload.view().clone();
+        let row_hash = *baseline.payload.row_hash();
 
         let observation = self
             .observe_signer_set_v2(
-                smart_account,
+                &smart_account,
                 rule_id,
                 source_account_strkey,
                 None,
@@ -4250,7 +4643,7 @@ impl SignersManager {
             Classified::Diverged { observed } => {
                 self.emit_signer_set_diverged(
                     rule_id,
-                    smart_account_redacted,
+                    &smart_account_redacted,
                     &expected,
                     &observed,
                     request_id,
@@ -4268,6 +4661,25 @@ impl SignersManager {
             }
             Classified::NotComparable { cause } => Err(cause),
         }
+    }
+
+    /// Reads the state row of the rule `guard` locks and compares the chain
+    /// with it: [`Self::read_baseline_locked`], then
+    /// [`Self::compare_locked`].
+    ///
+    /// # Errors
+    ///
+    /// The errors of the two steps.
+    pub(crate) async fn verify_signer_set_locked(
+        &self,
+        guard: &RuleLockGuard,
+        on_v1: V1Handling,
+        source_account_strkey: Option<&str>,
+        request_id: &str,
+    ) -> Result<ComparedState, SaError> {
+        let baseline = self.read_baseline_locked(guard, on_v1, request_id).await?;
+        self.compare_locked(guard, baseline, source_account_strkey, request_id)
+            .await
     }
 
     /// Observes rule `rule_id`'s signer set in version 2 through both RPC
@@ -5274,6 +5686,7 @@ impl SignersManager {
         &self,
         smart_account: ScAddress,
         rule_id: u32,
+        guards: &[RuleLockGuard],
         smart_account_strkey: &str,
         smart_account_redacted: &str,
         new_signer: ScVal,
@@ -5293,18 +5706,15 @@ impl SignersManager {
         })?;
         let identity = added.to_identity_v2();
 
-        let compared = self
-            .compare_signer_set_locked(
-                &smart_account,
-                smart_account_strkey,
-                smart_account_redacted,
-                rule_id,
-                Some(&source_pubkey_strkey),
+        let compared = [self
+            .verify_signer_set_locked(
+                held_guard(guards, smart_account_strkey, rule_id)?,
                 V1Handling::RefuseLegacy,
+                Some(&source_pubkey_strkey),
                 request_id,
             )
-            .await?;
-        let before = compared.observation.snapshot;
+            .await?];
+        let before = compared[0].snapshot();
 
         let current_signer_count = before.signer_count();
         let post_op_signer_count = current_signer_count.saturating_add(1);
@@ -5340,7 +5750,7 @@ impl SignersManager {
             .plan_signer_add_pin_update(
                 rule_id,
                 smart_account_redacted,
-                &before,
+                before,
                 &external_verifiers(std::iter::once(&added)),
                 overrides,
                 request_id,
@@ -5368,6 +5778,7 @@ impl SignersManager {
                 // latest_ledger`.
                 Some(ExpiryCheck { rule_id }),
                 request_id,
+                &borrowed(guards, &compared),
             )
             .await?;
 
@@ -5377,7 +5788,7 @@ impl SignersManager {
                 rule_id,
                 smart_account_redacted,
                 &source_pubkey_strkey,
-                &before,
+                before,
                 identity,
                 submitted,
                 request_id,
@@ -5557,6 +5968,7 @@ impl SignersManager {
         &self,
         smart_account: ScAddress,
         rule_id: u32,
+        guards: &[RuleLockGuard],
         smart_account_strkey: &str,
         smart_account_redacted: &str,
         signer_id: u32,
@@ -5565,34 +5977,30 @@ impl SignersManager {
     ) -> Result<ConfirmedMutation, SaError> {
         let source_pubkey_strkey = signer_source_strkey(signer).await?;
 
-        let compared = self
-            .compare_signer_set_locked(
-                &smart_account,
-                smart_account_strkey,
-                smart_account_redacted,
-                rule_id,
-                Some(&source_pubkey_strkey),
+        let compared = [self
+            .verify_signer_set_locked(
+                held_guard(guards, smart_account_strkey, rule_id)?,
                 V1Handling::RefuseLegacy,
+                Some(&source_pubkey_strkey),
                 request_id,
             )
-            .await?;
-        let observation = compared.observation;
+            .await?];
 
         // A rule whose policies include no simple-threshold policy lets
         // another policy decide which signers suffice (OZ
         // `weighted_threshold.rs:16-22`); a removal can make that policy's
         // threshold unreachable, and the wallet cannot check it.
-        if observation.snapshot.threshold.is_none() && !observation.policies.is_empty() {
+        if compared[0].snapshot().threshold.is_none() && !compared[0].policies().is_empty() {
             return Err(SaError::ThresholdPolicyIdentificationFailed {
                 rule_id,
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted,
                 ),
-                observed_wasm_hashes_summary: observation.policy_hashes,
+                observed_wasm_hashes_summary: compared[0].policy_hashes().clone(),
                 request_id: request_id.to_owned(),
             });
         }
-        let before = observation.snapshot;
+        let before = compared[0].snapshot();
 
         // Threshold invariant check. The threshold is unchanged (no bundle);
         // if the post-op count falls below it, the op would brick the rule.
@@ -5626,6 +6034,7 @@ impl SignersManager {
                 // Expiry check at signing-path entry.
                 Some(ExpiryCheck { rule_id }),
                 request_id,
+                &borrowed(guards, &compared),
             )
             .await?;
 
@@ -5639,7 +6048,7 @@ impl SignersManager {
                 request_id,
             )
             .await?;
-        let intended = without_signer(&before, signer_id);
+        let intended = without_signer(before, signer_id);
         let resulting = self.require_intended_state(
             rule_id,
             smart_account_redacted,
@@ -5664,6 +6073,7 @@ impl SignersManager {
         &self,
         smart_account: ScAddress,
         rule_id: u32,
+        guards: &[RuleLockGuard],
         smart_account_strkey: &str,
         smart_account_redacted: &str,
         new_threshold: u32,
@@ -5672,18 +6082,15 @@ impl SignersManager {
     ) -> Result<(ThresholdObservation, ConfirmedMutation), SaError> {
         let source_pubkey_strkey = signer_source_strkey(signer).await?;
 
-        let compared = self
-            .compare_signer_set_locked(
-                &smart_account,
-                smart_account_strkey,
-                smart_account_redacted,
-                rule_id,
-                Some(&source_pubkey_strkey),
+        let compared = [self
+            .verify_signer_set_locked(
+                held_guard(guards, smart_account_strkey, rule_id)?,
                 V1Handling::RefuseLegacy,
+                Some(&source_pubkey_strkey),
                 request_id,
             )
-            .await?;
-        let before = compared.observation.snapshot;
+            .await?];
+        let before = compared[0].snapshot();
 
         let Some(previous) = before.threshold.clone() else {
             return Err(SaError::ThresholdPolicyNotInstalled {
@@ -5729,7 +6136,7 @@ impl SignersManager {
         // checked.
         let target_args_vec: VecM<ScVal> = vec![
             ScVal::U32(new_threshold),
-            compared.observation.primary_rule,
+            compared[0].primary_rule().clone(),
             ScVal::Address(smart_account.clone()),
         ]
         .try_into()
@@ -5759,6 +6166,7 @@ impl SignersManager {
                 // Expiry check at signing-path entry.
                 Some(ExpiryCheck { rule_id }),
                 request_id,
+                &borrowed(guards, &compared),
             )
             .await?;
 
@@ -5801,6 +6209,10 @@ impl SignersManager {
     /// confirmed result: the simulated return value, the transaction hash
     /// and the confirmation ledger.
     ///
+    /// `rule_locks` is the verb's held-lock context: the target's guard and
+    /// the verb's comparison of it, so the submit path compares nothing
+    /// again for the target and acquires no lock.
+    ///
     /// Uses the six-stage flow (build → simulate → build_auth →
     /// sign_auth → delegated_entry → resimulate → envelope-sign → submit).
     ///
@@ -5826,6 +6238,7 @@ impl SignersManager {
         source_pubkey_strkey: &str,
         expiry_check: Option<ExpiryCheck>,
         request_id: &str,
+        rule_locks: &BorrowedRuleLocks<'_>,
     ) -> Result<crate::submit::SubmitInvokeResult, SaError> {
         self.submit_signed_invoke(
             contract,
@@ -5839,6 +6252,7 @@ impl SignersManager {
             expiry_check,
             request_id,
             None,
+            Some(rule_locks),
         )
         .await
     }
@@ -5861,8 +6275,10 @@ impl SignersManager {
     ///
     /// Every call runs the pinned-hash drift check through this manager
     /// ([`crate::submit::PinCheck`]) with `request_id`; `migrating_rule`
-    /// names the rule whose verifier check is skipped, and only
-    /// [`Self::submit_migration_step`] sets it.
+    /// names the rule exempt from the verifier check and the signer-set
+    /// steps, and only [`Self::submit_migration_step`] sets it. `rule_locks`
+    /// is the caller's held-lock context, `None` when the caller holds no
+    /// lock and the submit path acquires the locks of the rules it checks.
     ///
     /// # Implements
     ///
@@ -5885,7 +6301,8 @@ impl SignersManager {
         op_label: &'static str,
         expiry_check: Option<ExpiryCheck>,
         request_id: &str,
-        migrating_rule: Option<u32>,
+        migrating_rule: Option<crate::submit::MigratingRule>,
+        rule_locks: Option<&BorrowedRuleLocks<'_>>,
     ) -> Result<crate::submit::SubmitInvokeResult, SaError> {
         // Convert ScAddress → C-strkey for the free function.
         let contract_strkey = scaddress_to_strkey(&contract)?;
@@ -5932,6 +6349,7 @@ impl SignersManager {
                     request_id,
                     migrating_rule,
                 })
+                .maybe_rule_locks(rule_locks)
                 .build(),
         )
         .await
@@ -6043,19 +6461,70 @@ struct ObservationV2 {
 
 /// How a comparison treats a version-1 state row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum V1Handling {
+pub(crate) enum V1Handling {
     /// Compare through the observation's version-1 projection.
     Compare,
     /// Refuse with [`SaError::SignerSetBaselineLegacy`] before any RPC.
     RefuseLegacy,
 }
 
+/// A rule's newest signer-set state row, read under the rule's lock by
+/// [`SignersManager::read_baseline_locked`] for one comparison.
+pub(crate) struct BaselineRead {
+    payload: SignerSetViewPayload,
+    rule_id: u32,
+}
+
 /// The result of a comparison that matched: the observed view in the row's
-/// version, the matched row's hash and the observation.
-struct ComparedState {
+/// version, the matched row's hash and the observation. Produced only by
+/// [`SignersManager::compare_locked`].
+pub(crate) struct ComparedState {
     view: SignerSetView,
     row_hash: [u8; 32],
     observation: ObservationV2,
+}
+
+impl ComparedState {
+    /// The compared rule.
+    pub(crate) fn rule_id(&self) -> u32 {
+        self.observation.rule_id
+    }
+
+    /// The observation in the matched row's version.
+    pub(crate) fn view(&self) -> &SignerSetView {
+        &self.view
+    }
+
+    /// The hash of the matched state row.
+    pub(crate) fn row_hash(&self) -> &[u8; 32] {
+        &self.row_hash
+    }
+
+    /// The version-2 snapshot the observation built.
+    pub(crate) fn snapshot(&self) -> &SignerSetSnapshotV2 {
+        &self.observation.snapshot
+    }
+
+    /// The rule's attached policies, in the rule's order.
+    pub(crate) fn policies(&self) -> &[ScAddress] {
+        &self.observation.policies
+    }
+
+    /// The policy count and first observed executable hash, for a
+    /// threshold-policy refusal.
+    pub(crate) fn policy_hashes(&self) -> &WasmHashSummary {
+        &self.observation.policy_hashes
+    }
+
+    /// The smallest `latestLedger` across the reads the observation kept.
+    pub(crate) fn ledger(&self) -> u32 {
+        self.observation.ledger
+    }
+
+    /// The primary endpoint's verbatim `get_context_rule` value.
+    pub(crate) fn primary_rule(&self) -> &ScVal {
+        &self.observation.primary_rule
+    }
 }
 
 /// How an observation compares with a state row, in the row's version.
@@ -6222,7 +6691,8 @@ fn project_v1(obs: &ObservationV2) -> Result<ObservedSignerSet, SaError> {
 }
 
 /// Classifies `obs` against the state row `view` in the row's version; the
-/// one comparison body behind the signer verbs, `verify_signer_set_against_chain`,
+/// one comparison body behind `SignersManager::compare_locked` (the submit
+/// path, the passkey path, the signer verbs and the public entry),
 /// `list_signers` and `refresh_signer_baseline`.
 ///
 /// A version-2 row compares its snapshot's digest with the observation's.
@@ -8670,6 +9140,250 @@ pub(crate) mod tests {
             !Arc::ptr_eq(&arc1, &arc2),
             "different rule_id must return different Arc"
         );
+    }
+
+    // ── Held-lock contexts in the submit path ─────────────────────────────────
+
+    /// The smart account the held-lock context tests submit for.
+    const LOCK_TEST_ACCOUNT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+
+    /// A second smart account, whose guards the account check refuses.
+    fn other_lock_test_account() -> String {
+        stellar_strkey::Contract([0x77; 32])
+            .to_string()
+            .as_str()
+            .to_owned()
+    }
+
+    /// A URL the submit path never dials: every refusal below lands before
+    /// network I/O.
+    const LOCK_TEST_RPC: &str = "http://rule-locks-must-not-be-dialed.invalid";
+
+    /// A signers manager over a fresh audit log, with the directory that
+    /// holds the log.
+    fn lock_test_manager() -> (Arc<SignersManager>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("audit.jsonl");
+        let writer = Arc::new(Mutex::new(
+            AuditWriter::open(log_path.clone(), None).unwrap(),
+        ));
+        let manager = crate::test_helpers::signers_manager_for_tests(
+            LOCK_TEST_RPC,
+            LOCK_TEST_RPC,
+            writer,
+            log_path,
+            std::time::Duration::from_secs(5),
+        );
+        (manager, dir)
+    }
+
+    /// Submits `noop` on [`LOCK_TEST_ACCOUNT`] under `rule_ids`, with the
+    /// drift check through `manager` when `checked`, and `rule_locks`.
+    async fn submit_with_rule_locks(
+        manager: &SignersManager,
+        rule_ids: &[u32],
+        checked: bool,
+        rule_locks: &BorrowedRuleLocks<'_>,
+    ) -> Result<crate::submit::SubmitInvokeResult, SaError> {
+        let signer = stellar_agent_network::SoftwareSigningKey::new_from_bytes([0x51; 32]);
+        let rule_ids: Vec<ContextRuleId> =
+            rule_ids.iter().copied().map(ContextRuleId::new).collect();
+        let host_function = HostFunction::InvokeContract(InvokeContractArgs {
+            contract_address: crate::managers::rules::parse_c_strkey_to_smart_account(
+                LOCK_TEST_ACCOUNT,
+            )
+            .unwrap(),
+            function_name: ScSymbol::try_from("noop").unwrap(),
+            args: VecM::default(),
+        });
+        crate::submit::submit_signed_invoke(
+            crate::submit::SubmitInvokeArgs::builder()
+                .target_contract(LOCK_TEST_ACCOUNT)
+                .auth_rule_ids(&rule_ids)
+                .host_function(host_function)
+                .signer(&signer)
+                .primary_rpc_url(LOCK_TEST_RPC)
+                .network_passphrase(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE)
+                .chain_id("stellar:testnet")
+                .timeout(std::time::Duration::from_secs(5))
+                .op_label("rule_locks_unit")
+                .maybe_pin_check(checked.then_some(crate::submit::PinCheck {
+                    signers_manager: manager,
+                    request_id: "req-rule-locks",
+                    migrating_rule: None,
+                }))
+                .rule_locks(rule_locks)
+                .build(),
+        )
+        .await
+    }
+
+    fn lock_test_budget() -> PreSubmitBudget {
+        PreSubmitBudget {
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+            total: std::time::Duration::from_secs(5),
+        }
+    }
+
+    /// A held-lock context that holds no guard for a rule the submission
+    /// names refuses at stage `rule_lock_missing` naming that rule, before
+    /// any network I/O; the submit path acquires nothing in its place.
+    #[tokio::test]
+    async fn a_held_lock_context_without_a_named_rule_refuses_rule_lock_missing() {
+        let (manager, _dir) = lock_test_manager();
+        let guards = manager
+            .acquire_rule_locks(LOCK_TEST_ACCOUNT, [1], lock_test_budget())
+            .await
+            .unwrap();
+        let rule_locks = borrowed(&guards, &[]);
+
+        let err = submit_with_rule_locks(&manager, &[1, 2], true, &rule_locks)
+            .await
+            .unwrap_err();
+        match &err {
+            SaError::AuthEntryConstructionFailed {
+                stage,
+                redacted_reason,
+            } => {
+                assert_eq!(*stage, "rule_lock_missing");
+                assert_eq!(
+                    redacted_reason,
+                    "rule 2: the submission names an auth rule the caller holds no lock for"
+                );
+            }
+            other => panic!("expected AuthEntryConstructionFailed; got {other:?}"),
+        }
+    }
+
+    /// A guard for another account never stands in for the submission's
+    /// account: the context's guard of rule 1 on a second account refuses
+    /// rule 1 at stage `rule_lock_missing`.
+    #[tokio::test]
+    async fn a_held_lock_context_for_another_account_refuses_rule_lock_missing() {
+        let (manager, _dir) = lock_test_manager();
+        let guards = manager
+            .acquire_rule_locks(&other_lock_test_account(), [1], lock_test_budget())
+            .await
+            .unwrap();
+        let rule_locks = borrowed(&guards, &[]);
+
+        let err = submit_with_rule_locks(&manager, &[1], true, &rule_locks)
+            .await
+            .unwrap_err();
+        match &err {
+            SaError::AuthEntryConstructionFailed {
+                stage,
+                redacted_reason,
+            } => {
+                assert_eq!(*stage, "rule_lock_missing");
+                assert!(redacted_reason.starts_with("rule 1: "), "{redacted_reason}");
+            }
+            other => panic!("expected AuthEntryConstructionFailed; got {other:?}"),
+        }
+    }
+
+    /// A guard taken through a manager over another audit log never stands
+    /// in for the checking manager's lock: a context acquired through one
+    /// manager and submitted with another's drift check refuses rule 1 at
+    /// stage `rule_lock_missing`.
+    #[tokio::test]
+    async fn a_held_lock_context_from_another_log_refuses_rule_lock_missing() {
+        let (lending, _lending_dir) = lock_test_manager();
+        let (checking, _checking_dir) = lock_test_manager();
+        let guards = lending
+            .acquire_rule_locks(LOCK_TEST_ACCOUNT, [1], lock_test_budget())
+            .await
+            .unwrap();
+        let rule_locks = borrowed(&guards, &[]);
+
+        let err = submit_with_rule_locks(&checking, &[1], true, &rule_locks)
+            .await
+            .unwrap_err();
+        match &err {
+            SaError::AuthEntryConstructionFailed {
+                stage,
+                redacted_reason,
+            } => {
+                assert_eq!(*stage, "rule_lock_missing");
+                assert!(redacted_reason.starts_with("rule 1: "), "{redacted_reason}");
+            }
+            other => panic!("expected AuthEntryConstructionFailed; got {other:?}"),
+        }
+    }
+
+    /// A held-lock context without a drift check refuses at stage
+    /// `rule_locks_without_pin_check`, whatever the auth rules are.
+    #[tokio::test]
+    async fn a_held_lock_context_without_a_pin_check_refuses() {
+        let (manager, _dir) = lock_test_manager();
+        let guards = manager
+            .acquire_rule_locks(LOCK_TEST_ACCOUNT, [1, 2], lock_test_budget())
+            .await
+            .unwrap();
+        let rule_locks = borrowed(&guards, &[]);
+
+        for rule_ids in [&[1, 2][..], &[0][..]] {
+            let err = submit_with_rule_locks(&manager, rule_ids, false, &rule_locks)
+                .await
+                .unwrap_err();
+            match &err {
+                SaError::AuthEntryConstructionFailed { stage, .. } => {
+                    assert_eq!(*stage, "rule_locks_without_pin_check", "{rule_ids:?}");
+                }
+                other => panic!("expected AuthEntryConstructionFailed; got {other:?}"),
+            }
+        }
+    }
+
+    /// One acquisition locks its rules sorted and deduplicated, and a second
+    /// acquisition of an overlapping set waits for the first and refuses at
+    /// stage `rule_lock` when its budget ends, releasing what it took.
+    #[tokio::test]
+    async fn rule_lock_acquisition_is_sorted_and_bounded() {
+        let (manager, _dir) = lock_test_manager();
+        let held = manager
+            .acquire_rule_locks(LOCK_TEST_ACCOUNT, [3, 1, 3], lock_test_budget())
+            .await
+            .unwrap();
+        assert_eq!(
+            held.iter().map(RuleLockGuard::rule_id).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+
+        let short = PreSubmitBudget {
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_millis(50),
+            total: std::time::Duration::from_millis(50),
+        };
+        let err = manager
+            .acquire_rule_locks(LOCK_TEST_ACCOUNT, [2, 3], short)
+            .await
+            .err()
+            .expect("rule 3 is held");
+        match &err {
+            SaError::AuthEntryConstructionFailed {
+                stage,
+                redacted_reason,
+            } => {
+                assert_eq!(*stage, "rule_lock");
+                assert_eq!(
+                    redacted_reason,
+                    "rule 3: the rule lock was not acquired within its budget"
+                );
+            }
+            other => panic!("expected AuthEntryConstructionFailed; got {other:?}"),
+        }
+        // The refused acquisition released rule 2, which it had taken.
+        let rule_two = manager
+            .acquire_rule_lock(LOCK_TEST_ACCOUNT, 2, short)
+            .await
+            .expect("rule 2 was released");
+        drop(rule_two);
+
+        drop(held);
+        manager
+            .acquire_rule_locks(LOCK_TEST_ACCOUNT, [2, 3], lock_test_budget())
+            .await
+            .expect("the locks are free once the holder drops them");
     }
 
     // ── fetch_contract_wasm_hashes ──────────────────────────────────────────────

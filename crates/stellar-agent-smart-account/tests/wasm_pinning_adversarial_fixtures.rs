@@ -21,6 +21,7 @@
 //! | [`external_ref_install_pinning`] | external reference: `sa.verifier_mutable` / `sa.policy_mutable`, pending overrides, `ExecutableRefPin`, `executable changed during install` |
 //! | [`external_ref_drift_detection`] | external reference drift by kind, reference and hash |
 //! | [`passkey_signing_malformed_pin_record`] | malformed pin record: `failure:drift_check_unavailable` with the integrity source |
+//! | [`passkey_signing_check_order`] | missing baseline before a drifted verifier; `baseline_read` elapse wrapped as `failure:signer_set_diverged` |
 //!
 //! # Test organisation
 //!
@@ -96,6 +97,9 @@ mod external_ref_drift_detection;
 
 #[path = "smart-account-fixtures/adversarial/passkey_signing_malformed_pin_record.rs"]
 mod passkey_signing_malformed_pin_record;
+
+#[path = "smart-account-fixtures/adversarial/passkey_signing_check_order.rs"]
+mod passkey_signing_check_order;
 
 #[test]
 fn warn_if_test_helpers_feature_disabled() {

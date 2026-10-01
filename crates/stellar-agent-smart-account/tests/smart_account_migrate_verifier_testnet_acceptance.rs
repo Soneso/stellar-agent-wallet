@@ -2088,7 +2088,9 @@ async fn d3_migrate_verifier_on_chain_submit() {
     // Signed by the rule's Delegated co-signer (the rule is 1-of-2), so
     // verifier-B's `verify` is not called; the drift check compares
     // verifier-B and the policy against the rewritten pin record before
-    // anything is simulated.
+    // anything is simulated. The pairs above signed under the migrating-rule
+    // exemption and left the rule diverged; the refresh re-anchored it, so
+    // this transfer compares and signs.
     let funded = fund_sac_balance(
         "d3-migrate-verifier",
         TESTNET_RPC_URL,

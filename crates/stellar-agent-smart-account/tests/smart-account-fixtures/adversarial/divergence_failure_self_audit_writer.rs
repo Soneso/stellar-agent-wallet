@@ -2,16 +2,24 @@
 //!
 //! Scenario: every context-rule write path is called with `audit_writer: None`
 //! (the production CLI pattern) while the manager has a shared
-//! `self.audit_writer`. The configured `SignersManager` observes signer-set
-//! divergence before any signing or submission, so the write path must refuse
-//! and emit a `SaRawInvocation(PreSubmissionRefused)` row through the shared
-//! writer with the call's original `request_id`.
+//! `self.audit_writer`. The auth rule's version-1 state row records one
+//! signer and the chain holds two, so the submit path's signer-set
+//! comparison refuses before any signing or submission. The comparison
+//! writes the `SaSignerSetDiverged` row through the signers manager's writer,
+//! then the write path writes its `SaRawInvocation(PreSubmissionRefused)` row
+//! through the shared writer, both with the call's original `request_id`.
+//!
+//! The submit path reads the rule from the primary for its pin check first
+//! (the rule has no pin record, so the check reads nothing else), then
+//! reads the rule and the threshold from each endpoint for the comparison.
+//! The canned simulations follow that order.
 //!
 //! # Invariant
 //!
 //! Signer-set divergence detected before any write operation causes an
-//! immediate refusal and a `SaRawInvocation(PreSubmissionRefused)` audit row
-//! carrying the original `request_id`. No signing or submission occurs.
+//! immediate refusal, the diverged row, then a
+//! `SaRawInvocation(PreSubmissionRefused)` audit row carrying the original
+//! `request_id`. No signing or submission occurs.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -52,8 +60,28 @@ struct DivergenceFixture {
     smart_account: ScAddress,
     audit_log_path: PathBuf,
     _dir: tempfile::TempDir,
-    _primary_server: MockServer,
-    _secondary_server: MockServer,
+    primary_server: MockServer,
+    secondary_server: MockServer,
+}
+
+impl DivergenceFixture {
+    /// The `sendTransaction` requests both endpoints received.
+    async fn sends(&self) -> usize {
+        let mut sends = 0;
+        for server in [&self.primary_server, &self.secondary_server] {
+            sends += server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| {
+                    serde_json::from_slice::<serde_json::Value>(&request.body)
+                        .is_ok_and(|body| body["method"] == "sendTransaction")
+                })
+                .count();
+        }
+        sends
+    }
 }
 
 async fn build_fixture() -> DivergenceFixture {
@@ -88,7 +116,9 @@ async fn build_fixture() -> DivergenceFixture {
             &signer_g,
             &policy,
             KNOWN_WASM_HASH,
-            SequencedSimulate::new(vec![sim_cr.clone(), sim_th.clone()]),
+            // The pin check's rule read, then the comparison's rule and
+            // threshold reads.
+            SequencedSimulate::new(vec![sim_cr.clone(), sim_cr.clone(), sim_th.clone()]),
         ))
         .mount(&primary_server)
         .await;
@@ -130,8 +160,8 @@ async fn build_fixture() -> DivergenceFixture {
         smart_account: zero_sc_address(),
         audit_log_path,
         _dir: dir,
-        _primary_server: primary_server,
-        _secondary_server: secondary_server,
+        primary_server,
+        secondary_server,
     }
 }
 
@@ -151,12 +181,39 @@ fn auth_rule_ids() -> Vec<ContextRuleId> {
     vec![ContextRuleId::new(RULE_ID)]
 }
 
+/// The serialized kind of `entry`'s event.
+fn row_kind(entry: &AuditEntry) -> String {
+    serde_json::to_value(&entry.event_kind).expect("an event kind serializes")["kind"]
+        .as_str()
+        .expect("an event kind carries its kind")
+        .to_owned()
+}
+
 fn read_audit_entries(log_path: &Path) -> Vec<AuditEntry> {
     let content = std::fs::read_to_string(log_path).expect("audit log JSONL must be readable");
     content
         .lines()
         .filter_map(|line| serde_json::from_str::<AuditEntry>(line).ok())
         .collect()
+}
+
+/// Asserts the refusal's rows: the diverged row, then exactly one
+/// `SaRawInvocation(PreSubmissionRefused)` row with the divergence code, each
+/// carrying `request_id`; and that nothing was sent.
+async fn assert_divergence_rows(fixture: &DivergenceFixture, request_id: &str, op: &str) {
+    let entries = read_audit_entries(&fixture.audit_log_path);
+    let kinds: Vec<String> = entries
+        .iter()
+        .filter(|entry| entry.request_id == request_id)
+        .map(row_kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        ["sa_signer_set_diverged", "sa_raw_invocation"],
+        "{op}: the diverged row precedes the raw invocation row"
+    );
+    assert_eq!(fixture.sends().await, 0, "{op}: nothing is sent");
+    assert_divergence_raw_row(&fixture.audit_log_path, request_id, op);
 }
 
 fn assert_divergence_raw_row(log_path: &Path, request_id: &str, op: &str) {
@@ -224,7 +281,7 @@ async fn install_rule_divergence_failure_emits_via_self_audit_writer() {
         ),
         "install_rule must return SignerSetDiverged; got {result:?}"
     );
-    assert_divergence_raw_row(&fixture.audit_log_path, &request_id, "install_rule");
+    assert_divergence_rows(&fixture, &request_id, "install_rule").await;
 }
 
 /// `delete_rule` must emit the divergence failure via `self.audit_writer`.
@@ -258,7 +315,7 @@ async fn delete_rule_divergence_failure_emits_via_self_audit_writer() {
         ),
         "delete_rule must return SignerSetDiverged; got {result:?}"
     );
-    assert_divergence_raw_row(&fixture.audit_log_path, &request_id, "delete_rule");
+    assert_divergence_rows(&fixture, &request_id, "delete_rule").await;
 }
 
 /// `update_name` must emit the divergence failure via `self.audit_writer`.
@@ -293,7 +350,7 @@ async fn update_name_divergence_failure_emits_via_self_audit_writer() {
         ),
         "update_name must return SignerSetDiverged; got {result:?}"
     );
-    assert_divergence_raw_row(&fixture.audit_log_path, &request_id, "update_name");
+    assert_divergence_rows(&fixture, &request_id, "update_name").await;
 }
 
 /// `update_valid_until` must emit the divergence failure via `self.audit_writer`.
@@ -328,5 +385,5 @@ async fn update_valid_until_divergence_failure_emits_via_self_audit_writer() {
         ),
         "update_valid_until must return SignerSetDiverged; got {result:?}"
     );
-    assert_divergence_raw_row(&fixture.audit_log_path, &request_id, "update_valid_until");
+    assert_divergence_rows(&fixture, &request_id, "update_valid_until").await;
 }

@@ -533,7 +533,16 @@ pub enum SaError {
     /// the check exceeding the pre-submit budget. Nothing is signed. The
     /// check's own refusals, [`SaError::VerifierHashDrift`],
     /// [`SaError::PolicyHashDrift`] and [`SaError::PinnedPolicyAbsent`],
-    /// propagate as themselves and are never folded into this variant.
+    /// propagate as themselves and are never folded into this variant. The
+    /// signer-set steps that run beside the pin check propagate as themselves
+    /// too: [`SaError::SignerSetMissingBaseline`],
+    /// [`SaError::SignerSetDiverged`], [`SaError::NetworkRpcDivergence`] and
+    /// [`SaError::AuditLog`] from the baseline read or the comparison, and
+    /// [`SaError::AuthEntryConstructionFailed`] at the lock and signer-set
+    /// stages. The baseline read scans the audit log before the pin check
+    /// does, so an audit-log integrity error under a rule other than rule 0
+    /// is reported as [`SaError::AuditLog`]; under the migrating rule of a
+    /// verifier migration, which has no baseline read, it is reported here.
     ///
     /// `reason` is the inner error's wire code, a colon and its Display,
     /// capped at [`PIN_CHECK_REASON_MAX_BYTES`] bytes.
@@ -1631,6 +1640,21 @@ pub enum SaError {
     /// - `"multicall_check_undeclared"`: a multicall check without
     ///   `"multicall"` in the declared required checks. Surfaces from
     ///   `submit.rs` before any network I/O.
+    /// - `"rule_locks_without_pin_check"`: a held rule-lock context supplied
+    ///   without a pinned-hash drift check. Surfaces from `submit.rs` before
+    ///   any network I/O.
+    /// - `"rule_lock"`: a rule's lock was not acquired before the pre-submit
+    ///   deadline, or the manager's timeout for a verb that locks the rule
+    ///   itself. Surfaces from `managers/signers.rs`.
+    /// - `"rule_lock_missing"`: a submission names a rule the caller's
+    ///   held-lock context holds no lock for. Surfaces from `submit.rs`
+    ///   before any network I/O.
+    /// - `"baseline_read"`: the pre-submit deadline elapsed during or right
+    ///   after a rule's signer-set baseline read. Surfaces from `submit.rs`
+    ///   and `managers/credentials.rs`.
+    /// - `"signer_set_compare"`: the pre-submit deadline elapsed during a
+    ///   rule's signer-set comparison. Surfaces from `submit.rs` and
+    ///   `managers/credentials.rs`.
     ///
     /// # Security
     ///
@@ -2456,8 +2480,8 @@ pub enum SaError {
 /// Lifts an [`stellar_agent_core::audit_log::AuditLogIntegrityError`] into
 /// [`SaError::AuditLog`].
 ///
-/// Used by the `verify_signer_set_against_chain` path when the audit-log reader
-/// returns an integrity violation before the on-chain comparison fires.
+/// Used by the signer-set baseline read when the audit-log reader returns an
+/// integrity violation before the on-chain comparison runs.
 impl From<stellar_agent_core::audit_log::AuditLogIntegrityError> for SaError {
     fn from(err: stellar_agent_core::audit_log::AuditLogIntegrityError) -> Self {
         Self::AuditLog(err)
@@ -2536,6 +2560,11 @@ pub(crate) const ALL_AUTH_ENTRY_STAGES: &[&str] = &[
     "pin_check_required",
     "migrating_rule_mismatch",
     "multicall_check_undeclared",
+    "rule_locks_without_pin_check",
+    "rule_lock",
+    "rule_lock_missing",
+    "baseline_read",
+    "signer_set_compare",
 ];
 
 /// Which unresolved-submission condition [`SaError::SubmissionUnresolved`]
@@ -5570,12 +5599,12 @@ mod tests {
             stray_literals.join("\n")
         );
 
-        // Also assert that ALL_AUTH_ENTRY_STAGES has the expected 12 entries
+        // Also assert that ALL_AUTH_ENTRY_STAGES has the expected 17 entries
         // so a silent truncation of the const is caught.
         assert_eq!(
             ALL_AUTH_ENTRY_STAGES.len(),
-            12,
-            "ALL_AUTH_ENTRY_STAGES must contain exactly 12 entries"
+            17,
+            "ALL_AUTH_ENTRY_STAGES must contain exactly 17 entries"
         );
     }
 

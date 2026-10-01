@@ -1,9 +1,11 @@
 //! Adversarial fixture: drift-check infrastructure failure routes to unavailable.
 //!
 //! The signing path must not report `WasmHashDrift` unless a concrete
-//! verifier/policy drift row was emitted. This fixture makes the policy
-//! drift re-fetch hit two-RPC divergence after the signer-set divergence check
-//! has passed.
+//! verifier/policy drift row was emitted. The passkey path reads the rule's
+//! state row, then runs the pinned-hash drift check, then compares the
+//! signer set. This fixture makes the drift check's policy executable read
+//! diverge between the two endpoints, after the state row was read and
+//! before the signer-set comparison, which never runs.
 //!
 //! # Invariant
 //!
@@ -32,8 +34,8 @@ use wiremock::{
 use super::combined_rpc_responder::SequencedSimulate;
 use super::rpc_mock_helpers::{
     KNOWN_WASM_HASH, UNKNOWN_WASM_HASH, build_context_rule_scval_xdr, build_ledger_entries_account,
-    build_ledger_entries_contract_instance, build_simulate_response, build_threshold_scval_xdr,
-    policy_sc_address, signer_set_n_of_n, tmp_audit_writer, write_baseline,
+    build_ledger_entries_contract_instance, build_simulate_response, policy_sc_address,
+    signer_set_n_of_n, tmp_audit_writer, write_baseline,
 };
 
 const RULE_ID: u32 = 1;
@@ -157,23 +159,19 @@ async fn policy_rpc_divergence_routes_to_drift_check_unavailable() {
 
     let context_rule_xdr =
         build_context_rule_scval_xdr(RULE_ID, &signer_set, std::slice::from_ref(&policy));
-    let threshold_xdr = build_threshold_scval_xdr(1);
     let context_rule_response = build_simulate_response(&context_rule_xdr);
-    let threshold_response = build_simulate_response(&threshold_xdr);
 
-    // Primary simulations: the signer-set observation's rule read and
-    // threshold read, then the drift check's rule read. Each endpoint's first
-    // policy instance read is the observation's, its second the drift check's.
+    // The drift check reads the rule from the primary, then the policy's
+    // instance from each endpoint; the endpoints disagree on the policy's
+    // executable. The comparison's reads would follow; the refusal ends the
+    // check first. A ledger read past the first per endpoint fails the
+    // responder's range assertion.
     let primary = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/"))
         .respond_with(SequencedLedgerResponder::new(
-            vec![KNOWN_WASM_HASH, KNOWN_WASM_HASH],
-            vec![
-                context_rule_response.clone(),
-                threshold_response.clone(),
-                context_rule_response.clone(),
-            ],
+            vec![KNOWN_WASM_HASH],
+            vec![context_rule_response.clone()],
         ))
         .mount(&primary)
         .await;
@@ -182,8 +180,8 @@ async fn policy_rpc_divergence_routes_to_drift_check_unavailable() {
     Mock::given(method("POST"))
         .and(path("/"))
         .respond_with(SequencedLedgerResponder::new(
-            vec![KNOWN_WASM_HASH, UNKNOWN_WASM_HASH],
-            vec![context_rule_response.clone(), threshold_response],
+            vec![UNKNOWN_WASM_HASH],
+            vec![context_rule_response],
         ))
         .mount(&secondary)
         .await;
@@ -211,10 +209,18 @@ async fn policy_rpc_divergence_routes_to_drift_check_unavailable() {
         )
         .await;
 
-    assert!(
-        matches!(result, Err(CredentialsError::DriftCheckUnavailable { .. })),
-        "non-drift inner SaError must route to DriftCheckUnavailable; got {result:?}"
-    );
+    match &result {
+        Err(CredentialsError::DriftCheckUnavailable { source }) => assert!(
+            matches!(
+                source.as_ref(),
+                stellar_agent_smart_account::error::SaError::NetworkRpcDivergence { .. }
+            ),
+            "the drift check's policy read diverged: {source:?}"
+        ),
+        other => {
+            panic!("non-drift inner SaError must route to DriftCheckUnavailable; got {other:?}")
+        }
+    }
 
     let entries = read_audit_entries(&audit_log_path);
     assert!(

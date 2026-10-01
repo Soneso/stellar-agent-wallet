@@ -4,14 +4,15 @@
 //! [`ThresholdAffectingOp`] — the value types consumed by the
 //! `SignersManager` implementation (`managers/signers.rs`).
 //!
-//! # TOCTOU anchor
+//! # Comparison record
 //!
-//! [`FrozenChainStateTuple`] is the move-only TOCTOU primitive that binds
-//! the divergence-check result to the signing call: the constructor
-//! (`pub(crate)`) is called exclusively inside
-//! `managers/signers.rs::verify_signer_set_against_chain`, and the
-//! only consumer is the signing call that receives it by move.  Dropping it
-//! without consuming is detected at the call site by `#[must_use]`.
+//! [`FrozenChainStateTuple`] is the move-only record of one standalone
+//! signer-set comparison: the constructor (`pub(crate)`) is called only
+//! inside `managers/signers.rs::verify_signer_set_against_chain`, the public
+//! entry tests and live suites call. The submit path runs the same
+//! comparison under the rule's lock for every rule a submission is signed
+//! under and builds no tuple. Dropping one without reading it is detected at
+//! the call site by `#[must_use]`.
 
 use std::fmt;
 
@@ -21,68 +22,61 @@ use stellar_agent_core::audit_log::signer_set::SignerSetView;
 
 // ── FrozenChainStateTuple ─────────────────────────────────────────────────────
 
-/// Move-only TOCTOU anchor returned by
+/// Move-only record of one standalone signer-set comparison, returned by
 /// `managers/signers.rs::verify_signer_set_against_chain`.
 ///
-/// Binds the divergence-check result to a subsequent signing call so the
-/// on-chain state observed at check time cannot be silently replaced by a
-/// concurrent mutation before the signing call fires.
+/// It carries what the comparison matched: the observed view, the ledger
+/// and wall-clock instant of the reads, the matched state row's hash and
+/// the compared rule. It holds no lock.
 ///
 /// # Security invariants
 ///
-/// - `!Copy`, `!Clone` — enforced at compile time via
+/// - `!Copy`, `!Clone`: enforced at compile time via
 ///   `static_assertions::assert_not_impl_any!` in `#[cfg(test)]` (see
 ///   `frozen_chain_state_tuple_is_not_copy_or_clone`).
-/// - `pub(crate)` constructor — the ONLY authorised constructor call site is
-///   `managers/signers.rs::verify_signer_set_against_chain`. In test code
-///   the constructor is only called from `#[cfg(test)]` so the field values
-///   can be verified without a production call site.
-/// - `#[must_use]` — dropping without consuming triggers a warning at the call
-///   site, surfacing accidental discards during code review.
+/// - `pub(crate)` constructor: the only constructor call site is
+///   `managers/signers.rs::verify_signer_set_against_chain`, the standalone
+///   form of the submit path's comparison, which tests and live suites call
+///   to inspect a comparison's result.
+/// - `#[must_use]`: discarding the result of a comparison unread triggers a
+///   warning at the call site.
 ///
 /// # Usage
 ///
 /// ```ignore
-/// // Inside managers/signers.rs:
-/// let frozen = verify_signer_set_against_chain(&writer, rule_id, smart_account).await?;
-/// sign_with_frozen_state(&frozen, &payload).await
+/// let frozen = signers_manager
+///     .verify_signer_set_against_chain(smart_account, rule_id, None, request_id)
+///     .await?;
+/// assert_eq!(frozen.rule_id(), rule_id);
 /// ```
 ///
-#[must_use = "FrozenChainStateTuple binds the divergence-check result to the signing call; \
-              dropping it without consuming defeats the TOCTOU mitigation"]
+#[must_use = "FrozenChainStateTuple is the result of a standalone comparison; read it or drop \
+              it explicitly"]
 pub struct FrozenChainStateTuple {
-    /// The signer-set state observed at divergence-check time, in the
-    /// snapshot version of the baseline it matched.
+    /// The observed signer-set view, in the version of the state row it
+    /// matched.
     pub(crate) observed_chain_state: SignerSetView,
 
-    /// Simulation ledger at divergence-check time: `(latest_ledger_seq, observed_at_unix_ms)`.
-    ///
-    /// Used to bound the validity window of the frozen tuple. A signing call
-    /// that uses a tuple anchored to a ledger sequence far in the past should
-    /// be rejected (staleness check in the signing manager).
+    /// `(latest_ledger_seq, observed_at_unix_ms)`: the smallest
+    /// `latestLedger` of the comparison's reads and the wall-clock instant
+    /// the comparison completed.
     pub(crate) simulation_ledger: (u32, i64),
 
-    /// SHA-256 of the canonical JSON body of the audit-log baseline row that
-    /// was used to construct the expected signer-set view.
-    ///
-    /// Bound into the signing call so the signing path commits to exactly the
-    /// baseline row the divergence check validated. Any post-check append to the
-    /// log (which would change the row hash) causes a mismatch and aborts signing.
+    /// SHA-256 of the canonical JSON body of the state row the observation
+    /// matched.
     pub(crate) expected_audit_row_hash: [u8; 32],
 
-    /// The `rule_id` for which this tuple was produced.
-    ///
-    /// The signing call validates that its `rule_id` argument matches the frozen
-    /// tuple's `rule_id` before proceeding, preventing cross-rule confusion.
+    /// The compared rule.
     pub(crate) rule_id: u32,
 }
 
 impl FrozenChainStateTuple {
     /// Constructs a new `FrozenChainStateTuple`.
     ///
-    /// `pub(crate)` — the only authorised call site is
-    /// `managers/signers.rs::verify_signer_set_against_chain`.
-    /// Only `#[cfg(test)]` code calls this constructor in test mode.
+    /// `pub(crate)`: the only call site is
+    /// `managers/signers.rs::verify_signer_set_against_chain`, the public
+    /// entry tests and live suites call; in-crate tests construct one
+    /// directly to check the accessors.
     ///
     /// # Arguments
     ///
@@ -105,39 +99,29 @@ impl FrozenChainStateTuple {
         }
     }
 
-    /// Returns the rule identifier this tuple was produced for.
-    ///
-    /// The signing call compares this against its own `rule_id` argument to
-    /// prevent cross-rule confusion.
+    /// Returns the compared rule.
     #[must_use]
     pub fn rule_id(&self) -> u32 {
         self.rule_id
     }
 
-    /// Returns the simulation ledger snapshot as `(latest_ledger_seq, observed_at_unix_ms)`.
-    ///
-    /// Used by the signing call to check whether the frozen tuple has gone stale
-    /// relative to the current ledger sequence (signing manager staleness policy).
+    /// Returns `(latest_ledger_seq, observed_at_unix_ms)`: the smallest
+    /// `latestLedger` of the comparison's reads and the wall-clock instant the
+    /// comparison completed.
     #[must_use]
     pub fn simulation_ledger(&self) -> (u32, i64) {
         self.simulation_ledger
     }
 
-    /// Returns a reference to the expected-audit-row SHA-256 TOCTOU anchor.
-    ///
-    /// Returns `&[u8; 32]` (not `[u8; 32]` by value) so a caller cannot
-    /// persist the hash beyond the tuple's lifetime and forge an anchor binding
-    /// on a later signing call.
+    /// Returns the SHA-256 of the canonical JSON body of the state row the
+    /// observation matched.
     #[must_use]
     pub fn expected_audit_row_hash(&self) -> &[u8; 32] {
         &self.expected_audit_row_hash
     }
 
-    /// Returns a reference to the observed on-chain signer-set state, in the
-    /// snapshot version of the baseline it matched.
-    ///
-    /// The signing call uses this as the starting point for signing-entry
-    /// construction, after confirming the tuple's `rule_id` and staleness bound.
+    /// Returns the observed signer-set view, in the version of the state row
+    /// it matched.
     #[must_use]
     pub fn observed_chain_state(&self) -> &SignerSetView {
         &self.observed_chain_state
@@ -448,7 +432,7 @@ mod tests {
     /// Asserts at compile time that `FrozenChainStateTuple` does not implement
     /// `Copy` or `Clone`.
     ///
-    /// The move-only discipline requires that the TOCTOU anchor cannot be
+    /// The move-only discipline requires that the comparison record cannot be
     /// duplicated by a memcpy or `.clone()`.
     ///
     /// `assert_not_impl_any!` is a compile-time assertion: if a future engineer

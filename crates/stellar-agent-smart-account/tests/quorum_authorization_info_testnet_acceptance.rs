@@ -45,9 +45,7 @@
     reason = "test-only; panics are acceptable in testnet acceptance tests"
 )]
 
-#[path = "common/pin_check_manager.rs"]
-mod pin_check_manager;
-
+use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -71,6 +69,7 @@ use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRulePolicy, ContextRuleSignerInput,
     parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
+use stellar_agent_smart_account::managers::signers::SignersManager;
 use stellar_agent_smart_account::signers::policy_identification::THRESHOLD_POLICY_WASM;
 use stellar_agent_smart_account::submit::{PinCheck, SubmitInvokeArgs, submit_signed_invoke};
 use stellar_agent_smart_account::test_helpers::managers_for_tests;
@@ -153,16 +152,18 @@ async fn fund_via_friendbot(g_strkey: &str) {
     );
 }
 
-/// A testnet rule manager with a signers manager, both writing to one audit
+/// A testnet rule manager and its signers manager, both writing to one audit
 /// log under the returned `TempDir`, which the caller holds while it uses the
-/// manager. Rule install requires the signers manager.
-fn fresh_rule_manager() -> (ContextRuleManager, TempDir) {
-    let (manager, _signers_manager, _audit_log_path, dir) = managers_for_tests(
+/// managers. Rule install requires the signers manager, and a submission
+/// signed under the installed rule reads the baseline the install recorded
+/// through it.
+fn fresh_rule_manager() -> (ContextRuleManager, Arc<SignersManager>, TempDir) {
+    let (manager, signers_manager, _audit_log_path, dir) = managers_for_tests(
         TESTNET_RPC_URL,
         TESTNET_RPC_URL,
         Duration::from_secs(TIMEOUT_SECS),
     );
-    (manager, dir)
+    (manager, signers_manager, dir)
 }
 
 /// Deploys a fresh smart-account and returns its C-strkey.
@@ -414,7 +415,10 @@ async fn deploy_threshold_policy_wasm(
 
 /// Installs a rule with `signers` (all Delegated) and `threshold` on
 /// `sa_addr`. The install is authorised by `authorizing_signer` via
-/// `bootstrap_rule_id`.  Returns `(new_rule_id, policy_strkey)`.
+/// `bootstrap_rule_id`. Returns `(new_rule_id, policy_strkey)`, the signers
+/// manager whose log holds the install's baseline and pin record, and the
+/// directory that holds the log, which the caller keeps while it uses the
+/// manager.
 ///
 /// For the quorum acceptance test, `signers` contains 3 G-strkeys at a
 /// 2-of-3 threshold.
@@ -425,8 +429,8 @@ async fn install_multisigner_threshold_rule(
     authorizing_signer_g: &str,
     authorizing_signer: &(dyn Signer + Send + Sync),
     bootstrap_rule_id: ContextRuleId,
-) -> (u32, String) {
-    let (rule_manager, _audit_dir) = fresh_rule_manager();
+) -> (u32, String, Arc<SignersManager>, TempDir) {
+    let (rule_manager, signers_manager, audit_dir) = fresh_rule_manager();
 
     let policy_strkey =
         deploy_threshold_policy_wasm(authorizing_signer_g, authorizing_signer).await;
@@ -466,7 +470,12 @@ async fn install_multisigner_threshold_rule(
         .await
         .expect("install_multisigner_threshold_rule: install_rule must succeed");
 
-    (install_out.rule_id, policy_strkey)
+    (
+        install_out.rule_id,
+        policy_strkey,
+        signers_manager,
+        audit_dir,
+    )
 }
 
 // ── Offline quorum fail-closed (no RPC) ─────────────────────────────────
@@ -610,7 +619,7 @@ async fn q1_and_q3_two_of_three_quorum_invocation_accepted() {
         .expect("signer3_g must be valid G-strkey")
         .0;
 
-    let (rule_id, policy_strkey) = install_multisigner_threshold_rule(
+    let (rule_id, policy_strkey, signers_manager, _audit_dir) = install_multisigner_threshold_rule(
         sa_addr.clone(),
         &[&signer1_g, &signer2_g, &signer3_g],
         2, // 2-of-3 threshold
@@ -674,16 +683,10 @@ async fn q1_and_q3_two_of_three_quorum_invocation_accepted() {
     };
     let host_function = HostFunction::InvokeContract(invoke);
 
-    // The pin-check manager reads its own audit log, which holds no pin
-    // record of the rule (the install recorded its rows in the install
-    // manager's log); the drift check fetches the rule and passes it.
-    let pin_dir = tempfile::tempdir().expect("temporary audit directory");
-    let pin_manager = pin_check_manager::pin_check_manager(
-        TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
-        "quorum-acceptance",
-        pin_dir.path(),
-    );
+    // The installing manager's log holds the rule's install baseline and its
+    // pin record (one policy pin): the submission locks the rule, reads the
+    // baseline, checks the pin and compares the rule's signer set and
+    // threshold with the baseline before signing.
     let pin_request_id = rid();
 
     let result = submit_signed_invoke(
@@ -703,7 +706,7 @@ async fn q1_and_q3_two_of_three_quorum_invocation_accepted() {
             .op_label("execute_get_threshold_2of3")
             .emit_observability_logs(true)
             .pin_check(PinCheck {
-                signers_manager: &pin_manager,
+                signers_manager: &signers_manager,
                 request_id: &pin_request_id,
                 migrating_rule: None,
             })

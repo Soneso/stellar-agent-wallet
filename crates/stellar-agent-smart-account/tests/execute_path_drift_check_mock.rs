@@ -51,6 +51,7 @@ use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::SoftwareSigningKey;
+use stellar_agent_network::SubmissionRecorder;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::migration::{
     MigrationPlan, RuleMigration, SignerMigrationStep,
@@ -64,7 +65,7 @@ use stellar_agent_smart_account::managers::signers::{
 };
 use stellar_agent_smart_account::signers::THRESHOLD_POLICY_WASM_HASHES;
 use stellar_agent_smart_account::submit::{
-    PinCheck, SubmitInvokeArgs, SubmitInvokeResult, submit_signed_invoke,
+    MigratingRule, PinCheck, SubmitInvokeArgs, SubmitInvokeResult, submit_signed_invoke,
 };
 use stellar_agent_smart_account::verifier_allowlist::{VERIFIER_ALLOWLIST, VerifierAuditStatus};
 use stellar_agent_test_support::signed_envelope::{
@@ -72,10 +73,11 @@ use stellar_agent_test_support::signed_envelope::{
 };
 use stellar_agent_test_support::xdr_fixtures;
 use stellar_xdr::{
-    AccountId, BytesM, ContractId, Hash, HostFunction, InvokeContractArgs, LedgerKey, Limits,
-    OperationBody, PublicKey, ReadXdr, ScAddress, ScBytes, ScMap, ScMapEntry, ScString, ScSymbol,
-    ScVal, ScVec, SorobanAddressCredentials, SorobanAuthorizationEntry, SorobanAuthorizedFunction,
-    SorobanAuthorizedInvocation, SorobanCredentials, TransactionEnvelope, Uint256, VecM, WriteXdr,
+    AccountId, BytesM, ContractId, Hash, HostFunction, Int128Parts, InvokeContractArgs, LedgerKey,
+    Limits, OperationBody, PublicKey, ReadXdr, ScAddress, ScBytes, ScMap, ScMapEntry, ScString,
+    ScSymbol, ScVal, ScVec, SorobanAddressCredentials, SorobanAuthorizationEntry,
+    SorobanAuthorizedFunction, SorobanAuthorizedInvocation, SorobanCredentials,
+    TransactionEnvelope, Uint256, VecM, WriteXdr,
 };
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -435,12 +437,18 @@ impl Chain {
 struct Log {
     ledger_keys: Mutex<Vec<String>>,
     simulated: Mutex<Vec<String>>,
+    /// The rule id of each `get_context_rule` simulation, in order.
+    rule_reads: Mutex<Vec<u32>>,
     sends: AtomicUsize,
 }
 
 impl Log {
     fn simulated(&self) -> Vec<String> {
         self.simulated.lock().unwrap().clone()
+    }
+
+    fn rule_reads(&self) -> Vec<u32> {
+        self.rule_reads.lock().unwrap().clone()
     }
 
     /// Whether the endpoint saw no request at all.
@@ -466,6 +474,12 @@ struct Ledgers {
     /// How long every simulation after the send takes to answer; at once
     /// when unset.
     delay_after_send: Mutex<Option<Duration>>,
+    /// How long a simulation of a function takes to answer, by function
+    /// name, before and after the send; at once for a function without an
+    /// entry.
+    delay_simulated: Mutex<HashMap<&'static str, Duration>>,
+    /// How long `getTransaction` takes to answer; at once when unset.
+    delay_poll: Mutex<Option<Duration>>,
 }
 
 impl Ledgers {
@@ -682,6 +696,7 @@ impl Respond for Rpc {
                         let ScVal::U32(rule_id) = invoke.args[0] else {
                             panic!("get_context_rule takes a u32")
                         };
+                        self.log.rule_reads.lock().unwrap().push(rule_id);
                         match rules.get(&rule_id) {
                             Some(value) => reply(simulate_result(value, &[], ledger)),
                             // The contract's `ContextRuleNotFound` panic.
@@ -733,6 +748,16 @@ impl Respond for Rpc {
                         reply(simulate_result(&value, &auth, ledger))
                     }
                 };
+                let response = match self
+                    .ledgers
+                    .delay_simulated
+                    .lock()
+                    .unwrap()
+                    .get(function.as_str())
+                {
+                    Some(delay) => response.set_delay(*delay),
+                    None => response,
+                };
                 match *self.ledgers.delay_after_send.lock().unwrap() {
                     Some(delay) if sent => response.set_delay(delay),
                     _ => response,
@@ -754,11 +779,17 @@ impl Respond for Rpc {
                     "latestLedger": PRE_SEND_LEDGER, "latestLedgerCloseTime": "1234567890"
                 }))
             }
-            "getTransaction" => reply(json!({
-                "status": "SUCCESS", "latestLedger": CONFIRMATION_LEDGER, "oldestLedger": 1,
-                "ledger": CONFIRMATION_LEDGER,
-                "createdAt": (stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1_000).to_string(),
-            })),
+            "getTransaction" => {
+                let response = reply(json!({
+                    "status": "SUCCESS", "latestLedger": CONFIRMATION_LEDGER, "oldestLedger": 1,
+                    "ledger": CONFIRMATION_LEDGER,
+                    "createdAt": (stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1_000).to_string(),
+                }));
+                match *self.ledgers.delay_poll.lock().unwrap() {
+                    Some(delay) => response.set_delay(delay),
+                    None => response,
+                }
+            }
             "getNetwork" => reply(get_network_result(PASSPHRASE)),
             "getLatestLedger" => reply(
                 json!({"id": "ab".repeat(32), "sequence": PRE_SEND_LEDGER, "protocolVersion": 27}),
@@ -787,28 +818,82 @@ struct Harness {
     audit: Arc<Mutex<AuditWriter>>,
     log_path: PathBuf,
     manager: Arc<SignersManager>,
+    timeouts: Timeouts,
     _dir: tempfile::TempDir,
     _secondary: MockServer,
 }
 
+/// The two timeouts of a [`Harness`].
+#[derive(Clone, Copy)]
+struct Timeouts {
+    /// The pre-submit budget of the free function's submissions and the
+    /// timeout of the rule manager, whose submissions take it as theirs.
+    budget: Duration,
+    /// The signers manager's timeout: the timeout of each of its RPC reads,
+    /// the lock wait of its verbs and their `confirmation_recording` budget.
+    client: Duration,
+}
+
+/// The timeout of a harness that sets none.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl Harness {
     async fn new(chain: Chain) -> Self {
-        Self::build(chain, None, Duration::from_secs(10)).await
+        Self::build(
+            chain,
+            None,
+            Timeouts {
+                budget: DEFAULT_TIMEOUT,
+                client: DEFAULT_TIMEOUT,
+            },
+        )
+        .await
     }
 
     /// A harness whose secondary endpoint serves `secondary` instead of the
     /// primary's chain.
     async fn with_secondary(chain: Chain, secondary: Chain) -> Self {
-        Self::build(chain, Some(secondary), Duration::from_secs(10)).await
+        Self::build(
+            chain,
+            Some(secondary),
+            Timeouts {
+                budget: DEFAULT_TIMEOUT,
+                client: DEFAULT_TIMEOUT,
+            },
+        )
+        .await
     }
 
-    /// A harness whose manager has `timeout`, the `confirmation_recording`
-    /// budget of its signer verbs.
+    /// A harness whose pre-submit budget and signers-manager timeout are
+    /// both `timeout`.
     async fn with_timeout(chain: Chain, timeout: Duration) -> Self {
-        Self::build(chain, None, timeout).await
+        Self::build(
+            chain,
+            None,
+            Timeouts {
+                budget: timeout,
+                client: timeout,
+            },
+        )
+        .await
     }
 
-    async fn build(chain: Chain, secondary: Option<Chain>, timeout: Duration) -> Self {
+    /// A harness whose pre-submit budget is `budget` and whose signers
+    /// manager keeps the default timeout, so an RPC read's own timeout never
+    /// ends before the budget does.
+    async fn with_budget(chain: Chain, budget: Duration) -> Self {
+        Self::build(
+            chain,
+            None,
+            Timeouts {
+                budget,
+                client: DEFAULT_TIMEOUT,
+            },
+        )
+        .await
+    }
+
+    async fn build(chain: Chain, secondary: Option<Chain>, timeouts: Timeouts) -> Self {
         let chain = Arc::new(Mutex::new(chain));
         let secondary_chain = secondary.map_or_else(
             || Arc::clone(&chain),
@@ -864,7 +949,7 @@ impl Harness {
                 log_path.clone(),
                 PASSPHRASE.to_owned(),
                 "pin-check-mock".to_owned(),
-                timeout,
+                timeouts.client,
                 CHAIN_ID.to_owned(),
             ))
             .unwrap(),
@@ -881,6 +966,7 @@ impl Harness {
             audit,
             log_path,
             manager,
+            timeouts,
             _dir: dir,
             _secondary: secondary,
         }
@@ -893,7 +979,7 @@ impl Harness {
             ContextRuleManagerConfig::new(
                 self.primary.uri(),
                 PASSPHRASE.to_owned(),
-                Duration::from_secs(10),
+                self.timeouts.budget,
                 CHAIN_ID.to_owned(),
             )
             .with_signers_manager(Arc::clone(&self.manager))
@@ -967,6 +1053,34 @@ impl Harness {
     /// Makes the primary's simulated `function` return `value`.
     fn set_simulated_return(&self, function: &'static str, value: ScVal) {
         self.chain.lock().unwrap().returns.insert(function, value);
+    }
+
+    /// Poisons the audit writer now, before the next submission.
+    fn poison_audit_writer_now(&self) {
+        Poison {
+            at: "now",
+            audit: Arc::clone(&self.audit),
+        }
+        .fire();
+    }
+
+    /// Delays every simulation of `function` on both endpoints by `delay`.
+    /// The delay applies once the function name is decoded, so other
+    /// functions answer at once.
+    fn delay_simulated(&self, function: &'static str, delay: Duration) {
+        for ledgers in [&self.primary_ledgers, &self.secondary_ledgers] {
+            ledgers
+                .delay_simulated
+                .lock()
+                .unwrap()
+                .insert(function, delay);
+        }
+    }
+
+    /// Delays the primary's `getTransaction` answers by `delay`, so a sent
+    /// submission stalls in its confirmation poll.
+    fn delay_poll(&self, delay: Duration) {
+        *self.primary_ledgers.delay_poll.lock().unwrap() = Some(delay);
     }
 
     /// Poisons the audit writer when the primary endpoint receives `at`.
@@ -1170,21 +1284,56 @@ impl Harness {
     }
 
     /// Submits `noop()` on the smart account under `rule_ids`, with the
-    /// drift check through this harness's manager when `request_id` is set.
+    /// rule checks through this harness's manager when `request_id` is set.
     async fn submit(
         &self,
         rule_ids: &[u32],
         request_id: Option<&str>,
     ) -> Result<SubmitInvokeResult, SaError> {
-        self.submit_invocation("noop", rule_ids, request_id).await
+        self.submit_invocation("noop", rule_ids, request_id, None)
+            .await
     }
 
-    /// Submits `function()` on the smart account; see [`Self::submit`].
+    /// Submits `noop()` under `rule_id` alone with `rule_id` as the migrating
+    /// rule, as a verifier migration's step does.
+    async fn submit_as_migrating_rule(
+        &self,
+        rule_id: u32,
+        request_id: &str,
+    ) -> Result<SubmitInvokeResult, SaError> {
+        let signer = SoftwareSigningKey::new_from_bytes(SEED);
+        let rule_ids = [ContextRuleId::new(rule_id)];
+        let smart_account = strkey(&smart_account());
+        let uri = self.primary.uri();
+        submit_signed_invoke(
+            SubmitInvokeArgs::builder()
+                .target_contract(&smart_account)
+                .auth_rule_ids(&rule_ids)
+                .host_function(noop())
+                .signer(&signer)
+                .primary_rpc_url(&uri)
+                .network_passphrase(PASSPHRASE)
+                .chain_id(CHAIN_ID)
+                .timeout(self.timeouts.budget)
+                .op_label("pin_check_mock")
+                .pin_check(PinCheck {
+                    signers_manager: &self.manager,
+                    request_id,
+                    migrating_rule: Some(MigratingRule::for_tests(rule_id)),
+                })
+                .build(),
+        )
+        .await
+    }
+
+    /// Submits `function()` on the smart account, recording the submission
+    /// through `recorder` when one is given; see [`Self::submit`].
     async fn submit_invocation(
         &self,
         function: &str,
         rule_ids: &[u32],
         request_id: Option<&str>,
+        recorder: Option<&dyn SubmissionRecorder>,
     ) -> Result<SubmitInvokeResult, SaError> {
         let signer = SoftwareSigningKey::new_from_bytes(SEED);
         let rule_ids: Vec<ContextRuleId> =
@@ -1200,8 +1349,9 @@ impl Harness {
                 .primary_rpc_url(&uri)
                 .network_passphrase(PASSPHRASE)
                 .chain_id(CHAIN_ID)
-                .timeout(Duration::from_secs(10))
+                .timeout(self.timeouts.budget)
                 .op_label("pin_check_mock")
+                .maybe_submission_recorder(recorder)
                 .maybe_pin_check(request_id.map(|request_id| PinCheck {
                     signers_manager: &self.manager,
                     request_id,
@@ -1341,21 +1491,27 @@ fn rule_one_verifier_and_policy() -> ScVal {
     )
 }
 
+/// Rule 1 of [`rule_one_verifier_and_policy`] with verifier V running
+/// `verifier_hash` and P the simple-threshold policy at threshold 1.
 fn chain_with_rule_one(verifier_hash: [u8; 32]) -> Chain {
     Chain::default()
         .with_rule(1, rule_one_verifier_and_policy())
         .with_entry(wasm_instance(&verifier_v(), verifier_hash))
-        .with_entry(wasm_instance(&policy_p(), KNOWN_WASM_HASH))
+        .with_wasm(&policy_p(), KNOWN_WASM_HASH)
+        .with_threshold(&policy_p(), 1, 1)
 }
 
 // ── Drift refusals ────────────────────────────────────────────────────────────
 
 /// A live verifier that differs from the rule's pin refuses the submission
 /// before its invocation is simulated, and the drift row carries the
-/// caller's request id.
+/// caller's request id. The rule's baseline is present, so the refusal is
+/// the pin check's, and the signer-set comparison after it never runs: the
+/// only simulation is the pin check's primary rule read.
 #[tokio::test]
 async fn verifier_drift_refuses_before_simulation_with_the_callers_request_id() {
     let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
+    h.baseline_v2(1);
     h.pin_created(
         1,
         vec![FOREIGN_FIRST8.to_owned()],
@@ -1396,13 +1552,21 @@ async fn verifier_drift_refuses_before_simulation_with_the_callers_request_id() 
     assert_eq!(drift_rows.len(), 1);
     assert_eq!(drift_rows[0].request_id, "req-verifier-drift");
     assert!(!h.simulated("noop"), "nothing may be simulated after drift");
+    assert_eq!(h.primary_log.simulated(), vec!["get_context_rule"]);
+    assert!(
+        h.secondary_log.simulated().is_empty(),
+        "the comparison's two-endpoint reads never ran"
+    );
+    assert!(!h.simulated("get_threshold"));
     assert_eq!(h.sends(), 0);
 }
 
-/// A live policy that differs from the rule's pin refuses the same way.
+/// A live policy that differs from the rule's pin refuses the same way,
+/// after the baseline read and before the comparison.
 #[tokio::test]
 async fn policy_drift_refuses_before_simulation_with_the_callers_request_id() {
     let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
+    h.baseline_v2(1);
     h.pin_created(
         1,
         vec![first8(&webauthn_hash())],
@@ -1440,6 +1604,12 @@ async fn policy_drift_refuses_before_simulation_with_the_callers_request_id() {
     assert_eq!(drift_rows.len(), 1);
     assert_eq!(drift_rows[0].request_id, "req-policy-drift");
     assert!(!h.simulated("noop"));
+    assert_eq!(h.primary_log.simulated(), vec!["get_context_rule"]);
+    assert!(
+        h.secondary_log.simulated().is_empty(),
+        "the comparison's two-endpoint reads never ran"
+    );
+    assert!(!h.simulated("get_threshold"));
     assert_eq!(h.sends(), 0);
 }
 
@@ -1455,6 +1625,7 @@ async fn a_repointed_external_reference_refuses_with_the_observed_executable() {
         .with_entry(external_ref_instance(&verifier_v()))
         .with_entry(tag_entry(ed25519_hash()));
     let h = Harness::new(chain).await;
+    h.baseline_v2(1);
     h.pin_created(
         1,
         vec![first8(&webauthn_hash())],
@@ -1496,6 +1667,7 @@ async fn a_repointed_external_reference_refuses_with_the_observed_executable() {
 #[tokio::test]
 async fn an_rpc_failure_during_the_check_refuses_and_sends_nothing() {
     let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
+    h.baseline_v2(1);
     h.pin_created(
         1,
         vec![first8(&webauthn_hash())],
@@ -1524,11 +1696,18 @@ async fn an_rpc_failure_during_the_check_refuses_and_sends_nothing() {
     assert_eq!(h.sends(), 0);
 }
 
-/// A pin record with two verifier pins, and an audit log that fails its
-/// integrity check, each refuse as unavailable carrying the inner code.
+/// A pin record with two verifier pins refuses as unavailable carrying the
+/// inner code.
+///
+/// An audit log that fails its integrity check refuses with `sa.audit_log`
+/// at the baseline read, which scans the log before the pin check does; the
+/// rule is never fetched. Under the migrating rule, whose baseline read is
+/// skipped, the pin check's own scan meets the error and refuses as
+/// unavailable carrying `sa.audit_log`.
 #[tokio::test]
 async fn multiple_pins_and_an_audit_integrity_error_refuse_as_unavailable() {
     let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
+    h.baseline_v2(1);
     h.pin_created(
         1,
         vec![first8(&webauthn_hash()), first8(&ed25519_hash())],
@@ -1546,6 +1725,7 @@ async fn multiple_pins_and_an_audit_integrity_error_refuse_as_unavailable() {
     }
 
     let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
+    h.baseline_v2(1);
     h.pin_created(
         1,
         vec![first8(&webauthn_hash())],
@@ -1560,6 +1740,17 @@ async fn multiple_pins_and_an_audit_integrity_error_refuse_as_unavailable() {
         .write_all(b"not an audit row\n")
         .unwrap();
     let err = h.submit(&[1], Some("req-integrity")).await.unwrap_err();
+    assert!(matches!(err, SaError::AuditLog(_)), "{err:?}");
+    assert_eq!(err.wire_code(), "sa.audit_log");
+    assert!(
+        !h.simulated("get_context_rule"),
+        "the baseline read refuses before the pin check fetches the rule"
+    );
+
+    let err = h
+        .submit_as_migrating_rule(1, "req-integrity-migrating")
+        .await
+        .unwrap_err();
     match &err {
         SaError::PinCheckUnavailable { reason, .. } => {
             assert!(reason.starts_with("sa.audit_log: "), "{reason}");
@@ -1575,6 +1766,7 @@ async fn multiple_pins_and_an_audit_integrity_error_refuse_as_unavailable() {
 #[tokio::test]
 async fn a_rule_without_a_pin_record_signs() {
     let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
+    h.baseline_v2(1);
     let result = h.submit(&[1], Some("req-unpinned")).await.unwrap();
     assert!(!result.tx_hash.is_empty());
     assert!(
@@ -1598,6 +1790,7 @@ async fn rule_zero_only_signs_without_a_check() {
 #[tokio::test]
 async fn a_newer_pins_updated_row_is_the_record_the_check_reads() {
     let h = Harness::new(chain_with_rule_one(ed25519_hash())).await;
+    h.baseline_v2(1);
     h.pin_created(
         1,
         vec![first8(&webauthn_hash())],
@@ -1637,10 +1830,12 @@ async fn a_verifier_shared_by_two_rules_is_observed_once() {
         )
         .with_entry(wasm_instance(&verifier_v(), webauthn_hash()));
     let h = Harness::new(chain).await;
+    h.baseline_v2(1);
+    h.baseline_v2(2);
     h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
     h.pin_created(2, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
 
-    h.submit_invocation("pair", &[1, 2], Some("req-shared"))
+    h.submit_invocation("pair", &[1, 2], Some("req-shared"), None)
         .await
         .unwrap();
     assert_eq!(h.sends(), 1);
@@ -1709,7 +1904,7 @@ async fn a_migrating_rule_must_be_the_only_authorizing_rule() {
         let pin_check = PinCheck {
             signers_manager: &h.manager,
             request_id: "req-guard",
-            migrating_rule: Some(2),
+            migrating_rule: Some(MigratingRule::for_tests(2)),
         };
         let err = submit_signed_invoke(unroutable_args(&rule_ids, &signer, Some(pin_check)))
             .await
@@ -2476,6 +2671,8 @@ async fn a_second_policy_writes_two_pins_and_the_next_verb_refuses() {
     );
     assert_eq!(reason, PinsUpdateReason::PolicyAdded);
 
+    h.set_threshold(&policy_p(), 1, 1);
+    h.baseline_v2(1);
     let err = h
         .submit(&[1], Some("req-after-second-policy"))
         .await
@@ -2642,6 +2839,7 @@ async fn removing_a_drifted_only_policy_drops_its_pin() {
     assert_eq!(policies, vec![first8(&spending_limit_hash())]);
     assert_eq!(reason, PinsUpdateReason::PolicyAdded);
 
+    h.baseline_v2(1);
     h.submit(&[1], Some("req-after-drifted-replace"))
         .await
         .unwrap();
@@ -2699,6 +2897,8 @@ async fn removing_one_of_two_policies_drops_the_pin_of_its_hash() {
     assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::PolicyRemoved);
 
+    h.set_threshold(&policy_p(), 1, 1);
+    h.baseline_v2(1);
     h.submit(&[1], Some("req-after-remove-second"))
         .await
         .unwrap();
@@ -2720,6 +2920,8 @@ async fn removing_an_unpinned_policy_beside_a_pinned_one_keeps_the_pin() {
     remove_policy(&h, 1, "req-remove-unpinned").await.unwrap();
     assert!(h.pins_updated_rows().is_empty());
 
+    h.set_threshold(&policy_p(), 1, 1);
+    h.baseline_v2(1);
     h.set_entry(wasm_instance(&policy_p(), [0xab; 32]));
     let err = h
         .submit(&[1], Some("req-after-remove-unpinned"))
@@ -2752,6 +2954,7 @@ async fn removing_a_policy_no_pin_of_two_matches_writes_no_row() {
     assert_eq!(h.sends(), 1);
     assert!(h.pins_updated_rows().is_empty());
 
+    h.baseline_v2(1);
     let err = h
         .submit(&[1], Some("req-after-remove-under-two-pins"))
         .await
@@ -2778,6 +2981,7 @@ async fn removing_a_policy_no_pin_of_two_matches_writes_no_row() {
 #[tokio::test]
 async fn a_policy_pin_with_no_live_policy_refuses_and_sends_nothing() {
     let h = policy_harness(vec![]).await;
+    h.baseline_v2(1);
     h.pin_created(
         1,
         vec![first8(&webauthn_hash())],
@@ -2811,6 +3015,7 @@ async fn a_policy_pin_with_no_live_policy_refuses_and_sends_nothing() {
 #[tokio::test]
 async fn a_rule_without_policies_or_policy_pins_signs() {
     let h = policy_harness(vec![]).await;
+    h.baseline_v2(1);
     h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
     h.submit(&[1], Some("req-no-policy")).await.unwrap();
     assert_eq!(h.sends(), 1);
@@ -2841,6 +3046,7 @@ async fn a_policy_added_with_no_live_policy_replaces_a_stale_pin() {
     assert_eq!(reason, PinsUpdateReason::PolicyAdded);
     assert_eq!(h.sends(), 1);
 
+    h.baseline_v2(1);
     h.submit(&[1], Some("req-after-repin")).await.unwrap();
     assert_eq!(h.sends(), 2);
 }
@@ -2915,6 +3121,7 @@ async fn a_policy_added_with_no_live_policy_drops_a_stale_reference_pin() {
         other => panic!("expected SaContextRulePinsUpdated for rule 1; got {other:?}"),
     }
 
+    h.baseline_v2(1);
     h.submit(&[1], Some("req-after-repin-reference"))
         .await
         .unwrap();
@@ -3739,8 +3946,13 @@ async fn an_add_whose_simulated_return_is_not_a_u32_fails_at_stage_observe_and_p
 
 /// A passkey add, single or batched, on a rule whose pin record holds no
 /// verifier pin writes the passkey verifier's pin once the add confirms,
-/// although the confirmed state is never observed. A later change of that
-/// verifier's executable is then refused by the drift check.
+/// although the confirmed state is never observed.
+///
+/// The unrecorded add leaves the rule's state row behind the chain, so the
+/// next submission under the rule refuses at the signer-set comparison and
+/// sends nothing. Once `signers refresh` accepts the chain, a submission
+/// signs with the passkey verifier matching its pin, and a later change of
+/// that verifier's executable is refused by the drift check.
 #[tokio::test]
 async fn a_confirmed_passkey_add_that_fails_to_record_still_pins_its_verifier() {
     for batch in [false, true] {
@@ -3796,6 +4008,36 @@ async fn a_confirmed_passkey_add_that_fails_to_record_still_pins_its_verifier() 
         assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)], "batch {batch}");
         assert_eq!(reason, PinsUpdateReason::SignerAdded, "batch {batch}");
 
+        // The secondary catches up; both endpoints now serve the confirmed
+        // add, which no state row records.
+        *h.secondary_ledgers.after_send.lock().unwrap() = None;
+        let err = h
+            .submit(&[1], Some("req-unrecorded-add"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SaError::SignerSetDiverged {
+                    rule_id: 1,
+                    tx_hash: None,
+                    ..
+                }
+            ),
+            "batch {batch}: {err:?}"
+        );
+        assert_eq!(h.sends(), 1, "batch {batch}");
+
+        h.manager
+            .refresh_signer_baseline(
+                smart_account(),
+                1,
+                None,
+                true,
+                format!("req-accept-{batch}"),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("batch {batch}: the refresh accepts the chain: {e:?}"));
         h.submit(&[1], Some("req-pinned-verifier-matches"))
             .await
             .unwrap_or_else(|e| panic!("batch {batch}: the pinned verifier matches: {e:?}"));
@@ -5831,4 +6073,755 @@ async fn a_threshold_attach_whose_secondary_threshold_read_lags_is_recorded() {
         ],
         "the behind threshold read repeats the endpoint's observation: {secondary:?}"
     );
+}
+
+// ── The signer-set check in the submit path ───────────────────────────────────
+
+/// Rule 1 with a delegated signer and rule 2 with an External signer on
+/// verifier V, neither with a policy.
+fn two_rule_chain() -> Chain {
+    Chain::default()
+        .with_rule(1, rule(1, vec![delegated_account(0x31)], vec![]))
+        .with_rule(
+            2,
+            rule(2, vec![external_signer(&verifier_v(), &[0x12; 32])], vec![]),
+        )
+        .with_wasm(&verifier_v(), webauthn_hash())
+}
+
+/// Rule 2 of [`two_rule_chain`] with its External signer's key changed, as a
+/// change made outside the wallet.
+fn rule_two_with_another_key() -> ScVal {
+    rule(2, vec![external_signer(&verifier_v(), &[0x99; 32])], vec![])
+}
+
+/// The diverged rows written under `request_id`, as `(rule id, request id)`.
+fn diverged_rows(h: &Harness, request_id: &str) -> Vec<u32> {
+    rows_of(h, request_id)
+        .into_iter()
+        .filter_map(|entry| match entry.event_kind {
+            EventKind::SaSignerSetDiverged { rule_id, .. } => Some(rule_id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every auth rule of a submission is read and compared, each step in
+/// ascending rule order whatever the submission's order: the primary reads
+/// each rule for its pin check, then each rule for its comparison; the
+/// secondary reads each rule only for its comparison. A divergence on the
+/// second rule alone refuses with that rule's diverged row and sends
+/// nothing.
+#[tokio::test]
+async fn every_distinct_auth_rule_is_read_and_compared() {
+    let h = Harness::new(two_rule_chain()).await;
+    h.baseline_v2(1);
+    h.baseline_v2(2);
+
+    h.submit_invocation("pair", &[2, 1], Some("req-two-rules"), None)
+        .await
+        .unwrap();
+    assert_eq!(h.sends(), 1);
+    assert_eq!(h.primary_log.rule_reads(), vec![1, 2, 1, 2]);
+    assert_eq!(h.secondary_log.rule_reads(), vec![1, 2]);
+
+    let h = Harness::new(two_rule_chain()).await;
+    h.baseline_v2(1);
+    h.baseline_v2(2);
+    h.set_rule(2, &rule_two_with_another_key());
+    let err = h
+        .submit_invocation("pair", &[1, 2], Some("req-rule-two-diverged"), None)
+        .await
+        .unwrap_err();
+    match &err {
+        SaError::SignerSetDiverged {
+            rule_id,
+            tx_hash,
+            request_id,
+            ..
+        } => {
+            assert_eq!(*rule_id, 2);
+            assert_eq!(*tx_hash, None);
+            assert_eq!(request_id, "req-rule-two-diverged");
+        }
+        other => panic!("expected SignerSetDiverged; got {other:?}"),
+    }
+    assert_eq!(err.wire_code(), "sa.signer_set_diverged");
+    assert_eq!(diverged_rows(&h, "req-rule-two-diverged"), vec![2]);
+    assert!(!h.simulated("pair"));
+    assert_eq!(h.sends(), 0);
+}
+
+/// A rule without a state row refuses with `sa.signer_set_missing_baseline`
+/// before any RPC: the rule is never fetched, nothing is simulated or sent,
+/// and no baseline row is written.
+#[tokio::test]
+async fn a_missing_baseline_never_signs_or_baselines() {
+    let h = Harness::new(two_rule_chain()).await;
+    let err = h.submit(&[1], Some("req-no-baseline")).await.unwrap_err();
+    match &err {
+        SaError::SignerSetMissingBaseline {
+            rule_id,
+            request_id,
+            ..
+        } => {
+            assert_eq!(*rule_id, 1);
+            assert_eq!(request_id, "req-no-baseline");
+        }
+        other => panic!("expected SignerSetMissingBaseline; got {other:?}"),
+    }
+    assert_eq!(err.wire_code(), "sa.signer_set_missing_baseline");
+    assert!(h.primary_log.simulated().is_empty());
+    assert!(h.secondary_log.is_untouched());
+    assert_eq!(h.sends(), 0);
+    assert!(
+        !h.rows().iter().any(|e| matches!(
+            e.event_kind,
+            EventKind::SaSignerSetBaselined { .. } | EventKind::SaSignerSetBaselinedV2 { .. }
+        )),
+        "the refusal records no baseline"
+    );
+}
+
+/// A version-1 row on an auth rule is compared through the observation's
+/// version-1 projection, and the submission signs.
+#[tokio::test]
+async fn a_version_1_row_on_an_auth_rule_compares_and_signs() {
+    let h = Harness::new(verb_chain()).await;
+    h.baseline_v1(1);
+    h.submit(&[1], Some("req-v1-auth-rule")).await.unwrap();
+    assert_eq!(h.sends(), 1);
+    assert_eq!(h.secondary_log.rule_reads(), vec![1]);
+    assert!(
+        h.secondary_log
+            .simulated()
+            .contains(&"get_threshold".to_owned()),
+        "the version-1 comparison reads the threshold"
+    );
+    assert!(diverged_rows(&h, "req-v1-auth-rule").is_empty());
+}
+
+/// A signer whose key changed outside the wallet refuses with
+/// `sa.signer_set_diverged`, writes the diverged row under the caller's
+/// request id, and sends nothing.
+#[tokio::test]
+async fn an_identity_change_on_an_auth_rule_refuses_with_the_diverged_row() {
+    let h = Harness::new(two_rule_chain()).await;
+    h.baseline_v2(2);
+    h.set_rule(2, &rule_two_with_another_key());
+    let err = h.submit(&[2], Some("req-identity")).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SaError::SignerSetDiverged {
+                rule_id: 2,
+                tx_hash: None,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(diverged_rows(&h, "req-identity"), vec![2]);
+    assert_eq!(
+        row_kinds(&h.rows(), "req-identity"),
+        vec!["sa_signer_set_diverged"]
+    );
+    assert!(!h.simulated("noop"));
+    assert_eq!(h.sends(), 0);
+}
+
+/// Endpoints that disagree on an auth rule refuse with
+/// `network.rpc_divergence`, and an audit writer poisoned before the
+/// submission refuses with `sa.audit_log`; each sends nothing, and the two
+/// identities differ.
+#[tokio::test]
+async fn rpc_disagreement_and_a_poisoned_writer_refuse_distinctly() {
+    let mut secondary = two_rule_chain();
+    secondary.rules.insert(2, rule_two_with_another_key());
+    let h = Harness::with_secondary(two_rule_chain(), secondary).await;
+    h.baseline_v2(2);
+    let divergence = h.submit(&[2], Some("req-endpoints")).await.unwrap_err();
+    assert!(
+        matches!(
+            divergence,
+            SaError::NetworkRpcDivergence {
+                rule_id: Some(2),
+                ..
+            }
+        ),
+        "{divergence:?}"
+    );
+    assert_eq!(divergence.wire_code(), "network.rpc_divergence");
+    assert!(diverged_rows(&h, "req-endpoints").is_empty());
+    assert_eq!(h.sends(), 0);
+
+    let h = Harness::new(two_rule_chain()).await;
+    h.baseline_v2(2);
+    h.poison_audit_writer_now();
+    let corruption = h.submit(&[2], Some("req-poisoned")).await.unwrap_err();
+    assert!(matches!(corruption, SaError::AuditLog(_)), "{corruption:?}");
+    assert_eq!(corruption.wire_code(), "sa.audit_log");
+    assert!(h.primary_log.simulated().is_empty());
+    assert_eq!(h.sends(), 0);
+    assert_ne!(divergence.wire_code(), corruption.wire_code());
+}
+
+/// The comparison shares the pre-submit deadline: a `get_threshold` answer
+/// slower than the budget elapses at stage `signer_set_compare`, after the
+/// pin check read the rule, and nothing is sent. The read's own timeout (the
+/// signers manager's) is longer than its delay, so the budget ends first.
+#[tokio::test]
+async fn a_slow_comparison_elapses_at_signer_set_compare() {
+    let h = Harness::with_budget(verb_chain(), Duration::from_secs(1)).await;
+    h.baseline_v2(1);
+    h.delay_simulated("get_threshold", Duration::from_secs(5));
+    let err = h.submit(&[1], Some("req-slow-compare")).await.unwrap_err();
+    match &err {
+        SaError::AuthEntryConstructionFailed {
+            stage,
+            redacted_reason,
+        } => {
+            assert_eq!(*stage, "signer_set_compare");
+            assert_eq!(
+                redacted_reason,
+                "signer_set_compare exceeded collective pre-submit budget of 1s"
+            );
+        }
+        other => panic!("expected AuthEntryConstructionFailed; got {other:?}"),
+    }
+    assert_eq!(
+        h.primary_log.rule_reads()[0],
+        1,
+        "the pin check read the rule"
+    );
+    assert!(!h.simulated("noop"));
+    assert_eq!(h.sends(), 0);
+}
+
+/// A budget that is spent by the time the baseline read returns elapses at
+/// stage `baseline_read`, before any RPC.
+#[tokio::test]
+async fn a_spent_budget_elapses_at_baseline_read() {
+    let h = Harness::with_budget(verb_chain(), Duration::ZERO).await;
+    h.baseline_v2(1);
+    let err = h.submit(&[1], Some("req-zero-budget")).await.unwrap_err();
+    match &err {
+        SaError::AuthEntryConstructionFailed {
+            stage,
+            redacted_reason,
+        } => {
+            assert_eq!(*stage, "baseline_read");
+            assert_eq!(
+                redacted_reason,
+                "baseline_read exceeded collective pre-submit budget of 0s"
+            );
+        }
+        other => panic!("expected AuthEntryConstructionFailed; got {other:?}"),
+    }
+    assert!(h.primary_log.simulated().is_empty());
+    assert!(h.secondary_log.is_untouched());
+    assert_eq!(h.sends(), 0);
+}
+
+/// A rule whose lock another holder keeps refuses at stage `rule_lock`
+/// once the pre-submit budget ends, before any RPC; once the holder drops
+/// the lock, the same submission signs.
+#[tokio::test]
+async fn a_held_rule_lock_refuses_at_rule_lock_until_it_is_released() {
+    let h = Harness::with_budget(two_rule_chain(), Duration::from_secs(1)).await;
+    h.baseline_v2(1);
+    let holder = stellar_agent_smart_account::test_helpers::hold_rule_lock(
+        &h.manager,
+        &strkey(&smart_account()),
+        1,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    let err = h.submit(&[1], Some("req-held-lock")).await.unwrap_err();
+    match &err {
+        SaError::AuthEntryConstructionFailed {
+            stage,
+            redacted_reason,
+        } => {
+            assert_eq!(*stage, "rule_lock");
+            assert_eq!(
+                redacted_reason,
+                "rule 1: the rule lock was not acquired within its budget"
+            );
+        }
+        other => panic!("expected AuthEntryConstructionFailed; got {other:?}"),
+    }
+    assert!(h.primary_log.simulated().is_empty());
+    assert_eq!(h.sends(), 0);
+
+    drop(holder);
+    h.submit(&[1], Some("req-released-lock")).await.unwrap();
+    assert_eq!(h.sends(), 1);
+}
+
+/// The submit path releases the locks it acquired before the send: while a
+/// sent submission stalls in its confirmation poll, a `signers list` on the
+/// same rule takes the lock and completes first.
+#[tokio::test]
+async fn the_submit_path_releases_its_locks_before_the_send() {
+    let h = Harness::new(two_rule_chain()).await;
+    h.baseline_v2(1);
+    h.delay_poll(Duration::from_secs(2));
+
+    let submitted = async {
+        h.submit(&[1], Some("req-drop-point")).await.unwrap();
+        tokio::time::Instant::now()
+    };
+    let listed = async {
+        while h.sends() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        h.manager
+            .list_signers(smart_account(), 1, None, "req-list-during-poll".to_owned())
+            .await
+            .unwrap();
+        tokio::time::Instant::now()
+    };
+    let (submitted_at, listed_at) = tokio::join!(submitted, listed);
+    assert!(
+        listed_at < submitted_at,
+        "the list completed while the submission was still polling"
+    );
+}
+
+/// When faults coexist, a missing baseline on one rule refuses before a
+/// drifted verifier on another, and a drifted verifier on one rule refuses
+/// before a signer-set divergence on another.
+#[tokio::test]
+async fn coexisting_faults_refuse_in_the_check_order() {
+    let h = Harness::new(two_rule_chain()).await;
+    h.baseline_v2(2);
+    h.pin_created(2, vec![FOREIGN_FIRST8.to_owned()], vec![], vec![], vec![]);
+    let err = h
+        .submit_invocation("pair", &[1, 2], Some("req-baseline-first"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, SaError::SignerSetMissingBaseline { rule_id: 1, .. }),
+        "{err:?}"
+    );
+    assert!(h.primary_log.simulated().is_empty());
+    assert!(
+        !h.rows()
+            .iter()
+            .any(|e| matches!(e.event_kind, EventKind::SaVerifierHashDrift { .. }))
+    );
+
+    let chain = two_rule_chain().with_rule(
+        1,
+        rule(1, vec![external_signer(&verifier_v(), &[0x11; 32])], vec![]),
+    );
+    let h = Harness::new(chain).await;
+    h.baseline_v2(1);
+    h.baseline_v2(2);
+    h.pin_created(1, vec![FOREIGN_FIRST8.to_owned()], vec![], vec![], vec![]);
+    h.set_rule(2, &rule_two_with_another_key());
+    let err = h
+        .submit_invocation("pair", &[1, 2], Some("req-drift-first"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, SaError::VerifierHashDrift { rule_id: 1, .. }),
+        "{err:?}"
+    );
+    assert!(diverged_rows(&h, "req-drift-first").is_empty());
+    assert_eq!(h.sends(), 0);
+}
+
+/// Rule 0 beside rule 1 is neither locked nor compared: a held lock on rule
+/// 0 does not stop the submission, and only rule 1 is read.
+#[tokio::test]
+async fn rule_zero_beside_rule_one_checks_rule_one_only() {
+    let chain = two_rule_chain().with_rule(0, rule(0, vec![delegated_signer()], vec![]));
+    let h = Harness::with_timeout(chain, Duration::from_secs(2)).await;
+    h.baseline_v2(1);
+    let rule_zero = stellar_agent_smart_account::test_helpers::hold_rule_lock(
+        &h.manager,
+        &strkey(&smart_account()),
+        0,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    h.submit_invocation("pair", &[0, 1], Some("req-rule-zero"), None)
+        .await
+        .unwrap();
+    assert_eq!(h.sends(), 1);
+    assert_eq!(h.primary_log.rule_reads(), vec![1, 1]);
+    assert_eq!(h.secondary_log.rule_reads(), vec![1]);
+    drop(rule_zero);
+}
+
+/// A rule verb submitting through the rule manager meets the same deadline:
+/// an expiry update whose auth rule's comparison is slower than the budget
+/// elapses at stage `signer_set_compare`, writes its raw row with that code
+/// and sends nothing. The read's own timeout is longer than its delay, so
+/// the budget ends first.
+#[tokio::test]
+async fn a_rule_verbs_slow_comparison_elapses_at_signer_set_compare() {
+    let h = Harness::with_budget(verb_chain(), Duration::from_secs(1)).await;
+    h.baseline_v2(1);
+    h.delay_simulated("get_threshold", Duration::from_secs(5));
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+    let err = h
+        .rule_manager()
+        .update_valid_until(
+            smart_account(),
+            1,
+            Some(5_000),
+            vec![ContextRuleId::new(1)],
+            &signer,
+            None,
+            "req-wrapper-elapse".to_owned(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SaError::AuthEntryConstructionFailed {
+                stage: "signer_set_compare",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        raw_wire_code(&h, "req-wrapper-elapse"),
+        "sa.auth_entry_construction_failed"
+    );
+    assert!(!h.simulated("update_context_rule_valid_until"));
+    assert_eq!(h.sends(), 0);
+}
+
+/// Counts the submissions recorded as sent and settled.
+#[derive(Default)]
+struct CountingRecorder {
+    pre_sends: AtomicUsize,
+    outcomes: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl SubmissionRecorder for CountingRecorder {
+    async fn pre_send(
+        &self,
+        _intent: &stellar_agent_network::SubmissionIntent,
+    ) -> Result<(), stellar_agent_core::WalletError> {
+        self.pre_sends.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn outcome(
+        &self,
+        _intent: &stellar_agent_network::SubmissionIntent,
+        _outcome: &stellar_agent_network::SubmissionOutcome,
+    ) {
+        self.outcomes.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A missing-baseline refusal, a divergence refusal and a drift refusal
+/// each leave no submission record; a submission that signs leaves one.
+#[tokio::test]
+async fn a_refused_submission_leaves_no_record_and_a_sent_one_does() {
+    let recorder = CountingRecorder::default();
+
+    let h = Harness::new(two_rule_chain()).await;
+    let missing = h
+        .submit_invocation("noop", &[1], Some("req-record-missing"), Some(&recorder))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.wire_code(), "sa.signer_set_missing_baseline");
+
+    h.baseline_v2(2);
+    h.set_rule(2, &rule_two_with_another_key());
+    let diverged = h
+        .submit_invocation("noop", &[2], Some("req-record-diverged"), Some(&recorder))
+        .await
+        .unwrap_err();
+    assert_eq!(diverged.wire_code(), "sa.signer_set_diverged");
+
+    let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
+    h.baseline_v2(1);
+    h.pin_created(1, vec![FOREIGN_FIRST8.to_owned()], vec![], vec![], vec![]);
+    let drift = h
+        .submit_invocation("noop", &[1], Some("req-record-drift"), Some(&recorder))
+        .await
+        .unwrap_err();
+    assert_eq!(drift.wire_code(), "sa.verifier_hash_drift");
+    assert_eq!(recorder.pre_sends.load(Ordering::SeqCst), 0);
+    assert_eq!(recorder.outcomes.load(Ordering::SeqCst), 0);
+
+    let h = Harness::new(two_rule_chain()).await;
+    h.baseline_v2(1);
+    h.submit_invocation("noop", &[1], Some("req-record-sent"), Some(&recorder))
+        .await
+        .unwrap();
+    assert_eq!(recorder.pre_sends.load(Ordering::SeqCst), 1);
+    assert_eq!(recorder.outcomes.load(Ordering::SeqCst), 1);
+}
+
+// ── Auth rules a holder lends uncompared ──────────────────────────────────────
+
+/// Rules 1 and 2 of [`two_rule_chain`], with P served as the
+/// simple-threshold policy for an attach to rule 1.
+fn attach_chain() -> Chain {
+    two_rule_chain().with_wasm(&policy_p(), KNOWN_WASM_HASH)
+}
+
+/// The state a confirmed attach of P to rule 1 of [`attach_chain`] at
+/// threshold 1 leaves on chain.
+fn after_attach_on_rule_one() -> AfterSend {
+    AfterSend {
+        rules: vec![(1, rule(1, vec![delegated_account(0x31)], vec![policy_p()]))],
+        thresholds: vec![(strkey(&policy_p()), 1, 1)],
+    }
+}
+
+/// Attaches the simple-threshold policy P to rule 1 at threshold 1,
+/// authorized under `auth_rule_ids`.
+async fn attach_threshold_under(
+    h: &Harness,
+    auth_rule_ids: &[u32],
+    request_id: &str,
+) -> Result<u32, SaError> {
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+    h.rule_manager()
+        .add_policy(
+            smart_account(),
+            1,
+            policy_p(),
+            threshold_param(1),
+            auth_rule_ids
+                .iter()
+                .copied()
+                .map(ContextRuleId::new)
+                .collect(),
+            &signer,
+            None,
+            request_id.to_owned(),
+            false,
+            false,
+        )
+        .await
+}
+
+/// A threshold attach to rule 1 authorized under rule 2 compares rule 1
+/// itself and lends rule 2 to the submission uncompared; the submission
+/// reads rule 2's state row, and a rule 2 without one refuses with
+/// `sa.signer_set_missing_baseline` naming rule 2. Nothing is sent, and the
+/// only rule read is the entry's comparison of rule 1.
+#[tokio::test]
+async fn an_attach_under_an_unbaselined_auth_rule_refuses_missing_baseline() {
+    let h = Harness::new(attach_chain()).await;
+    h.baseline_v2(1);
+    h.after_send_state(&after_attach_on_rule_one());
+
+    let err = attach_threshold_under(&h, &[2], "req-attach-auth-unbaselined")
+        .await
+        .unwrap_err();
+    match &err {
+        SaError::SignerSetMissingBaseline {
+            rule_id,
+            request_id,
+            ..
+        } => {
+            assert_eq!(*rule_id, 2);
+            assert_eq!(request_id, "req-attach-auth-unbaselined");
+        }
+        other => panic!("expected SignerSetMissingBaseline; got {other:?}"),
+    }
+    assert_eq!(h.primary_log.rule_reads(), vec![1]);
+    assert_eq!(h.secondary_log.rule_reads(), vec![1]);
+    assert!(!h.simulated("add_policy"));
+    assert_eq!(h.sends(), 0);
+}
+
+/// The same attach with rule 2's signers changed since its state row was
+/// recorded refuses with `sa.signer_set_diverged` naming rule 2, writes the
+/// diverged row under the call's request id, and sends nothing.
+#[tokio::test]
+async fn an_attach_under_a_diverged_auth_rule_refuses_with_the_diverged_row() {
+    let h = Harness::new(attach_chain()).await;
+    h.baseline_v2(1);
+    h.baseline_v2(2);
+    h.set_rule(2, &rule_two_with_another_key());
+    h.after_send_state(&after_attach_on_rule_one());
+
+    let err = attach_threshold_under(&h, &[2], "req-attach-auth-diverged")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SaError::SignerSetDiverged {
+                rule_id: 2,
+                tx_hash: None,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(diverged_rows(&h, "req-attach-auth-diverged"), vec![2]);
+    assert!(!h.simulated("add_policy"));
+    assert_eq!(h.sends(), 0);
+}
+
+/// With both rules baselined the attach signs: the entry compares rule 1,
+/// the submission compares rule 2, and the threshold row records the
+/// attach.
+#[tokio::test]
+async fn an_attach_under_a_baselined_auth_rule_compares_it_and_signs() {
+    let h = Harness::new(attach_chain()).await;
+    h.baseline_v2(1);
+    h.baseline_v2(2);
+    h.after_send_state(&after_attach_on_rule_one());
+
+    attach_threshold_under(&h, &[2], "req-attach-auth-signs")
+        .await
+        .unwrap();
+    assert_eq!(h.sends(), 1);
+    let secondary = h.secondary_log.rule_reads();
+    assert!(
+        secondary.contains(&1) && secondary.contains(&2),
+        "both rules were compared through the secondary: {secondary:?}"
+    );
+    assert!(
+        row_kinds(&h.rows(), "req-attach-auth-signs")
+            .contains(&"sa_threshold_changed_v2".to_owned()),
+        "{:?}",
+        row_kinds(&h.rows(), "req-attach-auth-signs")
+    );
+}
+
+/// The spending-limit policy's stored data, as `get_spending_limit_data`
+/// returns it: `spending_limit`, `period_ledgers`, an empty history and no
+/// spend.
+fn spending_limit_data(spending_limit: i128, period_ledgers: u32) -> ScVal {
+    let i128_val = |value: i128| {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "canonical i128 split into its high and low 64 bits"
+        )]
+        ScVal::I128(Int128Parts {
+            hi: (value >> 64) as i64,
+            lo: value as u64,
+        })
+    };
+    let entry = |key: &str, val: ScVal| ScMapEntry {
+        key: symbol(key),
+        val,
+    };
+    ScVal::Map(Some(ScMap(
+        vec![
+            entry("cached_total_spent", i128_val(0)),
+            entry("period_ledgers", ScVal::U32(period_ledgers)),
+            entry("spending_history", scvec(vec![])),
+            entry("spending_limit", i128_val(spending_limit)),
+        ]
+        .try_into()
+        .unwrap(),
+    )))
+}
+
+/// Rule 1 holding the spending-limit policy Q beside [`two_rule_chain`]'s
+/// rule 2, with Q's stored data served.
+fn spending_limit_chain() -> Chain {
+    two_rule_chain()
+        .with_rule(1, rule(1, vec![delegated_account(0x31)], vec![policy_q()]))
+        .with_entry(wasm_instance(&policy_q(), spending_limit_hash()))
+}
+
+/// Retunes rule 1's spending limit, authorized under `auth_rule_ids`.
+async fn set_spending_limit_under(
+    h: &Harness,
+    auth_rule_ids: &[u32],
+    request_id: &str,
+) -> Result<(), SaError> {
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+    let auth_rule_ids: Vec<ContextRuleId> = auth_rule_ids
+        .iter()
+        .copied()
+        .map(ContextRuleId::new)
+        .collect();
+    h.manager
+        .set_spending_limit(
+            smart_account(),
+            1,
+            &auth_rule_ids,
+            2_000,
+            &signer,
+            request_id.to_owned(),
+        )
+        .await
+}
+
+/// A spending-limit retune of rule 1 authorized under admin rule 2 lends
+/// rule 2 to the submission uncompared; a rule 2 without a state row
+/// refuses with `sa.signer_set_missing_baseline` naming rule 2, and nothing
+/// is sent.
+#[tokio::test]
+async fn a_spending_limit_retune_under_an_unbaselined_admin_rule_refuses() {
+    let h = Harness::new(spending_limit_chain()).await;
+    h.set_simulated_return("get_spending_limit_data", spending_limit_data(1_000, 100));
+
+    let err = set_spending_limit_under(&h, &[2], "req-retune-admin-unbaselined")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, SaError::SignerSetMissingBaseline { rule_id: 2, .. }),
+        "{err:?}"
+    );
+    assert!(
+        !h.primary_log.rule_reads().contains(&2),
+        "the admin rule is refused before any read of it"
+    );
+    assert!(!h.simulated("execute"));
+    assert_eq!(h.sends(), 0);
+}
+
+/// The retune locks its admin rule beside its target: while another holder
+/// keeps rule 2's lock, the retune refuses at stage `rule_lock` naming rule
+/// 2 once the manager's timeout ends, before any RPC.
+#[tokio::test]
+async fn a_spending_limit_retune_waits_for_its_admin_rules_lock() {
+    let h = Harness::with_timeout(spending_limit_chain(), Duration::from_millis(300)).await;
+    h.set_simulated_return("get_spending_limit_data", spending_limit_data(1_000, 100));
+    let holder = stellar_agent_smart_account::test_helpers::hold_rule_lock(
+        &h.manager,
+        &strkey(&smart_account()),
+        2,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    let err = set_spending_limit_under(&h, &[2], "req-retune-admin-locked")
+        .await
+        .unwrap_err();
+    match &err {
+        SaError::AuthEntryConstructionFailed {
+            stage,
+            redacted_reason,
+        } => {
+            assert_eq!(*stage, "rule_lock");
+            assert_eq!(
+                redacted_reason,
+                "rule 2: the rule lock was not acquired within its budget"
+            );
+        }
+        other => panic!("expected AuthEntryConstructionFailed; got {other:?}"),
+    }
+    assert!(h.primary_log.simulated().is_empty());
+    assert_eq!(h.sends(), 0);
+    drop(holder);
 }
